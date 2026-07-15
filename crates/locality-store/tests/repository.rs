@@ -1,4 +1,7 @@
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use locality_core::freshness::{FreshnessTier, RemoteVersion};
 use locality_core::journal::{
@@ -10,13 +13,38 @@ use locality_core::planner::{PushOperation, PushPlan};
 use locality_core::shadow::ShadowDocument;
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
-    EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
-    InMemoryStateStore, JournalRepository, MetadataDiscoveryJobRecord,
-    MetadataDiscoveryJobRepository, MetadataDiscoveryPriority, MountConfig, MountLiveModeRecord,
-    MountLiveModeRepository, MountLiveModeState, MountRepository, RemoteObservationRecord,
-    RemoteObservationRepository, ShadowRepository, StoreError, VirtualMutationKind,
-    VirtualMutationRecord, VirtualMutationRepository,
+    ConnectorStateRecord, ConnectorStateRepository, EntityRecord, EntityRepository,
+    FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore, JournalRepository,
+    MetadataDiscoveryJobRecord, MetadataDiscoveryJobRepository, MetadataDiscoveryPriority,
+    MountConfig, MountLiveModeRecord, MountLiveModeRepository, MountLiveModeState, MountRepository,
+    RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
+    StoreError, VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
 };
+
+#[test]
+fn connector_state_round_trips_by_connector_scope() {
+    let mut store = InMemoryStateStore::new();
+    let record = ConnectorStateRecord {
+        connector: "granola".to_string(),
+        scope_kind: "mount".to_string(),
+        scope_id: "granola-main".to_string(),
+        state_version: 1,
+        min_reader_version: 1,
+        state_json: r#"{"last_success_unix_ms":123}"#.to_string(),
+        updated_at: "unix_ms:123".to_string(),
+    };
+
+    store
+        .save_connector_state(record.clone())
+        .expect("save connector state");
+
+    assert_eq!(
+        store
+            .get_connector_state("granola", "mount", "granola-main")
+            .expect("load connector state"),
+        Some(record)
+    );
+}
 
 #[test]
 fn mount_config_round_trips_with_read_only_flag() {
@@ -32,6 +60,53 @@ fn mount_config_round_trips_with_read_only_flag() {
         Some(mount)
     );
     assert_eq!(store.load_mounts().expect("load mounts").len(), 1);
+}
+
+#[test]
+fn repository_persists_mount_settings_json() {
+    fn exercise<S>(store: &mut S)
+    where
+        S: MountRepository,
+    {
+        let mount_id = MountId::new("gmail-main");
+        let mount = MountConfig::new(mount_id.clone(), "gmail", "/tmp/Locality/gmail-main")
+            .with_settings_json(
+                r#"{"gmail":{"date_window":{"after":"2026-07-01","before":"2026-07-15"},"view":"threads"}}"#,
+            );
+
+        store.save_mount(mount).expect("save mount");
+
+        let loaded = store
+            .get_mount(&mount_id)
+            .expect("load mount")
+            .expect("mount exists");
+        assert_eq!(
+            loaded.settings_json,
+            r#"{"gmail":{"date_window":{"after":"2026-07-01","before":"2026-07-15"},"view":"threads"}}"#
+        );
+
+        let updated_mount = MountConfig::new(mount_id.clone(), "gmail", "/tmp/Locality/gmail-main")
+            .with_settings_json(
+                r#"{"gmail":{"date_window":{"after":"2026-07-08","before":"2026-07-22"},"view":"messages"}}"#,
+            );
+        store.save_mount(updated_mount).expect("update mount");
+
+        let updated = store
+            .get_mount(&mount_id)
+            .expect("load updated mount")
+            .expect("mount exists");
+        assert_eq!(
+            updated.settings_json,
+            r#"{"gmail":{"date_window":{"after":"2026-07-08","before":"2026-07-22"},"view":"messages"}}"#
+        );
+    }
+
+    let mut memory = InMemoryStateStore::new();
+    exercise(&mut memory);
+
+    let fixture = SqliteFixture::new();
+    let mut sqlite = fixture.open();
+    exercise(&mut sqlite);
 }
 
 #[test]
@@ -91,6 +166,12 @@ fn remounting_same_mount_id_to_different_connection_clears_source_scoped_state()
             .is_empty()
     );
     assert!(store.list_journal().expect("list journal").is_empty());
+    assert_eq!(
+        store
+            .get_connector_state("notion", "mount", mount_id().as_str())
+            .expect("load connector state"),
+        None
+    );
     assert!(matches!(
         store.load_shadow(&mount_id(), &RemoteId::new("page-1")),
         Err(StoreError::ShadowMissing { .. })
@@ -137,6 +218,47 @@ fn remounting_same_mount_id_to_different_remote_root_clears_source_scoped_state(
             .expect("list entities")
             .is_empty()
     );
+}
+
+#[test]
+fn remounting_same_mount_id_with_different_settings_json_clears_source_scoped_state() {
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(mount_id(), "gmail", "/tmp/loc/gmail")
+                .with_connection_id(ConnectionId::new("gmail-default"))
+                .with_settings_json(r#"{"gmail":{"view":"messages"}}"#),
+        )
+        .expect("save original mount");
+    seed_source_scoped_state(&mut store);
+
+    store
+        .save_mount(
+            MountConfig::new(mount_id(), "gmail", "/tmp/loc/gmail")
+                .with_connection_id(ConnectionId::new("gmail-default"))
+                .with_settings_json(r#"{"gmail":{"view":"threads"}}"#),
+        )
+        .expect("remount with new settings");
+
+    assert_eq!(
+        store
+            .get_mount(&mount_id())
+            .expect("get mount")
+            .expect("mount")
+            .settings_json,
+        r#"{"gmail":{"view":"threads"}}"#
+    );
+    assert!(
+        store
+            .list_entities(&mount_id())
+            .expect("list entities")
+            .is_empty()
+    );
+    assert!(store.list_journal().expect("list journal").is_empty());
+    assert!(matches!(
+        store.load_shadow(&mount_id(), &RemoteId::new("page-1")),
+        Err(StoreError::ShadowMissing { .. })
+    ));
 }
 
 #[test]
@@ -597,6 +719,40 @@ fn mount_id() -> MountId {
     MountId::new("notion-main")
 }
 
+struct SqliteFixture {
+    state_root: PathBuf,
+}
+
+impl SqliteFixture {
+    fn new() -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "locality-store-repository-sqlite-{}-{unique}-{suffix}",
+            std::process::id()
+        ));
+        Self {
+            state_root: root.join("state"),
+        }
+    }
+
+    fn open(&self) -> SqliteStateStore {
+        SqliteStateStore::open(self.state_root.clone()).expect("open sqlite store")
+    }
+}
+
+impl Drop for SqliteFixture {
+    fn drop(&mut self) {
+        if let Some(root) = self.state_root.parent() {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+}
+
 #[test]
 fn metadata_discovery_jobs_promote_and_preserve_failures() {
     let mut store = InMemoryStateStore::new();
@@ -752,6 +908,17 @@ fn journal_entry(push_id: &str, status: JournalStatus) -> JournalEntry {
 }
 
 fn seed_source_scoped_state(store: &mut InMemoryStateStore) {
+    store
+        .save_connector_state(ConnectorStateRecord {
+            connector: "notion".to_string(),
+            scope_kind: "mount".to_string(),
+            scope_id: mount_id().0,
+            state_version: 1,
+            min_reader_version: 1,
+            state_json: "{}".to_string(),
+            updated_at: "1".to_string(),
+        })
+        .expect("save connector state");
     store
         .save_entity(entity_record("page-1", "Roadmap.md"))
         .expect("save entity");

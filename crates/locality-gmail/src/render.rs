@@ -6,7 +6,8 @@ use locality_core::validation::ValidationIssue;
 use locality_core::{LocalityError, LocalityResult};
 use serde::{Deserialize, Serialize};
 
-use crate::dto::{GmailMessage, GmailMessagePart, header_map};
+use crate::attachments::{GmailAttachmentSpec, collect_attachment_specs};
+use crate::dto::{GmailMessage, GmailMessagePart, GmailThread, header_map};
 use crate::oauth::GMAIL_CONNECTOR_ID;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,10 +16,24 @@ pub struct GmailNativeBundle {
     pub message: GmailMessage,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GmailThreadNativeBundle {
+    pub mailbox: String,
+    pub thread: GmailThread,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GmailThreadMessageNativeBundle {
+    pub mailbox: String,
+    pub thread_id: String,
+    pub message: GmailMessage,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GmailRenderedEntity {
     pub document: CanonicalDocument,
     pub shadow: ShadowDocument,
+    pub attachment_specs: Vec<GmailAttachmentSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,6 +46,14 @@ pub struct GmailDraftDocument {
 }
 
 pub fn render_gmail_message(bundle: &GmailNativeBundle) -> LocalityResult<GmailRenderedEntity> {
+    render_gmail_message_with_entity_id(bundle, RemoteId::new(bundle.message.id.clone()))
+}
+
+fn render_gmail_message_with_entity_id(
+    bundle: &GmailNativeBundle,
+    entity_id: RemoteId,
+) -> LocalityResult<GmailRenderedEntity> {
+    let attachment_specs = collect_attachment_specs(&bundle.message);
     let body = message_body(&bundle.message)
         .filter(|body| !body.is_empty())
         .unwrap_or_else(|| {
@@ -40,19 +63,91 @@ pub fn render_gmail_message(bundle: &GmailNativeBundle) -> LocalityResult<GmailR
                 String::new()
             }
         });
-    let frontmatter = message_frontmatter(bundle);
+    let frontmatter =
+        message_frontmatter_with_attachment_state(bundle, Some(&attachment_specs), &entity_id);
     let document = CanonicalDocument::new(frontmatter.clone(), body.clone());
     let native_block_ids = synthetic_body_block_ids(&bundle.message.id, &body);
-    let shadow = ShadowDocument::from_synced_body(
-        RemoteId::new(bundle.message.id.clone()),
-        body,
-        1,
-        native_block_ids,
-    )
-    .map_err(|error| LocalityError::InvalidState(error.to_string()))?
-    .with_frontmatter(frontmatter);
+    let shadow = ShadowDocument::from_synced_body(entity_id, body, 1, native_block_ids)
+        .map_err(|error| LocalityError::InvalidState(error.to_string()))?
+        .with_frontmatter(frontmatter);
 
-    Ok(GmailRenderedEntity { document, shadow })
+    Ok(GmailRenderedEntity {
+        document,
+        shadow,
+        attachment_specs,
+    })
+}
+
+pub fn thread_remote_id(mailbox: &str, thread_id: &str) -> RemoteId {
+    RemoteId::new(format!("gmail-thread:{mailbox}:{thread_id}"))
+}
+
+pub fn parse_thread_remote_id(remote_id: &RemoteId) -> Option<(&str, &str)> {
+    let rest = remote_id.as_str().strip_prefix("gmail-thread:")?;
+    rest.split_once(':')
+}
+
+pub fn thread_message_remote_id(mailbox: &str, thread_id: &str, message_id: &str) -> RemoteId {
+    RemoteId::new(format!(
+        "gmail-thread-message:{mailbox}:{thread_id}:{message_id}"
+    ))
+}
+
+pub fn parse_thread_message_remote_id(remote_id: &RemoteId) -> Option<(&str, &str, &str)> {
+    let rest = remote_id.as_str().strip_prefix("gmail-thread-message:")?;
+    let (mailbox, rest) = rest.split_once(':')?;
+    let (thread_id, message_id) = rest.split_once(':')?;
+    Some((mailbox, thread_id, message_id))
+}
+
+pub fn render_gmail_thread_message(
+    bundle: &GmailThreadMessageNativeBundle,
+) -> LocalityResult<GmailRenderedEntity> {
+    render_gmail_message_with_entity_id(
+        &GmailNativeBundle {
+            mailbox: bundle.mailbox.clone(),
+            message: bundle.message.clone(),
+        },
+        thread_message_remote_id(&bundle.mailbox, &bundle.thread_id, &bundle.message.id),
+    )
+}
+
+pub fn render_gmail_thread(
+    bundle: &GmailThreadNativeBundle,
+) -> LocalityResult<GmailRenderedEntity> {
+    let remote_id = thread_remote_id(&bundle.mailbox, &bundle.thread.id);
+    let subject = bundle
+        .thread
+        .messages
+        .first()
+        .map(message_subject_from_headers)
+        .unwrap_or_else(|| "(no subject)".to_string());
+    let attachment_specs = bundle
+        .thread
+        .messages
+        .iter()
+        .flat_map(collect_attachment_specs)
+        .collect::<Vec<_>>();
+    let version = thread_remote_version(&bundle.thread);
+    let body = thread_body(&bundle.thread);
+    let frontmatter = thread_frontmatter(
+        bundle,
+        remote_id.as_str(),
+        &subject,
+        &version,
+        &attachment_specs,
+    );
+    let document = CanonicalDocument::new(frontmatter.clone(), body.clone());
+    let native_block_ids = synthetic_body_block_ids(remote_id.as_str(), &body);
+    let shadow = ShadowDocument::from_synced_body(remote_id, body, 1, native_block_ids)
+        .map_err(|error| LocalityError::InvalidState(error.to_string()))?
+        .with_frontmatter(frontmatter);
+
+    Ok(GmailRenderedEntity {
+        document,
+        shadow,
+        attachment_specs,
+    })
 }
 
 fn synthetic_body_block_ids(message_id: &str, body: &str) -> Vec<RemoteId> {
@@ -64,7 +159,42 @@ fn synthetic_body_block_ids(message_id: &str, body: &str) -> Vec<RemoteId> {
         .collect()
 }
 
+fn thread_frontmatter(
+    bundle: &GmailThreadNativeBundle,
+    remote_id: &str,
+    subject: &str,
+    version: &str,
+    attachment_specs: &[GmailAttachmentSpec],
+) -> String {
+    let attachments = attachment_frontmatter(attachment_specs);
+
+    format!(
+        "loc:\n  id: {}\n  type: page\n  connector: {}\n  synced_at: {}\n  remote_edited_at: {}\ntitle: {}\ngmail:\n  mailbox: {}\n  thread_id: {}\n  message_count: {}\n{}",
+        yaml_scalar(remote_id),
+        GMAIL_CONNECTOR_ID,
+        yaml_scalar(version),
+        yaml_scalar(version),
+        yaml_scalar(subject),
+        yaml_scalar(&bundle.mailbox),
+        yaml_scalar(&bundle.thread.id),
+        bundle.thread.messages.len(),
+        attachments,
+    )
+}
+
 pub fn message_frontmatter(bundle: &GmailNativeBundle) -> String {
+    message_frontmatter_with_attachment_state(
+        bundle,
+        None,
+        &RemoteId::new(bundle.message.id.clone()),
+    )
+}
+
+fn message_frontmatter_with_attachment_state(
+    bundle: &GmailNativeBundle,
+    attachment_specs: Option<&[GmailAttachmentSpec]>,
+    entity_id: &RemoteId,
+) -> String {
     let message = &bundle.message;
     let version = remote_version(message);
     let headers = message.payload.as_ref().map(header_map).unwrap_or_default();
@@ -72,10 +202,13 @@ pub fn message_frontmatter(bundle: &GmailNativeBundle) -> String {
         .get("subject")
         .cloned()
         .unwrap_or_else(|| "(no subject)".to_string());
+    let attachments = attachment_specs
+        .map(attachment_frontmatter)
+        .unwrap_or_default();
 
     format!(
-        "loc:\n  id: {}\n  type: page\n  connector: {}\n  synced_at: {}\n  remote_edited_at: {}\ntitle: {}\ngmail:\n  mailbox: {}\n  message_id: {}\n  thread_id: {}\n  labels: [{}]\nfrom: {}\nto: [{}]\ncc: [{}]\nbcc: []\nsubject: {}\ndate: {}\n",
-        yaml_scalar(&message.id),
+        "loc:\n  id: {}\n  type: page\n  connector: {}\n  synced_at: {}\n  remote_edited_at: {}\ntitle: {}\ngmail:\n  mailbox: {}\n  message_id: {}\n  thread_id: {}\n  labels: [{}]\n{}from: {}\nto: [{}]\ncc: [{}]\nbcc: []\nsubject: {}\ndate: {}\n",
+        yaml_scalar(entity_id.as_str()),
         GMAIL_CONNECTOR_ID,
         yaml_scalar(&version),
         yaml_scalar(&version),
@@ -89,12 +222,34 @@ pub fn message_frontmatter(bundle: &GmailNativeBundle) -> String {
             .map(|label| yaml_scalar(label))
             .collect::<Vec<_>>()
             .join(", "),
+        attachments,
         yaml_scalar(headers.get("from").map(String::as_str).unwrap_or("")),
         yaml_list_items(headers.get("to").map(String::as_str).unwrap_or("")),
         yaml_list_items(headers.get("cc").map(String::as_str).unwrap_or("")),
         yaml_scalar(&subject),
         yaml_scalar(headers.get("date").map(String::as_str).unwrap_or("")),
     )
+}
+
+fn attachment_frontmatter(attachment_specs: &[GmailAttachmentSpec]) -> String {
+    if attachment_specs.is_empty() {
+        return "  attachments: []\n".to_string();
+    }
+
+    let mut output = String::from("  attachments:\n");
+    for spec in attachment_specs {
+        output.push_str(&format!(
+            "    - filename: {}\n      attachment_id: {}\n      mime_type: {}\n      size: {}\n      path: {}\n",
+            yaml_scalar(&spec.filename),
+            yaml_scalar(&spec.attachment_id),
+            yaml_scalar(&spec.mime_type),
+            spec.size
+                .map(|size| size.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            yaml_scalar(&spec.local_path.display().to_string())
+        ));
+    }
+    output
 }
 
 pub fn remote_version(message: &GmailMessage) -> String {
@@ -106,6 +261,21 @@ pub fn remote_version(message: &GmailMessage) -> String {
         message.id,
         message.internal_date.as_deref().unwrap_or("unknown"),
         labels.join(",")
+    )
+}
+
+pub fn thread_remote_version(thread: &GmailThread) -> String {
+    let mut message_versions = thread
+        .messages
+        .iter()
+        .map(remote_version)
+        .collect::<Vec<_>>();
+    message_versions.sort();
+    format!(
+        "gmail-thread:{}:{}:{}",
+        thread.id,
+        thread.history_id.as_deref().unwrap_or("unknown"),
+        message_versions.join("|")
     )
 }
 
@@ -170,6 +340,38 @@ fn message_body(message: &GmailMessage) -> Option<String> {
         .or_else(|| text_part(payload, "text/html").map(strip_html_tags))
         .map(escape_locality_directive_lines)
         .map(ensure_trailing_newline)
+}
+
+fn thread_body(thread: &GmailThread) -> String {
+    let mut output = String::new();
+    for (index, message) in thread.messages.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+
+        let headers = message.payload.as_ref().map(header_map).unwrap_or_default();
+        let from = headers.get("from").map(String::as_str).unwrap_or("");
+        let date = headers.get("date").map(String::as_str).unwrap_or("");
+        let body = message_body(message).unwrap_or_default();
+        output.push_str(&format!(
+            "## {from}\n\nDate: {date}\nMessage-ID: {}\n\n{body}",
+            message.id
+        ));
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+    output
+}
+
+fn message_subject_from_headers(message: &GmailMessage) -> String {
+    message
+        .payload
+        .as_ref()
+        .map(header_map)
+        .and_then(|headers| headers.get("subject").cloned())
+        .filter(|subject| !subject.trim().is_empty())
+        .unwrap_or_else(|| "(no subject)".to_string())
 }
 
 fn text_part(part: &GmailMessagePart, mime_type: &str) -> Option<String> {
@@ -400,8 +602,9 @@ mod tests {
     use locality_core::LocalityError;
 
     use super::{
-        GmailDraftDocument, GmailNativeBundle, build_draft_mime, remote_version,
-        render_gmail_message,
+        GmailDraftDocument, GmailNativeBundle, GmailThreadNativeBundle, build_draft_mime,
+        message_frontmatter, remote_version, render_gmail_message, render_gmail_thread,
+        yaml_scalar,
     };
     use crate::dto::GmailMessage;
 
@@ -432,9 +635,74 @@ mod tests {
 
         assert!(rendered.document.frontmatter.contains("connector: gmail"));
         assert!(rendered.document.frontmatter.contains("mailbox: \"inbox\""));
+        assert!(rendered.document.frontmatter.contains("attachments: []"));
         assert!(rendered.document.frontmatter.contains("subject: \"Hello\""));
         assert_eq!(rendered.document.body, "Hello from Gmail.\n");
         assert_eq!(rendered.shadow.entity_id.as_str(), "msg-1");
+    }
+
+    #[test]
+    fn renders_thread_document_with_message_sections() {
+        let thread: crate::dto::GmailThread = serde_json::from_value(serde_json::json!({
+            "id": "thread-1",
+            "historyId": "h1",
+            "messages": [
+                {
+                    "id": "msg-1",
+                    "threadId": "thread-1",
+                    "labelIds": ["INBOX"],
+                    "internalDate": "1720900000000",
+                    "payload": {
+                        "mimeType": "text/plain",
+                        "headers": [
+                            { "name": "From", "value": "Ann <ann@example.com>" },
+                            { "name": "Subject", "value": "Quarterly update" },
+                            { "name": "Date", "value": "Tue, 14 Jul 2026 09:30:00 +0000" }
+                        ],
+                        "body": { "data": "Rmlyc3QgbWVzc2FnZS4K" }
+                    }
+                },
+                {
+                    "id": "msg-2",
+                    "threadId": "thread-1",
+                    "labelIds": ["SENT"],
+                    "internalDate": "1720900500000",
+                    "payload": {
+                        "mimeType": "text/plain",
+                        "headers": [
+                            { "name": "From", "value": "Me <me@example.com>" },
+                            { "name": "Subject", "value": "Re: Quarterly update" },
+                            { "name": "Date", "value": "Tue, 14 Jul 2026 09:38:20 +0000" }
+                        ],
+                        "body": { "data": "UmVwbHkuCg" }
+                    }
+                }
+            ]
+        }))
+        .expect("thread");
+
+        let rendered = render_gmail_thread(&GmailThreadNativeBundle {
+            mailbox: "inbox".to_string(),
+            thread,
+        })
+        .expect("render thread");
+
+        assert!(rendered.document.frontmatter.contains("type: page"));
+        assert!(
+            rendered
+                .document
+                .frontmatter
+                .contains("thread_id: \"thread-1\"")
+        );
+        assert!(rendered.document.frontmatter.contains("message_count: 2"));
+        assert!(rendered.document.body.contains("## Ann <ann@example.com>"));
+        assert!(rendered.document.body.contains("First message."));
+        assert!(rendered.document.body.contains("## Me <me@example.com>"));
+        assert!(rendered.document.body.contains("Reply."));
+        assert_eq!(
+            rendered.shadow.entity_id.as_str(),
+            "gmail-thread:inbox:thread-1"
+        );
     }
 
     #[test]
@@ -461,6 +729,88 @@ mod tests {
         .expect("render");
 
         assert_eq!(rendered.document.body, "Hello from padded.\n");
+    }
+
+    #[test]
+    fn message_frontmatter_omits_attachments_when_metadata_cannot_know_them() {
+        let message: GmailMessage = serde_json::from_value(serde_json::json!({
+            "id": "msg-metadata",
+            "threadId": "thread-metadata",
+            "labelIds": ["INBOX"],
+            "internalDate": "1720900000000",
+            "payload": {
+                "mimeType": "text/plain",
+                "headers": [
+                    { "name": "Subject", "value": "Metadata only" }
+                ]
+            }
+        }))
+        .expect("message");
+
+        let frontmatter = message_frontmatter(&GmailNativeBundle {
+            mailbox: "inbox".to_string(),
+            message,
+        });
+
+        assert!(!frontmatter.contains("attachments:"));
+    }
+
+    #[test]
+    fn renders_attachment_metadata_without_downloading_bytes() {
+        let message: GmailMessage = serde_json::from_value(serde_json::json!({
+            "id": "msg-attach",
+            "threadId": "thread-attach",
+            "labelIds": ["INBOX"],
+            "internalDate": "1720900000000",
+            "payload": {
+                "mimeType": "multipart/mixed",
+                "headers": [
+                    { "name": "Subject", "value": "Attachments" }
+                ],
+                "parts": [
+                    {
+                        "mimeType": "text/plain",
+                        "body": { "data": "Qm9keQo" }
+                    },
+                    {
+                        "partId": "2",
+                        "filename": "Invoice.pdf",
+                        "mimeType": "application/pdf",
+                        "body": { "attachmentId": "attach-1", "size": 12 }
+                    }
+                ]
+            }
+        }))
+        .expect("message");
+
+        let rendered = render_gmail_message(&GmailNativeBundle {
+            mailbox: "inbox".to_string(),
+            message,
+        })
+        .expect("render");
+
+        let expected_path =
+            crate::attachments::attachment_local_path("msg-attach", "part-id:2", "Invoice.pdf");
+
+        assert_eq!(rendered.document.body, "Body\n");
+        assert_eq!(rendered.attachment_specs.len(), 1);
+        assert!(rendered.document.frontmatter.contains("attachments:"));
+        assert!(
+            rendered
+                .document
+                .frontmatter
+                .contains("filename: \"Invoice.pdf\"")
+        );
+        assert!(
+            rendered
+                .document
+                .frontmatter
+                .contains("attachment_id: \"attach-1\"")
+        );
+        assert!(rendered.document.frontmatter.contains(&format!(
+            "path: {}",
+            yaml_scalar(&expected_path.display().to_string())
+        )));
     }
 
     #[test]

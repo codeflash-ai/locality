@@ -1,0 +1,98 @@
+name: granola-live-e2e
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/granola-live-e2e.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/locality-connector/**"
+      - "crates/locality-core/**"
+      - "crates/locality-granola/**"
+      - "crates/locality-store/**"
+      - "crates/localityd/**"
+      - "crates/loc-cli/**"
+      - "crates/locality-fuse/**"
+      - "tests/live_granola_vfs_read.sh"
+  schedule:
+    - cron: "23 15 * * 2"
+  workflow_dispatch:
+
+concurrency:
+  group: granola-live-e2e
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  connector-live:
+    name: Granola public API live integrity
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: granola-live-e2e
+    env:
+      GRANOLA_API_KEY: ${{ secrets.GRANOLA_API_KEY }}
+      LOCALITY_GRANOLA_LIVE_NOTE_ID: ${{ secrets.LOCALITY_GRANOLA_LIVE_NOTE_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check live Granola secrets
+        shell: bash
+        run: |
+          missing=()
+          [ -n "$GRANOLA_API_KEY" ] || missing+=("GRANOLA_API_KEY")
+          [ -n "$LOCALITY_GRANOLA_LIVE_NOTE_ID" ] || missing+=("LOCALITY_GRANOLA_LIVE_NOTE_ID")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Live Granola e2e is missing required environment secrets: ${missing[*]}"
+            exit 1
+          fi
+      - name: Run live public API integrity test
+        run: cargo test -p locality-granola --test live_integrity -- --ignored --test-threads=1
+
+  linux-fuse-live:
+    name: Granola CLI daemon and Linux FUSE live e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: granola-live-e2e
+    env:
+      GRANOLA_API_KEY: ${{ secrets.GRANOLA_API_KEY }}
+      LOCALITY_GRANOLA_LIVE_NOTE_ID: ${{ secrets.LOCALITY_GRANOLA_LIVE_NOTE_ID }}
+      LOCALITY_LIVE_GRANOLA_VFS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install FUSE dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            fuse3 \
+            libfuse3-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            pkg-config \
+            sqlite3
+      - name: Check live Granola secrets and FUSE device
+        shell: bash
+        run: |
+          missing=()
+          [ -n "$GRANOLA_API_KEY" ] || missing+=("GRANOLA_API_KEY")
+          [ -n "$LOCALITY_GRANOLA_LIVE_NOTE_ID" ] || missing+=("LOCALITY_GRANOLA_LIVE_NOTE_ID")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Live Granola e2e is missing required environment secrets: ${missing[*]}"
+            exit 1
+          fi
+          if [ ! -e /dev/fuse ]; then
+            echo "::error::/dev/fuse is unavailable; the real Linux FUSE e2e cannot run"
+            exit 1
+          fi
+      - name: Run live mounted-filesystem test
+        run: tests/live_granola_vfs_read.sh

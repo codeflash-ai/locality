@@ -19,12 +19,13 @@ use locality_core::path_projection::{
 };
 use locality_gmail::{
     DEFAULT_GMAIL_OAUTH_BROKER_URL, DEFAULT_GMAIL_OAUTH_REDIRECT_URI, GMAIL_CONNECTOR_ID,
-    HttpGmailOAuthBrokerClient,
+    GmailMountSettings, GmailProjectionView, HttpGmailOAuthBrokerClient,
 };
 use locality_google_docs::{
     DEFAULT_GOOGLE_DOCS_OAUTH_BROKER_URL, DEFAULT_GOOGLE_DOCS_OAUTH_REDIRECT_URI,
     GOOGLE_DOCS_CONNECTOR_ID, HttpGoogleDocsOAuthBrokerClient,
 };
+use locality_granola::GRANOLA_CONNECTOR_ID;
 use locality_notion::oauth::{
     DEFAULT_LOCALITY_NOTION_OAUTH_BROKER_URL, DEFAULT_NOTION_OAUTH_AUTHORIZE_URL,
     HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NotionOAuthBrokerStart,
@@ -41,6 +42,7 @@ use localityd::autosave::auto_save_timestamp;
 use localityd::execution::PushJobReport;
 use localityd::file_provider as daemon_file_provider;
 use localityd::google_docs::resolve_google_docs_connector_for_mount;
+use localityd::granola::resolve_granola_connector_for_mount;
 use localityd::hydration::write_parent_database_schema_cache;
 use localityd::ipc::{DaemonClientError, DaemonRequest, send_request_with_timeout};
 use localityd::runtime::repair_clean_remote_deleted_projections;
@@ -55,10 +57,11 @@ use serde_json::Value;
 use crate::connect::{
     BrokerOAuthConnectOptions, ConnectError, ConnectOptions, ConnectReport, ConnectionShowReport,
     ConnectionsReport, DisconnectReport, GmailBrokerOAuthConnectOptions,
-    GoogleDocsBrokerOAuthConnectOptions, HttpNotionConnectionProbe, OAuthConnectOptions,
-    ProfilesReport, run_connect_gmail_broker_oauth, run_connect_google_docs_broker_oauth,
-    run_connect_notion, run_connect_notion_broker_oauth, run_connect_notion_oauth,
-    run_connection_show, run_connections, run_disconnect, run_profiles,
+    GoogleDocsBrokerOAuthConnectOptions, HttpGranolaConnectionProbe, HttpNotionConnectionProbe,
+    OAuthConnectOptions, ProfilesReport, run_connect_gmail_broker_oauth,
+    run_connect_google_docs_broker_oauth, run_connect_granola, run_connect_notion,
+    run_connect_notion_broker_oauth, run_connect_notion_oauth, run_connection_show,
+    run_connections, run_disconnect, run_profiles,
 };
 use crate::connector::{
     ConnectorResolveError, SourceDescriptor, resolve_notion_connector_for_mount,
@@ -223,6 +226,20 @@ enum ConnectCommand {
     GoogleDocs(ConnectGoogleDocsArgs),
     #[command(about = "Connect Gmail")]
     Gmail(ConnectGmailArgs),
+    #[command(about = "Connect Granola with an API key")]
+    Granola(ConnectGranolaArgs),
+}
+
+#[derive(Debug, Args)]
+struct ConnectGranolaArgs {
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Connection id to save. Defaults to granola-default."
+    )]
+    name: Option<String>,
+    #[arg(long, help = "Read a Granola API key from standard input.")]
+    api_key_stdin: bool,
 }
 
 #[derive(Debug, Args)]
@@ -373,6 +390,24 @@ enum MountCommand {
     GoogleDocs(MountGoogleDocsArgs),
     #[command(about = "Mount Gmail")]
     Gmail(MountGmailArgs),
+    #[command(about = "Mount Granola meeting notes read-only")]
+    Granola(MountGranolaArgs),
+}
+
+#[derive(Debug, Args)]
+struct MountGranolaArgs {
+    #[arg(value_name = "path", help = "Local directory for the Granola mount.")]
+    path: String,
+    #[arg(long, value_name = "id", help = "Connection id to use for this mount.")]
+    connection: Option<String>,
+    #[arg(
+        long,
+        value_name = "id",
+        help = "Mount id to save. Defaults to granola-main."
+    )]
+    mount_id: Option<String>,
+    #[arg(long, value_name = "mode", help = "Projection mode.")]
+    projection: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -476,6 +511,24 @@ struct MountGmailArgs {
         help = "Register the mount as read-only and block push operations."
     )]
     read_only: bool,
+    #[arg(
+        long,
+        value_name = "YYYY-MM-DD",
+        help = "Fetch Gmail messages on or after this date. Must be paired with --before."
+    )]
+    after: Option<String>,
+    #[arg(
+        long,
+        value_name = "YYYY-MM-DD",
+        help = "Fetch Gmail messages before this date. Must be paired with --after."
+    )]
+    before: Option<String>,
+    #[arg(
+        long,
+        value_name = "messages|threads",
+        help = "Gmail projection view. Defaults to messages."
+    )]
+    view: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -910,6 +963,11 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                         options.redirect_uri.as_deref(),
                     );
                 }
+                ConnectCommand::Granola(options) => {
+                    args.push("granola".to_string());
+                    push_optional_flag_value(&mut args, "--name", options.name.as_deref());
+                    push_flag(&mut args, "--api-key-stdin", options.api_key_stdin);
+                }
             }
         }
         LocalityCommand::Connections => args.push("connections".to_string()),
@@ -1009,7 +1067,25 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                         "--projection",
                         options.projection.as_deref(),
                     );
+                    push_optional_flag_value(&mut args, "--after", options.after.as_deref());
+                    push_optional_flag_value(&mut args, "--before", options.before.as_deref());
+                    push_optional_flag_value(&mut args, "--view", options.view.as_deref());
                     push_flag(&mut args, "--read-only", options.read_only);
+                }
+                MountCommand::Granola(options) => {
+                    args.push("granola".to_string());
+                    args.push(options.path.clone());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--connection",
+                        options.connection.as_deref(),
+                    );
+                    push_optional_flag_value(&mut args, "--mount-id", options.mount_id.as_deref());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--projection",
+                        options.projection.as_deref(),
+                    );
                 }
             }
         }
@@ -1330,6 +1406,9 @@ fn reset(args: &[String], json: bool) -> i32 {
 
 fn connect(args: &[String], json: bool) -> i32 {
     let connector = first_positional(args);
+    if connector == Some(GRANOLA_CONNECTOR_ID) {
+        return connect_granola(args, json);
+    }
     if connector == Some(GMAIL_CONNECTOR_ID) {
         return connect_gmail(args, json);
     }
@@ -1342,7 +1421,7 @@ fn connect(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "connect",
                 "usage",
-                "usage: loc connect <notion|google-docs|gmail> [options] [--json]",
+                "usage: loc connect <notion|google-docs|gmail|granola> [options] [--json]",
             ),
             EXIT_USAGE,
         );
@@ -1711,6 +1790,71 @@ fn connect_gmail(args: &[String], json: bool) -> i32 {
         redirect_uri: start.redirect_uri,
     };
     match run_connect_gmail_broker_oauth(&mut store, credentials.as_ref(), options, &broker) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_connect_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => connect_command_error("connect", json, error),
+    }
+}
+
+fn connect_granola(args: &[String], json: bool) -> i32 {
+    if !has_flag(args, "--api-key-stdin") {
+        return command_error(
+            json,
+            CommandError::new(
+                "connect",
+                "auth_required",
+                "Granola API keys must be provided with --api-key-stdin",
+            )
+            .with_suggested_command("loc connect granola --api-key-stdin"),
+            EXIT_USAGE,
+        );
+    }
+    let mut api_key = String::new();
+    if let Err(error) = io::stdin().read_to_string(&mut api_key) {
+        return command_error(
+            json,
+            CommandError::new("connect", "stdin_read_failed", error.to_string()),
+            EXIT_INTERNAL,
+        );
+    }
+    let api_key = api_key.trim().to_string();
+    if api_key.is_empty() {
+        return command_error(
+            json,
+            CommandError::new("connect", "auth_required", "empty Granola API key")
+                .with_suggested_command("loc connect granola --api-key-stdin"),
+            EXIT_USAGE,
+        );
+    }
+
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("connect", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let credentials = open_credential_store(&state_root);
+    let options = ConnectOptions {
+        connection_id: flag_value(args, "--name").map(ConnectionId::new),
+        token: api_key,
+    };
+    match run_connect_granola(
+        &mut store,
+        credentials.as_ref(),
+        options,
+        &HttpGranolaConnectionProbe,
+    ) {
         Ok(report) if json => {
             print_json(&report);
             EXIT_SUCCESS
@@ -2407,6 +2551,14 @@ fn mount(args: &[String], json: bool) -> i32 {
             );
         }
     };
+    let settings_json = if descriptor.id() == GMAIL_CONNECTOR_ID {
+        match gmail_mount_settings_json(args) {
+            Ok(settings_json) => settings_json,
+            Err(error) => return command_error(json, error, EXIT_USAGE),
+        }
+    } else {
+        "{}".to_string()
+    };
 
     let state_root = default_state_root();
     let mut store = match SqliteStateStore::open(state_root.clone()) {
@@ -2429,7 +2581,7 @@ fn mount(args: &[String], json: bool) -> i32 {
             .clone()
             .unwrap_or_else(|| descriptor.default_mount_id().to_string()),
     );
-    let read_only = has_flag(args, "--read-only");
+    let read_only = has_flag(args, "--read-only") || descriptor.id() == GRANOLA_CONNECTOR_ID;
     if let Some(error) = mounted_projection_preflight_error(
         projection.clone(),
         std::env::consts::OS,
@@ -2475,6 +2627,7 @@ fn mount(args: &[String], json: bool) -> i32 {
         connection_id,
         read_only,
         projection,
+        settings_json,
     };
     let mount_id = options.mount_id.clone();
 
@@ -2492,6 +2645,57 @@ fn mount(args: &[String], json: bool) -> i32 {
             EXIT_SUCCESS
         }
         Err(error) => mount_command_error(json, error),
+    }
+}
+
+fn gmail_mount_settings_json(args: &[String]) -> Result<String, CommandError> {
+    let after = flag_value(args, "--after");
+    let before = flag_value(args, "--before");
+    let view = flag_value(args, "--view")
+        .map(GmailProjectionView::parse)
+        .transpose()
+        .map_err(|error| {
+            CommandError::new("mount", "gmail_view_invalid", locality_error_message(error))
+        })?
+        .unwrap_or(GmailProjectionView::Messages);
+
+    if after.is_none() && before.is_none() && view == GmailProjectionView::Messages {
+        return Ok("{}".to_string());
+    }
+
+    let settings = match (after, before) {
+        (None, None) => GmailMountSettings::default().with_view(view),
+        (Some(after), Some(before)) => GmailMountSettings::with_date_window(after, before)
+            .map_err(|error| {
+                CommandError::new(
+                    "mount",
+                    "gmail_date_window_invalid",
+                    locality_error_message(error),
+                )
+            })?
+            .with_view(view),
+        _ => {
+            return Err(CommandError::new(
+                "mount",
+                "gmail_date_window_requires_after_and_before",
+                "Gmail date windows require both --after and --before",
+            ));
+        }
+    };
+
+    settings.to_json().map_err(|error| {
+        CommandError::new("mount", "gmail_settings_encode_failed", error.to_string())
+    })
+}
+
+fn locality_error_message(error: LocalityError) -> String {
+    match error {
+        LocalityError::Validation(issues) => issues
+            .into_iter()
+            .map(|issue| issue.message)
+            .collect::<Vec<_>>()
+            .join("; "),
+        other => other.to_string(),
     }
 }
 
@@ -2533,6 +2737,7 @@ fn mount_remote_root_id(
                 connection_id: connection_id.clone(),
                 read_only,
                 projection: projection.clone(),
+                settings_json: "{}".to_string(),
             };
             let credentials = open_credential_store(state_root);
             resolve_notion_connector_for_mount(store, credentials.as_ref(), &temp_mount)
@@ -2562,6 +2767,7 @@ fn mount_remote_root_id(
                 connection_id: connection_id.clone(),
                 read_only,
                 projection: projection.clone(),
+                settings_json: "{}".to_string(),
             };
             let credentials = open_credential_store(state_root);
             let connector =
@@ -2592,6 +2798,32 @@ fn mount_remote_root_id(
                     "loc mount gmail does not accept Notion or Google Docs root flags",
                 ));
             }
+            Ok(None)
+        }
+        GRANOLA_CONNECTOR_ID => {
+            if has_flag(args, "--workspace")
+                || flag_value(args, "--root-page").is_some()
+                || flag_value(args, "--workspace-folder").is_some()
+            {
+                return Err(CommandError::new(
+                    "mount",
+                    "usage",
+                    "loc mount granola does not accept source root flags",
+                ));
+            }
+            let temp_mount = MountConfig {
+                mount_id: mount_id.clone(),
+                connector: descriptor.id().to_string(),
+                root: PathBuf::from(root),
+                remote_root_id: None,
+                connection_id: connection_id.clone(),
+                read_only: true,
+                projection: projection.clone(),
+                settings_json: "{}".to_string(),
+            };
+            let credentials = open_credential_store(state_root);
+            resolve_granola_connector_for_mount(store, credentials.as_ref(), &temp_mount)
+                .map_err(|error| connector_resolve_command_error("mount", error))?;
             Ok(None)
         }
         connector => Err(CommandError::new(
@@ -5023,6 +5255,9 @@ fn print_mount_report(report: &MountReport) {
     if let Some(connection_id) = &report.connection_id {
         println!("connection: {connection_id}");
     }
+    if report.settings_json != "{}" {
+        println!("settings: {}", report.settings_json);
+    }
     println!(
         "agent guidance: {} {}, {} {}",
         report.guidance.agents_md.action.as_str(),
@@ -7421,7 +7656,7 @@ fn projection_mode_for_target(args: &[String], target_os: &str) -> Result<Projec
 
 fn mount_usage() -> String {
     format!(
-        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]",
+        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--read-only] [--json]\n       loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--json]",
         projection_usage_options_for_target(std::env::consts::OS)
     )
 }
@@ -7885,14 +8120,14 @@ mod tests {
         guard_linux_fuse_shared_root_unregister, guard_unresolved_linux_fuse_unregister,
         guard_unresolved_windows_cloud_files_unregister,
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
-        locate_result_from_report, mounted_projection_preflight_error, notion_authorize_url,
-        notion_oauth_broker_config, print_push_confirmation_preview, projection_mode_for_target,
-        projection_usage_options_for_target, prompt_for_push_confirmation,
-        pull_direct_fallback_error, push_confirmation_preview_matches_displayed,
-        push_preview_plan_matches, should_prompt_for_push_confirmation,
-        should_refresh_notion_url_search, spinner_config_for_command, spinner_enabled,
-        status as run_status_command, validate_virtual_projection_registration,
-        write_connect_report, write_log_report,
+        locate_result_from_report, mount_usage, mounted_projection_preflight_error,
+        notion_authorize_url, notion_oauth_broker_config, print_push_confirmation_preview,
+        projection_mode_for_target, projection_usage_options_for_target,
+        prompt_for_push_confirmation, pull_direct_fallback_error,
+        push_confirmation_preview_matches_displayed, push_preview_plan_matches,
+        should_prompt_for_push_confirmation, should_refresh_notion_url_search,
+        spinner_config_for_command, spinner_enabled, status as run_status_command,
+        validate_virtual_projection_registration, write_connect_report, write_log_report,
     };
 
     #[test]
@@ -7916,6 +8151,7 @@ mod tests {
                     "notion",
                     "google-docs",
                     "gmail",
+                    "granola",
                     "--json",
                 ],
             ),
@@ -7944,6 +8180,14 @@ mod tests {
                     "Connect Gmail",
                     "--broker-url",
                     "--redirect-uri",
+                ],
+            ),
+            (
+                vec!["connect", "granola", "--help"],
+                vec![
+                    "Usage: loc connect granola",
+                    "Connect Granola with an API key",
+                    "--api-key-stdin",
                 ],
             ),
             (
@@ -8016,6 +8260,7 @@ mod tests {
                     "notion",
                     "google-docs",
                     "gmail",
+                    "granola",
                     "--json",
                 ],
             ),
@@ -8041,6 +8286,15 @@ mod tests {
                 vec![
                     "Usage: loc mount gmail",
                     "Mount Gmail",
+                    "--connection",
+                    "--projection",
+                ],
+            ),
+            (
+                vec!["mount", "granola", "--help"],
+                vec![
+                    "Usage: loc mount granola",
+                    "Mount Granola meeting notes read-only",
                     "--connection",
                     "--projection",
                 ],
@@ -8304,6 +8558,14 @@ mod tests {
         assert!(help.contains("Usage: loc push"));
         assert!(help.contains("Push local changes"));
         assert!(!help.trim_start().starts_with('{'));
+    }
+
+    #[test]
+    fn mount_usage_mentions_gmail_settings_flags() {
+        let usage = mount_usage();
+
+        assert!(usage.contains("--after YYYY-MM-DD --before YYYY-MM-DD"));
+        assert!(usage.contains("--view messages|threads"));
     }
 
     #[test]

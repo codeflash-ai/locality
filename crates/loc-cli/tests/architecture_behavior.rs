@@ -473,19 +473,17 @@ impl Connector for FakeSource {
         });
         match request.container {
             ChildContainer::PageChildren(remote_id) if remote_id == RemoteId::new("page-1") => {
-                Ok(ListChildrenResult {
-                    entries: vec![TreeEntry {
-                        mount_id: request.mount_id,
-                        remote_id: RemoteId::new("child-1"),
-                        kind: EntityKind::Page,
-                        title: "Launch Plan".to_string(),
-                        path: request.parent_path.join("Launch Plan/page.md"),
-                        hydration: HydrationState::Stub,
-                        content_hash: None,
-                        remote_edited_at: Some("2026-06-12T00:00:00Z".to_string()),
-                        stub_frontmatter: Some(frontmatter("child-1", "Launch Plan")),
-                    }],
-                })
+                Ok(ListChildrenResult::complete(vec![TreeEntry {
+                    mount_id: request.mount_id,
+                    remote_id: RemoteId::new("child-1"),
+                    kind: EntityKind::Page,
+                    title: "Launch Plan".to_string(),
+                    path: request.parent_path.join("Launch Plan/page.md"),
+                    hydration: HydrationState::Stub,
+                    content_hash: None,
+                    remote_edited_at: Some("2026-06-12T00:00:00Z".to_string()),
+                    stub_frontmatter: Some(frontmatter("child-1", "Launch Plan")),
+                }]))
             }
             _ => Ok(ListChildrenResult::default()),
         }

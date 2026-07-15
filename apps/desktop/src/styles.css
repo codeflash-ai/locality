@@ -624,8 +624,6 @@ p {
 .workspace-card .live-mode-control,
 .attention-panel .primary-button,
 .attention-panel .secondary-button,
-.suggestion-card .primary-button,
-.suggestion-card .secondary-button,
 .located-path .secondary-button,
 .activity-item .secondary-button,
 .footer-actions .primary-button,
@@ -1010,15 +1008,19 @@ p {
 }
 
 .connector-option {
-  display: flex;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
   min-height: 72px;
   align-items: center;
-  justify-content: space-between;
   gap: 14px;
+  width: 100%;
   padding: 14px;
   border: 1px solid var(--line);
   border-radius: 15px;
   background: #ffffff;
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
 }
 
 .connector-option > div {
@@ -1030,6 +1032,25 @@ p {
   background: var(--accent-soft);
 }
 
+.connector-option.selectable {
+  cursor: pointer;
+}
+
+.connector-option.selectable:hover:not(:disabled),
+.connector-option.selectable.selected {
+  border-color: rgba(8, 123, 114, 0.42);
+  background: rgba(232, 248, 244, 0.96);
+  box-shadow: 0 12px 26px rgba(8, 123, 114, 0.12);
+}
+
+.connector-option.selectable:disabled {
+  cursor: default;
+}
+
+.connector-option.muted {
+  background: rgba(255, 255, 255, 0.72);
+}
+
 .connector-option strong,
 .connector-option small {
   display: block;
@@ -1039,6 +1060,20 @@ p {
   margin-top: 4px;
   color: var(--muted);
   line-height: 1.35;
+}
+
+.connector-option .connector-icon {
+  width: 32px;
+  height: 32px;
+}
+
+.onboarding-source-field {
+  max-width: 440px;
+  margin-top: 0;
+}
+
+.onboarding-source-field span {
+  color: var(--muted);
 }
 
 .path-field,
@@ -1687,7 +1722,6 @@ p {
 .activity-item,
 .setting-row,
 .option-row,
-.suggestion-card,
 .attention-panel {
   display: flex;
   align-items: center;
@@ -1727,7 +1761,6 @@ p {
 
 .workspace-card,
 .panel,
-.suggestion-card,
 .attention-panel,
 .empty-action-panel,
 .mount-hero,
@@ -1744,7 +1777,6 @@ p {
 }
 
 .workspace-card,
-.suggestion-card,
 .attention-panel,
 .empty-action-panel,
 .mount-hero,
@@ -2753,58 +2785,20 @@ button.home-stat:hover {
   height: 34px;
   place-items: center;
   border-radius: 8px;
+  overflow: hidden;
+  background: transparent;
+  color: inherit;
   font-size: 13px;
   font-weight: 950;
   letter-spacing: 0;
 }
 
-.connector-icon svg {
+.connector-icon img {
   display: block;
   width: 100%;
   height: 100%;
-}
-
-.connector-icon.notion {
-  background: #ffffff;
-  color: #111827;
-}
-
-.connector-icon.notion svg path {
-  fill: #111827;
-}
-
-.connector-icon.google-docs {
-  background: #2b7de9;
-  color: #ffffff;
-}
-
-.connector-icon.google-docs svg path {
-  fill: #4285f4;
-}
-
-.connector-icon.gmail {
-  background: #ffffff;
-  color: #202124;
-}
-
-.connector-icon.gmail .gmail-envelope {
-  fill: #ffffff;
-}
-
-.connector-icon.gmail .gmail-blue {
-  fill: #4285f4;
-}
-
-.connector-icon.gmail .gmail-green {
-  fill: #34a853;
-}
-
-.connector-icon.gmail .gmail-yellow {
-  fill: #fbbc04;
-}
-
-.connector-icon.gmail .gmail-red {
-  fill: #ea4335;
+  object-fit: contain;
+  user-select: none;
 }
 
 .connector-choice-facts {
@@ -2863,29 +2857,6 @@ button.home-stat:hover {
 
 .compact-settings {
   grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
-.suggestion-card {
-  justify-content: flex-start;
-}
-
-.suggestion-card > svg {
-  color: var(--accent);
-}
-
-.suggestion-card h3 {
-  margin-top: 4px;
-  font-size: 15px;
-}
-
-.suggestion-card p:last-child {
-  margin-top: 3px;
-  color: var(--muted);
-  font-size: var(--type-body);
-}
-
-.suggestion-card .secondary-button {
-  margin-left: auto;
 }
 
 .discovery-panel {

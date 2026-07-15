@@ -13,9 +13,9 @@ use locality_core::shadow::ShadowDocument;
 use crate::error::StoreResult;
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
-    ConnectorProfileRecord, EntityRecord, FreshnessStateRecord, HydrationJobRecord,
-    MetadataDiscoveryJobRecord, MountConfig, MountLiveModeRecord, RemoteObservationRecord,
-    ShadowSnapshotRecord, VirtualMutationRecord,
+    ConnectorProfileRecord, ConnectorStateRecord, EntityRecord, FreshnessStateRecord,
+    HydrationJobRecord, MetadataDiscoveryJobRecord, MountConfig, MountLiveModeRecord,
+    RemoteObservationRecord, ShadowSnapshotRecord, VirtualMutationRecord,
 };
 
 pub trait MountRepository {
@@ -46,6 +46,16 @@ pub trait ConnectorProfileRepository {
         profile_id: &ConnectorProfileId,
     ) -> StoreResult<Option<ConnectorProfileRecord>>;
     fn list_connector_profiles(&self) -> StoreResult<Vec<ConnectorProfileRecord>>;
+}
+
+pub trait ConnectorStateRepository {
+    fn save_connector_state(&mut self, state: ConnectorStateRecord) -> StoreResult<()>;
+    fn get_connector_state(
+        &self,
+        connector: &str,
+        scope_kind: &str,
+        scope_id: &str,
+    ) -> StoreResult<Option<ConnectorStateRecord>>;
 }
 
 pub trait EntityRepository {

@@ -22,9 +22,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(test)]
 use loc_cli::connect::DEFAULT_NOTION_PROFILE_ID;
 use loc_cli::connect::{
-    BrokerOAuthConnectOptions, GmailBrokerOAuthConnectOptions, GoogleDocsBrokerOAuthConnectOptions,
-    run_connect_gmail_broker_oauth, run_connect_google_docs_broker_oauth,
-    run_connect_notion_broker_oauth,
+    BrokerOAuthConnectOptions, ConnectOptions, GmailBrokerOAuthConnectOptions,
+    GoogleDocsBrokerOAuthConnectOptions, HttpGranolaConnectionProbe,
+    run_connect_gmail_broker_oauth, run_connect_google_docs_broker_oauth, run_connect_granola,
+    run_connect_notion_broker_oauth, run_disconnect,
 };
 use loc_cli::daemon::{DaemonRunState, run_daemon_control};
 use loc_cli::diff::{DiffReport, run_diff};
@@ -167,6 +168,10 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const VIRTUAL_PROJECTION_SOURCE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const VIRTUAL_PROJECTION_SOURCE_READY_POLL: Duration = Duration::from_millis(250);
 const VIRTUAL_PROJECTION_SOURCE_READY_LOG_EVERY: Duration = Duration::from_secs(2);
+#[cfg(target_os = "macos")]
+const MACOS_FILE_PROVIDER_MOUNT_ROOT_APPEAR_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "macos")]
+const MACOS_FILE_PROVIDER_MOUNT_ROOT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const LIVE_MODE_RUNNER_ACTIVE_INTERVAL: Duration = Duration::from_millis(500);
 const LIVE_MODE_RUNNER_IDLE_RECHECK: Duration = Duration::from_secs(5 * 60);
 const LIVE_MODE_RUNNER_PERIODIC_RECHECK: Duration = LIVE_MODE_ACTIVE_REMOTE_CHECK_INTERVAL;
@@ -760,7 +765,10 @@ fn debug_live_mode_status_blocking() -> Result<DesktopLiveModeDebugStatus, Strin
     let mounts = store
         .load_mounts()
         .map_err(|error| format!("Could not load mounts for Live Mode debug: {error}"))?;
-    let Some(mount) = choose_mount(&mounts) else {
+    let connections = store
+        .list_connections()
+        .map_err(|error| format!("Could not load connections for Live Mode debug: {error}"))?;
+    let Some(mount) = choose_mount(&mounts, &connections) else {
         return Ok(DesktopLiveModeDebugStatus {
             mount_id: None,
             enabled: false,
@@ -1303,6 +1311,223 @@ async fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
 #[tauri::command]
 async fn create_desktop_mount(app: AppHandle, request: CreateDesktopMountRequest) -> ActionReport {
     create_desktop_mount_command(app, request).await
+}
+
+#[tauri::command]
+async fn connect_granola(app: AppHandle, api_key: String) -> ActionReport {
+    let report = tauri::async_runtime::spawn_blocking(move || connect_granola_blocking(api_key))
+        .await
+        .map_err(|error| format!("Granola connection worker failed: {error}"))
+        .and_then(|result| result)
+        .map(|message| ActionReport { ok: true, message })
+        .unwrap_or_else(|message| ActionReport { ok: false, message });
+    if report.ok {
+        refresh_desktop_surfaces(&app);
+    }
+    report
+}
+
+fn connect_granola_blocking(api_key: String) -> Result<String, String> {
+    let api_key = api_key.trim().to_string();
+    if api_key.is_empty() {
+        return Err("Enter a Granola API key.".to_string());
+    }
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let credentials = open_credential_store(&state_root);
+    let report = run_connect_granola(
+        &mut store,
+        credentials.as_ref(),
+        ConnectOptions {
+            connection_id: Some(ConnectionId::new("granola-default")),
+            token: api_key,
+        },
+        &HttpGranolaConnectionProbe,
+    )
+    .map_err(|error| error.message())?;
+    let existing_mount = store
+        .get_mount(&MountId::new("granola-main"))
+        .map_err(|error| format!("Could not inspect Granola mount: {error}"))?
+        .filter(|mount| mount.connector == "granola");
+    drop(store);
+    if let Some(mount) = existing_mount {
+        ensure_daemon_running(&state_root)?;
+        reload_daemon_mounts(&state_root)?;
+        if mount.projection.uses_virtual_filesystem() {
+            activate_virtual_projection_mount(&state_root, &mount, true)?;
+        }
+        return Ok("Reconnected the existing Granola source.".to_string());
+    }
+
+    create_desktop_mount_blocking(CreateDesktopMountRequest {
+        connector: "granola".to_string(),
+        path: "granola".to_string(),
+        mount_id: "granola-main".to_string(),
+        connection_id: Some(report.connection_id),
+        read_only: true,
+        notion_root_page: None,
+        google_docs_workspace_folder: None,
+    })
+}
+
+#[tauri::command]
+async fn reset_source_state(
+    app: AppHandle,
+    mount_id: String,
+    confirmation: String,
+) -> ActionReport {
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        reset_source_state_blocking(mount_id, confirmation)
+    })
+    .await
+    .map_err(|error| format!("Source reset worker failed: {error}"))
+    .and_then(|result| result)
+    .map(|message| ActionReport { ok: true, message })
+    .unwrap_or_else(|message| ActionReport { ok: false, message });
+    if report.ok {
+        refresh_desktop_surfaces(&app);
+    }
+    report
+}
+
+fn reset_source_state_blocking(mount_id: String, confirmation: String) -> Result<String, String> {
+    let mount_id = MountId::new(mount_id.trim().to_string());
+    validate_source_action_confirmation("RESET", &mount_id, &confirmation)?;
+
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let mount = store
+        .get_mount(&mount_id)
+        .map_err(|error| format!("Could not inspect source mount: {error}"))?
+        .ok_or_else(|| format!("Source mount `{}` was not found.", mount_id.0))?;
+    let credentials = open_credential_store(&state_root);
+
+    // Resolve once before clearing any rebuildable state so a revoked or
+    // missing credential cannot turn a recoverable reset into an empty mount.
+    resolve_source_for_mount_id(&store, credentials.as_ref(), &mount_id).map_err(|error| {
+        format!(
+            "Could not access the source before reset: {}",
+            error.message()
+        )
+    })?;
+    ensure_virtual_projection_domain_available(&mount.projection)?;
+    ensure_daemon_running(&state_root)?;
+
+    let preserved =
+        prepare_existing_workspace_mount_for_remount(&mut store, &state_root, &mount_id)?;
+    reload_daemon_mounts(&state_root)?;
+
+    // Resolve again after clearing connector checkpoints so reset means a full
+    // source refresh, including append-only connectors such as Granola.
+    let source =
+        resolve_source_for_mount_id(&store, credentials.as_ref(), &mount_id).map_err(|error| {
+            format!(
+                "Could not prepare the source after reset: {}",
+                error.message()
+            )
+        })?;
+    run_pull_with_state_root(&mut store, &source, mount.root.clone(), Some(&state_root)).map_err(
+        |error| {
+            format!(
+                "Could not rebuild source `{}` after reset: {}",
+                mount.mount_id.0,
+                error.message()
+            )
+        },
+    )?;
+    reload_daemon_mounts(&state_root)?;
+    if mount.projection.uses_virtual_filesystem() {
+        activate_virtual_projection_mount(&state_root, &mount, true)?;
+    }
+
+    let mut message = format!(
+        "Reset {} source state and rebuilt `{}`.",
+        connector_label(&mount.connector),
+        absolute_display_path(&mount_access_root(&mount))
+    );
+    if let Some(preserved) = preserved {
+        message.push_str(&format!(
+            " Preserved {} pending local change{} at `{}`.",
+            preserved.count,
+            if preserved.count == 1 { "" } else { "s" },
+            preserved.directory.display()
+        ));
+    }
+    Ok(message)
+}
+
+#[tauri::command]
+async fn disconnect_source(app: AppHandle, mount_id: String, confirmation: String) -> ActionReport {
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        disconnect_source_blocking(mount_id, confirmation)
+    })
+    .await
+    .map_err(|error| format!("Source disconnect worker failed: {error}"))
+    .and_then(|result| result)
+    .map(|message| ActionReport { ok: true, message })
+    .unwrap_or_else(|message| ActionReport { ok: false, message });
+    if report.ok {
+        refresh_desktop_surfaces(&app);
+    }
+    report
+}
+
+fn disconnect_source_blocking(mount_id: String, confirmation: String) -> Result<String, String> {
+    let mount_id = MountId::new(mount_id.trim().to_string());
+    validate_source_action_confirmation("DISCONNECT", &mount_id, &confirmation)?;
+
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let mount = store
+        .get_mount(&mount_id)
+        .map_err(|error| format!("Could not inspect source mount: {error}"))?
+        .ok_or_else(|| format!("Source mount `{}` was not found.", mount_id.0))?;
+    let connection_id = match mount.connection_id.clone() {
+        Some(connection_id) => connection_id,
+        None => preferred_connection_id_for_connector(&store, &mount.connector)?
+            .ok_or_else(|| format!("Source mount `{}` has no saved connection.", mount_id.0))?,
+    };
+    let affected_mounts = store
+        .load_mounts()
+        .map_err(|error| format!("Could not inspect source mounts: {error}"))?
+        .into_iter()
+        .filter(|candidate| candidate.connection_id.as_ref() == Some(&connection_id))
+        .count();
+    let credentials = open_credential_store(&state_root);
+    run_disconnect(&mut store, credentials.as_ref(), connection_id.clone())
+        .map_err(|error| error.message())?;
+    ensure_daemon_running(&state_root)?;
+    reload_daemon_mounts(&state_root)?;
+
+    let mut message = format!(
+        "Disconnected {} connection `{}`. The local source folder remains registered for reconnection.",
+        connector_label(&mount.connector),
+        connection_id.0
+    );
+    if affected_mounts > 1 {
+        message.push_str(&format!(
+            " This connection was shared by {affected_mounts} source mounts, which now need reconnection."
+        ));
+    }
+    Ok(message)
+}
+
+fn validate_source_action_confirmation(
+    action: &str,
+    mount_id: &MountId,
+    confirmation: &str,
+) -> Result<(), String> {
+    if mount_id.0.trim().is_empty() {
+        return Err("Mount id is required.".to_string());
+    }
+    let required = format!("{action} {}", mount_id.0);
+    if confirmation.trim() != required {
+        return Err(format!("Type `{required}` to confirm this source action."));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -2294,7 +2519,10 @@ fn live_mode_enabled_mount(state_root: &Path) -> Result<Option<MountConfig>, Str
     let mounts = store
         .load_mounts()
         .map_err(|error| format!("Live Mode could not inspect mounted folders: {error}"))?;
-    let Some(mount) = choose_mount(&mounts) else {
+    let connections = store
+        .list_connections()
+        .map_err(|error| format!("Live Mode could not inspect connections: {error}"))?;
+    let Some(mount) = choose_mount(&mounts, &connections) else {
         return Ok(None);
     };
     let Some(record) = store
@@ -2400,7 +2628,10 @@ fn set_mount_live_mode_blocking(change: MountLiveModeChange) -> Result<ActionRep
     let mounts = store
         .load_mounts()
         .map_err(|error| format!("Could not inspect mounted folders: {error}"))?;
-    let mount = choose_mount(&mounts)
+    let connections = store
+        .list_connections()
+        .map_err(|error| format!("Could not inspect connections: {error}"))?;
+    let mount = choose_mount(&mounts, &connections)
         .ok_or_else(|| "Create a Notion folder before turning on Live Mode.".to_string())?;
     let now = live_mode_timestamp();
     let existing = store
@@ -3407,7 +3638,7 @@ fn load_desktop_snapshot_from_store(
         .list_connections()
         .map_err(|error| error.to_string())?;
     let journals = store.list_journal().unwrap_or_default();
-    let mount = choose_mount(&mounts);
+    let mount = choose_mount(&mounts, &connections);
     let connection = choose_connection(&connections, mount.as_ref());
     let needs_onboarding = desktop_needs_onboarding(connection.as_ref(), mount.as_ref());
     let pending_changes = match mount.as_ref() {
@@ -3539,10 +3770,20 @@ fn degraded_snapshot(message: String) -> DesktopSnapshot {
     }
 }
 
-fn choose_mount(mounts: &[MountConfig]) -> Option<MountConfig> {
+fn choose_mount(mounts: &[MountConfig], connections: &[ConnectionRecord]) -> Option<MountConfig> {
+    let has_active_connection = |mount: &&MountConfig| {
+        choose_connection_for_mount(connections, mount)
+            .as_ref()
+            .is_some_and(|connection| {
+                connection.status == "active" && connection.connector == mount.connector
+            })
+    };
+
     mounts
         .iter()
-        .find(|mount| mount.connector == "notion")
+        .find(|mount| mount.connector == "notion" && has_active_connection(mount))
+        .or_else(|| mounts.iter().find(has_active_connection))
+        .or_else(|| mounts.iter().find(|mount| mount.connector == "notion"))
         .or_else(|| mounts.first())
         .cloned()
 }
@@ -4797,7 +5038,7 @@ fn notion_access_miss_message() -> String {
     };
     let mounts = store.load_mounts().unwrap_or_default();
     let connections = store.list_connections().unwrap_or_default();
-    let mount = choose_mount(&mounts);
+    let mount = choose_mount(&mounts, &connections);
     let connection = choose_connection(&connections, mount.as_ref());
     let workspace = connection
         .as_ref()
@@ -6823,6 +7064,7 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
                 connection_id: connection_id.clone(),
                 read_only: request.read_only,
                 projection: projection.clone(),
+                settings_json: "{}".to_string(),
             };
             let credentials = open_credential_store(&state_root);
             let connector =
@@ -6835,7 +7077,7 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
                 })?;
             Some(folder_id)
         }
-        "gmail" => None,
+        "gmail" | "granola" => None,
         other => {
             return Err(format!(
                 "Desktop mount creation does not support connector `{other}`."
@@ -6858,6 +7100,7 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
             connection_id,
             read_only: request.read_only,
             projection: projection.clone(),
+            settings_json: "{}".to_string(),
         },
     )
     .map_err(|error| error.message())?;
@@ -8028,13 +8271,28 @@ fn recover_macos_file_provider_mount_root_if_needed(
     let expected_child_count =
         expected_virtual_projection_mount_point_child_count(state_root, mount)?;
     let root = mount_access_root(mount);
-    let details = evaluate_macos_file_provider_mount_root(&root)?;
-
-    let Some(reason) =
-        macos_file_provider_mount_root_recovery_reason(&root, &details, Some(expected_child_count))
-    else {
+    let inspection = evaluate_macos_file_provider_mount_root(&root);
+    let Some(mut reason) = macos_file_provider_mount_root_inspection_recovery_reason(
+        &root,
+        inspection
+            .as_ref()
+            .map(String::as_str)
+            .map_err(String::as_str),
+        Some(expected_child_count),
+    ) else {
         return Ok(());
     };
+
+    if inspection.is_err() && macos_file_provider_mount_root_is_missing(&reason) {
+        match wait_for_macos_file_provider_mount_root_recovery(
+            &root,
+            expected_child_count,
+            MACOS_FILE_PROVIDER_MOUNT_ROOT_APPEAR_TIMEOUT,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(latest_reason) => reason = latest_reason,
+        }
+    }
 
     desktop_log(
         "warn",
@@ -8058,7 +8316,11 @@ fn recover_macos_file_provider_mount_root_if_needed(
     ensure_virtual_projection_runtime(state_root, mount)?;
     signal_virtual_projection_refresh(mount);
 
-    wait_for_macos_file_provider_mount_root_recovery(&root, expected_child_count)?;
+    wait_for_macos_file_provider_mount_root_recovery(
+        &root,
+        expected_child_count,
+        MACOS_FILE_PROVIDER_MOUNT_ROOT_RECOVERY_TIMEOUT,
+    )?;
 
     desktop_log(
         "info",
@@ -8075,8 +8337,9 @@ fn recover_macos_file_provider_mount_root_if_needed(
 fn wait_for_macos_file_provider_mount_root_recovery(
     root: &Path,
     expected_child_count: usize,
+    timeout: Duration,
 ) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + timeout;
 
     loop {
         let reason = match evaluate_macos_file_provider_mount_root(root) {
@@ -8099,6 +8362,23 @@ fn wait_for_macos_file_provider_mount_root_recovery(
         }
         std::thread::sleep(VIRTUAL_PROJECTION_SOURCE_READY_POLL);
     }
+}
+
+fn macos_file_provider_mount_root_inspection_recovery_reason(
+    root: &Path,
+    inspection: Result<&str, &str>,
+    expected_child_count: Option<usize>,
+) -> Option<String> {
+    match inspection {
+        Ok(details) => {
+            macos_file_provider_mount_root_recovery_reason(root, details, expected_child_count)
+        }
+        Err(error) => Some(error.to_string()),
+    }
+}
+
+fn macos_file_provider_mount_root_is_missing(message: &str) -> bool {
+    message.contains("NSPOSIXErrorDomain Code=2") || message.contains("Couldn't find a file")
 }
 
 #[cfg(target_os = "macos")]
@@ -8420,8 +8700,9 @@ fn wait_for_virtual_projection_mount_point_children(
                     if attempts == 1 { "" } else { "s" }
                 ),
             );
-            return Err(format!(
-                "Notion connected, but Locality could not load any files for the mount point before mounting. Make sure at least one page is selected for Locality access, then try again. {diagnostic}"
+            return Err(virtual_projection_source_ready_timeout_message(
+                &mount.connector,
+                &diagnostic,
             ));
         }
 
@@ -8460,6 +8741,18 @@ fn wait_for_virtual_projection_mount_point_children(
 
         std::thread::sleep(VIRTUAL_PROJECTION_SOURCE_READY_POLL);
     }
+}
+
+fn virtual_projection_source_ready_timeout_message(connector: &str, diagnostic: &str) -> String {
+    let source = connector_label(connector);
+    let guidance = if connector == "notion" {
+        " Make sure at least one page is selected for Locality access, then try again."
+    } else {
+        " Confirm the source contains readable items, then retry setup."
+    };
+    format!(
+        "{source} connected, but Locality could not load any files before mounting.{guidance} {diagnostic}"
+    )
 }
 
 fn ensure_virtual_projection_runtime(state_root: &Path, mount: &MountConfig) -> Result<(), String> {
@@ -9681,14 +9974,14 @@ fn prepare_existing_workspace_mount_for_remount(
 ) -> Result<Option<PreservedLocalChanges>, String> {
     let Some(mount) = store
         .get_mount(mount_id)
-        .map_err(|error| format!("Could not inspect existing Notion mount: {error}"))?
+        .map_err(|error| format!("Could not inspect existing source mount: {error}"))?
     else {
         return Ok(None);
     };
 
     if mount_has_unfinished_journals(store, mount_id)? {
         return Err(
-            "A Notion push is still in progress. Wait for it to finish before remounting this workspace."
+            "A source push is still in progress. Wait for it to finish before resetting or remounting this source."
                 .to_string(),
         );
     }
@@ -9722,7 +10015,7 @@ fn mount_has_pending_local_changes(
 
     if store
         .list_entities(mount_id)
-        .map_err(|error| format!("Could not inspect cached Notion items: {error}"))?
+        .map_err(|error| format!("Could not inspect cached source items: {error}"))?
         .iter()
         .any(|entity| {
             matches!(
@@ -9785,11 +10078,11 @@ fn preserve_mount_pending_local_changes(
 ) -> Result<Option<PreservedLocalChanges>, String> {
     let mount = store
         .get_mount(mount_id)
-        .map_err(|error| format!("Could not inspect existing Notion mount: {error}"))?
-        .ok_or_else(|| format!("Could not find existing Notion mount `{}`.", mount_id.0))?;
+        .map_err(|error| format!("Could not inspect existing source mount: {error}"))?
+        .ok_or_else(|| format!("Could not find existing source mount `{}`.", mount_id.0))?;
     let pending_entities = store
         .list_entities(mount_id)
-        .map_err(|error| format!("Could not inspect cached Notion items: {error}"))?
+        .map_err(|error| format!("Could not inspect cached source items: {error}"))?
         .into_iter()
         .filter(|entity| {
             matches!(
@@ -9983,11 +10276,11 @@ fn clear_mount_cached_projection(
 ) -> Result<(), String> {
     let mount = store
         .get_mount(mount_id)
-        .map_err(|error| format!("Could not inspect cached Notion mount: {error}"))?;
+        .map_err(|error| format!("Could not inspect cached source mount: {error}"))?;
     let cached_entities = if mount.is_some() {
         store
             .list_entities(mount_id)
-            .map_err(|error| format!("Could not inspect cached Notion items: {error}"))?
+            .map_err(|error| format!("Could not inspect cached source items: {error}"))?
     } else {
         Vec::new()
     };
@@ -9998,13 +10291,13 @@ fn clear_mount_cached_projection(
 
     store
         .clear_mount_source_state(mount_id)
-        .map_err(|error| format!("Could not clear cached Notion mount state: {error}"))?;
+        .map_err(|error| format!("Could not clear cached source mount state: {error}"))?;
 
     let content_root = virtual_fs_content_root(state_root, mount_id);
     if content_root.exists() {
         fs::remove_dir_all(&content_root).map_err(|error| {
             format!(
-                "Could not clear cached Notion file contents at `{}`: {error}",
+                "Could not clear cached source file contents at `{}`: {error}",
                 content_root.display()
             )
         })?;
@@ -10883,21 +11176,24 @@ mod tests {
         live_mode_tick_from_snapshot, live_mode_wake_generation, load_desktop_activity,
         macos_app_bundle_for_exe, macos_file_provider_child_item_count,
         macos_file_provider_mount_root_health_error,
-        macos_file_provider_mount_root_recovery_reason, mark_mount_live_mode_syncing,
-        mount_has_pending_local_changes, mount_has_unfinished_journals, notion_id_from_url,
-        parse_daemon_build_info_json, pending_changes_from_status,
-        prepare_existing_workspace_mount_for_remount, preserve_mount_pending_local_changes,
-        pull_error_message, pull_report_message, push_action_message,
-        record_current_install_marker, record_desktop_activity, record_mount_live_mode_tick_result,
-        refresh_mount_root_after_access_change, refresh_visible_target_from_cache,
-        reset_to_remote_message, sample_live_mode_status, sample_snapshot,
-        screen_bounds_for_anchor_from_monitors, shell_single_quote, should_hide_tray_popover,
-        should_prioritize_located_result, state_event_path_requires_refresh,
-        state_event_path_wakes_live_mode, summarize_virtual_projection_children,
-        terminal_cli_link_state, tray_icon_image, tray_icon_should_use_template,
-        tray_popover_anchor, tray_popover_position, unsupported_notion_locator_url_message,
-        validate_mount_root, virtual_projection_prefetch_container_identifiers,
+        macos_file_provider_mount_root_inspection_recovery_reason,
+        macos_file_provider_mount_root_is_missing, macos_file_provider_mount_root_recovery_reason,
+        mark_mount_live_mode_syncing, mount_has_pending_local_changes,
+        mount_has_unfinished_journals, notion_id_from_url, parse_daemon_build_info_json,
+        pending_changes_from_status, prepare_existing_workspace_mount_for_remount,
+        preserve_mount_pending_local_changes, pull_error_message, pull_report_message,
+        push_action_message, record_current_install_marker, record_desktop_activity,
+        record_mount_live_mode_tick_result, refresh_mount_root_after_access_change,
+        refresh_visible_target_from_cache, reset_to_remote_message, sample_live_mode_status,
+        sample_snapshot, screen_bounds_for_anchor_from_monitors, shell_single_quote,
+        should_hide_tray_popover, should_prioritize_located_result,
+        state_event_path_requires_refresh, state_event_path_wakes_live_mode,
+        summarize_virtual_projection_children, terminal_cli_link_state, tray_icon_image,
+        tray_icon_should_use_template, tray_popover_anchor, tray_popover_position,
+        unsupported_notion_locator_url_message, validate_mount_root,
+        validate_source_action_confirmation, virtual_projection_prefetch_container_identifiers,
         virtual_projection_refresh_signal_identifiers,
+        virtual_projection_source_ready_timeout_message,
         virtual_projection_waits_for_mount_point_children_before_registration,
         wait_for_live_mode_state_change, wake_live_mode_runner, write_terminal_cli_path_section,
     };
@@ -11202,6 +11498,7 @@ mod tests {
         assert!(
             snapshot.recent_files[0]
                 .local_path
+                .replace('\\', "/")
                 .ends_with("Standups with Locality/page.md")
         );
         assert_eq!(
@@ -11259,6 +11556,65 @@ mod tests {
 
         assert!(snapshot.needs_onboarding);
         assert!(snapshot.recent_files.is_empty());
+    }
+
+    #[test]
+    fn desktop_snapshot_prefers_active_granola_over_stale_notion_mount() {
+        let temp = TestTempDir::new("desktop-granola-first");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let mut stale_notion = test_connection("workspace-1", "Old Notion");
+        stale_notion.status = "revoked".to_string();
+        let granola_connection = ConnectionRecord {
+            connection_id: ConnectionId::new("granola-default"),
+            profile_id: None,
+            connector: "granola".to_string(),
+            display_name: "granola-default".to_string(),
+            account_label: Some("Granola".to_string()),
+            workspace_id: None,
+            workspace_name: Some("Granola".to_string()),
+            auth_kind: "api_key".to_string(),
+            secret_ref: "connection:granola-default".to_string(),
+            scopes: Vec::new(),
+            capabilities_json: "{}".to_string(),
+            status: "active".to_string(),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+            expires_at: None,
+        };
+        let notion_mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            temp.path().join("notion"),
+        )
+        .with_connection_id(stale_notion.connection_id.clone())
+        .projection(ProjectionMode::LinuxFuse);
+        let granola_mount = MountConfig::new(
+            MountId::new("granola-main"),
+            "granola",
+            temp.path().join("granola"),
+        )
+        .with_connection_id(granola_connection.connection_id.clone())
+        .read_only(true)
+        .projection(ProjectionMode::LinuxFuse);
+
+        store
+            .save_connection(stale_notion)
+            .expect("save stale notion connection");
+        store
+            .save_connection(granola_connection)
+            .expect("save granola connection");
+        store
+            .save_mount(notion_mount)
+            .expect("save stale notion mount");
+        store.save_mount(granola_mount).expect("save granola mount");
+
+        let snapshot = super::load_desktop_snapshot_from_store(&store, temp.path())
+            .expect("load snapshot from test store");
+
+        assert_eq!(snapshot.active_mount_id.as_deref(), Some("granola-main"));
+        assert_eq!(snapshot.mount.connector, "granola");
+        assert_eq!(snapshot.connection.connector, "granola");
+        assert!(!snapshot.needs_onboarding);
     }
 
     #[test]
@@ -13657,6 +14013,37 @@ mod tests {
     }
 
     #[test]
+    fn virtual_projection_source_ready_timeout_guidance_names_the_connector() {
+        assert_eq!(
+            virtual_projection_source_ready_timeout_message("granola", "last error"),
+            "Granola connected, but Locality could not load any files before mounting. Confirm the source contains readable items, then retry setup. last error"
+        );
+        assert!(
+            virtual_projection_source_ready_timeout_message("notion", "last error")
+                .contains("at least one page is selected")
+        );
+    }
+
+    #[test]
+    fn source_destructive_actions_require_mount_scoped_typed_confirmation() {
+        let mount_id = MountId::new("granola-main");
+
+        assert!(
+            validate_source_action_confirmation("RESET", &mount_id, "RESET granola-main").is_ok()
+        );
+        assert!(
+            validate_source_action_confirmation("DISCONNECT", &mount_id, "DISCONNECT granola-main")
+                .is_ok()
+        );
+        let error = validate_source_action_confirmation("RESET", &mount_id, "RESET")
+            .expect_err("mount id is required in confirmation");
+        assert_eq!(
+            error,
+            "Type `RESET granola-main` to confirm this source action."
+        );
+    }
+
+    #[test]
     fn macos_file_provider_mount_root_health_accepts_provider_item() {
         let details = r#"
             fileproviderItems = (
@@ -13749,6 +14136,42 @@ mod tests {
                 Path::new("/tmp/Locality/notion"),
                 details,
                 Some(11),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn macos_file_provider_missing_mount_root_triggers_recovery() {
+        let error = r#"Could not inspect macOS File Provider mount root `/tmp/Locality/granola`: Error Domain=NSPOSIXErrorDomain Code=2 "Couldn't find a file for /tmp/Locality/granola""#;
+
+        assert!(macos_file_provider_mount_root_is_missing(error));
+        assert_eq!(
+            macos_file_provider_mount_root_inspection_recovery_reason(
+                Path::new("/tmp/Locality/granola"),
+                Err(error),
+                Some(705),
+            ),
+            Some(error.to_string())
+        );
+    }
+
+    #[test]
+    fn macos_file_provider_mount_root_inspection_accepts_healthy_item() {
+        let details = r#"
+            fileproviderItems = (
+              {
+                childItemCount = 705;
+                displayName = granola;
+              }
+            );
+        "#;
+
+        assert_eq!(
+            macos_file_provider_mount_root_inspection_recovery_reason(
+                Path::new("/tmp/Locality/granola"),
+                Ok(details),
+                Some(705),
             ),
             None
         );
@@ -14045,11 +14468,9 @@ mod tests {
             request: locality_connector::ListChildrenRequest,
         ) -> locality_core::LocalityResult<locality_connector::ListChildrenResult> {
             match request.container {
-                locality_connector::ChildContainer::Root => {
-                    Ok(locality_connector::ListChildrenResult {
-                        entries: self.entries.clone(),
-                    })
-                }
+                locality_connector::ChildContainer::Root => Ok(
+                    locality_connector::ListChildrenResult::complete(self.entries.clone()),
+                ),
                 locality_connector::ChildContainer::PageChildren(_)
                 | locality_connector::ChildContainer::DatabaseRows(_)
                 | locality_connector::ChildContainer::DirectoryChildren(_) => {
@@ -15949,6 +16370,7 @@ fn live_mode_e2e_provision_scratch_context() -> LiveModeE2eContext {
             connection_id: Some(ConnectionId::new("notion-default")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount live desktop scratch page");
@@ -16521,6 +16943,9 @@ fn main() {
             ensure_terminal_cli_available,
             create_workspace_mount,
             create_desktop_mount,
+            connect_granola,
+            reset_source_state,
+            disconnect_source,
             run_workspace_mount_onboarding,
             install_agent_guidance,
             locate_notion_page,
@@ -16651,6 +17076,16 @@ fn configure_main_window_chrome(app: &mut tauri::App) {
     }
 }
 
+#[cfg(windows)]
+fn main_window_native_decorations() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+fn main_window_native_decorations() -> bool {
+    true
+}
+
 fn build_main_window(app: &AppHandle) -> tauri::Result<()> {
     if app.get_webview_window("main").is_some() {
         return Ok(());
@@ -16661,7 +17096,7 @@ fn build_main_window(app: &AppHandle) -> tauri::Result<()> {
         .min_inner_size(860.0, 620.0)
         .resizable(true)
         .center()
-        .decorations(true)
+        .decorations(main_window_native_decorations())
         .transparent(false)
         .shadow(true)
         .visible(false);
@@ -16701,7 +17136,8 @@ fn agent_guidance_mount_path_at(state_root: &Path) -> Option<String> {
     }
     let store = SqliteStateStore::open(state_root.to_path_buf()).ok()?;
     let mounts = store.load_mounts().ok()?;
-    let mount = choose_mount(&mounts)?;
+    let connections = store.list_connections().ok()?;
+    let mount = choose_mount(&mounts, &connections)?;
     Some(display_path(&mount_access_root(&mount)))
 }
 

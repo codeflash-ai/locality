@@ -898,6 +898,48 @@ fn status_reads_virtual_projection_from_content_cache() {
 }
 
 #[test]
+fn status_accepts_virtual_named_markdown_page_workspace_file_target() {
+    let fixture = StatusFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let mount = MountConfig::new(fixture.mount_id.clone(), "gmail", fixture.root.clone())
+        .projection(ProjectionMode::LinuxFuse);
+    store.save_mount(mount.clone()).expect("save virtual mount");
+    fixture.hydrated_page(
+        &mut store,
+        "gmail-thread-message:inbox:thread-1:msg-1",
+        "inbox/thread-1/2026-07-14-hello-msg-1.md",
+        "# Hello\n\nSame paragraph.",
+    );
+    fixture.write_virtual_cache(
+        "inbox/thread-1/2026-07-14-hello-msg-1.md",
+        canonical_markdown(
+            "gmail-thread-message:inbox:thread-1:msg-1",
+            "# Hello\n\nSame paragraph.",
+        ),
+    );
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(
+                localityd::virtual_fs::virtual_projection_mount_point(&mount)
+                    .join("inbox/thread-1/2026-07-14-hello-msg-1/2026-07-14-hello-msg-1.md"),
+            ),
+            state_root: Some(fixture.state_root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert!(report.clean);
+    assert_eq!(report.summary.clean, 1);
+    assert_eq!(
+        entry_state(&report, "inbox/thread-1/2026-07-14-hello-msg-1.md"),
+        StatusState::Clean
+    );
+}
+
+#[test]
 fn status_reports_stub_virtual_cache_edits_as_dirty() {
     let fixture = StatusFixture::new();
     let mut store = InMemoryStateStore::new();

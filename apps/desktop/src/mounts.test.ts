@@ -9,6 +9,8 @@ import {
   selectedMountIdAfterOpenViewEvent,
   selectedMountIdAfterViewChange,
   selectedMountRow,
+  sourceDestructiveConfirmation,
+  sourceDestructiveConfirmationMatches,
   type MountSummary,
 } from "./mounts";
 
@@ -211,5 +213,20 @@ describe("selected mount navigation helpers", () => {
   it("leaves the selected mount unchanged when an open-view event requests another view", () => {
     expect(selectedMountIdAfterOpenViewEvent("google-docs-main", "pending")).toBe("google-docs-main");
     expect(selectedMountIdAfterOpenViewEvent(null, "pending")).toBeNull();
+  });
+});
+
+describe("source destructive action confirmation", () => {
+  it("scopes reset and disconnect phrases to the selected mount", () => {
+    expect(sourceDestructiveConfirmation("reset", "notion-main")).toBe("RESET notion-main");
+    expect(sourceDestructiveConfirmation("disconnect", "granola-main")).toBe(
+      "DISCONNECT granola-main",
+    );
+  });
+
+  it("requires the complete case-sensitive phrase", () => {
+    expect(sourceDestructiveConfirmationMatches("reset", "granola-main", " RESET granola-main ")).toBe(true);
+    expect(sourceDestructiveConfirmationMatches("reset", "granola-main", "RESET")).toBe(false);
+    expect(sourceDestructiveConfirmationMatches("reset", "granola-main", "reset granola-main")).toBe(false);
   });
 });

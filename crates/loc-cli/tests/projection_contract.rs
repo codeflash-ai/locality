@@ -344,19 +344,17 @@ impl Connector for ContractSource {
     fn list_children(&self, request: ListChildrenRequest) -> LocalityResult<ListChildrenResult> {
         match request.container {
             ChildContainer::PageChildren(remote_id) if remote_id == RemoteId::new("page-home") => {
-                Ok(ListChildrenResult {
-                    entries: vec![TreeEntry {
-                        mount_id: request.mount_id,
-                        remote_id: RemoteId::new("page-launch"),
-                        kind: EntityKind::Page,
-                        title: "Launch Plan".to_string(),
-                        path: request.parent_path.join("Launch Plan/page.md"),
-                        hydration: HydrationState::Stub,
-                        content_hash: None,
-                        remote_edited_at: Some("2026-06-20T00:00:00Z".to_string()),
-                        stub_frontmatter: Some(frontmatter("page-launch", "Launch Plan")),
-                    }],
-                })
+                Ok(ListChildrenResult::complete(vec![TreeEntry {
+                    mount_id: request.mount_id,
+                    remote_id: RemoteId::new("page-launch"),
+                    kind: EntityKind::Page,
+                    title: "Launch Plan".to_string(),
+                    path: request.parent_path.join("Launch Plan/page.md"),
+                    hydration: HydrationState::Stub,
+                    content_hash: None,
+                    remote_edited_at: Some("2026-06-20T00:00:00Z".to_string()),
+                    stub_frontmatter: Some(frontmatter("page-launch", "Launch Plan")),
+                }]))
             }
             _ => Ok(ListChildrenResult::default()),
         }

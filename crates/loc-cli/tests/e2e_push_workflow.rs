@@ -118,6 +118,7 @@ fn mount_pull_mid_page_insert_push_and_status_clean() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount");
@@ -198,6 +199,7 @@ fn push_journals_link_consecutive_edits_for_same_page() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount");
@@ -285,6 +287,7 @@ fn mount_agent_guidance_matches_filesystem_workflow_and_does_not_dirty_status() 
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount");
@@ -373,6 +376,7 @@ fn mount_agent_guidance_matches_filesystem_workflow_and_does_not_dirty_status() 
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount with custom guidance");
@@ -405,6 +409,7 @@ fn remote_delete_observation_e2e_removes_unopened_online_only_page() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount");
@@ -474,6 +479,7 @@ fn remote_delete_observation_e2e_removes_clean_hydrated_page() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount");
@@ -532,6 +538,7 @@ fn remote_delete_observation_e2e_review_then_restored_check_clears_remote_delete
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount");
@@ -640,6 +647,7 @@ fn pull_materializes_and_repairs_downloaded_media_cache() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount media cache fixture");
@@ -734,6 +742,7 @@ fn oversized_local_media_append_fails_without_connector_apply_and_records_failed
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount oversized media upload guardrail fixture");
@@ -819,6 +828,7 @@ fn multi_data_source_database_row_create_blocks_before_journaled_apply() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount multi-data-source row create guardrail fixture");
@@ -943,6 +953,7 @@ fn database_row_create_missing_schema_push_repairs_before_plan() {
                 connection_id: Some(ConnectionId::new("work")),
                 read_only: false,
                 projection: ProjectionMode::PlainFiles,
+                settings_json: "{}".to_string(),
             },
         )
         .unwrap_or_else(|error| {
@@ -1064,6 +1075,7 @@ fn database_row_create_unknown_property_blocks_before_journaled_apply() {
                 connection_id: Some(ConnectionId::new("work")),
                 read_only: false,
                 projection: ProjectionMode::PlainFiles,
+                settings_json: "{}".to_string(),
             },
         )
         .unwrap_or_else(|error| panic!("{name}: mount unknown row create fixture: {error:?}"));
@@ -1170,6 +1182,7 @@ fn database_row_create_invalid_property_values_block_before_journaled_apply() {
                 connection_id: Some(ConnectionId::new("work")),
                 read_only: false,
                 projection: ProjectionMode::PlainFiles,
+                settings_json: "{}".to_string(),
             },
         )
         .unwrap_or_else(|error| panic!("{name}: mount invalid row create fixture: {error:?}"));
@@ -1287,6 +1300,7 @@ fn database_row_create_read_only_property_blocks_before_journaled_apply() {
                 connection_id: Some(ConnectionId::new("work")),
                 read_only: false,
                 projection: ProjectionMode::PlainFiles,
+                settings_json: "{}".to_string(),
             },
         )
         .unwrap_or_else(|error| panic!("{name}: mount read-only row create fixture: {error:?}"));
@@ -1428,6 +1442,7 @@ fn database_row_create_locality_metadata_blocks_before_journaled_apply() {
                     connection_id: Some(ConnectionId::new("work")),
                     read_only: false,
                     projection: ProjectionMode::PlainFiles,
+                    settings_json: "{}".to_string(),
                 },
             )
             .unwrap_or_else(|error| {
@@ -1539,6 +1554,7 @@ fn database_row_read_only_property_blocks_before_journaled_apply() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount read-only property guardrail fixture");
@@ -1658,6 +1674,7 @@ fn database_row_unknown_property_blocks_before_journaled_apply() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount unknown property guardrail fixture");
@@ -1825,6 +1842,7 @@ fn database_row_optional_property_removals_clear_remote_values() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount optional property clear fixture");
@@ -2025,6 +2043,7 @@ fn database_row_missing_schema_diff_blocks_and_push_repairs_before_apply() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount missing-schema repair fixture");
@@ -2186,6 +2205,7 @@ fn database_row_people_relation_id_shapes_block_before_journaled_apply() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount ID-shaped property guardrail fixture");
@@ -2321,6 +2341,7 @@ fn database_row_scalar_property_shapes_block_before_journaled_apply() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount scalar property guardrail fixture");
@@ -2451,6 +2472,7 @@ fn property_only_push_journals_and_undo_reports_blocked_property_preimage() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount property-only undo fixture");
@@ -2684,6 +2706,7 @@ fn frontmatter_remote_id_mismatch_blocks_before_journaled_apply() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount frontmatter id mismatch fixture");
@@ -3878,6 +3901,7 @@ fn google_docs_workspace_folder_pull_stubs_nested_docs_without_hydrating_folder(
             connection_id: Some(ConnectionId::new("google-docs-work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount Google Docs workspace folder");
@@ -3945,6 +3969,7 @@ fn google_docs_mount_pull_edit_push_reconciles_clean_with_real_connector() {
             connection_id: Some(ConnectionId::new("google-docs-work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount Google Docs edit workflow");
@@ -4030,6 +4055,7 @@ fn google_docs_mount_create_push_reconciles_clean_with_real_connector() {
             connection_id: Some(ConnectionId::new("google-docs-work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount Google Docs create workflow");
@@ -4136,6 +4162,7 @@ fn pull_dirty_page_merges_non_overlapping_blocks_and_conflicts_same_block() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount non-overlapping pull fixture");
@@ -4194,6 +4221,7 @@ fn pull_dirty_page_merges_non_overlapping_blocks_and_conflicts_same_block() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount same-block pull fixture");
@@ -4259,6 +4287,7 @@ fn conflicted_pull_restore_requires_force_and_restores_remote_shadow() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount restore conflict fixture");
@@ -4352,6 +4381,7 @@ fn unresolved_pull_conflict_markers_block_push_before_journaled_apply() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount unresolved conflict fixture");
@@ -4463,6 +4493,7 @@ fn visible_projection_conflict_updates_visible_replica_and_cache(
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount visible projection fixture");
@@ -4586,6 +4617,7 @@ fn large_archive_plan_requires_confirm_before_journaled_apply() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount large archive fixture");
@@ -4704,6 +4736,7 @@ fn auto_save_safe_update_reconciles_and_destructive_update_blocks_before_journal
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount auto-save fixture");
@@ -4839,6 +4872,7 @@ fn cli_live_mode_toggles_file_auto_save_enrollment() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount live-mode CLI fixture");
@@ -4950,6 +4984,7 @@ fn cli_live_mode_page_directory_targets_known_page_document_without_materialized
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount live-mode page directory fixture");
@@ -5022,6 +5057,7 @@ fn cli_live_mode_rejects_mount_directory_without_page_file() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount live-mode directory fixture");
@@ -5077,6 +5113,7 @@ fn mount_pull_directive_move_pushes_copy_archive_and_status_clean() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount");
@@ -5162,6 +5199,7 @@ fn notion_table_header_mode_change_blocks_before_journaled_apply() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount Notion table header-mode guardrail fixture");
@@ -5288,6 +5326,7 @@ fn notion_link_preview_edit_move_delete_block_before_journaled_apply() {
                 connection_id: Some(ConnectionId::new("work")),
                 read_only: false,
                 projection: ProjectionMode::PlainFiles,
+                settings_json: "{}".to_string(),
             },
         )
         .unwrap_or_else(|error| panic!("mount link_preview {name} guardrail fixture: {error:?}"));
@@ -5385,6 +5424,7 @@ fn notion_link_to_page_label_edit_blocks_before_journaled_apply() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount link-to-page edit guardrail fixture");
@@ -5496,6 +5536,7 @@ fn notion_child_page_link_label_edit_blocks_before_journaled_apply() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount child-page link edit guardrail fixture");
@@ -5652,6 +5693,7 @@ fn google_docs_rendered_inline_object_and_table_guardrails_block_before_journale
                 connection_id: Some(ConnectionId::new("google-docs-work")),
                 read_only: false,
                 projection: ProjectionMode::PlainFiles,
+                settings_json: "{}".to_string(),
             },
         )
         .unwrap_or_else(|error| panic!("mount Google Docs {name} guardrail fixture: {error:?}"));
@@ -5786,6 +5828,7 @@ fn google_docs_frontmatter_and_unsupported_structure_blocks_before_journaled_app
                 connection_id: Some(ConnectionId::new("google-docs-work")),
                 read_only: false,
                 projection: ProjectionMode::PlainFiles,
+                settings_json: "{}".to_string(),
             },
         )
         .unwrap_or_else(|error| panic!("mount Google Docs frontmatter {name}: {error:?}"));
@@ -6049,6 +6092,7 @@ fn virtual_projection_modes_surface_pending_create_rename_delete_in_status_and_d
                 connection_id: Some(ConnectionId::new("work")),
                 read_only: false,
                 projection: projection.clone(),
+                settings_json: "{}".to_string(),
             },
         )
         .unwrap_or_else(|error| panic!("mount {projection:?} virtual projection: {error:?}"));
@@ -6823,6 +6867,7 @@ fn read_only_virtual_projection_modes_reject_local_mutations_without_dirty_state
                 connection_id: Some(ConnectionId::new("work")),
                 read_only: true,
                 projection: projection.clone(),
+                settings_json: "{}".to_string(),
             },
         )
         .unwrap_or_else(|error| panic!("mount {projection:?} read-only projection: {error:?}"));
@@ -7003,6 +7048,7 @@ fn shared_virtual_projection_modes_root_lists_mount_points_and_statuses_all_moun
                     connection_id: None,
                     read_only: false,
                     projection: projection.clone(),
+                    settings_json: "{}".to_string(),
                 },
             )
             .unwrap_or_else(|error| panic!("{projection:?}: mount {mount_point}: {error:?}"));
@@ -7180,6 +7226,7 @@ fn virtual_projection_modes_pull_page_directory_hydrates_target_and_descendants(
                 connection_id: Some(ConnectionId::new("work")),
                 read_only: false,
                 projection: projection.clone(),
+                settings_json: "{}".to_string(),
             },
         )
         .unwrap_or_else(|error| {
@@ -7287,6 +7334,7 @@ fn scheduled_pull_large_workspace_stubs_metadata_and_queues_only_root_hydration(
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount scheduled pull budget workspace");
@@ -7355,6 +7403,7 @@ fn scheduled_pull_idle_ticks_do_not_enumerate_or_queue_duplicate_hydrations() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount scheduled pull idle workspace");
@@ -7429,6 +7478,7 @@ fn scheduled_pull_hour_of_ticks_keeps_api_polls_to_interval_budget() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount scheduled pull hour budget workspace");
@@ -7542,6 +7592,7 @@ fn workspace_virtual_projection_modes_freshness_prioritizes_hot_work_and_caps_co
                 connection_id: Some(ConnectionId::new("work")),
                 read_only: false,
                 projection: projection.clone(),
+                settings_json: "{}".to_string(),
             },
         )
         .expect("mount workspace virtual freshness fixture");
@@ -7752,6 +7803,7 @@ fn notion_remote_observation_surfaces_remote_update_without_hydrating_blocks() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount remote observation fixture");
@@ -8012,6 +8064,7 @@ fn live_scratch_page_mount_edit_push_verifies_notion() {
             connection_id: None,
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount");
@@ -10756,6 +10809,7 @@ fn live_macos_file_provider_dirty_pull_conflict_materializes_visible_markers() {
             connection_id: None,
             read_only: false,
             projection: ProjectionMode::MacosFileProvider,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount live macos file provider page");
@@ -11250,6 +11304,7 @@ fn live_undo_database_row_create_archives_remote_row() {
             connection_id: None,
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount live undo database row root page");
@@ -11811,6 +11866,7 @@ fn live_database_row_directory_create_pushes_row_and_reconciles() {
             connection_id: None,
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount live database row directory root page");
@@ -11935,6 +11991,7 @@ fn live_database_row_invalid_select_option_blocks_before_journaled_apply() {
             connection_id: None,
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount live invalid row root page");
@@ -12081,6 +12138,7 @@ fn live_scheduled_pull_queues_and_applies_remote_fast_forward() {
             connection_id: None,
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount scheduled pull workspace");
@@ -12230,6 +12288,7 @@ fn live_scheduled_pull_idle_ticks_do_not_repeat_notion_enumeration_or_queue_dupl
             connection_id: None,
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount live scheduled idle workspace");
@@ -12353,6 +12412,7 @@ fn live_daemon_scheduler_polling_stays_within_notion_api_budget() {
             connection_id: Some(connection_id),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount live daemon scheduled workspace");
@@ -13914,6 +13974,7 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
             connection_id: None,
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount live database root page");
@@ -14325,13 +14386,12 @@ impl Connector for NestedPagePullSource {
         &self,
         request: ListChildrenRequest,
     ) -> locality_core::LocalityResult<ListChildrenResult> {
-        Ok(ListChildrenResult {
-            entries: self
-                .child_entries
+        Ok(ListChildrenResult::complete(
+            self.child_entries
                 .get(&request.parent_path)
                 .cloned()
                 .unwrap_or_default(),
-        })
+        ))
     }
 
     fn fetch(&self, _request: FetchRequest) -> locality_core::LocalityResult<NativeEntity> {
@@ -14957,6 +15017,7 @@ fn mount_virtual_workspace_with_projection(
             connection_id: None,
             read_only: false,
             projection,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount virtual live workspace");
@@ -15552,6 +15613,7 @@ fn pull_live_page(
             connection_id: None,
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount live page");

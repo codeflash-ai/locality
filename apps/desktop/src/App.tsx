@@ -28,7 +28,6 @@ import {
   Search,
   Settings,
   ShieldCheck,
-  Sparkles,
   Square,
   PanelLeftClose,
   PanelLeftOpen,
@@ -47,9 +46,12 @@ import {
   selectedMountIdAfterOpenViewEvent,
   selectedMountIdAfterViewChange,
   selectedMountRow,
+  sourceDestructiveConfirmation,
+  sourceDestructiveConfirmationMatches,
   type MountRow,
   type MountSummary,
   type ProviderRuntimeSummary,
+  type SourceDestructiveAction,
 } from "./mounts";
 import { connectionMissing, connectionReady } from "./connection-state";
 import { copyLoginLinkDisabled, loginLinkFlowMode } from "./onboarding-connect";
@@ -84,6 +86,17 @@ import {
   updateStatusLabel,
   type UpdateStatus,
 } from "./updater";
+import {
+  sourceSetupIsActiveConnector,
+  sourceSetupIsBusy,
+  sourceSetupProgressLabel,
+  type SourceConnectorId,
+  type SourceSetupState,
+} from "./source-setup";
+import gmailIconUrl from "./assets/connectors/gmail.svg";
+import googleDocsIconUrl from "./assets/connectors/google-docs.svg";
+import granolaIconUrl from "./assets/connectors/granola.svg";
+import notionIconUrl from "./assets/connectors/notion.svg";
 import localityShortDarkUrl from "./assets/brand/locality-short-dark.svg";
 import localityShortLightUrl from "./assets/brand/locality-short-light.svg";
 
@@ -94,12 +107,11 @@ const onboardingDemoVideoUrl = import.meta.env.VITE_LOCALITY_ONBOARDING_DEMO_VID
 type AppView = "home" | "files" | "mount" | "pending" | "review" | "activity" | "settings";
 type LocateState = "idle" | "preparing" | "ready" | "error";
 type OnboardingStep = 1 | 2 | 3 | 4 | 5;
+type OnboardingConnectorId = SourceConnectorId;
 type ReviewFilter = "all" | "approvals" | "problems";
 type FileStatusFilter = "all" | "review" | "conflict" | "synced";
 type DestructiveSettingsAction = "reset" | "uninstall";
 type SettingsSection = "general" | "sources" | "sync" | "activity" | "agents" | "advanced" | "about";
-type SourceSetupState = "idle" | "connecting" | "creating" | "changing" | "success" | "error";
-type SourceConnectorId = "notion" | "google-docs" | "gmail";
 type SourceListViewMode = "list" | "tiles";
 type ConnectorOption = {
   id: SourceConnectorId;
@@ -108,6 +120,13 @@ type ConnectorOption = {
   status: string;
   keywords: string[];
   mounted: boolean;
+};
+
+const CONNECTOR_ICON_URLS: Record<SourceConnectorId, string> = {
+  notion: notionIconUrl,
+  "google-docs": googleDocsIconUrl,
+  gmail: gmailIconUrl,
+  granola: granolaIconUrl,
 };
 
 const PRODUCT_TERMS = {
@@ -651,8 +670,131 @@ const sampleSearchResults: LocatedItem[] = [
   },
 ];
 
-function suggestedAgentPrompt(mountPath: string) {
-  return `Use Locality to edit my Notion workspace. Open the files under ${mountPath}, make the requested edits directly in Markdown, and leave changes pending for Locality review.`;
+function suggestedAgentPrompt(mountPath: string, connector: OnboardingConnectorId = "notion") {
+  switch (connector) {
+    case "granola":
+      return `Use Locality to read my Granola meetings. Open the files under ${mountPath}, search summaries and transcripts with normal file tools, and cite the meeting files you used. Granola is read-only in Locality, so do not try to push edits back.`;
+    case "google-docs":
+      return `Use Locality to edit my Google Docs workspace. Open the files under ${mountPath}, make the requested edits directly in Markdown, and leave changes pending for Locality review before pushing.`;
+    case "gmail":
+      return `Use Locality to inspect my Gmail source. Open the files under ${mountPath}, search mail with normal file tools, and prepare draft updates only when the mounted draft files support it. Leave outbound changes for Locality review.`;
+    case "notion":
+      return `Use Locality to edit my Notion workspace. Open the files under ${mountPath}, make the requested edits directly in Markdown, and leave changes pending for Locality review.`;
+  }
+}
+
+function isOnboardingConnector(value?: string | null): value is OnboardingConnectorId {
+  return value === "notion" || value === "google-docs" || value === "gmail" || value === "granola";
+}
+
+function onboardingConnectorFromSnapshot(snapshot: DesktopSnapshot): OnboardingConnectorId {
+  if (isOnboardingConnector(snapshot.mount.connector)) {
+    return snapshot.mount.connector;
+  }
+  if (isOnboardingConnector(snapshot.connection.connector)) {
+    return snapshot.connection.connector;
+  }
+  return "notion";
+}
+
+function connectorUsesOAuth(connector: OnboardingConnectorId) {
+  return connector === "notion" || connector === "google-docs" || connector === "gmail";
+}
+
+function connectorSkipsMountStep(connector: OnboardingConnectorId) {
+  return connector !== "notion";
+}
+
+function onboardingConnectorTitle(
+  connector: OnboardingConnectorId,
+  ready: boolean,
+  busy: boolean,
+) {
+  if (ready) {
+    return `Your ${sourceDisplayName(connector)} source is connected`;
+  }
+  if (busy) {
+    return connector === "granola"
+      ? "Checking Granola access."
+      : `Finish connecting in ${sourceDisplayName(connector)}.`;
+  }
+  return `Start with ${sourceDisplayName(connector)}.`;
+}
+
+function onboardingConnectorDescription(
+  connector: OnboardingConnectorId,
+  ready: boolean,
+  busy: boolean,
+  workspaceLabel: string,
+) {
+  if (ready) {
+    switch (connector) {
+      case "notion":
+        return `${workspaceLabel} is ready. Locality will now create the Notion folder under CloudStorage and prepare the local workspace.`;
+      case "google-docs":
+        return "Google Docs is ready. Locality mounted the selected Drive folder as local files under CloudStorage.";
+      case "gmail":
+        return "Gmail is ready. Locality mounted mailboxes as local files under CloudStorage.";
+      case "granola":
+        return "Granola is ready. Locality mounted meeting summaries and transcripts as read-only files under CloudStorage.";
+    }
+  }
+
+  if (busy) {
+    switch (connector) {
+      case "notion":
+        return "A browser window is open. Choose the workspace and pages Locality can access, then approve.";
+      case "google-docs":
+        return "A browser window is open. Approve Google Docs access, then Locality will create the local folder.";
+      case "gmail":
+        return "A browser window is open. Approve Gmail access, then Locality will create the local mailbox folder.";
+      case "granola":
+        return "Locality is validating the API key and creating a read-only Granola folder.";
+    }
+  }
+
+  switch (connector) {
+    case "notion":
+      return "Connect the source you want agents to help with. Your machine talks directly to Notion, and app credentials are protected by macOS Keychain.";
+    case "google-docs":
+      return "Connect Google Docs during setup so agents can work with docs through the same local file workflow.";
+    case "gmail":
+      return "Connect Gmail during setup so agents can search mailboxes and prepare reviewed draft work from local files.";
+    case "granola":
+      return "Paste a Granola API key to mount meeting summaries and transcripts as local read-only files. Keys are stored in your local credential store.";
+  }
+}
+
+function onboardingConnectorPills(connector: OnboardingConnectorId) {
+  switch (connector) {
+    case "notion":
+      return ["Scoped access", "Credentials in Keychain", "Direct app connection"];
+    case "google-docs":
+      return ["Google OAuth", "Drive folder", "Markdown edits"];
+    case "gmail":
+      return ["Google OAuth", "Mailbox files", "Draft review"];
+    case "granola":
+      return ["Read-only", "Meeting summaries", "Transcripts"];
+  }
+}
+
+function onboardingReadyCopy(connector: OnboardingConnectorId) {
+  switch (connector) {
+    case "notion":
+      return "Your local workspace is ready. Agents can open this folder, edit Markdown, and leave changes for Review Center. Open the app to review changes, manage sync, and turn on Live Mode when you want file saves to update Notion and new Notion changes to appear locally.";
+    case "google-docs":
+      return "Your Google Docs workspace is ready as local files. Agents can edit docs in Markdown and leave changes for Review Center before anything is pushed back.";
+    case "gmail":
+      return "Your Gmail source is ready as local files. Agents can search mailbox content and prepare reviewed draft work without leaving the filesystem.";
+    case "granola":
+      return "Your Granola meetings are ready as local read-only files. Agents can search summaries and transcripts with normal file tools, while Locality keeps the remote notes protected from edits.";
+  }
+}
+
+function onboardingPromptHint(connector: OnboardingConnectorId) {
+  return connector === "granola"
+    ? "Ask an agent to use the mounted meeting files."
+    : "Claude and Codex are now set up to use Locality.";
 }
 
 function sampleAgentGuidanceReport(mountPath: string): AgentGuidanceInstallReport {
@@ -1416,6 +1558,16 @@ function Onboarding({
   const [oauthError, setOauthError] = useState("");
   const [loginUrl, setLoginUrl] = useState("");
   const [loginCopyMessage, setLoginCopyMessage] = useState("");
+  const [selectedOnboardingConnector, setSelectedOnboardingConnector] = useState<OnboardingConnectorId>(() =>
+    onboardingConnectorFromSnapshot(snapshot),
+  );
+  const [connectedOnboardingConnector, setConnectedOnboardingConnector] = useState<OnboardingConnectorId | null>(() => {
+    const connector = onboardingConnectorFromSnapshot(snapshot);
+    return connectionReady(snapshot) && !mountMissing(snapshot) ? connector : null;
+  });
+  const [granolaApiKey, setGranolaApiKey] = useState("");
+  const [googleDocsWorkspaceFolder, setGoogleDocsWorkspaceFolder] = useState("Locality");
+  const [connectorConnecting, setConnectorConnecting] = useState(false);
   const [connectedWorkspace, setConnectedWorkspace] = useState(snapshot.connection.workspaceName);
   const [mountPath, setMountPath] = useState(snapshot.mount.localPath);
   const [mountPathDirty, setMountPathDirty] = useState(false);
@@ -1429,7 +1581,23 @@ function Onboarding({
   const [agentGuidanceReport, setAgentGuidanceReport] = useState<AgentGuidanceInstallReport | null>(null);
   const [agentGuidanceState, setAgentGuidanceState] = useState<"idle" | "installing" | "ready" | "error">("idle");
   const mountStartRequestedRef = useRef(false);
-  const connectionReadyNow = oauthReady || connectionReady(snapshot);
+  const snapshotConnectionConnector = isOnboardingConnector(snapshot.connection.connector)
+    ? snapshot.connection.connector
+    : null;
+  const snapshotMountConnector = isOnboardingConnector(snapshot.mount.connector)
+    ? snapshot.mount.connector
+    : null;
+  const connectionReadyNow = selectedOnboardingConnector === "notion"
+    ? oauthReady || (connectionReady(snapshot) && snapshotConnectionConnector === "notion")
+    : connectedOnboardingConnector === selectedOnboardingConnector ||
+      (
+        connectionReady(snapshot) &&
+        snapshotConnectionConnector === selectedOnboardingConnector &&
+        snapshotMountConnector === selectedOnboardingConnector &&
+        !mountMissing(snapshot)
+      );
+  const selectedSourceName = sourceDisplayName(selectedOnboardingConnector);
+  const selectedConnectorBusy = oauthInFlight || connectorConnecting;
 
   async function installAgentGuidance(path: string) {
     setAgentGuidanceState("installing");
@@ -1464,13 +1632,29 @@ function Onboarding({
   }, [snapshot.connection.workspaceName]);
 
   useEffect(() => {
+    const connector = onboardingConnectorFromSnapshot(snapshot);
+    if (!connectionReady(snapshot)) {
+      return;
+    }
+    if (connector === "notion") {
+      setOauthReady(true);
+    }
+    if (snapshot.mount.connector === connector && !mountMissing(snapshot)) {
+      setConnectedOnboardingConnector(connector);
+      if (connector !== "notion") {
+        setSelectedOnboardingConnector(connector);
+      }
+    }
+  }, [snapshot.connection.connector, snapshot.connection.status, snapshot.mount.connector, snapshot.mount.status]);
+
+  useEffect(() => {
     if (!mountPathDirty) {
       setMountPath(snapshot.mount.localPath);
     }
   }, [mountPathDirty, snapshot.mount.localPath]);
 
   useEffect(() => {
-    if (step !== 3 || !oauthInFlight || oauthReady) {
+    if (selectedOnboardingConnector !== "notion" || step !== 3 || !oauthInFlight || oauthReady) {
       return;
     }
 
@@ -1488,7 +1672,7 @@ function Onboarding({
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [oauthInFlight, oauthReady, step]);
+  }, [oauthInFlight, oauthReady, selectedOnboardingConnector, step]);
 
   useEffect(() => {
     if (!oauthInFlight) {
@@ -1506,17 +1690,27 @@ function Onboarding({
       return;
     }
 
-    setOauthReady(true);
+    const connector = onboardingConnectorFromSnapshot(snapshot);
+    setSelectedOnboardingConnector(connector);
+    if (connector === "notion") {
+      setOauthReady(true);
+    } else if (!mountMissing(snapshot)) {
+      setConnectedOnboardingConnector(connector);
+    }
     setStep((current) => {
       if (mountMissing(snapshot)) {
+        if (connectorSkipsMountStep(connector)) {
+          return current < 3 ? 3 : current;
+        }
         return current < 4 ? 4 : current;
       }
       return current < 5 ? 5 : current;
     });
-  }, [snapshot.connection.status, snapshot.mount.status, snapshotLoaded]);
+  }, [snapshot.connection.connector, snapshot.connection.status, snapshot.mount.connector, snapshot.mount.status, snapshotLoaded]);
 
   useEffect(() => {
     if (
+      selectedOnboardingConnector !== "notion" ||
       !shouldAutoCreateMount({
         step,
         connectionReady: connectionReadyNow,
@@ -1530,14 +1724,19 @@ function Onboarding({
       return;
     }
     void runMountOnboarding(automaticMountOnboardingAction());
-  }, [connectionReadyNow, mountOnboarding, mountPath, mounting, snapshot.mount.status, step]);
+  }, [connectionReadyNow, mountOnboarding, mountPath, mounting, selectedOnboardingConnector, snapshot.mount.status, step]);
 
   useEffect(() => {
-    if (step !== 5 || mountMissing(snapshot) || agentGuidanceState !== "idle") {
+    if (
+      selectedOnboardingConnector !== "notion" ||
+      step !== 5 ||
+      mountMissing(snapshot) ||
+      agentGuidanceState !== "idle"
+    ) {
       return;
     }
     void installAgentGuidance(mountPath);
-  }, [agentGuidanceState, mountPath, snapshot.mount.status, step]);
+  }, [agentGuidanceState, mountPath, selectedOnboardingConnector, snapshot.mount.status, step]);
 
   async function readLoginUrl() {
     return callCommand<string | null>("notion_login_link", undefined, null).catch(() => null);
@@ -1624,6 +1823,159 @@ function Onboarding({
 
   async function startConnect() {
     await runConnectFlow({ openBrowser: true });
+  }
+
+  async function createOnboardingConnectorMount(connector: Exclude<OnboardingConnectorId, "notion">) {
+    return callCommand<ActionReport>(
+      "create_desktop_mount",
+      {
+        request: {
+          connector,
+          path: sourceDefaultPath(snapshot, connector),
+          mountId: sourceMountId(connector),
+          connectionId: null,
+          readOnly: connector === "granola",
+          notionRootPage: null,
+          googleDocsWorkspaceFolder: connector === "google-docs"
+            ? googleDocsWorkspaceFolder.trim() || "Locality"
+            : null,
+        },
+      },
+      { ok: true, message: `Mounted demo ${sourceDisplayName(connector)} source.` },
+    );
+  }
+
+  async function connectGoogleOnboarding(connector: "google-docs" | "gmail") {
+    if (selectedConnectorBusy) {
+      return;
+    }
+    if (connector === "google-docs" && !googleDocsWorkspaceFolder.trim()) {
+      setOauthError("Enter a Google Drive folder name, URL, or ID.");
+      return;
+    }
+
+    setOauthError("");
+    setLoginCopyMessage("");
+    setMountOnboarding(null);
+    setOauthInFlight(true);
+    setStep(3);
+    try {
+      const command = connector === "google-docs" ? "connect_google_docs" : "connect_gmail";
+      const connectReport = await callCommand<ActionReport>(
+        command,
+        undefined,
+        { ok: true, message: `Connected demo ${sourceDisplayName(connector)} account.` },
+      );
+      if (!connectReport.ok) {
+        setOauthError(connectReport.message);
+        return;
+      }
+
+      const mountReport = await createOnboardingConnectorMount(connector);
+      if (!mountReport.ok) {
+        setOauthError(mountReport.message);
+        return;
+      }
+
+      const nextSnapshot = await callCommand<DesktopSnapshot>(
+        "desktop_snapshot",
+        undefined,
+        sampleSnapshot,
+      );
+      const sourceMount = nextSnapshot.mounts.find((mount) => mount.connector === connector)
+        ?? (nextSnapshot.mount.connector === connector ? nextSnapshot.mount : null);
+      setMountPathDirty(false);
+      setMountPath(sourceMount?.localPath || sourceDefaultPath(nextSnapshot, connector));
+      setConnectedWorkspace(sourceDisplayName(connector));
+      setConnectedOnboardingConnector(connector);
+      const cliReady = await ensureCliAvailable();
+      if (!cliReady) {
+        setOauthError(
+          `${sourceDisplayName(connector)} is connected, but Locality could not prepare the terminal command. Open Settings to repair Locality, then open the app.`,
+        );
+        return;
+      }
+      setStep(5);
+    } catch (error) {
+      setOauthError(errorMessage(error));
+    } finally {
+      setOauthInFlight(false);
+    }
+  }
+
+  async function connectSelectedOnboardingConnector() {
+    switch (selectedOnboardingConnector) {
+      case "notion":
+        await startConnect();
+        return;
+      case "google-docs":
+      case "gmail":
+        await connectGoogleOnboarding(selectedOnboardingConnector);
+        return;
+      case "granola":
+        await connectGranolaOnboarding();
+    }
+  }
+
+  function selectOnboardingConnector(connector: OnboardingConnectorId) {
+    if (selectedConnectorBusy || mounting) {
+      return;
+    }
+    setSelectedOnboardingConnector(connector);
+    setOauthError("");
+    setLoginCopyMessage("");
+    setMountOnboarding(null);
+  }
+
+  async function connectGranolaOnboarding() {
+    if (connectorConnecting || !granolaApiKey.trim()) {
+      if (!granolaApiKey.trim()) {
+        setOauthError("Enter a Granola API key.");
+      }
+      return;
+    }
+
+    setOauthError("");
+    setLoginCopyMessage("");
+    setMountOnboarding(null);
+    setConnectorConnecting(true);
+    setStep(3);
+    try {
+      const report = await callCommand<ActionReport>(
+        "connect_granola",
+        { apiKey: granolaApiKey },
+        { ok: true, message: "Connected demo Granola source." },
+      );
+      if (!report.ok) {
+        setOauthError(report.message);
+        return;
+      }
+
+      const nextSnapshot = await callCommand<DesktopSnapshot>(
+        "desktop_snapshot",
+        undefined,
+        sampleSnapshot,
+      );
+      const granolaMount = nextSnapshot.mounts.find((mount) => mount.connector === "granola")
+        ?? (nextSnapshot.mount.connector === "granola" ? nextSnapshot.mount : null);
+      const nextMountPath = granolaMount?.localPath || sourceDefaultPath(nextSnapshot, "granola");
+      setMountPathDirty(false);
+      setMountPath(nextMountPath);
+      setConnectedWorkspace("Granola");
+      setConnectedOnboardingConnector("granola");
+      const cliReady = await ensureCliAvailable();
+      if (!cliReady) {
+        setOauthError(
+          "Granola is connected, but Locality could not prepare the terminal command. Open Settings to repair Locality, then open the app.",
+        );
+        return;
+      }
+      setStep(5);
+    } catch (error) {
+      setOauthError(errorMessage(error));
+    } finally {
+      setConnectorConnecting(false);
+    }
   }
 
   async function copyLoginLink() {
@@ -1774,7 +2126,11 @@ function Onboarding({
       return;
     }
     setOptionalGuideReturnStep(null);
-    setStep(connectionReadyNow ? 4 : 3);
+    if (connectionReadyNow) {
+      setStep(connectorSkipsMountStep(selectedOnboardingConnector) ? 5 : 4);
+      return;
+    }
+    setStep(3);
   }
 
   async function locatePage() {
@@ -1805,7 +2161,9 @@ function Onboarding({
   }
 
   const workspaceLabel = connectedWorkspace || snapshot.connection.workspaceName || "Your workspace";
-  const finalPrompt = agentGuidanceReport?.prompt || suggestedAgentPrompt(mountPath);
+  const finalPrompt = selectedOnboardingConnector === "notion" && agentGuidanceReport?.prompt
+    ? agentGuidanceReport.prompt
+    : suggestedAgentPrompt(mountPath, selectedOnboardingConnector);
   const mountSetupError =
     mountOnboarding?.state === "failed"
       ? classifyMountSetupError(mountOnboarding.message)
@@ -1862,61 +2220,110 @@ function Onboarding({
 
         {step === 3 && (
           <SetupContent
-            side={<ConnectorOptions connected={connectionReadyNow} />}
+            side={
+              <ConnectorOptions
+                selected={selectedOnboardingConnector}
+                connectedConnector={connectionReadyNow ? selectedOnboardingConnector : null}
+                busy={selectedConnectorBusy}
+                onSelect={selectOnboardingConnector}
+              />
+            }
           >
             <div>
               <div className="eyebrow">Connect source</div>
-              {(oauthInFlight || connectionReadyNow) && (
+              {(selectedConnectorBusy || connectionReadyNow) && (
                 <div className={`sync-note ${connectionReadyNow ? "connected" : ""}`}>
                   {connectionReadyNow ? <Check /> : <Loader2 className="spin-icon" />}
-                  {connectionReadyNow ? "Notion connected" : "Waiting for Notion"}
+                  {connectionReadyNow ? `${selectedSourceName} connected` : `Waiting for ${selectedSourceName}`}
                 </div>
               )}
-              <h1>
-                {connectionReadyNow
-                  ? "Your Notion workspace is connected"
-                  : oauthInFlight
-                    ? "Finish connecting in Notion."
-                    : "Start with Notion."}
-              </h1>
+              <h1>{onboardingConnectorTitle(selectedOnboardingConnector, connectionReadyNow, selectedConnectorBusy)}</h1>
               <p>
-                {connectionReadyNow
-                  ? `${workspaceLabel} is ready. Locality will now create the Notion folder under CloudStorage and prepare the local workspace.`
-                  : oauthInFlight
-                    ? "A browser window is open. Choose the workspace and pages Locality can access, then approve."
-                    : "Connect the source you want agents to help with. Your machine talks directly to Notion, and app credentials are protected by macOS Keychain."}
+                {onboardingConnectorDescription(
+                  selectedOnboardingConnector,
+                  connectionReadyNow,
+                  selectedConnectorBusy,
+                  workspaceLabel,
+                )}
               </p>
             </div>
-            {oauthInFlight && !connectionReadyNow && (
+            {connectorUsesOAuth(selectedOnboardingConnector) && oauthInFlight && !connectionReadyNow && (
               <ProgressList
-                items={[
-                  { label: "Browser opened", state: oauthError ? "idle" : "done" },
-                  { label: "Select workspace and pages", state: "active" },
-                  { label: "Approve access", state: "idle" },
-                ]}
+                items={selectedOnboardingConnector === "notion"
+                  ? [
+                      { label: "Browser opened", state: oauthError ? "idle" : "done" },
+                      { label: "Select workspace and pages", state: "active" },
+                      { label: "Approve access", state: "idle" },
+                    ]
+                  : [
+                      { label: "Browser opened", state: oauthError ? "idle" : "done" },
+                      { label: `Approve ${selectedSourceName} access`, state: "active" },
+                      { label: "Create local folder", state: "idle" },
+                    ]}
               />
+            )}
+            {selectedOnboardingConnector === "granola" && !connectionReadyNow && (
+              <label className="source-inline-field onboarding-source-field">
+                <span>Granola API key</span>
+                <input
+                  type="password"
+                  autoComplete="off"
+                  value={granolaApiKey}
+                  placeholder="Paste API key"
+                  disabled={connectorConnecting}
+                  onChange={(event) => setGranolaApiKey(event.target.value)}
+                />
+              </label>
+            )}
+            {selectedOnboardingConnector === "google-docs" && !connectionReadyNow && (
+              <label className="source-inline-field onboarding-source-field">
+                <span>Drive folder</span>
+                <input
+                  value={googleDocsWorkspaceFolder}
+                  placeholder="Folder name, URL, or ID"
+                  disabled={oauthInFlight}
+                  onChange={(event) => setGoogleDocsWorkspaceFolder(event.target.value)}
+                />
+              </label>
             )}
             <div className="button-row">
               <PrimaryButton
-                busy={oauthInFlight && !connectionReadyNow}
-                onClick={connectionReadyNow ? () => setStep(4) : startConnect}
+                busy={selectedConnectorBusy && !connectionReadyNow}
+                disabled={
+                  !connectionReadyNow &&
+                  (
+                    (selectedOnboardingConnector === "granola" && !granolaApiKey.trim()) ||
+                    (selectedOnboardingConnector === "google-docs" && !googleDocsWorkspaceFolder.trim())
+                  )
+                }
+                onClick={
+                  connectionReadyNow
+                    ? () => setStep(connectorSkipsMountStep(selectedOnboardingConnector) ? 5 : 4)
+                    : () => void connectSelectedOnboardingConnector()
+                }
               >
-                {connectionReadyNow ? "Continue" : oauthInFlight ? "Waiting for Notion" : "Connect Notion"}
+                {connectionReadyNow
+                  ? "Continue"
+                  : selectedConnectorBusy
+                    ? `Connecting ${selectedSourceName}`
+                    : `Connect ${selectedSourceName}`}
               </PrimaryButton>
-              <SecondaryButton
-                disabled={copyLoginLinkDisabled({
-                  connectionReady: connectionReadyNow,
-                  oauthInFlight,
-                })}
-                onClick={() => void copyLoginLink()}
-              >
-                Copy login link
-              </SecondaryButton>
+              {selectedOnboardingConnector === "notion" && (
+                <SecondaryButton
+                  disabled={copyLoginLinkDisabled({
+                    connectionReady: connectionReadyNow,
+                    oauthInFlight,
+                  })}
+                  onClick={() => void copyLoginLink()}
+                >
+                  Copy login link
+                </SecondaryButton>
+              )}
             </div>
             <div className="onboarding-pill-row">
-              <span>Scoped access</span>
-              <span>Credentials in Keychain</span>
-              <span>Direct app connection</span>
+              {onboardingConnectorPills(selectedOnboardingConnector).map((label) => (
+                <span key={label}>{label}</span>
+              ))}
             </div>
             {loginCopyMessage && <p className="quiet-note inline-note">{loginCopyMessage}</p>}
             {oauthError && <p className="field-error">{oauthError}</p>}
@@ -1933,7 +2340,7 @@ function Onboarding({
               <h1>{mountOnboardingHeadline(mountOnboarding)}</h1>
               <p>
                 {mountOnboarding?.message ??
-                  "Locality is creating your Notion folder under the default CloudStorage root and verifying that files appear locally."}
+                  `Locality is creating your ${selectedSourceName} folder under the default CloudStorage root and verifying that files appear locally.`}
               </p>
             </div>
             <div className="sync-note">
@@ -1946,7 +2353,7 @@ function Onboarding({
               )}
               {mounting
                 ? "Waiting for macOS approval"
-                : mountOnboarding?.message ?? "Creating folder and preparing Notion files"}
+                : mountOnboarding?.message ?? `Creating folder and preparing ${selectedSourceName} files`}
             </div>
             <div className="path-field ready-path-field">
               <span>{mountPath}</span>
@@ -1981,7 +2388,7 @@ function Onboarding({
             )}
             <p className="quiet-note">
               Locality uses the default CloudStorage location so Finder and your agents see the
-              same Notion folder automatically.
+              same source folder automatically.
             </p>
           </SetupContent>
         )}
@@ -1990,12 +2397,7 @@ function Onboarding({
           <SetupContent mark={<BrandTile variant="ready" />} variant="final">
             <div>
               <h1>Locality is ready!</h1>
-              <p>
-                Your local workspace is ready. Agents can open this folder, edit
-                Markdown, and leave changes for Review Center. Open the app to review changes,
-                manage sync, and turn on Live Mode when you want file saves to update Notion and
-                new Notion changes to appear locally.
-              </p>
+              <p>{onboardingReadyCopy(selectedOnboardingConnector)}</p>
             </div>
             {mountOnboarding && <p className="field-error">{mountOnboarding.message}</p>}
             <div className="final-actions">
@@ -2010,7 +2412,7 @@ function Onboarding({
               <div className="ready-head">
                 <div>
                   <strong>Folder</strong>
-                  <p>Your Notion files are mounted here.</p>
+                  <p>Your {selectedSourceName} files are mounted here.</p>
                 </div>
                 <span className="onboarding-pill">Mounted</span>
               </div>
@@ -2025,7 +2427,7 @@ function Onboarding({
               <div className="agent-demo-header">
                 <div>
                   <strong>Try this agent prompt</strong>
-                  <p>Claude and Codex are now set up to use Locality.</p>
+                  <p>{onboardingPromptHint(selectedOnboardingConnector)}</p>
                 </div>
                 <SecondaryButton
                   onClick={() => copyText(finalPrompt)}
@@ -2584,17 +2986,6 @@ function HomeView({
         </section>
       )}
 
-      <section className="suggestion-card">
-        <Sparkles />
-        <div>
-          <p className="label">Suggestion</p>
-          <h3>Connect {snapshot.suggestions[0]?.connector ?? "Linear"}</h3>
-          <p>{snapshot.suggestions[0]?.description ?? "Connect more workspaces as local files."}</p>
-        </div>
-        <SecondaryButton compact disabled>
-          Coming Soon
-        </SecondaryButton>
-      </section>
     </div>
   );
 }
@@ -2617,12 +3008,17 @@ function MountsView({
   const [refreshing, setRefreshing] = useState(false);
   const [sourceDialogOpen, setSourceDialogOpen] = useState(false);
   const [sourceDialogState, setSourceDialogState] = useState<SourceSetupState>("idle");
+  const [sourceDialogConnector, setSourceDialogConnector] = useState<SourceConnectorId | null>(null);
   const [sourceDialogMessage, setSourceDialogMessage] = useState("");
+  const sourceSetupBusy = sourceSetupIsBusy(sourceDialogState);
 
   function openAddSourceDialog() {
     setActionError("");
-    setSourceDialogMessage("");
-    setSourceDialogState("idle");
+    if (!sourceSetupBusy) {
+      setSourceDialogMessage("");
+      setSourceDialogState("idle");
+      setSourceDialogConnector(null);
+    }
     setSourceDialogOpen(true);
   }
 
@@ -2708,6 +3104,9 @@ function MountsView({
     if (connector === "notion") {
       return connectNotionSource();
     }
+    if (connector === "granola") {
+      return { ok: false, message: "Granola requires an API key." };
+    }
 
     const command = connector === "google-docs" ? "connect_google_docs" : "connect_gmail";
     setActionError("");
@@ -2728,11 +3127,12 @@ function MountsView({
     connector: SourceConnectorId,
     options?: { googleDocsWorkspaceFolder?: string },
   ) {
-    if (sourceDialogState === "connecting" || sourceDialogState === "creating" || sourceDialogState === "changing") {
+    if (sourceSetupBusy) {
       return;
     }
 
     setSourceDialogMessage("");
+    setSourceDialogConnector(connector);
     const nextState = connector === "notion"
       ? connectionMissing(snapshot)
         ? "connecting"
@@ -2771,6 +3171,35 @@ function MountsView({
     }
   }
 
+  async function connectGranolaSource(apiKey: string) {
+    if (sourceSetupBusy) {
+      return;
+    }
+    setSourceDialogMessage("");
+    setSourceDialogConnector("granola");
+    setSourceDialogState("connecting");
+    try {
+      const report = await callCommand<ActionReport>(
+        "connect_granola",
+        { apiKey },
+        { ok: true, message: "Connected demo Granola source." },
+      );
+      setSourceDialogMessage(report.message);
+      setSourceDialogState(report.ok ? "success" : "error");
+      if (!report.ok) {
+        setActionError(report.message);
+      }
+      if (report.ok) {
+        await onRefresh();
+      }
+    } catch (error) {
+      const message = errorMessage(error);
+      setSourceDialogMessage(message);
+      setActionError(message);
+      setSourceDialogState("error");
+    }
+  }
+
   async function refreshMounts() {
     if (refreshing) {
       return;
@@ -2804,7 +3233,7 @@ function MountsView({
       <ViewHeader title={PRODUCT_TERMS.sources}>
         <SecondaryButton
           compact
-          busy={sourceDialogState === "connecting" || sourceDialogState === "creating" || sourceDialogState === "changing"}
+          busy={sourceSetupBusy}
           icon={<Plus />}
           onClick={openAddSourceDialog}
         >
@@ -2903,8 +3332,10 @@ function MountsView({
         <AddSourceDialog
           snapshot={snapshot}
           state={sourceDialogState}
+          activeConnector={sourceDialogConnector}
           message={sourceDialogMessage}
           onAction={(connector, options) => void runSourceDialogAction(connector, options)}
+          onGranolaAction={(apiKey) => void connectGranolaSource(apiKey)}
           onClose={() => setSourceDialogOpen(false)}
         />
       )}
@@ -2915,22 +3346,27 @@ function MountsView({
 function AddSourceDialog({
   snapshot,
   state,
+  activeConnector,
   message,
   onAction,
+  onGranolaAction,
   onClose,
 }: {
   snapshot: DesktopSnapshot;
   state: SourceSetupState;
+  activeConnector: SourceConnectorId | null;
   message: string;
   onAction: (connector: SourceConnectorId, options?: { googleDocsWorkspaceFolder?: string }) => void;
+  onGranolaAction: (apiKey: string) => void;
   onClose: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [viewMode, setViewMode] = useState<SourceListViewMode>("list");
   const [googleDocsWorkspaceFolder, setGoogleDocsWorkspaceFolder] = useState("Locality");
+  const [granolaApiKey, setGranolaApiKey] = useState("");
   const needsConnection = connectionMissing(snapshot);
   const needsFolder = !needsConnection && mountMissing(snapshot);
-  const busy = state === "connecting" || state === "creating" || state === "changing";
+  const busy = sourceSetupIsBusy(state);
   const sourceStatus = needsConnection
     ? "Not connected"
     : needsFolder
@@ -2962,6 +3398,14 @@ function AddSourceDialog({
       keywords: ["gmail", "mail", "email", "inbox", "drafts"],
       mounted: mountedConnectors.has("gmail"),
     },
+    {
+      id: "granola",
+      name: "Granola",
+      description: "Meeting summaries and raw transcripts as read-only files.",
+      status: mountedConnectors.has("granola") ? "Mounted" : "API key required",
+      keywords: ["granola", "meetings", "notes", "transcripts", "summaries"],
+      mounted: mountedConnectors.has("granola"),
+    },
   ];
   const normalizedQuery = query.trim().toLowerCase();
   const visibleConnectors = normalizedQuery
@@ -2982,7 +3426,7 @@ function AddSourceDialog({
             <h2 id="add-source-title">Connect a workspace</h2>
             <p>Choose the system Locality should expose as local files.</p>
           </div>
-          <button className="icon-button has-tooltip" data-tooltip="Close" disabled={busy} onClick={onClose}>
+          <button className="icon-button has-tooltip" data-tooltip="Close" onClick={onClose}>
             <X />
           </button>
         </div>
@@ -3022,7 +3466,11 @@ function AddSourceDialog({
         <div className="source-list-scroll">
           <div className={`connector-choice-grid ${viewMode}`}>
             {visibleConnectors.map((connector) => {
+              const connectorBusy = sourceSetupIsActiveConnector(state, activeConnector, connector.id);
               const disabled = busy || (connector.id !== "notion" && connector.mounted);
+              const displayedStatus = connectorBusy
+                ? sourceSetupProgressLabel(state, connector.mounted)
+                : connector.status;
               const actionLabel = sourceActionLabel(connector.id, {
                 needsConnection,
                 needsFolder,
@@ -3042,13 +3490,15 @@ function AddSourceDialog({
                     </div>
                     <StatusPill
                       tone={
-                        connector.mounted || (connector.id === "notion" && !needsConnection && !needsFolder)
+                        connectorBusy
+                          ? "warn"
+                          : connector.mounted || (connector.id === "notion" && !needsConnection && !needsFolder)
                           ? "ready"
                           : "warn"
                       }
-                      title={connector.status}
+                      title={displayedStatus}
                     >
-                      {connector.status}
+                      {displayedStatus}
                     </StatusPill>
                   </div>
                   <div className="connector-choice-facts">
@@ -3061,6 +3511,11 @@ function AddSourceDialog({
                     ) : connector.id === "google-docs" ? (
                       <>
                         <SettingRow title="Workspace folder" value={googleDocsWorkspaceFolder || "Locality"} />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                      </>
+                    ) : connector.id === "granola" ? (
+                      <>
+                        <SettingRow title="Content" value="Summaries and transcripts" />
                         <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
                       </>
                     ) : (
@@ -3080,19 +3535,47 @@ function AddSourceDialog({
                       />
                     </label>
                   )}
-                  {connector.mounted && connector.id !== "notion" ? (
+                  {connector.id === "granola" && !connector.mounted && (
+                    <>
+                      <label className="source-inline-field">
+                        <span>Granola API key</span>
+                        <input
+                          type="password"
+                          autoComplete="off"
+                          value={granolaApiKey}
+                          placeholder="Paste API key"
+                          disabled={busy}
+                          onChange={(event) => setGranolaApiKey(event.target.value)}
+                        />
+                      </label>
+                      <p className="quiet-note">
+                        Create a key in Granola Settings → Connectors → API keys. Business or Enterprise is required.
+                      </p>
+                    </>
+                  )}
+                  {connector.mounted && connector.id !== "notion" && !connectorBusy ? (
                     <SecondaryButton compact disabled icon={<Check />}>
                       Mounted
                     </SecondaryButton>
+                  ) : connector.id === "granola" ? (
+                    <PrimaryButton
+                      compact
+                      busy={connectorBusy}
+                      disabled={disabled || (!connector.mounted && !granolaApiKey.trim())}
+                      icon={<ShieldCheck />}
+                      onClick={() => onGranolaAction(granolaApiKey)}
+                    >
+                      {connectorBusy ? sourceSetupProgressLabel(state, connector.mounted) : "Connect Granola"}
+                    </PrimaryButton>
                   ) : (
                     <PrimaryButton
                       compact
-                      busy={busy}
-                      disabled={connector.id === "google-docs" && !googleDocsWorkspaceFolder.trim()}
-                      icon={busy ? <Loader2 className="spin-icon" /> : sourceActionIcon(connector.id, needsConnection)}
+                      busy={connectorBusy}
+                      disabled={disabled || (connector.id === "google-docs" && !googleDocsWorkspaceFolder.trim())}
+                      icon={sourceActionIcon(connector.id, needsConnection)}
                       onClick={() => onAction(connector.id, { googleDocsWorkspaceFolder })}
                     >
-                      {busy ? "Working" : actionLabel}
+                      {connectorBusy ? sourceSetupProgressLabel(state, connector.mounted) : actionLabel}
                     </PrimaryButton>
                   )}
                 </article>
@@ -3104,6 +3587,7 @@ function AddSourceDialog({
           </div>
         </div>
 
+        {busy && <p className="quiet-note inline-note">Setup continues if you close this window.</p>}
         {message && <p className={state === "error" ? "field-error" : "quiet-note inline-note"}>{message}</p>}
       </section>
     </div>
@@ -3118,6 +3602,8 @@ function sourceDisplayName(connector: SourceConnectorId) {
       return "Google Docs";
     case "gmail":
       return "Gmail";
+    case "granola":
+      return "Granola";
   }
 }
 
@@ -3129,6 +3615,8 @@ function sourceMountId(connector: SourceConnectorId) {
       return "google-docs-main";
     case "gmail":
       return "gmail-main";
+    case "granola":
+      return "granola-main";
   }
 }
 
@@ -3147,6 +3635,8 @@ function sourceDefaultPath(snapshot: DesktopSnapshot, connector: SourceConnector
       return "~/Library/CloudStorage/Locality/google-docs-main";
     case "gmail":
       return "~/Library/CloudStorage/Locality/gmail-main";
+    case "granola":
+      return "~/Library/CloudStorage/Locality/granola";
   }
 }
 
@@ -3176,25 +3666,7 @@ function sourceActionIcon(connector: SourceConnectorId, needsConnection: boolean
 function ConnectorIcon({ connector }: { connector: SourceConnectorId }) {
   return (
     <span className={`connector-icon ${connector}`} aria-hidden="true">
-      {connector === "notion" && (
-        <svg viewBox="0 0 24 24" role="img">
-          <path d="M4.459 4.208c.746.606 1.026.56 2.428.466l13.215-.793c.28 0 .047-.28-.046-.326L17.86 1.968c-.42-.326-.981-.7-2.055-.607L3.01 2.295c-.466.046-.56.28-.374.466zm.793 3.08v13.904c0 .747.373 1.027 1.214.98l14.523-.84c.841-.046.935-.56.935-1.167V6.354c0-.606-.233-.933-.748-.887l-15.177.887c-.56.047-.747.327-.747.933zm14.337.745c.093.42 0 .84-.42.888l-.7.14v10.264c-.608.327-1.168.514-1.635.514-.748 0-.935-.234-1.495-.933l-4.577-7.186v6.952L12.21 19s0 .84-1.168.84l-3.222.186c-.093-.186 0-.653.327-.746l.84-.233V9.854L7.822 9.76c-.094-.42.14-1.026.793-1.073l3.456-.233 4.764 7.279v-6.44l-1.215-.139c-.093-.514.28-.887.747-.933zM1.936 1.035l13.31-.98c1.634-.14 2.055-.047 3.082.7l4.249 2.986c.7.513.934.653.934 1.213v16.378c0 1.026-.373 1.634-1.68 1.726l-15.458.934c-.98.047-1.448-.093-1.962-.747l-3.129-4.06c-.56-.747-.793-1.306-.793-1.96V2.667c0-.839.374-1.54 1.447-1.632z" />
-        </svg>
-      )}
-      {connector === "google-docs" && (
-        <svg viewBox="0 0 24 24" role="img">
-          <path d="M14.727 6.727H14V0H4.91c-.905 0-1.637.732-1.637 1.636v20.728c0 .904.732 1.636 1.636 1.636h14.182c.904 0 1.636-.732 1.636-1.636V6.727h-6zm-.545 10.455H7.09v-1.364h7.09v1.364zm2.727-3.273H7.091v-1.364h9.818v1.364zm0-3.273H7.091V9.273h9.818v1.363zM14.727 6h6l-6-6v6z" />
-        </svg>
-      )}
-      {connector === "gmail" && (
-        <svg viewBox="0 0 32 32" role="img">
-          <path className="gmail-envelope" d="M6.5 9.2h19v13.6c0 1-.8 1.8-1.8 1.8H8.3c-1 0-1.8-.8-1.8-1.8V9.2Z" />
-          <path className="gmail-blue" d="M6.5 10.1v12.7c0 1 .8 1.8 1.8 1.8h2.6V13.4L6.5 10.1Z" />
-          <path className="gmail-green" d="M21.1 13.4v11.2h2.6c1 0 1.8-.8 1.8-1.8V10.1l-4.4 3.3Z" />
-          <path className="gmail-yellow" d="M21.1 13.4 16 17.2v3.2l5.1-3.8v-3.2Z" />
-          <path className="gmail-red" d="M6.5 9.2c0-1.5 1.8-2.4 3-1.5L16 12.6l6.5-4.9c1.2-.9 3 .0 3 1.5v.9L16 17.2 6.5 10.1v-.9Z" />
-        </svg>
-      )}
+      <img src={CONNECTOR_ICON_URLS[connector]} alt="" draggable="false" />
     </span>
   );
 }
@@ -3488,6 +3960,10 @@ function MountDetailView({
   const [accessState, setAccessState] = useState<"idle" | "changing" | "success" | "error">("idle");
   const [pullMessage, setPullMessage] = useState("");
   const [pullState, setPullState] = useState<"idle" | "pulling" | "success" | "error">("idle");
+  const [sourceAction, setSourceAction] = useState<SourceDestructiveAction | null>(null);
+  const [sourceConfirmation, setSourceConfirmation] = useState("");
+  const [sourceActionBusy, setSourceActionBusy] = useState(false);
+  const [sourceActionMessage, setSourceActionMessage] = useState("");
   const accountLabel = isActiveMount ? snapshot.connection.accountLabel.trim() : "";
   const showAccount = accountLabel.length > 0 && accountLabel !== mount.workspaceName;
   const providerState = mount.provider?.state ?? "Not registered";
@@ -3569,6 +4045,51 @@ function MountDetailView({
     } catch (error) {
       setPullMessage(errorMessage(error));
       setPullState("error");
+    }
+  }
+
+  function requestSourceAction(action: SourceDestructiveAction) {
+    setSourceActionMessage("");
+    setSourceConfirmation("");
+    setSourceAction(action);
+  }
+
+  function cancelSourceAction() {
+    if (sourceActionBusy) {
+      return;
+    }
+    setSourceAction(null);
+    setSourceConfirmation("");
+  }
+
+  async function confirmSourceAction() {
+    if (!sourceAction || sourceActionBusy) {
+      return;
+    }
+    setSourceActionMessage("");
+    setSourceActionBusy(true);
+    try {
+      const command = sourceAction === "reset" ? "reset_source_state" : "disconnect_source";
+      const report = await callCommand<ActionReport>(
+        command,
+        { mountId: mount.mountId, confirmation: sourceConfirmation },
+        {
+          ok: true,
+          message: sourceAction === "reset"
+            ? `Reset demo source ${mount.mountId}.`
+            : `Disconnected demo source ${mount.mountId}.`,
+        },
+      );
+      setSourceActionMessage(report.message);
+      if (report.ok) {
+        setSourceAction(null);
+        setSourceConfirmation("");
+        await onRefresh().catch(() => undefined);
+      }
+    } catch (error) {
+      setSourceActionMessage(errorMessage(error));
+    } finally {
+      setSourceActionBusy(false);
     }
   }
 
@@ -3768,20 +4289,180 @@ function MountDetailView({
           <div>
             <h3>Source-scoped destructive actions</h3>
             <p>
-              Disconnect and reset actions need typed confirmation before they are safe to expose.
-              Until then, use Settings for all-machine maintenance.
+              Reset rebuilds this source from remote data. Disconnect revokes its saved connection
+              while keeping the registered local folder available for reconnection.
             </p>
+            {sourceActionMessage && <p className="quiet-note inline-note">{sourceActionMessage}</p>}
           </div>
           <div className="danger-actions">
-            <SecondaryButton compact disabled>
-              Reset Source State
+            <SecondaryButton
+              compact
+              icon={sourceActionBusy && sourceAction === "reset" ? <Loader2 className="spin-icon" /> : <RotateCcw />}
+              disabled={sourceActionBusy}
+              onClick={() => requestSourceAction("reset")}
+            >
+              {sourceActionBusy && sourceAction === "reset" ? "Resetting" : "Reset Source State"}
             </SecondaryButton>
-            <SecondaryButton compact disabled>
-              Disconnect Source
+            <SecondaryButton
+              compact
+              icon={sourceActionBusy && sourceAction === "disconnect" ? <Loader2 className="spin-icon" /> : <Trash2 />}
+              disabled={sourceActionBusy}
+              onClick={() => requestSourceAction("disconnect")}
+            >
+              {sourceActionBusy && sourceAction === "disconnect" ? "Disconnecting" : "Disconnect Source"}
             </SecondaryButton>
           </div>
         </div>
       </details>
+      {sourceAction && (
+        <DestructiveSourceDialog
+          action={sourceAction}
+          mount={mount}
+          value={sourceConfirmation}
+          busy={sourceActionBusy}
+          message={sourceActionMessage}
+          onChange={setSourceConfirmation}
+          onCancel={cancelSourceAction}
+          onConfirm={() => void confirmSourceAction()}
+        />
+      )}
+    </div>
+  );
+}
+
+function DestructiveSourceDialog({
+  action,
+  mount,
+  value,
+  busy,
+  message,
+  onChange,
+  onCancel,
+  onConfirm,
+}: {
+  action: SourceDestructiveAction;
+  mount: MountSummary;
+  value: string;
+  busy: boolean;
+  message: string;
+  onChange: (value: string) => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const isReset = action === "reset";
+  const requiredValue = sourceDestructiveConfirmation(action, mount.mountId);
+  const confirmed = sourceDestructiveConfirmationMatches(action, mount.mountId, value);
+  const title = isReset ? `Reset ${mount.connectorName} source state` : `Disconnect ${mount.connectorName} source`;
+  const actionLabel = isReset ? "Reset source state" : "Disconnect source";
+  const description = isReset
+    ? `This clears Locality's cached state for ${mount.mountId} and rebuilds it from ${mount.connectorName}.`
+    : `This revokes the saved connection used by ${mount.mountId}.`;
+  const consequences = isReset
+    ? [
+        "The remote source is not changed.",
+        "Pending local changes are preserved in Locality's recovery folder before reset.",
+        "The source folder is repopulated from remote data.",
+      ]
+    : [
+        "The remote source is not changed.",
+        "Cached local files and the mount registration are kept.",
+        "Any other mount using the same saved connection will also need reconnection.",
+      ];
+
+  return (
+    <TypedDestructiveDialog
+      titleId="destructive-source-title"
+      title={title}
+      description={description}
+      consequences={consequences}
+      requiredValue={requiredValue}
+      actionLabel={actionLabel}
+      value={value}
+      confirmed={confirmed}
+      busy={busy}
+      message={message}
+      onChange={onChange}
+      onCancel={onCancel}
+      onConfirm={onConfirm}
+    />
+  );
+}
+
+function TypedDestructiveDialog({
+  titleId,
+  title,
+  description,
+  consequences,
+  requiredValue,
+  actionLabel,
+  value,
+  confirmed,
+  busy,
+  message = "",
+  onChange,
+  onCancel,
+  onConfirm,
+}: {
+  titleId: string;
+  title: string;
+  description: string;
+  consequences: string[];
+  requiredValue: string;
+  actionLabel: string;
+  value: string;
+  confirmed: boolean;
+  busy: boolean;
+  message?: string;
+  onChange: (value: string) => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section className="destructive-modal" role="dialog" aria-modal="true" aria-labelledby={titleId}>
+        <div className="destructive-modal-header">
+          <div>
+            <h2 id={titleId}>{title}</h2>
+            <p>{description}</p>
+          </div>
+          <button className="icon-button has-tooltip" data-tooltip="Cancel" disabled={busy} onClick={onCancel}>
+            <X />
+          </button>
+        </div>
+        <ul className="destructive-list">
+          {consequences.map((item) => (
+            <li key={item}>{item}</li>
+          ))}
+        </ul>
+        <label className="destructive-input-label">
+          <span>
+            Type <strong>{requiredValue}</strong> to confirm
+          </span>
+          <input
+            autoFocus
+            value={value}
+            disabled={busy}
+            onChange={(event) => onChange(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                onCancel();
+              }
+              if (event.key === "Enter" && confirmed && !busy) {
+                onConfirm();
+              }
+            }}
+          />
+        </label>
+        {message && <p className="field-error">{message}</p>}
+        <div className="modal-actions">
+          <SecondaryButton disabled={busy} onClick={onCancel}>
+            Cancel
+          </SecondaryButton>
+          <button className="destructive-action-button" disabled={!confirmed || busy} onClick={onConfirm}>
+            {busy ? "Working..." : actionLabel}
+          </button>
+        </div>
+      </section>
     </div>
   );
 }
@@ -5014,51 +5695,20 @@ function DestructiveSettingsDialog({
       ];
 
   return (
-    <div className="modal-backdrop" role="presentation">
-      <section className="destructive-modal" role="dialog" aria-modal="true" aria-labelledby="destructive-settings-title">
-        <div className="destructive-modal-header">
-          <div>
-            <h2 id="destructive-settings-title">{title}</h2>
-            <p>{description}</p>
-          </div>
-          <button className="icon-button has-tooltip" data-tooltip="Cancel" disabled={busy} onClick={onCancel}>
-            <X />
-          </button>
-        </div>
-        <ul className="destructive-list">
-          {consequences.map((item) => (
-            <li key={item}>{item}</li>
-          ))}
-        </ul>
-        <label className="destructive-input-label">
-          <span>
-            Type <strong>{requiredValue}</strong> to confirm
-          </span>
-          <input
-            autoFocus
-            value={value}
-            disabled={busy}
-            onChange={(event) => onChange(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Escape") {
-                onCancel();
-              }
-              if (event.key === "Enter" && confirmed && !busy) {
-                onConfirm();
-              }
-            }}
-          />
-        </label>
-        <div className="modal-actions">
-          <SecondaryButton disabled={busy} onClick={onCancel}>
-            Cancel
-          </SecondaryButton>
-          <button className="destructive-action-button" disabled={!confirmed || busy} onClick={onConfirm}>
-            {busy ? "Working..." : actionLabel}
-          </button>
-        </div>
-      </section>
-    </div>
+    <TypedDestructiveDialog
+      titleId="destructive-settings-title"
+      title={title}
+      description={description}
+      consequences={consequences}
+      requiredValue={requiredValue}
+      actionLabel={actionLabel}
+      value={value}
+      confirmed={confirmed}
+      busy={busy}
+      onChange={onChange}
+      onCancel={onCancel}
+      onConfirm={onConfirm}
+    />
   );
 }
 
@@ -6228,30 +6878,71 @@ loc: notion-page`}</pre>
   );
 }
 
-function ConnectorOptions({ connected }: { connected: boolean }) {
+function ConnectorOptions({
+  selected,
+  connectedConnector,
+  busy,
+  onSelect,
+}: {
+  selected: OnboardingConnectorId;
+  connectedConnector: OnboardingConnectorId | null;
+  busy: boolean;
+  onSelect: (connector: OnboardingConnectorId) => void;
+}) {
   return (
     <div className="connector-options">
-      <div className="connector-option available">
+      <button
+        type="button"
+        className={`connector-option available selectable ${selected === "notion" ? "selected" : ""}`}
+        disabled={busy}
+        onClick={() => onSelect("notion")}
+      >
+        <ConnectorIcon connector="notion" />
         <div>
           <strong>Notion</strong>
           <small>Pages, databases, properties, and Markdown edits.</small>
         </div>
-        <span>{connected ? "Connected" : "Available"}</span>
-      </div>
-      <div className="connector-option">
+        <span>{connectedConnector === "notion" ? "Connected" : "OAuth"}</span>
+      </button>
+      <button
+        type="button"
+        className={`connector-option available selectable ${selected === "google-docs" ? "selected" : ""}`}
+        disabled={busy}
+        onClick={() => onSelect("google-docs")}
+      >
+        <ConnectorIcon connector="google-docs" />
         <div>
           <strong>Google Docs</strong>
           <small>Docs and Drive folders through the same local model.</small>
         </div>
-        <span>Next</span>
-      </div>
-      <div className="connector-option">
+        <span>{connectedConnector === "google-docs" ? "Connected" : "OAuth"}</span>
+      </button>
+      <button
+        type="button"
+        className={`connector-option available selectable ${selected === "gmail" ? "selected" : ""}`}
+        disabled={busy}
+        onClick={() => onSelect("gmail")}
+      >
+        <ConnectorIcon connector="gmail" />
         <div>
-          <strong>Linear</strong>
-          <small>Issues and projects as agent-editable files.</small>
+          <strong>Gmail</strong>
+          <small>Inbox and sent as files, drafts as reviewed outbound mail.</small>
         </div>
-        <span>Planned</span>
-      </div>
+        <span>{connectedConnector === "gmail" ? "Connected" : "OAuth"}</span>
+      </button>
+      <button
+        type="button"
+        className={`connector-option available selectable ${selected === "granola" ? "selected" : ""}`}
+        disabled={busy}
+        onClick={() => onSelect("granola")}
+      >
+        <ConnectorIcon connector="granola" />
+        <div>
+          <strong>Granola</strong>
+          <small>Meeting summaries and transcripts as read-only files.</small>
+        </div>
+        <span>{connectedConnector === "granola" ? "Connected" : "API key"}</span>
+      </button>
     </div>
   );
 }

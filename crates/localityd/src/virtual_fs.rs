@@ -35,7 +35,9 @@ const CHILDREN_PREFIX: &str = "children:";
 const PATH_PREFIX: &str = "path:";
 const LOCAL_PREFIX: &str = "local:";
 const SCHEMA_PREFIX: &str = "schema:";
+const ASSET_CACHE_PREFIX: &str = "asset-cache:";
 const GUIDANCE_PREFIX: &str = "guidance:";
+const LOC_CACHE_ROOT: &str = ".loc";
 const AGENTS_FILE: &str = "AGENTS.md";
 const CLAUDE_FILE: &str = "CLAUDE.md";
 const AGENTS_GUIDANCE_IDENTIFIER: &str = "guidance:AGENTS.md";
@@ -329,6 +331,14 @@ pub fn virtual_fs_item_with_content_root<S>(
 where
     S: MountRepository + EntityRepository + VirtualMutationRepository,
 {
+    let mount = require_virtual_mount(store, mount_id)?;
+    if let Some(item) = loc_asset_cache_item_for_identifier(&mount, content_root, identifier)? {
+        return Ok(VirtualFsItemReport {
+            mount_id: mount_id.0.clone(),
+            item,
+        });
+    }
+
     let mut report = virtual_fs_item(store, mount_id, identifier)?;
     rewrite_item_materialized_path(content_root, &mut report.item)?;
     Ok(report)
@@ -423,6 +433,9 @@ where
     let mut report = virtual_fs_children(store, mount_id, container_identifier)?;
     let mount = require_mount(store, mount_id)?;
     let entities = store.list_entities(mount_id).map_err(LocalityError::from)?;
+    let mutations = store
+        .list_virtual_mutations(mount_id)
+        .map_err(LocalityError::from)?;
     if let Some(schema) =
         schema_item_for_container(&mount, &entities, content_root, container_identifier)?
         && !report
@@ -431,6 +444,16 @@ where
             .any(|child| child.identifier == schema.identifier)
     {
         report.children.push(schema);
+    }
+    let container_path = container_path(&mount, &entities, &mutations, container_identifier)?;
+    for child in loc_asset_cache_children(&mount, content_root, &container_path)? {
+        if !report
+            .children
+            .iter()
+            .any(|existing| existing.identifier == child.identifier)
+        {
+            report.children.push(child);
+        }
     }
     for child in &mut report.children {
         rewrite_item_materialized_path(content_root, child)?;
@@ -466,11 +489,22 @@ where
     let result = connector.list_children(ListChildrenRequest {
         mount_id: mount.mount_id.clone(),
         container,
-        parent_path,
+        parent_path: parent_path.clone(),
     })?;
+    let pruned = if result.is_complete() {
+        let returned_remote_ids = result
+            .entries
+            .iter()
+            .map(|entry| entry.remote_id.clone())
+            .collect::<BTreeSet<_>>();
+        prune_stale_virtual_children(store, mount_id, &parent_path, &returned_remote_ids)
+            .map_err(LocalityError::from)?
+    } else {
+        0
+    };
 
     let mut saved = 0;
-    let mut changed = false;
+    let mut changed = pruned > 0;
     for entry in result.entries {
         let existing = store
             .get_entity(&entry.mount_id, &entry.remote_id)
@@ -484,6 +518,53 @@ where
     }
 
     Ok(VirtualFsRefreshChildrenReport { saved, changed })
+}
+
+pub(crate) fn prune_stale_virtual_children<S>(
+    store: &mut S,
+    mount_id: &MountId,
+    parent_path: &Path,
+    returned_remote_ids: &BTreeSet<RemoteId>,
+) -> Result<usize, StoreError>
+where
+    S: EntityRepository,
+{
+    let entities = store.list_entities(mount_id)?;
+    let mut delete_ids = BTreeSet::new();
+    for entity in entities.iter().filter(|entity| {
+        entity_listing_parent_path(entity) == parent_path
+            && !returned_remote_ids.contains(&entity.remote_id)
+    }) {
+        let subtree = stale_virtual_child_subtree(&entities, entity);
+        if subtree.iter().any(|entity| {
+            matches!(
+                entity.hydration,
+                HydrationState::Dirty | HydrationState::Conflicted
+            )
+        }) {
+            continue;
+        }
+        delete_ids.extend(subtree.into_iter().map(|entity| entity.remote_id.clone()));
+    }
+
+    let pruned = delete_ids.len();
+    for remote_id in delete_ids {
+        store.delete_entity(mount_id, &remote_id)?;
+    }
+    Ok(pruned)
+}
+
+fn stale_virtual_child_subtree<'a>(
+    entities: &'a [EntityRecord],
+    child: &EntityRecord,
+) -> Vec<&'a EntityRecord> {
+    let subtree_root = entity_parent_container_path(child);
+    entities
+        .iter()
+        .filter(|entity| {
+            entity.remote_id == child.remote_id || entity.path.starts_with(&subtree_root)
+        })
+        .collect()
 }
 
 pub fn refresh_virtual_fs_children_with_content_root<S, C>(
@@ -566,15 +647,17 @@ where
     }
     let remote_id = RemoteId::new(entity_identifier(identifier)?);
     let entity = require_entity(store, mount_id, &remote_id)?;
-    if entity.kind != EntityKind::Page {
+    if !is_hydratable_markdown_entity(&entity) {
         return Err(LocalityError::Unsupported(
-            "only page.md files can be materialized by the virtual filesystem",
+            "only page.md and Markdown asset files can be materialized by the virtual filesystem",
         ));
     }
 
     let path = mount.root.join(&entity.path);
     let outcome = if is_materialized_hydration(&entity.hydration) && path.exists() {
-        write_parent_database_schema_cache(store, source, &mount, &entity, &mount.root)?;
+        if entity.kind == EntityKind::Page {
+            write_parent_database_schema_cache(store, source, &mount, &entity, &mount.root)?;
+        }
         VirtualFsMaterializeOutcome::AlreadyMaterialized
     } else {
         let request = HydrationRequest::new(
@@ -635,6 +718,9 @@ where
     if let Some(report) = materialize_guidance_item(&mount, content_root, identifier, true)? {
         return Ok(report);
     }
+    if let Some(report) = materialize_loc_asset_cache_item(&mount, content_root, identifier)? {
+        return Ok(report);
+    }
     if let Some(mutation) = local_mutation(store, mount_id, identifier)? {
         if mutation.mutation_kind != VirtualMutationKind::Create {
             return Err(LocalityError::Unsupported(
@@ -679,7 +765,7 @@ where
     }
     let remote_id = RemoteId::new(entity_identifier(identifier)?);
     let entity = require_entity(store, mount_id, &remote_id)?;
-    if entity.kind != EntityKind::Page {
+    if !is_hydratable_markdown_entity(&entity) {
         let path = content_path_for_relative(content_root, &entity.path)?;
         if path.exists() {
             return Ok(VirtualFsMaterializeReport {
@@ -692,13 +778,15 @@ where
             });
         }
         return Err(LocalityError::Unsupported(
-            "only page.md files can be materialized by the virtual filesystem",
+            "only page.md and Markdown asset files can be materialized by the virtual filesystem",
         ));
     }
 
     let path = content_path_for_relative(content_root, &entity.path)?;
     let outcome = if is_materialized_hydration(&entity.hydration) && path.exists() {
-        write_parent_database_schema_cache(store, source, &mount, &entity, content_root)?;
+        if entity.kind == EntityKind::Page {
+            write_parent_database_schema_cache(store, source, &mount, &entity, content_root)?;
+        }
         VirtualFsMaterializeOutcome::AlreadyMaterialized
     } else {
         let request = HydrationRequest::new(
@@ -786,6 +874,11 @@ where
     if is_guidance_identifier(identifier) {
         return Err(LocalityError::Unsupported(
             "agent guidance files are read-only in virtual filesystem mounts",
+        ));
+    }
+    if identifier.starts_with(ASSET_CACHE_PREFIX) {
+        return Err(LocalityError::Unsupported(
+            "downloaded asset cache files are read-only",
         ));
     }
     if let Some(mut mutation) = local_mutation(store, mount_id, identifier)? {
@@ -2528,6 +2621,230 @@ fn schema_item(
     }
 }
 
+fn loc_asset_cache_children(
+    mount: &MountConfig,
+    content_root: &Path,
+    container_path: &Path,
+) -> LocalityResult<Vec<VirtualFsItem>> {
+    let mut children = Vec::new();
+    if container_path.as_os_str().is_empty() {
+        let loc_path = Path::new(LOC_CACHE_ROOT);
+        let absolute_path = content_path_for_relative(content_root, loc_path)?;
+        if absolute_path.is_dir() {
+            children.push(loc_asset_cache_dir_item(mount, loc_path, &absolute_path));
+        }
+        return Ok(children);
+    }
+
+    if !is_loc_cache_path(container_path) {
+        return Ok(children);
+    }
+
+    let absolute_dir = content_path_for_relative(content_root, container_path)?;
+    let entries = match std::fs::read_dir(&absolute_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(children),
+        Err(error) => {
+            return Err(LocalityError::Io(format!(
+                "failed to read downloaded asset cache directory `{}`: {error}",
+                absolute_dir.display()
+            )));
+        }
+    };
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            LocalityError::Io(format!(
+                "failed to read downloaded asset cache entry in `{}`: {error}",
+                absolute_dir.display()
+            ))
+        })?;
+        let child_name = entry.file_name();
+        if is_loc_asset_cache_temp_name(&child_name) {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|error| {
+            LocalityError::Io(format!(
+                "failed to inspect downloaded asset cache entry `{}`: {error}",
+                entry.path().display()
+            ))
+        })?;
+        let child_path = container_path.join(&child_name);
+        if file_type.is_dir() {
+            children.push(loc_asset_cache_dir_item(mount, &child_path, &entry.path()));
+        } else if file_type.is_file() {
+            let metadata = entry.metadata().map_err(|error| {
+                LocalityError::Io(format!(
+                    "failed to inspect downloaded asset cache file `{}`: {error}",
+                    entry.path().display()
+                ))
+            })?;
+            children.push(loc_asset_cache_file_item(
+                mount,
+                &child_path,
+                &entry.path(),
+                Some(metadata.len()),
+            ));
+        }
+    }
+
+    Ok(children)
+}
+
+fn loc_asset_cache_item_for_identifier(
+    mount: &MountConfig,
+    content_root: &Path,
+    identifier: &str,
+) -> LocalityResult<Option<VirtualFsItem>> {
+    if let Some(path) = identifier.strip_prefix(ASSET_CACHE_PREFIX) {
+        let path = PathBuf::from(path);
+        ensure_loc_cache_path(identifier, &path)?;
+        let absolute_path = content_path_for_relative(content_root, &path)?;
+        let metadata = existing_metadata(identifier, &absolute_path)?;
+        if !metadata.is_file() {
+            return Err(missing_identifier(identifier));
+        }
+        return Ok(Some(loc_asset_cache_file_item(
+            mount,
+            &path,
+            &absolute_path,
+            Some(metadata.len()),
+        )));
+    }
+
+    if let Some(path) = identifier.strip_prefix(PATH_PREFIX) {
+        let path = PathBuf::from(path);
+        if !is_loc_cache_path(&path) {
+            return Ok(None);
+        }
+        let absolute_path = content_path_for_relative(content_root, &path)?;
+        let metadata = existing_metadata(identifier, &absolute_path)?;
+        if !metadata.is_dir() {
+            return Err(missing_identifier(identifier));
+        }
+        return Ok(Some(loc_asset_cache_dir_item(mount, &path, &absolute_path)));
+    }
+
+    Ok(None)
+}
+
+fn materialize_loc_asset_cache_item(
+    mount: &MountConfig,
+    content_root: &Path,
+    identifier: &str,
+) -> LocalityResult<Option<VirtualFsMaterializeReport>> {
+    let Some(path) = identifier.strip_prefix(ASSET_CACHE_PREFIX) else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    ensure_loc_cache_path(identifier, &path)?;
+    let absolute_path = content_path_for_relative(content_root, &path)?;
+    let metadata = existing_metadata(identifier, &absolute_path)?;
+    if !metadata.is_file() {
+        return Err(missing_identifier(identifier));
+    }
+
+    Ok(Some(VirtualFsMaterializeReport {
+        mount_id: mount.mount_id.0.clone(),
+        identifier: identifier.to_string(),
+        remote_id: identifier.to_string(),
+        path: absolute_path.display().to_string(),
+        outcome: VirtualFsMaterializeOutcome::AlreadyMaterialized,
+        hydration: HydrationState::Hydrated,
+    }))
+}
+
+fn loc_asset_cache_dir_item(
+    mount: &MountConfig,
+    path: &Path,
+    absolute_path: &Path,
+) -> VirtualFsItem {
+    VirtualFsItem {
+        identifier: format!("{PATH_PREFIX}{}", path_string(path)),
+        parent_identifier: Some(loc_asset_cache_parent_identifier(mount, path)),
+        filename: filename(path),
+        kind: VirtualFsItemKind::Folder,
+        read_only: true,
+        entity_kind: None,
+        remote_id: None,
+        path: path_string(path),
+        hydration: None,
+        content_type: "public.folder".to_string(),
+        remote_edited_at: None,
+        materialized_path: Some(absolute_path.display().to_string()),
+        byte_size: None,
+    }
+}
+
+fn loc_asset_cache_file_item(
+    mount: &MountConfig,
+    path: &Path,
+    absolute_path: &Path,
+    byte_size: Option<u64>,
+) -> VirtualFsItem {
+    VirtualFsItem {
+        identifier: format!("{ASSET_CACHE_PREFIX}{}", path_string(path)),
+        parent_identifier: Some(loc_asset_cache_parent_identifier(mount, path)),
+        filename: filename(path),
+        kind: VirtualFsItemKind::File,
+        read_only: true,
+        entity_kind: None,
+        remote_id: None,
+        path: path_string(path),
+        hydration: Some(HydrationState::Hydrated),
+        content_type: "public.data".to_string(),
+        remote_edited_at: None,
+        materialized_path: Some(absolute_path.display().to_string()),
+        byte_size,
+    }
+}
+
+fn loc_asset_cache_parent_identifier(mount: &MountConfig, path: &Path) -> String {
+    let parent = parent_path(path);
+    if parent.as_os_str().is_empty() {
+        mount_point_identifier(mount)
+    } else {
+        format!("{PATH_PREFIX}{}", path_string(parent))
+    }
+}
+
+fn ensure_loc_cache_path(identifier: &str, path: &Path) -> LocalityResult<()> {
+    if is_loc_cache_path(path) {
+        Ok(())
+    } else {
+        Err(LocalityError::InvalidState(format!(
+            "downloaded asset cache identifier `{identifier}` does not target .loc"
+        )))
+    }
+}
+
+fn is_loc_cache_path(path: &Path) -> bool {
+    validate_relative_path(path).is_ok()
+        && matches!(
+            path.components().next(),
+            Some(std::path::Component::Normal(component))
+                if component == OsStr::new(LOC_CACHE_ROOT)
+        )
+}
+
+fn is_loc_asset_cache_temp_name(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.starts_with('.') && name.ends_with(".loc-tmp"))
+}
+
+fn existing_metadata(identifier: &str, path: &Path) -> LocalityResult<std::fs::Metadata> {
+    std::fs::metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            missing_identifier(identifier)
+        } else {
+            LocalityError::Io(format!(
+                "failed to inspect downloaded asset cache path `{}`: {error}",
+                path.display()
+            ))
+        }
+    })
+}
+
 fn rewrite_item_materialized_path(
     content_root: &Path,
     item: &mut VirtualFsItem,
@@ -2626,6 +2943,15 @@ fn is_materialized_hydration(hydration: &HydrationState) -> bool {
         hydration,
         HydrationState::Hydrated | HydrationState::Dirty | HydrationState::Conflicted
     )
+}
+
+fn is_hydratable_markdown_entity(entity: &EntityRecord) -> bool {
+    entity.kind == EntityKind::Page
+        || (entity.kind == EntityKind::Asset
+            && entity
+                .path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("md")))
 }
 
 fn page_child_dir_item(
@@ -2793,6 +3119,7 @@ fn entity_identifier(identifier: &str) -> LocalityResult<String> {
         || identifier.starts_with(MOUNT_POINT_PREFIX)
         || identifier.starts_with(SOURCE_ROOT_PREFIX)
         || identifier.starts_with(GUIDANCE_PREFIX)
+        || identifier.starts_with(ASSET_CACHE_PREFIX)
     {
         return Err(LocalityError::InvalidState(format!(
             "virtual filesystem identifier `{identifier}` is not a materializable file"
@@ -3040,6 +3367,7 @@ mod tests {
         freshness::FreshnessTier,
         hydration::HydrationRequest,
         model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry},
+        shadow::ShadowDocument,
     };
     use locality_store::{
         EntityRecord, EntityRepository, FreshnessStateRepository, InMemoryStateStore, MountConfig,
@@ -3957,6 +4285,105 @@ mod tests {
     }
 
     #[test]
+    fn loc_asset_cache_files_are_projected_read_only_from_content_root() {
+        let mount_id = MountId::new("gmail-main");
+        let state_root = temp_root("loc-virtual-fs-loc-asset-cache");
+        let content_root = state_root.join("content/gmail-main/files");
+        let mut store = InMemoryStateStore::new();
+        let mount = virtual_mount_with_connector(&mount_id, "gmail");
+        store.save_mount(mount.clone()).expect("save mount");
+
+        let attachment_path = PathBuf::from(".loc/gmail/attachments/msg-1/screenshot-attach-1.png");
+        let absolute_attachment = content_root.join(&attachment_path);
+        std::fs::create_dir_all(absolute_attachment.parent().expect("attachment parent"))
+            .expect("create attachment parent");
+        std::fs::write(&absolute_attachment, b"\x89PNG\r\n\x1a\nattachment bytes")
+            .expect("write attachment");
+
+        let mount_children = virtual_fs_children_with_content_root(
+            &store,
+            &content_root,
+            &mount_id,
+            &mount_point_identifier(&mount),
+        )
+        .expect("list mount children");
+        let loc = mount_children
+            .children
+            .iter()
+            .find(|child| child.filename == ".loc")
+            .expect(".loc cache folder");
+        assert_eq!(loc.identifier, "path:.loc");
+        assert_eq!(loc.kind, VirtualFsItemKind::Folder);
+        assert!(loc.read_only);
+
+        let attachment_children = virtual_fs_children_with_content_root(
+            &store,
+            &content_root,
+            &mount_id,
+            "path:.loc/gmail/attachments/msg-1",
+        )
+        .expect("list attachment cache children");
+        let attachment = attachment_children
+            .children
+            .iter()
+            .find(|child| child.filename == "screenshot-attach-1.png")
+            .expect("attachment file");
+        assert_eq!(
+            attachment.identifier,
+            "asset-cache:.loc/gmail/attachments/msg-1/screenshot-attach-1.png"
+        );
+        assert_eq!(attachment.kind, VirtualFsItemKind::File);
+        assert!(attachment.read_only);
+        assert_eq!(attachment.hydration, Some(HydrationState::Hydrated));
+        assert_eq!(
+            attachment.materialized_path.as_deref(),
+            Some(absolute_attachment.to_string_lossy().as_ref())
+        );
+        assert_eq!(attachment.byte_size, Some(24));
+
+        let attachment_item = virtual_fs_item_with_content_root(
+            &store,
+            &content_root,
+            &mount_id,
+            &attachment.identifier,
+        )
+        .expect("look up attachment item");
+        assert_eq!(
+            attachment_item.item.materialized_path.as_deref(),
+            Some(absolute_attachment.to_string_lossy().as_ref())
+        );
+        assert_eq!(attachment_item.item.byte_size, Some(24));
+
+        let materialized = materialize_virtual_fs_item_with_content_root(
+            &mut store,
+            &FailingHydrationSource,
+            &content_root,
+            &mount_id,
+            &attachment.identifier,
+        )
+        .expect("materialize cached attachment");
+        assert_eq!(
+            materialized.outcome,
+            VirtualFsMaterializeOutcome::AlreadyMaterialized
+        );
+        assert_eq!(materialized.hydration, HydrationState::Hydrated);
+        assert_eq!(PathBuf::from(&materialized.path), absolute_attachment);
+
+        assert!(matches!(
+            commit_virtual_fs_write(
+                &mut store,
+                &content_root,
+                &mount_id,
+                &attachment.identifier,
+                b"edited",
+            )
+            .expect_err("cached asset writes are rejected"),
+            LocalityError::Unsupported("downloaded asset cache files are read-only")
+        ));
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
     fn child_folder_lists_nested_pages_under_stable_page_identifier() {
         let mount_id = MountId::new("notion-main");
         let mut store = InMemoryStateStore::new();
@@ -4122,6 +4549,7 @@ mod tests {
             }],
             expected_parent_path: PathBuf::new(),
             database_schema: None,
+            complete: true,
         };
         let mount_point_root = mount_point_identifier(&mount);
 
@@ -4166,6 +4594,145 @@ mod tests {
     }
 
     #[test]
+    fn refresh_children_prunes_clean_stale_virtual_child_subtree() {
+        let mount_id = MountId::new("notion-main");
+        let mut store = InMemoryStateStore::new();
+        let mount = virtual_mount(&mount_id);
+        store.save_mount(mount.clone()).expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("old-page"),
+                EntityKind::Page,
+                "Old",
+                "old/page.md",
+            ))
+            .expect("save old page");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("old-child"),
+                EntityKind::Page,
+                "Old Child",
+                "old/child/page.md",
+            ))
+            .expect("save old child");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new("dirty-page"),
+                    EntityKind::Page,
+                    "Dirty",
+                    "dirty/page.md",
+                )
+                .with_hydration(HydrationState::Dirty),
+            )
+            .expect("save dirty page");
+        let connector = StaticChildrenConnector {
+            entries: vec![TreeEntry {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("new-page"),
+                kind: EntityKind::Page,
+                title: "New Page".to_string(),
+                path: "new/page.md".into(),
+                hydration: HydrationState::Stub,
+                content_hash: None,
+                remote_edited_at: None,
+                stub_frontmatter: None,
+            }],
+            expected_parent_path: PathBuf::new(),
+            database_schema: None,
+            complete: true,
+        };
+
+        let saved = refresh_virtual_fs_children(
+            &mut store,
+            &connector,
+            &mount_id,
+            &mount_point_identifier(&mount),
+        )
+        .expect("refresh children");
+
+        assert_eq!(saved.saved, 1);
+        assert!(saved.changed);
+        assert!(
+            store
+                .get_entity(&mount_id, &RemoteId::new("old-page"))
+                .expect("old page lookup")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_entity(&mount_id, &RemoteId::new("old-child"))
+                .expect("old child lookup")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_entity(&mount_id, &RemoteId::new("dirty-page"))
+                .expect("dirty page lookup")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn incremental_refresh_merges_without_pruning_omitted_children() {
+        let mount_id = MountId::new("granola-main");
+        let mut store = InMemoryStateStore::new();
+        let mount = virtual_mount_with_connector(&mount_id, "granola");
+        store.save_mount(mount.clone()).expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("old-meeting"),
+                EntityKind::Directory,
+                "Old meeting",
+                "Old meeting",
+            ))
+            .expect("save old meeting");
+        let connector = StaticChildrenConnector {
+            entries: vec![TreeEntry {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("recent-meeting"),
+                kind: EntityKind::Directory,
+                title: "Recent meeting".to_string(),
+                path: "Recent meeting".into(),
+                hydration: HydrationState::Stub,
+                content_hash: None,
+                remote_edited_at: None,
+                stub_frontmatter: None,
+            }],
+            expected_parent_path: PathBuf::new(),
+            database_schema: None,
+            complete: false,
+        };
+
+        let saved = refresh_virtual_fs_children(
+            &mut store,
+            &connector,
+            &mount_id,
+            &mount_point_identifier(&mount),
+        )
+        .expect("merge incremental root refresh");
+
+        assert_eq!(saved.saved, 1);
+        assert!(saved.changed);
+        assert!(
+            store
+                .get_entity(&mount_id, &RemoteId::new("old-meeting"))
+                .expect("old meeting lookup")
+                .is_some()
+        );
+        assert!(
+            store
+                .get_entity(&mount_id, &RemoteId::new("recent-meeting"))
+                .expect("recent meeting lookup")
+                .is_some()
+        );
+    }
+
+    #[test]
     fn refresh_database_children_moves_existing_row_into_database_directory() {
         let mount_id = MountId::new("notion-main");
         let mut store = InMemoryStateStore::new();
@@ -4204,6 +4771,7 @@ mod tests {
             }],
             expected_parent_path: PathBuf::from("Root/Tasks"),
             database_schema: None,
+            complete: true,
         };
 
         let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "database-1")
@@ -4259,6 +4827,7 @@ mod tests {
             }],
             expected_parent_path: PathBuf::from("Root/Tasks"),
             database_schema: Some((RemoteId::new("database-1"), schema.to_string())),
+            complete: true,
         };
 
         let saved = refresh_virtual_fs_children_with_content_root(
@@ -4357,6 +4926,7 @@ mod tests {
             }],
             expected_parent_path: PathBuf::from("Root/Tasks"),
             database_schema: None,
+            complete: true,
         };
 
         let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "database-1")
@@ -4415,6 +4985,7 @@ mod tests {
             }],
             expected_parent_path: PathBuf::from("Root/Tasks"),
             database_schema: None,
+            complete: true,
         };
 
         let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "database-1")
@@ -4435,6 +5006,7 @@ mod tests {
         entries: Vec<TreeEntry>,
         expected_parent_path: PathBuf,
         database_schema: Option<(RemoteId, String)>,
+        complete: bool,
     }
 
     impl Connector for StaticChildrenConnector {
@@ -4464,8 +5036,10 @@ mod tests {
             request: ListChildrenRequest,
         ) -> locality_core::LocalityResult<ListChildrenResult> {
             assert_eq!(request.parent_path, self.expected_parent_path);
-            Ok(ListChildrenResult {
-                entries: self.entries.clone(),
+            Ok(if self.complete {
+                ListChildrenResult::complete(self.entries.clone())
+            } else {
+                ListChildrenResult::incremental(self.entries.clone())
             })
         }
 
@@ -4551,6 +5125,35 @@ mod tests {
         }
     }
 
+    struct MarkdownAssetHydrationSource;
+
+    impl HydrationSource for MarkdownAssetHydrationSource {
+        fn fetch_render(
+            &self,
+            request: &HydrationRequest,
+        ) -> locality_core::LocalityResult<HydratedEntity> {
+            let frontmatter = format!(
+                "loc:\n  id: {}\n  type: page\ntitle: Summary\n",
+                request.remote_id.0
+            );
+            let body = "Hydrated Markdown asset.\n".to_string();
+            let shadow = ShadowDocument::from_synced_body(
+                request.remote_id.clone(),
+                body.clone(),
+                frontmatter.lines().count() + 3,
+                [RemoteId::new("block-1")],
+            )
+            .expect("asset shadow")
+            .with_frontmatter(frontmatter.clone());
+            Ok(HydratedEntity {
+                document: CanonicalDocument::new(frontmatter, body),
+                shadow,
+                remote_edited_at: Some("2026-07-14T00:00:00Z".to_string()),
+                assets: Vec::new(),
+            })
+        }
+    }
+
     #[test]
     fn item_metadata_is_store_only_for_online_only_files() {
         let mount_id = MountId::new("notion-main");
@@ -4631,6 +5234,57 @@ mod tests {
         assert_eq!(
             std::fs::read(report.path).expect("read materialized cache"),
             conflicted_contents
+        );
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn markdown_asset_materializes_as_a_file_on_open() {
+        let mount_id = MountId::new("granola-main");
+        let remote_id = RemoteId::new("note-1:summary");
+        let state_root = temp_root("loc-virtual-fs-markdown-asset");
+        let content_root = state_root.join("content/granola-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount_with_connector(&mount_id, "granola").read_only(true))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                remote_id.clone(),
+                EntityKind::Asset,
+                "Summary",
+                "Meeting/summary.md",
+            ))
+            .expect("save asset");
+
+        let report = materialize_virtual_fs_item_with_content_root(
+            &mut store,
+            &MarkdownAssetHydrationSource,
+            &content_root,
+            &mount_id,
+            remote_id.as_str(),
+        )
+        .expect("materialize Markdown asset");
+
+        assert_eq!(report.outcome, VirtualFsMaterializeOutcome::Hydrated);
+        assert_eq!(report.hydration, HydrationState::Hydrated);
+        assert_eq!(
+            PathBuf::from(&report.path),
+            content_root.join("Meeting/summary.md")
+        );
+        assert!(
+            std::fs::read_to_string(&report.path)
+                .expect("read materialized asset")
+                .contains("Hydrated Markdown asset.")
+        );
+        assert_eq!(
+            store
+                .get_entity(&mount_id, &remote_id)
+                .expect("load asset")
+                .expect("asset exists")
+                .kind,
+            EntityKind::Asset
         );
         let _ = std::fs::remove_dir_all(state_root);
     }
@@ -5640,6 +6294,7 @@ mod tests {
                 entries: Vec::new(),
                 expected_parent_path: PathBuf::new(),
                 database_schema: None,
+                complete: true,
             },
             &mount_id,
             ROOT_CONTAINER_IDENTIFIER,

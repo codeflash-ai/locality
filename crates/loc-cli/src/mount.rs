@@ -25,6 +25,7 @@ pub struct MountOptions {
     pub connection_id: Option<ConnectionId>,
     pub read_only: bool,
     pub projection: ProjectionMode,
+    pub settings_json: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -38,6 +39,7 @@ pub struct MountReport {
     pub connection_id: Option<String>,
     pub read_only: bool,
     pub projection: String,
+    pub settings_json: String,
     pub guidance: MountGuidanceReport,
 }
 
@@ -105,7 +107,8 @@ where
 
     let mut mount = MountConfig::new(options.mount_id.clone(), options.connector.clone(), &root)
         .read_only(options.read_only)
-        .projection(options.projection.clone());
+        .projection(options.projection.clone())
+        .with_settings_json(options.settings_json.clone());
     if let Some(remote_root_id) = options.remote_root_id.clone() {
         mount = mount.with_remote_root_id(remote_root_id);
     }
@@ -125,6 +128,7 @@ where
         connection_id: options.connection_id.map(|connection_id| connection_id.0),
         read_only: options.read_only,
         projection: options.projection.as_str().to_string(),
+        settings_json: options.settings_json,
         guidance,
     })
 }

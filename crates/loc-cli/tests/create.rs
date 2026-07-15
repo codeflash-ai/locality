@@ -108,6 +108,7 @@ fn cli_create_page_private_flag_writes_marker() {
             connection_id: None,
             read_only: false,
             projection: locality_store::ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         })
         .expect("save mount");
 
@@ -388,6 +389,7 @@ impl CreateFixture {
                 connection_id: None,
                 read_only,
                 projection,
+                settings_json: "{}".to_string(),
             })
             .expect("save mount");
         store

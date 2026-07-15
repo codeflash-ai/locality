@@ -69,6 +69,14 @@ in Finder. Opening the raw mount root is not enough to test lazy enumeration:
 Finder must enter the File Provider domain so directory listings call
 `file_provider_children` on `localityd`.
 
+Mount activation signals the shared domain root after adding a source. Because
+macOS creates that source folder asynchronously, Locality briefly waits for the
+new mount point before inspecting it. If the folder remains absent or File
+Provider reports an unhealthy replica, Locality resets and re-registers the
+shared domain, refreshes it from durable mount state, and waits for the source
+folder to become healthy. Reconnecting an existing source retries this
+activation path instead of only reloading daemon mounts.
+
 Delete support still returns unsupported. Creates and renames are represented as
 daemon virtual mutations and stay pending until the normal review and push flow
 applies them to the remote source.

@@ -1,6 +1,7 @@
 # Connector SDK
 
-A connector implements seven responsibilities and leaves caching, journaling, validation, conflict detection, and rate limiting to the host:
+A connector implements seven responsibilities and leaves caching, journaling,
+validation, conflict detection, and network admission mechanics to the host:
 
 1. Enumerate remote tree metadata.
 2. Fetch full native content for one entity.
@@ -11,6 +12,32 @@ A connector implements seven responsibilities and leaves caching, journaling, va
 7. Apply a complete undo plan as remote reverse API operations.
 
 First-party connectors compile in as Rust crates. A future third-party connector ABI should be possible if this trait remains narrow, explicit, and host-mediated.
+
+## Network Policy
+
+Each connector supplies a `ConnectorNetworkConfig` for the quota scope enforced
+by its upstream API: requests per second, token-bucket burst, per-scope
+in-flight limit, request timeout, and retry backoff parameters. The shared
+network gate implements those mechanics. The connector still owns semantic
+decisions such as which methods and status codes are safe to retry, how to
+decode `Retry-After`, and how authentication failures are reported.
+
+A process-wide orchestrator sits above the connector scopes. It applies a high
+global in-flight ceiling as resource backpressure and admits waiting scopes in
+round-robin order. It is not a global requests-per-second limit: one provider's
+empty bucket or cooldown does not consume another provider's quota. Clients
+using the same quota scope share its bucket and cooldown.
+
+The global ceiling is 32 in-flight requests. It is internal product policy, not
+a user-facing environment setting. The limit is process-local; provider limits
+remain authoritative when CLI and daemon processes run at the same time, so
+connector defaults should remain conservative.
+
+Notion uses the same 3 requests/second, burst 3, four retries, and exponential
+backoff behavior as its previous production-tested limiter. Granola uses a
+separate 5 requests/second, burst 3, maximum 8 in-flight scope. Adding a
+connector should add a new policy and reuse the gate rather than creating a new
+scheduler or request-throttling implementation.
 
 First-party connectors are exposed through the daemon source registry. The
 registry is the single runtime list of connectors supported by the current

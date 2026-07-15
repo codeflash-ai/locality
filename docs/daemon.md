@@ -374,6 +374,23 @@ the user or agent is working on does not sit behind unrelated background pages.
 Scheduled and discovery-driven remote fast-forwards remain normal/background
 work.
 
+Connector network work is admitted in two layers. Each connector configures
+its provider quota and retry semantics, while a process-wide orchestrator caps
+total in-flight work and fairly rotates among ready connector scopes. The
+global ceiling is backpressure, not a shared requests-per-second throttle, so a
+Granola cooldown cannot stall Notion and vice versa. See
+`docs/network-orchestration.md` for the configuration and compatibility rules.
+
+Virtual-filesystem child discovery uses the existing daemon child-refresh
+queue. It can run up to 32 refresh workers, including up to 16 background
+workers. These are internal global orchestration policy; connector network
+gates still enforce the narrower upstream limits.
+
+Failed child discovery uses bounded exponential backoff and remains durable.
+The queue skips delayed work when another source is ready, while an interactive
+directory access promotes its own delayed request immediately. This prevents a
+disconnected mount from monopolizing discovery for healthy mounts.
+
 After a `remote_fast_forward` succeeds, the daemon compares the previous and
 current Synced Tree shadows for structural discovery hints. If the set of
 rendered `child_page` links changed, the daemon queues a background refresh for

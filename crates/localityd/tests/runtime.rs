@@ -36,6 +36,11 @@ use localityd::virtual_fs::{
 use localityd::watcher::{FileEvent, FileEventKind};
 use serde_json::json;
 
+// Positive cross-thread events may follow SQLite work. Windows hosted runners
+// can take longer than one second under the parallel all-targets CI workload.
+// Negative ordering assertions below keep their short, explicit deadlines.
+const ASYNC_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[test]
 fn runtime_answers_ping_while_pull_worker_is_blocked() {
     let (started_tx, started_rx) = mpsc::channel();
@@ -1962,7 +1967,7 @@ fn runtime_remote_fast_forward_request_uses_daemon_hydration_queue() {
         "remote fast-forward request failed: {response:?}"
     );
     let request = hydrated_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(ASYNC_EVENT_TIMEOUT)
         .expect("remote fast-forward hydration drained");
     assert_eq!(request.mount_id, MountId::new("notion-main"));
     assert_eq!(request.remote_id, RemoteId::new("page-1"));
@@ -2131,12 +2136,12 @@ fn runtime_queues_child_refresh_when_remote_fast_forward_discovers_child_link_di
         "remote fast-forward request failed: {response:?}"
     );
     let request = hydrated_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(ASYNC_EVENT_TIMEOUT)
         .expect("remote fast-forward hydration drained");
     assert_eq!(request.reason, HydrationReason::LiveModeRemoteFastForward);
     assert_eq!(
         refresh_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(ASYNC_EVENT_TIMEOUT)
             .expect("child refresh queued from discovery hint"),
         ("notion-main".to_string(), "children:page-1".to_string())
     );
@@ -2384,7 +2389,7 @@ impl SchedulerPolicySimulation {
     fn expect_started(&mut self, expected: SchedulerExpectedStart) -> SchedulerStartedOperation {
         let operation = self
             .started_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(ASYNC_EVENT_TIMEOUT)
             .unwrap_or_else(|error| {
                 panic!(
                     "expected scheduler operation {expected:?}; input log: {:?}; error: {error}",
@@ -2413,7 +2418,7 @@ impl SchedulerPolicySimulation {
         for _ in 0..N {
             operations.push(
                 self.started_rx
-                    .recv_timeout(Duration::from_secs(1))
+                    .recv_timeout(ASYNC_EVENT_TIMEOUT)
                     .unwrap_or_else(|error| {
                         panic!(
                             "expected scheduler operations {expected_set:?}; input log: {:?}; error: {error}",
