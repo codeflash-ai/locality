@@ -708,7 +708,7 @@ mod tests {
     use crate::client::GmailApi;
     use crate::dto::{
         GmailDraft, GmailDraftCreateRequest, GmailDraftSendRequest, GmailMessage, GmailMessageList,
-        GmailMessageRef,
+        GmailMessagePartBody, GmailMessageRef,
     };
     use crate::settings::{GmailMountSettings, GmailProjectionView};
 
@@ -1459,6 +1459,14 @@ mod tests {
             message_id: &str,
         ) -> locality_core::LocalityResult<GmailMessage> {
             Ok(message_fixture(message_id))
+        }
+
+        fn get_attachment(
+            &self,
+            _message_id: &str,
+            _attachment_id: &str,
+        ) -> locality_core::LocalityResult<GmailMessagePartBody> {
+            Ok(GmailMessagePartBody::default())
         }
 
         fn create_draft(

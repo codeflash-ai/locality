@@ -10,6 +10,7 @@ use serde::de::DeserializeOwned;
 
 use crate::dto::{
     GmailDraft, GmailDraftCreateRequest, GmailDraftSendRequest, GmailMessage, GmailMessageList,
+    GmailMessagePartBody,
 };
 
 pub const DEFAULT_GMAIL_API_BASE_URL: &str = "https://gmail.googleapis.com/gmail/v1";
@@ -27,6 +28,11 @@ pub trait GmailApi: std::fmt::Debug + Send + Sync {
     ) -> LocalityResult<GmailMessageList>;
     fn get_message_metadata(&self, message_id: &str) -> LocalityResult<GmailMessage>;
     fn get_message_full(&self, message_id: &str) -> LocalityResult<GmailMessage>;
+    fn get_attachment(
+        &self,
+        message_id: &str,
+        attachment_id: &str,
+    ) -> LocalityResult<GmailMessagePartBody>;
     fn create_draft(&self, request: GmailDraftCreateRequest) -> LocalityResult<GmailDraft>;
     fn send_draft(&self, request: GmailDraftSendRequest) -> LocalityResult<GmailMessage>;
 }
@@ -129,6 +135,17 @@ impl GmailApi for HttpGmailApiClient {
         self.get_json(
             &format!("/users/me/messages/{message_id}"),
             vec![("format".to_string(), "full".to_string())],
+        )
+    }
+
+    fn get_attachment(
+        &self,
+        message_id: &str,
+        attachment_id: &str,
+    ) -> LocalityResult<GmailMessagePartBody> {
+        self.get_json(
+            &format!("/users/me/messages/{message_id}/attachments/{attachment_id}"),
+            Vec::new(),
         )
     }
 
@@ -262,6 +279,29 @@ mod tests {
             LocalityError::Io(message)
                 if message.contains("gmail api GET returned HTTP 500 Internal Server Error: broken")
         ));
+    }
+
+    #[test]
+    fn get_attachment_calls_gmail_attachment_endpoint() {
+        let (base_url, request_rx, server) = spawn_response_server(
+            "HTTP/1.1 200 OK",
+            r#"{"attachmentId":"attach-1","size":5,"data":"SGVsbG8"}"#,
+        );
+        let client = HttpGmailApiClient::with_base_url("access-token", base_url);
+
+        let attachment = client
+            .get_attachment("msg-1", "attach-1")
+            .expect("attachment response");
+
+        assert_eq!(attachment.attachment_id.as_deref(), Some("attach-1"));
+        assert_eq!(attachment.size, Some(5));
+        assert_eq!(attachment.data.as_deref(), Some("SGVsbG8"));
+        let request = request_rx.recv().expect("request line");
+        server.join().expect("server exits");
+        assert!(
+            request.starts_with("GET /users/me/messages/msg-1/attachments/attach-1 "),
+            "{request}"
+        );
     }
 
     fn request_error_for_status(status_line: &'static str, body: &'static str) -> LocalityError {

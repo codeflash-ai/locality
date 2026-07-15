@@ -1,3 +1,4 @@
+pub mod attachments;
 pub mod client;
 pub mod connector;
 pub mod dto;
