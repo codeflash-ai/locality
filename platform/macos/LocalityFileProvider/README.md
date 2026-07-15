@@ -3,6 +3,7 @@
 This package contains the macOS online-only projection:
 
 - a `NSFileProviderReplicatedExtension` implementation;
+- a named File Provider service source for containing-app warm-up;
 - `locality-file-providerctl`, a small domain registration helper;
 - a minimal containing `Locality.app` bundle template; and
 - Command Line Tools scripts for a local ad-hoc development bundle.
@@ -40,6 +41,12 @@ mounts and connectors are added under one shared Locality root.
 
 The extension talks to `localityd` over `127.0.0.1:38567` by default because
 sandboxed app extensions should not depend on a Unix socket in `~/.loc`.
+
+The desktop app registers the shared `loc` domain from the foreground app
+process during onboarding. After registration it resolves the extension's named
+File Provider service and opens a short-lived XPC connection, matching the
+standard containing-app to provider-extension pattern. Finder's `Enable` button
+is recovery behavior, not the normal activation path.
 
 ## Development Build
 

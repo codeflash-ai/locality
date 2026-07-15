@@ -34,6 +34,8 @@ objc2-file-provider = { version = "0.3.2", default-features = false, features = 
   "std",
   "Extension",
   "NSFileProviderDomain",
+  "NSFileProviderItem",
+  "NSFileProviderService",
   "block2",
 ] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
@@ -42,7 +44,9 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
   "NSArray",
   "NSError",
   "NSEnumerator",
+  "NSFileManager",
   "NSString",
+  "NSXPCConnection",
 ] }
 
 [target.'cfg(windows)'.dependencies]

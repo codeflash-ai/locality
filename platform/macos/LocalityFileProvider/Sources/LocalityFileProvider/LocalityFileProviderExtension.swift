@@ -15,6 +15,10 @@ final class LocalityFileProviderExtension: NSObject, NSFileProviderReplicatedExt
 
   private let domain: NSFileProviderDomain
   private let client: Result<LocalityDaemonClient, Error>
+  private var serviceListener: NSXPCListener?
+  var domainIdentifierForService: String {
+    domain.identifier.rawValue
+  }
 
   required init(domain: NSFileProviderDomain) {
     self.domain = domain
@@ -25,6 +29,26 @@ final class LocalityFileProviderExtension: NSObject, NSFileProviderReplicatedExt
   }
 
   func invalidate() {}
+
+  func fileProviderServiceListenerEndpoint() throws -> NSXPCListenerEndpoint {
+    if serviceListener == nil {
+      let listener = NSXPCListener.anonymous()
+      listener.delegate = self
+      listener.resume()
+      serviceListener = listener
+    }
+
+    guard let endpoint = serviceListener?.endpoint else {
+      throw NSError(
+        domain: "ai.codeflash.locality.Locality.FileProvider",
+        code: 1,
+        userInfo: [
+          NSLocalizedDescriptionKey: "Locality File Provider service listener is unavailable."
+        ]
+      )
+    }
+    return endpoint
+  }
 
   func item(
     for identifier: NSFileProviderItemIdentifier,

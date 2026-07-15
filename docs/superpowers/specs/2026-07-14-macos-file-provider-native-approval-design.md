@@ -20,6 +20,12 @@ call, followed by interaction with a Nextcloud-owned window, and later showed
 the same domain as `userEnabled = true`. The domain had no testing modes and the
 app had no File Provider bypass entitlement.
 
+Nextcloud also resolves its File Provider service through
+`NSFileProviderManager.getServiceWithName` immediately after domain setup and
+uses the returned `NSFileProviderService` to connect to an extension-owned XPC
+listener. It does not open the CloudStorage location in Finder as its normal
+approval mechanism.
+
 Locality currently makes the same API call from the
 `locality-file-providerctl` child executable. The desktop then immediately asks
 that helper to resolve the CloudStorage URL. When the refetched domain remains
@@ -44,6 +50,9 @@ public FileProvider Objective-C API through the existing `objc2` ecosystem to:
 
 - construct the `loc` `NSFileProviderDomain`;
 - invoke `NSFileProviderManager.addDomain` from the Locality app process;
+- resolve the Locality File Provider service and open a short-lived provider
+  XPC connection after registration, matching the app-to-extension warm-up
+  pattern used by Nextcloud;
 - refetch registered domains and read the authoritative `userEnabled`,
   `disconnected`, and `hidden` values; and
 - report API failures and bounded wait timeouts without changing the domain's
@@ -59,6 +68,13 @@ The existing Swift helper remains the maintenance boundary for CLI operations,
 URL resolution, enumerator signalling, reimport, and noninteractive startup
 repair. It is no longer the normal first creator of the desktop onboarding
 domain.
+
+The File Provider extension implements `NSFileProviderServicing` and
+`NSFileProviderServiceSource` for a Locality-owned service name. The service
+vends an anonymous XPC listener endpoint so the containing app can resolve the
+provider service after registration. The current warm-up connection is used only
+to exercise the standard app-extension service path; durable credentials and
+mount configuration still flow through `localityd`.
 
 ### Bundle Construction
 
@@ -85,17 +101,21 @@ mismatched host/extension identifier prefixes, invalid nested signatures, and th
 1. The user starts mount creation from Locality onboarding.
 2. Before the blocking mount worker runs, the Tauri host schedules the native
    domain registration call on its main thread.
-3. After `addDomain` completes, a worker refetches domain state at a bounded
-   interval for up to 30 seconds.
-4. If macOS reports `userEnabled = true`, the existing mount workflow resolves
+3. After `addDomain` completes, the app best-effort resolves the Locality File
+   Provider service on the main thread and opens a short-lived provider
+   connection. A failure here is logged but does not block activation, because
+   older installed extensions or a still-disabled domain may not vend the
+   service yet.
+4. A worker refetches domain state at a bounded interval for up to 30 seconds.
+5. If macOS reports `userEnabled = true`, the existing mount workflow resolves
    the provider URL and continues creating durable mount state.
-5. If approval is still pending after the bounded wait, onboarding returns
+6. If approval is still pending after the bounded wait, onboarding returns
    `approval_required`. `Allow in macOS` repeats the foreground host call and
-   bounded state check.
-6. If the domain is enabled but the CloudStorage root is not ready, onboarding
+   bounded state check without revealing the CloudStorage root in Finder.
+7. If the domain is enabled but the CloudStorage root is not ready, onboarding
    returns `waiting_for_cloudstorage_root` and keeps the existing `Check again`
    path.
-7. Finder and System Settings instructions remain recovery guidance after a
+8. Finder and System Settings instructions remain recovery guidance after a
    denial, dismissal, or persistent disabled state. They are not the normal
    first-install path.
 
@@ -108,11 +128,9 @@ become its creator.
 
 - An already enabled domain proceeds without delay after a confirming refetch.
 - Re-adding an existing domain may update its display and hidden properties but
-  cannot override an explicit user denial. The app must respect a persistent
-  `userEnabled = false` result.
-- The app will not automatically remove a disabled domain. Removal can preserve
-  or discard provider-managed local state and is outside this first-install
-  fix.
+  cannot override an explicit user denial. On an explicit `Allow in macOS`
+  retry, Locality removes a disabled domain before re-registering so macOS can
+  present a fresh approval opportunity.
 - Startup repair remains noninteractive. It may restore a missing registration,
   but it must not try to manufacture approval without a foreground user action.
 - CLI-driven registration continues to use the helper and may require manual
@@ -149,6 +167,10 @@ Use test-first coverage for the new orchestration and packaging behavior:
   `waiting_for_cloudstorage_root`;
 - `Allow in macOS` retries foreground registration rather than merely opening
   Finder;
+- provider service warm-up runs after registration before polling and a warm-up
+  failure does not block activation;
+- the extension advertises the Locality File Provider service and can vend an
+  XPC listener endpoint;
 - non-macOS behavior and existing path validation remain unchanged; and
 - build/release checks validate extension platform metadata, application-
   extension compilation, identifier containment, signatures, and absence of

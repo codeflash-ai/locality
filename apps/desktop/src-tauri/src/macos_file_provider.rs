@@ -7,14 +7,18 @@ use std::time::{Duration, Instant};
 use block2::RcBlock;
 use objc2::AnyThread;
 use objc2::rc::{Retained, autoreleasepool};
-use objc2_file_provider::{NSFileProviderDomain, NSFileProviderManager};
-use objc2_foundation::{NSArray, NSError, NSString};
+use objc2_file_provider::{
+    NSFileProviderDomain, NSFileProviderManager, NSFileProviderRootContainerItemIdentifier,
+};
+use objc2_foundation::{NSArray, NSError, NSFileProviderService, NSString, NSXPCConnection};
 
 const ADD_CALLBACK_TIMEOUT: Duration = Duration::from_secs(15);
 const REMOVE_CALLBACK_TIMEOUT: Duration = Duration::from_secs(15);
 const DOMAIN_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const DOMAIN_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const DOMAIN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const SERVICE_WARM_UP_TIMEOUT: Duration = Duration::from_secs(5);
+const FILE_PROVIDER_SERVICE_NAME: &str = "ai.codeflash.locality.Locality.FileProvider.service";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DomainActivation {
@@ -34,24 +38,26 @@ pub(crate) fn register_domain_and_wait(
     identifier: &str,
     display_name: &str,
 ) -> Result<DomainActivation, String> {
-    register_domain_and_wait_opening_after_add(app, identifier, display_name, || Ok(()))
+    register_domain_and_wait_warming_after_add(app, identifier, display_name, || {
+        warm_file_provider_extension(app, identifier, display_name, SERVICE_WARM_UP_TIMEOUT)
+    })
 }
 
-pub(crate) fn register_domain_and_wait_opening_after_add<OpenAfterAdd>(
+pub(crate) fn register_domain_and_wait_warming_after_add<WarmUpAfterAdd>(
     app: &tauri::AppHandle,
     identifier: &str,
     display_name: &str,
-    open_after_add: OpenAfterAdd,
+    warm_up_after_add: WarmUpAfterAdd,
 ) -> Result<DomainActivation, String>
 where
-    OpenAfterAdd: FnMut() -> Result<(), String>,
+    WarmUpAfterAdd: FnMut() -> Result<(), String>,
 {
-    register_domain_and_wait_with_open_after_add(
+    register_domain_and_wait_with_warm_up_after_add(
         |sender| schedule_domain_add(app, identifier, display_name, sender),
         ADD_CALLBACK_TIMEOUT,
         DOMAIN_POLL_TIMEOUT,
         DOMAIN_POLL_INTERVAL,
-        open_after_add,
+        warm_up_after_add,
         |remaining| query_domain_state(identifier, remaining.min(DOMAIN_QUERY_TIMEOUT)),
         std::thread::sleep,
         {
@@ -106,7 +112,7 @@ where
     Sleep: FnMut(Duration),
     Now: FnMut() -> Duration,
 {
-    register_domain_and_wait_with_open_after_add(
+    register_domain_and_wait_with_warm_up_after_add(
         schedule_add,
         callback_timeout,
         poll_timeout,
@@ -118,19 +124,19 @@ where
     )
 }
 
-fn register_domain_and_wait_with_open_after_add<Schedule, OpenAfterAdd, Query, Sleep, Now>(
+fn register_domain_and_wait_with_warm_up_after_add<Schedule, WarmUpAfterAdd, Query, Sleep, Now>(
     schedule_add: Schedule,
     callback_timeout: Duration,
     poll_timeout: Duration,
     poll_interval: Duration,
-    mut open_after_add: OpenAfterAdd,
+    mut warm_up_after_add: WarmUpAfterAdd,
     mut query: Query,
     mut sleep: Sleep,
     mut now: Now,
 ) -> Result<DomainActivation, String>
 where
     Schedule: FnOnce(SyncSender<Result<(), String>>) -> Result<(), String>,
-    OpenAfterAdd: FnMut() -> Result<(), String>,
+    WarmUpAfterAdd: FnMut() -> Result<(), String>,
     Query: FnMut(Duration) -> Result<Option<DomainState>, String>,
     Sleep: FnMut(Duration),
     Now: FnMut() -> Duration,
@@ -153,7 +159,9 @@ where
         }
     }
 
-    open_after_add()?;
+    if let Err(error) = warm_up_after_add() {
+        eprintln!("Could not warm macOS File Provider service after registration: {error}");
+    }
 
     let poll_started = now();
     loop {
@@ -177,6 +185,121 @@ where
         }
         sleep(poll_interval.min(poll_timeout - elapsed));
     }
+}
+
+fn warm_file_provider_extension(
+    app: &tauri::AppHandle,
+    identifier: &str,
+    display_name: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let identifier = identifier.to_owned();
+    let display_name = display_name.to_owned();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    app.run_on_main_thread(move || {
+        start_file_provider_service_warm_up(&identifier, &display_name, sender);
+    })
+    .map_err(|error| {
+        format!("Could not schedule File Provider service warm-up on the main thread: {error}")
+    })?;
+
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(error @ RecvTimeoutError::Timeout) => Err(format!(
+            "File Provider service warm-up callback timed out: {error}"
+        )),
+        Err(RecvTimeoutError::Disconnected) => {
+            Err("File Provider service warm-up callback disconnected before delivery.".to_string())
+        }
+    }
+}
+
+fn start_file_provider_service_warm_up(
+    identifier: &str,
+    display_name: &str,
+    completion: SyncSender<Result<(), String>>,
+) {
+    let domain = unsafe { new_domain(identifier, display_name) };
+    let Some(manager) = (unsafe { NSFileProviderManager::managerForDomain(&domain) }) else {
+        deliver_callback(
+            &completion,
+            Err(format!(
+                "No File Provider manager is available for domain `{identifier}`."
+            )),
+        );
+        return;
+    };
+
+    let service_name = NSString::from_str(FILE_PROVIDER_SERVICE_NAME);
+    let service_completion = RcBlock::new(
+        move |service: *mut NSFileProviderService, error: *mut NSError| {
+            if !error.is_null() {
+                let error = unsafe { format_framework_error_from_nserror(error) };
+                deliver_callback(
+                    &completion,
+                    Err(format!(
+                        "Could not resolve File Provider service `{FILE_PROVIDER_SERVICE_NAME}`: {error}"
+                    )),
+                );
+                return;
+            }
+
+            if service.is_null() {
+                deliver_callback(
+                    &completion,
+                    Err(format!(
+                        "File Provider service `{FILE_PROVIDER_SERVICE_NAME}` was not returned."
+                    )),
+                );
+                return;
+            }
+
+            let connection_sender = completion.clone();
+            let connection_completion = RcBlock::new(
+                move |connection: *mut NSXPCConnection, error: *mut NSError| {
+                    let result = if !error.is_null() {
+                        let error = unsafe { format_framework_error_from_nserror(error) };
+                        Err(format!(
+                            "Could not open File Provider service connection `{FILE_PROVIDER_SERVICE_NAME}`: {error}"
+                        ))
+                    } else if connection.is_null() {
+                        Err(format!(
+                            "File Provider service connection `{FILE_PROVIDER_SERVICE_NAME}` was not returned."
+                        ))
+                    } else {
+                        // SAFETY: The callback provides a valid connection pointer for
+                        // the duration of the callback. Resuming then invalidating it
+                        // forces the provider-side listener path without sending app
+                        // data over the service.
+                        unsafe {
+                            let connection = &*connection;
+                            connection.resume();
+                            connection.invalidate();
+                        }
+                        Ok(())
+                    };
+                    deliver_callback(&connection_sender, result);
+                },
+            );
+
+            // SAFETY: File Provider supplied a non-null service pointer for this
+            // callback and copies the completion block for the asynchronous reply.
+            unsafe {
+                (&*service).getFileProviderConnectionWithCompletionHandler(&connection_completion)
+            };
+        },
+    );
+
+    // SAFETY: The manager belongs to the newly registered domain, the service
+    // name and root item identifier are immutable Objective-C strings, and the
+    // completion block owns its callback sender.
+    unsafe {
+        manager.getServiceWithName_itemIdentifier_completionHandler(
+            &service_name,
+            NSFileProviderRootContainerItemIdentifier,
+            &service_completion,
+        )
+    };
 }
 
 fn schedule_domain_add(
@@ -334,6 +457,20 @@ fn add_completion_result(domain: &str, code: isize, description: &str) -> Result
     }
 }
 
+unsafe fn format_framework_error_from_nserror(error: *mut NSError) -> String {
+    autoreleasepool(|pool| {
+        // SAFETY: Callers pass non-null NSError pointers provided by File
+        // Provider completion callbacks.
+        let error = unsafe { &*error };
+        let domain = error.domain();
+        let domain = unsafe { domain.to_str(pool) }.to_owned();
+        let code = error.code();
+        let description = error.localizedDescription();
+        let description = unsafe { description.to_str(pool) }.to_owned();
+        format_framework_error(&domain, code, &description)
+    })
+}
+
 fn format_framework_error(domain: &str, code: isize, description: &str) -> String {
     format!("{domain} ({code}): {description}")
 }
@@ -413,10 +550,10 @@ mod tests {
     }
 
     #[test]
-    fn approval_retry_opens_domain_after_registration_before_polling() {
+    fn service_warm_up_runs_after_registration_before_polling() {
         let clock = Cell::new(Duration::ZERO);
-        let opened = Cell::new(false);
-        let query_saw_open = Cell::new(false);
+        let warmed = Cell::new(false);
+        let query_saw_warm_up = Cell::new(false);
         let states = RefCell::new(VecDeque::from([
             Some(DomainState {
                 user_enabled: false,
@@ -430,17 +567,17 @@ mod tests {
             }),
         ]));
 
-        let result = register_domain_and_wait_with_open_after_add(
+        let result = register_domain_and_wait_with_warm_up_after_add(
             successful_add,
             Duration::from_millis(10),
             Duration::from_millis(3),
             Duration::from_millis(1),
             || {
-                opened.set(true);
+                warmed.set(true);
                 Ok(())
             },
             |_| {
-                query_saw_open.set(opened.get());
+                query_saw_warm_up.set(warmed.get());
                 Ok(states.borrow_mut().pop_front().expect("poll state"))
             },
             |duration| clock.set(clock.get() + duration),
@@ -448,8 +585,31 @@ mod tests {
         );
 
         assert_eq!(result, Ok(DomainActivation::Enabled));
-        assert!(opened.get());
-        assert!(query_saw_open.get());
+        assert!(warmed.get());
+        assert!(query_saw_warm_up.get());
+    }
+
+    #[test]
+    fn service_warm_up_error_does_not_block_enabled_domain() {
+        let clock = Cell::new(Duration::ZERO);
+        let result = register_domain_and_wait_with_warm_up_after_add(
+            successful_add,
+            Duration::from_millis(10),
+            Duration::from_millis(3),
+            Duration::from_millis(1),
+            || Err("extension service not ready".to_string()),
+            |_| {
+                Ok(Some(DomainState {
+                    user_enabled: true,
+                    disconnected: false,
+                    hidden: false,
+                }))
+            },
+            |duration| clock.set(clock.get() + duration),
+            || clock.get(),
+        );
+
+        assert_eq!(result, Ok(DomainActivation::Enabled));
     }
 
     #[test]
