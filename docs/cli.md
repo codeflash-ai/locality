@@ -93,7 +93,7 @@ printf '%s' "$GRANOLA_API_KEY" | loc connect granola --api-key-stdin
 loc mount granola ~/Library/CloudStorage/Locality/granola
 ```
 
-Granola mounts are always read-only. Each note becomes a flat, date-prefixed meeting directory with `summary.md` and `transcript.md`; the full Granola note ID prevents collisions. Granola folder membership, attendees, calendar data, ownership, timestamps, and web URL are retained in frontmatter. A missing transcript is represented explicitly because Granola may have captured none or may have deleted it under a retention policy.
+Granola mounts are always read-only. Each note becomes a flat, title-first meeting directory such as `Weekly product sync — 2026-07-14 17.30.00 UTC`, containing `summary.md` and `transcript.md`. The stable Granola note ID stays in Locality state and frontmatter instead of the visible directory name. Granola folder membership, attendees, calendar data, ownership, timestamps, and web URL are retained in frontmatter. A missing transcript is represented explicitly because Granola may have captured none or may have deleted it under a retention policy.
 
 `loc connections` and `loc connection show <id>` list connected-account metadata only, including the profile ID but never credentials. `loc profiles` lists connector auth profiles and contains no account secrets. `loc disconnect <id>` deletes the credential and marks the connection `revoked`; mounts remain registered and will report `connection_revoked` on the next pull/push until reconnected or remounted.
 

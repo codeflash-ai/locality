@@ -21,18 +21,23 @@ read-only `granola-main` mount automatically.
 
 ## Filesystem Contract
 
-Meetings are flat and sort chronologically by their Granola creation time:
+Meetings use title-first directory names so recurring meetings group together
+and remain readable in Finder. The UTC creation timestamp keeps meetings with
+the same title distinct:
 
 ```text
 granola/
-  2026-07-14T173000Z--weekly-product-sync--not_1d3tmYTlCICgjy/
+  Weekly product sync — 2026-07-14 17.30.00 UTC/
     summary.md
     transcript.md
 ```
 
-The title is slugged and capped, while the full note ID provides stable
-identity. Both files contain Locality identity plus Granola metadata for the
-owner, attendees, calendar event, folder ancestry, timestamps, and web URL.
+Titles preserve capitalization, spaces, and Unicode; only characters unsafe in
+cross-platform filenames are replaced. The Granola note ID remains the durable
+identity in Locality state and file frontmatter rather than cluttering the
+visible folder name. Both files contain Locality identity plus Granola metadata
+for the owner, attendees, calendar event, folder ancestry, timestamps, and web
+URL.
 
 `summary.md` prefers Granola's Markdown summary and falls back to its plain-text
 summary. `transcript.md` preserves every returned chunk in order with absolute

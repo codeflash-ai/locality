@@ -3,7 +3,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, ChildContainer,
     Connector, ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest,
@@ -301,30 +301,19 @@ fn observation_from_entry(entry: TreeEntry, parent: Option<RemoteId>) -> RemoteO
 pub fn meeting_directory_name(note: &GranolaNoteSummary) -> String {
     let timestamp = DateTime::parse_from_rfc3339(&note.created_at)
         .map(|value| {
-            value
-                .with_timezone(&Utc)
-                .format("%Y-%m-%dT%H%M%SZ")
-                .to_string()
+            let value = value.with_timezone(&Utc);
+            if value.nanosecond() == 0 {
+                value.format("%Y-%m-%d %H.%M.%S UTC").to_string()
+            } else {
+                value.format("%Y-%m-%d %H.%M.%S%.f UTC").to_string()
+            }
         })
-        .unwrap_or_else(|_| safe_slug(&note.created_at, 24));
+        .unwrap_or_else(|_| safe_filename(&note.created_at, 40));
     format!(
-        "{}--{}--{}",
+        "{} — {}",
+        safe_filename(&summary_title(note), 160),
         timestamp,
-        safe_slug(&summary_title(note), 80),
-        safe_id(&note.id)
     )
-}
-
-fn safe_id(value: &str) -> String {
-    let id = value
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
-        .collect::<String>();
-    if id.is_empty() {
-        "unknown-id".to_string()
-    } else {
-        id
-    }
 }
 
 fn summary_title(note: &GranolaNoteSummary) -> String {
@@ -335,26 +324,53 @@ fn summary_title(note: &GranolaNoteSummary) -> String {
         .to_string()
 }
 
-fn safe_slug(value: &str, limit: usize) -> String {
-    let mut slug = String::new();
-    let mut last_dash = false;
-    for ch in value.chars().flat_map(char::to_lowercase) {
-        if slug.chars().count() >= limit {
+fn safe_filename(value: &str, byte_limit: usize) -> String {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PendingSeparator {
+        None,
+        Space,
+        Divider,
+    }
+
+    let mut name = String::new();
+    let mut pending = PendingSeparator::None;
+    for character in value.chars() {
+        if character.is_control()
+            || matches!(
+                character,
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+            )
+        {
+            pending = PendingSeparator::Divider;
+            continue;
+        }
+        if character.is_whitespace() {
+            if pending == PendingSeparator::None {
+                pending = PendingSeparator::Space;
+            }
+            continue;
+        }
+
+        let separator = match pending {
+            PendingSeparator::None => "",
+            PendingSeparator::Space => " ",
+            PendingSeparator::Divider => " - ",
+        };
+        if !name.is_empty() && name.len() + separator.len() + character.len_utf8() > byte_limit {
             break;
         }
-        if ch.is_alphanumeric() {
-            slug.push(ch);
-            last_dash = false;
-        } else if !last_dash && !slug.is_empty() {
-            slug.push('-');
-            last_dash = true;
+        if !name.is_empty() {
+            name.push_str(separator);
         }
+        name.push(character);
+        pending = PendingSeparator::None;
     }
-    let slug = slug.trim_matches('-');
-    if slug.is_empty() {
-        "untitled".to_string()
+
+    let name = name.trim_matches([' ', '.', '-']);
+    if name.is_empty() {
+        "Untitled meeting".to_string()
     } else {
-        slug.to_string()
+        name.to_string()
     }
 }
 
@@ -371,7 +387,7 @@ mod tests {
     use super::{GranolaConfig, GranolaConnector};
 
     #[test]
-    fn enumeration_paginates_sorts_and_uses_stable_flat_names() {
+    fn enumeration_paginates_sorts_and_uses_readable_stable_flat_names() {
         let api = Arc::new(FakeApi::with_notes(vec![
             summary("not_second", "2026-07-14T18:30:00Z", Some("Sync")),
             summary("not_first", "2026-07-14T17:30:00Z", Some("Sync")),
@@ -386,11 +402,49 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(
             entries[0].path.to_string_lossy(),
-            "2026-07-14T173000Z--sync--not_first"
+            "Sync — 2026-07-14 17.30.00 UTC"
         );
         assert_eq!(
             entries[1].path.to_string_lossy(),
-            "2026-07-14T183000Z--sync--not_second"
+            "Sync — 2026-07-14 18.30.00 UTC"
+        );
+    }
+
+    #[test]
+    fn meeting_names_preserve_readable_titles_and_replace_unsafe_path_characters() {
+        let note = summary(
+            "not_1d3tmYTlCICgjy",
+            "2026-07-14T17:30:00Z",
+            Some("  Sales / Product: weekly sync?  "),
+        );
+
+        assert_eq!(
+            super::meeting_directory_name(&note),
+            "Sales - Product - weekly sync — 2026-07-14 17.30.00 UTC"
+        );
+    }
+
+    #[test]
+    fn meeting_names_fall_back_for_blank_titles_and_invalid_dates() {
+        let note = summary("not_", "date/unknown", Some("  "));
+
+        assert_eq!(
+            super::meeting_directory_name(&note),
+            "Untitled meeting — date - unknown"
+        );
+    }
+
+    #[test]
+    fn meeting_names_keep_available_fractional_timestamp_precision() {
+        let note = summary(
+            "not_fractional",
+            "2026-07-14T17:30:00.159Z",
+            Some("Customer call"),
+        );
+
+        assert_eq!(
+            super::meeting_directory_name(&note),
+            "Customer call — 2026-07-14 17.30.00.159 UTC"
         );
     }
 
@@ -404,7 +458,7 @@ mod tests {
                 container: ChildContainer::DirectoryChildren(locality_core::model::RemoteId::new(
                     "not_1d3tmYTlCICgjy",
                 )),
-                parent_path: "2026-07-14T173000Z--sync--not-1d3tmytlcicgjy".into(),
+                parent_path: "Sync — 2026-07-14 17.30.00 UTC".into(),
             })
             .expect("children");
         assert_eq!(result.entries[0].path.file_name().unwrap(), "summary.md");
