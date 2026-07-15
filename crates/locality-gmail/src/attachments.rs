@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::dto::{GmailMessage, GmailMessagePart, GmailMessagePartBody};
 
+const MAX_ATTACHMENT_FILENAME_LEN: usize = 240;
+const MAX_OPAQUE_COMPONENT_LEN: usize = 96;
+const MAX_EXTENSION_LEN: usize = 32;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GmailAttachmentSpec {
     pub message_id: String,
@@ -61,19 +65,22 @@ pub fn attachment_local_path(message_id: &str, attachment_id: &str, filename: &s
         .extension()
         .and_then(|value| value.to_str())
         .map(safe_component)
+        .map(|value| truncate_component(&value, MAX_EXTENSION_LEN.saturating_sub(1)))
         .filter(|value| !value.is_empty())
         .map(|value| format!(".{value}"))
         .unwrap_or_default();
+    let attachment_component = bounded_opaque_id_component(attachment_id);
+    let stem_budget = MAX_ATTACHMENT_FILENAME_LEN
+        .saturating_sub(1)
+        .saturating_sub(attachment_component.len())
+        .saturating_sub(extension.len())
+        .max("attachment".len());
+    let stem = truncate_component(&safe_stem(filename), stem_budget);
     PathBuf::from(".loc")
         .join("gmail")
         .join("attachments")
-        .join(opaque_id_component(message_id))
-        .join(format!(
-            "{}-{}{}",
-            safe_stem(filename),
-            opaque_id_component(attachment_id),
-            extension
-        ))
+        .join(bounded_opaque_id_component(message_id))
+        .join(format!("{stem}-{attachment_component}{extension}"))
 }
 
 pub fn decode_attachment_body(body: &GmailMessagePartBody) -> LocalityResult<Vec<u8>> {
@@ -126,6 +133,50 @@ fn opaque_id_component(value: &str) -> String {
     } else {
         format!("{readable}-{encoded}")
     }
+}
+
+fn bounded_opaque_id_component(value: &str) -> String {
+    let component = opaque_id_component(value);
+    if component.len() <= MAX_OPAQUE_COMPONENT_LEN {
+        return component;
+    }
+
+    let hash = stable_hex_hash(value.as_bytes());
+    let prefix_budget = MAX_OPAQUE_COMPONENT_LEN
+        .saturating_sub(hash.len())
+        .saturating_sub(1);
+    let prefix = truncate_component(&safe_component(value), prefix_budget);
+    if prefix.is_empty() {
+        format!("id-{hash}")
+    } else {
+        format!("{prefix}-{hash}")
+    }
+}
+
+fn truncate_component(value: &str, max_len: usize) -> String {
+    if value.len() <= max_len {
+        return value.to_string();
+    }
+    let truncated = value
+        .chars()
+        .take(max_len)
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if truncated.is_empty() {
+        "attachment".to_string()
+    } else {
+        truncated
+    }
+}
+
+fn stable_hex_hash(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -242,6 +293,32 @@ mod tests {
         let filename = file_name(&path);
 
         assert!(!filename.ends_with('.'), "{filename}");
+    }
+
+    #[test]
+    fn attachment_local_path_bounds_long_filenames_for_atomic_writes() {
+        let long_name = format!("{}.png", "screenshot-from-2026-05-01-16-26-59-".repeat(12));
+
+        let path = attachment_local_path("msg-1", &"attach-id-".repeat(30), &long_name);
+        let filename = file_name(&path);
+        let temp_filename = format!(".{filename}.loc-tmp");
+
+        assert!(filename.ends_with(".png"), "{filename}");
+        assert!(
+            filename.len() <= 240,
+            "filename should leave room for temp suffix: {}",
+            filename.len()
+        );
+        assert!(
+            temp_filename.len() <= 255,
+            "temp filename too long: {}",
+            temp_filename.len()
+        );
+        assert_safe_identity_fragment(&attachment_identity_fragment(
+            &path,
+            "screenshot-from-2026-05-01-16-26-59-",
+            ".png",
+        ));
     }
 
     #[test]
