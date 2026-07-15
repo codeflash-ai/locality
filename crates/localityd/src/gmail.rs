@@ -11,7 +11,7 @@ use locality_core::validation::{ValidationIssue, ValidationReport};
 use locality_core::{LocalityError, LocalityResult};
 use locality_gmail::render::{GmailNativeBundle, remote_version, render_gmail_message};
 use locality_gmail::{
-    GMAIL_CONNECTOR_ID, GmailConfig, GmailConnector, GmailOAuthScopeError,
+    GMAIL_CONNECTOR_ID, GmailConfig, GmailConnector, GmailMountSettings, GmailOAuthScopeError,
     HttpGmailOAuthBrokerClient, StoredGmailCredential,
 };
 use locality_store::{
@@ -48,13 +48,13 @@ where
                 suggested_command: GMAIL_CONNECT_COMMAND.to_string(),
             })?;
         validate_connection_profile(store, &connection)?;
-        return connector_from_connection(credentials, &connection);
+        return connector_from_connection(credentials, &connection, mount);
     }
 
     let active = active_gmail_connections(store)?;
     if active.len() == 1 {
         validate_connection_profile(store, &active[0])?;
-        return connector_from_connection(credentials, &active[0]);
+        return connector_from_connection(credentials, &active[0], mount);
     }
 
     let message = if active.is_empty() {
@@ -71,6 +71,7 @@ where
 fn connector_from_connection(
     credentials: &dyn CredentialStore,
     connection: &ConnectionRecord,
+    mount: &MountConfig,
 ) -> Result<GmailConnector, ConnectorResolveError> {
     if connection.connector != GMAIL_CONNECTOR_ID {
         return Err(ConnectorResolveError::UnsupportedConnector(
@@ -97,7 +98,20 @@ fn connector_from_connection(
     }
 
     let token = connection_access_token(credentials, connection)?;
-    Ok(GmailConnector::new(GmailConfig::new(token)))
+    Ok(GmailConnector::new(gmail_config_from_mount(token, mount)?))
+}
+
+fn gmail_config_from_mount(
+    token: String,
+    mount: &MountConfig,
+) -> Result<GmailConfig, ConnectorResolveError> {
+    let settings = GmailMountSettings::from_json(&mount.settings_json).map_err(|error| {
+        ConnectorResolveError::CredentialStoreUnavailable(format!(
+            "Gmail mount `{}` settings are invalid: {error}",
+            mount.mount_id.0
+        ))
+    })?;
+    Ok(GmailConfig::new(token).with_settings(settings))
 }
 
 fn connection_access_token(
