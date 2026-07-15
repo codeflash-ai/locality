@@ -16,14 +16,14 @@ use locality_core::shadow::ShadowDocument;
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
-    ConnectorProfileRecord, EntityRecord, FreshnessStateRecord, HydrationJobRecord,
-    MetadataDiscoveryJobRecord, MountConfig, MountLiveModeRecord, RemoteObservationRecord,
-    ShadowSnapshotRecord, VirtualMutationRecord,
+    ConnectorProfileRecord, ConnectorStateRecord, EntityRecord, FreshnessStateRecord,
+    HydrationJobRecord, MetadataDiscoveryJobRecord, MountConfig, MountLiveModeRecord,
+    RemoteObservationRecord, ShadowSnapshotRecord, VirtualMutationRecord,
 };
 use crate::repository::{
-    AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, EntityRepository,
-    EntitySearchRepository, FreshnessStateRepository, HydrationJobRepository, JournalRepository,
-    MetadataDiscoveryJobRepository, MountLiveModeRepository, MountRepository,
+    AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, ConnectorStateRepository,
+    EntityRepository, EntitySearchRepository, FreshnessStateRepository, HydrationJobRepository,
+    JournalRepository, MetadataDiscoveryJobRepository, MountLiveModeRepository, MountRepository,
     RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
 };
 
@@ -36,6 +36,7 @@ type AutoSaveKey = (MountId, PathBuf);
 type RemoteObservationKey = (MountId, RemoteId);
 type FreshnessStateKey = (MountId, RemoteId);
 type MetadataDiscoveryJobKey = (MountId, String);
+type ConnectorStateKey = (String, String, String);
 
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryStateStore {
@@ -43,6 +44,7 @@ pub struct InMemoryStateStore {
     mount_live_modes: BTreeMap<MountId, MountLiveModeRecord>,
     connections: BTreeMap<ConnectionId, ConnectionRecord>,
     connector_profiles: BTreeMap<ConnectorProfileId, ConnectorProfileRecord>,
+    connector_states: BTreeMap<ConnectorStateKey, ConnectorStateRecord>,
     entities: BTreeMap<EntityKey, EntityRecord>,
     entities_by_path: BTreeMap<PathKey, RemoteId>,
     shadows: BTreeMap<ShadowKey, ShadowSnapshotRecord>,
@@ -120,6 +122,10 @@ impl InMemoryStateStore {
             .retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
         self.metadata_discovery_jobs
             .retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
+        self.connector_states
+            .retain(|(_, scope_kind, scope_id), _| {
+                scope_kind != "mount" || scope_id != mount_id.as_str()
+            });
         self.journals.retain(|_, entry| entry.mount_id != *mount_id);
     }
 }
@@ -213,6 +219,36 @@ impl ConnectorProfileRepository for InMemoryStateStore {
 
     fn list_connector_profiles(&self) -> StoreResult<Vec<ConnectorProfileRecord>> {
         Ok(self.connector_profiles.values().cloned().collect())
+    }
+}
+
+impl ConnectorStateRepository for InMemoryStateStore {
+    fn save_connector_state(&mut self, state: ConnectorStateRecord) -> StoreResult<()> {
+        self.connector_states.insert(
+            (
+                state.connector.clone(),
+                state.scope_kind.clone(),
+                state.scope_id.clone(),
+            ),
+            state,
+        );
+        Ok(())
+    }
+
+    fn get_connector_state(
+        &self,
+        connector: &str,
+        scope_kind: &str,
+        scope_id: &str,
+    ) -> StoreResult<Option<ConnectorStateRecord>> {
+        Ok(self
+            .connector_states
+            .get(&(
+                connector.to_string(),
+                scope_kind.to_string(),
+                scope_id.to_string(),
+            ))
+            .cloned())
     }
 }
 

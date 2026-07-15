@@ -15,6 +15,7 @@ use locality_core::undo::{UndoApplier, UndoApplyRequest, UndoApplyResult, UndoPl
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+pub mod network;
 pub mod oauth_broker;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

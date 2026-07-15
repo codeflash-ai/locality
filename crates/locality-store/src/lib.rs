@@ -32,14 +32,15 @@ pub use live_mode::{
 pub use memory::InMemoryStateStore;
 pub use records::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveState, ConnectionId, ConnectionRecord,
-    ConnectorProfileId, ConnectorProfileRecord, EntityRecord, FreshnessStateRecord,
-    HydrationJobRecord, MetadataDiscoveryJobRecord, MetadataDiscoveryPriority, MountConfig,
-    MountLiveModeRecord, MountLiveModeState, ProjectionMode, RemoteObservationRecord,
-    ShadowBlockRecord, ShadowSnapshotRecord, VirtualMutationKind, VirtualMutationRecord,
+    ConnectorProfileId, ConnectorProfileRecord, ConnectorStateRecord, EntityRecord,
+    FreshnessStateRecord, HydrationJobRecord, MetadataDiscoveryJobRecord,
+    MetadataDiscoveryPriority, MountConfig, MountLiveModeRecord, MountLiveModeState,
+    ProjectionMode, RemoteObservationRecord, ShadowBlockRecord, ShadowSnapshotRecord,
+    VirtualMutationKind, VirtualMutationRecord,
 };
 pub use repository::{
-    AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, EntityRepository,
-    EntitySearchCandidate, EntitySearchRepository, FreshnessStateRepository,
+    AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, ConnectorStateRepository,
+    EntityRepository, EntitySearchCandidate, EntitySearchRepository, FreshnessStateRepository,
     HydrationJobRepository, JournalRepository, MetadataDiscoveryJobRepository,
     MountLiveModeRepository, MountRepository, RemoteObservationRepository, ShadowRepository,
     VirtualMutationRepository,

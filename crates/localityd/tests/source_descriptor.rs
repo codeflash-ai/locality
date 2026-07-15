@@ -6,6 +6,7 @@ use locality_core::shadow::ShadowDocument;
 use locality_core::validation::ValidationIssue;
 use locality_gmail::{GMAIL_CONNECTOR_ID, GMAIL_OAUTH_SCOPES, StoredGmailCredential};
 use locality_google_docs::{GOOGLE_DOCS_CONNECTOR_ID, StoredGoogleDocsCredential};
+use locality_granola::GRANOLA_CONNECTOR_ID;
 use locality_notion::client::DEFAULT_NOTION_TOKEN_ENV;
 use locality_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
@@ -13,12 +14,15 @@ use locality_store::{
     InMemoryStateStore, MountConfig,
 };
 use localityd::source::{
-    LocalSourceValidator, ResolvedSource, SourcePushValidator, SourceValidationContext,
-    resolve_source_for_mount, source_descriptor, source_display_name, supported_source_connectors,
+    LocalSourceValidator, ResolvedSource, ResolvedSourceSet, SourcePushValidator,
+    SourceValidationContext, resolve_source_for_mount, source_create_decision_for_parent_path,
+    source_descriptor, source_display_name, source_write_decision_for_path,
+    supported_source_connectors,
 };
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
+use std::time::Duration;
 
 #[test]
 fn notion_descriptor_exposes_cli_and_mount_metadata() {
@@ -31,6 +35,7 @@ fn notion_descriptor_exposes_cli_and_mount_metadata() {
     assert_eq!(descriptor.auth_env_var(), Some(DEFAULT_NOTION_TOKEN_ENV));
     assert!(descriptor.supports_oauth());
     assert!(descriptor.mount_guidance().contains("Notion facts:"));
+    assert_eq!(descriptor.periodic_discovery_interval(), None);
 }
 
 #[test]
@@ -73,6 +78,43 @@ fn gmail_descriptor_comes_from_registry() {
     assert_eq!(
         descriptor.create_entity_parent_kinds(),
         &[EntityKind::Directory]
+    );
+}
+
+#[test]
+fn granola_descriptor_is_read_only_and_uses_api_key_setup() {
+    let descriptor = source_descriptor(GRANOLA_CONNECTOR_ID);
+
+    assert_eq!(descriptor.display_name(), "Granola");
+    assert_eq!(descriptor.default_mount_id(), "granola-main");
+    assert_eq!(
+        descriptor.connect_command(),
+        Some("loc connect granola --api-key-stdin")
+    );
+    assert!(!descriptor.supports_oauth());
+    assert!(descriptor.create_entity_parent_kinds().is_empty());
+    assert!(descriptor.mount_guidance().contains("read-only"));
+    assert_eq!(
+        descriptor.periodic_discovery_interval(),
+        Some(Duration::from_secs(300))
+    );
+}
+
+#[test]
+fn granola_rejects_every_write_and_create_path() {
+    let mut mount = MountConfig::new(
+        MountId::new("granola-main"),
+        GRANOLA_CONNECTOR_ID,
+        "/tmp/locality/granola",
+    );
+    mount.read_only = false;
+    assert!(
+        !source_write_decision_for_path(&mount, std::path::Path::new("meeting/summary.md"))
+            .is_writable()
+    );
+    assert!(
+        !source_create_decision_for_parent_path(&mount, std::path::Path::new("meeting"))
+            .is_writable()
     );
 }
 
@@ -303,10 +345,10 @@ fn validate_gmail_changed(path: &str, markdown: &str) -> Vec<String> {
 }
 
 #[test]
-fn supported_source_connectors_include_gmail() {
+fn supported_source_connectors_include_first_party_connectors() {
     assert_eq!(
         supported_source_connectors(),
-        vec!["notion", "google-docs", "gmail"]
+        vec!["notion", "google-docs", "gmail", "granola"]
     );
 }
 
@@ -327,6 +369,39 @@ fn resolving_unregistered_connector_reports_unsupported_connector() {
         error.message(),
         "connector `custom` is not supported by this build"
     );
+}
+
+#[test]
+fn available_source_set_isolates_an_unavailable_mount() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (connection_id, secret_ref) =
+        save_gmail_connection(&mut store, "gmail-default", GMAIL_CONNECTOR_ID, "oauth");
+    credentials
+        .put(
+            &secret_ref,
+            &serde_json::to_string(&stored_gmail_credential("gmail-access-token"))
+                .expect("credential json"),
+        )
+        .expect("save credential");
+    let gmail = gmail_mount().with_connection_id(connection_id);
+    let unavailable = MountConfig::new(
+        MountId::new("custom-main"),
+        "custom",
+        "/tmp/locality/custom",
+    );
+
+    let (sources, failures) = ResolvedSourceSet::new_available(
+        &store,
+        &credentials,
+        &[gmail.clone(), unavailable.clone()],
+    );
+
+    assert!(sources.contains_mount(&gmail.mount_id));
+    assert!(!sources.contains_mount(&unavailable.mount_id));
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].0, unavailable.mount_id);
+    assert_eq!(failures[0].1.code(), "unsupported_connector");
 }
 
 #[test]

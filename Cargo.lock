@@ -2078,6 +2078,7 @@ dependencies = [
  "locality-core",
  "locality-gmail",
  "locality-google-docs",
+ "locality-granola",
  "locality-notion",
  "locality-platform",
  "locality-store",
@@ -2191,6 +2192,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "locality-granola"
+version = "0.3.0"
+dependencies = [
+ "chrono",
+ "locality-connector",
+ "locality-core",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "locality-notion"
 version = "0.3.0"
 dependencies = [
@@ -2232,11 +2246,13 @@ name = "localityd"
 version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "getrandom 0.3.4",
  "locality-connector",
  "locality-core",
  "locality-gmail",
  "locality-google-docs",
+ "locality-granola",
  "locality-notion",
  "locality-platform",
  "locality-store",

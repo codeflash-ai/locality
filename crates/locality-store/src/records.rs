@@ -227,6 +227,17 @@ pub struct ConnectorProfileRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorStateRecord {
+    pub connector: String,
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub state_version: i64,
+    pub min_reader_version: i64,
+    pub state_json: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntityRecord {
     pub mount_id: MountId,
     pub remote_id: RemoteId,

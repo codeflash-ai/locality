@@ -566,15 +566,17 @@ where
     }
     let remote_id = RemoteId::new(entity_identifier(identifier)?);
     let entity = require_entity(store, mount_id, &remote_id)?;
-    if entity.kind != EntityKind::Page {
+    if !is_hydratable_markdown_entity(&entity) {
         return Err(LocalityError::Unsupported(
-            "only page.md files can be materialized by the virtual filesystem",
+            "only page.md and Markdown asset files can be materialized by the virtual filesystem",
         ));
     }
 
     let path = mount.root.join(&entity.path);
     let outcome = if is_materialized_hydration(&entity.hydration) && path.exists() {
-        write_parent_database_schema_cache(store, source, &mount, &entity, &mount.root)?;
+        if entity.kind == EntityKind::Page {
+            write_parent_database_schema_cache(store, source, &mount, &entity, &mount.root)?;
+        }
         VirtualFsMaterializeOutcome::AlreadyMaterialized
     } else {
         let request = HydrationRequest::new(
@@ -679,7 +681,7 @@ where
     }
     let remote_id = RemoteId::new(entity_identifier(identifier)?);
     let entity = require_entity(store, mount_id, &remote_id)?;
-    if entity.kind != EntityKind::Page {
+    if !is_hydratable_markdown_entity(&entity) {
         let path = content_path_for_relative(content_root, &entity.path)?;
         if path.exists() {
             return Ok(VirtualFsMaterializeReport {
@@ -692,13 +694,15 @@ where
             });
         }
         return Err(LocalityError::Unsupported(
-            "only page.md files can be materialized by the virtual filesystem",
+            "only page.md and Markdown asset files can be materialized by the virtual filesystem",
         ));
     }
 
     let path = content_path_for_relative(content_root, &entity.path)?;
     let outcome = if is_materialized_hydration(&entity.hydration) && path.exists() {
-        write_parent_database_schema_cache(store, source, &mount, &entity, content_root)?;
+        if entity.kind == EntityKind::Page {
+            write_parent_database_schema_cache(store, source, &mount, &entity, content_root)?;
+        }
         VirtualFsMaterializeOutcome::AlreadyMaterialized
     } else {
         let request = HydrationRequest::new(
@@ -2628,6 +2632,15 @@ fn is_materialized_hydration(hydration: &HydrationState) -> bool {
     )
 }
 
+fn is_hydratable_markdown_entity(entity: &EntityRecord) -> bool {
+    entity.kind == EntityKind::Page
+        || (entity.kind == EntityKind::Asset
+            && entity
+                .path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("md")))
+}
+
 fn page_child_dir_item(
     mount: &MountConfig,
     path: &Path,
@@ -3040,6 +3053,7 @@ mod tests {
         freshness::FreshnessTier,
         hydration::HydrationRequest,
         model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry},
+        shadow::ShadowDocument,
     };
     use locality_store::{
         EntityRecord, EntityRepository, FreshnessStateRepository, InMemoryStateStore, MountConfig,
@@ -4551,6 +4565,35 @@ mod tests {
         }
     }
 
+    struct MarkdownAssetHydrationSource;
+
+    impl HydrationSource for MarkdownAssetHydrationSource {
+        fn fetch_render(
+            &self,
+            request: &HydrationRequest,
+        ) -> locality_core::LocalityResult<HydratedEntity> {
+            let frontmatter = format!(
+                "loc:\n  id: {}\n  type: page\ntitle: Summary\n",
+                request.remote_id.0
+            );
+            let body = "Hydrated Markdown asset.\n".to_string();
+            let shadow = ShadowDocument::from_synced_body(
+                request.remote_id.clone(),
+                body.clone(),
+                frontmatter.lines().count() + 3,
+                [RemoteId::new("block-1")],
+            )
+            .expect("asset shadow")
+            .with_frontmatter(frontmatter.clone());
+            Ok(HydratedEntity {
+                document: CanonicalDocument::new(frontmatter, body),
+                shadow,
+                remote_edited_at: Some("2026-07-14T00:00:00Z".to_string()),
+                assets: Vec::new(),
+            })
+        }
+    }
+
     #[test]
     fn item_metadata_is_store_only_for_online_only_files() {
         let mount_id = MountId::new("notion-main");
@@ -4631,6 +4674,57 @@ mod tests {
         assert_eq!(
             std::fs::read(report.path).expect("read materialized cache"),
             conflicted_contents
+        );
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn markdown_asset_materializes_as_a_file_on_open() {
+        let mount_id = MountId::new("granola-main");
+        let remote_id = RemoteId::new("note-1:summary");
+        let state_root = temp_root("loc-virtual-fs-markdown-asset");
+        let content_root = state_root.join("content/granola-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount_with_connector(&mount_id, "granola").read_only(true))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                remote_id.clone(),
+                EntityKind::Asset,
+                "Summary",
+                "Meeting/summary.md",
+            ))
+            .expect("save asset");
+
+        let report = materialize_virtual_fs_item_with_content_root(
+            &mut store,
+            &MarkdownAssetHydrationSource,
+            &content_root,
+            &mount_id,
+            remote_id.as_str(),
+        )
+        .expect("materialize Markdown asset");
+
+        assert_eq!(report.outcome, VirtualFsMaterializeOutcome::Hydrated);
+        assert_eq!(report.hydration, HydrationState::Hydrated);
+        assert_eq!(
+            PathBuf::from(&report.path),
+            content_root.join("Meeting/summary.md")
+        );
+        assert!(
+            std::fs::read_to_string(&report.path)
+                .expect("read materialized asset")
+                .contains("Hydrated Markdown asset.")
+        );
+        assert_eq!(
+            store
+                .get_entity(&mount_id, &remote_id)
+                .expect("load asset")
+                .expect("asset exists")
+                .kind,
+            EntityKind::Asset
         );
         let _ = std::fs::remove_dir_all(state_root);
     }

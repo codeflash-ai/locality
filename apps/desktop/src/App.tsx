@@ -97,7 +97,7 @@ type FileStatusFilter = "all" | "review" | "conflict" | "synced";
 type DestructiveSettingsAction = "reset" | "uninstall";
 type SettingsSection = "general" | "sources" | "sync" | "activity" | "agents" | "advanced" | "about";
 type SourceSetupState = "idle" | "connecting" | "creating" | "changing" | "success" | "error";
-type SourceConnectorId = "notion" | "google-docs" | "gmail";
+type SourceConnectorId = "notion" | "google-docs" | "gmail" | "granola";
 type SourceListViewMode = "list" | "tiles";
 type ConnectorOption = {
   id: SourceConnectorId;
@@ -2706,6 +2706,9 @@ function MountsView({
     if (connector === "notion") {
       return connectNotionSource();
     }
+    if (connector === "granola") {
+      return { ok: false, message: "Granola requires an API key." };
+    }
 
     const command = connector === "google-docs" ? "connect_google_docs" : "connect_gmail";
     setActionError("");
@@ -2761,6 +2764,29 @@ function MountsView({
       setSourceDialogMessage(message);
       setSourceDialogState(mountReport.ok ? "success" : "error");
       if (mountReport.ok) {
+        await onRefresh();
+      }
+    } catch (error) {
+      setSourceDialogMessage(errorMessage(error));
+      setSourceDialogState("error");
+    }
+  }
+
+  async function connectGranolaSource(apiKey: string) {
+    if (sourceDialogState === "connecting") {
+      return;
+    }
+    setSourceDialogMessage("");
+    setSourceDialogState("connecting");
+    try {
+      const report = await callCommand<ActionReport>(
+        "connect_granola",
+        { apiKey },
+        { ok: true, message: "Connected demo Granola source." },
+      );
+      setSourceDialogMessage(report.message);
+      setSourceDialogState(report.ok ? "success" : "error");
+      if (report.ok) {
         await onRefresh();
       }
     } catch (error) {
@@ -2903,6 +2929,7 @@ function MountsView({
           state={sourceDialogState}
           message={sourceDialogMessage}
           onAction={(connector, options) => void runSourceDialogAction(connector, options)}
+          onGranolaAction={(apiKey) => void connectGranolaSource(apiKey)}
           onClose={() => setSourceDialogOpen(false)}
         />
       )}
@@ -2915,17 +2942,20 @@ function AddSourceDialog({
   state,
   message,
   onAction,
+  onGranolaAction,
   onClose,
 }: {
   snapshot: DesktopSnapshot;
   state: SourceSetupState;
   message: string;
   onAction: (connector: SourceConnectorId, options?: { googleDocsWorkspaceFolder?: string }) => void;
+  onGranolaAction: (apiKey: string) => void;
   onClose: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [viewMode, setViewMode] = useState<SourceListViewMode>("list");
   const [googleDocsWorkspaceFolder, setGoogleDocsWorkspaceFolder] = useState("Locality");
+  const [granolaApiKey, setGranolaApiKey] = useState("");
   const needsConnection = connectionMissing(snapshot);
   const needsFolder = !needsConnection && mountMissing(snapshot);
   const busy = state === "connecting" || state === "creating" || state === "changing";
@@ -2959,6 +2989,14 @@ function AddSourceDialog({
       status: mountedConnectors.has("gmail") ? "Mounted" : "Ready to connect",
       keywords: ["gmail", "mail", "email", "inbox", "drafts"],
       mounted: mountedConnectors.has("gmail"),
+    },
+    {
+      id: "granola",
+      name: "Granola",
+      description: "Meeting summaries and raw transcripts as read-only files.",
+      status: mountedConnectors.has("granola") ? "Mounted" : "API key required",
+      keywords: ["granola", "meetings", "notes", "transcripts", "summaries"],
+      mounted: mountedConnectors.has("granola"),
     },
   ];
   const normalizedQuery = query.trim().toLowerCase();
@@ -3061,6 +3099,11 @@ function AddSourceDialog({
                         <SettingRow title="Workspace folder" value={googleDocsWorkspaceFolder || "Locality"} />
                         <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
                       </>
+                    ) : connector.id === "granola" ? (
+                      <>
+                        <SettingRow title="Content" value="Summaries and transcripts" />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                      </>
                     ) : (
                       <>
                         <SettingRow title="Mailboxes" value="Inbox, Sent, Draft" />
@@ -3078,10 +3121,38 @@ function AddSourceDialog({
                       />
                     </label>
                   )}
+                  {connector.id === "granola" && !connector.mounted && (
+                    <>
+                      <label className="source-inline-field">
+                        <span>Granola API key</span>
+                        <input
+                          type="password"
+                          autoComplete="off"
+                          value={granolaApiKey}
+                          placeholder="Paste API key"
+                          disabled={busy}
+                          onChange={(event) => setGranolaApiKey(event.target.value)}
+                        />
+                      </label>
+                      <p className="quiet-note">
+                        Create a key in Granola Settings → Connectors → API keys. Business or Enterprise is required.
+                      </p>
+                    </>
+                  )}
                   {connector.mounted && connector.id !== "notion" ? (
                     <SecondaryButton compact disabled icon={<Check />}>
                       Mounted
                     </SecondaryButton>
+                  ) : connector.id === "granola" ? (
+                    <PrimaryButton
+                      compact
+                      busy={busy}
+                      disabled={!granolaApiKey.trim()}
+                      icon={busy ? <Loader2 className="spin-icon" /> : <ShieldCheck />}
+                      onClick={() => onGranolaAction(granolaApiKey)}
+                    >
+                      {busy ? "Connecting" : "Connect Granola"}
+                    </PrimaryButton>
                   ) : (
                     <PrimaryButton
                       compact
@@ -3116,6 +3187,8 @@ function sourceDisplayName(connector: SourceConnectorId) {
       return "Google Docs";
     case "gmail":
       return "Gmail";
+    case "granola":
+      return "Granola";
   }
 }
 
@@ -3127,6 +3200,8 @@ function sourceMountId(connector: SourceConnectorId) {
       return "google-docs-main";
     case "gmail":
       return "gmail-main";
+    case "granola":
+      return "granola-main";
   }
 }
 
@@ -3145,6 +3220,8 @@ function sourceDefaultPath(snapshot: DesktopSnapshot, connector: SourceConnector
       return "~/Library/CloudStorage/Locality/google-docs-main";
     case "gmail":
       return "~/Library/CloudStorage/Locality/gmail-main";
+    case "granola":
+      return "~/Library/CloudStorage/Locality/granola";
   }
 }
 
@@ -3193,6 +3270,7 @@ function ConnectorIcon({ connector }: { connector: SourceConnectorId }) {
           <path className="gmail-red" d="M6.5 9.2c0-1.5 1.8-2.4 3-1.5L16 12.6l6.5-4.9c1.2-.9 3 .0 3 1.5v.9L16 17.2 6.5 10.1v-.9Z" />
         </svg>
       )}
+      {connector === "granola" && <span>G</span>}
     </span>
   );
 }

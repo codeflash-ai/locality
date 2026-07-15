@@ -30,14 +30,14 @@ use crate::compatibility::{
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
-    ConnectorProfileRecord, EntityRecord, FreshnessStateRecord, HydrationJobRecord,
-    MetadataDiscoveryJobRecord, MetadataDiscoveryPriority, MountConfig, MountLiveModeRecord,
-    MountLiveModeState, ProjectionMode, RemoteObservationRecord, ShadowBlockRecord,
-    ShadowSnapshotRecord, VirtualMutationKind, VirtualMutationRecord,
+    ConnectorProfileRecord, ConnectorStateRecord, EntityRecord, FreshnessStateRecord,
+    HydrationJobRecord, MetadataDiscoveryJobRecord, MetadataDiscoveryPriority, MountConfig,
+    MountLiveModeRecord, MountLiveModeState, ProjectionMode, RemoteObservationRecord,
+    ShadowBlockRecord, ShadowSnapshotRecord, VirtualMutationKind, VirtualMutationRecord,
 };
 use crate::repository::{
-    AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, EntityRepository,
-    EntitySearchCandidate, EntitySearchRepository, FreshnessStateRepository,
+    AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, ConnectorStateRepository,
+    EntityRepository, EntitySearchCandidate, EntitySearchRepository, FreshnessStateRepository,
     HydrationJobRepository, JournalRepository, MetadataDiscoveryJobRepository,
     MountLiveModeRepository, MountRepository, RemoteObservationRepository, ShadowRepository,
     VirtualMutationRepository,
@@ -73,6 +73,15 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
         required: true,
         rebuildable: false,
         data_json: "{\"connector_version\":\"notion.v1\"}",
+    },
+    StateComponentDefinition {
+        component_id: "connector:granola",
+        component_kind: "connector_state",
+        current_version: 1,
+        min_reader_version: 1,
+        required: true,
+        rebuildable: false,
+        data_json: "{\"connector_version\":\"granola.v1\"}",
     },
     StateComponentDefinition {
         component_id: "projection:plain_files",
@@ -544,6 +553,69 @@ impl ConnectorProfileRepository for SqliteStateStore {
         let rows = statement.query_map([], connector_profile_row)?;
 
         rows.map(|row| connector_profile_from_row(row?)).collect()
+    }
+}
+
+impl ConnectorStateRepository for SqliteStateStore {
+    fn save_connector_state(&mut self, state: ConnectorStateRecord) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO connector_state (
+                connector,
+                scope_kind,
+                scope_id,
+                state_version,
+                min_reader_version,
+                state_json,
+                updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(connector, scope_kind, scope_id) DO UPDATE SET
+                state_version = excluded.state_version,
+                min_reader_version = excluded.min_reader_version,
+                state_json = excluded.state_json,
+                updated_at = excluded.updated_at",
+            params![
+                state.connector,
+                state.scope_kind,
+                state.scope_id,
+                state.state_version,
+                state.min_reader_version,
+                state.state_json,
+                state.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_connector_state(
+        &self,
+        connector: &str,
+        scope_kind: &str,
+        scope_id: &str,
+    ) -> StoreResult<Option<ConnectorStateRecord>> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT connector, scope_kind, scope_id, state_version,
+                        min_reader_version, state_json, updated_at
+                 FROM connector_state
+                 WHERE connector = ?1 AND scope_kind = ?2 AND scope_id = ?3",
+                params![connector, scope_kind, scope_id],
+                |row| {
+                    Ok(ConnectorStateRecord {
+                        connector: row.get(0)?,
+                        scope_kind: row.get(1)?,
+                        scope_id: row.get(2)?,
+                        state_version: row.get(3)?,
+                        min_reader_version: row.get(4)?,
+                        state_json: row.get(5)?,
+                        updated_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
     }
 }
 
@@ -1494,6 +1566,10 @@ fn clear_mount_source_state(connection: &Connection, mount_id: &MountId) -> Stor
             params![&mount_id.0],
         )?;
     }
+    connection.execute(
+        "DELETE FROM connector_state WHERE scope_kind = 'mount' AND scope_id = ?1",
+        params![&mount_id.0],
+    )?;
     Ok(())
 }
 

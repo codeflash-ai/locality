@@ -19,14 +19,14 @@ use locality_core::undo::{UndoOperation, UndoPlanStatus, plan_journal_undo};
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
     ConnectionRecord, ConnectionRepository, ConnectorProfileId, ConnectorProfileRecord,
-    ConnectorProfileRepository, EntityRecord, EntityRepository, EntitySearchRepository,
-    FreshnessStateRecord, FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository,
-    JournalRepository, MetadataDiscoveryJobRecord, MetadataDiscoveryJobRepository,
-    MetadataDiscoveryPriority, MountConfig, MountLiveModeRecord, MountLiveModeRepository,
-    MountLiveModeState, MountRepository, ProjectionMode, RemoteObservationRecord,
-    RemoteObservationRepository, ShadowRepository, SqliteStateStore, StateCompatibilityIssue,
-    StateCompatibilityStatus, StoreError, VirtualMutationKind, VirtualMutationRecord,
-    VirtualMutationRepository,
+    ConnectorProfileRepository, ConnectorStateRecord, ConnectorStateRepository, EntityRecord,
+    EntityRepository, EntitySearchRepository, FreshnessStateRecord, FreshnessStateRepository,
+    HydrationJobRecord, HydrationJobRepository, JournalRepository, MetadataDiscoveryJobRecord,
+    MetadataDiscoveryJobRepository, MetadataDiscoveryPriority, MountConfig, MountLiveModeRecord,
+    MountLiveModeRepository, MountLiveModeState, MountRepository, ProjectionMode,
+    RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
+    StateCompatibilityIssue, StateCompatibilityStatus, StoreError, VirtualMutationKind,
+    VirtualMutationRecord, VirtualMutationRepository,
 };
 use rusqlite::{Connection, params};
 use serde_json::json;
@@ -79,6 +79,14 @@ fn sqlite_store_seeds_state_compatibility_components() {
                 1,
                 0,
                 1
+            ),
+            (
+                "connector:granola".to_string(),
+                "connector_state".to_string(),
+                1,
+                1,
+                1,
+                0
             ),
             (
                 "connector:notion".to_string(),
@@ -168,6 +176,38 @@ fn sqlite_store_seeds_state_compatibility_components() {
         SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect state");
     assert_eq!(report.status, StateCompatibilityStatus::Ready);
     assert!(report.issues.is_empty());
+}
+
+#[test]
+fn sqlite_connector_state_round_trips_by_connector_scope() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    let record = ConnectorStateRecord {
+        connector: "granola".to_string(),
+        scope_kind: "mount".to_string(),
+        scope_id: "granola-main".to_string(),
+        state_version: 1,
+        min_reader_version: 1,
+        state_json: r#"{"last_success_unix_ms":123}"#.to_string(),
+        updated_at: "unix_ms:123".to_string(),
+    };
+
+    store
+        .save_connector_state(record.clone())
+        .expect("save connector state");
+
+    assert_eq!(
+        store
+            .get_connector_state("granola", "mount", "granola-main")
+            .expect("load connector state"),
+        Some(record)
+    );
+    assert_eq!(
+        store
+            .get_connector_state("granola", "mount", "other")
+            .expect("load missing connector state"),
+        None
+    );
 }
 
 #[test]
@@ -1575,6 +1615,12 @@ fn remounting_same_mount_id_to_different_connection_clears_source_scoped_state()
             .is_empty()
     );
     assert!(reopened.list_journal().expect("list journal").is_empty());
+    assert_eq!(
+        reopened
+            .get_connector_state("notion", "mount", fixture.mount_id.as_str())
+            .expect("load connector state"),
+        None
+    );
     assert!(matches!(
         reopened.load_shadow(&fixture.mount_id, &RemoteId::new("page-1")),
         Err(StoreError::ShadowMissing { .. })
@@ -3546,6 +3592,17 @@ fn journal_entry(push_id: &str, status: JournalStatus) -> JournalEntry {
 }
 
 fn seed_source_scoped_state(store: &mut SqliteStateStore, mount_id: &MountId) {
+    store
+        .save_connector_state(ConnectorStateRecord {
+            connector: "notion".to_string(),
+            scope_kind: "mount".to_string(),
+            scope_id: mount_id.0.clone(),
+            state_version: 1,
+            min_reader_version: 1,
+            state_json: "{}".to_string(),
+            updated_at: "1".to_string(),
+        })
+        .expect("save connector state");
     store.save_entity(entity_record()).expect("save entity");
     store
         .save_shadow(mount_id, shadow_document("# Roadmap\n\nSame paragraph."))

@@ -2807,6 +2807,11 @@ button.home-stat:hover {
   fill: #ea4335;
 }
 
+.connector-icon.granola {
+  background: #eee9df;
+  color: #443f37;
+}
+
 .connector-choice-facts {
   display: grid;
   border: 1px solid var(--line-soft);

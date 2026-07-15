@@ -7,6 +7,7 @@ The `loc` command is the single supported control surface for users and coding a
 - `loc connect notion [--name <id>] [--token-stdin|--no-browser|--direct-oauth] [--broker-url <url>] [--redirect-uri <uri>] [--json]`
 - `loc connect google-docs [--name <id>] [--no-browser] [--broker-url <url>] [--redirect-uri <uri>] [--json]`
 - `loc connect gmail [--name <id>] [--no-browser] [--broker-url <url>] [--redirect-uri <uri>] [--json]`
+- `loc connect granola --api-key-stdin [--name <id>] [--json]`
 - `loc connections [--json]`
 - `loc profiles [--json]`
 - `loc connection show <id> [--json]`
@@ -14,6 +15,7 @@ The `loc` command is the single supported control surface for users and coding a
 - `loc mount notion <path> --root-page <page-id> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--json]`
 - `loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--json]`
 - `loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--json]`
+- `loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--json]`
 - `loc daemon status [--json]`
 - `loc info [path] [--json]`
 - `loc status [path] [--json]`
@@ -83,6 +85,15 @@ Google Docs mounts use Google Docs document access plus Drive `drive.file` and D
 Gmail OAuth uses `openid`, `email`, `profile`, `https://www.googleapis.com/auth/gmail.readonly`, and `https://www.googleapis.com/auth/gmail.compose`. No broader Gmail account scope is required.
 
 `loc mount gmail <path>` registers a Gmail mount. If `--connection` is omitted, the daemon resolves the mount through the only active Gmail connection at runtime; with multiple active Gmail connections, pass `--connection <id>`. When `--mount-id` is omitted, Locality uses `gmail-main` when available. Gmail mounts project `inbox/`, `sent/`, and `draft/` folders. `inbox/` and `sent/` are read-only; create a Markdown file directly under `draft/` to send mail on push.
+
+`loc connect granola --api-key-stdin [--name <id>]` validates a Granola Business or Enterprise API key against the official public API and stores it in Locality's credential store. The default connection is `granola-default`; the connector profile is `granola-api-key-default` at semantic version `granola.v1`. The key is never written to SQLite or command output.
+
+```bash
+printf '%s' "$GRANOLA_API_KEY" | loc connect granola --api-key-stdin
+loc mount granola ~/Library/CloudStorage/Locality/granola
+```
+
+Granola mounts are always read-only. Each note becomes a flat, date-prefixed meeting directory with `summary.md` and `transcript.md`; the full Granola note ID prevents collisions. Granola folder membership, attendees, calendar data, ownership, timestamps, and web URL are retained in frontmatter. A missing transcript is represented explicitly because Granola may have captured none or may have deleted it under a retention policy.
 
 `loc connections` and `loc connection show <id>` list connected-account metadata only, including the profile ID but never credentials. `loc profiles` lists connector auth profiles and contains no account secrets. `loc disconnect <id>` deletes the credential and marks the connection `revoked`; mounts remain registered and will report `connection_revoked` on the next pull/push until reconnected or remounted.
 

@@ -6,9 +6,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use locality_connector::network::{
+    ConnectorNetworkConfig, ConnectorNetworkGate, NetworkPermit, RetryConfig,
+};
 use locality_core::{LocalityError, LocalityResult};
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, multipart};
@@ -31,7 +33,7 @@ const DEFAULT_NOTION_REQUESTS_PER_SECOND: f64 = 3.0;
 const DEFAULT_NOTION_REQUEST_BURST: f64 = 3.0;
 const DEFAULT_NOTION_RATE_LIMIT_RETRIES: usize = 4;
 
-static NOTION_RATE_LIMITER: OnceLock<Mutex<NotionRateLimiter>> = OnceLock::new();
+static NOTION_NETWORK_GATE: OnceLock<ConnectorNetworkGate> = OnceLock::new();
 static NOTION_REQUEST_DEBUG: OnceLock<Mutex<NotionRequestDebugState>> = OnceLock::new();
 static NOTION_REQUEST_DEBUG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static NOTION_REQUEST_DEBUG_ENABLED_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
@@ -210,15 +212,18 @@ impl NotionRequestDebugActiveInternal {
 
 pub fn notion_request_debug_status() -> NotionRequestDebugStatus {
     enable_notion_request_debug_for(Duration::from_secs(3));
-    let limiter = notion_rate_limiter()
-        .lock()
-        .expect("notion request rate limiter lock poisoned")
-        .debug_status();
+    let network = notion_network_gate().status();
+    let limiter = NotionRateLimiterDebugStatus {
+        tokens: network.tokens,
+        burst: network.burst,
+        requests_per_second: network.requests_per_second,
+        cooldown_remaining_ms: network.cooldown_remaining.map(duration_ms),
+    };
     let state = notion_request_debug_state()
         .lock()
         .expect("notion request debug lock poisoned");
     NotionRequestDebugStatus {
-        waiting_for_token: state.waiting_for_token,
+        waiting_for_token: state.waiting_for_token.max(network.waiting),
         active: state
             .active
             .values()
@@ -327,7 +332,7 @@ enum NotionRetryClass {
 impl HttpNotionApi {
     pub fn new(config: NotionConfig) -> Self {
         let client = notion_http_client_builder()
-            .timeout(notion_http_timeout())
+            .timeout(DEFAULT_NOTION_HTTP_TIMEOUT)
             .build()
             .unwrap_or_else(|_| notion_http_client());
         Self { config, client }
@@ -420,8 +425,8 @@ impl HttpNotionApi {
             DEFAULT_NOTION_API_BASE_URL, upload_id
         );
         let upload_path = format!("/v1/file_uploads/{upload_id}/send");
-        for attempt in 0..=notion_rate_limit_retries() {
-            let waited_for_token = acquire_notion_request_token();
+        for attempt in 0..=DEFAULT_NOTION_RATE_LIMIT_RETRIES {
+            let (_network_permit, waited_for_token) = acquire_notion_request_token();
             let request_debug_id =
                 start_notion_request_debug("POST", &upload_path, attempt, waited_for_token);
             let part = multipart::Part::bytes(bytes.clone())
@@ -459,7 +464,7 @@ impl HttpNotionApi {
                 return Err(LocalityError::RemoteNotFound(body));
             }
             if is_retryable_notion_http_status(status, NotionRetryClass::Mutation)
-                && attempt < notion_rate_limit_retries()
+                && attempt < DEFAULT_NOTION_RATE_LIMIT_RETRIES
             {
                 record_notion_rate_limit(attempt, retry_after);
                 continue;
@@ -532,15 +537,15 @@ impl HttpNotionApi {
     where
         T: DeserializeOwned,
     {
-        for attempt in 0..=notion_rate_limit_retries() {
-            let waited_for_token = acquire_notion_request_token();
+        for attempt in 0..=DEFAULT_NOTION_RATE_LIMIT_RETRIES {
+            let (_network_permit, waited_for_token) = acquire_notion_request_token();
             let request_debug_id =
                 start_notion_request_debug(method, path, attempt, waited_for_token);
             let response = match build_request().send() {
                 Ok(response) => response,
                 Err(error)
                     if is_retryable_notion_transport_error(&error)
-                        && attempt < notion_rate_limit_retries() =>
+                        && attempt < DEFAULT_NOTION_RATE_LIMIT_RETRIES =>
                 {
                     finish_notion_request_debug(
                         request_debug_id,
@@ -571,7 +576,7 @@ impl HttpNotionApi {
                 .text()
                 .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
             if is_retryable_notion_http_status(status, retry_class)
-                && attempt < notion_rate_limit_retries()
+                && attempt < DEFAULT_NOTION_RATE_LIMIT_RETRIES
             {
                 record_notion_rate_limit(attempt, retry_after);
                 continue;
@@ -602,15 +607,6 @@ impl HttpNotionApi {
     }
 }
 
-fn notion_http_timeout() -> Duration {
-    std::env::var("LOCALITY_NOTION_HTTP_TIMEOUT_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .map(Duration::from_millis)
-        .unwrap_or(DEFAULT_NOTION_HTTP_TIMEOUT)
-}
-
 fn duration_ms(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
@@ -624,142 +620,43 @@ fn unix_time_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn notion_rate_limit_retries() -> usize {
-    std::env::var("LOCALITY_NOTION_RATE_LIMIT_RETRIES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_NOTION_RATE_LIMIT_RETRIES)
-}
-
 pub fn notion_requests_per_second_setting() -> f64 {
-    notion_requests_per_second()
+    DEFAULT_NOTION_REQUESTS_PER_SECOND
 }
 
-fn notion_requests_per_second() -> f64 {
-    std::env::var("LOCALITY_NOTION_REQUESTS_PER_SECOND")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .unwrap_or(DEFAULT_NOTION_REQUESTS_PER_SECOND)
+fn notion_network_config() -> ConnectorNetworkConfig {
+    ConnectorNetworkConfig::new(
+        "notion",
+        DEFAULT_NOTION_REQUESTS_PER_SECOND,
+        DEFAULT_NOTION_REQUEST_BURST,
+    )
+    .request_timeout(DEFAULT_NOTION_HTTP_TIMEOUT)
+    .retry(RetryConfig::exponential(
+        DEFAULT_NOTION_RATE_LIMIT_RETRIES,
+        Duration::from_secs(1),
+        Duration::from_secs(16),
+    ))
 }
 
-fn notion_request_burst() -> f64 {
-    std::env::var("LOCALITY_NOTION_REQUEST_BURST")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value >= 1.0)
-        .unwrap_or(DEFAULT_NOTION_REQUEST_BURST)
+fn notion_network_gate() -> &'static ConnectorNetworkGate {
+    NOTION_NETWORK_GATE.get_or_init(|| ConnectorNetworkGate::global(notion_network_config()))
 }
 
-#[derive(Debug)]
-struct NotionRateLimiter {
-    tokens: f64,
-    last_refill: Instant,
-    cooldown_until: Option<Instant>,
-}
-
-impl NotionRateLimiter {
-    fn new() -> Self {
-        Self {
-            tokens: notion_request_burst(),
-            last_refill: Instant::now(),
-            cooldown_until: None,
-        }
-    }
-
-    fn acquire(&mut self) -> Option<Duration> {
-        let now = Instant::now();
-        if let Some(cooldown_until) = self.cooldown_until {
-            if cooldown_until > now {
-                return Some(cooldown_until.saturating_duration_since(now));
-            }
-            self.cooldown_until = None;
-        }
-
-        let rate = notion_requests_per_second();
-        let burst = notion_request_burst();
-        let elapsed = now.saturating_duration_since(self.last_refill);
-        self.tokens = (self.tokens + elapsed.as_secs_f64() * rate).min(burst);
-        self.last_refill = now;
-
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            return None;
-        }
-
-        let needed = 1.0 - self.tokens;
-        Some(Duration::from_secs_f64(needed / rate))
-    }
-
-    fn record_rate_limit(&mut self, delay: Duration) {
-        let until = Instant::now() + delay;
-        self.cooldown_until = Some(
-            self.cooldown_until
-                .map_or(until, |current| current.max(until)),
-        );
-        self.tokens = 0.0;
-        self.last_refill = Instant::now();
-    }
-
-    fn debug_status(&self) -> NotionRateLimiterDebugStatus {
-        let now = Instant::now();
-        let burst = notion_request_burst();
-        let requests_per_second = notion_requests_per_second();
-        let cooldown_remaining = self
-            .cooldown_until
-            .filter(|cooldown_until| *cooldown_until > now)
-            .map(|cooldown_until| cooldown_until.saturating_duration_since(now));
-        let tokens = if cooldown_remaining.is_some() {
-            self.tokens
-        } else {
-            let elapsed = now.saturating_duration_since(self.last_refill);
-            (self.tokens + elapsed.as_secs_f64() * requests_per_second).min(burst)
-        };
-        NotionRateLimiterDebugStatus {
-            tokens,
-            burst,
-            requests_per_second,
-            cooldown_remaining_ms: cooldown_remaining.map(duration_ms),
-        }
-    }
-}
-
-fn notion_rate_limiter() -> &'static Mutex<NotionRateLimiter> {
-    NOTION_RATE_LIMITER.get_or_init(|| Mutex::new(NotionRateLimiter::new()))
-}
-
-fn acquire_notion_request_token() -> Duration {
-    let mut waited = Duration::ZERO;
-    loop {
-        let wait = notion_rate_limiter()
-            .lock()
-            .expect("notion request rate limiter lock poisoned")
-            .acquire();
-        match wait {
-            Some(delay) if !delay.is_zero() => {
-                let recorded_wait = record_notion_token_wait_start();
-                thread::sleep(delay);
-                record_notion_token_wait_end(recorded_wait);
-                waited = waited.saturating_add(delay);
-            }
-            _ => return waited,
-        }
-    }
+fn acquire_notion_request_token() -> (NetworkPermit, Duration) {
+    let recorded_wait = record_notion_token_wait_start();
+    let permit = notion_network_gate().acquire();
+    record_notion_token_wait_end(recorded_wait);
+    let waited = permit.waited();
+    (permit, waited)
 }
 
 fn record_notion_rate_limit(attempt: usize, retry_after: Option<Duration>) {
     let delay = retry_after.unwrap_or_else(|| rate_limit_backoff(attempt));
-    notion_rate_limiter()
-        .lock()
-        .expect("notion request rate limiter lock poisoned")
-        .record_rate_limit(delay);
+    notion_network_gate().record_cooldown(delay);
 }
 
 fn record_notion_transient_request_failure(attempt: usize) {
-    notion_rate_limiter()
-        .lock()
-        .expect("notion request rate limiter lock poisoned")
-        .record_rate_limit(rate_limit_backoff(attempt));
+    notion_network_gate().record_cooldown(rate_limit_backoff(attempt));
 }
 
 fn is_retryable_notion_transport_error(error: &reqwest::Error) -> bool {
@@ -794,8 +691,7 @@ fn is_retryable_notion_http_status(status: StatusCode, retry_class: NotionRetryC
 }
 
 fn rate_limit_backoff(attempt: usize) -> Duration {
-    let seconds = 1_u64 << attempt.min(4);
-    Duration::from_secs(seconds)
+    notion_network_config().retry.backoff(attempt)
 }
 
 impl NotionApi for HttpNotionApi {
@@ -974,7 +870,7 @@ fn data_source_search_body(start_cursor: Option<&str>) -> Value {
 mod tests {
     use super::{
         HttpNotionApi, NotionRetryClass, data_source_search_body, notion_http_client_builder,
-        rate_limit_backoff, retry_after_header,
+        notion_network_config, rate_limit_backoff, retry_after_header,
     };
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
     use serde_json::Value;
@@ -1009,6 +905,19 @@ mod tests {
         assert_eq!(rate_limit_backoff(0), Duration::from_secs(1));
         assert_eq!(rate_limit_backoff(3), Duration::from_secs(8));
         assert_eq!(rate_limit_backoff(99), Duration::from_secs(16));
+    }
+
+    #[test]
+    fn network_policy_uses_the_established_internal_notion_values() {
+        let config = notion_network_config();
+
+        assert_eq!(config.quota_scope, "notion");
+        assert_eq!(config.requests_per_second, 3.0);
+        assert_eq!(config.burst, 3.0);
+        assert_eq!(config.request_timeout, Duration::from_secs(30));
+        assert_eq!(config.retry.max_retries, 4);
+        assert_eq!(config.retry.initial_backoff, Duration::from_secs(1));
+        assert_eq!(config.retry.max_backoff, Duration::from_secs(16));
     }
 
     #[test]

@@ -21,8 +21,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(test)]
 use loc_cli::connect::DEFAULT_NOTION_PROFILE_ID;
 use loc_cli::connect::{
-    BrokerOAuthConnectOptions, GmailBrokerOAuthConnectOptions, GoogleDocsBrokerOAuthConnectOptions,
-    run_connect_gmail_broker_oauth, run_connect_google_docs_broker_oauth,
+    BrokerOAuthConnectOptions, ConnectOptions, GmailBrokerOAuthConnectOptions,
+    GoogleDocsBrokerOAuthConnectOptions, HttpGranolaConnectionProbe,
+    run_connect_gmail_broker_oauth, run_connect_google_docs_broker_oauth, run_connect_granola,
     run_connect_notion_broker_oauth,
 };
 use loc_cli::daemon::{DaemonRunState, run_daemon_control};
@@ -1287,6 +1288,61 @@ async fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
 #[tauri::command]
 async fn create_desktop_mount(app: AppHandle, request: CreateDesktopMountRequest) -> ActionReport {
     create_desktop_mount_command(app, request).await
+}
+
+#[tauri::command]
+async fn connect_granola(app: AppHandle, api_key: String) -> ActionReport {
+    let report = tauri::async_runtime::spawn_blocking(move || connect_granola_blocking(api_key))
+        .await
+        .map_err(|error| format!("Granola connection worker failed: {error}"))
+        .and_then(|result| result)
+        .map(|message| ActionReport { ok: true, message })
+        .unwrap_or_else(|message| ActionReport { ok: false, message });
+    if report.ok {
+        refresh_desktop_surfaces(&app);
+    }
+    report
+}
+
+fn connect_granola_blocking(api_key: String) -> Result<String, String> {
+    let api_key = api_key.trim().to_string();
+    if api_key.is_empty() {
+        return Err("Enter a Granola API key.".to_string());
+    }
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let credentials = open_credential_store(&state_root);
+    let report = run_connect_granola(
+        &mut store,
+        credentials.as_ref(),
+        ConnectOptions {
+            connection_id: Some(ConnectionId::new("granola-default")),
+            token: api_key,
+        },
+        &HttpGranolaConnectionProbe,
+    )
+    .map_err(|error| error.message())?;
+    let mount_exists = store
+        .get_mount(&MountId::new("granola-main"))
+        .map_err(|error| format!("Could not inspect Granola mount: {error}"))?
+        .is_some_and(|mount| mount.connector == "granola");
+    drop(store);
+    if mount_exists {
+        ensure_daemon_running(&state_root)?;
+        reload_daemon_mounts(&state_root)?;
+        return Ok("Reconnected the existing Granola source.".to_string());
+    }
+
+    create_desktop_mount_blocking(CreateDesktopMountRequest {
+        connector: "granola".to_string(),
+        path: "granola".to_string(),
+        mount_id: "granola-main".to_string(),
+        connection_id: Some(report.connection_id),
+        read_only: true,
+        notion_root_page: None,
+        google_docs_workspace_folder: None,
+    })
 }
 
 #[tauri::command]
@@ -6637,7 +6693,7 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
                 })?;
             Some(folder_id)
         }
-        "gmail" => None,
+        "gmail" | "granola" => None,
         other => {
             return Err(format!(
                 "Desktop mount creation does not support connector `{other}`."
@@ -16002,6 +16058,7 @@ fn main() {
             ensure_terminal_cli_available,
             create_workspace_mount,
             create_desktop_mount,
+            connect_granola,
             run_workspace_mount_onboarding,
             install_agent_guidance,
             locate_notion_page,
