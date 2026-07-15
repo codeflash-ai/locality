@@ -34,6 +34,7 @@
     "macOS": {
       "minimumSystemVersion": "14.0",
       "signingIdentity": "-",
+      "infoPlist": "Info.plist",
       "files": {
         "PlugIns/LocalityFileProvider.appex": "macos/LocalityFileProvider/LocalityFileProvider.appex",
         "MacOS/locality-file-providerctl": "macos/LocalityFileProvider/locality-file-providerctl",

@@ -1541,7 +1541,10 @@ async fn activate_macos_file_provider_for_user_action(
         }
 
         if action == WorkspaceMountOnboardingAction::AllowInMacos {
-            prepare_macos_file_provider_approval_retry()?;
+            macos_file_provider::prepare_approval_retry(
+                localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
+                localityd::file_provider::MACOS_FILE_PROVIDER_DISPLAY_NAME,
+            )?;
         }
 
         let activation = tauri::async_runtime::spawn_blocking(move || {
@@ -1567,45 +1570,6 @@ async fn activate_macos_file_provider_for_user_action(
         let _ = app;
         non_macos_file_provider_activation(action)
     }
-}
-
-#[cfg(target_os = "macos")]
-fn prepare_macos_file_provider_approval_retry() -> Result<(), String> {
-    let report =
-        run_macos_file_provider_helper("list", Vec::new()).map_err(|error| error.message())?;
-    if !macos_file_provider_approval_retry_should_unregister(&report.helper_report) {
-        return Ok(());
-    }
-
-    run_macos_file_provider_helper(
-        "unregister",
-        vec![
-            "--mount-id".to_string(),
-            localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID.to_string(),
-        ],
-    )
-    .map(|_| ())
-    .map_err(|error| {
-        format!(
-            "Could not reset the denied macOS File Provider approval before retrying: {}",
-            error.message()
-        )
-    })
-}
-
-fn macos_file_provider_approval_retry_should_unregister(helper_report: &serde_json::Value) -> bool {
-    helper_report
-        .get("domains")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|domains| {
-            domains.iter().find(|domain| {
-                domain.get("identifier").and_then(serde_json::Value::as_str)
-                    == Some(localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
-            })
-        })
-        .and_then(|domain| domain.get("userEnabled"))
-        .and_then(serde_json::Value::as_bool)
-        == Some(false)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -13027,30 +12991,6 @@ mod tests {
         assert_eq!(events.into_inner(), vec!["activate"]);
         assert_eq!(report.state, "approval_required");
         assert_eq!(report.primary_action, "allow_in_macos");
-    }
-
-    #[test]
-    fn macos_file_provider_approval_retry_unregisters_disabled_domain() {
-        assert!(super::macos_file_provider_approval_retry_should_unregister(
-            &serde_json::json!({
-                "domains": [
-                    {
-                        "identifier": "loc",
-                        "userEnabled": false
-                    }
-                ]
-            })
-        ));
-        assert!(
-            !super::macos_file_provider_approval_retry_should_unregister(&serde_json::json!({
-                "domains": [
-                    {
-                        "identifier": "loc",
-                        "userEnabled": true
-                    }
-                ]
-            }))
-        );
     }
 
     #[test]

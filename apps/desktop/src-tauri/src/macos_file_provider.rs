@@ -11,6 +11,7 @@ use objc2_file_provider::{NSFileProviderDomain, NSFileProviderManager};
 use objc2_foundation::{NSArray, NSError, NSString};
 
 const ADD_CALLBACK_TIMEOUT: Duration = Duration::from_secs(15);
+const REMOVE_CALLBACK_TIMEOUT: Duration = Duration::from_secs(15);
 const DOMAIN_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const DOMAIN_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const DOMAIN_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -47,8 +48,33 @@ pub(crate) fn register_domain_and_wait(
     )
 }
 
+pub(crate) fn prepare_approval_retry(identifier: &str, display_name: &str) -> Result<(), String> {
+    prepare_approval_retry_with(
+        || query_domain_state(identifier, DOMAIN_QUERY_TIMEOUT),
+        || remove_domain(identifier, display_name, REMOVE_CALLBACK_TIMEOUT),
+    )
+}
+
 fn deliver_callback<T>(sender: &SyncSender<T>, value: T) {
     let _ = sender.send(value);
+}
+
+fn prepare_approval_retry_with<Query, Remove>(query: Query, remove: Remove) -> Result<(), String>
+where
+    Query: FnOnce() -> Result<Option<DomainState>, String>,
+    Remove: FnOnce() -> Result<(), String>,
+{
+    match query()? {
+        Some(DomainState {
+            user_enabled: false,
+            ..
+        }) => remove().map_err(|error| {
+            format!(
+                "Could not reset the denied macOS File Provider approval before retrying: {error}"
+            )
+        }),
+        _ => Ok(()),
+    }
 }
 
 fn register_domain_and_wait_with<Schedule, Query, Sleep, Now>(
@@ -150,6 +176,42 @@ unsafe fn add_domain(
     });
 
     unsafe { NSFileProviderManager::addDomain_completionHandler(&domain, &completion) };
+}
+
+fn remove_domain(identifier: &str, display_name: &str, timeout: Duration) -> Result<(), String> {
+    let identifier = identifier.to_owned();
+    let display_name = display_name.to_owned();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let domain = unsafe { new_domain(&identifier, &display_name) };
+    let completion = RcBlock::new(move |error: *mut NSError| {
+        let result = if error.is_null() {
+            Ok(())
+        } else {
+            autoreleasepool(|pool| {
+                // SAFETY: File Provider guarantees a non-null NSError pointer remains
+                // valid for the duration of its completion callback.
+                let error = unsafe { &*error };
+                let domain = error.domain();
+                let domain = unsafe { domain.to_str(pool) }.to_owned();
+                let code = error.code();
+                let description = error.localizedDescription();
+                let description = unsafe { description.to_str(pool) }.to_owned();
+                Err(format_framework_error(&domain, code, &description))
+            })
+        };
+        deliver_callback(&sender, result);
+    });
+
+    unsafe { NSFileProviderManager::removeDomain_completionHandler(&domain, &completion) };
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(error @ RecvTimeoutError::Timeout) => Err(format!(
+            "File Provider domain removal callback timed out: {error}"
+        )),
+        Err(RecvTimeoutError::Disconnected) => {
+            Err("File Provider domain removal callback disconnected before delivery.".to_string())
+        }
+    }
 }
 
 fn query_domain_state(identifier: &str, timeout: Duration) -> Result<Option<DomainState>, String> {
@@ -490,6 +552,27 @@ mod tests {
                 Duration::from_millis(1),
             ]
         );
+    }
+
+    #[test]
+    fn approval_retry_preflight_removes_disabled_domain_before_registration() {
+        let removed = Cell::new(false);
+        prepare_approval_retry_with(
+            || {
+                Ok(Some(DomainState {
+                    user_enabled: false,
+                    disconnected: false,
+                    hidden: false,
+                }))
+            },
+            || {
+                removed.set(true);
+                Ok(())
+            },
+        )
+        .expect("retry preflight succeeds");
+
+        assert!(removed.get());
     }
 
     #[test]

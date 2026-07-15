@@ -6,6 +6,7 @@ MAKEFILE="${ROOT}/Makefile"
 PUBLISH_SCRIPT="${ROOT}/scripts/publish-macos.sh"
 HOMEBREW_SCRIPT="${ROOT}/scripts/render-homebrew-cask.sh"
 TAURI_CONF="${ROOT}/apps/desktop/src-tauri/tauri.conf.json"
+TAURI_INFO_PLIST="${ROOT}/apps/desktop/src-tauri/Info.plist"
 DMG_BACKGROUND="${ROOT}/apps/desktop/src-tauri/assets/dmg-background.png"
 MOUNT_LOGO_ICNS="${ROOT}/apps/desktop/src-tauri/icons/locality-mount-logo.icns"
 MOUNT_LOGO_SVG="${ROOT}/apps/desktop/src-tauri/icons/locality-mount-logo.svg"
@@ -130,6 +131,12 @@ grep -F -q 'Contents/Resources/locality-mount-logo.svg' "${FILE_PROVIDER_BUILD_S
 bash "${FILE_PROVIDER_BUILD_TEST}" >/dev/null
 jq -e '.bundle.macOS.files["Resources/locality-mount-logo.icns"] == "icons/locality-mount-logo.icns"' "${TAURI_CONF}" >/dev/null \
   || fail "Tauri macOS host app must package the mount logo ICNS resource"
+jq -e '.bundle.macOS.infoPlist == "Info.plist"' "${TAURI_CONF}" >/dev/null \
+  || fail "Tauri macOS host app must merge the macOS Info.plist override"
+[[ -f "${TAURI_INFO_PLIST}" ]] \
+  || fail "Tauri macOS host app Info.plist override is missing"
+"${PLISTBUDDY:-/usr/libexec/PlistBuddy}" -c 'Print :NSPrincipalClass' "${TAURI_INFO_PLIST}" | grep -F -q 'NSApplication' \
+  || fail "Tauri macOS host app Info.plist override must set NSPrincipalClass to NSApplication"
 jq -e '.bundle.macOS.dmg.background == "assets/dmg-background.png"' "${TAURI_CONF}" >/dev/null \
   || fail "DMG must use the instructional installer background"
 jq -e '.bundle.macOS.dmg.windowSize.width >= 720 and .bundle.macOS.dmg.windowSize.height >= 420' "${TAURI_CONF}" >/dev/null \
