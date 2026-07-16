@@ -51,6 +51,38 @@ separate fetch/render path hydrates an entity. The daemon must persist the
 opaque checkpoint JSON only after the complete batch has been validated and
 reconciled successfully.
 
+### Daemon Batch Reconciliation Planning
+
+`crates/localityd/src/discovery.rs` provides the read-only planning boundary for
+checkpointed batch observation. `plan_batch_discovery` validates the complete
+connector batch, reads the current durable state, and returns one deterministic
+`DiscoveryPlan`. The plan separates filesystem projection actions that must
+happen before commit, held changes that require review, post-commit hydration
+requests, and the single `DiscoveryCommit` that publishes all accepted or held
+state together with the next connector checkpoint. Planning itself does not
+mutate the filesystem or store.
+
+The planner preserves incremental omissions and treats complete omissions as
+deletes. Unknown tombstones are no-ops. Held upserts and tombstones are retained
+in a tagged, versioned replay envelope in remote-observation state, so a later
+empty incremental batch can reconsider them. A newer replay format fails with
+an update-required result; an incoming connector change for the same remote id
+takes precedence over an older held replay.
+
+Structural creates, moves, and deletes fail closed unless the caller supplies a
+safe projection assessment. Remote changes against dirty or conflicted
+entities, incompatible entity kind changes, and explicitly blocked projections
+remain held. New entries must be metadata-only `Virtual` or `Stub` entries, and
+accepted remote metadata for existing `Virtual` and `Stub` entities updates the
+durable entity record. Remote drift for a `Hydrated` entity preserves synced
+fields, leaves a remote hint pending, queues post-commit hydration, and pauses
+enabled auto-save. For an accepted move, the paused auto-save record uses the
+final path so it composes with the store's atomic enrollment rehome.
+
+This module currently implements planning only. Runtime connector scheduling,
+filesystem projection execution, connected-component grouping, mutation and
+journal handling, and recent-edit lease policy are separate integration work.
+
 Daemon hydration uses `fetch_render`, not the raw connector `fetch` method
 directly. The common daemon-side abstraction is `HydrationSource::fetch_render`
 in `crates/localityd/src/hydration.rs`; concrete adapters live in
