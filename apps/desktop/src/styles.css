@@ -4119,6 +4119,64 @@ button.home-stat:hover {
   color: var(--accent);
 }
 
+:root[data-theme="dark"] .source-view-toggle button.active,
+:root[data-theme="dark"] .file-filter-bar button.active,
+:root[data-theme="dark"] .file-filter-bar button:hover,
+:root[data-theme="dark"] .activity-tabs button.active,
+:root[data-theme="dark"] .settings-nav button:hover,
+:root[data-theme="dark"] .settings-nav button.active,
+:root[data-theme="dark"] .theme-segmented button.active,
+:root[data-theme="dark"] .option-row:hover {
+  border-color: rgba(42, 161, 152, 0.32);
+  background: rgba(42, 161, 152, 0.16);
+  color: #dff8f4;
+  box-shadow: inset 0 0 0 1px rgba(42, 161, 152, 0.12);
+}
+
+:root[data-theme="dark"] .settings-nav button:hover small,
+:root[data-theme="dark"] .settings-nav button.active small {
+  color: #bfd2ce;
+}
+
+:root[data-theme="dark"] .live-mode-control.active,
+:root[data-theme="dark"] .tray-live-mode-control,
+:root[data-theme="dark"] .connector-option.available,
+:root[data-theme="dark"] .connector-option.selectable:hover:not(:disabled),
+:root[data-theme="dark"] .connector-option.selectable.selected,
+:root[data-theme="dark"] .source-ready-card,
+:root[data-theme="dark"] .connector-choice-card.active,
+:root[data-theme="dark"] .mount-card.active,
+:root[data-theme="dark"] .file-row.expanded {
+  border-color: rgba(42, 161, 152, 0.34);
+  background: linear-gradient(180deg, rgba(35, 55, 58, 0.96), rgba(29, 46, 49, 0.96));
+  color: var(--ink);
+}
+
+:root[data-theme="dark"] .connector-choice-card,
+:root[data-theme="dark"] .connector-choice-card.mounted,
+:root[data-theme="dark"] .workspace-path-row,
+:root[data-theme="dark"] .workspace-facts span,
+:root[data-theme="dark"] .tray-change-list button {
+  border-color: var(--line);
+  background: rgba(22, 31, 34, 0.9);
+  color: var(--ink);
+}
+
+:root[data-theme="dark"] .connector-choice-heading p,
+:root[data-theme="dark"] .mount-card-title span span,
+:root[data-theme="dark"] .mount-card-footer > span,
+:root[data-theme="dark"] .file-row span,
+:root[data-theme="dark"] .tray-change-list small {
+  color: var(--muted);
+}
+
+:root[data-theme="dark"] .source-ready-card span,
+:root[data-theme="dark"] .connector-choice-card.active p,
+:root[data-theme="dark"] .connector-option small,
+:root[data-theme="dark"] .file-row.expanded span {
+  color: #c4d4d0;
+}
+
 :root[data-theme="dark"] .toggle {
   background: #334247;
 }
