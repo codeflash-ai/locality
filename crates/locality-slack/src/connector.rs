@@ -194,7 +194,10 @@ impl Connector for SlackConnector {
     }
 
     fn capabilities(&self) -> ConnectorCapabilities {
-        ConnectorCapabilities::read_only()
+        ConnectorCapabilities {
+            supports_oauth: true,
+            ..ConnectorCapabilities::read_only()
+        }
     }
 
     fn supported_push_operations(&self) -> BTreeSet<PushOperationKind> {
@@ -977,10 +980,11 @@ mod tests {
         let connector = connector_with_api(FakeSlackApi::default());
 
         assert_eq!(connector.kind().0, SLACK_CONNECTOR_ID);
-        assert_eq!(
-            connector.capabilities(),
-            locality_connector::ConnectorCapabilities::read_only()
-        );
+        let expected_capabilities = ConnectorCapabilities {
+            supports_oauth: true,
+            ..ConnectorCapabilities::read_only()
+        };
+        assert_eq!(connector.capabilities(), expected_capabilities);
         assert!(connector.supported_push_operations().is_empty());
         assert!(
             connector
