@@ -2,43 +2,38 @@
 
 import FileProvider
 @testable import LocalityFileProvider
-import XCTest
+import Testing
 
-final class LocalityFileProviderServiceTests: XCTestCase {
-  func testExtensionAdvertisesLocalityServiceSource() {
-    let provider = providerExtension()
-    let expectation = expectation(description: "service sources")
-    var sources: [NSFileProviderServiceSource]?
-    var serviceError: Error?
+@Test func extensionAdvertisesLocalityServiceSource() {
+  let provider = providerExtension()
+  var sources: [NSFileProviderServiceSource]?
+  var serviceError: Error?
 
-    let progress = provider.supportedServiceSources(for: .rootContainer) { resolvedSources, error in
-      sources = resolvedSources
-      serviceError = error
-      expectation.fulfill()
-    }
+  let progress = provider.supportedServiceSources(for: .rootContainer) { resolvedSources, error in
+    sources = resolvedSources
+    serviceError = error
+  }
 
-    wait(for: [expectation], timeout: 1)
-    XCTAssertEqual(progress.completedUnitCount, 1)
-    XCTAssertNil(serviceError)
-    XCTAssertEqual(sources?.count, 1)
-    XCTAssertEqual(
-      sources?.first?.serviceName,
-      NSFileProviderServiceName("ai.codeflash.locality.Locality.FileProvider.service")
+  #expect(progress.completedUnitCount == 1)
+  #expect(serviceError == nil)
+  #expect(sources?.count == 1)
+  #expect(
+    sources?.first?.serviceName
+      == NSFileProviderServiceName("ai.codeflash.locality.Locality.FileProvider.service")
+  )
+}
+
+@Test func extensionServiceSourceVendsListenerEndpoint() throws {
+  let provider = providerExtension()
+
+  _ = try provider.makeListenerEndpoint()
+}
+
+private func providerExtension() -> LocalityFileProviderExtension {
+  LocalityFileProviderExtension(
+    domain: NSFileProviderDomain(
+      identifier: NSFileProviderDomainIdentifier("loc"),
+      displayName: "Locality"
     )
-  }
-
-  func testExtensionServiceSourceVendsListenerEndpoint() throws {
-    let provider = providerExtension()
-
-    _ = try provider.makeListenerEndpoint()
-  }
-
-  private func providerExtension() -> LocalityFileProviderExtension {
-    LocalityFileProviderExtension(
-      domain: NSFileProviderDomain(
-        identifier: NSFileProviderDomainIdentifier("loc"),
-        displayName: "Locality"
-      )
-    )
-  }
+  )
 }
