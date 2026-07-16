@@ -923,7 +923,7 @@ function sourceSyncModeLabel(liveMode: MountLiveMode, active: boolean) {
 }
 
 function reviewQueueCounts(changes: PendingChange[]) {
-  const problems = changes.filter((change) => change.state === "conflict" || change.state === "blocked").length;
+  const problems = changes.filter(isProblemReviewChange).length;
   return {
     total: changes.length,
     approvals: changes.length - problems,
@@ -945,8 +945,12 @@ function changeMatchesReviewFilter(change: PendingChange, filter: ReviewFilter) 
   if (filter === "all") {
     return true;
   }
-  const isProblem = change.state === "conflict" || change.state === "blocked";
+  const isProblem = isProblemReviewChange(change);
   return filter === "problems" ? isProblem : !isProblem;
+}
+
+function isProblemReviewChange(change: PendingChange) {
+  return change.state === "conflict" || change.state === "blocked";
 }
 
 function fileStatusFilterLabel(filter: FileStatusFilter) {
@@ -1090,6 +1094,7 @@ export default function App() {
   );
   const [snapshotLoaded, setSnapshotLoaded] = useState(() => !isTauriRuntime());
   const [view, setView] = useState<AppView>("home");
+  const [reviewInitialFilter, setReviewInitialFilter] = useState<ReviewFilter>("all");
   const [route, setRoute] = useState(initialRoute);
   const [showOnboarding, setShowOnboarding] = useState(() =>
     routeForcesOnboarding(initialRoute) || previewRouteStartsOnboarding(initialRoute),
@@ -1516,12 +1521,17 @@ export default function App() {
   }
 
   return (
-    <MainShell
-      snapshot={snapshot}
-      view={view}
-      onViewChange={setView}
-      onRefresh={refreshSnapshot}
-      updateStatus={updateStatus}
+            <MainShell
+              snapshot={snapshot}
+              view={view}
+              onViewChange={setView}
+              reviewInitialFilter={reviewInitialFilter}
+              onOpenReview={(filter = "all") => {
+                setReviewInitialFilter(filter);
+                setView("pending");
+              }}
+              onRefresh={refreshSnapshot}
+              updateStatus={updateStatus}
       onCheckForUpdate={checkForAppUpdate}
       onInstallUpdate={installAppUpdate}
       appStoreDistribution={appStoreDistribution}
@@ -2524,6 +2534,8 @@ function MainShell({
   snapshot,
   view,
   onViewChange,
+  reviewInitialFilter,
+  onOpenReview,
   onRefresh,
   updateStatus,
   onCheckForUpdate,
@@ -2534,6 +2546,8 @@ function MainShell({
   snapshot: DesktopSnapshot;
   view: AppView;
   onViewChange: (view: AppView) => void;
+  reviewInitialFilter: ReviewFilter;
+  onOpenReview: (filter?: ReviewFilter) => void;
   onRefresh: () => Promise<void>;
   updateStatus: UpdateStatus;
   onCheckForUpdate: (options?: AppUpdateCheckOptions) => Promise<void>;
@@ -2583,8 +2597,17 @@ function MainShell({
     onViewChange("mount");
   }
 
+  function openReviewCenter(filter: ReviewFilter = "all") {
+    setSelectedMountId(null);
+    onOpenReview(filter);
+  }
+
   function openStatusTarget() {
     if (statusTarget) {
+      if (statusTarget === "pending") {
+        openReviewCenter();
+        return;
+      }
       onViewChange(statusTarget);
       return;
     }
@@ -2597,7 +2620,7 @@ function MainShell({
         title="Locality"
         meta={meta}
         metaTitle={statusTitle}
-        onMetaClick={statusTarget ? () => onViewChange(statusTarget) : undefined}
+        onMetaClick={statusTarget ? openStatusTarget : undefined}
       />
       <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
         <aside className="sidebar">
@@ -2627,7 +2650,7 @@ function MainShell({
             <SidebarButton
               active={view === "pending" || view === "review"}
               icon={<ListChecks />}
-              onClick={() => onViewChange("pending")}
+              onClick={() => openReviewCenter()}
             >
               {PRODUCT_TERMS.reviewCenter}
             </SidebarButton>
@@ -2662,7 +2685,7 @@ function MainShell({
               snapshot={snapshot}
               onMount={openMountsView}
               onFiles={() => onViewChange("files")}
-              onReview={() => onViewChange("pending")}
+              onReview={openReviewCenter}
               onRefresh={onRefresh}
             />
           )}
@@ -2673,7 +2696,7 @@ function MainShell({
               onHome={() => onViewChange("home")}
               onMounts={() => setSelectedMountId(null)}
               onRefresh={onRefresh}
-              onReview={() => onViewChange("pending")}
+              onReview={() => openReviewCenter()}
             />
           )}
           {view === "files" && (
@@ -2681,7 +2704,7 @@ function MainShell({
               snapshot={snapshot}
               onHome={() => onViewChange("home")}
               onRefresh={onRefresh}
-              onReview={() => onViewChange("pending")}
+              onReview={() => openReviewCenter()}
             />
           )}
           {view === "mount" && !selectedMount && (
@@ -2699,13 +2722,14 @@ function MainShell({
               onHome={() => onViewChange("home")}
               onReview={() => onViewChange("review")}
               onRefresh={onRefresh}
+              initialFilter={reviewInitialFilter}
             />
           )}
           {view === "review" && (
             <ReviewView
               snapshot={snapshot}
               onHome={() => onViewChange("home")}
-              onPending={() => onViewChange("pending")}
+              onPending={() => openReviewCenter()}
               onRefresh={onRefresh}
               onDone={() => onViewChange("activity")}
             />
@@ -2774,7 +2798,7 @@ function HomeView({
   snapshot: DesktopSnapshot;
   onMount: () => void;
   onFiles: () => void;
-  onReview: () => void;
+  onReview: (filter?: ReviewFilter) => void;
   onRefresh: () => Promise<void>;
 }) {
   const [url, setUrl] = useState("");
@@ -2903,16 +2927,16 @@ function HomeView({
               <span>Sources</span>
               <strong>{snapshot.mounts.length || 1}</strong>
             </button>
-            <button type="button" className="home-stat" onClick={onReview}>
+            <button type="button" className="home-stat" onClick={() => onReview()}>
               <span>Awaiting review</span>
               <strong className={homeReviewCounts.total > 0 ? "warn" : ""}>{homeReviewCounts.total}</strong>
             </button>
-            <div className="home-stat passive">
+            <button type="button" className="home-stat" onClick={() => onReview("problems")}>
               <span>Problems</span>
               <strong className={homeReviewCounts.problems > 0 ? "danger" : ""}>
                 {homeReviewCounts.problems > 0 ? homeReviewCounts.problems : "0"}
               </strong>
-            </div>
+            </button>
           </section>
           <section className="workspace-card">
             <div className="workspace-summary">
@@ -4744,18 +4768,24 @@ function PendingView({
   onHome,
   onReview,
   onRefresh,
+  initialFilter,
 }: {
   snapshot: DesktopSnapshot;
   onHome: () => void;
   onReview: () => void;
   onRefresh: () => Promise<void>;
+  initialFilter: ReviewFilter;
 }) {
   const hasPendingChanges = snapshot.pendingChanges.length > 0;
-  const [filter, setFilter] = useState<ReviewFilter>("all");
+  const [filter, setFilter] = useState<ReviewFilter>(initialFilter);
   const [pushState, setPushState] = useState<"idle" | "pushing" | "success" | "error">("idle");
   const [pushMessage, setPushMessage] = useState("");
   const reviewCounts = reviewQueueCounts(snapshot.pendingChanges);
   const visibleChanges = snapshot.pendingChanges.filter((change) => changeMatchesReviewFilter(change, filter));
+
+  useEffect(() => {
+    setFilter(initialFilter);
+  }, [initialFilter]);
 
   async function pushAll() {
     if (!hasPendingChanges || pushState === "pushing") {
@@ -4794,16 +4824,16 @@ function PendingView({
       <Breadcrumbs items={[{ label: PRODUCT_TERMS.home, onClick: onHome }, { label: PRODUCT_TERMS.reviewCenter }]} />
       <ViewHeader title={PRODUCT_TERMS.reviewCenter}>
         <div className="button-row">
-          <SecondaryButton
+          <PrimaryButton
             disabled={!hasPendingChanges || isPushing}
             icon={isPushing ? <Loader2 className="spin-icon" /> : <ShieldCheck />}
             onClick={() => void pushAll()}
           >
             {isPushing ? "Pushing..." : "Push Safe Changes"}
-          </SecondaryButton>
-          <PrimaryButton disabled={!hasPendingChanges || isPushing} icon={<ListChecks />} onClick={onReview}>
-            Review Push
           </PrimaryButton>
+          <SecondaryButton disabled={!hasPendingChanges || isPushing} icon={<ListChecks />} onClick={onReview}>
+            Review Push
+          </SecondaryButton>
         </div>
       </ViewHeader>
       {pushMessage && (
