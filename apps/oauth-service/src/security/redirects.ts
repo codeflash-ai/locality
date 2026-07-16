@@ -16,6 +16,11 @@ const DEFAULT_GMAIL_REDIRECT_URIS = [
   "http://127.0.0.1:8757/oauth/gmail/callback"
 ];
 
+const DEFAULT_SLACK_REDIRECT_URIS = [
+  "http://localhost:8757/oauth/slack/callback",
+  "http://127.0.0.1:8757/oauth/slack/callback"
+];
+
 export function allowedNotionRedirectUris(env: BrokerEnv): string[] {
   return splitList(env.LOCALITY_NOTION_REDIRECT_URIS) ?? DEFAULT_NOTION_REDIRECT_URIS;
 }
@@ -38,6 +43,14 @@ export function allowedGmailRedirectUris(env: BrokerEnv): string[] {
 
 export function validateGmailRedirectUri(env: BrokerEnv, redirectUri: string): string {
   return validateLoopbackRedirectUri("Gmail", allowedGmailRedirectUris(env), redirectUri);
+}
+
+export function allowedSlackRedirectUris(env: BrokerEnv): string[] {
+  return splitList(env.LOCALITY_SLACK_REDIRECT_URIS) ?? DEFAULT_SLACK_REDIRECT_URIS;
+}
+
+export function validateSlackRedirectUri(env: BrokerEnv, redirectUri: string): string {
+  return validateLoopbackRedirectUri("Slack", allowedSlackRedirectUris(env), redirectUri);
 }
 
 function validateLoopbackRedirectUri(connectorName: string, allowed: string[], redirectUri: string): string {

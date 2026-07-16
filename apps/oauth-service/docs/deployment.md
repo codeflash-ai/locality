@@ -16,6 +16,8 @@ wrangler secret put LOCALITY_NOTION_CLIENT_ID
 wrangler secret put LOCALITY_NOTION_CLIENT_SECRET
 wrangler secret put LOCALITY_GOOGLE_CLIENT_ID
 wrangler secret put LOCALITY_GOOGLE_CLIENT_SECRET
+wrangler secret put LOCALITY_SLACK_CLIENT_ID
+wrangler secret put LOCALITY_SLACK_CLIENT_SECRET
 wrangler deploy
 ```
 
@@ -37,6 +39,14 @@ http://localhost:8757/oauth/gmail/callback
 http://127.0.0.1:8757/oauth/gmail/callback
 ```
 
+Configure the Slack OAuth app with the exact localhost callbacks used by
+Locality:
+
+```text
+http://localhost:8757/oauth/slack/callback
+http://127.0.0.1:8757/oauth/slack/callback
+```
+
 Use a stable production URL such as:
 
 ```text
@@ -51,16 +61,20 @@ LOCALITY_NOTION_OAUTH_CLIENT_ID=<public client id>
 ```
 
 The client ID may also be fetched from `/v1/oauth/notion/start`,
-`/v1/oauth/google-docs/start`, or `/v1/oauth/gmail/start`; keeping it in the
-Locality binary is fine because it is not confidential. The two Google start
-endpoints return the same shared Google OAuth client ID.
+`/v1/oauth/google-docs/start`, `/v1/oauth/gmail/start`, or
+`/v1/oauth/slack/start`; keeping it in the Locality binary is fine because it is
+not confidential. The two Google start endpoints return the same shared Google
+OAuth client ID.
 
-Optional broker environment overrides for Gmail local testing:
+Optional broker environment overrides for connector local testing:
 
 ```text
 LOCALITY_GMAIL_REDIRECT_URIS=http://localhost:8757/oauth/gmail/callback,http://127.0.0.1:8757/oauth/gmail/callback
 LOCALITY_GMAIL_AUTH_BASE_URL=https://accounts.google.com
 LOCALITY_GMAIL_API_BASE_URL=https://oauth2.googleapis.com
+LOCALITY_SLACK_REDIRECT_URIS=http://localhost:8757/oauth/slack/callback,http://127.0.0.1:8757/oauth/slack/callback
+LOCALITY_SLACK_AUTH_BASE_URL=https://slack.com
+LOCALITY_SLACK_API_BASE_URL=https://slack.com/api
 ```
 
 ## GitHub Actions CD

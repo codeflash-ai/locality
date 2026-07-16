@@ -13,8 +13,17 @@ interface StartResponse {
 }
 
 interface BrokerTokenResponse {
+  connector?: string;
   access_token: string;
+  token_type?: string;
+  expires_in?: number;
   scope?: string;
+  scopes?: string[];
+  account_id?: string;
+  account_label?: string;
+  workspace_id?: string;
+  workspace_name?: string;
+  bot_id?: string;
   refresh_token?: string;
   refresh_token_kind?: string;
   refresh_token_handle?: string;
@@ -36,7 +45,12 @@ const env: BrokerEnv = {
   LOCALITY_GOOGLE_DOCS_REDIRECT_URIS: "http://localhost:8757/oauth/google-docs/callback",
   LOCALITY_GMAIL_API_BASE_URL: "https://oauth2.example.test",
   LOCALITY_GMAIL_AUTH_BASE_URL: "https://accounts.example.test",
-  LOCALITY_GMAIL_REDIRECT_URIS: "http://localhost:8757/oauth/gmail/callback"
+  LOCALITY_GMAIL_REDIRECT_URIS: "http://localhost:8757/oauth/gmail/callback",
+  LOCALITY_SLACK_CLIENT_ID: "slack-client-id",
+  LOCALITY_SLACK_CLIENT_SECRET: "slack-client-secret",
+  LOCALITY_SLACK_API_BASE_URL: "https://slack-api.example.test",
+  LOCALITY_SLACK_AUTH_BASE_URL: "https://slack-auth.example.test",
+  LOCALITY_SLACK_REDIRECT_URIS: "http://localhost:8757/oauth/slack/callback"
 };
 
 describe("auth broker", () => {
@@ -59,6 +73,20 @@ describe("auth broker", () => {
     await expect(response.json()).resolves.toMatchObject({
       connectors: {
         gmail: {
+          oauth: "brokered_confidential",
+          session_ttl_seconds: 600,
+          refresh_token_modes: ["handle"]
+        }
+      }
+    });
+  });
+
+  it("publishes Slack in broker discovery", async () => {
+    const response = await app.request("/.well-known/loc-auth-broker", { method: "GET" }, env);
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      connectors: {
+        slack: {
           oauth: "brokered_confidential",
           session_ttl_seconds: 600,
           refresh_token_modes: ["handle"]
@@ -546,6 +574,222 @@ describe("auth broker", () => {
     });
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it("creates a Slack OAuth session and authorization URL", async () => {
+    const response = await app.request("/v1/oauth/slack/start", { method: "POST" }, env);
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as StartResponse;
+    expect(body.connector).toBe("slack");
+    expect(body.client_id).toBe("slack-client-id");
+    const authorizationUrl = new URL(body.authorization_url);
+    expect(`${authorizationUrl.origin}${authorizationUrl.pathname}`).toBe(
+      "https://slack-auth.example.test/oauth/v2/authorize"
+    );
+    expect(authorizationUrl.searchParams.get("client_id")).toBe("slack-client-id");
+    expect(authorizationUrl.searchParams.get("redirect_uri")).toBe("http://localhost:8757/oauth/slack/callback");
+    expect(authorizationUrl.searchParams.get("state")).toBe(body.state);
+    const scopes = authorizationUrl.searchParams.get("scope")?.split(",") ?? [];
+    expect(scopes).toContain("channels:history");
+    expect(scopes).toContain("files:read");
+    expect(scopes).not.toContain("chat:write");
+    expect(body.redirect_uri).toBe("http://localhost:8757/oauth/slack/callback");
+    expect(body.session).toBeTruthy();
+    expect(body.state).toBeTruthy();
+  });
+
+  it("exchanges a Slack authorization code without exposing the raw refresh token in handle mode", async () => {
+    const start = await startSlackSession();
+    const slackScope =
+      "channels:read,channels:history,groups:read,groups:history,im:read,im:history,mpim:read,mpim:history,users:read,team:read,files:read";
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      Response.json({
+        ok: true,
+        access_token: "xoxb-access-token",
+        refresh_token: "slack-refresh-token",
+        token_type: "bot",
+        expires_in: 43200,
+        scope: slackScope,
+        bot_user_id: "U999",
+        team: { id: "T123", name: "Locality" }
+      })
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const response = await app.request(
+      "/v1/oauth/slack/exchange",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          session: start.session,
+          state: start.state,
+          code: "authorization-code",
+          redirect_uri: "http://localhost:8757/oauth/slack/callback"
+        })
+      },
+      env
+    );
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as BrokerTokenResponse;
+    expect(body.connector).toBe("slack");
+    expect(body.access_token).toBe("xoxb-access-token");
+    expect(body.token_type).toBe("bot");
+    expect(body.expires_in).toBe(43200);
+    expect(body.scope).toBe(
+      "channels:read channels:history groups:read groups:history im:read im:history mpim:read mpim:history users:read team:read files:read"
+    );
+    expect(body.scopes).toEqual([
+      "channels:read",
+      "channels:history",
+      "groups:read",
+      "groups:history",
+      "im:read",
+      "im:history",
+      "mpim:read",
+      "mpim:history",
+      "users:read",
+      "team:read",
+      "files:read"
+    ]);
+    expect(body.account_id).toBe("T123");
+    expect(body.account_label).toBe("Locality");
+    expect(body.workspace_id).toBe("T123");
+    expect(body.workspace_name).toBe("Locality");
+    expect(body.bot_id).toBe("U999");
+    expect(body.refresh_token).toBeUndefined();
+    expect(body.refresh_token_kind).toBe("handle");
+    expect(body.refresh_token_handle).toMatch(/^locrh_v1\./);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://slack-api.example.test/oauth.v2.access",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          "Content-Type": "application/x-www-form-urlencoded"
+        })
+      })
+    );
+    const requestBody = new URLSearchParams((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
+    expect(requestBody.get("client_id")).toBe("slack-client-id");
+    expect(requestBody.get("client_secret")).toBe("slack-client-secret");
+    expect(requestBody.get("grant_type")).toBe("authorization_code");
+    expect(requestBody.get("code")).toBe("authorization-code");
+    expect(requestBody.get("redirect_uri")).toBe("http://localhost:8757/oauth/slack/callback");
+  });
+
+  it("does not expose raw Slack OAuth error text to callers", async () => {
+    const start = await startSlackSession();
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      Response.json({
+        ok: false,
+        error: "bad_code authorization-code slack-client-secret slack-refresh-token"
+      })
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const response = await app.request(
+      "/v1/oauth/slack/exchange",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          session: start.session,
+          state: start.state,
+          code: "authorization-code",
+          redirect_uri: "http://localhost:8757/oauth/slack/callback"
+        })
+      },
+      env
+    );
+
+    expect(response.status).toBe(502);
+    const body = await response.json();
+    expect(body).toMatchObject({
+      error: {
+        code: "upstream_oauth_error",
+        message: "Slack OAuth failed"
+      }
+    });
+    const serialized = JSON.stringify(body);
+    expect(serialized).not.toContain("bad_code");
+    expect(serialized).not.toContain("authorization-code");
+    expect(serialized).not.toContain("slack-client-secret");
+    expect(serialized).not.toContain("slack-refresh-token");
+  });
+
+  it("refreshes Slack credentials through an opaque refresh handle", async () => {
+    const start = await startSlackSession();
+    let calls = 0;
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => {
+      calls += 1;
+      if (calls === 1) {
+        return Response.json({
+          ok: true,
+          access_token: "xoxb-access-token",
+          refresh_token: "slack-refresh-token",
+          expires_in: 43200
+        });
+      }
+      return Response.json({
+        ok: true,
+        access_token: "new-xoxb-access-token",
+        refresh_token: "new-slack-refresh-token",
+        expires_in: 43200
+      });
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const exchanged = await app.request(
+      "/v1/oauth/slack/exchange",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          session: start.session,
+          state: start.state,
+          code: "authorization-code",
+          redirect_uri: "http://localhost:8757/oauth/slack/callback"
+        })
+      },
+      env
+    );
+    const exchangeBody = (await exchanged.json()) as BrokerTokenResponse;
+
+    const refreshed = await app.request(
+      "/v1/oauth/slack/refresh",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ refresh_token_handle: exchangeBody.refresh_token_handle })
+      },
+      env
+    );
+
+    expect(refreshed.status).toBe(200);
+    const refreshBody = (await refreshed.json()) as BrokerTokenResponse;
+    expect(refreshBody.access_token).toBe("new-xoxb-access-token");
+    expect(refreshBody.refresh_token).toBeUndefined();
+    expect(refreshBody.refresh_token_handle).toMatch(/^locrh_v1\./);
+    const refreshRequest = new URLSearchParams((fetchMock.mock.calls[1]?.[1] as RequestInit).body as string);
+    expect(refreshRequest.get("grant_type")).toBe("refresh_token");
+    expect(refreshRequest.get("refresh_token")).toBe("slack-refresh-token");
+  });
+
+  it("rejects unconfigured Slack redirect URIs", async () => {
+    const response = await app.request(
+      "/v1/oauth/slack/start",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ redirect_uri: "http://localhost:9999/oauth/slack/callback" })
+      },
+      env
+    );
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "redirect_uri_not_allowed" }
+    });
+  });
 });
 
 async function startSession() {
@@ -562,6 +806,12 @@ async function startGoogleDocsSession() {
 
 async function startGmailSession() {
   const response = await app.request("/v1/oauth/gmail/start", { method: "POST" }, env);
+  expect(response.status).toBe(200);
+  return response.json() as Promise<StartResponse>;
+}
+
+async function startSlackSession() {
+  const response = await app.request("/v1/oauth/slack/start", { method: "POST" }, env);
   expect(response.status).toBe(200);
   return response.json() as Promise<StartResponse>;
 }
