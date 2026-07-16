@@ -17,6 +17,7 @@ use locality_store::{
     ProjectionMode, ShadowRepository, StoreError, VirtualMutationRepository,
 };
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -230,10 +231,13 @@ pub struct ProjectionRefreshReport {
     pub skipped_missing_projection: usize,
     pub skipped_unchanged: usize,
     pub skipped_local_changes: usize,
+    pub recovery_paths: Vec<PathBuf>,
 }
 
 const WINDOWS_CLOUD_FILES_PROJECTION_ACK_VERSION: u32 = 1;
 const WINDOWS_CLOUD_FILES_PROJECTION_ACK_MAX_AGE_MS: u64 = 5 * 60 * 1_000;
+const WINDOWS_CLOUD_FILES_RECOVERY_STATE_VERSION: u32 = 1;
+const WINDOWS_CLOUD_FILES_RECOVERY_MIN_READER_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -243,6 +247,10 @@ pub enum WindowsCloudFilesProjectionEvent {
     WatcherRemoveMoveSource,
     CloudFilesDeleteArchivedEntity,
     WatcherRemoveArchivedEntity,
+    CloudFilesQuarantineMoveSource,
+    WatcherQuarantineMoveSource,
+    CloudFilesQuarantineArchiveSource,
+    WatcherQuarantineArchiveSource,
 }
 
 impl WindowsCloudFilesProjectionEvent {
@@ -253,6 +261,10 @@ impl WindowsCloudFilesProjectionEvent {
             Self::WatcherRemoveMoveSource => "watcher_remove_move_source",
             Self::CloudFilesDeleteArchivedEntity => "cloud_files_delete_archived_entity",
             Self::WatcherRemoveArchivedEntity => "watcher_remove_archived_entity",
+            Self::CloudFilesQuarantineMoveSource => "cloud_files_quarantine_move_source",
+            Self::WatcherQuarantineMoveSource => "watcher_quarantine_move_source",
+            Self::CloudFilesQuarantineArchiveSource => "cloud_files_quarantine_archive_source",
+            Self::WatcherQuarantineArchiveSource => "watcher_quarantine_archive_source",
         }
     }
 }
@@ -267,6 +279,8 @@ struct WindowsCloudFilesProjectionAcknowledgement {
     relative_path_key: String,
     event: WindowsCloudFilesProjectionEvent,
     expected_entity_path_key: Option<String>,
+    #[serde(default)]
+    quarantine_path: Option<PathBuf>,
     created_at_unix_ms: u64,
 }
 
@@ -276,6 +290,58 @@ struct WindowsCloudFilesProjectionAcknowledgementSpec<'a> {
     relative_path: &'a Path,
     event: WindowsCloudFilesProjectionEvent,
     expected_entity_path: Option<&'a Path>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsCloudFilesProjectionRecoveryOperation {
+    Move,
+    Archive,
+    Orphan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsCloudFilesProjectionRecoveryPayloadKind {
+    File,
+    PageContainer,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsCloudFilesProjectionRecoveryStatus {
+    Prepared,
+    QuarantinedClean,
+    NeedsReview,
+    SourcePresent,
+    Missing,
+    Orphaned,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsCloudFilesProjectionRecovery {
+    pub state_version: u32,
+    pub min_reader_version: u32,
+    pub recovery_id: String,
+    pub record_revision: u32,
+    pub mount_id: Option<MountId>,
+    pub entity_id: Option<RemoteId>,
+    pub operation: WindowsCloudFilesProjectionRecoveryOperation,
+    pub payload_kind: WindowsCloudFilesProjectionRecoveryPayloadKind,
+    pub status: WindowsCloudFilesProjectionRecoveryStatus,
+    pub source_access_root: Option<PathBuf>,
+    pub source_relative_path: Option<PathBuf>,
+    pub source_path: Option<PathBuf>,
+    pub intended_entity_path: Option<PathBuf>,
+    pub quarantine_path: PathBuf,
+    pub payload_document_relative_path: Option<PathBuf>,
+    pub payload_byte_size: Option<u64>,
+    pub payload_hash: Option<String>,
+    pub unexpected_entries: Vec<PathBuf>,
+    pub review_reason: Option<String>,
+    pub created_at_unix_ms: u64,
+    pub updated_at_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -462,9 +528,9 @@ where
     refresh_entity_projection_if_clean(store, state_root, &mount, remote_id, previous_shadow)
 }
 
-/// Relocates an already-materialized Windows Cloud Files replica after durable
-/// entity state has moved, then refreshes its contents from the daemon cache.
-/// The old replica must still match the shadow that preceded the remote update.
+/// Quarantines an already-materialized Windows Cloud Files replica after durable
+/// entity state has moved. Provider enumeration rematerializes the new path from
+/// authoritative entity and cache state.
 pub fn reconcile_windows_cloud_files_entity_projection_if_clean<S>(
     store: &S,
     state_root: &Path,
@@ -530,18 +596,7 @@ where
             report.skipped_local_changes += 1;
             continue;
         }
-
         let restored_projection_path = root.join(&entity.path);
-        let refresh_outcome = prepare_windows_projection_refresh(
-            &entity,
-            &content_root,
-            &restored_projection_path,
-            previous_shadow,
-        )?;
-        let Some(cache_contents) = refresh_outcome else {
-            report.skipped_missing_cache += 1;
-            continue;
-        };
         let previous_namespace_path = projection_namespace_path(&previous_projection_path);
         let restored_namespace_path = projection_namespace_path(&restored_projection_path);
         if restored_namespace_path.exists() {
@@ -550,58 +605,89 @@ where
                 restored_namespace_path.display()
             )));
         }
-        if let Some(parent) = restored_namespace_path.parent() {
-            std::fs::create_dir_all(parent).map_err(LocalityError::from)?;
+        let refresh_outcome = prepare_windows_projection_refresh(
+            &entity,
+            &content_root,
+            &restored_projection_path,
+            previous_shadow,
+        )?;
+        let Some(_cache_contents) = refresh_outcome else {
+            report.skipped_missing_cache += 1;
+            continue;
+        };
+        let page_container = previous_path
+            .file_name()
+            .is_some_and(|filename| filename == "page.md");
+        if page_container
+            && !windows_projection_container_contains_only(
+                &previous_namespace_path,
+                &previous_projection_path,
+            )
+            .map_err(LocalityError::from)?
+        {
+            return Err(LocalityError::InvalidState(format!(
+                "Windows Cloud Files undo cannot quarantine nonempty page container `{}`",
+                previous_namespace_path.display()
+            )));
         }
         let previous_namespace_relative_path = projection_namespace_path(previous_path);
-        let restored_namespace_relative_path = projection_namespace_path(&entity.path);
         let provider_identifier =
             windows_cloud_files_projection_identifier(remote_id, previous_path);
-        let acknowledgements = [
+        let mut acknowledgements = vec![
             WindowsCloudFilesProjectionAcknowledgementSpec {
                 provider_identifier: &provider_identifier,
-                relative_path: &restored_namespace_relative_path,
-                event: WindowsCloudFilesProjectionEvent::CloudFilesRenameTarget,
+                relative_path: &previous_namespace_relative_path,
+                event: WindowsCloudFilesProjectionEvent::CloudFilesQuarantineMoveSource,
                 expected_entity_path: Some(&entity.path),
             },
             WindowsCloudFilesProjectionAcknowledgementSpec {
                 provider_identifier: &provider_identifier,
                 relative_path: &previous_namespace_relative_path,
-                event: WindowsCloudFilesProjectionEvent::CloudFilesDeleteMoveSource,
-                expected_entity_path: Some(&entity.path),
-            },
-            WindowsCloudFilesProjectionAcknowledgementSpec {
-                provider_identifier: &provider_identifier,
-                relative_path: &previous_namespace_relative_path,
-                event: WindowsCloudFilesProjectionEvent::WatcherRemoveMoveSource,
+                event: WindowsCloudFilesProjectionEvent::WatcherQuarantineMoveSource,
                 expected_entity_path: Some(&entity.path),
             },
         ];
-        record_windows_cloud_files_projection_acknowledgements(
+        if page_container {
+            acknowledgements.extend([
+                WindowsCloudFilesProjectionAcknowledgementSpec {
+                    provider_identifier: &remote_id.0,
+                    relative_path: previous_path,
+                    event: WindowsCloudFilesProjectionEvent::CloudFilesQuarantineMoveSource,
+                    expected_entity_path: Some(&entity.path),
+                },
+                WindowsCloudFilesProjectionAcknowledgementSpec {
+                    provider_identifier: &remote_id.0,
+                    relative_path: previous_path,
+                    event: WindowsCloudFilesProjectionEvent::WatcherQuarantineMoveSource,
+                    expected_entity_path: Some(&entity.path),
+                },
+            ]);
+        }
+        let recovery = quarantine_windows_cloud_files_projection_namespace(
             state_root,
             &root,
             mount_id,
             remote_id,
+            WindowsCloudFilesProjectionRecoveryOperation::Move,
+            if page_container {
+                WindowsCloudFilesProjectionRecoveryPayloadKind::PageContainer
+            } else {
+                WindowsCloudFilesProjectionRecoveryPayloadKind::File
+            },
+            &previous_namespace_path,
+            &previous_namespace_relative_path,
+            page_container.then(|| Path::new("page.md")),
+            Some(&entity.path),
+            previous_shadow,
             &acknowledgements,
         )?;
-        if let Err(error) = std::fs::rename(&previous_namespace_path, &restored_namespace_path) {
-            revoke_windows_cloud_files_projection_acknowledgements(
-                state_root,
-                &root,
-                mount_id,
-                &acknowledgements,
-            );
-            return Err(LocalityError::from(error));
-        }
-        if let Err(error) = std::fs::write(&restored_projection_path, cache_contents) {
-            return Err(LocalityError::from(error));
-        }
+        report.recovery_paths.push(recovery.quarantine_path);
         report.refreshed += 1;
     }
     Ok(report)
 }
 
-/// Removes an already-materialized Windows Cloud Files replica after its
+/// Quarantines an already-materialized Windows Cloud Files replica after its
 /// created remote entity has been archived and removed from durable state.
 pub fn remove_windows_cloud_files_entity_projection_if_clean(
     state_root: &Path,
@@ -630,99 +716,70 @@ pub fn remove_windows_cloud_files_entity_projection_if_clean(
             report.skipped_local_changes += 1;
             continue;
         }
-        let file_acknowledgements = [
+        let page_container = previous_path
+            .file_name()
+            .is_some_and(|filename| filename == "page.md");
+        let namespace_path = projection_namespace_path(&projection_path);
+        let namespace_relative_path = projection_namespace_path(previous_path);
+        if page_container
+            && !windows_projection_container_contains_only(&namespace_path, &projection_path)
+                .map_err(LocalityError::from)?
+        {
+            return Err(LocalityError::InvalidState(format!(
+                "Windows Cloud Files undo cannot quarantine nonempty page container `{}`",
+                namespace_path.display()
+            )));
+        }
+        let mut acknowledgements = vec![
             WindowsCloudFilesProjectionAcknowledgementSpec {
                 provider_identifier: &entity_id.0,
                 relative_path: previous_path,
-                event: WindowsCloudFilesProjectionEvent::CloudFilesDeleteArchivedEntity,
+                event: WindowsCloudFilesProjectionEvent::CloudFilesQuarantineArchiveSource,
                 expected_entity_path: None,
             },
             WindowsCloudFilesProjectionAcknowledgementSpec {
                 provider_identifier: &entity_id.0,
                 relative_path: previous_path,
-                event: WindowsCloudFilesProjectionEvent::WatcherRemoveArchivedEntity,
+                event: WindowsCloudFilesProjectionEvent::WatcherQuarantineArchiveSource,
                 expected_entity_path: None,
             },
         ];
-        record_windows_cloud_files_projection_acknowledgements(
+        let container_identifier = format!("children:{}", entity_id.0);
+        if page_container {
+            acknowledgements.extend([
+                WindowsCloudFilesProjectionAcknowledgementSpec {
+                    provider_identifier: &container_identifier,
+                    relative_path: &namespace_relative_path,
+                    event: WindowsCloudFilesProjectionEvent::CloudFilesQuarantineArchiveSource,
+                    expected_entity_path: None,
+                },
+                WindowsCloudFilesProjectionAcknowledgementSpec {
+                    provider_identifier: &container_identifier,
+                    relative_path: &namespace_relative_path,
+                    event: WindowsCloudFilesProjectionEvent::WatcherQuarantineArchiveSource,
+                    expected_entity_path: None,
+                },
+            ]);
+        }
+        let recovery = quarantine_windows_cloud_files_projection_namespace(
             state_root,
             &root,
             &mount.mount_id,
             entity_id,
-            &file_acknowledgements,
+            WindowsCloudFilesProjectionRecoveryOperation::Archive,
+            if page_container {
+                WindowsCloudFilesProjectionRecoveryPayloadKind::PageContainer
+            } else {
+                WindowsCloudFilesProjectionRecoveryPayloadKind::File
+            },
+            &namespace_path,
+            &namespace_relative_path,
+            page_container.then(|| Path::new("page.md")),
+            None,
+            previous_shadow,
+            &acknowledgements,
         )?;
-        let page_container = previous_path
-            .file_name()
-            .is_some_and(|filename| filename == "page.md")
-            .then(|| previous_path.parent())
-            .flatten();
-        let container_identifier = format!("children:{}", entity_id.0);
-        let container_acknowledgements = page_container.map(|container| {
-            [
-                WindowsCloudFilesProjectionAcknowledgementSpec {
-                    provider_identifier: &container_identifier,
-                    relative_path: container,
-                    event: WindowsCloudFilesProjectionEvent::CloudFilesDeleteArchivedEntity,
-                    expected_entity_path: None,
-                },
-                WindowsCloudFilesProjectionAcknowledgementSpec {
-                    provider_identifier: &container_identifier,
-                    relative_path: container,
-                    event: WindowsCloudFilesProjectionEvent::WatcherRemoveArchivedEntity,
-                    expected_entity_path: None,
-                },
-            ]
-        });
-        if let Some(container_acknowledgements) = container_acknowledgements.as_ref()
-            && let Err(error) = record_windows_cloud_files_projection_acknowledgements(
-                state_root,
-                &root,
-                &mount.mount_id,
-                entity_id,
-                container_acknowledgements,
-            )
-        {
-            revoke_windows_cloud_files_projection_acknowledgements(
-                state_root,
-                &root,
-                &mount.mount_id,
-                &file_acknowledgements,
-            );
-            return Err(error);
-        }
-        if let Err(error) = std::fs::remove_file(&projection_path) {
-            revoke_windows_cloud_files_projection_acknowledgements(
-                state_root,
-                &root,
-                &mount.mount_id,
-                &file_acknowledgements,
-            );
-            if let Some(container_acknowledgements) = container_acknowledgements.as_ref() {
-                revoke_windows_cloud_files_projection_acknowledgements(
-                    state_root,
-                    &root,
-                    &mount.mount_id,
-                    container_acknowledgements,
-                );
-            }
-            return Err(LocalityError::from(error));
-        }
-        if projection_path
-            .file_name()
-            .is_some_and(|filename| filename == "page.md")
-            && let Some(container) = projection_path.parent()
-        {
-            if std::fs::remove_dir(container).is_err()
-                && let Some(container_acknowledgements) = container_acknowledgements.as_ref()
-            {
-                revoke_windows_cloud_files_projection_acknowledgements(
-                    state_root,
-                    &root,
-                    &mount.mount_id,
-                    container_acknowledgements,
-                );
-            }
-        }
+        report.recovery_paths.push(recovery.quarantine_path);
         report.refreshed += 1;
     }
     Ok(report)
@@ -747,10 +804,12 @@ pub fn record_windows_cloud_files_projection_acknowledgement(
         relative_path,
         event,
         expected_entity_path,
+        None,
         current_unix_millis(),
     )
 }
 
+#[cfg(test)]
 fn record_windows_cloud_files_projection_acknowledgements(
     state_root: &Path,
     access_root: &Path,
@@ -783,6 +842,50 @@ fn record_windows_cloud_files_projection_acknowledgements(
     Ok(())
 }
 
+fn record_windows_cloud_files_projection_acknowledgements_for_quarantine(
+    state_root: &Path,
+    access_root: &Path,
+    mount_id: &MountId,
+    entity_id: &RemoteId,
+    acknowledgements: &[WindowsCloudFilesProjectionAcknowledgementSpec<'_>],
+    quarantine_path: &Path,
+) -> LocalityResult<()> {
+    let mut recorded = Vec::with_capacity(acknowledgements.len());
+    for acknowledgement in acknowledgements {
+        let acknowledgement_quarantine_path = if acknowledgement
+            .relative_path
+            .file_name()
+            .is_some_and(|filename| filename == "page.md")
+        {
+            quarantine_path.join("page.md")
+        } else {
+            quarantine_path.to_path_buf()
+        };
+        if let Err(error) = record_windows_cloud_files_projection_acknowledgement_at(
+            state_root,
+            access_root,
+            mount_id,
+            entity_id,
+            acknowledgement.provider_identifier,
+            acknowledgement.relative_path,
+            acknowledgement.event,
+            acknowledgement.expected_entity_path,
+            Some(&acknowledgement_quarantine_path),
+            current_unix_millis(),
+        ) {
+            revoke_windows_cloud_files_projection_acknowledgements(
+                state_root,
+                access_root,
+                mount_id,
+                &recorded,
+            );
+            return Err(error);
+        }
+        recorded.push(*acknowledgement);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_windows_cloud_files_projection_acknowledgement_at(
     state_root: &Path,
@@ -793,11 +896,21 @@ fn record_windows_cloud_files_projection_acknowledgement_at(
     relative_path: &Path,
     event: WindowsCloudFilesProjectionEvent,
     expected_entity_path: Option<&Path>,
+    quarantine_path: Option<&Path>,
     created_at_unix_ms: u64,
 ) -> LocalityResult<()> {
     validate_windows_projection_relative_path(relative_path)?;
     if let Some(expected_entity_path) = expected_entity_path {
         validate_windows_projection_relative_path(expected_entity_path)?;
+    }
+    if let Some(quarantine_path) = quarantine_path
+        && (!quarantine_path.is_absolute() || quarantine_path.starts_with(access_root))
+    {
+        return Err(LocalityError::InvalidState(format!(
+            "Windows projection quarantine target `{}` must be absolute and outside access root `{}`",
+            quarantine_path.display(),
+            access_root.display()
+        )));
     }
     repair_windows_cloud_files_projection_acknowledgements(state_root, current_unix_millis());
     let acknowledgement = WindowsCloudFilesProjectionAcknowledgement {
@@ -809,6 +922,7 @@ fn record_windows_cloud_files_projection_acknowledgement_at(
         relative_path_key: windows_projection_path_key(relative_path),
         event,
         expected_entity_path_key: expected_entity_path.map(windows_projection_path_key),
+        quarantine_path: quarantine_path.map(Path::to_path_buf),
         created_at_unix_ms,
     };
     let path = windows_cloud_files_projection_acknowledgement_path(
@@ -848,6 +962,56 @@ pub fn consume_windows_cloud_files_projection_acknowledgement(
     event: WindowsCloudFilesProjectionEvent,
     current_entity: Option<&EntityRecord>,
 ) -> bool {
+    consume_windows_cloud_files_projection_acknowledgement_inner(
+        state_root,
+        access_root,
+        mount_id,
+        entity_id,
+        provider_identifier,
+        relative_path,
+        event,
+        current_entity,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn consume_windows_cloud_files_quarantine_acknowledgement(
+    state_root: &Path,
+    access_root: &Path,
+    mount_id: &MountId,
+    entity_id: &RemoteId,
+    provider_identifier: &str,
+    relative_path: &Path,
+    event: WindowsCloudFilesProjectionEvent,
+    current_entity: Option<&EntityRecord>,
+    observed_quarantine_path: Option<&Path>,
+) -> bool {
+    consume_windows_cloud_files_projection_acknowledgement_inner(
+        state_root,
+        access_root,
+        mount_id,
+        entity_id,
+        provider_identifier,
+        relative_path,
+        event,
+        current_entity,
+        observed_quarantine_path,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consume_windows_cloud_files_projection_acknowledgement_inner(
+    state_root: &Path,
+    access_root: &Path,
+    mount_id: &MountId,
+    entity_id: &RemoteId,
+    provider_identifier: &str,
+    relative_path: &Path,
+    event: WindowsCloudFilesProjectionEvent,
+    current_entity: Option<&EntityRecord>,
+    observed_quarantine_path: Option<&Path>,
+) -> bool {
     let now = current_unix_millis();
     repair_windows_cloud_files_projection_acknowledgements(state_root, now);
     let path = windows_cloud_files_projection_acknowledgement_path(
@@ -858,6 +1022,24 @@ pub fn consume_windows_cloud_files_projection_acknowledgement(
         relative_path,
         event,
     );
+    let acknowledgement_before_claim = std::fs::read(&path).ok().and_then(|bytes| {
+        serde_json::from_slice::<WindowsCloudFilesProjectionAcknowledgement>(&bytes).ok()
+    });
+    if acknowledgement_before_claim
+        .as_ref()
+        .is_some_and(|acknowledgement| acknowledgement.quarantine_path.is_some())
+        && !acknowledgement_before_claim
+            .as_ref()
+            .is_some_and(|acknowledgement| {
+                windows_projection_quarantine_acknowledgement_proof_matches(
+                    acknowledgement,
+                    event,
+                    observed_quarantine_path,
+                )
+            })
+    {
+        return false;
+    }
     let claimed = windows_projection_acknowledgement_temporary_path(&path, "claim");
     if std::fs::rename(&path, &claimed).is_err() {
         return false;
@@ -865,31 +1047,576 @@ pub fn consume_windows_cloud_files_projection_acknowledgement(
     let acknowledgement = std::fs::read(&claimed).ok().and_then(|bytes| {
         serde_json::from_slice::<WindowsCloudFilesProjectionAcknowledgement>(&bytes).ok()
     });
-    let _ = std::fs::remove_file(&claimed);
     let Some(acknowledgement) = acknowledgement else {
+        let _ = std::fs::remove_file(&claimed);
         return false;
     };
-    if !windows_projection_acknowledgement_is_current(&acknowledgement, now)
-        || acknowledgement.version != WINDOWS_CLOUD_FILES_PROJECTION_ACK_VERSION
-        || acknowledgement.mount_id != *mount_id
-        || acknowledgement.entity_id != *entity_id
-        || acknowledgement.provider_identifier
-            != normalize_windows_cloud_files_provider_identifier(provider_identifier)
-        || acknowledgement.access_root_key != windows_projection_path_key(access_root)
-        || acknowledgement.relative_path_key != windows_projection_path_key(relative_path)
-        || acknowledgement.event != event
-    {
-        return false;
-    }
-
-    match acknowledgement.expected_entity_path_key.as_deref() {
+    let durable_state_matches = match acknowledgement.expected_entity_path_key.as_deref() {
         Some(expected_path_key) => current_entity.is_some_and(|entity| {
             entity.mount_id == *mount_id
                 && entity.remote_id == *entity_id
                 && windows_projection_path_key(&entity.path) == expected_path_key
         }),
         None => current_entity.is_none(),
+    };
+    let valid = windows_projection_acknowledgement_is_current(&acknowledgement, now)
+        && acknowledgement.version == WINDOWS_CLOUD_FILES_PROJECTION_ACK_VERSION
+        && acknowledgement.mount_id == *mount_id
+        && acknowledgement.entity_id == *entity_id
+        && acknowledgement.provider_identifier
+            == normalize_windows_cloud_files_provider_identifier(provider_identifier)
+        && acknowledgement.access_root_key == windows_projection_path_key(access_root)
+        && acknowledgement.relative_path_key == windows_projection_path_key(relative_path)
+        && acknowledgement.event == event
+        && durable_state_matches
+        && windows_projection_quarantine_acknowledgement_proof_matches(
+            &acknowledgement,
+            event,
+            observed_quarantine_path,
+        );
+    if !valid && acknowledgement.quarantine_path.is_some() {
+        if std::fs::rename(&claimed, &path).is_err() {
+            let _ = std::fs::remove_file(&claimed);
+        }
+        return false;
     }
+    let _ = std::fs::remove_file(&claimed);
+    valid
+}
+
+fn windows_projection_quarantine_acknowledgement_proof_matches(
+    acknowledgement: &WindowsCloudFilesProjectionAcknowledgement,
+    event: WindowsCloudFilesProjectionEvent,
+    observed_quarantine_path: Option<&Path>,
+) -> bool {
+    let Some(quarantine_path) = acknowledgement.quarantine_path.as_deref() else {
+        return !matches!(
+            event,
+            WindowsCloudFilesProjectionEvent::CloudFilesQuarantineMoveSource
+                | WindowsCloudFilesProjectionEvent::WatcherQuarantineMoveSource
+                | WindowsCloudFilesProjectionEvent::CloudFilesQuarantineArchiveSource
+                | WindowsCloudFilesProjectionEvent::WatcherQuarantineArchiveSource
+        );
+    };
+    if matches!(
+        event,
+        WindowsCloudFilesProjectionEvent::CloudFilesQuarantineMoveSource
+            | WindowsCloudFilesProjectionEvent::CloudFilesQuarantineArchiveSource
+    ) && observed_quarantine_path.is_none()
+    {
+        return false;
+    }
+    if observed_quarantine_path.is_some_and(|observed| {
+        windows_projection_path_key(observed) != windows_projection_path_key(quarantine_path)
+    }) {
+        return false;
+    }
+    quarantine_path.try_exists().unwrap_or(false)
+}
+
+pub fn list_windows_cloud_files_projection_recoveries(
+    state_root: &Path,
+) -> LocalityResult<Vec<WindowsCloudFilesProjectionRecovery>> {
+    let directory = windows_cloud_files_projection_recovery_manifest_dir(state_root);
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(LocalityError::from(error)),
+    };
+    let mut latest =
+        std::collections::BTreeMap::<String, WindowsCloudFilesProjectionRecovery>::new();
+    for entry in entries {
+        let entry = entry.map_err(LocalityError::from)?;
+        let path = entry.path();
+        if !entry.file_type().map_err(LocalityError::from)?.is_file()
+            || path.extension().and_then(|extension| extension.to_str()) != Some("json")
+        {
+            continue;
+        }
+        let bytes = std::fs::read(&path).map_err(LocalityError::from)?;
+        let recovery = serde_json::from_slice::<WindowsCloudFilesProjectionRecovery>(&bytes)
+            .map_err(|error| {
+                LocalityError::InvalidState(format!(
+                    "Windows Cloud Files recovery manifest `{}` is malformed: {error}",
+                    path.display()
+                ))
+            })?;
+        validate_windows_cloud_files_projection_recovery_version(&recovery, &path)?;
+        let replace = latest
+            .get(&recovery.recovery_id)
+            .is_none_or(|current| recovery.record_revision > current.record_revision);
+        if replace {
+            latest.insert(recovery.recovery_id.clone(), recovery);
+        }
+    }
+    Ok(latest.into_values().collect())
+}
+
+pub fn repair_windows_cloud_files_projection_recoveries(
+    state_root: &Path,
+    access_root: &Path,
+) -> LocalityResult<Vec<WindowsCloudFilesProjectionRecovery>> {
+    let recoveries = list_windows_cloud_files_projection_recoveries(state_root)?;
+    let now = current_unix_millis();
+    let access_root_key = windows_projection_path_key(access_root);
+    for recovery in &recoveries {
+        if recovery
+            .source_access_root
+            .as_deref()
+            .is_some_and(|root| windows_projection_path_key(root) != access_root_key)
+        {
+            continue;
+        }
+        let source_exists = recovery
+            .source_path
+            .as_deref()
+            .map(Path::try_exists)
+            .transpose()
+            .map_err(LocalityError::from)?
+            .unwrap_or(false);
+        let quarantine_exists = recovery
+            .quarantine_path
+            .try_exists()
+            .map_err(LocalityError::from)?;
+        if recovery.status == WindowsCloudFilesProjectionRecoveryStatus::Prepared {
+            let mut repaired = recovery.clone();
+            repaired.record_revision = repaired.record_revision.saturating_add(1);
+            repaired.updated_at_unix_ms = now;
+            match (source_exists, quarantine_exists) {
+                (true, false) => {
+                    repaired.status = WindowsCloudFilesProjectionRecoveryStatus::SourcePresent;
+                    repaired.review_reason =
+                        Some("prepared recovery did not rename the source namespace".to_string());
+                }
+                (_, true) => {
+                    repaired.status = WindowsCloudFilesProjectionRecoveryStatus::NeedsReview;
+                    repaired.review_reason = Some(
+                        "recovered a quarantine payload after an interrupted namespace rename"
+                            .to_string(),
+                    );
+                    inspect_windows_cloud_files_projection_recovery(&mut repaired);
+                }
+                (false, false) => {
+                    repaired.status = WindowsCloudFilesProjectionRecoveryStatus::Missing;
+                    repaired.review_reason = Some(
+                        "prepared recovery has neither its source nor quarantine payload"
+                            .to_string(),
+                    );
+                }
+            }
+            persist_windows_cloud_files_projection_recovery(state_root, &repaired)?;
+            continue;
+        }
+        if recovery.status == WindowsCloudFilesProjectionRecoveryStatus::QuarantinedClean {
+            let mut inspected = recovery.clone();
+            if !quarantine_exists {
+                inspected.status = WindowsCloudFilesProjectionRecoveryStatus::Missing;
+                inspected.review_reason =
+                    Some("quarantine payload is missing from durable recovery storage".to_string());
+            } else {
+                let previous_hash = inspected.payload_hash.clone();
+                let previous_size = inspected.payload_byte_size;
+                let previous_unexpected = inspected.unexpected_entries.clone();
+                inspect_windows_cloud_files_projection_recovery(&mut inspected);
+                if inspected.payload_hash == previous_hash
+                    && inspected.payload_byte_size == previous_size
+                    && inspected.unexpected_entries == previous_unexpected
+                {
+                    continue;
+                }
+                inspected.status = WindowsCloudFilesProjectionRecoveryStatus::NeedsReview;
+                inspected.review_reason = Some(
+                    "quarantine payload changed after its clean recovery record was written"
+                        .to_string(),
+                );
+            }
+            inspected.record_revision = inspected.record_revision.saturating_add(1);
+            inspected.updated_at_unix_ms = now;
+            persist_windows_cloud_files_projection_recovery(state_root, &inspected)?;
+        }
+    }
+
+    let indexed = list_windows_cloud_files_projection_recoveries(state_root)?
+        .into_iter()
+        .map(|recovery| windows_projection_path_key(&recovery.quarantine_path))
+        .collect::<std::collections::BTreeSet<_>>();
+    let quarantine_root = windows_cloud_files_projection_quarantine_root(access_root)?;
+    match std::fs::read_dir(&quarantine_root) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(LocalityError::from)?;
+                let path = entry.path();
+                if indexed.contains(&windows_projection_path_key(&path)) {
+                    continue;
+                }
+                let metadata = entry.metadata().map_err(LocalityError::from)?;
+                let mut orphan = WindowsCloudFilesProjectionRecovery {
+                    state_version: WINDOWS_CLOUD_FILES_RECOVERY_STATE_VERSION,
+                    min_reader_version: WINDOWS_CLOUD_FILES_RECOVERY_MIN_READER_VERSION,
+                    recovery_id: format!(
+                        "orphan-{:016x}",
+                        stable_projection_ack_hash(&windows_projection_path_key(&path))
+                    ),
+                    record_revision: 1,
+                    mount_id: None,
+                    entity_id: None,
+                    operation: WindowsCloudFilesProjectionRecoveryOperation::Orphan,
+                    payload_kind: if metadata.is_dir() {
+                        WindowsCloudFilesProjectionRecoveryPayloadKind::PageContainer
+                    } else {
+                        WindowsCloudFilesProjectionRecoveryPayloadKind::Unknown
+                    },
+                    status: WindowsCloudFilesProjectionRecoveryStatus::Orphaned,
+                    source_access_root: Some(access_root.to_path_buf()),
+                    source_relative_path: None,
+                    source_path: None,
+                    intended_entity_path: None,
+                    quarantine_path: path,
+                    payload_document_relative_path: None,
+                    payload_byte_size: None,
+                    payload_hash: None,
+                    unexpected_entries: Vec::new(),
+                    review_reason: Some(
+                        "quarantine payload had no durable recovery manifest".to_string(),
+                    ),
+                    created_at_unix_ms: now,
+                    updated_at_unix_ms: now,
+                };
+                inspect_windows_cloud_files_projection_recovery(&mut orphan);
+                persist_windows_cloud_files_projection_recovery(state_root, &orphan)?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(LocalityError::from(error)),
+    }
+    list_windows_cloud_files_projection_recoveries(state_root)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quarantine_windows_cloud_files_projection_namespace(
+    state_root: &Path,
+    access_root: &Path,
+    mount_id: &MountId,
+    entity_id: &RemoteId,
+    operation: WindowsCloudFilesProjectionRecoveryOperation,
+    payload_kind: WindowsCloudFilesProjectionRecoveryPayloadKind,
+    source_path: &Path,
+    source_relative_path: &Path,
+    payload_document_relative_path: Option<&Path>,
+    intended_entity_path: Option<&Path>,
+    previous_shadow: &ShadowDocument,
+    acknowledgements: &[WindowsCloudFilesProjectionAcknowledgementSpec<'_>],
+) -> LocalityResult<WindowsCloudFilesProjectionRecovery> {
+    let _ = repair_windows_cloud_files_projection_recoveries(state_root, access_root)?;
+    let mut recovery = prepare_windows_cloud_files_projection_recovery(
+        state_root,
+        access_root,
+        mount_id,
+        entity_id,
+        operation,
+        payload_kind,
+        source_path,
+        source_relative_path,
+        payload_document_relative_path,
+        intended_entity_path,
+    )?;
+    if let Err(error) = record_windows_cloud_files_projection_acknowledgements_for_quarantine(
+        state_root,
+        access_root,
+        mount_id,
+        entity_id,
+        acknowledgements,
+        &recovery.quarantine_path,
+    ) {
+        record_windows_projection_recovery_source_present(
+            state_root,
+            &mut recovery,
+            "provider acknowledgement recording failed before quarantine rename",
+        );
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(source_path, &recovery.quarantine_path) {
+        revoke_windows_cloud_files_projection_acknowledgements(
+            state_root,
+            access_root,
+            mount_id,
+            acknowledgements,
+        );
+        record_windows_projection_recovery_source_present(
+            state_root,
+            &mut recovery,
+            "atomic quarantine rename failed; source namespace remains in place",
+        );
+        return Err(LocalityError::from(error));
+    }
+
+    recovery.record_revision = recovery.record_revision.saturating_add(1);
+    recovery.updated_at_unix_ms = current_unix_millis();
+    inspect_windows_cloud_files_projection_recovery(&mut recovery);
+    let payload_contents = windows_cloud_files_projection_recovery_document_contents(&recovery);
+    match payload_contents {
+        Ok(contents)
+            if recovery.unexpected_entries.is_empty()
+                && projection_contents_are_replaceable(&contents, Some(previous_shadow)) =>
+        {
+            recovery.status = WindowsCloudFilesProjectionRecoveryStatus::QuarantinedClean;
+            recovery.review_reason = None;
+        }
+        Ok(_) => {
+            recovery.status = WindowsCloudFilesProjectionRecoveryStatus::NeedsReview;
+            recovery.review_reason =
+                Some("quarantined projection changed after the initial clean check".to_string());
+        }
+        Err(error) => {
+            recovery.status = WindowsCloudFilesProjectionRecoveryStatus::NeedsReview;
+            recovery.review_reason = Some(format!(
+                "quarantined projection could not be inspected after rename: {error}"
+            ));
+        }
+    }
+    if let Err(error) = persist_windows_cloud_files_projection_recovery(state_root, &recovery) {
+        return Err(LocalityError::InvalidState(format!(
+            "Windows Cloud Files projection was preserved at `{}` but final recovery metadata could not be written: {error}",
+            recovery.quarantine_path.display()
+        )));
+    }
+    if recovery.status == WindowsCloudFilesProjectionRecoveryStatus::NeedsReview {
+        return Err(LocalityError::InvalidState(format!(
+            "Windows Cloud Files projection changed during reconciliation and was preserved for recovery at `{}`",
+            recovery.quarantine_path.display()
+        )));
+    }
+    Ok(recovery)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_windows_cloud_files_projection_recovery(
+    state_root: &Path,
+    access_root: &Path,
+    mount_id: &MountId,
+    entity_id: &RemoteId,
+    operation: WindowsCloudFilesProjectionRecoveryOperation,
+    payload_kind: WindowsCloudFilesProjectionRecoveryPayloadKind,
+    source_path: &Path,
+    source_relative_path: &Path,
+    payload_document_relative_path: Option<&Path>,
+    intended_entity_path: Option<&Path>,
+) -> LocalityResult<WindowsCloudFilesProjectionRecovery> {
+    static RECOVERY_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let quarantine_root = windows_cloud_files_projection_quarantine_root(access_root)?;
+    std::fs::create_dir_all(&quarantine_root).map_err(LocalityError::from)?;
+    let now = current_unix_millis();
+    let recovery_id = format!(
+        "{:016x}-{}-{}",
+        now,
+        std::process::id(),
+        RECOVERY_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let suffix = match payload_kind {
+        WindowsCloudFilesProjectionRecoveryPayloadKind::PageContainer => "page-container",
+        WindowsCloudFilesProjectionRecoveryPayloadKind::File => "file",
+        WindowsCloudFilesProjectionRecoveryPayloadKind::Unknown => "payload",
+    };
+    let recovery = WindowsCloudFilesProjectionRecovery {
+        state_version: WINDOWS_CLOUD_FILES_RECOVERY_STATE_VERSION,
+        min_reader_version: WINDOWS_CLOUD_FILES_RECOVERY_MIN_READER_VERSION,
+        recovery_id: recovery_id.clone(),
+        record_revision: 1,
+        mount_id: Some(mount_id.clone()),
+        entity_id: Some(entity_id.clone()),
+        operation,
+        payload_kind,
+        status: WindowsCloudFilesProjectionRecoveryStatus::Prepared,
+        source_access_root: Some(access_root.to_path_buf()),
+        source_relative_path: Some(source_relative_path.to_path_buf()),
+        source_path: Some(source_path.to_path_buf()),
+        intended_entity_path: intended_entity_path.map(Path::to_path_buf),
+        quarantine_path: quarantine_root.join(format!("{recovery_id}.{suffix}")),
+        payload_document_relative_path: payload_document_relative_path.map(Path::to_path_buf),
+        payload_byte_size: None,
+        payload_hash: None,
+        unexpected_entries: Vec::new(),
+        review_reason: None,
+        created_at_unix_ms: now,
+        updated_at_unix_ms: now,
+    };
+    persist_windows_cloud_files_projection_recovery(state_root, &recovery)?;
+    Ok(recovery)
+}
+
+fn record_windows_projection_recovery_source_present(
+    state_root: &Path,
+    recovery: &mut WindowsCloudFilesProjectionRecovery,
+    reason: &str,
+) {
+    recovery.record_revision = recovery.record_revision.saturating_add(1);
+    recovery.status = WindowsCloudFilesProjectionRecoveryStatus::SourcePresent;
+    recovery.review_reason = Some(reason.to_string());
+    recovery.updated_at_unix_ms = current_unix_millis();
+    let _ = persist_windows_cloud_files_projection_recovery(state_root, recovery);
+}
+
+fn windows_cloud_files_projection_recovery_manifest_dir(state_root: &Path) -> PathBuf {
+    state_root.join("provider-recovery/windows-cloud-files")
+}
+
+fn windows_cloud_files_projection_quarantine_root(access_root: &Path) -> LocalityResult<PathBuf> {
+    let provider_root = access_root.parent().ok_or_else(|| {
+        LocalityError::InvalidState(format!(
+            "Windows Cloud Files access root `{}` has no provider root",
+            access_root.display()
+        ))
+    })?;
+    let outside_parent = provider_root.parent().ok_or_else(|| {
+        LocalityError::InvalidState(format!(
+            "Windows Cloud Files provider root `{}` has no same-volume recovery parent",
+            provider_root.display()
+        ))
+    })?;
+    let provider_key = windows_projection_path_key(provider_root);
+    Ok(outside_parent
+        .join(".locality-recovery")
+        .join("windows-cloud-files")
+        .join(format!(
+            "{:016x}",
+            stable_projection_ack_hash(&provider_key)
+        )))
+}
+
+fn persist_windows_cloud_files_projection_recovery(
+    state_root: &Path,
+    recovery: &WindowsCloudFilesProjectionRecovery,
+) -> LocalityResult<()> {
+    static MANIFEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let directory = windows_cloud_files_projection_recovery_manifest_dir(state_root);
+    std::fs::create_dir_all(&directory).map_err(LocalityError::from)?;
+    let sequence = MANIFEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = directory.join(format!(
+        "{}-r{:08}-{sequence}.json",
+        recovery.recovery_id, recovery.record_revision
+    ));
+    let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    let bytes = serde_json::to_vec_pretty(recovery)
+        .map_err(|error| LocalityError::InvalidState(error.to_string()))?;
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(LocalityError::from)?;
+    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(LocalityError::from(error));
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(LocalityError::from(error));
+    }
+    Ok(())
+}
+
+fn validate_windows_cloud_files_projection_recovery_version(
+    recovery: &WindowsCloudFilesProjectionRecovery,
+    path: &Path,
+) -> LocalityResult<()> {
+    if recovery.state_version > WINDOWS_CLOUD_FILES_RECOVERY_STATE_VERSION
+        || recovery.min_reader_version > WINDOWS_CLOUD_FILES_RECOVERY_STATE_VERSION
+    {
+        return Err(LocalityError::InvalidState(format!(
+            "update required to read Windows Cloud Files recovery manifest `{}` version {}",
+            path.display(),
+            recovery.state_version
+        )));
+    }
+    if recovery.state_version == 0
+        || recovery.min_reader_version == 0
+        || recovery.min_reader_version > recovery.state_version
+    {
+        return Err(LocalityError::InvalidState(format!(
+            "Windows Cloud Files recovery manifest `{}` has invalid version metadata",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn inspect_windows_cloud_files_projection_recovery(
+    recovery: &mut WindowsCloudFilesProjectionRecovery,
+) {
+    match windows_projection_recovery_unexpected_entries(recovery) {
+        Ok(entries) => recovery.unexpected_entries = entries,
+        Err(error) => {
+            recovery.unexpected_entries.clear();
+            recovery.review_reason = Some(error.to_string());
+        }
+    }
+    match windows_cloud_files_projection_recovery_document_contents(recovery) {
+        Ok(contents) => {
+            recovery.payload_byte_size = Some(contents.len() as u64);
+            recovery.payload_hash =
+                Some(format!("{:016x}", stable_projection_bytes_hash(&contents)));
+        }
+        Err(error) => {
+            recovery.payload_byte_size = None;
+            recovery.payload_hash = None;
+            if recovery.review_reason.is_none() {
+                recovery.review_reason = Some(error.to_string());
+            }
+        }
+    }
+}
+
+fn windows_cloud_files_projection_recovery_document_contents(
+    recovery: &WindowsCloudFilesProjectionRecovery,
+) -> std::io::Result<Vec<u8>> {
+    match recovery.payload_kind {
+        WindowsCloudFilesProjectionRecoveryPayloadKind::File
+        | WindowsCloudFilesProjectionRecoveryPayloadKind::Unknown => {
+            std::fs::read(&recovery.quarantine_path)
+        }
+        WindowsCloudFilesProjectionRecoveryPayloadKind::PageContainer => {
+            let document_relative_path = recovery
+                .payload_document_relative_path
+                .as_deref()
+                .unwrap_or(Path::new("page.md"));
+            std::fs::read(recovery.quarantine_path.join(document_relative_path))
+        }
+    }
+}
+
+fn windows_projection_recovery_unexpected_entries(
+    recovery: &WindowsCloudFilesProjectionRecovery,
+) -> std::io::Result<Vec<PathBuf>> {
+    if recovery.payload_kind != WindowsCloudFilesProjectionRecoveryPayloadKind::PageContainer {
+        return Ok(Vec::new());
+    }
+    let expected = recovery
+        .payload_document_relative_path
+        .as_deref()
+        .unwrap_or(Path::new("page.md"));
+    let mut unexpected = Vec::new();
+    for entry in std::fs::read_dir(&recovery.quarantine_path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let relative = entry_path
+            .strip_prefix(&recovery.quarantine_path)
+            .unwrap_or(&entry_path)
+            .to_path_buf();
+        if windows_projection_path_key(&relative) != windows_projection_path_key(expected) {
+            unexpected.push(relative);
+        }
+    }
+    unexpected.sort();
+    Ok(unexpected)
+}
+
+fn stable_projection_bytes_hash(value: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// Repairs already-materialized macOS File Provider replicas after a background
@@ -1367,6 +2094,22 @@ fn projection_namespace_path(path: &Path) -> PathBuf {
         return path.parent().unwrap_or(path).to_path_buf();
     }
     path.to_path_buf()
+}
+
+fn windows_projection_container_contains_only(
+    container: &Path,
+    expected_file: &Path,
+) -> std::io::Result<bool> {
+    let expected_key = windows_projection_path_key(expected_file);
+    let mut found_expected_file = false;
+    for entry in std::fs::read_dir(container)? {
+        let entry = entry?;
+        if windows_projection_path_key(&entry.path()) != expected_key {
+            return Ok(false);
+        }
+        found_expected_file = true;
+    }
+    Ok(found_expected_file)
 }
 
 fn windows_cloud_files_projection_identifier(remote_id: &RemoteId, path: &Path) -> String {
@@ -2443,6 +3186,7 @@ mod tests {
             relative_path,
             event,
             Some(Path::new("teams/old/Roadmap.md")),
+            None,
             expired_at,
         )
         .expect("record expired acknowledgement");
@@ -2528,6 +3272,218 @@ mod tests {
         ));
 
         let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn windows_quarantine_acknowledgement_requires_materialized_exact_target_before_consumption() {
+        let root = temp_root("loc-windows-quarantine-ack-order");
+        let state_root = root.join("state");
+        let access_root = root.join("provider/notion-main");
+        let quarantine_path = root.join("recovery/page-1.file");
+        let wrong_path = root.join("recovery/wrong.file");
+        fs::create_dir_all(&access_root).expect("create access root");
+        fs::create_dir_all(quarantine_path.parent().expect("quarantine parent"))
+            .expect("create quarantine parent");
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let relative_path = Path::new("teams/new/Roadmap.md");
+        let entity = EntityRecord::new(
+            mount_id.clone(),
+            remote_id.clone(),
+            EntityKind::Page,
+            "Roadmap",
+            "teams/old/Roadmap.md",
+        );
+
+        record_windows_cloud_files_projection_acknowledgement_at(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            "page-1",
+            relative_path,
+            WindowsCloudFilesProjectionEvent::CloudFilesQuarantineMoveSource,
+            Some(&entity.path),
+            Some(&quarantine_path),
+            current_unix_millis(),
+        )
+        .expect("record Cloud Files quarantine acknowledgement");
+        assert!(!consume_windows_cloud_files_quarantine_acknowledgement(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            "page-1",
+            relative_path,
+            WindowsCloudFilesProjectionEvent::CloudFilesQuarantineMoveSource,
+            Some(&entity),
+            Some(&quarantine_path),
+        ));
+        fs::write(&quarantine_path, "preserved").expect("materialize quarantine target");
+        assert!(!consume_windows_cloud_files_quarantine_acknowledgement(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            "page-1",
+            relative_path,
+            WindowsCloudFilesProjectionEvent::CloudFilesQuarantineMoveSource,
+            Some(&entity),
+            Some(&wrong_path),
+        ));
+        assert!(consume_windows_cloud_files_quarantine_acknowledgement(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            "page-1",
+            relative_path,
+            WindowsCloudFilesProjectionEvent::CloudFilesQuarantineMoveSource,
+            Some(&entity),
+            Some(&quarantine_path),
+        ));
+
+        let watcher_quarantine_path = root.join("recovery/page-1-watcher.file");
+        record_windows_cloud_files_projection_acknowledgement_at(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            "page-1",
+            relative_path,
+            WindowsCloudFilesProjectionEvent::WatcherQuarantineMoveSource,
+            Some(&entity.path),
+            Some(&watcher_quarantine_path),
+            current_unix_millis(),
+        )
+        .expect("record watcher quarantine acknowledgement");
+        assert!(!consume_windows_cloud_files_quarantine_acknowledgement(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            "page-1",
+            relative_path,
+            WindowsCloudFilesProjectionEvent::WatcherQuarantineMoveSource,
+            Some(&entity),
+            None,
+        ));
+        fs::write(&watcher_quarantine_path, "preserved")
+            .expect("materialize watcher quarantine target");
+        assert!(consume_windows_cloud_files_quarantine_acknowledgement(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            "page-1",
+            relative_path,
+            WindowsCloudFilesProjectionEvent::WatcherQuarantineMoveSource,
+            Some(&entity),
+            None,
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn windows_projection_recovery_repairs_interrupted_and_source_present_manifests() {
+        let root = temp_root("loc-windows-recovery-repair");
+        let state_root = root.join("state");
+        let access_root = root.join("provider/notion-main");
+        fs::create_dir_all(&access_root).expect("create access root");
+        let mount_id = MountId::new("notion-main");
+        let first_id = RemoteId::new("page-1");
+        let first_source = access_root.join("first.md");
+        fs::write(&first_source, "first").expect("write first source");
+        let first = prepare_windows_cloud_files_projection_recovery(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &first_id,
+            WindowsCloudFilesProjectionRecoveryOperation::Move,
+            WindowsCloudFilesProjectionRecoveryPayloadKind::File,
+            &first_source,
+            Path::new("first.md"),
+            None,
+            Some(Path::new("restored/first.md")),
+        )
+        .expect("prepare source-present recovery");
+
+        let second_id = RemoteId::new("page-2");
+        let second_source = access_root.join("second.md");
+        fs::write(&second_source, "second").expect("write second source");
+        let second = prepare_windows_cloud_files_projection_recovery(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &second_id,
+            WindowsCloudFilesProjectionRecoveryOperation::Move,
+            WindowsCloudFilesProjectionRecoveryPayloadKind::File,
+            &second_source,
+            Path::new("second.md"),
+            None,
+            Some(Path::new("restored/second.md")),
+        )
+        .expect("prepare interrupted recovery");
+        fs::rename(&second_source, &second.quarantine_path).expect("simulate quarantine rename");
+
+        let repaired = repair_windows_cloud_files_projection_recoveries(&state_root, &access_root)
+            .expect("repair recovery manifests");
+        let first = repaired
+            .iter()
+            .find(|recovery| recovery.recovery_id == first.recovery_id)
+            .expect("first recovery");
+        assert_eq!(
+            first.status,
+            WindowsCloudFilesProjectionRecoveryStatus::SourcePresent
+        );
+        let second = repaired
+            .iter()
+            .find(|recovery| recovery.recovery_id == second.recovery_id)
+            .expect("second recovery");
+        assert_eq!(
+            second.status,
+            WindowsCloudFilesProjectionRecoveryStatus::NeedsReview
+        );
+        assert!(second.quarantine_path.is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn windows_projection_recovery_discovers_orphan_and_rejects_newer_state() {
+        let root = temp_root("loc-windows-recovery-orphan");
+        let state_root = root.join("state");
+        let access_root = root.join("provider/notion-main");
+        fs::create_dir_all(&access_root).expect("create access root");
+        let quarantine_root =
+            windows_cloud_files_projection_quarantine_root(&access_root).expect("quarantine root");
+        fs::create_dir_all(&quarantine_root).expect("create quarantine root");
+        let orphan_path = quarantine_root.join("orphan.file");
+        fs::write(&orphan_path, "orphan bytes").expect("write orphan payload");
+
+        let repaired = repair_windows_cloud_files_projection_recoveries(&state_root, &access_root)
+            .expect("discover orphan payload");
+        let orphan = repaired
+            .iter()
+            .find(|recovery| recovery.quarantine_path == orphan_path)
+            .expect("orphan recovery record");
+        assert_eq!(
+            orphan.status,
+            WindowsCloudFilesProjectionRecoveryStatus::Orphaned
+        );
+
+        let mut newer = orphan.clone();
+        newer.recovery_id = "newer-state".to_string();
+        newer.state_version = WINDOWS_CLOUD_FILES_RECOVERY_STATE_VERSION + 1;
+        newer.min_reader_version = newer.state_version;
+        persist_windows_cloud_files_projection_recovery(&state_root, &newer)
+            .expect("persist newer recovery state");
+        let error = list_windows_cloud_files_projection_recoveries(&state_root)
+            .expect_err("newer recovery state must require an update");
+        assert!(error.to_string().contains("update required"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

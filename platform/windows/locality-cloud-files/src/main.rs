@@ -1626,6 +1626,33 @@ impl ProviderContext {
         path: &Path,
         event: localityd::file_provider::WindowsCloudFilesProjectionEvent,
     ) -> bool {
+        self.consume_projection_acknowledgement_inner(identifier, path, event, None, false)
+    }
+
+    fn consume_quarantine_acknowledgement(
+        &self,
+        identifier: &str,
+        path: &Path,
+        event: localityd::file_provider::WindowsCloudFilesProjectionEvent,
+        observed_quarantine_path: Option<&Path>,
+    ) -> bool {
+        self.consume_projection_acknowledgement_inner(
+            identifier,
+            path,
+            event,
+            observed_quarantine_path,
+            true,
+        )
+    }
+
+    fn consume_projection_acknowledgement_inner(
+        &self,
+        identifier: &str,
+        path: &Path,
+        event: localityd::file_provider::WindowsCloudFilesProjectionEvent,
+        observed_quarantine_path: Option<&Path>,
+        quarantine: bool,
+    ) -> bool {
         let Ok(resolved) = self.resolve_identifier(identifier) else {
             return false;
         };
@@ -1642,16 +1669,30 @@ impl ProviderContext {
         let Ok(entity) = store.get_entity(&resolved.mount.mount_id, &remote_id) else {
             return false;
         };
-        localityd::file_provider::consume_windows_cloud_files_projection_acknowledgement(
-            &self.state_dir,
-            &path_match.access_root,
-            &resolved.mount.mount_id,
-            &remote_id,
-            &resolved.daemon_identifier,
-            &path_match.relative_path,
-            event,
-            entity.as_ref(),
-        )
+        if quarantine {
+            localityd::file_provider::consume_windows_cloud_files_quarantine_acknowledgement(
+                &self.state_dir,
+                &path_match.access_root,
+                &resolved.mount.mount_id,
+                &remote_id,
+                &resolved.daemon_identifier,
+                &path_match.relative_path,
+                event,
+                entity.as_ref(),
+                observed_quarantine_path,
+            )
+        } else {
+            localityd::file_provider::consume_windows_cloud_files_projection_acknowledgement(
+                &self.state_dir,
+                &path_match.access_root,
+                &resolved.mount.mount_id,
+                &remote_id,
+                &resolved.daemon_identifier,
+                &path_match.relative_path,
+                event,
+                entity.as_ref(),
+            )
+        }
     }
 
     fn request<T>(
@@ -2013,7 +2054,17 @@ fn handle_local_remove_like_path(
         ));
         return Ok(());
     };
-    if context.consume_projection_acknowledgement(
+    if context.consume_quarantine_acknowledgement(
+        &identifier,
+        &path,
+        localityd::file_provider::WindowsCloudFilesProjectionEvent::WatcherQuarantineMoveSource,
+        None,
+    ) || context.consume_quarantine_acknowledgement(
+        &identifier,
+        &path,
+        localityd::file_provider::WindowsCloudFilesProjectionEvent::WatcherQuarantineArchiveSource,
+        None,
+    ) || context.consume_projection_acknowledgement(
         &identifier,
         &path,
         localityd::file_provider::WindowsCloudFilesProjectionEvent::WatcherRemoveMoveSource,
@@ -2839,7 +2890,31 @@ unsafe fn handle_rename(
     {
         identifier = refreshed;
     }
+    let target_path = pcwstr_to_path(rename.TargetPath)
+        .ok_or_else(|| HelperError::new("invalid_callback", "rename missing target path"))?;
+    let target_path = absolute_cloud_path(context, &target_path);
     if !target_in_scope {
+        if let Some(source_path) = source_path.as_deref()
+            && (context.consume_quarantine_acknowledgement(
+                &identifier,
+                source_path,
+                localityd::file_provider::WindowsCloudFilesProjectionEvent::CloudFilesQuarantineMoveSource,
+                Some(&target_path),
+            ) || context.consume_quarantine_acknowledgement(
+                &identifier,
+                source_path,
+                localityd::file_provider::WindowsCloudFilesProjectionEvent::CloudFilesQuarantineArchiveSource,
+                Some(&target_path),
+            ))
+        {
+            trace_cloud_files(format!(
+                "rename-out acknowledged source=`{}` target=`{}` identity=`{identifier}` reason=quarantined",
+                source_path.display(),
+                target_path.display()
+            ));
+            context.forget_path_identities(source_path);
+            return Ok(());
+        }
         if let Some(source_path) = source_path.as_deref()
             && cloud_path_still_exists_after_remove_settle(source_path)
         {
@@ -2857,9 +2932,6 @@ unsafe fn handle_rename(
         return Ok(());
     }
 
-    let target_path = pcwstr_to_path(rename.TargetPath)
-        .ok_or_else(|| HelperError::new("invalid_callback", "rename missing target path"))?;
-    let target_path = absolute_cloud_path(context, &target_path);
     if context.consume_projection_acknowledgement(
         &identifier,
         &target_path,

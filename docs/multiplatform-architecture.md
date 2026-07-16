@@ -303,14 +303,28 @@ sync-root filesystem watcher, converted to placeholders after the daemon records
 the virtual mutation, and then tracked through the same placeholder identity path
 as existing cloud items.
 
-Remote reconciliation changes durable entity state before updating an existing
-Cloud Files namespace entry. Undo follows that order and only relocates or removes
-a materialized replica that still matches its previous synced shadow. Before the
-filesystem operation, the daemon atomically records short-lived, one-shot
-acknowledgements keyed by mount, access root, normalized provider identity, exact
-relative path, and callback channel. Cloud Filter and watcher notifications each
-consume their own acknowledgement only when durable entity state also matches;
-ordinary, malformed, expired, or unmatched events use the normal mutation path.
+Remote reconciliation changes durable entity and cache state before touching an
+existing Cloud Files namespace entry. Undo never creates destination ancestors
+or writes a restored visible file directly. It atomically moves the verified
+source leaf, or an otherwise-empty page container, to durable same-volume
+recovery storage outside the watched provider root. Provider enumeration later
+rematerializes the authoritative path. Child or untracked page-container content
+makes quarantine fail closed before the namespace move.
+
+Each quarantine has immutable, atomically written recovery manifests with
+`state_version` and `min_reader_version`. A prepared manifest is durable before
+the namespace rename; final records include payload path, size, fingerprint, and
+review state. Next-run repair distinguishes an untouched source from a completed
+quarantine, detects changed or missing recovery bytes, and indexes orphan
+payloads. Recovery payloads are durable user state and are never overwritten or
+deleted by reconciliation.
+
+Short-lived, one-shot provider acknowledgements are keyed by mount, access root,
+normalized identity, exact source path, and callback channel. Quarantine tokens
+are also bound to the unique recovery target and cannot be consumed until it
+exists; Cloud Filter rename-out callbacks must report that exact target. Ordinary,
+malformed, expired, unmatched, and pre-rename user events use the normal mutation
+path.
 
 Current implementation direction: Windows uses the Rust `locality-cloud-files.exe`
 helper. The CLI exposes `loc file-provider start|stop|status|restart` as the

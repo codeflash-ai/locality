@@ -23,7 +23,10 @@ use locality_store::{
     VirtualMutationRecord, VirtualMutationRepository,
 };
 use localityd::file_provider::{
-    WindowsCloudFilesProjectionEvent, consume_windows_cloud_files_projection_acknowledgement,
+    WindowsCloudFilesProjectionEvent, WindowsCloudFilesProjectionRecoveryStatus,
+    consume_windows_cloud_files_projection_acknowledgement,
+    consume_windows_cloud_files_quarantine_acknowledgement,
+    list_windows_cloud_files_projection_recoveries,
 };
 use localityd::virtual_fs::virtual_fs_content_path;
 
@@ -712,7 +715,7 @@ fn virtual_undo_move_relocates_cache_without_recording_local_mutation() {
 }
 
 #[test]
-fn windows_cloud_files_undo_move_relocates_clean_visible_projection_without_local_mutation() {
+fn windows_cloud_files_undo_move_dematerializes_when_destination_parent_is_missing() {
     let fixture = HistoryFixture::new();
     let mut store = InMemoryStateStore::new();
     let (visible_root, state_root, current_path) =
@@ -742,9 +745,110 @@ fn windows_cloud_files_undo_move_relocates_clean_visible_projection_without_loca
 
     assert!(report.ok);
     assert!(!visible_root.join(&current_path).exists());
+    assert!(!visible_root.join(&restored_path).exists());
+    assert!(!visible_root.join("teams/old").exists());
+    let old_cache = virtual_fs_content_path(&state_root, &fixture.mount_id, &current_path)
+        .expect("old cache path");
+    let restored_cache = virtual_fs_content_path(&state_root, &fixture.mount_id, &restored_path)
+        .expect("restored cache path");
+    assert!(!old_cache.exists());
     assert_eq!(
-        fs::read_to_string(visible_root.join(&restored_path))
-            .expect("read restored visible projection"),
+        fs::read_to_string(restored_cache).expect("read restored cache"),
+        expected
+    );
+    let recoveries = list_windows_cloud_files_projection_recoveries(&state_root)
+        .expect("list projection recoveries");
+    assert_eq!(recoveries.len(), 1);
+    assert_eq!(
+        recoveries[0].status,
+        WindowsCloudFilesProjectionRecoveryStatus::QuarantinedClean
+    );
+    assert!(recoveries[0].quarantine_path.is_file());
+    assert!(
+        store
+            .list_virtual_mutations(&fixture.mount_id)
+            .expect("list virtual mutations")
+            .is_empty(),
+        "provider reconciliation must not replay as a local move"
+    );
+    let entity = store
+        .get_entity(&fixture.mount_id, &RemoteId::new("page-1"))
+        .expect("read restored entity")
+        .expect("restored entity");
+    let wrapped_identifier =
+        localityd::virtual_projection::wrap_identifier(&fixture.mount_id, "page-1");
+    assert!(!consume_windows_cloud_files_projection_acknowledgement(
+        &state_root,
+        &visible_root,
+        &fixture.mount_id,
+        &RemoteId::new("page-1"),
+        &wrapped_identifier,
+        &restored_path,
+        WindowsCloudFilesProjectionEvent::CloudFilesRenameTarget,
+        Some(&entity),
+    ));
+    for (event, observed_quarantine_path) in [
+        (
+            WindowsCloudFilesProjectionEvent::CloudFilesQuarantineMoveSource,
+            Some(recoveries[0].quarantine_path.as_path()),
+        ),
+        (
+            WindowsCloudFilesProjectionEvent::WatcherQuarantineMoveSource,
+            None,
+        ),
+    ] {
+        assert!(consume_windows_cloud_files_quarantine_acknowledgement(
+            &state_root,
+            &visible_root,
+            &fixture.mount_id,
+            &RemoteId::new("page-1"),
+            &wrapped_identifier,
+            &current_path,
+            event,
+            Some(&entity),
+            observed_quarantine_path,
+        ));
+    }
+}
+
+#[test]
+fn windows_cloud_files_undo_move_dematerializes_when_destination_parent_exists() {
+    let fixture = HistoryFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let (visible_root, state_root, current_path) =
+        seed_virtual_move_undo(&fixture, &mut store, ProjectionMode::WindowsCloudFiles);
+    let restored_path = PathBuf::from("teams/old/ENG-42 Old title.md");
+    fs::create_dir_all(visible_root.join("teams/old")).expect("create existing destination parent");
+    let expected = render_canonical_markdown(&CanonicalDocument::new(
+        "loc:\n  id: page-1\n  type: page\n  parent: team-old\n  synced_at: now\n  remote_edited_at: now\ntitle: Old title\n",
+        "# Roadmap\n\nOriginal body",
+    ));
+    let observation = RemoteObservation::new(
+        fixture.mount_id.clone(),
+        RemoteId::new("page-1"),
+        EntityKind::Page,
+        "Old title",
+        "ENG-42 Old title.md",
+    )
+    .with_parent(RemoteId::new("team-old"));
+    let mut applier = FakeUndoApplier::default().with_observations(vec![observation]);
+
+    let report = run_undo_with_applier_at_state_root(
+        &mut store,
+        "push-move",
+        &mut applier,
+        Some(&state_root),
+    )
+    .expect("undo Windows Cloud Files move");
+
+    assert!(report.ok);
+    assert!(!visible_root.join(&current_path).exists());
+    assert!(!visible_root.join(&restored_path).exists());
+    assert!(visible_root.join("teams/old").is_dir());
+    let restored_cache = virtual_fs_content_path(&state_root, &fixture.mount_id, &restored_path)
+        .expect("restored cache path");
+    assert_eq!(
+        fs::read_to_string(restored_cache).expect("read restored cache"),
         expected
     );
     assert!(
@@ -760,30 +864,215 @@ fn windows_cloud_files_undo_move_relocates_clean_visible_projection_without_loca
         .expect("restored entity");
     let wrapped_identifier =
         localityd::virtual_projection::wrap_identifier(&fixture.mount_id, "page-1");
-    for (path, event) in [
+    assert!(!consume_windows_cloud_files_projection_acknowledgement(
+        &state_root,
+        &visible_root,
+        &fixture.mount_id,
+        &RemoteId::new("page-1"),
+        &wrapped_identifier,
+        &restored_path,
+        WindowsCloudFilesProjectionEvent::CloudFilesRenameTarget,
+        Some(&entity),
+    ));
+    let recoveries = list_windows_cloud_files_projection_recoveries(&state_root)
+        .expect("list projection recoveries");
+    assert_eq!(recoveries.len(), 1);
+    assert!(recoveries[0].quarantine_path.is_file());
+    for (event, observed_quarantine_path) in [
         (
-            restored_path.as_path(),
-            WindowsCloudFilesProjectionEvent::CloudFilesRenameTarget,
+            WindowsCloudFilesProjectionEvent::CloudFilesQuarantineMoveSource,
+            Some(recoveries[0].quarantine_path.as_path()),
         ),
         (
-            current_path.as_path(),
-            WindowsCloudFilesProjectionEvent::CloudFilesDeleteMoveSource,
-        ),
-        (
-            current_path.as_path(),
-            WindowsCloudFilesProjectionEvent::WatcherRemoveMoveSource,
+            WindowsCloudFilesProjectionEvent::WatcherQuarantineMoveSource,
+            None,
         ),
     ] {
-        assert!(consume_windows_cloud_files_projection_acknowledgement(
+        assert!(consume_windows_cloud_files_quarantine_acknowledgement(
             &state_root,
             &visible_root,
             &fixture.mount_id,
             &RemoteId::new("page-1"),
             &wrapped_identifier,
-            path,
+            &current_path,
             event,
             Some(&entity),
+            observed_quarantine_path,
         ));
+    }
+}
+
+#[test]
+fn windows_cloud_files_undo_move_preserves_nonempty_page_container() {
+    let fixture = HistoryFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let current_path = PathBuf::from("teams/new/New title/page.md");
+    let (visible_root, state_root, current_path) = seed_virtual_move_undo_at(
+        &fixture,
+        &mut store,
+        ProjectionMode::WindowsCloudFiles,
+        current_path,
+    );
+    let current_container = visible_root.join(current_path.parent().expect("current container"));
+    let untracked_path = current_container.join("local-notes.md");
+    fs::write(&untracked_path, "keep this local content").expect("write untracked local content");
+    let restored_path = PathBuf::from("teams/old/Old title/page.md");
+    let observation = RemoteObservation::new(
+        fixture.mount_id.clone(),
+        RemoteId::new("page-1"),
+        EntityKind::Page,
+        "Old title",
+        "Old title/page.md",
+    )
+    .with_parent(RemoteId::new("team-old"));
+    let mut applier = FakeUndoApplier::default().with_observations(vec![observation]);
+
+    run_undo_with_applier_at_state_root(&mut store, "push-move", &mut applier, Some(&state_root))
+        .expect_err("nonempty page container must not be recursively dematerialized");
+
+    assert!(current_container.exists());
+    assert!(visible_root.join(&current_path).exists());
+    assert_eq!(
+        fs::read_to_string(untracked_path).expect("read preserved local content"),
+        "keep this local content"
+    );
+    assert!(!visible_root.join(&restored_path).exists());
+    assert!(!visible_root.join("teams/old").exists());
+    assert!(
+        store
+            .list_virtual_mutations(&fixture.mount_id)
+            .expect("list virtual mutations")
+            .is_empty()
+    );
+    let recoveries = list_windows_cloud_files_projection_recoveries(&state_root)
+        .expect("list projection recoveries");
+    assert!(recoveries.is_empty());
+    let entity = store
+        .get_entity(&fixture.mount_id, &RemoteId::new("page-1"))
+        .expect("read restored entity")
+        .expect("restored entity");
+    let wrapped_file_identifier =
+        localityd::virtual_projection::wrap_identifier(&fixture.mount_id, "page-1");
+    let wrapped_container_identifier =
+        localityd::virtual_projection::wrap_identifier(&fixture.mount_id, "children:page-1");
+    for (identifier, path) in [
+        (wrapped_file_identifier.as_str(), current_path.as_path()),
+        (
+            wrapped_container_identifier.as_str(),
+            current_path.parent().expect("current relative container"),
+        ),
+    ] {
+        for (event, observed_quarantine_path) in [
+            (
+                WindowsCloudFilesProjectionEvent::CloudFilesQuarantineMoveSource,
+                Some(state_root.join("missing-quarantine")),
+            ),
+            (
+                WindowsCloudFilesProjectionEvent::WatcherQuarantineMoveSource,
+                None,
+            ),
+        ] {
+            assert!(!consume_windows_cloud_files_quarantine_acknowledgement(
+                &state_root,
+                &visible_root,
+                &fixture.mount_id,
+                &RemoteId::new("page-1"),
+                identifier,
+                path,
+                event,
+                Some(&entity),
+                observed_quarantine_path.as_deref(),
+            ));
+        }
+    }
+}
+
+#[test]
+fn windows_cloud_files_undo_move_dematerializes_empty_page_container() {
+    let fixture = HistoryFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let current_path = PathBuf::from("teams/new/New title/page.md");
+    let (visible_root, state_root, current_path) = seed_virtual_move_undo_at(
+        &fixture,
+        &mut store,
+        ProjectionMode::WindowsCloudFiles,
+        current_path,
+    );
+    let current_container = visible_root.join(current_path.parent().expect("current container"));
+    let restored_path = PathBuf::from("teams/old/Old title/page.md");
+    let observation = RemoteObservation::new(
+        fixture.mount_id.clone(),
+        RemoteId::new("page-1"),
+        EntityKind::Page,
+        "Old title",
+        "Old title/page.md",
+    )
+    .with_parent(RemoteId::new("team-old"));
+    let mut applier = FakeUndoApplier::default().with_observations(vec![observation]);
+
+    run_undo_with_applier_at_state_root(&mut store, "push-move", &mut applier, Some(&state_root))
+        .expect("dematerialize empty page container");
+
+    assert!(!current_container.exists());
+    assert!(!visible_root.join(&restored_path).exists());
+    assert!(!visible_root.join("teams/old").exists());
+    assert!(
+        store
+            .list_virtual_mutations(&fixture.mount_id)
+            .expect("list virtual mutations")
+            .is_empty()
+    );
+    let recoveries = list_windows_cloud_files_projection_recoveries(&state_root)
+        .expect("list projection recoveries");
+    assert_eq!(recoveries.len(), 1);
+    assert_eq!(
+        recoveries[0].status,
+        WindowsCloudFilesProjectionRecoveryStatus::QuarantinedClean
+    );
+    assert!(recoveries[0].quarantine_path.is_dir());
+    assert!(recoveries[0].quarantine_path.join("page.md").is_file());
+    let entity = store
+        .get_entity(&fixture.mount_id, &RemoteId::new("page-1"))
+        .expect("read restored entity")
+        .expect("restored entity");
+    let wrapped_file_identifier =
+        localityd::virtual_projection::wrap_identifier(&fixture.mount_id, "page-1");
+    let wrapped_container_identifier =
+        localityd::virtual_projection::wrap_identifier(&fixture.mount_id, "children:page-1");
+    for (identifier, path, quarantine_path) in [
+        (
+            wrapped_file_identifier.as_str(),
+            current_path.as_path(),
+            recoveries[0].quarantine_path.join("page.md"),
+        ),
+        (
+            wrapped_container_identifier.as_str(),
+            current_path.parent().expect("current relative container"),
+            recoveries[0].quarantine_path.clone(),
+        ),
+    ] {
+        for (event, observed_quarantine_path) in [
+            (
+                WindowsCloudFilesProjectionEvent::CloudFilesQuarantineMoveSource,
+                Some(quarantine_path.as_path()),
+            ),
+            (
+                WindowsCloudFilesProjectionEvent::WatcherQuarantineMoveSource,
+                None,
+            ),
+        ] {
+            assert!(consume_windows_cloud_files_quarantine_acknowledgement(
+                &state_root,
+                &visible_root,
+                &fixture.mount_id,
+                &RemoteId::new("page-1"),
+                identifier,
+                path,
+                event,
+                Some(&entity),
+                observed_quarantine_path,
+            ));
+        }
     }
 }
 
@@ -1138,17 +1427,24 @@ fn windows_cloud_files_undo_archive_removes_clean_visible_projection_without_loc
     let fixture = HistoryFixture::new();
     let mut store = fixture.store();
     let created_path = seed_created_entity_undo(&fixture, &mut store);
+    let visible_root = fixture.root.join("provider/notion-main");
+    let visible_path = visible_root.join(&created_path);
+    fs::create_dir_all(visible_path.parent().expect("visible parent"))
+        .expect("create visible parent");
+    fs::rename(fixture.root.join(&created_path), &visible_path)
+        .expect("move created projection into provider root");
     let mut mount = store
         .get_mount(&fixture.mount_id)
         .expect("get mount")
         .expect("mount");
+    mount.root = visible_root.clone();
     mount.projection = ProjectionMode::WindowsCloudFiles;
     store.save_mount(mount).expect("save virtual mount");
     let state_root = fixture.root.join("state");
     let cache_path =
         virtual_fs_content_path(&state_root, &fixture.mount_id, &created_path).expect("cache path");
     fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("create cache parent");
-    fs::copy(fixture.root.join(&created_path), &cache_path).expect("seed cache");
+    fs::copy(&visible_path, &cache_path).expect("seed cache");
     let observation = created_entity_observation(&fixture).deleted(true);
     let mut applier = FakeUndoApplier::default()
         .with_changed_remote_ids(vec![RemoteId::new("created-page-1")])
@@ -1164,52 +1460,113 @@ fn windows_cloud_files_undo_archive_removes_clean_visible_projection_without_loc
 
     assert!(report.ok);
     assert!(!cache_path.exists());
-    assert!(!fixture.root.join(&created_path).exists());
+    assert!(!visible_path.exists());
     assert!(
         store
             .list_virtual_mutations(&fixture.mount_id)
             .expect("list virtual mutations")
             .is_empty()
     );
+    let recoveries = list_windows_cloud_files_projection_recoveries(&state_root)
+        .expect("list projection recoveries");
+    assert_eq!(recoveries.len(), 1);
+    assert_eq!(
+        recoveries[0].status,
+        WindowsCloudFilesProjectionRecoveryStatus::QuarantinedClean
+    );
+    assert!(recoveries[0].quarantine_path.join("page.md").is_file());
     let wrapped_file_identifier =
         localityd::virtual_projection::wrap_identifier(&fixture.mount_id, "created-page-1");
     let wrapped_container_identifier = localityd::virtual_projection::wrap_identifier(
         &fixture.mount_id,
         "children:created-page-1",
     );
-    for (identifier, path, event) in [
+    for (identifier, path, event, observed_quarantine_path) in [
         (
             wrapped_file_identifier.as_str(),
             created_path.as_path(),
-            WindowsCloudFilesProjectionEvent::CloudFilesDeleteArchivedEntity,
+            WindowsCloudFilesProjectionEvent::CloudFilesQuarantineArchiveSource,
+            Some(recoveries[0].quarantine_path.join("page.md")),
         ),
         (
             wrapped_file_identifier.as_str(),
             created_path.as_path(),
-            WindowsCloudFilesProjectionEvent::WatcherRemoveArchivedEntity,
+            WindowsCloudFilesProjectionEvent::WatcherQuarantineArchiveSource,
+            None,
         ),
         (
             wrapped_container_identifier.as_str(),
             created_path.parent().expect("created page container"),
-            WindowsCloudFilesProjectionEvent::CloudFilesDeleteArchivedEntity,
+            WindowsCloudFilesProjectionEvent::CloudFilesQuarantineArchiveSource,
+            Some(recoveries[0].quarantine_path.clone()),
         ),
         (
             wrapped_container_identifier.as_str(),
             created_path.parent().expect("created page container"),
-            WindowsCloudFilesProjectionEvent::WatcherRemoveArchivedEntity,
+            WindowsCloudFilesProjectionEvent::WatcherQuarantineArchiveSource,
+            None,
         ),
     ] {
-        assert!(consume_windows_cloud_files_projection_acknowledgement(
+        assert!(consume_windows_cloud_files_quarantine_acknowledgement(
             &state_root,
-            &fixture.root,
+            &visible_root,
             &fixture.mount_id,
             &RemoteId::new("created-page-1"),
             identifier,
             path,
             event,
             None,
+            observed_quarantine_path.as_deref(),
         ));
     }
+}
+
+#[test]
+fn windows_cloud_files_undo_archive_preserves_nonempty_page_container() {
+    let fixture = HistoryFixture::new();
+    let mut store = fixture.store();
+    let created_path = seed_created_entity_undo(&fixture, &mut store);
+    let visible_root = fixture.root.join("provider/notion-main");
+    let visible_path = visible_root.join(&created_path);
+    fs::create_dir_all(visible_path.parent().expect("visible parent"))
+        .expect("create visible parent");
+    fs::rename(fixture.root.join(&created_path), &visible_path)
+        .expect("move created projection into provider root");
+    let untracked_path = visible_path
+        .parent()
+        .expect("page container")
+        .join("local-notes.md");
+    fs::write(&untracked_path, "keep archive notes").expect("write untracked notes");
+    let mut mount = store
+        .get_mount(&fixture.mount_id)
+        .expect("get mount")
+        .expect("mount");
+    mount.root = visible_root;
+    mount.projection = ProjectionMode::WindowsCloudFiles;
+    store.save_mount(mount).expect("save virtual mount");
+    let state_root = fixture.root.join("state");
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, &created_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("create cache parent");
+    fs::copy(&visible_path, &cache_path).expect("seed cache");
+    let observation = created_entity_observation(&fixture).deleted(true);
+    let mut applier = FakeUndoApplier::default()
+        .with_changed_remote_ids(vec![RemoteId::new("created-page-1")])
+        .with_observations(vec![observation]);
+
+    run_undo_with_applier_at_state_root(&mut store, "push-create", &mut applier, Some(&state_root))
+        .expect_err("nonempty archived page container must fail closed");
+
+    assert!(visible_path.is_file());
+    assert_eq!(
+        fs::read_to_string(untracked_path).expect("read untracked notes"),
+        "keep archive notes"
+    );
+    assert!(
+        list_windows_cloud_files_projection_recoveries(&state_root)
+            .expect("list projection recoveries")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1649,10 +2006,23 @@ fn seed_virtual_move_undo(
     store: &mut InMemoryStateStore,
     projection: ProjectionMode,
 ) -> (PathBuf, PathBuf, PathBuf) {
+    seed_virtual_move_undo_at(
+        fixture,
+        store,
+        projection,
+        PathBuf::from("teams/new/ENG-42 New title.md"),
+    )
+}
+
+fn seed_virtual_move_undo_at(
+    fixture: &HistoryFixture,
+    store: &mut InMemoryStateStore,
+    projection: ProjectionMode,
+    current_path: PathBuf,
+) -> (PathBuf, PathBuf, PathBuf) {
     let materialize_visible = projection == ProjectionMode::WindowsCloudFiles;
     let visible_root = fixture.root.join("provider").join("notion-main");
     let state_root = fixture.root.join("state");
-    let current_path = PathBuf::from("teams/new/ENG-42 New title.md");
     store
         .save_mount(
             MountConfig::new(fixture.mount_id.clone(), "notion", visible_root.clone())
