@@ -688,6 +688,11 @@ they call one of the trigger paths above.
   fast-forward hydration, but the observation call itself does not fetch bodies.
 - `observe_batch` is mount-wide metadata discovery. Its upserts remain stubs or
   metadata until a separate hydration trigger fetches their bodies.
+- An accepted batch is not published directly. The daemon reserves a durable
+  discovery transaction from the exact store snapshot used by planning,
+  performs projection work, and only then asks the store to atomically publish
+  the stored commit, checkpoint, and committed marker. Reservation drift leaves
+  the old checkpoint authoritative and requires rollback or review.
 - `list_children` paths must not fetch page bodies according to the connector
   contract.
 - `loc status` and `loc diff` may inspect local projection and shadow state, but

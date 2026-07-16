@@ -15,11 +15,13 @@ use locality_core::planner::PushPlan;
 use locality_core::{LocalityError, LocalityResult};
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState,
-    ConnectorStateRecord, ConnectorStateRepository, DiscoveryRepository, EntityRecord,
-    EntityRepository, FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore,
-    JournalRepository, MetadataDiscoveryJobRecord, MetadataDiscoveryJobRepository,
-    MetadataDiscoveryPriority, MountConfig, MountRepository, RemoteObservationRepository,
-    SqliteStateStore, VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
+    ConnectorStateRecord, ConnectorStateRepository, DiscoveryCommit, DiscoveryRepository,
+    DiscoveryTransactionId, DiscoveryTransactionStatus, EntityRecord, EntityRepository,
+    FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore, JournalRepository,
+    MetadataDiscoveryJobRecord, MetadataDiscoveryJobRepository, MetadataDiscoveryPriority,
+    MountConfig, MountRepository, PreparedDiscoveryTransaction, RemoteObservationRepository,
+    SqliteStateStore, StoreResult, TransactionalDiscoveryCommit, VirtualMutationKind,
+    VirtualMutationRecord, VirtualMutationRepository,
 };
 use localityd::discovery::{
     DiscoveryChangeKind, DiscoveryHoldReason, DiscoveryPlan, DiscoveryPostCommitAction,
@@ -29,6 +31,43 @@ use localityd::discovery::{
 };
 
 const NOW: &str = "unix_ms:100000";
+
+trait DiscoveryTestCommit {
+    fn commit_discovery(&mut self, commit: DiscoveryCommit) -> StoreResult<()>;
+}
+
+impl<S> DiscoveryTestCommit for S
+where
+    S: DiscoveryRepository,
+{
+    fn commit_discovery(&mut self, commit: DiscoveryCommit) -> StoreResult<()> {
+        static TRANSACTION_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let reservation = self.capture_discovery_reservation(&commit.mount_id)?;
+        let projection = reservation.mount.projection.clone();
+        let sequence = TRANSACTION_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let transaction_id = DiscoveryTransactionId::new(format!(
+            "test-unprojected-{}-{sequence}",
+            commit.mount_id.0
+        ));
+        let timestamp = format!("test:{sequence}");
+        self.reserve_discovery_transaction(PreparedDiscoveryTransaction::new(
+            TransactionalDiscoveryCommit::new(transaction_id.clone(), commit),
+            projection,
+            serde_json::json!({"test_only": "unprojected_commit"}),
+            reservation,
+            timestamp.clone(),
+        ))?;
+        self.mark_discovery_transaction_applying(&transaction_id, &timestamp)?;
+        self.mark_discovery_transaction_projected(
+            &transaction_id,
+            DiscoveryTransactionStatus::Applying,
+            &timestamp,
+        )?;
+        self.commit_discovery_transaction(&transaction_id, &timestamp)?;
+        self.mark_discovery_transaction_finalized(&transaction_id, &timestamp)?;
+        Ok(())
+    }
+}
 
 #[test]
 fn projection_components_follow_namespace_ancestry_and_bridge_chains() {

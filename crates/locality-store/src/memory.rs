@@ -12,8 +12,14 @@ use locality_core::journal::{
 };
 use locality_core::model::{MountId, RemoteId};
 use locality_core::shadow::ShadowDocument;
+use serde_json::Value;
 
-use crate::discovery::{DiscoveryCommit, DiscoveryPreflight, DiscoveryRepository};
+use crate::discovery::{
+    DiscoveryCommit, DiscoveryPreflight, DiscoveryRepository, DiscoveryReservation,
+    DiscoveryTransactionId, DiscoveryTransactionRecord, DiscoveryTransactionStatus,
+    PreparedDiscoveryTransaction, prepared_matches_record, record_from_prepared,
+    require_transaction_status, reservation_changed, transaction_missing,
+};
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
@@ -39,6 +45,19 @@ type FreshnessStateKey = (MountId, RemoteId);
 type MetadataDiscoveryJobKey = (MountId, String);
 type ConnectorStateKey = (String, String, String);
 
+fn illegal_transition(
+    transaction_id: &DiscoveryTransactionId,
+    from: DiscoveryTransactionStatus,
+    to: DiscoveryTransactionStatus,
+) -> StoreError {
+    StoreError::InvalidState(format!(
+        "discovery transaction `{}` cannot transition from `{}` to `{}`",
+        transaction_id.0,
+        from.as_str(),
+        to.as_str()
+    ))
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryStateStore {
     mounts: BTreeMap<MountId, MountConfig>,
@@ -56,6 +75,7 @@ pub struct InMemoryStateStore {
     freshness_states: BTreeMap<FreshnessStateKey, FreshnessStateRecord>,
     metadata_discovery_jobs: BTreeMap<MetadataDiscoveryJobKey, MetadataDiscoveryJobRecord>,
     journals: BTreeMap<String, JournalEntry>,
+    discovery_transactions: BTreeMap<DiscoveryTransactionId, DiscoveryTransactionRecord>,
 }
 
 impl InMemoryStateStore {
@@ -255,22 +275,321 @@ impl ConnectorStateRepository for InMemoryStateStore {
 }
 
 impl DiscoveryRepository for InMemoryStateStore {
-    fn commit_discovery(&mut self, commit: DiscoveryCommit) -> StoreResult<()> {
-        commit.validate()?;
+    fn capture_discovery_reservation(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<DiscoveryReservation> {
         let mount = self
             .mounts
-            .get(&commit.mount_id)
-            .ok_or_else(|| StoreError::MountMissing(commit.mount_id.clone()))?;
-        commit.validate_connector(&mount.connector)?;
+            .get(mount_id)
+            .cloned()
+            .ok_or_else(|| StoreError::MountMissing(mount_id.clone()))?;
+        let checkpoint = self
+            .connector_states
+            .get(&(
+                mount.connector.clone(),
+                "mount".to_string(),
+                mount_id.0.clone(),
+            ))
+            .cloned();
+        Ok(DiscoveryReservation {
+            mount,
+            mount_live_mode: self.mount_live_modes.get(mount_id).cloned(),
+            checkpoint,
+            entities: self
+                .entities
+                .values()
+                .filter(|record| record.mount_id == *mount_id)
+                .cloned()
+                .collect(),
+            shadows: self
+                .shadows
+                .values()
+                .filter(|record| record.mount_id == *mount_id)
+                .cloned()
+                .collect(),
+            hydration_jobs: self
+                .hydration_jobs
+                .values()
+                .filter(|record| record.mount_id == *mount_id)
+                .cloned()
+                .collect(),
+            virtual_mutations: self
+                .virtual_mutations
+                .values()
+                .filter(|record| record.mount_id == *mount_id)
+                .cloned()
+                .collect(),
+            auto_save_enrollments: self
+                .auto_save_enrollments
+                .values()
+                .filter(|record| record.mount_id == *mount_id)
+                .cloned()
+                .collect(),
+            remote_observations: self
+                .remote_observations
+                .values()
+                .filter(|record| record.mount_id == *mount_id)
+                .cloned()
+                .collect(),
+            freshness_states: self
+                .freshness_states
+                .values()
+                .filter(|record| record.mount_id == *mount_id)
+                .cloned()
+                .collect(),
+            metadata_discovery_jobs: self
+                .metadata_discovery_jobs
+                .values()
+                .filter(|record| record.mount_id == *mount_id)
+                .cloned()
+                .collect(),
+            unsettled_journals: self
+                .journals
+                .values()
+                .filter(|record| record.mount_id == *mount_id && record.status.is_unsettled())
+                .cloned()
+                .collect(),
+        })
+    }
+
+    fn reserve_discovery_transaction(
+        &mut self,
+        prepared: PreparedDiscoveryTransaction,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        let transaction_id = prepared.commit.transaction_id.clone();
+        if let Some(existing) = self.discovery_transactions.get(&transaction_id) {
+            return if prepared_matches_record(&prepared, existing) {
+                Ok(existing.clone())
+            } else {
+                Err(StoreError::InvalidState(format!(
+                    "discovery transaction `{}` reservation retry does not match its immutable payload",
+                    transaction_id.0
+                )))
+            };
+        }
+        let mount_id = prepared.commit.commit.mount_id.clone();
+        if let Some(active) = self
+            .discovery_transactions
+            .values()
+            .find(|record| record.mount_id == mount_id && record.active)
+        {
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` already has active discovery transaction `{}`",
+                mount_id.0, active.transaction_id.0
+            )));
+        }
+        let current = self.capture_discovery_reservation(&mount_id)?;
+        let record = record_from_prepared(prepared, &current)?;
+        self.discovery_transactions
+            .insert(transaction_id, record.clone());
+        Ok(record)
+    }
+
+    fn get_discovery_transaction(
+        &self,
+        transaction_id: &DiscoveryTransactionId,
+    ) -> StoreResult<Option<DiscoveryTransactionRecord>> {
+        Ok(self.discovery_transactions.get(transaction_id).cloned())
+    }
+
+    fn list_active_discovery_transactions(&self) -> StoreResult<Vec<DiscoveryTransactionRecord>> {
+        let mut records = self
+            .discovery_transactions
+            .values()
+            .filter(|record| record.active)
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            (&left.mount_id, &left.transaction_id).cmp(&(&right.mount_id, &right.transaction_id))
+        });
+        Ok(records)
+    }
+
+    fn mark_discovery_transaction_applying(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        updated_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        self.transition_discovery_transaction(
+            transaction_id,
+            DiscoveryTransactionStatus::Reserved,
+            DiscoveryTransactionStatus::Applying,
+            updated_at,
+        )
+    }
+
+    fn record_discovery_transaction_effects(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        expected_status: DiscoveryTransactionStatus,
+        effects: Value,
+        updated_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        let record = self
+            .discovery_transactions
+            .get_mut(transaction_id)
+            .ok_or_else(|| transaction_missing(transaction_id))?;
+        require_transaction_status(record, expected_status)?;
+        record.effects = crate::discovery::canonicalize_json_value(effects);
+        record.updated_at = updated_at.to_string();
+        Ok(record.clone())
+    }
+
+    fn mark_discovery_transaction_projected(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        expected_status: DiscoveryTransactionStatus,
+        updated_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        if !matches!(
+            expected_status,
+            DiscoveryTransactionStatus::Applying | DiscoveryTransactionStatus::RepairPending
+        ) {
+            return Err(illegal_transition(
+                transaction_id,
+                expected_status,
+                DiscoveryTransactionStatus::Projected,
+            ));
+        }
+        self.transition_discovery_transaction(
+            transaction_id,
+            expected_status,
+            DiscoveryTransactionStatus::Projected,
+            updated_at,
+        )
+    }
+
+    fn commit_discovery_transaction(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        committed_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        let record = self
+            .discovery_transactions
+            .get(transaction_id)
+            .cloned()
+            .ok_or_else(|| transaction_missing(transaction_id))?;
+        require_transaction_status(&record, DiscoveryTransactionStatus::Projected)?;
+        if record.commit.transaction_id != *transaction_id {
+            return Err(StoreError::InvalidState(format!(
+                "discovery transaction `{}` stored commit identifier does not match its row",
+                transaction_id.0
+            )));
+        }
+        let current = self.capture_discovery_reservation(&record.mount_id)?;
+        if let Some(category) = record.reservation.changed_category(&current) {
+            return Err(reservation_changed(transaction_id, category));
+        }
 
         let mut next = self.clone();
-        next.apply_discovery(commit)?;
+        next.apply_discovery(record.commit.commit)?;
+        let committed = next
+            .discovery_transactions
+            .get_mut(transaction_id)
+            .expect("cloned discovery transaction exists");
+        committed.status = DiscoveryTransactionStatus::Committed;
+        committed.active = true;
+        committed.updated_at = committed_at.to_string();
+        committed.committed_at = Some(committed_at.to_string());
+        committed.error = None;
+        let committed = committed.clone();
         *self = next;
-        Ok(())
+        Ok(committed)
+    }
+
+    fn mark_discovery_transaction_repair_pending(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        expected_status: DiscoveryTransactionStatus,
+        error: Value,
+        updated_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        if !matches!(
+            expected_status,
+            DiscoveryTransactionStatus::Applying | DiscoveryTransactionStatus::Projected
+        ) {
+            return Err(illegal_transition(
+                transaction_id,
+                expected_status,
+                DiscoveryTransactionStatus::RepairPending,
+            ));
+        }
+        let record = self
+            .discovery_transactions
+            .get_mut(transaction_id)
+            .ok_or_else(|| transaction_missing(transaction_id))?;
+        require_transaction_status(record, expected_status)?;
+        record.status = DiscoveryTransactionStatus::RepairPending;
+        record.error = Some(crate::discovery::canonicalize_json_value(error));
+        record.updated_at = updated_at.to_string();
+        Ok(record.clone())
+    }
+
+    fn mark_discovery_transaction_aborted(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        expected_status: DiscoveryTransactionStatus,
+        updated_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        if !matches!(
+            expected_status,
+            DiscoveryTransactionStatus::Reserved
+                | DiscoveryTransactionStatus::Applying
+                | DiscoveryTransactionStatus::Projected
+                | DiscoveryTransactionStatus::RepairPending
+        ) {
+            return Err(illegal_transition(
+                transaction_id,
+                expected_status,
+                DiscoveryTransactionStatus::Aborted,
+            ));
+        }
+        self.transition_discovery_transaction(
+            transaction_id,
+            expected_status,
+            DiscoveryTransactionStatus::Aborted,
+            updated_at,
+        )
+    }
+
+    fn mark_discovery_transaction_finalized(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        finalized_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        let mut record = self.transition_discovery_transaction(
+            transaction_id,
+            DiscoveryTransactionStatus::Committed,
+            DiscoveryTransactionStatus::Finalized,
+            finalized_at,
+        )?;
+        record.finalized_at = Some(finalized_at.to_string());
+        self.discovery_transactions
+            .insert(transaction_id.clone(), record.clone());
+        Ok(record)
     }
 }
 
 impl InMemoryStateStore {
+    fn transition_discovery_transaction(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        expected_status: DiscoveryTransactionStatus,
+        next_status: DiscoveryTransactionStatus,
+        updated_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        let record = self
+            .discovery_transactions
+            .get_mut(transaction_id)
+            .ok_or_else(|| transaction_missing(transaction_id))?;
+        require_transaction_status(record, expected_status)?;
+        record.status = next_status;
+        record.active = next_status.is_active();
+        record.updated_at = updated_at.to_string();
+        Ok(record.clone())
+    }
+
     fn apply_discovery(&mut self, commit: DiscoveryCommit) -> StoreResult<()> {
         let mount_id = &commit.mount_id;
         let existing_mount_entities = self

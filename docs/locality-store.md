@@ -47,22 +47,43 @@
   projection layout state to mount-point roots under the shared projection root.
 - SQLite migrates v17 rows to v18 by adding `mounts.settings_json`, a generic
   mount-scoped JSON settings field used by connector-specific mount options.
+- SQLite migrates v18 rows to v19 by adding durable discovery-projection
+  transactions without rewriting or discarding existing mount work.
 - SQLite records component versions for durable subsystems so compatibility is
   decided from persisted state contracts instead of desktop build IDs.
 - SQLite enables WAL mode, a busy timeout, foreign keys, and `PRAGMA user_version` schema versioning.
 
-## Atomic Discovery Commits
+## Durable Discovery Transactions
 
-`DiscoveryRepository::commit_discovery` is the durable boundary for a validated
-connector batch. One commit can upsert and delete entities, upsert remote
-observations and freshness, pause or update auto-save enrollment, explicitly
-remove invalidated metadata jobs and stale virtual mutations, and advance the
-mount-scoped connector checkpoint. The checkpoint insert is the final SQLite
-statement before transaction commit, so a batch checkpoint is never visible
-without all associated entity and hold-state changes.
+Discovery publication requires a `TransactionalDiscoveryCommit`; there is no
+production API that directly applies a bare `DiscoveryCommit`. The daemon first
+captures a mount reservation, prepares its versioned plan, and reserves a
+transaction ID. Reservation is idempotent for the same immutable transaction
+payload, fails closed for a mismatched retry, and permits only one active
+transaction per mount.
 
-The in-memory implementation applies the same contract to a clone and swaps it
-into place only after every check succeeds. SQLite uses one transaction and
+The reservation is a canonical snapshot of the mount, mount Live Mode,
+mount-scoped connector checkpoint, entities, shadows, hydration and metadata
+jobs, virtual mutations, auto-save enrollments, remote observations, freshness,
+and unsettled journals. Credentials, connection secrets, derived search rows,
+and other discovery transactions are excluded. Reserve and commit both recapture
+this state and name only the changed category when rejecting drift; errors do not
+echo document contents or stored metadata.
+
+The daemon advances transactions through `reserved`, `applying`, `projected`,
+`committed`, and `finalized`, with `repair_pending` and `aborted` recovery paths.
+Transitions use compare-and-swap status checks. Only `aborted` and `finalized`
+are inactive, and committed transactions cannot move backward.
+
+`commit_discovery_transaction` loads the stored commit rather than accepting a
+caller replacement. One SQLite transaction revalidates the reservation and
+shared discovery preflight, applies entity and related state changes, advances
+the connector checkpoint, and marks the transaction committed. A checkpoint or
+commit-marker failure rolls back all three. The committed transaction remains
+active until post-commit work explicitly finalizes it.
+
+The in-memory implementation applies the same transaction contract to a clone
+and swaps it into place only after every check succeeds. SQLite uses one transaction and
 temporarily stages changing entity paths, allowing swaps and longer path cycles
 without violating `UNIQUE(mount_id, path)`. Hydration jobs and auto-save
 enrollments follow authoritative entity path changes without resetting failure,
@@ -78,8 +99,10 @@ remote ID. Explicit auto-save upserts can override an automatic rehome only for
 the same owner. A bound upsert must match the remote ID and exact path in the
 final entity map; unbound path-addressed enrollments remain supported.
 
-This contract uses existing tables and existing JSON meanings. It therefore
-does not change `PRAGMA user_version` or any state-component version.
+Plan, commit, reservation, and effect payloads use recursively canonicalized
+versioned JSON envelopes. The required non-rebuildable
+`durable:discovery_projection` component is version 1. Newer row envelopes or
+component versions fail with an update-required compatibility result.
 
 ## SQLite Schema
 
@@ -101,6 +124,9 @@ The first schema keeps high-value lookup fields relational and stores complex co
 - `state_migrations`: append-only migration history for state/schema upgrades;
 - `connector_state`: connector-owned durable state versioned by connector and
   scope, for future connectors and connector-specific migrations;
+- `discovery_projection_transactions`: immutable discovery plans, commits, and
+  reservations plus durable execution effects, status, recovery error, and
+  commit/finalization timestamps;
 - `projection_state`: projection-owned state such as File Provider/FUSE layout
   versions and repair generations.
 
@@ -124,7 +150,7 @@ Shadow blocks, journal plans, journal preimages, and journal apply effects are J
 - Unknown required components block older binaries. Unknown non-required
   rebuildable components are ignored by older binaries.
 
-The SQLite test suite includes a v18 schema snapshot, old-DB migration fixtures,
+The SQLite test suite includes a v19 schema snapshot, old-DB migration fixtures,
 newer-schema detection, newer-component detection, and unknown-component
 compatibility checks. A PR that changes durable state should update these tests
 as part of the same change.

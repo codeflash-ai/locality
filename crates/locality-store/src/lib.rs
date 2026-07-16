@@ -24,7 +24,11 @@ pub use credentials::{
     CredentialError, CredentialResult, CredentialStore, FileCredentialStore,
     InMemoryCredentialStore, open_credential_store,
 };
-pub use discovery::{DiscoveryCommit, DiscoveryRepository, discovery_auto_save_candidate};
+pub use discovery::{
+    DiscoveryCommit, DiscoveryRepository, DiscoveryReservation, DiscoveryTransactionEnvelope,
+    DiscoveryTransactionId, DiscoveryTransactionRecord, DiscoveryTransactionStatus,
+    PreparedDiscoveryTransaction, TransactionalDiscoveryCommit, discovery_auto_save_candidate,
+};
 pub use error::{StoreError, StoreResult};
 pub use live_mode::{
     LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountLiveModeStateChangeError,

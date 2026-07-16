@@ -7,15 +7,53 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use locality_core::journal::JournalEntry;
 use locality_core::model::{MountId, RemoteId};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectorStateRecord, EntityRecord, FreshnessStateRecord,
-    RemoteObservationRecord, VirtualMutationRecord,
+    HydrationJobRecord, MetadataDiscoveryJobRecord, MountConfig, MountLiveModeRecord,
+    ProjectionMode, RemoteObservationRecord, ShadowSnapshotRecord, VirtualMutationRecord,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+pub const DISCOVERY_TRANSACTION_STATE_VERSION: i64 = 1;
+pub const DISCOVERY_TRANSACTION_MIN_READER_VERSION: i64 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DiscoveryTransactionId(pub String);
+
+impl DiscoveryTransactionId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryTransactionEnvelope<T> {
+    pub state_version: i64,
+    pub min_reader_version: i64,
+    pub payload: T,
+}
+
+impl<T> DiscoveryTransactionEnvelope<T> {
+    pub fn current(payload: T) -> Self {
+        Self {
+            state_version: DISCOVERY_TRANSACTION_STATE_VERSION,
+            min_reader_version: DISCOVERY_TRANSACTION_MIN_READER_VERSION,
+            payload,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveryCommit {
     pub mount_id: MountId,
     pub entity_upserts: Vec<EntityRecord>,
@@ -30,8 +68,390 @@ pub struct DiscoveryCommit {
     pub checkpoint: ConnectorStateRecord,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransactionalDiscoveryCommit {
+    pub transaction_id: DiscoveryTransactionId,
+    pub commit: DiscoveryCommit,
+}
+
+impl TransactionalDiscoveryCommit {
+    pub fn new(transaction_id: DiscoveryTransactionId, commit: DiscoveryCommit) -> Self {
+        Self {
+            transaction_id,
+            commit,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryReservation {
+    pub mount: MountConfig,
+    pub mount_live_mode: Option<MountLiveModeRecord>,
+    pub checkpoint: Option<ConnectorStateRecord>,
+    pub entities: Vec<EntityRecord>,
+    pub shadows: Vec<ShadowSnapshotRecord>,
+    pub hydration_jobs: Vec<HydrationJobRecord>,
+    pub virtual_mutations: Vec<VirtualMutationRecord>,
+    pub auto_save_enrollments: Vec<AutoSaveEnrollmentRecord>,
+    pub remote_observations: Vec<RemoteObservationRecord>,
+    pub freshness_states: Vec<FreshnessStateRecord>,
+    pub metadata_discovery_jobs: Vec<MetadataDiscoveryJobRecord>,
+    pub unsettled_journals: Vec<JournalEntry>,
+}
+
+impl DiscoveryReservation {
+    pub(crate) fn changed_category(&self, current: &Self) -> Option<&'static str> {
+        if self.mount != current.mount {
+            Some("mount")
+        } else if self.mount_live_mode != current.mount_live_mode {
+            Some("mount_live_mode")
+        } else if self.checkpoint != current.checkpoint {
+            Some("checkpoint")
+        } else if self.entities != current.entities {
+            Some("entities")
+        } else if self.shadows != current.shadows {
+            Some("shadows")
+        } else if self.hydration_jobs != current.hydration_jobs {
+            Some("hydration_jobs")
+        } else if self.virtual_mutations != current.virtual_mutations {
+            Some("virtual_mutations")
+        } else if self.auto_save_enrollments != current.auto_save_enrollments {
+            Some("auto_save_enrollments")
+        } else if self.remote_observations != current.remote_observations {
+            Some("remote_observations")
+        } else if self.freshness_states != current.freshness_states {
+            Some("freshness_states")
+        } else if self.metadata_discovery_jobs != current.metadata_discovery_jobs {
+            Some("metadata_discovery_jobs")
+        } else if self.unsettled_journals != current.unsettled_journals {
+            Some("unsettled_journals")
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryTransactionStatus {
+    Reserved,
+    Applying,
+    Projected,
+    Committed,
+    RepairPending,
+    Aborted,
+    Finalized,
+}
+
+impl DiscoveryTransactionStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reserved => "reserved",
+            Self::Applying => "applying",
+            Self::Projected => "projected",
+            Self::Committed => "committed",
+            Self::RepairPending => "repair_pending",
+            Self::Aborted => "aborted",
+            Self::Finalized => "finalized",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> StoreResult<Self> {
+        match value {
+            "reserved" => Ok(Self::Reserved),
+            "applying" => Ok(Self::Applying),
+            "projected" => Ok(Self::Projected),
+            "committed" => Ok(Self::Committed),
+            "repair_pending" => Ok(Self::RepairPending),
+            "aborted" => Ok(Self::Aborted),
+            "finalized" => Ok(Self::Finalized),
+            _ => Err(StoreError::InvalidState(format!(
+                "unknown discovery transaction status `{value}`"
+            ))),
+        }
+    }
+
+    pub(crate) fn is_active(self) -> bool {
+        !matches!(self, Self::Aborted | Self::Finalized)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedDiscoveryTransaction {
+    pub commit: TransactionalDiscoveryCommit,
+    pub projection: ProjectionMode,
+    pub plan: Value,
+    pub reservation: DiscoveryReservation,
+    pub effects: Value,
+    pub created_at: String,
+}
+
+impl PreparedDiscoveryTransaction {
+    pub fn new(
+        commit: TransactionalDiscoveryCommit,
+        projection: ProjectionMode,
+        plan: Value,
+        reservation: DiscoveryReservation,
+        created_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            commit,
+            projection,
+            plan: canonicalize_json_value(plan),
+            reservation,
+            effects: Value::Array(Vec::new()),
+            created_at: created_at.into(),
+        }
+    }
+
+    pub fn with_effects(mut self, effects: Value) -> Self {
+        self.effects = canonicalize_json_value(effects);
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscoveryTransactionRecord {
+    pub transaction_id: DiscoveryTransactionId,
+    pub mount_id: MountId,
+    pub projection: ProjectionMode,
+    pub status: DiscoveryTransactionStatus,
+    pub active: bool,
+    pub plan: Value,
+    pub commit: TransactionalDiscoveryCommit,
+    pub reservation: DiscoveryReservation,
+    pub effects: Value,
+    pub error: Option<Value>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub committed_at: Option<String>,
+    pub finalized_at: Option<String>,
+}
+
 pub trait DiscoveryRepository {
-    fn commit_discovery(&mut self, commit: DiscoveryCommit) -> StoreResult<()>;
+    fn capture_discovery_reservation(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<DiscoveryReservation>;
+    fn reserve_discovery_transaction(
+        &mut self,
+        prepared: PreparedDiscoveryTransaction,
+    ) -> StoreResult<DiscoveryTransactionRecord>;
+    fn get_discovery_transaction(
+        &self,
+        transaction_id: &DiscoveryTransactionId,
+    ) -> StoreResult<Option<DiscoveryTransactionRecord>>;
+    fn list_active_discovery_transactions(&self) -> StoreResult<Vec<DiscoveryTransactionRecord>>;
+    fn mark_discovery_transaction_applying(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        updated_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord>;
+    fn record_discovery_transaction_effects(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        expected_status: DiscoveryTransactionStatus,
+        effects: Value,
+        updated_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord>;
+    fn mark_discovery_transaction_projected(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        expected_status: DiscoveryTransactionStatus,
+        updated_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord>;
+    fn commit_discovery_transaction(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        committed_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord>;
+    fn mark_discovery_transaction_repair_pending(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        expected_status: DiscoveryTransactionStatus,
+        error: Value,
+        updated_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord>;
+    fn mark_discovery_transaction_aborted(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        expected_status: DiscoveryTransactionStatus,
+        updated_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord>;
+    fn mark_discovery_transaction_finalized(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        finalized_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord>;
+}
+
+pub(crate) fn canonical_envelope_json<T: Serialize>(payload: &T) -> StoreResult<String> {
+    let envelope = DiscoveryTransactionEnvelope::current(payload);
+    canonical_json(&envelope)
+}
+
+pub(crate) fn decode_envelope<T: DeserializeOwned>(value: &str, label: &str) -> StoreResult<T> {
+    let envelope: DiscoveryTransactionEnvelope<T> = serde_json::from_str(value)?;
+    validate_envelope_version(envelope.state_version, envelope.min_reader_version, label)?;
+    Ok(envelope.payload)
+}
+
+pub(crate) fn validate_envelope_version(
+    state_version: i64,
+    min_reader_version: i64,
+    label: &str,
+) -> StoreResult<()> {
+    if state_version <= 0 || min_reader_version <= 0 || min_reader_version > state_version {
+        return Err(StoreError::InvalidState(format!(
+            "discovery transaction {label} envelope has invalid version metadata"
+        )));
+    }
+    if state_version > DISCOVERY_TRANSACTION_STATE_VERSION
+        || min_reader_version > DISCOVERY_TRANSACTION_STATE_VERSION
+    {
+        return Err(StoreError::StateCompatibility(format!(
+            "discovery transaction {label} envelope requires version {state_version}, supported {}",
+            DISCOVERY_TRANSACTION_STATE_VERSION
+        )));
+    }
+    if state_version != DISCOVERY_TRANSACTION_STATE_VERSION {
+        return Err(StoreError::StateCompatibility(format!(
+            "discovery transaction {label} envelope version {state_version} requires migration"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn canonical_json<T: Serialize>(value: &T) -> StoreResult<String> {
+    let value = serde_json::to_value(value)?;
+    serde_json::to_string(&canonicalize_json_value(value)).map_err(Into::into)
+}
+
+pub(crate) fn canonicalize_json_value(value: Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(canonicalize_json_value).collect())
+        }
+        Value::Object(values) => {
+            let mut entries = values.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, canonicalize_json_value(value)))
+                    .collect(),
+            )
+        }
+        value => value,
+    }
+}
+
+pub(crate) fn record_from_prepared(
+    mut prepared: PreparedDiscoveryTransaction,
+    current: &DiscoveryReservation,
+) -> StoreResult<DiscoveryTransactionRecord> {
+    prepared.plan = canonicalize_json_value(prepared.plan);
+    prepared.effects = canonicalize_json_value(prepared.effects);
+    let transaction_id = &prepared.commit.transaction_id;
+    if transaction_id.0.is_empty() {
+        return Err(StoreError::InvalidState(
+            "discovery transaction identifier cannot be empty".to_string(),
+        ));
+    }
+    if prepared.created_at.is_empty() {
+        return Err(StoreError::InvalidState(format!(
+            "discovery transaction `{}` created_at cannot be empty",
+            transaction_id.0
+        )));
+    }
+    let commit = &prepared.commit.commit;
+    if commit.mount_id != prepared.reservation.mount.mount_id {
+        return Err(StoreError::InvalidState(format!(
+            "discovery transaction `{}` commit mount does not match its reservation",
+            transaction_id.0
+        )));
+    }
+    if prepared.projection != prepared.reservation.mount.projection {
+        return Err(StoreError::InvalidState(format!(
+            "discovery transaction `{}` projection does not match its reservation",
+            transaction_id.0
+        )));
+    }
+    if prepared.projection != current.mount.projection {
+        return Err(StoreError::InvalidState(format!(
+            "discovery transaction `{}` projection does not match current mount projection",
+            transaction_id.0
+        )));
+    }
+    if let Some(category) = prepared.reservation.changed_category(current) {
+        return Err(reservation_changed(transaction_id, category));
+    }
+    commit.preflight_details(
+        &current.mount.connector,
+        &current.entities,
+        &current.auto_save_enrollments,
+        &current.virtual_mutations,
+    )?;
+
+    Ok(DiscoveryTransactionRecord {
+        transaction_id: transaction_id.clone(),
+        mount_id: commit.mount_id.clone(),
+        projection: prepared.projection,
+        status: DiscoveryTransactionStatus::Reserved,
+        active: true,
+        plan: prepared.plan,
+        commit: prepared.commit,
+        reservation: prepared.reservation,
+        effects: prepared.effects,
+        error: None,
+        created_at: prepared.created_at.clone(),
+        updated_at: prepared.created_at,
+        committed_at: None,
+        finalized_at: None,
+    })
+}
+
+pub(crate) fn prepared_matches_record(
+    prepared: &PreparedDiscoveryTransaction,
+    record: &DiscoveryTransactionRecord,
+) -> bool {
+    prepared.commit == record.commit
+        && prepared.projection == record.projection
+        && canonicalize_json_value(prepared.plan.clone()) == record.plan
+        && prepared.reservation == record.reservation
+        && prepared.created_at == record.created_at
+}
+
+pub(crate) fn reservation_changed(
+    transaction_id: &DiscoveryTransactionId,
+    category: &str,
+) -> StoreError {
+    StoreError::InvalidState(format!(
+        "discovery transaction `{}` reservation changed: {category}",
+        transaction_id.0
+    ))
+}
+
+pub(crate) fn transaction_missing(transaction_id: &DiscoveryTransactionId) -> StoreError {
+    StoreError::InvalidState(format!(
+        "discovery transaction `{}` was not found",
+        transaction_id.0
+    ))
+}
+
+pub(crate) fn require_transaction_status(
+    record: &DiscoveryTransactionRecord,
+    expected: DiscoveryTransactionStatus,
+) -> StoreResult<()> {
+    if record.status != expected || !record.active {
+        return Err(StoreError::InvalidState(format!(
+            "discovery transaction `{}` expected active status `{}`, found `{}`",
+            record.transaction_id.0,
+            expected.as_str(),
+            record.status.as_str()
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

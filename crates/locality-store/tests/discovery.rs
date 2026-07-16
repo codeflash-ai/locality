@@ -9,14 +9,444 @@ use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use locality_core::shadow::ShadowDocument;
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, ConnectorStateRecord,
-    ConnectorStateRepository, DiscoveryCommit, DiscoveryRepository, EntityRecord, EntityRepository,
-    EntitySearchRepository, FreshnessStateRecord, FreshnessStateRepository, HydrationJobRecord,
-    HydrationJobRepository, InMemoryStateStore, MetadataDiscoveryJobRecord,
-    MetadataDiscoveryJobRepository, MetadataDiscoveryPriority, MountConfig, MountRepository,
-    RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
-    StoreError, VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
+    ConnectorStateRepository, DiscoveryCommit, DiscoveryRepository, DiscoveryTransactionId,
+    DiscoveryTransactionStatus, EntityRecord, EntityRepository, EntitySearchRepository,
+    FreshnessStateRecord, FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository,
+    InMemoryStateStore, MetadataDiscoveryJobRecord, MetadataDiscoveryJobRepository,
+    MetadataDiscoveryPriority, MountConfig, MountRepository, PreparedDiscoveryTransaction,
+    ProjectionMode, RemoteObservationRecord, RemoteObservationRepository, ShadowRepository,
+    SqliteStateStore, StoreError, StoreResult, TransactionalDiscoveryCommit, VirtualMutationKind,
+    VirtualMutationRecord, VirtualMutationRepository,
 };
 use rusqlite::Connection;
+use serde_json::json;
+
+trait DiscoveryTestCommit {
+    fn commit_discovery(&mut self, commit: DiscoveryCommit) -> StoreResult<()>;
+}
+
+impl<S> DiscoveryTestCommit for S
+where
+    S: DiscoveryRepository,
+{
+    fn commit_discovery(&mut self, commit: DiscoveryCommit) -> StoreResult<()> {
+        static TRANSACTION_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let reservation = self.capture_discovery_reservation(&commit.mount_id)?;
+        let projection = reservation.mount.projection.clone();
+        let sequence = TRANSACTION_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let transaction_id = DiscoveryTransactionId::new(format!(
+            "test-unprojected-{}-{sequence}",
+            commit.mount_id.0
+        ));
+        let timestamp = format!("test:{sequence}");
+        self.reserve_discovery_transaction(PreparedDiscoveryTransaction::new(
+            TransactionalDiscoveryCommit::new(transaction_id.clone(), commit),
+            projection,
+            json!({"test_only": "unprojected_commit"}),
+            reservation,
+            timestamp.clone(),
+        ))?;
+        self.mark_discovery_transaction_applying(&transaction_id, &timestamp)?;
+        self.mark_discovery_transaction_projected(
+            &transaction_id,
+            DiscoveryTransactionStatus::Applying,
+            &timestamp,
+        )?;
+        self.commit_discovery_transaction(&transaction_id, &timestamp)?;
+        self.mark_discovery_transaction_finalized(&transaction_id, &timestamp)?;
+        Ok(())
+    }
+}
+
+#[test]
+fn discovery_transaction_lifecycle_matches_memory_and_sqlite() {
+    let mut memory = InMemoryStateStore::new();
+    exercise_transaction_lifecycle(&mut memory);
+
+    let fixture = SqliteFixture::new();
+    let mut sqlite = fixture.open();
+    exercise_transaction_lifecycle(&mut sqlite);
+}
+
+fn exercise_transaction_lifecycle<S>(store: &mut S)
+where
+    S: DiscoveryRepository + MountRepository + EntityRepository + ConnectorStateRepository,
+{
+    seed_mount(store, MAIN_MOUNT);
+    let transaction_id = DiscoveryTransactionId::new("discovery-1");
+    let commit = DiscoveryCommit {
+        mount_id: mount_id(MAIN_MOUNT),
+        entity_upserts: vec![entity("issue-1", "One/page.md", "One")],
+        entity_deletes: vec![],
+        observation_upserts: vec![],
+        freshness_upserts: vec![],
+        auto_save_upserts: vec![],
+        metadata_discovery_deletes: vec![],
+        virtual_mutation_deletes: vec![],
+        checkpoint: checkpoint(2, r#"{"cursor":"next"}"#),
+    };
+    let reservation = store
+        .capture_discovery_reservation(&mount_id(MAIN_MOUNT))
+        .expect("capture reservation");
+    let prepared = PreparedDiscoveryTransaction::new(
+        TransactionalDiscoveryCommit::new(transaction_id.clone(), commit),
+        ProjectionMode::PlainFiles,
+        json!({"components": []}),
+        reservation,
+        "2026-07-16T00:00:00Z",
+    );
+
+    let reserved = store
+        .reserve_discovery_transaction(prepared)
+        .expect("reserve transaction");
+    assert_eq!(reserved.status, DiscoveryTransactionStatus::Reserved);
+    assert!(reserved.active);
+
+    store
+        .mark_discovery_transaction_applying(&transaction_id, "2026-07-16T00:00:01Z")
+        .expect("mark applying");
+    store
+        .mark_discovery_transaction_projected(
+            &transaction_id,
+            DiscoveryTransactionStatus::Applying,
+            "2026-07-16T00:00:02Z",
+        )
+        .expect("mark projected");
+    let committed = store
+        .commit_discovery_transaction(&transaction_id, "2026-07-16T00:00:03Z")
+        .expect("commit transaction");
+    assert_eq!(committed.status, DiscoveryTransactionStatus::Committed);
+    assert!(committed.active);
+    assert_eq!(
+        store
+            .get_entity(&mount_id(MAIN_MOUNT), &RemoteId::new("issue-1"))
+            .expect("load committed entity")
+            .map(|entity| entity.path),
+        Some(PathBuf::from("One/page.md"))
+    );
+    assert_eq!(
+        store
+            .get_connector_state("linear", "mount", MAIN_MOUNT)
+            .expect("load committed checkpoint")
+            .map(|state| state.state_json),
+        Some(r#"{"cursor":"next"}"#.to_string())
+    );
+
+    let finalized = store
+        .mark_discovery_transaction_finalized(&transaction_id, "2026-07-16T00:00:04Z")
+        .expect("finalize transaction");
+    assert_eq!(finalized.status, DiscoveryTransactionStatus::Finalized);
+    assert!(!finalized.active);
+}
+
+#[test]
+fn discovery_reservation_is_idempotent_immutable_and_exclusive_per_mount() {
+    let mut memory = InMemoryStateStore::new();
+    exercise_reservation_identity(&mut memory);
+
+    let fixture = SqliteFixture::new();
+    let mut sqlite = fixture.open();
+    exercise_reservation_identity(&mut sqlite);
+}
+
+fn exercise_reservation_identity<S>(store: &mut S)
+where
+    S: DiscoveryRepository + MountRepository,
+{
+    seed_mount(store, MAIN_MOUNT);
+    seed_mount(store, OTHER_MOUNT);
+    let prepared = prepared_transaction(
+        store,
+        "transaction-a",
+        empty_commit(MAIN_MOUNT),
+        serde_json::from_str(r#"{"z":{"b":1,"a":2},"a":0}"#).expect("plan json"),
+    );
+    let first = store
+        .reserve_discovery_transaction(prepared.clone())
+        .expect("reserve first");
+    let retry = store
+        .reserve_discovery_transaction(prepared.clone())
+        .expect("idempotent retry");
+    assert_eq!(retry, first);
+    assert_eq!(retry.plan, json!({"a": 0, "z": {"a": 2, "b": 1}}));
+    store
+        .mark_discovery_transaction_applying(
+            &DiscoveryTransactionId::new("transaction-a"),
+            "applying",
+        )
+        .expect("mark applying");
+    store
+        .record_discovery_transaction_effects(
+            &DiscoveryTransactionId::new("transaction-a"),
+            DiscoveryTransactionStatus::Applying,
+            json!({"installed": ["One/page.md"]}),
+            "effect",
+        )
+        .expect("record mutable effects");
+    let progressed_retry = store
+        .reserve_discovery_transaction(prepared.clone())
+        .expect("idempotent retry after progress");
+    assert_eq!(
+        progressed_retry.status,
+        DiscoveryTransactionStatus::Applying
+    );
+    assert_eq!(
+        progressed_retry.effects,
+        json!({"installed": ["One/page.md"]})
+    );
+
+    let mut mismatch = prepared.clone();
+    mismatch.plan = json!({"changed": true});
+    assert_eq!(
+        store.reserve_discovery_transaction(mismatch),
+        Err(StoreError::InvalidState(
+            "discovery transaction `transaction-a` reservation retry does not match its immutable payload"
+                .to_string()
+        ))
+    );
+
+    let competing =
+        prepared_transaction(store, "transaction-b", empty_commit(MAIN_MOUNT), json!({}));
+    assert_eq!(
+        store.reserve_discovery_transaction(competing),
+        Err(StoreError::InvalidState(
+            "mount `linear-main` already has active discovery transaction `transaction-a`"
+                .to_string()
+        ))
+    );
+
+    let mut wrong_projection = prepared_transaction(
+        store,
+        "transaction-wrong-projection",
+        empty_commit(OTHER_MOUNT),
+        json!({}),
+    );
+    wrong_projection.projection = ProjectionMode::LinuxFuse;
+    assert_eq!(
+        store.reserve_discovery_transaction(wrong_projection),
+        Err(StoreError::InvalidState(
+            "discovery transaction `transaction-wrong-projection` projection does not match its reservation"
+                .to_string()
+        ))
+    );
+
+    let other = prepared_transaction(
+        store,
+        "aaa-transaction-other",
+        empty_commit(OTHER_MOUNT),
+        json!({}),
+    );
+    store
+        .reserve_discovery_transaction(other)
+        .expect("different mount can reserve");
+    let active_ids = store
+        .list_active_discovery_transactions()
+        .expect("active transactions")
+        .into_iter()
+        .map(|record| record.transaction_id.0)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        active_ids,
+        vec![
+            "transaction-a".to_string(),
+            "aaa-transaction-other".to_string()
+        ]
+    );
+}
+
+#[test]
+fn discovery_reservation_drift_names_only_the_changed_category() {
+    let mut memory = InMemoryStateStore::new();
+    exercise_reservation_drift(&mut memory);
+
+    let fixture = SqliteFixture::new();
+    let mut sqlite = fixture.open();
+    exercise_reservation_drift(&mut sqlite);
+}
+
+fn exercise_reservation_drift<S>(store: &mut S)
+where
+    S: DiscoveryRepository
+        + MountRepository
+        + EntityRepository
+        + HydrationJobRepository
+        + ConnectorStateRepository,
+{
+    seed_mount(store, MAIN_MOUNT);
+    let transaction_id = DiscoveryTransactionId::new("transaction-drift");
+    store
+        .reserve_discovery_transaction(prepared_transaction(
+            store,
+            transaction_id.as_str(),
+            DiscoveryCommit {
+                entity_upserts: vec![entity("issue-1", "One/page.md", "One")],
+                ..empty_commit(MAIN_MOUNT)
+            },
+            json!({}),
+        ))
+        .expect("reserve");
+    store
+        .mark_discovery_transaction_applying(&transaction_id, "t1")
+        .expect("applying");
+    store
+        .mark_discovery_transaction_projected(
+            &transaction_id,
+            DiscoveryTransactionStatus::Applying,
+            "t2",
+        )
+        .expect("projected");
+    store
+        .upsert_hydration_job(hydration_job("issue-else", "Else/page.md"))
+        .expect("change hydration reservation");
+
+    assert_eq!(
+        store.commit_discovery_transaction(&transaction_id, "t3"),
+        Err(StoreError::InvalidState(
+            "discovery transaction `transaction-drift` reservation changed: hydration_jobs"
+                .to_string()
+        ))
+    );
+    assert!(
+        store
+            .get_entity(&mount_id(MAIN_MOUNT), &RemoteId::new("issue-1"))
+            .expect("entity lookup")
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .get_discovery_transaction(&transaction_id)
+            .expect("transaction lookup")
+            .expect("transaction")
+            .status,
+        DiscoveryTransactionStatus::Projected
+    );
+}
+
+#[test]
+fn discovery_transaction_transitions_are_compare_and_swap_and_committed_is_irreversible() {
+    let mut memory = InMemoryStateStore::new();
+    exercise_transition_guards(&mut memory);
+
+    let fixture = SqliteFixture::new();
+    let mut sqlite = fixture.open();
+    exercise_transition_guards(&mut sqlite);
+}
+
+fn exercise_transition_guards<S>(store: &mut S)
+where
+    S: DiscoveryRepository + MountRepository,
+{
+    seed_mount(store, MAIN_MOUNT);
+    seed_mount(store, OTHER_MOUNT);
+    let transaction_id = DiscoveryTransactionId::new("transaction-cas");
+    store
+        .reserve_discovery_transaction(prepared_transaction(
+            store,
+            transaction_id.as_str(),
+            empty_commit(MAIN_MOUNT),
+            json!({}),
+        ))
+        .expect("reserve");
+    assert_eq!(
+        store.mark_discovery_transaction_projected(
+            &transaction_id,
+            DiscoveryTransactionStatus::Applying,
+            "t1"
+        ),
+        Err(StoreError::InvalidState(
+            "discovery transaction `transaction-cas` expected active status `applying`, found `reserved`"
+                .to_string()
+        ))
+    );
+    store
+        .mark_discovery_transaction_applying(&transaction_id, "t2")
+        .expect("applying");
+    store
+        .mark_discovery_transaction_repair_pending(
+            &transaction_id,
+            DiscoveryTransactionStatus::Applying,
+            json!({"reason": "interrupted"}),
+            "t3",
+        )
+        .expect("repair pending");
+    store
+        .mark_discovery_transaction_projected(
+            &transaction_id,
+            DiscoveryTransactionStatus::RepairPending,
+            "t4",
+        )
+        .expect("repaired projection");
+    store
+        .commit_discovery_transaction(&transaction_id, "t5")
+        .expect("commit");
+    assert_eq!(
+        store.mark_discovery_transaction_aborted(
+            &transaction_id,
+            DiscoveryTransactionStatus::Committed,
+            "t6"
+        ),
+        Err(StoreError::InvalidState(
+            "discovery transaction `transaction-cas` cannot transition from `committed` to `aborted`"
+                .to_string()
+        ))
+    );
+
+    let aborted_id = DiscoveryTransactionId::new("transaction-aborted");
+    let aborted_prepared = prepared_transaction(
+        store,
+        aborted_id.as_str(),
+        empty_commit(OTHER_MOUNT),
+        json!({}),
+    );
+    store
+        .reserve_discovery_transaction(aborted_prepared)
+        .expect("reserve abort candidate");
+    let aborted = store
+        .mark_discovery_transaction_aborted(&aborted_id, DiscoveryTransactionStatus::Reserved, "t7")
+        .expect("abort reserved transaction");
+    assert_eq!(aborted.status, DiscoveryTransactionStatus::Aborted);
+    assert!(!aborted.active);
+}
+
+fn prepared_transaction<S: DiscoveryRepository>(
+    store: &S,
+    transaction_id: &str,
+    commit: DiscoveryCommit,
+    plan: serde_json::Value,
+) -> PreparedDiscoveryTransaction {
+    let reservation = store
+        .capture_discovery_reservation(&commit.mount_id)
+        .expect("capture transaction reservation");
+    PreparedDiscoveryTransaction::new(
+        TransactionalDiscoveryCommit::new(DiscoveryTransactionId::new(transaction_id), commit),
+        reservation.mount.projection.clone(),
+        plan,
+        reservation,
+        "created",
+    )
+}
+
+fn empty_commit(mount: &str) -> DiscoveryCommit {
+    DiscoveryCommit {
+        mount_id: mount_id(mount),
+        entity_upserts: vec![],
+        entity_deletes: vec![],
+        observation_upserts: vec![],
+        freshness_upserts: vec![],
+        auto_save_upserts: vec![],
+        metadata_discovery_deletes: vec![],
+        virtual_mutation_deletes: vec![],
+        checkpoint: ConnectorStateRecord {
+            connector: "linear".to_string(),
+            scope_kind: "mount".to_string(),
+            scope_id: mount.to_string(),
+            state_version: 1,
+            min_reader_version: 1,
+            state_json: "{}".to_string(),
+            updated_at: "created".to_string(),
+        },
+    }
+}
 
 #[test]
 fn discovery_commit_round_trips_in_memory_and_sqlite() {
@@ -289,6 +719,231 @@ fn sqlite_checkpoint_failure_rolls_back_all_discovery_changes() {
             .expect("sqlite index")
             .len(),
         1
+    );
+    let transaction = store
+        .list_active_discovery_transactions()
+        .expect("active transaction")
+        .into_iter()
+        .next()
+        .expect("projected transaction remains");
+    assert_eq!(transaction.status, DiscoveryTransactionStatus::Projected);
+}
+
+#[test]
+fn sqlite_commit_marker_failure_rolls_back_state_and_checkpoint() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    seed_mount(&mut store, MAIN_MOUNT);
+    let old_checkpoint = checkpoint(1, r#"{"cursor":"old"}"#);
+    store
+        .save_connector_state(old_checkpoint.clone())
+        .expect("save old checkpoint");
+    let transaction_id = DiscoveryTransactionId::new("marker-failure");
+    store
+        .reserve_discovery_transaction(prepared_transaction(
+            &store,
+            transaction_id.as_str(),
+            DiscoveryCommit {
+                entity_upserts: vec![entity("issue-1", "New/page.md", "New")],
+                checkpoint: checkpoint(2, r#"{"cursor":"new"}"#),
+                ..empty_commit(MAIN_MOUNT)
+            },
+            json!({}),
+        ))
+        .expect("reserve");
+    store
+        .mark_discovery_transaction_applying(&transaction_id, "t1")
+        .expect("applying");
+    store
+        .mark_discovery_transaction_projected(
+            &transaction_id,
+            DiscoveryTransactionStatus::Applying,
+            "t2",
+        )
+        .expect("projected");
+    let connection = Connection::open(&store.db_path).expect("raw sqlite");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_discovery_commit_marker
+             BEFORE UPDATE OF status ON discovery_projection_transactions
+             WHEN NEW.status = 'committed'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected commit marker failure');
+             END;",
+        )
+        .expect("install marker trigger");
+    drop(connection);
+
+    let error = store
+        .commit_discovery_transaction(&transaction_id, "t3")
+        .expect_err("marker trigger must abort commit");
+    assert!(
+        matches!(error, StoreError::Database(message) if message.contains("injected commit marker failure"))
+    );
+    assert!(
+        store
+            .get_entity(&mount_id(MAIN_MOUNT), &RemoteId::new("issue-1"))
+            .expect("entity lookup")
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .get_connector_state("linear", "mount", MAIN_MOUNT)
+            .expect("checkpoint"),
+        Some(old_checkpoint)
+    );
+    assert_eq!(
+        store
+            .get_discovery_transaction(&transaction_id)
+            .expect("transaction lookup")
+            .expect("transaction")
+            .status,
+        DiscoveryTransactionStatus::Projected
+    );
+}
+
+#[test]
+fn sqlite_discovery_payloads_are_canonical_versioned_and_fail_closed() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    seed_mount(&mut store, MAIN_MOUNT);
+    let transaction_id = DiscoveryTransactionId::new("canonical-envelope");
+    store
+        .reserve_discovery_transaction(prepared_transaction(
+            &store,
+            transaction_id.as_str(),
+            empty_commit(MAIN_MOUNT),
+            serde_json::from_str(r#"{"z":{"b":1,"a":2},"a":0}"#).expect("plan"),
+        ))
+        .expect("reserve");
+    let connection = Connection::open(&store.db_path).expect("raw sqlite");
+    let (plan_json, effects_json, commit_json): (String, String, String) = connection
+        .query_row(
+            "SELECT plan_json, effects_json, commit_json
+             FROM discovery_projection_transactions
+             WHERE transaction_id = 'canonical-envelope'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("transaction json");
+    assert_eq!(
+        plan_json,
+        r#"{"min_reader_version":1,"payload":{"a":0,"z":{"a":2,"b":1}},"state_version":1}"#
+    );
+    assert_eq!(
+        effects_json,
+        r#"{"min_reader_version":1,"payload":[],"state_version":1}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&commit_json).expect("commit envelope")["payload"]
+            ["transaction_id"],
+        json!("canonical-envelope")
+    );
+    let mut mismatched_commit =
+        serde_json::from_str::<serde_json::Value>(&commit_json).expect("commit envelope");
+    mismatched_commit["payload"]["transaction_id"] = json!("different-transaction");
+    connection
+        .execute(
+            "UPDATE discovery_projection_transactions
+             SET commit_json = ?2
+             WHERE transaction_id = ?1",
+            rusqlite::params![transaction_id.as_str(), mismatched_commit.to_string()],
+        )
+        .expect("inject mismatched commit identifier");
+    assert_eq!(
+        store.get_discovery_transaction(&transaction_id),
+        Err(StoreError::InvalidState(
+            "discovery transaction `canonical-envelope` stored commit identifier does not match its row"
+                .to_string()
+        ))
+    );
+    connection
+        .execute(
+            "UPDATE discovery_projection_transactions
+             SET commit_json = ?2
+             WHERE transaction_id = ?1",
+            rusqlite::params![transaction_id.as_str(), commit_json],
+        )
+        .expect("restore commit envelope");
+    connection
+        .execute(
+            "UPDATE discovery_projection_transactions
+             SET plan_json = ?2
+             WHERE transaction_id = ?1",
+            rusqlite::params![
+                transaction_id.as_str(),
+                r#"{"min_reader_version":1,"payload":{},"state_version":2}"#
+            ],
+        )
+        .expect("inject newer envelope");
+    drop(connection);
+
+    assert_eq!(
+        store.get_discovery_transaction(&transaction_id),
+        Err(StoreError::StateCompatibility(
+            "discovery transaction plan envelope requires version 2, supported 1".to_string()
+        ))
+    );
+}
+
+#[test]
+fn sqlite_active_discovery_transaction_blocks_mount_deletion() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    seed_mount(&mut store, MAIN_MOUNT);
+    let transaction_id = DiscoveryTransactionId::new("delete-guard");
+    store
+        .reserve_discovery_transaction(prepared_transaction(
+            &store,
+            transaction_id.as_str(),
+            empty_commit(MAIN_MOUNT),
+            json!({}),
+        ))
+        .expect("reserve");
+    let connection = Connection::open(&store.db_path).expect("raw sqlite");
+    connection
+        .execute_batch("PRAGMA foreign_keys = ON;")
+        .expect("enable foreign keys");
+    let error = connection
+        .execute("DELETE FROM mounts WHERE mount_id = 'linear-main'", [])
+        .expect_err("active transaction must block mount deletion");
+    assert!(error.to_string().contains("active discovery projection"));
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM mounts WHERE mount_id = 'linear-main'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("mount count"),
+        1
+    );
+    drop(connection);
+
+    store
+        .mark_discovery_transaction_aborted(
+            &transaction_id,
+            DiscoveryTransactionStatus::Reserved,
+            "aborted",
+        )
+        .expect("abort transaction");
+    let connection = Connection::open(&store.db_path).expect("raw sqlite after abort");
+    connection
+        .execute_batch("PRAGMA foreign_keys = ON;")
+        .expect("enable foreign keys");
+    connection
+        .execute("DELETE FROM mounts WHERE mount_id = 'linear-main'", [])
+        .expect("terminal transaction allows mount deletion");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM discovery_projection_transactions
+                 WHERE transaction_id = 'delete-guard'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("transaction count"),
+        0
     );
 }
 
