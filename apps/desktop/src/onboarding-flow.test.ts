@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { mountRecoveryEnabled, shouldAutoCreateMount } from "./onboarding-flow";
+import {
+  initialOnboardingStepForRoute,
+  mountProviderSetupRequiredForOnboarding,
+  mountRecoveryEnabled,
+  nextOnboardingStepAfterInitialStepChange,
+  nextOnboardingStepForReadySnapshot,
+  shouldAutoCreateMount,
+} from "./onboarding-flow";
 
 describe("shouldAutoCreateMount", () => {
   it("starts automatic mount creation on the setup step when the workspace is connected", () => {
@@ -110,5 +117,62 @@ describe("mountRecoveryEnabled", () => {
         message: "Could not load the top-level Notion folder",
       }),
     ).toBe(false);
+  });
+});
+
+describe("nextOnboardingStepForReadySnapshot", () => {
+  it("keeps existing macOS File Provider mounts on the approval step until enabled", () => {
+    expect(
+      nextOnboardingStepForReadySnapshot({
+        currentStep: 5,
+        mountMissing: false,
+        connectorSkipsMountStep: false,
+        providerApprovalRequired: true,
+      }),
+    ).toBe(4);
+  });
+});
+
+describe("initialOnboardingStepForRoute", () => {
+  it("starts forced onboarding at the macOS approval step when provider approval is pending", () => {
+    expect(
+      initialOnboardingStepForRoute({
+        route: "#onboarding",
+        providerApprovalRequired: true,
+      }),
+    ).toBe(4);
+  });
+});
+
+describe("nextOnboardingStepAfterInitialStepChange", () => {
+  it("moves an already mounted onboarding view to the latest parent-selected step", () => {
+    expect(
+      nextOnboardingStepAfterInitialStepChange({
+        currentStep: 3,
+        initialStep: 4,
+      }),
+    ).toBe(4);
+  });
+});
+
+describe("mountProviderSetupRequiredForOnboarding", () => {
+  it("requires the macOS setup step while the File Provider domain is unregistered", () => {
+    expect(
+      mountProviderSetupRequiredForOnboarding({
+        mountStatus: "provider_unregistered",
+        providerState: "running",
+        providerRegistered: false,
+      }),
+    ).toBe(true);
+  });
+
+  it("requires the macOS setup step while provider status cannot be inspected", () => {
+    expect(
+      mountProviderSetupRequiredForOnboarding({
+        mountStatus: "provider_error",
+        providerState: "error",
+        providerRegistered: null,
+      }),
+    ).toBe(true);
   });
 });

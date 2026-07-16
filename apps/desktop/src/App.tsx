@@ -55,7 +55,14 @@ import {
 } from "./mounts";
 import { connectionMissing, connectionReady } from "./connection-state";
 import { copyLoginLinkDisabled, loginLinkFlowMode } from "./onboarding-connect";
-import { mountRecoveryEnabled, shouldAutoCreateMount } from "./onboarding-flow";
+import {
+  initialOnboardingStepForRoute,
+  mountProviderSetupRequiredForOnboarding,
+  mountRecoveryEnabled,
+  nextOnboardingStepAfterInitialStepChange,
+  nextOnboardingStepForReadySnapshot,
+  shouldAutoCreateMount,
+} from "./onboarding-flow";
 import { classifyMountSetupError } from "./onboarding-errors";
 import {
   automaticMountOnboardingAction,
@@ -66,6 +73,7 @@ import {
   mountOnboardingNextAction,
   mountOnboardingPrimaryLabel,
   mountOnboardingSupplementaryNote,
+  providerSetupMountOnboardingReport,
   type WorkspaceMountOnboardingCommandAction,
   type WorkspaceMountOnboardingReport,
 } from "./onboarding-mount";
@@ -1082,7 +1090,10 @@ export default function App() {
   );
   const [onboardingKey, setOnboardingKey] = useState(0);
   const [onboardingInitialStep, setOnboardingInitialStep] = useState<OnboardingStep>(() =>
-    initialRoute === "#onboarding-ready" ? 5 : 1,
+    initialOnboardingStepForRoute({
+      route: initialRoute,
+      providerApprovalRequired: false,
+    }) as OnboardingStep,
   );
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>(emptyUpdateStatus);
   const updateStatusRef = useRef<UpdateStatus>(updateStatus);
@@ -1399,13 +1410,23 @@ export default function App() {
     }
 
     if (route === "#onboarding-ready") {
-      setOnboardingInitialStep(5);
+      setOnboardingInitialStep(
+        initialOnboardingStepForRoute({
+          route,
+          providerApprovalRequired: mountProviderApprovalRequired(snapshot),
+        }) as OnboardingStep,
+      );
       setShowOnboarding(true);
       return;
     }
 
     if (routeShouldShowOnboarding(route, snapshot)) {
-      setOnboardingInitialStep(1);
+      setOnboardingInitialStep(
+        initialOnboardingStepForRoute({
+          route,
+          providerApprovalRequired: mountProviderApprovalRequired(snapshot),
+        }) as OnboardingStep,
+      );
       setShowOnboarding(true);
       return;
     }
@@ -1628,8 +1649,37 @@ function Onboarding({
   }
 
   useEffect(() => {
+    setStep((current) =>
+      nextOnboardingStepAfterInitialStepChange({
+        currentStep: current,
+        initialStep,
+      }) as OnboardingStep,
+    );
+  }, [initialStep]);
+
+  useEffect(() => {
     setConnectedWorkspace(snapshot.connection.workspaceName);
   }, [snapshot.connection.workspaceName]);
+
+  useEffect(() => {
+    setMountOnboarding((current) => {
+      if (mountProviderApprovalRequired(snapshot)) {
+        if (current?.state === "approval_required") {
+          return current;
+        }
+        return providerSetupMountOnboardingReport(snapshot.mount.provider?.message);
+      }
+      if (current?.state === "approval_required") {
+        return null;
+      }
+      return current;
+    });
+  }, [
+    snapshot.mount.provider?.message,
+    snapshot.mount.provider?.registered,
+    snapshot.mount.provider?.state,
+    snapshot.mount.status,
+  ]);
 
   useEffect(() => {
     const connector = onboardingConnectorFromSnapshot(snapshot);
@@ -1681,10 +1731,11 @@ function Onboarding({
   }, [oauthInFlight]);
 
   useEffect(() => {
+    const providerApprovalRequired = mountProviderApprovalRequired(snapshot);
     if (
       !snapshotLoaded ||
-      window.location.hash === "#onboarding" ||
-      window.location.hash === "#onboarding-ready" ||
+      (window.location.hash === "#onboarding" && !providerApprovalRequired) ||
+      (window.location.hash === "#onboarding-ready" && !providerApprovalRequired) ||
       connectionMissing(snapshot)
     ) {
       return;
@@ -1698,13 +1749,12 @@ function Onboarding({
       setConnectedOnboardingConnector(connector);
     }
     setStep((current) => {
-      if (mountMissing(snapshot)) {
-        if (connectorSkipsMountStep(connector)) {
-          return current < 3 ? 3 : current;
-        }
-        return current < 4 ? 4 : current;
-      }
-      return current < 5 ? 5 : current;
+      return nextOnboardingStepForReadySnapshot({
+        currentStep: current,
+        mountMissing: mountMissing(snapshot),
+        connectorSkipsMountStep: connectorSkipsMountStep(connector),
+        providerApprovalRequired,
+      }) as OnboardingStep;
     });
   }, [snapshot.connection.connector, snapshot.connection.status, snapshot.mount.connector, snapshot.mount.status, snapshotLoaded]);
 
@@ -7312,6 +7362,14 @@ function Metric({ label, value }: { label: string; value: React.ReactNode }) {
 
 function mountMissing(snapshot: DesktopSnapshot) {
   return snapshot.mount.status === "not_mounted";
+}
+
+function mountProviderApprovalRequired(snapshot: DesktopSnapshot) {
+  return mountProviderSetupRequiredForOnboarding({
+    mountStatus: snapshot.mount.status,
+    providerState: snapshot.mount.provider?.state,
+    providerRegistered: snapshot.mount.provider?.registered,
+  });
 }
 
 function normalizeAppView(value: string): AppView | null {

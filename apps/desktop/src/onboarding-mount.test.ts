@@ -8,6 +8,7 @@ import {
   mountOnboardingNextAction,
   mountOnboardingPrimaryLabel,
   mountOnboardingSupplementaryNote,
+  providerSetupMountOnboardingReport,
   type WorkspaceMountOnboardingReport,
 } from "./onboarding-mount";
 
@@ -108,6 +109,16 @@ describe("mount onboarding helpers", () => {
       "check_again",
     );
     expect(mountOnboardingNextAction(report({ primaryAction: "retry_setup" }))).toBe("start");
+  });
+
+  it("maps provider setup state to the approval action report", () => {
+    expect(
+      providerSetupMountOnboardingReport("The Locality File Provider is registered but not enabled."),
+    ).toEqual(
+      report({
+        message: "The Locality File Provider is registered but not enabled.",
+      }),
+    );
   });
 
   it("uses a non-approval command for automatic restore checks", () => {

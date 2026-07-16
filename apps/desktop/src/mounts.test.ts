@@ -193,6 +193,7 @@ describe("mount display helpers", () => {
     ).toBe("warn");
     expect(mountStatusTone(mount({ status: "provider_stopped" }))).toBe("danger");
     expect(mountStatusTone(mount({ status: "provider_error" }))).toBe("danger");
+    expect(mountStatusTone(mount({ status: "provider_approval_required" }))).toBe("warn");
   });
 });
 

@@ -91,6 +91,19 @@ export function mountOnboardingSupplementaryNote(
   return "Locality is waiting for macOS to create the CloudStorage folder before the final onboarding step can continue.";
 }
 
+export function providerSetupMountOnboardingReport(
+  message: string | null | undefined,
+): WorkspaceMountOnboardingReport {
+  return {
+    state: "approval_required",
+    message:
+      message?.trim() ||
+      "Click OK in the macOS \"Start Syncing\" prompt. Locality will continue once macOS enables the CloudStorage folder.",
+    primaryAction: "allow_in_macos",
+    launchStrategy: "instructions_only",
+  };
+}
+
 export function mountOnboardingNextAction(
   report: WorkspaceMountOnboardingReport | null,
 ): WorkspaceMountOnboardingCommandAction {

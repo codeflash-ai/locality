@@ -3677,7 +3677,6 @@ fn load_desktop_snapshot_from_store(
     let journals = store.list_journal().unwrap_or_default();
     let mount = choose_mount(&mounts, &connections);
     let connection = choose_connection(&connections, mount.as_ref());
-    let needs_onboarding = desktop_needs_onboarding(connection.as_ref(), mount.as_ref());
     let pending_changes = match mount.as_ref() {
         Some(mount) => pending_changes_for_mount(store, state_root, &mount.mount_id)?,
         None => Vec::new(),
@@ -3706,6 +3705,11 @@ fn load_desktop_snapshot_from_store(
     let provider = mount
         .as_ref()
         .and_then(|mount| provider_runtime_summary(state_root, mount));
+    let needs_onboarding = desktop_needs_onboarding_with_provider(
+        connection.as_ref(),
+        mount.as_ref(),
+        provider.as_ref(),
+    );
     let live_mode = mount_live_mode_summary(store, mount.as_ref(), &pending_changes);
     let recent_files = match mount.as_ref() {
         Some(mount) if desktop_mount_has_current_access(mount, connection.as_ref()) => {
@@ -3825,11 +3829,30 @@ fn choose_mount(mounts: &[MountConfig], connections: &[ConnectionRecord]) -> Opt
         .cloned()
 }
 
+#[cfg(test)]
 fn desktop_needs_onboarding(
     connection: Option<&ConnectionRecord>,
     mount: Option<&MountConfig>,
 ) -> bool {
-    !matches!(connection, Some(connection) if connection.status == "active") || mount.is_none()
+    desktop_needs_onboarding_with_provider(connection, mount, None)
+}
+
+fn desktop_needs_onboarding_with_provider(
+    connection: Option<&ConnectionRecord>,
+    mount: Option<&MountConfig>,
+    provider: Option<&ProviderRuntimeSummary>,
+) -> bool {
+    !matches!(connection, Some(connection) if connection.status == "active")
+        || mount.is_none()
+        || provider_is_waiting_for_user_setup(provider)
+}
+
+fn provider_is_waiting_for_user_setup(provider: Option<&ProviderRuntimeSummary>) -> bool {
+    provider.is_some_and(|provider| {
+        provider.state == "approval_required"
+            || provider.state == "error"
+            || provider.registered == Some(false)
+    })
 }
 
 fn desktop_mount_has_current_access(
@@ -4087,6 +4110,7 @@ fn mount_live_mode_state_label(record: &MountLiveModeRecord) -> (&'static str, &
 
 fn mount_status_from_provider(provider: &ProviderRuntimeSummary) -> Option<&'static str> {
     match provider.state.as_str() {
+        "approval_required" => Some("provider_approval_required"),
         "running" if provider.registered == Some(false) => Some("provider_unregistered"),
         "running" => Some("ready"),
         "stopped" => Some("provider_stopped"),
@@ -4106,9 +4130,95 @@ fn provider_runtime_summary(
         ProjectionMode::WindowsCloudFiles => {
             Some(windows_cloud_files_provider_status(state_root, mount))
         }
-        ProjectionMode::MacosFileProvider
-        | ProjectionMode::LinuxFuse
-        | ProjectionMode::PlainFiles => None,
+        ProjectionMode::MacosFileProvider => macos_file_provider_status(state_root),
+        ProjectionMode::LinuxFuse | ProjectionMode::PlainFiles => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_provider_status(state_root: &Path) -> Option<ProviderRuntimeSummary> {
+    let daemon_running = daemon_is_ready(state_root);
+    Some(match run_macos_file_provider_helper("list", Vec::new()) {
+        Ok(report) => {
+            macos_file_provider_status_from_helper_report(&report.helper_report, daemon_running)
+        }
+        Err(error) => ProviderRuntimeSummary {
+            state: "error".to_string(),
+            message: format!("Could not inspect macOS File Provider: {}", error.message()),
+            daemon_running,
+            registered: None,
+            pid: None,
+            stale_pid_file: false,
+        },
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_file_provider_status(_state_root: &Path) -> Option<ProviderRuntimeSummary> {
+    None
+}
+
+fn macos_file_provider_status_from_helper_report(
+    helper_report: &serde_json::Value,
+    daemon_running: bool,
+) -> ProviderRuntimeSummary {
+    let domain = helper_report
+        .get("domains")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|domains| {
+            domains.iter().find(|domain| {
+                domain.get("identifier").and_then(serde_json::Value::as_str)
+                    == Some(localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
+            })
+        });
+
+    let Some(domain) = domain else {
+        return ProviderRuntimeSummary {
+            state: "running".to_string(),
+            message: "macOS File Provider domain is not registered.".to_string(),
+            daemon_running,
+            registered: Some(false),
+            pid: None,
+            stale_pid_file: false,
+        };
+    };
+
+    let user_enabled = domain
+        .get("userEnabled")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let disconnected = domain
+        .get("disconnected")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let hidden = domain.get("hidden").and_then(serde_json::Value::as_bool) == Some(true);
+
+    if user_enabled && !disconnected && !hidden {
+        return ProviderRuntimeSummary {
+            state: "running".to_string(),
+            message: "macOS File Provider is enabled.".to_string(),
+            daemon_running,
+            registered: Some(true),
+            pid: None,
+            stale_pid_file: false,
+        };
+    }
+
+    let message = if !user_enabled {
+        "The Locality File Provider is registered but not enabled."
+    } else if disconnected {
+        "The Locality File Provider is disconnected in macOS."
+    } else {
+        "The Locality File Provider is hidden in macOS."
+    };
+
+    ProviderRuntimeSummary {
+        state: "approval_required".to_string(),
+        message: message.to_string(),
+        daemon_running,
+        registered: Some(true),
+        pid: None,
+        stale_pid_file: false,
     }
 }
 
@@ -11701,6 +11811,92 @@ mod tests {
         assert!(!super::desktop_needs_onboarding(
             Some(&active_connection),
             Some(&mount),
+        ));
+    }
+
+    #[test]
+    fn mount_status_reports_pending_macos_provider_approval() {
+        let provider = super::ProviderRuntimeSummary {
+            state: "approval_required".to_string(),
+            message: "The Locality File Provider is registered but not enabled.".to_string(),
+            daemon_running: true,
+            registered: Some(true),
+            pid: None,
+            stale_pid_file: false,
+        };
+
+        assert_eq!(
+            super::mount_status_from_provider(&provider),
+            Some("provider_approval_required")
+        );
+    }
+
+    #[test]
+    fn macos_provider_status_reports_disabled_domain_as_approval_required() {
+        let helper_report = serde_json::json!({
+            "domains": [
+                {
+                    "identifier": "loc",
+                    "displayName": "Locality",
+                    "userEnabled": false,
+                    "disconnected": false,
+                    "hidden": false
+                }
+            ]
+        });
+
+        let provider = super::macos_file_provider_status_from_helper_report(&helper_report, true);
+
+        assert_eq!(provider.state, "approval_required");
+        assert_eq!(provider.registered, Some(true));
+        assert!(provider.message.contains("not enabled"));
+    }
+
+    #[test]
+    fn desktop_onboarding_is_required_while_macos_provider_approval_is_pending() {
+        let active_connection = test_connection("workspace-1", "Synergy Labs");
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/tmp/Locality/notion",
+        );
+        let provider = super::ProviderRuntimeSummary {
+            state: "approval_required".to_string(),
+            message: "The Locality File Provider is registered but not enabled.".to_string(),
+            daemon_running: true,
+            registered: Some(true),
+            pid: None,
+            stale_pid_file: false,
+        };
+
+        assert!(super::desktop_needs_onboarding_with_provider(
+            Some(&active_connection),
+            Some(&mount),
+            Some(&provider),
+        ));
+    }
+
+    #[test]
+    fn desktop_onboarding_is_required_while_macos_provider_status_errors() {
+        let active_connection = test_connection("workspace-1", "Synergy Labs");
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/tmp/Locality/notion",
+        );
+        let provider = super::ProviderRuntimeSummary {
+            state: "error".to_string(),
+            message: "Could not inspect macOS File Provider.".to_string(),
+            daemon_running: true,
+            registered: None,
+            pid: None,
+            stale_pid_file: false,
+        };
+
+        assert!(super::desktop_needs_onboarding_with_provider(
+            Some(&active_connection),
+            Some(&mount),
+            Some(&provider),
         ));
     }
 

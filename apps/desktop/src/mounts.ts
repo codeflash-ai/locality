@@ -138,6 +138,7 @@ export function mountStatusTone(mount: MountSummary): "ready" | "warn" | "danger
     providerState.includes("unregistered") ||
     providerState.includes("stale") ||
     status.includes("unregistered") ||
+    status.includes("approval") ||
     status.includes("preparing") ||
     status.includes("pending") ||
     status.includes("review") ||
