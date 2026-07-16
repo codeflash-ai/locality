@@ -19,7 +19,9 @@ use sha2::{Digest, Sha256};
 
 use crate::discovery::{
     DiscoveryPlan, DiscoveryPostCommitAction, DiscoveryProjectionAction,
-    DiscoveryProjectionComponent, build_discovery_projection_components,
+    DiscoveryProjectionComponent, ProjectionStructuralChange,
+    build_discovery_projection_components, projection_action_covers_change,
+    projection_structural_change,
 };
 use crate::durable_fs::{
     create_dir_all_durable, remove_dir_all_durable, remove_path_durable, rename_noreplace_durable,
@@ -62,6 +64,17 @@ pub enum DiscoveryExecutionOperation {
         expected_fingerprint: DiscoveryPathFingerprint,
         materialization: DiscoveryCreateMaterialization,
     },
+    CreateContainer {
+        operation_id: String,
+        action_index: u32,
+        remote_id: RemoteId,
+        projected_from: PathBuf,
+        projected_to: PathBuf,
+        destination: PathBuf,
+        payload: PathBuf,
+        temporary_payload: PathBuf,
+        expected_fingerprint: DiscoveryPathFingerprint,
+    },
     Move {
         operation_id: String,
         action_index: u32,
@@ -90,6 +103,7 @@ impl DiscoveryExecutionOperation {
     fn operation_id(&self) -> &str {
         match self {
             Self::Create { operation_id, .. }
+            | Self::CreateContainer { operation_id, .. }
             | Self::Move { operation_id, .. }
             | Self::Delete { operation_id, .. } => operation_id,
         }
@@ -98,6 +112,10 @@ impl DiscoveryExecutionOperation {
     fn expected_fingerprint(&self) -> &DiscoveryPathFingerprint {
         match self {
             Self::Create {
+                expected_fingerprint,
+                ..
+            }
+            | Self::CreateContainer {
                 expected_fingerprint,
                 ..
             }
@@ -114,7 +132,9 @@ impl DiscoveryExecutionOperation {
 
     fn destination(&self) -> Option<&Path> {
         match self {
-            Self::Create { destination, .. } | Self::Move { destination, .. } => Some(destination),
+            Self::Create { destination, .. }
+            | Self::CreateContainer { destination, .. }
+            | Self::Move { destination, .. } => Some(destination),
             Self::Delete { .. } => None,
         }
     }
@@ -122,13 +142,14 @@ impl DiscoveryExecutionOperation {
     fn source(&self) -> Option<&Path> {
         match self {
             Self::Move { source, .. } | Self::Delete { source, .. } => Some(source),
-            Self::Create { .. } => None,
+            Self::Create { .. } | Self::CreateContainer { .. } => None,
         }
     }
 
     fn action_index(&self) -> usize {
         match self {
             Self::Create { action_index, .. }
+            | Self::CreateContainer { action_index, .. }
             | Self::Move { action_index, .. }
             | Self::Delete { action_index, .. } => *action_index as usize,
         }
@@ -137,6 +158,10 @@ impl DiscoveryExecutionOperation {
     fn set_expected_fingerprint(&mut self, fingerprint: DiscoveryPathFingerprint) {
         match self {
             Self::Create {
+                expected_fingerprint,
+                ..
+            }
+            | Self::CreateContainer {
                 expected_fingerprint,
                 ..
             }
@@ -173,26 +198,6 @@ struct DiscoveryFingerprintRecord {
     kind: DiscoveryPathKind,
     bytes: u64,
     content_sha256: Option<[u8; 32]>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum StructuralProjectionIntent {
-    Create {
-        remote_id: RemoteId,
-        kind: EntityKind,
-        path: PathBuf,
-    },
-    Move {
-        remote_id: RemoteId,
-        kind: EntityKind,
-        from: PathBuf,
-        to: PathBuf,
-    },
-    Delete {
-        remote_id: RemoteId,
-        kind: EntityKind,
-        path: PathBuf,
-    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -475,7 +480,7 @@ where
                     step_rollback(store, &record, &execution, &mut effects, updated_at)
                 } else {
                     validate_installed_projection(&execution, &effects)?;
-                    validate_committed_recovery_tree(&execution, &effects)?;
+                    validate_committed_recovery_tree(&execution, &effects, false)?;
                     store
                         .commit_discovery_transaction(transaction_id, updated_at)
                         .map_err(repository_error)?;
@@ -791,7 +796,13 @@ where
         let mut creates = component
             .operations
             .iter()
-            .filter(|operation| matches!(operation, DiscoveryExecutionOperation::Create { .. }))
+            .filter(|operation| {
+                matches!(
+                    operation,
+                    DiscoveryExecutionOperation::Create { .. }
+                        | DiscoveryExecutionOperation::CreateContainer { .. }
+                )
+            })
             .collect::<Vec<_>>();
         creates.sort_by(compare_install_operations);
         for operation in creates {
@@ -924,6 +935,7 @@ where
             matches!(
                 operation,
                 DiscoveryExecutionOperation::Create { .. }
+                    | DiscoveryExecutionOperation::CreateContainer { .. }
                     | DiscoveryExecutionOperation::Move { .. }
             ) && matches!(
                 operation_effect_state(effects, operation),
@@ -981,7 +993,13 @@ where
         .components
         .iter()
         .flat_map(|component| component.operations.iter())
-        .filter(|operation| matches!(operation, DiscoveryExecutionOperation::Create { .. }))
+        .filter(|operation| {
+            matches!(
+                operation,
+                DiscoveryExecutionOperation::Create { .. }
+                    | DiscoveryExecutionOperation::CreateContainer { .. }
+            )
+        })
     {
         if matches!(
             operation_effect_state(effects, operation),
@@ -1036,6 +1054,11 @@ where
 {
     let (destination, recovery) = match operation {
         DiscoveryExecutionOperation::Create {
+            destination,
+            payload,
+            ..
+        }
+        | DiscoveryExecutionOperation::CreateContainer {
             destination,
             payload,
             ..
@@ -1103,7 +1126,8 @@ where
                     ))
                 }
             }
-            DiscoveryExecutionOperation::Create { .. } => Ok(None),
+            DiscoveryExecutionOperation::Create { .. }
+            | DiscoveryExecutionOperation::CreateContainer { .. } => Ok(None),
             DiscoveryExecutionOperation::Delete { .. } => unreachable!(),
         },
         _ => invalid(format!(
@@ -1127,7 +1151,8 @@ where
     let (source, stage) = match operation {
         DiscoveryExecutionOperation::Move { source, stage, .. }
         | DiscoveryExecutionOperation::Delete { source, stage, .. } => (source, stage),
-        DiscoveryExecutionOperation::Create { .. } => return Ok(None),
+        DiscoveryExecutionOperation::Create { .. }
+        | DiscoveryExecutionOperation::CreateContainer { .. } => return Ok(None),
     };
     let (effect_index, _) = operation_effect_state(effects, operation).expect("effect exists");
     let source = checked_join(&execution.mount_root, source, "rollback source")?;
@@ -1186,14 +1211,20 @@ fn rollback_create_operation<S>(
 where
     S: DiscoveryRepository,
 {
-    let DiscoveryExecutionOperation::Create {
-        destination,
-        payload,
-        temporary_payload,
-        ..
-    } = operation
-    else {
-        return Ok(None);
+    let (destination, payload, temporary_payload) = match operation {
+        DiscoveryExecutionOperation::Create {
+            destination,
+            payload,
+            temporary_payload,
+            ..
+        }
+        | DiscoveryExecutionOperation::CreateContainer {
+            destination,
+            payload,
+            temporary_payload,
+            ..
+        } => (destination, payload, temporary_payload),
+        _ => return Ok(None),
     };
     let (effect_index, _) = operation_effect_state(effects, operation).expect("effect exists");
     let destination = checked_join(&execution.mount_root, destination, "rollback destination")?;
@@ -1405,6 +1436,58 @@ where
                 }
             }
         }
+        DiscoveryExecutionOperation::CreateContainer {
+            operation_id,
+            payload,
+            temporary_payload,
+            expected_fingerprint,
+            ..
+        } => {
+            let recovery_root = expected_recovery_root(record)?;
+            let payload = checked_join(&recovery_root, payload, "container payload")?;
+            let temporary = checked_join(
+                &recovery_root,
+                temporary_payload,
+                "temporary container payload",
+            )?;
+            match fingerprint_if_exists(&payload)? {
+                Some(fingerprint) if fingerprint == *expected_fingerprint => {
+                    effects.operations[effect_index].state = DiscoveryOperationEffectState::Staged;
+                    record_effects(
+                        store,
+                        &record.transaction_id,
+                        DiscoveryTransactionStatus::Applying,
+                        effects,
+                        updated_at,
+                    )?;
+                    Ok(DiscoveryExecutionStep::OperationRecorded {
+                        operation_id: operation_id.clone(),
+                        state: DiscoveryOperationEffectState::Staged,
+                    })
+                }
+                Some(_) => invalid(format!(
+                    "discovery container payload `{}` no longer matches its fingerprint",
+                    payload.display()
+                )),
+                None => {
+                    publish_create_container_payload(
+                        record.reservation.mount.root.parent().ok_or_else(|| {
+                            LocalityError::InvalidState(format!(
+                                "mount root `{}` has no recovery parent",
+                                record.reservation.mount.root.display()
+                            ))
+                        })?,
+                        &temporary,
+                        &payload,
+                        expected_fingerprint,
+                    )?;
+                    Ok(DiscoveryExecutionStep::FilesystemMutation {
+                        operation_id: operation_id.clone(),
+                        mutation: DiscoveryFilesystemMutation::PayloadPublished,
+                    })
+                }
+            }
+        }
         DiscoveryExecutionOperation::Move {
             operation_id,
             source,
@@ -1505,6 +1588,13 @@ where
 {
     match operation {
         DiscoveryExecutionOperation::Create {
+            operation_id,
+            destination,
+            payload,
+            expected_fingerprint,
+            ..
+        }
+        | DiscoveryExecutionOperation::CreateContainer {
             operation_id,
             destination,
             payload,
@@ -1698,7 +1788,7 @@ where
 {
     if !effects.projection_validated {
         validate_installed_projection(execution, effects)?;
-        validate_committed_recovery_tree(execution, effects)?;
+        validate_committed_recovery_tree(execution, effects, false)?;
         effects.projection_validated = true;
         record_effects(
             store,
@@ -1739,12 +1829,12 @@ where
     if !effects.cleanup_complete {
         match fs::symlink_metadata(&recovery_root) {
             Ok(_) => {
-                validate_committed_recovery_tree(execution, effects)?;
+                validate_committed_recovery_tree(execution, effects, true)?;
                 remove_dir_all_durable(&recovery_root).map_err(LocalityError::from)?;
                 return Ok(DiscoveryExecutionStep::RecoveryPayloadsRemoved);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                validate_committed_recovery_tree(execution, effects)?;
+                validate_committed_recovery_tree(execution, effects, true)?;
             }
             Err(error) => return Err(LocalityError::from(error)),
         }
@@ -1778,6 +1868,7 @@ where
 fn validate_committed_recovery_tree(
     execution: &DiscoveryExecutionPlan,
     effects: &DiscoveryExecutionEffects,
+    allow_missing_root: bool,
 ) -> LocalityResult<()> {
     let mut expected = BTreeMap::new();
     for component in &execution.components {
@@ -1803,8 +1894,14 @@ fn validate_committed_recovery_tree(
     let root_metadata = match fs::symlink_metadata(&execution.recovery_root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // Cleanup may have completed immediately before a process crash.
-            return Ok(());
+            if allow_missing_root || execution.components.iter().all(|c| c.operations.is_empty()) {
+                // Cleanup may have completed immediately before its effect was recorded.
+                return Ok(());
+            }
+            return invalid(format!(
+                "discovery recovery root `{}` is missing before cleanup",
+                execution.recovery_root.display()
+            ));
         }
         Err(error) => return Err(LocalityError::from(error)),
     };
@@ -2081,13 +2178,13 @@ fn validate_projection_commit_coverage(
     let mut expected = Vec::new();
     for entity in &commit.entity_upserts {
         match existing_by_id.get(&entity.remote_id) {
-            None => expected.push(StructuralProjectionIntent::Create {
+            None => expected.push(ProjectionStructuralChange::Create {
                 remote_id: entity.remote_id.clone(),
                 kind: entity.kind.clone(),
                 path: entity.path.clone(),
             }),
             Some(existing) if existing.path != entity.path => {
-                expected.push(StructuralProjectionIntent::Move {
+                expected.push(ProjectionStructuralChange::Move {
                     remote_id: entity.remote_id.clone(),
                     kind: entity.kind.clone(),
                     from: existing.path.clone(),
@@ -2099,75 +2196,26 @@ fn validate_projection_commit_coverage(
     }
     for remote_id in &commit.entity_deletes {
         if let Some(existing) = existing_by_id.get(remote_id) {
-            expected.push(StructuralProjectionIntent::Delete {
+            expected.push(ProjectionStructuralChange::Delete {
                 remote_id: remote_id.clone(),
                 kind: existing.kind.clone(),
                 path: existing.path.clone(),
             });
         }
     }
-    let mut actual = actions
-        .iter()
-        .map(|action| match action {
-            DiscoveryProjectionAction::Create { entry } => StructuralProjectionIntent::Create {
-                remote_id: entry.remote_id.clone(),
-                kind: entry.kind.clone(),
-                path: entry.path.clone(),
-            },
-            DiscoveryProjectionAction::Move {
-                remote_id,
-                kind,
-                from,
-                to,
-            } => StructuralProjectionIntent::Move {
-                remote_id: remote_id.clone(),
-                kind: kind.clone(),
-                from: from.clone(),
-                to: to.clone(),
-            },
-            DiscoveryProjectionAction::Delete {
-                remote_id,
-                kind,
-                path,
-            } => StructuralProjectionIntent::Delete {
-                remote_id: remote_id.clone(),
-                kind: kind.clone(),
-                path: path.clone(),
-            },
-        })
-        .collect::<Vec<_>>();
-    expected.sort_by_key(structural_projection_intent_key);
-    actual.sort_by_key(structural_projection_intent_key);
-    if expected != actual {
+    let every_commit_change_is_covered = expected.iter().all(|change| {
+        actions
+            .iter()
+            .any(|action| projection_action_covers_change(action, change))
+    });
+    let every_action_has_an_exact_commit_change = actions.iter().all(|action| {
+        let action_change = projection_structural_change(action);
+        expected.iter().any(|change| change == &action_change)
+    });
+    if !every_commit_change_is_covered || !every_action_has_an_exact_commit_change {
         return invalid("discovery projection actions do not cover structural commit changes");
     }
     Ok(())
-}
-
-fn structural_projection_intent_key(intent: &StructuralProjectionIntent) -> String {
-    match intent {
-        StructuralProjectionIntent::Create {
-            remote_id,
-            kind,
-            path,
-        } => format!("create\0{}\0{kind:?}\0{}", remote_id.0, path.display()),
-        StructuralProjectionIntent::Move {
-            remote_id,
-            kind,
-            from,
-            to,
-        } => format!(
-            "move\0{}\0{kind:?}\0{}\0{}",
-            remote_id.0,
-            from.display(),
-            to.display()
-        ),
-        StructuralProjectionIntent::Delete {
-            remote_id,
-            kind,
-            path,
-        } => format!("delete\0{}\0{kind:?}\0{}", remote_id.0, path.display()),
-    }
 }
 
 fn validate_operation(operation: &DiscoveryExecutionOperation) -> LocalityResult<()> {
@@ -2195,6 +2243,31 @@ fn validate_operation(operation: &DiscoveryExecutionOperation) -> LocalityResult
                     != expected_fingerprint
             {
                 return invalid("discovery create materialization fingerprint was tampered");
+            }
+        }
+        DiscoveryExecutionOperation::CreateContainer {
+            projected_from,
+            projected_to,
+            destination,
+            payload,
+            temporary_payload,
+            expected_fingerprint,
+            ..
+        } => {
+            for path in [
+                projected_from,
+                projected_to,
+                destination,
+                payload,
+                temporary_payload,
+            ] {
+                validate_relative_path(path)?;
+            }
+            if !move_requires_destination_container(&EntityKind::Page, projected_from, projected_to)
+                || *destination != page_container_path(projected_to)
+                || *expected_fingerprint != fingerprint_virtual_directory(&[])
+            {
+                return invalid("discovery move container operation was tampered");
             }
         }
         DiscoveryExecutionOperation::Move {
@@ -2329,17 +2402,17 @@ fn validate_move_operations(
     required: &[(PathBuf, PathBuf)],
     optional: Option<&(PathBuf, PathBuf)>,
 ) -> LocalityResult<()> {
-    if operations.len() < required.len()
-        || operations.len() > required.len() + usize::from(optional.is_some())
-    {
+    let container_required = move_requires_destination_container(kind, from, to);
+    let minimum = required.len() + usize::from(container_required);
+    let maximum = required.len() + usize::from(optional.is_some());
+    if operations.len() < minimum || operations.len() > maximum {
         return invalid(format!(
             "discovery move `{}` has the wrong operation count",
             remote_id.0
         ));
     }
-    let expected = required.iter().chain(optional).take(operations.len());
     for (unit_index, (operation, (source, destination))) in
-        operations.iter().zip(expected).enumerate()
+        operations.iter().zip(required).enumerate()
     {
         match operation {
             DiscoveryExecutionOperation::Move {
@@ -2368,6 +2441,67 @@ fn validate_move_operations(
                 ));
             }
         }
+    }
+    let Some(operation) = operations.get(required.len()) else {
+        return Ok(());
+    };
+    let Some((optional_source, optional_destination)) = optional else {
+        return invalid(format!(
+            "discovery move `{}` operation {} does not match its action",
+            remote_id.0,
+            required.len()
+        ));
+    };
+    let optional_matches = match operation {
+        DiscoveryExecutionOperation::Move {
+            operation_id,
+            remote_id: operation_remote_id,
+            kind: operation_kind,
+            projected_from,
+            projected_to,
+            source,
+            stage,
+            destination,
+            ..
+        } => {
+            operation_id == &unit_operation_id(base_id, required.len())
+                && operation_remote_id == remote_id
+                && operation_kind == kind
+                && projected_from == from
+                && projected_to == to
+                && source == optional_source
+                && destination == optional_destination
+                && stage
+                    == &PathBuf::from("stages").join(unit_operation_id(base_id, required.len()))
+        }
+        DiscoveryExecutionOperation::CreateContainer {
+            operation_id,
+            remote_id: operation_remote_id,
+            projected_from,
+            projected_to,
+            destination,
+            payload,
+            temporary_payload,
+            ..
+        } => {
+            container_required
+                && operation_id == &container_operation_id(base_id)
+                && operation_remote_id == remote_id
+                && projected_from == from
+                && projected_to == to
+                && destination == optional_destination
+                && payload == &PathBuf::from("payloads").join(container_operation_id(base_id))
+                && temporary_payload
+                    == &PathBuf::from("temporary").join(container_operation_id(base_id))
+        }
+        _ => false,
+    };
+    if !optional_matches {
+        return invalid(format!(
+            "discovery move `{}` operation {} does not match its action",
+            remote_id.0,
+            required.len()
+        ));
     }
     Ok(())
 }
@@ -2451,7 +2585,7 @@ fn validate_reserved_operation_units(
         match action {
             DiscoveryProjectionAction::Create { .. } => {}
             DiscoveryProjectionAction::Move { kind, from, to, .. } => {
-                let expected = move_unit_paths(mount_root, kind, from, to)?;
+                let expected = move_execution_units(mount_root, kind, from, to)?;
                 let actual = operations
                     .iter()
                     .map(|operation| match operation {
@@ -2459,7 +2593,15 @@ fn validate_reserved_operation_units(
                             source,
                             destination,
                             ..
-                        } => Ok((source.clone(), destination.clone())),
+                        } => Ok(MoveExecutionUnit::Move {
+                            source: source.clone(),
+                            destination: destination.clone(),
+                        }),
+                        DiscoveryExecutionOperation::CreateContainer { destination, .. } => {
+                            Ok(MoveExecutionUnit::CreateContainer {
+                                destination: destination.clone(),
+                            })
+                        }
                         _ => invalid("move action contains a non-move operation"),
                     })
                     .collect::<LocalityResult<Vec<_>>>()?;
@@ -2551,6 +2693,12 @@ fn ensure_operation_can_prepare(
             payload,
             temporary_payload,
             ..
+        }
+        | DiscoveryExecutionOperation::CreateContainer {
+            destination,
+            payload,
+            temporary_payload,
+            ..
         } => {
             let destination = checked_join(&execution.mount_root, destination, "destination")?;
             let payload = checked_join(&execution.recovery_root, payload, "payload")?;
@@ -2623,6 +2771,7 @@ fn validate_installed_projection(
             }
             match operation {
                 DiscoveryExecutionOperation::Create { destination, .. }
+                | DiscoveryExecutionOperation::CreateContainer { destination, .. }
                 | DiscoveryExecutionOperation::Move { destination, .. } => {
                     let destination =
                         checked_join(&execution.mount_root, destination, "destination")?;
@@ -2782,6 +2931,48 @@ fn publish_create_payload(
     if fingerprint_path(payload)? != *expected_fingerprint {
         return invalid(format!(
             "published discovery payload `{}` has the wrong fingerprint",
+            payload.display()
+        ));
+    }
+    Ok(())
+}
+
+fn publish_create_container_payload(
+    recovery_parent: &Path,
+    temporary: &Path,
+    payload: &Path,
+    expected_fingerprint: &DiscoveryPathFingerprint,
+) -> LocalityResult<()> {
+    ensure_recovery_parent(recovery_parent, temporary)?;
+    ensure_recovery_parent(recovery_parent, payload)?;
+    match fingerprint_if_exists(temporary)? {
+        Some(fingerprint) if fingerprint == *expected_fingerprint => {}
+        Some(_) => {
+            return invalid(format!(
+                "temporary discovery container payload `{}` is not fingerprint-owned",
+                temporary.display()
+            ));
+        }
+        None => {
+            create_dir_all_durable(temporary).map_err(LocalityError::from)?;
+            if fingerprint_path(temporary)? != *expected_fingerprint {
+                return invalid(format!(
+                    "temporary discovery container payload `{}` has the wrong fingerprint",
+                    temporary.display()
+                ));
+            }
+        }
+    }
+    if fingerprint_if_exists(payload)?.is_some() {
+        return invalid(format!(
+            "discovery container payload `{}` appeared before publication",
+            payload.display()
+        ));
+    }
+    rename_noreplace_durable(temporary, payload).map_err(LocalityError::from)?;
+    if fingerprint_path(payload)? != *expected_fingerprint {
+        return invalid(format!(
+            "published discovery container payload `{}` has the wrong fingerprint",
             payload.display()
         ));
     }
@@ -3202,6 +3393,11 @@ fn validate_execution_path_ancestry(execution: &DiscoveryExecutionPlan) -> Local
                 payload,
                 temporary_payload,
                 ..
+            }
+            | DiscoveryExecutionOperation::CreateContainer {
+                payload,
+                temporary_payload,
+                ..
             } => {
                 validate_relative_path_ancestry(&execution.recovery_root, payload).or_else(
                     |error| {
@@ -3317,23 +3513,50 @@ fn prepare_components(
                     from,
                     to,
                 } => {
-                    let units = move_unit_paths(mount_root, kind, from, to)?;
-                    for (unit_index, (source, destination)) in units.into_iter().enumerate() {
-                        validate_relative_path_ancestry(mount_root, &source)?;
-                        validate_relative_path_ancestry(mount_root, &destination)?;
-                        let operation_id = unit_operation_id(&base_id, unit_index);
-                        operations.push(DiscoveryExecutionOperation::Move {
-                            operation_id: operation_id.clone(),
-                            action_index: action_index as u32,
-                            remote_id: remote_id.clone(),
-                            kind: kind.clone(),
-                            projected_from: from.clone(),
-                            projected_to: to.clone(),
-                            expected_fingerprint: fingerprint_path(&mount_root.join(&source))?,
-                            source,
-                            stage: PathBuf::from("stages").join(operation_id),
-                            destination,
-                        });
+                    let units = move_execution_units(mount_root, kind, from, to)?;
+                    let mut move_unit_index = 0;
+                    for unit in units {
+                        match unit {
+                            MoveExecutionUnit::Move {
+                                source,
+                                destination,
+                            } => {
+                                validate_relative_path_ancestry(mount_root, &source)?;
+                                validate_relative_path_ancestry(mount_root, &destination)?;
+                                let operation_id = unit_operation_id(&base_id, move_unit_index);
+                                move_unit_index += 1;
+                                operations.push(DiscoveryExecutionOperation::Move {
+                                    operation_id: operation_id.clone(),
+                                    action_index: action_index as u32,
+                                    remote_id: remote_id.clone(),
+                                    kind: kind.clone(),
+                                    projected_from: from.clone(),
+                                    projected_to: to.clone(),
+                                    expected_fingerprint: fingerprint_path(
+                                        &mount_root.join(&source),
+                                    )?,
+                                    source,
+                                    stage: PathBuf::from("stages").join(operation_id),
+                                    destination,
+                                });
+                            }
+                            MoveExecutionUnit::CreateContainer { destination } => {
+                                validate_relative_path_ancestry(mount_root, &destination)?;
+                                let operation_id = container_operation_id(&base_id);
+                                operations.push(DiscoveryExecutionOperation::CreateContainer {
+                                    operation_id: operation_id.clone(),
+                                    action_index: action_index as u32,
+                                    remote_id: remote_id.clone(),
+                                    projected_from: from.clone(),
+                                    projected_to: to.clone(),
+                                    destination,
+                                    payload: PathBuf::from("payloads").join(&operation_id),
+                                    temporary_payload: PathBuf::from("temporary")
+                                        .join(&operation_id),
+                                    expected_fingerprint: fingerprint_virtual_directory(&[]),
+                                });
+                            }
+                        }
                     }
                 }
                 DiscoveryProjectionAction::Delete {
@@ -3383,22 +3606,51 @@ fn unit_operation_id(base: &str, unit_index: usize) -> String {
     }
 }
 
-fn move_unit_paths(
+fn container_operation_id(base: &str) -> String {
+    format!("{base}-container")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MoveExecutionUnit {
+    Move {
+        source: PathBuf,
+        destination: PathBuf,
+    },
+    CreateContainer {
+        destination: PathBuf,
+    },
+}
+
+fn move_execution_units(
     mount_root: &Path,
     kind: &EntityKind,
     from: &Path,
     to: &Path,
-) -> LocalityResult<Vec<(PathBuf, PathBuf)>> {
-    let (mut required, optional) = allowed_move_unit_paths(kind, from, to)?;
+) -> LocalityResult<Vec<MoveExecutionUnit>> {
+    let (required, optional) = allowed_move_unit_paths(kind, from, to)?;
+    let mut units = required
+        .into_iter()
+        .map(|(source, destination)| MoveExecutionUnit::Move {
+            source,
+            destination,
+        })
+        .collect::<Vec<_>>();
     if let Some((source, destination)) = optional {
         validate_relative_path_ancestry(mount_root, &source)?;
         match fs::symlink_metadata(mount_root.join(&source)) {
-            Ok(_) => required.push((source, destination)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => units.push(MoveExecutionUnit::Move {
+                source,
+                destination,
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if move_requires_destination_container(kind, from, to) {
+                    units.push(MoveExecutionUnit::CreateContainer { destination });
+                }
+            }
             Err(error) => return Err(LocalityError::from(error)),
         }
     }
-    Ok(required)
+    Ok(units)
 }
 
 fn delete_unit_paths(
@@ -3420,6 +3672,10 @@ fn delete_unit_paths(
 }
 
 type MoveUnit = (PathBuf, PathBuf);
+
+fn move_requires_destination_container(kind: &EntityKind, from: &Path, to: &Path) -> bool {
+    *kind == EntityKind::Page && !is_page_document_path(from) && is_page_document_path(to)
+}
 
 fn allowed_move_unit_paths(
     kind: &EntityKind,
@@ -3513,6 +3769,11 @@ fn validate_prepared_destinations(
         }
         match operation {
             DiscoveryExecutionOperation::Create {
+                payload,
+                temporary_payload,
+                ..
+            }
+            | DiscoveryExecutionOperation::CreateContainer {
                 payload,
                 temporary_payload,
                 ..

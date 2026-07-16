@@ -21,9 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::durable_fs::{
-    create_dir_all_durable, remove_path_durable, rename_noreplace_durable, write_new_file_durable,
-};
+use crate::durable_fs::{create_dir_all_durable, rename_noreplace_durable, write_new_file_durable};
 use crate::hydration::HydrationSource;
 use crate::shadow_match::{
     parsed_changes_retain_current_shadow_blocks, parsed_documents_match_ignoring_sync_metadata,
@@ -1511,6 +1509,20 @@ fn persist_windows_cloud_files_projection_recovery_with_durable_publish(
     recovery: &WindowsCloudFilesProjectionRecovery,
     durable_publish: impl FnOnce(&Path, &Path, &Path) -> std::io::Result<()>,
 ) -> LocalityResult<()> {
+    persist_windows_cloud_files_projection_recovery_with_durable_io(
+        state_root,
+        recovery,
+        write_new_file_durable,
+        durable_publish,
+    )
+}
+
+fn persist_windows_cloud_files_projection_recovery_with_durable_io(
+    state_root: &Path,
+    recovery: &WindowsCloudFilesProjectionRecovery,
+    write_new: impl FnOnce(&Path, &[u8]) -> std::io::Result<()>,
+    durable_publish: impl FnOnce(&Path, &Path, &Path) -> std::io::Result<()>,
+) -> LocalityResult<()> {
     static MANIFEST_COUNTER: AtomicU64 = AtomicU64::new(0);
     let directory = windows_cloud_files_projection_recovery_manifest_dir(state_root);
     create_dir_all_durable(&directory).map_err(LocalityError::from)?;
@@ -1522,14 +1534,8 @@ fn persist_windows_cloud_files_projection_recovery_with_durable_publish(
     let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
     let bytes = serde_json::to_vec_pretty(recovery)
         .map_err(|error| LocalityError::InvalidState(error.to_string()))?;
-    if let Err(error) = write_new_file_durable(&temporary, &bytes) {
-        let _ = remove_path_durable(&temporary);
-        return Err(LocalityError::from(error));
-    }
-    if let Err(error) = durable_publish(&temporary, &path, &directory) {
-        let _ = remove_path_durable(&temporary);
-        return Err(LocalityError::from(error));
-    }
+    write_new(&temporary, &bytes).map_err(LocalityError::from)?;
+    durable_publish(&temporary, &path, &directory).map_err(LocalityError::from)?;
     Ok(())
 }
 
@@ -3541,6 +3547,210 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn windows_projection_recovery_manifest_preserves_preexisting_temporary_paths() {
+        for path_kind in ["file", "directory"] {
+            let (root, state_root, recovery) = windows_recovery_manifest_fixture(&format!(
+                "loc-windows-recovery-temp-{path_kind}"
+            ));
+            let temporary_path = std::cell::RefCell::new(None);
+
+            persist_windows_cloud_files_projection_recovery_with_durable_io(
+                &state_root,
+                &recovery,
+                |temporary, bytes| {
+                    temporary_path.replace(Some(temporary.to_path_buf()));
+                    if path_kind == "file" {
+                        fs::write(temporary, "foreign temporary contents")?;
+                    } else {
+                        fs::create_dir(temporary)?;
+                        fs::write(temporary.join("foreign"), "foreign directory contents")?;
+                    }
+                    write_new_file_durable(temporary, bytes)
+                },
+                |_, _, _| panic!("publish must not run after a create-new collision"),
+            )
+            .expect_err("pre-existing temporary path must reject publication");
+
+            let temporary = temporary_path
+                .into_inner()
+                .expect("temporary path was observed");
+            if path_kind == "file" {
+                assert_eq!(
+                    fs::read_to_string(&temporary).expect("foreign temporary file is preserved"),
+                    "foreign temporary contents"
+                );
+            } else {
+                assert_eq!(
+                    fs::read_to_string(temporary.join("foreign"))
+                        .expect("foreign temporary directory is preserved"),
+                    "foreign directory contents"
+                );
+            }
+            assert!(
+                list_windows_cloud_files_projection_recoveries(&state_root)
+                    .expect("list ignores temporary paths")
+                    .is_empty()
+            );
+
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn windows_projection_recovery_manifest_preserves_ambiguous_partial_write() {
+        let (root, state_root, recovery) =
+            windows_recovery_manifest_fixture("loc-windows-recovery-partial-write");
+        let temporary_path = std::cell::RefCell::new(None);
+
+        let error = persist_windows_cloud_files_projection_recovery_with_durable_io(
+            &state_root,
+            &recovery,
+            |temporary, _| {
+                temporary_path.replace(Some(temporary.to_path_buf()));
+                fs::write(temporary, "partial manifest")?;
+                Err(std::io::Error::other("injected ambiguous write failure"))
+            },
+            |_, _, _| panic!("publish must not run after a write failure"),
+        )
+        .expect_err("ambiguous write failure must propagate");
+
+        assert_eq!(
+            error,
+            LocalityError::Io("injected ambiguous write failure".to_string())
+        );
+        let temporary = temporary_path
+            .into_inner()
+            .expect("temporary path was observed");
+        assert_eq!(
+            fs::read_to_string(&temporary).expect("partial temporary manifest is preserved"),
+            "partial manifest"
+        );
+        assert!(
+            list_windows_cloud_files_projection_recoveries(&state_root)
+                .expect("list ignores partial temporary manifest")
+                .is_empty()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn windows_projection_recovery_manifest_preserves_before_rename_failure() {
+        let (root, state_root, recovery) =
+            windows_recovery_manifest_fixture("loc-windows-recovery-before-rename");
+        let temporary_path = std::cell::RefCell::new(None);
+        let destination_path = std::cell::RefCell::new(None);
+
+        let error = persist_windows_cloud_files_projection_recovery_with_durable_io(
+            &state_root,
+            &recovery,
+            write_new_file_durable,
+            |temporary, destination, _| {
+                temporary_path.replace(Some(temporary.to_path_buf()));
+                destination_path.replace(Some(destination.to_path_buf()));
+                Err(std::io::Error::other("injected before-rename failure"))
+            },
+        )
+        .expect_err("before-rename failure must propagate");
+
+        assert_eq!(
+            error,
+            LocalityError::Io("injected before-rename failure".to_string())
+        );
+        let temporary = temporary_path
+            .into_inner()
+            .expect("temporary path was observed");
+        let destination = destination_path
+            .into_inner()
+            .expect("destination path was observed");
+        assert_eq!(
+            fs::read(&temporary).expect("unpublished temporary manifest is preserved"),
+            serde_json::to_vec_pretty(&recovery).expect("serialize expected recovery")
+        );
+        assert!(!destination.exists());
+        assert!(
+            list_windows_cloud_files_projection_recoveries(&state_root)
+                .expect("list ignores unpublished temporary manifest")
+                .is_empty()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn windows_projection_recovery_manifest_keeps_published_revision_after_rename_failure() {
+        let (root, state_root, recovery) =
+            windows_recovery_manifest_fixture("loc-windows-recovery-after-rename");
+        let temporary_path = std::cell::RefCell::new(None);
+        let destination_path = std::cell::RefCell::new(None);
+
+        let error = persist_windows_cloud_files_projection_recovery_with_durable_io(
+            &state_root,
+            &recovery,
+            write_new_file_durable,
+            |temporary, destination, _| {
+                temporary_path.replace(Some(temporary.to_path_buf()));
+                destination_path.replace(Some(destination.to_path_buf()));
+                fs::rename(temporary, destination)?;
+                Err(std::io::Error::other("injected after-rename failure"))
+            },
+        )
+        .expect_err("after-rename failure must propagate");
+
+        assert_eq!(
+            error,
+            LocalityError::Io("injected after-rename failure".to_string())
+        );
+        let temporary = temporary_path
+            .into_inner()
+            .expect("temporary path was observed");
+        let destination = destination_path
+            .into_inner()
+            .expect("destination path was observed");
+        assert!(!temporary.exists());
+        assert_eq!(
+            fs::read(&destination).expect("published manifest is preserved"),
+            serde_json::to_vec_pretty(&recovery).expect("serialize expected recovery")
+        );
+        assert_eq!(
+            list_windows_cloud_files_projection_recoveries(&state_root)
+                .expect("published revision remains listable"),
+            vec![recovery]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn windows_recovery_manifest_fixture(
+        label: &str,
+    ) -> (PathBuf, PathBuf, WindowsCloudFilesProjectionRecovery) {
+        let root = temp_root(label);
+        let state_root = root.join("state");
+        let access_root = root.join("provider/notion-main");
+        fs::create_dir_all(&access_root).expect("create access root");
+        let source = access_root.join("page.md");
+        fs::write(&source, "page").expect("write source");
+        let recovery = prepare_windows_cloud_files_projection_recovery(
+            &state_root,
+            &access_root,
+            &MountId::new("notion-main"),
+            &RemoteId::new("page-1"),
+            WindowsCloudFilesProjectionRecoveryOperation::Move,
+            WindowsCloudFilesProjectionRecoveryPayloadKind::File,
+            &source,
+            Path::new("page.md"),
+            None,
+            Some(Path::new("restored/page.md")),
+        )
+        .expect("prepare recovery fixture");
+        fs::remove_dir_all(windows_cloud_files_projection_recovery_manifest_dir(
+            &state_root,
+        ))
+        .expect("remove fixture manifest directory");
+        (root, state_root, recovery)
     }
 
     #[test]

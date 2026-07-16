@@ -228,6 +228,11 @@ fn fingerprints_use_stable_streamed_content_digest_records() {
                 expected_fingerprint,
                 ..
             }
+            | DiscoveryExecutionOperation::CreateContainer {
+                remote_id,
+                expected_fingerprint,
+                ..
+            }
             | DiscoveryExecutionOperation::Move {
                 remote_id,
                 expected_fingerprint,
@@ -1042,6 +1047,11 @@ fn mixed_parent_create_and_child_move_stages_every_source_then_installs_parent_f
                 remote_id,
                 ..
             }
+            | DiscoveryExecutionOperation::CreateContainer {
+                operation_id,
+                remote_id,
+                ..
+            }
             | DiscoveryExecutionOperation::Move {
                 operation_id,
                 remote_id,
@@ -1459,6 +1469,407 @@ fn page_moves_preserve_children_across_named_and_canonical_layouts() {
 }
 
 #[test]
+fn recursive_parent_move_and_delete_actions_cover_descendant_commits() {
+    {
+        let fixture = Fixture::new("recursive-parent-move");
+        let mut store = InMemoryStateStore::new();
+        store.save_mount(fixture.mount.clone()).expect("save mount");
+        for (remote_id, path, contents) in [
+            ("parent", "Old/page.md", "parent\n"),
+            ("child", "Old/Child/page.md", "child\n"),
+        ] {
+            store
+                .save_entity(entity_record(remote_id, path))
+                .expect("save entity");
+            let document = fixture.root.join(path);
+            fs::create_dir_all(document.parent().expect("document parent"))
+                .expect("create document parent");
+            fs::write(document, contents).expect("write document");
+        }
+        let plan = discovery_plan(
+            &store,
+            &fixture.mount,
+            vec![
+                entry("parent", EntityKind::Page, "New/page.md"),
+                entry("child", EntityKind::Page, "New/Child/page.md"),
+            ],
+        );
+        assert_eq!(plan.projection_actions.len(), 1);
+        assert_eq!(plan.projection_components.len(), 1);
+        assert_eq!(plan.projection_components[0].actions.len(), 1);
+        let transaction_id = DiscoveryTransactionId::new("recursive-parent-move");
+        prepare_plain_files_discovery_transaction(
+            &mut store,
+            plan,
+            transaction_id.clone(),
+            "t0",
+            vec![],
+        )
+        .expect("prepare normalized recursive move");
+        run_steps_to_finalized(&mut store, &transaction_id);
+
+        assert!(!fixture.root.join("Old").exists());
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("New/page.md")).expect("parent moved"),
+            "parent\n"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("New/Child/page.md")).expect("child moved"),
+            "child\n"
+        );
+        for (remote_id, path) in [
+            (RemoteId::new("parent"), PathBuf::from("New/page.md")),
+            (RemoteId::new("child"), PathBuf::from("New/Child/page.md")),
+        ] {
+            assert_eq!(
+                store
+                    .get_entity(&fixture.mount.mount_id, &remote_id)
+                    .expect("entity lookup")
+                    .expect("entity")
+                    .path,
+                path
+            );
+        }
+    }
+
+    {
+        let fixture = Fixture::new("recursive-parent-delete");
+        let mut store = InMemoryStateStore::new();
+        store.save_mount(fixture.mount.clone()).expect("save mount");
+        for (remote_id, path, contents) in [
+            ("parent", "Deleted/page.md", "parent\n"),
+            ("child", "Deleted/Child/page.md", "child\n"),
+        ] {
+            store
+                .save_entity(entity_record(remote_id, path))
+                .expect("save entity");
+            let document = fixture.root.join(path);
+            fs::create_dir_all(document.parent().expect("document parent"))
+                .expect("create document parent");
+            fs::write(document, contents).expect("write document");
+        }
+        let plan = discovery_plan_changes(
+            &store,
+            &fixture.mount,
+            vec![
+                BatchObservationChange::Tombstone {
+                    remote_id: RemoteId::new("parent"),
+                },
+                BatchObservationChange::Tombstone {
+                    remote_id: RemoteId::new("child"),
+                },
+            ],
+        );
+        assert_eq!(plan.projection_actions.len(), 1);
+        assert_eq!(plan.projection_components.len(), 1);
+        assert_eq!(plan.projection_components[0].actions.len(), 1);
+        let transaction_id = DiscoveryTransactionId::new("recursive-parent-delete");
+        prepare_plain_files_discovery_transaction(
+            &mut store,
+            plan,
+            transaction_id.clone(),
+            "t0",
+            vec![],
+        )
+        .expect("prepare normalized recursive delete");
+        run_steps_to_finalized(&mut store, &transaction_id);
+
+        assert!(!fixture.root.join("Deleted").exists());
+        for remote_id in [RemoteId::new("parent"), RemoteId::new("child")] {
+            assert!(
+                store
+                    .get_entity(&fixture.mount.mount_id, &remote_id)
+                    .expect("entity lookup")
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[test]
+fn named_leaf_move_to_canonical_path_uses_a_recoverable_container_operation() {
+    let fixture = Fixture::new("named-leaf-to-canonical");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(fixture.mount.clone()).expect("save mount");
+    store
+        .save_entity(entity_record("page", "Old.md"))
+        .expect("save page");
+    fs::write(fixture.root.join("Old.md"), "leaf\n").expect("write leaf page");
+    let plan = discovery_plan(
+        &store,
+        &fixture.mount,
+        vec![entry("page", EntityKind::Page, "New/page.md")],
+    );
+    let transaction_id = DiscoveryTransactionId::new("named-leaf-to-canonical");
+    let reserved = prepare_plain_files_discovery_transaction(
+        &mut store,
+        plan,
+        transaction_id.clone(),
+        "t0",
+        vec![],
+    )
+    .expect("prepare named leaf move");
+    let operation_types = reserved.plan["components"][0]["operations"]
+        .as_array()
+        .expect("operations")
+        .iter()
+        .map(|operation| operation["type"].as_str().expect("operation type"))
+        .collect::<Vec<_>>();
+    assert_eq!(operation_types, vec!["move", "create_container"]);
+    let mut missing_container = reserved.clone();
+    missing_container.plan["components"][0]["operations"]
+        .as_array_mut()
+        .expect("operations")
+        .pop();
+    assert_eq!(
+        validate_plain_files_discovery_transaction_record(&missing_container)
+            .expect_err("missing container operation must fail"),
+        LocalityError::InvalidState(
+            "discovery move `page` has the wrong operation count".to_string()
+        )
+    );
+    let mut redirected_container = reserved.clone();
+    redirected_container.plan["components"][0]["operations"][1]["destination"] =
+        serde_json::json!("Elsewhere");
+    assert_eq!(
+        validate_plain_files_discovery_transaction_record(&redirected_container)
+            .expect_err("redirected container operation must fail"),
+        LocalityError::InvalidState(
+            "discovery move `page` operation 1 does not match its action".to_string()
+        )
+    );
+
+    run_steps_to_finalized(&mut store, &transaction_id);
+
+    assert!(!fixture.root.join("Old.md").exists());
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("New/page.md")).expect("canonical page"),
+        "leaf\n"
+    );
+    assert_eq!(
+        store
+            .get_entity(&fixture.mount.mount_id, &RemoteId::new("page"))
+            .expect("entity lookup")
+            .expect("entity")
+            .path,
+        PathBuf::from("New/page.md")
+    );
+}
+
+#[test]
+fn named_leaf_container_install_crash_resumes_before_file_install() {
+    let fixture = Fixture::new("named-leaf-container-crash");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(fixture.mount.clone()).expect("save mount");
+    store
+        .save_entity(entity_record("page", "Old.md"))
+        .expect("save page");
+    fs::write(fixture.root.join("Old.md"), "leaf\n").expect("write leaf page");
+    let plan = discovery_plan(
+        &store,
+        &fixture.mount,
+        vec![entry("page", EntityKind::Page, "New/page.md")],
+    );
+    let transaction_id = DiscoveryTransactionId::new("named-leaf-container-crash");
+    let reserved = prepare_plain_files_discovery_transaction(
+        &mut store,
+        plan,
+        transaction_id.clone(),
+        "t0",
+        vec![],
+    )
+    .expect("prepare named leaf move");
+    let container_id = reserved.plan["components"][0]["operations"]
+        .as_array()
+        .expect("operations")
+        .iter()
+        .find(|operation| operation["type"] == "create_container")
+        .and_then(|operation| operation["operation_id"].as_str())
+        .expect("container operation")
+        .to_string();
+    for sequence in 1..=20 {
+        if step(&mut store, &transaction_id, sequence)
+            == (DiscoveryExecutionStep::FilesystemMutation {
+                operation_id: container_id.clone(),
+                mutation: DiscoveryFilesystemMutation::DestinationInstalled,
+            })
+        {
+            break;
+        }
+    }
+    assert!(fixture.root.join("New").is_dir());
+    assert!(!fixture.root.join("New/page.md").exists());
+    assert!(!fixture.root.join("Old.md").exists());
+
+    assert_eq!(
+        repair_plain_files_discovery_transaction(&mut store, &transaction_id, "t30")
+            .expect("resume container install crash"),
+        DiscoveryExecutionTerminal::Finalized
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("New/page.md")).expect("canonical page"),
+        "leaf\n"
+    );
+}
+
+#[test]
+fn named_leaf_container_move_rolls_back_losslessly_on_commit_drift() {
+    let fixture = Fixture::new("named-leaf-container-rollback");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(fixture.mount.clone()).expect("save mount");
+    store
+        .save_entity(entity_record("page", "Old.md"))
+        .expect("save page");
+    fs::write(fixture.root.join("Old.md"), "leaf\n").expect("write leaf page");
+    let plan = discovery_plan(
+        &store,
+        &fixture.mount,
+        vec![entry("page", EntityKind::Page, "New/page.md")],
+    );
+    let transaction_id = DiscoveryTransactionId::new("named-leaf-container-rollback");
+    prepare_plain_files_discovery_transaction(
+        &mut store,
+        plan,
+        transaction_id.clone(),
+        "t0",
+        vec![],
+    )
+    .expect("prepare named leaf move");
+    run_steps_to_projected(&mut store, &transaction_id);
+    store
+        .upsert_hydration_job(HydrationJobRecord::from(HydrationRequest::new(
+            fixture.mount.mount_id.clone(),
+            RemoteId::new("unrelated"),
+            fixture.root.join("Elsewhere/page.md"),
+            HydrationState::Hydrated,
+            HydrationReason::Policy,
+        )))
+        .expect("introduce commit drift");
+
+    assert_eq!(
+        repair_plain_files_discovery_transaction(&mut store, &transaction_id, "t30")
+            .expect("rollback named leaf move"),
+        DiscoveryExecutionTerminal::Aborted
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("Old.md")).expect("restored leaf"),
+        "leaf\n"
+    );
+    assert!(!fixture.root.join("New").exists());
+    assert_eq!(
+        store
+            .get_entity(&fixture.mount.mount_id, &RemoteId::new("page"))
+            .expect("entity lookup")
+            .expect("entity")
+            .path,
+        PathBuf::from("Old.md")
+    );
+}
+
+#[test]
+fn named_leaf_container_collisions_and_unknown_content_are_preserved() {
+    {
+        let fixture = Fixture::new("named-leaf-container-collision");
+        let mut store = InMemoryStateStore::new();
+        store.save_mount(fixture.mount.clone()).expect("save mount");
+        store
+            .save_entity(entity_record("page", "Old.md"))
+            .expect("save page");
+        fs::write(fixture.root.join("Old.md"), "leaf\n").expect("write leaf page");
+        fs::create_dir(fixture.root.join("New")).expect("create colliding container");
+        fs::write(fixture.root.join("New/unknown"), "preserve\n").expect("write collision content");
+        let plan = discovery_plan(
+            &store,
+            &fixture.mount,
+            vec![entry("page", EntityKind::Page, "New/page.md")],
+        );
+        let transaction_id = DiscoveryTransactionId::new("named-leaf-container-collision");
+
+        let error = prepare_plain_files_discovery_transaction(
+            &mut store,
+            plan,
+            transaction_id.clone(),
+            "t0",
+            vec![],
+        )
+        .expect_err("existing destination container must fail");
+        assert_eq!(
+            error,
+            LocalityError::InvalidState(format!(
+                "discovery destination `{}` already exists outside a staged source",
+                fixture.root.join("New").display()
+            ))
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("New/unknown")).expect("preserved collision"),
+            "preserve\n"
+        );
+        assert!(
+            store
+                .get_discovery_transaction(&transaction_id)
+                .expect("transaction lookup")
+                .is_none()
+        );
+    }
+
+    {
+        let fixture = Fixture::new("named-leaf-container-unknown-after-install");
+        let mut store = InMemoryStateStore::new();
+        store.save_mount(fixture.mount.clone()).expect("save mount");
+        store
+            .save_entity(entity_record("page", "Old.md"))
+            .expect("save page");
+        fs::write(fixture.root.join("Old.md"), "leaf\n").expect("write leaf page");
+        let plan = discovery_plan(
+            &store,
+            &fixture.mount,
+            vec![entry("page", EntityKind::Page, "New/page.md")],
+        );
+        let transaction_id =
+            DiscoveryTransactionId::new("named-leaf-container-unknown-after-install");
+        let reserved = prepare_plain_files_discovery_transaction(
+            &mut store,
+            plan,
+            transaction_id.clone(),
+            "t0",
+            vec![],
+        )
+        .expect("prepare named leaf move");
+        let container_id = reserved.plan["components"][0]["operations"]
+            .as_array()
+            .expect("operations")
+            .iter()
+            .find(|operation| operation["type"] == "create_container")
+            .and_then(|operation| operation["operation_id"].as_str())
+            .expect("container operation")
+            .to_string();
+        for sequence in 1..=20 {
+            if step(&mut store, &transaction_id, sequence)
+                == (DiscoveryExecutionStep::FilesystemMutation {
+                    operation_id: container_id.clone(),
+                    mutation: DiscoveryFilesystemMutation::DestinationInstalled,
+                })
+            {
+                break;
+            }
+        }
+        fs::write(fixture.root.join("New/unknown"), "preserve\n")
+            .expect("write unknown container content");
+
+        assert_eq!(
+            run_plain_files_discovery_transaction(&mut store, &transaction_id, "t30")
+                .expect("classify changed container"),
+            DiscoveryExecutionTerminal::NeedsReview
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("New/unknown"))
+                .expect("unknown content preserved"),
+            "preserve\n"
+        );
+    }
+}
+
+#[test]
 fn committed_repair_upserts_hydration_idempotently_before_cleanup() {
     let fixture = Fixture::new("hydration");
     let mut store = InMemoryStateStore::new();
@@ -1772,6 +2183,120 @@ fn committed_repair_rejects_reappeared_delete_source_before_side_effects() {
             .expect("hydration jobs")
             .is_empty()
     );
+}
+
+#[test]
+fn delete_recovery_root_is_required_before_commit_and_projection_barrier() {
+    for phase in ["projected", "committed"] {
+        let fixture = Fixture::new(&format!("delete-recovery-required-{phase}"));
+        let mut store = InMemoryStateStore::new();
+        store.save_mount(fixture.mount.clone()).expect("save mount");
+        store
+            .save_entity(entity_record("page", "Deleted/page.md"))
+            .expect("save page");
+        fs::create_dir_all(fixture.root.join("Deleted")).expect("create deleted page");
+        fs::write(fixture.root.join("Deleted/page.md"), "original\n").expect("write deleted page");
+        let mut plan = discovery_plan_changes(
+            &store,
+            &fixture.mount,
+            vec![BatchObservationChange::Tombstone {
+                remote_id: RemoteId::new("page"),
+            }],
+        );
+        plan.post_commit
+            .push(DiscoveryPostCommitAction::QueueHydration(
+                HydrationRequest::new(
+                    fixture.mount.mount_id.clone(),
+                    RemoteId::new("page"),
+                    fixture.root.join("Deleted/page.md"),
+                    HydrationState::Hydrated,
+                    HydrationReason::Policy,
+                ),
+            ));
+        let transaction_id = DiscoveryTransactionId::new(format!("delete-{phase}"));
+        let reserved = prepare_plain_files_discovery_transaction(
+            &mut store,
+            plan,
+            transaction_id.clone(),
+            "t0",
+            vec![],
+        )
+        .expect("prepare delete");
+        let execution: DiscoveryExecutionPlan =
+            serde_json::from_value(reserved.plan).expect("decode execution");
+        if phase == "projected" {
+            run_steps_to_projected(&mut store, &transaction_id);
+        } else {
+            run_steps_to_committed(&mut store, &transaction_id);
+        }
+        fs::remove_dir_all(&execution.recovery_root).expect("remove recovery quarantine");
+        let before = store
+            .get_discovery_transaction(&transaction_id)
+            .expect("transaction lookup")
+            .expect("transaction");
+
+        assert_eq!(
+            repair_plain_files_discovery_transaction(&mut store, &transaction_id, "t30")
+                .expect("classify missing recovery quarantine"),
+            DiscoveryExecutionTerminal::NeedsReview,
+            "{phase}"
+        );
+        let after = store
+            .get_discovery_transaction(&transaction_id)
+            .expect("transaction lookup")
+            .expect("transaction");
+        if phase == "projected" {
+            assert_ne!(after.status, DiscoveryTransactionStatus::Committed);
+            assert!(
+                store
+                    .get_entity(&fixture.mount.mount_id, &RemoteId::new("page"))
+                    .expect("entity lookup")
+                    .is_some()
+            );
+        } else {
+            assert_eq!(after, before);
+            assert!(
+                !after.effects["projection_validated"]
+                    .as_bool()
+                    .expect("projection marker")
+            );
+        }
+        assert!(
+            store
+                .list_hydration_jobs()
+                .expect("hydration jobs")
+                .is_empty()
+        );
+        assert!(!execution.recovery_root.exists());
+    }
+}
+
+#[test]
+fn zero_operation_transaction_does_not_require_a_recovery_root() {
+    let fixture = Fixture::new("zero-operation-recovery");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(fixture.mount.clone()).expect("save mount");
+    let plan = discovery_plan(&store, &fixture.mount, vec![]);
+    let transaction_id = DiscoveryTransactionId::new("zero-operation-recovery");
+    let reserved = prepare_plain_files_discovery_transaction(
+        &mut store,
+        plan,
+        transaction_id.clone(),
+        "t0",
+        vec![],
+    )
+    .expect("prepare zero-operation transaction");
+    let execution: DiscoveryExecutionPlan =
+        serde_json::from_value(reserved.plan).expect("decode execution");
+
+    assert!(execution.components.is_empty());
+    assert!(!execution.recovery_root.exists());
+    assert_eq!(
+        run_plain_files_discovery_transaction(&mut store, &transaction_id, "t1")
+            .expect("run zero-operation transaction"),
+        DiscoveryExecutionTerminal::Finalized
+    );
+    assert!(!execution.recovery_root.exists());
 }
 
 #[test]
@@ -3161,6 +3686,18 @@ fn run_steps_to_committed(store: &mut InMemoryStateStore, transaction_id: &Disco
         last = Some(outcome);
     }
     panic!("transaction did not commit within bounded steps; last={last:?}");
+}
+
+fn run_steps_to_projected(store: &mut InMemoryStateStore, transaction_id: &DiscoveryTransactionId) {
+    let mut last = None;
+    for sequence in 1..=30 {
+        let outcome = step(store, transaction_id, sequence);
+        if outcome == DiscoveryExecutionStep::Projected {
+            return;
+        }
+        last = Some(outcome);
+    }
+    panic!("transaction did not project within bounded steps; last={last:?}");
 }
 
 fn run_steps_to_finalized_from(

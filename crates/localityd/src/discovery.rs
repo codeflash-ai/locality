@@ -63,6 +63,137 @@ pub enum DiscoveryProjectionAction {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ProjectionStructuralChange {
+    Create {
+        remote_id: RemoteId,
+        kind: EntityKind,
+        path: PathBuf,
+    },
+    Move {
+        remote_id: RemoteId,
+        kind: EntityKind,
+        from: PathBuf,
+        to: PathBuf,
+    },
+    Delete {
+        remote_id: RemoteId,
+        kind: EntityKind,
+        path: PathBuf,
+    },
+}
+
+pub(crate) fn projection_structural_change(
+    action: &DiscoveryProjectionAction,
+) -> ProjectionStructuralChange {
+    match action {
+        DiscoveryProjectionAction::Create { entry } => ProjectionStructuralChange::Create {
+            remote_id: entry.remote_id.clone(),
+            kind: entry.kind.clone(),
+            path: entry.path.clone(),
+        },
+        DiscoveryProjectionAction::Move {
+            remote_id,
+            kind,
+            from,
+            to,
+        } => ProjectionStructuralChange::Move {
+            remote_id: remote_id.clone(),
+            kind: kind.clone(),
+            from: from.clone(),
+            to: to.clone(),
+        },
+        DiscoveryProjectionAction::Delete {
+            remote_id,
+            kind,
+            path,
+        } => ProjectionStructuralChange::Delete {
+            remote_id: remote_id.clone(),
+            kind: kind.clone(),
+            path: path.clone(),
+        },
+    }
+}
+
+pub(crate) fn projection_action_covers_change(
+    action: &DiscoveryProjectionAction,
+    change: &ProjectionStructuralChange,
+) -> bool {
+    match (action, change) {
+        (
+            DiscoveryProjectionAction::Create { entry },
+            ProjectionStructuralChange::Create {
+                remote_id,
+                kind,
+                path,
+            },
+        ) => entry.remote_id == *remote_id && entry.kind == *kind && entry.path == *path,
+        (
+            DiscoveryProjectionAction::Delete {
+                remote_id,
+                kind,
+                path,
+            },
+            ProjectionStructuralChange::Delete {
+                remote_id: change_remote_id,
+                kind: change_kind,
+                path: change_path,
+            },
+        ) => {
+            if remote_id == change_remote_id && kind == change_kind && path == change_path {
+                return true;
+            }
+            let root = projection_namespace_root(change_kind, change_path);
+            let candidate_root = projection_namespace_root(kind, path);
+            candidate_root != root && root.starts_with(candidate_root)
+        }
+        (
+            DiscoveryProjectionAction::Move {
+                remote_id,
+                kind,
+                from,
+                to,
+            },
+            ProjectionStructuralChange::Move {
+                remote_id: change_remote_id,
+                kind: change_kind,
+                from: change_from,
+                to: change_to,
+            },
+        ) => {
+            if remote_id == change_remote_id
+                && kind == change_kind
+                && from == change_from
+                && to == change_to
+            {
+                return true;
+            }
+            let source = projection_namespace_root(change_kind, change_from);
+            let destination = projection_namespace_root(change_kind, change_to);
+            let candidate_source = projection_namespace_root(kind, from);
+            let candidate_destination = projection_namespace_root(kind, to);
+            if paths_overlap(&candidate_source, &candidate_destination)
+                || candidate_source == source
+            {
+                return false;
+            }
+            let namespace_maps_exactly =
+                source.strip_prefix(&candidate_source).is_ok_and(|suffix| {
+                    !suffix.as_os_str().is_empty()
+                        && candidate_destination.join(suffix) == destination
+                });
+            let projected_path_maps_exactly = change_from
+                .strip_prefix(&candidate_source)
+                .is_ok_and(|suffix| {
+                    !suffix.as_os_str().is_empty()
+                        && candidate_destination.join(suffix) == *change_to
+                });
+            namespace_maps_exactly && projected_path_maps_exactly
+        }
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveryProjectionComponent {
     pub namespace_roots: Vec<PathBuf>,
@@ -241,56 +372,10 @@ fn projection_action_is_redundant(
     action: &DiscoveryProjectionAction,
     component: &[DiscoveryProjectionAction],
 ) -> bool {
-    match action {
-        DiscoveryProjectionAction::Delete { kind, path, .. } => {
-            let root = projection_namespace_root(kind, path);
-            component.iter().any(|candidate| {
-                let DiscoveryProjectionAction::Delete {
-                    kind: candidate_kind,
-                    path: candidate_path,
-                    ..
-                } = candidate
-                else {
-                    return false;
-                };
-                let candidate_root = projection_namespace_root(candidate_kind, candidate_path);
-                candidate_root != root && root.starts_with(candidate_root)
-            })
-        }
-        DiscoveryProjectionAction::Move { kind, from, to, .. } => {
-            let source = projection_namespace_root(kind, from);
-            let destination = projection_namespace_root(kind, to);
-            component.iter().any(|candidate| {
-                let DiscoveryProjectionAction::Move {
-                    kind: candidate_kind,
-                    from: candidate_from,
-                    to: candidate_to,
-                    ..
-                } = candidate
-                else {
-                    return false;
-                };
-                let candidate_source = projection_namespace_root(candidate_kind, candidate_from);
-                let candidate_destination = projection_namespace_root(candidate_kind, candidate_to);
-                if paths_overlap(&candidate_source, &candidate_destination)
-                    || candidate_source == source
-                {
-                    return false;
-                }
-                let namespace_maps_exactly =
-                    source.strip_prefix(&candidate_source).is_ok_and(|suffix| {
-                        !suffix.as_os_str().is_empty()
-                            && candidate_destination.join(suffix) == destination
-                    });
-                let projected_path_maps_exactly =
-                    from.strip_prefix(&candidate_source).is_ok_and(|suffix| {
-                        !suffix.as_os_str().is_empty() && candidate_destination.join(suffix) == *to
-                    });
-                namespace_maps_exactly && projected_path_maps_exactly
-            })
-        }
-        DiscoveryProjectionAction::Create { .. } => false,
-    }
+    let change = projection_structural_change(action);
+    component
+        .iter()
+        .any(|candidate| candidate != action && projection_action_covers_change(candidate, &change))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
