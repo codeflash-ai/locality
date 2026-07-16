@@ -10,6 +10,7 @@ pub mod ipc;
 pub mod mcp;
 pub mod media;
 pub mod notion;
+pub mod pre_hydration;
 pub mod projection_state;
 pub mod pull;
 pub mod push;
