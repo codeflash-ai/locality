@@ -254,7 +254,11 @@ content root; direct Developer ID builds keep the cache in `~/.loc/content` so
 normal startup and sync do not touch protected app-container data.
 When older pending virtual mutations still store app-group cache paths, daemon
 read paths recompute the current content-cache location outside the sandbox
-instead of reopening the legacy app-group file.
+instead of reopening the legacy app-group file. On upgrade, daemon-owned
+materialization, push, and File Provider reconciliation copy any missing files
+from the legacy app-group content tree into the current content root before
+reading or writing the new root; existing current-root files are never
+overwritten.
 
 Scheduled reconciliation skips writing placeholder Markdown files for virtual
 filesystem projection modes such as `macos_file_provider` and `linux_fuse`; it

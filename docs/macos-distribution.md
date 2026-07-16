@@ -143,7 +143,10 @@ Direct-download Developer ID builds are not app-sandboxed, so daemon-owned
 virtual projection content stays under `~/.loc/content`. The app group is still
 part of the File Provider/App Store entitlement set, but non-sandboxed startup
 paths should not create or watch the group container because macOS can classify
-that as app-data access.
+that as app-data access. Upgrade repair may copy missing legacy virtual content
+from the old app-group cache into `~/.loc/content`, but that path is bounded to
+preserving existing cache bytes and does not make the group container a watched
+or active content root.
 
 Find the local signing identity:
 

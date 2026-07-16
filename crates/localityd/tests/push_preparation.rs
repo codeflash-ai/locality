@@ -1114,11 +1114,13 @@ fn prepare_push_ignores_legacy_app_group_content_path_outside_sandbox() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn prepare_push_falls_back_to_visible_file_when_legacy_app_group_cache_is_ignored() {
+fn prepare_push_recovers_pending_create_from_legacy_app_group_cache() {
     let fixture = PrepareFixture::new_macos_default_state_root();
     let mut store = fixture.virtual_store("fake");
     fixture.save_parent_page(&mut store);
     let source_path = Path::new("Roadmap/Draft/page.md");
+    let current_path = virtual_fs_content_path(&fixture.state_root, &fixture.mount_id, source_path)
+        .expect("current path");
     let legacy_path = fixture.write_legacy_app_group_page(
         source_path.to_str().expect("source path"),
         "---\ntitle: Legacy Draft\n---\nLegacy body.\n",
@@ -1136,6 +1138,7 @@ fn prepare_push_falls_back_to_visible_file_when_legacy_app_group_cache_is_ignore
             legacy_path,
         ))
         .expect("save mutation");
+    assert!(!current_path.exists());
 
     let prepared = prepare_push(
         &store,
@@ -1148,11 +1151,77 @@ fn prepare_push_falls_back_to_visible_file_when_legacy_app_group_cache_is_ignore
     let plan = prepared.pipeline.plan.expect("plan");
     match &plan.operations[0] {
         PushOperation::CreateEntity { title, body, .. } => {
-            assert_eq!(title, "Projected Draft");
-            assert_eq!(body, "Projected body.\n");
+            assert_eq!(title, "Legacy Draft");
+            assert_eq!(body, "Legacy body.\n");
         }
         operation => panic!("unexpected operation: {operation:?}"),
     }
+    assert_eq!(
+        fs::read_to_string(&current_path).expect("read migrated cache"),
+        "---\ntitle: Legacy Draft\n---\nLegacy body.\n"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn prepare_push_recovers_dirty_entity_from_legacy_app_group_cache() {
+    let fixture = PrepareFixture::new_macos_default_state_root();
+    let mut store = fixture.virtual_store("fake");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap/page.md",
+            )
+            .with_hydration(HydrationState::Dirty),
+        )
+        .expect("save dirty entity");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("page-1"),
+                "Original body.",
+                8,
+                [RemoteId::new("paragraph-1")],
+            )
+            .expect("shadow"),
+        )
+        .expect("save shadow");
+    let source_path = Path::new("Roadmap/page.md");
+    let current_path = virtual_fs_content_path(&fixture.state_root, &fixture.mount_id, source_path)
+        .expect("current path");
+    let legacy_path = fixture.write_legacy_app_group_page(
+        source_path.to_str().expect("source path"),
+        &canonical_markdown("page-1", "Updated from legacy cache."),
+    );
+    assert_ne!(legacy_path, current_path);
+    assert!(!current_path.exists());
+
+    let prepared = prepare_push(
+        &store,
+        &job(fixture.root.join(source_path)),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare push");
+
+    let plan = prepared.pipeline.plan.expect("plan");
+    assert_eq!(plan.summary.blocks_updated, 1, "{plan:#?}");
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("paragraph-1"),
+            content: "Updated from legacy cache.".to_string(),
+        }]
+    );
+    assert_eq!(
+        fs::read_to_string(&current_path).expect("read migrated cache"),
+        canonical_markdown("page-1", "Updated from legacy cache.")
+    );
 }
 
 #[test]
