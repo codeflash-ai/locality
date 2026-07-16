@@ -7671,9 +7671,15 @@ function FinderEnableGuide({ waitingForRoot }: { waitingForRoot: boolean }) {
           </span>
         </div>
         <div className="finder-enable-content">
-          <FolderOpen />
-          <strong>Locality</strong>
+          <p>
+            <strong>&quot;Locality&quot; is not enabled.</strong> To access Locality, click Enable.
+          </p>
           <span className="finder-enable-control">Enable</span>
+          <div className="finder-enable-placeholders">
+            <i />
+            <i />
+            <i />
+          </div>
         </div>
       </div>
     </div>

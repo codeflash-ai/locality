@@ -8,6 +8,7 @@ describe("Finder enablement checkpoint", () => {
   it("renders the Finder cue and recovery actions", () => {
     expect(app).toContain('className="finder-enable-guide"');
     expect(app).toContain('className="finder-enable-control"');
+    expect(app).toContain('&quot;Locality&quot; is not enabled.');
     expect(app).toContain("Reopen Finder");
     expect(app).toContain("Having trouble?");
   });

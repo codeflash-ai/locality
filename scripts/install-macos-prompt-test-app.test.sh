@@ -82,6 +82,7 @@ test_dry_run_plans_fresh_prompt_test_app_installation() {
   assert_contains "${output}" "LocalityFileProvider.entitlements"
   assert_contains "${output}" "LocalityFileProvider.appex"
   assert_contains "${output}" "pluginkit -a"
+  assert_contains "${output}" "locality-file-providerctl register --mount-id loc --display-name Locality\\ Prompt\\ Test --json"
   assert_not_contains "${output}" "open -a"
 }
 

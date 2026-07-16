@@ -322,6 +322,7 @@ install_bundle() {
   run pluginkit -a "${appex}"
   run codesign --verify --deep --strict --verbose=2 "${APP_PATH}"
   run pluginkit -m -v -i "${extension_bundle_id}"
+  run "${APP_PATH}/Contents/MacOS/locality-file-providerctl" register --mount-id loc --display-name "${DISPLAY_NAME}" --json
   run_may_fail "${APP_PATH}/Contents/MacOS/locality-file-providerctl" --json list
 
   if [[ "${LAUNCH}" == "1" ]]; then

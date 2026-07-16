@@ -599,24 +599,22 @@ p {
 
 .finder-enable-content {
   display: grid;
-  grid-template-columns: 34px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 10px;
-  padding: 18px 22px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-content: start;
+  align-items: start;
+  gap: 14px;
+  padding: 16px;
 }
 
-.finder-enable-content > svg {
-  width: 30px;
-  height: 30px;
-  color: #4c7cae;
-}
-
-.finder-enable-content > strong {
+.finder-enable-content > p {
   min-width: 0;
-  overflow: hidden;
-  font-size: 13px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  color: #5e6c7b;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.finder-enable-content > p strong {
+  color: #384858;
 }
 
 .finder-enable-control {
@@ -633,6 +631,20 @@ p {
   font-size: 11px;
   font-weight: 850;
   animation: finder-enable-pulse 1.7s ease-in-out infinite;
+}
+
+.finder-enable-placeholders {
+  display: grid;
+  grid-column: 1 / -1;
+  gap: 8px;
+}
+
+.finder-enable-placeholders i {
+  display: block;
+  width: 100%;
+  height: 10px;
+  border-radius: 4px;
+  background: rgba(105, 123, 143, 0.1);
 }
 
 .finder-enable-guide.complete {
@@ -719,6 +731,14 @@ p {
 
 [data-theme="dark"] .finder-enable-sidebar small {
   color: #adbbb8;
+}
+
+[data-theme="dark"] .finder-enable-content > p {
+  color: #b8c6c3;
+}
+
+[data-theme="dark"] .finder-enable-content > p strong {
+  color: #eef7f4;
 }
 
 [data-theme="dark"] .finder-enable-control {
