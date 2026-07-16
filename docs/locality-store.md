@@ -16,6 +16,7 @@
 | --- | --- |
 | `records` | Durable connector profile, connection, mount, entity, shadow snapshot, and shadow block record shapes. |
 | `repository` | Split repository traits for connector profiles, connections, mounts, entities, shadows, hydration jobs, and journals. |
+| `discovery` | Connector-neutral atomic batch-discovery commit, validation, and conservative pending-work guards. |
 | `memory` | Deterministic in-memory implementation for tests and early orchestration. |
 | `sqlite` | SQLite-backed durable implementation of the repository traits. |
 | `error` | Store-specific structured errors and conversion to `locality-core` errors. |
@@ -49,6 +50,35 @@
 - SQLite records component versions for durable subsystems so compatibility is
   decided from persisted state contracts instead of desktop build IDs.
 - SQLite enables WAL mode, a busy timeout, foreign keys, and `PRAGMA user_version` schema versioning.
+
+## Atomic Discovery Commits
+
+`DiscoveryRepository::commit_discovery` is the durable boundary for a validated
+connector batch. One commit can upsert and delete entities, upsert remote
+observations and freshness, pause or update auto-save enrollment, explicitly
+remove invalidated metadata jobs and stale virtual mutations, and advance the
+mount-scoped connector checkpoint. The checkpoint insert is the final SQLite
+statement before transaction commit, so a batch checkpoint is never visible
+without all associated entity and hold-state changes.
+
+The in-memory implementation applies the same contract to a clone and swaps it
+into place only after every check succeeds. SQLite uses one transaction and
+temporarily stages changing entity paths, allowing swaps and longer path cycles
+without violating `UNIQUE(mount_id, path)`. Hydration jobs and auto-save
+enrollments follow authoritative entity path changes without resetting failure,
+origin, or scheduling state.
+
+Discovery deletion is deliberately conservative. Entity-owned shadows,
+hydration, freshness, observations, auto-save state, and FTS rows are removed,
+but opaque metadata-job and virtual-mutation identifiers must be supplied
+explicitly by the daemon. A move or delete that intersects unlisted pending
+virtual work fails atomically. Auto-save ownership is also preflighted: a row at
+an affected path may be unbound or bound to that entity, never to a different
+remote ID. Explicit auto-save upserts can override an automatic rehome only for
+the same owner.
+
+This contract uses existing tables and existing JSON meanings. It therefore
+does not change `PRAGMA user_version` or any state-component version.
 
 ## SQLite Schema
 

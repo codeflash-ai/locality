@@ -7,6 +7,7 @@
 
 pub mod compatibility;
 pub mod credentials;
+pub mod discovery;
 pub mod error;
 pub mod live_mode;
 pub mod memory;
@@ -23,6 +24,7 @@ pub use credentials::{
     CredentialError, CredentialResult, CredentialStore, FileCredentialStore,
     InMemoryCredentialStore, open_credential_store,
 };
+pub use discovery::{DiscoveryCommit, DiscoveryRepository};
 pub use error::{StoreError, StoreResult};
 pub use live_mode::{
     LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountLiveModeStateChangeError,

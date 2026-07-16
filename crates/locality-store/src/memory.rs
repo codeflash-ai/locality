@@ -3,7 +3,7 @@
 //! This store is intentionally deterministic and cloneable. It is suitable for
 //! unit tests and for wiring CLI/daemon flows before the SQLite schema is built.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use locality_core::LocalityResult;
@@ -13,6 +13,7 @@ use locality_core::journal::{
 use locality_core::model::{MountId, RemoteId};
 use locality_core::shadow::ShadowDocument;
 
+use crate::discovery::{DiscoveryCommit, DiscoveryRepository};
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
@@ -250,6 +251,210 @@ impl ConnectorStateRepository for InMemoryStateStore {
                 scope_id.to_string(),
             ))
             .cloned())
+    }
+}
+
+impl DiscoveryRepository for InMemoryStateStore {
+    fn commit_discovery(&mut self, commit: DiscoveryCommit) -> StoreResult<()> {
+        commit.validate()?;
+        let mount = self
+            .mounts
+            .get(&commit.mount_id)
+            .ok_or_else(|| StoreError::MountMissing(commit.mount_id.clone()))?;
+        commit.validate_connector(&mount.connector)?;
+
+        let mut next = self.clone();
+        next.apply_discovery(commit)?;
+        *self = next;
+        Ok(())
+    }
+}
+
+impl InMemoryStateStore {
+    fn apply_discovery(&mut self, commit: DiscoveryCommit) -> StoreResult<()> {
+        let mount_id = &commit.mount_id;
+        let entity_deletes = commit
+            .entity_deletes
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let deleted_paths = commit
+            .entity_deletes
+            .iter()
+            .filter_map(|remote_id| {
+                self.entities
+                    .get(&Self::entity_key(mount_id, remote_id))
+                    .map(|entity| entity.path.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        let path_moves = commit
+            .entity_upserts
+            .iter()
+            .filter_map(|entity| {
+                let existing = self
+                    .entities
+                    .get(&Self::entity_key(mount_id, &entity.remote_id))?;
+                (existing.path != entity.path).then(|| {
+                    (
+                        entity.remote_id.clone(),
+                        existing.path.clone(),
+                        entity.path.clone(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut affected_entities = commit
+            .entity_deletes
+            .iter()
+            .map(|remote_id| {
+                (
+                    remote_id.clone(),
+                    self.entities
+                        .get(&Self::entity_key(mount_id, remote_id))
+                        .map(|entity| entity.path.clone()),
+                )
+            })
+            .collect::<Vec<_>>();
+        affected_entities.extend(
+            path_moves
+                .iter()
+                .map(|(remote_id, old_path, _)| (remote_id.clone(), Some(old_path.clone()))),
+        );
+        let mount_enrollments = self
+            .auto_save_enrollments
+            .values()
+            .filter(|enrollment| enrollment.mount_id == *mount_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut affected_remote_ids = entity_deletes.clone();
+        let mut affected_paths = deleted_paths.clone();
+        for (remote_id, old_path, new_path) in &path_moves {
+            affected_remote_ids.insert(remote_id.clone());
+            affected_paths.insert(old_path.clone());
+            affected_paths.insert(new_path.clone());
+        }
+        let mount_mutations = self
+            .virtual_mutations
+            .values()
+            .filter(|mutation| mutation.mount_id == *mount_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        commit.validate_virtual_mutation_changes(
+            &mount_mutations,
+            &affected_remote_ids,
+            &affected_paths,
+        )?;
+
+        let auto_save_rehomes =
+            commit.plan_auto_save_changes(&mount_enrollments, &affected_entities, &path_moves)?;
+
+        let mut final_entities = self.entities.clone();
+        for remote_id in &commit.entity_deletes {
+            final_entities.remove(&Self::entity_key(mount_id, remote_id));
+        }
+        for entity in &commit.entity_upserts {
+            final_entities.insert(
+                Self::entity_key(&entity.mount_id, &entity.remote_id),
+                entity.clone(),
+            );
+        }
+        let mut final_paths = BTreeMap::new();
+        for entity in final_entities.values() {
+            let path_key = Self::path_key(&entity.mount_id, &entity.path);
+            if let Some(existing_remote_id) = final_paths.insert(path_key, entity.remote_id.clone())
+                && existing_remote_id != entity.remote_id
+            {
+                return Err(StoreError::DuplicateEntityPath {
+                    mount_id: entity.mount_id.clone(),
+                    path: entity.path.clone(),
+                });
+            }
+        }
+
+        for remote_id in &commit.entity_deletes {
+            let key = Self::entity_key(mount_id, remote_id);
+            self.shadows.remove(&Self::shadow_key(mount_id, remote_id));
+            self.hydration_jobs
+                .remove(&Self::hydration_job_key(mount_id, remote_id));
+            self.remote_observations
+                .remove(&Self::remote_observation_key(mount_id, remote_id));
+            self.freshness_states
+                .remove(&Self::freshness_state_key(mount_id, remote_id));
+            self.entities.remove(&key);
+        }
+        self.auto_save_enrollments
+            .retain(|(entry_mount_id, path), enrollment| {
+                entry_mount_id != mount_id
+                    || (!enrollment
+                        .remote_id
+                        .as_ref()
+                        .is_some_and(|remote_id| entity_deletes.contains(remote_id))
+                        && !deleted_paths.contains(path))
+            });
+        for identifier in &commit.metadata_discovery_deletes {
+            self.metadata_discovery_jobs
+                .remove(&Self::metadata_discovery_job_key(mount_id, identifier));
+        }
+        for local_id in &commit.virtual_mutation_deletes {
+            self.virtual_mutations
+                .remove(&Self::virtual_mutation_key(mount_id, local_id));
+        }
+
+        for (remote_id, _, new_path) in &path_moves {
+            if let Some(job) = self
+                .hydration_jobs
+                .get_mut(&Self::hydration_job_key(mount_id, remote_id))
+            {
+                job.path = new_path.clone();
+            }
+        }
+        for rehome in &auto_save_rehomes {
+            self.auto_save_enrollments
+                .remove(&Self::auto_save_key(mount_id, &rehome.old_path));
+        }
+        for rehome in auto_save_rehomes {
+            let enrollment = rehome.enrollment;
+            let key = Self::auto_save_key(mount_id, &enrollment.path);
+            if self.auto_save_enrollments.contains_key(&key) {
+                return Err(StoreError::InvalidState(format!(
+                    "cannot rehome auto-save enrollment to occupied path `{}`",
+                    enrollment.path.display()
+                )));
+            }
+            self.auto_save_enrollments.insert(key, enrollment);
+        }
+        for enrollment in commit.auto_save_upserts {
+            self.auto_save_enrollments.insert(
+                Self::auto_save_key(&enrollment.mount_id, &enrollment.path),
+                enrollment,
+            );
+        }
+
+        self.entities = final_entities;
+        self.entities_by_path = final_paths;
+        for observation in commit.observation_upserts {
+            self.remote_observations.insert(
+                Self::remote_observation_key(&observation.mount_id, &observation.remote_id),
+                observation,
+            );
+        }
+        for freshness in commit.freshness_upserts {
+            self.freshness_states.insert(
+                Self::freshness_state_key(&freshness.mount_id, &freshness.remote_id),
+                freshness,
+            );
+        }
+
+        let checkpoint = commit.checkpoint;
+        self.connector_states.insert(
+            (
+                checkpoint.connector.clone(),
+                checkpoint.scope_kind.clone(),
+                checkpoint.scope_id.clone(),
+            ),
+            checkpoint,
+        );
+        Ok(())
     }
 }
 

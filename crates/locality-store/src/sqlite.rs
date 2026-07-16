@@ -5,6 +5,7 @@
 //! columns, while shadow block arrays and journal plans are stored as JSON blobs
 //! until query needs justify normalization.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,6 +28,7 @@ use crate::compatibility::{
     StateCompatibilityIssue, StateCompatibilityReport, StateCompatibilityStatus,
     StateComponentDefinition, StateComponentRecord,
 };
+use crate::discovery::{DiscoveryCommit, DiscoveryRepository};
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
@@ -622,6 +624,240 @@ impl ConnectorStateRepository for SqliteStateStore {
             )
             .optional()
             .map_err(StoreError::from)
+    }
+}
+
+impl DiscoveryRepository for SqliteStateStore {
+    fn commit_discovery(&mut self, commit: DiscoveryCommit) -> StoreResult<()> {
+        commit.validate()?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let connector = transaction
+            .query_row(
+                "SELECT connector FROM mounts WHERE mount_id = ?1",
+                params![commit.mount_id.0.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::MountMissing(commit.mount_id.clone()))?;
+        commit.validate_connector(&connector)?;
+
+        let existing_entities = discovery_entities(&transaction, &commit.mount_id)?;
+        let existing_by_id = existing_entities
+            .iter()
+            .map(|entity| (entity.remote_id.clone(), entity.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let deleted_paths = commit
+            .entity_deletes
+            .iter()
+            .filter_map(|remote_id| {
+                existing_by_id
+                    .get(remote_id)
+                    .map(|entity| (remote_id.clone(), entity.path.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let path_moves = commit
+            .entity_upserts
+            .iter()
+            .filter_map(|entity| {
+                let existing = existing_by_id.get(&entity.remote_id)?;
+                (existing.path != entity.path).then(|| {
+                    (
+                        entity.remote_id.clone(),
+                        existing.path.clone(),
+                        entity.path.clone(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut affected_entities = commit
+            .entity_deletes
+            .iter()
+            .map(|remote_id| {
+                (
+                    remote_id.clone(),
+                    existing_by_id
+                        .get(remote_id)
+                        .map(|entity| entity.path.clone()),
+                )
+            })
+            .collect::<Vec<_>>();
+        affected_entities.extend(
+            path_moves
+                .iter()
+                .map(|(remote_id, old_path, _)| (remote_id.clone(), Some(old_path.clone()))),
+        );
+        let auto_save_enrollments =
+            discovery_auto_save_enrollments(&transaction, &commit.mount_id)?;
+
+        let mut affected_remote_ids = commit
+            .entity_deletes
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let deleted_path_set = deleted_paths.values().cloned().collect::<BTreeSet<_>>();
+        let mut affected_paths = deleted_path_set.clone();
+        for (remote_id, old_path, new_path) in &path_moves {
+            affected_remote_ids.insert(remote_id.clone());
+            affected_paths.insert(old_path.clone());
+            affected_paths.insert(new_path.clone());
+        }
+        commit.validate_virtual_mutation_changes(
+            &discovery_virtual_mutations(&transaction, &commit.mount_id)?,
+            &affected_remote_ids,
+            &affected_paths,
+        )?;
+
+        validate_discovery_final_paths(&commit, existing_entities)?;
+        let auto_save_rehomes = commit.plan_auto_save_changes(
+            &auto_save_enrollments,
+            &affected_entities,
+            &path_moves,
+        )?;
+
+        let final_path_texts = commit
+            .entity_upserts
+            .iter()
+            .map(|entity| logical_path_to_text(&entity.path))
+            .collect::<BTreeSet<_>>();
+        for (index, (remote_id, _, _)) in path_moves.iter().enumerate() {
+            let staging_path =
+                discovery_staging_path(&transaction, &commit.mount_id, index, &final_path_texts)?;
+            transaction.execute(
+                "UPDATE entities SET path = ?3 WHERE mount_id = ?1 AND remote_id = ?2",
+                params![
+                    commit.mount_id.0.as_str(),
+                    remote_id.0.as_str(),
+                    staging_path
+                ],
+            )?;
+        }
+
+        for rehome in &auto_save_rehomes {
+            transaction.execute(
+                "DELETE FROM auto_save_enrollments WHERE mount_id = ?1 AND path = ?2",
+                params![commit.mount_id.0.as_str(), path_to_text(&rehome.old_path)],
+            )?;
+        }
+
+        for remote_id in &commit.entity_deletes {
+            transaction.execute(
+                "DELETE FROM shadows WHERE mount_id = ?1 AND entity_id = ?2",
+                params![commit.mount_id.0.as_str(), remote_id.0.as_str()],
+            )?;
+            transaction.execute(
+                "DELETE FROM hydration_jobs WHERE mount_id = ?1 AND remote_id = ?2",
+                params![commit.mount_id.0.as_str(), remote_id.0.as_str()],
+            )?;
+            transaction.execute(
+                "DELETE FROM freshness_states WHERE mount_id = ?1 AND remote_id = ?2",
+                params![commit.mount_id.0.as_str(), remote_id.0.as_str()],
+            )?;
+            transaction.execute(
+                "DELETE FROM remote_observations WHERE mount_id = ?1 AND remote_id = ?2",
+                params![commit.mount_id.0.as_str(), remote_id.0.as_str()],
+            )?;
+            if let Some(path) = deleted_paths.get(remote_id) {
+                let path = logical_path_to_text(path);
+                transaction.execute(
+                    "DELETE FROM auto_save_enrollments
+                     WHERE mount_id = ?1 AND (remote_id = ?2 OR path = ?3)",
+                    params![commit.mount_id.0.as_str(), remote_id.0.as_str(), path],
+                )?;
+            } else {
+                transaction.execute(
+                    "DELETE FROM auto_save_enrollments
+                     WHERE mount_id = ?1 AND remote_id = ?2",
+                    params![commit.mount_id.0.as_str(), remote_id.0.as_str()],
+                )?;
+            }
+            delete_entity_search_index(&transaction, &commit.mount_id, remote_id)?;
+            transaction.execute(
+                "DELETE FROM entities WHERE mount_id = ?1 AND remote_id = ?2",
+                params![commit.mount_id.0.as_str(), remote_id.0.as_str()],
+            )?;
+        }
+        for identifier in &commit.metadata_discovery_deletes {
+            transaction.execute(
+                "DELETE FROM metadata_discovery_jobs
+                 WHERE mount_id = ?1 AND container_identifier = ?2",
+                params![commit.mount_id.0.as_str(), identifier],
+            )?;
+        }
+        for local_id in &commit.virtual_mutation_deletes {
+            transaction.execute(
+                "DELETE FROM virtual_mutations WHERE mount_id = ?1 AND local_id = ?2",
+                params![commit.mount_id.0.as_str(), local_id],
+            )?;
+        }
+
+        for (remote_id, _, new_path) in &path_moves {
+            transaction.execute(
+                "UPDATE hydration_jobs SET path = ?3
+                 WHERE mount_id = ?1 AND remote_id = ?2",
+                params![
+                    commit.mount_id.0.as_str(),
+                    remote_id.0.as_str(),
+                    path_to_text(new_path),
+                ],
+            )?;
+        }
+        for entity in &commit.entity_upserts {
+            upsert_discovery_entity(&transaction, entity)?;
+        }
+        for observation in &commit.observation_upserts {
+            upsert_discovery_observation(&transaction, observation)?;
+        }
+        for freshness in &commit.freshness_upserts {
+            upsert_discovery_freshness(&transaction, freshness)?;
+        }
+        for rehome in auto_save_rehomes {
+            upsert_discovery_auto_save(&transaction, &rehome.enrollment)?;
+        }
+        for enrollment in &commit.auto_save_upserts {
+            upsert_discovery_auto_save(&transaction, enrollment)?;
+        }
+
+        let search_updates = commit
+            .entity_deletes
+            .iter()
+            .chain(commit.entity_upserts.iter().map(|entity| &entity.remote_id))
+            .chain(
+                commit
+                    .observation_upserts
+                    .iter()
+                    .map(|observation| &observation.remote_id),
+            )
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for remote_id in search_updates {
+            upsert_entity_search_index(&transaction, &commit.mount_id, &remote_id)?;
+        }
+
+        let checkpoint = &commit.checkpoint;
+        transaction.execute(
+            "INSERT INTO connector_state (
+                connector, scope_kind, scope_id, state_version,
+                min_reader_version, state_json, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(connector, scope_kind, scope_id) DO UPDATE SET
+                state_version = excluded.state_version,
+                min_reader_version = excluded.min_reader_version,
+                state_json = excluded.state_json,
+                updated_at = excluded.updated_at",
+            params![
+                checkpoint.connector.as_str(),
+                checkpoint.scope_kind.as_str(),
+                checkpoint.scope_id.as_str(),
+                checkpoint.state_version,
+                checkpoint.min_reader_version,
+                checkpoint.state_json.as_str(),
+                checkpoint.updated_at.as_str(),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 }
 
@@ -3764,6 +4000,223 @@ fn delete_entity_search_index(
     connection.execute(
         "DELETE FROM entity_search_fts WHERE mount_id = ?1 AND remote_id = ?2",
         params![mount_id.0, remote_id.0],
+    )?;
+    Ok(())
+}
+
+fn discovery_entities(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<Vec<EntityRecord>> {
+    let mut statement = connection.prepare(
+        &(ENTITY_SELECT_WITH_WHERE.to_owned() + "WHERE mount_id = ?1 ORDER BY remote_id"),
+    )?;
+    let rows = statement.query_map(params![mount_id.0.as_str()], entity_row)?;
+    rows.map(|row| entity_from_row(row?)).collect()
+}
+
+fn validate_discovery_final_paths(
+    commit: &DiscoveryCommit,
+    existing: Vec<EntityRecord>,
+) -> StoreResult<()> {
+    let mut by_id = existing
+        .into_iter()
+        .map(|entity| (entity.remote_id.clone(), entity))
+        .collect::<BTreeMap<_, _>>();
+    for remote_id in &commit.entity_deletes {
+        by_id.remove(remote_id);
+    }
+    for entity in &commit.entity_upserts {
+        by_id.insert(entity.remote_id.clone(), entity.clone());
+    }
+
+    let mut by_path = BTreeMap::new();
+    for entity in by_id.into_values() {
+        if let Some(existing_remote_id) =
+            by_path.insert(entity.path.clone(), entity.remote_id.clone())
+            && existing_remote_id != entity.remote_id
+        {
+            return Err(StoreError::DuplicateEntityPath {
+                mount_id: commit.mount_id.clone(),
+                path: entity.path,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn discovery_virtual_mutations(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<Vec<VirtualMutationRecord>> {
+    let mut statement = connection.prepare(
+        &(VIRTUAL_MUTATION_SELECT_WITH_WHERE.to_owned() + "WHERE mount_id = ?1 ORDER BY local_id"),
+    )?;
+    let rows = statement.query_map(params![mount_id.0.as_str()], virtual_mutation_row)?;
+    rows.map(|row| virtual_mutation_from_row(row?)).collect()
+}
+
+fn discovery_auto_save_enrollments(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<Vec<AutoSaveEnrollmentRecord>> {
+    let mut statement = connection
+        .prepare(&(AUTO_SAVE_SELECT_WITH_WHERE.to_owned() + "WHERE mount_id = ?1 ORDER BY path"))?;
+    let rows = statement.query_map(params![mount_id.0.as_str()], auto_save_enrollment_row)?;
+    rows.map(|row| auto_save_enrollment_from_row(row?))
+        .collect()
+}
+
+fn discovery_staging_path(
+    connection: &Connection,
+    mount_id: &MountId,
+    index: usize,
+    final_paths: &BTreeSet<String>,
+) -> StoreResult<String> {
+    for nonce in 0_u64.. {
+        let candidate = format!(".locality-discovery-staging/{index}-{nonce}");
+        if final_paths.contains(&candidate) {
+            continue;
+        }
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM entities WHERE mount_id = ?1 AND path = ?2",
+                params![mount_id.0.as_str(), candidate.as_str()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(candidate);
+        }
+    }
+    unreachable!("u64 staging path space exhausted")
+}
+
+fn upsert_discovery_entity(connection: &Connection, entity: &EntityRecord) -> StoreResult<()> {
+    connection.execute(
+        "INSERT INTO entities (
+            mount_id, remote_id, kind_json, title, path, hydration_json,
+            content_hash, remote_edited_at
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(mount_id, remote_id) DO UPDATE SET
+            kind_json = excluded.kind_json,
+            title = excluded.title,
+            path = excluded.path,
+            hydration_json = excluded.hydration_json,
+            content_hash = excluded.content_hash,
+            remote_edited_at = excluded.remote_edited_at",
+        params![
+            entity.mount_id.0.as_str(),
+            entity.remote_id.0.as_str(),
+            to_json(&entity.kind)?,
+            entity.title.as_str(),
+            logical_path_to_text(&entity.path),
+            to_json(&entity.hydration)?,
+            entity.content_hash.as_deref(),
+            entity.remote_edited_at.as_deref(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_discovery_observation(
+    connection: &Connection,
+    observation: &RemoteObservationRecord,
+) -> StoreResult<()> {
+    connection.execute(
+        "INSERT INTO remote_observations (
+            mount_id, remote_id, kind_json, title, parent_remote_id, projected_path,
+            remote_version_json, observed_at, deleted, raw_metadata_json
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(mount_id, remote_id) DO UPDATE SET
+            kind_json = excluded.kind_json,
+            title = excluded.title,
+            parent_remote_id = excluded.parent_remote_id,
+            projected_path = excluded.projected_path,
+            remote_version_json = excluded.remote_version_json,
+            observed_at = excluded.observed_at,
+            deleted = excluded.deleted,
+            raw_metadata_json = excluded.raw_metadata_json",
+        params![
+            observation.mount_id.0.as_str(),
+            observation.remote_id.0.as_str(),
+            to_json(&observation.kind)?,
+            observation.title.as_str(),
+            observation.parent_remote_id.as_ref().map(RemoteId::as_str),
+            logical_path_to_text(&observation.projected_path),
+            to_json(&observation.remote_version)?,
+            observation.observed_at.as_str(),
+            bool_to_int(observation.deleted),
+            observation.raw_metadata_json.as_str(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_discovery_freshness(
+    connection: &Connection,
+    state: &FreshnessStateRecord,
+) -> StoreResult<()> {
+    connection.execute(
+        "INSERT INTO freshness_states (
+            mount_id, remote_id, tier_json, last_checked_at, next_check_at,
+            last_opened_at, last_local_change_at, remote_hint_pending
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(mount_id, remote_id) DO UPDATE SET
+            tier_json = excluded.tier_json,
+            last_checked_at = excluded.last_checked_at,
+            next_check_at = excluded.next_check_at,
+            last_opened_at = excluded.last_opened_at,
+            last_local_change_at = excluded.last_local_change_at,
+            remote_hint_pending = excluded.remote_hint_pending",
+        params![
+            state.mount_id.0.as_str(),
+            state.remote_id.0.as_str(),
+            to_json(&state.tier)?,
+            state.last_checked_at.as_deref(),
+            state.next_check_at.as_deref(),
+            state.last_opened_at.as_deref(),
+            state.last_local_change_at.as_deref(),
+            bool_to_int(state.remote_hint_pending),
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_discovery_auto_save(
+    connection: &Connection,
+    enrollment: &AutoSaveEnrollmentRecord,
+) -> StoreResult<()> {
+    connection.execute(
+        "INSERT INTO auto_save_enrollments (
+            mount_id, path, remote_id, enabled, origin_json, state_json,
+            last_reason, last_push_id, created_at, updated_at
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(mount_id, path) DO UPDATE SET
+            remote_id = excluded.remote_id,
+            enabled = excluded.enabled,
+            origin_json = excluded.origin_json,
+            state_json = excluded.state_json,
+            last_reason = excluded.last_reason,
+            last_push_id = excluded.last_push_id,
+            updated_at = excluded.updated_at",
+        params![
+            enrollment.mount_id.0.as_str(),
+            path_to_text(&enrollment.path),
+            enrollment.remote_id.as_ref().map(RemoteId::as_str),
+            bool_to_int(enrollment.enabled),
+            to_json(&enrollment.origin)?,
+            to_json(&enrollment.state)?,
+            enrollment.last_reason.as_deref(),
+            enrollment.last_push_id.as_deref(),
+            enrollment.created_at.as_str(),
+            enrollment.updated_at.as_str(),
+        ],
     )?;
     Ok(())
 }
