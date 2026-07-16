@@ -2231,6 +2231,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "locality-slack"
+version = "0.3.2"
+dependencies = [
+ "chrono",
+ "locality-connector",
+ "locality-core",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "locality-store"
 version = "0.3.2"
 dependencies = [
