@@ -34,6 +34,9 @@ pub enum DaemonRequest {
         remote_id: String,
         path: PathBuf,
     },
+    StartPreHydration {
+        mount_id: String,
+    },
     ObserveEntity {
         mount_id: String,
         remote_id: String,

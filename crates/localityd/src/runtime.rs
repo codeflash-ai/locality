@@ -38,7 +38,8 @@ use locality_store::{
     FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository,
     MetadataDiscoveryJobRecord, MetadataDiscoveryJobRepository, MetadataDiscoveryPriority,
     MountConfig, MountLiveModeRepository, MountRepository, ProjectionMode, RemoteObservationRecord,
-    RemoteObservationRepository, ShadowRepository, SqliteStateStore, open_credential_store,
+    RemoteObservationRepository, ShadowRepository, SqliteStateStore,
+    load_mount_pre_hydration_state, open_credential_store,
 };
 use serde_json::{Value, json};
 
@@ -62,6 +63,7 @@ use crate::ipc::{
     DaemonActiveJobStatus, DaemonDebugQueueItem, DaemonDebugQueueSection, DaemonDebugQueueStatus,
     DaemonProviderCooldownStatus, DaemonRequest, DaemonResponse, DaemonRuntimeStatus,
 };
+use crate::pre_hydration::{execute_mount_pre_hydration, status_is_finished};
 use crate::pull::run_pull_with_state_root;
 use crate::push::{
     execute_auto_save_push_job_with_content_root, execute_push_job_with_content_root,
@@ -72,7 +74,9 @@ use crate::reconcile::{
 };
 use crate::scheduler::{PullScheduler, PullSchedulerTick};
 use crate::shadow_match::parsed_matches_shadow;
-use crate::source::{ResolvedSourceSet, resolve_source_for_mount_id, resolve_source_for_path};
+use crate::source::{
+    ResolvedSourceSet, resolve_source_for_mount_id, resolve_source_for_path, source_descriptor,
+};
 use crate::virtual_fs::{
     MOUNT_POINT_PREFIX, ROOT_CONTAINER_IDENTIFIER, VirtualFsItemKind,
     VirtualFsRefreshChildrenReport, commit_virtual_fs_write, create_virtual_fs_directory,
@@ -181,6 +185,12 @@ impl DaemonRuntimeHandle {
             .send(RuntimeMessage::PrimeVirtualMounts)
             .map_err(|_| RuntimeSendError)
     }
+
+    pub fn prime_pre_hydration_mounts(&self) -> Result<(), RuntimeSendError> {
+        self.sender
+            .send(RuntimeMessage::PrimePreHydrationMounts)
+            .map_err(|_| RuntimeSendError)
+    }
 }
 
 #[derive(Debug)]
@@ -274,6 +284,16 @@ pub trait RuntimeJobRunner: Send + Sync + 'static {
     ) -> locality_core::LocalityResult<ScheduledPullRuntimeReport> {
         Err(LocalityError::Unsupported(
             "runtime runner does not support phased scheduled pull reconciliation",
+        ))
+    }
+
+    fn run_pre_hydration(
+        &self,
+        _state_root: PathBuf,
+        _mount_id: MountId,
+    ) -> locality_core::LocalityResult<ScheduledPullRuntimeReport> {
+        Err(LocalityError::Unsupported(
+            "runtime runner does not handle pre-hydration",
         ))
     }
 
@@ -477,7 +497,7 @@ pub struct FileEventRuntimeReport {
     pub auto_push_targets: Vec<PathBuf>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScheduledPullRuntimeReport {
     pub report: ScheduledPullReport,
     pub queued_hydrations: Vec<HydrationRequest>,
@@ -636,6 +656,44 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         policy: HydrationPolicy,
     ) -> locality_core::LocalityResult<ScheduledPullRuntimeReport> {
         reconcile_fetched_scheduled_pull(&state_root, fetched, &policy)
+    }
+
+    fn run_pre_hydration(
+        &self,
+        state_root: PathBuf,
+        mount_id: MountId,
+    ) -> locality_core::LocalityResult<ScheduledPullRuntimeReport> {
+        let mut store = SqliteStateStore::open(state_root.clone()).map_err(LocalityError::from)?;
+        let mount = store
+            .get_mount(&mount_id)
+            .map_err(LocalityError::from)?
+            .ok_or_else(|| {
+                LocalityError::InvalidState(format!("mount `{}` does not exist", mount_id.0))
+            })?;
+        if !source_descriptor(&mount.connector).supports_pre_hydration() {
+            return Err(LocalityError::Unsupported(
+                "connector does not support pre-hydration",
+            ));
+        }
+
+        let credentials = open_credential_store(&state_root);
+        let source = resolve_source_for_mount_id(&store, credentials.as_ref(), &mount_id)
+            .map_err(LocalityError::from)?;
+        let mut hydration = HydrationCollector::default();
+        let report = execute_mount_pre_hydration(
+            &mut store,
+            &mut hydration,
+            &mount,
+            &source,
+            Some(&state_root),
+            &freshness_timestamp(),
+        )?;
+
+        Ok(ScheduledPullRuntimeReport {
+            report,
+            queued_hydrations: hydration.into_requests(),
+            freshness_jobs: Vec::new(),
+        })
     }
 
     fn run_hydration(
@@ -1376,6 +1434,7 @@ struct RuntimeState {
     deferred_scheduled_pull: Option<DeferredScheduledPull>,
     active_scheduled_fetch: Option<ActiveRuntimeJob>,
     pending_scheduled_reconcile: Option<ScheduledPullFetch>,
+    pending_pre_hydration: VecDeque<MountId>,
     scheduler: PullScheduler,
     last_scheduler_advance: Instant,
     active_job: Option<ActiveRuntimeJob>,
@@ -1531,6 +1590,7 @@ impl RuntimeState {
             deferred_scheduled_pull: None,
             active_scheduled_fetch: None,
             pending_scheduled_reconcile: None,
+            pending_pre_hydration: VecDeque::new(),
             active_job: None,
         }
     }
@@ -1554,6 +1614,7 @@ impl RuntimeState {
                     let _ = respond_to.send(self.status());
                 }
                 Ok(RuntimeMessage::PrimeVirtualMounts) => self.prime_virtual_mounts(),
+                Ok(RuntimeMessage::PrimePreHydrationMounts) => self.prime_pre_hydration_mounts(),
                 Ok(RuntimeMessage::JobFinished(completion)) => self.handle_completion(completion),
                 Ok(RuntimeMessage::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => self.handle_timeout(),
@@ -1625,6 +1686,15 @@ impl RuntimeState {
                     "mount_id": mount_id,
                     "remote_id": remote_id,
                     "path": path,
+                })));
+                self.maybe_start_next_job();
+            }
+            DaemonRequest::StartPreHydration { mount_id } => {
+                let mount_id = MountId::new(mount_id);
+                let queued = self.queue_pre_hydration_mount(mount_id.clone());
+                let _ = respond_to.send(DaemonResponse::ok(json!({
+                    "queued": queued,
+                    "mount_id": mount_id.0,
                 })));
                 self.maybe_start_next_job();
             }
@@ -1964,6 +2034,15 @@ impl RuntimeState {
                 Ok(result) => self.finish_scheduled_pull(result),
                 Err(error) => eprintln!("localityd scheduled pull reconcile failed: {error}"),
             },
+            JobCompletion::PreHydration { mount_id, result } => match result {
+                Ok(result) => self.finish_pre_hydration(result),
+                Err(error) => {
+                    eprintln!(
+                        "localityd pre-hydration failed for `{}`: {error}",
+                        mount_id.0
+                    )
+                }
+            },
             JobCompletion::Hydration {
                 request,
                 result,
@@ -2170,6 +2249,8 @@ impl RuntimeState {
                 .pop_ready_at(Some(&freshness_timestamp()), FRESHNESS_JOB_BUDGET_UNITS)
             {
                 Some(MutatingJob::Freshness { job })
+            } else if let Some(mount_id) = self.pending_pre_hydration.pop_front() {
+                Some(MutatingJob::PreHydration { mount_id })
             } else if let Some(fetched) = self.pending_scheduled_reconcile.take() {
                 Some(MutatingJob::ScheduledPullReconcile { fetched })
             } else {
@@ -2373,6 +2454,13 @@ impl RuntimeState {
         }
     }
 
+    fn finish_pre_hydration(&mut self, result: ScheduledPullRuntimeReport) {
+        self.queue_hydration_batch(result.queued_hydrations);
+        for job in result.freshness_jobs {
+            self.queue_freshness(job);
+        }
+    }
+
     fn defer_hydration_retry(&mut self, request: HydrationRequest) {
         self.deferred_hydration.push(request);
         let retry_at = Instant::now() + self.config.hydration_retry_delay;
@@ -2412,6 +2500,43 @@ impl RuntimeState {
             Err(error) => eprintln!("localityd failed to persist hydration request: {error}"),
         }
         queued
+    }
+
+    fn queue_hydration_batch(&mut self, requests: Vec<HydrationRequest>) {
+        if requests.is_empty() {
+            return;
+        }
+
+        for request in &requests {
+            self.hydration.queue_request(request.clone());
+        }
+        let jobs = requests
+            .into_iter()
+            .map(HydrationJobRecord::from)
+            .collect::<Vec<_>>();
+        match SqliteStateStore::open(self.config.state_root.clone())
+            .and_then(|mut store| store.upsert_hydration_jobs(jobs))
+        {
+            Ok(()) => {}
+            Err(error) => eprintln!("localityd failed to persist hydration request batch: {error}"),
+        }
+    }
+
+    fn queue_pre_hydration_mount(&mut self, mount_id: MountId) -> bool {
+        if self.active_job.as_ref().is_some_and(|job| {
+            job.kind == "pre_hydration" && job.target.as_ref() == Some(&mount_id.0)
+        }) {
+            return false;
+        }
+        if self
+            .pending_pre_hydration
+            .iter()
+            .any(|pending| pending == &mount_id)
+        {
+            return false;
+        }
+        self.pending_pre_hydration.push_back(mount_id);
+        true
     }
 
     fn remote_fast_forward_target_is_already_queued(&self, request: &HydrationRequest) -> bool {
@@ -2504,6 +2629,48 @@ impl RuntimeState {
                 0,
             );
         }
+    }
+
+    fn prime_pre_hydration_mounts(&mut self) {
+        let store = match SqliteStateStore::open(self.config.state_root.clone()) {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("localityd failed to open state for pre-hydration priming: {error}");
+                return;
+            }
+        };
+        let mounts = match store.load_mounts() {
+            Ok(mounts) => mounts,
+            Err(error) => {
+                eprintln!("localityd failed to load mounts for pre-hydration priming: {error}");
+                return;
+            }
+        };
+
+        for mount in mounts {
+            if !source_descriptor(&mount.connector).supports_pre_hydration() {
+                continue;
+            }
+            let state =
+                match load_mount_pre_hydration_state(&store, &mount.connector, &mount.mount_id) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        eprintln!(
+                            "localityd failed to load pre-hydration state for `{}`: {error}",
+                            mount.mount_id.0
+                        );
+                        continue;
+                    }
+                };
+            if state
+                .as_ref()
+                .is_some_and(|state| state.enabled && !status_is_finished(&state.status))
+            {
+                self.queue_pre_hydration_mount(mount.mount_id);
+            }
+        }
+
+        self.maybe_start_next_job();
     }
 
     fn queue_due_periodic_discovery(&mut self, now: Instant) {
@@ -2981,6 +3148,20 @@ impl RuntimeState {
         });
 
         sections.push(DaemonDebugQueueSection {
+            name: "pre_hydration".to_string(),
+            label: "Mount pre-hydration".to_string(),
+            total: self.pending_pre_hydration.len(),
+            ready: Some(self.pending_pre_hydration.len()),
+            deferred: None,
+            items: self
+                .pending_pre_hydration
+                .iter()
+                .take(DEBUG_QUEUE_ITEM_LIMIT)
+                .map(debug_pre_hydration_item)
+                .collect(),
+        });
+
+        sections.push(DaemonDebugQueueSection {
             name: "child_refreshes".to_string(),
             label: "Directory discovery".to_string(),
             total: self.child_refreshes.len(),
@@ -3099,7 +3280,9 @@ impl RuntimeState {
                         .map(ActiveRuntimeJob::status)
                 })
                 .or(active_child_refresh),
-            pending_requests: self.pending_requests.len() + self.child_refreshes.len(),
+            pending_requests: self.pending_requests.len()
+                + self.pending_pre_hydration.len()
+                + self.child_refreshes.len(),
             pending_hydrations: self.hydration.len(),
             deferred_hydrations: self.deferred_hydration.len(),
             pending_freshness: freshness_metrics.total_jobs,
@@ -3248,6 +3431,19 @@ fn debug_freshness_item(debug: crate::freshness::FreshnessQueueDebugJob) -> Daem
             format!("deferred {}", job.tier.as_str())
         }),
         next_eligible_at: job.next_eligible_at,
+    }
+}
+
+fn debug_pre_hydration_item(mount_id: &MountId) -> DaemonDebugQueueItem {
+    DaemonDebugQueueItem {
+        kind: "pre_hydration".to_string(),
+        target: Some(mount_id.0.clone()),
+        mount_id: Some(mount_id.0.clone()),
+        remote_id: None,
+        path: None,
+        reason: Some("enabled mount".to_string()),
+        priority: Some("background".to_string()),
+        next_eligible_at: None,
     }
 }
 
@@ -4151,6 +4347,10 @@ fn run_job(
         MutatingJob::ScheduledPullReconcile { fetched } => JobCompletion::ScheduledPullReconcile(
             runner.run_scheduled_pull_reconcile(state_root, fetched, policy),
         ),
+        MutatingJob::PreHydration { mount_id } => JobCompletion::PreHydration {
+            mount_id: mount_id.clone(),
+            result: runner.run_pre_hydration(state_root, mount_id),
+        },
         MutatingJob::Hydration { request } => {
             let previous_shadow = remote_fast_forward_previous_shadow(&state_root, &request);
             let result = runner.run_hydration(state_root, request.clone());
@@ -4312,6 +4512,7 @@ enum RuntimeMessage {
         respond_to: Sender<DaemonRuntimeStatus>,
     },
     PrimeVirtualMounts,
+    PrimePreHydrationMounts,
     JobFinished(JobCompletion),
     Shutdown,
 }
@@ -4381,6 +4582,7 @@ enum MutatingRequest {
 enum MutatingJob {
     Request(MutatingRequest),
     ScheduledPullReconcile { fetched: ScheduledPullFetch },
+    PreHydration { mount_id: MountId },
     Hydration { request: HydrationRequest },
     Freshness { job: SyncJob },
 }
@@ -4390,6 +4592,9 @@ impl MutatingJob {
         match self {
             Self::Request(request) => request.active_status_parts(),
             Self::ScheduledPullReconcile { .. } => ("scheduled_pull_reconcile".to_string(), None),
+            Self::PreHydration { mount_id } => {
+                ("pre_hydration".to_string(), Some(mount_id.0.clone()))
+            }
             Self::Hydration { request } => (
                 "hydration".to_string(),
                 Some(request.path.display().to_string()),
@@ -4534,6 +4739,10 @@ enum JobCompletion {
         result: locality_core::LocalityResult<ScheduledPullFetchOutcome>,
     },
     ScheduledPullReconcile(locality_core::LocalityResult<ScheduledPullRuntimeReport>),
+    PreHydration {
+        mount_id: MountId,
+        result: locality_core::LocalityResult<ScheduledPullRuntimeReport>,
+    },
     Hydration {
         request: HydrationRequest,
         result: locality_core::LocalityResult<HydrationOutcome>,

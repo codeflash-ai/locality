@@ -16,7 +16,8 @@ use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, EntityRecord, EntityRepository,
     FreshnessStateRecord, FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository,
     InMemoryStateStore, MountConfig, MountLiveModeRecord, MountLiveModeRepository, MountRepository,
-    ProjectionMode, ShadowRepository, SqliteStateStore, live_mode_state_change_signal_path,
+    ProjectionMode, ShadowRepository, SqliteStateStore, enable_mount_pre_hydration,
+    live_mode_state_change_signal_path,
 };
 use localityd::DaemonConfig;
 use localityd::execution::{DaemonEventReport, PushJob};
@@ -2423,6 +2424,137 @@ fn runtime_drains_persisted_hydration_on_startup() {
     runtime.shutdown();
 }
 
+#[test]
+fn runtime_start_pre_hydration_returns_before_worker_finishes() {
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(
+        relay_config("pre-hydration-nonblocking"),
+        BlockingPreHydrationRunner {
+            started: started_tx,
+            release: Mutex::new(release_rx),
+        },
+    )
+    .expect("spawn runtime");
+
+    let response = runtime.handle().request(DaemonRequest::StartPreHydration {
+        mount_id: "notion-main".to_string(),
+    });
+
+    assert!(response.ok, "{response:?}");
+    assert_eq!(response.payload.as_ref().unwrap()["queued"], true);
+    assert_eq!(response.payload.unwrap()["mount_id"], "notion-main");
+    assert_eq!(
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker started"),
+        MountId::new("notion-main")
+    );
+    release_tx.send(()).expect("release worker");
+    runtime.shutdown();
+}
+
+#[test]
+fn runtime_primes_enabled_pre_hydration_mounts_on_startup() {
+    let config = relay_config("pre-hydration-prime");
+    let mount_root = temp_root("pre-hydration-prime-mount");
+    let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
+    let mount_id = MountId::new("notion-main");
+    store
+        .save_mount(MountConfig::new(mount_id.clone(), "notion", mount_root))
+        .expect("save mount");
+    enable_mount_pre_hydration(&mut store, "notion", &mount_id, "2026-07-16T10:00:00Z")
+        .expect("enable pre-hydration");
+    drop(store);
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(
+        config,
+        BlockingPreHydrationRunner {
+            started: started_tx,
+            release: Mutex::new(release_rx),
+        },
+    )
+    .expect("spawn runtime");
+
+    runtime
+        .handle()
+        .prime_pre_hydration_mounts()
+        .expect("prime pre-hydration");
+    assert_eq!(
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker started"),
+        MountId::new("notion-main")
+    );
+    release_tx.send(()).expect("release worker");
+    runtime.shutdown();
+}
+
+#[test]
+fn runtime_persists_pre_hydration_prefetches_in_batch_completion_path() {
+    let config = relay_config("pre-hydration-batch");
+    let mount_root = temp_root("pre-hydration-batch-mount");
+    let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
+    let mount_id = MountId::new("notion-main");
+    store
+        .save_mount(MountConfig::new(
+            mount_id.clone(),
+            "notion",
+            mount_root.clone(),
+        ))
+        .expect("save mount");
+    drop(store);
+
+    let (hydrated_tx, hydrated_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(
+        config.clone(),
+        PreHydrationBatchRunner {
+            mount_root: mount_root.clone(),
+            hydrated: hydrated_tx,
+            release: Mutex::new(release_rx),
+        },
+    )
+    .expect("spawn runtime");
+
+    let response = runtime.handle().request(DaemonRequest::StartPreHydration {
+        mount_id: mount_id.0.clone(),
+    });
+    assert!(response.ok, "{response:?}");
+    assert_eq!(response.payload.unwrap()["queued"], true);
+
+    let first = hydrated_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first hydration started");
+    assert_eq!(first.reason, HydrationReason::Prefetch);
+
+    let mut jobs = SqliteStateStore::open(config.state_root.clone())
+        .expect("reopen store")
+        .list_hydration_jobs()
+        .expect("list hydration jobs");
+    jobs.sort_by(|left, right| left.remote_id.cmp(&right.remote_id));
+    assert_eq!(jobs.len(), 3);
+    assert_eq!(
+        jobs.iter()
+            .map(|job| job.remote_id.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            RemoteId::new("page-a"),
+            RemoteId::new("page-b"),
+            RemoteId::new("page-c")
+        ]
+    );
+    assert!(
+        jobs.iter()
+            .all(|job| job.reason == HydrationReason::Prefetch)
+    );
+
+    release_tx.send(()).expect("release hydration");
+    runtime.shutdown();
+}
+
 fn assert_hydration_jobs_drained(state_root: PathBuf) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -2955,6 +3087,124 @@ struct BlockingPullAndEventRunner {
     started: mpsc::Sender<()>,
     events: mpsc::Sender<FileEvent>,
     release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+struct BlockingPreHydrationRunner {
+    started: mpsc::Sender<MountId>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+struct PreHydrationBatchRunner {
+    mount_root: PathBuf,
+    hydrated: mpsc::Sender<HydrationRequest>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl RuntimeJobRunner for BlockingPreHydrationRunner {
+    fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+        DaemonResponse::error("unexpected_pull", "pull should not run")
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> locality_core::LocalityResult<ScheduledPullRuntimeReport> {
+        Err(LocalityError::InvalidState(
+            "scheduled pull should not run".to_string(),
+        ))
+    }
+
+    fn run_hydration(
+        &self,
+        _state_root: PathBuf,
+        _request: HydrationRequest,
+    ) -> locality_core::LocalityResult<HydrationOutcome> {
+        Err(LocalityError::InvalidState(
+            "hydration should not run".to_string(),
+        ))
+    }
+
+    fn run_pre_hydration(
+        &self,
+        _state_root: PathBuf,
+        mount_id: MountId,
+    ) -> LocalityResult<ScheduledPullRuntimeReport> {
+        self.started.send(mount_id).expect("send started");
+        self.release
+            .lock()
+            .expect("release lock")
+            .recv_timeout(Duration::from_secs(5))
+            .expect("release worker");
+        Ok(ScheduledPullRuntimeReport {
+            report: Default::default(),
+            queued_hydrations: Vec::new(),
+            freshness_jobs: Vec::new(),
+        })
+    }
+}
+
+impl RuntimeJobRunner for PreHydrationBatchRunner {
+    fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+        DaemonResponse::error("unexpected_pull", "pull should not run")
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> locality_core::LocalityResult<ScheduledPullRuntimeReport> {
+        Err(LocalityError::InvalidState(
+            "scheduled pull should not run".to_string(),
+        ))
+    }
+
+    fn run_hydration(
+        &self,
+        _state_root: PathBuf,
+        request: HydrationRequest,
+    ) -> locality_core::LocalityResult<HydrationOutcome> {
+        self.hydrated.send(request).expect("send hydration");
+        self.release
+            .lock()
+            .expect("release lock")
+            .recv_timeout(Duration::from_secs(5))
+            .expect("release hydration");
+        Ok(HydrationOutcome::Hydrated)
+    }
+
+    fn run_pre_hydration(
+        &self,
+        _state_root: PathBuf,
+        mount_id: MountId,
+    ) -> LocalityResult<ScheduledPullRuntimeReport> {
+        Ok(ScheduledPullRuntimeReport {
+            report: Default::default(),
+            queued_hydrations: ["page-a", "page-b", "page-c"]
+                .into_iter()
+                .map(|remote_id| {
+                    HydrationRequest::new(
+                        mount_id.clone(),
+                        RemoteId::new(remote_id),
+                        self.mount_root.join(format!("{remote_id}.md")),
+                        HydrationState::Hydrated,
+                        HydrationReason::Prefetch,
+                    )
+                })
+                .collect(),
+            freshness_jobs: Vec::new(),
+        })
+    }
 }
 
 impl RuntimeJobRunner for BlockingPullAndEventRunner {

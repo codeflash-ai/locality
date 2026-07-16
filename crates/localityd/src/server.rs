@@ -36,6 +36,9 @@ pub fn run_foreground(config: &DaemonConfig) -> LocalityResult<()> {
     if config.background_connector_sync && runtime_handle.prime_virtual_mounts().is_err() {
         eprintln!("localityd could not queue virtual filesystem priming: runtime stopped");
     }
+    if config.background_connector_sync && runtime_handle.prime_pre_hydration_mounts().is_err() {
+        eprintln!("localityd could not queue mount pre-hydration priming: runtime stopped");
+    }
     let server = DaemonServerHandle {
         runtime: runtime_handle.clone(),
         watch_manager: Arc::clone(&watch_manager),
@@ -235,6 +238,13 @@ fn handle_request(request: DaemonRequest, server: &DaemonServerHandle) -> Daemon
                     {
                         eprintln!(
                             "localityd could not queue virtual filesystem priming after mount reload: runtime stopped"
+                        );
+                    }
+                    if watch_manager.config.background_connector_sync
+                        && server.runtime.prime_pre_hydration_mounts().is_err()
+                    {
+                        eprintln!(
+                            "localityd could not queue mount pre-hydration priming after mount reload: runtime stopped"
                         );
                     }
                     DaemonResponse::ok(report)
