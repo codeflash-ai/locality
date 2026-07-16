@@ -5765,6 +5765,12 @@ fn print_daemon_report(report: &DaemonControlReport) {
                 active.elapsed_ms
             );
         }
+        if let Some(cooldown) = &status.runtime.provider_cooldown {
+            println!(
+                "  provider cooldown: provider={} operation={} attempt={} retry_at_unix_ms={}",
+                cooldown.provider, cooldown.operation, cooldown.attempt, cooldown.retry_at_unix_ms
+            );
+        }
         println!("  scheduler: {}", status.runtime.scheduler_mode);
     }
     if let Some(log) = &report.stderr_log {
@@ -7558,6 +7564,7 @@ fn locality_error_code(error: &LocalityError) -> &'static str {
         LocalityError::Conflict(_) => "conflict",
         LocalityError::Guardrail(_) => "guardrail",
         LocalityError::RemoteNotFound(_) => "remote_not_found",
+        LocalityError::RateLimited { .. } => "rate_limited",
         LocalityError::InvalidState(_) => "invalid_state",
         LocalityError::Unsupported(_) => "unsupported",
         LocalityError::NotImplemented(_) => "not_implemented",

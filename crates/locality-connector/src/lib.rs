@@ -21,6 +21,24 @@ pub mod oauth_broker;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectorKind(pub &'static str);
 
+/// Host-selected execution behavior for connector network operations.
+///
+/// Connectors still own provider quotas, retry classification, and response
+/// decoding. This policy only decides whether a provider cooldown is waited
+/// inline or returned to a scheduler that can park the operation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConnectorExecutionPolicy {
+    #[default]
+    Inline,
+    DeferProviderCooldown,
+}
+
+impl ConnectorExecutionPolicy {
+    pub fn defers_provider_cooldown(self) -> bool {
+        self == Self::DeferProviderCooldown
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorCapabilities {
     pub supports_block_updates: bool,
@@ -181,6 +199,13 @@ pub struct ApplyUndoResult {
 }
 
 pub trait Connector {
+    fn with_execution_policy(&self, _policy: ConnectorExecutionPolicy) -> Self
+    where
+        Self: Sized + Clone,
+    {
+        self.clone()
+    }
+
     fn kind(&self) -> ConnectorKind;
     fn capabilities(&self) -> ConnectorCapabilities;
     fn supported_push_operations(&self) -> std::collections::BTreeSet<PushOperationKind> {

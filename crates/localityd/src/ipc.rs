@@ -143,9 +143,20 @@ pub struct DaemonRuntimeStatus {
     pub freshness_budget_units: u16,
     pub ready_freshness_budget_units: u16,
     pub pending_scheduled_pull: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_cooldown: Option<DaemonProviderCooldownStatus>,
     pub scheduler_mode: String,
     pub active_interval_ms: u64,
     pub cold_interval_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonProviderCooldownStatus {
+    pub provider: String,
+    pub operation: String,
+    pub attempt: u32,
+    pub retry_at_unix_ms: u64,
+    pub last_error: String,
 }
 
 /// Debug-only queue snapshot for the desktop Activity debug tab.

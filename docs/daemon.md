@@ -214,6 +214,29 @@ remote pull, hydration, or push reconciliation. Runtime status includes the
 current active job kind, target, start time, and elapsed time so wedged workers
 are visible through `loc daemon status`.
 
+Provider rate limits are a scheduling boundary. Scheduled discovery requests a
+deferred-cooldown execution policy from every connector instead of naming a
+provider in the runtime. When a connector returns a structured cooldown, the
+runtime releases the worker, records the provider, attempt, error, and retry
+timestamp, and retries automatically with bounded exponential backoff and
+jitter while honoring a longer `Retry-After`. `loc daemon status`, the desktop
+Activity queue, logs, and `loc doctor` expose this state. An explicit daemon
+`loc pull` returns an actionable `rate_limited` error rather than monopolizing
+the worker; the background scheduler remains responsible for automatic
+recovery.
+
+Scheduled pulls run in two phases. Remote enumeration and schema reads execute
+as a non-mutating fetch job, allowing local filesystem events, hydration, and
+status work to continue. The fetched snapshot is then queued for a short
+serialized reconciliation phase that writes SQLite observations and projection
+metadata. Push and explicit pull requests wait until that snapshot has either
+been reconciled or discarded, preventing a remote mutation from making the
+fetched snapshot stale before commit.
+
+Repeated watcher events with the same path and kind coalesce while one is active
+or queued. This bounds root-event growth when projection writes or sandbox file
+scanners repeatedly touch a mount during provider downtime.
+
 ## Virtual Filesystem Projections
 
 Product-grade online-only mounts must use a virtual filesystem projection, not

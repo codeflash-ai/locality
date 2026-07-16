@@ -18,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use locality_connector::ConnectorExecutionPolicy;
 use locality_connector::{Connector, ObserveRequest};
 use locality_core::LocalityError;
 use locality_core::canonical::parse_canonical_markdown;
@@ -27,7 +28,7 @@ use locality_core::freshness::{
     SyncJobKind,
 };
 use locality_core::hydration::{HydrationPolicy, HydrationReason, HydrationRequest};
-use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
+use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
 use locality_core::planner::PushOperation;
 use locality_core::pull::PullMode;
 use locality_core::shadow::{ShadowDocument, rendered_bodies_equivalent};
@@ -59,14 +60,15 @@ use crate::hydration::{
 };
 use crate::ipc::{
     DaemonActiveJobStatus, DaemonDebugQueueItem, DaemonDebugQueueSection, DaemonDebugQueueStatus,
-    DaemonRequest, DaemonResponse, DaemonRuntimeStatus,
+    DaemonProviderCooldownStatus, DaemonRequest, DaemonResponse, DaemonRuntimeStatus,
 };
 use crate::pull::run_pull_with_state_root;
 use crate::push::{
     execute_auto_save_push_job_with_content_root, execute_push_job_with_content_root,
 };
 use crate::reconcile::{
-    DefaultFetchScheduleStrategy, ScheduledPullReport, reconcile_scheduled_pull_with_state_root,
+    DefaultFetchScheduleStrategy, FetchScheduleStrategy, MountFetchSchedule, ScheduledPullReport,
+    ScheduledPullSource, reconcile_scheduled_pull_with_state_root,
 };
 use crate::scheduler::{PullScheduler, PullSchedulerTick};
 use crate::shadow_match::parsed_matches_shadow;
@@ -101,6 +103,7 @@ const CHILD_REFRESH_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const CHILD_REFRESH_RETRY_MAX_DELAY: Duration = Duration::from_secs(300);
 const PERIODIC_DISCOVERY_DEPTH: u32 = u32::MAX;
 const DEBUG_QUEUE_ITEM_LIMIT: usize = 25;
+const SCHEDULED_PULL_RETRY_MAX_DELAY: Duration = Duration::from_secs(300);
 
 fn child_refresh_retry_delay(attempts: u32) -> Duration {
     let exponent = attempts.saturating_sub(1).min(31);
@@ -108,6 +111,30 @@ fn child_refresh_retry_delay(attempts: u32) -> Duration {
     CHILD_REFRESH_RETRY_INITIAL_DELAY
         .saturating_mul(multiplier)
         .min(CHILD_REFRESH_RETRY_MAX_DELAY)
+}
+
+fn merge_pull_ticks(target: &mut PullSchedulerTick, incoming: PullSchedulerTick) {
+    target.poll_active |= incoming.poll_active;
+    target.poll_cold |= incoming.poll_cold;
+}
+
+fn scheduled_pull_retry_delay(provider_delay: Duration, attempt: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(31);
+    let multiplier = 1_u32.checked_shl(exponent).unwrap_or(u32::MAX);
+    let exponential = Duration::from_secs(1)
+        .saturating_mul(multiplier)
+        .min(SCHEDULED_PULL_RETRY_MAX_DELAY);
+    let base = provider_delay.max(exponential);
+    let jitter_window_ms = (base.as_millis() / 4).min(u128::from(u64::MAX)) as u64;
+    if jitter_window_ms == 0 {
+        return base;
+    }
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64
+        ^ u64::from(attempt).wrapping_mul(0x9E37_79B9);
+    base.saturating_add(Duration::from_millis(seed % (jitter_window_ms + 1)))
 }
 
 impl DaemonRuntimeHandle {
@@ -228,6 +255,27 @@ pub trait RuntimeJobRunner: Send + Sync + 'static {
         tick: PullSchedulerTick,
         policy: HydrationPolicy,
     ) -> locality_core::LocalityResult<ScheduledPullRuntimeReport>;
+
+    fn run_scheduled_pull_fetch(
+        &self,
+        state_root: PathBuf,
+        tick: PullSchedulerTick,
+        policy: HydrationPolicy,
+    ) -> locality_core::LocalityResult<ScheduledPullFetchOutcome> {
+        self.run_scheduled_pull(state_root, tick, policy)
+            .map(ScheduledPullFetchOutcome::Complete)
+    }
+
+    fn run_scheduled_pull_reconcile(
+        &self,
+        _state_root: PathBuf,
+        _fetched: ScheduledPullFetch,
+        _policy: HydrationPolicy,
+    ) -> locality_core::LocalityResult<ScheduledPullRuntimeReport> {
+        Err(LocalityError::Unsupported(
+            "runtime runner does not support phased scheduled pull reconciliation",
+        ))
+    }
 
     fn run_hydration(
         &self,
@@ -436,6 +484,51 @@ pub struct ScheduledPullRuntimeReport {
     pub freshness_jobs: Vec<SyncJob>,
 }
 
+#[derive(Clone, Debug)]
+pub enum ScheduledPullFetchOutcome {
+    Complete(ScheduledPullRuntimeReport),
+    Fetched(ScheduledPullFetch),
+}
+
+#[derive(Clone, Debug)]
+pub struct ScheduledPullFetch {
+    mounts: Vec<MountConfig>,
+    tick: PullSchedulerTick,
+    source: PrefetchedScheduledPullSource,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PrefetchedScheduledPullSource {
+    entries: BTreeMap<MountId, Vec<TreeEntry>>,
+    database_schemas: BTreeMap<(MountId, RemoteId), Option<String>>,
+}
+
+impl ScheduledPullSource for PrefetchedScheduledPullSource {
+    fn enumerate_mount(
+        &self,
+        mount: &MountConfig,
+    ) -> locality_core::LocalityResult<Vec<TreeEntry>> {
+        self.entries.get(&mount.mount_id).cloned().ok_or_else(|| {
+            LocalityError::InvalidState(format!(
+                "scheduled pull fetch for mount `{}` is missing",
+                mount.mount_id.0
+            ))
+        })
+    }
+
+    fn database_schema_yaml(
+        &self,
+        mount: &MountConfig,
+        remote_id: &RemoteId,
+    ) -> locality_core::LocalityResult<Option<String>> {
+        Ok(self
+            .database_schemas
+            .get(&(mount.mount_id.clone(), remote_id.clone()))
+            .cloned()
+            .flatten())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FreshnessRuntimeReport {
     pub job: SyncJob,
@@ -457,7 +550,9 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         };
         let credentials = open_credential_store(&state_root);
         let connector = match resolve_source_for_path(&store, credentials.as_ref(), &path) {
-            Ok(connector) => connector,
+            Ok(connector) => {
+                connector.with_execution_policy(ConnectorExecutionPolicy::DeferProviderCooldown)
+            }
             Err(error) => return DaemonResponse::error(error.code(), error.message()),
         };
 
@@ -521,41 +616,26 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         tick: PullSchedulerTick,
         policy: HydrationPolicy,
     ) -> locality_core::LocalityResult<ScheduledPullRuntimeReport> {
-        let mut store = SqliteStateStore::open(state_root.clone()).map_err(LocalityError::from)?;
-        let mounts = store.load_mounts().map_err(LocalityError::from)?;
-        let credentials = open_credential_store(&state_root);
-        let (source, unavailable) =
-            ResolvedSourceSet::new_available(&store, credentials.as_ref(), &mounts);
-        for (mount_id, error) in unavailable {
-            eprintln!(
-                "localityd scheduled pull skipped unavailable mount `{}`: {}",
-                mount_id.0,
-                error.message()
-            );
-        }
-        let available_mounts = mounts
-            .iter()
-            .filter(|mount| source.contains_mount(&mount.mount_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut hydration = HydrationCollector::default();
-        let report = reconcile_scheduled_pull_with_state_root(
-            &mut store,
-            &mut hydration,
-            &available_mounts,
-            &tick,
-            &source,
-            &DefaultFetchScheduleStrategy,
-            &policy,
-            Some(&state_root),
-        )?;
-        let freshness_jobs = workspace_virtual_freshness_jobs(&store, &available_mounts, &tick)?;
+        let fetched = fetch_scheduled_pull(&state_root, tick, &policy)?;
+        reconcile_fetched_scheduled_pull(&state_root, fetched, &policy)
+    }
 
-        Ok(ScheduledPullRuntimeReport {
-            report,
-            queued_hydrations: hydration.into_requests(),
-            freshness_jobs,
-        })
+    fn run_scheduled_pull_fetch(
+        &self,
+        state_root: PathBuf,
+        tick: PullSchedulerTick,
+        policy: HydrationPolicy,
+    ) -> locality_core::LocalityResult<ScheduledPullFetchOutcome> {
+        fetch_scheduled_pull(&state_root, tick, &policy).map(ScheduledPullFetchOutcome::Fetched)
+    }
+
+    fn run_scheduled_pull_reconcile(
+        &self,
+        state_root: PathBuf,
+        fetched: ScheduledPullFetch,
+        policy: HydrationPolicy,
+    ) -> locality_core::LocalityResult<ScheduledPullRuntimeReport> {
+        reconcile_fetched_scheduled_pull(&state_root, fetched, &policy)
     }
 
     fn run_hydration(
@@ -687,7 +767,8 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         }
         let credentials = open_credential_store(&state_root);
         let connector = resolve_source_for_mount_id(&store, credentials.as_ref(), &mount_id)
-            .map_err(LocalityError::from)?;
+            .map_err(LocalityError::from)?
+            .with_execution_policy(ConnectorExecutionPolicy::DeferProviderCooldown);
         let content_root = virtual_fs_content_root(&state_root, &mount_id);
         let report = refresh_virtual_fs_children_with_content_root(
             &mut store,
@@ -953,6 +1034,96 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
     }
 }
 
+fn fetch_scheduled_pull(
+    state_root: &Path,
+    tick: PullSchedulerTick,
+    policy: &HydrationPolicy,
+) -> locality_core::LocalityResult<ScheduledPullFetch> {
+    let store = SqliteStateStore::open(state_root.to_path_buf()).map_err(LocalityError::from)?;
+    let mounts = store.load_mounts().map_err(LocalityError::from)?;
+    let credentials = open_credential_store(state_root);
+    let (source, unavailable) =
+        ResolvedSourceSet::new_available_for_background(&store, credentials.as_ref(), &mounts);
+    for (mount_id, error) in unavailable {
+        eprintln!(
+            "localityd scheduled pull skipped unavailable mount `{}`: {}",
+            mount_id.0,
+            error.message()
+        );
+    }
+    let available_mounts = mounts
+        .into_iter()
+        .filter(|mount| source.contains_mount(&mount.mount_id))
+        .collect::<Vec<_>>();
+    let strategy = DefaultFetchScheduleStrategy;
+    let mut prefetched = PrefetchedScheduledPullSource::default();
+
+    for mount in &available_mounts {
+        if !strategy
+            .mount_plan(MountFetchSchedule {
+                mount,
+                tick: &tick,
+                policy,
+            })
+            .enumerate
+        {
+            continue;
+        }
+        let entries = source.enumerate_mount(mount)?;
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.kind == EntityKind::Database)
+        {
+            if mount.projection.uses_virtual_filesystem()
+                && virtual_fs_content_root(state_root, &mount.mount_id)
+                    .join(&entry.path)
+                    .join("_schema.yaml")
+                    .exists()
+            {
+                continue;
+            }
+            let schema = source.database_schema_yaml(mount, &entry.remote_id)?;
+            prefetched
+                .database_schemas
+                .insert((mount.mount_id.clone(), entry.remote_id.clone()), schema);
+        }
+        prefetched.entries.insert(mount.mount_id.clone(), entries);
+    }
+
+    Ok(ScheduledPullFetch {
+        mounts: available_mounts,
+        tick,
+        source: prefetched,
+    })
+}
+
+fn reconcile_fetched_scheduled_pull(
+    state_root: &Path,
+    fetched: ScheduledPullFetch,
+    policy: &HydrationPolicy,
+) -> locality_core::LocalityResult<ScheduledPullRuntimeReport> {
+    let mut store =
+        SqliteStateStore::open(state_root.to_path_buf()).map_err(LocalityError::from)?;
+    let mut hydration = HydrationCollector::default();
+    let report = reconcile_scheduled_pull_with_state_root(
+        &mut store,
+        &mut hydration,
+        &fetched.mounts,
+        &fetched.tick,
+        &fetched.source,
+        &DefaultFetchScheduleStrategy,
+        policy,
+        Some(state_root),
+    )?;
+    let freshness_jobs = workspace_virtual_freshness_jobs(&store, &fetched.mounts, &fetched.tick)?;
+
+    Ok(ScheduledPullRuntimeReport {
+        report,
+        queued_hydrations: hydration.into_requests(),
+        freshness_jobs,
+    })
+}
+
 fn file_provider_read_materialized(
     store: &SqliteStateStore,
     content_root: &Path,
@@ -1201,9 +1372,21 @@ struct RuntimeState {
     deferred_hydration: Vec<HydrationRequest>,
     next_hydration_retry: Option<Instant>,
     pending_scheduled_tick: Option<PullSchedulerTick>,
+    pending_scheduled_pull_attempt: u32,
+    deferred_scheduled_pull: Option<DeferredScheduledPull>,
+    active_scheduled_fetch: Option<ActiveRuntimeJob>,
+    pending_scheduled_reconcile: Option<ScheduledPullFetch>,
     scheduler: PullScheduler,
     last_scheduler_advance: Instant,
     active_job: Option<ActiveRuntimeJob>,
+}
+
+#[derive(Clone, Debug)]
+struct DeferredScheduledPull {
+    tick: PullSchedulerTick,
+    attempt: u32,
+    retry_at: Instant,
+    status: DaemonProviderCooldownStatus,
 }
 
 #[derive(Clone, Debug)]
@@ -1278,6 +1461,16 @@ impl ActiveRuntimeJob {
         }
     }
 
+    fn scheduled_pull_fetch(attempt: u32) -> Self {
+        Self {
+            kind: "scheduled_pull_fetch".to_string(),
+            target: Some(format!("attempt {attempt}")),
+            live_mode_fast_forward_target: None,
+            started_at: Instant::now(),
+            started_at_unix_ms: unix_time_ms(),
+        }
+    }
+
     fn status(&self) -> DaemonActiveJobStatus {
         DaemonActiveJobStatus {
             kind: self.kind.clone(),
@@ -1334,6 +1527,10 @@ impl RuntimeState {
             deferred_hydration: Vec::new(),
             next_hydration_retry: None,
             pending_scheduled_tick: None,
+            pending_scheduled_pull_attempt: 0,
+            deferred_scheduled_pull: None,
+            active_scheduled_fetch: None,
+            pending_scheduled_reconcile: None,
             active_job: None,
         }
     }
@@ -1648,6 +1845,11 @@ impl RuntimeState {
     }
 
     fn handle_file_event(&mut self, event: FileEvent) {
+        if self.pending_requests.iter().any(|request| {
+            matches!(request, MutatingRequest::FileEvent { event: pending } if pending == &event)
+        }) {
+            return;
+        }
         eprintln!(
             "localityd local file event queued immediately for `{}`",
             event.path.display()
@@ -1670,6 +1872,7 @@ impl RuntimeState {
                 };
                 self.active_child_refreshes.remove(&key);
             }
+            JobCompletion::ScheduledPullFetch { .. } => self.active_scheduled_fetch = None,
             _ => self.active_job = None,
         }
 
@@ -1739,16 +1942,27 @@ impl RuntimeState {
                     &result,
                 );
             }
-            JobCompletion::ScheduledPull(result) => match result {
-                Ok(result) => {
-                    for request in result.queued_hydrations {
-                        self.queue_hydration(request);
-                    }
-                    for job in result.freshness_jobs {
-                        self.queue_freshness(job);
-                    }
+            JobCompletion::ScheduledPullFetch {
+                tick,
+                attempt,
+                result,
+            } => match result {
+                Ok(ScheduledPullFetchOutcome::Complete(result)) => {
+                    self.finish_scheduled_pull(result)
                 }
+                Ok(ScheduledPullFetchOutcome::Fetched(fetched)) => {
+                    self.pending_scheduled_reconcile = Some(fetched);
+                }
+                Err(LocalityError::RateLimited {
+                    provider,
+                    retry_after,
+                    message,
+                }) => self.defer_scheduled_pull(tick, attempt, provider, retry_after, message),
                 Err(error) => eprintln!("localityd scheduled pull failed: {error}"),
+            },
+            JobCompletion::ScheduledPullReconcile(result) => match result {
+                Ok(result) => self.finish_scheduled_pull(result),
+                Err(error) => eprintln!("localityd scheduled pull reconcile failed: {error}"),
             },
             JobCompletion::Hydration {
                 request,
@@ -1878,7 +2092,12 @@ impl RuntimeState {
                         .entry(key)
                         .and_modify(|attempts| *attempts = attempts.saturating_add(1))
                         .or_insert(1);
-                    let retry_delay = child_refresh_retry_delay(*attempts);
+                    let retry_delay = match error {
+                        LocalityError::RateLimited { retry_after, .. } => {
+                            scheduled_pull_retry_delay(*retry_after, *attempts)
+                        }
+                        _ => child_refresh_retry_delay(*attempts),
+                    };
                     self.child_refreshes.queue_after(
                         ChildRefreshRequest {
                             mount_id: mount_id.to_string(),
@@ -1912,6 +2131,19 @@ impl RuntimeState {
             self.next_hydration_retry = None;
         }
 
+        if self
+            .deferred_scheduled_pull
+            .as_ref()
+            .is_some_and(|deferred| now >= deferred.retry_at)
+        {
+            let deferred = self
+                .deferred_scheduled_pull
+                .take()
+                .expect("checked deferred scheduled pull");
+            self.pending_scheduled_pull_attempt = deferred.attempt;
+            self.merge_pending_scheduled_tick(deferred.tick);
+        }
+
         if now >= self.next_periodic_discovery_check {
             self.next_periodic_discovery_check =
                 now + DEFAULT_PERIODIC_DISCOVERY_SCHEDULER_INTERVAL;
@@ -1929,7 +2161,7 @@ impl RuntimeState {
 
     fn maybe_start_next_job(&mut self) {
         if self.active_job.is_none() {
-            let job = if let Some(request) = self.pending_requests.pop_front() {
+            let job = if let Some(request) = self.pop_next_pending_request() {
                 Some(MutatingJob::Request(request))
             } else if let Some(request) = self.hydration.pop_ready() {
                 Some(MutatingJob::Hydration { request })
@@ -1938,10 +2170,10 @@ impl RuntimeState {
                 .pop_ready_at(Some(&freshness_timestamp()), FRESHNESS_JOB_BUDGET_UNITS)
             {
                 Some(MutatingJob::Freshness { job })
+            } else if let Some(fetched) = self.pending_scheduled_reconcile.take() {
+                Some(MutatingJob::ScheduledPullReconcile { fetched })
             } else {
-                self.pending_scheduled_tick
-                    .take()
-                    .map(|tick| MutatingJob::ScheduledPull { tick })
+                None
             };
 
             if let Some(job) = job {
@@ -1949,7 +2181,48 @@ impl RuntimeState {
             }
         }
 
+        self.maybe_start_scheduled_pull_fetch();
         self.maybe_start_child_refresh_jobs();
+    }
+
+    fn pop_next_pending_request(&mut self) -> Option<MutatingRequest> {
+        if self.active_scheduled_fetch.is_none() && self.pending_scheduled_reconcile.is_none() {
+            return self.pending_requests.pop_front();
+        }
+        let position = self
+            .pending_requests
+            .iter()
+            .position(|request| !request.requires_stable_remote_snapshot())?;
+        self.pending_requests.remove(position)
+    }
+
+    fn maybe_start_scheduled_pull_fetch(&mut self) {
+        if self.active_job.is_some()
+            || self.active_scheduled_fetch.is_some()
+            || self.pending_scheduled_reconcile.is_some()
+            || self.deferred_scheduled_pull.is_some()
+        {
+            return;
+        }
+        let Some(tick) = self.pending_scheduled_tick.take() else {
+            return;
+        };
+        let attempt = std::mem::take(&mut self.pending_scheduled_pull_attempt);
+        self.active_scheduled_fetch = Some(ActiveRuntimeJob::scheduled_pull_fetch(attempt));
+        let sender = self.sender.clone();
+        let runner = Arc::clone(&self.runner);
+        let state_root = self.config.state_root.clone();
+        let policy = self.config.pull_scheduler.hydration_policy.clone();
+        thread::spawn(move || {
+            let result = runner.run_scheduled_pull_fetch(state_root, tick.clone(), policy);
+            let _ = sender.send(RuntimeMessage::JobFinished(
+                JobCompletion::ScheduledPullFetch {
+                    tick,
+                    attempt,
+                    result,
+                },
+            ));
+        });
     }
 
     fn start_exclusive_job(&mut self, job: MutatingJob) {
@@ -1977,8 +2250,9 @@ impl RuntimeState {
             };
 
             if request.priority == ChildRefreshPriority::Background
-                && self.active_background_child_refreshes()
+                && (self.active_background_child_refreshes()
                     >= DEFAULT_MAX_BACKGROUND_CHILD_REFRESH_WORKERS
+                    || !self.background_child_refresh_scope_has_capacity(&request))
             {
                 self.child_refreshes.queue(request);
                 break;
@@ -1993,6 +2267,30 @@ impl RuntimeState {
             .values()
             .filter(|active| active.request.priority == ChildRefreshPriority::Background)
             .count()
+    }
+
+    fn background_child_refresh_scope_has_capacity(&self, request: &ChildRefreshRequest) -> bool {
+        let Ok(store) = SqliteStateStore::open(self.config.state_root.clone()) else {
+            return false;
+        };
+        let Ok(Some(request_mount)) = store.get_mount(&MountId::new(&request.mount_id)) else {
+            return false;
+        };
+        let connector = request_mount.connector;
+        let limit = crate::source::source_descriptor(&connector).max_background_discovery_workers();
+        let active_mounts = self
+            .active_child_refreshes
+            .values()
+            .filter(|active| active.request.priority == ChildRefreshPriority::Background)
+            .filter_map(|active| {
+                store
+                    .get_mount(&MountId::new(&active.request.mount_id))
+                    .ok()
+                    .flatten()
+            })
+            .filter(|mount| mount.connector == connector)
+            .count();
+        active_mounts < limit
     }
 
     fn start_child_refresh_job(&mut self, request: ChildRefreshRequest) {
@@ -2022,12 +2320,56 @@ impl RuntimeState {
     }
 
     fn merge_scheduled_tick(&mut self, tick: PullSchedulerTick) {
+        if let Some(deferred) = &mut self.deferred_scheduled_pull {
+            merge_pull_ticks(&mut deferred.tick, tick);
+            return;
+        }
+        self.merge_pending_scheduled_tick(tick);
+    }
+
+    fn merge_pending_scheduled_tick(&mut self, tick: PullSchedulerTick) {
         match &mut self.pending_scheduled_tick {
-            Some(pending) => {
-                pending.poll_active |= tick.poll_active;
-                pending.poll_cold |= tick.poll_cold;
-            }
+            Some(pending) => merge_pull_ticks(pending, tick),
             None => self.pending_scheduled_tick = Some(tick),
+        }
+    }
+
+    fn defer_scheduled_pull(
+        &mut self,
+        tick: PullSchedulerTick,
+        attempt: u32,
+        provider: String,
+        retry_after: Duration,
+        message: String,
+    ) {
+        let attempt = attempt.saturating_add(1);
+        let delay = scheduled_pull_retry_delay(retry_after, attempt);
+        let retry_at_unix_ms =
+            unix_time_ms().saturating_add(delay.as_millis().try_into().unwrap_or(u64::MAX));
+        eprintln!(
+            "localityd scheduled pull deferred after {provider} rate limit: attempt={attempt} retry_in_ms={} retry_at_unix_ms={retry_at_unix_ms}",
+            delay.as_millis()
+        );
+        self.deferred_scheduled_pull = Some(DeferredScheduledPull {
+            tick,
+            attempt,
+            retry_at: Instant::now() + delay,
+            status: DaemonProviderCooldownStatus {
+                provider,
+                operation: "scheduled_pull".to_string(),
+                attempt,
+                retry_at_unix_ms,
+                last_error: message,
+            },
+        });
+    }
+
+    fn finish_scheduled_pull(&mut self, result: ScheduledPullRuntimeReport) {
+        for request in result.queued_hydrations {
+            self.queue_hydration(request);
+        }
+        for job in result.freshness_jobs {
+            self.queue_freshness(job);
         }
     }
 
@@ -2652,18 +2994,46 @@ impl RuntimeState {
                 .collect(),
         });
 
+        let scheduled_ready = usize::from(self.pending_scheduled_tick.is_some())
+            + usize::from(self.pending_scheduled_reconcile.is_some());
+        let scheduled_deferred = usize::from(self.deferred_scheduled_pull.is_some());
+        let mut scheduled_items = self
+            .pending_scheduled_tick
+            .as_ref()
+            .map(debug_scheduled_pull_item)
+            .into_iter()
+            .collect::<Vec<_>>();
+        if let Some(deferred) = &self.deferred_scheduled_pull {
+            scheduled_items.push(DaemonDebugQueueItem {
+                kind: "scheduled_pull_rate_limited".to_string(),
+                target: Some(deferred.status.provider.clone()),
+                mount_id: None,
+                remote_id: None,
+                path: None,
+                reason: Some(format!("attempt {}", deferred.status.attempt)),
+                priority: Some("deferred".to_string()),
+                next_eligible_at: Some(format!("unix_ms:{}", deferred.status.retry_at_unix_ms)),
+            });
+        }
+        if self.pending_scheduled_reconcile.is_some() {
+            scheduled_items.push(DaemonDebugQueueItem {
+                kind: "scheduled_pull_reconcile".to_string(),
+                target: None,
+                mount_id: None,
+                remote_id: None,
+                path: None,
+                reason: Some("remote metadata fetched".to_string()),
+                priority: Some("scheduled".to_string()),
+                next_eligible_at: None,
+            });
+        }
         sections.push(DaemonDebugQueueSection {
             name: "scheduled_pull".to_string(),
             label: "Scheduled pull".to_string(),
-            total: usize::from(self.pending_scheduled_tick.is_some()),
-            ready: Some(usize::from(self.pending_scheduled_tick.is_some())),
-            deferred: None,
-            items: self
-                .pending_scheduled_tick
-                .as_ref()
-                .map(debug_scheduled_pull_item)
-                .into_iter()
-                .collect(),
+            total: scheduled_ready + scheduled_deferred,
+            ready: Some(scheduled_ready),
+            deferred: Some(scheduled_deferred),
+            items: scheduled_items,
         });
 
         DaemonDebugQueueStatus {
@@ -2697,6 +3067,9 @@ impl RuntimeState {
         if let Some(job) = &self.active_job {
             active.push(job.status());
         }
+        if let Some(job) = &self.active_scheduled_fetch {
+            active.push(job.status());
+        }
         active.extend(
             self.active_child_refreshes
                 .values()
@@ -2713,11 +3086,18 @@ impl RuntimeState {
             .next()
             .map(|active| active.status.status());
         DaemonRuntimeStatus {
-            active_job: self.active_job.is_some() || active_child_refresh.is_some(),
+            active_job: self.active_job.is_some()
+                || self.active_scheduled_fetch.is_some()
+                || active_child_refresh.is_some(),
             active_job_detail: self
                 .active_job
                 .as_ref()
                 .map(ActiveRuntimeJob::status)
+                .or_else(|| {
+                    self.active_scheduled_fetch
+                        .as_ref()
+                        .map(ActiveRuntimeJob::status)
+                })
                 .or(active_child_refresh),
             pending_requests: self.pending_requests.len() + self.child_refreshes.len(),
             pending_hydrations: self.hydration.len(),
@@ -2727,7 +3107,13 @@ impl RuntimeState {
             deferred_freshness: freshness_metrics.deferred_jobs,
             freshness_budget_units: freshness_metrics.total_budget_units,
             ready_freshness_budget_units: freshness_metrics.ready_budget_units,
-            pending_scheduled_pull: self.pending_scheduled_tick.is_some(),
+            pending_scheduled_pull: self.pending_scheduled_tick.is_some()
+                || self.deferred_scheduled_pull.is_some()
+                || self.pending_scheduled_reconcile.is_some(),
+            provider_cooldown: self
+                .deferred_scheduled_pull
+                .as_ref()
+                .map(|deferred| deferred.status.clone()),
             scheduler_mode: match self.scheduler.config.mode {
                 PullMode::Polling => "polling",
                 PullMode::Relay => "relay",
@@ -3762,9 +4148,9 @@ fn run_job(
                 auto_push_targets: Vec::new(),
             }
         }
-        MutatingJob::ScheduledPull { tick } => {
-            JobCompletion::ScheduledPull(runner.run_scheduled_pull(state_root, tick, policy))
-        }
+        MutatingJob::ScheduledPullReconcile { fetched } => JobCompletion::ScheduledPullReconcile(
+            runner.run_scheduled_pull_reconcile(state_root, fetched, policy),
+        ),
         MutatingJob::Hydration { request } => {
             let previous_shadow = remote_fast_forward_previous_shadow(&state_root, &request);
             let result = runner.run_hydration(state_root, request.clone());
@@ -3994,7 +4380,7 @@ enum MutatingRequest {
 
 enum MutatingJob {
     Request(MutatingRequest),
-    ScheduledPull { tick: PullSchedulerTick },
+    ScheduledPullReconcile { fetched: ScheduledPullFetch },
     Hydration { request: HydrationRequest },
     Freshness { job: SyncJob },
 }
@@ -4003,7 +4389,7 @@ impl MutatingJob {
     fn active_status_parts(&self) -> (String, Option<String>) {
         match self {
             Self::Request(request) => request.active_status_parts(),
-            Self::ScheduledPull { .. } => ("scheduled_pull".to_string(), None),
+            Self::ScheduledPullReconcile { .. } => ("scheduled_pull_reconcile".to_string(), None),
             Self::Hydration { request } => (
                 "hydration".to_string(),
                 Some(request.path.display().to_string()),
@@ -4031,6 +4417,13 @@ impl MutatingJob {
 }
 
 impl MutatingRequest {
+    fn requires_stable_remote_snapshot(&self) -> bool {
+        matches!(
+            self,
+            Self::Pull { .. } | Self::Push { .. } | Self::AutoPush { .. }
+        )
+    }
+
     fn active_status_parts(&self) -> (String, Option<String>) {
         match self {
             Self::Pull { path, .. } => ("pull".to_string(), Some(path.display().to_string())),
@@ -4135,7 +4528,12 @@ enum JobCompletion {
         priority: ChildRefreshPriority,
         result: locality_core::LocalityResult<VirtualFsRefreshChildrenReport>,
     },
-    ScheduledPull(locality_core::LocalityResult<ScheduledPullRuntimeReport>),
+    ScheduledPullFetch {
+        tick: PullSchedulerTick,
+        attempt: u32,
+        result: locality_core::LocalityResult<ScheduledPullFetchOutcome>,
+    },
+    ScheduledPullReconcile(locality_core::LocalityResult<ScheduledPullRuntimeReport>),
     Hydration {
         request: HydrationRequest,
         result: locality_core::LocalityResult<HydrationOutcome>,
@@ -5032,6 +5430,7 @@ fn locality_error_code(error: &LocalityError) -> &'static str {
         LocalityError::Conflict(_) => "conflict",
         LocalityError::Guardrail(_) => "guardrail",
         LocalityError::RemoteNotFound(_) => "remote_not_found",
+        LocalityError::RateLimited { .. } => "rate_limited",
         LocalityError::InvalidState(_) => "invalid_state",
         LocalityError::Unsupported(_) => "unsupported",
         LocalityError::NotImplemented(_) => "not_implemented",

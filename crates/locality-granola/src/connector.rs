@@ -6,8 +6,9 @@ use std::sync::Arc;
 use chrono::{DateTime, Timelike, Utc};
 use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, ChildContainer,
-    Connector, ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest,
-    ListChildrenRequest, ListChildrenResult, NativeEntity, ObserveRequest, ParsedEntity,
+    Connector, ConnectorCapabilities, ConnectorExecutionPolicy, ConnectorKind, EnumerateRequest,
+    FetchRequest, ListChildrenRequest, ListChildrenResult, NativeEntity, ObserveRequest,
+    ParsedEntity,
 };
 use locality_core::freshness::{RemoteObservation, RemoteVersion};
 use locality_core::model::{
@@ -30,6 +31,7 @@ const PAGE_SIZE: u32 = 30;
 pub struct GranolaConfig {
     pub api_key: String,
     pub updated_after: Option<String>,
+    pub execution_policy: ConnectorExecutionPolicy,
 }
 
 impl GranolaConfig {
@@ -37,11 +39,17 @@ impl GranolaConfig {
         Self {
             api_key: api_key.into(),
             updated_after: None,
+            execution_policy: ConnectorExecutionPolicy::Inline,
         }
     }
 
     pub fn with_updated_after(mut self, updated_after: impl Into<String>) -> Self {
         self.updated_after = Some(updated_after.into());
+        self
+    }
+
+    pub fn with_execution_policy(mut self, execution_policy: ConnectorExecutionPolicy) -> Self {
+        self.execution_policy = execution_policy;
         self
     }
 }
@@ -51,6 +59,7 @@ impl fmt::Debug for GranolaConfig {
         f.debug_struct("GranolaConfig")
             .field("api_key", &"<redacted>")
             .field("updated_after", &self.updated_after)
+            .field("execution_policy", &self.execution_policy)
             .finish()
     }
 }
@@ -71,7 +80,10 @@ impl fmt::Debug for GranolaConnector {
 
 impl GranolaConnector {
     pub fn new(config: GranolaConfig) -> Self {
-        let api = Arc::new(HttpGranolaApiClient::new(config.api_key.clone()));
+        let api = Arc::new(HttpGranolaApiClient::with_execution_policy(
+            config.api_key.clone(),
+            config.execution_policy,
+        ));
         Self::with_api(config, api)
     }
 
@@ -121,6 +133,10 @@ impl GranolaConnector {
 }
 
 impl Connector for GranolaConnector {
+    fn with_execution_policy(&self, policy: ConnectorExecutionPolicy) -> Self {
+        Self::new(self.config.clone().with_execution_policy(policy))
+    }
+
     fn kind(&self) -> ConnectorKind {
         ConnectorKind(GRANOLA_CONNECTOR_ID)
     }

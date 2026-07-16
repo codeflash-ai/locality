@@ -3465,6 +3465,7 @@ fn locality_error_code(error: &LocalityError) -> &'static str {
         LocalityError::Conflict(_) => "conflict",
         LocalityError::Guardrail(_) => "guardrail",
         LocalityError::RemoteNotFound(_) => "remote_not_found",
+        LocalityError::RateLimited { .. } => "rate_limited",
         LocalityError::InvalidState(_) => "invalid_state",
         LocalityError::Unsupported(_) => "unsupported",
         LocalityError::NotImplemented(_) => "not_implemented",

@@ -2127,6 +2127,7 @@ impl PullError {
         match self {
             Self::Connector(locality_core::LocalityError::NotImplemented(_)) => "not_implemented",
             Self::Connector(locality_core::LocalityError::RemoteNotFound(_)) => "remote_not_found",
+            Self::Connector(locality_core::LocalityError::RateLimited { .. }) => "rate_limited",
             Self::Connector(_) => "connector_error",
             Self::CurrentDir(_) => "current_dir_failed",
             Self::MountNotFound(_) => "mount_not_found",
