@@ -21,6 +21,8 @@ import {
   List,
   Loader2,
   Minus,
+  Monitor,
+  Moon,
   Plus,
   Power,
   RefreshCw,
@@ -29,6 +31,7 @@ import {
   Settings,
   ShieldCheck,
   Square,
+  Sun,
   PanelLeftClose,
   PanelLeftOpen,
   Trash2,
@@ -115,6 +118,10 @@ type FileStatusFilter = "all" | "review" | "conflict" | "synced";
 type DestructiveSettingsAction = "reset" | "uninstall";
 type SettingsSection = "general" | "sources" | "sync" | "activity" | "agents" | "advanced" | "about";
 type SourceListViewMode = "list" | "tiles";
+type AppTheme = "system" | "light" | "dark";
+
+const APP_THEME_STORAGE_KEY = "locality.desktop.theme";
+
 type ConnectorOption = {
   id: SourceConnectorId;
   name: string;
@@ -1087,6 +1094,29 @@ function useNotionSearchResults(query: string, enabled = true) {
   return { results, searching };
 }
 
+function initialAppTheme(): AppTheme {
+  try {
+    const saved = window.localStorage.getItem(APP_THEME_STORAGE_KEY);
+    return saved === "light" || saved === "dark" || saved === "system" ? saved : "system";
+  } catch {
+    return "system";
+  }
+}
+
+function resolvedAppTheme(theme: AppTheme): "light" | "dark" {
+  if (theme !== "system") {
+    return theme;
+  }
+  return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function applyAppTheme(theme: AppTheme) {
+  const resolved = resolvedAppTheme(theme);
+  document.documentElement.dataset.theme = resolved;
+  document.documentElement.dataset.themePreference = theme;
+  document.documentElement.style.colorScheme = resolved;
+}
+
 export default function App() {
   const initialRoute = window.location.hash;
   const [snapshot, setSnapshot] = useState<DesktopSnapshot>(() =>
@@ -1095,6 +1125,7 @@ export default function App() {
   const [snapshotLoaded, setSnapshotLoaded] = useState(() => !isTauriRuntime());
   const [view, setView] = useState<AppView>("home");
   const [reviewInitialFilter, setReviewInitialFilter] = useState<ReviewFilter>("all");
+  const [theme, setTheme] = useState<AppTheme>(() => initialAppTheme());
   const [route, setRoute] = useState(initialRoute);
   const [showOnboarding, setShowOnboarding] = useState(() =>
     routeForcesOnboarding(initialRoute) || previewRouteStartsOnboarding(initialRoute),
@@ -1112,6 +1143,27 @@ export default function App() {
   useEffect(() => {
     updateStatusRef.current = updateStatus;
   }, [updateStatus]);
+
+  useEffect(() => {
+    applyAppTheme(theme);
+    try {
+      window.localStorage.setItem(APP_THEME_STORAGE_KEY, theme);
+    } catch {
+      // Keep the in-memory theme even when storage is unavailable.
+    }
+
+    if (theme !== "system") {
+      return undefined;
+    }
+
+    const media = window.matchMedia?.("(prefers-color-scheme: dark)");
+    if (!media) {
+      return undefined;
+    }
+    const syncSystemTheme = () => applyAppTheme("system");
+    media.addEventListener("change", syncSystemTheme);
+    return () => media.removeEventListener("change", syncSystemTheme);
+  }, [theme]);
 
   async function loadDesktopSnapshot() {
     const nextSnapshot = await callCommand<DesktopSnapshot>("desktop_snapshot", undefined, sampleSnapshot);
@@ -1530,6 +1582,8 @@ export default function App() {
                 setReviewInitialFilter(filter);
                 setView("pending");
               }}
+              theme={theme}
+              onThemeChange={setTheme}
               onRefresh={refreshSnapshot}
               updateStatus={updateStatus}
       onCheckForUpdate={checkForAppUpdate}
@@ -2536,6 +2590,8 @@ function MainShell({
   onViewChange,
   reviewInitialFilter,
   onOpenReview,
+  theme,
+  onThemeChange,
   onRefresh,
   updateStatus,
   onCheckForUpdate,
@@ -2548,6 +2604,8 @@ function MainShell({
   onViewChange: (view: AppView) => void;
   reviewInitialFilter: ReviewFilter;
   onOpenReview: (filter?: ReviewFilter) => void;
+  theme: AppTheme;
+  onThemeChange: (theme: AppTheme) => void;
   onRefresh: () => Promise<void>;
   updateStatus: UpdateStatus;
   onCheckForUpdate: (options?: AppUpdateCheckOptions) => Promise<void>;
@@ -2744,6 +2802,8 @@ function MainShell({
               onCheckForUpdate={onCheckForUpdate}
               onInstallUpdate={onInstallUpdate}
               appStoreDistribution={appStoreDistribution}
+              theme={theme}
+              onThemeChange={onThemeChange}
               onActivity={() => onViewChange("activity")}
               onSources={openMountsView}
               onResetComplete={onResetComplete}
@@ -5405,6 +5465,8 @@ function SettingsView({
   onCheckForUpdate,
   onInstallUpdate,
   appStoreDistribution,
+  theme,
+  onThemeChange,
   onActivity,
   onSources,
   onResetComplete,
@@ -5416,6 +5478,8 @@ function SettingsView({
   onCheckForUpdate: (options?: AppUpdateCheckOptions) => Promise<void>;
   onInstallUpdate: () => Promise<void>;
   appStoreDistribution: boolean;
+  theme: AppTheme;
+  onThemeChange: (theme: AppTheme) => void;
   onActivity: () => void;
   onSources: () => void;
   onResetComplete: () => void;
@@ -5655,6 +5719,7 @@ function SettingsView({
           {settingsSection === "general" && (
             <section className="panel settings-section-panel">
               <PanelTitle title="Desktop behavior" />
+              <ThemeRow value={theme} onChange={onThemeChange} />
               <ToggleRow
                 title="Launch Locality at login"
                 enabled={localSettings.launchAtLogin}
@@ -7504,6 +7569,41 @@ function ToggleRow({
       >
         <i />
       </button>
+    </div>
+  );
+}
+
+function ThemeRow({
+  value,
+  onChange,
+}: {
+  value: AppTheme;
+  onChange: (theme: AppTheme) => void;
+}) {
+  const options: Array<{ value: AppTheme; label: string; icon: React.ReactNode }> = [
+    { value: "system", label: "System", icon: <Monitor /> },
+    { value: "light", label: "Light", icon: <Sun /> },
+    { value: "dark", label: "Dark", icon: <Moon /> },
+  ];
+
+  return (
+    <div className="setting-row theme-setting-row">
+      <span>Appearance</span>
+      <div className="theme-segmented" role="radiogroup" aria-label="Appearance">
+        {options.map((option) => (
+          <button
+            key={option.value}
+            type="button"
+            className={value === option.value ? "active" : ""}
+            role="radio"
+            aria-checked={value === option.value}
+            onClick={() => onChange(option.value)}
+          >
+            {option.icon}
+            <span>{option.label}</span>
+          </button>
+        ))}
+      </div>
     </div>
   );
 }
