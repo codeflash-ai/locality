@@ -37,11 +37,15 @@ use localityd::virtual_fs::{
 const LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON: &str = "LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON";
 const LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_PREFIX: &str =
     "LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_PREFIX";
+const LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_ID_FILE: &str =
+    "LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_ID_FILE";
+const LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_ID: &str = "LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_ID";
 const LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON: &str = "LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON";
 const LOCALITY_GMAIL_LIVE_TEST_RECIPIENT: &str = "LOCALITY_GMAIL_LIVE_TEST_RECIPIENT";
 const LOCALITY_GMAIL_LIVE_AFTER: &str = "LOCALITY_GMAIL_LIVE_AFTER";
 const LOCALITY_GMAIL_LIVE_BEFORE: &str = "LOCALITY_GMAIL_LIVE_BEFORE";
 const LOCALITY_GOOGLE_LIVE_FORCE_REFRESH: &str = "LOCALITY_GOOGLE_LIVE_FORCE_REFRESH";
+const LOCALITY_GOOGLE_LIVE_VFS_STATE_ROOT: &str = "LOCALITY_GOOGLE_LIVE_VFS_STATE_ROOT";
 const KEEP_TMP_ENV: &str = "LOCALITY_GOOGLE_LIVE_KEEP_TMP";
 const EXPIRED_SENTINEL_ACCESS_TOKEN: &str = "locality-live-expired-access-token";
 const GMAIL_LIVE_BODY: &str = "This message was sent by the Locality live Gmail e2e suite.";
@@ -184,6 +188,68 @@ fn seed_live_connection(
         .expect("save connection");
 
     secret_ref
+}
+
+#[test]
+#[ignore = "helper invoked by tests/live_google_docs_vfs_push_pull.sh"]
+fn live_google_docs_seed_state_for_vfs() {
+    let state_root = PathBuf::from(required_env(LOCALITY_GOOGLE_LIVE_VFS_STATE_ROOT));
+    let workspace_id_file =
+        PathBuf::from(required_env(LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_ID_FILE));
+    fs::create_dir_all(&state_root).expect("create live Google Docs VFS state root");
+
+    let connection_id = ConnectionId::new("google-docs-live");
+    seed_live_connection(
+        &state_root,
+        GoogleLiveConnector::GoogleDocs,
+        &connection_id,
+    );
+    let bootstrap_connector = resolve_google_docs_from_store(
+        &state_root,
+        connection_id,
+        RemoteId::new("bootstrap-workspace"),
+    );
+    let api = HttpGoogleApiClient::new(bootstrap_connector.config().access_token.clone());
+    let workspace_prefix = std::env::var(LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_PREFIX)
+        .unwrap_or_else(|_| "Locality live Google Docs VFS e2e".to_string());
+    let workspace = api
+        .create_file(DriveCreateFileRequest::folder(
+            format!("{workspace_prefix} {}", timestamp_string()),
+            None,
+        ))
+        .expect("create scratch Google Docs VFS workspace folder");
+
+    if let Some(parent) = workspace_id_file.parent() {
+        fs::create_dir_all(parent).expect("create workspace id file parent");
+    }
+    fs::write(&workspace_id_file, format!("{}\n", workspace.id))
+        .expect("write scratch Google Docs VFS workspace id");
+}
+
+#[test]
+#[ignore = "helper invoked by tests/live_google_docs_vfs_push_pull.sh cleanup"]
+fn live_google_docs_trash_vfs_workspace() {
+    let state_root = PathBuf::from(required_env(LOCALITY_GOOGLE_LIVE_VFS_STATE_ROOT));
+    let workspace_id = required_env(LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_ID);
+    let connector = resolve_google_docs_from_store(
+        &state_root,
+        ConnectionId::new("google-docs-live"),
+        RemoteId::new(workspace_id.clone()),
+    );
+    let api = HttpGoogleApiClient::new(connector.config().access_token.clone());
+    api.update_file(&workspace_id, DriveUpdateFileRequest::trash())
+        .expect("trash scratch Google Docs VFS workspace folder");
+}
+
+#[test]
+#[ignore = "helper invoked by tests/live_gmail_vfs_read_send.sh"]
+fn live_gmail_seed_state_for_vfs() {
+    let state_root = PathBuf::from(required_env(LOCALITY_GOOGLE_LIVE_VFS_STATE_ROOT));
+    fs::create_dir_all(&state_root).expect("create live Gmail VFS state root");
+
+    let connection_id = ConnectionId::new("gmail-live");
+    seed_live_connection(&state_root, GoogleLiveConnector::Gmail, &connection_id);
+    let _connector = resolve_gmail_from_store(&state_root, connection_id);
 }
 
 #[test]
