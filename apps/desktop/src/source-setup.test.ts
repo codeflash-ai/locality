@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  connectedSourcesReadyToMount,
   sourceSetupIsActiveConnector,
   sourceSetupIsBusy,
   sourceSetupProgressLabel,
@@ -18,5 +19,27 @@ describe("source setup progress", () => {
     expect(sourceSetupProgressLabel("creating", false)).toBe("Mounting");
     expect(sourceSetupProgressLabel("connecting", true)).toBe("Finishing setup");
     expect(sourceSetupProgressLabel("changing", true)).toBe("Updating access");
+  });
+
+  it("keeps connected but unmounted sources visible when another source is mounted", () => {
+    expect(
+      connectedSourcesReadyToMount({
+        connection: { connector: "granola", status: "active" },
+        connections: [
+          { connector: "granola", status: "active" },
+          { connector: "notion", status: "active" },
+        ],
+        mounts: [{ connector: "granola", status: "ready" }],
+      }),
+    ).toEqual(["notion"]);
+  });
+
+  it("falls back to the selected connection when older snapshots do not include all connections", () => {
+    expect(
+      connectedSourcesReadyToMount({
+        connection: { connector: "notion", status: "active" },
+        mounts: [],
+      }),
+    ).toEqual(["notion"]);
   });
 });

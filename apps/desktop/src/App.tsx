@@ -85,6 +85,10 @@ import {
   type UpdateStatus,
 } from "./updater";
 import {
+  connectedSourcesReadyToMount,
+  isSourceConnectorId,
+  sourceConnectionReady,
+  sourceMounted,
   sourceSetupIsActiveConnector,
   sourceSetupIsBusy,
   sourceSetupProgressLabel,
@@ -147,12 +151,8 @@ type DesktopSnapshot = {
     state: string;
     attentionCount: number;
   };
-  connection: {
-    connector: string;
-    workspaceName: string;
-    accountLabel: string;
-    status: string;
-  };
+  connection: ConnectionSummary;
+  connections?: ConnectionSummary[];
   mount: MountSummary;
   mounts: MountSummary[];
   activeMountId?: string | null;
@@ -166,6 +166,13 @@ type DesktopSnapshot = {
   recentFiles: LocatedItem[];
   activity: ActivityItem[];
   suggestions: ConnectorSuggestion[];
+};
+
+type ConnectionSummary = {
+  connector: string;
+  workspaceName: string;
+  accountLabel: string;
+  status: string;
 };
 
 type MountLiveMode = {
@@ -402,6 +409,14 @@ const sampleSnapshot: DesktopSnapshot = {
     accountLabel: "saurabh@codeflash.ai",
     status: "ready",
   },
+  connections: [
+    {
+      connector: "notion",
+      workspaceName: "CodeFlash",
+      accountLabel: "saurabh@codeflash.ai",
+      status: "ready",
+    },
+  ],
   mount: sampleMount,
   mounts: [sampleMount, sampleGoogleMount],
   activeMountId: sampleMount.mountId,
@@ -600,6 +615,7 @@ const loadingSnapshot: DesktopSnapshot = {
     accountLabel: "",
     status: "loading",
   },
+  connections: [],
   mount: {
     ...sampleSnapshot.mount,
     workspaceName: "Loading",
@@ -3011,6 +3027,8 @@ function MountsView({
   const [sourceDialogConnector, setSourceDialogConnector] = useState<SourceConnectorId | null>(null);
   const [sourceDialogMessage, setSourceDialogMessage] = useState("");
   const sourceSetupBusy = sourceSetupIsBusy(sourceDialogState);
+  const readyToMountSources = connectedSourcesReadyToMount(snapshot);
+  const hasVisibleSources = rows.length > 0 || readyToMountSources.length > 0;
 
   function openAddSourceDialog() {
     setActionError("");
@@ -3138,21 +3156,28 @@ function MountsView({
 
     setSourceDialogMessage("");
     setSourceDialogConnector(connector);
-    const nextState = connector === "notion"
-      ? connectionMissing(snapshot)
-        ? "connecting"
-        : mountMissing(snapshot)
-          ? "creating"
-          : "changing"
-      : "connecting";
+    const connectorReady = sourceConnectionReady(snapshot, connector);
+    const connectorHasMount = sourceMounted(snapshot, connector);
+    const nextState = !connectorReady
+      ? "connecting"
+      : !connectorHasMount
+        ? "creating"
+        : connector === "notion"
+          ? "changing"
+          : "success";
     setSourceDialogState(nextState);
     try {
+      if (connectorReady && !connectorHasMount) {
+        const mountReport = await createConnectorMount(connector, options?.googleDocsWorkspaceFolder);
+        setSourceDialogMessage(mountReport.message);
+        setSourceDialogState(mountReport.ok ? "success" : "error");
+        return;
+      }
+
       const report = connector === "notion"
-        ? connectionMissing(snapshot)
-          ? await connectNotionSource()
-          : mountMissing(snapshot)
-            ? await createMount()
-            : await changeNotionSourceAccess()
+        ? connectorReady
+          ? await changeNotionSourceAccess()
+          : await connectNotionSource()
         : await connectConnectorSource(connector);
       if (!report.ok || connector === "notion") {
         setSourceDialogMessage(report.message);
@@ -3283,7 +3308,7 @@ function MountsView({
         </SecondaryButton>
       </ViewHeader>
 
-      {rows.length === 0 ? (
+      {!hasVisibleSources ? (
         <section className="empty-action-panel">
           <BrandTile variant="folder" />
           <div>
@@ -3301,8 +3326,35 @@ function MountsView({
       ) : (
         <>
           <p className="view-copy">
-            {rows.length} connected {rows.length === 1 ? "source" : "sources"} registered for this Locality state.
+            {rows.length} mounted {rows.length === 1 ? "source" : "sources"}
+            {readyToMountSources.length > 0
+              ? ` · ${readyToMountSources.length} ready to mount`
+              : ""}.
           </p>
+          {readyToMountSources.length > 0 && (
+            <section className="source-ready-strip" aria-label="Sources ready to mount">
+              {readyToMountSources.map((connector) => (
+                <article className="source-ready-card" key={connector}>
+                  <ConnectorIcon connector={connector} />
+                  <div>
+                    <strong>{sourceDisplayName(connector)}</strong>
+                    <span>Connected. Create the local folder to use it from Files and agents.</span>
+                  </div>
+                  <StatusPill tone="warn" title="Connection is ready but no local folder exists yet.">
+                    Folder needed
+                  </StatusPill>
+                  <SecondaryButton
+                    compact
+                    busy={creating}
+                    icon={<FolderOpen />}
+                    onClick={() => void createConnectorMount(connector)}
+                  >
+                    Create Folder
+                  </SecondaryButton>
+                </article>
+              ))}
+            </section>
+          )}
           <section className="mounts-grid" aria-label="Connected sources">
             {rows.map((row) => (
               <article className={`mount-card ${row.active ? "active" : ""}`} key={row.id}>
@@ -3341,16 +3393,6 @@ function MountsView({
                   >
                     <FolderOpen />
                   </button>
-                  <button
-                    className="icon-button has-tooltip"
-                    data-tooltip="Export backup"
-                    aria-label={`Export backup for ${row.title}`}
-                    type="button"
-                    disabled={backupMountId !== null}
-                    onClick={() => void exportSourceBackup(row.id)}
-                  >
-                    {backupMountId === row.id ? <Loader2 className="spin-icon" /> : <Download />}
-                  </button>
                 </div>
                 <div className="mount-card-meta">
                   {row.active && <span className="primary">Primary</span>}
@@ -3361,6 +3403,15 @@ function MountsView({
                 </div>
                 <div className="mount-card-footer">
                   <span>{row.mount.mountId}</span>
+                  <button
+                    className="mount-details-button"
+                    type="button"
+                    disabled={backupMountId !== null}
+                    onClick={() => void exportSourceBackup(row.id)}
+                  >
+                    {backupMountId === row.id ? "Exporting" : "Backup"}
+                    {backupMountId === row.id ? <Loader2 className="spin-icon" /> : <Download />}
+                  </button>
                   <button className="mount-details-button" type="button" onClick={() => onSelectMount(row.id)}>
                     Details
                     <ChevronRight />
@@ -3409,47 +3460,39 @@ function AddSourceDialog({
   const [viewMode, setViewMode] = useState<SourceListViewMode>("list");
   const [googleDocsWorkspaceFolder, setGoogleDocsWorkspaceFolder] = useState("Locality");
   const [granolaApiKey, setGranolaApiKey] = useState("");
-  const needsConnection = connectionMissing(snapshot);
-  const needsFolder = !needsConnection && mountMissing(snapshot);
   const busy = sourceSetupIsBusy(state);
-  const sourceStatus = needsConnection
-    ? "Not connected"
-    : needsFolder
-      ? "Connected, folder needed"
-      : "Ready";
-  const mountedConnectors = new Set(snapshot.mounts.map((mount) => mount.connector));
   const connectors: ConnectorOption[] = [
     {
       id: "notion",
       name: "Notion",
       description: "Pages and databases as folders with page.md files.",
-      status: sourceStatus,
+      status: sourceConnectorStatus(snapshot, "notion"),
       keywords: ["notion", "wiki", "pages", "database", "docs"],
-      mounted: mountedConnectors.has("notion") || !mountMissing(snapshot),
+      mounted: sourceMounted(snapshot, "notion"),
     },
     {
       id: "google-docs",
       name: "Google Docs",
       description: "Docs and Drive folders through the same local file workflow.",
-      status: mountedConnectors.has("google-docs") ? "Mounted" : "Ready to connect",
+      status: sourceConnectorStatus(snapshot, "google-docs"),
       keywords: ["google", "docs", "gdocs", "drive", "documents"],
-      mounted: mountedConnectors.has("google-docs"),
+      mounted: sourceMounted(snapshot, "google-docs"),
     },
     {
       id: "gmail",
       name: "Gmail",
       description: "Inbox and sent as readable files, drafts as reviewed outbound mail.",
-      status: mountedConnectors.has("gmail") ? "Mounted" : "Ready to connect",
+      status: sourceConnectorStatus(snapshot, "gmail"),
       keywords: ["gmail", "mail", "email", "inbox", "drafts"],
-      mounted: mountedConnectors.has("gmail"),
+      mounted: sourceMounted(snapshot, "gmail"),
     },
     {
       id: "granola",
       name: "Granola",
       description: "Meeting summaries and raw transcripts as read-only files.",
-      status: mountedConnectors.has("granola") ? "Mounted" : "API key required",
+      status: sourceConnectorStatus(snapshot, "granola"),
       keywords: ["granola", "meetings", "notes", "transcripts", "summaries"],
-      mounted: mountedConnectors.has("granola"),
+      mounted: sourceMounted(snapshot, "granola"),
     },
   ];
   const normalizedQuery = query.trim().toLowerCase();
@@ -3512,6 +3555,11 @@ function AddSourceDialog({
           <div className={`connector-choice-grid ${viewMode}`}>
             {visibleConnectors.map((connector) => {
               const connectorBusy = sourceSetupIsActiveConnector(state, activeConnector, connector.id);
+              const connected = sourceConnectionReady(snapshot, connector.id);
+              const needsConnection = !connected;
+              const needsFolder = connected && !connector.mounted;
+              const connectionDetails = sourceConnectionDetails(snapshot, connector.id);
+              const mountDetails = sourceMountDetails(snapshot, connector.id);
               const disabled = busy || (connector.id !== "notion" && connector.mounted);
               const displayedStatus = connectorBusy
                 ? sourceSetupProgressLabel(state, connector.mounted)
@@ -3549,9 +3597,9 @@ function AddSourceDialog({
                   <div className="connector-choice-facts">
                     {connector.id === "notion" ? (
                       <>
-                        <SettingRow title="Workspace" value={snapshot.connection.workspaceName || "Not connected"} />
+                        <SettingRow title="Workspace" value={connectionDetails?.workspaceName || "Not connected"} />
                         <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
-                        <SettingRow title="Access" value={snapshot.mount.accessScope || "Not requested"} />
+                        <SettingRow title="Access" value={mountDetails?.accessScope || (connected ? "Ready to mount" : "Not requested")} />
                       </>
                     ) : connector.id === "google-docs" ? (
                       <>
@@ -3580,7 +3628,7 @@ function AddSourceDialog({
                       />
                     </label>
                   )}
-                  {connector.id === "granola" && !connector.mounted && (
+                  {connector.id === "granola" && !connector.mounted && needsConnection && (
                     <>
                       <label className="source-inline-field">
                         <span>Granola API key</span>
@@ -3606,11 +3654,17 @@ function AddSourceDialog({
                     <PrimaryButton
                       compact
                       busy={connectorBusy}
-                      disabled={disabled || (!connector.mounted && !granolaApiKey.trim())}
-                      icon={<ShieldCheck />}
-                      onClick={() => onGranolaAction(granolaApiKey)}
+                      disabled={disabled || (needsConnection && !granolaApiKey.trim())}
+                      icon={needsConnection ? <ShieldCheck /> : <FolderOpen />}
+                      onClick={() => {
+                        if (needsConnection) {
+                          onGranolaAction(granolaApiKey);
+                        } else {
+                          onAction(connector.id);
+                        }
+                      }}
                     >
-                      {connectorBusy ? sourceSetupProgressLabel(state, connector.mounted) : "Connect Granola"}
+                      {connectorBusy ? sourceSetupProgressLabel(state, connector.mounted) : actionLabel}
                     </PrimaryButton>
                   ) : (
                     <PrimaryButton
@@ -3665,12 +3719,51 @@ function sourceMountId(connector: SourceConnectorId) {
   }
 }
 
+function sourceConnectionDetails(snapshot: DesktopSnapshot, connector: SourceConnectorId): ConnectionSummary | null {
+  const connections = snapshot.connections?.length ? snapshot.connections : [snapshot.connection];
+  return (
+    connections.find((connection) => connection.connector === connector && sourceConnectionStatusReady(connection.status)) ??
+    connections.find((connection) => connection.connector === connector) ??
+    null
+  );
+}
+
+function sourceMountDetails(snapshot: DesktopSnapshot, connector: SourceConnectorId): MountSummary | null {
+  return (
+    snapshot.mounts.find((mount) => mount.connector === connector) ??
+    (snapshot.mount.connector === connector && snapshot.mount.status !== "not_mounted" ? snapshot.mount : null)
+  );
+}
+
+function sourceConnectorStatus(snapshot: DesktopSnapshot, connector: SourceConnectorId) {
+  if (sourceMounted(snapshot, connector)) {
+    return "Mounted";
+  }
+  if (sourceConnectionReady(snapshot, connector)) {
+    return "Folder needed";
+  }
+  if (connector === "granola") {
+    return "API key required";
+  }
+  return "Ready to connect";
+}
+
+function sourceConnectionStatusReady(status: string) {
+  const normalized = status.trim().toLowerCase();
+  return normalized === "active" || normalized === "ready";
+}
+
 function sourceDefaultPath(snapshot: DesktopSnapshot, connector: SourceConnectorId) {
   const existing = snapshot.mounts.find((mount) => mount.connector === connector)?.localPath;
   if (existing?.trim()) {
     return existing;
   }
-  if (connector === "notion" && snapshot.mount.localPath.trim()) {
+  if (
+    connector === "notion" &&
+    snapshot.mount.connector === "notion" &&
+    snapshot.mount.status !== "not_mounted" &&
+    snapshot.mount.localPath.trim()
+  ) {
     return snapshot.mount.localPath;
   }
   switch (connector) {
@@ -3690,7 +3783,10 @@ function sourceActionLabel(
   state: { needsConnection: boolean; needsFolder: boolean; mounted: boolean },
 ) {
   if (connector !== "notion") {
-    return state.mounted ? "Mounted" : "Connect & Mount";
+    if (state.mounted) {
+      return "Mounted";
+    }
+    return state.needsFolder ? "Create Folder" : "Connect & Mount";
   }
   if (state.needsConnection) {
     return "Connect Notion";
@@ -7427,12 +7523,36 @@ function chromeStatusLabel(snapshot: DesktopSnapshot) {
 
 function sidebarStatusLabel(snapshot: DesktopSnapshot) {
   if (snapshot.health.state === "ready") {
-    return "Notion Ready";
+    const mountedSources = snapshot.mounts.filter((mount) => mount.status !== "not_mounted");
+    if (mountedSources.length > 1) {
+      return "Sources Ready";
+    }
+    if (mountedSources.length === 1) {
+      return `${sourceDisplayNameFromConnector(mountedSources[0].connector)} Ready`;
+    }
+    const readyToMountSources = connectedSourcesReadyToMount(snapshot);
+    if (readyToMountSources.length > 1) {
+      return "Sources Connected";
+    }
+    if (readyToMountSources.length === 1) {
+      return `${sourceDisplayName(readyToMountSources[0])} Connected`;
+    }
+    return "Ready";
   }
   if (snapshot.health.state === "needs_review") {
     return PRODUCT_TERMS.reviewNeeded;
   }
   return healthLabel(snapshot.health.state);
+}
+
+function sourceDisplayNameFromConnector(connector: string) {
+  return isSourceConnectorId(connector)
+    ? sourceDisplayName(connector)
+    : connector
+        .split(/[-_\s]+/)
+        .filter(Boolean)
+        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(" ") || "Source";
 }
 
 function chromeStatusTarget(snapshot: DesktopSnapshot): AppView | null {

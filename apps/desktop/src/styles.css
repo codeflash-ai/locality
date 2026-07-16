@@ -2171,6 +2171,45 @@ button.home-stat:hover {
   gap: 10px;
 }
 
+.source-ready-strip {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.source-ready-card {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid rgba(8, 123, 114, 0.18);
+  border-radius: 8px;
+  background: rgba(248, 252, 251, 0.94);
+}
+
+.source-ready-card strong,
+.source-ready-card span {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.source-ready-card strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.source-ready-card span {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 760;
+}
+
 .mount-card {
   display: grid;
   gap: 10px;
@@ -2256,7 +2295,7 @@ button.home-stat:hover {
 
 .mount-card-path {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) repeat(3, 32px);
+  grid-template-columns: minmax(0, 1fr) repeat(2, 32px);
   align-items: center;
   gap: 6px;
   min-height: 38px;

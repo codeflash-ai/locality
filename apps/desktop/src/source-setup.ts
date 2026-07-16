@@ -1,6 +1,25 @@
 export type SourceSetupState = "idle" | "connecting" | "creating" | "changing" | "success" | "error";
 export type SourceConnectorId = "notion" | "google-docs" | "gmail" | "granola";
 
+type SourceConnectionLike = {
+  connector: string;
+  status: string;
+};
+
+type SourceMountLike = {
+  connector: string;
+  status?: string | null;
+};
+
+type SourceSnapshotLike = {
+  connection?: SourceConnectionLike | null;
+  connections?: SourceConnectionLike[] | null;
+  mount?: SourceMountLike | null;
+  mounts?: SourceMountLike[] | null;
+};
+
+const SOURCE_CONNECTORS: SourceConnectorId[] = ["notion", "google-docs", "gmail", "granola"];
+
 export function sourceSetupIsBusy(state: SourceSetupState): boolean {
   return state === "connecting" || state === "creating" || state === "changing";
 }
@@ -27,4 +46,58 @@ export function sourceSetupProgressLabel(state: SourceSetupState, mounted: boole
     return "Connecting";
   }
   return "";
+}
+
+export function isSourceConnectorId(value: string): value is SourceConnectorId {
+  return SOURCE_CONNECTORS.includes(value as SourceConnectorId);
+}
+
+export function sourceConnectionReady(
+  snapshot: SourceSnapshotLike,
+  connector: SourceConnectorId,
+): boolean {
+  return sourceConnections(snapshot).some(
+    (connection) => connection.connector === connector && sourceConnectionStatusReady(connection.status),
+  );
+}
+
+export function sourceMounted(
+  snapshot: SourceSnapshotLike,
+  connector: SourceConnectorId,
+): boolean {
+  return sourceMounts(snapshot).some(
+    (mount) => mount.connector === connector && mount.status !== "not_mounted",
+  );
+}
+
+export function connectedSourcesReadyToMount(snapshot: SourceSnapshotLike): SourceConnectorId[] {
+  return SOURCE_CONNECTORS.filter(
+    (connector) => sourceConnectionReady(snapshot, connector) && !sourceMounted(snapshot, connector),
+  );
+}
+
+function sourceConnections(snapshot: SourceSnapshotLike): SourceConnectionLike[] {
+  const byConnector = new Map<string, SourceConnectionLike>();
+  for (const connection of snapshot.connections ?? []) {
+    if (connection?.connector) {
+      byConnector.set(connection.connector, connection);
+    }
+  }
+  if (snapshot.connection?.connector && !byConnector.has(snapshot.connection.connector)) {
+    byConnector.set(snapshot.connection.connector, snapshot.connection);
+  }
+  return Array.from(byConnector.values());
+}
+
+function sourceMounts(snapshot: SourceSnapshotLike): SourceMountLike[] {
+  const mounts = [...(snapshot.mounts ?? [])];
+  if (snapshot.mount?.connector && !mounts.some((mount) => mount.connector === snapshot.mount?.connector)) {
+    mounts.push(snapshot.mount);
+  }
+  return mounts;
+}
+
+function sourceConnectionStatusReady(status: string): boolean {
+  const normalized = status.trim().toLowerCase();
+  return normalized === "active" || normalized === "ready";
 }
