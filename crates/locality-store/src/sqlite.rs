@@ -35,6 +35,7 @@ use crate::records::{
     HydrationJobRecord, MetadataDiscoveryJobRecord, MetadataDiscoveryPriority, MountConfig,
     MountLiveModeRecord, MountLiveModeState, ProjectionMode, RemoteObservationRecord,
     ShadowBlockRecord, ShadowSnapshotRecord, VirtualMutationKind, VirtualMutationRecord,
+    merge_hydration_job_record,
 };
 use crate::repository::{
     AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, ConnectorStateRepository,
@@ -810,6 +811,7 @@ impl EntitySearchRepository for SqliteStateStore {
 impl HydrationJobRepository for SqliteStateStore {
     fn upsert_hydration_job(&mut self, job: HydrationJobRecord) -> StoreResult<()> {
         let connection = self.connection()?;
+        let job = merged_hydration_job_for_upsert(&connection, job)?;
         connection.execute(
             UPSERT_HYDRATION_JOB_SQL,
             params![
@@ -829,6 +831,7 @@ impl HydrationJobRepository for SqliteStateStore {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         for job in jobs {
+            let job = merged_hydration_job_for_upsert(&transaction, job)?;
             transaction.execute(
                 UPSERT_HYDRATION_JOB_SQL,
                 params![
@@ -2469,6 +2472,29 @@ fn hydration_job_from_row(row: HydrationJobRow) -> StoreResult<HydrationJobRecor
         attempts,
         last_error: row.6,
     })
+}
+
+fn merged_hydration_job_for_upsert(
+    connection: &Connection,
+    incoming: HydrationJobRecord,
+) -> StoreResult<HydrationJobRecord> {
+    let existing = connection
+        .query_row(
+            "SELECT mount_id, remote_id, path, target_state_json, reason_json, attempts, last_error
+             FROM hydration_jobs
+             WHERE mount_id = ?1 AND remote_id = ?2",
+            params![incoming.mount_id.0.as_str(), incoming.remote_id.0.as_str()],
+            hydration_job_row,
+        )
+        .optional()?
+        .map(hydration_job_from_row)
+        .transpose()?;
+    let Some(mut existing) = existing else {
+        return Ok(incoming);
+    };
+
+    merge_hydration_job_record(&mut existing, incoming);
+    Ok(existing)
 }
 
 fn metadata_discovery_job_row(

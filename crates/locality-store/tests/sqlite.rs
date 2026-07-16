@@ -2216,6 +2216,100 @@ fn hydration_jobs_batch_upsert_persists_multiple_jobs_and_preserves_failure_meta
 }
 
 #[test]
+fn hydration_jobs_batch_upsert_does_not_demote_existing_high_priority_job() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config())
+        .expect("save mount");
+    store
+        .upsert_hydration_job(HydrationJobRecord {
+            path: fixture.mount_root.join("Open.md"),
+            target_state: HydrationState::Hydrated,
+            reason: HydrationReason::FileOpen,
+            ..hydration_job_record()
+        })
+        .expect("save file-open hydration job");
+    store
+        .record_hydration_job_failure(
+            &fixture.mount_id,
+            &RemoteId::new("page-1"),
+            "network timeout".to_string(),
+        )
+        .expect("record failure");
+
+    store
+        .upsert_hydration_jobs(vec![HydrationJobRecord {
+            path: fixture.mount_root.join("Prefetch.md"),
+            target_state: HydrationState::Stub,
+            reason: HydrationReason::Prefetch,
+            ..hydration_job_record()
+        }])
+        .expect("batch upsert lower-priority hydration job");
+    drop(store);
+
+    let reopened = fixture.open();
+    assert_eq!(
+        reopened.list_hydration_jobs().expect("list hydration jobs"),
+        vec![HydrationJobRecord {
+            path: fixture.mount_root.join("Open.md"),
+            target_state: HydrationState::Hydrated,
+            reason: HydrationReason::FileOpen,
+            attempts: 1,
+            last_error: Some("network timeout".to_string()),
+            ..hydration_job_record()
+        }]
+    );
+}
+
+#[test]
+fn hydration_jobs_batch_upsert_promotes_existing_lower_priority_job() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config())
+        .expect("save mount");
+    store
+        .upsert_hydration_job(HydrationJobRecord {
+            path: fixture.mount_root.join("Prefetch.md"),
+            target_state: HydrationState::Stub,
+            reason: HydrationReason::Prefetch,
+            ..hydration_job_record()
+        })
+        .expect("save prefetch hydration job");
+    store
+        .record_hydration_job_failure(
+            &fixture.mount_id,
+            &RemoteId::new("page-1"),
+            "network timeout".to_string(),
+        )
+        .expect("record failure");
+
+    store
+        .upsert_hydration_jobs(vec![HydrationJobRecord {
+            path: fixture.mount_root.join("Open.md"),
+            target_state: HydrationState::Hydrated,
+            reason: HydrationReason::ExplicitPull,
+            ..hydration_job_record()
+        }])
+        .expect("batch upsert higher-priority hydration job");
+    drop(store);
+
+    let reopened = fixture.open();
+    assert_eq!(
+        reopened.list_hydration_jobs().expect("list hydration jobs"),
+        vec![HydrationJobRecord {
+            path: fixture.mount_root.join("Open.md"),
+            target_state: HydrationState::Hydrated,
+            reason: HydrationReason::ExplicitPull,
+            attempts: 1,
+            last_error: Some("network timeout".to_string()),
+            ..hydration_job_record()
+        }]
+    );
+}
+
+#[test]
 fn sqlite_store_migrates_v5_projection_and_connections_schema() {
     let fixture = SqliteFixture::new();
     fs::create_dir_all(&fixture.state_root).expect("state root");

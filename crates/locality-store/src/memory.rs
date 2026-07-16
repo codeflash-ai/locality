@@ -20,6 +20,7 @@ use crate::records::{
     ConnectorProfileRecord, ConnectorStateRecord, EntityRecord, FreshnessStateRecord,
     HydrationJobRecord, MetadataDiscoveryJobRecord, MountConfig, MountLiveModeRecord,
     RemoteObservationRecord, ShadowSnapshotRecord, VirtualMutationRecord,
+    merge_hydration_job_record,
 };
 use crate::repository::{
     AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, ConnectorStateRepository,
@@ -582,9 +583,7 @@ impl HydrationJobRepository for InMemoryStateStore {
     fn upsert_hydration_job(&mut self, job: HydrationJobRecord) -> StoreResult<()> {
         let key = Self::hydration_job_key(&job.mount_id, &job.remote_id);
         if let Some(existing) = self.hydration_jobs.get_mut(&key) {
-            existing.path = job.path;
-            existing.target_state = job.target_state;
-            existing.reason = job.reason;
+            merge_hydration_job_record(existing, job);
         } else {
             self.hydration_jobs.insert(key, job);
         }
@@ -596,9 +595,7 @@ impl HydrationJobRepository for InMemoryStateStore {
         for job in jobs {
             let key = Self::hydration_job_key(&job.mount_id, &job.remote_id);
             if let Some(existing) = self.hydration_jobs.get_mut(&key) {
-                existing.path = job.path;
-                existing.target_state = job.target_state;
-                existing.reason = job.reason;
+                merge_hydration_job_record(existing, job);
             } else {
                 self.hydration_jobs.insert(key, job);
             }

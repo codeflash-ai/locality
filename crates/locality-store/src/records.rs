@@ -631,6 +631,36 @@ impl HydrationJobRecord {
     }
 }
 
+pub fn merge_hydration_job_record(existing: &mut HydrationJobRecord, incoming: HydrationJobRecord) {
+    if hydration_reason_rank(&incoming.reason) >= hydration_reason_rank(&existing.reason) {
+        existing.path = incoming.path;
+        existing.reason = incoming.reason;
+    }
+    if hydration_state_rank(&incoming.target_state) > hydration_state_rank(&existing.target_state) {
+        existing.target_state = incoming.target_state;
+    }
+}
+
+fn hydration_reason_rank(reason: &HydrationReason) -> u8 {
+    match reason {
+        HydrationReason::ExplicitPull
+        | HydrationReason::FileOpen
+        | HydrationReason::LiveModeRemoteFastForward
+        | HydrationReason::StubRead => 2,
+        HydrationReason::Policy | HydrationReason::RemoteFastForward => 1,
+        HydrationReason::Prefetch => 0,
+    }
+}
+
+fn hydration_state_rank(state: &HydrationState) -> u8 {
+    match state {
+        HydrationState::Virtual => 0,
+        HydrationState::Stub => 1,
+        HydrationState::Hydrated => 2,
+        HydrationState::Dirty | HydrationState::Conflicted => 3,
+    }
+}
+
 impl From<HydrationRequest> for HydrationJobRecord {
     fn from(value: HydrationRequest) -> Self {
         Self::new(value)

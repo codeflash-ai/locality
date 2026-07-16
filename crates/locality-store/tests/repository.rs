@@ -392,6 +392,106 @@ fn in_memory_hydration_jobs_batch_upsert_preserves_failure_metadata() {
 }
 
 #[test]
+fn in_memory_hydration_jobs_batch_upsert_does_not_demote_existing_high_priority_job() {
+    let mut store = InMemoryStateStore::new();
+    let mount_id = MountId::new("notion-main");
+
+    store
+        .upsert_hydration_job(HydrationJobRecord {
+            mount_id: mount_id.clone(),
+            remote_id: RemoteId::new("page-1"),
+            path: PathBuf::from("Open.md"),
+            target_state: HydrationState::Hydrated,
+            reason: HydrationReason::FileOpen,
+            attempts: 0,
+            last_error: None,
+        })
+        .expect("save file-open hydration job");
+    store
+        .record_hydration_job_failure(
+            &mount_id,
+            &RemoteId::new("page-1"),
+            "network timeout".to_string(),
+        )
+        .expect("record failure");
+
+    store
+        .upsert_hydration_jobs(vec![HydrationJobRecord {
+            mount_id: mount_id.clone(),
+            remote_id: RemoteId::new("page-1"),
+            path: PathBuf::from("Prefetch.md"),
+            target_state: HydrationState::Stub,
+            reason: HydrationReason::Prefetch,
+            attempts: 0,
+            last_error: None,
+        }])
+        .expect("batch upsert lower-priority hydration job");
+
+    assert_eq!(
+        store.list_hydration_jobs().expect("list hydration jobs"),
+        vec![HydrationJobRecord {
+            mount_id,
+            remote_id: RemoteId::new("page-1"),
+            path: PathBuf::from("Open.md"),
+            target_state: HydrationState::Hydrated,
+            reason: HydrationReason::FileOpen,
+            attempts: 1,
+            last_error: Some("network timeout".to_string()),
+        }]
+    );
+}
+
+#[test]
+fn in_memory_hydration_jobs_batch_upsert_promotes_existing_lower_priority_job() {
+    let mut store = InMemoryStateStore::new();
+    let mount_id = MountId::new("notion-main");
+
+    store
+        .upsert_hydration_job(HydrationJobRecord {
+            mount_id: mount_id.clone(),
+            remote_id: RemoteId::new("page-1"),
+            path: PathBuf::from("Prefetch.md"),
+            target_state: HydrationState::Stub,
+            reason: HydrationReason::Prefetch,
+            attempts: 0,
+            last_error: None,
+        })
+        .expect("save prefetch hydration job");
+    store
+        .record_hydration_job_failure(
+            &mount_id,
+            &RemoteId::new("page-1"),
+            "network timeout".to_string(),
+        )
+        .expect("record failure");
+
+    store
+        .upsert_hydration_jobs(vec![HydrationJobRecord {
+            mount_id: mount_id.clone(),
+            remote_id: RemoteId::new("page-1"),
+            path: PathBuf::from("Open.md"),
+            target_state: HydrationState::Hydrated,
+            reason: HydrationReason::ExplicitPull,
+            attempts: 0,
+            last_error: None,
+        }])
+        .expect("batch upsert higher-priority hydration job");
+
+    assert_eq!(
+        store.list_hydration_jobs().expect("list hydration jobs"),
+        vec![HydrationJobRecord {
+            mount_id,
+            remote_id: RemoteId::new("page-1"),
+            path: PathBuf::from("Open.md"),
+            target_state: HydrationState::Hydrated,
+            reason: HydrationReason::ExplicitPull,
+            attempts: 1,
+            last_error: Some("network timeout".to_string()),
+        }]
+    );
+}
+
+#[test]
 fn mount_config_round_trips_with_read_only_flag() {
     let mut store = InMemoryStateStore::new();
     let mount = MountConfig::new(mount_id(), "notion", "/Users/saurabh/loc/notion")
