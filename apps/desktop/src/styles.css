@@ -9,8 +9,10 @@
   --line: rgba(148, 163, 184, 0.28);
   --line-soft: #e7ebed;
   --line-strong: rgba(86, 107, 125, 0.28);
-  --teal: #087b72;
-  --teal-wash: #e2f0ee;
+  --teal: #0f766e;
+  --teal-strong: #0b625c;
+  --teal-deep: #084c47;
+  --teal-wash: #e7f1ef;
   --amber: #c08a00;
   --amber-soft: #faf3e0;
   --orange: #d97706;
@@ -26,8 +28,8 @@
   --surface-strong: var(--paper);
   --accent: var(--teal);
   --accent-soft: var(--teal-wash);
-  --green: #1f9d68;
-  --green-soft: #e5f8ef;
+  --green: #23845f;
+  --green-soft: #e8f4ee;
   --shadow: 0 24px 70px rgba(20, 30, 43, 0.14);
   --tight-shadow: 0 14px 36px rgba(20, 30, 43, 0.12);
   --type-caption: 11px;
@@ -575,14 +577,14 @@ p {
 
 .primary-button {
   padding: 0 18px;
-  background: #121b28;
+  background: var(--accent);
   color: #fff;
-  box-shadow: 0 16px 30px rgba(18, 27, 40, 0.2);
+  box-shadow: 0 14px 28px rgba(8, 123, 114, 0.18);
 }
 
 .primary-button:hover:not(:disabled) {
-  background: #0b1320;
-  box-shadow: 0 16px 30px rgba(18, 27, 40, 0.26);
+  background: var(--teal-strong);
+  box-shadow: 0 16px 32px rgba(8, 123, 114, 0.24);
 }
 
 .primary-button:active:not(:disabled),
@@ -603,8 +605,8 @@ p {
 }
 
 .primary-button:disabled {
-  background: #dce3e7;
-  color: #657283;
+  background: #dbe7e5;
+  color: #6c7d7a;
   box-shadow: none;
 }
 
@@ -637,15 +639,16 @@ p {
 
 .secondary-button {
   padding: 0 18px;
-  border: 1px solid var(--line);
-  background: rgba(255, 255, 255, 0.82);
-  color: var(--ink);
+  border: 1px solid rgba(86, 107, 125, 0.22);
+  background: rgba(255, 255, 255, 0.86);
+  color: #405563;
 }
 
 .secondary-button:hover:not(:disabled) {
-  border-color: var(--line-strong);
-  background: #fff;
-  box-shadow: 0 8px 20px rgba(20, 30, 43, 0.08);
+  border-color: rgba(8, 123, 114, 0.24);
+  background: rgba(248, 252, 251, 0.98);
+  color: var(--accent);
+  box-shadow: 0 8px 20px rgba(8, 123, 114, 0.1);
 }
 
 .live-mode-button {
@@ -2362,16 +2365,17 @@ button.home-stat:hover {
   gap: 4px;
   min-height: 28px;
   padding: 0 8px;
-  border: 1px solid var(--line);
+  border: 1px solid rgba(86, 107, 125, 0.2);
   border-radius: 8px;
   background: #fff;
-  color: var(--muted);
+  color: #4f6170;
   font-size: 11px;
   font-weight: 850;
 }
 
 .mount-details-button:hover {
-  border-color: rgba(8, 123, 114, 0.24);
+  border-color: rgba(8, 123, 114, 0.26);
+  background: rgba(248, 252, 251, 0.98);
   color: var(--accent);
 }
 
@@ -2520,6 +2524,18 @@ button.home-stat:hover {
   flex-wrap: wrap;
   gap: 8px;
   justify-content: flex-end;
+}
+
+.danger-actions .secondary-button {
+  border-color: rgba(220, 38, 38, 0.24);
+  color: var(--red);
+}
+
+.danger-actions .secondary-button:hover:not(:disabled) {
+  border-color: rgba(220, 38, 38, 0.36);
+  background: var(--red-soft);
+  color: var(--red);
+  box-shadow: 0 8px 20px rgba(220, 38, 38, 0.1);
 }
 
 .settings-danger-accordion {
@@ -3215,10 +3231,10 @@ button.home-stat:hover {
   flex: 0 0 32px;
   width: 32px;
   height: 32px;
-  border: 1px solid var(--line);
+  border: 1px solid rgba(86, 107, 125, 0.2);
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.82);
-  color: var(--ink);
+  color: #526575;
   transition:
     background-color 170ms ease,
     border-color 170ms ease,
@@ -3229,9 +3245,10 @@ button.home-stat:hover {
 }
 
 .icon-button:hover:not(:disabled) {
-  border-color: var(--line-strong);
-  background: #fff;
-  box-shadow: 0 8px 18px rgba(20, 30, 43, 0.08);
+  border-color: rgba(8, 123, 114, 0.26);
+  background: rgba(248, 252, 251, 0.98);
+  color: var(--accent);
+  box-shadow: 0 8px 18px rgba(8, 123, 114, 0.09);
 }
 
 .icon-button:active:not(:disabled) {
