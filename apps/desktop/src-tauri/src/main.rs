@@ -348,6 +348,14 @@ struct WorkspaceMountOnboardingReport {
     launch_strategy: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileProviderEnablementReport {
+    state: String,
+    message: String,
+    path: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MacosWorkspaceMountOnboardingState {
     Created,
@@ -360,7 +368,7 @@ impl MacosWorkspaceMountOnboardingState {
     fn as_str(self) -> &'static str {
         match self {
             Self::Created => "created",
-            Self::ApprovalRequired => "approval_required",
+            Self::ApprovalRequired => "needs_finder_enable",
             Self::WaitingForCloudStorageRoot => "waiting_for_cloudstorage_root",
             Self::Failed => "failed",
         }
@@ -1918,6 +1926,33 @@ async fn run_workspace_mount_onboarding(
         refresh_desktop_surfaces(&app);
     }
     report
+}
+
+#[tauri::command]
+async fn file_provider_enablement_status() -> FileProviderEnablementReport {
+    tauri::async_runtime::spawn_blocking(macos_file_provider_enablement_status_blocking)
+        .await
+        .unwrap_or_else(|error| FileProviderEnablementReport {
+            state: "unavailable".to_string(),
+            message: format!("File Provider status worker failed: {error}"),
+            path: None,
+        })
+}
+
+#[tauri::command]
+async fn reveal_file_provider_enablement() -> ActionReport {
+    tauri::async_runtime::spawn_blocking(reveal_file_provider_enablement_blocking)
+        .await
+        .map_or_else(
+            |error| ActionReport {
+                ok: false,
+                message: format!("Finder worker failed: {error}"),
+            },
+            |result| match result {
+                Ok(message) => ActionReport { ok: true, message },
+                Err(message) => ActionReport { ok: false, message },
+            },
+        )
 }
 
 async fn create_desktop_mount_command(
@@ -10059,7 +10094,7 @@ fn workspace_mount_onboarding_curated_message(
 ) -> Option<&'static str> {
     match state {
         MacosWorkspaceMountOnboardingState::ApprovalRequired => {
-            Some("Enable Locality in Finder, then return here and click Check again.")
+            Some("In Finder, click Enable for Locality. Locality will continue automatically.")
         }
         MacosWorkspaceMountOnboardingState::WaitingForCloudStorageRoot => {
             Some("Locality is still waiting for the CloudStorage folder to appear.")
@@ -10149,6 +10184,128 @@ fn macos_workspace_mount_domain_user_enabled() -> Result<bool, String> {
         .and_then(|domain| domain.get("userEnabled"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false))
+}
+
+fn classify_macos_file_provider_enablement(
+    user_enabled: Option<bool>,
+    fallback_path: Option<PathBuf>,
+    resolved_root: Result<Option<PathBuf>, String>,
+) -> FileProviderEnablementReport {
+    let path = |value: Option<PathBuf>| value.map(|path| path.display().to_string());
+    match user_enabled {
+        None => FileProviderEnablementReport {
+            state: "not_registered".to_string(),
+            message: "Locality is preparing the Finder location.".to_string(),
+            path: path(fallback_path),
+        },
+        Some(false) => FileProviderEnablementReport {
+            state: "needs_finder_enable".to_string(),
+            message: "In Finder, click Enable for Locality.".to_string(),
+            path: path(fallback_path),
+        },
+        Some(true) => match resolved_root {
+            Ok(Some(root)) => FileProviderEnablementReport {
+                state: "ready".to_string(),
+                message: "Locality is enabled in Finder.".to_string(),
+                path: path(Some(root)),
+            },
+            Ok(None) => FileProviderEnablementReport {
+                state: "waiting_for_root".to_string(),
+                message: "Finishing the Locality folder setup.".to_string(),
+                path: path(fallback_path),
+            },
+            Err(message) => FileProviderEnablementReport {
+                state: "unavailable".to_string(),
+                message,
+                path: path(fallback_path),
+            },
+        },
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_provider_enablement_status_blocking() -> FileProviderEnablementReport {
+    let provider_roots = macos_file_provider_cloud_storage_roots();
+    let fallback_path = provider_roots.first().cloned();
+    let report = match run_macos_file_provider_helper("list", Vec::new()) {
+        Ok(report) => report,
+        Err(error) => {
+            return FileProviderEnablementReport {
+                state: "unavailable".to_string(),
+                message: error.message(),
+                path: fallback_path.map(|path| path.display().to_string()),
+            };
+        }
+    };
+    let user_enabled = report
+        .helper_report
+        .get("domains")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|domains| {
+            domains.iter().find(|domain| {
+                domain.get("identifier").and_then(serde_json::Value::as_str)
+                    == Some(localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
+            })
+        })
+        .and_then(|domain| domain.get("userEnabled"))
+        .and_then(serde_json::Value::as_bool);
+
+    let resolved_root = if user_enabled == Some(true) {
+        match macos_file_provider_domain_url(
+            localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
+        ) {
+            Ok(root) => Ok(Some(root)),
+            Err(error) if recoverable_macos_file_provider_activation_error(&error.message()) => {
+                Ok(None)
+            }
+            Err(error) => Err(error.message()),
+        }
+    } else {
+        Ok(None)
+    };
+    classify_macos_file_provider_enablement(user_enabled, fallback_path, resolved_root)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_file_provider_enablement_status_blocking() -> FileProviderEnablementReport {
+    FileProviderEnablementReport {
+        state: "unavailable".to_string(),
+        message: "File Provider enablement is only available on macOS.".to_string(),
+        path: None,
+    }
+}
+
+fn macos_file_provider_reveal_path(
+    domain_path: Option<&Path>,
+    candidates: &[PathBuf],
+) -> Option<PathBuf> {
+    domain_path
+        .into_iter()
+        .chain(candidates.iter().map(PathBuf::as_path))
+        .find_map(|candidate| {
+            candidate
+                .ancestors()
+                .find(|ancestor| ancestor.is_dir())
+                .map(Path::to_path_buf)
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn reveal_file_provider_enablement_blocking() -> Result<String, String> {
+    let report = macos_file_provider_enablement_status_blocking();
+    let domain_path = report.path.as_deref().map(Path::new);
+    let path =
+        macos_file_provider_reveal_path(domain_path, &macos_file_provider_cloud_storage_roots())
+            .ok_or_else(|| {
+                "Could not find the Locality location or its CloudStorage parent.".to_string()
+            })?;
+    open_in_file_manager(&path)?;
+    Ok(format!("Opened {} in Finder.", path.display()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn reveal_file_provider_enablement_blocking() -> Result<String, String> {
+    Err("File Provider enablement is only available on macOS.".to_string())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -13511,6 +13668,79 @@ mod tests {
     }
 
     #[test]
+    fn file_provider_enablement_report_distinguishes_registration_and_approval() {
+        let missing = super::classify_macos_file_provider_enablement(None, None, Ok(None));
+        assert_eq!(missing.state, "not_registered");
+
+        let disabled = super::classify_macos_file_provider_enablement(
+            Some(false),
+            Some(PathBuf::from("/Users/test/Library/CloudStorage/Locality")),
+            Ok(None),
+        );
+        assert_eq!(disabled.state, "needs_finder_enable");
+        assert_eq!(
+            disabled.path.as_deref(),
+            Some("/Users/test/Library/CloudStorage/Locality")
+        );
+    }
+
+    #[test]
+    fn file_provider_enablement_report_waits_for_enabled_root() {
+        let report = super::classify_macos_file_provider_enablement(
+            Some(true),
+            Some(PathBuf::from("/Users/test/Library/CloudStorage/Locality")),
+            Ok(None),
+        );
+
+        assert_eq!(report.state, "waiting_for_root");
+        assert!(report.message.contains("Finishing"));
+    }
+
+    #[test]
+    fn file_provider_enablement_report_is_ready_only_with_resolved_root() {
+        let root = PathBuf::from("/Users/test/Library/CloudStorage/Locality");
+        let report = super::classify_macos_file_provider_enablement(
+            Some(true),
+            Some(root.clone()),
+            Ok(Some(root.clone())),
+        );
+
+        assert_eq!(report.state, "ready");
+        assert_eq!(report.path.as_deref(), root.to_str());
+    }
+
+    #[test]
+    fn file_provider_enablement_report_exposes_unavailable_errors() {
+        let report = super::classify_macos_file_provider_enablement(
+            Some(true),
+            None,
+            Err("File Provider helper unavailable".to_string()),
+        );
+
+        assert_eq!(report.state, "unavailable");
+        assert_eq!(report.message, "File Provider helper unavailable");
+    }
+
+    #[test]
+    fn file_provider_reveal_path_prefers_domain_then_existing_parent() {
+        let temp = TestTempDir::new("file-provider-reveal");
+        let cloud_storage = temp.path().join("Library/CloudStorage");
+        fs::create_dir_all(&cloud_storage).expect("create CloudStorage parent");
+        let domain = cloud_storage.join("Locality");
+
+        assert_eq!(
+            super::macos_file_provider_reveal_path(Some(&domain), &[domain.clone()]),
+            Some(cloud_storage)
+        );
+
+        fs::create_dir_all(&domain).expect("create domain root");
+        assert_eq!(
+            super::macos_file_provider_reveal_path(Some(&domain), &[domain.clone()]),
+            Some(domain)
+        );
+    }
+
+    #[test]
     fn macos_file_provider_approval_surface_path_uses_first_existing_candidate() {
         let temp = TestTempDir::new("approval-surface");
         let missing = temp.path().join("Library/CloudStorage/Locality");
@@ -13544,6 +13774,9 @@ mod tests {
             ),
             expected
         );
+        if let Some(state) = expected {
+            assert_eq!(state.as_str(), "needs_finder_enable");
+        }
     }
 
     #[test]
@@ -13584,7 +13817,7 @@ mod tests {
             super::workspace_mount_onboarding_curated_message(
                 super::MacosWorkspaceMountOnboardingState::ApprovalRequired
             ),
-            Some("Enable Locality in Finder, then return here and click Check again.")
+            Some("In Finder, click Enable for Locality. Locality will continue automatically.")
         );
         assert_eq!(
             super::workspace_mount_onboarding_curated_message(
@@ -16931,6 +17164,8 @@ fn main() {
             disconnect_source,
             export_source_backup,
             run_workspace_mount_onboarding,
+            file_provider_enablement_status,
+            reveal_file_provider_enablement,
             install_agent_guidance,
             locate_notion_page,
             search_notion_pages,
