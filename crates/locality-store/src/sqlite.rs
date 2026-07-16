@@ -53,6 +53,20 @@ const RETIRED_NOTION_WORKSPACE_ROOTS_SUPPORTED_VERSION: i64 = 2;
 const RETIRED_NOTION_PRIVATE_ROOT_ID: &str = "notion-root:private";
 const RETIRED_NOTION_WORKSPACE_ROOT_ID: &str = "notion-root:workspace";
 const ENTITY_SEARCH_CANDIDATE_LIMIT: i64 = 256;
+const UPSERT_HYDRATION_JOB_SQL: &str = "INSERT INTO hydration_jobs (
+                mount_id,
+                remote_id,
+                path,
+                target_state_json,
+                reason_json,
+                attempts,
+                last_error
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(mount_id, remote_id) DO UPDATE SET
+                path = excluded.path,
+                target_state_json = excluded.target_state_json,
+                reason_json = excluded.reason_json";
 const DEFAULT_NOTION_CAPABILITIES_JSON: &str = "{\"supports_block_updates\":true,\"supports_databases\":true,\"supports_oauth\":true,\"supports_remote_observation\":true,\"supports_lazy_child_enumeration\":true,\"supports_media_download\":true,\"supports_undo\":true,\"supports_batch_observation\":false}";
 const DEFAULT_JOURNAL_METADATA_JSON: &str =
     "{\"author\":{\"kind\":\"anonymous\",\"display_name\":\"anonymous\"}}";
@@ -797,20 +811,7 @@ impl HydrationJobRepository for SqliteStateStore {
     fn upsert_hydration_job(&mut self, job: HydrationJobRecord) -> StoreResult<()> {
         let connection = self.connection()?;
         connection.execute(
-            "INSERT INTO hydration_jobs (
-                mount_id,
-                remote_id,
-                path,
-                target_state_json,
-                reason_json,
-                attempts,
-                last_error
-             )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(mount_id, remote_id) DO UPDATE SET
-                path = excluded.path,
-                target_state_json = excluded.target_state_json,
-                reason_json = excluded.reason_json",
+            UPSERT_HYDRATION_JOB_SQL,
             params![
                 job.mount_id.0,
                 job.remote_id.0,
@@ -821,6 +822,27 @@ impl HydrationJobRepository for SqliteStateStore {
                 job.last_error,
             ],
         )?;
+        Ok(())
+    }
+
+    fn upsert_hydration_jobs(&mut self, jobs: Vec<HydrationJobRecord>) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        for job in jobs {
+            transaction.execute(
+                UPSERT_HYDRATION_JOB_SQL,
+                params![
+                    job.mount_id.0,
+                    job.remote_id.0,
+                    path_to_text(&job.path),
+                    to_json(&job.target_state)?,
+                    to_json(&job.reason)?,
+                    i64::from(job.attempts),
+                    job.last_error,
+                ],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 

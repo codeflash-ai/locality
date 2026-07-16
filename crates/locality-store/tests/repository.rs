@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use locality_core::freshness::{FreshnessTier, RemoteVersion};
+use locality_core::hydration::HydrationReason;
 use locality_core::journal::{
     JournalApplyEffect, JournalEntry, JournalMetadata, JournalStatus, JournalStore, PushId,
     PushOperationId,
@@ -14,14 +15,14 @@ use locality_core::shadow::ShadowDocument;
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
     ConnectorStateRecord, ConnectorStateRepository, EntityRecord, EntityRepository,
-    FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore, JournalRepository,
-    MetadataDiscoveryJobRecord, MetadataDiscoveryJobRepository, MetadataDiscoveryPriority,
-    MountConfig, MountLiveModeRecord, MountLiveModeRepository, MountLiveModeState,
-    MountPreHydrationState, MountPreHydrationStatus, MountRepository,
-    PRE_HYDRATION_MIN_READER_VERSION, PRE_HYDRATION_SCOPE_KIND, PRE_HYDRATION_STATE_VERSION,
-    RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
-    StoreError, VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
-    enable_mount_pre_hydration, load_mount_pre_hydration_state,
+    FreshnessStateRecord, FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository,
+    InMemoryStateStore, JournalRepository, MetadataDiscoveryJobRecord,
+    MetadataDiscoveryJobRepository, MetadataDiscoveryPriority, MountConfig, MountLiveModeRecord,
+    MountLiveModeRepository, MountLiveModeState, MountPreHydrationState, MountPreHydrationStatus,
+    MountRepository, PRE_HYDRATION_MIN_READER_VERSION, PRE_HYDRATION_SCOPE_KIND,
+    PRE_HYDRATION_STATE_VERSION, RemoteObservationRecord, RemoteObservationRepository,
+    ShadowRepository, SqliteStateStore, StoreError, VirtualMutationKind, VirtualMutationRecord,
+    VirtualMutationRepository, enable_mount_pre_hydration, load_mount_pre_hydration_state,
     mark_mount_pre_hydration_enumerating, mark_mount_pre_hydration_error,
     mark_mount_pre_hydration_hydrating, save_mount_pre_hydration_state,
 };
@@ -315,6 +316,78 @@ fn pre_hydration_state_is_cleared_when_in_memory_mount_source_changes() {
     assert_eq!(
         load_mount_pre_hydration_state(&store, "notion", &mount_id).expect("load state"),
         None
+    );
+}
+
+#[test]
+fn in_memory_hydration_jobs_batch_upsert_preserves_failure_metadata() {
+    let mut store = InMemoryStateStore::new();
+    let mount_id = MountId::new("notion-main");
+
+    store
+        .upsert_hydration_job(HydrationJobRecord {
+            mount_id: mount_id.clone(),
+            remote_id: RemoteId::new("page-1"),
+            path: PathBuf::from("Roadmap.md"),
+            target_state: HydrationState::Hydrated,
+            reason: HydrationReason::Policy,
+            attempts: 0,
+            last_error: None,
+        })
+        .expect("save hydration job");
+    store
+        .record_hydration_job_failure(
+            &mount_id,
+            &RemoteId::new("page-1"),
+            "network timeout".to_string(),
+        )
+        .expect("record failure");
+
+    store
+        .upsert_hydration_jobs(vec![
+            HydrationJobRecord {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("page-1"),
+                path: PathBuf::from("Roadmap renamed.md"),
+                target_state: HydrationState::Hydrated,
+                reason: HydrationReason::FileOpen,
+                attempts: 0,
+                last_error: None,
+            },
+            HydrationJobRecord {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("page-2"),
+                path: PathBuf::from("Specs.md"),
+                target_state: HydrationState::Stub,
+                reason: HydrationReason::Prefetch,
+                attempts: 0,
+                last_error: None,
+            },
+        ])
+        .expect("batch upsert hydration jobs");
+
+    assert_eq!(
+        store.list_hydration_jobs().expect("list hydration jobs"),
+        vec![
+            HydrationJobRecord {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("page-1"),
+                path: PathBuf::from("Roadmap renamed.md"),
+                target_state: HydrationState::Hydrated,
+                reason: HydrationReason::FileOpen,
+                attempts: 1,
+                last_error: Some("network timeout".to_string()),
+            },
+            HydrationJobRecord {
+                mount_id,
+                remote_id: RemoteId::new("page-2"),
+                path: PathBuf::from("Specs.md"),
+                target_state: HydrationState::Stub,
+                reason: HydrationReason::Prefetch,
+                attempts: 0,
+                last_error: None,
+            },
+        ]
     );
 }
 

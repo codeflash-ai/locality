@@ -2152,6 +2152,70 @@ fn hydration_jobs_round_trip_and_preserve_failure_metadata() {
 }
 
 #[test]
+fn hydration_jobs_batch_upsert_persists_multiple_jobs_and_preserves_failure_metadata() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config())
+        .expect("save mount");
+    store
+        .upsert_hydration_job(hydration_job_record())
+        .expect("save initial hydration job");
+    store
+        .record_hydration_job_failure(
+            &fixture.mount_id,
+            &RemoteId::new("page-1"),
+            "network timeout".to_string(),
+        )
+        .expect("record failure");
+
+    store
+        .upsert_hydration_jobs(vec![
+            HydrationJobRecord {
+                path: fixture.mount_root.join("Roadmap renamed.md"),
+                reason: HydrationReason::FileOpen,
+                ..hydration_job_record()
+            },
+            HydrationJobRecord {
+                mount_id: fixture.mount_id.clone(),
+                remote_id: RemoteId::new("page-2"),
+                path: fixture.mount_root.join("Specs.md"),
+                target_state: HydrationState::Stub,
+                reason: HydrationReason::Prefetch,
+                attempts: 0,
+                last_error: None,
+            },
+        ])
+        .expect("batch upsert hydration jobs");
+    drop(store);
+
+    let reopened = fixture.open();
+    let jobs = reopened.list_hydration_jobs().expect("list hydration jobs");
+
+    assert_eq!(
+        jobs,
+        vec![
+            HydrationJobRecord {
+                mount_id: fixture.mount_id.clone(),
+                remote_id: RemoteId::new("page-2"),
+                path: fixture.mount_root.join("Specs.md"),
+                target_state: HydrationState::Stub,
+                reason: HydrationReason::Prefetch,
+                attempts: 0,
+                last_error: None,
+            },
+            HydrationJobRecord {
+                path: fixture.mount_root.join("Roadmap renamed.md"),
+                reason: HydrationReason::FileOpen,
+                attempts: 1,
+                last_error: Some("network timeout".to_string()),
+                ..hydration_job_record()
+            },
+        ]
+    );
+}
+
+#[test]
 fn sqlite_store_migrates_v5_projection_and_connections_schema() {
     let fixture = SqliteFixture::new();
     fs::create_dir_all(&fixture.state_root).expect("state root");

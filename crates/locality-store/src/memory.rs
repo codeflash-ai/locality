@@ -592,6 +592,21 @@ impl HydrationJobRepository for InMemoryStateStore {
         Ok(())
     }
 
+    fn upsert_hydration_jobs(&mut self, jobs: Vec<HydrationJobRecord>) -> StoreResult<()> {
+        for job in jobs {
+            let key = Self::hydration_job_key(&job.mount_id, &job.remote_id);
+            if let Some(existing) = self.hydration_jobs.get_mut(&key) {
+                existing.path = job.path;
+                existing.target_state = job.target_state;
+                existing.reason = job.reason;
+            } else {
+                self.hydration_jobs.insert(key, job);
+            }
+        }
+
+        Ok(())
+    }
+
     fn list_hydration_jobs(&self) -> StoreResult<Vec<HydrationJobRecord>> {
         Ok(self.hydration_jobs.values().cloned().collect())
     }

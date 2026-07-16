@@ -81,6 +81,53 @@ fn debug_requests_follow_drain_priority_without_mutating_queue() {
 }
 
 #[test]
+fn queue_uses_priority_buckets_for_large_prefetch_backlog_and_promotion() {
+    let mut queue = HydrationQueue::new();
+    for index in 0..128 {
+        queue.queue_request(request(
+            "mount",
+            &format!("prefetch-{index:03}"),
+            HydrationReason::Prefetch,
+        ));
+    }
+
+    queue.queue_request(request("mount", "interactive", HydrationReason::FileOpen));
+
+    assert_eq!(queue.debug_priority_bucket_lengths(), (1, 0, 128));
+    assert_eq!(
+        queue.peek_ready().expect("interactive peek").remote_id,
+        RemoteId::new("interactive")
+    );
+    assert_eq!(
+        queue.pop_ready().expect("interactive pop").remote_id,
+        RemoteId::new("interactive")
+    );
+
+    for index in 0..128 {
+        assert_eq!(
+            queue.pop_ready().expect("prefetch pop").remote_id,
+            RemoteId::new(format!("prefetch-{index:03}"))
+        );
+    }
+    assert!(queue.is_empty());
+
+    let mut prefetch = request("mount", "promoted", HydrationReason::Prefetch);
+    prefetch.path = PathBuf::from("old.md");
+    let mut explicit = request("mount", "promoted", HydrationReason::ExplicitPull);
+    explicit.path = PathBuf::from("new.md");
+
+    assert!(queue.queue_request(prefetch));
+    assert!(!queue.queue_request(explicit));
+    assert_eq!(queue.debug_priority_bucket_lengths(), (1, 0, 0));
+
+    let promoted = queue.pop_ready().expect("promoted request");
+    assert_eq!(promoted.reason, HydrationReason::ExplicitPull);
+    assert_eq!(promoted.path, PathBuf::from("new.md"));
+    assert!(queue.is_empty());
+    assert_eq!(queue.debug_priority_bucket_lengths(), (0, 0, 0));
+}
+
+#[test]
 fn duplicate_entity_request_is_deduped_and_promoted() {
     let mut queue = HydrationQueue::new();
     let mut low = request("mount", "page-1", HydrationReason::Prefetch);

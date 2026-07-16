@@ -163,6 +163,12 @@ pub trait FreshnessStateRepository {
 
 pub trait HydrationJobRepository {
     fn upsert_hydration_job(&mut self, job: HydrationJobRecord) -> StoreResult<()>;
+    fn upsert_hydration_jobs(&mut self, jobs: Vec<HydrationJobRecord>) -> StoreResult<()> {
+        for job in jobs {
+            self.upsert_hydration_job(job)?;
+        }
+        Ok(())
+    }
     fn list_hydration_jobs(&self) -> StoreResult<Vec<HydrationJobRecord>>;
     fn delete_hydration_job(&mut self, mount_id: &MountId, remote_id: &RemoteId)
     -> StoreResult<()>;
