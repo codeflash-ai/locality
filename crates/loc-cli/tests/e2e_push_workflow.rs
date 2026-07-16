@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, hash_map::DefaultHasher};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -17805,10 +17806,28 @@ fn timestamp_string() -> String {
 }
 
 fn unique_id_prefix() -> String {
-    let mut value = SystemTime::now()
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
+    unique_id_prefix_from_parts(
+        nanos,
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed),
+    )
+}
+
+fn unique_id_prefix_from_parts(nanos: u128, process_id: u32, sequence: u64) -> String {
+    // Notion requires this prefix to be unique across the workspace, including archived
+    // databases. Encoding the low timestamp digits directly repeated every ~56 seconds.
+    // Hash all entropy first so successive CI runs do not revisit that short cycle.
+    let mut hasher = DefaultHasher::new();
+    nanos.hash(&mut hasher);
+    process_id.hash(&mut hasher);
+    sequence.hash(&mut hasher);
+    let mut value = hasher.finish() as u128;
     let first_alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
     let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut prefix = String::new();
@@ -17821,6 +17840,16 @@ fn unique_id_prefix() -> String {
         value /= alphabet.len() as u128;
     }
     prefix
+}
+
+#[test]
+fn notion_unique_id_prefix_does_not_repeat_on_the_old_timestamp_cycle() {
+    const OLD_CYCLE_NANOS: u128 = 26 * 36_u128.pow(6);
+
+    assert_ne!(
+        unique_id_prefix_from_parts(1_000_000_000, 42, 0),
+        unique_id_prefix_from_parts(1_000_000_000 + OLD_CYCLE_NANOS, 42, 0)
+    );
 }
 
 fn file_name(path: &Path) -> &str {
