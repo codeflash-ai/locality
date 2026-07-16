@@ -1499,6 +1499,388 @@ fn disconnect_source_blocking(mount_id: String, confirmation: String) -> Result<
     Ok(message)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceBackupManifest {
+    generated_at: String,
+    mount_id: String,
+    connector: String,
+    connector_name: String,
+    source_path: String,
+    backup_path: String,
+    files_path: String,
+    file_count: usize,
+    directory_count: usize,
+    bytes: u64,
+    skipped: Vec<SourceBackupSkippedItem>,
+    note: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceBackupSkippedItem {
+    path: String,
+    reason: String,
+}
+
+#[derive(Default)]
+struct SourceBackupStats {
+    files: usize,
+    directories: usize,
+    bytes: u64,
+    skipped: Vec<SourceBackupSkippedItem>,
+}
+
+struct SourceBackupExport {
+    directory: PathBuf,
+    stats: SourceBackupStats,
+    mount: MountConfig,
+}
+
+impl SourceBackupExport {
+    fn skipped_count(&self) -> usize {
+        self.stats.skipped.len()
+    }
+}
+
+#[tauri::command]
+async fn export_source_backup(app: AppHandle, mount_id: String) -> ActionReport {
+    let report =
+        tauri::async_runtime::spawn_blocking(move || export_source_backup_blocking(mount_id))
+            .await
+            .map_err(|error| format!("Source backup worker failed: {error}"))
+            .and_then(|result| result)
+            .map(|message| ActionReport { ok: true, message })
+            .unwrap_or_else(|message| ActionReport { ok: false, message });
+    if report.ok {
+        refresh_desktop_surfaces(&app);
+    }
+    report
+}
+
+fn export_source_backup_blocking(mount_id: String) -> Result<String, String> {
+    let state_root = default_state_root();
+    let store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let backup_root = source_backup_root()?;
+    let export = export_source_backup_to_root(&store, &backup_root, &mount_id)?;
+    let skipped = export.skipped_count();
+    let skipped_note = if skipped > 0 {
+        format!(
+            " {skipped} item{} could not be copied; see manifest.json.",
+            if skipped == 1 { "" } else { "s" }
+        )
+    } else {
+        String::new()
+    };
+    let message = format!(
+        "Exported {} source backup to `{}` ({} file{}).{}",
+        connector_label(&export.mount.connector),
+        display_path(&export.directory),
+        export.stats.files,
+        if export.stats.files == 1 { "" } else { "s" },
+        skipped_note
+    );
+    if let Err(error) = record_desktop_activity(
+        &state_root,
+        "Exported source backup",
+        &format!(
+            "{} source `{}` was exported to `{}`.",
+            connector_label(&export.mount.connector),
+            export.mount.mount_id.0,
+            display_path(&export.directory)
+        ),
+        "backup",
+    ) {
+        desktop_log(
+            "warn",
+            "source_backup.activity_failed",
+            format!("could not record source backup activity: {error}"),
+        );
+    }
+    Ok(message)
+}
+
+fn export_source_backup_to_root(
+    store: &SqliteStateStore,
+    backup_root: &Path,
+    mount_id: &str,
+) -> Result<SourceBackupExport, String> {
+    let mount_id = MountId::new(mount_id.trim().to_string());
+    if mount_id.0.is_empty() {
+        return Err("Source mount id is required.".to_string());
+    }
+    let mount = store
+        .get_mount(&mount_id)
+        .map_err(|error| format!("Could not inspect source mount: {error}"))?
+        .ok_or_else(|| format!("Source mount `{}` was not found.", mount_id.0))?;
+    let source_root = mount_access_root(&mount);
+    if !source_root.exists() {
+        return Err(format!(
+            "Source folder `{}` does not exist yet. Open or sync the source before exporting a backup.",
+            display_path(&source_root)
+        ));
+    }
+    if !source_root.is_dir() {
+        return Err(format!(
+            "Source folder `{}` is not a directory.",
+            display_path(&source_root)
+        ));
+    }
+
+    let backup_dir = unique_source_backup_dir(backup_root, &mount_id.0);
+    let files_dir = backup_dir.join("files");
+    fs::create_dir_all(&files_dir)
+        .map_err(|error| format!("Could not create source backup folder: {error}"))?;
+    let stats = copy_source_backup_tree(&source_root, &files_dir)?;
+    write_source_backup_readme(&backup_dir, &mount, &source_root, &files_dir, &stats)?;
+    write_source_backup_manifest(&backup_dir, &mount, &source_root, &files_dir, &stats)?;
+
+    Ok(SourceBackupExport {
+        directory: backup_dir,
+        stats,
+        mount,
+    })
+}
+
+fn source_backup_root() -> Result<PathBuf, String> {
+    home_dir()
+        .map(|home| home.join("Locality Backups"))
+        .map_err(|error| format!("Could not find a home folder for source backups: {error}"))
+}
+
+fn unique_source_backup_dir(backup_root: &Path, mount_id: &str) -> PathBuf {
+    let source_root = backup_root.join(safe_backup_segment(mount_id));
+    let timestamp = source_backup_timestamp();
+    let mut candidate = source_root.join(&timestamp);
+    let mut suffix = 2;
+    while candidate.exists() {
+        candidate = source_root.join(format!("{timestamp}-{suffix}"));
+        suffix += 1;
+    }
+    candidate
+}
+
+fn source_backup_timestamp() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!("backup-{millis}")
+}
+
+fn safe_backup_segment(value: &str) -> String {
+    let mut output = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while output.contains("--") {
+        output = output.replace("--", "-");
+    }
+    let output = output.trim_matches('-').to_string();
+    if output.is_empty() {
+        "source".to_string()
+    } else {
+        output
+    }
+}
+
+fn copy_source_backup_tree(
+    source_root: &Path,
+    files_dir: &Path,
+) -> Result<SourceBackupStats, String> {
+    let mut stats = SourceBackupStats::default();
+    let entries = fs::read_dir(source_root).map_err(|error| {
+        format!(
+            "Could not read source folder `{}` for backup: {error}",
+            display_path(source_root)
+        )
+    })?;
+    for entry in entries {
+        match entry {
+            Ok(entry) => {
+                let destination = files_dir.join(entry.file_name());
+                copy_source_backup_entry(source_root, &entry.path(), &destination, &mut stats);
+            }
+            Err(error) => stats.skipped.push(SourceBackupSkippedItem {
+                path: ".".to_string(),
+                reason: format!("Could not read source folder entry: {error}"),
+            }),
+        }
+    }
+    Ok(stats)
+}
+
+fn copy_source_backup_entry(
+    source_root: &Path,
+    source_path: &Path,
+    destination_path: &Path,
+    stats: &mut SourceBackupStats,
+) {
+    let relative_path = source_backup_relative_path(source_root, source_path);
+    let metadata = match fs::symlink_metadata(source_path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            stats.skipped.push(SourceBackupSkippedItem {
+                path: relative_path,
+                reason: format!("Could not inspect item: {error}"),
+            });
+            return;
+        }
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        stats.skipped.push(SourceBackupSkippedItem {
+            path: relative_path,
+            reason: "Symbolic links are skipped so backups stay self-contained.".to_string(),
+        });
+        return;
+    }
+    if metadata.is_dir() {
+        if let Err(error) = fs::create_dir_all(destination_path) {
+            stats.skipped.push(SourceBackupSkippedItem {
+                path: relative_path,
+                reason: format!("Could not create backup directory: {error}"),
+            });
+            return;
+        }
+        stats.directories += 1;
+        let entries = match fs::read_dir(source_path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                stats.skipped.push(SourceBackupSkippedItem {
+                    path: relative_path,
+                    reason: format!("Could not read directory: {error}"),
+                });
+                return;
+            }
+        };
+        for entry in entries {
+            match entry {
+                Ok(entry) => {
+                    copy_source_backup_entry(
+                        source_root,
+                        &entry.path(),
+                        &destination_path.join(entry.file_name()),
+                        stats,
+                    );
+                }
+                Err(error) => stats.skipped.push(SourceBackupSkippedItem {
+                    path: relative_path.clone(),
+                    reason: format!("Could not read directory entry: {error}"),
+                }),
+            }
+        }
+        return;
+    }
+    if metadata.is_file() {
+        if let Some(parent) = destination_path.parent() {
+            if let Err(error) = fs::create_dir_all(parent) {
+                stats.skipped.push(SourceBackupSkippedItem {
+                    path: relative_path,
+                    reason: format!("Could not create backup parent folder: {error}"),
+                });
+                return;
+            }
+        }
+        match fs::copy(source_path, destination_path) {
+            Ok(bytes) => {
+                stats.files += 1;
+                stats.bytes = stats.bytes.saturating_add(bytes);
+            }
+            Err(error) => stats.skipped.push(SourceBackupSkippedItem {
+                path: relative_path,
+                reason: format!("Could not copy file: {error}"),
+            }),
+        }
+        return;
+    }
+
+    stats.skipped.push(SourceBackupSkippedItem {
+        path: relative_path,
+        reason: "Unsupported filesystem item type.".to_string(),
+    });
+}
+
+fn source_backup_relative_path(source_root: &Path, source_path: &Path) -> String {
+    source_path
+        .strip_prefix(source_root)
+        .ok()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| ".".to_string())
+}
+
+fn write_source_backup_readme(
+    backup_dir: &Path,
+    mount: &MountConfig,
+    source_root: &Path,
+    files_dir: &Path,
+    stats: &SourceBackupStats,
+) -> Result<(), String> {
+    let skipped_note = if stats.skipped.is_empty() {
+        "No items were skipped.".to_string()
+    } else {
+        format!(
+            "{} item{} could not be copied. See `manifest.json` for details.",
+            stats.skipped.len(),
+            if stats.skipped.len() == 1 { "" } else { "s" }
+        )
+    };
+    let contents = format!(
+        "# Locality Source Backup\n\n\
+This folder is a point-in-time export of the `{}` source mounted at `{}`.\n\n\
+- Files are copied under `files/`.\n\
+- `manifest.json` records the source, destination, copied file count, and skipped items.\n\
+- Editing this backup does not sync back to {}. Use the mounted source folder for live work.\n\n\
+Copied {} file{} from `{}` into `{}`.\n{}\n",
+        mount.mount_id.0,
+        display_path(source_root),
+        connector_label(&mount.connector),
+        stats.files,
+        if stats.files == 1 { "" } else { "s" },
+        display_path(source_root),
+        display_path(files_dir),
+        skipped_note
+    );
+    fs::write(backup_dir.join("README.md"), contents)
+        .map_err(|error| format!("Could not write source backup README: {error}"))
+}
+
+fn write_source_backup_manifest(
+    backup_dir: &Path,
+    mount: &MountConfig,
+    source_root: &Path,
+    files_dir: &Path,
+    stats: &SourceBackupStats,
+) -> Result<(), String> {
+    let manifest = SourceBackupManifest {
+        generated_at: activity_timestamp(),
+        mount_id: mount.mount_id.0.clone(),
+        connector: mount.connector.clone(),
+        connector_name: connector_label(&mount.connector),
+        source_path: source_root.display().to_string(),
+        backup_path: backup_dir.display().to_string(),
+        files_path: files_dir.display().to_string(),
+        file_count: stats.files,
+        directory_count: stats.directories,
+        bytes: stats.bytes,
+        skipped: stats.skipped.clone(),
+        note: "This backup is a local export only. It does not sync back to the remote source."
+            .to_string(),
+    };
+    let contents = serde_json::to_string_pretty(&manifest)
+        .map_err(|error| format!("Could not serialize source backup manifest: {error}"))?;
+    fs::write(backup_dir.join("manifest.json"), contents)
+        .map_err(|error| format!("Could not write source backup manifest: {error}"))
+}
+
 fn validate_source_action_confirmation(
     action: &str,
     mount_id: &MountId,
@@ -12836,6 +13218,73 @@ mod tests {
     }
 
     #[test]
+    fn source_backup_exports_current_files_manifest_and_readme() {
+        let temp = TestTempDir::new("source-backup");
+        let state_root = temp.path().join("state");
+        let source_root = temp.path().join("source");
+        let backup_root = temp.path().join("backups");
+        fs::create_dir_all(source_root.join("Engineering Wiki/Standups"))
+            .expect("create source tree");
+        fs::write(
+            source_root.join("Engineering Wiki/Standups/page.md"),
+            "# Standups\n\nToday we shipped backup export.\n",
+        )
+        .expect("write source page");
+        fs::write(source_root.join("README.md"), "# Source\n").expect("write source readme");
+
+        let mut store = SqliteStateStore::open(state_root).expect("open state store");
+        store
+            .save_mount(MountConfig::new(
+                MountId::new("notion-main"),
+                "notion",
+                &source_root,
+            ))
+            .expect("save mount");
+
+        let export = super::export_source_backup_to_root(&store, &backup_root, "notion-main")
+            .expect("export backup");
+
+        assert!(
+            export
+                .directory
+                .starts_with(backup_root.join("notion-main"))
+        );
+        assert_eq!(
+            fs::read_to_string(
+                export
+                    .directory
+                    .join("files/Engineering Wiki/Standups/page.md")
+            )
+            .expect("read exported page"),
+            "# Standups\n\nToday we shipped backup export.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(export.directory.join("files/README.md"))
+                .expect("read exported readme"),
+            "# Source\n"
+        );
+        assert!(export.directory.join("README.md").is_file());
+        let manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(export.directory.join("manifest.json"))
+                .expect("read backup manifest"),
+        )
+        .expect("parse backup manifest");
+        assert_eq!(manifest["mountId"], "notion-main");
+        assert_eq!(manifest["connector"], "notion");
+        assert_eq!(manifest["connectorName"], "Notion");
+        assert_eq!(manifest["fileCount"], 2);
+        assert_eq!(
+            manifest["skipped"].as_array().expect("skipped array").len(),
+            0
+        );
+        assert!(
+            fs::read_to_string(export.directory.join("README.md"))
+                .expect("read backup readme")
+                .contains("Editing this backup does not sync back to Notion.")
+        );
+    }
+
+    #[test]
     fn windows_cloud_files_mount_access_root_stays_at_sync_root() {
         let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/Locality")
             .projection(ProjectionMode::WindowsCloudFiles);
@@ -16426,6 +16875,7 @@ fn main() {
             connect_granola,
             reset_source_state,
             disconnect_source,
+            export_source_backup,
             run_workspace_mount_onboarding,
             install_agent_guidance,
             locate_notion_page,
