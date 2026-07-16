@@ -156,6 +156,7 @@ impl InspectError {
             Self::Store(_) => "store_error",
             Self::RemoteFetch(LocalityError::RemoteNotFound(_)) => "remote_fetch_not_found",
             Self::RemoteFetch(LocalityError::Unsupported(_)) => "remote_fetch_unsupported",
+            Self::RemoteFetch(LocalityError::UpdateRequired { .. }) => "update_required",
             Self::RemoteFetch(_) => "remote_fetch_failed",
             Self::UnsupportedEntity { .. } => "unsupported_entity",
         }
@@ -185,6 +186,24 @@ impl InspectError {
                 )
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod update_required_error_code_tests {
+    use locality_core::LocalityError;
+
+    use super::InspectError;
+
+    #[test]
+    fn update_required_has_stable_inspect_error_code() {
+        let error = InspectError::RemoteFetch(LocalityError::UpdateRequired {
+            component: "linear:discovery".to_string(),
+            found: 2,
+            supported: 1,
+        });
+
+        assert_eq!(error.code(), "update_required");
     }
 }
 

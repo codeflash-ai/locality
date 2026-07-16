@@ -20,6 +20,9 @@ In this document:
   children with `Connector::list_children`.
 - **Observation** means asking a connector for metadata or freshness for a
   known entity. Observation is not enumeration and is not hydration by itself.
+- **Batch observation** means asking a connector for mount-wide metadata
+  changes relative to an opaque connector checkpoint. It is discovery, but it
+  is neither full-tree enumeration nor body hydration.
 - **Hydration** means fetching/rendering a remote entity body through
   `fetch_render` and then using the result for a local file, shadow, assets, or
   comparison.
@@ -32,10 +35,21 @@ The connector boundary is in `crates/locality-connector/src/lib.rs`.
   metadata for a mount. It is the full-tree path.
 - `Connector::observe(ObserveRequest)` returns metadata/freshness for a known
   remote entity. It does not fetch body content.
+- `Connector::observe_batch(BatchObserveRequest)` returns metadata upserts and
+  explicit tombstones plus a connector-owned next checkpoint. A `Complete`
+  result authorizes omission-based removal only inside the configured mount
+  scope. An `Incremental` result never treats omission as deletion.
 - `Connector::list_children(ListChildrenRequest)` returns immediate child
   metadata for a `ChildContainer`. The trait comments explicitly keep it to
   metadata and require implementations not to fetch page bodies.
 - `Connector::fetch(FetchRequest)` returns the connector-native entity body.
+
+Unlike `enumerate`, batch observation returns changes rather than requiring a
+full remote tree on every call. Unlike `observe`, it can discover entities that
+are not already known locally. All three paths remain metadata-only unless a
+separate fetch/render path hydrates an entity. The daemon must persist the
+opaque checkpoint JSON only after the complete batch has been validated and
+reconciled successfully.
 
 Daemon hydration uses `fetch_render`, not the raw connector `fetch` method
 directly. The common daemon-side abstraction is `HydrationSource::fetch_render`
@@ -611,6 +625,8 @@ they call one of the trigger paths above.
   local mount configuration. It does not call a connector.
 - `observe` paths are metadata/freshness checks. They can lead to later
   fast-forward hydration, but the observation call itself does not fetch bodies.
+- `observe_batch` is mount-wide metadata discovery. Its upserts remain stubs or
+  metadata until a separate hydration trigger fetches their bodies.
 - `list_children` paths must not fetch page bodies according to the connector
   contract.
 - `loc status` and `loc diff` may inspect local projection and shadow state, but

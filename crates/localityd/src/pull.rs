@@ -2122,9 +2122,15 @@ impl PullError {
         match self {
             Self::Connector(locality_core::LocalityError::NotImplemented(_)) => "not_implemented",
             Self::Connector(locality_core::LocalityError::RemoteNotFound(_)) => "remote_not_found",
+            Self::Connector(locality_core::LocalityError::UpdateRequired { .. }) => {
+                "update_required"
+            }
             Self::Connector(_) => "connector_error",
             Self::CurrentDir(_) => "current_dir_failed",
             Self::MountNotFound(_) => "mount_not_found",
+            Self::Projection(locality_core::LocalityError::UpdateRequired { .. }) => {
+                "update_required"
+            }
             Self::Projection(_) => "projection_refresh_failed",
             Self::ReadFile { .. } => "read_file_failed",
             Self::Store(StoreError::EntityPathMissing { .. }) => "entity_path_missing",
@@ -2149,6 +2155,24 @@ impl PullError {
                 format!("failed to write `{}`: {message}", path.display())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod update_required_error_code_tests {
+    use locality_core::LocalityError;
+
+    use super::PullError;
+
+    #[test]
+    fn update_required_has_stable_pull_error_code() {
+        let error = PullError::Connector(LocalityError::UpdateRequired {
+            component: "linear:discovery".to_string(),
+            found: 2,
+            supported: 1,
+        });
+
+        assert_eq!(error.code(), "update_required");
     }
 }
 

@@ -169,6 +169,7 @@ impl DiffError {
             Self::Prepare(LocalityError::Guardrail(_)) => "guardrail",
             Self::Prepare(LocalityError::RemoteNotFound(_)) => "remote_not_found",
             Self::Prepare(LocalityError::InvalidState(_)) => "invalid_state",
+            Self::Prepare(LocalityError::UpdateRequired { .. }) => "update_required",
             Self::Prepare(LocalityError::Unsupported(_)) => "unsupported",
             Self::Prepare(LocalityError::Io(_)) => "io_error",
         }
@@ -185,6 +186,24 @@ impl DiffError {
             Self::Store(error) => error.to_string(),
             Self::Prepare(error) => error.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod update_required_error_code_tests {
+    use locality_core::LocalityError;
+
+    use super::DiffError;
+
+    #[test]
+    fn update_required_has_stable_diff_error_code() {
+        let error = DiffError::Prepare(LocalityError::UpdateRequired {
+            component: "linear:discovery".to_string(),
+            found: 2,
+            supported: 1,
+        });
+
+        assert_eq!(error.code(), "update_required");
     }
 }
 

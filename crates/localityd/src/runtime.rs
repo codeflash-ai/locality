@@ -5030,6 +5030,7 @@ fn locality_error_code(error: &LocalityError) -> &'static str {
         LocalityError::Guardrail(_) => "guardrail",
         LocalityError::RemoteNotFound(_) => "remote_not_found",
         LocalityError::InvalidState(_) => "invalid_state",
+        LocalityError::UpdateRequired { .. } => "update_required",
         LocalityError::Unsupported(_) => "unsupported",
         LocalityError::NotImplemented(_) => "not_implemented",
         LocalityError::Io(_) => "io_error",
@@ -5068,9 +5069,22 @@ mod tests {
         ActiveChildRefresh, ActiveRuntimeJob, ChildRefreshPriority, ChildRefreshQueue,
         ChildRefreshRequest, DaemonRequest, DefaultRuntimeJobRunner, JobCompletion,
         RemoteDiscoveryHint, RuntimeJobRunner, RuntimeState, child_refresh_retry_delay,
-        execute_file_event, execute_observe_entity_job, observable_remote_identifier,
-        remote_fast_forward_discovery_hints, repair_clean_remote_deleted_projections,
+        execute_file_event, execute_observe_entity_job, locality_error_code,
+        observable_remote_identifier, remote_fast_forward_discovery_hints,
+        repair_clean_remote_deleted_projections,
     };
+
+    #[test]
+    fn update_required_has_stable_runtime_error_code() {
+        assert_eq!(
+            locality_error_code(&LocalityError::UpdateRequired {
+                component: "linear:discovery".to_string(),
+                found: 2,
+                supported: 1,
+            }),
+            "update_required"
+        );
+    }
 
     #[test]
     fn child_refresh_queue_promotes_existing_requests() {

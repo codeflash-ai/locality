@@ -17,6 +17,11 @@ pub enum LocalityError {
     Guardrail(String),
     RemoteNotFound(String),
     InvalidState(String),
+    UpdateRequired {
+        component: String,
+        found: i64,
+        supported: i64,
+    },
     Unsupported(&'static str),
     NotImplemented(&'static str),
     Io(String),
@@ -30,6 +35,14 @@ impl Display for LocalityError {
             Self::Guardrail(message) => write!(f, "guardrail blocked push: {message}"),
             Self::RemoteNotFound(message) => write!(f, "remote object not found: {message}"),
             Self::InvalidState(message) => write!(f, "invalid state: {message}"),
+            Self::UpdateRequired {
+                component,
+                found,
+                supported,
+            } => write!(
+                f,
+                "update required for {component}: found version {found}, supported version {supported}"
+            ),
             Self::Unsupported(feature) => write!(f, "unsupported feature: {feature}"),
             Self::NotImplemented(feature) => write!(f, "not implemented: {feature}"),
             Self::Io(message) => write!(f, "io error: {message}"),

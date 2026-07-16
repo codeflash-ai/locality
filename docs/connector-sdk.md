@@ -1,15 +1,16 @@
 # Connector SDK
 
-A connector implements seven responsibilities and leaves caching, journaling,
+A connector implements eight responsibilities and leaves caching, journaling,
 validation, conflict detection, and network admission mechanics to the host:
 
 1. Enumerate remote tree metadata.
-2. Fetch full native content for one entity.
-3. Render native content to canonical Markdown plus frontmatter.
-4. Parse edited canonical content back to a connector-owned model.
-5. Check remote concurrency immediately before mutation.
-6. Apply a validated push plan as remote API operations.
-7. Apply a complete undo plan as remote reverse API operations.
+2. Observe mount-wide metadata changes in checkpointed batches.
+3. Fetch full native content for one entity.
+4. Render native content to canonical Markdown plus frontmatter.
+5. Parse edited canonical content back to a connector-owned model.
+6. Check remote concurrency immediately before mutation.
+7. Apply a validated push plan as remote API operations.
+8. Apply a complete undo plan as remote reverse API operations.
 
 First-party connectors compile in as Rust crates. A future third-party connector ABI should be possible if this trait remains narrow, explicit, and host-mediated.
 
@@ -57,9 +58,29 @@ I/O.
 Capabilities are explicit connector-neutral booleans. The current contract
 tracks block updates, whole-entity body updates, databases, OAuth, cheap remote
 observation, lazy child enumeration, media download, entity moves, undo, and
-future batch observation.
+batch observation.
 Hosts should use capabilities for scheduling and preflight decisions, not for
 bypassing authoritative push concurrency checks.
+
+## Batch Observation
+
+`Connector::observe_batch` is the mount-wide metadata discovery contract. A
+request carries the mount ID and an optional `ConnectorCheckpoint`; a result
+contains upserts or explicit tombstones, a completeness declaration, and the
+next checkpoint. The checkpoint JSON is opaque and connector-owned. Its
+`state_version` and `min_reader_version` let a connector reject state written by
+a newer incompatible implementation with a structured `UpdateRequired` error.
+
+Batch observation does not hydrate entity bodies. An upsert is a `TreeEntry`
+metadata record suitable for reconciliation and later lazy hydration. A
+`Complete` result makes omission authoritative only within that mount's
+configured remote scope. An `Incremental` result never turns omission into a
+deletion; only an explicit tombstone authorizes deletion handling.
+
+The host must validate and reconcile the entire result before persisting
+`next_checkpoint`. If validation, store mutation, or projection reconciliation
+fails, the previous checkpoint remains current so the connector can safely
+replay the batch.
 
 Apply requests include the core `push_id`, mount ID, approved push plan, and deterministic operation IDs aligned with `plan.operations`. Connectors should use those operation IDs as source-side idempotency keys for block-level API calls when the source supports idempotent writes.
 

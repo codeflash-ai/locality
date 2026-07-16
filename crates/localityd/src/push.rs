@@ -3457,9 +3457,29 @@ fn locality_error_code(error: &LocalityError) -> &'static str {
         LocalityError::Guardrail(_) => "guardrail",
         LocalityError::RemoteNotFound(_) => "remote_not_found",
         LocalityError::InvalidState(_) => "invalid_state",
+        LocalityError::UpdateRequired { .. } => "update_required",
         LocalityError::Unsupported(_) => "unsupported",
         LocalityError::NotImplemented(_) => "not_implemented",
         LocalityError::Io(_) => "io_error",
+    }
+}
+
+#[cfg(test)]
+mod locality_error_code_tests {
+    use locality_core::LocalityError;
+
+    use super::locality_error_code;
+
+    #[test]
+    fn update_required_has_stable_push_error_code() {
+        assert_eq!(
+            locality_error_code(&LocalityError::UpdateRequired {
+                component: "linear:discovery".to_string(),
+                found: 2,
+                supported: 1,
+            }),
+            "update_required"
+        );
     }
 }
 

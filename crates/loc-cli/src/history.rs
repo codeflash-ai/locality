@@ -250,6 +250,7 @@ where
             let action = match &error {
                 LocalityError::NotImplemented(_) => "reverse_apply_not_implemented",
                 LocalityError::RemoteNotFound(_) => "reverse_apply_remote_not_found",
+                LocalityError::UpdateRequired { .. } => "update_required",
                 _ => "reverse_apply_failed",
             };
             return Ok(UndoReport {

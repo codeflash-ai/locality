@@ -1,9 +1,10 @@
 use std::cell::RefCell;
 
 use locality_connector::{
-    ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
-    ConnectorCapabilities, ConnectorKind, ConnectorUndoApplier, EnumerateRequest, FetchRequest,
-    NativeEntity, ParsedEntity,
+    ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, BatchObservationChange,
+    BatchObservationCompleteness, BatchObserveRequest, BatchObserveResult, Connector,
+    ConnectorCapabilities, ConnectorCheckpoint, ConnectorKind, ConnectorUndoApplier,
+    EnumerateRequest, FetchRequest, NativeEntity, ParsedEntity,
 };
 use locality_core::LocalityResult;
 use locality_core::journal::PushId;
@@ -90,6 +91,111 @@ fn connector_capabilities_default_entity_body_updates_for_old_json() {
     )
     .expect("current capabilities");
     assert!(decoded.supports_entity_body_updates);
+}
+
+#[test]
+fn connector_capabilities_default_batch_observation_for_old_json() {
+    let old_json = r#"{
+        "supports_block_updates": true,
+        "supports_entity_body_updates": false,
+        "supports_databases": false,
+        "supports_oauth": false,
+        "supports_remote_observation": false,
+        "supports_lazy_child_enumeration": false,
+        "supports_media_download": false,
+        "supports_undo": false
+    }"#;
+
+    let capabilities: ConnectorCapabilities =
+        serde_json::from_str(old_json).expect("old capabilities");
+
+    assert!(!capabilities.supports_batch_observation);
+}
+
+#[test]
+fn batch_observation_alone_supports_local_only_stage10() {
+    let capabilities = ConnectorCapabilities {
+        supports_batch_observation: true,
+        ..ConnectorCapabilities::default()
+    };
+
+    assert!(capabilities.supports_local_only_stage10());
+}
+
+#[test]
+fn batch_observation_completeness_defaults_to_incremental() {
+    assert_eq!(
+        BatchObservationCompleteness::default(),
+        BatchObservationCompleteness::Incremental
+    );
+}
+
+#[test]
+fn batch_observation_constructors_preserve_changes_and_checkpoint() {
+    let entry = TreeEntry {
+        mount_id: MountId::new("linear-main"),
+        remote_id: RemoteId::new("issue-1"),
+        kind: EntityKind::Page,
+        title: "Fix login".to_string(),
+        path: "teams/Engineering (ENG)/ENG-1-fix-login/page.md".into(),
+        hydration: HydrationState::Stub,
+        content_hash: None,
+        remote_edited_at: Some("2026-07-15T12:00:00Z".to_string()),
+        stub_frontmatter: None,
+    };
+    let changes = vec![
+        BatchObservationChange::Upsert(entry.clone()),
+        BatchObservationChange::Tombstone {
+            remote_id: RemoteId::new("issue-2"),
+        },
+    ];
+    let checkpoint = ConnectorCheckpoint {
+        state_version: 1,
+        min_reader_version: 1,
+        state_json: r#"{"watermark":"2026-07-15T12:00:00Z"}"#.to_string(),
+    };
+
+    let complete = BatchObserveResult::complete(changes.clone(), checkpoint.clone());
+    assert_eq!(complete.changes, changes);
+    assert_eq!(
+        complete.completeness,
+        BatchObservationCompleteness::Complete
+    );
+    assert_eq!(complete.next_checkpoint, checkpoint);
+    assert!(complete.is_complete());
+
+    let incremental_changes = vec![BatchObservationChange::Upsert(entry)];
+    let incremental_checkpoint = ConnectorCheckpoint {
+        state_version: 2,
+        min_reader_version: 1,
+        state_json: "{}".to_string(),
+    };
+    let incremental = BatchObserveResult::incremental(
+        incremental_changes.clone(),
+        incremental_checkpoint.clone(),
+    );
+    assert_eq!(incremental.changes, incremental_changes);
+    assert_eq!(
+        incremental.completeness,
+        BatchObservationCompleteness::Incremental
+    );
+    assert!(!incremental.is_complete());
+    assert_eq!(incremental.next_checkpoint, incremental_checkpoint);
+}
+
+#[test]
+fn connector_default_batch_observation_is_exact_unsupported_error() {
+    let error = FakeConnector::default()
+        .observe_batch(BatchObserveRequest {
+            mount_id: MountId::new("linear-main"),
+            checkpoint: None,
+        })
+        .expect_err("default batch observation must be unsupported");
+
+    assert_eq!(
+        error,
+        locality_core::LocalityError::Unsupported("connector does not support batch observation")
+    );
 }
 
 #[test]

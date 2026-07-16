@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use locality_connector::{
-    ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
-    ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, ListChildrenRequest,
-    ListChildrenResult, NativeEntity, ObserveRequest, ParsedEntity,
+    ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, BatchObserveRequest,
+    BatchObserveResult, Connector, ConnectorCapabilities, ConnectorKind, EnumerateRequest,
+    FetchRequest, ListChildrenRequest, ListChildrenResult, NativeEntity, ObserveRequest,
+    ParsedEntity,
 };
 use locality_core::canonical::ParsedCanonicalDocument;
 use locality_core::freshness::RemoteObservation;
@@ -606,6 +607,15 @@ impl Connector for ResolvedSource {
             Self::GoogleDocs(source) => source.observe(request),
             Self::Gmail(source) => source.observe(request),
             Self::Granola(source) => source.observe(request),
+        }
+    }
+
+    fn observe_batch(&self, request: BatchObserveRequest) -> LocalityResult<BatchObserveResult> {
+        match self {
+            Self::Notion(source) => source.observe_batch(request),
+            Self::GoogleDocs(source) => source.observe_batch(request),
+            Self::Gmail(source) => source.observe_batch(request),
+            Self::Granola(source) => source.observe_batch(request),
         }
     }
 

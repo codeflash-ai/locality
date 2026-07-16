@@ -7572,6 +7572,7 @@ fn locality_error_code(error: &LocalityError) -> &'static str {
         LocalityError::Guardrail(_) => "guardrail",
         LocalityError::RemoteNotFound(_) => "remote_not_found",
         LocalityError::InvalidState(_) => "invalid_state",
+        LocalityError::UpdateRequired { .. } => "update_required",
         LocalityError::Unsupported(_) => "unsupported",
         LocalityError::NotImplemented(_) => "not_implemented",
         LocalityError::Io(_) => "io_error",
@@ -8105,6 +8106,7 @@ mod tests {
     use clap::Parser;
     use clap::error::ErrorKind;
 
+    use locality_core::LocalityError;
     use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
     use locality_core::shadow::ShadowDocument;
     use locality_google_docs::GOOGLE_DOCS_CONNECTOR_ID;
@@ -8133,15 +8135,28 @@ mod tests {
         guard_linux_fuse_shared_root_unregister, guard_unresolved_linux_fuse_unregister,
         guard_unresolved_windows_cloud_files_unregister,
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
-        locate_result_from_report, mount_usage, mounted_projection_preflight_error,
-        notion_authorize_url, notion_oauth_broker_config, print_push_confirmation_preview,
-        projection_mode_for_target, projection_usage_options_for_target,
-        prompt_for_push_confirmation, pull_direct_fallback_error,
-        push_confirmation_preview_matches_displayed, push_preview_plan_matches,
-        should_prompt_for_push_confirmation, should_refresh_notion_url_search,
-        spinner_config_for_command, spinner_enabled, status as run_status_command,
-        validate_virtual_projection_registration, write_connect_report, write_log_report,
+        locality_error_code, locate_result_from_report, mount_usage,
+        mounted_projection_preflight_error, notion_authorize_url, notion_oauth_broker_config,
+        print_push_confirmation_preview, projection_mode_for_target,
+        projection_usage_options_for_target, prompt_for_push_confirmation,
+        pull_direct_fallback_error, push_confirmation_preview_matches_displayed,
+        push_preview_plan_matches, should_prompt_for_push_confirmation,
+        should_refresh_notion_url_search, spinner_config_for_command, spinner_enabled,
+        status as run_status_command, validate_virtual_projection_registration,
+        write_connect_report, write_log_report,
     };
+
+    #[test]
+    fn update_required_has_stable_command_error_code() {
+        assert_eq!(
+            locality_error_code(&LocalityError::UpdateRequired {
+                component: "linear:discovery".to_string(),
+                found: 2,
+                supported: 1,
+            }),
+            "update_required"
+        );
+    }
 
     #[test]
     fn clap_help_is_available_for_commands_and_nested_subcommands() {
