@@ -10,7 +10,7 @@ use std::path::Path;
 
 use locality_core::hydration::HydrationPolicy;
 use locality_core::hydration::HydrationReason;
-use locality_core::model::{EntityKind, RemoteId, TreeEntry};
+use locality_core::model::{EntityKind, HydrationState, RemoteId, TreeEntry};
 use locality_core::{LocalityError, LocalityResult};
 use locality_store::{
     ConnectorStateRepository, EntityRepository, FreshnessStateRepository, MountConfig,
@@ -35,7 +35,7 @@ impl FetchScheduleStrategy for PreHydrationFetchScheduleStrategy {
     }
 
     fn entity_plan(&self, request: EntityFetchSchedule<'_>) -> EntityFetchPlan {
-        if request.entry.kind == EntityKind::Page {
+        if request.entry.kind == EntityKind::Page && should_queue_prefetch(&request) {
             return EntityFetchPlan {
                 queue_hydration: Some(HydrationReason::Prefetch),
             };
@@ -81,30 +81,33 @@ where
     ) {
         Ok(report) => report,
         Err(error) => {
-            let _ = mark_mount_pre_hydration_error(
-                store,
-                &mount.connector,
-                &mount.mount_id,
-                &error.to_string(),
-                now,
-            );
+            record_mount_pre_hydration_error(store, mount, &error, now);
             return Err(error);
         }
     };
 
-    let queued_pages = u64::try_from(report.queued_hydrations).map_err(|_| {
-        LocalityError::InvalidState(
-            "pre-hydration queued hydration count does not fit in u64".to_string(),
-        )
-    })?;
-    mark_mount_pre_hydration_hydrating(
+    let queued_pages = match u64::try_from(report.queued_hydrations) {
+        Ok(queued_pages) => queued_pages,
+        Err(_) => {
+            let error = LocalityError::InvalidState(
+                "pre-hydration queued hydration count does not fit in u64".to_string(),
+            );
+            record_mount_pre_hydration_error(store, mount, &error, now);
+            return Err(error);
+        }
+    };
+    if let Err(error) = mark_mount_pre_hydration_hydrating(
         store,
         &mount.connector,
         &mount.mount_id,
         counting_source.discovered_pages(),
         queued_pages,
         now,
-    )?;
+    ) {
+        let error = LocalityError::from(error);
+        record_mount_pre_hydration_error(store, mount, &error, now);
+        return Err(error);
+    }
 
     Ok(report)
 }
@@ -114,6 +117,35 @@ pub fn status_is_finished(status: &MountPreHydrationStatus) -> bool {
         status,
         MountPreHydrationStatus::Complete | MountPreHydrationStatus::Error
     )
+}
+
+fn should_queue_prefetch(request: &EntityFetchSchedule<'_>) -> bool {
+    matches!(
+        request.existing.map(|existing| &existing.hydration),
+        None | Some(HydrationState::Stub | HydrationState::Virtual)
+    )
+}
+
+fn record_mount_pre_hydration_error<S>(
+    store: &mut S,
+    mount: &MountConfig,
+    error: &LocalityError,
+    now: &str,
+) where
+    S: ConnectorStateRepository,
+{
+    if let Err(record_error) = mark_mount_pre_hydration_error(
+        store,
+        &mount.connector,
+        &mount.mount_id,
+        &error.to_string(),
+        now,
+    ) {
+        eprintln!(
+            "localityd failed to record pre-hydration error for mount `{}`: {record_error}",
+            mount.mount_id.0
+        );
+    }
 }
 
 struct PreHydrationCountingSource<'a, Source: ?Sized> {
