@@ -93,13 +93,24 @@ pub fn save_mount_pre_hydration_state(
     mount_id: &MountId,
     state: &MountPreHydrationState,
 ) -> StoreResult<()> {
-    let state_json = serde_json::to_string(state)?;
     let updated_at = state
         .completed_at
         .as_ref()
         .or(state.started_at.as_ref())
         .unwrap_or(&state.requested_at)
-        .clone();
+        .as_str();
+
+    save_mount_pre_hydration_state_with_updated_at(store, connector, mount_id, state, updated_at)
+}
+
+fn save_mount_pre_hydration_state_with_updated_at(
+    store: &mut impl ConnectorStateRepository,
+    connector: &str,
+    mount_id: &MountId,
+    state: &MountPreHydrationState,
+    updated_at: &str,
+) -> StoreResult<()> {
+    let state_json = serde_json::to_string(state)?;
 
     store.save_connector_state(ConnectorStateRecord {
         connector: connector.to_string(),
@@ -108,7 +119,7 @@ pub fn save_mount_pre_hydration_state(
         state_version: PRE_HYDRATION_STATE_VERSION,
         min_reader_version: PRE_HYDRATION_MIN_READER_VERSION,
         state_json,
-        updated_at,
+        updated_at: updated_at.to_string(),
     })
 }
 
@@ -127,7 +138,7 @@ pub fn mark_mount_pre_hydration_enumerating(
     state.last_error = None;
     state.discovered_pages = 0;
     state.queued_pages = 0;
-    save_mount_pre_hydration_state(store, connector, mount_id, &state)?;
+    save_mount_pre_hydration_state_with_updated_at(store, connector, mount_id, &state, now)?;
     Ok(state)
 }
 
@@ -153,7 +164,7 @@ pub fn mark_mount_pre_hydration_hydrating(
     state.last_error = None;
     state.discovered_pages = discovered_pages;
     state.queued_pages = queued_pages;
-    save_mount_pre_hydration_state(store, connector, mount_id, &state)?;
+    save_mount_pre_hydration_state_with_updated_at(store, connector, mount_id, &state, now)?;
     Ok(state)
 }
 
@@ -171,6 +182,6 @@ pub fn mark_mount_pre_hydration_error(
     state.started_at.get_or_insert_with(|| now.to_string());
     state.completed_at = Some(now.to_string());
     state.last_error = Some(message.to_string());
-    save_mount_pre_hydration_state(store, connector, mount_id, &state)?;
+    save_mount_pre_hydration_state_with_updated_at(store, connector, mount_id, &state, now)?;
     Ok(state)
 }

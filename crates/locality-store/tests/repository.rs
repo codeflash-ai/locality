@@ -269,6 +269,30 @@ fn pre_hydration_connector_state_metadata_and_updated_at_are_stable() {
 }
 
 #[test]
+fn pre_hydration_hydrating_in_progress_updates_connector_state_timestamp() {
+    let mut store = InMemoryStateStore::new();
+    let mount_id = MountId::new("notion-main");
+
+    mark_mount_pre_hydration_enumerating(&mut store, "notion", &mount_id, "2026-07-16T10:00:01Z")
+        .expect("mark enumerating");
+    mark_mount_pre_hydration_hydrating(
+        &mut store,
+        "notion",
+        &mount_id,
+        12,
+        12,
+        "2026-07-16T10:00:02Z",
+    )
+    .expect("mark hydrating");
+
+    let record = store
+        .get_connector_state("notion", PRE_HYDRATION_SCOPE_KIND, mount_id.as_str())
+        .expect("load connector state")
+        .expect("connector state exists");
+    assert_eq!(record.updated_at, "2026-07-16T10:00:02Z");
+}
+
+#[test]
 fn pre_hydration_state_is_cleared_when_in_memory_mount_source_changes() {
     let mut store = InMemoryStateStore::new();
     let mount_id = MountId::new("notion-main");
