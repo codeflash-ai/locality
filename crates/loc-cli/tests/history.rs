@@ -22,6 +22,9 @@ use locality_store::{
     MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore, VirtualMutationKind,
     VirtualMutationRecord, VirtualMutationRepository,
 };
+use localityd::file_provider::{
+    WindowsCloudFilesProjectionEvent, consume_windows_cloud_files_projection_acknowledgement,
+};
 use localityd::virtual_fs::virtual_fs_content_path;
 
 #[test]
@@ -751,6 +754,37 @@ fn windows_cloud_files_undo_move_relocates_clean_visible_projection_without_loca
             .is_empty(),
         "provider reconciliation must not replay as a local move"
     );
+    let entity = store
+        .get_entity(&fixture.mount_id, &RemoteId::new("page-1"))
+        .expect("read restored entity")
+        .expect("restored entity");
+    let wrapped_identifier =
+        localityd::virtual_projection::wrap_identifier(&fixture.mount_id, "page-1");
+    for (path, event) in [
+        (
+            restored_path.as_path(),
+            WindowsCloudFilesProjectionEvent::CloudFilesRenameTarget,
+        ),
+        (
+            current_path.as_path(),
+            WindowsCloudFilesProjectionEvent::CloudFilesDeleteMoveSource,
+        ),
+        (
+            current_path.as_path(),
+            WindowsCloudFilesProjectionEvent::WatcherRemoveMoveSource,
+        ),
+    ] {
+        assert!(consume_windows_cloud_files_projection_acknowledgement(
+            &state_root,
+            &visible_root,
+            &fixture.mount_id,
+            &RemoteId::new("page-1"),
+            &wrapped_identifier,
+            path,
+            event,
+            Some(&entity),
+        ));
+    }
 }
 
 #[test]
@@ -1090,7 +1124,7 @@ fn undo_with_applier_archives_clean_created_entity_and_removes_projection() {
 
     assert!(report.ok);
     assert_eq!(report.changed_remote_ids, vec!["created-page-1"]);
-    assert!(!fixture.root.join(created_path).exists());
+    assert!(!fixture.root.join(&created_path).exists());
     assert!(
         store
             .get_entity(&fixture.mount_id, &RemoteId::new("created-page-1"))
@@ -1130,13 +1164,52 @@ fn windows_cloud_files_undo_archive_removes_clean_visible_projection_without_loc
 
     assert!(report.ok);
     assert!(!cache_path.exists());
-    assert!(!fixture.root.join(created_path).exists());
+    assert!(!fixture.root.join(&created_path).exists());
     assert!(
         store
             .list_virtual_mutations(&fixture.mount_id)
             .expect("list virtual mutations")
             .is_empty()
     );
+    let wrapped_file_identifier =
+        localityd::virtual_projection::wrap_identifier(&fixture.mount_id, "created-page-1");
+    let wrapped_container_identifier = localityd::virtual_projection::wrap_identifier(
+        &fixture.mount_id,
+        "children:created-page-1",
+    );
+    for (identifier, path, event) in [
+        (
+            wrapped_file_identifier.as_str(),
+            created_path.as_path(),
+            WindowsCloudFilesProjectionEvent::CloudFilesDeleteArchivedEntity,
+        ),
+        (
+            wrapped_file_identifier.as_str(),
+            created_path.as_path(),
+            WindowsCloudFilesProjectionEvent::WatcherRemoveArchivedEntity,
+        ),
+        (
+            wrapped_container_identifier.as_str(),
+            created_path.parent().expect("created page container"),
+            WindowsCloudFilesProjectionEvent::CloudFilesDeleteArchivedEntity,
+        ),
+        (
+            wrapped_container_identifier.as_str(),
+            created_path.parent().expect("created page container"),
+            WindowsCloudFilesProjectionEvent::WatcherRemoveArchivedEntity,
+        ),
+    ] {
+        assert!(consume_windows_cloud_files_projection_acknowledgement(
+            &state_root,
+            &fixture.root,
+            &fixture.mount_id,
+            &RemoteId::new("created-page-1"),
+            identifier,
+            path,
+            event,
+            None,
+        ));
+    }
 }
 
 #[test]

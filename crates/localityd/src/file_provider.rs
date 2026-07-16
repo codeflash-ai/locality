@@ -232,6 +232,52 @@ pub struct ProjectionRefreshReport {
     pub skipped_local_changes: usize,
 }
 
+const WINDOWS_CLOUD_FILES_PROJECTION_ACK_VERSION: u32 = 1;
+const WINDOWS_CLOUD_FILES_PROJECTION_ACK_MAX_AGE_MS: u64 = 5 * 60 * 1_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsCloudFilesProjectionEvent {
+    CloudFilesRenameTarget,
+    CloudFilesDeleteMoveSource,
+    WatcherRemoveMoveSource,
+    CloudFilesDeleteArchivedEntity,
+    WatcherRemoveArchivedEntity,
+}
+
+impl WindowsCloudFilesProjectionEvent {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CloudFilesRenameTarget => "cloud_files_rename_target",
+            Self::CloudFilesDeleteMoveSource => "cloud_files_delete_move_source",
+            Self::WatcherRemoveMoveSource => "watcher_remove_move_source",
+            Self::CloudFilesDeleteArchivedEntity => "cloud_files_delete_archived_entity",
+            Self::WatcherRemoveArchivedEntity => "watcher_remove_archived_entity",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct WindowsCloudFilesProjectionAcknowledgement {
+    version: u32,
+    mount_id: MountId,
+    entity_id: RemoteId,
+    provider_identifier: String,
+    access_root_key: String,
+    relative_path_key: String,
+    event: WindowsCloudFilesProjectionEvent,
+    expected_entity_path_key: Option<String>,
+    created_at_unix_ms: u64,
+}
+
+#[derive(Clone, Copy)]
+struct WindowsCloudFilesProjectionAcknowledgementSpec<'a> {
+    provider_identifier: &'a str,
+    relative_path: &'a Path,
+    event: WindowsCloudFilesProjectionEvent,
+    expected_entity_path: Option<&'a Path>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectionRefreshBase {
     pub mount_id: MountId,
@@ -507,9 +553,49 @@ where
         if let Some(parent) = restored_namespace_path.parent() {
             std::fs::create_dir_all(parent).map_err(LocalityError::from)?;
         }
-        std::fs::rename(&previous_namespace_path, &restored_namespace_path)
-            .map_err(LocalityError::from)?;
-        std::fs::write(&restored_projection_path, cache_contents).map_err(LocalityError::from)?;
+        let previous_namespace_relative_path = projection_namespace_path(previous_path);
+        let restored_namespace_relative_path = projection_namespace_path(&entity.path);
+        let provider_identifier =
+            windows_cloud_files_projection_identifier(remote_id, previous_path);
+        let acknowledgements = [
+            WindowsCloudFilesProjectionAcknowledgementSpec {
+                provider_identifier: &provider_identifier,
+                relative_path: &restored_namespace_relative_path,
+                event: WindowsCloudFilesProjectionEvent::CloudFilesRenameTarget,
+                expected_entity_path: Some(&entity.path),
+            },
+            WindowsCloudFilesProjectionAcknowledgementSpec {
+                provider_identifier: &provider_identifier,
+                relative_path: &previous_namespace_relative_path,
+                event: WindowsCloudFilesProjectionEvent::CloudFilesDeleteMoveSource,
+                expected_entity_path: Some(&entity.path),
+            },
+            WindowsCloudFilesProjectionAcknowledgementSpec {
+                provider_identifier: &provider_identifier,
+                relative_path: &previous_namespace_relative_path,
+                event: WindowsCloudFilesProjectionEvent::WatcherRemoveMoveSource,
+                expected_entity_path: Some(&entity.path),
+            },
+        ];
+        record_windows_cloud_files_projection_acknowledgements(
+            state_root,
+            &root,
+            mount_id,
+            remote_id,
+            &acknowledgements,
+        )?;
+        if let Err(error) = std::fs::rename(&previous_namespace_path, &restored_namespace_path) {
+            revoke_windows_cloud_files_projection_acknowledgements(
+                state_root,
+                &root,
+                mount_id,
+                &acknowledgements,
+            );
+            return Err(LocalityError::from(error));
+        }
+        if let Err(error) = std::fs::write(&restored_projection_path, cache_contents) {
+            return Err(LocalityError::from(error));
+        }
         report.refreshed += 1;
     }
     Ok(report)
@@ -518,7 +604,9 @@ where
 /// Removes an already-materialized Windows Cloud Files replica after its
 /// created remote entity has been archived and removed from durable state.
 pub fn remove_windows_cloud_files_entity_projection_if_clean(
+    state_root: &Path,
     mount: &MountConfig,
+    entity_id: &RemoteId,
     previous_path: &Path,
     previous_shadow: &ShadowDocument,
 ) -> LocalityResult<ProjectionRefreshReport> {
@@ -542,17 +630,266 @@ pub fn remove_windows_cloud_files_entity_projection_if_clean(
             report.skipped_local_changes += 1;
             continue;
         }
-        std::fs::remove_file(&projection_path).map_err(LocalityError::from)?;
+        let file_acknowledgements = [
+            WindowsCloudFilesProjectionAcknowledgementSpec {
+                provider_identifier: &entity_id.0,
+                relative_path: previous_path,
+                event: WindowsCloudFilesProjectionEvent::CloudFilesDeleteArchivedEntity,
+                expected_entity_path: None,
+            },
+            WindowsCloudFilesProjectionAcknowledgementSpec {
+                provider_identifier: &entity_id.0,
+                relative_path: previous_path,
+                event: WindowsCloudFilesProjectionEvent::WatcherRemoveArchivedEntity,
+                expected_entity_path: None,
+            },
+        ];
+        record_windows_cloud_files_projection_acknowledgements(
+            state_root,
+            &root,
+            &mount.mount_id,
+            entity_id,
+            &file_acknowledgements,
+        )?;
+        let page_container = previous_path
+            .file_name()
+            .is_some_and(|filename| filename == "page.md")
+            .then(|| previous_path.parent())
+            .flatten();
+        let container_identifier = format!("children:{}", entity_id.0);
+        let container_acknowledgements = page_container.map(|container| {
+            [
+                WindowsCloudFilesProjectionAcknowledgementSpec {
+                    provider_identifier: &container_identifier,
+                    relative_path: container,
+                    event: WindowsCloudFilesProjectionEvent::CloudFilesDeleteArchivedEntity,
+                    expected_entity_path: None,
+                },
+                WindowsCloudFilesProjectionAcknowledgementSpec {
+                    provider_identifier: &container_identifier,
+                    relative_path: container,
+                    event: WindowsCloudFilesProjectionEvent::WatcherRemoveArchivedEntity,
+                    expected_entity_path: None,
+                },
+            ]
+        });
+        if let Some(container_acknowledgements) = container_acknowledgements.as_ref()
+            && let Err(error) = record_windows_cloud_files_projection_acknowledgements(
+                state_root,
+                &root,
+                &mount.mount_id,
+                entity_id,
+                container_acknowledgements,
+            )
+        {
+            revoke_windows_cloud_files_projection_acknowledgements(
+                state_root,
+                &root,
+                &mount.mount_id,
+                &file_acknowledgements,
+            );
+            return Err(error);
+        }
+        if let Err(error) = std::fs::remove_file(&projection_path) {
+            revoke_windows_cloud_files_projection_acknowledgements(
+                state_root,
+                &root,
+                &mount.mount_id,
+                &file_acknowledgements,
+            );
+            if let Some(container_acknowledgements) = container_acknowledgements.as_ref() {
+                revoke_windows_cloud_files_projection_acknowledgements(
+                    state_root,
+                    &root,
+                    &mount.mount_id,
+                    container_acknowledgements,
+                );
+            }
+            return Err(LocalityError::from(error));
+        }
         if projection_path
             .file_name()
             .is_some_and(|filename| filename == "page.md")
             && let Some(container) = projection_path.parent()
         {
-            let _ = std::fs::remove_dir(container);
+            if std::fs::remove_dir(container).is_err()
+                && let Some(container_acknowledgements) = container_acknowledgements.as_ref()
+            {
+                revoke_windows_cloud_files_projection_acknowledgements(
+                    state_root,
+                    &root,
+                    &mount.mount_id,
+                    container_acknowledgements,
+                );
+            }
         }
         report.refreshed += 1;
     }
     Ok(report)
+}
+
+pub fn record_windows_cloud_files_projection_acknowledgement(
+    state_root: &Path,
+    access_root: &Path,
+    mount_id: &MountId,
+    entity_id: &RemoteId,
+    provider_identifier: &str,
+    relative_path: &Path,
+    event: WindowsCloudFilesProjectionEvent,
+    expected_entity_path: Option<&Path>,
+) -> LocalityResult<()> {
+    record_windows_cloud_files_projection_acknowledgement_at(
+        state_root,
+        access_root,
+        mount_id,
+        entity_id,
+        provider_identifier,
+        relative_path,
+        event,
+        expected_entity_path,
+        current_unix_millis(),
+    )
+}
+
+fn record_windows_cloud_files_projection_acknowledgements(
+    state_root: &Path,
+    access_root: &Path,
+    mount_id: &MountId,
+    entity_id: &RemoteId,
+    acknowledgements: &[WindowsCloudFilesProjectionAcknowledgementSpec<'_>],
+) -> LocalityResult<()> {
+    let mut recorded = Vec::with_capacity(acknowledgements.len());
+    for acknowledgement in acknowledgements {
+        if let Err(error) = record_windows_cloud_files_projection_acknowledgement(
+            state_root,
+            access_root,
+            mount_id,
+            entity_id,
+            acknowledgement.provider_identifier,
+            acknowledgement.relative_path,
+            acknowledgement.event,
+            acknowledgement.expected_entity_path,
+        ) {
+            revoke_windows_cloud_files_projection_acknowledgements(
+                state_root,
+                access_root,
+                mount_id,
+                &recorded,
+            );
+            return Err(error);
+        }
+        recorded.push(*acknowledgement);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_windows_cloud_files_projection_acknowledgement_at(
+    state_root: &Path,
+    access_root: &Path,
+    mount_id: &MountId,
+    entity_id: &RemoteId,
+    provider_identifier: &str,
+    relative_path: &Path,
+    event: WindowsCloudFilesProjectionEvent,
+    expected_entity_path: Option<&Path>,
+    created_at_unix_ms: u64,
+) -> LocalityResult<()> {
+    validate_windows_projection_relative_path(relative_path)?;
+    if let Some(expected_entity_path) = expected_entity_path {
+        validate_windows_projection_relative_path(expected_entity_path)?;
+    }
+    repair_windows_cloud_files_projection_acknowledgements(state_root, current_unix_millis());
+    let acknowledgement = WindowsCloudFilesProjectionAcknowledgement {
+        version: WINDOWS_CLOUD_FILES_PROJECTION_ACK_VERSION,
+        mount_id: mount_id.clone(),
+        entity_id: entity_id.clone(),
+        provider_identifier: normalize_windows_cloud_files_provider_identifier(provider_identifier),
+        access_root_key: windows_projection_path_key(access_root),
+        relative_path_key: windows_projection_path_key(relative_path),
+        event,
+        expected_entity_path_key: expected_entity_path.map(windows_projection_path_key),
+        created_at_unix_ms,
+    };
+    let path = windows_cloud_files_projection_acknowledgement_path(
+        state_root,
+        access_root,
+        mount_id,
+        provider_identifier,
+        relative_path,
+        event,
+    );
+    let parent = path.parent().ok_or_else(|| {
+        LocalityError::InvalidState("Windows projection acknowledgement path has no parent".into())
+    })?;
+    std::fs::create_dir_all(parent).map_err(LocalityError::from)?;
+    let bytes = serde_json::to_vec(&acknowledgement)
+        .map_err(|error| LocalityError::InvalidState(error.to_string()))?;
+    let temporary = windows_projection_acknowledgement_temporary_path(&path, "write");
+    std::fs::write(&temporary, bytes).map_err(LocalityError::from)?;
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(LocalityError::from)?;
+    }
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(LocalityError::from(error));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn consume_windows_cloud_files_projection_acknowledgement(
+    state_root: &Path,
+    access_root: &Path,
+    mount_id: &MountId,
+    entity_id: &RemoteId,
+    provider_identifier: &str,
+    relative_path: &Path,
+    event: WindowsCloudFilesProjectionEvent,
+    current_entity: Option<&EntityRecord>,
+) -> bool {
+    let now = current_unix_millis();
+    repair_windows_cloud_files_projection_acknowledgements(state_root, now);
+    let path = windows_cloud_files_projection_acknowledgement_path(
+        state_root,
+        access_root,
+        mount_id,
+        provider_identifier,
+        relative_path,
+        event,
+    );
+    let claimed = windows_projection_acknowledgement_temporary_path(&path, "claim");
+    if std::fs::rename(&path, &claimed).is_err() {
+        return false;
+    }
+    let acknowledgement = std::fs::read(&claimed).ok().and_then(|bytes| {
+        serde_json::from_slice::<WindowsCloudFilesProjectionAcknowledgement>(&bytes).ok()
+    });
+    let _ = std::fs::remove_file(&claimed);
+    let Some(acknowledgement) = acknowledgement else {
+        return false;
+    };
+    if !windows_projection_acknowledgement_is_current(&acknowledgement, now)
+        || acknowledgement.version != WINDOWS_CLOUD_FILES_PROJECTION_ACK_VERSION
+        || acknowledgement.mount_id != *mount_id
+        || acknowledgement.entity_id != *entity_id
+        || acknowledgement.provider_identifier
+            != normalize_windows_cloud_files_provider_identifier(provider_identifier)
+        || acknowledgement.access_root_key != windows_projection_path_key(access_root)
+        || acknowledgement.relative_path_key != windows_projection_path_key(relative_path)
+        || acknowledgement.event != event
+    {
+        return false;
+    }
+
+    match acknowledgement.expected_entity_path_key.as_deref() {
+        Some(expected_path_key) => current_entity.is_some_and(|entity| {
+            entity.mount_id == *mount_id
+                && entity.remote_id == *entity_id
+                && windows_projection_path_key(&entity.path) == expected_path_key
+        }),
+        None => current_entity.is_none(),
+    }
 }
 
 /// Repairs already-materialized macOS File Provider replicas after a background
@@ -1030,6 +1367,169 @@ fn projection_namespace_path(path: &Path) -> PathBuf {
         return path.parent().unwrap_or(path).to_path_buf();
     }
     path.to_path_buf()
+}
+
+fn windows_cloud_files_projection_identifier(remote_id: &RemoteId, path: &Path) -> String {
+    if path
+        .file_name()
+        .is_some_and(|filename| filename == "page.md")
+    {
+        format!("children:{}", remote_id.0)
+    } else {
+        remote_id.0.clone()
+    }
+}
+
+fn normalize_windows_cloud_files_provider_identifier(identifier: &str) -> String {
+    crate::virtual_projection::unwrap_identifier(identifier)
+        .map(|unwrapped| unwrapped.daemon_identifier)
+        .unwrap_or_else(|_| identifier.to_string())
+}
+
+fn validate_windows_projection_relative_path(path: &Path) -> LocalityResult<()> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(LocalityError::InvalidState(format!(
+            "Windows projection acknowledgement path `{}` is not a safe relative path",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn windows_projection_path_key(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .trim_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn windows_cloud_files_projection_acknowledgement_dir(state_root: &Path) -> PathBuf {
+    state_root.join("provider-reconciliation/windows-cloud-files")
+}
+
+fn windows_cloud_files_projection_acknowledgement_path(
+    state_root: &Path,
+    access_root: &Path,
+    mount_id: &MountId,
+    provider_identifier: &str,
+    relative_path: &Path,
+    event: WindowsCloudFilesProjectionEvent,
+) -> PathBuf {
+    let key = format!(
+        "{}\n{}\n{}\n{}\n{}",
+        mount_id.0,
+        normalize_windows_cloud_files_provider_identifier(provider_identifier),
+        windows_projection_path_key(access_root),
+        event.as_str(),
+        windows_projection_path_key(relative_path),
+    );
+    windows_cloud_files_projection_acknowledgement_dir(state_root)
+        .join(format!("{:016x}.json", stable_projection_ack_hash(&key)))
+}
+
+fn revoke_windows_cloud_files_projection_acknowledgement(
+    state_root: &Path,
+    access_root: &Path,
+    mount_id: &MountId,
+    provider_identifier: &str,
+    relative_path: &Path,
+    event: WindowsCloudFilesProjectionEvent,
+) {
+    let path = windows_cloud_files_projection_acknowledgement_path(
+        state_root,
+        access_root,
+        mount_id,
+        provider_identifier,
+        relative_path,
+        event,
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+fn revoke_windows_cloud_files_projection_acknowledgements(
+    state_root: &Path,
+    access_root: &Path,
+    mount_id: &MountId,
+    acknowledgements: &[WindowsCloudFilesProjectionAcknowledgementSpec<'_>],
+) {
+    for acknowledgement in acknowledgements {
+        revoke_windows_cloud_files_projection_acknowledgement(
+            state_root,
+            access_root,
+            mount_id,
+            acknowledgement.provider_identifier,
+            acknowledgement.relative_path,
+            acknowledgement.event,
+        );
+    }
+}
+
+fn stable_projection_ack_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn windows_projection_acknowledgement_temporary_path(path: &Path, purpose: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let filename = path
+        .file_name()
+        .and_then(|filename| filename.to_str())
+        .unwrap_or("acknowledgement.json");
+    path.with_file_name(format!(
+        ".{filename}.{purpose}.{}.{counter}.tmp",
+        std::process::id()
+    ))
+}
+
+fn current_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn windows_projection_acknowledgement_is_current(
+    acknowledgement: &WindowsCloudFilesProjectionAcknowledgement,
+    now: u64,
+) -> bool {
+    acknowledgement.created_at_unix_ms <= now
+        && now.saturating_sub(acknowledgement.created_at_unix_ms)
+            <= WINDOWS_CLOUD_FILES_PROJECTION_ACK_MAX_AGE_MS
+}
+
+fn repair_windows_cloud_files_projection_acknowledgements(state_root: &Path, now: u64) {
+    let directory = windows_cloud_files_projection_acknowledgement_dir(state_root);
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|file_type| file_type.is_file()) {
+            continue;
+        }
+        let valid = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| {
+                serde_json::from_slice::<WindowsCloudFilesProjectionAcknowledgement>(&bytes).ok()
+            })
+            .is_some_and(|acknowledgement| {
+                acknowledgement.version == WINDOWS_CLOUD_FILES_PROJECTION_ACK_VERSION
+                    && windows_projection_acknowledgement_is_current(&acknowledgement, now)
+            });
+        if !valid {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 fn prepare_windows_projection_refresh(
@@ -1764,6 +2264,270 @@ mod tests {
             PathBuf::from("/tmp/Locality/notion-main")
         );
         assert_eq!(matched.relative_path, PathBuf::from("roadmap/page.md"));
+    }
+
+    #[test]
+    fn windows_projection_acknowledgements_are_exact_one_shot_and_identity_normalized() {
+        let state_root = temp_root("loc-windows-projection-ack");
+        let access_root = PathBuf::from(r"C:\Locality\notion-main");
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let entity = EntityRecord::new(
+            mount_id.clone(),
+            remote_id.clone(),
+            EntityKind::Page,
+            "Roadmap",
+            "teams/old/Roadmap/page.md",
+        );
+        let wrapped_directory =
+            crate::virtual_projection::wrap_identifier(&mount_id, "children:page-1");
+
+        record_windows_cloud_files_projection_acknowledgement(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            "children:page-1",
+            Path::new("teams/old/Roadmap"),
+            WindowsCloudFilesProjectionEvent::CloudFilesRenameTarget,
+            Some(Path::new("teams/old/Roadmap/page.md")),
+        )
+        .expect("record move target acknowledgement");
+        record_windows_cloud_files_projection_acknowledgement(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            "children:page-1",
+            Path::new("teams/new/Roadmap"),
+            WindowsCloudFilesProjectionEvent::CloudFilesDeleteMoveSource,
+            Some(Path::new("teams/old/Roadmap/page.md")),
+        )
+        .expect("record Cloud Files move source acknowledgement");
+        record_windows_cloud_files_projection_acknowledgement(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            "children:page-1",
+            Path::new("teams/new/Roadmap"),
+            WindowsCloudFilesProjectionEvent::WatcherRemoveMoveSource,
+            Some(Path::new("teams/old/Roadmap/page.md")),
+        )
+        .expect("record watcher move source acknowledgement");
+
+        assert!(!consume_windows_cloud_files_projection_acknowledgement(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            &wrapped_directory,
+            Path::new("teams/pending/Roadmap"),
+            WindowsCloudFilesProjectionEvent::WatcherRemoveMoveSource,
+            Some(&entity),
+        ));
+        assert!(!consume_windows_cloud_files_projection_acknowledgement(
+            &state_root,
+            Path::new(r"C:\Locality\other-access-root"),
+            &mount_id,
+            &remote_id,
+            &wrapped_directory,
+            Path::new("teams/old/Roadmap"),
+            WindowsCloudFilesProjectionEvent::CloudFilesRenameTarget,
+            Some(&entity),
+        ));
+        assert!(consume_windows_cloud_files_projection_acknowledgement(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            &wrapped_directory,
+            Path::new("teams/old/Roadmap"),
+            WindowsCloudFilesProjectionEvent::CloudFilesRenameTarget,
+            Some(&entity),
+        ));
+        assert!(!consume_windows_cloud_files_projection_acknowledgement(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            &wrapped_directory,
+            Path::new("teams/old/Roadmap"),
+            WindowsCloudFilesProjectionEvent::CloudFilesRenameTarget,
+            Some(&entity),
+        ));
+        assert!(consume_windows_cloud_files_projection_acknowledgement(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            &wrapped_directory,
+            Path::new("teams/new/Roadmap"),
+            WindowsCloudFilesProjectionEvent::CloudFilesDeleteMoveSource,
+            Some(&entity),
+        ));
+        assert!(consume_windows_cloud_files_projection_acknowledgement(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            &wrapped_directory,
+            Path::new("teams/new/Roadmap"),
+            WindowsCloudFilesProjectionEvent::WatcherRemoveMoveSource,
+            Some(&entity),
+        ));
+
+        record_windows_cloud_files_projection_acknowledgement(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            "page-1",
+            Path::new("teams/old/Roadmap/page.md"),
+            WindowsCloudFilesProjectionEvent::CloudFilesDeleteArchivedEntity,
+            None,
+        )
+        .expect("record Cloud Files archive acknowledgement");
+        record_windows_cloud_files_projection_acknowledgement(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            "page-1",
+            Path::new("teams/old/Roadmap/page.md"),
+            WindowsCloudFilesProjectionEvent::WatcherRemoveArchivedEntity,
+            None,
+        )
+        .expect("record watcher archive acknowledgement");
+        assert!(consume_windows_cloud_files_projection_acknowledgement(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            "page-1",
+            Path::new("teams/old/Roadmap/page.md"),
+            WindowsCloudFilesProjectionEvent::CloudFilesDeleteArchivedEntity,
+            None,
+        ));
+        assert!(consume_windows_cloud_files_projection_acknowledgement(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            "page-1",
+            Path::new("teams/old/Roadmap/page.md"),
+            WindowsCloudFilesProjectionEvent::WatcherRemoveArchivedEntity,
+            None,
+        ));
+
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn windows_projection_acknowledgements_expire_when_provider_is_stopped_and_repair_malformed_state()
+     {
+        let state_root = temp_root("loc-windows-projection-ack-repair");
+        let access_root = PathBuf::from(r"C:\Locality\notion-main");
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let relative_path = Path::new("teams/new/Roadmap.md");
+        let event = WindowsCloudFilesProjectionEvent::WatcherRemoveMoveSource;
+        let expired_at =
+            current_unix_millis().saturating_sub(WINDOWS_CLOUD_FILES_PROJECTION_ACK_MAX_AGE_MS + 1);
+        record_windows_cloud_files_projection_acknowledgement_at(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            "page-1",
+            relative_path,
+            event,
+            Some(Path::new("teams/old/Roadmap.md")),
+            expired_at,
+        )
+        .expect("record expired acknowledgement");
+
+        assert!(!consume_windows_cloud_files_projection_acknowledgement(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            "page-1",
+            relative_path,
+            event,
+            None,
+        ));
+
+        let malformed_path = windows_cloud_files_projection_acknowledgement_path(
+            &state_root,
+            &access_root,
+            &mount_id,
+            "page-1",
+            relative_path,
+            event,
+        );
+        fs::create_dir_all(malformed_path.parent().expect("ack parent"))
+            .expect("create ack parent");
+        fs::write(&malformed_path, b"{not-json").expect("write malformed acknowledgement");
+        assert!(!consume_windows_cloud_files_projection_acknowledgement(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            "page-1",
+            relative_path,
+            event,
+            None,
+        ));
+        assert!(!malformed_path.exists());
+
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn windows_projection_acknowledgement_group_revokes_prior_records_on_failure() {
+        let state_root = temp_root("loc-windows-projection-ack-revoke");
+        let access_root = PathBuf::from(r"C:\Locality\notion-main");
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let valid_path = Path::new("teams/new/Roadmap.md");
+        let acknowledgements = [
+            WindowsCloudFilesProjectionAcknowledgementSpec {
+                provider_identifier: "page-1",
+                relative_path: valid_path,
+                event: WindowsCloudFilesProjectionEvent::CloudFilesDeleteMoveSource,
+                expected_entity_path: Some(Path::new("teams/old/Roadmap.md")),
+            },
+            WindowsCloudFilesProjectionAcknowledgementSpec {
+                provider_identifier: "page-1",
+                relative_path: Path::new("../outside.md"),
+                event: WindowsCloudFilesProjectionEvent::WatcherRemoveMoveSource,
+                expected_entity_path: Some(Path::new("teams/old/Roadmap.md")),
+            },
+        ];
+
+        assert!(
+            record_windows_cloud_files_projection_acknowledgements(
+                &state_root,
+                &access_root,
+                &mount_id,
+                &remote_id,
+                &acknowledgements,
+            )
+            .is_err()
+        );
+        assert!(!consume_windows_cloud_files_projection_acknowledgement(
+            &state_root,
+            &access_root,
+            &mount_id,
+            &remote_id,
+            "page-1",
+            valid_path,
+            WindowsCloudFilesProjectionEvent::CloudFilesDeleteMoveSource,
+            None,
+        ));
+
+        let _ = fs::remove_dir_all(state_root);
     }
 
     #[test]

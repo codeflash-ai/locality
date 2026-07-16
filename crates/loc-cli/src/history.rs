@@ -313,7 +313,9 @@ enum UndoProjectionRefresh {
         previous_shadow: locality_core::shadow::ShadowDocument,
     },
     WindowsCloudFilesRemovedEntity {
+        state_root: PathBuf,
         mount: MountConfig,
+        entity_id: RemoteId,
         previous_path: PathBuf,
         previous_shadow: locality_core::shadow::ShadowDocument,
     },
@@ -381,12 +383,16 @@ where
             Ok(())
         }
         UndoProjectionRefresh::WindowsCloudFilesRemovedEntity {
+            state_root,
             mount,
+            entity_id,
             previous_path,
             previous_shadow,
         } => {
             let report = file_provider::remove_windows_cloud_files_entity_projection_if_clean(
+                state_root,
                 mount,
+                entity_id,
                 previous_path,
                 previous_shadow,
             )
@@ -846,7 +852,16 @@ where
             });
         } else if mount.projection == locality_store::ProjectionMode::WindowsCloudFiles {
             projection_refreshes.push(UndoProjectionRefresh::WindowsCloudFilesRemovedEntity {
+                state_root: state_root
+                    .ok_or_else(|| {
+                        HistoryError::Store(StoreError::Io(
+                            "Windows Cloud Files undo reconciliation requires a state root"
+                                .to_string(),
+                        ))
+                    })?
+                    .to_path_buf(),
                 mount: mount.clone(),
+                entity_id: entity_id.clone(),
                 previous_path: entity.path,
                 previous_shadow,
             });
