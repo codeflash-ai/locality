@@ -305,10 +305,16 @@ where
 
 #[derive(Clone, Debug)]
 enum UndoProjectionRefresh {
-    VisibleEntity {
+    WindowsCloudFilesEntity {
         state_root: PathBuf,
         mount_id: MountId,
         entity_id: RemoteId,
+        previous_path: PathBuf,
+        previous_shadow: locality_core::shadow::ShadowDocument,
+    },
+    WindowsCloudFilesRemovedEntity {
+        mount: MountConfig,
+        previous_path: PathBuf,
         previous_shadow: locality_core::shadow::ShadowDocument,
     },
     MacosContainers {
@@ -350,23 +356,44 @@ where
     S: MountRepository + EntityRepository,
 {
     match refresh {
-        UndoProjectionRefresh::VisibleEntity {
+        UndoProjectionRefresh::WindowsCloudFilesEntity {
             state_root,
             mount_id,
             entity_id,
+            previous_path,
             previous_shadow,
         } => {
-            let report = file_provider::refresh_visible_entity_projection_if_clean(
+            let report = file_provider::reconcile_windows_cloud_files_entity_projection_if_clean(
                 store,
                 state_root,
                 mount_id,
                 entity_id,
+                previous_path,
                 previous_shadow,
             )
             .map_err(|error| HistoryError::Store(StoreError::Io(error.to_string())))?;
             if report.skipped_local_changes > 0 {
                 return Err(unsafe_undo_local_state(
                     entity_id,
+                    "visible provider replica changed while remote undo was applying",
+                ));
+            }
+            Ok(())
+        }
+        UndoProjectionRefresh::WindowsCloudFilesRemovedEntity {
+            mount,
+            previous_path,
+            previous_shadow,
+        } => {
+            let report = file_provider::remove_windows_cloud_files_entity_projection_if_clean(
+                mount,
+                previous_path,
+                previous_shadow,
+            )
+            .map_err(|error| HistoryError::Store(StoreError::Io(error.to_string())))?;
+            if report.skipped_local_changes > 0 {
+                return Err(unsafe_undo_local_state(
+                    &previous_shadow.entity_id,
                     "visible provider replica changed while remote undo was applying",
                 ));
             }
@@ -758,13 +785,15 @@ where
             .save_shadow(&entry.mount_id, preimage.shadow.clone())
             .map_err(HistoryError::Store)?;
         store.save_entity(entity).map_err(HistoryError::Store)?;
-        if let (Some(state_root), Some(previous_shadow)) = (state_root, previous_shadow.as_ref())
-            && direct_visible_undo_refresh_enabled(&mount.projection)
+        if let (Some(state_root), Some(previous_path), Some(previous_shadow)) =
+            (state_root, previous_path.as_ref(), previous_shadow.as_ref())
+            && windows_undo_projection_refresh_enabled(&mount.projection)
         {
-            projection_refreshes.push(UndoProjectionRefresh::VisibleEntity {
+            projection_refreshes.push(UndoProjectionRefresh::WindowsCloudFilesEntity {
                 state_root: state_root.to_path_buf(),
                 mount_id: entry.mount_id.clone(),
                 entity_id: preimage.entity_id.clone(),
+                previous_path: previous_path.clone(),
                 previous_shadow: previous_shadow.clone(),
             });
         }
@@ -794,6 +823,9 @@ where
         } else {
             Vec::new()
         };
+        let previous_shadow = store
+            .load_shadow(&entry.mount_id, entity_id)
+            .map_err(HistoryError::Store)?;
         let (content_path, visible_paths) =
             undo_entity_projection_paths(state_root, &mount, &entity)?;
         remove_undo_projection(&content_path)?;
@@ -812,13 +844,19 @@ where
                 mount: mount.clone(),
                 identifiers: refresh_identifiers,
             });
+        } else if mount.projection == locality_store::ProjectionMode::WindowsCloudFiles {
+            projection_refreshes.push(UndoProjectionRefresh::WindowsCloudFilesRemovedEntity {
+                mount: mount.clone(),
+                previous_path: entity.path,
+                previous_shadow,
+            });
         }
     }
 
     Ok(projection_refreshes)
 }
 
-fn direct_visible_undo_refresh_enabled(projection: &locality_store::ProjectionMode) -> bool {
+fn windows_undo_projection_refresh_enabled(projection: &locality_store::ProjectionMode) -> bool {
     matches!(
         projection,
         locality_store::ProjectionMode::WindowsCloudFiles
@@ -1959,13 +1997,13 @@ mod tests {
 
     #[test]
     fn macos_undo_never_directly_rewrites_visible_replica() {
-        assert!(!direct_visible_undo_refresh_enabled(
+        assert!(!windows_undo_projection_refresh_enabled(
             &locality_store::ProjectionMode::MacosFileProvider
         ));
-        assert!(direct_visible_undo_refresh_enabled(
+        assert!(windows_undo_projection_refresh_enabled(
             &locality_store::ProjectionMode::WindowsCloudFiles
         ));
-        assert!(!direct_visible_undo_refresh_enabled(
+        assert!(!windows_undo_projection_refresh_enabled(
             &locality_store::ProjectionMode::LinuxFuse
         ));
     }

@@ -6,6 +6,8 @@ use locality_platform::{
     cloud_files_mount_id_component, decode_cloud_files_mount_id_component,
     windows_cloud_files_registration_marker_dir,
 };
+#[cfg(target_os = "windows")]
+use locality_store::EntityRepository;
 #[cfg(any(target_os = "windows", test))]
 use locality_store::MountConfig;
 use locality_store::{MountRepository, ProjectionMode, SqliteStateStore};
@@ -1618,6 +1620,33 @@ impl ProviderContext {
         self.local_file_index.forget_subtree(&source);
     }
 
+    fn provider_event_already_matches_durable_state(
+        &self,
+        identifier: &str,
+        path: &Path,
+        event: ProviderNamespaceEvent,
+    ) -> Result<bool, HelperError> {
+        let resolved = self.resolve_identifier(identifier)?;
+        let Some(remote_id) = provider_identity_remote_id(&resolved.daemon_identifier) else {
+            return Ok(false);
+        };
+        let Some(path_match) = localityd::file_provider::match_mount_path(&resolved.mount, path)
+        else {
+            return Ok(false);
+        };
+        let store = SqliteStateStore::open(self.state_dir.clone())
+            .map_err(|error| HelperError::new("state_open_failed", error.to_string()))?;
+        let entity = store
+            .get_entity(&resolved.mount.mount_id, &remote_id)
+            .map_err(|error| HelperError::new("state_read_failed", error.to_string()))?;
+        Ok(provider_event_already_matches_durable_state(
+            &resolved.daemon_identifier,
+            &path_match.relative_path,
+            entity.as_ref(),
+            event,
+        ))
+    }
+
     fn request<T>(
         &self,
         request: &localityd::ipc::DaemonRequest,
@@ -1977,6 +2006,18 @@ fn handle_local_remove_like_path(
         ));
         return Ok(());
     };
+    if context.provider_event_already_matches_durable_state(
+        &identifier,
+        &path,
+        ProviderNamespaceEvent::RemovedSource,
+    )? {
+        trace_cloud_files(format!(
+            "local remove acknowledged path=`{}` identity=`{identifier}` reason=already_durable",
+            path.display()
+        ));
+        context.forget_path_identities(&path);
+        return Ok(());
+    }
     trace_cloud_files(format!(
         "local remove trash path=`{}` identity=`{identifier}`",
         path.display()
@@ -2071,6 +2112,71 @@ fn cached_identity_refresh_unavailable(error: &HelperError) -> bool {
 fn is_local_identity(identifier: &str) -> bool {
     let identifier = daemon_identifier_for_identity_check(identifier);
     identifier.starts_with("local:") || identifier.starts_with("children:local:")
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderNamespaceEvent {
+    RenameTarget,
+    RemovedSource,
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn provider_identity_remote_id(identifier: &str) -> Option<locality_core::model::RemoteId> {
+    let identifier = daemon_identifier_for_identity_check(identifier);
+    let identifier = identifier.strip_prefix("children:").unwrap_or(&identifier);
+    if identifier.is_empty()
+        || identifier == localityd::file_provider::ROOT_CONTAINER_IDENTIFIER
+        || [
+            "local:",
+            "mount:",
+            "source:",
+            "path:",
+            "schema:",
+            "asset-cache:",
+            "guidance:",
+        ]
+        .iter()
+        .any(|prefix| identifier.starts_with(prefix))
+    {
+        return None;
+    }
+    Some(locality_core::model::RemoteId::new(identifier))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn provider_event_already_matches_durable_state(
+    identifier: &str,
+    observed_relative_path: &Path,
+    current_entity: Option<&locality_store::EntityRecord>,
+    event: ProviderNamespaceEvent,
+) -> bool {
+    let Some(remote_id) = provider_identity_remote_id(identifier) else {
+        return false;
+    };
+    let Some(entity) = current_entity else {
+        return event == ProviderNamespaceEvent::RemovedSource;
+    };
+    if entity.remote_id != remote_id {
+        return false;
+    }
+
+    let identifier = daemon_identifier_for_identity_check(identifier);
+    let current_path = if identifier.starts_with("children:")
+        && entity
+            .path
+            .file_name()
+            .is_some_and(|filename| filename == "page.md")
+    {
+        entity.path.parent().unwrap_or(&entity.path)
+    } else {
+        &entity.path
+    };
+    let event_matches_current_path = same_cloud_path(observed_relative_path, current_path);
+    match event {
+        ProviderNamespaceEvent::RenameTarget => event_matches_current_path,
+        ProviderNamespaceEvent::RemovedSource => !event_matches_current_path,
+    }
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -2785,6 +2891,24 @@ unsafe fn handle_rename(
     let target_path = pcwstr_to_path(rename.TargetPath)
         .ok_or_else(|| HelperError::new("invalid_callback", "rename missing target path"))?;
     let target_path = absolute_cloud_path(context, &target_path);
+    if context.provider_event_already_matches_durable_state(
+        &identifier,
+        &target_path,
+        ProviderNamespaceEvent::RenameTarget,
+    )? {
+        trace_cloud_files(format!(
+            "rename acknowledged path=`{}` identity=`{identifier}` reason=already_durable",
+            target_path.display()
+        ));
+        if let Some(source_path) = source_path.as_deref() {
+            context.move_path_identities(source_path, &target_path);
+        }
+        context.remember_path_identity(&target_path, &identifier);
+        if std::fs::metadata(&target_path).is_ok_and(|metadata| metadata.is_file()) {
+            context.remember_local_file(&target_path, &identifier);
+        }
+        return Ok(());
+    }
     let new_filename = target_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -2833,6 +2957,20 @@ unsafe fn handle_delete(
         && let Some(refreshed) = daemon_identity_for_path(context, path)?
     {
         identifier = refreshed;
+    }
+    if let Some(path) = path.as_deref()
+        && context.provider_event_already_matches_durable_state(
+            &identifier,
+            path,
+            ProviderNamespaceEvent::RemovedSource,
+        )?
+    {
+        trace_cloud_files(format!(
+            "delete acknowledged path=`{}` identity=`{identifier}` reason=already_durable",
+            path.display()
+        ));
+        context.forget_path_identities(path);
+        return Ok(());
     }
     if let Some(path) = path.as_deref()
         && cloud_path_still_exists_after_remove_settle(path)
@@ -4160,6 +4298,96 @@ mod tests {
         assert!(stale_pending_page_directory_delete(
             &child_local,
             &missing_directory
+        ));
+    }
+
+    #[test]
+    fn provider_reconciliation_classifier_suppresses_only_already_durable_remote_events() {
+        let entity = locality_store::EntityRecord::new(
+            locality_core::model::MountId::new("notion-main"),
+            locality_core::model::RemoteId::new("page-1"),
+            locality_core::model::EntityKind::Page,
+            "Old title",
+            "teams/old/ENG-42 Old title.md",
+        );
+        let other_entity = locality_store::EntityRecord::new(
+            locality_core::model::MountId::new("notion-main"),
+            locality_core::model::RemoteId::new("page-2"),
+            locality_core::model::EntityKind::Page,
+            "Other",
+            "teams/old/Other.md",
+        );
+
+        assert!(provider_event_already_matches_durable_state(
+            "page-1",
+            Path::new("teams/old/ENG-42 Old title.md"),
+            Some(&entity),
+            ProviderNamespaceEvent::RenameTarget,
+        ));
+        assert!(provider_event_already_matches_durable_state(
+            "page-1",
+            Path::new("teams/new/ENG-42 New title.md"),
+            Some(&entity),
+            ProviderNamespaceEvent::RemovedSource,
+        ));
+        assert!(provider_event_already_matches_durable_state(
+            "page-1",
+            Path::new("teams/new/ENG-42 New title.md"),
+            None,
+            ProviderNamespaceEvent::RemovedSource,
+        ));
+
+        assert!(!provider_event_already_matches_durable_state(
+            "page-1",
+            Path::new("teams/old/ENG-42 Old title.md"),
+            Some(&entity),
+            ProviderNamespaceEvent::RemovedSource,
+        ));
+        assert!(!provider_event_already_matches_durable_state(
+            "page-1",
+            Path::new("teams/old/ENG-42 Old title.md"),
+            None,
+            ProviderNamespaceEvent::RenameTarget,
+        ));
+        assert!(!provider_event_already_matches_durable_state(
+            "page-1",
+            Path::new("teams/old/ENG-42 Old title.md"),
+            Some(&other_entity),
+            ProviderNamespaceEvent::RenameTarget,
+        ));
+        assert!(!provider_event_already_matches_durable_state(
+            "local:123",
+            Path::new("teams/old/Draft.md"),
+            None,
+            ProviderNamespaceEvent::RemovedSource,
+        ));
+    }
+
+    #[test]
+    fn provider_reconciliation_classifier_accepts_wrapped_file_and_page_directory_identities() {
+        let mount_id = locality_core::model::MountId::new("notion-main");
+        let entity = locality_store::EntityRecord::new(
+            mount_id.clone(),
+            locality_core::model::RemoteId::new("page-1"),
+            locality_core::model::EntityKind::Page,
+            "Roadmap",
+            "teams/old/Roadmap/page.md",
+        );
+        let wrapped_file = localityd::virtual_projection::wrap_identifier(&mount_id, "page-1");
+        let wrapped_directory =
+            localityd::virtual_projection::wrap_identifier(&mount_id, "children:page-1");
+
+        assert!(provider_event_already_matches_durable_state(
+            &wrapped_file,
+            Path::new("teams/old/Roadmap/page.md"),
+            Some(&entity),
+            ProviderNamespaceEvent::RenameTarget,
+        ));
+        assert!(provider_event_already_matches_durable_state(
+            &wrapped_directory,
+            Path::new("teams/old/Roadmap"),
+            Some(&entity),
+            ProviderNamespaceEvent::RenameTarget,
         ));
     }
 

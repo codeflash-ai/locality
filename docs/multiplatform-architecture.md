@@ -303,6 +303,14 @@ sync-root filesystem watcher, converted to placeholders after the daemon records
 the virtual mutation, and then tracked through the same placeholder identity path
 as existing cloud items.
 
+Remote reconciliation changes durable entity state before updating an existing
+Cloud Files namespace entry. Undo follows that order and only relocates or removes
+a materialized replica that still matches its previous synced shadow. Rename and
+delete notifications then compare the placeholder identity and event path with
+durable state; an event for the same entity already moved or removed is
+acknowledged without recording a local virtual mutation, while ordinary user
+rename and delete events still use the normal mutation path.
+
 Current implementation direction: Windows uses the Rust `locality-cloud-files.exe`
 helper. The CLI exposes `loc file-provider start|stop|status|restart` as the
 shared lifecycle surface for the provider runtime; the desktop app should call

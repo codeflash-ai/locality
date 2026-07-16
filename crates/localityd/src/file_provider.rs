@@ -416,6 +416,145 @@ where
     refresh_entity_projection_if_clean(store, state_root, &mount, remote_id, previous_shadow)
 }
 
+/// Relocates an already-materialized Windows Cloud Files replica after durable
+/// entity state has moved, then refreshes its contents from the daemon cache.
+/// The old replica must still match the shadow that preceded the remote update.
+pub fn reconcile_windows_cloud_files_entity_projection_if_clean<S>(
+    store: &S,
+    state_root: &Path,
+    mount_id: &MountId,
+    remote_id: &RemoteId,
+    previous_path: &Path,
+    previous_shadow: &ShadowDocument,
+) -> LocalityResult<ProjectionRefreshReport>
+where
+    S: MountRepository + EntityRepository,
+{
+    let Some(mount) = store.get_mount(mount_id).map_err(LocalityError::from)? else {
+        return Ok(ProjectionRefreshReport::default());
+    };
+    if mount.projection != ProjectionMode::WindowsCloudFiles {
+        return Ok(ProjectionRefreshReport::default());
+    }
+    let Some(entity) = store
+        .get_entity(mount_id, remote_id)
+        .map_err(LocalityError::from)?
+    else {
+        return Ok(ProjectionRefreshReport::default());
+    };
+    if entity.kind != EntityKind::Page {
+        return Ok(ProjectionRefreshReport::default());
+    }
+    if entity.path == previous_path {
+        let content_root = virtual_fs::virtual_fs_content_root(state_root, mount_id);
+        let mut report = ProjectionRefreshReport::default();
+        let candidates = existing_projection_paths(&mount, &entity.path);
+        if candidates.is_empty() {
+            report.skipped_missing_projection += 1;
+            return Ok(report);
+        }
+        for candidate in candidates {
+            record_windows_projection_refresh_outcome(
+                &mut report,
+                refresh_windows_projection_candidate_if_clean(
+                    &entity,
+                    &content_root,
+                    &candidate,
+                    previous_shadow,
+                )?,
+            );
+        }
+        return Ok(report);
+    }
+
+    let content_root = virtual_fs::virtual_fs_content_root(state_root, mount_id);
+    let mut report = ProjectionRefreshReport::default();
+    for root in source_projection_roots(&mount) {
+        let previous_projection_path = root.join(previous_path);
+        let previous_contents = match std::fs::read(&previous_projection_path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                report.skipped_missing_projection += 1;
+                continue;
+            }
+            Err(error) => return Err(LocalityError::from(error)),
+        };
+        report.checked += 1;
+        if !projection_contents_are_replaceable(&previous_contents, Some(previous_shadow)) {
+            report.skipped_local_changes += 1;
+            continue;
+        }
+
+        let restored_projection_path = root.join(&entity.path);
+        let refresh_outcome = prepare_windows_projection_refresh(
+            &entity,
+            &content_root,
+            &restored_projection_path,
+            previous_shadow,
+        )?;
+        let Some(cache_contents) = refresh_outcome else {
+            report.skipped_missing_cache += 1;
+            continue;
+        };
+        let previous_namespace_path = projection_namespace_path(&previous_projection_path);
+        let restored_namespace_path = projection_namespace_path(&restored_projection_path);
+        if restored_namespace_path.exists() {
+            return Err(LocalityError::InvalidState(format!(
+                "Windows Cloud Files undo destination `{}` already exists",
+                restored_namespace_path.display()
+            )));
+        }
+        if let Some(parent) = restored_namespace_path.parent() {
+            std::fs::create_dir_all(parent).map_err(LocalityError::from)?;
+        }
+        std::fs::rename(&previous_namespace_path, &restored_namespace_path)
+            .map_err(LocalityError::from)?;
+        std::fs::write(&restored_projection_path, cache_contents).map_err(LocalityError::from)?;
+        report.refreshed += 1;
+    }
+    Ok(report)
+}
+
+/// Removes an already-materialized Windows Cloud Files replica after its
+/// created remote entity has been archived and removed from durable state.
+pub fn remove_windows_cloud_files_entity_projection_if_clean(
+    mount: &MountConfig,
+    previous_path: &Path,
+    previous_shadow: &ShadowDocument,
+) -> LocalityResult<ProjectionRefreshReport> {
+    if mount.projection != ProjectionMode::WindowsCloudFiles {
+        return Ok(ProjectionRefreshReport::default());
+    }
+
+    let mut report = ProjectionRefreshReport::default();
+    for root in source_projection_roots(mount) {
+        let projection_path = root.join(previous_path);
+        let contents = match std::fs::read(&projection_path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                report.skipped_missing_projection += 1;
+                continue;
+            }
+            Err(error) => return Err(LocalityError::from(error)),
+        };
+        report.checked += 1;
+        if !projection_contents_are_replaceable(&contents, Some(previous_shadow)) {
+            report.skipped_local_changes += 1;
+            continue;
+        }
+        std::fs::remove_file(&projection_path).map_err(LocalityError::from)?;
+        if projection_path
+            .file_name()
+            .is_some_and(|filename| filename == "page.md")
+            && let Some(container) = projection_path.parent()
+        {
+            let _ = std::fs::remove_dir(container);
+        }
+        report.refreshed += 1;
+    }
+    Ok(report)
+}
+
 /// Repairs already-materialized macOS File Provider replicas after a background
 /// remote fast-forward.
 ///
@@ -881,6 +1020,77 @@ fn source_projection_roots(mount: &MountConfig) -> Vec<PathBuf> {
                 .is_some_and(|name| name == mount_point_dir.as_str())
         })
         .collect()
+}
+
+fn projection_namespace_path(path: &Path) -> PathBuf {
+    if path
+        .file_name()
+        .is_some_and(|filename| filename == "page.md")
+    {
+        return path.parent().unwrap_or(path).to_path_buf();
+    }
+    path.to_path_buf()
+}
+
+fn prepare_windows_projection_refresh(
+    entity: &EntityRecord,
+    content_root: &Path,
+    projection_path: &Path,
+    previous_shadow: &ShadowDocument,
+) -> LocalityResult<Option<Vec<u8>>> {
+    let content_path = content_cache_path(content_root, &entity.path)?;
+    let Ok(cache_contents) = std::fs::read(content_path) else {
+        return Ok(None);
+    };
+    if projection_path.exists() {
+        let projection_contents = std::fs::read(projection_path).map_err(LocalityError::from)?;
+        if !projection_contents_are_replaceable(&projection_contents, Some(previous_shadow)) {
+            return Err(LocalityError::InvalidState(format!(
+                "Windows Cloud Files projection `{}` changed during refresh",
+                projection_path.display()
+            )));
+        }
+    }
+    Ok(Some(cache_contents))
+}
+
+fn refresh_windows_projection_candidate_if_clean(
+    entity: &EntityRecord,
+    content_root: &Path,
+    projection_path: &Path,
+    previous_shadow: &ShadowDocument,
+) -> LocalityResult<ProjectionRefreshOutcome> {
+    let Some(cache_contents) =
+        prepare_windows_projection_refresh(entity, content_root, projection_path, previous_shadow)?
+    else {
+        return Ok(ProjectionRefreshOutcome::MissingCache);
+    };
+    let projection_contents = match std::fs::read(projection_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProjectionRefreshOutcome::MissingProjection);
+        }
+        Err(error) => return Err(LocalityError::from(error)),
+    };
+    if projection_contents == cache_contents {
+        return Ok(ProjectionRefreshOutcome::Unchanged);
+    }
+    std::fs::write(projection_path, cache_contents).map_err(LocalityError::from)?;
+    Ok(ProjectionRefreshOutcome::Refreshed)
+}
+
+fn record_windows_projection_refresh_outcome(
+    report: &mut ProjectionRefreshReport,
+    outcome: ProjectionRefreshOutcome,
+) {
+    report.checked += 1;
+    match outcome {
+        ProjectionRefreshOutcome::MissingCache => report.skipped_missing_cache += 1,
+        ProjectionRefreshOutcome::MissingProjection => report.skipped_missing_projection += 1,
+        ProjectionRefreshOutcome::Unchanged => report.skipped_unchanged += 1,
+        ProjectionRefreshOutcome::SkippedLocalChanges => report.skipped_local_changes += 1,
+        ProjectionRefreshOutcome::Refreshed => report.refreshed += 1,
+    }
 }
 
 fn reconcile_projection_candidate<S>(

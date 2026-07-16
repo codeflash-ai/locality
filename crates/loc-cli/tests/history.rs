@@ -709,6 +709,51 @@ fn virtual_undo_move_relocates_cache_without_recording_local_mutation() {
 }
 
 #[test]
+fn windows_cloud_files_undo_move_relocates_clean_visible_projection_without_local_mutation() {
+    let fixture = HistoryFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let (visible_root, state_root, current_path) =
+        seed_virtual_move_undo(&fixture, &mut store, ProjectionMode::WindowsCloudFiles);
+    let restored_path = PathBuf::from("teams/old/ENG-42 Old title.md");
+    let expected = render_canonical_markdown(&CanonicalDocument::new(
+        "loc:\n  id: page-1\n  type: page\n  parent: team-old\n  synced_at: now\n  remote_edited_at: now\ntitle: Old title\n",
+        "# Roadmap\n\nOriginal body",
+    ));
+    let observation = RemoteObservation::new(
+        fixture.mount_id.clone(),
+        RemoteId::new("page-1"),
+        EntityKind::Page,
+        "Old title",
+        "ENG-42 Old title.md",
+    )
+    .with_parent(RemoteId::new("team-old"));
+    let mut applier = FakeUndoApplier::default().with_observations(vec![observation]);
+
+    let report = run_undo_with_applier_at_state_root(
+        &mut store,
+        "push-move",
+        &mut applier,
+        Some(&state_root),
+    )
+    .expect("undo Windows Cloud Files move");
+
+    assert!(report.ok);
+    assert!(!visible_root.join(&current_path).exists());
+    assert_eq!(
+        fs::read_to_string(visible_root.join(&restored_path))
+            .expect("read restored visible projection"),
+        expected
+    );
+    assert!(
+        store
+            .list_virtual_mutations(&fixture.mount_id)
+            .expect("list virtual mutations")
+            .is_empty(),
+        "provider reconciliation must not replay as a local move"
+    );
+}
+
+#[test]
 fn virtual_undo_move_preflights_backing_and_visible_destination_collisions() {
     for collision in ["backing", "visible"] {
         let fixture = HistoryFixture::new();
@@ -1055,7 +1100,7 @@ fn undo_with_applier_archives_clean_created_entity_and_removes_projection() {
 }
 
 #[test]
-fn virtual_undo_archive_removes_cache_without_replaying_local_delete() {
+fn windows_cloud_files_undo_archive_removes_clean_visible_projection_without_local_mutation() {
     let fixture = HistoryFixture::new();
     let mut store = fixture.store();
     let created_path = seed_created_entity_undo(&fixture, &mut store);
@@ -1085,10 +1130,7 @@ fn virtual_undo_archive_removes_cache_without_replaying_local_delete() {
 
     assert!(report.ok);
     assert!(!cache_path.exists());
-    assert!(
-        fixture.root.join(created_path).exists(),
-        "provider-visible replicas are removed by provider invalidation, not direct filesystem delete"
-    );
+    assert!(!fixture.root.join(created_path).exists());
     assert!(
         store
             .list_virtual_mutations(&fixture.mount_id)
