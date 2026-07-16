@@ -954,6 +954,19 @@ mod tests {
     }
 
     #[test]
+    fn file_provider_warm_up_helper_keeps_connection_alive_for_approval_poll() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let protocol_source = manifest_dir
+            .join("macos")
+            .join("LocalityFileProviderServiceProtocol.m");
+        let source = std::fs::read_to_string(&protocol_source).expect("read protocol source");
+
+        assert!(source.contains("LocalityFileProviderHoldWarmUpConnection"));
+        assert!(source.contains("dispatch_after"));
+        assert!(!source.contains("[connection invalidate];\n        callback"));
+    }
+
+    #[test]
     fn cocoa_file_exists_error_is_an_idempotent_add() {
         assert_eq!(
             add_completion_result(
