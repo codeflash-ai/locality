@@ -179,6 +179,7 @@ const DESKTOP_BACKGROUND_LAUNCH_ARG: &str = "--background";
 struct DesktopSnapshot {
     health: AppHealth,
     connection: ConnectionSummary,
+    connections: Vec<ConnectionSummary>,
     mount: MountSummary,
     mounts: Vec<MountSummary>,
     active_mount_id: Option<String>,
@@ -3877,6 +3878,7 @@ fn load_desktop_snapshot_from_store(
             attention_count: pending_changes.len(),
         },
         connection: connection_summary(connection.as_ref()),
+        connections: connection_summaries(&connections),
         mount: mount_summary_with_pending_change_count(
             Some(store),
             state_root,
@@ -3914,6 +3916,12 @@ fn degraded_snapshot(message: String) -> DesktopSnapshot {
             account_label: "Open Settings to repair".to_string(),
             status: "error".to_string(),
         },
+        connections: vec![ConnectionSummary {
+            connector: "notion".to_string(),
+            workspace_name: "Locality state unavailable".to_string(),
+            account_label: "Open Settings to repair".to_string(),
+            status: "error".to_string(),
+        }],
         mount: MountSummary {
             mount_id: String::new(),
             connector: "notion".to_string(),
@@ -4051,6 +4059,30 @@ fn connection_summary(connection: Option<&ConnectionRecord>) -> ConnectionSummar
             .unwrap_or_else(|| connection.display_name.clone()),
         account_label: connection.account_label.clone().unwrap_or_default(),
         status: connection.status.clone(),
+    }
+}
+
+fn connection_summaries(connections: &[ConnectionRecord]) -> Vec<ConnectionSummary> {
+    let mut summaries = connections
+        .iter()
+        .map(|connection| connection_summary(Some(connection)))
+        .collect::<Vec<_>>();
+    summaries.sort_by(|left, right| {
+        connection_connector_rank(&left.connector)
+            .cmp(&connection_connector_rank(&right.connector))
+            .then_with(|| left.connector.cmp(&right.connector))
+            .then_with(|| left.workspace_name.cmp(&right.workspace_name))
+    });
+    summaries
+}
+
+fn connection_connector_rank(connector: &str) -> usize {
+    match connector {
+        "notion" => 0,
+        "google-docs" => 1,
+        "gmail" => 2,
+        "granola" => 3,
+        _ => 10,
     }
 }
 
@@ -11673,6 +11705,14 @@ mod tests {
         assert_eq!(snapshot.mount.mount_id, "notion-main");
         assert_eq!(
             snapshot
+                .connections
+                .iter()
+                .map(|connection| connection.connector.as_str())
+                .collect::<Vec<_>>(),
+            vec!["notion", "google-docs"]
+        );
+        assert_eq!(
+            snapshot
                 .mounts
                 .iter()
                 .map(|mount| mount.mount_id.as_str())
@@ -11809,6 +11849,14 @@ mod tests {
         assert_eq!(snapshot.active_mount_id.as_deref(), Some("granola-main"));
         assert_eq!(snapshot.mount.connector, "granola");
         assert_eq!(snapshot.connection.connector, "granola");
+        assert_eq!(
+            snapshot
+                .connections
+                .iter()
+                .map(|connection| connection.connector.as_str())
+                .collect::<Vec<_>>(),
+            vec!["notion", "granola"]
+        );
         assert!(!snapshot.needs_onboarding);
     }
 
@@ -16118,6 +16166,12 @@ fn sample_snapshot() -> DesktopSnapshot {
             account_label: "saurabh@codeflash.ai".to_string(),
             status: "ready".to_string(),
         },
+        connections: vec![ConnectionSummary {
+            connector: "notion".to_string(),
+            workspace_name: "CodeFlash".to_string(),
+            account_label: "saurabh@codeflash.ai".to_string(),
+            status: "ready".to_string(),
+        }],
         mount: mount.clone(),
         mounts: vec![mount],
         active_mount_id: Some("notion-main".to_string()),
