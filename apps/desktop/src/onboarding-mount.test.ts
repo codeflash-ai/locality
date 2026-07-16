@@ -70,13 +70,12 @@ describe("mount onboarding helpers", () => {
     ).toBe(false);
   });
 
-  it("keeps native approval and System Settings guidance in the approval instructions", () => {
+  it("keeps native approval and Finder Enable guidance in the approval instructions", () => {
     expect(
       mountOnboardingInstructions?.(report({ launchStrategy: "instructions_only" })) ?? null,
     ).toBe(
-      "Click OK in the macOS \"Start Syncing\" prompt. If it no longer appears, open " +
-        "System Settings > Login Items & Extensions > File Providers, turn on Locality, " +
-        "then return here and click Allow in macOS.",
+      "Click OK in the macOS \"Start Syncing\" prompt. If macOS opens Finder instead, " +
+        "click Enable in the Locality folder, then return here and click Allow in macOS.",
     );
   });
 
