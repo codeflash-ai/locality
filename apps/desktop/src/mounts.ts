@@ -7,6 +7,12 @@ export type ProviderRuntimeSummary = {
   stalePidFile: boolean;
 };
 
+export type MountHydrationProgress = {
+  indexedFiles: number;
+  remainingFiles: number;
+  totalFiles: number;
+};
+
 export type MountSummary = {
   mountId: string;
   connector: string;
@@ -22,6 +28,7 @@ export type MountSummary = {
   status: string;
   rootExists: boolean;
   entityCount: number;
+  hydrationProgress?: MountHydrationProgress | null;
   pendingChangeCount: number;
   provider?: ProviderRuntimeSummary | null;
 };
@@ -152,6 +159,25 @@ export function mountEntityCountLabel(mount: MountSummary): string {
   return `${mount.entityCount} ${mount.entityCount === 1 ? "item" : "items"}`;
 }
 
+export function mountFileIndexProgressLabel(mount: MountSummary): string | null {
+  const value = mountFileIndexProgressValue(mount);
+  return value ? `Indexed: ${value}` : null;
+}
+
+export function mountFileIndexProgressValue(mount: MountSummary): string | null {
+  const progress = mount.hydrationProgress;
+  if (!progress || progress.totalFiles <= 0) {
+    return null;
+  }
+
+  const fileLabel = progress.totalFiles === 1 ? "file" : "files";
+  const base = `${progress.indexedFiles} of ${progress.totalFiles} ${fileLabel}`;
+  if (progress.remainingFiles <= 0) {
+    return base;
+  }
+  return `${base}, ${progress.remainingFiles} left`;
+}
+
 export function compactPath(path: string, maxLength = 64): string {
   const trimmed = path.trim();
   if (trimmed.length <= maxLength) {
@@ -235,6 +261,11 @@ function mountPathName(path: string): string {
 }
 
 function mountContentLabel(mount: MountSummary): string {
+  const fileProgress = mountFileIndexProgressLabel(mount);
+  if (mount.hydrationProgress && mount.hydrationProgress.remainingFiles > 0 && fileProgress) {
+    return fileProgress;
+  }
+
   const itemLabel = mountEntityCountLabel(mount);
   if (mount.pendingChangeCount === 0) {
     return itemLabel;

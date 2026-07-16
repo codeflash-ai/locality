@@ -42,6 +42,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   compactPath,
   mountEntityCountLabel,
+  mountFileIndexProgressLabel,
+  mountFileIndexProgressValue,
   mountAccessLabel,
   mountRows,
   mountStatusLabel,
@@ -382,6 +384,11 @@ const sampleMount: MountSummary = {
   status: "ready",
   rootExists: true,
   entityCount: 24,
+  hydrationProgress: {
+    indexedFiles: 16,
+    remainingFiles: 4,
+    totalFiles: 20,
+  },
   pendingChangeCount: 3,
   provider: null,
 };
@@ -414,14 +421,14 @@ const sampleSnapshot: DesktopSnapshot = {
     connector: "notion",
     workspaceName: "CodeFlash",
     accountLabel: "saurabh@codeflash.ai",
-    status: "ready",
+    status: "active",
   },
   connections: [
     {
       connector: "notion",
       workspaceName: "CodeFlash",
       accountLabel: "saurabh@codeflash.ai",
-      status: "ready",
+      status: "active",
     },
   ],
   mount: sampleMount,
@@ -4006,6 +4013,7 @@ function CurrentWorkspacePanel({
   const [pullState, setPullState] = useState<"idle" | "pulling" | "success" | "error">("idle");
   const accountLabel = snapshot.connection.accountLabel.trim();
   const showAccount = accountLabel.length > 0 && accountLabel !== snapshot.connection.workspaceName;
+  const fileProgressLabel = mountFileIndexProgressLabel(snapshot.mount);
 
   async function openFolder() {
     setActionError("");
@@ -4144,7 +4152,7 @@ function CurrentWorkspacePanel({
       <div className="workspace-facts">
         <span>Permission: {snapshot.mount.readOnly ? "Read only" : "Edit enabled"}</span>
         <span>Projection: {snapshot.mount.projection}</span>
-        <span>Indexed: {mountEntityCountLabel(snapshot.mount)}</span>
+        <span>{fileProgressLabel ?? `Indexed: ${mountEntityCountLabel(snapshot.mount)}`}</span>
         {showAccount && <span>Account: {accountLabel}</span>}
       </div>
 
@@ -4204,6 +4212,7 @@ function MountDetailView({
   } = useMountLiveModeController(snapshot, onRefresh);
   const liveModeAppliesToSource = isActiveMount && mount.connector === "notion";
   const sourceSyncMode = sourceSyncModeLabel(snapshot.liveMode, liveModeAppliesToSource);
+  const fileProgressValue = mountFileIndexProgressValue(mount);
 
   async function openFolder() {
     setActionError("");
@@ -4449,6 +4458,7 @@ function MountDetailView({
           <SettingRow title="Location" value={mount.localPath} />
           <SettingRow title="Projection" value={mount.projection} />
           <SettingRow title="Mounted content" value={`${mount.entityCount} items`} />
+          {fileProgressValue && <SettingRow title="Files indexed" value={fileProgressValue} />}
           <SettingRow title="Root exists" value={mount.rootExists ? "Yes" : "No"} />
         </div>
       </section>
