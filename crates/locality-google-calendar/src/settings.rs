@@ -50,6 +50,13 @@ impl GoogleCalendarMountSettings {
             },
         })
     }
+
+    pub fn effective_date_window(&self) -> GoogleCalendarDateWindow {
+        self.google_calendar
+            .date_window
+            .clone()
+            .unwrap_or_else(GoogleCalendarDateWindow::default_for_now)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,9 +67,7 @@ pub struct GoogleCalendarSettings {
 
 impl Default for GoogleCalendarSettings {
     fn default() -> Self {
-        Self {
-            date_window: Some(GoogleCalendarDateWindow::default()),
-        }
+        Self { date_window: None }
     }
 }
 
@@ -74,10 +79,7 @@ pub struct GoogleCalendarDateWindow {
 
 impl Default for GoogleCalendarDateWindow {
     fn default() -> Self {
-        let today = Utc::now().date_naive();
-        let epoch = unix_epoch();
-        let unix_day = today.signed_duration_since(epoch).num_days();
-        Self::default_for_unix_day(unix_day)
+        Self::default_for_now()
     }
 }
 
@@ -125,6 +127,13 @@ impl GoogleCalendarDateWindow {
             after: GoogleCalendarDate::from_naive(after),
             before: GoogleCalendarDate::from_naive(before),
         }
+    }
+
+    pub fn default_for_now() -> Self {
+        let today = Utc::now().date_naive();
+        let epoch = unix_epoch();
+        let unix_day = today.signed_duration_since(epoch).num_days();
+        Self::default_for_unix_day(unix_day)
     }
 
     pub fn after(&self) -> &GoogleCalendarDate {
@@ -242,7 +251,7 @@ fn error_message(error: LocalityError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{GoogleCalendarDateWindow, GoogleCalendarMountSettings};
+    use super::{GoogleCalendarDateWindow, GoogleCalendarMountSettings, GoogleCalendarSettings};
 
     #[test]
     fn explicit_date_window_serializes_to_mount_settings_json() {
@@ -281,6 +290,20 @@ mod tests {
         assert_eq!(window.before().as_str(), "2027-01-12");
         assert_eq!(window.time_min_rfc3339(), "2026-06-16T00:00:00Z");
         assert_eq!(window.time_max_rfc3339(), "2027-01-12T00:00:00Z");
+    }
+
+    #[test]
+    fn default_settings_store_no_date_window_and_effective_window_uses_current_default() {
+        let settings = GoogleCalendarMountSettings::default();
+
+        assert_eq!(GoogleCalendarSettings::default().date_window, None);
+        assert_eq!(settings.google_calendar.date_window, None);
+
+        let effective = settings.effective_date_window();
+        let expected = GoogleCalendarDateWindow::default_for_now();
+
+        assert_eq!(effective.after().as_str(), expected.after().as_str());
+        assert_eq!(effective.before().as_str(), expected.before().as_str());
     }
 
     #[test]

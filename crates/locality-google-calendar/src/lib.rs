@@ -11,4 +11,21 @@ pub use oauth::{
     GOOGLE_CALENDAR_CONNECTOR_ID, GOOGLE_CALENDAR_OAUTH_SCOPES,
     HttpGoogleCalendarOAuthBrokerClient, StoredGoogleCalendarCredential,
 };
-pub use settings::{GoogleCalendarDateWindow, GoogleCalendarMountSettings};
+pub use settings::{
+    GoogleCalendarDate, GoogleCalendarDateWindow, GoogleCalendarMountSettings,
+    GoogleCalendarSettings,
+};
+
+#[cfg(test)]
+mod tests {
+    use super::{GoogleCalendarDate, GoogleCalendarSettings};
+
+    #[test]
+    fn settings_reexports_include_date_and_settings_types() {
+        let date = GoogleCalendarDate::parse("2026-07-01").expect("valid date");
+        let settings = GoogleCalendarSettings::default();
+
+        assert_eq!(date.as_str(), "2026-07-01");
+        assert_eq!(settings.date_window, None);
+    }
+}
