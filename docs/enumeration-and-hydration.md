@@ -688,28 +688,36 @@ they call one of the trigger paths above.
   fast-forward hydration, but the observation call itself does not fetch bodies.
 - `observe_batch` is mount-wide metadata discovery. Its upserts remain stubs or
   metadata until a separate hydration trigger fetches their bodies.
-- An accepted batch is not published directly. The daemon reserves a durable
-  discovery transaction from the exact store snapshot used by planning,
-  performs projection work, and only then asks the store to atomically publish
-  the stored commit, checkpoint, and committed marker. Reservation drift leaves
-  the old checkpoint authoritative and requires rollback or review.
-- Plain-file projection work uses a versioned execution plan under a hashed,
-  same-volume `.locality-recovery/discovery` path beside the mount. Creates,
-  moves, swaps, and deletes use durable create-new files and no-replace renames.
-  Each filesystem rename returns before its matching effect is recorded, so a
-  restart can distinguish either side of that crash boundary from path
-  fingerprints instead of guessing.
+- An accepted batch is not published directly. The transactional discovery
+  APIs reserve from the exact store snapshot used by planning, perform
+  projection work, and only then atomically publish the stored commit,
+  checkpoint, and committed marker. Reservation drift leaves the old checkpoint
+  authoritative and requires rollback or review.
+- Plain-file projection work uses a versioned execution plan under a hashed
+  `.locality-recovery/discovery` path beside the mount. Preparation requires the
+  mount and recovery parent to be on the same volume, binds public projection
+  actions and normalized components to the structural commit changes, and
+  rejects missing destination ancestors unless directory operations provide
+  them. Each filesystem change returns before its matching effect is recorded,
+  so repair can distinguish the two crash orderings from path fingerprints.
+- Unix execution flushes created files and syncs affected parent directories
+  around no-replace renames and removals. Windows flushes created files and
+  requests write-through for same-volume no-replace renames, but cannot portably
+  fsync parent directories; namespace creation and removal are therefore not
+  claimed to survive every power loss on Windows.
 - Directory ownership fingerprints stream each file into a SHA-256 content
   digest and hash sorted path/kind/size/digest records. They do not retain an
   entire moved subtree in memory. Create materializations use the same record
   format as files read back from disk.
-- Normal execution drives a newly reserved transaction through projection,
-  atomic store commit, hydration-job publication, recovery cleanup, and
-  finalization. The active-transaction repair API aborts untouched `reserved`
-  work, resumes fingerprint-valid `applying`, `projected`, and `committed` work,
-  and returns `needs_review` for ambiguous `repair_pending` state. A newer
-  execution version fails with an update-required result before state or files
-  change.
+- `run_plain_files_discovery_transaction` drives a newly reserved transaction
+  through projection, atomic store commit, hydration-job publication, recovery
+  cleanup, and finalization. `repair_plain_files_discovery_transaction` aborts
+  untouched `reserved` work without re-fingerprinting source paths, resumes or
+  rolls back later work, and preserves ambiguous or mismatched temporary create
+  payloads for review. `repair_active_plain_files_discovery_transactions`
+  filters active records to this executor. These APIs do not imply a daemon
+  startup integration. A newer execution version fails with an update-required
+  result before state or files change.
 - This executor is intentionally limited to `plain_files`. File Provider,
   FUSE, and Cloud Files transactions keep their provider-owned projection
   paths; active repair filters those records without decoding or mutating

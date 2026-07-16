@@ -10,9 +10,9 @@ use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_core::path_projection::{is_page_document_path, page_container_path};
 use locality_core::{LocalityError, LocalityResult};
 use locality_store::{
-    DiscoveryRepository, DiscoveryTransactionId, DiscoveryTransactionRecord,
-    DiscoveryTransactionStatus, HydrationJobRecord, HydrationJobRepository,
-    PreparedDiscoveryTransaction, ProjectionMode, TransactionalDiscoveryCommit,
+    DiscoveryCommit, DiscoveryRepository, DiscoveryTransactionId, DiscoveryTransactionRecord,
+    DiscoveryTransactionStatus, EntityRecord, HydrationJobRecord, HydrationJobRepository,
+    PreparedDiscoveryTransaction, ProjectionMode, StoreError, TransactionalDiscoveryCommit,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,7 +23,7 @@ use crate::discovery::{
 };
 use crate::durable_fs::{
     create_dir_all_durable, remove_dir_all_durable, remove_path_durable, rename_noreplace_durable,
-    write_new_file_durable,
+    same_volume, write_new_file_durable,
 };
 
 pub const DISCOVERY_EXECUTION_STATE_VERSION: i64 = 1;
@@ -175,6 +175,26 @@ struct DiscoveryFingerprintRecord {
     content_sha256: Option<[u8; 32]>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StructuralProjectionIntent {
+    Create {
+        remote_id: RemoteId,
+        kind: EntityKind,
+        path: PathBuf,
+    },
+    Move {
+        remote_id: RemoteId,
+        kind: EntityKind,
+        from: PathBuf,
+        to: PathBuf,
+    },
+    Delete {
+        remote_id: RemoteId,
+        kind: EntityKind,
+        path: PathBuf,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DiscoveryCreateMaterialization {
@@ -316,10 +336,15 @@ pub fn prepare_plain_files_discovery_transaction<S>(
 where
     S: DiscoveryRepository,
 {
+    if build_discovery_projection_components(&plan.projection_actions) != plan.projection_components
+    {
+        return invalid("discovery projection components do not match projection actions");
+    }
     let commit = plan.commit().clone();
     let reservation = store
         .capture_discovery_reservation(&commit.mount_id)
-        .map_err(LocalityError::from)?;
+        .map_err(repository_error)?;
+    validate_projection_commit_coverage(&plan.projection_actions, &commit, &reservation.entities)?;
     if reservation.mount.projection != ProjectionMode::PlainFiles {
         return invalid(format!(
             "discovery projection execution supports only plain_files, found {}",
@@ -366,7 +391,7 @@ where
     );
     store
         .reserve_discovery_transaction(prepared)
-        .map_err(LocalityError::from)
+        .map_err(repository_error)
 }
 
 pub fn step_plain_files_discovery_transaction<S>(
@@ -379,9 +404,9 @@ where
 {
     let record = store
         .get_discovery_transaction(transaction_id)
-        .map_err(LocalityError::from)?
+        .map_err(repository_error)?
         .ok_or_else(|| {
-            LocalityError::InvalidState(format!(
+            LocalityError::Io(format!(
                 "discovery transaction `{}` was not found",
                 transaction_id.0
             ))
@@ -396,12 +421,14 @@ where
                 )
                 && !matches!(error, LocalityError::UpdateRequired { .. })
             {
-                let _ = store.mark_discovery_transaction_repair_pending(
-                    transaction_id,
-                    record.status,
-                    serde_json::json!({"reason": error.to_string()}),
-                    updated_at,
-                );
+                store
+                    .mark_discovery_transaction_repair_pending(
+                        transaction_id,
+                        record.status,
+                        serde_json::json!({"reason": error.to_string()}),
+                        updated_at,
+                    )
+                    .map_err(repository_error)?;
             }
             return Err(error);
         }
@@ -422,7 +449,7 @@ where
                 }
                 store
                     .mark_discovery_transaction_applying(transaction_id, updated_at)
-                    .map_err(LocalityError::from)?;
+                    .map_err(repository_error)?;
                 Ok(DiscoveryExecutionStep::Applying)
             }
             DiscoveryTransactionStatus::Applying => {
@@ -439,7 +466,7 @@ where
                     validate_installed_projection(&execution, &effects)?;
                     store
                         .commit_discovery_transaction(transaction_id, updated_at)
-                        .map_err(LocalityError::from)?;
+                        .map_err(repository_error)?;
                     Ok(DiscoveryExecutionStep::Committed)
                 }
             }
@@ -491,6 +518,7 @@ where
     S: DiscoveryRepository + HydrationJobRepository,
 {
     let record = get_discovery_transaction(store, transaction_id)?;
+    preflight_execution_record(&record)?;
     match record.status {
         DiscoveryTransactionStatus::Finalized => {
             return Ok(DiscoveryExecutionTerminal::Finalized);
@@ -500,7 +528,9 @@ where
         }
         _ => {}
     }
-    let (execution, _) = decode_and_validate_execution(&record)?;
+    let Some((execution, _)) = decode_for_public_execution(&record)? else {
+        return Ok(DiscoveryExecutionTerminal::NeedsReview);
+    };
     drive_plain_files_discovery_transaction(store, transaction_id, updated_at, &execution)
 }
 
@@ -513,11 +543,13 @@ where
     S: DiscoveryRepository + HydrationJobRepository,
 {
     let record = get_discovery_transaction(store, transaction_id)?;
+    preflight_execution_record(&record)?;
     match record.status {
         DiscoveryTransactionStatus::Finalized => Ok(DiscoveryExecutionTerminal::Finalized),
         DiscoveryTransactionStatus::Aborted => Ok(DiscoveryExecutionTerminal::Aborted),
         DiscoveryTransactionStatus::Reserved => {
-            let (_, effects) = decode_and_validate_execution(&record)?;
+            let effects = serde_json::from_value::<DiscoveryExecutionEffects>(record.effects)
+                .map_err(invalid_json)?;
             if effects != DiscoveryExecutionEffects::default() {
                 return invalid(format!(
                     "reserved discovery transaction `{}` has execution effects",
@@ -530,11 +562,13 @@ where
                     DiscoveryTransactionStatus::Reserved,
                     updated_at,
                 )
-                .map_err(LocalityError::from)?;
+                .map_err(repository_error)?;
             Ok(DiscoveryExecutionTerminal::Aborted)
         }
         DiscoveryTransactionStatus::RepairPending => {
-            let (execution, effects) = decode_and_validate_execution(&record)?;
+            let Some((execution, effects)) = decode_for_public_execution(&record)? else {
+                return Ok(DiscoveryExecutionTerminal::NeedsReview);
+            };
             if effects.rollback_reason.is_none() {
                 return Ok(DiscoveryExecutionTerminal::NeedsReview);
             }
@@ -543,7 +577,9 @@ where
         DiscoveryTransactionStatus::Applying
         | DiscoveryTransactionStatus::Projected
         | DiscoveryTransactionStatus::Committed => {
-            let (execution, _) = decode_and_validate_execution(&record)?;
+            let Some((execution, _)) = decode_for_public_execution(&record)? else {
+                return Ok(DiscoveryExecutionTerminal::NeedsReview);
+            };
             drive_plain_files_discovery_transaction(store, transaction_id, updated_at, &execution)
         }
     }
@@ -558,7 +594,7 @@ where
 {
     let transactions = store
         .list_active_discovery_transactions()
-        .map_err(LocalityError::from)?;
+        .map_err(repository_error)?;
     let mut results = Vec::new();
     for transaction in transactions
         .into_iter()
@@ -587,7 +623,14 @@ where
     S: DiscoveryRepository + HydrationJobRepository,
 {
     for _ in 0..discovery_execution_step_bound(execution) {
-        match step_plain_files_discovery_transaction(store, transaction_id, updated_at)? {
+        let step = match step_plain_files_discovery_transaction(store, transaction_id, updated_at) {
+            Ok(step) => step,
+            Err(LocalityError::InvalidState(_)) => {
+                return Ok(DiscoveryExecutionTerminal::NeedsReview);
+            }
+            Err(error) => return Err(error),
+        };
+        match step {
             DiscoveryExecutionStep::Finalized => {
                 return Ok(DiscoveryExecutionTerminal::Finalized);
             }
@@ -624,13 +667,23 @@ where
 {
     store
         .get_discovery_transaction(transaction_id)
-        .map_err(LocalityError::from)?
+        .map_err(repository_error)?
         .ok_or_else(|| {
-            LocalityError::InvalidState(format!(
+            LocalityError::Io(format!(
                 "discovery transaction `{}` was not found",
                 transaction_id.0
             ))
         })
+}
+
+fn decode_for_public_execution(
+    record: &DiscoveryTransactionRecord,
+) -> LocalityResult<Option<(DiscoveryExecutionPlan, DiscoveryExecutionEffects)>> {
+    match decode_and_validate_execution(record) {
+        Ok(decoded) => Ok(Some(decoded)),
+        Err(LocalityError::InvalidState(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn handle_precommit_failure<S>(
@@ -651,7 +704,7 @@ where
                 serde_json::json!({"reason": error.to_string()}),
                 updated_at,
             )
-            .map_err(LocalityError::from)?;
+            .map_err(repository_error)?;
         return Ok(DiscoveryExecutionStep::RepairPending);
     }
     effects.rollback_reason = Some(error.to_string());
@@ -808,7 +861,7 @@ where
             DiscoveryTransactionStatus::Applying,
             updated_at,
         )
-        .map_err(LocalityError::from)?;
+        .map_err(repository_error)?;
     Ok(DiscoveryExecutionStep::Projected)
 }
 
@@ -921,7 +974,7 @@ where
     }
     store
         .mark_discovery_transaction_aborted(&record.transaction_id, record.status, updated_at)
-        .map_err(LocalityError::from)?;
+        .map_err(repository_error)?;
     Ok(DiscoveryExecutionStep::Aborted)
 }
 
@@ -972,7 +1025,7 @@ where
             Ok(None)
         }
         (Some(fingerprint), None) if fingerprint == *operation.expected_fingerprint() => {
-            ensure_safe_parent(
+            ensure_recovery_parent(
                 execution.mount_root.parent().ok_or_else(|| {
                     LocalityError::InvalidState(format!(
                         "mount root `{}` has no recovery parent",
@@ -1053,7 +1106,7 @@ where
             }))
         }
         (None, Some(fingerprint)) if fingerprint == *operation.expected_fingerprint() => {
-            ensure_safe_parent(&execution.mount_root, &source)?;
+            require_existing_safe_parent(&execution.mount_root, &source)?;
             rename_noreplace_durable(&stage, &source).map_err(LocalityError::from)?;
             Ok(Some(DiscoveryExecutionStep::FilesystemMutation {
                 operation_id: operation.operation_id().to_string(),
@@ -1124,7 +1177,13 @@ where
         temporary_payload,
         "rollback temporary payload",
     )?;
-    if fingerprint_if_exists(&temporary)?.is_some() {
+    if let Some(fingerprint) = fingerprint_if_exists(&temporary)? {
+        if fingerprint != *operation.expected_fingerprint() {
+            return invalid(format!(
+                "rollback temporary payload `{}` is not fingerprint-owned",
+                temporary.display()
+            ));
+        }
         remove_path_durable(&temporary).map_err(LocalityError::from)?;
         return Ok(Some(DiscoveryExecutionStep::FilesystemMutation {
             operation_id: operation.operation_id().to_string(),
@@ -1338,7 +1397,7 @@ where
                     })
                 }
                 (Some(fingerprint), None) if fingerprint == *expected_fingerprint => {
-                    ensure_safe_parent(
+                    ensure_recovery_parent(
                         mount_root.parent().ok_or_else(|| {
                             LocalityError::InvalidState(format!(
                                 "mount root `{}` has no recovery parent",
@@ -1430,7 +1489,7 @@ where
                     })
                 }
                 (Some(fingerprint), None) if fingerprint == *expected_fingerprint => {
-                    ensure_safe_parent(mount_root, &destination)?;
+                    require_existing_safe_parent(mount_root, &destination)?;
                     if fingerprint_if_exists(&destination)?.is_some() {
                         return invalid(format!(
                             "discovery destination `{}` appeared before install",
@@ -1497,7 +1556,7 @@ where
                     })
                 }
                 (Some(fingerprint), None) if fingerprint == *expected_fingerprint => {
-                    ensure_safe_parent(mount_root, &destination)?;
+                    require_existing_safe_parent(mount_root, &destination)?;
                     if fingerprint_path(&stage)? != *expected_fingerprint
                         || fingerprint_if_exists(&destination)?.is_some()
                     {
@@ -1586,7 +1645,7 @@ where
         }
         store
             .upsert_hydration_job(HydrationJobRecord::from(request.clone()))
-            .map_err(LocalityError::from)?;
+            .map_err(repository_error)?;
         effects.hydration_jobs.push(DiscoveryHydrationEffect {
             remote_id: request.remote_id.clone(),
             upserted: true,
@@ -1638,7 +1697,7 @@ where
     }
     store
         .mark_discovery_transaction_finalized(&record.transaction_id, updated_at)
-        .map_err(LocalityError::from)?;
+        .map_err(repository_error)?;
     Ok(DiscoveryExecutionStep::Finalized)
 }
 
@@ -1760,20 +1819,13 @@ where
             serde_json::to_value(effects).map_err(invalid_json)?,
             updated_at,
         )
-        .map_err(LocalityError::from)
+        .map_err(repository_error)
 }
 
 fn decode_and_validate_execution(
     record: &DiscoveryTransactionRecord,
 ) -> LocalityResult<(DiscoveryExecutionPlan, DiscoveryExecutionEffects)> {
-    if record.projection != ProjectionMode::PlainFiles {
-        return invalid(format!(
-            "discovery transaction `{}` is not a plain-files projection",
-            record.transaction_id.0
-        ));
-    }
-    validate_raw_execution_version(&record.plan, "plan")?;
-    validate_raw_execution_version(&record.effects, "effects")?;
+    preflight_execution_record(record)?;
     let execution = serde_json::from_value::<DiscoveryExecutionPlan>(record.plan.clone())
         .map_err(invalid_json)?;
     let effects = serde_json::from_value::<DiscoveryExecutionEffects>(record.effects.clone())
@@ -1814,6 +1866,11 @@ fn decode_and_validate_execution(
         .iter()
         .flat_map(|component| component.component.actions.iter().cloned())
         .collect::<Vec<_>>();
+    validate_projection_commit_coverage(
+        &flattened,
+        &record.commit.commit,
+        &record.reservation.entities,
+    )?;
     let normalized = build_discovery_projection_components(&flattened);
     let stored_components = execution
         .components
@@ -1877,6 +1934,17 @@ fn decode_and_validate_execution(
     Ok((execution, effects))
 }
 
+fn preflight_execution_record(record: &DiscoveryTransactionRecord) -> LocalityResult<()> {
+    if record.projection != ProjectionMode::PlainFiles {
+        return invalid(format!(
+            "discovery transaction `{}` is not a plain-files projection",
+            record.transaction_id.0
+        ));
+    }
+    validate_raw_execution_version(&record.plan, "plan")?;
+    validate_raw_execution_version(&record.effects, "effects")
+}
+
 fn validate_raw_execution_version(value: &serde_json::Value, label: &str) -> LocalityResult<()> {
     let object = value.as_object().ok_or_else(|| {
         LocalityError::InvalidState(format!("discovery execution {label} must be a JSON object"))
@@ -1925,6 +1993,107 @@ fn validate_execution_version(
         ));
     }
     Ok(())
+}
+
+fn validate_projection_commit_coverage(
+    actions: &[DiscoveryProjectionAction],
+    commit: &DiscoveryCommit,
+    existing_entities: &[EntityRecord],
+) -> LocalityResult<()> {
+    let existing_by_id = existing_entities
+        .iter()
+        .map(|entity| (&entity.remote_id, entity))
+        .collect::<BTreeMap<_, _>>();
+    let mut expected = Vec::new();
+    for entity in &commit.entity_upserts {
+        match existing_by_id.get(&entity.remote_id) {
+            None => expected.push(StructuralProjectionIntent::Create {
+                remote_id: entity.remote_id.clone(),
+                kind: entity.kind.clone(),
+                path: entity.path.clone(),
+            }),
+            Some(existing) if existing.path != entity.path => {
+                expected.push(StructuralProjectionIntent::Move {
+                    remote_id: entity.remote_id.clone(),
+                    kind: entity.kind.clone(),
+                    from: existing.path.clone(),
+                    to: entity.path.clone(),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    for remote_id in &commit.entity_deletes {
+        if let Some(existing) = existing_by_id.get(remote_id) {
+            expected.push(StructuralProjectionIntent::Delete {
+                remote_id: remote_id.clone(),
+                kind: existing.kind.clone(),
+                path: existing.path.clone(),
+            });
+        }
+    }
+    let mut actual = actions
+        .iter()
+        .map(|action| match action {
+            DiscoveryProjectionAction::Create { entry } => StructuralProjectionIntent::Create {
+                remote_id: entry.remote_id.clone(),
+                kind: entry.kind.clone(),
+                path: entry.path.clone(),
+            },
+            DiscoveryProjectionAction::Move {
+                remote_id,
+                kind,
+                from,
+                to,
+            } => StructuralProjectionIntent::Move {
+                remote_id: remote_id.clone(),
+                kind: kind.clone(),
+                from: from.clone(),
+                to: to.clone(),
+            },
+            DiscoveryProjectionAction::Delete {
+                remote_id,
+                kind,
+                path,
+            } => StructuralProjectionIntent::Delete {
+                remote_id: remote_id.clone(),
+                kind: kind.clone(),
+                path: path.clone(),
+            },
+        })
+        .collect::<Vec<_>>();
+    expected.sort_by_key(structural_projection_intent_key);
+    actual.sort_by_key(structural_projection_intent_key);
+    if expected != actual {
+        return invalid("discovery projection actions do not cover structural commit changes");
+    }
+    Ok(())
+}
+
+fn structural_projection_intent_key(intent: &StructuralProjectionIntent) -> String {
+    match intent {
+        StructuralProjectionIntent::Create {
+            remote_id,
+            kind,
+            path,
+        } => format!("create\0{}\0{kind:?}\0{}", remote_id.0, path.display()),
+        StructuralProjectionIntent::Move {
+            remote_id,
+            kind,
+            from,
+            to,
+        } => format!(
+            "move\0{}\0{kind:?}\0{}\0{}",
+            remote_id.0,
+            from.display(),
+            to.display()
+        ),
+        StructuralProjectionIntent::Delete {
+            remote_id,
+            kind,
+            path,
+        } => format!("delete\0{}\0{kind:?}\0{}", remote_id.0, path.display()),
+    }
 }
 
 fn validate_operation(operation: &DiscoveryExecutionOperation) -> LocalityResult<()> {
@@ -2473,44 +2642,53 @@ fn publish_create_payload(
     materialization: &DiscoveryCreateMaterialization,
     expected_fingerprint: &DiscoveryPathFingerprint,
 ) -> LocalityResult<()> {
-    ensure_safe_parent(recovery_parent, temporary)?;
-    ensure_safe_parent(recovery_parent, payload)?;
-    if fingerprint_if_exists(temporary)?.is_some() {
-        return invalid(format!(
-            "temporary discovery payload `{}` already exists",
-            temporary.display()
-        ));
-    }
-    match (expected_fingerprint.kind, materialization) {
-        (DiscoveryPathKind::File, DiscoveryCreateMaterialization::Page { document, .. }) => {
-            write_new_file_durable(temporary, document.as_bytes()).map_err(LocalityError::from)?;
+    ensure_recovery_parent(recovery_parent, temporary)?;
+    ensure_recovery_parent(recovery_parent, payload)?;
+    match fingerprint_if_exists(temporary)? {
+        Some(fingerprint) if fingerprint == *expected_fingerprint => {}
+        Some(_) => {
+            return invalid(format!(
+                "temporary discovery payload `{}` is not fingerprint-owned",
+                temporary.display()
+            ));
         }
-        (DiscoveryPathKind::Directory, _) => {
-            create_dir_all_durable(temporary).map_err(LocalityError::from)?;
-            match materialization {
-                DiscoveryCreateMaterialization::Page { document, .. } => {
-                    write_new_file_durable(&temporary.join("page.md"), document.as_bytes())
+        None => {
+            match (expected_fingerprint.kind, materialization) {
+                (
+                    DiscoveryPathKind::File,
+                    DiscoveryCreateMaterialization::Page { document, .. },
+                ) => {
+                    write_new_file_durable(temporary, document.as_bytes())
                         .map_err(LocalityError::from)?;
                 }
-                DiscoveryCreateMaterialization::Database { schema_yaml, .. } => {
-                    if let Some(schema_yaml) = schema_yaml {
-                        write_new_file_durable(
-                            &temporary.join("_schema.yaml"),
-                            schema_yaml.as_bytes(),
-                        )
-                        .map_err(LocalityError::from)?;
+                (DiscoveryPathKind::Directory, _) => {
+                    create_dir_all_durable(temporary).map_err(LocalityError::from)?;
+                    match materialization {
+                        DiscoveryCreateMaterialization::Page { document, .. } => {
+                            write_new_file_durable(&temporary.join("page.md"), document.as_bytes())
+                                .map_err(LocalityError::from)?;
+                        }
+                        DiscoveryCreateMaterialization::Database { schema_yaml, .. } => {
+                            if let Some(schema_yaml) = schema_yaml {
+                                write_new_file_durable(
+                                    &temporary.join("_schema.yaml"),
+                                    schema_yaml.as_bytes(),
+                                )
+                                .map_err(LocalityError::from)?;
+                            }
+                        }
+                        DiscoveryCreateMaterialization::Directory { .. } => {}
                     }
                 }
-                DiscoveryCreateMaterialization::Directory { .. } => {}
+                _ => return invalid("discovery payload kind does not match its materialization"),
+            }
+            if fingerprint_path(temporary)? != *expected_fingerprint {
+                return invalid(format!(
+                    "temporary discovery payload `{}` has the wrong fingerprint",
+                    temporary.display()
+                ));
             }
         }
-        _ => return invalid("discovery payload kind does not match its materialization"),
-    }
-    if fingerprint_path(temporary)? != *expected_fingerprint {
-        return invalid(format!(
-            "temporary discovery payload `{}` has the wrong fingerprint",
-            temporary.display()
-        ));
     }
     if fingerprint_if_exists(payload)?.is_some() {
         return invalid(format!(
@@ -2750,7 +2928,7 @@ fn checked_join(base: &Path, relative: &Path, label: &str) -> LocalityResult<Pat
     Ok(joined)
 }
 
-fn ensure_safe_parent(base: &Path, path: &Path) -> LocalityResult<()> {
+fn ensure_recovery_parent(base: &Path, path: &Path) -> LocalityResult<()> {
     let parent = path.parent().ok_or_else(|| {
         LocalityError::InvalidState(format!("path `{}` has no parent", path.display()))
     })?;
@@ -2787,6 +2965,48 @@ fn ensure_safe_parent(base: &Path, path: &Path) -> LocalityResult<()> {
     create_dir_all_durable(parent).map_err(LocalityError::from)
 }
 
+fn require_existing_safe_parent(base: &Path, path: &Path) -> LocalityResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        LocalityError::InvalidState(format!("path `{}` has no parent", path.display()))
+    })?;
+    let relative = parent.strip_prefix(base).map_err(|_| {
+        LocalityError::InvalidState(format!(
+            "path `{}` is outside `{}`",
+            parent.display(),
+            base.display()
+        ))
+    })?;
+    reject_symlink(base)?;
+    let mut cursor = base.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return invalid(format!(
+                "path `{}` is not normalized below `{}`",
+                parent.display(),
+                base.display()
+            ));
+        };
+        cursor.push(component);
+        match fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return invalid(format!("path `{}` is a symlink", cursor.display()));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return invalid(format!("path `{}` is not a directory", cursor.display()));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return invalid(format!(
+                    "required destination parent `{}` does not exist",
+                    cursor.display()
+                ));
+            }
+            Err(error) => return Err(LocalityError::from(error)),
+        }
+    }
+    Ok(())
+}
+
 fn reject_symlink(path: &Path) -> LocalityResult<()> {
     let metadata = fs::symlink_metadata(path).map_err(LocalityError::from)?;
     if metadata.file_type().is_symlink() {
@@ -2810,9 +3030,18 @@ fn validate_mount_root(path: &Path) -> LocalityResult<()> {
         ));
     }
     reject_symlink(path)?;
-    reject_symlink(path.parent().ok_or_else(|| {
+    let parent = path.parent().ok_or_else(|| {
         LocalityError::InvalidState(format!("mount root `{}` has no parent", path.display()))
-    })?)
+    })?;
+    reject_symlink(parent)?;
+    if !same_volume(path, parent).map_err(LocalityError::from)? {
+        return invalid(format!(
+            "discovery mount root `{}` and recovery parent `{}` are on different volumes",
+            path.display(),
+            parent.display()
+        ));
+    }
+    Ok(())
 }
 
 fn validate_relative_path_ancestry(base: &Path, relative: &Path) -> LocalityResult<()> {
@@ -3221,6 +3450,7 @@ fn validate_prepared_destinations(
         };
         validate_relative_path(destination)?;
         validate_relative_path_ancestry(mount_root, destination)?;
+        validate_destination_ancestor_coverage(mount_root, destination, operations)?;
         if destinations
             .insert(destination.to_path_buf(), operation.operation_id())
             .is_some()
@@ -3238,6 +3468,53 @@ fn validate_prepared_destinations(
                 "discovery destination `{}` already exists outside a staged source",
                 destination_path.display()
             ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_destination_ancestor_coverage(
+    mount_root: &Path,
+    destination: &Path,
+    operations: &[DiscoveryExecutionOperation],
+) -> LocalityResult<()> {
+    let parent = destination.parent().ok_or_else(|| {
+        LocalityError::InvalidState(format!(
+            "discovery destination `{}` has no parent",
+            destination.display()
+        ))
+    })?;
+    let mut relative = PathBuf::new();
+    for component in parent.components() {
+        let Component::Normal(component) = component else {
+            return invalid(format!(
+                "discovery destination `{}` is not normalized",
+                destination.display()
+            ));
+        };
+        relative.push(component);
+        let path = mount_root.join(&relative);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return invalid(format!("path `{}` is a symlink", path.display()));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return invalid(format!("path `{}` is not a directory", path.display()));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let provided = operations.iter().any(|candidate| {
+                    candidate.destination() == Some(relative.as_path())
+                        && candidate.expected_fingerprint().kind == DiscoveryPathKind::Directory
+                });
+                if !provided {
+                    return invalid(format!(
+                        "discovery destination ancestor `{}` is absent and no directory operation provides it",
+                        path.display()
+                    ));
+                }
+            }
+            Err(error) => return Err(LocalityError::from(error)),
         }
     }
     Ok(())
@@ -3303,6 +3580,15 @@ fn validate_relative_path(path: &Path) -> LocalityResult<()> {
 
 fn invalid<T>(message: impl Into<String>) -> LocalityResult<T> {
     Err(LocalityError::InvalidState(message.into()))
+}
+
+fn repository_error(error: StoreError) -> LocalityError {
+    match error {
+        StoreError::InvalidState(message) => {
+            LocalityError::Io(format!("discovery repository invalid state: {message}"))
+        }
+        error => LocalityError::from(error),
+    }
 }
 
 fn invalid_json(error: serde_json::Error) -> LocalityError {

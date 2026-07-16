@@ -75,21 +75,37 @@ The daemon advances transactions through `reserved`, `applying`, `projected`,
 Transitions use compare-and-swap status checks. Only `aborted` and `finalized`
 are inactive, and committed transactions cannot move backward.
 
-For plain-file mounts, the daemon stores a second versioned execution envelope
-inside the transaction plan and effects fields. It records deterministic
-projection components, exact create materializations, streamed path
-fingerprints, recovery paths, and operation effects. Filesystem staging and
-installation use same-volume no-replace renames with file and directory
-durability barriers. The effect following a rename is deliberately a separate
-store update, making either crash ordering recoverable after SQLite reopens.
+For plain-file mounts, the executor stores a second versioned envelope inside
+the transaction plan and effects fields. It records normalized projection
+components, exact create materializations, streamed path fingerprints, recovery
+paths, and operation effects. Preparation verifies that the public projection
+actions, normalized components, and structural commit changes describe the same
+work. Every absent destination ancestor must be supplied by an explicit
+directory operation; execution never creates an unjournaled mount ancestor.
+The mount root and its recovery parent must also resolve to the same volume
+before reservation.
 
-The daemon repair entry point processes only active `plain_files` transactions.
-An untouched reservation is aborted without projection, applying/projected work
-resumes or rolls back from its fingerprints, committed work finishes hydration
-publication and quarantine cleanup, and ambiguous repair state remains
-review-required. Provider-mode records are left untouched. Execution version
-fields are checked from raw JSON before typed decoding so future layouts fail
-update-required without mutating durable state.
+On Unix, new-file writes flush the file before syncing its parent directory,
+and no-replace renames and removals sync the affected parent directories. On
+Windows, new files are flushed and same-volume no-replace renames request
+`MOVEFILE_WRITE_THROUGH`, but there is no portable parent-directory fsync and
+power-loss persistence of namespace creation or removal is not guaranteed. In
+both cases the effect following a filesystem change is a separate store update,
+so repair reconciles the two crash orderings from stored fingerprints. A
+temporary create payload is reused only when its exact fingerprint matches;
+partial or replaced payloads are preserved for review.
+
+`run_plain_files_discovery_transaction` drives one prepared transaction.
+`repair_plain_files_discovery_transaction` aborts an untouched `reserved`
+transaction without re-fingerprinting its source paths, resumes or rolls back
+later work from recorded effects and fingerprints, and completes committed
+hydration publication and recovery cleanup.
+`repair_active_plain_files_discovery_transactions` applies that repair API only
+to active `plain_files` records and leaves provider-mode records untouched.
+These are executor APIs, not a claim about a daemon startup call site. Ambiguous
+filesystem state returns `needs_review`; repository and I/O failures propagate.
+Raw projection and version fields are checked before typed decoding so future
+layouts fail update-required without mutating durable state.
 
 `commit_discovery_transaction` loads the stored commit rather than accepting a
 caller replacement. One SQLite transaction revalidates the reservation and
