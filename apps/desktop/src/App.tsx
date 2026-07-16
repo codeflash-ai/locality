@@ -7247,7 +7247,7 @@ function WindowChrome({
       onMouseDown={handleChromeMouseDown}
     >
       <div className="native-traffic-space" aria-hidden="true" />
-      <div data-tauri-drag-region>{title}</div>
+      <div className="window-title" data-tauri-drag-region>{title}</div>
       <div
         className="window-chrome-actions"
         data-tauri-drag-region={(!onMetaClick && !showWindowControls) || undefined}
