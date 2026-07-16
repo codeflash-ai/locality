@@ -145,12 +145,7 @@ pub fn parse_google_calendar_draft_document(
     };
 
     let mut issues = Vec::new();
-    let summary = raw
-        .summary
-        .or(raw.title)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    let summary = first_non_blank([raw.summary.as_deref(), raw.title.as_deref()]);
     if summary.is_empty() {
         issues.push(ValidationIssue::new(
             "google_calendar_draft_missing_summary",
@@ -237,6 +232,16 @@ pub fn parse_google_calendar_draft_document(
     })
 }
 
+fn first_non_blank<const N: usize>(values: [Option<&str>; N]) -> String {
+    values
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EventDateTimeShape {
     Date,
@@ -248,6 +253,35 @@ fn validate_event_datetime_shape(
     value: &EventDateTime,
     issues: &mut Vec<ValidationIssue>,
 ) -> Option<EventDateTimeShape> {
+    let date_is_blank = value
+        .date
+        .as_ref()
+        .is_some_and(|date| date.trim().is_empty());
+    let date_time_is_blank = value
+        .date_time
+        .as_ref()
+        .is_some_and(|date_time| date_time.trim().is_empty());
+    if date_is_blank {
+        issues.push(ValidationIssue::new(
+            format!("google_calendar_draft_blank_{field}_date"),
+            PathBuf::new(),
+            Some(1),
+            format!("Google Calendar draft `{field}.date` must not be blank"),
+            Some(format!("remove `{field}.date` or set a non-empty date")),
+        ));
+    }
+    if date_time_is_blank {
+        issues.push(ValidationIssue::new(
+            format!("google_calendar_draft_blank_{field}_date_time"),
+            PathBuf::new(),
+            Some(1),
+            format!("Google Calendar draft `{field}.dateTime` must not be blank"),
+            Some(format!(
+                "remove `{field}.dateTime` or set a non-empty dateTime"
+            )),
+        ));
+    }
+
     let has_date = value
         .date
         .as_ref()
@@ -256,6 +290,9 @@ fn validate_event_datetime_shape(
         .date_time
         .as_ref()
         .is_some_and(|date_time| !date_time.trim().is_empty());
+    if date_is_blank || date_time_is_blank {
+        return None;
+    }
 
     match (has_date, has_date_time) {
         (true, false) => Some(EventDateTimeShape::Date),
@@ -428,7 +465,7 @@ fn quote_yaml_frontmatter_strings(yaml: &str) -> String {
     let mut index = 0;
     while index < lines.len() {
         let line = lines[index];
-        if let Some((key, value)) = line.split_once(':') {
+        if let Some((key, value)) = split_yaml_mapping_separator(line) {
             let scalar = value.trim();
             let key_name = key.trim().trim_start_matches("- ").trim();
             if matches!(scalar, "|" | "|-" | "|+") {
@@ -454,6 +491,20 @@ fn quote_yaml_frontmatter_strings(yaml: &str) -> String {
         index += 1;
     }
     output
+}
+
+fn split_yaml_mapping_separator(line: &str) -> Option<(&str, &str)> {
+    for (index, ch) in line.char_indices() {
+        if ch != ':' {
+            continue;
+        }
+        let value_start = index + ch.len_utf8();
+        let rest = &line[value_start..];
+        if rest.chars().next().is_none_or(|next| next.is_whitespace()) {
+            return Some((&line[..index], rest));
+        }
+    }
+    None
 }
 
 fn collect_yaml_block_scalar(lines: &[&str], start: usize) -> (String, usize) {
@@ -633,6 +684,30 @@ mod tests {
     }
 
     #[test]
+    fn render_event_preserves_colon_recurrence_values_as_yaml_strings() {
+        let event = CalendarEvent {
+            id: Some("event-recurrence".to_string()),
+            summary: Some("Weekly sync".to_string()),
+            recurrence: vec!["RRULE:FREQ=WEEKLY;COUNT=2".to_string()],
+            ..CalendarEvent::default()
+        };
+
+        let rendered = render_google_calendar_event(
+            "primary",
+            &RemoteId::new("google-calendar-event:primary:event-recurrence"),
+            &event,
+        )
+        .expect("render");
+        let frontmatter: serde_json::Value =
+            yaml_serde::from_str(&rendered.document.frontmatter).expect("frontmatter yaml");
+
+        assert_eq!(
+            frontmatter.pointer("/google_calendar/event/recurrence/0"),
+            Some(&json!("RRULE:FREQ=WEEKLY;COUNT=2"))
+        );
+    }
+
+    #[test]
     fn parse_draft_accepts_native_timed_event_shape_and_google_meet_flag() {
         let document = locality_core::model::CanonicalDocument::new(
             r#"summary: Design review
@@ -666,6 +741,24 @@ google_calendar:
         );
         assert_eq!(draft.attendees[0].email.as_deref(), Some("ann@example.com"));
         assert!(draft.create_google_meet);
+    }
+
+    #[test]
+    fn parse_draft_uses_title_when_summary_is_blank() {
+        let document = locality_core::model::CanonicalDocument::new(
+            r#"summary: " "
+title: Design review
+start:
+  dateTime: "2026-07-20T10:00:00Z"
+end:
+  dateTime: "2026-07-20T10:30:00Z"
+"#,
+            "",
+        );
+
+        let draft = parse_google_calendar_draft_document(&document).expect("parse draft");
+
+        assert_eq!(draft.summary, "Design review");
     }
 
     #[test]
@@ -707,6 +800,29 @@ end:
         assert!(has_message(
             &messages,
             "Google Calendar draft `start` must include exactly one of `date` or `dateTime`"
+        ));
+    }
+
+    #[test]
+    fn parse_draft_rejects_blank_present_date_time_field() {
+        let document = locality_core::model::CanonicalDocument::new(
+            r#"summary: Ambiguous
+start:
+  date: ""
+  dateTime: "2026-07-20T10:00:00Z"
+end:
+  dateTime: "2026-07-20T10:30:00Z"
+"#,
+            "",
+        );
+
+        let messages = validation_messages(
+            parse_google_calendar_draft_document(&document).expect_err("invalid draft"),
+        );
+
+        assert!(has_message(
+            &messages,
+            "Google Calendar draft `start.date` must not be blank"
         ));
     }
 
