@@ -2256,7 +2256,7 @@ button.home-stat:hover {
 
 .mount-card-path {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) repeat(2, 32px);
+  grid-template-columns: minmax(0, 1fr) repeat(3, 32px);
   align-items: center;
   gap: 6px;
   min-height: 38px;

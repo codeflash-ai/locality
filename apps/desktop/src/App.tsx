@@ -3002,8 +3002,10 @@ function MountsView({
   onSelectMount: (mountId: string) => void;
 }) {
   const [actionError, setActionError] = useState("");
+  const [actionMessage, setActionMessage] = useState("");
   const [creating, setCreating] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [backupMountId, setBackupMountId] = useState<string | null>(null);
   const [sourceDialogOpen, setSourceDialogOpen] = useState(false);
   const [sourceDialogState, setSourceDialogState] = useState<SourceSetupState>("idle");
   const [sourceDialogConnector, setSourceDialogConnector] = useState<SourceConnectorId | null>(null);
@@ -3012,6 +3014,7 @@ function MountsView({
 
   function openAddSourceDialog() {
     setActionError("");
+    setActionMessage("");
     if (!sourceSetupBusy) {
       setSourceDialogMessage("");
       setSourceDialogState("idle");
@@ -3028,6 +3031,7 @@ function MountsView({
       return { ok: false, message: "Source setup is already running." };
     }
     setActionError("");
+    setActionMessage("");
     setCreating(true);
     try {
       const report = await callCommand<ActionReport>(
@@ -3070,6 +3074,7 @@ function MountsView({
 
   async function connectNotionSource(): Promise<ActionReport> {
     setActionError("");
+    setActionMessage("");
     const report = await callCommand<ActionReport>(
       "connect_notion",
       undefined,
@@ -3085,6 +3090,7 @@ function MountsView({
 
   async function changeNotionSourceAccess(): Promise<ActionReport> {
     setActionError("");
+    setActionMessage("");
     const report = await callCommand<ActionReport>(
       "change_notion_access",
       undefined,
@@ -3108,6 +3114,7 @@ function MountsView({
 
     const command = connector === "google-docs" ? "connect_google_docs" : "connect_gmail";
     setActionError("");
+    setActionMessage("");
     const report = await callCommand<ActionReport>(
       command,
       undefined,
@@ -3174,6 +3181,7 @@ function MountsView({
       return;
     }
     setSourceDialogMessage("");
+    setActionMessage("");
     setSourceDialogConnector("granola");
     setSourceDialogState("connecting");
     try {
@@ -3203,6 +3211,7 @@ function MountsView({
       return;
     }
     setActionError("");
+    setActionMessage("");
     setRefreshing(true);
     try {
       await onRefresh();
@@ -3215,6 +3224,7 @@ function MountsView({
 
   async function openMountFolder(path: string) {
     setActionError("");
+    setActionMessage("");
     const report = await callCommand<ActionReport>(
       "open_path",
       { path },
@@ -3222,6 +3232,32 @@ function MountsView({
     );
     if (!report.ok) {
       setActionError(report.message);
+    }
+  }
+
+  async function exportSourceBackup(mountId: string) {
+    if (backupMountId) {
+      return;
+    }
+    setActionError("");
+    setActionMessage("");
+    setBackupMountId(mountId);
+    try {
+      const report = await callCommand<ActionReport>(
+        "export_source_backup",
+        { mountId },
+        { ok: true, message: `Exported demo backup for ${mountId}.` },
+      );
+      if (!report.ok) {
+        setActionError(report.message);
+        return;
+      }
+      setActionMessage(report.message);
+      await onRefresh().catch(() => undefined);
+    } catch (error) {
+      setActionError(errorMessage(error));
+    } finally {
+      setBackupMountId(null);
     }
   }
 
@@ -3305,6 +3341,16 @@ function MountsView({
                   >
                     <FolderOpen />
                   </button>
+                  <button
+                    className="icon-button has-tooltip"
+                    data-tooltip="Export backup"
+                    aria-label={`Export backup for ${row.title}`}
+                    type="button"
+                    disabled={backupMountId !== null}
+                    onClick={() => void exportSourceBackup(row.id)}
+                  >
+                    {backupMountId === row.id ? <Loader2 className="spin-icon" /> : <Download />}
+                  </button>
                 </div>
                 <div className="mount-card-meta">
                   {row.active && <span className="primary">Primary</span>}
@@ -3326,6 +3372,7 @@ function MountsView({
         </>
       )}
       {actionError && <p className="field-error">{actionError}</p>}
+      {actionMessage && <p className="quiet-note inline-note">{actionMessage}</p>}
       {sourceDialogOpen && (
         <AddSourceDialog
           snapshot={snapshot}
@@ -3958,6 +4005,8 @@ function MountDetailView({
   const [accessState, setAccessState] = useState<"idle" | "changing" | "success" | "error">("idle");
   const [pullMessage, setPullMessage] = useState("");
   const [pullState, setPullState] = useState<"idle" | "pulling" | "success" | "error">("idle");
+  const [backupMessage, setBackupMessage] = useState("");
+  const [backupState, setBackupState] = useState<"idle" | "exporting" | "success" | "error">("idle");
   const [sourceAction, setSourceAction] = useState<SourceDestructiveAction | null>(null);
   const [sourceConfirmation, setSourceConfirmation] = useState("");
   const [sourceActionBusy, setSourceActionBusy] = useState(false);
@@ -3978,6 +4027,7 @@ function MountDetailView({
 
   async function openFolder() {
     setActionError("");
+    setBackupMessage("");
     const report = await callCommand<ActionReport>(
       "open_path",
       { path: mount.localPath },
@@ -3990,6 +4040,7 @@ function MountDetailView({
 
   async function openVsCode() {
     setActionError("");
+    setBackupMessage("");
     const report = await callCommand<ActionReport>(
       "open_in_vs_code",
       { path: mount.localPath },
@@ -4006,6 +4057,7 @@ function MountDetailView({
     }
 
     setAccessMessage("");
+    setBackupMessage("");
     setAccessState("changing");
     const report = await callCommand<ActionReport>(
       "change_notion_access",
@@ -4029,6 +4081,7 @@ function MountDetailView({
 
     setActionError("");
     setPullMessage("");
+    setBackupMessage("");
     setPullState("pulling");
 
     try {
@@ -4043,6 +4096,31 @@ function MountDetailView({
     } catch (error) {
       setPullMessage(errorMessage(error));
       setPullState("error");
+    }
+  }
+
+  async function exportBackup() {
+    if (backupState === "exporting") {
+      return;
+    }
+
+    setActionError("");
+    setBackupMessage("");
+    setBackupState("exporting");
+    try {
+      const report = await callCommand<ActionReport>(
+        "export_source_backup",
+        { mountId: mount.mountId },
+        { ok: true, message: `Exported demo backup for ${mount.mountId}.` },
+      );
+      setBackupMessage(report.message);
+      setBackupState(report.ok ? "success" : "error");
+      if (report.ok) {
+        await onRefresh().catch(() => undefined);
+      }
+    } catch (error) {
+      setBackupMessage(errorMessage(error));
+      setBackupState("error");
     }
   }
 
@@ -4127,6 +4205,15 @@ function MountDetailView({
           <SecondaryButton compact icon={<Code2 />} onClick={() => void openVsCode()}>
             Open in VS Code
           </SecondaryButton>
+          <SecondaryButton
+            compact
+            busy={backupState === "exporting"}
+            disabled={!mount.localPath.trim()}
+            icon={<Download />}
+            onClick={() => void exportBackup()}
+          >
+            {backupState === "exporting" ? "Exporting" : "Export Backup"}
+          </SecondaryButton>
           {showNotionAccessAction && (
             <SecondaryButton
               compact
@@ -4157,6 +4244,11 @@ function MountDetailView({
       )}
       {pullMessage && (
         <p className={pullState === "error" ? "field-error" : "quiet-note inline-note"}>{pullMessage}</p>
+      )}
+      {backupMessage && (
+        <p className={backupState === "error" ? "field-error" : "quiet-note inline-note"}>
+          {backupMessage}
+        </p>
       )}
 
       <section className="detail-grid">
