@@ -669,6 +669,37 @@ fn journal_repository_finds_previous_journal_by_created_entity_apply_effect() {
 }
 
 #[test]
+fn journal_repository_finds_failed_journal_by_apply_effect_parent() {
+    let mut store = InMemoryStateStore::new();
+    store
+        .append_journal(
+            JournalEntry::new(
+                PushId("push-failed-create".to_string()),
+                mount_id(),
+                vec![],
+                PushPlan::default(),
+                JournalStatus::Failed("remote create failed".to_string()),
+            )
+            .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
+                operation_id: PushOperationId(
+                    "push-failed-create:0:create_entity:parent-page".to_string(),
+                ),
+                operation_index: 0,
+                parent_id: RemoteId::new("parent-page"),
+                entity_id: RemoteId::new("created-page"),
+            }]),
+        )
+        .expect("append failed journal");
+
+    assert_eq!(
+        store
+            .latest_failed_journal_for_entity(&mount_id(), &RemoteId::new("parent-page"))
+            .expect("failed journal"),
+        Some("remote create failed".to_string())
+    );
+}
+
+#[test]
 fn journal_repository_matches_preimage_and_entity_operation_only_ids() {
     let mut store = InMemoryStateStore::new();
     let mount_id = MountId::new("notion-main");

@@ -8,23 +8,29 @@ use locality_connector::{
 };
 use locality_core::freshness::{FreshnessTier, RemoteVersion};
 use locality_core::hydration::{HydrationReason, HydrationRequest};
+use locality_core::journal::{JournalEntry, PushId};
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
+use locality_core::path_projection::{page_container_path, projection_namespace_root};
 use locality_core::{LocalityError, LocalityResult};
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveRepository, ConnectorStateRecord, DiscoveryCommit,
-    EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository, MountConfig,
-    RemoteObservationRecord, RemoteObservationRepository, VirtualMutationRecord,
-    VirtualMutationRepository, discovery_auto_save_candidate,
+    EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
+    JournalRepository, MountConfig, RemoteObservationRecord, RemoteObservationRepository,
+    VirtualMutationRecord, VirtualMutationRepository, discovery_auto_save_candidate,
 };
 use serde::{Deserialize, Serialize};
 
+use crate::freshness::parse_freshness_timestamp;
+
 const DISCOVERY_REPLAY_TAG: &str = "localityd.discovery_replay";
 const DISCOVERY_REPLAY_VERSION: i64 = 1;
+const RECENT_LOCAL_EDIT_WINDOW_MS: u64 = 30_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoveryPlan {
     commit: DiscoveryCommit,
     pub projection_actions: Vec<DiscoveryProjectionAction>,
+    pub projection_components: Vec<DiscoveryProjectionComponent>,
     pub held: Vec<HeldDiscoveryItem>,
     pub post_commit: Vec<DiscoveryPostCommitAction>,
 }
@@ -58,6 +64,236 @@ pub enum DiscoveryProjectionAction {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscoveryProjectionComponent {
+    pub namespace_roots: Vec<PathBuf>,
+    pub actions: Vec<DiscoveryProjectionAction>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DiscoverySafetySnapshot {
+    pub active_child_refresh_namespace_roots: BTreeSet<PathBuf>,
+}
+
+pub fn build_discovery_projection_components(
+    actions: &[DiscoveryProjectionAction],
+) -> Vec<DiscoveryProjectionComponent> {
+    group_discovery_projection_actions(actions)
+        .into_iter()
+        .map(|component| DiscoveryProjectionComponent {
+            namespace_roots: component.namespace_roots,
+            actions: component
+                .actions
+                .iter()
+                .filter(|action| !projection_action_is_redundant(action, &component.actions))
+                .cloned()
+                .collect(),
+        })
+        .collect()
+}
+
+fn group_discovery_projection_actions(
+    actions: &[DiscoveryProjectionAction],
+) -> Vec<DiscoveryProjectionComponent> {
+    let mut actions = actions.to_vec();
+    actions.sort_by(compare_projection_actions);
+    let action_roots = actions
+        .iter()
+        .map(projection_action_namespace_roots)
+        .collect::<Vec<_>>();
+    let mut parents = (0..actions.len()).collect::<Vec<_>>();
+
+    for left in 0..actions.len() {
+        for right in (left + 1)..actions.len() {
+            if action_roots[left].iter().any(|left_root| {
+                action_roots[right]
+                    .iter()
+                    .any(|right_root| paths_overlap(left_root, right_root))
+            }) {
+                union_components(&mut parents, left, right);
+            }
+        }
+    }
+
+    let mut grouped = BTreeMap::<usize, Vec<usize>>::new();
+    for index in 0..actions.len() {
+        let root = find_component(&mut parents, index);
+        grouped.entry(root).or_default().push(index);
+    }
+
+    let mut components = grouped
+        .into_values()
+        .map(|indices| {
+            let namespace_roots = minimal_namespace_roots(
+                indices
+                    .iter()
+                    .flat_map(|index| action_roots[*index].iter().cloned())
+                    .collect(),
+            );
+            let actions = indices
+                .into_iter()
+                .map(|index| actions[index].clone())
+                .collect::<Vec<_>>();
+            DiscoveryProjectionComponent {
+                namespace_roots,
+                actions,
+            }
+        })
+        .collect::<Vec<_>>();
+    components.sort_by(|left, right| {
+        left.namespace_roots
+            .cmp(&right.namespace_roots)
+            .then_with(|| compare_action_slices(&left.actions, &right.actions))
+    });
+    components
+}
+
+fn projection_action_namespace_roots(action: &DiscoveryProjectionAction) -> Vec<PathBuf> {
+    let mut roots = match action {
+        DiscoveryProjectionAction::Create { entry } => {
+            vec![projection_namespace_root(&entry.kind, &entry.path)]
+        }
+        DiscoveryProjectionAction::Move { kind, from, to, .. } => vec![
+            projection_namespace_root(kind, from),
+            projection_namespace_root(kind, to),
+        ],
+        DiscoveryProjectionAction::Delete { kind, path, .. } => {
+            vec![projection_namespace_root(kind, path)]
+        }
+    };
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn projection_action_remote_id(action: &DiscoveryProjectionAction) -> &RemoteId {
+    match action {
+        DiscoveryProjectionAction::Create { entry } => &entry.remote_id,
+        DiscoveryProjectionAction::Move { remote_id, .. }
+        | DiscoveryProjectionAction::Delete { remote_id, .. } => remote_id,
+    }
+}
+
+fn compare_projection_actions(
+    left: &DiscoveryProjectionAction,
+    right: &DiscoveryProjectionAction,
+) -> std::cmp::Ordering {
+    projection_action_remote_id(left)
+        .0
+        .cmp(&projection_action_remote_id(right).0)
+        .then_with(|| projection_action_rank(left).cmp(&projection_action_rank(right)))
+        .then_with(|| {
+            projection_action_namespace_roots(left).cmp(&projection_action_namespace_roots(right))
+        })
+}
+
+fn projection_action_rank(action: &DiscoveryProjectionAction) -> u8 {
+    match action {
+        DiscoveryProjectionAction::Create { .. } => 0,
+        DiscoveryProjectionAction::Move { .. } => 1,
+        DiscoveryProjectionAction::Delete { .. } => 2,
+    }
+}
+
+fn compare_action_slices(
+    left: &[DiscoveryProjectionAction],
+    right: &[DiscoveryProjectionAction],
+) -> std::cmp::Ordering {
+    for (left, right) in left.iter().zip(right) {
+        let ordering = compare_projection_actions(left, right);
+        if !ordering.is_eq() {
+            return ordering;
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
+fn find_component(parents: &mut [usize], index: usize) -> usize {
+    if parents[index] != index {
+        parents[index] = find_component(parents, parents[index]);
+    }
+    parents[index]
+}
+
+fn union_components(parents: &mut [usize], left: usize, right: usize) {
+    let left_root = find_component(parents, left);
+    let right_root = find_component(parents, right);
+    if left_root != right_root {
+        parents[right_root] = left_root.min(right_root);
+        parents[left_root] = left_root.min(right_root);
+    }
+}
+
+fn minimal_namespace_roots(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    roots.sort();
+    roots.dedup();
+    roots
+        .iter()
+        .filter(|root| {
+            !roots
+                .iter()
+                .any(|candidate| candidate != *root && root.starts_with(candidate))
+        })
+        .cloned()
+        .collect()
+}
+
+fn projection_action_is_redundant(
+    action: &DiscoveryProjectionAction,
+    component: &[DiscoveryProjectionAction],
+) -> bool {
+    match action {
+        DiscoveryProjectionAction::Delete { kind, path, .. } => {
+            let root = projection_namespace_root(kind, path);
+            component.iter().any(|candidate| {
+                let DiscoveryProjectionAction::Delete {
+                    kind: candidate_kind,
+                    path: candidate_path,
+                    ..
+                } = candidate
+                else {
+                    return false;
+                };
+                let candidate_root = projection_namespace_root(candidate_kind, candidate_path);
+                candidate_root != root && root.starts_with(candidate_root)
+            })
+        }
+        DiscoveryProjectionAction::Move { kind, from, to, .. } => {
+            let source = projection_namespace_root(kind, from);
+            let destination = projection_namespace_root(kind, to);
+            component.iter().any(|candidate| {
+                let DiscoveryProjectionAction::Move {
+                    kind: candidate_kind,
+                    from: candidate_from,
+                    to: candidate_to,
+                    ..
+                } = candidate
+                else {
+                    return false;
+                };
+                let candidate_source = projection_namespace_root(candidate_kind, candidate_from);
+                let candidate_destination = projection_namespace_root(candidate_kind, candidate_to);
+                if paths_overlap(&candidate_source, &candidate_destination)
+                    || candidate_source == source
+                {
+                    return false;
+                }
+                let namespace_maps_exactly =
+                    source.strip_prefix(&candidate_source).is_ok_and(|suffix| {
+                        !suffix.as_os_str().is_empty()
+                            && candidate_destination.join(suffix) == destination
+                    });
+                let projected_path_maps_exactly =
+                    from.strip_prefix(&candidate_source).is_ok_and(|suffix| {
+                        !suffix.as_os_str().is_empty() && candidate_destination.join(suffix) == *to
+                    });
+                namespace_maps_exactly && projected_path_maps_exactly
+            })
+        }
+        DiscoveryProjectionAction::Create { .. } => false,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiscoveryPostCommitAction {
     QueueHydration(HydrationRequest),
     InvalidateProvider {
@@ -86,6 +322,9 @@ pub enum DiscoveryHoldReason {
     Dirty,
     Conflicted,
     PendingVirtualMutation { local_id: String },
+    UnsettledJournal { push_id: PushId },
+    RecentLocalEdit { remote_id: RemoteId },
+    ActiveChildRefresh { namespace_root: PathBuf },
     UnsupportedKindChange { from: EntityKind, to: EntityKind },
     UntrackedSource(PathBuf),
     UntrackedDestination(PathBuf),
@@ -109,18 +348,25 @@ pub fn plan_batch_discovery<S>(
     observed_at: &str,
     metadata_job_id: Option<&str>,
     assessments: &BTreeMap<RemoteId, ProjectionAssessment>,
+    safety_snapshot: &DiscoverySafetySnapshot,
 ) -> LocalityResult<DiscoveryPlan>
 where
     S: EntityRepository
         + RemoteObservationRepository
         + FreshnessStateRepository
         + AutoSaveRepository
-        + VirtualMutationRepository,
+        + VirtualMutationRepository
+        + JournalRepository,
 {
     if metadata_job_id.is_some_and(str::is_empty) {
         return invalid("discovery metadata job identifier cannot be empty");
     }
     validate_batch(mount, &batch)?;
+    let observed_at_ms = parse_freshness_timestamp(observed_at).ok_or_else(|| {
+        LocalityError::InvalidState(
+            "discovery observed_at must be a parseable freshness timestamp".to_string(),
+        )
+    })?;
     let existing = store
         .list_entities(&mount.mount_id)
         .map_err(LocalityError::from)?
@@ -146,6 +392,8 @@ where
         .list_virtual_mutations(&mount.mount_id)
         .map_err(LocalityError::from)?;
     virtual_mutations.sort_by(|left, right| left.local_id.cmp(&right.local_id));
+    let mut journals = store.list_journal().map_err(LocalityError::from)?;
+    journals.sort_by(|left, right| left.push_id.0.cmp(&right.push_id.0));
     let mut intents = BTreeMap::new();
     let mut incoming_ids = BTreeSet::new();
     for change in batch.changes {
@@ -208,6 +456,19 @@ where
         }
     }
     validate_merged_intent_paths(&intents)?;
+    let prospective_actions = prospective_projection_actions(&intents, &existing);
+    let component_holds = projection_component_holds(
+        &prospective_actions,
+        &intents,
+        &existing,
+        &existing_freshness,
+        &virtual_mutations,
+        &journals,
+        assessments,
+        safety_snapshot,
+        &mount.mount_id,
+        observed_at_ms,
+    );
 
     let mut entity_upserts = Vec::new();
     let mut entity_deletes = Vec::new();
@@ -254,26 +515,26 @@ where
                     }
                     None => vec![entry.path.as_path()],
                 };
-                let hold_reason = remote_changed
-                    .then(|| {
-                        pending_virtual_mutation_hold_reason(
-                            &virtual_mutations,
-                            &remote_id,
-                            &changed_paths,
-                        )
-                    })
-                    .flatten()
-                    .or_else(|| {
-                        remote_changed
-                            .then(|| entity_hold_reason(current))
-                            .flatten()
-                    })
-                    .or_else(|| kind_change_hold_reason(current, &entry))
-                    .or_else(|| {
-                        structural
-                            .then(|| assessment_hold_reason(assessments.get(&remote_id)))
-                            .flatten()
-                    });
+                let hold_reason = if structural {
+                    component_holds.get(&remote_id).cloned()
+                } else {
+                    remote_changed
+                        .then(|| {
+                            pending_virtual_mutation_hold_reason(
+                                &virtual_mutations,
+                                &remote_id,
+                                current.map_or(&entry.kind, |entity| &entity.kind),
+                                &changed_paths,
+                            )
+                        })
+                        .flatten()
+                        .or_else(|| {
+                            remote_changed
+                                .then(|| entity_hold_reason(current))
+                                .flatten()
+                        })
+                        .or_else(|| kind_change_hold_reason(current, &entry))
+                };
                 observation_upserts.push(observation_for_entry(&entry, observed_at)?);
                 let accepted_remote_metadata = hold_reason.is_none()
                     && current.is_none_or(|current| {
@@ -375,13 +636,7 @@ where
                     Some(&current.path),
                 )
                 .map_err(LocalityError::from)?;
-                let hold_reason = pending_virtual_mutation_hold_reason(
-                    &virtual_mutations,
-                    &remote_id,
-                    &[current.path.as_path()],
-                )
-                .or_else(|| entity_hold_reason(Some(current)))
-                .or_else(|| assessment_hold_reason(assessments.get(&remote_id)));
+                let hold_reason = component_holds.get(&remote_id).cloned();
                 if let Some(reason) = hold_reason {
                     observation_upserts.push(observation_for_tombstone(current, observed_at)?);
                     freshness_upserts.push(next_freshness(
@@ -416,6 +671,11 @@ where
             }
         }
     }
+    let projection_components = build_discovery_projection_components(&projection_actions);
+    let projection_actions = projection_components
+        .iter()
+        .flat_map(|component| component.actions.iter().cloned())
+        .collect();
 
     let checkpoint = ConnectorStateRecord {
         connector: mount.connector.clone(),
@@ -456,6 +716,7 @@ where
     Ok(DiscoveryPlan {
         commit,
         projection_actions,
+        projection_components,
         held,
         post_commit,
     })
@@ -465,6 +726,236 @@ where
 enum DiscoveryIntent {
     Upsert(TreeEntry),
     Tombstone,
+}
+
+fn prospective_projection_actions(
+    intents: &BTreeMap<RemoteId, DiscoveryIntent>,
+    existing: &BTreeMap<RemoteId, EntityRecord>,
+) -> Vec<DiscoveryProjectionAction> {
+    intents
+        .iter()
+        .filter_map(|(remote_id, intent)| match intent {
+            DiscoveryIntent::Upsert(entry) => match existing.get(remote_id) {
+                None => Some(DiscoveryProjectionAction::Create {
+                    entry: entry.clone(),
+                }),
+                Some(current) if current.path != entry.path => {
+                    Some(DiscoveryProjectionAction::Move {
+                        remote_id: remote_id.clone(),
+                        kind: current.kind.clone(),
+                        from: current.path.clone(),
+                        to: entry.path.clone(),
+                    })
+                }
+                Some(_) => None,
+            },
+            DiscoveryIntent::Tombstone => {
+                existing
+                    .get(remote_id)
+                    .map(|current| DiscoveryProjectionAction::Delete {
+                        remote_id: remote_id.clone(),
+                        kind: current.kind.clone(),
+                        path: current.path.clone(),
+                    })
+            }
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn projection_component_holds(
+    actions: &[DiscoveryProjectionAction],
+    intents: &BTreeMap<RemoteId, DiscoveryIntent>,
+    existing: &BTreeMap<RemoteId, EntityRecord>,
+    freshness: &BTreeMap<RemoteId, FreshnessStateRecord>,
+    mutations: &[VirtualMutationRecord],
+    journals: &[JournalEntry],
+    assessments: &BTreeMap<RemoteId, ProjectionAssessment>,
+    safety_snapshot: &DiscoverySafetySnapshot,
+    mount_id: &MountId,
+    observed_at_ms: u64,
+) -> BTreeMap<RemoteId, DiscoveryHoldReason> {
+    let mut holds = BTreeMap::new();
+    for component in group_discovery_projection_actions(actions) {
+        let action_ids = component
+            .actions
+            .iter()
+            .map(projection_action_remote_id)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut expanded_ids = action_ids.clone();
+        for entity in existing.values() {
+            let entity_root = projection_namespace_root(&entity.kind, &entity.path);
+            if component
+                .namespace_roots
+                .iter()
+                .any(|root| paths_overlap(root, &entity_root))
+            {
+                expanded_ids.insert(entity.remote_id.clone());
+            }
+        }
+        let expanded_ids = expanded_ids.into_iter().collect::<Vec<_>>();
+        let reason = projection_component_hold_reason(
+            &component,
+            &action_ids,
+            &expanded_ids,
+            intents,
+            existing,
+            freshness,
+            mutations,
+            journals,
+            assessments,
+            safety_snapshot,
+            mount_id,
+            observed_at_ms,
+        );
+        if let Some(reason) = reason {
+            for remote_id in action_ids {
+                holds.insert(remote_id, reason.clone());
+            }
+        }
+    }
+    holds
+}
+
+#[allow(clippy::too_many_arguments)]
+fn projection_component_hold_reason(
+    component: &DiscoveryProjectionComponent,
+    action_ids: &BTreeSet<RemoteId>,
+    expanded_ids: &[RemoteId],
+    intents: &BTreeMap<RemoteId, DiscoveryIntent>,
+    existing: &BTreeMap<RemoteId, EntityRecord>,
+    freshness: &BTreeMap<RemoteId, FreshnessStateRecord>,
+    mutations: &[VirtualMutationRecord],
+    journals: &[JournalEntry],
+    assessments: &BTreeMap<RemoteId, ProjectionAssessment>,
+    safety_snapshot: &DiscoverySafetySnapshot,
+    mount_id: &MountId,
+    observed_at_ms: u64,
+) -> Option<DiscoveryHoldReason> {
+    if let Some(mutation) = mutations.iter().find(|mutation| {
+        mutation_intersects_projection_component(mutation, expanded_ids, &component.namespace_roots)
+    }) {
+        return Some(DiscoveryHoldReason::PendingVirtualMutation {
+            local_id: mutation.local_id.clone(),
+        });
+    }
+
+    if let Some(journal) = journals.iter().find(|journal| {
+        journal.mount_id == *mount_id
+            && journal.status.is_unsettled()
+            && journal.touches_any_entity(expanded_ids)
+    }) {
+        return Some(DiscoveryHoldReason::UnsettledJournal {
+            push_id: journal.push_id.clone(),
+        });
+    }
+
+    if let Some(remote_id) = expanded_ids.iter().find(|remote_id| {
+        freshness
+            .get(*remote_id)
+            .and_then(|state| state.last_local_change_at.as_deref())
+            .is_some_and(|timestamp| local_edit_is_recent_or_uncertain(timestamp, observed_at_ms))
+    }) {
+        return Some(DiscoveryHoldReason::RecentLocalEdit {
+            remote_id: remote_id.clone(),
+        });
+    }
+
+    if let Some(namespace_root) = safety_snapshot
+        .active_child_refresh_namespace_roots
+        .iter()
+        .find(|active_root| {
+            component
+                .namespace_roots
+                .iter()
+                .any(|root| paths_overlap(root, active_root))
+        })
+    {
+        return Some(DiscoveryHoldReason::ActiveChildRefresh {
+            namespace_root: namespace_root.clone(),
+        });
+    }
+
+    if expanded_ids.iter().any(|remote_id| {
+        existing
+            .get(remote_id)
+            .is_some_and(|entity| entity.hydration == HydrationState::Dirty)
+    }) {
+        return Some(DiscoveryHoldReason::Dirty);
+    }
+    if expanded_ids.iter().any(|remote_id| {
+        existing
+            .get(remote_id)
+            .is_some_and(|entity| entity.hydration == HydrationState::Conflicted)
+    }) {
+        return Some(DiscoveryHoldReason::Conflicted);
+    }
+
+    for remote_id in action_ids {
+        let Some(DiscoveryIntent::Upsert(entry)) = intents.get(remote_id) else {
+            continue;
+        };
+        if let Some(reason) = kind_change_hold_reason(existing.get(remote_id), entry) {
+            return Some(reason);
+        }
+    }
+
+    for remote_id in action_ids {
+        if let Some(ProjectionAssessment::Blocked(reason)) = assessments.get(remote_id) {
+            return Some(reason.clone());
+        }
+    }
+    if action_ids
+        .iter()
+        .any(|remote_id| !assessments.contains_key(remote_id))
+    {
+        return Some(DiscoveryHoldReason::UnknownProjection);
+    }
+    None
+}
+
+fn mutation_intersects_projection_component(
+    mutation: &VirtualMutationRecord,
+    expanded_ids: &[RemoteId],
+    namespace_roots: &[PathBuf],
+) -> bool {
+    mutation
+        .target_remote_id
+        .as_ref()
+        .is_some_and(|remote_id| expanded_ids.contains(remote_id))
+        || mutation
+            .parent_remote_id
+            .as_ref()
+            .is_some_and(|remote_id| expanded_ids.contains(remote_id))
+        || mutation
+            .original_path
+            .as_ref()
+            .is_some_and(|path| mutation_path_overlaps_component(path, namespace_roots))
+        || mutation_path_overlaps_component(&mutation.projected_path, namespace_roots)
+}
+
+fn mutation_path_overlaps_component(path: &Path, namespace_roots: &[PathBuf]) -> bool {
+    let mutation_root = page_container_path(path);
+    namespace_roots
+        .iter()
+        .any(|root| paths_overlap(root, path) || paths_overlap(root, &mutation_root))
+}
+
+fn mutation_path_overlaps_projection(
+    kind: &EntityKind,
+    projection_path: &Path,
+    mutation_path: &Path,
+) -> bool {
+    let namespace_root = projection_namespace_root(kind, projection_path);
+    mutation_path_overlaps_component(mutation_path, std::slice::from_ref(&namespace_root))
+}
+
+fn local_edit_is_recent_or_uncertain(timestamp: &str, observed_at_ms: u64) -> bool {
+    parse_freshness_timestamp(timestamp).is_none_or(|last_local_change_ms| {
+        last_local_change_ms > observed_at_ms
+            || observed_at_ms - last_local_change_ms < RECENT_LOCAL_EDIT_WINDOW_MS
+    })
 }
 
 fn validate_merged_intent_paths(
@@ -576,6 +1067,7 @@ fn entity_hold_reason(current: Option<&EntityRecord>) -> Option<DiscoveryHoldRea
 fn pending_virtual_mutation_hold_reason(
     mutations: &[VirtualMutationRecord],
     remote_id: &RemoteId,
+    kind: &EntityKind,
     paths: &[&Path],
 ) -> Option<DiscoveryHoldReason> {
     mutations
@@ -587,37 +1079,21 @@ fn pending_virtual_mutation_hold_reason(
                     .original_path
                     .as_ref()
                     .is_some_and(|mutation_path| {
-                        paths
-                            .iter()
-                            .any(|path| projected_paths_overlap(path, mutation_path))
+                        paths.iter().any(|path| {
+                            mutation_path_overlaps_projection(kind, path, mutation_path)
+                        })
                     })
-                || paths
-                    .iter()
-                    .any(|path| projected_paths_overlap(path, &mutation.projected_path))
+                || paths.iter().any(|path| {
+                    mutation_path_overlaps_projection(kind, path, &mutation.projected_path)
+                })
         })
         .map(|mutation| DiscoveryHoldReason::PendingVirtualMutation {
             local_id: mutation.local_id.clone(),
         })
 }
 
-fn projected_paths_overlap(left: &Path, right: &Path) -> bool {
-    paths_overlap(left, right)
-        || page_container(left).is_some_and(|container| paths_overlap(container, right))
-        || page_container(right).is_some_and(|container| paths_overlap(left, container))
-        || page_container(left).is_some_and(|left_container| {
-            page_container(right)
-                .is_some_and(|right_container| paths_overlap(left_container, right_container))
-        })
-}
-
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
-}
-
-fn page_container(path: &Path) -> Option<&Path> {
-    path.file_name()
-        .is_some_and(|file_name| file_name == "page.md")
-        .then(|| path.parent().unwrap_or_else(|| Path::new("")))
 }
 
 fn kind_change_hold_reason(
@@ -629,16 +1105,6 @@ fn kind_change_hold_reason(
         from: current.kind.clone(),
         to: entry.kind.clone(),
     })
-}
-
-fn assessment_hold_reason(
-    assessment: Option<&ProjectionAssessment>,
-) -> Option<DiscoveryHoldReason> {
-    match assessment {
-        Some(ProjectionAssessment::Safe) => None,
-        Some(ProjectionAssessment::Blocked(reason)) => Some(reason.clone()),
-        None => Some(DiscoveryHoldReason::UnknownProjection),
-    }
 }
 
 fn entity_remote_changed(current: &EntityRecord, entry: &TreeEntry) -> bool {

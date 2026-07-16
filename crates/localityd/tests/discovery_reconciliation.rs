@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,24 +7,790 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::os::unix::ffi::OsStringExt;
 
 use locality_connector::{BatchObservationChange, BatchObserveResult, ConnectorCheckpoint};
-use locality_core::LocalityError;
 use locality_core::freshness::{FreshnessTier, RemoteVersion};
 use locality_core::hydration::{HydrationReason, HydrationRequest};
+use locality_core::journal::{JournalEntry, JournalStatus, PushId};
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
+use locality_core::planner::PushPlan;
+use locality_core::{LocalityError, LocalityResult};
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState,
     ConnectorStateRecord, ConnectorStateRepository, DiscoveryRepository, EntityRecord,
     EntityRepository, FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore,
-    MetadataDiscoveryJobRecord, MetadataDiscoveryJobRepository, MetadataDiscoveryPriority,
-    MountConfig, MountRepository, RemoteObservationRepository, SqliteStateStore,
-    VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
+    JournalRepository, MetadataDiscoveryJobRecord, MetadataDiscoveryJobRepository,
+    MetadataDiscoveryPriority, MountConfig, MountRepository, RemoteObservationRepository,
+    SqliteStateStore, VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
 };
 use localityd::discovery::{
-    DiscoveryChangeKind, DiscoveryHoldReason, DiscoveryPostCommitAction, DiscoveryProjectionAction,
-    HeldDiscoveryItem, ProjectionAssessment, plan_batch_discovery,
+    DiscoveryChangeKind, DiscoveryHoldReason, DiscoveryPlan, DiscoveryPostCommitAction,
+    DiscoveryProjectionAction, DiscoveryProjectionComponent, DiscoverySafetySnapshot,
+    HeldDiscoveryItem, ProjectionAssessment, build_discovery_projection_components,
+    plan_batch_discovery as plan_batch_discovery_with_safety,
 };
 
 const NOW: &str = "unix_ms:100000";
+
+#[test]
+fn projection_components_follow_namespace_ancestry_and_bridge_chains() {
+    let actions = vec![
+        create_action("child", "Parent/Child/page.md"),
+        create_action("separate", "Parentish/page.md"),
+        move_action("bridge", "Parent/page.md", "Destination/page.md"),
+        create_action("destination-child", "Destination/Child/page.md"),
+    ];
+
+    assert_eq!(
+        build_discovery_projection_components(&actions),
+        vec![
+            DiscoveryProjectionComponent {
+                namespace_roots: vec![PathBuf::from("Destination"), PathBuf::from("Parent")],
+                actions: vec![
+                    move_action("bridge", "Parent/page.md", "Destination/page.md"),
+                    create_action("child", "Parent/Child/page.md"),
+                    create_action("destination-child", "Destination/Child/page.md"),
+                ],
+            },
+            DiscoveryProjectionComponent {
+                namespace_roots: vec![PathBuf::from("Parentish")],
+                actions: vec![create_action("separate", "Parentish/page.md")],
+            },
+        ]
+    );
+}
+
+#[test]
+fn projection_components_normalize_only_provably_redundant_descendants() {
+    let actions = vec![
+        delete_action("parent-delete", "Deleted/page.md"),
+        delete_action("child-delete", "Deleted/Child/page.md"),
+        move_action("parent-move", "Old/page.md", "New/page.md"),
+        move_action("redundant-child", "Old/Child/page.md", "New/Child/page.md"),
+        move_action(
+            "layout-changing-child",
+            "Old/Layout.md",
+            "New/Layout/page.md",
+        ),
+        move_action(
+            "divergent-child",
+            "Old/Divergent/page.md",
+            "Somewhere Else/page.md",
+        ),
+    ];
+
+    assert_eq!(
+        build_discovery_projection_components(&actions),
+        vec![
+            DiscoveryProjectionComponent {
+                namespace_roots: vec![PathBuf::from("Deleted")],
+                actions: vec![delete_action("parent-delete", "Deleted/page.md")],
+            },
+            DiscoveryProjectionComponent {
+                namespace_roots: vec![
+                    PathBuf::from("New"),
+                    PathBuf::from("Old"),
+                    PathBuf::from("Somewhere Else"),
+                ],
+                actions: vec![
+                    move_action(
+                        "divergent-child",
+                        "Old/Divergent/page.md",
+                        "Somewhere Else/page.md",
+                    ),
+                    move_action(
+                        "layout-changing-child",
+                        "Old/Layout.md",
+                        "New/Layout/page.md",
+                    ),
+                    move_action("parent-move", "Old/page.md", "New/page.md"),
+                ],
+            },
+        ]
+    );
+}
+
+#[test]
+fn projection_components_preserve_move_cycles() {
+    let actions = vec![
+        move_action("a", "A/page.md", "B/page.md"),
+        move_action("b", "B/page.md", "A/page.md"),
+    ];
+
+    assert_eq!(
+        build_discovery_projection_components(&actions),
+        vec![DiscoveryProjectionComponent {
+            namespace_roots: vec![PathBuf::from("A"), PathBuf::from("B")],
+            actions: vec![
+                move_action("a", "A/page.md", "B/page.md"),
+                move_action("b", "B/page.md", "A/page.md"),
+            ],
+        }]
+    );
+}
+
+#[test]
+fn pending_mutation_holds_every_action_in_a_projection_component() {
+    let mount = mount();
+    let mut store = InMemoryStateStore::new();
+    let parent = entity(
+        "parent",
+        "Source/page.md",
+        HydrationState::Stub,
+        "remote-v1",
+    );
+    store.save_entity(parent.clone()).expect("save parent");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            "local:child",
+            VirtualMutationKind::Rename,
+            Some("child"),
+            None,
+            Some("Unrelated/page.md"),
+            "Still Unrelated/page.md",
+        ))
+        .expect("save mutation");
+    let moved_parent = page_entry("parent", "Bridge/page.md", "remote-v2");
+    let child = page_entry("child", "Bridge/Child/page.md", "remote-v1");
+
+    let plan = plan_batch_discovery_with_safety(
+        &store,
+        &mount,
+        BatchObserveResult::incremental(
+            vec![
+                BatchObservationChange::Upsert(moved_parent),
+                BatchObservationChange::Upsert(child),
+            ],
+            checkpoint(2, "{}"),
+        ),
+        NOW,
+        None,
+        &BTreeMap::from([
+            (RemoteId::new("child"), ProjectionAssessment::Safe),
+            (RemoteId::new("parent"), ProjectionAssessment::Safe),
+        ]),
+        &DiscoverySafetySnapshot::default(),
+    )
+    .expect("component-held plan");
+
+    assert_eq!(
+        plan.held,
+        vec![
+            HeldDiscoveryItem {
+                remote_id: RemoteId::new("child"),
+                change: DiscoveryChangeKind::Create,
+                reason: DiscoveryHoldReason::PendingVirtualMutation {
+                    local_id: "local:child".to_string(),
+                },
+            },
+            HeldDiscoveryItem {
+                remote_id: RemoteId::new("parent"),
+                change: DiscoveryChangeKind::Move,
+                reason: DiscoveryHoldReason::PendingVirtualMutation {
+                    local_id: "local:child".to_string(),
+                },
+            },
+        ]
+    );
+    assert!(plan.projection_actions.is_empty());
+    assert!(plan.projection_components.is_empty());
+    assert!(plan.commit().entity_upserts.is_empty());
+}
+
+#[test]
+fn dirty_or_conflicted_member_holds_every_action_in_a_projection_component() {
+    for (hydration, expected_reason) in [
+        (HydrationState::Dirty, DiscoveryHoldReason::Dirty),
+        (HydrationState::Conflicted, DiscoveryHoldReason::Conflicted),
+    ] {
+        let mount = mount();
+        let mut store = InMemoryStateStore::new();
+        let parent = entity(
+            "parent",
+            "Source/page.md",
+            HydrationState::Stub,
+            "remote-v1",
+        );
+        let child = entity("child", "Source/Child/page.md", hydration, "remote-v1");
+        store.save_entity(parent.clone()).expect("save parent");
+        store.save_entity(child.clone()).expect("save child");
+
+        let plan = plan_batch_discovery_with_safety(
+            &store,
+            &mount,
+            BatchObserveResult::incremental(
+                vec![
+                    BatchObservationChange::Upsert(page_entry(
+                        "parent",
+                        "Destination/page.md",
+                        "remote-v2",
+                    )),
+                    BatchObservationChange::Upsert(page_entry(
+                        "child",
+                        "Destination/Child/page.md",
+                        "remote-v2",
+                    )),
+                ],
+                checkpoint(2, "{}"),
+            ),
+            NOW,
+            None,
+            &BTreeMap::from([
+                (child.remote_id.clone(), ProjectionAssessment::Safe),
+                (parent.remote_id.clone(), ProjectionAssessment::Safe),
+            ]),
+            &DiscoverySafetySnapshot::default(),
+        )
+        .expect("state-held component plan");
+
+        assert_eq!(plan.held.len(), 2);
+        assert!(plan.held.iter().all(|item| item.reason == expected_reason));
+        assert!(plan.projection_actions.is_empty());
+    }
+}
+
+#[test]
+fn dirty_or_conflicted_descendant_without_an_action_holds_parent_component() {
+    for (hydration, expected_reason) in [
+        (HydrationState::Dirty, DiscoveryHoldReason::Dirty),
+        (HydrationState::Conflicted, DiscoveryHoldReason::Conflicted),
+    ] {
+        let mount = mount();
+        let mut store = InMemoryStateStore::new();
+        let parent = entity(
+            "parent",
+            "Parent/page.md",
+            HydrationState::Stub,
+            "remote-v1",
+        );
+        let child = entity("child", "Parent/Child/page.md", hydration, "remote-v1");
+        store.save_entity(parent.clone()).expect("save parent");
+        store.save_entity(child).expect("save child");
+
+        let plan = plan_batch_discovery_with_safety(
+            &store,
+            &mount,
+            BatchObserveResult::incremental(
+                vec![BatchObservationChange::Tombstone {
+                    remote_id: parent.remote_id.clone(),
+                }],
+                checkpoint(2, "{}"),
+            ),
+            NOW,
+            None,
+            &BTreeMap::from([(parent.remote_id.clone(), ProjectionAssessment::Safe)]),
+            &DiscoverySafetySnapshot::default(),
+        )
+        .expect("descendant state-aware plan");
+
+        assert_eq!(
+            plan.held,
+            vec![HeldDiscoveryItem {
+                remote_id: parent.remote_id,
+                change: DiscoveryChangeKind::Delete,
+                reason: expected_reason,
+            }]
+        );
+        assert!(plan.projection_actions.is_empty());
+    }
+}
+
+#[test]
+fn raw_asset_mutation_path_holds_structural_component() {
+    let mount = mount();
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_virtual_mutation(virtual_mutation(
+            "local:asset",
+            VirtualMutationKind::Create,
+            None,
+            None,
+            None,
+            "assets/readme.md",
+        ))
+        .expect("save asset mutation");
+    let mut asset = page_entry("asset", "assets/readme.md", "remote-v1");
+    asset.kind = EntityKind::Asset;
+
+    let plan = plan_batch_discovery_with_safety(
+        &store,
+        &mount,
+        BatchObserveResult::incremental(
+            vec![BatchObservationChange::Upsert(asset.clone())],
+            checkpoint(2, "{}"),
+        ),
+        NOW,
+        None,
+        &BTreeMap::from([(asset.remote_id.clone(), ProjectionAssessment::Safe)]),
+        &DiscoverySafetySnapshot::default(),
+    )
+    .expect("asset mutation-aware plan");
+
+    assert_eq!(
+        plan.held,
+        vec![HeldDiscoveryItem {
+            remote_id: asset.remote_id,
+            change: DiscoveryChangeKind::Create,
+            reason: DiscoveryHoldReason::PendingVirtualMutation {
+                local_id: "local:asset".to_string(),
+            },
+        }]
+    );
+}
+
+#[test]
+fn raw_asset_mutation_path_holds_same_path_remote_drift() {
+    let mount = mount();
+    let mut store = InMemoryStateStore::new();
+    let mut current = entity(
+        "asset",
+        "assets/readme.md",
+        HydrationState::Hydrated,
+        "remote-v1",
+    );
+    current.kind = EntityKind::Asset;
+    store.save_entity(current.clone()).expect("save asset");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            "local:asset",
+            VirtualMutationKind::Rename,
+            None,
+            None,
+            Some("assets/readme.md"),
+            "unrelated/page.md",
+        ))
+        .expect("save asset mutation");
+    let mut changed = page_entry("asset", "assets/readme.md", "remote-v2");
+    changed.kind = EntityKind::Asset;
+
+    let plan = plan_batch_discovery_with_safety(
+        &store,
+        &mount,
+        BatchObserveResult::incremental(
+            vec![BatchObservationChange::Upsert(changed)],
+            checkpoint(2, "{}"),
+        ),
+        NOW,
+        None,
+        &BTreeMap::new(),
+        &DiscoverySafetySnapshot::default(),
+    )
+    .expect("asset drift mutation-aware plan");
+
+    assert_eq!(
+        plan.held,
+        vec![HeldDiscoveryItem {
+            remote_id: current.remote_id,
+            change: DiscoveryChangeKind::RemoteDrift,
+            reason: DiscoveryHoldReason::PendingVirtualMutation {
+                local_id: "local:asset".to_string(),
+            },
+        }]
+    );
+}
+
+#[test]
+fn blocked_or_missing_member_assessment_holds_its_projection_component() {
+    for assessment in [
+        Some(ProjectionAssessment::Blocked(
+            DiscoveryHoldReason::HostCollision(PathBuf::from("Destination/Child")),
+        )),
+        None,
+    ] {
+        let mount = mount();
+        let mut store = InMemoryStateStore::new();
+        let parent = entity(
+            "parent",
+            "Source/page.md",
+            HydrationState::Stub,
+            "remote-v1",
+        );
+        store.save_entity(parent.clone()).expect("save parent");
+        let mut assessments =
+            BTreeMap::from([(parent.remote_id.clone(), ProjectionAssessment::Safe)]);
+        if let Some(assessment) = assessment.clone() {
+            assessments.insert(RemoteId::new("child"), assessment);
+        }
+
+        let plan = plan_batch_discovery_with_safety(
+            &store,
+            &mount,
+            BatchObserveResult::incremental(
+                vec![
+                    BatchObservationChange::Upsert(page_entry(
+                        "parent",
+                        "Destination/page.md",
+                        "remote-v2",
+                    )),
+                    BatchObservationChange::Upsert(page_entry(
+                        "child",
+                        "Destination/Child/page.md",
+                        "remote-v1",
+                    )),
+                ],
+                checkpoint(2, "{}"),
+            ),
+            NOW,
+            None,
+            &assessments,
+            &DiscoverySafetySnapshot::default(),
+        )
+        .expect("assessment-held component plan");
+
+        let expected_reason = match assessment {
+            Some(ProjectionAssessment::Blocked(reason)) => reason,
+            None => DiscoveryHoldReason::UnknownProjection,
+            Some(ProjectionAssessment::Safe) => unreachable!(),
+        };
+        assert_eq!(plan.held.len(), 2);
+        assert!(plan.held.iter().all(|item| item.reason == expected_reason));
+        assert!(plan.projection_actions.is_empty());
+    }
+}
+
+#[test]
+fn member_kind_change_holds_its_projection_component() {
+    let mount = mount();
+    let mut store = InMemoryStateStore::new();
+    let parent = entity(
+        "parent",
+        "Source/page.md",
+        HydrationState::Stub,
+        "remote-v1",
+    );
+    let child = entity(
+        "child",
+        "Source/Child/page.md",
+        HydrationState::Stub,
+        "remote-v1",
+    );
+    store.save_entity(parent.clone()).expect("save parent");
+    store.save_entity(child.clone()).expect("save child");
+    let mut changed_child = page_entry("child", "Destination/Child", "remote-v2");
+    changed_child.kind = EntityKind::Directory;
+
+    let plan = plan_batch_discovery_with_safety(
+        &store,
+        &mount,
+        BatchObserveResult::incremental(
+            vec![
+                BatchObservationChange::Upsert(page_entry(
+                    "parent",
+                    "Destination/page.md",
+                    "remote-v2",
+                )),
+                BatchObservationChange::Upsert(changed_child),
+            ],
+            checkpoint(2, "{}"),
+        ),
+        NOW,
+        None,
+        &BTreeMap::from([
+            (child.remote_id.clone(), ProjectionAssessment::Safe),
+            (parent.remote_id.clone(), ProjectionAssessment::Safe),
+        ]),
+        &DiscoverySafetySnapshot::default(),
+    )
+    .expect("kind-change-held component plan");
+
+    assert_eq!(plan.held.len(), 2);
+    assert!(plan.held.iter().all(|item| {
+        item.reason
+            == DiscoveryHoldReason::UnsupportedKindChange {
+                from: EntityKind::Page,
+                to: EntityKind::Directory,
+            }
+    }));
+    assert!(plan.projection_actions.is_empty());
+}
+
+#[test]
+fn descendant_journals_hold_components_until_reconciled_or_reverted() {
+    let cases = [
+        (JournalStatus::Prepared, true),
+        (JournalStatus::Applying, true),
+        (JournalStatus::Applied, true),
+        (JournalStatus::Failed("failed".to_string()), true),
+        (JournalStatus::Reconciled, false),
+        (JournalStatus::Reverted, false),
+    ];
+
+    for (status, blocked) in cases {
+        let mount = mount();
+        let mut store = InMemoryStateStore::new();
+        let parent = entity(
+            "parent",
+            "Parent/page.md",
+            HydrationState::Stub,
+            "remote-v1",
+        );
+        let child = entity(
+            "child",
+            "Parent/Child/page.md",
+            HydrationState::Stub,
+            "remote-v1",
+        );
+        store.save_entity(parent.clone()).expect("save parent");
+        store.save_entity(child.clone()).expect("save child");
+        store
+            .append_journal(JournalEntry::new(
+                PushId("push:child".to_string()),
+                mount.mount_id.clone(),
+                vec![child.remote_id.clone()],
+                PushPlan::default(),
+                status,
+            ))
+            .expect("append journal");
+
+        let plan = plan_batch_discovery_with_safety(
+            &store,
+            &mount,
+            BatchObserveResult::incremental(
+                vec![BatchObservationChange::Tombstone {
+                    remote_id: parent.remote_id.clone(),
+                }],
+                checkpoint(2, "{}"),
+            ),
+            NOW,
+            None,
+            &BTreeMap::from([(parent.remote_id.clone(), ProjectionAssessment::Safe)]),
+            &DiscoverySafetySnapshot::default(),
+        )
+        .expect("journal-aware plan");
+
+        if blocked {
+            assert_eq!(
+                plan.held,
+                vec![HeldDiscoveryItem {
+                    remote_id: parent.remote_id,
+                    change: DiscoveryChangeKind::Delete,
+                    reason: DiscoveryHoldReason::UnsettledJournal {
+                        push_id: PushId("push:child".to_string()),
+                    },
+                }]
+            );
+            assert!(plan.projection_actions.is_empty());
+        } else {
+            assert!(plan.held.is_empty());
+            assert_eq!(plan.projection_actions.len(), 1);
+        }
+    }
+}
+
+#[test]
+fn recent_descendant_edits_hold_the_parent_component_conservatively() {
+    let cases = [
+        ("unix_ms:70001", true),
+        ("unix_ms:70000", false),
+        ("unix_ms:69999", false),
+        ("unix_ms:100001", true),
+        ("malformed", true),
+    ];
+
+    for (last_local_change_at, blocked) in cases {
+        let mount = mount();
+        let mut store = InMemoryStateStore::new();
+        let parent = entity(
+            "parent",
+            "Parent/page.md",
+            HydrationState::Stub,
+            "remote-v1",
+        );
+        let child = entity(
+            "child",
+            "Parent/Child/page.md",
+            HydrationState::Stub,
+            "remote-v1",
+        );
+        store.save_entity(parent.clone()).expect("save parent");
+        store.save_entity(child.clone()).expect("save child");
+        store
+            .save_freshness_state(
+                FreshnessStateRecord::new(
+                    mount.mount_id.clone(),
+                    child.remote_id.clone(),
+                    FreshnessTier::Hot,
+                )
+                .local_change_at(last_local_change_at),
+            )
+            .expect("save freshness");
+
+        let plan = plan_batch_discovery_with_safety(
+            &store,
+            &mount,
+            BatchObserveResult::incremental(
+                vec![BatchObservationChange::Tombstone {
+                    remote_id: parent.remote_id.clone(),
+                }],
+                checkpoint(2, "{}"),
+            ),
+            NOW,
+            None,
+            &BTreeMap::from([(parent.remote_id.clone(), ProjectionAssessment::Safe)]),
+            &DiscoverySafetySnapshot::default(),
+        )
+        .expect("freshness-aware plan");
+
+        if blocked {
+            assert_eq!(
+                plan.held,
+                vec![HeldDiscoveryItem {
+                    remote_id: parent.remote_id,
+                    change: DiscoveryChangeKind::Delete,
+                    reason: DiscoveryHoldReason::RecentLocalEdit {
+                        remote_id: child.remote_id,
+                    },
+                }]
+            );
+        } else {
+            assert!(plan.held.is_empty());
+            assert_eq!(plan.projection_actions.len(), 1);
+        }
+    }
+}
+
+#[test]
+fn active_child_refresh_snapshot_holds_the_whole_component() {
+    let mount = mount();
+    let mut store = InMemoryStateStore::new();
+    let parent = entity(
+        "parent",
+        "Parent/page.md",
+        HydrationState::Stub,
+        "remote-v1",
+    );
+    store.save_entity(parent.clone()).expect("save parent");
+    let safety = DiscoverySafetySnapshot {
+        active_child_refresh_namespace_roots: BTreeSet::from([PathBuf::from("Parent/Child")]),
+    };
+
+    let plan = plan_batch_discovery_with_safety(
+        &store,
+        &mount,
+        BatchObserveResult::incremental(
+            vec![BatchObservationChange::Tombstone {
+                remote_id: parent.remote_id.clone(),
+            }],
+            checkpoint(2, "{}"),
+        ),
+        NOW,
+        Some("persisted-metadata-job-does-not-imply-active"),
+        &BTreeMap::from([(parent.remote_id.clone(), ProjectionAssessment::Safe)]),
+        &safety,
+    )
+    .expect("refresh-aware plan");
+
+    assert_eq!(
+        plan.held,
+        vec![HeldDiscoveryItem {
+            remote_id: parent.remote_id,
+            change: DiscoveryChangeKind::Delete,
+            reason: DiscoveryHoldReason::ActiveChildRefresh {
+                namespace_root: PathBuf::from("Parent/Child"),
+            },
+        }]
+    );
+}
+
+#[test]
+fn component_blocker_priority_is_deterministic() {
+    let mount = mount();
+    let mut store = InMemoryStateStore::new();
+    let parent = entity(
+        "parent",
+        "Parent/page.md",
+        HydrationState::Dirty,
+        "remote-v1",
+    );
+    store.save_entity(parent.clone()).expect("save parent");
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(
+                mount.mount_id.clone(),
+                parent.remote_id.clone(),
+                FreshnessTier::Hot,
+            )
+            .local_change_at("unix_ms:99999"),
+        )
+        .expect("save freshness");
+    for local_id in ["local:z", "local:a"] {
+        store
+            .save_virtual_mutation(virtual_mutation(
+                local_id,
+                VirtualMutationKind::Rename,
+                Some("parent"),
+                None,
+                Some("Unrelated/page.md"),
+                "Still Unrelated/page.md",
+            ))
+            .expect("save mutation");
+    }
+    for push_id in ["push:z", "push:a"] {
+        store
+            .append_journal(JournalEntry::new(
+                PushId(push_id.to_string()),
+                mount.mount_id.clone(),
+                vec![parent.remote_id.clone()],
+                PushPlan::default(),
+                JournalStatus::Prepared,
+            ))
+            .expect("append journal");
+    }
+    let safety = DiscoverySafetySnapshot {
+        active_child_refresh_namespace_roots: BTreeSet::from([PathBuf::from("Parent/Child")]),
+    };
+
+    let plan = plan_batch_discovery_with_safety(
+        &store,
+        &mount,
+        BatchObserveResult::incremental(
+            vec![BatchObservationChange::Tombstone {
+                remote_id: parent.remote_id.clone(),
+            }],
+            checkpoint(2, "{}"),
+        ),
+        NOW,
+        None,
+        &BTreeMap::from([(
+            parent.remote_id.clone(),
+            ProjectionAssessment::Blocked(DiscoveryHoldReason::HostCollision(PathBuf::from(
+                "Parent",
+            ))),
+        )]),
+        &safety,
+    )
+    .expect("deterministically held plan");
+
+    assert_eq!(
+        plan.held,
+        vec![HeldDiscoveryItem {
+            remote_id: parent.remote_id,
+            change: DiscoveryChangeKind::Delete,
+            reason: DiscoveryHoldReason::PendingVirtualMutation {
+                local_id: "local:a".to_string(),
+            },
+        }]
+    );
+}
+
+#[test]
+fn invalid_planner_timestamp_fails_closed() {
+    let error = plan_batch_discovery_with_safety(
+        &InMemoryStateStore::new(),
+        &mount(),
+        BatchObserveResult::incremental(vec![], checkpoint(1, "{}")),
+        "not-a-timestamp",
+        None,
+        &BTreeMap::new(),
+        &DiscoverySafetySnapshot::default(),
+    )
+    .expect_err("planner time is required for safety leases");
+
+    assert_eq!(
+        error,
+        LocalityError::InvalidState(
+            "discovery observed_at must be a parseable freshness timestamp".to_string()
+        )
+    );
+}
 
 #[test]
 fn safe_create_is_planned_without_side_effects() {
@@ -1208,7 +1974,7 @@ fn merged_replay_and_incoming_create_cannot_share_a_projected_path() {
 }
 
 #[test]
-fn held_move_cannot_leave_a_safe_create_on_its_occupied_source_path() {
+fn held_move_holds_a_connected_create_on_its_occupied_source_path() {
     let mount = mount();
     let mut store = InMemoryStateStore::new();
     store.save_mount(mount.clone()).expect("save mount");
@@ -1217,7 +1983,7 @@ fn held_move_cannot_leave_a_safe_create_on_its_occupied_source_path() {
     let moved = page_entry("a", "destination/page.md", "remote-v2");
     let created = page_entry("b", "source/page.md", "remote-v1");
 
-    let error = plan_batch_discovery(
+    let plan = plan_batch_discovery(
         &store,
         &mount,
         BatchObserveResult::incremental(
@@ -1239,14 +2005,29 @@ fn held_move_cannot_leave_a_safe_create_on_its_occupied_source_path() {
             (created.remote_id, ProjectionAssessment::Safe),
         ]),
     )
-    .expect_err("planned final map collision must fail before projection");
+    .expect("connected structural changes are held together");
 
     assert_eq!(
-        error,
-        LocalityError::Io(
-            "path `source/page.md` is already mapped in mount `linear-main`".to_string()
-        )
+        plan.held,
+        vec![
+            HeldDiscoveryItem {
+                remote_id: RemoteId::new("a"),
+                change: DiscoveryChangeKind::Move,
+                reason: DiscoveryHoldReason::UntrackedDestination(PathBuf::from(
+                    "destination/page.md"
+                )),
+            },
+            HeldDiscoveryItem {
+                remote_id: RemoteId::new("b"),
+                change: DiscoveryChangeKind::Create,
+                reason: DiscoveryHoldReason::UntrackedDestination(PathBuf::from(
+                    "destination/page.md"
+                )),
+            },
+        ]
     );
+    assert!(plan.projection_actions.is_empty());
+    assert!(plan.commit().entity_upserts.is_empty());
 }
 
 #[test]
@@ -1474,7 +2255,8 @@ where
         + MetadataDiscoveryJobRepository
         + ConnectorStateRepository
         + DiscoveryRepository
-        + VirtualMutationRepository,
+        + VirtualMutationRepository
+        + JournalRepository,
 {
     let mount = mount();
     store.save_mount(mount.clone()).expect("save mount");
@@ -1610,7 +2392,8 @@ where
         + AutoSaveRepository
         + FreshnessStateRepository
         + RemoteObservationRepository
-        + VirtualMutationRepository,
+        + VirtualMutationRepository
+        + JournalRepository,
 {
     let mount = mount();
     store.save_mount(mount.clone()).expect("save mount");
@@ -1651,6 +2434,33 @@ where
     );
 }
 
+fn plan_batch_discovery<S>(
+    store: &S,
+    mount: &MountConfig,
+    batch: BatchObserveResult,
+    observed_at: &str,
+    metadata_job_id: Option<&str>,
+    assessments: &BTreeMap<RemoteId, ProjectionAssessment>,
+) -> LocalityResult<DiscoveryPlan>
+where
+    S: EntityRepository
+        + RemoteObservationRepository
+        + FreshnessStateRepository
+        + AutoSaveRepository
+        + VirtualMutationRepository
+        + JournalRepository,
+{
+    plan_batch_discovery_with_safety(
+        store,
+        mount,
+        batch,
+        observed_at,
+        metadata_job_id,
+        assessments,
+        &DiscoverySafetySnapshot::default(),
+    )
+}
+
 fn mount() -> MountConfig {
     MountConfig::new(MountId::new("linear-main"), "linear", "/tmp/linear-main")
 }
@@ -1666,6 +2476,29 @@ fn page_entry(remote_id: &str, path: &str, remote_version: &str) -> TreeEntry {
         content_hash: Some(format!("hash:{remote_id}")),
         remote_edited_at: Some(remote_version.to_string()),
         stub_frontmatter: Some(format!("title: {remote_id}\n")),
+    }
+}
+
+fn create_action(remote_id: &str, path: &str) -> DiscoveryProjectionAction {
+    DiscoveryProjectionAction::Create {
+        entry: page_entry(remote_id, path, "remote-v1"),
+    }
+}
+
+fn move_action(remote_id: &str, from: &str, to: &str) -> DiscoveryProjectionAction {
+    DiscoveryProjectionAction::Move {
+        remote_id: RemoteId::new(remote_id),
+        kind: EntityKind::Page,
+        from: PathBuf::from(from),
+        to: PathBuf::from(to),
+    }
+}
+
+fn delete_action(remote_id: &str, path: &str) -> DiscoveryProjectionAction {
+    DiscoveryProjectionAction::Delete {
+        remote_id: RemoteId::new(remote_id),
+        kind: EntityKind::Page,
+        path: PathBuf::from(path),
     }
 }
 

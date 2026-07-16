@@ -18,7 +18,7 @@ use locality_core::hydration::{HydrationReason, HydrationRequest};
 use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, RemoteId, TreeEntry};
 use locality_core::path_projection::{
     is_page_document_path, named_markdown_page_workspace_entity_path, page_container_path,
-    page_listing_parent_path,
+    page_listing_parent_path, projection_namespace_root,
 };
 use locality_core::shadow::ShadowDocument;
 use locality_store::{
@@ -1053,8 +1053,8 @@ where
             continue;
         }
 
-        let source_root = projection_subtree_path(&existing.kind, &existing.path);
-        let destination_root = projection_subtree_path(&entry.kind, &entry.path);
+        let source_root = projection_namespace_root(&existing.kind, &existing.path);
+        let destination_root = projection_namespace_root(&entry.kind, &entry.path);
         let blockers =
             remote_move_blockers(store, mount, state_root, &existing_entities, &source_root)?;
         if blockers.is_empty() {
@@ -1100,7 +1100,7 @@ where
 {
     let mut blockers = Vec::new();
     for entity in existing_entities {
-        let candidate_root = projection_subtree_path(&entity.kind, &entity.path);
+        let candidate_root = projection_namespace_root(&entity.kind, &entity.path);
         if !path_in_projection_subtree(&candidate_root, source_root) {
             continue;
         }
@@ -1143,22 +1143,12 @@ fn should_preserve_for_blocked_move(
         return false;
     }
 
-    let existing_root = projection_subtree_path(&existing.kind, &existing.path);
-    let entry_root = projection_subtree_path(&entry.kind, &entry.path);
+    let existing_root = projection_namespace_root(&existing.kind, &existing.path);
+    let entry_root = projection_namespace_root(&entry.kind, &entry.path);
     blocked_moves.iter().any(|blocked| {
         path_in_projection_subtree(&existing_root, &blocked.source_root)
             && path_in_projection_subtree(&entry_root, &blocked.destination_root)
     })
-}
-
-fn projection_subtree_path(kind: &EntityKind, path: &Path) -> PathBuf {
-    match kind {
-        EntityKind::Page => page_container_path(path),
-        EntityKind::Database
-        | EntityKind::Directory
-        | EntityKind::Asset
-        | EntityKind::Unknown(_) => path.to_path_buf(),
-    }
 }
 
 fn path_in_projection_subtree(path: &Path, subtree: &Path) -> bool {

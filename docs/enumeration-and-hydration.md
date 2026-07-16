@@ -69,28 +69,48 @@ empty incremental batch can reconsider them. A newer replay format fails with
 an update-required result; an incoming connector change for the same remote id
 takes precedence over an older held replay.
 
-Structural creates, moves, and deletes fail closed unless the caller supplies a
-safe projection assessment. Remote changes against dirty or conflicted
-entities, incompatible entity kind changes, and explicitly blocked projections
-remain held. New entries must be metadata-only `Virtual` or `Stub` entries, and
-accepted remote metadata for existing `Virtual` and `Stub` entities updates the
-durable entity record. Remote drift for a `Hydrated` entity preserves synced
-fields, leaves a remote hint pending, queues post-commit hydration, and pauses
-enabled auto-save. For an accepted move, the paused auto-save record uses the
-final path so it composes with the store's atomic enrollment rehome.
+Structural creates, moves, and deletes are grouped into deterministic projection
+components before admission. Each action contributes connector-neutral
+namespace roots: pages use their containing directory, while databases,
+directories, assets, and unknown kinds use their projected path unchanged.
+Actions belong to one component when any roots are equal or have an
+ancestor/descendant relationship, including transitive bridge relationships.
+The returned component roots and actions are sorted deterministically. A
+descendant delete is omitted when an ancestor delete already realizes it, and a
+descendant move is omitted only when an acyclic ancestor move maps the exact
+same relative suffix for both its namespace and raw projected path. Divergent
+moves, layout-changing moves, and move cycles remain explicit.
 
-Pending virtual mutations are individual conservative blockers. A remote
-change is held when its remote identity or old/new page-container namespace
-intersects a mutation target, parent, original path, or projected path. The
-planner never deletes mutation state. Before returning filesystem actions, it
-also runs the store's read-only `DiscoveryCommit` preflight against the state it
-read, so final entity paths, mutation guards, and auto-save ownership use the
-same admission rules as the atomic memory and SQLite commit paths.
+Every structural action in a component is held when any member has an
+incompatible kind change, a blocked or missing projection assessment, or an
+intersecting pending virtual mutation. The planner also expands the component
+over all existing entities in overlapping namespace subtrees. A dirty or
+conflicted entity, an unsettled push journal (`Prepared`, `Applying`, `Applied`,
+or `Failed`), a local edit whose 30-second lease is still active, or an
+explicitly reported active child-refresh namespace anywhere in that expanded
+component holds every action in it. Malformed or future local-edit timestamps
+hold conservatively. Reconciled and reverted journals are settled. Blocker
+selection is deterministic, with pending mutations taking priority over
+journals, recent edits, active refreshes, entity state, kind changes, and
+projection assessments.
 
-This module currently implements planning only. Runtime connector scheduling,
-filesystem projection execution, connected-component grouping, mutation
-cleanup, journal handling, and recent-edit lease policy are separate integration
-work.
+Same-path remote drift is not a structural component action. It retains the
+individual mutation, dirty/conflicted, and kind-change checks. New entries must
+be metadata-only `Virtual` or `Stub` entries. Accepted remote metadata for
+existing `Virtual` and `Stub` entities updates the durable entity record, while
+remote drift for a `Hydrated` entity preserves synced fields, leaves a remote
+hint pending, queues post-commit hydration, and pauses enabled auto-save. Held
+changes retain replay observations and freshness state, and the planner never
+deletes virtual-mutation state.
+
+Before returning filesystem actions, the planner runs the store's read-only
+`DiscoveryCommit` preflight against the state it read, so final entity paths,
+mutation guards, and auto-save ownership use the same admission rules as the
+atomic memory and SQLite commit paths. This module still implements planning
+only. A future filesystem projection executor must serialize component
+execution per mount and publish the accompanying commit only after projection
+succeeds. Runtime connector scheduling, projection execution, and mutation
+cleanup remain separate integration work.
 
 Daemon hydration uses `fetch_render`, not the raw connector `fetch` method
 directly. The common daemon-side abstraction is `HydrationSource::fetch_render`
