@@ -2512,7 +2512,7 @@ button.home-stat:hover {
   font-weight: 850;
 }
 
-.mount-details-button:hover {
+.mount-details-button:hover:not(:disabled) {
   border-color: rgba(8, 123, 114, 0.26);
   background: rgba(248, 252, 251, 0.98);
   color: var(--accent);
@@ -4188,7 +4188,7 @@ button.home-stat:hover {
 
 :root[data-theme="dark"] .secondary-button:hover:not(:disabled),
 :root[data-theme="dark"] .icon-button:hover:not(:disabled),
-:root[data-theme="dark"] .mount-details-button:hover,
+:root[data-theme="dark"] .mount-details-button:hover:not(:disabled),
 :root[data-theme="dark"] .settings-activity-row:hover {
   border-color: rgba(15, 118, 110, 0.38);
   background: rgba(18, 39, 39, 0.94);

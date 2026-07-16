@@ -27,4 +27,11 @@ describe("dark theme UI contrast", () => {
     expect(styles).toMatch(/:root\[data-theme="dark"\] \.tray-popover\s*\{/);
     expect(styles).not.toMatch(/:root\[data-theme="dark"\] \.tray-live-mode-control,[\s\S]*?\.file-row\.expanded/s);
   });
+
+  it("keeps disabled mount detail buttons from taking hover colors", () => {
+    expect(styles).toMatch(/\.mount-details-button:hover:not\(:disabled\)\s*\{/);
+    expect(styles).toMatch(
+      /:root\[data-theme="dark"\] \.mount-details-button:hover:not\(:disabled\),/,
+    );
+  });
 });
