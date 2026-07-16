@@ -389,7 +389,9 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
-    use super::{ConnectorNetworkConfig, ConnectorNetworkGate, NetworkOrchestrator, RetryConfig};
+    use super::{
+        ConnectorNetworkConfig, ConnectorNetworkGate, NetworkOrchestrator, RetryConfig, ScopeState,
+    };
     use std::time::{Duration, Instant};
 
     #[test]
@@ -504,16 +506,23 @@ mod tests {
 
     #[test]
     fn cooldown_time_refills_tokens_like_the_existing_notion_limiter() {
-        let orchestrator = NetworkOrchestrator::new(1);
-        let gate = ConnectorNetworkGate::new(
-            orchestrator,
-            ConnectorNetworkConfig::new("notion-compatible", 5.0, 1.0),
+        let config = ConnectorNetworkConfig::new("notion-compatible", 5.0, 1.0);
+        let mut scope = ScopeState::new(&config);
+        let started = Instant::now();
+
+        scope.tokens = 0.0;
+        scope.last_refill = started;
+        scope.cooldown_until = Some(started + Duration::from_millis(220));
+
+        scope.refill(started + Duration::from_millis(219));
+        assert_eq!(scope.tokens, 0.0);
+        assert_eq!(
+            scope.cooldown_until,
+            Some(started + Duration::from_millis(220))
         );
-        gate.record_cooldown(Duration::from_millis(220));
 
-        let permit = gate.acquire();
-
-        assert!(permit.waited() >= Duration::from_millis(180));
-        assert!(permit.waited() < Duration::from_millis(320));
+        scope.refill(started + Duration::from_millis(220));
+        assert_eq!(scope.tokens, 1.0);
+        assert_eq!(scope.cooldown_until, None);
     }
 }
