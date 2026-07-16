@@ -1,0 +1,61 @@
+name: oauth-service-deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "apps/oauth-service/**"
+      - ".github/workflows/oauth-service-deploy.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: oauth-service-deploy
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: OAuth service checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/oauth-service/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+        working-directory: apps/oauth-service
+      - name: Typecheck and test
+        run: npm run check
+        working-directory: apps/oauth-service
+
+  deploy:
+    name: Deploy Cloudflare Worker
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: oauth-broker
+    defaults:
+      run:
+        working-directory: apps/oauth-service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/oauth-service/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Deploy Worker
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: apps/oauth-service
+          packageManager: npm
+          # Match the lockfile so CI deploy behavior stays reproducible.
+          wranglerVersion: "4.103.0"
+          command: deploy

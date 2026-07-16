@@ -22,8 +22,8 @@ use std::sync::Arc;
 
 use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
-    ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, ListChildrenRequest,
-    ListChildrenResult, NativeEntity, ObserveRequest, ParsedEntity,
+    ConnectorCapabilities, ConnectorExecutionPolicy, ConnectorKind, EnumerateRequest, FetchRequest,
+    ListChildrenRequest, ListChildrenResult, NativeEntity, ObserveRequest, ParsedEntity,
 };
 use locality_core::freshness::RemoteObservation;
 use locality_core::model::{CanonicalDocument, RemoteId, TreeEntry};
@@ -50,6 +50,7 @@ pub struct NotionConfig {
     pub token: Option<String>,
     /// Environment variable or future keychain key used to find the bearer token.
     pub token_key: String,
+    pub execution_policy: ConnectorExecutionPolicy,
 }
 
 impl std::fmt::Debug for NotionConfig {
@@ -59,6 +60,7 @@ impl std::fmt::Debug for NotionConfig {
             .field("root_page_id", &self.root_page_id)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .field("token_key", &self.token_key)
+            .field("execution_policy", &self.execution_policy)
             .finish()
     }
 }
@@ -70,6 +72,7 @@ impl Default for NotionConfig {
             root_page_id: None,
             token: None,
             token_key: DEFAULT_NOTION_TOKEN_ENV.to_string(),
+            execution_policy: ConnectorExecutionPolicy::Inline,
         }
     }
 }
@@ -82,6 +85,11 @@ impl NotionConfig {
 
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
+        self
+    }
+
+    pub fn with_execution_policy(mut self, execution_policy: ConnectorExecutionPolicy) -> Self {
+        self.execution_policy = execution_policy;
         self
     }
 }
@@ -193,6 +201,10 @@ impl NotionConnector {
 }
 
 impl Connector for NotionConnector {
+    fn with_execution_policy(&self, policy: ConnectorExecutionPolicy) -> Self {
+        Self::new(self.config.clone().with_execution_policy(policy))
+    }
+
     fn kind(&self) -> ConnectorKind {
         ConnectorKind("notion")
     }

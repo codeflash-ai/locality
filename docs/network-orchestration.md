@@ -19,6 +19,16 @@ permits. A connector owns request semantics: safe retry methods, retryable HTTP
 statuses, authentication, `Retry-After` parsing, and response decoding. A
 provider response can cool down only its own scope.
 
+Connector operations receive a host-selected execution policy. Foreground work
+can use bounded inline retries, while daemon-owned discovery asks connectors to
+return provider cooldowns instead of sleeping through them. The transport
+returns a structured provider, delay, and error after the first rate-limit
+response; the daemon parks the operation until that delay plus bounded jitter
+has elapsed. Later scheduler ticks merge into the deferred job, so only one
+retry exists and unrelated local work can continue. Notion and Granola both
+implement this connector-neutral policy using their existing internal network
+configuration.
+
 Current defaults are:
 
 | Scope | Requests/second | Burst | Scope in flight | Retries | Timeout |
@@ -50,6 +60,12 @@ filesystem discovery. Its global worker limits are separate from API quotas:
 32 total child refreshes and 16 background refreshes by default. A connector
 descriptor may opt into periodic root discovery without changing Notion's
 recursive discovery behavior.
+
+Background admission is additionally capped per connector. Notion and Granola
+each admit at most three background discovery workers, matching their initial
+token-bucket burst. Interactive discovery can still use the remaining global
+capacity. A workspace walk therefore cannot turn all 16 background slots into
+threads waiting inside one connector's rate limiter.
 
 Failed durable child refreshes remain queued with exponential retry delay from
 one second up to five minutes. Delayed work from one mount does not block ready

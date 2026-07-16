@@ -2,6 +2,7 @@ use std::fmt;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use locality_connector::ConnectorExecutionPolicy;
 use locality_connector::network::{ConnectorNetworkConfig, ConnectorNetworkGate, RetryConfig};
 use locality_core::{LocalityError, LocalityResult};
 use reqwest::StatusCode;
@@ -37,6 +38,7 @@ pub struct HttpGranolaApiClient {
     api_key: String,
     base_url: String,
     client: Client,
+    execution_policy: ConnectorExecutionPolicy,
 }
 
 impl fmt::Debug for HttpGranolaApiClient {
@@ -50,10 +52,33 @@ impl fmt::Debug for HttpGranolaApiClient {
 
 impl HttpGranolaApiClient {
     pub fn new(api_key: impl Into<String>) -> Self {
-        Self::with_base_url(api_key, DEFAULT_GRANOLA_API_BASE_URL)
+        Self::with_execution_policy(api_key, ConnectorExecutionPolicy::Inline)
+    }
+
+    pub fn with_execution_policy(
+        api_key: impl Into<String>,
+        execution_policy: ConnectorExecutionPolicy,
+    ) -> Self {
+        Self::with_base_url_and_execution_policy(
+            api_key,
+            DEFAULT_GRANOLA_API_BASE_URL,
+            execution_policy,
+        )
     }
 
     pub fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
+        Self::with_base_url_and_execution_policy(
+            api_key,
+            base_url,
+            ConnectorExecutionPolicy::Inline,
+        )
+    }
+
+    pub fn with_base_url_and_execution_policy(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        execution_policy: ConnectorExecutionPolicy,
+    ) -> Self {
         ensure_reqwest_crypto_provider();
         let client = Client::builder()
             .timeout(GRANOLA_HTTP_TIMEOUT)
@@ -63,6 +88,7 @@ impl HttpGranolaApiClient {
             api_key: api_key.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             client,
+            execution_policy,
         }
     }
 
@@ -102,6 +128,18 @@ impl HttpGranolaApiClient {
             if is_retryable_status(status) && attempt < DEFAULT_GRANOLA_RATE_LIMIT_RETRIES {
                 let delay = retry_after(&response).unwrap_or_else(|| granola_backoff(attempt));
                 granola_network_gate().record_cooldown(delay);
+                if status == StatusCode::TOO_MANY_REQUESTS
+                    && self.execution_policy.defers_provider_cooldown()
+                {
+                    let body = response
+                        .text()
+                        .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
+                    return Err(LocalityError::RateLimited {
+                        provider: "granola".to_string(),
+                        retry_after: delay,
+                        message: body,
+                    });
+                }
                 continue;
             }
             return decode_response(response);
@@ -241,6 +279,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    use locality_connector::ConnectorExecutionPolicy;
     use locality_core::LocalityError;
 
     use super::{GranolaApi, HttpGranolaApiClient};
@@ -309,6 +348,30 @@ mod tests {
         server.join().expect("server");
         assert!(
             matches!(error, LocalityError::Guardrail(message) if message.contains("reconnect Granola"))
+        );
+    }
+
+    #[test]
+    fn deferred_execution_returns_structured_rate_limit_without_inline_retry() {
+        let (base_url, request_rx, server) =
+            spawn_response("HTTP/1.1 429 Too Many Requests", "slow down");
+        let client = HttpGranolaApiClient::with_base_url_and_execution_policy(
+            "grn_secret",
+            base_url,
+            ConnectorExecutionPolicy::DeferProviderCooldown,
+        );
+        let error = client
+            .list_notes(None, 1, None, None, None)
+            .expect_err("rate limit");
+        request_rx.recv().expect("one request");
+        server.join().expect("server");
+        assert_eq!(
+            error,
+            LocalityError::RateLimited {
+                provider: "granola".to_string(),
+                retry_after: Duration::from_secs(1),
+                message: "slow down".to_string(),
+            }
         );
     }
 

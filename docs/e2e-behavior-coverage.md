@@ -102,6 +102,11 @@ Files provider are running.
 
 ## Expected Behavior Coverage
 
+The E2E-024 runtime coverage includes mocked Notion 429 handling: scheduled
+pulls move to a visible deferred cooldown without retaining the active worker,
+duplicate filesystem events coalesce, unrelated local work continues, and the
+pull resumes after its eligible retry time.
+
 Coverage labels:
 
 - **Covered live**: exercised against real Notion and verified after API reads.

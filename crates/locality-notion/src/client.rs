@@ -578,7 +578,17 @@ impl HttpNotionApi {
             if is_retryable_notion_http_status(status, retry_class)
                 && attempt < DEFAULT_NOTION_RATE_LIMIT_RETRIES
             {
-                record_notion_rate_limit(attempt, retry_after);
+                let delay = retry_after.unwrap_or_else(|| rate_limit_backoff(attempt));
+                record_notion_rate_limit(attempt, Some(delay));
+                if self.config.execution_policy.defers_provider_cooldown()
+                    && is_notion_rate_limited(status)
+                {
+                    return Err(LocalityError::RateLimited {
+                        provider: "notion".to_string(),
+                        retry_after: delay,
+                        message: body,
+                    });
+                }
                 continue;
             }
             return Err(LocalityError::Io(format!(
@@ -872,6 +882,7 @@ mod tests {
         HttpNotionApi, NotionRetryClass, data_source_search_body, notion_http_client_builder,
         notion_network_config, rate_limit_backoff, retry_after_header,
     };
+    use locality_core::LocalityError;
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
     use serde_json::Value;
     use std::io::{Read, Write};
@@ -1043,6 +1054,58 @@ mod tests {
         assert_eq!(
             result.expect("retry 503 request").get("ok"),
             Some(&Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn deferred_background_request_returns_structured_rate_limit_without_inline_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let url = format!("http://{}/rate-limited", listener.local_addr().unwrap());
+        let expected_body =
+            r#"{"object":"error","status":429,"code":"rate_limited","message":"slow down"}"#;
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            read_http_request_headers(&mut stream);
+            let body =
+                br#"{"object":"error","status":429,"code":"rate_limited","message":"slow down"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("write headers");
+            stream.write_all(body).expect("write body");
+        });
+
+        let api = HttpNotionApi {
+            config: crate::NotionConfig::default().with_execution_policy(
+                locality_connector::ConnectorExecutionPolicy::DeferProviderCooldown,
+            ),
+            client: notion_http_client_builder()
+                .timeout(Duration::from_millis(500))
+                .build()
+                .expect("build client"),
+        };
+        let mut attempts = 0;
+        let error = api
+            .send_request_with_retry::<Value>("GET", "/test", NotionRetryClass::ReadSafe, || {
+                attempts += 1;
+                api.client.get(&url)
+            })
+            .expect_err("429 should be returned to background scheduler");
+
+        server.join().expect("join server");
+        assert_eq!(
+            attempts, 1,
+            "background request must not sleep and retry inline"
+        );
+        assert_eq!(
+            error,
+            LocalityError::RateLimited {
+                provider: "notion".to_string(),
+                retry_after: Duration::ZERO,
+                message: expected_body.to_string(),
+            }
         );
     }
 

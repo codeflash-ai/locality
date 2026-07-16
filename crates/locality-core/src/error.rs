@@ -4,6 +4,7 @@
 //! structured categories that map cleanly to stable CLI exit codes and JSON.
 
 use std::fmt::{Display, Formatter};
+use std::time::Duration;
 
 use crate::conflict::ConflictSummary;
 use crate::validation::ValidationIssue;
@@ -16,6 +17,11 @@ pub enum LocalityError {
     Conflict(ConflictSummary),
     Guardrail(String),
     RemoteNotFound(String),
+    RateLimited {
+        provider: String,
+        retry_after: Duration,
+        message: String,
+    },
     InvalidState(String),
     Unsupported(&'static str),
     NotImplemented(&'static str),
@@ -29,6 +35,15 @@ impl Display for LocalityError {
             Self::Conflict(summary) => write!(f, "conflict on {}", summary.path.display()),
             Self::Guardrail(message) => write!(f, "guardrail blocked push: {message}"),
             Self::RemoteNotFound(message) => write!(f, "remote object not found: {message}"),
+            Self::RateLimited {
+                provider,
+                retry_after,
+                message,
+            } => write!(
+                f,
+                "{provider} rate limited for {}ms: {message}",
+                retry_after.as_millis()
+            ),
             Self::InvalidState(message) => write!(f, "invalid state: {message}"),
             Self::Unsupported(feature) => write!(f, "unsupported feature: {feature}"),
             Self::NotImplemented(feature) => write!(f, "not implemented: {feature}"),

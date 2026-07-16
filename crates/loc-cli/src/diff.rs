@@ -168,6 +168,7 @@ impl DiffError {
             Self::Prepare(LocalityError::Conflict(_)) => "conflict",
             Self::Prepare(LocalityError::Guardrail(_)) => "guardrail",
             Self::Prepare(LocalityError::RemoteNotFound(_)) => "remote_not_found",
+            Self::Prepare(LocalityError::RateLimited { .. }) => "rate_limited",
             Self::Prepare(LocalityError::InvalidState(_)) => "invalid_state",
             Self::Prepare(LocalityError::Unsupported(_)) => "unsupported",
             Self::Prepare(LocalityError::Io(_)) => "io_error",

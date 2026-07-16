@@ -217,6 +217,7 @@ impl NotionConnectionProbe for HttpNotionConnectionProbe {
             root_page_id: None,
             token: Some(token.to_string()),
             token_key: DEFAULT_NOTION_TOKEN_ENV.to_string(),
+            execution_policy: locality_connector::ConnectorExecutionPolicy::Inline,
         });
         let user = api
             .retrieve_current_user()

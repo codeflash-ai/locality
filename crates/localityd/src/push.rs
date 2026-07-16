@@ -69,7 +69,10 @@ use crate::shadow_match::shadows_match;
 use crate::source::{
     LocalSourceValidator, SourcePushValidator, SourceValidationContext, source_descriptor,
 };
-use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
+use crate::virtual_fs::{
+    repair_legacy_macos_content_root, virtual_fs_content_path, virtual_fs_content_root,
+    virtual_mutation_content_path_for_read,
+};
 
 pub fn execute_push_job<S, Source>(
     store: &mut S,
@@ -2052,6 +2055,7 @@ where
         let Some(state_root) = state_root else {
             return Ok(());
         };
+        repair_legacy_macos_content_root(state_root, &mount.mount_id)?;
         virtual_fs_content_root(state_root, &mount.mount_id)
     } else {
         mount.root.clone()
@@ -2374,13 +2378,18 @@ fn pending_create_read_path(
     state_root: Option<&Path>,
     absolute_path: &Path,
 ) -> Result<PathBuf, PushPrepareError> {
-    let content_path = pending.content_path.clone().or_else(|| {
-        state_root.map(|root| {
-            virtual_fs_content_root(root, &mount.mount_id).join(&pending.projected_path)
-        })
-    });
+    if mount.projection.uses_virtual_filesystem()
+        && let Some(state_root) = state_root
+    {
+        repair_legacy_macos_content_root(state_root, &mount.mount_id)
+            .map_err(PushPrepareError::Core)?;
+    }
+    let content_path = virtual_mutation_content_path_for_read(state_root, &mount.mount_id, pending)
+        .map_err(PushPrepareError::Core)?;
 
-    if mount.projection.uses_virtual_filesystem() && state_root.is_none() && absolute_path.is_file()
+    if mount.projection.uses_virtual_filesystem()
+        && absolute_path.is_file()
+        && (state_root.is_none() || content_path.as_ref().is_some_and(|path| !path.is_file()))
     {
         return Ok(absolute_path.to_path_buf());
     }
@@ -2790,6 +2799,7 @@ fn projection_read_path(
     if mount.projection.uses_virtual_filesystem()
         && let Some(state_root) = state_root
     {
+        repair_legacy_macos_content_root(state_root, &mount.mount_id)?;
         return virtual_fs_content_path(state_root, &mount.mount_id, relative_path);
     }
 
@@ -3455,6 +3465,7 @@ fn locality_error_code(error: &LocalityError) -> &'static str {
         LocalityError::Conflict(_) => "conflict",
         LocalityError::Guardrail(_) => "guardrail",
         LocalityError::RemoteNotFound(_) => "remote_not_found",
+        LocalityError::RateLimited { .. } => "rate_limited",
         LocalityError::InvalidState(_) => "invalid_state",
         LocalityError::Unsupported(_) => "unsupported",
         LocalityError::NotImplemented(_) => "not_implemented",
@@ -3757,6 +3768,7 @@ fn projection_output_root(
     if mount.projection.uses_virtual_filesystem()
         && let Some(state_root) = state_root
     {
+        repair_legacy_macos_content_root(state_root, &mount.mount_id)?;
         return Ok(virtual_fs_content_root(state_root, &mount.mount_id));
     }
 
@@ -3769,6 +3781,98 @@ fn generate_push_id() -> PushId {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     PushId(format!("push-{timestamp}-{}", std::process::id()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn schema_preflight_repairs_legacy_app_group_cache_before_remote_fetch() {
+        use locality_core::hydration::HydrationRequest;
+        use locality_store::{InMemoryStateStore, ProjectionMode};
+
+        struct SchemaSource;
+
+        impl HydrationSource for SchemaSource {
+            fn fetch_render(
+                &self,
+                _request: &HydrationRequest,
+            ) -> locality_core::LocalityResult<HydratedEntity> {
+                panic!("schema preflight should not hydrate")
+            }
+
+            fn fetch_database_schema_yaml(
+                &self,
+                _database_id: &RemoteId,
+            ) -> locality_core::LocalityResult<Option<String>> {
+                Ok(Some("remote schema\n".to_string()))
+            }
+        }
+
+        let home = std::env::temp_dir().join(format!(
+            "loc-push-schema-legacy-home-{}",
+            std::process::id()
+        ));
+        let state_root = home.join(".loc");
+        let visible_root = home.join("visible");
+        let mount_id = MountId::new("notion-main");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(mount_id.clone(), "notion", &visible_root)
+                    .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("database-1"),
+                EntityKind::Database,
+                "Tasks",
+                "Tasks",
+            ))
+            .expect("save database");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Existing task",
+                "Tasks/Existing task.md",
+            ))
+            .expect("save page");
+        let legacy_schema_path = home
+            .join("Library")
+            .join("Group Containers")
+            .join("C484HB7Q6S.group.ai.codeflash.locality")
+            .join("content")
+            .join(&mount_id.0)
+            .join("files")
+            .join("Tasks/_schema.yaml");
+        std::fs::create_dir_all(legacy_schema_path.parent().expect("legacy parent"))
+            .expect("legacy parent");
+        std::fs::write(&legacy_schema_path, "legacy schema\n").expect("write legacy schema");
+        let current_schema_path =
+            virtual_fs_content_root(&state_root, &mount_id).join("Tasks/_schema.yaml");
+        assert!(!current_schema_path.exists());
+
+        repair_missing_database_schema_for_target(
+            &store,
+            &SchemaSource,
+            &visible_root.join("Tasks/Existing task.md"),
+            Some(&state_root),
+        )
+        .expect("schema preflight");
+
+        assert_eq!(
+            std::fs::read_to_string(&current_schema_path).expect("read current schema"),
+            "legacy schema\n"
+        );
+
+        let _ = std::fs::remove_dir_all(home);
+    }
 }
 
 fn push_timestamp() -> String {

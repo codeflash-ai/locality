@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
-    ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, ListChildrenRequest,
-    ListChildrenResult, NativeEntity, ObserveRequest, ParsedEntity,
+    ConnectorCapabilities, ConnectorExecutionPolicy, ConnectorKind, EnumerateRequest, FetchRequest,
+    ListChildrenRequest, ListChildrenResult, NativeEntity, ObserveRequest, ParsedEntity,
 };
 use locality_core::canonical::ParsedCanonicalDocument;
 use locality_core::freshness::RemoteObservation;
@@ -48,6 +48,17 @@ pub enum ResolvedSource {
     GoogleDocs(GoogleDocsConnector),
     Gmail(GmailConnector),
     Granola(GranolaConnector),
+}
+
+impl ResolvedSource {
+    pub fn with_execution_policy(&self, policy: ConnectorExecutionPolicy) -> Self {
+        match self {
+            Self::Notion(source) => Self::Notion(source.with_execution_policy(policy)),
+            Self::GoogleDocs(source) => Self::GoogleDocs(source.with_execution_policy(policy)),
+            Self::Gmail(source) => Self::Gmail(source.with_execution_policy(policy)),
+            Self::Granola(source) => Self::Granola(source.with_execution_policy(policy)),
+        }
+    }
 }
 
 pub trait SourceResolverStore:
@@ -124,6 +135,7 @@ pub struct SourceDescriptor {
     source_root_create_parent_kind: Option<EntityKind>,
     create_entity_parent_kinds: Vec<EntityKind>,
     periodic_discovery_interval: Option<Duration>,
+    max_background_discovery_workers: usize,
 }
 
 impl SourceDescriptor {
@@ -165,6 +177,10 @@ impl SourceDescriptor {
 
     pub fn periodic_discovery_interval(&self) -> Option<Duration> {
         self.periodic_discovery_interval
+    }
+
+    pub fn max_background_discovery_workers(&self) -> usize {
+        self.max_background_discovery_workers
     }
 }
 
@@ -268,6 +284,7 @@ fn notion_source_descriptor() -> SourceDescriptor {
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
         periodic_discovery_interval: None,
+        max_background_discovery_workers: 3,
     }
 }
 
@@ -283,6 +300,7 @@ fn google_docs_source_descriptor() -> SourceDescriptor {
         source_root_create_parent_kind: Some(EntityKind::Directory),
         create_entity_parent_kinds: vec![EntityKind::Directory],
         periodic_discovery_interval: None,
+        max_background_discovery_workers: 4,
     }
 }
 
@@ -298,6 +316,7 @@ fn gmail_source_descriptor() -> SourceDescriptor {
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Directory],
         periodic_discovery_interval: None,
+        max_background_discovery_workers: 4,
     }
 }
 
@@ -313,6 +332,7 @@ fn granola_source_descriptor() -> SourceDescriptor {
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: Vec::new(),
         periodic_discovery_interval: Some(Duration::from_secs(300)),
+        max_background_discovery_workers: 3,
     }
 }
 
@@ -361,6 +381,7 @@ fn generic_source_descriptor(connector: &str) -> SourceDescriptor {
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
         periodic_discovery_interval: None,
+        max_background_discovery_workers: 1,
     }
 }
 
@@ -530,6 +551,24 @@ impl ResolvedSourceSet {
             }
         }
         (Self { sources }, unavailable)
+    }
+
+    /// Resolve sources for daemon-owned background work. Notion returns a
+    /// structured cooldown on HTTP 429 so the runtime can park the scheduled
+    /// job instead of tying up its serialized reconciliation worker.
+    pub fn new_available_for_background<S>(
+        store: &S,
+        credentials: &dyn CredentialStore,
+        mounts: &[MountConfig],
+    ) -> (Self, Vec<(MountId, ConnectorResolveError)>)
+    where
+        S: ConnectionRepository + ConnectorProfileRepository + ConnectorStateRepository,
+    {
+        let (mut resolved, unavailable) = Self::new_available(store, credentials, mounts);
+        for source in resolved.sources.values_mut() {
+            *source = source.with_execution_policy(ConnectorExecutionPolicy::DeferProviderCooldown);
+        }
+        (resolved, unavailable)
     }
 
     pub fn contains_mount(&self, mount_id: &MountId) -> bool {
