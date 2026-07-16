@@ -840,6 +840,10 @@ fn start_windows_cloud_files_lifecycle(
     }
 
     register_windows_cloud_files_sync_root(state_root, mount, display_name)?;
+    run_windows_cloud_files_helper(
+        "preflight",
+        windows_cloud_files_preflight_args(state_root, mount),
+    )?;
     std::fs::create_dir_all(windows_cloud_files_lifecycle_dir(state_root))
         .map_err(|error| WindowsCloudFilesHelperError::Failed(error.to_string()))?;
     let log_dir = windows_cloud_files_log_dir(state_root);
@@ -1448,6 +1452,11 @@ fn windows_cloud_files_run_args(state_root: &Path, mount: &MountConfig) -> Vec<S
         "--state-dir".to_string(),
         helper_path_arg(state_root),
     ]
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_cloud_files_preflight_args(state_root: &Path, mount: &MountConfig) -> Vec<String> {
+    windows_cloud_files_run_args(state_root, mount)
 }
 
 pub fn windows_cloud_files_run_command_args(state_root: &Path, mount: &MountConfig) -> Vec<String> {
@@ -3225,6 +3234,22 @@ mod tests {
                 .any(|pair| { pair[0] == "--sync-root" && pair[1] == r"C:\Users\Ada\Locality" })
         );
         assert!(!args.windows(2).any(|pair| pair[0] == "--mount-id"));
+    }
+
+    #[test]
+    fn windows_cloud_files_preflight_args_match_detached_run_scope() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            r"C:\Users\Ada\Locality\notion-main",
+        )
+        .projection(ProjectionMode::WindowsCloudFiles);
+        let state_root = std::path::Path::new(r"C:\Users\Ada\.loc");
+
+        assert_eq!(
+            super::windows_cloud_files_preflight_args(state_root, &mount),
+            super::windows_cloud_files_run_args(state_root, &mount)
+        );
     }
 
     #[test]

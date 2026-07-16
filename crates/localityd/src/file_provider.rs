@@ -236,7 +236,7 @@ pub struct ProjectionRefreshReport {
 
 const WINDOWS_CLOUD_FILES_PROJECTION_ACK_VERSION: u32 = 1;
 const WINDOWS_CLOUD_FILES_PROJECTION_ACK_MAX_AGE_MS: u64 = 5 * 60 * 1_000;
-const WINDOWS_CLOUD_FILES_RECOVERY_STATE_VERSION: u32 = 1;
+const WINDOWS_CLOUD_FILES_RECOVERY_STATE_VERSION: u32 = 2;
 const WINDOWS_CLOUD_FILES_RECOVERY_MIN_READER_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,6 +330,8 @@ pub struct WindowsCloudFilesProjectionRecovery {
     pub operation: WindowsCloudFilesProjectionRecoveryOperation,
     pub payload_kind: WindowsCloudFilesProjectionRecoveryPayloadKind,
     pub status: WindowsCloudFilesProjectionRecoveryStatus,
+    #[serde(default)]
+    pub provider_root: Option<PathBuf>,
     pub source_access_root: Option<PathBuf>,
     pub source_relative_path: Option<PathBuf>,
     pub source_path: Option<PathBuf>,
@@ -1240,6 +1242,7 @@ pub fn repair_windows_cloud_files_projection_recoveries(
         .into_iter()
         .map(|recovery| windows_projection_path_key(&recovery.quarantine_path))
         .collect::<std::collections::BTreeSet<_>>();
+    let provider_root = windows_cloud_files_projection_provider_root(access_root)?;
     let quarantine_root = windows_cloud_files_projection_quarantine_root(access_root)?;
     match std::fs::read_dir(&quarantine_root) {
         Ok(entries) => {
@@ -1267,7 +1270,8 @@ pub fn repair_windows_cloud_files_projection_recoveries(
                         WindowsCloudFilesProjectionRecoveryPayloadKind::Unknown
                     },
                     status: WindowsCloudFilesProjectionRecoveryStatus::Orphaned,
-                    source_access_root: Some(access_root.to_path_buf()),
+                    provider_root: Some(provider_root.clone()),
+                    source_access_root: None,
                     source_relative_path: None,
                     source_path: None,
                     intended_entity_path: None,
@@ -1403,6 +1407,7 @@ fn prepare_windows_cloud_files_projection_recovery(
     intended_entity_path: Option<&Path>,
 ) -> LocalityResult<WindowsCloudFilesProjectionRecovery> {
     static RECOVERY_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let provider_root = windows_cloud_files_projection_provider_root(access_root)?;
     let quarantine_root = windows_cloud_files_projection_quarantine_root(access_root)?;
     std::fs::create_dir_all(&quarantine_root).map_err(LocalityError::from)?;
     let now = current_unix_millis();
@@ -1427,6 +1432,7 @@ fn prepare_windows_cloud_files_projection_recovery(
         operation,
         payload_kind,
         status: WindowsCloudFilesProjectionRecoveryStatus::Prepared,
+        provider_root: Some(provider_root),
         source_access_root: Some(access_root.to_path_buf()),
         source_relative_path: Some(source_relative_path.to_path_buf()),
         source_path: Some(source_path.to_path_buf()),
@@ -1461,19 +1467,14 @@ fn windows_cloud_files_projection_recovery_manifest_dir(state_root: &Path) -> Pa
 }
 
 fn windows_cloud_files_projection_quarantine_root(access_root: &Path) -> LocalityResult<PathBuf> {
-    let provider_root = access_root.parent().ok_or_else(|| {
-        LocalityError::InvalidState(format!(
-            "Windows Cloud Files access root `{}` has no provider root",
-            access_root.display()
-        ))
-    })?;
+    let provider_root = windows_cloud_files_projection_provider_root(access_root)?;
     let outside_parent = provider_root.parent().ok_or_else(|| {
         LocalityError::InvalidState(format!(
             "Windows Cloud Files provider root `{}` has no same-volume recovery parent",
             provider_root.display()
         ))
     })?;
-    let provider_key = windows_projection_path_key(provider_root);
+    let provider_key = windows_projection_path_key(&provider_root);
     Ok(outside_parent
         .join(".locality-recovery")
         .join("windows-cloud-files")
@@ -1483,13 +1484,35 @@ fn windows_cloud_files_projection_quarantine_root(access_root: &Path) -> Localit
         )))
 }
 
+fn windows_cloud_files_projection_provider_root(access_root: &Path) -> LocalityResult<PathBuf> {
+    access_root.parent().map(Path::to_path_buf).ok_or_else(|| {
+        LocalityError::InvalidState(format!(
+            "Windows Cloud Files access root `{}` has no provider root",
+            access_root.display()
+        ))
+    })
+}
+
 fn persist_windows_cloud_files_projection_recovery(
     state_root: &Path,
     recovery: &WindowsCloudFilesProjectionRecovery,
 ) -> LocalityResult<()> {
+    persist_windows_cloud_files_projection_recovery_with_durable_publish(
+        state_root,
+        recovery,
+        durably_publish_recovery_manifest,
+    )
+}
+
+fn persist_windows_cloud_files_projection_recovery_with_durable_publish(
+    state_root: &Path,
+    recovery: &WindowsCloudFilesProjectionRecovery,
+    durable_publish: impl FnOnce(&Path, &Path, &Path) -> std::io::Result<()>,
+) -> LocalityResult<()> {
     static MANIFEST_COUNTER: AtomicU64 = AtomicU64::new(0);
     let directory = windows_cloud_files_projection_recovery_manifest_dir(state_root);
-    std::fs::create_dir_all(&directory).map_err(LocalityError::from)?;
+    create_windows_cloud_files_projection_recovery_manifest_dir(state_root, &directory)
+        .map_err(LocalityError::from)?;
     let sequence = MANIFEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = directory.join(format!(
         "{}-r{:08}-{sequence}.json",
@@ -1508,11 +1531,159 @@ fn persist_windows_cloud_files_projection_recovery(
         return Err(LocalityError::from(error));
     }
     drop(file);
-    if let Err(error) = std::fs::rename(&temporary, &path) {
+    if let Err(error) = durable_publish(&temporary, &path, &directory) {
         let _ = std::fs::remove_file(&temporary);
         return Err(LocalityError::from(error));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn create_windows_cloud_files_projection_recovery_manifest_dir(
+    state_root: &Path,
+    directory: &Path,
+) -> std::io::Result<()> {
+    create_windows_cloud_files_projection_recovery_manifest_dir_with_sync(
+        state_root,
+        directory,
+        |parent| std::fs::File::open(parent)?.sync_all(),
+    )
+}
+
+#[cfg(windows)]
+fn create_windows_cloud_files_projection_recovery_manifest_dir(
+    _state_root: &Path,
+    directory: &Path,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(directory)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_windows_cloud_files_projection_recovery_manifest_dir(
+    state_root: &Path,
+    directory: &Path,
+) -> std::io::Result<()> {
+    create_windows_cloud_files_projection_recovery_manifest_dir_with_sync(
+        state_root,
+        directory,
+        |parent| std::fs::File::open(parent)?.sync_all(),
+    )
+}
+
+fn create_windows_cloud_files_projection_recovery_manifest_dir_with_sync(
+    state_root: &Path,
+    directory: &Path,
+    mut sync_directory: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    directory.strip_prefix(state_root).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "recovery manifest directory `{}` is outside state root `{}`",
+                directory.display(),
+                state_root.display()
+            ),
+        )
+    })?;
+    std::fs::create_dir_all(directory)?;
+    let mut child = directory;
+    while child != state_root {
+        let parent = child.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "recovery manifest directory `{}` has no parent inside state root `{}`",
+                    directory.display(),
+                    state_root.display()
+                ),
+            )
+        })?;
+        sync_directory(parent)?;
+        child = parent;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn durably_publish_recovery_manifest(
+    temporary: &Path,
+    destination: &Path,
+    directory: &Path,
+) -> std::io::Result<()> {
+    rename_recovery_manifest_without_replacement(temporary, destination)?;
+    std::fs::File::open(directory)?.sync_all()
+}
+
+#[cfg(all(
+    unix,
+    any(target_os = "linux", target_vendor = "apple", target_os = "redox")
+))]
+fn rename_recovery_manifest_without_replacement(
+    temporary: &Path,
+    destination: &Path,
+) -> std::io::Result<()> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        temporary,
+        rustix::fs::CWD,
+        destination,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_vendor = "apple", target_os = "redox"))
+))]
+fn rename_recovery_manifest_without_replacement(
+    temporary: &Path,
+    destination: &Path,
+) -> std::io::Result<()> {
+    std::fs::hard_link(temporary, destination)?;
+    std::fs::remove_file(temporary)
+}
+
+#[cfg(windows)]
+fn durably_publish_recovery_manifest(
+    temporary: &Path,
+    destination: &Path,
+    _directory: &Path,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let temporary = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let moved = unsafe {
+        MoveFileExW(
+            temporary.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn durably_publish_recovery_manifest(
+    temporary: &Path,
+    destination: &Path,
+    directory: &Path,
+) -> std::io::Result<()> {
+    std::fs::rename(temporary, destination)?;
+    std::fs::File::open(directory)?.sync_all()
 }
 
 fn validate_windows_cloud_files_projection_recovery_version(
@@ -3451,6 +3622,170 @@ mod tests {
     }
 
     #[test]
+    fn windows_projection_recovery_manifest_syncs_directory_after_rename_and_propagates_failure() {
+        let root = temp_root("loc-windows-recovery-directory-sync");
+        let state_root = root.join("state");
+        let access_root = root.join("provider/notion-main");
+        fs::create_dir_all(&access_root).expect("create access root");
+        let source = access_root.join("page.md");
+        fs::write(&source, "page").expect("write source");
+        let recovery = prepare_windows_cloud_files_projection_recovery(
+            &state_root,
+            &access_root,
+            &MountId::new("notion-main"),
+            &RemoteId::new("page-1"),
+            WindowsCloudFilesProjectionRecoveryOperation::Move,
+            WindowsCloudFilesProjectionRecoveryPayloadKind::File,
+            &source,
+            Path::new("page.md"),
+            None,
+            Some(Path::new("restored/page.md")),
+        )
+        .expect("prepare recovery fixture");
+        let manifest_dir = windows_cloud_files_projection_recovery_manifest_dir(&state_root);
+        fs::remove_dir_all(&manifest_dir).expect("remove fixture manifest");
+        let sync_calls = std::cell::Cell::new(0);
+
+        let error = persist_windows_cloud_files_projection_recovery_with_durable_publish(
+            &state_root,
+            &recovery,
+            |temporary, destination, directory| {
+                fs::rename(temporary, destination).expect("rename manifest before directory sync");
+                sync_calls.set(sync_calls.get() + 1);
+                assert_eq!(directory, manifest_dir);
+                let entries = fs::read_dir(directory)
+                    .expect("manifest directory exists before sync")
+                    .map(|entry| entry.expect("read manifest entry").path())
+                    .collect::<Vec<_>>();
+                assert_eq!(entries.len(), 1);
+                assert_eq!(
+                    entries[0].extension().and_then(|value| value.to_str()),
+                    Some("json")
+                );
+                Err(std::io::Error::other("injected directory sync failure"))
+            },
+        )
+        .expect_err("directory sync failure must fail manifest publication");
+
+        assert_eq!(sync_calls.get(), 1);
+        assert!(
+            error
+                .to_string()
+                .contains("injected directory sync failure")
+        );
+        assert_eq!(
+            list_windows_cloud_files_projection_recoveries(&state_root)
+                .expect("renamed manifest remains inspectable"),
+            vec![recovery]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn windows_projection_recovery_manifest_directory_syncs_ancestry_bottom_up() {
+        let root = temp_root("loc-windows-recovery-directory-ancestry");
+        let state_root = root.join("state");
+        fs::create_dir_all(&state_root).expect("create durable state root");
+        let manifest_dir = windows_cloud_files_projection_recovery_manifest_dir(&state_root);
+        let synced = std::cell::RefCell::new(Vec::new());
+
+        create_windows_cloud_files_projection_recovery_manifest_dir_with_sync(
+            &state_root,
+            &manifest_dir,
+            |directory| {
+                assert!(manifest_dir.is_dir());
+                synced.borrow_mut().push(directory.to_path_buf());
+                Ok(())
+            },
+        )
+        .expect("create and sync manifest directory ancestry");
+
+        assert_eq!(
+            synced.into_inner(),
+            vec![state_root.join("provider-recovery"), state_root.clone()]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_projection_recovery_manifest_publish_never_replaces_existing_revision() {
+        let root = temp_root("loc-windows-recovery-manifest-collision");
+        fs::create_dir_all(&root).expect("create manifest directory");
+        let temporary = root.join("manifest.tmp");
+        let destination = root.join("manifest.json");
+        fs::write(&temporary, "new revision").expect("write temporary manifest");
+        fs::write(&destination, "existing revision").expect("write existing manifest");
+
+        let error = durably_publish_recovery_manifest(&temporary, &destination, &root)
+            .expect_err("immutable manifest collision must fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_to_string(&destination).expect("read existing manifest"),
+            "existing revision"
+        );
+        assert_eq!(
+            fs::read_to_string(&temporary).expect("read unpublished temporary manifest"),
+            "new revision"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn windows_projection_recovery_detects_payload_rename_rollback_after_clean_record() {
+        let root = temp_root("loc-windows-recovery-payload-rollback");
+        let state_root = root.join("state");
+        let access_root = root.join("provider/notion-main");
+        fs::create_dir_all(&access_root).expect("create access root");
+        let source = access_root.join("page.md");
+        fs::write(&source, "page").expect("write source");
+        let mut recovery = prepare_windows_cloud_files_projection_recovery(
+            &state_root,
+            &access_root,
+            &MountId::new("notion-main"),
+            &RemoteId::new("page-1"),
+            WindowsCloudFilesProjectionRecoveryOperation::Move,
+            WindowsCloudFilesProjectionRecoveryPayloadKind::File,
+            &source,
+            Path::new("page.md"),
+            None,
+            Some(Path::new("restored/page.md")),
+        )
+        .expect("prepare recovery");
+        fs::rename(&source, &recovery.quarantine_path).expect("move payload to quarantine");
+        inspect_windows_cloud_files_projection_recovery(&mut recovery);
+        recovery.record_revision += 1;
+        recovery.status = WindowsCloudFilesProjectionRecoveryStatus::QuarantinedClean;
+        persist_windows_cloud_files_projection_recovery(&state_root, &recovery)
+            .expect("persist clean recovery record");
+        fs::rename(&recovery.quarantine_path, &source).expect("simulate namespace rollback");
+
+        let repaired = repair_windows_cloud_files_projection_recoveries(&state_root, &access_root)
+            .expect("repair rolled-back payload rename");
+        let repaired = repaired
+            .iter()
+            .find(|candidate| candidate.recovery_id == recovery.recovery_id)
+            .expect("repaired recovery");
+        assert_eq!(
+            repaired.status,
+            WindowsCloudFilesProjectionRecoveryStatus::Missing
+        );
+        assert!(source.is_file());
+        assert!(
+            repaired
+                .review_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("quarantine payload is missing"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn windows_projection_recovery_discovers_orphan_and_rejects_newer_state() {
         let root = temp_root("loc-windows-recovery-orphan");
         let state_root = root.join("state");
@@ -3471,6 +3806,11 @@ mod tests {
         assert_eq!(
             orphan.status,
             WindowsCloudFilesProjectionRecoveryStatus::Orphaned
+        );
+        assert_eq!(orphan.source_access_root, None);
+        assert_eq!(
+            orphan.provider_root,
+            access_root.parent().map(Path::to_path_buf)
         );
 
         let mut newer = orphan.clone();
