@@ -2,13 +2,21 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use loc_cli::diff::run_diff_with_state_root;
+use loc_cli::mount::{MountOptions, run_mount};
+use loc_cli::pull::run_pull_with_state_root;
+use loc_cli::push::{PushOptions, run_push_with_daemon_at_state_root};
+use loc_cli::status::{StatusOptions, run_status};
 use locality_core::model::{MountId, RemoteId};
 use locality_gmail::{
     GMAIL_CONNECTOR_ID, GMAIL_OAUTH_SCOPES, GmailConnector, StoredGmailCredential,
     gmail_capabilities_json,
 };
+use locality_google_docs::client::{GoogleDocsApi, GoogleDriveApi, HttpGoogleApiClient};
+use locality_google_docs::docs_dto::{GoogleDocument, StructuralElement};
+use locality_google_docs::drive_dto::{DriveCreateFileRequest, DriveUpdateFileRequest};
 use locality_google_docs::{
     GOOGLE_DOCS_CONNECTOR_ID, GOOGLE_DOCS_OAUTH_SCOPES, GoogleDocsConnector,
     StoredGoogleDocsCredential, google_docs_capabilities_json,
@@ -19,8 +27,15 @@ use locality_store::{
     MountConfig, MountRepository, ProjectionMode, SqliteStateStore,
 };
 use localityd::source::{ResolvedSource, resolve_source_for_mount};
+use localityd::virtual_fs::{
+    VirtualFsItem, VirtualFsItemKind, materialize_virtual_fs_item_with_content_root,
+    mount_point_identifier, refresh_virtual_fs_children, rename_virtual_fs_item,
+    trash_virtual_fs_item, virtual_fs_children_with_content_root, virtual_fs_content_root,
+};
 
 const LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON: &str = "LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON";
+const LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_PREFIX: &str =
+    "LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_PREFIX";
 const LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON: &str = "LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON";
 const LOCALITY_GMAIL_LIVE_TEST_RECIPIENT: &str = "LOCALITY_GMAIL_LIVE_TEST_RECIPIENT";
 const LOCALITY_GOOGLE_LIVE_FORCE_REFRESH: &str = "LOCALITY_GOOGLE_LIVE_FORCE_REFRESH";
@@ -64,6 +79,32 @@ impl Drop for LiveFixture {
     fn drop(&mut self) {
         if std::env::var(KEEP_TMP_ENV).ok().as_deref() != Some("1") {
             let _ = fs::remove_dir_all(self.state_root.parent().expect("fixture root parent"));
+        }
+    }
+}
+
+struct DriveTrashGuard {
+    api: Option<HttpGoogleApiClient>,
+    file_id: String,
+}
+
+impl DriveTrashGuard {
+    fn new(api: HttpGoogleApiClient, file_id: String) -> Self {
+        Self {
+            api: Some(api),
+            file_id,
+        }
+    }
+
+    fn use_api(&mut self, api: HttpGoogleApiClient) {
+        self.api = Some(api);
+    }
+}
+
+impl Drop for DriveTrashGuard {
+    fn drop(&mut self) {
+        if let Some(api) = &self.api {
+            let _ = api.update_file(&self.file_id, DriveUpdateFileRequest::trash());
         }
     }
 }
@@ -139,6 +180,320 @@ fn seed_live_connection(
         .expect("save connection");
 
     secret_ref
+}
+
+#[test]
+#[ignore = "requires LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON with broker refresh handle; creates and trashes scratch Google Drive content"]
+fn live_google_docs_workspace_create_edit_move_archive_round_trip() {
+    let fixture = LiveFixture::new("loc-live-google-docs");
+    let connection_id = ConnectionId::new("google-docs-live");
+    seed_live_connection(
+        &fixture.state_root,
+        GoogleLiveConnector::GoogleDocs,
+        &connection_id,
+    );
+    let bootstrap_connector = resolve_google_docs_from_store(
+        &fixture.state_root,
+        connection_id.clone(),
+        RemoteId::new("bootstrap-workspace"),
+    );
+    let bootstrap_api = HttpGoogleApiClient::new(bootstrap_connector.config().access_token.clone());
+    let workspace_prefix = std::env::var(LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_PREFIX)
+        .unwrap_or_else(|_| "Locality live Google Docs e2e".to_string());
+    let workspace = bootstrap_api
+        .create_file(DriveCreateFileRequest::folder(
+            format!("{workspace_prefix} {}", timestamp_string()),
+            None,
+        ))
+        .expect("create scratch Google Docs workspace folder");
+    let mut cleanup = DriveTrashGuard::new(bootstrap_api, workspace.id.clone());
+
+    let connector = resolve_google_docs_from_store(
+        &fixture.state_root,
+        connection_id.clone(),
+        RemoteId::new(workspace.id.clone()),
+    );
+    let api = HttpGoogleApiClient::new(connector.config().access_token.clone());
+    cleanup.use_api(api.clone());
+
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).expect("open state store");
+    let plain_mount_id = MountId::new("google-docs-main");
+    let plain_mount_root = fixture.mount_root.join("google-docs-main");
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: plain_mount_id.clone(),
+            connector: GOOGLE_DOCS_CONNECTOR_ID.to_string(),
+            root: plain_mount_root.clone(),
+            remote_root_id: Some(RemoteId::new(workspace.id.clone())),
+            connection_id: Some(connection_id.clone()),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
+        },
+    )
+    .expect("mount live Google Docs plain workspace");
+    let pull = run_pull_with_state_root(
+        &mut store,
+        &connector,
+        &plain_mount_root,
+        Some(&fixture.state_root),
+    )
+    .expect("pull live Google Docs plain workspace");
+    assert!(pull.ok, "{pull:#?}");
+
+    let page_dir = plain_mount_root.join("draft-plan");
+    fs::create_dir_all(&page_dir).expect("create draft page directory");
+    let page_path = page_dir.join("page.md");
+    fs::write(
+        &page_path,
+        "---\ntitle: Draft Plan\n---\n# Draft Plan\n\nCreated from live Google Docs e2e.\n",
+    )
+    .expect("write draft page");
+    let create_diff = run_diff_with_state_root(&store, &page_path, Some(&fixture.state_root))
+        .expect("diff Google Docs create");
+    assert!(create_diff.ok, "{create_diff:#?}");
+    assert_eq!(create_diff.action, "confirm_plan", "{create_diff:#?}");
+    let create_plan = create_diff.plan.as_ref().expect("Google Docs create plan");
+    assert_eq!(create_plan.summary.entities_created, 1, "{create_plan:#?}");
+
+    let create_push = run_push_with_daemon_at_state_root(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        Some(&fixture.state_root),
+    )
+    .expect("push Google Docs create");
+    assert!(create_push.ok, "{create_push:#?}");
+    assert_eq!(create_push.action, "reconciled", "{create_push:#?}");
+    let created_id = create_push
+        .changed_remote_ids
+        .iter()
+        .find(|id| *id != &workspace.id)
+        .cloned()
+        .expect("created Google Docs remote id");
+    let created_doc = api
+        .get_document(&created_id)
+        .expect("fetch created Google Doc");
+    assert_eq!(created_doc.document_id, created_id);
+    let created_file = api
+        .get_file(&created_id)
+        .expect("fetch created Google Drive file");
+    assert_eq!(created_file.name, "Draft Plan");
+    assert_eq!(created_file.parents, vec![workspace.id.clone()]);
+
+    let created_markdown = fs::read_to_string(&page_path).expect("read created page");
+    fs::write(
+        &page_path,
+        created_markdown.replace(
+            "Created from live Google Docs e2e.",
+            "Edited from live Google Docs e2e.",
+        ),
+    )
+    .expect("write edited page");
+    let edit_push = run_push_with_daemon_at_state_root(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        Some(&fixture.state_root),
+    )
+    .expect("push Google Docs edit");
+    assert!(edit_push.ok, "{edit_push:#?}");
+    assert_eq!(edit_push.action, "reconciled", "{edit_push:#?}");
+    assert!(
+        edit_push.changed_remote_ids.contains(&created_id),
+        "{edit_push:#?}"
+    );
+    let edited_doc = api
+        .get_document(&created_id)
+        .expect("fetch edited Google Doc");
+    let edited_text = google_document_text(&edited_doc);
+    assert!(
+        edited_text.contains("Edited from live Google Docs e2e."),
+        "{edited_text}"
+    );
+    let plain_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(plain_mount_root.clone()),
+            state_root: Some(fixture.state_root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("plain status after create/edit");
+    assert!(plain_status.clean, "{plain_status:#?}");
+
+    let second_doc = api
+        .create_file(DriveCreateFileRequest::google_doc(
+            "Move Me",
+            workspace.id.clone(),
+        ))
+        .expect("create second Google Doc for virtual move");
+    let archive_folder = api
+        .create_file(DriveCreateFileRequest::folder(
+            "Archive",
+            Some(workspace.id.as_str()),
+        ))
+        .expect("create Archive Drive folder");
+    let virtual_mount_id = MountId::new("google-docs-virtual");
+    let virtual_mount_root = fixture.mount_root.join("google-docs-virtual");
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: virtual_mount_id.clone(),
+            connector: GOOGLE_DOCS_CONNECTOR_ID.to_string(),
+            root: virtual_mount_root.clone(),
+            remote_root_id: Some(RemoteId::new(workspace.id.clone())),
+            connection_id: Some(connection_id.clone()),
+            read_only: false,
+            projection: ProjectionMode::LinuxFuse,
+            settings_json: "{}".to_string(),
+        },
+    )
+    .expect("mount live Google Docs virtual workspace");
+    let virtual_pull = run_pull_with_state_root(
+        &mut store,
+        &connector,
+        &virtual_mount_root,
+        Some(&fixture.state_root),
+    )
+    .expect("pull live Google Docs virtual workspace");
+    assert!(virtual_pull.ok, "{virtual_pull:#?}");
+
+    let virtual_mount = MountConfig::new(
+        virtual_mount_id.clone(),
+        GOOGLE_DOCS_CONNECTOR_ID,
+        virtual_mount_root.clone(),
+    )
+    .with_remote_root_id(RemoteId::new(workspace.id.clone()))
+    .with_connection_id(connection_id.clone())
+    .projection(ProjectionMode::LinuxFuse);
+    let content_root = virtual_fs_content_root(&fixture.state_root, &virtual_mount_id);
+    let mount_point_root = mount_point_identifier(&virtual_mount);
+    let second_doc_item = refresh_virtual_children_until_remote_item(
+        &mut store,
+        &connector,
+        &content_root,
+        &virtual_mount_id,
+        &mount_point_root,
+        &second_doc.id,
+        VirtualFsItemKind::Folder,
+    );
+    assert_eq!(
+        second_doc_item.identifier,
+        format!("children:{}", second_doc.id)
+    );
+    let archive_item = refresh_virtual_children_until_remote_item(
+        &mut store,
+        &connector,
+        &content_root,
+        &virtual_mount_id,
+        &mount_point_root,
+        &archive_folder.id,
+        VirtualFsItemKind::Folder,
+    );
+    materialize_virtual_fs_item_with_content_root(
+        &mut store,
+        &connector,
+        &content_root,
+        &virtual_mount_id,
+        &second_doc.id,
+    )
+    .expect("materialize second Google Doc");
+
+    let renamed = rename_virtual_fs_item(
+        &mut store,
+        &content_root,
+        &virtual_mount_id,
+        &second_doc_item.identifier,
+        &archive_item.identifier,
+        "Renamed Plan",
+    )
+    .expect("move and rename second Google Doc into Archive");
+    assert_eq!(renamed.identifier, format!("children:{}", second_doc.id));
+    assert_eq!(renamed.item.kind, VirtualFsItemKind::Folder);
+    assert_eq!(renamed.item.path, "Archive/Renamed Plan");
+    let renamed_page_path = virtual_mount_root.join(&renamed.item.path).join("page.md");
+    let move_diff = run_diff_with_state_root(&store, &renamed_page_path, Some(&fixture.state_root))
+        .expect("diff Google Docs virtual move");
+    assert!(move_diff.ok, "{move_diff:#?}");
+    assert_eq!(move_diff.action, "confirm_plan", "{move_diff:#?}");
+    let move_plan = move_diff.plan.as_ref().expect("Google Docs move plan");
+    assert_eq!(move_plan.summary.entities_moved, 1, "{move_plan:#?}");
+
+    let move_push = run_push_with_daemon_at_state_root(
+        &mut store,
+        &connector,
+        &renamed_page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        Some(&fixture.state_root),
+    )
+    .expect("push Google Docs virtual move");
+    assert!(move_push.ok, "{move_push:#?}");
+    assert_eq!(move_push.action, "reconciled", "{move_push:#?}");
+    assert_eq!(move_push.changed_remote_ids, vec![second_doc.id.clone()]);
+    let moved_file = api
+        .get_file(&second_doc.id)
+        .expect("fetch moved Google Drive file");
+    assert_eq!(moved_file.name, "Renamed Plan");
+    assert_eq!(moved_file.parents, vec![archive_folder.id.clone()]);
+
+    let trashed = trash_virtual_fs_item(
+        &mut store,
+        &content_root,
+        &virtual_mount_id,
+        &renamed.identifier,
+    )
+    .expect("trash moved Google Doc through virtual filesystem");
+    assert_eq!(trashed.identifier, format!("children:{}", second_doc.id));
+    let trash_diff =
+        run_diff_with_state_root(&store, &virtual_mount_root, Some(&fixture.state_root))
+            .expect("diff Google Docs virtual trash");
+    assert!(trash_diff.ok, "{trash_diff:#?}");
+    assert_eq!(trash_diff.action, "confirm_plan", "{trash_diff:#?}");
+    let trash_plan = trash_diff.plan.as_ref().expect("Google Docs trash plan");
+    assert_eq!(trash_plan.summary.entities_archived, 1, "{trash_plan:#?}");
+
+    let trash_push = run_push_with_daemon_at_state_root(
+        &mut store,
+        &connector,
+        &virtual_mount_root,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: true,
+        },
+        Some(&fixture.state_root),
+    )
+    .expect("push Google Docs virtual trash");
+    assert!(trash_push.ok, "{trash_push:#?}");
+    assert_eq!(trash_push.action, "reconciled", "{trash_push:#?}");
+    assert_eq!(trash_push.changed_remote_ids, vec![second_doc.id.clone()]);
+    let trashed_file = api
+        .get_file(&second_doc.id)
+        .expect("fetch trashed Google Drive file");
+    assert!(trashed_file.trashed, "{trashed_file:#?}");
+
+    let virtual_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(virtual_mount_root.clone()),
+            state_root: Some(fixture.state_root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("virtual status after move/trash");
+    assert!(virtual_status.clean, "{virtual_status:#?}");
 }
 
 fn stored_google_docs_secret() -> String {
@@ -433,4 +788,67 @@ fn mount_root_for_state_root(state_root: &Path) -> PathBuf {
         .parent()
         .map(|root| root.join("Locality"))
         .unwrap_or_else(|| state_root.join("Locality"))
+}
+
+fn google_document_text(document: &GoogleDocument) -> String {
+    let mut text = String::new();
+    collect_google_structural_text(&document.body.content, &mut text);
+    text
+}
+
+fn collect_google_structural_text(elements: &[StructuralElement], text: &mut String) {
+    for element in elements {
+        if let Some(paragraph) = &element.paragraph {
+            for paragraph_element in &paragraph.elements {
+                if let Some(text_run) = &paragraph_element.text_run {
+                    text.push_str(&text_run.content);
+                }
+            }
+        }
+        if let Some(table) = &element.table {
+            for row in &table.table_rows {
+                for cell in &row.table_cells {
+                    collect_google_structural_text(&cell.content, text);
+                }
+            }
+        }
+    }
+}
+
+fn refresh_virtual_children_until_remote_item(
+    store: &mut SqliteStateStore,
+    connector: &GoogleDocsConnector,
+    content_root: &Path,
+    mount_id: &MountId,
+    container_identifier: &str,
+    remote_id: &str,
+    kind: VirtualFsItemKind,
+) -> VirtualFsItem {
+    let mut last_children = None;
+    for _ in 0..8 {
+        refresh_virtual_fs_children(store, connector, mount_id, container_identifier)
+            .expect("refresh Google Docs virtual children");
+        let report = virtual_fs_children_with_content_root(
+            store,
+            content_root,
+            mount_id,
+            container_identifier,
+        )
+        .expect("list Google Docs virtual children after refresh");
+        if let Some(item) = report
+            .children
+            .iter()
+            .find(|item| item.remote_id.as_deref() == Some(remote_id) && item.kind == kind)
+            .cloned()
+        {
+            return item;
+        }
+        last_children = Some(report.children);
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    panic!(
+        "missing virtual {kind:?} for {remote_id} after refreshed parent `{container_identifier}`: {:#?}",
+        last_children.unwrap_or_default()
+    );
 }
