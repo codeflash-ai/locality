@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use loc_cli::diff::run_diff_with_state_root;
@@ -9,10 +10,10 @@ use loc_cli::mount::{MountOptions, run_mount};
 use loc_cli::pull::run_pull_with_state_root;
 use loc_cli::push::{PushOptions, run_push_with_daemon_at_state_root};
 use loc_cli::status::{StatusOptions, run_status};
-use locality_core::model::{MountId, RemoteId};
+use locality_core::model::{CanonicalDocument, MountId, RemoteId};
 use locality_gmail::{
-    GMAIL_CONNECTOR_ID, GMAIL_OAUTH_SCOPES, GmailConnector, StoredGmailCredential,
-    gmail_capabilities_json,
+    GMAIL_CONNECTOR_ID, GMAIL_OAUTH_SCOPES, GmailConnector, GmailMountSettings,
+    GmailProjectionView, StoredGmailCredential, gmail_capabilities_json,
 };
 use locality_google_docs::client::{GoogleDocsApi, GoogleDriveApi, HttpGoogleApiClient};
 use locality_google_docs::docs_dto::{GoogleDocument, StructuralElement};
@@ -38,9 +39,12 @@ const LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_PREFIX: &str =
     "LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_PREFIX";
 const LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON: &str = "LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON";
 const LOCALITY_GMAIL_LIVE_TEST_RECIPIENT: &str = "LOCALITY_GMAIL_LIVE_TEST_RECIPIENT";
+const LOCALITY_GMAIL_LIVE_AFTER: &str = "LOCALITY_GMAIL_LIVE_AFTER";
+const LOCALITY_GMAIL_LIVE_BEFORE: &str = "LOCALITY_GMAIL_LIVE_BEFORE";
 const LOCALITY_GOOGLE_LIVE_FORCE_REFRESH: &str = "LOCALITY_GOOGLE_LIVE_FORCE_REFRESH";
 const KEEP_TMP_ENV: &str = "LOCALITY_GOOGLE_LIVE_KEEP_TMP";
 const EXPIRED_SENTINEL_ACCESS_TOKEN: &str = "locality-live-expired-access-token";
+const GMAIL_LIVE_BODY: &str = "This message was sent by the Locality live Gmail e2e suite.";
 
 #[derive(Clone, Copy)]
 enum GoogleLiveConnector {
@@ -496,6 +500,244 @@ fn live_google_docs_workspace_create_edit_move_archive_round_trip() {
     assert!(virtual_status.clean, "{virtual_status:#?}");
 }
 
+#[test]
+#[ignore = "requires LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON with broker refresh handle and LOCALITY_GMAIL_LIVE_TEST_RECIPIENT; sends a scratch Gmail message"]
+fn live_gmail_pull_send_read_only_guardrail_and_threads_round_trip() {
+    if !gmail_live_env_available() {
+        eprintln!(
+            "skipping live Gmail e2e: set {LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON} and {LOCALITY_GMAIL_LIVE_TEST_RECIPIENT}"
+        );
+        return;
+    }
+
+    let fixture = LiveFixture::new("loc-live-gmail");
+    let connection_id = ConnectionId::new("gmail-live");
+    seed_live_connection(
+        &fixture.state_root,
+        GoogleLiveConnector::Gmail,
+        &connection_id,
+    );
+
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).expect("open state store");
+    let messages_mount_id = MountId::new("gmail-main");
+    let messages_mount_root = fixture.mount_root.join("gmail-main");
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: messages_mount_id.clone(),
+            connector: GMAIL_CONNECTOR_ID.to_string(),
+            root: messages_mount_root.clone(),
+            remote_root_id: None,
+            connection_id: Some(connection_id.clone()),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+            settings_json: gmail_live_settings_json(),
+        },
+    )
+    .expect("mount live Gmail messages view");
+    let messages_connector =
+        resolve_gmail_mount_from_store(&fixture.state_root, messages_mount_id.clone());
+    let messages_pull = run_pull_with_state_root(
+        &mut store,
+        &messages_connector,
+        &messages_mount_root,
+        Some(&fixture.state_root),
+    )
+    .expect("pull live Gmail messages view");
+    assert!(messages_pull.ok, "{messages_pull:#?}");
+    assert!(messages_mount_root.join("inbox").is_dir());
+    assert!(messages_mount_root.join("sent").is_dir());
+    assert!(messages_mount_root.join("draft").is_dir());
+
+    let marker = format!(
+        "loc-live-gmail-{}-{}",
+        std::process::id(),
+        timestamp_millis_string()
+    );
+    let subject = format!("Locality live Gmail e2e {marker}");
+    let draft_path = messages_mount_root
+        .join("draft")
+        .join(format!("{marker}.md"));
+    fs::write(
+        &draft_path,
+        format!(
+            "---\nto:\n  - \"{}\"\nsubject: \"{}\"\n---\n{}\n",
+            live_gmail_recipient(),
+            subject,
+            GMAIL_LIVE_BODY
+        ),
+    )
+    .expect("write live Gmail draft");
+
+    let create_diff = run_diff_with_state_root(&store, &draft_path, Some(&fixture.state_root))
+        .expect("diff Gmail draft create");
+    assert!(create_diff.ok, "{create_diff:#?}");
+    assert_eq!(create_diff.action, "confirm_plan", "{create_diff:#?}");
+    let create_plan = create_diff.plan.as_ref().expect("Gmail create plan");
+    assert_eq!(create_plan.summary.entities_created, 1, "{create_plan:#?}");
+
+    let create_push = run_push_with_daemon_at_state_root(
+        &mut store,
+        &messages_connector,
+        &draft_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        Some(&fixture.state_root),
+    )
+    .expect("push Gmail draft send");
+    assert!(create_push.ok, "{create_push:#?}");
+    assert_eq!(create_push.action, "reconciled", "{create_push:#?}");
+    assert_eq!(create_push.apply_effect_count, 1, "{create_push:#?}");
+    assert!(
+        !draft_path.exists(),
+        "sent Gmail draft should be reconciled away from draft/"
+    );
+
+    let sent_verification_mount_id = MountId::new("gmail-messages-verify");
+    let sent_verification_mount_root = fixture.mount_root.join("gmail-messages-verify");
+    mount_live_gmail_plain_files(
+        &mut store,
+        sent_verification_mount_id.clone(),
+        sent_verification_mount_root.clone(),
+        connection_id.clone(),
+        gmail_live_settings_json(),
+        "mount live Gmail messages verification view",
+    );
+    let sent_verification_connector =
+        resolve_gmail_mount_from_store(&fixture.state_root, sent_verification_mount_id.clone());
+    let sent_file = pull_until_hydrated_file_containing(
+        &mut store,
+        &sent_verification_connector,
+        &sent_verification_mount_root,
+        Some(&fixture.state_root),
+        &sent_verification_mount_root.join("sent"),
+        &marker,
+    )
+    .expect("sent Gmail message containing marker");
+    let sent_contents = fs::read_to_string(&sent_file).expect("read sent Gmail message");
+    assert!(sent_contents.contains(&marker), "{sent_contents}");
+    assert!(
+        sent_contents.contains("connector: gmail"),
+        "{sent_contents}"
+    );
+    assert!(sent_contents.contains("gmail:"), "{sent_contents}");
+    assert!(
+        sent_contents.contains("mailbox: \"sent\""),
+        "{sent_contents}"
+    );
+    assert!(sent_contents.contains("message_id:"), "{sent_contents}");
+    assert!(sent_contents.contains("thread_id:"), "{sent_contents}");
+    assert!(sent_contents.contains(GMAIL_LIVE_BODY), "{sent_contents}");
+    assert!(
+        !sent_contents.contains(CanonicalDocument::STUB_MARKER),
+        "{sent_contents}"
+    );
+
+    fs::write(
+        &sent_file,
+        format!("{sent_contents}\nLocal edit that must stay read-only.\n"),
+    )
+    .expect("edit sent Gmail message");
+    let read_only_diff = run_diff_with_state_root(&store, &sent_file, Some(&fixture.state_root))
+        .expect("diff read-only Gmail sent edit");
+    assert!(!read_only_diff.ok, "{read_only_diff:#?}");
+    assert!(
+        read_only_diff
+            .validation
+            .iter()
+            .any(|issue| issue.code == "gmail_read_only_mailbox"),
+        "{read_only_diff:#?}"
+    );
+
+    let threads_mount_id = MountId::new("gmail-threads");
+    let threads_mount_root = fixture.mount_root.join("gmail-threads");
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: threads_mount_id.clone(),
+            connector: GMAIL_CONNECTOR_ID.to_string(),
+            root: threads_mount_root.clone(),
+            remote_root_id: None,
+            connection_id: Some(connection_id.clone()),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+            settings_json: gmail_thread_settings_json(),
+        },
+    )
+    .expect("mount live Gmail threads view");
+    let threads_connector =
+        resolve_gmail_mount_from_store(&fixture.state_root, threads_mount_id.clone());
+    let thread_file = pull_until_hydrated_file_containing(
+        &mut store,
+        &threads_connector,
+        &threads_mount_root,
+        Some(&fixture.state_root),
+        &threads_mount_root.join("sent"),
+        &marker,
+    )
+    .expect("sent Gmail thread view containing marker");
+    let thread_contents = fs::read_to_string(&thread_file).expect("read Gmail thread view file");
+    assert!(thread_contents.contains(&marker), "{thread_contents}");
+    assert!(
+        thread_contents.contains("connector: gmail"),
+        "{thread_contents}"
+    );
+    assert!(thread_contents.contains("gmail:"), "{thread_contents}");
+    assert!(thread_contents.contains("thread_id:"), "{thread_contents}");
+    assert!(
+        thread_contents.contains(GMAIL_LIVE_BODY),
+        "{thread_contents}"
+    );
+    assert!(
+        !thread_contents.contains(CanonicalDocument::STUB_MARKER),
+        "{thread_contents}"
+    );
+}
+
+#[test]
+fn live_gmail_recipient_validation_requires_single_email_like_value() {
+    assert!(valid_live_gmail_recipient("locality.live+test@example.com"));
+
+    for invalid in [
+        "",
+        "locality.live+test",
+        "locality.live+test@example",
+        "locality.live+test@example..com",
+        "locality.live+test@",
+        "@example.com",
+        "locality live@example.com",
+        " locality.live+test@example.com",
+        "locality.live+test@example.com ",
+        "locality.live+test@example.com\n",
+        "locality.live+test@example.com\t",
+        "locality.live+test@example.com,other@example.com",
+        "locality.live+test@example.com;other@example.com",
+        "locality.live+test@example.com other@example.com",
+        "locality.live+test@@example.com",
+        "Locality <locality.live+test@example.com>",
+        "locality.live+test@example.com (Locality)",
+    ] {
+        assert!(
+            !valid_live_gmail_recipient(invalid),
+            "recipient should be rejected: {invalid:?}"
+        );
+    }
+}
+
+#[test]
+fn gmail_default_date_window_uses_yesterday_and_tomorrow_utc() {
+    let noon_epoch = UNIX_EPOCH
+        .checked_add(Duration::from_secs(12 * 60 * 60))
+        .expect("noon epoch");
+
+    assert_eq!(
+        gmail_default_date_window(noon_epoch),
+        ("1969-12-31".to_string(), "1970-01-02".to_string())
+    );
+}
+
 fn stored_google_docs_secret() -> String {
     let secret = required_env(LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON);
     let stored =
@@ -602,6 +844,14 @@ fn timestamp_string() -> String {
         .to_string()
 }
 
+fn timestamp_millis_string() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_millis()
+        .to_string()
+}
+
 fn resolve_google_docs_from_store(
     state_root: &Path,
     connection_id: ConnectionId,
@@ -642,8 +892,6 @@ fn resolve_google_docs_from_store(
 
 fn resolve_gmail_from_store(state_root: &Path, connection_id: ConnectionId) -> GmailConnector {
     let mut store = SqliteStateStore::open(state_root.to_path_buf()).expect("open state store");
-    let credentials = FileCredentialStore::new(state_root);
-    let secret_ref = format!("connection:{}", connection_id.as_str());
     let mount = MountConfig::new(
         MountId::new("gmail-main"),
         GMAIL_CONNECTOR_ID,
@@ -653,6 +901,23 @@ fn resolve_gmail_from_store(state_root: &Path, connection_id: ConnectionId) -> G
     .projection(ProjectionMode::PlainFiles);
     store.save_mount(mount.clone()).expect("save Gmail mount");
 
+    resolve_gmail_mount_from_store(state_root, mount.mount_id)
+}
+
+fn resolve_gmail_mount_from_store(state_root: &Path, mount_id: MountId) -> GmailConnector {
+    let store = SqliteStateStore::open(state_root.to_path_buf()).expect("open state store");
+    let mount = store
+        .get_mount(&mount_id)
+        .expect("load Gmail mount")
+        .unwrap_or_else(|| panic!("missing Gmail mount `{}`", mount_id.as_str()));
+    let credentials = FileCredentialStore::new(state_root);
+    let connection_id = mount.connection_id.as_ref().unwrap_or_else(|| {
+        panic!(
+            "Gmail mount `{}` must have connection_id",
+            mount_id.as_str()
+        )
+    });
+    let secret_ref = format!("connection:{}", connection_id.as_str());
     let source = resolve_source_for_mount(&store, &credentials, &mount).expect("resolve Gmail");
     let ResolvedSource::Gmail(connector) = source else {
         panic!("expected Gmail connector");
@@ -664,6 +929,187 @@ fn resolve_gmail_from_store(state_root: &Path, connection_id: ConnectionId) -> G
     );
     assert_forced_refresh_persisted(&credentials, GoogleLiveConnector::Gmail, &secret_ref);
     connector
+}
+
+fn gmail_live_settings_json() -> String {
+    gmail_settings_json(GmailProjectionView::Messages)
+}
+
+fn gmail_thread_settings_json() -> String {
+    gmail_settings_json(GmailProjectionView::Threads)
+}
+
+fn gmail_settings_json(view: GmailProjectionView) -> String {
+    let (after, before) = gmail_live_date_window();
+    GmailMountSettings::with_date_window(&after, &before)
+        .expect("valid Gmail live date window")
+        .with_view(view)
+        .to_json()
+        .expect("serialize Gmail live settings")
+}
+
+fn gmail_live_date_window() -> (String, String) {
+    static WINDOW: OnceLock<(String, String)> = OnceLock::new();
+    WINDOW
+        .get_or_init(|| {
+            let (default_after, default_before) = gmail_default_date_window(SystemTime::now());
+            let after = std::env::var(LOCALITY_GMAIL_LIVE_AFTER).unwrap_or(default_after);
+            let before = std::env::var(LOCALITY_GMAIL_LIVE_BEFORE).unwrap_or(default_before);
+            (after, before)
+        })
+        .clone()
+}
+
+fn gmail_default_date_window(now: SystemTime) -> (String, String) {
+    let days = now
+        .duration_since(UNIX_EPOCH)
+        .expect("Gmail live date window requires time after Unix epoch")
+        .as_secs() as i64
+        / 86_400;
+    (
+        utc_date_string_from_unix_days(days - 1),
+        utc_date_string_from_unix_days(days + 1),
+    )
+}
+
+fn utc_date_string_from_unix_days(days: i64) -> String {
+    let (year, month, day) = civil_date_from_unix_days(days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn civil_date_from_unix_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = year + if month <= 2 { 1 } else { 0 };
+    (year as i32, month as u32, day as u32)
+}
+
+fn gmail_live_env_available() -> bool {
+    std::env::var_os(LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON).is_some()
+        && std::env::var_os(LOCALITY_GMAIL_LIVE_TEST_RECIPIENT).is_some()
+}
+
+fn live_gmail_recipient() -> String {
+    let recipient = required_env(LOCALITY_GMAIL_LIVE_TEST_RECIPIENT);
+    assert!(
+        valid_live_gmail_recipient(&recipient),
+        "{LOCALITY_GMAIL_LIVE_TEST_RECIPIENT} must be a single email-like recipient"
+    );
+    recipient
+}
+
+fn valid_live_gmail_recipient(value: &str) -> bool {
+    if value.is_empty()
+        || value.chars().any(|character| {
+            character.is_whitespace()
+                || character.is_control()
+                || is_gmail_recipient_delimiter(character)
+        })
+        || value.matches('@').count() != 1
+    {
+        return false;
+    }
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && !local.starts_with('.')
+        && !local.ends_with('.')
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !domain.contains("..")
+        && domain.split('.').all(|part| !part.is_empty())
+}
+
+fn is_gmail_recipient_delimiter(character: char) -> bool {
+    matches!(
+        character,
+        ',' | ';' | '<' | '>' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}'
+    )
+}
+
+fn find_file_containing(root: &Path, needle: &str) -> Option<PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+                continue;
+            }
+            if fs::read_to_string(&path)
+                .ok()
+                .is_some_and(|contents| contents.contains(needle))
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn pull_until_hydrated_file_containing(
+    store: &mut SqliteStateStore,
+    connector: &GmailConnector,
+    mount_root: &Path,
+    state_root: Option<&Path>,
+    search_root: &Path,
+    needle: &str,
+) -> Option<PathBuf> {
+    for _ in 0..8 {
+        let pull = run_pull_with_state_root(store, connector, mount_root, state_root)
+            .expect("pull Gmail while waiting for sent message");
+        assert!(pull.ok, "{pull:#?}");
+        if let Some(path) = find_file_containing(search_root, needle) {
+            let hydrate = run_pull_with_state_root(store, connector, &path, state_root)
+                .expect("hydrate Gmail file containing marker");
+            assert!(hydrate.ok, "{hydrate:#?}");
+            let contents = fs::read_to_string(&path).expect("read hydrated Gmail file");
+            if contents.contains(needle) && !contents.contains(CanonicalDocument::STUB_MARKER) {
+                return Some(path);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(750));
+    }
+    None
+}
+
+fn mount_live_gmail_plain_files(
+    store: &mut SqliteStateStore,
+    mount_id: MountId,
+    root: PathBuf,
+    connection_id: ConnectionId,
+    settings_json: String,
+    context: &str,
+) {
+    run_mount(
+        store,
+        MountOptions {
+            mount_id,
+            connector: GMAIL_CONNECTOR_ID.to_string(),
+            root,
+            remote_root_id: None,
+            connection_id: Some(connection_id),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+            settings_json,
+        },
+    )
+    .unwrap_or_else(|error| panic!("{context}: {error:?}"));
 }
 
 fn assert_broker_url(oauth_broker_url: Option<&str>, connector_name: &str) {
