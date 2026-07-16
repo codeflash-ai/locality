@@ -118,6 +118,16 @@ Live testing found and fixed several integration issues:
 - The OAuth broker project must have both Google Docs API and Google Drive API
   enabled.
 
+## Live E2E
+
+The live Google Docs suite uses a dedicated Google account connected through the
+Locality OAuth broker. CI stores the broker-backed `StoredGoogleDocsCredential`
+JSON in `LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON`; the JSON must include an
+opaque `refresh_token_handle`, not a raw refresh token. The tests force token
+refresh with `LOCALITY_GOOGLE_LIVE_FORCE_REFRESH=1`, create a scratch Drive
+workspace folder, run the mount/pull/diff/push workflow, and trash scratch
+content before exit.
+
 ## Useful Commands
 
 Connect with the local broker:
