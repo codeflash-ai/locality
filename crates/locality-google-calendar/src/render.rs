@@ -494,14 +494,45 @@ fn quote_yaml_frontmatter_strings(yaml: &str) -> String {
 }
 
 fn split_yaml_mapping_separator(line: &str) -> Option<(&str, &str)> {
-    for (index, ch) in line.char_indices() {
-        if ch != ':' {
+    let mut chars = line.char_indices().peekable();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+
+    while let Some((index, ch)) = chars.next() {
+        if in_single_quote {
+            if ch == '\'' {
+                if chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                    chars.next();
+                } else {
+                    in_single_quote = false;
+                }
+            }
             continue;
         }
-        let value_start = index + ch.len_utf8();
-        let rest = &line[value_start..];
-        if rest.chars().next().is_none_or(|next| next.is_whitespace()) {
-            return Some((&line[..index], rest));
+        if in_double_quote {
+            match ch {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => {
+                    in_double_quote = false;
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' => in_single_quote = true,
+            '"' => in_double_quote = true,
+            ':' => {
+                let value_start = index + ch.len_utf8();
+                let rest = &line[value_start..];
+                if rest.chars().next().is_none_or(|next| next.is_whitespace()) {
+                    return Some((&line[..index], rest));
+                }
+            }
+            _ => {}
         }
     }
     None
@@ -704,6 +735,32 @@ mod tests {
         assert_eq!(
             frontmatter.pointer("/google_calendar/event/recurrence/0"),
             Some(&json!("RRULE:FREQ=WEEKLY;COUNT=2"))
+        );
+    }
+
+    #[test]
+    fn render_event_preserves_quoted_extra_sequence_values_with_colon_space() {
+        let mut event = CalendarEvent {
+            id: Some("event-extra".to_string()),
+            summary: Some("Extra field".to_string()),
+            ..CalendarEvent::default()
+        };
+        event
+            .extra
+            .insert("futureArray".to_string(), json!(["foo: bar"]));
+
+        let rendered = render_google_calendar_event(
+            "primary",
+            &RemoteId::new("google-calendar-event:primary:event-extra"),
+            &event,
+        )
+        .expect("render");
+        let frontmatter: serde_json::Value =
+            yaml_serde::from_str(&rendered.document.frontmatter).expect("frontmatter yaml");
+
+        assert_eq!(
+            frontmatter.pointer("/google_calendar/event/futureArray/0"),
+            Some(&json!("foo: bar"))
         );
     }
 
