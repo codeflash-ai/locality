@@ -10223,22 +10223,10 @@ fn classify_macos_file_provider_enablement(
     }
 }
 
-#[cfg(target_os = "macos")]
-fn macos_file_provider_enablement_status_blocking() -> FileProviderEnablementReport {
-    let provider_roots = macos_file_provider_cloud_storage_roots();
-    let fallback_path = provider_roots.first().cloned();
-    let report = match run_macos_file_provider_helper("list", Vec::new()) {
-        Ok(report) => report,
-        Err(error) => {
-            return FileProviderEnablementReport {
-                state: "unavailable".to_string(),
-                message: error.message(),
-                path: fallback_path.map(|path| path.display().to_string()),
-            };
-        }
-    };
-    let user_enabled = report
-        .helper_report
+fn macos_file_provider_domain_status(
+    report: &serde_json::Value,
+) -> (Option<bool>, Option<PathBuf>) {
+    let domain = report
         .get("domains")
         .and_then(serde_json::Value::as_array)
         .and_then(|domains| {
@@ -10246,9 +10234,35 @@ fn macos_file_provider_enablement_status_blocking() -> FileProviderEnablementRep
                 domain.get("identifier").and_then(serde_json::Value::as_str)
                     == Some(localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
             })
-        })
+        });
+    let user_enabled = domain
         .and_then(|domain| domain.get("userEnabled"))
         .and_then(serde_json::Value::as_bool);
+    let path = domain
+        .and_then(|domain| domain.get("url"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|url| !url.is_empty())
+        .map(PathBuf::from);
+    (user_enabled, path)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_provider_enablement_status_blocking() -> FileProviderEnablementReport {
+    let provider_roots = macos_file_provider_cloud_storage_roots();
+    let report = match run_macos_file_provider_helper("list", Vec::new()) {
+        Ok(report) => report,
+        Err(error) => {
+            return FileProviderEnablementReport {
+                state: "unavailable".to_string(),
+                message: error.message(),
+                path: provider_roots
+                    .first()
+                    .map(|path| path.display().to_string()),
+            };
+        }
+    };
+    let (user_enabled, reported_path) = macos_file_provider_domain_status(&report.helper_report);
+    let fallback_path = reported_path.or_else(|| provider_roots.first().cloned());
 
     let resolved_root = if user_enabled == Some(true) {
         match macos_file_provider_domain_url(
@@ -13681,6 +13695,27 @@ mod tests {
         assert_eq!(
             disabled.path.as_deref(),
             Some("/Users/test/Library/CloudStorage/Locality")
+        );
+    }
+
+    #[test]
+    fn file_provider_domain_status_reads_helper_url_while_disabled() {
+        let helper_report = serde_json::json!({
+            "domains": [{
+                "identifier": "loc",
+                "userEnabled": false,
+                "url": "/Users/test/Library/CloudStorage/LocalityPromptTest"
+            }]
+        });
+
+        let (user_enabled, path) = super::macos_file_provider_domain_status(&helper_report);
+
+        assert_eq!(user_enabled, Some(false));
+        assert_eq!(
+            path,
+            Some(PathBuf::from(
+                "/Users/test/Library/CloudStorage/LocalityPromptTest"
+            ))
         );
     }
 
