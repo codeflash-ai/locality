@@ -9,9 +9,9 @@ pub use client::{DEFAULT_SLACK_API_BASE_URL, HttpSlackApiClient, SlackApi};
 pub use connector::{SLACK_CONNECTOR_ID, SlackConfig, SlackConnector};
 pub use dto::*;
 pub use oauth::{
-    DEFAULT_SLACK_OAUTH_BROKER_URL, DEFAULT_SLACK_OAUTH_REDIRECT_URI, SLACK_OAUTH_SCOPES,
-    HttpSlackOAuthBrokerClient, SlackOAuthScopeError, StoredSlackCredential,
-    slack_capabilities_json, validate_slack_oauth_scopes,
+    DEFAULT_SLACK_OAUTH_BROKER_URL, DEFAULT_SLACK_OAUTH_REDIRECT_URI, HttpSlackOAuthBrokerClient,
+    SLACK_OAUTH_SCOPES, SlackOAuthScopeError, StoredSlackCredential, slack_capabilities_json,
+    validate_slack_oauth_scopes,
 };
 pub use render::{
     SlackNativeBundle, SlackRenderedKind, conversation_remote_id, recent_remote_id,

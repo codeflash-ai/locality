@@ -1,6 +1,5 @@
 pub const DEFAULT_SLACK_OAUTH_BROKER_URL: &str = "https://oauth.locality.dev";
-pub const DEFAULT_SLACK_OAUTH_REDIRECT_URI: &str =
-    "http://localhost:8757/oauth/slack/callback";
+pub const DEFAULT_SLACK_OAUTH_REDIRECT_URI: &str = "http://localhost:8757/oauth/slack/callback";
 
 pub const SLACK_OAUTH_SCOPES: &[&str] = &[
     "channels:read",
