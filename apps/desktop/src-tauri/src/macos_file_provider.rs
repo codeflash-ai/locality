@@ -1,16 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
-use objc2::AnyThread;
 use objc2::rc::{Retained, autoreleasepool};
+use objc2::runtime::{AnyProtocol, NSObjectProtocol, ProtocolBuilder};
+use objc2::{AnyThread, ProtocolType, msg_send, sel};
 use objc2_file_provider::{
     NSFileProviderDomain, NSFileProviderManager, NSFileProviderRootContainerItemIdentifier,
 };
-use objc2_foundation::{NSArray, NSError, NSFileProviderService, NSString, NSXPCConnection};
+use objc2_foundation::{
+    NSArray, NSError, NSFileProviderService, NSString, NSXPCConnection, NSXPCInterface,
+};
 
 const ADD_CALLBACK_TIMEOUT: Duration = Duration::from_secs(15);
 const REMOVE_CALLBACK_TIMEOUT: Duration = Duration::from_secs(15);
@@ -76,6 +81,19 @@ pub(crate) fn prepare_approval_retry(identifier: &str, display_name: &str) -> Re
 
 fn deliver_callback<T>(sender: &SyncSender<T>, value: T) {
     let _ = sender.send(value);
+}
+
+fn deliver_file_provider_warm_up_once(
+    delivered: &AtomicBool,
+    sender: &SyncSender<Result<(), String>>,
+    result: Result<(), String>,
+) {
+    if delivered
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        deliver_callback(sender, result);
+    }
 }
 
 fn prepare_approval_retry_with<Query, Remove>(query: Query, remove: Remove) -> Result<(), String>
@@ -231,6 +249,7 @@ fn start_file_provider_service_warm_up(
     };
 
     let service_name = NSString::from_str(FILE_PROVIDER_SERVICE_NAME);
+    let expected_identifier = identifier.to_owned();
     let service_completion = RcBlock::new(
         move |service: *mut NSFileProviderService, error: *mut NSError| {
             if !error.is_null() {
@@ -255,30 +274,112 @@ fn start_file_provider_service_warm_up(
             }
 
             let connection_sender = completion.clone();
+            let expected_identifier = expected_identifier.clone();
             let connection_completion = RcBlock::new(
                 move |connection: *mut NSXPCConnection, error: *mut NSError| {
-                    let result = if !error.is_null() {
+                    if !error.is_null() {
                         let error = unsafe { format_framework_error_from_nserror(error) };
-                        Err(format!(
-                            "Could not open File Provider service connection `{FILE_PROVIDER_SERVICE_NAME}`: {error}"
-                        ))
-                    } else if connection.is_null() {
-                        Err(format!(
-                            "File Provider service connection `{FILE_PROVIDER_SERVICE_NAME}` was not returned."
-                        ))
-                    } else {
-                        // SAFETY: The callback provides a valid connection pointer for
-                        // the duration of the callback. Resuming then invalidating it
-                        // forces the provider-side listener path without sending app
-                        // data over the service.
-                        unsafe {
-                            let connection = &*connection;
-                            connection.resume();
-                            connection.invalidate();
-                        }
-                        Ok(())
+                        deliver_callback(
+                            &connection_sender,
+                            Err(format!(
+                                "Could not open File Provider service connection `{FILE_PROVIDER_SERVICE_NAME}`: {error}"
+                            )),
+                        );
+                        return;
+                    }
+
+                    if connection.is_null() {
+                        deliver_callback(
+                            &connection_sender,
+                            Err(format!(
+                                "File Provider service connection `{FILE_PROVIDER_SERVICE_NAME}` was not returned."
+                            )),
+                        );
+                        return;
+                    }
+
+                    let Some(connection) = (unsafe { Retained::retain(connection) }) else {
+                        deliver_callback(
+                            &connection_sender,
+                            Err(format!(
+                                "Could not retain File Provider service connection `{FILE_PROVIDER_SERVICE_NAME}`."
+                            )),
+                        );
+                        return;
                     };
-                    deliver_callback(&connection_sender, result);
+
+                    let protocol = match locality_file_provider_service_protocol() {
+                        Ok(protocol) => protocol,
+                        Err(error) => {
+                            connection.invalidate();
+                            deliver_callback(&connection_sender, Err(error));
+                            return;
+                        }
+                    };
+                    let interface = unsafe { NSXPCInterface::interfaceWithProtocol(protocol) };
+                    connection.setRemoteObjectInterface(Some(&interface));
+                    connection.resume();
+
+                    let delivered = Arc::new(AtomicBool::new(false));
+                    let error_sender = connection_sender.clone();
+                    let error_delivered = delivered.clone();
+                    let error_connection = connection.clone();
+                    let error_handler = RcBlock::new(move |error: NonNull<NSError>| {
+                        let error = unsafe { format_framework_error_from_nserror(error.as_ptr()) };
+                        error_connection.invalidate();
+                        deliver_file_provider_warm_up_once(
+                            &error_delivered,
+                            &error_sender,
+                            Err(format!(
+                                "Could not open File Provider service connection `{FILE_PROVIDER_SERVICE_NAME}`: {error}"
+                            )),
+                        );
+                    });
+                    let remote_proxy = connection.remoteObjectProxyWithErrorHandler(&error_handler);
+                    let conforms_to_protocol: bool =
+                        unsafe { msg_send![&*remote_proxy, conformsToProtocol: protocol] };
+                    if !conforms_to_protocol {
+                        connection.invalidate();
+                        deliver_file_provider_warm_up_once(
+                            &delivered,
+                            &connection_sender,
+                            Err(format!(
+                                "File Provider service `{FILE_PROVIDER_SERVICE_NAME}` does not conform to `LocalityFileProviderServiceProtocol`."
+                            )),
+                        );
+                        return;
+                    }
+
+                    let reply_sender = connection_sender.clone();
+                    let reply_delivered = delivered.clone();
+                    let reply_connection = connection.clone();
+                    let expected_identifier = expected_identifier.clone();
+                    let domain_completion = RcBlock::new(move |domain_id: *mut NSString| {
+                        let result = if domain_id.is_null() {
+                            Err("File Provider service returned an empty domain identifier."
+                                .to_string())
+                        } else {
+                            autoreleasepool(|pool| {
+                                let domain_id = unsafe { (&*domain_id).to_str(pool) }.to_owned();
+                                if domain_id == expected_identifier {
+                                    Ok(())
+                                } else {
+                                    Err(format!(
+                                        "File Provider service returned domain `{domain_id}` while warming `{expected_identifier}`."
+                                    ))
+                                }
+                            })
+                        };
+                        reply_connection.invalidate();
+                        deliver_file_provider_warm_up_once(&reply_delivered, &reply_sender, result);
+                    });
+
+                    unsafe {
+                        let _: () = msg_send![
+                            &*remote_proxy,
+                            fileProviderDomainIdentifierWithCompletionHandler: &*domain_completion
+                        ];
+                    }
                 },
             );
 
@@ -300,6 +401,35 @@ fn start_file_provider_service_warm_up(
             &service_completion,
         )
     };
+}
+
+fn locality_file_provider_service_protocol() -> Result<&'static AnyProtocol, String> {
+    static PROTOCOL: OnceLock<Result<&'static AnyProtocol, String>> = OnceLock::new();
+
+    match PROTOCOL.get_or_init(|| {
+        let name = c"LocalityFileProviderServiceProtocol";
+        if let Some(protocol) = AnyProtocol::get(name) {
+            return Ok(protocol);
+        }
+
+        let mut builder = ProtocolBuilder::new(name).ok_or_else(|| {
+            "Could not allocate `LocalityFileProviderServiceProtocol` for File Provider XPC."
+                .to_string()
+        })?;
+        let ns_object_protocol = <dyn NSObjectProtocol>::protocol().ok_or_else(|| {
+            "Could not resolve `NSObject` protocol for File Provider XPC.".to_string()
+        })?;
+        builder.add_protocol(ns_object_protocol);
+        builder.add_method_description::<(&block2::DynBlock<dyn Fn(*mut NSString)>,), ()>(
+            sel!(fileProviderDomainIdentifierWithCompletionHandler:),
+            true,
+        );
+
+        Ok(builder.register())
+    }) {
+        Ok(protocol) => Ok(*protocol),
+        Err(error) => Err(error.clone()),
+    }
 }
 
 fn schedule_domain_add(
@@ -826,6 +956,17 @@ mod tests {
             let domain = unsafe { new_domain("loc", "") };
             assert!(!unsafe { domain.supportsSyncingTrash() });
         });
+    }
+
+    #[test]
+    fn file_provider_service_protocol_is_registered_for_xpc_warm_up() {
+        let protocol = locality_file_provider_service_protocol()
+            .expect("service protocol should be available to the main app");
+
+        assert_eq!(
+            protocol.name().to_str().unwrap(),
+            "LocalityFileProviderServiceProtocol"
+        );
     }
 
     #[test]
