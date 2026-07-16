@@ -33,7 +33,9 @@ behavior as `macos_file_provider`.
   `virtual_fs_item` without creating placeholder files.
 - `readdir`: list child entries from `virtual_fs_children`.
 - `open`/`read`: call `virtual_fs_materialize`, block until hydration completes,
-  then read bytes from the daemon-materialized canonical Markdown path.
+  then read bytes from the daemon-materialized canonical Markdown path. File
+  handles use FUSE direct I/O so a pre-hydration zero-length inode cannot make
+  the kernel return EOF after `open` has materialized non-empty contents.
 - `write`/`flush`: stage local contents under `~/.loc/fuse-staging/` and submit
   the final bytes through `virtual_fs_commit_write`. The daemon writes the
   content cache and marks dirty state; the FUSE process does not mutate SQLite or

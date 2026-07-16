@@ -14,7 +14,7 @@ on:
       - "crates/locality-store/**"
       - "crates/localityd/**"
       - "crates/loc-cli/**"
-      - "crates/locality-fuse/**"
+      - "platform/linux/locality-fuse/**"
       - "tests/live_granola_vfs_read.sh"
   schedule:
     - cron: "23 15 * * 2"
