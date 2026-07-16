@@ -219,6 +219,7 @@ impl Connector for NotionConnector {
             supports_media_download: true,
             supports_undo: true,
             supports_batch_observation: false,
+            supports_pre_hydration: true,
         }
     }
 

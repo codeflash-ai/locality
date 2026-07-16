@@ -177,6 +177,7 @@ pub fn google_docs_capabilities_json() -> Result<String, serde_json::Error> {
         supports_media_download: false,
         supports_undo: false,
         supports_batch_observation: false,
+        supports_pre_hydration: true,
     };
     serde_json::to_string(&capabilities)
 }
@@ -222,6 +223,7 @@ mod tests {
         assert!(capabilities.supports_oauth);
         assert!(!capabilities.supports_databases);
         assert!(!capabilities.supports_undo);
+        assert!(capabilities.supports_pre_hydration);
     }
 
     #[test]

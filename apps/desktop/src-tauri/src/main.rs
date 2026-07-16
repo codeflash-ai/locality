@@ -16480,6 +16480,7 @@ fn live_mode_e2e_notion_capabilities_json() -> String {
         supports_media_download: true,
         supports_undo: true,
         supports_batch_observation: false,
+        supports_pre_hydration: true,
     })
     .expect("serialize Notion capabilities")
 }

@@ -15495,6 +15495,7 @@ fn notion_capabilities_json_for_live_test() -> String {
         supports_media_download: true,
         supports_undo: true,
         supports_batch_observation: false,
+        supports_pre_hydration: true,
     })
     .expect("serialize Notion capabilities")
 }
@@ -17161,6 +17162,7 @@ impl Connector for BlockingGuardrailConnector {
             supports_media_download: false,
             supports_undo: false,
             supports_batch_observation: false,
+            supports_pre_hydration: false,
         }
     }
 
@@ -17269,6 +17271,7 @@ impl Connector for PropertyOnlyConnector {
             supports_media_download: false,
             supports_undo: true,
             supports_batch_observation: false,
+            supports_pre_hydration: false,
         }
     }
 

@@ -1225,6 +1225,7 @@ fn notion_capabilities_json() -> Result<String, ConnectError> {
         supports_media_download: true,
         supports_undo: true,
         supports_batch_observation: false,
+        supports_pre_hydration: true,
     };
     serde_json::to_string(&capabilities).map_err(|error| {
         ConnectError::CredentialEncode(CredentialEncodeFailure::notion(error.to_string()))

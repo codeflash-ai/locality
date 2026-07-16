@@ -131,6 +131,7 @@ pub struct SourceDescriptor {
     connect_command: Option<Cow<'static, str>>,
     auth_env_var: Option<&'static str>,
     supports_oauth: bool,
+    supports_pre_hydration: bool,
     mount_guidance: Cow<'static, str>,
     source_root_create_parent_kind: Option<EntityKind>,
     create_entity_parent_kinds: Vec<EntityKind>,
@@ -161,6 +162,10 @@ impl SourceDescriptor {
 
     pub fn supports_oauth(&self) -> bool {
         self.supports_oauth
+    }
+
+    pub fn supports_pre_hydration(&self) -> bool {
+        self.supports_pre_hydration
     }
 
     pub fn mount_guidance(&self) -> &str {
@@ -280,6 +285,7 @@ fn notion_source_descriptor() -> SourceDescriptor {
         connect_command: Some(Cow::Borrowed("loc connect notion")),
         auth_env_var: Some(DEFAULT_NOTION_TOKEN_ENV),
         supports_oauth: true,
+        supports_pre_hydration: true,
         mount_guidance: Cow::Borrowed(NOTION_AGENT_GUIDANCE),
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
@@ -296,6 +302,7 @@ fn google_docs_source_descriptor() -> SourceDescriptor {
         connect_command: Some(Cow::Borrowed("loc connect google-docs")),
         auth_env_var: None,
         supports_oauth: true,
+        supports_pre_hydration: true,
         mount_guidance: Cow::Owned(google_docs_mount_guidance()),
         source_root_create_parent_kind: Some(EntityKind::Directory),
         create_entity_parent_kinds: vec![EntityKind::Directory],
@@ -312,6 +319,7 @@ fn gmail_source_descriptor() -> SourceDescriptor {
         connect_command: Some(Cow::Borrowed("loc connect gmail")),
         auth_env_var: None,
         supports_oauth: true,
+        supports_pre_hydration: false,
         mount_guidance: Cow::Owned(gmail_mount_guidance()),
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Directory],
@@ -328,6 +336,7 @@ fn granola_source_descriptor() -> SourceDescriptor {
         connect_command: Some(Cow::Borrowed("loc connect granola --api-key-stdin")),
         auth_env_var: None,
         supports_oauth: false,
+        supports_pre_hydration: false,
         mount_guidance: Cow::Owned(granola_mount_guidance()),
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: Vec::new(),
@@ -377,6 +386,7 @@ fn generic_source_descriptor(connector: &str) -> SourceDescriptor {
         connect_command: None,
         auth_env_var: None,
         supports_oauth: false,
+        supports_pre_hydration: false,
         mount_guidance: Cow::Owned(generic_mount_guidance(connector)),
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
@@ -868,4 +878,21 @@ fn absolute_path(path: &Path) -> Result<PathBuf, String> {
 
 fn find_mount_for_path<'a>(mounts: &'a [MountConfig], path: &Path) -> Option<&'a MountConfig> {
     file_provider::find_mount_for_path(mounts, path).map(|(mount, _)| mount)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_descriptor;
+    use locality_gmail::GMAIL_CONNECTOR_ID;
+    use locality_google_docs::GOOGLE_DOCS_CONNECTOR_ID;
+    use locality_granola::GRANOLA_CONNECTOR_ID;
+
+    #[test]
+    fn source_descriptors_expose_pre_hydration_support() {
+        assert!(source_descriptor("notion").supports_pre_hydration());
+        assert!(source_descriptor(GOOGLE_DOCS_CONNECTOR_ID).supports_pre_hydration());
+        assert!(!source_descriptor(GMAIL_CONNECTOR_ID).supports_pre_hydration());
+        assert!(!source_descriptor(GRANOLA_CONNECTOR_ID).supports_pre_hydration());
+        assert!(!source_descriptor("unknown").supports_pre_hydration());
+    }
 }

@@ -49,6 +49,8 @@ pub struct ConnectorCapabilities {
     pub supports_media_download: bool,
     pub supports_undo: bool,
     pub supports_batch_observation: bool,
+    #[serde(default)]
+    pub supports_pre_hydration: bool,
 }
 
 impl ConnectorCapabilities {

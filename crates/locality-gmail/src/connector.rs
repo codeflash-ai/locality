@@ -117,6 +117,7 @@ impl Connector for GmailConnector {
             supports_media_download: false,
             supports_undo: false,
             supports_batch_observation: false,
+            supports_pre_hydration: false,
         }
     }
 
