@@ -79,9 +79,18 @@ fields, leaves a remote hint pending, queues post-commit hydration, and pauses
 enabled auto-save. For an accepted move, the paused auto-save record uses the
 final path so it composes with the store's atomic enrollment rehome.
 
+Pending virtual mutations are individual conservative blockers. A remote
+change is held when its remote identity or old/new page-container namespace
+intersects a mutation target, parent, original path, or projected path. The
+planner never deletes mutation state. Before returning filesystem actions, it
+also runs the store's read-only `DiscoveryCommit` preflight against the state it
+read, so final entity paths, mutation guards, and auto-save ownership use the
+same admission rules as the atomic memory and SQLite commit paths.
+
 This module currently implements planning only. Runtime connector scheduling,
-filesystem projection execution, connected-component grouping, mutation and
-journal handling, and recent-edit lease policy are separate integration work.
+filesystem projection execution, connected-component grouping, mutation
+cleanup, journal handling, and recent-edit lease policy are separate integration
+work.
 
 Daemon hydration uses `fetch_render`, not the raw connector `fetch` method
 directly. The common daemon-side abstraction is `HydrationSource::fetch_render`

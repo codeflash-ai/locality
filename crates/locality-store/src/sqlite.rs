@@ -5,7 +5,7 @@
 //! columns, while shadow block arrays and journal plans are stored as JSON blobs
 //! until query needs justify normalization.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -28,7 +28,7 @@ use crate::compatibility::{
     StateCompatibilityIssue, StateCompatibilityReport, StateCompatibilityStatus,
     StateComponentDefinition, StateComponentRecord,
 };
-use crate::discovery::{DiscoveryCommit, DiscoveryRepository};
+use crate::discovery::{DiscoveryCommit, DiscoveryPreflight, DiscoveryRepository};
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
@@ -643,77 +643,20 @@ impl DiscoveryRepository for SqliteStateStore {
         commit.validate_connector(&connector)?;
 
         let existing_entities = discovery_entities(&transaction, &commit.mount_id)?;
-        let final_entities = commit.final_entity_map(&existing_entities)?;
-        let existing_by_id = existing_entities
-            .iter()
-            .map(|entity| (entity.remote_id.clone(), entity.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let deleted_paths = commit
-            .entity_deletes
-            .iter()
-            .filter_map(|remote_id| {
-                existing_by_id
-                    .get(remote_id)
-                    .map(|entity| (remote_id.clone(), entity.path.clone()))
-            })
-            .collect::<BTreeMap<_, _>>();
-        let path_moves = commit
-            .entity_upserts
-            .iter()
-            .filter_map(|entity| {
-                let existing = existing_by_id.get(&entity.remote_id)?;
-                (existing.path != entity.path).then(|| {
-                    (
-                        entity.remote_id.clone(),
-                        existing.path.clone(),
-                        entity.path.clone(),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut affected_entities = commit
-            .entity_deletes
-            .iter()
-            .map(|remote_id| {
-                (
-                    remote_id.clone(),
-                    existing_by_id
-                        .get(remote_id)
-                        .map(|entity| entity.path.clone()),
-                )
-            })
-            .collect::<Vec<_>>();
-        affected_entities.extend(
-            path_moves
-                .iter()
-                .map(|(remote_id, old_path, _)| (remote_id.clone(), Some(old_path.clone()))),
-        );
         let auto_save_enrollments =
             discovery_auto_save_enrollments(&transaction, &commit.mount_id)?;
-
-        let mut affected_remote_ids = commit
-            .entity_deletes
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let deleted_path_set = deleted_paths.values().cloned().collect::<BTreeSet<_>>();
-        let mut affected_paths = deleted_path_set.clone();
-        for (remote_id, old_path, new_path) in &path_moves {
-            affected_remote_ids.insert(remote_id.clone());
-            affected_paths.insert(old_path.clone());
-            affected_paths.insert(new_path.clone());
-        }
-        commit.validate_virtual_mutation_changes(
-            &discovery_virtual_mutations(&transaction, &commit.mount_id)?,
-            &affected_remote_ids,
-            &affected_paths,
-        )?;
-
-        let auto_save_rehomes = commit.plan_auto_save_changes(
+        let virtual_mutations = discovery_virtual_mutations(&transaction, &commit.mount_id)?;
+        let DiscoveryPreflight {
+            final_entities: _,
+            entity_deletes: _,
+            deleted_paths,
+            path_moves,
+            auto_save_rehomes,
+        } = commit.preflight_details(
+            &connector,
+            &existing_entities,
             &auto_save_enrollments,
-            &affected_entities,
-            &path_moves,
-            &final_entities,
+            &virtual_mutations,
         )?;
 
         let final_path_texts = commit

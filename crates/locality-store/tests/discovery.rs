@@ -113,6 +113,60 @@ fn discovery_checkpoint_only_auto_save_upserts_validate_final_entities() {
 }
 
 #[test]
+fn discovery_preflight_rejects_cross_mount_snapshot_rows() {
+    let commit = DiscoveryCommit {
+        mount_id: mount_id(MAIN_MOUNT),
+        entity_upserts: vec![],
+        entity_deletes: vec![],
+        observation_upserts: vec![],
+        freshness_upserts: vec![],
+        auto_save_upserts: vec![],
+        metadata_discovery_deletes: vec![],
+        virtual_mutation_deletes: vec![],
+        checkpoint: checkpoint(2, "{}"),
+    };
+    let mut foreign_entity = entity("issue-1", "One/page.md", "One");
+    foreign_entity.mount_id = mount_id(OTHER_MOUNT);
+    assert_eq!(
+        commit.preflight("linear", &[foreign_entity], &[], &[]),
+        Err(StoreError::InvalidState(
+            "discovery preflight entity `issue-1` belongs to mount `linear-other`, expected `linear-main`"
+                .to_string()
+        ))
+    );
+
+    let mut foreign_enrollment = paused_auto_save("issue-1", "One/page.md");
+    foreign_enrollment.mount_id = mount_id(OTHER_MOUNT);
+    assert_eq!(
+        commit.preflight("linear", &[], &[foreign_enrollment], &[]),
+        Err(StoreError::InvalidState(
+            "discovery preflight auto-save enrollment `One/page.md` belongs to mount `linear-other`, expected `linear-main`"
+                .to_string()
+        ))
+    );
+
+    let mut foreign_mutation = pending_mutation("local:one", "issue-1", "One/page.md");
+    foreign_mutation.mount_id = mount_id(OTHER_MOUNT);
+    assert_eq!(
+        commit.preflight("linear", &[], &[], &[foreign_mutation]),
+        Err(StoreError::InvalidState(
+            "discovery preflight virtual mutation `local:one` belongs to mount `linear-other`, expected `linear-main`"
+                .to_string()
+        ))
+    );
+}
+
+#[test]
+fn discovery_preflight_matches_memory_and_sqlite_commit_rejection() {
+    let mut memory = InMemoryStateStore::new();
+    exercise_preflight_commit_parity(&mut memory);
+
+    let fixture = SqliteFixture::new();
+    let mut sqlite = fixture.open();
+    exercise_preflight_commit_parity(&mut sqlite);
+}
+
+#[test]
 fn sqlite_checkpoint_failure_rolls_back_all_discovery_changes() {
     let fixture = SqliteFixture::new();
     let mut store = fixture.open();
@@ -240,6 +294,34 @@ fn sqlite_checkpoint_failure_rolls_back_all_discovery_changes() {
 
 const MAIN_MOUNT: &str = "linear-main";
 const OTHER_MOUNT: &str = "linear-other";
+
+fn exercise_preflight_commit_parity<S>(store: &mut S)
+where
+    S: MountRepository + EntityRepository + DiscoveryRepository,
+{
+    seed_mount(store, MAIN_MOUNT);
+    let existing = entity("issue-1", "Occupied/page.md", "Existing");
+    store.save_entity(existing.clone()).expect("save entity");
+    let commit = DiscoveryCommit {
+        mount_id: mount_id(MAIN_MOUNT),
+        entity_upserts: vec![entity("issue-2", "Occupied/page.md", "Incoming")],
+        entity_deletes: vec![],
+        observation_upserts: vec![],
+        freshness_upserts: vec![],
+        auto_save_upserts: vec![],
+        metadata_discovery_deletes: vec![],
+        virtual_mutation_deletes: vec![],
+        checkpoint: checkpoint(2, "{}"),
+    };
+
+    let preflight_error = commit
+        .preflight("linear", &[existing], &[], &[])
+        .expect_err("preflight must reject final path collision");
+    let commit_error = store
+        .commit_discovery(commit)
+        .expect_err("commit must reject the same path collision");
+    assert_eq!(preflight_error, commit_error);
+}
 
 fn exercise_round_trip<S>(store: &mut S)
 where

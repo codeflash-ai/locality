@@ -13,7 +13,7 @@ use locality_core::journal::{
 use locality_core::model::{MountId, RemoteId};
 use locality_core::shadow::ShadowDocument;
 
-use crate::discovery::{DiscoveryCommit, DiscoveryRepository};
+use crate::discovery::{DiscoveryCommit, DiscoveryPreflight, DiscoveryRepository};
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
@@ -279,85 +279,36 @@ impl InMemoryStateStore {
             .filter(|entity| entity.mount_id == *mount_id)
             .cloned()
             .collect::<Vec<_>>();
-        let final_mount_entities = commit.final_entity_map(&existing_mount_entities)?;
-        let entity_deletes = commit
-            .entity_deletes
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let deleted_paths = commit
-            .entity_deletes
-            .iter()
-            .filter_map(|remote_id| {
-                self.entities
-                    .get(&Self::entity_key(mount_id, remote_id))
-                    .map(|entity| entity.path.clone())
-            })
-            .collect::<BTreeSet<_>>();
-        let path_moves = commit
-            .entity_upserts
-            .iter()
-            .filter_map(|entity| {
-                let existing = self
-                    .entities
-                    .get(&Self::entity_key(mount_id, &entity.remote_id))?;
-                (existing.path != entity.path).then(|| {
-                    (
-                        entity.remote_id.clone(),
-                        existing.path.clone(),
-                        entity.path.clone(),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut affected_entities = commit
-            .entity_deletes
-            .iter()
-            .map(|remote_id| {
-                (
-                    remote_id.clone(),
-                    self.entities
-                        .get(&Self::entity_key(mount_id, remote_id))
-                        .map(|entity| entity.path.clone()),
-                )
-            })
-            .collect::<Vec<_>>();
-        affected_entities.extend(
-            path_moves
-                .iter()
-                .map(|(remote_id, old_path, _)| (remote_id.clone(), Some(old_path.clone()))),
-        );
         let mount_enrollments = self
             .auto_save_enrollments
             .values()
             .filter(|enrollment| enrollment.mount_id == *mount_id)
             .cloned()
             .collect::<Vec<_>>();
-        let mut affected_remote_ids = entity_deletes.clone();
-        let mut affected_paths = deleted_paths.clone();
-        for (remote_id, old_path, new_path) in &path_moves {
-            affected_remote_ids.insert(remote_id.clone());
-            affected_paths.insert(old_path.clone());
-            affected_paths.insert(new_path.clone());
-        }
         let mount_mutations = self
             .virtual_mutations
             .values()
             .filter(|mutation| mutation.mount_id == *mount_id)
             .cloned()
             .collect::<Vec<_>>();
-        commit.validate_virtual_mutation_changes(
-            &mount_mutations,
-            &affected_remote_ids,
-            &affected_paths,
-        )?;
-
-        let auto_save_rehomes = commit.plan_auto_save_changes(
+        let connector = &self
+            .mounts
+            .get(mount_id)
+            .ok_or_else(|| StoreError::MountMissing(mount_id.clone()))?
+            .connector;
+        let DiscoveryPreflight {
+            final_entities: final_mount_entities,
+            entity_deletes,
+            deleted_paths,
+            path_moves,
+            auto_save_rehomes,
+        } = commit.preflight_details(
+            connector,
+            &existing_mount_entities,
             &mount_enrollments,
-            &affected_entities,
-            &path_moves,
-            &final_mount_entities,
+            &mount_mutations,
         )?;
+        let deleted_paths = deleted_paths.into_values().collect::<BTreeSet<_>>();
 
         let mut final_entities = self.entities.clone();
         final_entities.retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);

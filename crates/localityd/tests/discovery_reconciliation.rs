@@ -17,6 +17,7 @@ use locality_store::{
     EntityRepository, FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore,
     MetadataDiscoveryJobRecord, MetadataDiscoveryJobRepository, MetadataDiscoveryPriority,
     MountConfig, MountRepository, RemoteObservationRepository, SqliteStateStore,
+    VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
 };
 use localityd::discovery::{
     DiscoveryChangeKind, DiscoveryHoldReason, DiscoveryPostCommitAction, DiscoveryProjectionAction,
@@ -354,6 +355,267 @@ fn missing_or_blocked_projection_assessment_holds_structural_changes() {
 }
 
 #[test]
+fn pending_virtual_mutations_hold_intersecting_individual_structural_changes() {
+    let mount = mount();
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    let moving = entity("move", "Moving/page.md", HydrationState::Stub, "remote-v1");
+    let deleting = entity(
+        "delete",
+        "Parent/page.md",
+        HydrationState::Stub,
+        "remote-v1",
+    );
+    store.save_entity(moving.clone()).expect("save moving");
+    store.save_entity(deleting.clone()).expect("save deleting");
+    let mutations = vec![
+        virtual_mutation(
+            "local:create",
+            VirtualMutationKind::Create,
+            None,
+            None,
+            None,
+            "Draft/page.md",
+        ),
+        virtual_mutation(
+            "local:move",
+            VirtualMutationKind::Move,
+            Some("move"),
+            None,
+            Some("Moving/page.md"),
+            "Locally Moved/page.md",
+        ),
+        virtual_mutation(
+            "local:a-delete-id",
+            VirtualMutationKind::Create,
+            None,
+            Some("delete"),
+            None,
+            "Unrelated/page.md",
+        ),
+        virtual_mutation(
+            "local:z-delete-path",
+            VirtualMutationKind::Create,
+            None,
+            None,
+            Some("Parent/Child/page.md"),
+            "Also Unrelated/page.md",
+        ),
+    ];
+    for mutation in &mutations {
+        store
+            .save_virtual_mutation(mutation.clone())
+            .expect("save mutation");
+    }
+    let created = page_entry("create", "Draft/page.md", "remote-v1");
+    let moved = page_entry("move", "Remote Move/page.md", "remote-v2");
+
+    let plan = plan_batch_discovery(
+        &store,
+        &mount,
+        BatchObserveResult::incremental(
+            vec![
+                BatchObservationChange::Upsert(created.clone()),
+                BatchObservationChange::Upsert(moved.clone()),
+                BatchObservationChange::Tombstone {
+                    remote_id: deleting.remote_id.clone(),
+                },
+            ],
+            checkpoint(2, "{}"),
+        ),
+        NOW,
+        None,
+        &BTreeMap::from([
+            (created.remote_id.clone(), ProjectionAssessment::Safe),
+            (moved.remote_id.clone(), ProjectionAssessment::Safe),
+            (deleting.remote_id.clone(), ProjectionAssessment::Safe),
+        ]),
+    )
+    .expect("mutation-held plan");
+
+    assert_eq!(
+        plan.held,
+        vec![
+            HeldDiscoveryItem {
+                remote_id: created.remote_id,
+                change: DiscoveryChangeKind::Create,
+                reason: DiscoveryHoldReason::PendingVirtualMutation {
+                    local_id: "local:create".to_string(),
+                },
+            },
+            HeldDiscoveryItem {
+                remote_id: deleting.remote_id,
+                change: DiscoveryChangeKind::Delete,
+                reason: DiscoveryHoldReason::PendingVirtualMutation {
+                    local_id: "local:a-delete-id".to_string(),
+                },
+            },
+            HeldDiscoveryItem {
+                remote_id: moving.remote_id,
+                change: DiscoveryChangeKind::Move,
+                reason: DiscoveryHoldReason::PendingVirtualMutation {
+                    local_id: "local:move".to_string(),
+                },
+            },
+        ]
+    );
+    assert!(plan.projection_actions.is_empty());
+    assert!(plan.commit().entity_upserts.is_empty());
+    assert!(plan.commit().entity_deletes.is_empty());
+    assert!(plan.commit().virtual_mutation_deletes.is_empty());
+
+    store
+        .commit_discovery(plan.into_commit())
+        .expect("held commit remains store-valid");
+    assert_eq!(
+        store
+            .list_virtual_mutations(&mount.mount_id)
+            .expect("mutations remain")
+            .len(),
+        mutations.len()
+    );
+}
+
+#[test]
+fn page_container_overlap_is_component_aware_without_string_prefix_false_positives() {
+    let mount = mount();
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    let parent = entity(
+        "parent",
+        "Parent/page.md",
+        HydrationState::Stub,
+        "remote-v1",
+    );
+    store.save_entity(parent.clone()).expect("save parent");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            "local:child",
+            VirtualMutationKind::Create,
+            None,
+            None,
+            None,
+            "Parent/Child/page.md",
+        ))
+        .expect("save mutation");
+    let prefixed = page_entry("prefix", "Parentish/page.md", "remote-v1");
+
+    let plan = plan_batch_discovery(
+        &store,
+        &mount,
+        BatchObserveResult::incremental(
+            vec![
+                BatchObservationChange::Tombstone {
+                    remote_id: parent.remote_id.clone(),
+                },
+                BatchObservationChange::Upsert(prefixed.clone()),
+            ],
+            checkpoint(2, "{}"),
+        ),
+        NOW,
+        None,
+        &BTreeMap::from([
+            (parent.remote_id.clone(), ProjectionAssessment::Safe),
+            (prefixed.remote_id.clone(), ProjectionAssessment::Safe),
+        ]),
+    )
+    .expect("component-aware plan");
+
+    assert_eq!(
+        plan.held,
+        vec![HeldDiscoveryItem {
+            remote_id: parent.remote_id,
+            change: DiscoveryChangeKind::Delete,
+            reason: DiscoveryHoldReason::PendingVirtualMutation {
+                local_id: "local:child".to_string(),
+            },
+        }]
+    );
+    assert_eq!(
+        plan.projection_actions,
+        vec![DiscoveryProjectionAction::Create { entry: prefixed }]
+    );
+}
+
+#[test]
+fn pending_virtual_mutation_holds_changed_remote_drift_but_not_unchanged_observation() {
+    let mount = mount();
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    let current = entity(
+        "issue-1",
+        "Same/page.md",
+        HydrationState::Hydrated,
+        "remote-v1",
+    );
+    store.save_entity(current.clone()).expect("save entity");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            "local:rename",
+            VirtualMutationKind::Move,
+            Some("issue-1"),
+            None,
+            Some("Same/page.md"),
+            "Renamed/page.md",
+        ))
+        .expect("save mutation");
+    let unchanged = TreeEntry {
+        mount_id: current.mount_id.clone(),
+        remote_id: current.remote_id.clone(),
+        kind: current.kind.clone(),
+        title: current.title.clone(),
+        path: current.path.clone(),
+        hydration: HydrationState::Stub,
+        content_hash: current.content_hash.clone(),
+        remote_edited_at: current.remote_edited_at.clone(),
+        stub_frontmatter: None,
+    };
+    let unchanged_plan = plan_batch_discovery(
+        &store,
+        &mount,
+        BatchObserveResult::incremental(
+            vec![BatchObservationChange::Upsert(unchanged)],
+            checkpoint(1, "{}"),
+        ),
+        NOW,
+        None,
+        &BTreeMap::new(),
+    )
+    .expect("unchanged observation");
+    assert!(unchanged_plan.held.is_empty());
+    assert!(unchanged_plan.post_commit.is_empty());
+
+    let mut changed = page_entry("issue-1", "Same/page.md", "remote-v2");
+    changed.title = "Remote title".to_string();
+    let changed_plan = plan_batch_discovery(
+        &store,
+        &mount,
+        BatchObserveResult::incremental(
+            vec![BatchObservationChange::Upsert(changed)],
+            checkpoint(2, "{}"),
+        ),
+        "unix_ms:100001",
+        None,
+        &BTreeMap::new(),
+    )
+    .expect("changed drift is held");
+
+    assert_eq!(
+        changed_plan.held,
+        vec![HeldDiscoveryItem {
+            remote_id: current.remote_id,
+            change: DiscoveryChangeKind::RemoteDrift,
+            reason: DiscoveryHoldReason::PendingVirtualMutation {
+                local_id: "local:rename".to_string(),
+            },
+        }]
+    );
+    assert!(changed_plan.post_commit.is_empty());
+    assert!(changed_plan.commit().entity_upserts.is_empty());
+    assert!(changed_plan.commit().freshness_upserts[0].remote_hint_pending);
+}
+
+#[test]
 fn dirty_and_conflicted_entities_hold_move_and_delete_even_when_projection_is_safe() {
     let mount = mount();
     let mut store = InMemoryStateStore::new();
@@ -609,10 +871,10 @@ fn safe_hydrated_move_preserves_synced_fields() {
     assert_eq!(
         plan.projection_actions,
         vec![DiscoveryProjectionAction::Move {
-            remote_id: current.remote_id,
+            remote_id: current.remote_id.clone(),
             kind: EntityKind::Page,
-            from: current.path,
-            to: moved.path,
+            from: current.path.clone(),
+            to: moved.path.clone(),
         }]
     );
     assert_eq!(plan.post_commit.len(), 1);
@@ -620,6 +882,172 @@ fn safe_hydrated_move_preserves_synced_fields() {
     assert_eq!(
         plan.commit().auto_save_upserts,
         vec![enrollment.paused_remote_changed("remote discovery is awaiting hydration", NOW,)]
+    );
+    store
+        .commit_discovery(plan.into_commit())
+        .expect("move and pause commit together");
+    assert_eq!(
+        store
+            .get_auto_save_enrollment(&mount.mount_id, &moved.path)
+            .expect("new auto-save path")
+            .expect("paused auto-save")
+            .state,
+        AutoSaveState::PausedRemoteChanged
+    );
+}
+
+#[test]
+fn ambiguous_auto_save_ownership_rejects_structural_change_during_planning() {
+    let mut store = InMemoryStateStore::new();
+    exercise_ambiguous_auto_save_ownership(&mut store);
+
+    let root = temp_root("discovery-auto-save-ambiguity");
+    let mut sqlite = SqliteStateStore::open(root.clone()).expect("open sqlite");
+    exercise_ambiguous_auto_save_ownership(&mut sqlite);
+    drop(sqlite);
+    fs::remove_dir_all(root).expect("remove sqlite fixture");
+}
+
+#[test]
+fn wrong_auto_save_owner_at_structural_source_is_rejected() {
+    let mount = mount();
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    let current = entity("issue-1", "old/page.md", HydrationState::Stub, "remote-v1");
+    store.save_entity(current.clone()).expect("save entity");
+    let mut enrollment = AutoSaveEnrollmentRecord::new(
+        mount.mount_id.clone(),
+        current.path.clone(),
+        AutoSaveOrigin::UserEnabled,
+        "created",
+    );
+    enrollment.remote_id = Some(RemoteId::new("other"));
+    store
+        .save_auto_save_enrollment(enrollment)
+        .expect("save auto-save");
+
+    let error = plan_batch_discovery(
+        &store,
+        &mount,
+        BatchObserveResult::incremental(
+            vec![BatchObservationChange::Upsert(page_entry(
+                "issue-1",
+                "new/page.md",
+                "remote-v2",
+            ))],
+            checkpoint(2, "{}"),
+        ),
+        NOW,
+        None,
+        &BTreeMap::from([(current.remote_id, ProjectionAssessment::Safe)]),
+    )
+    .expect_err("wrong owner must fail before projection");
+    assert_eq!(
+        error,
+        LocalityError::InvalidState(
+            "auto-save enrollment at `old/page.md` belongs to `other` instead of `issue-1`"
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn single_stale_id_bound_auto_save_rehomes_with_safe_move() {
+    let mount = mount();
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    let current = entity("issue-1", "old/page.md", HydrationState::Stub, "remote-v1");
+    store.save_entity(current.clone()).expect("save entity");
+    let mut enrollment = AutoSaveEnrollmentRecord::new(
+        mount.mount_id.clone(),
+        "stale/page.md",
+        AutoSaveOrigin::UserEnabled,
+        "created",
+    );
+    enrollment.remote_id = Some(current.remote_id.clone());
+    store
+        .save_auto_save_enrollment(enrollment)
+        .expect("save stale auto-save");
+    let moved = page_entry("issue-1", "new/page.md", "remote-v2");
+
+    let plan = plan_batch_discovery(
+        &store,
+        &mount,
+        BatchObserveResult::incremental(
+            vec![BatchObservationChange::Upsert(moved.clone())],
+            checkpoint(2, "{}"),
+        ),
+        NOW,
+        None,
+        &BTreeMap::from([(current.remote_id.clone(), ProjectionAssessment::Safe)]),
+    )
+    .expect("single id binding is authoritative");
+    store
+        .commit_discovery(plan.into_commit())
+        .expect("store rehomes authoritative enrollment");
+
+    assert!(
+        store
+            .get_auto_save_enrollment(&mount.mount_id, PathBuf::from("stale/page.md").as_path())
+            .expect("stale path")
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .get_auto_save_enrollment(&mount.mount_id, &moved.path)
+            .expect("new path")
+            .expect("rehomed enrollment")
+            .remote_id,
+        Some(current.remote_id)
+    );
+}
+
+#[test]
+fn ambiguous_auto_save_ownership_rejects_same_path_pause() {
+    let mount = mount();
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    let current = entity(
+        "issue-1",
+        "same/page.md",
+        HydrationState::Hydrated,
+        "remote-v1",
+    );
+    store.save_entity(current.clone()).expect("save entity");
+    for path in ["same/page.md", "stale/page.md"] {
+        let mut enrollment = AutoSaveEnrollmentRecord::new(
+            mount.mount_id.clone(),
+            path,
+            AutoSaveOrigin::UserEnabled,
+            "created",
+        );
+        enrollment.remote_id = Some(current.remote_id.clone());
+        store
+            .save_auto_save_enrollment(enrollment)
+            .expect("save auto-save");
+    }
+
+    let error = plan_batch_discovery(
+        &store,
+        &mount,
+        BatchObserveResult::incremental(
+            vec![BatchObservationChange::Upsert(page_entry(
+                "issue-1",
+                "same/page.md",
+                "remote-v2",
+            ))],
+            checkpoint(2, "{}"),
+        ),
+        NOW,
+        None,
+        &BTreeMap::new(),
+    )
+    .expect_err("ambiguous pause must fail before hydration action");
+    assert_eq!(
+        error,
+        LocalityError::InvalidState(
+            "multiple auto-save enrollments belong to entity `issue-1`".to_string()
+        )
     );
 }
 
@@ -732,6 +1160,173 @@ fn empty_incremental_replays_held_move_and_delete() {
     );
     assert_eq!(replayed.commit().entity_deletes, vec![deleting.remote_id]);
     assert_eq!(replayed.commit().entity_upserts[0].path, moved.path);
+}
+
+#[test]
+fn merged_replay_and_incoming_create_cannot_share_a_projected_path() {
+    let mount = mount();
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    let pending = page_entry("pending", "shared/page.md", "remote-v1");
+    let held = plan_batch_discovery(
+        &store,
+        &mount,
+        BatchObserveResult::incremental(
+            vec![BatchObservationChange::Upsert(pending)],
+            checkpoint(1, "{}"),
+        ),
+        NOW,
+        None,
+        &BTreeMap::new(),
+    )
+    .expect("held create");
+    store
+        .commit_discovery(held.into_commit())
+        .expect("persist replay");
+    let incoming = page_entry("incoming", "shared/page.md", "remote-v2");
+
+    let error = plan_batch_discovery(
+        &store,
+        &mount,
+        BatchObserveResult::incremental(
+            vec![BatchObservationChange::Upsert(incoming.clone())],
+            checkpoint(2, "{}"),
+        ),
+        "unix_ms:100001",
+        None,
+        &BTreeMap::from([(incoming.remote_id, ProjectionAssessment::Safe)]),
+    )
+    .expect_err("merged intent collision must fail before projection");
+
+    assert_eq!(
+        error,
+        LocalityError::InvalidState(
+            "discovery merged intents contain duplicate projected path `shared/page.md`"
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn held_move_cannot_leave_a_safe_create_on_its_occupied_source_path() {
+    let mount = mount();
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    let moving = entity("a", "source/page.md", HydrationState::Stub, "remote-v1");
+    store.save_entity(moving.clone()).expect("save entity");
+    let moved = page_entry("a", "destination/page.md", "remote-v2");
+    let created = page_entry("b", "source/page.md", "remote-v1");
+
+    let error = plan_batch_discovery(
+        &store,
+        &mount,
+        BatchObserveResult::incremental(
+            vec![
+                BatchObservationChange::Upsert(moved.clone()),
+                BatchObservationChange::Upsert(created.clone()),
+            ],
+            checkpoint(2, "{}"),
+        ),
+        NOW,
+        None,
+        &BTreeMap::from([
+            (
+                moved.remote_id,
+                ProjectionAssessment::Blocked(DiscoveryHoldReason::UntrackedDestination(
+                    PathBuf::from("destination/page.md"),
+                )),
+            ),
+            (created.remote_id, ProjectionAssessment::Safe),
+        ]),
+    )
+    .expect_err("planned final map collision must fail before projection");
+
+    assert_eq!(
+        error,
+        LocalityError::Io(
+            "path `source/page.md` is already mapped in mount `linear-main`".to_string()
+        )
+    );
+}
+
+#[test]
+fn path_swap_cycle_with_unique_final_paths_remains_valid() {
+    let mount = mount();
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    let a = entity("a", "A/page.md", HydrationState::Stub, "remote-v1");
+    let b = entity("b", "B/page.md", HydrationState::Stub, "remote-v1");
+    for current in [&a, &b] {
+        store.save_entity(current.clone()).expect("save entity");
+        let mut enrollment = AutoSaveEnrollmentRecord::new(
+            mount.mount_id.clone(),
+            current.path.clone(),
+            AutoSaveOrigin::UserEnabled,
+            "created",
+        );
+        enrollment.remote_id = Some(current.remote_id.clone());
+        store
+            .save_auto_save_enrollment(enrollment)
+            .expect("save auto-save");
+    }
+    let moved_a = page_entry("a", "B/page.md", "remote-v2");
+    let moved_b = page_entry("b", "A/page.md", "remote-v2");
+
+    let plan = plan_batch_discovery(
+        &store,
+        &mount,
+        BatchObserveResult::incremental(
+            vec![
+                BatchObservationChange::Upsert(moved_a.clone()),
+                BatchObservationChange::Upsert(moved_b.clone()),
+            ],
+            checkpoint(2, "{}"),
+        ),
+        NOW,
+        None,
+        &BTreeMap::from([
+            (a.remote_id.clone(), ProjectionAssessment::Safe),
+            (b.remote_id.clone(), ProjectionAssessment::Safe),
+        ]),
+    )
+    .expect("path cycle remains a valid batch plan");
+
+    assert_eq!(plan.projection_actions.len(), 2);
+    store
+        .commit_discovery(plan.into_commit())
+        .expect("store stages the cycle atomically");
+    assert_eq!(
+        store
+            .get_entity(&mount.mount_id, &a.remote_id)
+            .expect("entity a")
+            .expect("entity a remains")
+            .path,
+        moved_a.path
+    );
+    assert_eq!(
+        store
+            .get_entity(&mount.mount_id, &b.remote_id)
+            .expect("entity b")
+            .expect("entity b remains")
+            .path,
+        moved_b.path
+    );
+    assert_eq!(
+        store
+            .get_auto_save_enrollment(&mount.mount_id, PathBuf::from("B/page.md").as_path())
+            .expect("a enrollment")
+            .expect("a enrollment moved")
+            .remote_id,
+        Some(a.remote_id)
+    );
+    assert_eq!(
+        store
+            .get_auto_save_enrollment(&mount.mount_id, PathBuf::from("A/page.md").as_path())
+            .expect("b enrollment")
+            .expect("b enrollment moved")
+            .remote_id,
+        Some(b.remote_id)
+    );
 }
 
 #[test]
@@ -878,7 +1473,8 @@ where
         + AutoSaveRepository
         + MetadataDiscoveryJobRepository
         + ConnectorStateRepository
-        + DiscoveryRepository,
+        + DiscoveryRepository
+        + VirtualMutationRepository,
 {
     let mount = mount();
     store.save_mount(mount.clone()).expect("save mount");
@@ -1007,6 +1603,54 @@ where
     );
 }
 
+fn exercise_ambiguous_auto_save_ownership<S>(store: &mut S)
+where
+    S: MountRepository
+        + EntityRepository
+        + AutoSaveRepository
+        + FreshnessStateRepository
+        + RemoteObservationRepository
+        + VirtualMutationRepository,
+{
+    let mount = mount();
+    store.save_mount(mount.clone()).expect("save mount");
+    let current = entity("issue-1", "old/page.md", HydrationState::Stub, "remote-v1");
+    store.save_entity(current.clone()).expect("save entity");
+    for path in ["old/page.md", "stale/page.md"] {
+        let mut enrollment = AutoSaveEnrollmentRecord::new(
+            mount.mount_id.clone(),
+            path,
+            AutoSaveOrigin::UserEnabled,
+            "created",
+        );
+        enrollment.remote_id = Some(current.remote_id.clone());
+        store
+            .save_auto_save_enrollment(enrollment)
+            .expect("save auto-save");
+    }
+    let moved = page_entry("issue-1", "new/page.md", "remote-v2");
+
+    let error = plan_batch_discovery(
+        store,
+        &mount,
+        BatchObserveResult::incremental(
+            vec![BatchObservationChange::Upsert(moved)],
+            checkpoint(2, "{}"),
+        ),
+        NOW,
+        None,
+        &BTreeMap::from([(current.remote_id, ProjectionAssessment::Safe)]),
+    )
+    .expect_err("ambiguous ownership must fail before projection");
+
+    assert_eq!(
+        error,
+        LocalityError::InvalidState(
+            "multiple auto-save enrollments belong to entity `issue-1`".to_string()
+        )
+    );
+}
+
 fn mount() -> MountConfig {
     MountConfig::new(MountId::new("linear-main"), "linear", "/tmp/linear-main")
 }
@@ -1060,6 +1704,29 @@ fn connector_state(state_version: i64, state_json: &str, updated_at: &str) -> Co
         min_reader_version: 1,
         state_json: state_json.to_string(),
         updated_at: updated_at.to_string(),
+    }
+}
+
+fn virtual_mutation(
+    local_id: &str,
+    mutation_kind: VirtualMutationKind,
+    target_remote_id: Option<&str>,
+    parent_remote_id: Option<&str>,
+    original_path: Option<&str>,
+    projected_path: &str,
+) -> VirtualMutationRecord {
+    VirtualMutationRecord {
+        mount_id: MountId::new("linear-main"),
+        local_id: local_id.to_string(),
+        mutation_kind,
+        target_remote_id: target_remote_id.map(RemoteId::new),
+        parent_remote_id: parent_remote_id.map(RemoteId::new),
+        original_path: original_path.map(PathBuf::from),
+        projected_path: PathBuf::from(projected_path),
+        title: local_id.to_string(),
+        content_path: None,
+        created_at: "created".to_string(),
+        updated_at: "updated".to_string(),
     }
 }
 

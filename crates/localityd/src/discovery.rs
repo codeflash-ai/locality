@@ -13,7 +13,8 @@ use locality_core::{LocalityError, LocalityResult};
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveRepository, ConnectorStateRecord, DiscoveryCommit,
     EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository, MountConfig,
-    RemoteObservationRecord, RemoteObservationRepository,
+    RemoteObservationRecord, RemoteObservationRepository, VirtualMutationRecord,
+    VirtualMutationRepository, discovery_auto_save_candidate,
 };
 use serde::{Deserialize, Serialize};
 
@@ -84,6 +85,7 @@ pub enum DiscoveryChangeKind {
 pub enum DiscoveryHoldReason {
     Dirty,
     Conflicted,
+    PendingVirtualMutation { local_id: String },
     UnsupportedKindChange { from: EntityKind, to: EntityKind },
     UntrackedSource(PathBuf),
     UntrackedDestination(PathBuf),
@@ -112,7 +114,8 @@ where
     S: EntityRepository
         + RemoteObservationRepository
         + FreshnessStateRepository
-        + AutoSaveRepository,
+        + AutoSaveRepository
+        + VirtualMutationRepository,
 {
     if metadata_job_id.is_some_and(str::is_empty) {
         return invalid("discovery metadata job identifier cannot be empty");
@@ -139,6 +142,10 @@ where
     let auto_save_enrollments = store
         .list_auto_save_enrollments(&mount.mount_id)
         .map_err(LocalityError::from)?;
+    let mut virtual_mutations = store
+        .list_virtual_mutations(&mount.mount_id)
+        .map_err(LocalityError::from)?;
+    virtual_mutations.sort_by(|left, right| left.local_id.cmp(&right.local_id));
     let mut intents = BTreeMap::new();
     let mut incoming_ids = BTreeSet::new();
     for change in batch.changes {
@@ -200,6 +207,7 @@ where
             }
         }
     }
+    validate_merged_intent_paths(&intents)?;
 
     let mut entity_upserts = Vec::new();
     let mut entity_deletes = Vec::new();
@@ -232,9 +240,34 @@ where
                 let structural = change_kind != DiscoveryChangeKind::RemoteDrift;
                 let remote_changed =
                     current.is_none_or(|current| entity_remote_changed(current, &entry));
+                if structural {
+                    discovery_auto_save_candidate(
+                        &auto_save_enrollments,
+                        &remote_id,
+                        Some(current.map_or(entry.path.as_path(), |entity| entity.path.as_path())),
+                    )
+                    .map_err(LocalityError::from)?;
+                }
+                let changed_paths = match current {
+                    Some(current) => {
+                        vec![current.path.as_path(), entry.path.as_path()]
+                    }
+                    None => vec![entry.path.as_path()],
+                };
                 let hold_reason = remote_changed
-                    .then(|| entity_hold_reason(current))
+                    .then(|| {
+                        pending_virtual_mutation_hold_reason(
+                            &virtual_mutations,
+                            &remote_id,
+                            &changed_paths,
+                        )
+                    })
                     .flatten()
+                    .or_else(|| {
+                        remote_changed
+                            .then(|| entity_hold_reason(current))
+                            .flatten()
+                    })
                     .or_else(|| kind_change_hold_reason(current, &entry))
                     .or_else(|| {
                         structural
@@ -273,7 +306,7 @@ where
                         observed_at,
                         "remote discovery is held for local review",
                         &mut auto_save_upserts,
-                    );
+                    )?;
                     continue;
                 }
 
@@ -293,7 +326,7 @@ where
                         observed_at,
                         "remote discovery is awaiting hydration",
                         &mut auto_save_upserts,
-                    );
+                    )?;
                 }
 
                 match current {
@@ -336,8 +369,19 @@ where
                     }
                     continue;
                 };
-                let hold_reason = entity_hold_reason(Some(current))
-                    .or_else(|| assessment_hold_reason(assessments.get(&remote_id)));
+                discovery_auto_save_candidate(
+                    &auto_save_enrollments,
+                    &remote_id,
+                    Some(&current.path),
+                )
+                .map_err(LocalityError::from)?;
+                let hold_reason = pending_virtual_mutation_hold_reason(
+                    &virtual_mutations,
+                    &remote_id,
+                    &[current.path.as_path()],
+                )
+                .or_else(|| entity_hold_reason(Some(current)))
+                .or_else(|| assessment_hold_reason(assessments.get(&remote_id)));
                 if let Some(reason) = hold_reason {
                     observation_upserts.push(observation_for_tombstone(current, observed_at)?);
                     freshness_upserts.push(next_freshness(
@@ -355,7 +399,7 @@ where
                         observed_at,
                         "remote discovery is held for local review",
                         &mut auto_save_upserts,
-                    );
+                    )?;
                     held.push(HeldDiscoveryItem {
                         remote_id,
                         change: DiscoveryChangeKind::Delete,
@@ -388,18 +432,29 @@ where
         ));
     }
 
+    let commit = DiscoveryCommit {
+        mount_id: mount.mount_id.clone(),
+        entity_upserts,
+        entity_deletes,
+        observation_upserts,
+        freshness_upserts,
+        auto_save_upserts,
+        metadata_discovery_deletes: metadata_job_id.map(str::to_string).into_iter().collect(),
+        virtual_mutation_deletes: Vec::new(),
+        checkpoint,
+    };
+    let existing_entities = existing.values().cloned().collect::<Vec<_>>();
+    commit
+        .preflight(
+            &mount.connector,
+            &existing_entities,
+            &auto_save_enrollments,
+            &virtual_mutations,
+        )
+        .map_err(LocalityError::from)?;
+
     Ok(DiscoveryPlan {
-        commit: DiscoveryCommit {
-            mount_id: mount.mount_id.clone(),
-            entity_upserts,
-            entity_deletes,
-            observation_upserts,
-            freshness_upserts,
-            auto_save_upserts,
-            metadata_discovery_deletes: metadata_job_id.map(str::to_string).into_iter().collect(),
-            virtual_mutation_deletes: Vec::new(),
-            checkpoint,
-        },
+        commit,
         projection_actions,
         held,
         post_commit,
@@ -410,6 +465,24 @@ where
 enum DiscoveryIntent {
     Upsert(TreeEntry),
     Tombstone,
+}
+
+fn validate_merged_intent_paths(
+    intents: &BTreeMap<RemoteId, DiscoveryIntent>,
+) -> LocalityResult<()> {
+    let mut paths = BTreeSet::new();
+    for intent in intents.values() {
+        let DiscoveryIntent::Upsert(entry) = intent else {
+            continue;
+        };
+        if !paths.insert(entry.path.clone()) {
+            return invalid(format!(
+                "discovery merged intents contain duplicate projected path `{}`",
+                entry.path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_batch(mount: &MountConfig, batch: &BatchObserveResult) -> LocalityResult<()> {
@@ -498,6 +571,53 @@ fn entity_hold_reason(current: Option<&EntityRecord>) -> Option<DiscoveryHoldRea
         Some(HydrationState::Conflicted) => Some(DiscoveryHoldReason::Conflicted),
         _ => None,
     }
+}
+
+fn pending_virtual_mutation_hold_reason(
+    mutations: &[VirtualMutationRecord],
+    remote_id: &RemoteId,
+    paths: &[&Path],
+) -> Option<DiscoveryHoldReason> {
+    mutations
+        .iter()
+        .find(|mutation| {
+            mutation.target_remote_id.as_ref() == Some(remote_id)
+                || mutation.parent_remote_id.as_ref() == Some(remote_id)
+                || mutation
+                    .original_path
+                    .as_ref()
+                    .is_some_and(|mutation_path| {
+                        paths
+                            .iter()
+                            .any(|path| projected_paths_overlap(path, mutation_path))
+                    })
+                || paths
+                    .iter()
+                    .any(|path| projected_paths_overlap(path, &mutation.projected_path))
+        })
+        .map(|mutation| DiscoveryHoldReason::PendingVirtualMutation {
+            local_id: mutation.local_id.clone(),
+        })
+}
+
+fn projected_paths_overlap(left: &Path, right: &Path) -> bool {
+    paths_overlap(left, right)
+        || page_container(left).is_some_and(|container| paths_overlap(container, right))
+        || page_container(right).is_some_and(|container| paths_overlap(left, container))
+        || page_container(left).is_some_and(|left_container| {
+            page_container(right)
+                .is_some_and(|right_container| paths_overlap(left_container, right_container))
+        })
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+fn page_container(path: &Path) -> Option<&Path> {
+    path.file_name()
+        .is_some_and(|file_name| file_name == "page.md")
+        .then(|| path.parent().unwrap_or_else(|| Path::new("")))
 }
 
 fn kind_change_hold_reason(
@@ -617,13 +737,14 @@ fn pause_auto_save(
     observed_at: &str,
     reason: &str,
     output: &mut Vec<AutoSaveEnrollmentRecord>,
-) {
+) -> LocalityResult<()> {
     let Some(current) = current else {
-        return;
+        return Ok(());
     };
-    if let Some(enrollment) = enrollments.iter().find(|enrollment| {
-        enrollment.remote_id.as_ref() == Some(&current.remote_id) || enrollment.path == current.path
-    }) && enrollment.enabled
+    if let Some(enrollment) =
+        discovery_auto_save_candidate(enrollments, &current.remote_id, Some(&current.path))
+            .map_err(LocalityError::from)?
+        && enrollment.enabled
     {
         let mut paused = enrollment.clone();
         if let Some(final_path) = final_path {
@@ -632,6 +753,7 @@ fn pause_auto_save(
         paused = paused.paused_remote_changed(reason, observed_at);
         output.push(paused);
     }
+    Ok(())
 }
 
 fn queue_hydration(mount: &MountConfig, entity: &EntityRecord) -> DiscoveryPostCommitAction {

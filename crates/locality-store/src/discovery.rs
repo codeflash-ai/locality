@@ -5,7 +5,7 @@
 //! the associated entity state atomically.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use locality_core::model::{MountId, RemoteId};
 
@@ -34,7 +34,146 @@ pub trait DiscoveryRepository {
     fn commit_discovery(&mut self, commit: DiscoveryCommit) -> StoreResult<()>;
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DiscoveryPreflight {
+    pub final_entities: BTreeMap<RemoteId, EntityRecord>,
+    pub entity_deletes: BTreeSet<RemoteId>,
+    pub deleted_paths: BTreeMap<RemoteId, PathBuf>,
+    pub path_moves: Vec<(RemoteId, PathBuf, PathBuf)>,
+    pub auto_save_rehomes: Vec<AutoSaveRehome>,
+}
+
 impl DiscoveryCommit {
+    /// Validates this commit against a caller-provided snapshot without mutating state.
+    ///
+    /// Every snapshot row must belong to the commit mount. Repository implementations
+    /// use the same preflight calculation immediately before applying a commit.
+    pub fn preflight(
+        &self,
+        connector: &str,
+        existing_entities: &[EntityRecord],
+        auto_save_enrollments: &[AutoSaveEnrollmentRecord],
+        virtual_mutations: &[VirtualMutationRecord],
+    ) -> StoreResult<()> {
+        self.preflight_details(
+            connector,
+            existing_entities,
+            auto_save_enrollments,
+            virtual_mutations,
+        )
+        .map(|_| ())
+    }
+
+    pub(crate) fn preflight_details(
+        &self,
+        connector: &str,
+        existing_entities: &[EntityRecord],
+        auto_save_enrollments: &[AutoSaveEnrollmentRecord],
+        virtual_mutations: &[VirtualMutationRecord],
+    ) -> StoreResult<DiscoveryPreflight> {
+        self.validate()?;
+        self.validate_connector(connector)?;
+        for entity in existing_entities {
+            validate_mount(
+                "preflight entity",
+                &entity.remote_id,
+                &entity.mount_id,
+                &self.mount_id,
+            )?;
+        }
+        for enrollment in auto_save_enrollments {
+            if enrollment.mount_id != self.mount_id {
+                return invalid(format!(
+                    "discovery preflight auto-save enrollment `{}` belongs to mount `{}`, expected `{}`",
+                    enrollment.path.display(),
+                    enrollment.mount_id.0,
+                    self.mount_id.0
+                ));
+            }
+        }
+        for mutation in virtual_mutations {
+            if mutation.mount_id != self.mount_id {
+                return invalid(format!(
+                    "discovery preflight virtual mutation `{}` belongs to mount `{}`, expected `{}`",
+                    mutation.local_id, mutation.mount_id.0, self.mount_id.0
+                ));
+            }
+        }
+
+        let final_entities = self.final_entity_map(existing_entities)?;
+        let existing_by_id = existing_entities
+            .iter()
+            .map(|entity| (entity.remote_id.clone(), entity))
+            .collect::<BTreeMap<_, _>>();
+        let entity_deletes = self.entity_deletes.iter().cloned().collect::<BTreeSet<_>>();
+        let deleted_paths = self
+            .entity_deletes
+            .iter()
+            .filter_map(|remote_id| {
+                existing_by_id
+                    .get(remote_id)
+                    .map(|entity| (remote_id.clone(), entity.path.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let path_moves = self
+            .entity_upserts
+            .iter()
+            .filter_map(|entity| {
+                let existing = existing_by_id.get(&entity.remote_id)?;
+                (existing.path != entity.path).then(|| {
+                    (
+                        entity.remote_id.clone(),
+                        existing.path.clone(),
+                        entity.path.clone(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut affected_entities = self
+            .entity_deletes
+            .iter()
+            .map(|remote_id| {
+                (
+                    remote_id.clone(),
+                    existing_by_id
+                        .get(remote_id)
+                        .map(|entity| entity.path.clone()),
+                )
+            })
+            .collect::<Vec<_>>();
+        affected_entities.extend(
+            path_moves
+                .iter()
+                .map(|(remote_id, old_path, _)| (remote_id.clone(), Some(old_path.clone()))),
+        );
+        let mut affected_remote_ids = entity_deletes.clone();
+        let mut affected_paths = deleted_paths.values().cloned().collect::<BTreeSet<_>>();
+        for (remote_id, old_path, new_path) in &path_moves {
+            affected_remote_ids.insert(remote_id.clone());
+            affected_paths.insert(old_path.clone());
+            affected_paths.insert(new_path.clone());
+        }
+        self.validate_virtual_mutation_changes(
+            virtual_mutations,
+            &affected_remote_ids,
+            &affected_paths,
+        )?;
+        let auto_save_rehomes = self.plan_auto_save_changes(
+            auto_save_enrollments,
+            &affected_entities,
+            &path_moves,
+            &final_entities,
+        )?;
+
+        Ok(DiscoveryPreflight {
+            final_entities,
+            entity_deletes,
+            deleted_paths,
+            path_moves,
+            auto_save_rehomes,
+        })
+    }
+
     pub(crate) fn validate(&self) -> StoreResult<()> {
         let mut entity_upserts = BTreeSet::new();
         let mut entity_paths = BTreeSet::new();
@@ -280,36 +419,7 @@ impl DiscoveryCommit {
         affected_entities: &[(RemoteId, Option<PathBuf>)],
     ) -> StoreResult<()> {
         for (remote_id, old_path) in affected_entities {
-            if let Some(enrollment) = old_path.as_ref().and_then(|path| {
-                enrollments
-                    .iter()
-                    .find(|enrollment| enrollment.path == *path)
-            }) && let Some(owner) = &enrollment.remote_id
-                && owner != remote_id
-            {
-                return invalid(format!(
-                    "auto-save enrollment at `{}` belongs to `{}` instead of `{}`",
-                    enrollment.path.display(),
-                    owner.0,
-                    remote_id.0
-                ));
-            }
-
-            let owned_count = enrollments
-                .iter()
-                .filter(|enrollment| {
-                    enrollment.remote_id.as_ref() == Some(remote_id)
-                        || old_path
-                            .as_ref()
-                            .is_some_and(|path| enrollment.path == *path)
-                })
-                .count();
-            if owned_count > 1 {
-                return invalid(format!(
-                    "multiple auto-save enrollments belong to entity `{}`",
-                    remote_id.0
-                ));
-            }
+            discovery_auto_save_candidate(enrollments, remote_id, old_path.as_deref())?;
         }
         Ok(())
     }
@@ -493,6 +603,44 @@ impl DiscoveryCommit {
         }
         Ok(rehomes)
     }
+}
+
+/// Resolves the only auto-save enrollment that can belong to an entity change.
+///
+/// A path bound to another remote entity or multiple ID/path candidates is invalid
+/// durable state and must be rejected before projection work begins.
+pub fn discovery_auto_save_candidate<'a>(
+    enrollments: &'a [AutoSaveEnrollmentRecord],
+    remote_id: &RemoteId,
+    owned_path: Option<&Path>,
+) -> StoreResult<Option<&'a AutoSaveEnrollmentRecord>> {
+    if let Some(enrollment) = owned_path.and_then(|path| {
+        enrollments
+            .iter()
+            .find(|enrollment| enrollment.path == path)
+    }) && let Some(owner) = &enrollment.remote_id
+        && owner != remote_id
+    {
+        return invalid(format!(
+            "auto-save enrollment at `{}` belongs to `{}` instead of `{}`",
+            enrollment.path.display(),
+            owner.0,
+            remote_id.0
+        ));
+    }
+
+    let mut candidates = enrollments.iter().filter(|enrollment| {
+        enrollment.remote_id.as_ref() == Some(remote_id)
+            || owned_path.is_some_and(|path| enrollment.path == path)
+    });
+    let candidate = candidates.next();
+    if candidates.next().is_some() {
+        return invalid(format!(
+            "multiple auto-save enrollments belong to entity `{}`",
+            remote_id.0
+        ));
+    }
+    Ok(candidate)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
