@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use objc2::rc::{Retained, autoreleasepool};
-use objc2::runtime::{AnyProtocol, NSObjectProtocol, ProtocolBuilder};
-use objc2::{AnyThread, ProtocolType, msg_send, sel};
+use objc2::runtime::AnyProtocol;
+use objc2::{AnyThread, msg_send};
 use objc2_file_provider::{
     NSFileProviderDomain, NSFileProviderManager, NSFileProviderRootContainerItemIdentifier,
 };
@@ -24,6 +24,10 @@ const DOMAIN_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const DOMAIN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const SERVICE_WARM_UP_TIMEOUT: Duration = Duration::from_secs(5);
 const FILE_PROVIDER_SERVICE_NAME: &str = "ai.codeflash.locality.Locality.FileProvider.service";
+
+unsafe extern "C" {
+    fn LocalityFileProviderServiceProtocolForXPC() -> *const AnyProtocol;
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DomainActivation {
@@ -404,32 +408,10 @@ fn start_file_provider_service_warm_up(
 }
 
 fn locality_file_provider_service_protocol() -> Result<&'static AnyProtocol, String> {
-    static PROTOCOL: OnceLock<Result<&'static AnyProtocol, String>> = OnceLock::new();
-
-    match PROTOCOL.get_or_init(|| {
-        let name = c"LocalityFileProviderServiceProtocol";
-        if let Some(protocol) = AnyProtocol::get(name) {
-            return Ok(protocol);
-        }
-
-        let mut builder = ProtocolBuilder::new(name).ok_or_else(|| {
-            "Could not allocate `LocalityFileProviderServiceProtocol` for File Provider XPC."
-                .to_string()
-        })?;
-        let ns_object_protocol = <dyn NSObjectProtocol>::protocol().ok_or_else(|| {
-            "Could not resolve `NSObject` protocol for File Provider XPC.".to_string()
-        })?;
-        builder.add_protocol(ns_object_protocol);
-        builder.add_method_description::<(&block2::DynBlock<dyn Fn(*mut NSString)>,), ()>(
-            sel!(fileProviderDomainIdentifierWithCompletionHandler:),
-            true,
-        );
-
-        Ok(builder.register())
-    }) {
-        Ok(protocol) => Ok(*protocol),
-        Err(error) => Err(error.clone()),
-    }
+    let protocol = unsafe { LocalityFileProviderServiceProtocolForXPC() };
+    unsafe { protocol.as_ref() }.ok_or_else(|| {
+        "Could not resolve `LocalityFileProviderServiceProtocol` for File Provider XPC.".to_string()
+    })
 }
 
 fn schedule_domain_add(
@@ -967,6 +949,19 @@ mod tests {
             protocol.name().to_str().unwrap(),
             "LocalityFileProviderServiceProtocol"
         );
+    }
+
+    #[test]
+    fn file_provider_service_protocol_is_backed_by_clang_metadata_source() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let protocol_source = manifest_dir
+            .join("macos")
+            .join("LocalityFileProviderServiceProtocol.m");
+        let build_script =
+            std::fs::read_to_string(manifest_dir.join("build.rs")).expect("read build script");
+
+        assert!(protocol_source.exists());
+        assert!(build_script.contains("LocalityFileProviderServiceProtocol.m"));
     }
 
     #[test]

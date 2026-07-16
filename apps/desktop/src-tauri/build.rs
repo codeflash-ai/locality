@@ -7,6 +7,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LOCALITY_DESKTOP_BUILD_ID_OVERRIDE");
     println!("cargo:rerun-if-env-changed=LOCALITY_DISTRIBUTION_CHANNEL");
     println!("cargo:rerun-if-changed=build.rs");
+    compile_macos_file_provider_protocol();
     let workspace = workspace_root();
     println!(
         "cargo:rerun-if-changed={}",
@@ -25,6 +26,19 @@ fn main() {
     println!("cargo:rustc-env=LOCALITY_DISTRIBUTION_CHANNEL={distribution_channel}");
 
     tauri_build::build();
+}
+
+fn compile_macos_file_provider_protocol() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        return;
+    }
+
+    println!("cargo:rerun-if-changed=macos/LocalityFileProviderServiceProtocol.h");
+    println!("cargo:rerun-if-changed=macos/LocalityFileProviderServiceProtocol.m");
+
+    cc::Build::new()
+        .file("macos/LocalityFileProviderServiceProtocol.m")
+        .compile("LocalityFileProviderServiceProtocol");
 }
 
 fn workspace_root() -> PathBuf {
