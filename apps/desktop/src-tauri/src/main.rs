@@ -225,8 +225,17 @@ struct MountSummary {
     status: String,
     root_exists: bool,
     entity_count: usize,
+    hydration_progress: Option<MountHydrationProgress>,
     pending_change_count: usize,
     provider: Option<ProviderRuntimeSummary>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MountHydrationProgress {
+    indexed_files: usize,
+    remaining_files: usize,
+    total_files: usize,
 }
 
 #[derive(Clone, Serialize)]
@@ -3937,6 +3946,7 @@ fn degraded_snapshot(message: String) -> DesktopSnapshot {
             status: "error".to_string(),
             root_exists: false,
             entity_count: 0,
+            hydration_progress: None,
             pending_change_count: 0,
             provider: None,
         },
@@ -4122,6 +4132,7 @@ fn mount_summary_with_pending_change_count(
             status: "not_mounted".to_string(),
             root_exists: false,
             entity_count: 0,
+            hydration_progress: None,
             pending_change_count: 0,
             provider: None,
         };
@@ -4133,6 +4144,7 @@ fn mount_summary_with_pending_change_count(
         .unwrap_or("ready");
     let access_root = mount_access_root(mount);
     let root_exists = mount_root_exists_for_desktop_summary(mount, &access_root);
+    let entities = store.and_then(|store| store.list_entities(&mount.mount_id).ok());
 
     MountSummary {
         mount_id: mount.mount_id.0.clone(),
@@ -4160,10 +4172,13 @@ fn mount_summary_with_pending_change_count(
         read_only: mount.read_only,
         status: mount_status.to_string(),
         root_exists,
-        entity_count: store
-            .and_then(|store| store.list_entities(&mount.mount_id).ok())
+        entity_count: entities
+            .as_ref()
             .map(|entities| entities.len())
             .unwrap_or(0),
+        hydration_progress: entities
+            .as_ref()
+            .and_then(|entities| mount_hydration_progress(entities)),
         pending_change_count: pending_change_count.unwrap_or_else(|| {
             store
                 .map(|store| pending_changes_for_mount(store, state_root, &mount.mount_id))
@@ -4173,6 +4188,33 @@ fn mount_summary_with_pending_change_count(
         }),
         provider,
     }
+}
+
+fn mount_hydration_progress(entities: &[EntityRecord]) -> Option<MountHydrationProgress> {
+    let mut indexed_files = 0usize;
+    let mut remaining_files = 0usize;
+
+    for entity in entities {
+        if entity.kind != EntityKind::Page {
+            continue;
+        }
+        match entity.hydration {
+            HydrationState::Hydrated | HydrationState::Dirty | HydrationState::Conflicted => {
+                indexed_files += 1;
+            }
+            HydrationState::Stub => {
+                remaining_files += 1;
+            }
+            HydrationState::Virtual => {}
+        }
+    }
+
+    let total_files = indexed_files + remaining_files;
+    (total_files > 0).then_some(MountHydrationProgress {
+        indexed_files,
+        remaining_files,
+        total_files,
+    })
 }
 
 fn mount_live_mode_summary(
@@ -11603,6 +11645,7 @@ mod tests {
         let summary = super::mount_summary(None, Path::new("."), None, None, None);
 
         assert!(Path::new(&summary.local_path).is_absolute());
+        assert!(summary.hydration_progress.is_none());
     }
 
     #[test]
@@ -11791,6 +11834,95 @@ mod tests {
 
         assert!(snapshot.needs_onboarding);
         assert!(snapshot.recent_files.is_empty());
+    }
+
+    #[test]
+    fn desktop_snapshot_reports_hydratable_file_progress() {
+        let temp = TestTempDir::new("desktop-file-progress");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let connection = test_connection("workspace-1", "CodeFlash");
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            temp.path().join("codeflash-wiki"),
+        )
+        .with_connection_id(connection.connection_id.clone())
+        .projection(ProjectionMode::LinuxFuse);
+
+        store.save_connection(connection).expect("save connection");
+        store.save_mount(mount).expect("save mount");
+
+        for (remote_id, title, path, hydration) in [
+            (
+                "hydrated-page",
+                "Hydrated",
+                "Hydrated/page.md",
+                HydrationState::Hydrated,
+            ),
+            (
+                "dirty-page",
+                "Dirty",
+                "Dirty/page.md",
+                HydrationState::Dirty,
+            ),
+            (
+                "conflicted-page",
+                "Conflicted",
+                "Conflicted/page.md",
+                HydrationState::Conflicted,
+            ),
+            ("stub-page", "Stub", "Stub/page.md", HydrationState::Stub),
+            (
+                "virtual-page",
+                "Virtual",
+                "Virtual/page.md",
+                HydrationState::Virtual,
+            ),
+        ] {
+            store
+                .save_entity(
+                    EntityRecord::new(
+                        MountId::new("notion-main"),
+                        RemoteId::new(remote_id),
+                        EntityKind::Page,
+                        title,
+                        path,
+                    )
+                    .with_hydration(hydration),
+                )
+                .expect("save page entity");
+        }
+
+        for (remote_id, kind, path) in [
+            ("directory-1", EntityKind::Directory, "Directory"),
+            ("database-1", EntityKind::Database, "Database"),
+            ("asset-1", EntityKind::Asset, "asset.png"),
+        ] {
+            store
+                .save_entity(
+                    EntityRecord::new(
+                        MountId::new("notion-main"),
+                        RemoteId::new(remote_id),
+                        kind,
+                        remote_id,
+                        path,
+                    )
+                    .with_hydration(HydrationState::Stub),
+                )
+                .expect("save non-page entity");
+        }
+
+        let snapshot = super::load_desktop_snapshot_from_store(&store, temp.path())
+            .expect("load snapshot from test store");
+        let progress = snapshot
+            .mount
+            .hydration_progress
+            .expect("file progress is reported");
+
+        assert_eq!(snapshot.mount.entity_count, 8);
+        assert_eq!(progress.indexed_files, 3);
+        assert_eq!(progress.remaining_files, 1);
+        assert_eq!(progress.total_files, 4);
     }
 
     #[test]
@@ -16152,6 +16284,11 @@ fn sample_snapshot() -> DesktopSnapshot {
         status: "ready".to_string(),
         root_exists: true,
         entity_count: 42,
+        hydration_progress: Some(MountHydrationProgress {
+            indexed_files: 16,
+            remaining_files: 4,
+            total_files: 20,
+        }),
         pending_change_count: 3,
         provider: None,
     };

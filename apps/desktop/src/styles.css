@@ -2553,7 +2553,7 @@ button.home-stat:hover {
   font-weight: 850;
 }
 
-.mount-details-button:hover {
+.mount-details-button:hover:not(:disabled) {
   border-color: var(--control-border-hover);
   background: var(--control-bg-hover);
   color: var(--accent);
@@ -4234,7 +4234,7 @@ button.home-stat:hover {
 
 :root[data-theme="dark"] .secondary-button:hover:not(:disabled),
 :root[data-theme="dark"] .icon-button:hover:not(:disabled),
-:root[data-theme="dark"] .mount-details-button:hover,
+:root[data-theme="dark"] .mount-details-button:hover:not(:disabled),
 :root[data-theme="dark"] .settings-activity-row:hover {
   border-color: var(--control-border-hover);
   background: var(--control-bg-hover);

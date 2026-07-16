@@ -186,6 +186,11 @@ where most items complete instantly; once the folder and agent instructions are
 ready, route directly to the final ready screen and show background sync as a
 short supporting detail rather than a task the user waits on.
 
+After the mount exists, the main app may show file preparation progress as a
+plain count, for example files indexed and files left. This progress is derived
+from durable hydration state for page-like Markdown files, not from daemon queue
+internals, and it must not block the ready screen.
+
 ### 5. Ready
 
 The completion screen is the final onboarding step and should have exactly one
