@@ -18,7 +18,7 @@ use locality_store::{
 };
 
 use crate::file_provider;
-use crate::virtual_fs::virtual_fs_content_path;
+use crate::virtual_fs::{virtual_fs_content_path, virtual_mutation_content_path_for_read};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProjectionStateReconcileReport {
@@ -620,8 +620,10 @@ fn pending_create_identity(
     mutation: &VirtualMutationRecord,
 ) -> LocalityResult<PendingCreateIdentity> {
     let mut paths = Vec::new();
-    if let Some(path) = mutation.content_path.as_ref() {
-        paths.push(path.clone());
+    if let Some(path) =
+        virtual_mutation_content_path_for_read(state_root, &mount.mount_id, mutation)?
+    {
+        paths.push(path);
     }
     if let Some(state_root) = state_root {
         paths.push(virtual_fs_content_path(
@@ -729,6 +731,8 @@ fn dedupe_paths(paths: &mut Vec<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(target_os = "macos")]
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1129,6 +1133,40 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reconcile_ignores_legacy_app_group_create_content_path_outside_sandbox() {
+        let fixture = Fixture::new_macos_default_state_root();
+        let mut store = fixture.store();
+        fixture.entity(&mut store, "page-1", "Roadmap/page.md");
+        fixture.write_file(
+            "Roadmap/page.md",
+            canonical_markdown("page-1", "Roadmap", "Visible body."),
+        );
+        let legacy_path = fixture.write_legacy_app_group_file(
+            "Roadmap/page.md",
+            canonical_markdown("page-2", "Roadmap", "Legacy app-group body."),
+        );
+        store
+            .save_virtual_mutation(fixture.pending_create(
+                "local:create",
+                "Roadmap/page.md",
+                Some(legacy_path),
+            ))
+            .expect("save mutation");
+
+        let report = reconcile_projection_state_for_target(
+            &mut store,
+            Some(&fixture.state_root),
+            Some(&fixture.root.join("Roadmap/page.md")),
+        )
+        .expect("reconcile state");
+
+        assert_eq!(report.repaired, 1, "{report:#?}");
+        assert_eq!(report.conflicts, 0, "{report:#?}");
+        assert_eq!(report.diagnostics[0].code, "redundant_pending_create");
+    }
+
     struct Fixture {
         root: PathBuf,
         state_root: PathBuf,
@@ -1158,6 +1196,15 @@ mod tests {
                 state_root,
                 mount_id: MountId::new("notion-main"),
             }
+        }
+
+        #[cfg(target_os = "macos")]
+        fn new_macos_default_state_root() -> Self {
+            let mut fixture = Self::new();
+            let home = fixture.root.join("home");
+            fixture.state_root = home.join(".loc");
+            fs::create_dir_all(&fixture.state_root).expect("state root");
+            fixture
         }
 
         fn store(&self) -> InMemoryStateStore {
@@ -1214,6 +1261,32 @@ mod tests {
                 fs::create_dir_all(parent).expect("state parent");
             }
             fs::write(&path, contents).expect("write state file");
+            path
+        }
+
+        #[cfg(target_os = "macos")]
+        fn write_legacy_app_group_file(
+            &self,
+            relative_path: &str,
+            contents: impl AsRef<[u8]>,
+        ) -> PathBuf {
+            let home = self
+                .state_root
+                .parent()
+                .expect("state root parent")
+                .to_path_buf();
+            let path = home
+                .join("Library")
+                .join("Group Containers")
+                .join("C484HB7Q6S.group.ai.codeflash.locality")
+                .join("content")
+                .join(&self.mount_id.0)
+                .join("files")
+                .join(relative_path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("legacy parent");
+            }
+            fs::write(&path, contents).expect("write legacy file");
             path
         }
 

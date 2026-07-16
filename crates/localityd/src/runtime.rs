@@ -76,9 +76,10 @@ use crate::virtual_fs::{
     VirtualFsRefreshChildrenReport, commit_virtual_fs_write, create_virtual_fs_directory,
     create_virtual_fs_file, materialize_virtual_fs_guidance_with_content_root,
     materialize_virtual_fs_item_with_content_root, mount_point_identifier,
-    refresh_virtual_fs_children_with_content_root, rename_virtual_fs_item, trash_virtual_fs_item,
-    virtual_fs_children_refresh_needed, virtual_fs_children_with_content_root,
-    virtual_fs_container_depth, virtual_fs_content_root, virtual_fs_item_with_content_root,
+    refresh_virtual_fs_children_with_content_root, rename_virtual_fs_item,
+    repair_legacy_macos_content_root, trash_virtual_fs_item, virtual_fs_children_refresh_needed,
+    virtual_fs_children_with_content_root, virtual_fs_container_depth, virtual_fs_content_root,
+    virtual_fs_item_with_content_root,
 };
 use crate::watcher::{FileEvent, FileEventKind};
 
@@ -3150,6 +3151,7 @@ where
     else {
         return Ok(request);
     };
+    repair_legacy_macos_content_root(state_root, &mount.mount_id)?;
     Ok(HydrationRequest::new(
         request.mount_id,
         request.remote_id,
@@ -3173,10 +3175,11 @@ where
     else {
         return Ok(None);
     };
-    Ok(mount
-        .projection
-        .uses_virtual_filesystem()
-        .then(|| virtual_fs_content_root(state_root, &mount.mount_id)))
+    if mount.projection.uses_virtual_filesystem() {
+        repair_legacy_macos_content_root(state_root, &mount.mount_id)?;
+        return Ok(Some(virtual_fs_content_root(state_root, &mount.mount_id)));
+    }
+    Ok(None)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5048,6 +5051,7 @@ mod tests {
     use locality_core::freshness::{
         ChangeHintKind, FreshnessTier, RemoteObservation, RemoteVersion, SyncJob, SyncJobKind,
     };
+    use locality_core::hydration::{HydrationReason, HydrationRequest};
     use locality_core::model::{
         CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, SourceSpan,
     };
@@ -5819,6 +5823,70 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hydration_request_for_virtual_projection_repairs_legacy_dirty_cache_first() {
+        let home = temp_runtime_root("runtime-legacy-hydration-home");
+        let state_root = home.join(".loc");
+        let visible_root = home.join("visible");
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(mount_id.clone(), "notion", &visible_root)
+                    .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "Roadmap",
+                    "Roadmap.md",
+                )
+                .with_hydration(HydrationState::Dirty),
+            )
+            .expect("save entity");
+        let legacy_path = home
+            .join("Library")
+            .join("Group Containers")
+            .join("C484HB7Q6S.group.ai.codeflash.locality")
+            .join("content")
+            .join(&mount_id.0)
+            .join("files")
+            .join("Roadmap.md");
+        std::fs::create_dir_all(legacy_path.parent().expect("legacy parent"))
+            .expect("legacy parent");
+        std::fs::write(&legacy_path, b"legacy dirty bytes").expect("write legacy cache");
+        let current_path =
+            crate::virtual_fs::virtual_fs_content_root(&state_root, &mount_id).join("Roadmap.md");
+        assert!(!current_path.exists());
+
+        let request = super::hydration_request_for_projection(
+            &store,
+            &state_root,
+            HydrationRequest::new(
+                mount_id.clone(),
+                remote_id,
+                PathBuf::from("Roadmap.md"),
+                HydrationState::Hydrated,
+                HydrationReason::FileOpen,
+            ),
+        )
+        .expect("projection request");
+
+        assert_eq!(request.path, current_path);
+        assert_eq!(
+            std::fs::read(&request.path).expect("read repaired cache"),
+            b"legacy dirty bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

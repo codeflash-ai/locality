@@ -1064,6 +1064,166 @@ fn prepare_push_prefers_content_cache_for_linux_fuse_pending_create() {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn prepare_push_ignores_legacy_app_group_content_path_outside_sandbox() {
+    let fixture = PrepareFixture::new_macos_default_state_root();
+    let mut store = fixture.virtual_store("fake");
+    fixture.save_parent_page(&mut store);
+    let source_path = Path::new("Roadmap/Draft/page.md");
+    let current_path = fixture.write_virtual_page(
+        source_path.to_str().expect("source path"),
+        "---\ntitle: Current Draft\n---\nCurrent body.\n",
+    );
+    let legacy_path = fixture.write_legacy_app_group_page(
+        source_path.to_str().expect("source path"),
+        "---\ntitle: Legacy Draft\n---\nLegacy body.\n",
+    );
+    let projected_path = fixture.write_raw(
+        source_path.to_str().expect("source path"),
+        "---\ntitle: Projected Draft\n---\nProjected body.\n",
+    );
+    assert_ne!(legacy_path, current_path);
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:draft",
+            Some(RemoteId::new("page-parent")),
+            source_path.to_str().expect("source path"),
+            legacy_path,
+        ))
+        .expect("save mutation");
+
+    let prepared = prepare_push(
+        &store,
+        &job(projected_path),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare push");
+
+    let plan = prepared.pipeline.plan.expect("plan");
+    match &plan.operations[0] {
+        PushOperation::CreateEntity { title, body, .. } => {
+            assert_eq!(title, "Current Draft");
+            assert_eq!(body, "Current body.\n");
+        }
+        operation => panic!("unexpected operation: {operation:?}"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn prepare_push_recovers_pending_create_from_legacy_app_group_cache() {
+    let fixture = PrepareFixture::new_macos_default_state_root();
+    let mut store = fixture.virtual_store("fake");
+    fixture.save_parent_page(&mut store);
+    let source_path = Path::new("Roadmap/Draft/page.md");
+    let current_path = virtual_fs_content_path(&fixture.state_root, &fixture.mount_id, source_path)
+        .expect("current path");
+    let legacy_path = fixture.write_legacy_app_group_page(
+        source_path.to_str().expect("source path"),
+        "---\ntitle: Legacy Draft\n---\nLegacy body.\n",
+    );
+    let projected_path = fixture.write_raw(
+        source_path.to_str().expect("source path"),
+        "---\ntitle: Projected Draft\n---\nProjected body.\n",
+    );
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:draft",
+            Some(RemoteId::new("page-parent")),
+            source_path.to_str().expect("source path"),
+            legacy_path,
+        ))
+        .expect("save mutation");
+    assert!(!current_path.exists());
+
+    let prepared = prepare_push(
+        &store,
+        &job(projected_path),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare push");
+
+    let plan = prepared.pipeline.plan.expect("plan");
+    match &plan.operations[0] {
+        PushOperation::CreateEntity { title, body, .. } => {
+            assert_eq!(title, "Legacy Draft");
+            assert_eq!(body, "Legacy body.\n");
+        }
+        operation => panic!("unexpected operation: {operation:?}"),
+    }
+    assert_eq!(
+        fs::read_to_string(&current_path).expect("read migrated cache"),
+        "---\ntitle: Legacy Draft\n---\nLegacy body.\n"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn prepare_push_recovers_dirty_entity_from_legacy_app_group_cache() {
+    let fixture = PrepareFixture::new_macos_default_state_root();
+    let mut store = fixture.virtual_store("fake");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap/page.md",
+            )
+            .with_hydration(HydrationState::Dirty),
+        )
+        .expect("save dirty entity");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("page-1"),
+                "Original body.",
+                8,
+                [RemoteId::new("paragraph-1")],
+            )
+            .expect("shadow"),
+        )
+        .expect("save shadow");
+    let source_path = Path::new("Roadmap/page.md");
+    let current_path = virtual_fs_content_path(&fixture.state_root, &fixture.mount_id, source_path)
+        .expect("current path");
+    let legacy_path = fixture.write_legacy_app_group_page(
+        source_path.to_str().expect("source path"),
+        &canonical_markdown("page-1", "Updated from legacy cache."),
+    );
+    assert_ne!(legacy_path, current_path);
+    assert!(!current_path.exists());
+
+    let prepared = prepare_push(
+        &store,
+        &job(fixture.root.join(source_path)),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare push");
+
+    let plan = prepared.pipeline.plan.expect("plan");
+    assert_eq!(plan.summary.blocks_updated, 1, "{plan:#?}");
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("paragraph-1"),
+            content: "Updated from legacy cache.".to_string(),
+        }]
+    );
+    assert_eq!(
+        fs::read_to_string(&current_path).expect("read migrated cache"),
+        canonical_markdown("page-1", "Updated from legacy cache.")
+    );
+}
+
 #[test]
 fn prepare_push_plans_virtual_create_under_mount_remote_root() {
     let fixture = PrepareFixture::new();
@@ -1524,6 +1684,15 @@ impl PrepareFixture {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn new_macos_default_state_root() -> Self {
+        let mut fixture = Self::new();
+        let home = fixture.root.join("home");
+        fixture.state_root = home.join(".loc");
+        fs::create_dir_all(&fixture.state_root).expect("fixture state root");
+        fixture
+    }
+
     fn store(&self, connector: &str) -> InMemoryStateStore {
         let mut store = InMemoryStateStore::new();
         store
@@ -1608,6 +1777,28 @@ impl PrepareFixture {
             fs::create_dir_all(parent).expect("content parent");
         }
         fs::write(&path, contents).expect("write virtual page");
+        path
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_legacy_app_group_page(&self, relative_path: &str, contents: &str) -> PathBuf {
+        let home = self
+            .state_root
+            .parent()
+            .expect("state root parent")
+            .to_path_buf();
+        let path = home
+            .join("Library")
+            .join("Group Containers")
+            .join("C484HB7Q6S.group.ai.codeflash.locality")
+            .join("content")
+            .join(&self.mount_id.0)
+            .join("files")
+            .join(relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("legacy parent");
+        }
+        fs::write(&path, contents).expect("write legacy page");
         path
     }
 
