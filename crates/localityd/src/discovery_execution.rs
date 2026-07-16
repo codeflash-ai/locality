@@ -1691,6 +1691,7 @@ fn step_committed<S>(
 where
     S: DiscoveryRepository + HydrationJobRepository,
 {
+    validate_installed_projection(execution, effects)?;
     for request in &execution.hydration_jobs {
         if effects
             .hydration_jobs
@@ -2620,8 +2621,8 @@ fn validate_installed_projection(
                         .filter(|relative| !relative.as_os_str().is_empty())
                         .map(Path::to_path_buf)
                         .collect::<Vec<_>>();
-                    if fingerprint_path_excluding(&destination, &exclusions)?
-                        != *operation.expected_fingerprint()
+                    if fingerprint_if_exists_excluding(&destination, &exclusions)?.as_ref()
+                        != Some(operation.expected_fingerprint())
                     {
                         return invalid(format!(
                             "discovery destination `{}` no longer matches its fingerprint",
@@ -2637,8 +2638,16 @@ fn validate_installed_projection(
                         .any(|destination| destination == source);
                     let source = checked_join(&execution.mount_root, source, "source")?;
                     let stage = checked_join(&execution.recovery_root, stage, "stage")?;
+                    let stage_fingerprint = fingerprint_if_exists(&stage)?;
+                    let recovery_root_missing = match fs::symlink_metadata(&execution.recovery_root)
+                    {
+                        Ok(_) => false,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                        Err(error) => return Err(LocalityError::from(error)),
+                    };
                     if (fingerprint_if_exists(&source)?.is_some() && !source_replaced_by_component)
-                        || fingerprint_path(&stage)? != *operation.expected_fingerprint()
+                        || (stage_fingerprint.as_ref() != Some(operation.expected_fingerprint())
+                            && !(stage_fingerprint.is_none() && recovery_root_missing))
                     {
                         return invalid(format!(
                             "staged delete `{}` no longer matches its fingerprint",
@@ -2763,8 +2772,15 @@ fn publish_create_payload(
 }
 
 fn fingerprint_if_exists(path: &Path) -> LocalityResult<Option<DiscoveryPathFingerprint>> {
+    fingerprint_if_exists_excluding(path, &[])
+}
+
+fn fingerprint_if_exists_excluding(
+    path: &Path,
+    exclusions: &[PathBuf],
+) -> LocalityResult<Option<DiscoveryPathFingerprint>> {
     match fs::symlink_metadata(path) {
-        Ok(_) => fingerprint_path(path).map(Some),
+        Ok(_) => fingerprint_path_excluding(path, exclusions).map(Some),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(LocalityError::from(error)),
     }

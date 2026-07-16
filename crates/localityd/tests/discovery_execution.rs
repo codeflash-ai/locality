@@ -1488,6 +1488,192 @@ fn committed_repair_upserts_hydration_idempotently_before_cleanup() {
 }
 
 #[test]
+fn committed_repair_rejects_missing_or_mismatched_create_and_move_destinations_before_side_effects()
+{
+    for operation_kind in ["create", "move"] {
+        for corruption in ["missing", "mismatched"] {
+            let label = format!("committed-{operation_kind}-{corruption}");
+            let fixture = Fixture::new(&label);
+            let mut store = InMemoryStateStore::new();
+            store.save_mount(fixture.mount.clone()).expect("save mount");
+            if operation_kind == "move" {
+                store
+                    .save_entity(entity_record("page", "Old/page.md"))
+                    .expect("save existing page");
+                fs::create_dir_all(fixture.root.join("Old")).expect("create old page");
+                fs::write(fixture.root.join("Old/page.md"), "original\n").expect("write old page");
+            }
+            let mut plan = discovery_plan(
+                &store,
+                &fixture.mount,
+                vec![entry("page", EntityKind::Page, "New/page.md")],
+            );
+            plan.post_commit
+                .push(DiscoveryPostCommitAction::QueueHydration(
+                    HydrationRequest::new(
+                        fixture.mount.mount_id.clone(),
+                        RemoteId::new("page"),
+                        fixture.root.join("New/page.md"),
+                        HydrationState::Hydrated,
+                        HydrationReason::Policy,
+                    ),
+                ));
+            let transaction_id = DiscoveryTransactionId::new(&label);
+            let materializations = if operation_kind == "create" {
+                vec![DiscoveryCreateMaterialization::Page {
+                    remote_id: RemoteId::new("page"),
+                    document: "original\n".to_string(),
+                }]
+            } else {
+                vec![]
+            };
+            let reserved = prepare_plain_files_discovery_transaction(
+                &mut store,
+                plan,
+                transaction_id.clone(),
+                "t0",
+                materializations,
+            )
+            .expect("prepare transaction");
+            let execution: DiscoveryExecutionPlan =
+                serde_json::from_value(reserved.plan).expect("decode execution");
+            let destination = execution
+                .components
+                .iter()
+                .flat_map(|component| component.operations.iter())
+                .find_map(|operation| match (operation_kind, operation) {
+                    ("create", DiscoveryExecutionOperation::Create { destination, .. })
+                    | ("move", DiscoveryExecutionOperation::Move { destination, .. }) => {
+                        Some(execution.mount_root.join(destination))
+                    }
+                    _ => None,
+                })
+                .expect("destination operation");
+            run_steps_to_committed(&mut store, &transaction_id);
+
+            if corruption == "missing" {
+                fs::remove_dir_all(&destination).expect("remove installed destination");
+            } else {
+                fs::write(destination.join("page.md"), "tampered\n")
+                    .expect("replace installed bytes");
+            }
+            let transaction_before = store
+                .get_discovery_transaction(&transaction_id)
+                .expect("transaction lookup")
+                .expect("transaction");
+            let visible_before = filesystem_snapshot(&fixture.root);
+            let recovery_before = filesystem_snapshot(&execution.recovery_root);
+
+            assert_eq!(
+                repair_plain_files_discovery_transaction(&mut store, &transaction_id, "t30")
+                    .expect("classify committed projection drift"),
+                DiscoveryExecutionTerminal::NeedsReview,
+                "{label}"
+            );
+            assert_eq!(
+                store
+                    .get_discovery_transaction(&transaction_id)
+                    .expect("transaction lookup")
+                    .expect("transaction"),
+                transaction_before,
+                "{label}"
+            );
+            assert_eq!(
+                filesystem_snapshot(&fixture.root),
+                visible_before,
+                "{label}"
+            );
+            assert_eq!(
+                filesystem_snapshot(&execution.recovery_root),
+                recovery_before,
+                "{label}"
+            );
+            assert!(
+                store
+                    .list_hydration_jobs()
+                    .expect("hydration jobs")
+                    .is_empty(),
+                "{label}"
+            );
+        }
+    }
+}
+
+#[test]
+fn committed_repair_rejects_reappeared_delete_source_before_side_effects() {
+    let fixture = Fixture::new("committed-delete-source-reappeared");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(fixture.mount.clone()).expect("save mount");
+    store
+        .save_entity(entity_record("page", "Deleted/page.md"))
+        .expect("save existing page");
+    fs::create_dir_all(fixture.root.join("Deleted")).expect("create deleted page");
+    fs::write(fixture.root.join("Deleted/page.md"), "original\n").expect("write deleted page");
+    let mut plan = discovery_plan_changes(
+        &store,
+        &fixture.mount,
+        vec![BatchObservationChange::Tombstone {
+            remote_id: RemoteId::new("page"),
+        }],
+    );
+    plan.post_commit
+        .push(DiscoveryPostCommitAction::QueueHydration(
+            HydrationRequest::new(
+                fixture.mount.mount_id.clone(),
+                RemoteId::new("page"),
+                fixture.root.join("Deleted/page.md"),
+                HydrationState::Hydrated,
+                HydrationReason::Policy,
+            ),
+        ));
+    let transaction_id = DiscoveryTransactionId::new("committed-delete-source-reappeared");
+    let reserved = prepare_plain_files_discovery_transaction(
+        &mut store,
+        plan,
+        transaction_id.clone(),
+        "t0",
+        vec![],
+    )
+    .expect("prepare delete transaction");
+    let execution: DiscoveryExecutionPlan =
+        serde_json::from_value(reserved.plan).expect("decode execution");
+    run_steps_to_committed(&mut store, &transaction_id);
+    fs::create_dir_all(fixture.root.join("Deleted")).expect("recreate deleted source");
+    fs::write(fixture.root.join("Deleted/page.md"), "reappeared\n")
+        .expect("write reappeared source");
+    let transaction_before = store
+        .get_discovery_transaction(&transaction_id)
+        .expect("transaction lookup")
+        .expect("transaction");
+    let visible_before = filesystem_snapshot(&fixture.root);
+    let recovery_before = filesystem_snapshot(&execution.recovery_root);
+
+    assert_eq!(
+        repair_plain_files_discovery_transaction(&mut store, &transaction_id, "t30")
+            .expect("classify committed delete drift"),
+        DiscoveryExecutionTerminal::NeedsReview
+    );
+    assert_eq!(
+        store
+            .get_discovery_transaction(&transaction_id)
+            .expect("transaction lookup")
+            .expect("transaction"),
+        transaction_before
+    );
+    assert_eq!(filesystem_snapshot(&fixture.root), visible_before);
+    assert_eq!(
+        filesystem_snapshot(&execution.recovery_root),
+        recovery_before
+    );
+    assert!(
+        store
+            .list_hydration_jobs()
+            .expect("hydration jobs")
+            .is_empty()
+    );
+}
+
+#[test]
 fn projected_commit_drift_rolls_projection_back_and_aborts() {
     let fixture = Fixture::new("rollback-commit-drift");
     let mut store = InMemoryStateStore::new();
@@ -2815,6 +3001,18 @@ fn run_steps_to_finalized(store: &mut InMemoryStateStore, transaction_id: &Disco
         last = Some(outcome);
     }
     panic!("transaction did not finalize within bounded steps; last={last:?}");
+}
+
+fn run_steps_to_committed(store: &mut InMemoryStateStore, transaction_id: &DiscoveryTransactionId) {
+    let mut last = None;
+    for sequence in 1..=30 {
+        let outcome = step(store, transaction_id, sequence);
+        if outcome == DiscoveryExecutionStep::Committed {
+            return;
+        }
+        last = Some(outcome);
+    }
+    panic!("transaction did not commit within bounded steps; last={last:?}");
 }
 
 fn run_steps_to_finalized_from(
