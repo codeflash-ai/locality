@@ -593,10 +593,11 @@ where
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HydrationQueue {
-    high_priority: VecDeque<HydrationKey>,
-    normal_priority: VecDeque<HydrationKey>,
-    low_priority: VecDeque<HydrationKey>,
-    pending: BTreeMap<HydrationKey, HydrationRequest>,
+    high_priority: VecDeque<HydrationQueueEntry>,
+    normal_priority: VecDeque<HydrationQueueEntry>,
+    low_priority: VecDeque<HydrationQueueEntry>,
+    pending: BTreeMap<HydrationKey, PendingHydration>,
+    next_sequence: u64,
 }
 
 impl HydrationQueue {
@@ -622,17 +623,23 @@ impl HydrationQueue {
         let inserted = !self.pending.contains_key(&key);
 
         if inserted {
-            self.push_ready_key(hydration_priority(&request.reason), key.clone());
-            self.pending.insert(key, request);
+            let sequence = self.next_sequence();
+            self.push_ready_key(hydration_priority(&request.reason), key.clone(), sequence);
+            self.pending
+                .insert(key, PendingHydration { request, sequence });
             return true;
         }
 
         if let Some(existing) = self.pending.get_mut(&key) {
-            let previous_priority = hydration_priority(&existing.reason);
-            merge_request(existing, request);
-            let merged_priority = hydration_priority(&existing.reason);
+            let previous_priority = hydration_priority(&existing.request.reason);
+            merge_request(&mut existing.request, request);
+            let merged_priority = hydration_priority(&existing.request.reason);
             if merged_priority > previous_priority {
-                self.push_ready_key(merged_priority, key);
+                let sequence = self.next_sequence();
+                if let Some(existing) = self.pending.get_mut(&key) {
+                    existing.sequence = sequence;
+                }
+                self.push_ready_key(merged_priority, key, sequence);
             }
         }
 
@@ -640,22 +647,25 @@ impl HydrationQueue {
     }
 
     pub fn peek_ready(&self) -> Option<&HydrationRequest> {
-        let key = self.next_ready_key()?;
-        self.pending.get(key)
+        let entry = self.next_ready_entry()?;
+        self.pending.get(&entry.key).map(|pending| &pending.request)
     }
 
     pub fn pop_ready(&mut self) -> Option<HydrationRequest> {
-        let key = self.pop_ready_key()?;
-        self.pending.remove(&key)
+        let entry = self.pop_ready_entry()?;
+        self.pending
+            .remove(&entry.key)
+            .map(|pending| pending.request)
     }
 
     pub fn debug_requests(&self, limit: usize) -> Vec<HydrationRequest> {
         self.ready_buckets()
             .into_iter()
             .flat_map(|(priority, bucket)| {
-                bucket.iter().filter_map(move |key| {
-                    self.pending.get(key).and_then(|request| {
-                        (hydration_priority(&request.reason) == priority).then(|| request.clone())
+                bucket.iter().filter_map(move |entry| {
+                    self.pending.get(&entry.key).and_then(|pending| {
+                        self.entry_matches_pending(entry, pending, priority)
+                            .then(|| pending.request.clone())
                     })
                 })
             })
@@ -690,36 +700,37 @@ impl HydrationQueue {
         Ok(drained)
     }
 
-    fn next_ready_key(&self) -> Option<&HydrationKey> {
+    fn next_ready_entry(&self) -> Option<&HydrationQueueEntry> {
         self.ready_buckets()
             .into_iter()
             .find_map(|(priority, bucket)| {
                 bucket
                     .iter()
-                    .find(|key| self.key_matches_priority(key, priority))
+                    .find(|entry| self.entry_matches_priority(entry, priority))
             })
     }
 
-    fn pop_ready_key(&mut self) -> Option<HydrationKey> {
+    fn pop_ready_entry(&mut self) -> Option<HydrationQueueEntry> {
         for priority in [
             HydrationPriority::High,
             HydrationPriority::Normal,
             HydrationPriority::Low,
         ] {
-            while let Some(key) = self.bucket_mut(priority).pop_front() {
-                if self.key_matches_priority(&key, priority) {
-                    return Some(key);
+            while let Some(entry) = self.bucket_mut(priority).pop_front() {
+                if self.entry_matches_priority(&entry, priority) {
+                    return Some(entry);
                 }
             }
         }
         None
     }
 
-    fn push_ready_key(&mut self, priority: HydrationPriority, key: HydrationKey) {
-        self.bucket_mut(priority).push_back(key);
+    fn push_ready_key(&mut self, priority: HydrationPriority, key: HydrationKey, sequence: u64) {
+        self.bucket_mut(priority)
+            .push_back(HydrationQueueEntry { key, sequence });
     }
 
-    fn bucket_mut(&mut self, priority: HydrationPriority) -> &mut VecDeque<HydrationKey> {
+    fn bucket_mut(&mut self, priority: HydrationPriority) -> &mut VecDeque<HydrationQueueEntry> {
         match priority {
             HydrationPriority::High => &mut self.high_priority,
             HydrationPriority::Normal => &mut self.normal_priority,
@@ -727,7 +738,7 @@ impl HydrationQueue {
         }
     }
 
-    fn ready_buckets(&self) -> [(HydrationPriority, &VecDeque<HydrationKey>); 3] {
+    fn ready_buckets(&self) -> [(HydrationPriority, &VecDeque<HydrationQueueEntry>); 3] {
         [
             (HydrationPriority::High, &self.high_priority),
             (HydrationPriority::Normal, &self.normal_priority),
@@ -735,21 +746,41 @@ impl HydrationQueue {
         ]
     }
 
-    fn key_matches_priority(&self, key: &HydrationKey, priority: HydrationPriority) -> bool {
+    fn entry_matches_priority(
+        &self,
+        entry: &HydrationQueueEntry,
+        priority: HydrationPriority,
+    ) -> bool {
         self.pending
-            .get(key)
-            .is_some_and(|request| hydration_priority(&request.reason) == priority)
+            .get(&entry.key)
+            .is_some_and(|pending| self.entry_matches_pending(entry, pending, priority))
+    }
+
+    fn entry_matches_pending(
+        &self,
+        entry: &HydrationQueueEntry,
+        pending: &PendingHydration,
+        priority: HydrationPriority,
+    ) -> bool {
+        pending.sequence == entry.sequence
+            && hydration_priority(&pending.request.reason) == priority
     }
 
     fn valid_bucket_len(
         &self,
         priority: HydrationPriority,
-        bucket: &VecDeque<HydrationKey>,
+        bucket: &VecDeque<HydrationQueueEntry>,
     ) -> usize {
         bucket
             .iter()
-            .filter(|key| self.key_matches_priority(key, priority))
+            .filter(|entry| self.entry_matches_priority(entry, priority))
             .count()
+    }
+
+    fn next_sequence(&mut self) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        sequence
     }
 }
 
@@ -785,6 +816,18 @@ pub fn hydration_priority(reason: &HydrationReason) -> HydrationPriority {
         HydrationReason::Policy | HydrationReason::RemoteFastForward => HydrationPriority::Normal,
         HydrationReason::Prefetch => HydrationPriority::Low,
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingHydration {
+    request: HydrationRequest,
+    sequence: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HydrationQueueEntry {
+    key: HydrationKey,
+    sequence: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]

@@ -128,6 +128,41 @@ fn queue_uses_priority_buckets_for_large_prefetch_backlog_and_promotion() {
 }
 
 #[test]
+fn stale_promoted_bucket_entry_does_not_reorder_requeued_prefetch() {
+    let mut queue = HydrationQueue::new();
+    queue.queue_request(request("mount", "page-a", HydrationReason::Prefetch));
+    queue.queue_request(request("mount", "page-a", HydrationReason::ExplicitPull));
+
+    assert_eq!(
+        queue.pop_ready().expect("promoted page-a").remote_id,
+        RemoteId::new("page-a")
+    );
+
+    queue.queue_request(request("mount", "page-b", HydrationReason::Prefetch));
+    queue.queue_request(request("mount", "page-a", HydrationReason::Prefetch));
+
+    let debug_ids = queue
+        .debug_requests(10)
+        .into_iter()
+        .map(|request| request.remote_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        debug_ids,
+        vec![RemoteId::new("page-b"), RemoteId::new("page-a")]
+    );
+
+    assert_eq!(
+        queue.pop_ready().expect("page-b").remote_id,
+        RemoteId::new("page-b")
+    );
+    assert_eq!(
+        queue.pop_ready().expect("requeued page-a").remote_id,
+        RemoteId::new("page-a")
+    );
+    assert!(queue.is_empty());
+}
+
+#[test]
 fn duplicate_entity_request_is_deduped_and_promoted() {
     let mut queue = HydrationQueue::new();
     let mut low = request("mount", "page-1", HydrationReason::Prefetch);
