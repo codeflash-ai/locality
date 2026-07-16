@@ -693,6 +693,27 @@ they call one of the trigger paths above.
   performs projection work, and only then asks the store to atomically publish
   the stored commit, checkpoint, and committed marker. Reservation drift leaves
   the old checkpoint authoritative and requires rollback or review.
+- Plain-file projection work uses a versioned execution plan under a hashed,
+  same-volume `.locality-recovery/discovery` path beside the mount. Creates,
+  moves, swaps, and deletes use durable create-new files and no-replace renames.
+  Each filesystem rename returns before its matching effect is recorded, so a
+  restart can distinguish either side of that crash boundary from path
+  fingerprints instead of guessing.
+- Directory ownership fingerprints stream each file into a SHA-256 content
+  digest and hash sorted path/kind/size/digest records. They do not retain an
+  entire moved subtree in memory. Create materializations use the same record
+  format as files read back from disk.
+- Normal execution drives a newly reserved transaction through projection,
+  atomic store commit, hydration-job publication, recovery cleanup, and
+  finalization. The active-transaction repair API aborts untouched `reserved`
+  work, resumes fingerprint-valid `applying`, `projected`, and `committed` work,
+  and returns `needs_review` for ambiguous `repair_pending` state. A newer
+  execution version fails with an update-required result before state or files
+  change.
+- This executor is intentionally limited to `plain_files`. File Provider,
+  FUSE, and Cloud Files transactions keep their provider-owned projection
+  paths; active repair filters those records without decoding or mutating
+  their opaque plans.
 - `list_children` paths must not fetch page bodies according to the connector
   contract.
 - `loc status` and `loc diff` may inspect local projection and shadow state, but

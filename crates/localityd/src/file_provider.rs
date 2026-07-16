@@ -17,11 +17,13 @@ use locality_store::{
     ProjectionMode, ShadowRepository, StoreError, VirtualMutationRepository,
 };
 use serde::{Deserialize, Serialize};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::durable_fs::{
+    create_dir_all_durable, remove_path_durable, rename_noreplace_durable, write_new_file_durable,
+};
 use crate::hydration::HydrationSource;
 use crate::shadow_match::{
     parsed_changes_retain_current_shadow_blocks, parsed_documents_match_ignoring_sync_metadata,
@@ -1511,8 +1513,7 @@ fn persist_windows_cloud_files_projection_recovery_with_durable_publish(
 ) -> LocalityResult<()> {
     static MANIFEST_COUNTER: AtomicU64 = AtomicU64::new(0);
     let directory = windows_cloud_files_projection_recovery_manifest_dir(state_root);
-    create_windows_cloud_files_projection_recovery_manifest_dir(state_root, &directory)
-        .map_err(LocalityError::from)?;
+    create_dir_all_durable(&directory).map_err(LocalityError::from)?;
     let sequence = MANIFEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = directory.join(format!(
         "{}-r{:08}-{sequence}.json",
@@ -1521,169 +1522,29 @@ fn persist_windows_cloud_files_projection_recovery_with_durable_publish(
     let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
     let bytes = serde_json::to_vec_pretty(recovery)
         .map_err(|error| LocalityError::InvalidState(error.to_string()))?;
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)
-        .map_err(LocalityError::from)?;
-    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
-        let _ = std::fs::remove_file(&temporary);
+    if let Err(error) = write_new_file_durable(&temporary, &bytes) {
+        let _ = remove_path_durable(&temporary);
         return Err(LocalityError::from(error));
     }
-    drop(file);
     if let Err(error) = durable_publish(&temporary, &path, &directory) {
-        let _ = std::fs::remove_file(&temporary);
+        let _ = remove_path_durable(&temporary);
         return Err(LocalityError::from(error));
     }
     Ok(())
 }
 
-#[cfg(unix)]
-fn create_windows_cloud_files_projection_recovery_manifest_dir(
-    state_root: &Path,
+fn durably_publish_recovery_manifest(
+    temporary: &Path,
+    destination: &Path,
     directory: &Path,
 ) -> std::io::Result<()> {
-    create_windows_cloud_files_projection_recovery_manifest_dir_with_sync(
-        state_root,
-        directory,
-        |parent| std::fs::File::open(parent)?.sync_all(),
-    )
-}
-
-#[cfg(windows)]
-fn create_windows_cloud_files_projection_recovery_manifest_dir(
-    _state_root: &Path,
-    directory: &Path,
-) -> std::io::Result<()> {
-    std::fs::create_dir_all(directory)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn create_windows_cloud_files_projection_recovery_manifest_dir(
-    state_root: &Path,
-    directory: &Path,
-) -> std::io::Result<()> {
-    create_windows_cloud_files_projection_recovery_manifest_dir_with_sync(
-        state_root,
-        directory,
-        |parent| std::fs::File::open(parent)?.sync_all(),
-    )
-}
-
-fn create_windows_cloud_files_projection_recovery_manifest_dir_with_sync(
-    state_root: &Path,
-    directory: &Path,
-    mut sync_directory: impl FnMut(&Path) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    directory.strip_prefix(state_root).map_err(|_| {
-        std::io::Error::new(
+    if destination.parent() != Some(directory) {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!(
-                "recovery manifest directory `{}` is outside state root `{}`",
-                directory.display(),
-                state_root.display()
-            ),
-        )
-    })?;
-    std::fs::create_dir_all(directory)?;
-    let mut child = directory;
-    while child != state_root {
-        let parent = child.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "recovery manifest directory `{}` has no parent inside state root `{}`",
-                    directory.display(),
-                    state_root.display()
-                ),
-            )
-        })?;
-        sync_directory(parent)?;
-        child = parent;
+            "recovery manifest destination is outside its directory",
+        ));
     }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn durably_publish_recovery_manifest(
-    temporary: &Path,
-    destination: &Path,
-    directory: &Path,
-) -> std::io::Result<()> {
-    rename_recovery_manifest_without_replacement(temporary, destination)?;
-    std::fs::File::open(directory)?.sync_all()
-}
-
-#[cfg(all(
-    unix,
-    any(target_os = "linux", target_vendor = "apple", target_os = "redox")
-))]
-fn rename_recovery_manifest_without_replacement(
-    temporary: &Path,
-    destination: &Path,
-) -> std::io::Result<()> {
-    rustix::fs::renameat_with(
-        rustix::fs::CWD,
-        temporary,
-        rustix::fs::CWD,
-        destination,
-        rustix::fs::RenameFlags::NOREPLACE,
-    )
-    .map_err(std::io::Error::from)
-}
-
-#[cfg(all(
-    unix,
-    not(any(target_os = "linux", target_vendor = "apple", target_os = "redox"))
-))]
-fn rename_recovery_manifest_without_replacement(
-    temporary: &Path,
-    destination: &Path,
-) -> std::io::Result<()> {
-    std::fs::hard_link(temporary, destination)?;
-    std::fs::remove_file(temporary)
-}
-
-#[cfg(windows)]
-fn durably_publish_recovery_manifest(
-    temporary: &Path,
-    destination: &Path,
-    _directory: &Path,
-) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
-
-    let temporary = temporary
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let destination = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let moved = unsafe {
-        MoveFileExW(
-            temporary.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn durably_publish_recovery_manifest(
-    temporary: &Path,
-    destination: &Path,
-    directory: &Path,
-) -> std::io::Result<()> {
-    std::fs::rename(temporary, destination)?;
-    std::fs::File::open(directory)?.sync_all()
+    rename_noreplace_durable(temporary, destination)
 }
 
 fn validate_windows_cloud_files_projection_recovery_version(
@@ -3683,27 +3544,28 @@ mod tests {
     }
 
     #[test]
-    fn windows_projection_recovery_manifest_directory_syncs_ancestry_bottom_up() {
+    fn windows_projection_recovery_manifest_directory_uses_shared_durable_creation() {
         let root = temp_root("loc-windows-recovery-directory-ancestry");
         let state_root = root.join("state");
         fs::create_dir_all(&state_root).expect("create durable state root");
         let manifest_dir = windows_cloud_files_projection_recovery_manifest_dir(&state_root);
         let synced = std::cell::RefCell::new(Vec::new());
 
-        create_windows_cloud_files_projection_recovery_manifest_dir_with_sync(
-            &state_root,
-            &manifest_dir,
-            |directory| {
-                assert!(manifest_dir.is_dir());
-                synced.borrow_mut().push(directory.to_path_buf());
-                Ok(())
-            },
-        )
+        crate::durable_fs::create_dir_all_durable_with_sync(&manifest_dir, |directory| {
+            assert!(directory.is_dir());
+            synced.borrow_mut().push(directory.to_path_buf());
+            Ok(())
+        })
         .expect("create and sync manifest directory ancestry");
 
         assert_eq!(
             synced.into_inner(),
-            vec![state_root.join("provider-recovery"), state_root.clone()]
+            vec![
+                state_root.clone(),
+                state_root.join("provider-recovery"),
+                state_root.join("provider-recovery"),
+                manifest_dir,
+            ]
         );
 
         let _ = fs::remove_dir_all(root);

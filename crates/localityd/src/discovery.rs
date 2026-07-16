@@ -45,7 +45,7 @@ impl DiscoveryPlan {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiscoveryProjectionAction {
     Create {
         entry: TreeEntry,
@@ -63,7 +63,7 @@ pub enum DiscoveryProjectionAction {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveryProjectionComponent {
     pub namespace_roots: Vec<PathBuf>,
     pub actions: Vec<DiscoveryProjectionAction>,

@@ -1,5 +1,7 @@
 pub mod autosave;
 pub mod discovery;
+pub mod discovery_execution;
+mod durable_fs;
 pub mod execution;
 pub mod file_provider;
 pub mod freshness;

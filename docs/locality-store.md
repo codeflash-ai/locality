@@ -75,6 +75,22 @@ The daemon advances transactions through `reserved`, `applying`, `projected`,
 Transitions use compare-and-swap status checks. Only `aborted` and `finalized`
 are inactive, and committed transactions cannot move backward.
 
+For plain-file mounts, the daemon stores a second versioned execution envelope
+inside the transaction plan and effects fields. It records deterministic
+projection components, exact create materializations, streamed path
+fingerprints, recovery paths, and operation effects. Filesystem staging and
+installation use same-volume no-replace renames with file and directory
+durability barriers. The effect following a rename is deliberately a separate
+store update, making either crash ordering recoverable after SQLite reopens.
+
+The daemon repair entry point processes only active `plain_files` transactions.
+An untouched reservation is aborted without projection, applying/projected work
+resumes or rolls back from its fingerprints, committed work finishes hydration
+publication and quarantine cleanup, and ambiguous repair state remains
+review-required. Provider-mode records are left untouched. Execution version
+fields are checked from raw JSON before typed decoding so future layouts fail
+update-required without mutating durable state.
+
 `commit_discovery_transaction` loads the stored commit rather than accepting a
 caller replacement. One SQLite transaction revalidates the reservation and
 shared discovery preflight, applies entity and related state changes, advances
