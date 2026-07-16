@@ -32,8 +32,8 @@ pub struct MountPreHydrationState {
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
     pub last_error: Option<String>,
-    pub discovered_pages: usize,
-    pub queued_pages: usize,
+    pub discovered_pages: u64,
+    pub queued_pages: u64,
 }
 
 impl MountPreHydrationState {
@@ -74,7 +74,7 @@ pub fn load_mount_pre_hydration_state(
     };
 
     if record.min_reader_version > PRE_HYDRATION_STATE_VERSION {
-        return Err(StoreError::Database(format!(
+        return Err(StoreError::StateCompatibility(format!(
             "mount pre-hydration state for connector `{connector}` mount `{}` requires reader version {}, but supported version is {}; update Locality to read this state",
             mount_id.as_str(),
             record.min_reader_version,
@@ -82,12 +82,9 @@ pub fn load_mount_pre_hydration_state(
         )));
     }
 
-    serde_json::from_str(&record.state_json).map(Some).map_err(|error| {
-        StoreError::Database(format!(
-            "failed to decode mount pre-hydration state for connector `{connector}` mount `{}`: {error}",
-            mount_id.as_str()
-        ))
-    })
+    serde_json::from_str(&record.state_json)
+        .map(Some)
+        .map_err(StoreError::from)
 }
 
 pub fn save_mount_pre_hydration_state(
@@ -96,12 +93,7 @@ pub fn save_mount_pre_hydration_state(
     mount_id: &MountId,
     state: &MountPreHydrationState,
 ) -> StoreResult<()> {
-    let state_json = serde_json::to_string(state).map_err(|error| {
-        StoreError::Database(format!(
-            "failed to encode mount pre-hydration state for connector `{connector}` mount `{}`: {error}",
-            mount_id.as_str()
-        ))
-    })?;
+    let state_json = serde_json::to_string(state)?;
     let updated_at = state
         .completed_at
         .as_ref()
@@ -133,6 +125,8 @@ pub fn mark_mount_pre_hydration_enumerating(
     state.started_at = Some(now.to_string());
     state.completed_at = None;
     state.last_error = None;
+    state.discovered_pages = 0;
+    state.queued_pages = 0;
     save_mount_pre_hydration_state(store, connector, mount_id, &state)?;
     Ok(state)
 }
@@ -141,8 +135,8 @@ pub fn mark_mount_pre_hydration_hydrating(
     store: &mut impl ConnectorStateRepository,
     connector: &str,
     mount_id: &MountId,
-    discovered_pages: usize,
-    queued_pages: usize,
+    discovered_pages: u64,
+    queued_pages: u64,
     now: &str,
 ) -> StoreResult<MountPreHydrationState> {
     let mut state = load_mount_pre_hydration_state(store, connector, mount_id)?
