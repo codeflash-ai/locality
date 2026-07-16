@@ -5,7 +5,7 @@ use locality_core::model::{CanonicalDocument, RemoteId};
 use locality_core::shadow::{ShadowDocument, segment_markdown_body};
 use locality_core::validation::ValidationIssue;
 use locality_core::{LocalityError, LocalityResult};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
 use crate::dto::{CalendarEvent, CalendarEventCreateRequest, EventAttendee, EventDateTime};
@@ -96,7 +96,8 @@ struct RawDraftFrontmatter {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawGoogleCalendarDraftFrontmatter {
-    conference: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    conference: Option<Value>,
 }
 
 pub fn render_google_calendar_event(
@@ -104,7 +105,11 @@ pub fn render_google_calendar_event(
     remote_id: &RemoteId,
     event: &CalendarEvent,
 ) -> LocalityResult<GoogleCalendarRenderedEntity> {
-    let body = event.description.clone().unwrap_or_default();
+    let body = event
+        .description
+        .clone()
+        .map(escape_locality_directive_lines)
+        .unwrap_or_default();
     let frontmatter = event_frontmatter(calendar_id, remote_id, event)?;
     let native_block_ids = segment_markdown_body(&body, 1)
         .into_iter()
@@ -181,28 +186,27 @@ pub fn parse_google_calendar_draft_document(
             None
         }
     };
-    if let Some(start) = &start
-        && !start.is_present()
+    let start_shape = start
+        .as_ref()
+        .and_then(|start| validate_event_datetime_shape("start", start, &mut issues));
+    let end_shape = end
+        .as_ref()
+        .and_then(|end| validate_event_datetime_shape("end", end, &mut issues));
+    if let (Some(start_shape), Some(end_shape)) = (start_shape, end_shape)
+        && start_shape != end_shape
     {
         issues.push(ValidationIssue::new(
-            "google_calendar_draft_empty_start",
+            "google_calendar_draft_mixed_date_shapes",
             PathBuf::new(),
             Some(1),
-            "Google Calendar draft `start` must include `date` or `dateTime`",
-            Some("set `start.dateTime` or `start.date`".to_string()),
+            "Google Calendar draft `start` and `end` must both use `date` or both use `dateTime`",
+            Some(
+                "use `date` for both all-day boundaries or `dateTime` for both timed boundaries"
+                    .to_string(),
+            ),
         ));
     }
-    if let Some(end) = &end
-        && !end.is_present()
-    {
-        issues.push(ValidationIssue::new(
-            "google_calendar_draft_empty_end",
-            PathBuf::new(),
-            Some(1),
-            "Google Calendar draft `end` must include `date` or `dateTime`",
-            Some("set `end.dateTime` or `end.date`".to_string()),
-        ));
-    }
+    let create_google_meet = validate_conference(raw.google_calendar.as_ref(), &mut issues);
     if !issues.is_empty() {
         return Err(LocalityError::Validation(issues));
     }
@@ -224,16 +228,79 @@ pub fn parse_google_calendar_draft_document(
         reminders: raw.reminders,
         transparency: raw.transparency,
         visibility: raw.visibility,
-        create_google_meet: raw
-            .google_calendar
-            .and_then(|calendar| calendar.conference)
-            .is_some_and(|conference| conference == "google_meet"),
+        create_google_meet,
         extra: raw
             .extra
             .into_iter()
             .filter(|(key, _)| !matches!(key.as_str(), "loc" | "google_calendar"))
             .collect(),
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventDateTimeShape {
+    Date,
+    DateTime,
+}
+
+fn validate_event_datetime_shape(
+    field: &str,
+    value: &EventDateTime,
+    issues: &mut Vec<ValidationIssue>,
+) -> Option<EventDateTimeShape> {
+    let has_date = value
+        .date
+        .as_ref()
+        .is_some_and(|date| !date.trim().is_empty());
+    let has_date_time = value
+        .date_time
+        .as_ref()
+        .is_some_and(|date_time| !date_time.trim().is_empty());
+
+    match (has_date, has_date_time) {
+        (true, false) => Some(EventDateTimeShape::Date),
+        (false, true) => Some(EventDateTimeShape::DateTime),
+        _ => {
+            issues.push(ValidationIssue::new(
+                format!("google_calendar_draft_invalid_{field}_shape"),
+                PathBuf::new(),
+                Some(1),
+                format!(
+                    "Google Calendar draft `{field}` must include exactly one of `date` or `dateTime`"
+                ),
+                Some(format!("set either `{field}.date` or `{field}.dateTime`, not both")),
+            ));
+            None
+        }
+    }
+}
+
+fn validate_conference(
+    google_calendar: Option<&RawGoogleCalendarDraftFrontmatter>,
+    issues: &mut Vec<ValidationIssue>,
+) -> bool {
+    let Some(conference) = google_calendar.and_then(|calendar| calendar.conference.as_ref()) else {
+        return false;
+    };
+    if matches!(conference, Value::String(value) if value.trim() == "google_meet") {
+        return true;
+    }
+
+    issues.push(ValidationIssue::new(
+        "google_calendar_draft_unsupported_conference",
+        PathBuf::new(),
+        Some(1),
+        "Google Calendar draft `google_calendar.conference` supports only `google_meet`",
+        Some("remove `google_calendar.conference` or set it to `google_meet`".to_string()),
+    ));
+    false
+}
+
+fn deserialize_present_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 fn event_frontmatter(
@@ -293,6 +360,66 @@ fn event_frontmatter(
 
 fn json_error(error: serde_json::Error) -> LocalityError {
     LocalityError::Io(format!("google calendar event JSON encode failed: {error}"))
+}
+
+fn escape_locality_directive_lines(value: String) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    let mut line_start = 0;
+
+    while line_start < value.len() {
+        let Some((line_end, terminator_end)) = next_line_bounds(&value, line_start) else {
+            escape_locality_directive_line(&value[line_start..], &mut escaped);
+            break;
+        };
+
+        escape_locality_directive_line(&value[line_start..line_end], &mut escaped);
+        escaped.push_str(&value[line_end..terminator_end]);
+        line_start = terminator_end;
+    }
+
+    escaped
+}
+
+fn next_line_bounds(value: &str, line_start: usize) -> Option<(usize, usize)> {
+    for (offset, ch) in value[line_start..].char_indices() {
+        let index = line_start + offset;
+        match ch {
+            '\n' => return Some((index, index + ch.len_utf8())),
+            '\r' => {
+                let terminator_end = if value[index + ch.len_utf8()..].starts_with('\n') {
+                    index + "\r\n".len()
+                } else {
+                    index + ch.len_utf8()
+                };
+                return Some((index, terminator_end));
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn escape_locality_directive_line(line: &str, output: &mut String) {
+    let Some((index, _)) = line
+        .char_indices()
+        .find(|(_, ch)| !matches!(ch, ' ' | '\t'))
+    else {
+        output.push_str(line);
+        return;
+    };
+
+    if locality_directive_marker_needs_escape(&line[index..]) {
+        output.push_str(&line[..index]);
+        output.push('\\');
+        output.push_str(&line[index..]);
+    } else {
+        output.push_str(line);
+    }
+}
+
+fn locality_directive_marker_needs_escape(value: &str) -> bool {
+    value.starts_with("::loc") || value.starts_with("::afs")
 }
 
 fn quote_yaml_frontmatter_strings(yaml: &str) -> String {
@@ -391,8 +518,12 @@ fn yaml_scalar(value: &str) -> String {
 mod tests {
     use locality_core::LocalityError;
     use locality_core::model::RemoteId;
+    use serde_json::json;
 
-    use super::{parse_google_calendar_draft_document, render_google_calendar_event};
+    use super::{
+        GoogleCalendarDraftDocument, parse_google_calendar_draft_document,
+        render_google_calendar_event,
+    };
     use crate::dto::{CalendarEvent, EventDateTime};
 
     #[test]
@@ -473,6 +604,35 @@ mod tests {
     }
 
     #[test]
+    fn render_event_escapes_literal_locality_directives_in_remote_description() {
+        let event = CalendarEvent {
+            id: Some("event-directives".to_string()),
+            summary: Some("Directive text".to_string()),
+            description: Some(
+                "::loc{id=x type=paragraph}\n  ::afs{id=y type=paragraph}\n".to_string(),
+            ),
+            ..CalendarEvent::default()
+        };
+
+        let rendered = render_google_calendar_event(
+            "primary",
+            &RemoteId::new("google-calendar-event:primary:event-directives"),
+            &event,
+        )
+        .expect("render");
+
+        assert_eq!(
+            rendered.document.body,
+            "\\::loc{id=x type=paragraph}\n  \\::afs{id=y type=paragraph}\n"
+        );
+        assert_eq!(rendered.shadow.rendered_body, rendered.document.body);
+        assert_eq!(rendered.shadow.blocks.len(), 1);
+        assert!(rendered.document.frontmatter.contains(
+            "description: \"::loc{id=x type=paragraph}\\n  ::afs{id=y type=paragraph}\\n\""
+        ));
+    }
+
+    #[test]
     fn parse_draft_accepts_native_timed_event_shape_and_google_meet_flag() {
         let document = locality_core::model::CanonicalDocument::new(
             r#"summary: Design review
@@ -528,22 +688,177 @@ end:
     }
 
     #[test]
+    fn parse_draft_rejects_date_time_with_both_date_and_datetime() {
+        let document = locality_core::model::CanonicalDocument::new(
+            r#"summary: Ambiguous
+start:
+  date: "2026-07-20"
+  dateTime: "2026-07-20T10:00:00-07:00"
+end:
+  dateTime: "2026-07-20T10:30:00-07:00"
+"#,
+            "",
+        );
+
+        let messages = validation_messages(
+            parse_google_calendar_draft_document(&document).expect_err("invalid draft"),
+        );
+
+        assert!(has_message(
+            &messages,
+            "Google Calendar draft `start` must include exactly one of `date` or `dateTime`"
+        ));
+    }
+
+    #[test]
+    fn parse_draft_rejects_mixed_all_day_and_timed_shapes() {
+        let document = locality_core::model::CanonicalDocument::new(
+            r#"summary: Mixed
+start:
+  date: "2026-07-20"
+end:
+  dateTime: "2026-07-20T10:30:00-07:00"
+"#,
+            "",
+        );
+
+        let messages = validation_messages(
+            parse_google_calendar_draft_document(&document).expect_err("invalid draft"),
+        );
+
+        assert!(has_message(
+            &messages,
+            "Google Calendar draft `start` and `end` must both use `date` or both use `dateTime`"
+        ));
+    }
+
+    #[test]
+    fn parse_draft_rejects_unsupported_conference_value() {
+        let document = locality_core::model::CanonicalDocument::new(
+            r#"summary: Design review
+start:
+  dateTime: "2026-07-20T10:00:00-07:00"
+end:
+  dateTime: "2026-07-20T10:30:00-07:00"
+google_calendar:
+  conference: Google_Meet
+"#,
+            "",
+        );
+
+        let messages = validation_messages(
+            parse_google_calendar_draft_document(&document).expect_err("invalid draft"),
+        );
+
+        assert!(has_message(
+            &messages,
+            "Google Calendar draft `google_calendar.conference` supports only `google_meet`"
+        ));
+    }
+
+    #[test]
+    fn parse_draft_rejects_blank_conference_value() {
+        let document = locality_core::model::CanonicalDocument::new(
+            r#"summary: Design review
+start:
+  dateTime: "2026-07-20T10:00:00-07:00"
+end:
+  dateTime: "2026-07-20T10:30:00-07:00"
+google_calendar:
+  conference:
+"#,
+            "",
+        );
+
+        let messages = validation_messages(
+            parse_google_calendar_draft_document(&document).expect_err("invalid draft"),
+        );
+
+        assert!(has_message(
+            &messages,
+            "Google Calendar draft `google_calendar.conference` supports only `google_meet`"
+        ));
+    }
+
+    #[test]
+    fn draft_into_create_request_adds_google_meet_and_locality_event_id() {
+        let draft = GoogleCalendarDraftDocument {
+            summary: "Design review".to_string(),
+            description: Some("Agenda\n".to_string()),
+            location: Some("Room 12".to_string()),
+            start: EventDateTime {
+                date: None,
+                date_time: Some("2026-07-20T10:00:00-07:00".to_string()),
+                time_zone: None,
+            },
+            end: EventDateTime {
+                date: None,
+                date_time: Some("2026-07-20T10:30:00-07:00".to_string()),
+                time_zone: None,
+            },
+            attendees: Vec::new(),
+            recurrence: Vec::new(),
+            reminders: None,
+            transparency: None,
+            visibility: None,
+            create_google_meet: true,
+            extra: Default::default(),
+        };
+
+        let request = draft.into_create_request(
+            "locality-event-1".to_string(),
+            "conference-request-1".to_string(),
+        );
+
+        assert_eq!(
+            request.conference_data,
+            Some(json!({
+                "createRequest": {
+                    "requestId": "conference-request-1",
+                    "conferenceSolutionKey": { "type": "hangoutsMeet" }
+                }
+            }))
+        );
+        assert_eq!(
+            request.extended_properties,
+            Some(json!({
+                "private": {
+                    "locality_event_id": "locality-event-1"
+                }
+            }))
+        );
+    }
+
+    #[test]
     fn parse_draft_reports_validation_for_missing_summary_start_and_end() {
         let document = locality_core::model::CanonicalDocument::new("location: Room 12\n", "");
 
-        let error = parse_google_calendar_draft_document(&document).expect_err("invalid draft");
+        let messages = validation_messages(
+            parse_google_calendar_draft_document(&document).expect_err("invalid draft"),
+        );
+
+        assert!(has_message(
+            &messages,
+            "Google Calendar draft requires `summary` or `title` frontmatter"
+        ));
+        assert!(has_message(
+            &messages,
+            "Google Calendar draft requires `start` frontmatter"
+        ));
+        assert!(has_message(
+            &messages,
+            "Google Calendar draft requires `end` frontmatter"
+        ));
+    }
+
+    fn validation_messages(error: LocalityError) -> Vec<String> {
         let LocalityError::Validation(issues) = error else {
             panic!("expected validation error");
         };
-        let messages = issues
-            .iter()
-            .map(|issue| issue.message.as_str())
-            .collect::<Vec<_>>();
+        issues.into_iter().map(|issue| issue.message).collect()
+    }
 
-        assert!(
-            messages.contains(&"Google Calendar draft requires `summary` or `title` frontmatter")
-        );
-        assert!(messages.contains(&"Google Calendar draft requires `start` frontmatter"));
-        assert!(messages.contains(&"Google Calendar draft requires `end` frontmatter"));
+    fn has_message(messages: &[String], expected: &str) -> bool {
+        messages.iter().any(|message| message == expected)
     }
 }
