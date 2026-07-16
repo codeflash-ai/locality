@@ -82,8 +82,8 @@ struct RawDraftFrontmatter {
     summary: Option<String>,
     description: Option<String>,
     location: Option<String>,
-    start: Option<EventDateTime>,
-    end: Option<EventDateTime>,
+    start: Option<RawDraftEventDateTime>,
+    end: Option<RawDraftEventDateTime>,
     attendees: Option<Vec<EventAttendee>>,
     recurrence: Option<Vec<String>>,
     reminders: Option<Value>,
@@ -92,6 +92,16 @@ struct RawDraftFrontmatter {
     google_calendar: Option<RawGoogleCalendarDraftFrontmatter>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawDraftEventDateTime {
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    date: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    date_time: Option<Value>,
+    time_zone: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -205,8 +215,12 @@ pub fn parse_google_calendar_draft_document(
     if !issues.is_empty() {
         return Err(LocalityError::Validation(issues));
     }
-    let start = start.expect("validated start frontmatter");
-    let end = end.expect("validated end frontmatter");
+    let start = start
+        .expect("validated start frontmatter")
+        .into_event_datetime();
+    let end = end
+        .expect("validated end frontmatter")
+        .into_event_datetime();
 
     Ok(GoogleCalendarDraftDocument {
         summary,
@@ -232,6 +246,23 @@ pub fn parse_google_calendar_draft_document(
     })
 }
 
+impl RawDraftEventDateTime {
+    fn into_event_datetime(self) -> EventDateTime {
+        EventDateTime {
+            date: raw_string_value(self.date),
+            date_time: raw_string_value(self.date_time),
+            time_zone: self.time_zone,
+        }
+    }
+}
+
+fn raw_string_value(value: Option<Value>) -> Option<String> {
+    match value {
+        Some(Value::String(value)) => Some(value),
+        _ => None,
+    }
+}
+
 fn first_non_blank<const N: usize>(values: [Option<&str>; N]) -> String {
     values
         .into_iter()
@@ -250,49 +281,17 @@ enum EventDateTimeShape {
 
 fn validate_event_datetime_shape(
     field: &str,
-    value: &EventDateTime,
+    value: &RawDraftEventDateTime,
     issues: &mut Vec<ValidationIssue>,
 ) -> Option<EventDateTimeShape> {
-    let date_is_blank = value
-        .date
-        .as_ref()
-        .is_some_and(|date| date.trim().is_empty());
-    let date_time_is_blank = value
-        .date_time
-        .as_ref()
-        .is_some_and(|date_time| date_time.trim().is_empty());
-    if date_is_blank {
-        issues.push(ValidationIssue::new(
-            format!("google_calendar_draft_blank_{field}_date"),
-            PathBuf::new(),
-            Some(1),
-            format!("Google Calendar draft `{field}.date` must not be blank"),
-            Some(format!("remove `{field}.date` or set a non-empty date")),
-        ));
-    }
-    if date_time_is_blank {
-        issues.push(ValidationIssue::new(
-            format!("google_calendar_draft_blank_{field}_date_time"),
-            PathBuf::new(),
-            Some(1),
-            format!("Google Calendar draft `{field}.dateTime` must not be blank"),
-            Some(format!(
-                "remove `{field}.dateTime` or set a non-empty dateTime"
-            )),
-        ));
-    }
-
-    let has_date = value
-        .date
-        .as_ref()
-        .is_some_and(|date| !date.trim().is_empty());
-    let has_date_time = value
-        .date_time
-        .as_ref()
-        .is_some_and(|date_time| !date_time.trim().is_empty());
-    if date_is_blank || date_time_is_blank {
+    let date = validate_event_datetime_field(field, "date", value.date.as_ref(), issues);
+    let date_time =
+        validate_event_datetime_field(field, "dateTime", value.date_time.as_ref(), issues);
+    if date.invalid || date_time.invalid {
         return None;
     }
+    let has_date = date.present;
+    let has_date_time = date_time.present;
 
     match (has_date, has_date_time) {
         (true, false) => Some(EventDateTimeShape::Date),
@@ -309,6 +308,75 @@ fn validate_event_datetime_shape(
             ));
             None
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct EventDateTimeFieldValidation {
+    present: bool,
+    invalid: bool,
+}
+
+fn validate_event_datetime_field(
+    field: &str,
+    component: &str,
+    value: Option<&Value>,
+    issues: &mut Vec<ValidationIssue>,
+) -> EventDateTimeFieldValidation {
+    let Some(value) = value else {
+        return EventDateTimeFieldValidation::default();
+    };
+
+    match value {
+        Value::String(value) if !value.trim().is_empty() => EventDateTimeFieldValidation {
+            present: true,
+            invalid: false,
+        },
+        Value::String(_) => {
+            issues.push(ValidationIssue::new(
+                format!(
+                    "google_calendar_draft_blank_{}_{}",
+                    field,
+                    date_component_code(component)
+                ),
+                PathBuf::new(),
+                Some(1),
+                format!("Google Calendar draft `{field}.{component}` must not be blank"),
+                Some(format!(
+                    "remove `{field}.{component}` or set a non-empty {component}"
+                )),
+            ));
+            EventDateTimeFieldValidation {
+                present: false,
+                invalid: true,
+            }
+        }
+        _ => {
+            issues.push(ValidationIssue::new(
+                format!(
+                    "google_calendar_draft_invalid_{}_{}",
+                    field,
+                    date_component_code(component)
+                ),
+                PathBuf::new(),
+                Some(1),
+                format!("Google Calendar draft `{field}.{component}` must be a non-empty string"),
+                Some(format!(
+                    "remove `{field}.{component}` or set a non-empty string"
+                )),
+            ));
+            EventDateTimeFieldValidation {
+                present: false,
+                invalid: true,
+            }
+        }
+    }
+}
+
+fn date_component_code(component: &str) -> &str {
+    match component {
+        "dateTime" => "date_time",
+        _ => component,
     }
 }
 
@@ -880,6 +948,52 @@ end:
         assert!(has_message(
             &messages,
             "Google Calendar draft `start.date` must not be blank"
+        ));
+    }
+
+    #[test]
+    fn parse_draft_rejects_null_present_date_field() {
+        let document = locality_core::model::CanonicalDocument::new(
+            r#"summary: Ambiguous
+start:
+  date:
+  dateTime: "2026-07-20T10:00:00Z"
+end:
+  dateTime: "2026-07-20T10:30:00Z"
+"#,
+            "",
+        );
+
+        let messages = validation_messages(
+            parse_google_calendar_draft_document(&document).expect_err("invalid draft"),
+        );
+
+        assert!(has_message(
+            &messages,
+            "Google Calendar draft `start.date` must be a non-empty string"
+        ));
+    }
+
+    #[test]
+    fn parse_draft_rejects_null_present_date_time_field() {
+        let document = locality_core::model::CanonicalDocument::new(
+            r#"summary: Ambiguous
+start:
+  date: "2026-07-20"
+  dateTime:
+end:
+  date: "2026-07-21"
+"#,
+            "",
+        );
+
+        let messages = validation_messages(
+            parse_google_calendar_draft_document(&document).expect_err("invalid draft"),
+        );
+
+        assert!(has_message(
+            &messages,
+            "Google Calendar draft `start.dateTime` must be a non-empty string"
         ));
     }
 
