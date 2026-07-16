@@ -30,6 +30,21 @@ use localityd::discovery_execution::{
 const NOW: &str = "unix_ms:100000";
 
 #[test]
+fn execution_effects_without_projection_validation_marker_decode_as_unvalidated() {
+    let mut value =
+        serde_json::to_value(DiscoveryExecutionEffects::default()).expect("serialize effects");
+    value
+        .as_object_mut()
+        .expect("effects object")
+        .remove("projection_validated");
+
+    let effects: DiscoveryExecutionEffects =
+        serde_json::from_value(value).expect("decode older effects");
+
+    assert!(!effects.projection_validated);
+}
+
+#[test]
 fn preparation_reserves_versioned_components_and_exact_create_materializations() {
     let fixture = Fixture::new("prepare");
     let mut store = InMemoryStateStore::new();
@@ -711,19 +726,31 @@ fn page_create_execution_exposes_every_durable_and_filesystem_boundary() {
     );
     assert_eq!(
         step(&mut store, &transaction_id, 9),
+        DiscoveryExecutionStep::ProjectionValidated
+    );
+    assert!(execution.recovery_root.exists());
+    let barrier_record = store
+        .get_discovery_transaction(&transaction_id)
+        .expect("transaction lookup")
+        .expect("transaction");
+    let barrier_effects: DiscoveryExecutionEffects =
+        serde_json::from_value(barrier_record.effects).expect("decode barrier effects");
+    assert!(barrier_effects.projection_validated);
+    assert_eq!(
+        step(&mut store, &transaction_id, 10),
         DiscoveryExecutionStep::RecoveryPayloadsRemoved
     );
     assert!(!execution.recovery_root.exists());
     assert_eq!(
-        step(&mut store, &transaction_id, 10),
+        step(&mut store, &transaction_id, 11),
         DiscoveryExecutionStep::CleanupComplete
     );
     assert_eq!(
-        step(&mut store, &transaction_id, 11),
+        step(&mut store, &transaction_id, 12),
         DiscoveryExecutionStep::CompletionRecorded
     );
     assert_eq!(
-        step(&mut store, &transaction_id, 12),
+        step(&mut store, &transaction_id, 13),
         DiscoveryExecutionStep::Finalized
     );
     assert_eq!(
@@ -1469,7 +1496,25 @@ fn committed_repair_upserts_hydration_idempotently_before_cleanup() {
         DiscoveryExecutionStep::Committed
     );
     assert_eq!(
-        repair_plain_files_discovery_transaction(&mut store, &transaction_id, "t4")
+        step(&mut store, &transaction_id, 4),
+        DiscoveryExecutionStep::ProjectionValidated
+    );
+    let barrier_record = store
+        .get_discovery_transaction(&transaction_id)
+        .expect("transaction lookup")
+        .expect("transaction");
+    let barrier_effects: DiscoveryExecutionEffects =
+        serde_json::from_value(barrier_record.effects).expect("decode barrier effects");
+    assert!(barrier_effects.projection_validated);
+    assert!(barrier_effects.hydration_jobs.is_empty());
+    assert!(
+        store
+            .list_hydration_jobs()
+            .expect("hydration jobs")
+            .is_empty()
+    );
+    assert_eq!(
+        repair_plain_files_discovery_transaction(&mut store, &transaction_id, "t5")
             .expect("repair committed transaction"),
         DiscoveryExecutionTerminal::Finalized
     );
@@ -1477,9 +1522,65 @@ fn committed_repair_upserts_hydration_idempotently_before_cleanup() {
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].remote_id, RemoteId::new("page"));
     assert_eq!(
-        repair_plain_files_discovery_transaction(&mut store, &transaction_id, "t5")
+        repair_plain_files_discovery_transaction(&mut store, &transaction_id, "t6")
             .expect("repeat finalized repair"),
         DiscoveryExecutionTerminal::Finalized
+    );
+    assert_eq!(
+        store.list_hydration_jobs().expect("hydration jobs").len(),
+        1
+    );
+}
+
+#[test]
+fn projection_validation_barrier_allows_later_hydrated_bytes_without_overwrite() {
+    let fixture = Fixture::new("projection-validation-hydration");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(fixture.mount.clone()).expect("save mount");
+    let mut plan = discovery_plan(
+        &store,
+        &fixture.mount,
+        vec![entry("page", EntityKind::Page, "Roadmap/page.md")],
+    );
+    plan.post_commit
+        .push(DiscoveryPostCommitAction::QueueHydration(
+            HydrationRequest::new(
+                fixture.mount.mount_id.clone(),
+                RemoteId::new("page"),
+                fixture.root.join("Roadmap/page.md"),
+                HydrationState::Hydrated,
+                HydrationReason::Policy,
+            ),
+        ));
+    let transaction_id = DiscoveryTransactionId::new("projection-validation-hydration");
+    prepare_plain_files_discovery_transaction(
+        &mut store,
+        plan,
+        transaction_id.clone(),
+        "t0",
+        vec![DiscoveryCreateMaterialization::Page {
+            remote_id: RemoteId::new("page"),
+            document: "stub\n".to_string(),
+        }],
+    )
+    .expect("prepare transaction");
+    run_steps_to_committed(&mut store, &transaction_id);
+    assert_eq!(
+        step_plain_files_discovery_transaction(&mut store, &transaction_id, "t20")
+            .expect("record projection barrier"),
+        DiscoveryExecutionStep::ProjectionValidated
+    );
+    fs::write(fixture.root.join("Roadmap/page.md"), "hydrated\n")
+        .expect("simulate hydration replacement");
+
+    assert_eq!(
+        repair_plain_files_discovery_transaction(&mut store, &transaction_id, "t21")
+            .expect("resume after hydration replacement"),
+        DiscoveryExecutionTerminal::Finalized
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("Roadmap/page.md")).expect("read hydrated document"),
+        "hydrated\n"
     );
     assert_eq!(
         store.list_hydration_jobs().expect("hydration jobs").len(),
@@ -2829,70 +2930,111 @@ fn sqlite_committed_repair_recovers_hydration_upsert_and_cleanup_before_effect_b
     let hydration_fixture = Fixture::new("sqlite-committed-hydration-boundary");
     let hydration_state = hydration_fixture.sandbox.join("state");
     let hydration_id = DiscoveryTransactionId::new("sqlite-committed-hydration-boundary");
+    let hydration_request = HydrationRequest::new(
+        hydration_fixture.mount.mount_id.clone(),
+        RemoteId::new("page"),
+        hydration_fixture.root.join("Roadmap/page.md"),
+        HydrationState::Hydrated,
+        HydrationReason::Policy,
+    );
     {
         let mut store = SqliteStateStore::open(hydration_state.clone()).expect("open sqlite");
         store
             .save_mount(hydration_fixture.mount.clone())
             .expect("save mount");
-        store
-            .save_entity(
-                entity_record("page", "Roadmap/page.md").with_hydration(HydrationState::Hydrated),
-            )
-            .expect("save hydrated entity");
-        let plan = discovery_plan_sqlite(
+        let mut plan = discovery_plan_sqlite(
             &store,
             &hydration_fixture.mount,
             vec![entry("page", EntityKind::Page, "Roadmap/page.md")],
         );
+        plan.post_commit
+            .push(DiscoveryPostCommitAction::QueueHydration(
+                hydration_request.clone(),
+            ));
         let reserved = prepare_plain_files_discovery_transaction(
             &mut store,
             plan,
             hydration_id.clone(),
             "t0",
-            vec![],
+            vec![DiscoveryCreateMaterialization::Page {
+                remote_id: RemoteId::new("page"),
+                document: "stub\n".to_string(),
+            }],
         )
         .expect("prepare hydration transaction");
         let execution: DiscoveryExecutionPlan =
             serde_json::from_value(reserved.plan).expect("decode hydration execution");
         assert_eq!(execution.hydration_jobs.len(), 1);
+        for sequence in 1..=20 {
+            if step_plain_files_discovery_transaction(
+                &mut store,
+                &hydration_id,
+                &format!("t{sequence}"),
+            )
+            .expect("advance hydration transaction")
+                == DiscoveryExecutionStep::Committed
+            {
+                break;
+            }
+        }
         assert_eq!(
-            step_plain_files_discovery_transaction(&mut store, &hydration_id, "t1")
-                .expect("mark applying"),
-            DiscoveryExecutionStep::Applying
+            step_plain_files_discovery_transaction(&mut store, &hydration_id, "t21")
+                .expect("record projection barrier"),
+            DiscoveryExecutionStep::ProjectionValidated
         );
-        assert_eq!(
-            step_plain_files_discovery_transaction(&mut store, &hydration_id, "t2")
-                .expect("mark projected"),
-            DiscoveryExecutionStep::Projected
-        );
-        assert_eq!(
-            step_plain_files_discovery_transaction(&mut store, &hydration_id, "t3")
-                .expect("commit transaction"),
-            DiscoveryExecutionStep::Committed
-        );
-        store
-            .upsert_hydration_job(HydrationJobRecord::from(
-                execution.hydration_jobs[0].clone(),
-            ))
-            .expect("simulate hydration upsert before effect crash");
         let record = store
             .get_discovery_transaction(&hydration_id)
             .expect("transaction lookup")
             .expect("transaction");
         let effects: DiscoveryExecutionEffects =
             serde_json::from_value(record.effects).expect("decode effects");
+        assert!(effects.projection_validated);
+        assert!(effects.hydration_jobs.is_empty());
+        assert!(
+            store
+                .list_hydration_jobs()
+                .expect("hydration jobs")
+                .is_empty()
+        );
+    }
+    {
+        let mut store = SqliteStateStore::open(hydration_state.clone()).expect("reopen at barrier");
+        let record = store
+            .get_discovery_transaction(&hydration_id)
+            .expect("transaction lookup")
+            .expect("transaction");
+        let effects: DiscoveryExecutionEffects =
+            serde_json::from_value(record.effects).expect("decode reopened effects");
+        assert!(effects.projection_validated);
+        fs::write(hydration_fixture.root.join("Roadmap/page.md"), "hydrated\n")
+            .expect("simulate hydrated bytes");
+        store
+            .upsert_hydration_job(HydrationJobRecord::from(hydration_request.clone()))
+            .expect("simulate hydration upsert before effect crash");
+        let record = store
+            .get_discovery_transaction(&hydration_id)
+            .expect("transaction lookup")
+            .expect("transaction");
+        let effects: DiscoveryExecutionEffects =
+            serde_json::from_value(record.effects).expect("decode effects after job upsert");
+        assert!(effects.projection_validated);
         assert!(effects.hydration_jobs.is_empty());
     }
     {
-        let mut store = SqliteStateStore::open(hydration_state).expect("reopen sqlite");
+        let mut store = SqliteStateStore::open(hydration_state).expect("reopen after job upsert");
         assert_eq!(
-            repair_plain_files_discovery_transaction(&mut store, &hydration_id, "t4")
+            repair_plain_files_discovery_transaction(&mut store, &hydration_id, "t22")
                 .expect("repair hydration boundary"),
             DiscoveryExecutionTerminal::Finalized
         );
         assert_eq!(
             store.list_hydration_jobs().expect("hydration jobs").len(),
             1
+        );
+        assert_eq!(
+            fs::read_to_string(hydration_fixture.root.join("Roadmap/page.md"))
+                .expect("read hydrated bytes"),
+            "hydrated\n"
         );
     }
 
@@ -2941,6 +3083,11 @@ fn sqlite_committed_repair_recovers_hydration_upsert_and_cleanup_before_effect_b
                 break;
             }
         }
+        assert_eq!(
+            step_plain_files_discovery_transaction(&mut store, &cleanup_id, "t21")
+                .expect("record cleanup projection barrier"),
+            DiscoveryExecutionStep::ProjectionValidated
+        );
         assert!(recovery_root.exists());
         fs::remove_dir_all(&recovery_root).expect("simulate cleanup before effect crash");
         let record = store
@@ -2950,6 +3097,7 @@ fn sqlite_committed_repair_recovers_hydration_upsert_and_cleanup_before_effect_b
         assert_eq!(record.status, DiscoveryTransactionStatus::Committed);
         let effects: DiscoveryExecutionEffects =
             serde_json::from_value(record.effects).expect("decode cleanup effects");
+        assert!(effects.projection_validated);
         assert!(!effects.cleanup_complete);
     }
     {

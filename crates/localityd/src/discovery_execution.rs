@@ -236,6 +236,8 @@ pub struct DiscoveryExecutionEffects {
     pub operations: Vec<DiscoveryOperationEffect>,
     pub hydration_jobs: Vec<DiscoveryHydrationEffect>,
     #[serde(default)]
+    pub projection_validated: bool,
+    #[serde(default)]
     pub rollback_reason: Option<String>,
     pub cleanup_complete: bool,
     pub completion_recorded: bool,
@@ -248,6 +250,7 @@ impl Default for DiscoveryExecutionEffects {
             min_reader_version: DISCOVERY_EXECUTION_MIN_READER_VERSION,
             operations: Vec::new(),
             hydration_jobs: Vec::new(),
+            projection_validated: false,
             rollback_reason: None,
             cleanup_complete: false,
             completion_recorded: false,
@@ -294,6 +297,7 @@ pub enum DiscoveryExecutionStep {
     },
     Projected,
     Committed,
+    ProjectionValidated,
     HydrationJobUpserted {
         remote_id: RemoteId,
     },
@@ -444,6 +448,7 @@ where
                 require_recovery_root_absent(&execution.recovery_root)?;
                 if !effects.operations.is_empty()
                     || !effects.hydration_jobs.is_empty()
+                    || effects.projection_validated
                     || effects.rollback_reason.is_some()
                     || effects.cleanup_complete
                     || effects.completion_recorded
@@ -1691,7 +1696,19 @@ fn step_committed<S>(
 where
     S: DiscoveryRepository + HydrationJobRepository,
 {
-    validate_installed_projection(execution, effects)?;
+    if !effects.projection_validated {
+        validate_installed_projection(execution, effects)?;
+        validate_committed_recovery_tree(execution, effects)?;
+        effects.projection_validated = true;
+        record_effects(
+            store,
+            &record.transaction_id,
+            DiscoveryTransactionStatus::Committed,
+            effects,
+            updated_at,
+        )?;
+        return Ok(DiscoveryExecutionStep::ProjectionValidated);
+    }
     for request in &execution.hydration_jobs {
         if effects
             .hydration_jobs
