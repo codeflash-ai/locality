@@ -37,6 +37,7 @@ pub struct CalendarEvent {
     pub original_start_time: Option<EventDateTime>,
     pub transparency: Option<String>,
     pub visibility: Option<String>,
+    #[serde(rename = "iCalUID")]
     pub i_cal_uid: Option<String>,
     pub sequence: Option<i64>,
     #[serde(default)]
@@ -66,7 +67,7 @@ pub struct EventDateTime {
     pub time_zone: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventAttendee {
     pub email: Option<String>,
@@ -79,6 +80,9 @@ pub struct EventAttendee {
     pub organizer: Option<bool>,
     pub self_: Option<bool>,
     pub id: Option<String>,
+    pub async_operation: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -145,5 +149,52 @@ impl EventDateTime {
                 .date_time
                 .as_ref()
                 .is_some_and(|value| !value.trim().is_empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{CalendarEvent, EventAttendee};
+
+    #[test]
+    fn event_uses_google_ical_uid_field_spelling() {
+        let event: CalendarEvent =
+            serde_json::from_value(json!({"id": "event-1", "iCalUID": "ical@example.com"}))
+                .expect("event");
+
+        assert_eq!(event.i_cal_uid.as_deref(), Some("ical@example.com"));
+
+        let encoded = serde_json::to_value(&event).expect("json");
+
+        assert_eq!(encoded.get("iCalUID"), Some(&json!("ical@example.com")));
+        assert!(!encoded.as_object().expect("object").contains_key("iCalUid"));
+    }
+
+    #[test]
+    fn attendee_preserves_async_operation_and_unknown_fields() {
+        let attendee: EventAttendee = serde_json::from_value(json!({
+            "email": "ann@example.com",
+            "asyncOperation": "move",
+            "futureNested": {
+                "id": "future-1"
+            }
+        }))
+        .expect("attendee");
+
+        assert_eq!(attendee.async_operation.as_deref(), Some("move"));
+        assert_eq!(
+            attendee.extra.get("futureNested"),
+            Some(&json!({"id": "future-1"}))
+        );
+
+        let encoded = serde_json::to_value(&attendee).expect("json");
+
+        assert_eq!(encoded.get("asyncOperation"), Some(&json!("move")));
+        assert_eq!(
+            encoded.get("futureNested"),
+            Some(&json!({"id": "future-1"}))
+        );
     }
 }

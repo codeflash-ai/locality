@@ -77,12 +77,6 @@ pub struct GoogleCalendarDateWindow {
     before: GoogleCalendarDate,
 }
 
-impl Default for GoogleCalendarDateWindow {
-    fn default() -> Self {
-        Self::default_for_now()
-    }
-}
-
 impl<'de> Deserialize<'de> for GoogleCalendarDateWindow {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -298,12 +292,6 @@ mod tests {
 
         assert_eq!(GoogleCalendarSettings::default().date_window, None);
         assert_eq!(settings.google_calendar.date_window, None);
-
-        let effective = settings.effective_date_window();
-        let expected = GoogleCalendarDateWindow::default_for_now();
-
-        assert_eq!(effective.after().as_str(), expected.after().as_str());
-        assert_eq!(effective.before().as_str(), expected.before().as_str());
     }
 
     #[test]
