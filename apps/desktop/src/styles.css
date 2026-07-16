@@ -1,3 +1,5 @@
+/* Designer-facing theme tokens live here. Component rules should prefer these
+   semantic tokens over one-off hex or rgba colors. */
 :root {
   --canvas: #f2f4f5;
   --paper: #ffffff;
@@ -28,6 +30,20 @@
   --surface-strong: var(--paper);
   --accent: var(--teal);
   --accent-soft: var(--teal-wash);
+  --control-bg: rgba(255, 255, 255, 0.9);
+  --control-bg-hover: rgba(248, 252, 251, 0.98);
+  --control-text: #334756;
+  --control-muted: #526575;
+  --control-border: rgba(86, 107, 125, 0.24);
+  --control-border-hover: rgba(8, 123, 114, 0.3);
+  --control-disabled-bg: #edf3f2;
+  --control-disabled-text: #72817e;
+  --control-selected-bg: rgba(15, 118, 110, 0.1);
+  --control-selected-text: var(--accent);
+  --chip-bg: rgba(247, 249, 251, 0.9);
+  --chip-text: #536273;
+  --chip-border: rgba(148, 163, 184, 0.28);
+  --field-bg: #ffffff;
   --green: #23845f;
   --green-soft: #e8f4ee;
   --shadow: 0 24px 70px rgba(20, 30, 43, 0.14);
@@ -71,6 +87,20 @@
   --bg: var(--canvas);
   --surface: rgba(32, 43, 47, 0.94);
   --surface-strong: #263338;
+  --control-bg: rgba(31, 42, 46, 0.98);
+  --control-bg-hover: rgba(35, 50, 54, 0.98);
+  --control-text: #eef7f4;
+  --control-muted: #c8d6d2;
+  --control-border: rgba(163, 183, 190, 0.28);
+  --control-border-hover: rgba(42, 161, 152, 0.44);
+  --control-disabled-bg: rgba(42, 54, 58, 0.82);
+  --control-disabled-text: #aebfbb;
+  --control-selected-bg: rgba(42, 161, 152, 0.18);
+  --control-selected-text: #e8fbf7;
+  --chip-bg: rgba(39, 52, 57, 0.92);
+  --chip-text: #c8d6d2;
+  --chip-border: rgba(163, 183, 190, 0.22);
+  --field-bg: rgba(22, 31, 34, 0.92);
   --shadow: 0 24px 70px rgba(0, 0, 0, 0.28);
   --tight-shadow: 0 14px 36px rgba(0, 0, 0, 0.22);
 }
@@ -677,8 +707,8 @@ p {
 }
 
 .primary-button:disabled {
-  background: #dbe7e5;
-  color: #6c7d7a;
+  background: var(--control-disabled-bg);
+  color: var(--control-disabled-text);
   box-shadow: none;
 }
 
@@ -711,14 +741,14 @@ p {
 
 .secondary-button {
   padding: 0 18px;
-  border: 1px solid rgba(86, 107, 125, 0.22);
-  background: rgba(255, 255, 255, 0.86);
-  color: #405563;
+  border: 1px solid var(--control-border);
+  background: var(--control-bg);
+  color: var(--control-text);
 }
 
 .secondary-button:hover:not(:disabled) {
-  border-color: rgba(8, 123, 114, 0.24);
-  background: rgba(248, 252, 251, 0.98);
+  border-color: var(--control-border-hover);
+  background: var(--control-bg-hover);
   color: var(--accent);
   box-shadow: 0 8px 20px rgba(8, 123, 114, 0.1);
 }
@@ -818,8 +848,18 @@ p {
 }
 
 .secondary-button:disabled,
+.mount-details-button:disabled,
+.icon-button:disabled {
+  border-color: var(--control-border);
+  background: var(--control-disabled-bg);
+  color: var(--control-disabled-text);
+  opacity: 1;
+  box-shadow: none;
+}
+
 .text-button:disabled {
-  opacity: 0.58;
+  color: var(--control-disabled-text);
+  opacity: 1;
 }
 
 .text-button {
@@ -2326,9 +2366,9 @@ button.home-stat:hover {
   gap: 10px;
   min-width: 0;
   padding: 10px;
-  border: 1px solid rgba(8, 123, 114, 0.18);
+  border: 1px solid var(--control-border-hover);
   border-radius: 8px;
-  background: rgba(248, 252, 251, 0.94);
+  background: var(--surface);
 }
 
 .source-ready-card strong,
@@ -2364,8 +2404,8 @@ button.home-stat:hover {
 }
 
 .mount-card.active {
-  border-color: rgba(8, 123, 114, 0.28);
-  background: rgba(248, 252, 251, 0.96);
+  border-color: var(--control-border-hover);
+  background: var(--surface-strong);
 }
 
 .mount-card-top {
@@ -2444,7 +2484,7 @@ button.home-stat:hover {
   padding: 5px 6px 5px 9px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #ffffff;
+  background: var(--field-bg);
 }
 
 .mount-card-path code {
@@ -2467,17 +2507,18 @@ button.home-stat:hover {
 .mount-card-meta span {
   min-height: 23px;
   padding: 4px 7px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--chip-border);
   border-radius: 999px;
-  background: rgba(247, 249, 251, 0.86);
-  color: var(--muted);
+  background: var(--chip-bg);
+  color: var(--chip-text);
   font-size: 10px;
   font-weight: 850;
 }
 
 .mount-card-meta span.primary {
-  background: var(--accent-soft);
-  color: var(--accent);
+  border-color: var(--control-border-hover);
+  background: var(--control-selected-bg);
+  color: var(--control-selected-text);
 }
 
 .mount-card-footer {
@@ -2504,17 +2545,17 @@ button.home-stat:hover {
   gap: 4px;
   min-height: 28px;
   padding: 0 8px;
-  border: 1px solid rgba(86, 107, 125, 0.2);
+  border: 1px solid var(--control-border);
   border-radius: 8px;
-  background: #fff;
-  color: #4f6170;
+  background: var(--control-bg);
+  color: var(--control-text);
   font-size: 11px;
   font-weight: 850;
 }
 
 .mount-details-button:hover {
-  border-color: rgba(8, 123, 114, 0.26);
-  background: rgba(248, 252, 251, 0.98);
+  border-color: var(--control-border-hover);
+  background: var(--control-bg-hover);
   color: var(--accent);
 }
 
@@ -2830,7 +2871,7 @@ button.home-stat:hover {
   padding: 0 11px;
   border: 1px solid var(--line);
   border-radius: 10px;
-  background: #ffffff;
+  background: var(--field-bg);
 }
 
 .source-search-row svg {
@@ -2854,7 +2895,7 @@ button.home-stat:hover {
   padding: 3px;
   border: 1px solid var(--line);
   border-radius: 10px;
-  background: #ffffff;
+  background: var(--field-bg);
 }
 
 .source-view-toggle button {
@@ -2867,7 +2908,7 @@ button.home-stat:hover {
   border: 0;
   border-radius: 8px;
   background: transparent;
-  color: var(--muted);
+  color: var(--control-muted);
   font: inherit;
   font-size: 12px;
   font-weight: 850;
@@ -2875,9 +2916,9 @@ button.home-stat:hover {
 }
 
 .source-view-toggle button.active {
-  background: rgba(8, 123, 114, 0.1);
-  color: var(--teal);
-  box-shadow: inset 0 0 0 1px rgba(8, 123, 114, 0.14);
+  background: var(--control-selected-bg);
+  color: var(--control-selected-text);
+  box-shadow: inset 0 0 0 1px var(--control-border-hover);
 }
 
 .source-view-toggle button:focus-visible {
@@ -2913,7 +2954,7 @@ button.home-stat:hover {
   padding: 12px;
   border: 1px solid var(--line);
   border-radius: 10px;
-  background: rgba(255, 255, 255, 0.84);
+  background: var(--surface);
 }
 
 .connector-choice-grid.tiles .connector-choice-card {
@@ -2924,13 +2965,13 @@ button.home-stat:hover {
 }
 
 .connector-choice-card.active {
-  border-color: rgba(8, 123, 114, 0.24);
-  background: rgba(248, 252, 251, 0.98);
+  border-color: var(--control-border-hover);
+  background: var(--surface-strong);
 }
 
 .connector-choice-card.mounted {
-  border-color: rgba(37, 124, 93, 0.18);
-  background: rgba(247, 249, 251, 0.86);
+  border-color: var(--chip-border);
+  background: var(--chip-bg);
 }
 
 .connector-choice-card.disabled {
@@ -3386,10 +3427,10 @@ button.home-stat:hover {
   flex: 0 0 32px;
   width: 32px;
   height: 32px;
-  border: 1px solid rgba(86, 107, 125, 0.2);
+  border: 1px solid var(--control-border);
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.82);
-  color: #526575;
+  background: var(--control-bg);
+  color: var(--control-text);
   transition:
     background-color 170ms ease,
     border-color 170ms ease,
@@ -3400,8 +3441,8 @@ button.home-stat:hover {
 }
 
 .icon-button:hover:not(:disabled) {
-  border-color: rgba(8, 123, 114, 0.26);
-  background: rgba(248, 252, 251, 0.98);
+  border-color: var(--control-border-hover);
+  background: var(--control-bg-hover);
   color: var(--accent);
   box-shadow: 0 8px 18px rgba(8, 123, 114, 0.09);
 }
@@ -3411,8 +3452,8 @@ button.home-stat:hover {
 }
 
 .icon-button:disabled {
-  color: var(--subtle);
-  opacity: 0.7;
+  color: var(--control-disabled-text);
+  opacity: 1;
 }
 
 .icon-button svg {
@@ -4181,18 +4222,33 @@ button.home-stat:hover {
 :root[data-theme="dark"] .settings-empty-state,
 :root[data-theme="dark"] input,
 :root[data-theme="dark"] textarea {
-  border-color: var(--line);
-  background: rgba(22, 31, 34, 0.92);
+  border-color: var(--control-border);
+  background: var(--control-bg);
   color: var(--ink);
+}
+
+:root[data-theme="dark"] input,
+:root[data-theme="dark"] textarea {
+  background: var(--field-bg);
 }
 
 :root[data-theme="dark"] .secondary-button:hover:not(:disabled),
 :root[data-theme="dark"] .icon-button:hover:not(:disabled),
 :root[data-theme="dark"] .mount-details-button:hover,
 :root[data-theme="dark"] .settings-activity-row:hover {
-  border-color: rgba(15, 118, 110, 0.38);
-  background: rgba(18, 39, 39, 0.94);
+  border-color: var(--control-border-hover);
+  background: var(--control-bg-hover);
   color: var(--accent);
+}
+
+:root[data-theme="dark"] .secondary-button:disabled,
+:root[data-theme="dark"] .icon-button:disabled,
+:root[data-theme="dark"] .mount-details-button:disabled {
+  border-color: var(--control-border);
+  background: var(--control-disabled-bg);
+  color: var(--control-disabled-text);
+  opacity: 1;
+  box-shadow: none;
 }
 
 :root[data-theme="dark"] .source-view-toggle button.active,
@@ -4203,9 +4259,9 @@ button.home-stat:hover {
 :root[data-theme="dark"] .settings-nav button.active,
 :root[data-theme="dark"] .theme-segmented button.active,
 :root[data-theme="dark"] .option-row:hover {
-  border-color: rgba(42, 161, 152, 0.32);
-  background: rgba(42, 161, 152, 0.16);
-  color: #dff8f4;
+  border-color: var(--control-border-hover);
+  background: var(--control-selected-bg);
+  color: var(--control-selected-text);
   box-shadow: inset 0 0 0 1px rgba(42, 161, 152, 0.12);
 }
 
@@ -4231,8 +4287,8 @@ button.home-stat:hover {
 :root[data-theme="dark"] .connector-choice-card.mounted,
 :root[data-theme="dark"] .workspace-path-row,
 :root[data-theme="dark"] .workspace-facts span {
-  border-color: var(--line);
-  background: rgba(22, 31, 34, 0.9);
+  border-color: var(--control-border);
+  background: var(--control-bg);
   color: var(--ink);
 }
 
