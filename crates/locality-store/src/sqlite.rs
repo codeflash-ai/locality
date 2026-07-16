@@ -643,6 +643,7 @@ impl DiscoveryRepository for SqliteStateStore {
         commit.validate_connector(&connector)?;
 
         let existing_entities = discovery_entities(&transaction, &commit.mount_id)?;
+        let final_entities = commit.final_entity_map(&existing_entities)?;
         let existing_by_id = existing_entities
             .iter()
             .map(|entity| (entity.remote_id.clone(), entity.clone()))
@@ -708,11 +709,11 @@ impl DiscoveryRepository for SqliteStateStore {
             &affected_paths,
         )?;
 
-        validate_discovery_final_paths(&commit, existing_entities)?;
         let auto_save_rehomes = commit.plan_auto_save_changes(
             &auto_save_enrollments,
             &affected_entities,
             &path_moves,
+            &final_entities,
         )?;
 
         let final_path_texts = commit
@@ -4013,36 +4014,6 @@ fn discovery_entities(
     )?;
     let rows = statement.query_map(params![mount_id.0.as_str()], entity_row)?;
     rows.map(|row| entity_from_row(row?)).collect()
-}
-
-fn validate_discovery_final_paths(
-    commit: &DiscoveryCommit,
-    existing: Vec<EntityRecord>,
-) -> StoreResult<()> {
-    let mut by_id = existing
-        .into_iter()
-        .map(|entity| (entity.remote_id.clone(), entity))
-        .collect::<BTreeMap<_, _>>();
-    for remote_id in &commit.entity_deletes {
-        by_id.remove(remote_id);
-    }
-    for entity in &commit.entity_upserts {
-        by_id.insert(entity.remote_id.clone(), entity.clone());
-    }
-
-    let mut by_path = BTreeMap::new();
-    for entity in by_id.into_values() {
-        if let Some(existing_remote_id) =
-            by_path.insert(entity.path.clone(), entity.remote_id.clone())
-            && existing_remote_id != entity.remote_id
-        {
-            return Err(StoreError::DuplicateEntityPath {
-                mount_id: commit.mount_id.clone(),
-                path: entity.path,
-            });
-        }
-    }
-    Ok(())
 }
 
 fn discovery_virtual_mutations(

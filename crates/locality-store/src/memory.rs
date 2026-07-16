@@ -273,6 +273,13 @@ impl DiscoveryRepository for InMemoryStateStore {
 impl InMemoryStateStore {
     fn apply_discovery(&mut self, commit: DiscoveryCommit) -> StoreResult<()> {
         let mount_id = &commit.mount_id;
+        let existing_mount_entities = self
+            .entities
+            .values()
+            .filter(|entity| entity.mount_id == *mount_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let final_mount_entities = commit.final_entity_map(&existing_mount_entities)?;
         let entity_deletes = commit
             .entity_deletes
             .iter()
@@ -345,31 +352,30 @@ impl InMemoryStateStore {
             &affected_paths,
         )?;
 
-        let auto_save_rehomes =
-            commit.plan_auto_save_changes(&mount_enrollments, &affected_entities, &path_moves)?;
+        let auto_save_rehomes = commit.plan_auto_save_changes(
+            &mount_enrollments,
+            &affected_entities,
+            &path_moves,
+            &final_mount_entities,
+        )?;
 
         let mut final_entities = self.entities.clone();
-        for remote_id in &commit.entity_deletes {
-            final_entities.remove(&Self::entity_key(mount_id, remote_id));
-        }
-        for entity in &commit.entity_upserts {
+        final_entities.retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
+        for entity in final_mount_entities.values() {
             final_entities.insert(
                 Self::entity_key(&entity.mount_id, &entity.remote_id),
                 entity.clone(),
             );
         }
-        let mut final_paths = BTreeMap::new();
-        for entity in final_entities.values() {
-            let path_key = Self::path_key(&entity.mount_id, &entity.path);
-            if let Some(existing_remote_id) = final_paths.insert(path_key, entity.remote_id.clone())
-                && existing_remote_id != entity.remote_id
-            {
-                return Err(StoreError::DuplicateEntityPath {
-                    mount_id: entity.mount_id.clone(),
-                    path: entity.path.clone(),
-                });
-            }
-        }
+        let final_paths = final_entities
+            .values()
+            .map(|entity| {
+                (
+                    Self::path_key(&entity.mount_id, &entity.path),
+                    entity.remote_id.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
 
         for remote_id in &commit.entity_deletes {
             let key = Self::entity_key(mount_id, remote_id);

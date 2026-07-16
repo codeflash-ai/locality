@@ -200,6 +200,37 @@ impl DiscoveryCommit {
         Ok(())
     }
 
+    pub(crate) fn final_entity_map(
+        &self,
+        existing: &[EntityRecord],
+    ) -> StoreResult<BTreeMap<RemoteId, EntityRecord>> {
+        let mut by_id = existing
+            .iter()
+            .cloned()
+            .map(|entity| (entity.remote_id.clone(), entity))
+            .collect::<BTreeMap<_, _>>();
+        for remote_id in &self.entity_deletes {
+            by_id.remove(remote_id);
+        }
+        for entity in &self.entity_upserts {
+            by_id.insert(entity.remote_id.clone(), entity.clone());
+        }
+
+        let mut by_path = BTreeMap::new();
+        for entity in by_id.values() {
+            if let Some(existing_remote_id) =
+                by_path.insert(entity.path.clone(), entity.remote_id.clone())
+                && existing_remote_id != entity.remote_id
+            {
+                return Err(StoreError::DuplicateEntityPath {
+                    mount_id: self.mount_id.clone(),
+                    path: entity.path.clone(),
+                });
+            }
+        }
+        Ok(by_id)
+    }
+
     pub(crate) fn validate_virtual_mutation_changes(
         &self,
         mutations: &[VirtualMutationRecord],
@@ -288,6 +319,7 @@ impl DiscoveryCommit {
         existing: &[AutoSaveEnrollmentRecord],
         affected_entities: &[(RemoteId, Option<PathBuf>)],
         path_moves: &[(RemoteId, PathBuf, PathBuf)],
+        final_entities: &BTreeMap<RemoteId, EntityRecord>,
     ) -> StoreResult<Vec<AutoSaveRehome>> {
         self.validate_auto_save_ownership(existing, affected_entities)?;
 
@@ -367,6 +399,33 @@ impl DiscoveryCommit {
         }
 
         for enrollment in &self.auto_save_upserts {
+            if let Some(remote_id) = &enrollment.remote_id {
+                let Some(entity) = final_entities.get(remote_id) else {
+                    return invalid(format!(
+                        "auto-save enrollment `{}` references entity `{}` outside the final mount tree",
+                        enrollment.path.display(),
+                        remote_id.0
+                    ));
+                };
+                if enrollment.path != entity.path {
+                    let occupied_by = final_entities
+                        .values()
+                        .find(|candidate| candidate.path == enrollment.path)
+                        .map(|candidate| candidate.remote_id.as_str());
+                    return invalid(match occupied_by {
+                        Some(occupied_by) => format!(
+                            "auto-save enrollment at `{}` belongs to `{}` but that path is occupied by `{occupied_by}`",
+                            enrollment.path.display(),
+                            remote_id.0
+                        ),
+                        None => format!(
+                            "auto-save enrollment for `{}` must use final path `{}`",
+                            remote_id.0,
+                            entity.path.display()
+                        ),
+                    });
+                }
+            }
             if let Some(remote_id) = &enrollment.remote_id
                 && deleted_remote_ids.contains(remote_id)
             {
@@ -450,9 +509,9 @@ fn auto_save_owner(enrollment: &AutoSaveEnrollmentRecord) -> &str {
 }
 
 fn path_is_affected(path: &std::path::Path, affected_paths: &BTreeSet<PathBuf>) -> bool {
-    affected_paths
-        .iter()
-        .any(|affected| path == affected || path.starts_with(affected))
+    affected_paths.iter().any(|affected| {
+        path == affected || path.starts_with(affected) || affected.starts_with(path)
+    })
 }
 
 fn validate_mount(

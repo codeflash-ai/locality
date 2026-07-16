@@ -75,7 +75,8 @@ explicitly by the daemon. A move or delete that intersects unlisted pending
 virtual work fails atomically. Auto-save ownership is also preflighted: a row at
 an affected path may be unbound or bound to that entity, never to a different
 remote ID. Explicit auto-save upserts can override an automatic rehome only for
-the same owner.
+the same owner. A bound upsert must match the remote ID and exact path in the
+final entity map; unbound path-addressed enrollments remain supported.
 
 This contract uses existing tables and existing JSON meanings. It therefore
 does not change `PRAGMA user_version` or any state-component version.

@@ -93,6 +93,26 @@ fn discovery_rejects_inconsistent_auto_save_ownership() {
 }
 
 #[test]
+fn discovery_mutation_ancestor_guards_are_symmetric() {
+    let mut memory = InMemoryStateStore::new();
+    exercise_mutation_ancestor_guards(&mut memory);
+
+    let fixture = SqliteFixture::new();
+    let mut sqlite = fixture.open();
+    exercise_mutation_ancestor_guards(&mut sqlite);
+}
+
+#[test]
+fn discovery_checkpoint_only_auto_save_upserts_validate_final_entities() {
+    let mut memory = InMemoryStateStore::new();
+    exercise_checkpoint_only_auto_save_validation(&mut memory);
+
+    let fixture = SqliteFixture::new();
+    let mut sqlite = fixture.open();
+    exercise_checkpoint_only_auto_save_validation(&mut sqlite);
+}
+
+#[test]
 fn sqlite_checkpoint_failure_rolls_back_all_discovery_changes() {
     let fixture = SqliteFixture::new();
     let mut store = fixture.open();
@@ -802,6 +822,215 @@ where
             .expect("checkpoint"),
         Some(old_checkpoint)
     );
+}
+
+fn exercise_mutation_ancestor_guards<S>(store: &mut S)
+where
+    S: MountRepository
+        + EntityRepository
+        + DiscoveryRepository
+        + ConnectorStateRepository
+        + VirtualMutationRepository,
+{
+    seed_mount(store, MAIN_MOUNT);
+    store
+        .save_entity(entity("issue-move", "Move/page.md", "Move"))
+        .expect("save moving entity");
+    store
+        .save_entity(entity("issue-delete", "Delete/page.md", "Delete"))
+        .expect("save deleted entity");
+    let old_checkpoint = checkpoint(1, r#"{"watermark":"old"}"#);
+    store
+        .save_connector_state(old_checkpoint.clone())
+        .expect("save checkpoint");
+
+    let mut move_ancestor = pending_mutation("mutation:move-ancestor", "unused", "Move");
+    move_ancestor.target_remote_id = None;
+    move_ancestor.original_path = None;
+    store
+        .save_virtual_mutation(move_ancestor)
+        .expect("save move ancestor mutation");
+    let mut delete_ancestor = pending_mutation("mutation:delete-ancestor", "unused", "Delete");
+    delete_ancestor.target_remote_id = None;
+    delete_ancestor.original_path = None;
+    store
+        .save_virtual_mutation(delete_ancestor)
+        .expect("save delete ancestor mutation");
+    store
+        .save_virtual_mutation(pending_mutation(
+            "mutation:unrelated",
+            "issue-unrelated",
+            "Unrelated/page.md",
+        ))
+        .expect("save unrelated mutation");
+
+    let move_commit = DiscoveryCommit {
+        mount_id: mount_id(MAIN_MOUNT),
+        entity_upserts: vec![entity("issue-move", "Moved/page.md", "Move")],
+        entity_deletes: vec![],
+        observation_upserts: vec![],
+        freshness_upserts: vec![],
+        auto_save_upserts: vec![],
+        metadata_discovery_deletes: vec![],
+        virtual_mutation_deletes: vec![],
+        checkpoint: checkpoint(2, r#"{"watermark":"move"}"#),
+    };
+    assert!(matches!(
+        store.commit_discovery(move_commit.clone()),
+        Err(StoreError::InvalidState(_))
+    ));
+
+    let delete_commit = DiscoveryCommit {
+        mount_id: mount_id(MAIN_MOUNT),
+        entity_upserts: vec![],
+        entity_deletes: vec![RemoteId::new("issue-delete")],
+        observation_upserts: vec![],
+        freshness_upserts: vec![],
+        auto_save_upserts: vec![],
+        metadata_discovery_deletes: vec![],
+        virtual_mutation_deletes: vec![],
+        checkpoint: checkpoint(2, r#"{"watermark":"delete"}"#),
+    };
+    assert!(matches!(
+        store.commit_discovery(delete_commit.clone()),
+        Err(StoreError::InvalidState(_))
+    ));
+
+    let unrelated_explicit = DiscoveryCommit {
+        virtual_mutation_deletes: vec![
+            "mutation:move-ancestor".to_string(),
+            "mutation:unrelated".to_string(),
+        ],
+        ..move_commit.clone()
+    };
+    assert!(matches!(
+        store.commit_discovery(unrelated_explicit),
+        Err(StoreError::InvalidState(_))
+    ));
+    assert_eq!(
+        store
+            .get_connector_state("linear", "mount", MAIN_MOUNT)
+            .expect("unchanged checkpoint"),
+        Some(old_checkpoint)
+    );
+
+    store
+        .commit_discovery(DiscoveryCommit {
+            virtual_mutation_deletes: vec!["mutation:move-ancestor".to_string()],
+            ..move_commit
+        })
+        .expect("explicit ancestor mutation permits move");
+    store
+        .commit_discovery(DiscoveryCommit {
+            virtual_mutation_deletes: vec!["mutation:delete-ancestor".to_string()],
+            checkpoint: checkpoint(3, r#"{"watermark":"delete"}"#),
+            ..delete_commit
+        })
+        .expect("explicit ancestor mutation permits delete");
+
+    assert!(
+        store
+            .find_entity_by_path(&mount_id(MAIN_MOUNT), Path::new("Moved/page.md"))
+            .expect("moved entity")
+            .is_some()
+    );
+    assert!(
+        store
+            .get_entity(&mount_id(MAIN_MOUNT), &RemoteId::new("issue-delete"))
+            .expect("deleted entity")
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .list_virtual_mutations(&mount_id(MAIN_MOUNT))
+            .expect("remaining mutations")
+            .into_iter()
+            .map(|mutation| mutation.local_id)
+            .collect::<Vec<_>>(),
+        vec!["mutation:unrelated".to_string()]
+    );
+    assert_eq!(
+        store
+            .get_connector_state("linear", "mount", MAIN_MOUNT)
+            .expect("final checkpoint"),
+        Some(checkpoint(3, r#"{"watermark":"delete"}"#))
+    );
+}
+
+fn exercise_checkpoint_only_auto_save_validation<S>(store: &mut S)
+where
+    S: MountRepository
+        + EntityRepository
+        + DiscoveryRepository
+        + ConnectorStateRepository
+        + RemoteObservationRepository
+        + AutoSaveRepository,
+{
+    seed_mount(store, MAIN_MOUNT);
+    let first = entity("issue-1", "Existing/page.md", "Existing");
+    let second = entity("issue-2", "Other/page.md", "Other");
+    store.save_entity(first.clone()).expect("save first entity");
+    store
+        .save_entity(second.clone())
+        .expect("save second entity");
+    let old_observation = observation("issue-1", "Existing/page.md", "remote-v1");
+    store
+        .save_remote_observation(old_observation.clone())
+        .expect("save observation");
+    let old_checkpoint = checkpoint(1, r#"{"watermark":"old"}"#);
+    store
+        .save_connector_state(old_checkpoint.clone())
+        .expect("save checkpoint");
+
+    let cases = [
+        paused_auto_save("issue-2", "Existing/page.md"),
+        paused_auto_save("issue-1", "Wrong/page.md"),
+        paused_auto_save("issue-unknown", "Unknown/page.md"),
+    ];
+    for enrollment in cases {
+        let error = store
+            .commit_discovery(DiscoveryCommit {
+                mount_id: mount_id(MAIN_MOUNT),
+                entity_upserts: vec![],
+                entity_deletes: vec![],
+                observation_upserts: vec![observation(
+                    "issue-1",
+                    "Existing/page.md",
+                    "remote-invalid",
+                )],
+                freshness_upserts: vec![],
+                auto_save_upserts: vec![enrollment],
+                metadata_discovery_deletes: vec![],
+                virtual_mutation_deletes: vec![],
+                checkpoint: checkpoint(2, r#"{"watermark":"invalid"}"#),
+            })
+            .expect_err("invalid auto-save owner must roll back batch");
+        assert!(matches!(error, StoreError::InvalidState(_)));
+        assert_eq!(
+            store
+                .list_entities(&mount_id(MAIN_MOUNT))
+                .expect("unchanged entities"),
+            vec![first.clone(), second.clone()]
+        );
+        assert_eq!(
+            store
+                .get_remote_observation(&mount_id(MAIN_MOUNT), &RemoteId::new("issue-1"))
+                .expect("unchanged observation"),
+            Some(old_observation.clone())
+        );
+        assert!(
+            store
+                .list_auto_save_enrollments(&mount_id(MAIN_MOUNT))
+                .expect("no auto-save changes")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .get_connector_state("linear", "mount", MAIN_MOUNT)
+                .expect("unchanged checkpoint"),
+            Some(old_checkpoint.clone())
+        );
+    }
 }
 
 fn exercise_validation_rollback<S>(store: &mut S)
