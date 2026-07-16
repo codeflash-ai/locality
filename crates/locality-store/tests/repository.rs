@@ -16,9 +16,12 @@ use locality_store::{
     ConnectorStateRecord, ConnectorStateRepository, EntityRecord, EntityRepository,
     FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore, JournalRepository,
     MetadataDiscoveryJobRecord, MetadataDiscoveryJobRepository, MetadataDiscoveryPriority,
-    MountConfig, MountLiveModeRecord, MountLiveModeRepository, MountLiveModeState, MountRepository,
-    RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
-    StoreError, VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
+    MountConfig, MountLiveModeRecord, MountLiveModeRepository, MountLiveModeState,
+    MountPreHydrationStatus, MountRepository, PRE_HYDRATION_SCOPE_KIND,
+    PRE_HYDRATION_STATE_VERSION, RemoteObservationRecord, RemoteObservationRepository,
+    ShadowRepository, SqliteStateStore, StoreError, VirtualMutationKind, VirtualMutationRecord,
+    VirtualMutationRepository, enable_mount_pre_hydration, load_mount_pre_hydration_state,
+    mark_mount_pre_hydration_enumerating, mark_mount_pre_hydration_hydrating,
 };
 
 #[test]
@@ -44,6 +47,61 @@ fn connector_state_round_trips_by_connector_scope() {
             .expect("load connector state"),
         Some(record)
     );
+}
+
+#[test]
+fn pre_hydration_state_round_trips_through_connector_state() {
+    let mut store = InMemoryStateStore::new();
+    let mount_id = MountId::new("notion-main");
+
+    let requested =
+        enable_mount_pre_hydration(&mut store, "notion", &mount_id, "2026-07-16T10:00:00Z")
+            .expect("enable pre-hydration");
+    assert_eq!(requested.status, MountPreHydrationStatus::Requested);
+    assert!(requested.enabled);
+
+    mark_mount_pre_hydration_enumerating(&mut store, "notion", &mount_id, "2026-07-16T10:00:01Z")
+        .expect("mark enumerating");
+    mark_mount_pre_hydration_hydrating(
+        &mut store,
+        "notion",
+        &mount_id,
+        12,
+        12,
+        "2026-07-16T10:00:02Z",
+    )
+    .expect("mark hydrating");
+
+    let loaded = load_mount_pre_hydration_state(&store, "notion", &mount_id)
+        .expect("load pre-hydration")
+        .expect("state exists");
+    assert_eq!(loaded.status, MountPreHydrationStatus::Hydrating);
+    assert_eq!(loaded.discovered_pages, 12);
+    assert_eq!(loaded.queued_pages, 12);
+    assert_eq!(loaded.started_at.as_deref(), Some("2026-07-16T10:00:01Z"));
+}
+
+#[test]
+fn pre_hydration_state_rejects_future_reader_version() {
+    let mut store = InMemoryStateStore::new();
+    let mount_id = MountId::new("notion-main");
+    store
+        .save_connector_state(ConnectorStateRecord {
+            connector: "notion".to_string(),
+            scope_kind: PRE_HYDRATION_SCOPE_KIND.to_string(),
+            scope_id: mount_id.as_str().to_string(),
+            state_version: PRE_HYDRATION_STATE_VERSION,
+            min_reader_version: PRE_HYDRATION_STATE_VERSION + 1,
+            state_json: "{}".to_string(),
+            updated_at: "2026-07-16T10:00:00Z".to_string(),
+        })
+        .expect("save future pre-hydration state");
+
+    let error = load_mount_pre_hydration_state(&store, "notion", &mount_id)
+        .expect_err("future reader state should fail");
+    let message = error.to_string();
+    assert!(message.contains("requires reader version"));
+    assert!(message.contains("update"));
 }
 
 #[test]

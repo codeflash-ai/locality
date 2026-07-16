@@ -10,6 +10,7 @@ pub mod credentials;
 pub mod error;
 pub mod live_mode;
 pub mod memory;
+pub mod pre_hydration;
 pub mod records;
 pub mod repository;
 pub mod reset;
@@ -30,6 +31,13 @@ pub use live_mode::{
     publish_live_mode_state_change_signal, save_mount_live_mode_and_publish_signal,
 };
 pub use memory::InMemoryStateStore;
+pub use pre_hydration::{
+    MountPreHydrationState, MountPreHydrationStatus, PRE_HYDRATION_MIN_READER_VERSION,
+    PRE_HYDRATION_SCOPE_KIND, PRE_HYDRATION_STATE_VERSION, enable_mount_pre_hydration,
+    load_mount_pre_hydration_state, mark_mount_pre_hydration_enumerating,
+    mark_mount_pre_hydration_error, mark_mount_pre_hydration_hydrating,
+    save_mount_pre_hydration_state,
+};
 pub use records::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveState, ConnectionId, ConnectionRecord,
     ConnectorProfileId, ConnectorProfileRecord, ConnectorStateRecord, EntityRecord,

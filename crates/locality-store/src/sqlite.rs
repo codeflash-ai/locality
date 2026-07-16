@@ -28,6 +28,7 @@ use crate::compatibility::{
     StateComponentDefinition, StateComponentRecord,
 };
 use crate::error::{StoreError, StoreResult};
+use crate::pre_hydration::PRE_HYDRATION_SCOPE_KIND;
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorStateRecord, EntityRecord, FreshnessStateRecord,
@@ -1573,8 +1574,8 @@ fn clear_mount_source_state(connection: &Connection, mount_id: &MountId) -> Stor
         )?;
     }
     connection.execute(
-        "DELETE FROM connector_state WHERE scope_kind = 'mount' AND scope_id = ?1",
-        params![&mount_id.0],
+        "DELETE FROM connector_state WHERE scope_kind IN (?1, ?2) AND scope_id = ?3",
+        params!["mount", PRE_HYDRATION_SCOPE_KIND, &mount_id.0],
     )?;
     Ok(())
 }

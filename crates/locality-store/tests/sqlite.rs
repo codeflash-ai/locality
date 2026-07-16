@@ -26,7 +26,8 @@ use locality_store::{
     MountLiveModeRepository, MountLiveModeState, MountRepository, ProjectionMode,
     RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
     StateCompatibilityIssue, StateCompatibilityStatus, StoreError, VirtualMutationKind,
-    VirtualMutationRecord, VirtualMutationRepository,
+    VirtualMutationRecord, VirtualMutationRepository, enable_mount_pre_hydration,
+    load_mount_pre_hydration_state,
 };
 use rusqlite::{Connection, params};
 use serde_json::json;
@@ -207,6 +208,46 @@ fn sqlite_connector_state_round_trips_by_connector_scope() {
             .get_connector_state("granola", "mount", "other")
             .expect("load missing connector state"),
         None
+    );
+}
+
+#[test]
+fn source_identity_change_clears_pre_hydration_state() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(
+            MountConfig::new(
+                fixture.mount_id.clone(),
+                "notion",
+                fixture.mount_root.clone(),
+            )
+            .with_remote_root_id(RemoteId::new("root-a")),
+        )
+        .expect("save first mount");
+    enable_mount_pre_hydration(
+        &mut store,
+        "notion",
+        &fixture.mount_id,
+        "2026-07-16T10:00:00Z",
+    )
+    .expect("enable pre-hydration");
+
+    store
+        .save_mount(
+            MountConfig::new(
+                fixture.mount_id.clone(),
+                "notion",
+                fixture.mount_root.clone(),
+            )
+            .with_remote_root_id(RemoteId::new("root-b")),
+        )
+        .expect("save changed mount");
+
+    assert!(
+        load_mount_pre_hydration_state(&store, "notion", &fixture.mount_id)
+            .expect("load state")
+            .is_none()
     );
 }
 

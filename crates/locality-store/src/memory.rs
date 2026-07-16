@@ -14,6 +14,7 @@ use locality_core::model::{MountId, RemoteId};
 use locality_core::shadow::ShadowDocument;
 
 use crate::error::{StoreError, StoreResult};
+use crate::pre_hydration::PRE_HYDRATION_SCOPE_KIND;
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorStateRecord, EntityRecord, FreshnessStateRecord,
@@ -124,7 +125,8 @@ impl InMemoryStateStore {
             .retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
         self.connector_states
             .retain(|(_, scope_kind, scope_id), _| {
-                scope_kind != "mount" || scope_id != mount_id.as_str()
+                !matches!(scope_kind.as_str(), "mount" | PRE_HYDRATION_SCOPE_KIND)
+                    || scope_id != mount_id.as_str()
             });
         self.journals.retain(|_, entry| entry.mount_id != *mount_id);
     }
