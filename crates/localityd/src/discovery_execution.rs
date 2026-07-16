@@ -357,12 +357,7 @@ where
         &reservation.mount.mount_id,
         &transaction_id,
     )?;
-    if fs::symlink_metadata(&recovery_root).is_ok() {
-        return invalid(format!(
-            "discovery recovery root `{}` already exists",
-            recovery_root.display()
-        ));
-    }
+    require_recovery_root_absent(&recovery_root)?;
     let hydration_jobs = plain_files_hydration_actions(plan.post_commit)?;
     let components = prepare_components(
         &reservation.mount.root,
@@ -411,6 +406,16 @@ where
                 transaction_id.0
             ))
         })?;
+    preflight_execution_record(&record)?;
+    match record.status {
+        DiscoveryTransactionStatus::Finalized => {
+            return Ok(DiscoveryExecutionStep::Finalized);
+        }
+        DiscoveryTransactionStatus::Aborted => {
+            return Ok(DiscoveryExecutionStep::Aborted);
+        }
+        _ => {}
+    }
     let (execution, mut effects) = match decode_and_validate_execution(&record) {
         Ok(decoded) => decoded,
         Err(error) => {
@@ -436,6 +441,7 @@ where
     let result = (|| -> LocalityResult<DiscoveryExecutionStep> {
         match record.status {
             DiscoveryTransactionStatus::Reserved => {
+                require_recovery_root_absent(&execution.recovery_root)?;
                 if !effects.operations.is_empty()
                     || !effects.hydration_jobs.is_empty()
                     || effects.rollback_reason.is_some()
@@ -464,6 +470,7 @@ where
                     step_rollback(store, &record, &execution, &mut effects, updated_at)
                 } else {
                     validate_installed_projection(&execution, &effects)?;
+                    validate_committed_recovery_tree(&execution, &effects)?;
                     store
                         .commit_discovery_transaction(transaction_id, updated_at)
                         .map_err(repository_error)?;
@@ -728,6 +735,9 @@ fn step_applying<S>(
 where
     S: DiscoveryRepository + HydrationJobRepository,
 {
+    if effects.operations.is_empty() {
+        require_recovery_root_absent(&execution.recovery_root)?;
+    }
     for component in &execution.components {
         let mut sources = component
             .operations
@@ -773,13 +783,48 @@ where
             }
         }
 
-        let mut installs = component
+        let mut creates = component
             .operations
             .iter()
-            .filter(|operation| !matches!(operation, DiscoveryExecutionOperation::Create { .. }))
+            .filter(|operation| matches!(operation, DiscoveryExecutionOperation::Create { .. }))
             .collect::<Vec<_>>();
-        installs.sort_by(compare_install_operations);
-        for operation in installs {
+        creates.sort_by(compare_install_operations);
+        for operation in creates {
+            match operation_effect_state(effects, operation) {
+                None => {
+                    return prepare_operation(
+                        store, record, execution, effects, operation, updated_at,
+                    );
+                }
+                Some((effect_index, DiscoveryOperationEffectState::Prepared)) => {
+                    return step_prepared_operation(
+                        store,
+                        record,
+                        execution,
+                        effects,
+                        effect_index,
+                        operation,
+                        updated_at,
+                    );
+                }
+                Some((_, DiscoveryOperationEffectState::Staged))
+                | Some((_, DiscoveryOperationEffectState::Installed)) => {}
+                Some((_, DiscoveryOperationEffectState::RolledBack)) => {
+                    return invalid(format!(
+                        "applying discovery operation `{}` is already rolled back",
+                        operation.operation_id()
+                    ));
+                }
+            }
+        }
+
+        let mut destinations = component
+            .operations
+            .iter()
+            .filter(|operation| operation.destination().is_some())
+            .collect::<Vec<_>>();
+        destinations.sort_by(compare_install_operations);
+        for operation in destinations {
             match operation_effect_state(effects, operation) {
                 Some((effect_index, DiscoveryOperationEffectState::Staged)) => {
                     return step_staged_operation(
@@ -809,30 +854,14 @@ where
             }
         }
 
-        let mut creates = component
+        let mut deletes = component
             .operations
             .iter()
-            .filter(|operation| matches!(operation, DiscoveryExecutionOperation::Create { .. }))
+            .filter(|operation| matches!(operation, DiscoveryExecutionOperation::Delete { .. }))
             .collect::<Vec<_>>();
-        creates.sort_by(compare_install_operations);
-        for operation in creates {
+        deletes.sort_by_key(|operation| operation.operation_id());
+        for operation in deletes {
             match operation_effect_state(effects, operation) {
-                None => {
-                    return prepare_operation(
-                        store, record, execution, effects, operation, updated_at,
-                    );
-                }
-                Some((effect_index, DiscoveryOperationEffectState::Prepared)) => {
-                    return step_prepared_operation(
-                        store,
-                        record,
-                        execution,
-                        effects,
-                        effect_index,
-                        operation,
-                        updated_at,
-                    );
-                }
                 Some((effect_index, DiscoveryOperationEffectState::Staged)) => {
                     return step_staged_operation(
                         store,
@@ -845,9 +874,16 @@ where
                     );
                 }
                 Some((_, DiscoveryOperationEffectState::Installed)) => {}
-                Some((_, DiscoveryOperationEffectState::RolledBack)) => {
+                Some((_, state)) => {
                     return invalid(format!(
-                        "applying discovery operation `{}` is already rolled back",
+                        "discovery delete `{}` has invalid finalization state `{:?}`",
+                        operation.operation_id(),
+                        state
+                    ));
+                }
+                None => {
+                    return invalid(format!(
+                        "discovery delete `{}` was not staged",
                         operation.operation_id()
                     ));
                 }
@@ -956,10 +992,14 @@ where
     }
 
     let recovery_root = expected_recovery_root(record)?;
-    if fs::symlink_metadata(&recovery_root).is_ok() {
-        validate_empty_recovery_scaffolding(&recovery_root)?;
-        remove_dir_all_durable(&recovery_root).map_err(LocalityError::from)?;
-        return Ok(DiscoveryExecutionStep::RecoveryPayloadsRemoved);
+    match fs::symlink_metadata(&recovery_root) {
+        Ok(_) => {
+            validate_empty_recovery_scaffolding(&recovery_root)?;
+            remove_dir_all_durable(&recovery_root).map_err(LocalityError::from)?;
+            return Ok(DiscoveryExecutionStep::RecoveryPayloadsRemoved);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(LocalityError::from(error)),
     }
     if !effects.cleanup_complete {
         effects.cleanup_complete = true;
@@ -1449,7 +1489,7 @@ where
 fn step_staged_operation<S>(
     store: &mut S,
     record: &DiscoveryTransactionRecord,
-    _execution: &DiscoveryExecutionPlan,
+    execution: &DiscoveryExecutionPlan,
     effects: &mut DiscoveryExecutionEffects,
     effect_index: usize,
     operation: &DiscoveryExecutionOperation,
@@ -1600,9 +1640,25 @@ where
         } => {
             let mount_root = &record.reservation.mount.root;
             let recovery_root = expected_recovery_root(record)?;
+            let source_replaced_by_component = execution
+                .components
+                .iter()
+                .find(|component| {
+                    component
+                        .operations
+                        .iter()
+                        .any(|candidate| candidate.operation_id() == operation_id)
+                })
+                .is_some_and(|component| {
+                    component
+                        .operations
+                        .iter()
+                        .filter_map(DiscoveryExecutionOperation::destination)
+                        .any(|destination| destination == source)
+                });
             let source = checked_join(mount_root, source, "source")?;
             let stage = checked_join(&recovery_root, stage, "stage")?;
-            if fingerprint_if_exists(&source)?.is_some()
+            if (fingerprint_if_exists(&source)?.is_some() && !source_replaced_by_component)
                 || fingerprint_path(&stage)? != *expected_fingerprint
             {
                 return invalid(format!(
@@ -3016,6 +3072,17 @@ fn reject_symlink(path: &Path) -> LocalityResult<()> {
         return invalid(format!("path `{}` is not a directory", path.display()));
     }
     Ok(())
+}
+
+fn require_recovery_root_absent(path: &Path) -> LocalityResult<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => invalid(format!(
+            "discovery recovery root `{}` already exists",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(LocalityError::from(error)),
+    }
 }
 
 fn validate_mount_root(path: &Path) -> LocalityResult<()> {

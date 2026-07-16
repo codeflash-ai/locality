@@ -974,6 +974,119 @@ fn nested_creates_install_parent_first_and_validate_independent_child_ownership(
 }
 
 #[test]
+fn mixed_parent_create_and_child_move_stages_every_source_then_installs_parent_first() {
+    let fixture = Fixture::new("mixed-parent-create-child-move");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(fixture.mount.clone()).expect("save mount");
+    store
+        .save_entity(entity_record("child", "Old/page.md"))
+        .expect("save child");
+    fs::create_dir_all(fixture.root.join("Old")).expect("create child source");
+    fs::write(fixture.root.join("Old/page.md"), "child\n").expect("write child source");
+    let plan = discovery_plan(
+        &store,
+        &fixture.mount,
+        vec![
+            entry("child", EntityKind::Page, "Parent/Child/page.md"),
+            entry("parent", EntityKind::Page, "Parent/page.md"),
+        ],
+    );
+    let transaction_id = DiscoveryTransactionId::new("mixed-parent-create-child-move");
+    let reserved = prepare_plain_files_discovery_transaction(
+        &mut store,
+        plan,
+        transaction_id.clone(),
+        "t0",
+        vec![DiscoveryCreateMaterialization::Page {
+            remote_id: RemoteId::new("parent"),
+            document: "parent\n".to_string(),
+        }],
+    )
+    .expect("prepare mixed component");
+    let execution: DiscoveryExecutionPlan =
+        serde_json::from_value(reserved.plan).expect("decode mixed execution");
+    assert_eq!(execution.components.len(), 1);
+    let operation_ids = execution.components[0]
+        .operations
+        .iter()
+        .map(|operation| match operation {
+            DiscoveryExecutionOperation::Create {
+                operation_id,
+                remote_id,
+                ..
+            }
+            | DiscoveryExecutionOperation::Move {
+                operation_id,
+                remote_id,
+                ..
+            } => (remote_id.clone(), operation_id.clone()),
+            DiscoveryExecutionOperation::Delete { .. } => panic!("unexpected delete"),
+        })
+        .collect::<BTreeMap<_, _>>();
+    let child = operation_ids[&RemoteId::new("child")].clone();
+    let parent = operation_ids[&RemoteId::new("parent")].clone();
+
+    let actual = (1..=11)
+        .map(|sequence| step(&mut store, &transaction_id, sequence))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            DiscoveryExecutionStep::Applying,
+            DiscoveryExecutionStep::OperationPrepared {
+                operation_id: child.clone(),
+            },
+            DiscoveryExecutionStep::FilesystemMutation {
+                operation_id: child.clone(),
+                mutation: DiscoveryFilesystemMutation::SourceStaged,
+            },
+            DiscoveryExecutionStep::OperationRecorded {
+                operation_id: child.clone(),
+                state: DiscoveryOperationEffectState::Staged,
+            },
+            DiscoveryExecutionStep::OperationPrepared {
+                operation_id: parent.clone(),
+            },
+            DiscoveryExecutionStep::FilesystemMutation {
+                operation_id: parent.clone(),
+                mutation: DiscoveryFilesystemMutation::PayloadPublished,
+            },
+            DiscoveryExecutionStep::OperationRecorded {
+                operation_id: parent.clone(),
+                state: DiscoveryOperationEffectState::Staged,
+            },
+            DiscoveryExecutionStep::FilesystemMutation {
+                operation_id: parent.clone(),
+                mutation: DiscoveryFilesystemMutation::DestinationInstalled,
+            },
+            DiscoveryExecutionStep::OperationRecorded {
+                operation_id: parent,
+                state: DiscoveryOperationEffectState::Installed,
+            },
+            DiscoveryExecutionStep::FilesystemMutation {
+                operation_id: child.clone(),
+                mutation: DiscoveryFilesystemMutation::DestinationInstalled,
+            },
+            DiscoveryExecutionStep::OperationRecorded {
+                operation_id: child,
+                state: DiscoveryOperationEffectState::Installed,
+            },
+        ]
+    );
+    run_steps_to_finalized_from(&mut store, &transaction_id, 12);
+
+    assert!(!fixture.root.join("Old").exists());
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("Parent/page.md")).expect("parent document"),
+        "parent\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("Parent/Child/page.md")).expect("child document"),
+        "child\n"
+    );
+}
+
+#[test]
 fn missing_journaled_parent_during_nested_create_rolls_back_without_recreating_it() {
     let fixture = Fixture::new("nested-create-parent-removed");
     let mut store = InMemoryStateStore::new();
@@ -1505,6 +1618,119 @@ fn committed_cleanup_refuses_unknown_recovery_content_without_rolling_back() {
 }
 
 #[test]
+fn recovery_root_appearing_after_reservation_is_never_adopted() {
+    let fixture = Fixture::new("recovery-root-after-reservation");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(fixture.mount.clone()).expect("save mount");
+    let transaction_id = DiscoveryTransactionId::new("recovery-root-after-reservation");
+    let plan = discovery_plan(
+        &store,
+        &fixture.mount,
+        vec![entry("page", EntityKind::Page, "Roadmap/page.md")],
+    );
+    let reserved = prepare_plain_files_discovery_transaction(
+        &mut store,
+        plan,
+        transaction_id.clone(),
+        "t0",
+        vec![DiscoveryCreateMaterialization::Page {
+            remote_id: RemoteId::new("page"),
+            document: "roadmap\n".to_string(),
+        }],
+    )
+    .expect("prepare transaction");
+    let execution: DiscoveryExecutionPlan =
+        serde_json::from_value(reserved.plan.clone()).expect("decode execution");
+    fs::create_dir_all(&execution.recovery_root).expect("create colliding recovery root");
+    let unknown = execution.recovery_root.join("unknown");
+    fs::write(&unknown, "preserve\n").expect("write unknown recovery content");
+
+    assert_eq!(
+        step_plain_files_discovery_transaction(&mut store, &transaction_id, "t1")
+            .expect_err("colliding recovery root must fail before applying"),
+        LocalityError::InvalidState(format!(
+            "discovery recovery root `{}` already exists",
+            execution.recovery_root.display()
+        ))
+    );
+    assert_eq!(
+        store
+            .get_discovery_transaction(&transaction_id)
+            .expect("transaction lookup")
+            .expect("transaction"),
+        reserved
+    );
+    assert_eq!(
+        fs::read_to_string(&unknown).expect("unknown content remains"),
+        "preserve\n"
+    );
+    assert!(!fixture.root.join("Roadmap").exists());
+}
+
+#[test]
+fn unknown_recovery_content_appearing_during_execution_blocks_commit_and_cleanup() {
+    let fixture = Fixture::new("unknown-recovery-before-commit");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(fixture.mount.clone()).expect("save mount");
+    let transaction_id = DiscoveryTransactionId::new("unknown-recovery-before-commit");
+    let plan = discovery_plan(
+        &store,
+        &fixture.mount,
+        vec![entry("page", EntityKind::Page, "Roadmap/page.md")],
+    );
+    let reserved = prepare_plain_files_discovery_transaction(
+        &mut store,
+        plan,
+        transaction_id.clone(),
+        "t0",
+        vec![DiscoveryCreateMaterialization::Page {
+            remote_id: RemoteId::new("page"),
+            document: "roadmap\n".to_string(),
+        }],
+    )
+    .expect("prepare transaction");
+    let execution: DiscoveryExecutionPlan =
+        serde_json::from_value(reserved.plan).expect("decode execution");
+    for sequence in 1..=7 {
+        let outcome = step(&mut store, &transaction_id, sequence);
+        if sequence == 7 {
+            assert_eq!(outcome, DiscoveryExecutionStep::Projected);
+        }
+    }
+    let unknown = execution.recovery_root.join("unknown");
+    fs::write(&unknown, "preserve\n").expect("write unknown recovery content");
+
+    assert_eq!(
+        step(&mut store, &transaction_id, 8),
+        DiscoveryExecutionStep::RollbackStarted
+    );
+    assert_eq!(
+        store
+            .get_discovery_transaction(&transaction_id)
+            .expect("transaction lookup")
+            .expect("transaction")
+            .status,
+        DiscoveryTransactionStatus::Projected
+    );
+    assert!(
+        store
+            .get_entity(&fixture.mount.mount_id, &RemoteId::new("page"))
+            .expect("entity lookup")
+            .is_none()
+    );
+    assert_eq!(
+        run_plain_files_discovery_transaction(&mut store, &transaction_id, "t9")
+            .expect("rollback transaction"),
+        DiscoveryExecutionTerminal::NeedsReview
+    );
+    assert!(!fixture.root.join("Roadmap").exists());
+    assert_eq!(
+        fs::read_to_string(&unknown).expect("unknown content remains"),
+        "preserve\n"
+    );
+}
+
+#[test]
 fn changed_precommit_source_enters_repair_pending_without_deleting_content() {
     let fixture = Fixture::new("repair-pending");
     let mut store = InMemoryStateStore::new();
@@ -2030,6 +2256,57 @@ fn terminal_outcomes_ignore_mutable_bytes_but_still_reject_future_versions_witho
             .expect("read stable repair terminal"),
         DiscoveryExecutionTerminal::Finalized
     );
+    fs::remove_dir_all(&fixture.root).expect("remove finalized mount root");
+    assert_eq!(
+        step_plain_files_discovery_transaction(&mut store, &transaction_id, "t4")
+            .expect("read stable step terminal without mount root"),
+        DiscoveryExecutionStep::Finalized
+    );
+
+    let aborted_fixture = Fixture::new("aborted-terminal-step");
+    let mut aborted_store = InMemoryStateStore::new();
+    aborted_store
+        .save_mount(aborted_fixture.mount.clone())
+        .expect("save aborted mount");
+    let aborted_id = DiscoveryTransactionId::new("aborted-terminal-step");
+    let aborted_plan = discovery_plan(
+        &aborted_store,
+        &aborted_fixture.mount,
+        vec![entry("page", EntityKind::Page, "Roadmap/page.md")],
+    );
+    prepare_plain_files_discovery_transaction(
+        &mut aborted_store,
+        aborted_plan,
+        aborted_id.clone(),
+        "t0",
+        vec![DiscoveryCreateMaterialization::Page {
+            remote_id: RemoteId::new("page"),
+            document: "roadmap\n".to_string(),
+        }],
+    )
+    .expect("prepare aborted transaction");
+    assert_eq!(
+        repair_plain_files_discovery_transaction(&mut aborted_store, &aborted_id, "t1")
+            .expect("abort reserved transaction"),
+        DiscoveryExecutionTerminal::Aborted
+    );
+    let aborted_before = aborted_store
+        .get_discovery_transaction(&aborted_id)
+        .expect("aborted transaction lookup")
+        .expect("aborted transaction");
+    fs::remove_dir_all(&aborted_fixture.root).expect("remove aborted mount root");
+    assert_eq!(
+        step_plain_files_discovery_transaction(&mut aborted_store, &aborted_id, "t2")
+            .expect("read stable aborted step terminal without mount root"),
+        DiscoveryExecutionStep::Aborted
+    );
+    assert_eq!(
+        aborted_store
+            .get_discovery_transaction(&aborted_id)
+            .expect("aborted transaction lookup")
+            .expect("aborted transaction"),
+        aborted_before
+    );
 
     let future_fixture = Fixture::new("future-terminal");
     let mut future_store = InMemoryStateStore::new();
@@ -2066,13 +2343,20 @@ fn terminal_outcomes_ignore_mutable_bytes_but_still_reject_future_versions_witho
     let before_reservation = future_store
         .capture_discovery_reservation(&future_fixture.mount.mount_id)
         .expect("capture future state");
-    let before_entries = fs::read_dir(&future_fixture.root)
-        .expect("read future root")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect future root");
+    fs::remove_dir_all(&future_fixture.root).expect("remove future terminal mount root");
 
     assert_eq!(
-        repair_plain_files_discovery_transaction(&mut future_store, &future_id, "t5")
+        step_plain_files_discovery_transaction(&mut future_store, &future_id, "t5")
+            .expect_err("future terminal step must require an update"),
+        LocalityError::UpdateRequired {
+            component: "daemon:discovery_execution_plan".to_string(),
+            found: 2,
+            supported: 1,
+        }
+    );
+
+    assert_eq!(
+        repair_plain_files_discovery_transaction(&mut future_store, &future_id, "t6")
             .expect_err("future terminal must require an update"),
         LocalityError::UpdateRequired {
             component: "daemon:discovery_execution_plan".to_string(),
@@ -2093,12 +2377,7 @@ fn terminal_outcomes_ignore_mutable_bytes_but_still_reject_future_versions_witho
             .expect("capture future state after error"),
         before_reservation
     );
-    assert_eq!(
-        fs::read_dir(&future_fixture.root)
-            .expect("read future root after error")
-            .count(),
-        before_entries.len()
-    );
+    assert!(!future_fixture.root.exists());
 }
 
 #[test]
