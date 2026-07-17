@@ -398,6 +398,31 @@ impl SlackApi for FakeSlackApi {
         })
     }
 
+    fn conversations_replies(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        _cursor: Option<&str>,
+        _limit: u32,
+    ) -> LocalityResult<SlackHistoryResponse> {
+        Ok(SlackHistoryResponse {
+            ok: true,
+            messages: self
+                .messages
+                .lock()
+                .expect("messages")
+                .get(channel)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|message| {
+                    message.ts == thread_ts || message.thread_ts.as_deref() == Some(thread_ts)
+                })
+                .collect(),
+            ..SlackHistoryResponse::default()
+        })
+    }
+
     fn conversations_join(&self, channel: &str) -> LocalityResult<SlackJoinResponse> {
         let channel = self
             .conversations

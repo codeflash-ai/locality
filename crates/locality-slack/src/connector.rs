@@ -17,7 +17,7 @@ use locality_core::planner::PushOperationKind;
 use locality_core::{LocalityError, LocalityResult};
 
 use crate::client::{HttpSlackApiClient, SlackApi};
-use crate::dto::{SlackConversation, SlackUser};
+use crate::dto::{SlackConversation, SlackMessage, SlackUser};
 use crate::render::{
     SlackNativeBundle, SlackRenderedKind, conversation_remote_id, parse_recent_remote_id,
     recent_remote_id, render_slack_entity, slack_remote_version, users_remote_id,
@@ -211,6 +211,49 @@ impl SlackConnector {
             ..conversation
         }))
     }
+
+    fn recent_thread_replies(
+        &self,
+        conversation_id: &str,
+        messages: &[SlackMessage],
+    ) -> LocalityResult<BTreeMap<String, Vec<SlackMessage>>> {
+        let mut threads = BTreeMap::new();
+        let mut seen_threads = BTreeSet::new();
+        for message in messages {
+            if !message_has_thread_replies(message) {
+                continue;
+            }
+            let thread_ts = message.thread_ts.as_deref().unwrap_or(message.ts.as_str());
+            if !seen_threads.insert(thread_ts.to_string()) {
+                continue;
+            }
+            let replies = self
+                .api
+                .conversations_replies(
+                    conversation_id,
+                    thread_ts,
+                    None,
+                    self.config.settings.slack.history_limit,
+                )?
+                .messages
+                .into_iter()
+                .filter(|reply| reply.ts != thread_ts)
+                .collect::<Vec<_>>();
+            if !replies.is_empty() {
+                threads.insert(thread_ts.to_string(), replies);
+            }
+        }
+        Ok(threads)
+    }
+}
+
+fn message_has_thread_replies(message: &SlackMessage) -> bool {
+    message.reply_count.unwrap_or(0) > 0
+        && message
+            .thread_ts
+            .as_deref()
+            .map(|thread_ts| thread_ts == message.ts)
+            .unwrap_or(true)
 }
 
 impl Connector for SlackConnector {
@@ -329,7 +372,8 @@ impl Connector for SlackConnector {
                 None,
                 self.config.settings.slack.history_limit,
             )?;
-            let bundle = recent_bundle(conversation, users, history.messages);
+            let threads = self.recent_thread_replies(conversation_id, &history.messages)?;
+            let bundle = recent_bundle(conversation, users, history.messages, threads);
             let version = slack_remote_version(&bundle)?;
             return Ok(RemoteObservation::new(
                 request.mount_id,
@@ -373,7 +417,8 @@ impl Connector for SlackConnector {
             None,
             self.config.settings.slack.history_limit,
         )?;
-        let bundle = recent_bundle(conversation, self.all_users()?, history.messages);
+        let threads = self.recent_thread_replies(conversation_id, &history.messages)?;
+        let bundle = recent_bundle(conversation, self.all_users()?, history.messages, threads);
         native_entity(request.remote_id, "slack_recent", bundle)
     }
 
@@ -420,6 +465,7 @@ fn users_bundle(users: Vec<SlackUser>) -> SlackNativeBundle {
         conversation: None,
         users,
         messages: Vec::new(),
+        threads: BTreeMap::new(),
     }
 }
 
@@ -430,13 +476,15 @@ fn users_remote_version(users: &[SlackUser]) -> LocalityResult<String> {
 fn recent_bundle(
     conversation: SlackConversation,
     users: Vec<SlackUser>,
-    messages: Vec<crate::dto::SlackMessage>,
+    messages: Vec<SlackMessage>,
+    threads: BTreeMap<String, Vec<SlackMessage>>,
 ) -> SlackNativeBundle {
     SlackNativeBundle {
         kind: SlackRenderedKind::Recent,
         conversation: Some(conversation),
         users,
         messages,
+        threads,
     }
 }
 
@@ -944,6 +992,70 @@ mod tests {
     }
 
     #[test]
+    fn fetch_recent_includes_thread_replies_for_parent_messages() {
+        let parent_ts = "1780000000.000100";
+        let reply_ts = "1780000001.000200";
+        let api = FakeSlackApi::default()
+            .with_conversations(vec![SlackConversation {
+                id: "C123".to_string(),
+                name: Some("general".to_string()),
+                is_channel: true,
+                ..SlackConversation::default()
+            }])
+            .with_users(vec![
+                SlackUser {
+                    id: "U123".to_string(),
+                    real_name: Some("Ada Lovelace".to_string()),
+                    ..SlackUser::default()
+                },
+                SlackUser {
+                    id: "U456".to_string(),
+                    real_name: Some("Grace Hopper".to_string()),
+                    ..SlackUser::default()
+                },
+            ])
+            .with_messages(vec![SlackMessage {
+                user: Some("U123".to_string()),
+                text: "Parent message".to_string(),
+                ts: parent_ts.to_string(),
+                thread_ts: Some(parent_ts.to_string()),
+                reply_count: Some(1),
+                ..SlackMessage::default()
+            }])
+            .with_thread_replies(
+                parent_ts,
+                vec![SlackMessage {
+                    user: Some("U456".to_string()),
+                    text: "Thread reply body".to_string(),
+                    ts: reply_ts.to_string(),
+                    thread_ts: Some(parent_ts.to_string()),
+                    ..SlackMessage::default()
+                }],
+            );
+        let connector = connector_with_api(api.clone());
+
+        let native = connector
+            .fetch(FetchRequest {
+                remote_id: RemoteId::new("slack-recent:C123"),
+            })
+            .expect("fetch recent");
+
+        assert_eq!(
+            *api.thread_requests.lock().expect("thread requests"),
+            vec![("C123".to_string(), parent_ts.to_string(), 15)]
+        );
+        let bundle: SlackNativeBundle = serde_json::from_slice(&native.raw).expect("bundle");
+        assert_eq!(
+            bundle.threads.get(parent_ts).expect("thread replies")[0].text,
+            "Thread reply body"
+        );
+        let document = connector.render(&native).expect("render recent");
+        assert!(document.body.contains("### Thread"));
+        assert!(document.body.contains("**Grace Hopper**"));
+        assert!(document.body.contains("Thread reply body"));
+    }
+
+    #[test]
     fn users_fetch_render_and_observe_versions_match_renderer_frontmatter() {
         let connector = connector_with_api(FakeSlackApi::default());
 
@@ -1099,6 +1211,65 @@ mod tests {
                         ts: "1780000000.000100".to_string(),
                         ..SlackMessage::default()
                     }]),
+            ),
+            "slack-recent:C123",
+        );
+
+        assert_content_remote_version(&before);
+        assert_content_remote_version(&after);
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn remote_version_for_recent_changes_when_thread_reply_text_changes() {
+        let parent = SlackMessage {
+            text: "parent message".to_string(),
+            ts: "1780000000.000100".to_string(),
+            thread_ts: Some("1780000000.000100".to_string()),
+            reply_count: Some(1),
+            ..SlackMessage::default()
+        };
+        let before = observe_version(
+            connector_with_api(
+                FakeSlackApi::default()
+                    .with_conversations(vec![SlackConversation {
+                        id: "C123".to_string(),
+                        name: Some("general".to_string()),
+                        is_channel: true,
+                        ..SlackConversation::default()
+                    }])
+                    .with_messages(vec![parent.clone()])
+                    .with_thread_replies(
+                        "1780000000.000100",
+                        vec![SlackMessage {
+                            text: "original reply".to_string(),
+                            ts: "1780000001.000200".to_string(),
+                            thread_ts: Some("1780000000.000100".to_string()),
+                            ..SlackMessage::default()
+                        }],
+                    ),
+            ),
+            "slack-recent:C123",
+        );
+        let after = observe_version(
+            connector_with_api(
+                FakeSlackApi::default()
+                    .with_conversations(vec![SlackConversation {
+                        id: "C123".to_string(),
+                        name: Some("general".to_string()),
+                        is_channel: true,
+                        ..SlackConversation::default()
+                    }])
+                    .with_messages(vec![parent])
+                    .with_thread_replies(
+                        "1780000000.000100",
+                        vec![SlackMessage {
+                            text: "edited reply".to_string(),
+                            ts: "1780000001.000200".to_string(),
+                            thread_ts: Some("1780000000.000100".to_string()),
+                            ..SlackMessage::default()
+                        }],
+                    ),
             ),
             "slack-recent:C123",
         );
@@ -1343,6 +1514,8 @@ mod tests {
         conversations: Arc<Mutex<Vec<SlackConversation>>>,
         users: Arc<Mutex<Vec<SlackUser>>>,
         messages: Arc<Mutex<Vec<SlackMessage>>>,
+        thread_replies: Arc<Mutex<BTreeMap<String, Vec<SlackMessage>>>>,
+        thread_requests: Arc<Mutex<Vec<(String, String, u32)>>>,
         history_limit: Arc<Mutex<Option<u32>>>,
         conversation_types: Arc<Mutex<Vec<String>>>,
         joined_channels: Arc<Mutex<Vec<String>>>,
@@ -1362,6 +1535,14 @@ mod tests {
 
         fn with_messages(self, messages: Vec<SlackMessage>) -> Self {
             *self.messages.lock().expect("messages") = messages;
+            self
+        }
+
+        fn with_thread_replies(self, thread_ts: &str, messages: Vec<SlackMessage>) -> Self {
+            self.thread_replies
+                .lock()
+                .expect("thread replies")
+                .insert(thread_ts.to_string(), messages);
             self
         }
     }
@@ -1404,6 +1585,39 @@ mod tests {
             Ok(SlackHistoryResponse {
                 ok: true,
                 messages: self.messages.lock().expect("messages").clone(),
+                ..SlackHistoryResponse::default()
+            })
+        }
+
+        fn conversations_replies(
+            &self,
+            channel: &str,
+            thread_ts: &str,
+            _cursor: Option<&str>,
+            limit: u32,
+        ) -> LocalityResult<SlackHistoryResponse> {
+            self.thread_requests.lock().expect("thread requests").push((
+                channel.to_string(),
+                thread_ts.to_string(),
+                limit,
+            ));
+            let mut messages = vec![SlackMessage {
+                text: "Parent message".to_string(),
+                ts: thread_ts.to_string(),
+                thread_ts: Some(thread_ts.to_string()),
+                ..SlackMessage::default()
+            }];
+            messages.extend(
+                self.thread_replies
+                    .lock()
+                    .expect("thread replies")
+                    .get(thread_ts)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            Ok(SlackHistoryResponse {
+                ok: true,
+                messages,
                 ..SlackHistoryResponse::default()
             })
         }

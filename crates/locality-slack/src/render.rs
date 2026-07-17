@@ -22,6 +22,8 @@ pub struct SlackNativeBundle {
     pub conversation: Option<SlackConversation>,
     pub users: Vec<SlackUser>,
     pub messages: Vec<SlackMessage>,
+    #[serde(default)]
+    pub threads: BTreeMap<String, Vec<SlackMessage>>,
 }
 
 pub fn conversation_remote_id(conversation_id: &str) -> String {
@@ -160,14 +162,7 @@ fn render_recent_body(bundle: &SlackNativeBundle, title: &str) -> String {
         return body;
     }
     for message in messages {
-        let author = message
-            .user
-            .as_deref()
-            .and_then(|user_id| users.get(user_id))
-            .cloned()
-            .or_else(|| message.username.clone())
-            .or_else(|| message.bot_id.clone())
-            .unwrap_or_else(|| "Unknown".to_string());
+        let author = message_author(&message, &users);
         body.push_str(&format!(
             "## {}\n\n**{}**\n\n{}\n\n",
             slack_ts_heading(&message.ts),
@@ -177,26 +172,67 @@ fn render_recent_body(bundle: &SlackNativeBundle, title: &str) -> String {
         if let Some(reply_count) = message.reply_count.filter(|count| *count > 0) {
             body.push_str(&format!("_Thread replies: {reply_count}_\n\n"));
         }
-        if !message.files.is_empty() {
-            body.push_str("Files:\n");
-            for file in &message.files {
-                let name = file
-                    .title
-                    .as_deref()
-                    .or(file.name.as_deref())
-                    .unwrap_or(file.id.as_str());
-                let mimetype = file.mimetype.as_deref().unwrap_or("unknown");
-                body.push_str(&format!(
-                    "- {} ({}, id `{}`)\n",
-                    escape_markdown_inline(name),
-                    escape_markdown_inline(mimetype),
-                    file.id
-                ));
-            }
-            body.push('\n');
-        }
+        render_message_files(&mut body, &message);
+        let thread_ts = message.thread_ts.as_deref().unwrap_or(message.ts.as_str());
+        render_thread_replies(&mut body, bundle.threads.get(thread_ts), &users);
     }
     body
+}
+
+fn render_thread_replies(
+    body: &mut String,
+    replies: Option<&Vec<SlackMessage>>,
+    users: &BTreeMap<String, String>,
+) {
+    let Some(replies) = replies.filter(|replies| !replies.is_empty()) else {
+        return;
+    };
+    let mut replies = replies.clone();
+    replies.sort_by(|left, right| left.ts.cmp(&right.ts));
+    body.push_str("### Thread\n\n");
+    for reply in replies {
+        let author = message_author(&reply, users);
+        body.push_str(&format!(
+            "#### {}\n\n**{}**\n\n{}\n\n",
+            slack_ts_heading(&reply.ts),
+            escape_markdown_inline(&author),
+            slack_text_to_markdown(&reply.text, users),
+        ));
+        render_message_files(body, &reply);
+    }
+}
+
+fn message_author(message: &SlackMessage, users: &BTreeMap<String, String>) -> String {
+    message
+        .user
+        .as_deref()
+        .and_then(|user_id| users.get(user_id))
+        .cloned()
+        .or_else(|| message.username.clone())
+        .or_else(|| message.bot_id.clone())
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
+fn render_message_files(body: &mut String, message: &SlackMessage) {
+    if message.files.is_empty() {
+        return;
+    }
+    body.push_str("Files:\n");
+    for file in &message.files {
+        let name = file
+            .title
+            .as_deref()
+            .or(file.name.as_deref())
+            .unwrap_or(file.id.as_str());
+        let mimetype = file.mimetype.as_deref().unwrap_or("unknown");
+        body.push_str(&format!(
+            "- {} ({}, id `{}`)\n",
+            escape_markdown_inline(name),
+            escape_markdown_inline(mimetype),
+            file.id
+        ));
+    }
+    body.push('\n');
 }
 
 fn user_map(users: &[SlackUser]) -> BTreeMap<String, String> {
@@ -391,6 +427,7 @@ mod tests {
                 ts: ts.to_string(),
                 ..SlackMessage::default()
             }],
+            threads: BTreeMap::new(),
         };
 
         render_slack_entity(&bundle).expect("render")
@@ -424,6 +461,7 @@ mod tests {
                 reply_count: Some(2),
                 ..SlackMessage::default()
             }],
+            threads: BTreeMap::new(),
         };
 
         let document = render_slack_entity(&bundle).expect("render");
@@ -440,6 +478,60 @@ mod tests {
     }
 
     #[test]
+    fn renders_inline_thread_replies_for_recent_messages() {
+        let raw = r#"{
+          "kind": "recent",
+          "conversation": {
+            "id": "C123",
+            "name": "general",
+            "is_channel": true
+          },
+          "users": [
+            {
+              "id": "U123",
+              "name": "ada",
+              "profile": { "real_name": "Ada Lovelace" }
+            },
+            {
+              "id": "U456",
+              "name": "grace",
+              "profile": { "real_name": "Grace Hopper" }
+            }
+          ],
+          "messages": [
+            {
+              "type": "message",
+              "user": "U123",
+              "text": "Parent message",
+              "ts": "1780000000.000100",
+              "thread_ts": "1780000000.000100",
+              "reply_count": 1
+            }
+          ],
+          "threads": {
+            "1780000000.000100": [
+              {
+                "type": "message",
+                "user": "U456",
+                "text": "Thread reply body",
+                "ts": "1780000001.000200",
+                "thread_ts": "1780000000.000100"
+              }
+            ]
+          }
+        }"#;
+        let bundle: SlackNativeBundle = serde_json::from_str(raw).expect("decode bundle");
+
+        let document = render_slack_entity(&bundle).expect("render");
+
+        assert!(document.body.contains("_Thread replies: 1_"));
+        assert!(document.body.contains("### Thread"));
+        assert!(document.body.contains("#### 2026-05-28 20:26:41 UTC"));
+        assert!(document.body.contains("**Grace Hopper**"));
+        assert!(document.body.contains("Thread reply body"));
+    }
+
+    #[test]
     fn renders_users_directory_without_email() {
         let bundle = SlackNativeBundle {
             kind: SlackRenderedKind::Users,
@@ -451,6 +543,7 @@ mod tests {
                 real_name: Some("Ada Lovelace".to_string()),
                 ..SlackUser::default()
             }],
+            threads: BTreeMap::new(),
         };
 
         let document = render_slack_entity(&bundle).expect("render users");

@@ -46,6 +46,14 @@ pub trait SlackApi: fmt::Debug + Send + Sync {
         limit: u32,
     ) -> LocalityResult<SlackHistoryResponse>;
 
+    fn conversations_replies(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> LocalityResult<SlackHistoryResponse>;
+
     fn conversations_join(&self, channel: &str) -> LocalityResult<SlackJoinResponse>;
 
     fn users_list(
@@ -220,6 +228,29 @@ impl SlackApi for HttpSlackApiClient {
         self.get_json(
             Method::GET,
             "conversations.history",
+            &query,
+            SlackRateGate::History,
+        )
+    }
+
+    fn conversations_replies(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> LocalityResult<SlackHistoryResponse> {
+        let mut query = vec![
+            ("channel", channel.to_string()),
+            ("ts", thread_ts.to_string()),
+            ("limit", limit.clamp(1, 15).to_string()),
+        ];
+        if let Some(cursor) = cursor.filter(|value| !value.is_empty()) {
+            query.push(("cursor", cursor.to_string()));
+        }
+        self.get_json(
+            Method::GET,
+            "conversations.replies",
             &query,
             SlackRateGate::History,
         )
@@ -478,6 +509,31 @@ mod tests {
         server.join().expect("server");
 
         assert!(request.starts_with("POST /auth.test HTTP/1.1"));
+    }
+
+    #[test]
+    fn conversations_replies_sends_channel_thread_and_bounded_limit() {
+        let (base_url, request_rx, server) = spawn_response(
+            "HTTP/1.1 200 OK",
+            r#"{"ok":true,"messages":[{"type":"message","text":"reply","ts":"1780000001.000200"}]}"#,
+        );
+        let client = HttpSlackApiClient::with_base_url_and_execution_policy(
+            "xoxb-token",
+            base_url,
+            ConnectorExecutionPolicy::Inline,
+        );
+
+        let response = client
+            .conversations_replies("C123", "1780000000.000100", None, 50)
+            .expect("replies");
+        let request = request_rx.recv().expect("request");
+        server.join().expect("server");
+
+        assert_eq!(response.messages[0].text, "reply");
+        assert!(request.starts_with("GET /conversations.replies?"));
+        assert!(request.contains("channel=C123"));
+        assert!(request.contains("ts=1780000000.000100"));
+        assert!(request.contains("limit=15"));
     }
 
     #[test]

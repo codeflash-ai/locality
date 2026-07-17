@@ -58,7 +58,8 @@ slack-main/
   stable disambiguation.
 - `users.md` contains workspace user metadata.
 - Each conversation directory contains `recent.md` with the latest projected
-  messages for that conversation.
+  messages for that conversation. Parent messages with Slack thread replies
+  include a bounded inline `Thread` section with the fetched reply messages.
 
 ## Sync and limits
 
@@ -77,8 +78,8 @@ Locality keeps the default conservative so read-only sync stays provider-safe.
 Slack mounts are read-only. Locality rejects edits, creates, renames, moves,
 deletes, push writes, undo writes, and autosave writes under Slack mounts.
 
-V1 does not post messages, expand thread bodies, subscribe to Slack events, or
-store arbitrary Slack search results.
+V1 does not post messages, subscribe to Slack events, or store arbitrary Slack
+search results.
 
 ## Useful commands
 
