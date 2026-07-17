@@ -99,6 +99,7 @@ import {
   connectedSourcesReadyToMount,
   isSourceConnectorId,
   sourceConnectionReady,
+  sourceMountRetryOutcome,
   sourceMounted,
   sourceSetupIsActiveConnector,
   sourceSetupIsBusy,
@@ -3299,12 +3300,14 @@ function MountsView({
             pendingMountRetry.connector,
             pendingMountRetry.googleDocsWorkspaceFolder,
           );
-          if (mountReport.ok) {
-            setPendingMountRetry(null);
-            setSourceFileProviderEnablement(null);
-            setSourceDialogMessage(mountReport.message);
-            setSourceDialogState("success");
+          const outcome = sourceMountRetryOutcome(mountReport);
+          if (outcome.kind === "retry") {
+            return;
           }
+          setPendingMountRetry(null);
+          setSourceFileProviderEnablement(null);
+          setSourceDialogMessage(outcome.message);
+          setSourceDialogState(outcome.kind);
         }, 350);
       },
     });
@@ -3776,8 +3779,6 @@ function MountsView({
           onReopenFinder={() => void revealSourceFileProviderEnablement()}
           onClose={() => {
             setSourceDialogOpen(false);
-            setPendingMountRetry(null);
-            setSourceFileProviderEnablement(null);
           }}
         />
       )}

@@ -13,9 +13,15 @@ describe("Finder enablement checkpoint", () => {
     expect(app).toContain("Having trouble?");
   });
 
-  it("reuses the guided state for later source mount recovery", () => {
-    expect(app).toContain("sourceFileProviderEnablement");
-    expect(app).toContain("pendingMountRetry");
+  it("keeps later source recovery running when its dialog closes", () => {
+    const addSourceDialog = app.match(
+      /<AddSourceDialog[\s\S]*?fileProviderEnablement=\{sourceFileProviderEnablement\}[\s\S]*?onClose=\{\(\) => \{([\s\S]*?)\}\}\s*\/>/,
+    );
+
+    expect(addSourceDialog?.[1].trim()).toBe("setSourceDialogOpen(false);");
+  });
+
+  it("passes later source recovery state into the guided dialog", () => {
     expect(app).toContain("fileProviderEnablement={sourceFileProviderEnablement}");
   });
 

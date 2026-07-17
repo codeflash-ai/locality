@@ -3,6 +3,7 @@ import {
   connectedSourcesReadyToMount,
   sourceSetupIsActiveConnector,
   sourceSetupIsBusy,
+  sourceMountRetryOutcome,
   sourceSetupProgressLabel,
 } from "./source-setup";
 
@@ -41,5 +42,31 @@ describe("source setup progress", () => {
         mounts: [],
       }),
     ).toEqual(["notion"]);
+  });
+});
+
+describe("source File Provider mount retry", () => {
+  it("completes a successful automatic mount retry", () => {
+    expect(sourceMountRetryOutcome({ ok: true, message: "Mounted Notion." })).toEqual({
+      kind: "success",
+      message: "Mounted Notion.",
+    });
+  });
+
+  it("continues recovery when File Provider is still disabled", () => {
+    expect(sourceMountRetryOutcome({
+      ok: false,
+      message: "The Locality File Provider is registered but not enabled.",
+    })).toEqual({ kind: "retry" });
+  });
+
+  it("turns another automatic mount failure into a visible dialog error", () => {
+    expect(sourceMountRetryOutcome({
+      ok: false,
+      message: "Could not load the top-level Notion folder.",
+    })).toEqual({
+      kind: "error",
+      message: "Could not load the top-level Notion folder.",
+    });
   });
 });
