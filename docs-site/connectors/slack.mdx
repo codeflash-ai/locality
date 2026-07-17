@@ -1,0 +1,69 @@
+---
+title: "Slack connector"
+description: "Mount Slack conversations as read-only Markdown."
+---
+
+The Slack connector mounts recent Slack conversation history as read-only
+Markdown.
+
+## Connect
+
+```bash
+loc connect slack
+```
+
+Locality requests read-only bot scopes for conversation metadata and history,
+users and team metadata, and file metadata. It does not request `chat:write`,
+admin scopes, search scopes, or user email scope.
+
+## Mount
+
+```bash
+loc mount slack ~/Locality/slack-main
+loc pull ~/Locality/slack-main
+```
+
+Default settings:
+
+```json
+{"slack":{"history_limit":15,"types":["public_channel","private_channel","im","mpim"]}}
+```
+
+## Projection
+
+```text
+slack-main/
+  channels/
+    product/
+      recent.md
+  private-channels/
+    leadership/
+      recent.md
+  dms/
+    jane-doe/
+      recent.md
+  group-dms/
+    design-triage/
+      recent.md
+  users.md
+```
+
+- public channels live under `channels/`;
+- private channels live under `private-channels/`;
+- direct messages live under `dms/`;
+- multi-person direct messages live under `group-dms/`;
+- workspace user metadata lives in `users.md`;
+- each conversation directory contains `recent.md`.
+
+## Current limits
+
+- Slack V1 is read-only.
+- Locality rejects edits, creates, renames, moves, deletes, push writes, undo
+  writes, and autosave writes under Slack mounts.
+- History sync defaults to 15 messages per request and a 1 request/minute gate
+  to satisfy Slack's strictest documented policy for new non-Marketplace
+  commercial apps.
+- Internal customer-built and Marketplace apps may have different provider
+  limits, but Locality keeps this default conservative.
+- V1 does not post messages, expand thread bodies, subscribe to Slack events,
+  or store arbitrary Slack search results.

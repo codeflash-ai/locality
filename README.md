@@ -10,11 +10,11 @@ This file approach simplifies external apps for your agents, and collaborating w
 
 https://github.com/user-attachments/assets/b2486a4a-e957-4c4f-8e4d-12163c920b16
 
-The first supported platform is Notion: pages become directories, page bodies live
+Locality began with Notion support: pages become directories, page bodies live
 in `page.md`, child pages become child directories, and database rows become
 page-like folders with frontmatter. Humans, editors, scripts, and coding agents
-can search, read, and edit those files with ordinary filesystem tools while keeping
-Notion as the source of truth.
+can search, read, and edit mounted files with ordinary filesystem tools while
+keeping the remote app as the source of truth.
 
 ```text
 ~/Library/CloudStorage/Locality/notion
@@ -239,6 +239,7 @@ Core crates and directories:
 | `crates/locality-core` | Connector-neutral sync model, canonical Markdown, diff planning, validation, guardrails, conflicts, and journals. |
 | `crates/locality-connector` | Connector trait and data types for enumerate, fetch, render, parse, apply, and reverse apply. |
 | `crates/locality-notion` | Notion API client, DTOs, renderer, parser/apply support, database schema handling, media, and OAuth integration. |
+| `crates/locality-slack` | Slack Web API client, OAuth credential handling, read-only conversation projection, and Markdown rendering. |
 | `crates/locality-store` | SQLite state store, migrations, mounts, entities, shadows, journals, credentials metadata, and freshness state. |
 | `platform/linux/locality-fuse` | Linux FUSE helper for online-only virtual mounts. |
 | `platform/windows/locality-cloud-files` | Windows Cloud Files provider runtime. |
