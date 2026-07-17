@@ -1228,6 +1228,7 @@ where
             )?;
             let old_path = content_path_for_relative(content_root, &mutation.projected_path)?;
             let new_content_path = content_path_for_relative(content_root, &new_path)?;
+            ensure_pending_create_materializable(&mutation, &old_path)?;
             let title = match rename_policy {
                 VirtualRenamePolicy::FilenameDerived => filename_title.clone(),
                 VirtualRenamePolicy::PreserveCanonical => mutation.title.clone(),
@@ -1355,6 +1356,7 @@ where
         ensure_source_path_writable(&mount, &mutation.projected_path)?;
         let old_path = content_path_for_relative(content_root, &mutation.projected_path)?;
         let new_content_path = content_path_for_relative(content_root, &new_path)?;
+        ensure_pending_create_materializable(&mutation, &old_path)?;
         rename_cached_file_if_present(&old_path, &new_content_path)?;
         mutation.projected_path = new_path;
         if rename_policy == VirtualRenamePolicy::FilenameDerived {
@@ -2158,6 +2160,19 @@ where
         ))),
         Err(error) => Err(error.into()),
     }
+}
+
+fn ensure_pending_create_materializable(
+    mutation: &VirtualMutationRecord,
+    cached_path: &Path,
+) -> LocalityResult<()> {
+    if cached_path.is_file() {
+        return Ok(());
+    }
+    Err(LocalityError::InvalidState(format!(
+        "pending create `{}` must be materialized before it can be moved or renamed",
+        mutation.local_id
+    )))
 }
 
 fn rename_cached_file_if_present(from: &Path, to: &Path) -> LocalityResult<()> {
@@ -6143,6 +6158,141 @@ mod tests {
             mutation.projected_path,
             PathBuf::from("Team A/ENG-2-new.md")
         );
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn linear_pending_page_directory_rename_without_cache_fails_before_state_changes() {
+        let mount_id = MountId::new("linear-main");
+        let state_root = temp_root("loc-virtual-fs-linear-pending-dir-missing-cache");
+        let content_root = state_root.join("content/linear-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount_with_connector(&mount_id, "linear"))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("team-a"),
+                EntityKind::Page,
+                "Team A",
+                "Team A/page.md",
+            ))
+            .expect("save parent");
+        let created = create_virtual_fs_directory(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "children:team-a",
+            "ENG-7-old",
+        )
+        .expect("create pending issue");
+        let local_id = created
+            .identifier
+            .strip_prefix("children:")
+            .expect("pending local id");
+        let old_cache = content_root.join("Team A/ENG-7-old/page.md");
+        std::fs::remove_file(&old_cache).expect("remove pending cache");
+        let before_entities = store.list_entities(&mount_id).expect("list entities");
+        let before_mutation = store
+            .get_virtual_mutation(&mount_id, local_id)
+            .expect("get mutation")
+            .expect("mutation");
+
+        let error = rename_virtual_fs_item(
+            &mut store,
+            &content_root,
+            &mount_id,
+            &created.identifier,
+            "children:team-a",
+            "ENG-7-new",
+        )
+        .expect_err("missing pending page cache must fail");
+
+        assert_eq!(
+            error,
+            LocalityError::InvalidState(format!(
+                "pending create `{local_id}` must be materialized before it can be moved or renamed"
+            ))
+        );
+        assert_eq!(
+            store.list_entities(&mount_id).expect("list entities"),
+            before_entities
+        );
+        assert_eq!(
+            store
+                .get_virtual_mutation(&mount_id, local_id)
+                .expect("get mutation"),
+            Some(before_mutation)
+        );
+        assert!(!old_cache.exists());
+        assert!(!content_root.join("Team A/ENG-7-new").exists());
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn linear_pending_flat_rename_without_cache_fails_before_state_changes() {
+        let mount_id = MountId::new("linear-main");
+        let state_root = temp_root("loc-virtual-fs-linear-pending-flat-missing-cache");
+        let content_root = state_root.join("content/linear-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount_with_connector(&mount_id, "linear"))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("team-a"),
+                EntityKind::Page,
+                "Team A",
+                "Team A/page.md",
+            ))
+            .expect("save parent");
+        let created = create_virtual_fs_file(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "children:team-a",
+            "ENG-8-old.md",
+        )
+        .expect("create pending issue");
+        let old_cache = content_root.join("Team A/ENG-8-old.md");
+        std::fs::remove_file(&old_cache).expect("remove pending cache");
+        let before_entities = store.list_entities(&mount_id).expect("list entities");
+        let before_mutation = store
+            .get_virtual_mutation(&mount_id, &created.identifier)
+            .expect("get mutation")
+            .expect("mutation");
+
+        let error = rename_virtual_fs_item(
+            &mut store,
+            &content_root,
+            &mount_id,
+            &created.identifier,
+            "children:team-a",
+            "ENG-8-new.md",
+        )
+        .expect_err("missing pending flat cache must fail");
+
+        assert_eq!(
+            error,
+            LocalityError::InvalidState(format!(
+                "pending create `{}` must be materialized before it can be moved or renamed",
+                created.identifier
+            ))
+        );
+        assert_eq!(
+            store.list_entities(&mount_id).expect("list entities"),
+            before_entities
+        );
+        assert_eq!(
+            store
+                .get_virtual_mutation(&mount_id, &created.identifier)
+                .expect("get mutation"),
+            Some(before_mutation)
+        );
+        assert!(!old_cache.exists());
+        assert!(!content_root.join("Team A/ENG-8-new.md").exists());
         let _ = std::fs::remove_dir_all(state_root);
     }
 
