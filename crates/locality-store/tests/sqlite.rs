@@ -108,7 +108,7 @@ fn sqlite_store_seeds_state_compatibility_components() {
             (
                 "durable:journals".to_string(),
                 "durable_json".to_string(),
-                2,
+                3,
                 1,
                 1,
                 0
@@ -1311,7 +1311,39 @@ fn sqlite_store_blocks_components_that_require_newer_readers() {
         vec![StateCompatibilityIssue::ComponentRequiresNewerReader {
             component_id: "durable:journals".to_string(),
             min_reader_version: 999,
-            supported: 2,
+            supported: 3,
+        }]
+    );
+
+    let error = SqliteStateStore::open(fixture.state_root.clone()).expect_err("open blocked");
+    assert!(matches!(error, StoreError::StateCompatibility(_)));
+}
+
+#[test]
+fn sqlite_store_blocks_newer_journal_component_versions() {
+    let fixture = SqliteFixture::new();
+    let store = fixture.open();
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    connection
+        .execute(
+            "UPDATE state_components
+             SET version = 999
+             WHERE component_id = 'durable:journals'",
+            [],
+        )
+        .expect("bump journal component");
+    drop(connection);
+    drop(store);
+
+    let report =
+        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect state");
+    assert_eq!(report.status, StateCompatibilityStatus::NeedsUpdate);
+    assert_eq!(
+        report.issues,
+        vec![StateCompatibilityIssue::NewerComponent {
+            component_id: "durable:journals".to_string(),
+            found: 999,
+            supported: 3,
         }]
     );
 
@@ -3111,7 +3143,7 @@ fn sqlite_store_migrates_v16_journals_with_empty_edit_metadata() {
         .expect("journal");
 
     assert_eq!(user_version, 18);
-    assert_eq!(journals_component_version, 2);
+    assert_eq!(journals_component_version, 3);
     assert_eq!(
         metadata_json,
         serde_json::to_string(&JournalMetadata::default()).expect("default metadata json")

@@ -249,12 +249,14 @@ pub fn property_value_from_frontmatter(value: &Value) -> PropertyValue {
         Value::Bool(value) => PropertyValue::Bool(*value),
         Value::Number(value) => PropertyValue::Number(value.to_string()),
         Value::String(value) => PropertyValue::String(value.clone()),
-        Value::Sequence(values) => PropertyValue::List(
-            values
-                .iter()
-                .filter_map(simple_frontmatter_string)
-                .collect::<Vec<_>>(),
-        ),
+        Value::Sequence(values) => values
+            .iter()
+            .map(simple_frontmatter_string)
+            .collect::<Option<Vec<_>>>()
+            .map(PropertyValue::List)
+            .unwrap_or_else(|| {
+                PropertyValue::Array(values.iter().map(property_value_from_frontmatter).collect())
+            }),
         Value::Mapping(mapping) => PropertyValue::Object(
             mapping
                 .iter()
@@ -1032,4 +1034,62 @@ fn issue(code: impl Into<String>, line: usize, message: impl Into<String>) -> Va
         message,
         Some("restore the directive line exactly or delete it to delete the block".to_string()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::property_value_from_frontmatter;
+    use crate::planner::PropertyValue;
+    use yaml_serde::Value;
+
+    #[test]
+    fn property_value_from_frontmatter_preserves_nested_sequences_for_connector_drafts() {
+        let value: Value = yaml_serde::from_str(
+            r#"
+attendees:
+  - email: ann@example.com
+    optional: true
+reminders:
+  overrides:
+    - method: popup
+      minutes: 10
+"#,
+        )
+        .expect("yaml");
+
+        let converted = property_value_from_frontmatter(&value);
+        let PropertyValue::Object(root) = converted else {
+            panic!("expected root object");
+        };
+        let PropertyValue::Array(attendees) = root.get("attendees").expect("attendees") else {
+            panic!("expected attendees array");
+        };
+        let PropertyValue::Object(attendee) = attendees.first().expect("first attendee") else {
+            panic!("expected attendee object");
+        };
+        assert_eq!(
+            attendee.get("email"),
+            Some(&PropertyValue::String("ann@example.com".to_string()))
+        );
+        assert_eq!(attendee.get("optional"), Some(&PropertyValue::Bool(true)));
+
+        let PropertyValue::Object(reminders) = root.get("reminders").expect("reminders") else {
+            panic!("expected reminders object");
+        };
+        let PropertyValue::Array(overrides) = reminders.get("overrides").expect("overrides") else {
+            panic!("expected reminders overrides array");
+        };
+        let PropertyValue::Object(override_value) = overrides.first().expect("first override")
+        else {
+            panic!("expected override object");
+        };
+        assert_eq!(
+            override_value.get("method"),
+            Some(&PropertyValue::String("popup".to_string()))
+        );
+        assert_eq!(
+            override_value.get("minutes"),
+            Some(&PropertyValue::Number("10".to_string()))
+        );
+    }
 }
