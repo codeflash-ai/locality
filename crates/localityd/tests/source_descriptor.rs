@@ -5,6 +5,9 @@ use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_core::shadow::ShadowDocument;
 use locality_core::validation::ValidationIssue;
 use locality_gmail::{GMAIL_CONNECTOR_ID, GMAIL_OAUTH_SCOPES, StoredGmailCredential};
+use locality_google_calendar::{
+    GOOGLE_CALENDAR_CONNECTOR_ID, GOOGLE_CALENDAR_OAUTH_SCOPES, StoredGoogleCalendarCredential,
+};
 use locality_google_docs::{GOOGLE_DOCS_CONNECTOR_ID, StoredGoogleDocsCredential};
 use locality_granola::GRANOLA_CONNECTOR_ID;
 use locality_notion::client::DEFAULT_NOTION_TOKEN_ENV;
@@ -66,6 +69,30 @@ fn google_docs_descriptor_comes_from_registry() {
 }
 
 #[test]
+fn google_calendar_descriptor_comes_from_registry() {
+    let descriptor = source_descriptor("google-calendar");
+
+    assert_eq!(descriptor.id(), "google-calendar");
+    assert_eq!(descriptor.display_name(), "Google Calendar");
+    assert_eq!(descriptor.default_mount_id(), "google-calendar-main");
+    assert_eq!(
+        descriptor.connect_command(),
+        Some("loc connect google-calendar")
+    );
+    assert_eq!(descriptor.auth_env_var(), None);
+    assert!(descriptor.supports_oauth());
+    assert!(
+        descriptor
+            .mount_guidance()
+            .contains("Google Calendar facts")
+    );
+    assert_eq!(
+        descriptor.create_entity_parent_kinds(),
+        &[EntityKind::Directory]
+    );
+}
+
+#[test]
 fn gmail_descriptor_comes_from_registry() {
     let descriptor = source_descriptor("gmail");
 
@@ -117,6 +144,31 @@ fn granola_rejects_every_write_and_create_path() {
     assert!(
         !source_create_decision_for_parent_path(&mount, std::path::Path::new("meeting"))
             .is_writable()
+    );
+}
+
+#[test]
+fn google_calendar_write_policy_allows_only_direct_drafts() {
+    let mut mount = MountConfig::new(
+        MountId::new("google-calendar-main"),
+        GOOGLE_CALENDAR_CONNECTOR_ID,
+        "/tmp/locality/google-calendar",
+    );
+    mount.read_only = false;
+
+    assert!(
+        !source_write_decision_for_path(&mount, std::path::Path::new("events/foo.md"))
+            .is_writable()
+    );
+    assert!(
+        source_write_decision_for_path(&mount, std::path::Path::new("draft/foo.md")).is_writable()
+    );
+    assert!(
+        !source_create_decision_for_parent_path(&mount, std::path::Path::new("events"))
+            .is_writable()
+    );
+    assert!(
+        source_create_decision_for_parent_path(&mount, std::path::Path::new("draft")).is_writable()
     );
 }
 
@@ -255,6 +307,55 @@ fn save_gmail_connection(
     (connection_id, secret_ref)
 }
 
+fn save_google_calendar_connection(store: &mut InMemoryStateStore) -> (ConnectionId, String) {
+    let profile_id = ConnectorProfileId::new("google-calendar-oauth-default");
+    let connection_id = ConnectionId::new("google-calendar-default");
+    let secret_ref = "connection:google-calendar-default".to_string();
+
+    store
+        .save_connector_profile(ConnectorProfileRecord {
+            profile_id: profile_id.clone(),
+            connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
+            display_name: "Google Calendar OAuth".to_string(),
+            auth_kind: "oauth".to_string(),
+            scopes: GOOGLE_CALENDAR_OAUTH_SCOPES
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect(),
+            capabilities_json: "{}".to_string(),
+            enabled_actions_json: "[]".to_string(),
+            connector_version: "1".to_string(),
+            status: "active".to_string(),
+            created_at: "2026-06-25T10:00:00Z".to_string(),
+            updated_at: "2026-06-25T10:00:00Z".to_string(),
+        })
+        .expect("save profile");
+    store
+        .save_connection(ConnectionRecord {
+            connection_id: connection_id.clone(),
+            profile_id: Some(profile_id),
+            connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
+            display_name: "Google Calendar".to_string(),
+            account_label: Some("user@example.com".to_string()),
+            workspace_id: Some("primary".to_string()),
+            workspace_name: Some("Primary calendar".to_string()),
+            auth_kind: "oauth".to_string(),
+            secret_ref: secret_ref.clone(),
+            scopes: GOOGLE_CALENDAR_OAUTH_SCOPES
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect(),
+            capabilities_json: "{}".to_string(),
+            status: "active".to_string(),
+            created_at: "2026-06-25T10:00:00Z".to_string(),
+            updated_at: "2026-06-25T10:00:00Z".to_string(),
+            expires_at: None,
+        })
+        .expect("save connection");
+
+    (connection_id, secret_ref)
+}
+
 fn stored_gmail_credential(access_token: &str) -> StoredGmailCredential {
     StoredGmailCredential::from_broker_token(
         OAuthBrokerToken {
@@ -267,6 +368,28 @@ fn stored_gmail_credential(access_token: &str) -> StoredGmailCredential {
             workspace_id: Some("gmail".to_string()),
             workspace_name: Some("Gmail".to_string()),
             scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_string()],
+        },
+        "client-id".to_string(),
+        "https://auth.example.test".to_string(),
+        4_102_444_800,
+    )
+}
+
+fn stored_google_calendar_credential(access_token: &str) -> StoredGoogleCalendarCredential {
+    StoredGoogleCalendarCredential::from_broker_token(
+        OAuthBrokerToken {
+            access_token: access_token.to_string(),
+            token_type: Some("Bearer".to_string()),
+            expires_in: Some(3600),
+            refresh_token_handle: Some("handle-1".to_string()),
+            account_id: Some("acct-1".to_string()),
+            account_label: Some("user@example.com".to_string()),
+            workspace_id: Some("primary".to_string()),
+            workspace_name: Some("Primary calendar".to_string()),
+            scopes: GOOGLE_CALENDAR_OAUTH_SCOPES
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect(),
         },
         "client-id".to_string(),
         "https://auth.example.test".to_string(),
@@ -300,6 +423,14 @@ fn expired_gmail_credential(access_token: &str, broker_url: String) -> StoredGma
 
 fn gmail_mount() -> MountConfig {
     MountConfig::new(MountId::new("gmail-main"), GMAIL_CONNECTOR_ID, "/tmp/gmail")
+}
+
+fn google_calendar_mount() -> MountConfig {
+    MountConfig::new(
+        MountId::new("google-calendar-main"),
+        GOOGLE_CALENDAR_CONNECTOR_ID,
+        "/tmp/google-calendar",
+    )
 }
 
 fn validate_gmail_create_issues(path: &str, markdown: &str) -> Vec<ValidationIssue> {
@@ -346,11 +477,57 @@ fn validate_gmail_changed(path: &str, markdown: &str) -> Vec<String> {
         .collect()
 }
 
+fn validate_google_calendar_create(path: &str, markdown: &str) -> Vec<String> {
+    let mount = google_calendar_mount();
+    let parsed = parse_canonical_markdown(markdown).expect("parse google calendar markdown");
+
+    LocalSourceValidator
+        .validate_create_frontmatter(SourceValidationContext {
+            state_root: None,
+            mount: &mount,
+            parent: None,
+            relative_path: std::path::Path::new(path),
+            parsed: &parsed,
+            shadow: None,
+        })
+        .expect("validate google calendar create")
+        .issues
+        .into_iter()
+        .map(|issue| issue.code)
+        .collect()
+}
+
+fn validate_google_calendar_changed(path: &str, markdown: &str) -> Vec<String> {
+    let mount = google_calendar_mount();
+    let parsed = parse_canonical_markdown(markdown).expect("parse google calendar markdown");
+
+    LocalSourceValidator
+        .validate_changed_frontmatter(SourceValidationContext {
+            state_root: None,
+            mount: &mount,
+            parent: None,
+            relative_path: std::path::Path::new(path),
+            parsed: &parsed,
+            shadow: None,
+        })
+        .expect("validate google calendar changed")
+        .issues
+        .into_iter()
+        .map(|issue| issue.code)
+        .collect()
+}
+
 #[test]
 fn supported_source_connectors_include_first_party_connectors() {
     assert_eq!(
         supported_source_connectors(),
-        vec!["notion", "google-docs", "gmail", "granola"]
+        vec![
+            "notion",
+            "google-docs",
+            "google-calendar",
+            "gmail",
+            "granola"
+        ]
     );
 }
 
@@ -427,6 +604,28 @@ fn resolving_gmail_mount_uses_active_oauth_connection_credentials() {
         panic!("expected gmail source");
     };
     assert_eq!(connector.config().access_token, "gmail-access-token");
+}
+
+#[test]
+fn resolving_google_calendar_mount_uses_active_oauth_connection_credentials() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (_connection_id, secret_ref) = save_google_calendar_connection(&mut store);
+    credentials
+        .put(
+            &secret_ref,
+            &serde_json::to_string(&stored_google_calendar_credential("calendar-access-token"))
+                .expect("credential json"),
+        )
+        .expect("save credential");
+
+    let source = resolve_source_for_mount(&store, &credentials, &google_calendar_mount())
+        .expect("resolve google calendar");
+
+    let ResolvedSource::GoogleCalendar(connector) = source else {
+        panic!("expected google calendar source");
+    };
+    assert_eq!(connector.config().access_token, "calendar-access-token");
 }
 
 #[test]
@@ -883,6 +1082,50 @@ fn local_gmail_validator_blocks_changed_inbox_and_sent_items() {
 
         assert_eq!(issues, vec!["gmail_read_only_mailbox"]);
     }
+}
+
+#[test]
+fn local_google_calendar_validator_allows_valid_direct_draft_create() {
+    let issues = validate_google_calendar_create(
+        "draft/foo.md",
+        "---\nsummary: Team sync\nstart:\n  dateTime: \"2026-07-20T10:00:00Z\"\nend:\n  dateTime: \"2026-07-20T10:30:00Z\"\n---\nAgenda\n",
+    );
+
+    assert!(issues.is_empty());
+}
+
+#[test]
+fn local_google_calendar_validator_blocks_nested_draft_create() {
+    let issues = validate_google_calendar_create(
+        "draft/nested/foo.md",
+        "---\nsummary: Team sync\nstart:\n  dateTime: \"2026-07-20T10:00:00Z\"\nend:\n  dateTime: \"2026-07-20T10:30:00Z\"\n---\nAgenda\n",
+    );
+
+    assert_eq!(issues, vec!["google_calendar_create_outside_draft"]);
+}
+
+#[test]
+fn local_google_calendar_validator_blocks_changed_events() {
+    let issues = validate_google_calendar_changed(
+        "events/foo.md",
+        "---\nloc:\n  id: event-1\n  type: page\n  connector: google-calendar\nsummary: Team sync\n---\nAgenda\n",
+    );
+
+    assert_eq!(issues, vec!["google_calendar_events_read_only"]);
+}
+
+#[test]
+fn local_google_calendar_validator_blocks_missing_required_draft_frontmatter() {
+    let issues = validate_google_calendar_create("draft/foo.md", "---\n---\nAgenda\n");
+
+    assert_eq!(
+        issues,
+        vec![
+            "google_calendar_draft_missing_start",
+            "google_calendar_draft_missing_end",
+            "google_calendar_draft_missing_summary"
+        ]
+    );
 }
 
 #[test]
