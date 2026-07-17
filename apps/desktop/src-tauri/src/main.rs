@@ -11478,6 +11478,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use loc_cli::search::{SearchRemoteState, SearchResult, SearchSafety};
@@ -11489,6 +11490,7 @@ mod tests {
     };
     use locality_core::planner::PushPlan;
     use locality_core::shadow::ShadowDocument;
+    use locality_slack::{SLACK_CONNECTOR_ID, SlackMountSettings};
     use locality_store::{
         AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, ConnectionId,
         ConnectionRecord, ConnectionRepository, ConnectorProfileId, EntityRecord, EntityRepository,
@@ -12000,6 +12002,48 @@ mod tests {
 
         assert_eq!(selected.mount_id, google.mount_id);
         assert_eq!(selected.connector, "google-docs");
+    }
+
+    #[test]
+    fn create_desktop_mount_blocking_persists_slack_as_read_only_with_default_settings() {
+        let _lock = state_root_env_lock().lock().expect("state root env lock");
+        let temp = TestTempDir::new("desktop-slack-mount-safety");
+        let state_root = temp.path().join(".loc");
+        let shared_root = temp.path().join("Locality");
+        let mount_root = shared_root.join("slack");
+        fs::create_dir_all(&shared_root).expect("create shared mount root");
+        let mount_id = MountId::new("slack-main");
+        let state_root_guard = LocalityStateDirGuard::set(&state_root);
+
+        let _ = super::create_desktop_mount_blocking(super::CreateDesktopMountRequest {
+            connector: SLACK_CONNECTOR_ID.to_string(),
+            path: mount_root.display().to_string(),
+            mount_id: mount_id.0.clone(),
+            connection_id: None,
+            read_only: false,
+            notion_root_page: Some("should-not-be-used".to_string()),
+            google_docs_workspace_folder: Some("should-not-be-used".to_string()),
+        });
+        drop(state_root_guard);
+
+        let store = SqliteStateStore::open(state_root.clone()).expect("open state store");
+        let mount = store
+            .get_mount(&mount_id)
+            .expect("load persisted Slack mount")
+            .expect("Slack mount persisted before provider activation");
+
+        assert_eq!(mount.mount_id, mount_id);
+        assert_eq!(mount.connector, SLACK_CONNECTOR_ID);
+        assert_eq!(mount.root, mount_root);
+        assert_eq!(mount.connection_id, None);
+        assert_eq!(mount.remote_root_id, None);
+        assert!(mount.read_only);
+        assert_eq!(
+            mount.settings_json,
+            SlackMountSettings::default()
+                .to_json()
+                .expect("serialize default Slack settings")
+        );
     }
 
     #[test]
@@ -16197,6 +16241,46 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    struct LocalityStateDirGuard {
+        previous: Option<std::ffi::OsString>,
+        state_root: PathBuf,
+    }
+
+    impl LocalityStateDirGuard {
+        fn set(state_root: &Path) -> Self {
+            let previous = std::env::var_os("LOCALITY_STATE_DIR");
+            unsafe {
+                std::env::set_var("LOCALITY_STATE_DIR", state_root);
+            }
+            Self {
+                previous,
+                state_root: state_root.to_path_buf(),
+            }
+        }
+    }
+
+    impl Drop for LocalityStateDirGuard {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => unsafe {
+                    std::env::set_var("LOCALITY_STATE_DIR", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("LOCALITY_STATE_DIR");
+                },
+            }
+            let _ = loc_cli::daemon::run_daemon_control(&super::daemon_control_args_any_manager(
+                "stop",
+                &self.state_root,
+            ));
+        }
+    }
+
+    fn state_root_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
     }
 
     fn test_connection(workspace_id: &str, workspace_name: &str) -> ConnectionRecord {
