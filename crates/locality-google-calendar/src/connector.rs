@@ -586,7 +586,11 @@ fn draft_from_push_create(
             .filter(|summary| !summary.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| title.to_string()),
-        description: (!body.is_empty()).then(|| body.to_string()),
+        description: if body.is_empty() {
+            string_property(properties, "description").cloned()
+        } else {
+            Some(body.to_string())
+        },
         location: non_blank_string_property(properties, "location"),
         start: start.expect("validated start property"),
         end: end.expect("validated end property"),
@@ -596,8 +600,31 @@ fn draft_from_push_create(
         transparency: non_blank_string_property(properties, "transparency"),
         visibility: non_blank_string_property(properties, "visibility"),
         create_google_meet,
-        extra: BTreeMap::new(),
+        extra: properties
+            .iter()
+            .filter(|(key, _)| !calendar_draft_known_property(key))
+            .map(|(key, value)| (key.clone(), property_value_to_json(value)))
+            .collect(),
     })
+}
+
+fn calendar_draft_known_property(key: &str) -> bool {
+    matches!(
+        key,
+        "title"
+            | "summary"
+            | "description"
+            | "location"
+            | "start"
+            | "end"
+            | "attendees"
+            | "recurrence"
+            | "reminders"
+            | "transparency"
+            | "visibility"
+            | "google_calendar"
+            | "loc"
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1441,6 +1468,46 @@ google_calendar:
         assert_eq!(request.attendees[0].additional_guests, Some(2));
         assert!(request.conference_data.is_some());
         assert!(*create_conference);
+    }
+
+    #[test]
+    fn apply_create_entity_uses_frontmatter_description_and_preserves_extra_fields() {
+        let api = Arc::new(FakeGoogleCalendarApi::default());
+        let connector =
+            GoogleCalendarConnector::with_api(GoogleCalendarConfig::new("token"), api.clone());
+        let mut plan = draft_create_plan("draft/design-review.md");
+        let PushOperation::CreateEntity {
+            properties, body, ..
+        } = &mut plan.operations[0]
+        else {
+            panic!("expected create entity operation");
+        };
+        body.clear();
+        properties.insert(
+            "description".to_string(),
+            PropertyValue::String("Frontmatter description".to_string()),
+        );
+        properties.insert("colorId".to_string(), PropertyValue::String("7".to_string()));
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("calendar-main"),
+                plan: &plan,
+                operation_ids: &[PushOperationId("op-1".to_string())],
+                remote_preconditions: &[] as &[RemotePrecondition],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(calls.insert_events.len(), 1);
+        let (_, request, _) = &calls.insert_events[0];
+        assert_eq!(
+            request.description.as_deref(),
+            Some("Frontmatter description")
+        );
+        assert_eq!(request.extra.get("colorId"), Some(&json!("7")));
     }
 
     #[test]

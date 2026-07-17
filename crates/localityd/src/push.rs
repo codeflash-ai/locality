@@ -2998,7 +2998,7 @@ where
                         entity_path,
                     )
                     .with_hydration(HydrationState::Stub);
-                    let rendered = self.source.fetch_render(
+                    let mut rendered = self.source.fetch_render(
                         &locality_core::hydration::HydrationRequest::new(
                             request.mount_id.clone(),
                             entity_id.clone(),
@@ -3007,7 +3007,7 @@ where
                             locality_core::hydration::HydrationReason::ExplicitPull,
                         ),
                     )?;
-                    entity.path = created_entity_reconcile_path_from_rendered(
+                    let rendered_path = created_entity_reconcile_path_from_rendered(
                         self.store,
                         request.mount_id,
                         &entity.path,
@@ -3016,6 +3016,20 @@ where
                         entity_id,
                         &rendered,
                     )?;
+                    if rendered_path != entity.path {
+                        entity.path = rendered_path;
+                        rendered = self.source.fetch_render(
+                            &locality_core::hydration::HydrationRequest::new(
+                                request.mount_id.clone(),
+                                entity_id.clone(),
+                                entity.path.clone(),
+                                HydrationState::Hydrated,
+                                locality_core::hydration::HydrationReason::ExplicitPull,
+                            ),
+                        )?;
+                    } else {
+                        entity.path = rendered_path;
+                    }
                     let path =
                         projection_write_path(self.state_root.as_deref(), &mount, &entity.path);
                     let output_root = projection_output_root(self.state_root.as_deref(), &mount)?;
@@ -3198,6 +3212,9 @@ where
     if let Some(filename) = gmail_rendered_message_filename(entity_id, rendered) {
         return Ok(parent.path.join(filename));
     }
+    if let Some(filename) = google_calendar_rendered_event_filename(entity_id, rendered) {
+        return Ok(parent.path.join(filename));
+    }
 
     Ok(current_path.to_path_buf())
 }
@@ -3230,9 +3247,9 @@ fn gmail_rendered_message_filename(
 
     Some(format!(
         "{}-{}-{}.md",
-        gmail_safe_slug(internal_date),
-        gmail_safe_slug(title),
-        gmail_safe_slug(entity_id.as_str())
+        created_entity_safe_slug(internal_date),
+        created_entity_safe_slug(title),
+        created_entity_safe_slug(entity_id.as_str())
     ))
 }
 
@@ -3248,7 +3265,85 @@ fn gmail_internal_date<'a>(entity_id: &RemoteId, remote_version: &'a str) -> Opt
     })
 }
 
-fn gmail_safe_slug(value: &str) -> String {
+fn google_calendar_rendered_event_filename(
+    entity_id: &RemoteId,
+    rendered: &HydratedEntity,
+) -> Option<String> {
+    let rendered_markdown = render_canonical_markdown(&rendered.document);
+    let parsed = parse_canonical_markdown(&rendered_markdown).ok()?;
+    let event_id = google_calendar_frontmatter_event_id(&parsed.frontmatter.properties)
+        .or_else(|| google_calendar_event_id_from_remote_id(entity_id))?;
+    let start = google_calendar_start_value(&parsed.frontmatter.properties)?;
+    let summary = frontmatter_string(&parsed.frontmatter.properties, "summary");
+    let title = parsed
+        .frontmatter
+        .title
+        .as_deref()
+        .or(summary.as_deref())
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or("untitled");
+
+    Some(format!(
+        "{}-{}-{}.md",
+        google_calendar_compact_start_prefix(&start),
+        created_entity_safe_slug(title),
+        created_entity_safe_slug(&event_id)
+    ))
+}
+
+fn google_calendar_frontmatter_event_id(
+    properties: &locality_core::canonical::FrontmatterProperties,
+) -> Option<String> {
+    let PropertyValue::Object(google_calendar) =
+        properties.get("google_calendar").map(property_value_from_frontmatter)?
+    else {
+        return None;
+    };
+    match google_calendar.get("event_id") {
+        Some(PropertyValue::String(value)) if !value.trim().is_empty() => {
+            Some(value.trim().to_string())
+        }
+        _ => None,
+    }
+}
+
+fn google_calendar_start_value(
+    properties: &locality_core::canonical::FrontmatterProperties,
+) -> Option<String> {
+    let PropertyValue::Object(start) = properties.get("start").map(property_value_from_frontmatter)?
+    else {
+        return None;
+    };
+    match start.get("dateTime").or_else(|| start.get("date")) {
+        Some(PropertyValue::String(value)) if !value.trim().is_empty() => {
+            Some(value.trim().to_string())
+        }
+        _ => None,
+    }
+}
+
+fn google_calendar_event_id_from_remote_id(entity_id: &RemoteId) -> Option<String> {
+    entity_id
+        .as_str()
+        .strip_prefix("google-calendar-event:")
+        .and_then(|rest| rest.split_once(':'))
+        .and_then(|(_, event_id)| (!event_id.is_empty()).then(|| event_id.to_string()))
+}
+
+fn google_calendar_compact_start_prefix(sort_start_key: &str) -> String {
+    let mut digits = sort_start_key
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .take(14)
+        .collect::<String>();
+    while digits.len() < 14 {
+        digits.push('0');
+    }
+    format!("{}-{}", &digits[..8], &digits[8..14])
+}
+
+fn created_entity_safe_slug(value: &str) -> String {
     let mut slug = String::new();
     let mut last_was_dash = false;
     for ch in value.chars().flat_map(char::to_lowercase) {
