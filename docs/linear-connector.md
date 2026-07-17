@@ -11,11 +11,13 @@ default connection with:
 
 ```bash
 printf '%s' "$LINEAR_API_KEY" | loc connect linear --api-key-stdin
+loc mount linear ~/Locality/linear --connection linear-default
 ```
 
 `loc connect linear` stores the API key in the credential store under the
 connection secret reference and persists only non-secret connection metadata in
-SQLite. The default connection id is `linear-default`; Linear mounts default to
+SQLite. `loc mount linear` validates the stored connection before saving the
+mount. The default connection id is `linear-default`; Linear mounts default to
 `linear-main`. OAuth is intentionally not advertised by the source descriptor
 until a Locality OAuth broker flow exists for Linear.
 

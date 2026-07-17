@@ -46,6 +46,7 @@ use localityd::google_docs::resolve_google_docs_connector_for_mount;
 use localityd::granola::resolve_granola_connector_for_mount;
 use localityd::hydration::write_parent_database_schema_cache;
 use localityd::ipc::{DaemonClientError, DaemonRequest, send_request_with_timeout};
+use localityd::linear::resolve_linear_connector_for_mount;
 use localityd::runtime::repair_clean_remote_deleted_projections;
 use localityd::virtual_fs::{
     VirtualFsChildrenReport, mount_point_identifier, virtual_fs_ancestor_container_identifiers,
@@ -407,6 +408,8 @@ enum MountCommand {
     Gmail(MountGmailArgs),
     #[command(about = "Mount Granola meeting notes read-only")]
     Granola(MountGranolaArgs),
+    #[command(about = "Mount Linear issues")]
+    Linear(MountLinearArgs),
 }
 
 #[derive(Debug, Args)]
@@ -423,6 +426,31 @@ struct MountGranolaArgs {
     mount_id: Option<String>,
     #[arg(long, value_name = "mode", help = "Projection mode.")]
     projection: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct MountLinearArgs {
+    #[arg(value_name = "path", help = "Local directory for the Linear mount.")]
+    path: String,
+    #[arg(long, value_name = "id", help = "Connection id to use for this mount.")]
+    connection: Option<String>,
+    #[arg(
+        long,
+        value_name = "id",
+        help = "Mount id to save. Defaults to linear-main."
+    )]
+    mount_id: Option<String>,
+    #[arg(
+        long,
+        value_name = "mode",
+        help = "Projection mode. Supported values depend on the host platform."
+    )]
+    projection: Option<String>,
+    #[arg(
+        long,
+        help = "Register the mount as read-only and block push operations."
+    )]
+    read_only: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1106,6 +1134,22 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                         "--projection",
                         options.projection.as_deref(),
                     );
+                }
+                MountCommand::Linear(options) => {
+                    args.push("linear".to_string());
+                    args.push(options.path.clone());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--connection",
+                        options.connection.as_deref(),
+                    );
+                    push_optional_flag_value(&mut args, "--mount-id", options.mount_id.as_deref());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--projection",
+                        options.projection.as_deref(),
+                    );
+                    push_flag(&mut args, "--read-only", options.read_only);
                 }
             }
         }
@@ -2911,6 +2955,32 @@ fn mount_remote_root_id(
             };
             let credentials = open_credential_store(state_root);
             resolve_granola_connector_for_mount(store, credentials.as_ref(), &temp_mount)
+                .map_err(|error| connector_resolve_command_error("mount", error))?;
+            Ok(None)
+        }
+        LINEAR_CONNECTOR_ID => {
+            if has_flag(args, "--workspace")
+                || flag_value(args, "--root-page").is_some()
+                || flag_value(args, "--workspace-folder").is_some()
+            {
+                return Err(CommandError::new(
+                    "mount",
+                    "usage",
+                    "loc mount linear does not accept source root flags",
+                ));
+            }
+            let temp_mount = MountConfig {
+                mount_id: mount_id.clone(),
+                connector: descriptor.id().to_string(),
+                root: PathBuf::from(root),
+                remote_root_id: None,
+                connection_id: connection_id.clone(),
+                read_only,
+                projection: projection.clone(),
+                settings_json: "{}".to_string(),
+            };
+            let credentials = open_credential_store(state_root);
+            resolve_linear_connector_for_mount(store, credentials.as_ref(), &temp_mount)
                 .map_err(|error| connector_resolve_command_error("mount", error))?;
             Ok(None)
         }
@@ -7758,7 +7828,7 @@ fn projection_mode_for_target(args: &[String], target_os: &str) -> Result<Projec
 
 fn mount_usage() -> String {
     format!(
-        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--read-only] [--json]\n       loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--json]",
+        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--read-only] [--json]\n       loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--json]\n       loc mount linear <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]",
         projection_usage_options_for_target(std::env::consts::OS)
     )
 }
@@ -8386,6 +8456,7 @@ mod tests {
                     "google-docs",
                     "gmail",
                     "granola",
+                    "linear",
                     "--json",
                 ],
             ),
@@ -8420,6 +8491,15 @@ mod tests {
                 vec![
                     "Usage: loc mount granola",
                     "Mount Granola meeting notes read-only",
+                    "--connection",
+                    "--projection",
+                ],
+            ),
+            (
+                vec!["mount", "linear", "--help"],
+                vec![
+                    "Usage: loc mount linear",
+                    "Mount Linear issues",
                     "--connection",
                     "--projection",
                 ],
@@ -8691,6 +8771,7 @@ mod tests {
 
         assert!(usage.contains("--after YYYY-MM-DD --before YYYY-MM-DD"));
         assert!(usage.contains("--view messages|threads"));
+        assert!(usage.contains("loc mount linear <path>"));
     }
 
     #[test]
