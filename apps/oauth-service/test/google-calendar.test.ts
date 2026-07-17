@@ -12,6 +12,7 @@ interface StartResponse {
 }
 
 interface BrokerTokenResponse {
+  connector: string;
   access_token: string;
   scope?: string;
   id_token?: string;
@@ -125,6 +126,7 @@ describe("Google Calendar OAuth broker", () => {
 
     expect(response.status).toBe(200);
     const body = (await response.json()) as BrokerTokenResponse;
+    expect(body.connector).toBe("google-calendar");
     expect(body.access_token).toBe("calendar-access-token");
     expect(body.scope).toBe("openid email profile https://www.googleapis.com/auth/calendar.events");
     expect(body.id_token).toBe("calendar-id-token");
