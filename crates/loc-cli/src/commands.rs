@@ -2846,11 +2846,7 @@ fn mount_slack(args: &[String], json: bool) -> i32 {
     }
 
     let Some(root) = nth_positional(args, 1) else {
-        return command_error(
-            json,
-            CommandError::new("mount", "usage", mount_usage()),
-            EXIT_USAGE,
-        );
+        return command_error(json, slack_mount_missing_path_error(), EXIT_USAGE);
     };
     let projection = match projection_mode(args) {
         Ok(projection) => projection,
@@ -2932,6 +2928,14 @@ fn mount_slack(args: &[String], json: bool) -> i32 {
         }
         Err(error) => mount_command_error(json, error),
     }
+}
+
+fn slack_mount_missing_path_error() -> CommandError {
+    CommandError::new(
+        "mount",
+        "usage",
+        "usage: loc mount slack <path> [--connection <id>] [--mount-id <id>] [--projection <mode>] [--history-limit 1-15] [--types public_channel,private_channel,im,mpim]",
+    )
 }
 
 fn slack_settings_from_mount_args(args: &[String]) -> Result<String, CommandError> {
@@ -8530,22 +8534,22 @@ mod tests {
     #[cfg(target_os = "windows")]
     use super::resolve_mount_target;
     use super::{
-        Cli, ConnectReport, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION,
-        FileProviderCommandReport, PushConfirmationPromptError, VirtualProjectionRegistration,
-        absolute_command_path, auto_registration_for_mounted_projection,
-        default_mount_id_for_source, diff_report_exit_code, exact_located_entity_record,
-        file_provider_list_lines, google_docs_oauth_broker_config,
-        guard_linux_fuse_shared_root_unregister, guard_unresolved_linux_fuse_unregister,
-        guard_unresolved_windows_cloud_files_unregister,
+        Cli, ConnectReport, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_USAGE, EXIT_VALIDATION,
+        FileProviderCommandReport, PushConfirmationPromptError, SLACK_CONNECTOR_ID,
+        VirtualProjectionRegistration, absolute_command_path,
+        auto_registration_for_mounted_projection, default_mount_id_for_source,
+        diff_report_exit_code, exact_located_entity_record, file_provider_list_lines,
+        google_docs_oauth_broker_config, guard_linux_fuse_shared_root_unregister,
+        guard_unresolved_linux_fuse_unregister, guard_unresolved_windows_cloud_files_unregister,
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
-        locate_result_from_report, mount_usage, mounted_projection_preflight_error,
+        locate_result_from_report, mount_slack, mount_usage, mounted_projection_preflight_error,
         notion_authorize_url, notion_oauth_broker_config, print_push_confirmation_preview,
         projection_mode_for_target, projection_usage_options_for_target,
         prompt_for_push_confirmation, pull_direct_fallback_error,
         push_confirmation_preview_matches_displayed, push_preview_plan_matches,
         should_prompt_for_push_confirmation, should_refresh_notion_url_search,
-        slack_oauth_broker_config, spinner_config_for_command, spinner_enabled,
-        status as run_status_command, validate_virtual_projection_registration,
+        slack_mount_missing_path_error, slack_oauth_broker_config, spinner_config_for_command,
+        spinner_enabled, status as run_status_command, validate_virtual_projection_registration,
         write_connect_report, write_log_report,
     };
 
@@ -9008,6 +9012,21 @@ mod tests {
         assert!(usage.contains("--view messages|threads"));
         assert!(usage.contains("--history-limit 1-15"));
         assert!(usage.contains("--types public_channel,private_channel,im,mpim"));
+    }
+
+    #[test]
+    fn slack_mount_missing_path_runtime_error_uses_exact_usage() {
+        let error = slack_mount_missing_path_error();
+
+        assert_eq!(error.code, "usage");
+        assert_eq!(
+            error.message,
+            "usage: loc mount slack <path> [--connection <id>] [--mount-id <id>] [--projection <mode>] [--history-limit 1-15] [--types public_channel,private_channel,im,mpim]"
+        );
+        assert_eq!(
+            mount_slack(&[SLACK_CONNECTOR_ID.to_string()], true),
+            EXIT_USAGE
+        );
     }
 
     #[test]
