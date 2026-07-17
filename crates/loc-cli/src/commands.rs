@@ -116,6 +116,8 @@ const EXIT_USAGE: i32 = 2;
 const EXIT_VALIDATION: i32 = 3;
 const DEFAULT_DAEMON_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_DAEMON_MUTATING_TIMEOUT: Duration = Duration::from_secs(60);
+const MIN_SLACK_HISTORY_LIMIT: u32 = 1;
+const MAX_SLACK_HISTORY_LIMIT: u32 = 15;
 const SLACK_CONVERSATION_TYPE_VALUES: &str = "public_channel,private_channel,im,mpim";
 
 #[derive(Debug, Parser)]
@@ -2935,13 +2937,21 @@ fn mount_slack(args: &[String], json: bool) -> i32 {
 fn slack_settings_from_mount_args(args: &[String]) -> Result<String, CommandError> {
     let mut settings = SlackMountSettings::default();
     if let Some(value) = flag_value(args, "--history-limit") {
-        settings.slack.history_limit = value.parse::<u32>().map_err(|_| {
+        let history_limit = value.parse::<u32>().map_err(|_| {
             CommandError::new(
                 "mount",
                 "slack_history_limit_invalid",
                 "`--history-limit` must be an integer from 1 to 15",
             )
         })?;
+        if !(MIN_SLACK_HISTORY_LIMIT..=MAX_SLACK_HISTORY_LIMIT).contains(&history_limit) {
+            return Err(CommandError::new(
+                "mount",
+                "slack_history_limit_invalid",
+                "`--history-limit` must be an integer from 1 to 15",
+            ));
+        }
+        settings.slack.history_limit = history_limit;
     }
     if let Some(value) = flag_value(args, "--types") {
         settings.slack.types = slack_conversation_types_from_mount_arg(value)?;

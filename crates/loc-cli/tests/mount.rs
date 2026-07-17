@@ -592,6 +592,40 @@ fn cli_mount_slack_persists_requested_read_only_registration() {
 }
 
 #[test]
+fn cli_mount_slack_rejects_out_of_range_history_limit_before_state_open() {
+    for history_limit in ["0", "999"] {
+        let fixture = MountFixture::new("loc-cli-slack-invalid-history-limit");
+        let state_root = fixture.root.join("state");
+
+        let loc = env!("CARGO_BIN_EXE_loc");
+        let mount_root = fixture.root.join("slack");
+        let mount_root_arg = mount_root.display().to_string();
+
+        let body = loc_json_with_exit(
+            loc_command(loc, &state_root).args([
+                "mount",
+                "slack",
+                mount_root_arg.as_str(),
+                "--connection",
+                "slack-work",
+                "--projection",
+                "plain-files",
+                "--history-limit",
+                history_limit,
+                "--json",
+            ]),
+            2,
+        );
+
+        assert_eq!(body["code"], "slack_history_limit_invalid", "{body:#?}");
+        assert!(
+            !state_root.exists(),
+            "invalid Slack history limit {history_limit} should fail before opening state"
+        );
+    }
+}
+
+#[test]
 fn cli_mount_gmail_persists_date_window_and_thread_view() {
     let fixture = MountFixture::new("loc-cli-gmail-mount-settings");
     fs::create_dir_all(&fixture.root).expect("create fixture root");
