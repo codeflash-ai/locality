@@ -141,8 +141,8 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
     StateComponentDefinition {
         component_id: "durable:virtual_mutations",
         component_kind: "durable_json",
-        current_version: 2,
-        min_reader_version: 1,
+        current_version: 3,
+        min_reader_version: 3,
         required: true,
         rebuildable: false,
         data_json: "{}",
@@ -2567,7 +2567,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         migrate_linux_fuse_projection_layout_to_v2(connection, false)?;
         migrate_windows_cloud_files_projection_layout_to_v2(connection, false)?;
         migrate_journals_component_to_v3(connection)?;
-        migrate_virtual_mutations_component_to_v2(connection)?;
+        migrate_virtual_mutations_component_to_v3(connection)?;
         return Ok(());
     }
 
@@ -3167,9 +3167,9 @@ fn state_component_issue_allows_schema_migration(
         issue,
         StateCompatibilityIssue::OlderComponent {
             component_id,
-            found: 1,
-            current: 2,
-        } if component_id == "durable:virtual_mutations"
+            found,
+            current: 3,
+        } if component_id == "durable:virtual_mutations" && matches!(*found, 1 | 2)
     ) || matches!(
         issue,
         StateCompatibilityIssue::MissingComponent { component_id }
@@ -3919,7 +3919,7 @@ fn migrate_windows_cloud_files_projection_layout_to_v2(
     )
 }
 
-fn migrate_virtual_mutations_component_to_v2(connection: &Connection) -> StoreResult<()> {
+fn migrate_virtual_mutations_component_to_v3(connection: &Connection) -> StoreResult<()> {
     migrate_state_component_to_current(connection, "durable:virtual_mutations")
 }
 

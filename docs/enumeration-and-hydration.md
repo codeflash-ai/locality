@@ -103,6 +103,14 @@ hint pending, queues post-commit hydration, and pauses enabled auto-save. Held
 changes retain replay observations and freshness state, and the planner never
 deletes virtual-mutation state.
 
+Pending virtual mutations are durable write intent, not a projection cache.
+Their semantic component is versioned independently of SQLite's physical
+schema. Version 3 requires move/rename planning to preserve coexisting cached
+document edits and to clear structural intent only after successful remote
+readback. The v1/v2 to v3 migration changes component metadata only and leaves
+every pending row byte-for-byte intact; a newer component version is
+update-required and must not mutate state.
+
 Before returning filesystem actions, the planner runs the store's read-only
 `DiscoveryCommit` preflight against the state it read, so final entity paths,
 mutation guards, and auto-save ownership use the same admission rules as the

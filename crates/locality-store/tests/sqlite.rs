@@ -140,8 +140,8 @@ fn sqlite_store_seeds_state_compatibility_components() {
             (
                 "durable:virtual_mutations".to_string(),
                 "durable_json".to_string(),
-                2,
-                1,
+                3,
+                3,
                 1,
                 0,
             ),
@@ -697,45 +697,114 @@ fn sqlite_store_does_not_rewrite_v2_linux_fuse_mount_point_roots() {
 }
 
 #[test]
-fn sqlite_store_migrates_virtual_mutations_component_v1_to_v2() {
+fn sqlite_store_migrates_virtual_mutations_v1_and_v2_to_v3_without_rewriting_rows() {
+    for old_version in [1, 2] {
+        let fixture = SqliteFixture::new();
+        let mut store = fixture.open();
+        store
+            .save_mount(fixture.mount_config())
+            .expect("save mount");
+        store
+            .save_virtual_mutation(virtual_mutation_record())
+            .expect("save mutation");
+        let connection = Connection::open(&store.db_path).expect("raw connection");
+        connection
+            .execute(
+                "UPDATE state_components
+                 SET version = ?1, min_reader_version = 1
+                 WHERE component_id = 'durable:virtual_mutations'",
+                [old_version],
+            )
+            .expect("downgrade virtual mutations component");
+        let before_row = virtual_mutation_raw_row(&connection);
+        let before_user_version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user version");
+        drop(connection);
+        drop(store);
+
+        let before = SqliteStateStore::inspect_compatibility(fixture.state_root.clone())
+            .expect("inspect state");
+        assert_eq!(before.status, StateCompatibilityStatus::Migratable);
+        assert_eq!(
+            before.issues,
+            vec![StateCompatibilityIssue::OlderComponent {
+                component_id: "durable:virtual_mutations".to_string(),
+                found: old_version,
+                current: 3,
+            }]
+        );
+
+        let reopened = fixture.open();
+        let connection = Connection::open(&reopened.db_path).expect("raw reopened connection");
+        let component: (i64, i64) = connection
+            .query_row(
+                "SELECT version, min_reader_version
+                 FROM state_components
+                 WHERE component_id = 'durable:virtual_mutations'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("virtual mutations component version");
+        let after_user_version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user version");
+        assert_eq!(component, (3, 3));
+        assert_eq!(virtual_mutation_raw_row(&connection), before_row);
+        assert_eq!(after_user_version, before_user_version);
+    }
+}
+
+#[test]
+fn sqlite_store_reports_virtual_mutations_v4_without_mutating_state() {
     let fixture = SqliteFixture::new();
-    let store = fixture.open();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config())
+        .expect("save mount");
+    store
+        .save_virtual_mutation(virtual_mutation_record())
+        .expect("save mutation");
+    let db_path = store.db_path.clone();
     let connection = Connection::open(&store.db_path).expect("raw connection");
     connection
         .execute(
             "UPDATE state_components
-             SET version = 1
+             SET version = 4, min_reader_version = 4
              WHERE component_id = 'durable:virtual_mutations'",
             [],
         )
-        .expect("downgrade virtual mutations component");
+        .expect("mark future virtual mutation component");
+    let before_row = virtual_mutation_raw_row(&connection);
     drop(connection);
     drop(store);
 
-    let before =
-        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect state");
-    assert_eq!(before.status, StateCompatibilityStatus::Migratable);
+    let report =
+        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect v4");
+    assert_eq!(report.status, StateCompatibilityStatus::NeedsUpdate);
     assert_eq!(
-        before.issues,
-        vec![StateCompatibilityIssue::OlderComponent {
+        report.issues,
+        vec![StateCompatibilityIssue::NewerComponent {
             component_id: "durable:virtual_mutations".to_string(),
-            found: 1,
-            current: 2,
+            found: 4,
+            supported: 3,
         }]
     );
-
-    let reopened = fixture.open();
-    let connection = Connection::open(&reopened.db_path).expect("raw reopened connection");
-    let version: i64 = connection
+    assert!(matches!(
+        SqliteStateStore::open(fixture.state_root.clone()),
+        Err(StoreError::StateCompatibility(_))
+    ));
+    let connection = Connection::open(db_path).expect("raw reopen");
+    assert_eq!(virtual_mutation_raw_row(&connection), before_row);
+    let component: (i64, i64) = connection
         .query_row(
-            "SELECT version
-             FROM state_components
+            "SELECT version, min_reader_version FROM state_components
              WHERE component_id = 'durable:virtual_mutations'",
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .expect("virtual mutations component version");
-    assert_eq!(version, 2);
+        .expect("component metadata");
+    assert_eq!(component, (4, 4));
 }
 
 #[test]
@@ -4160,6 +4229,48 @@ fn virtual_mutation_record() -> VirtualMutationRecord {
         created_at: "2026-06-12T00:00:00Z".to_string(),
         updated_at: "2026-06-12T00:00:00Z".to_string(),
     }
+}
+
+type VirtualMutationRawRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+);
+
+fn virtual_mutation_raw_row(connection: &Connection) -> VirtualMutationRawRow {
+    connection
+        .query_row(
+            "SELECT mount_id, local_id, mutation_kind_json, target_remote_id,
+                    parent_remote_id, original_path, projected_path, title,
+                    content_path, created_at, updated_at
+             FROM virtual_mutations
+             WHERE mount_id = 'notion-main' AND local_id = 'local:draft'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            },
+        )
+        .expect("virtual mutation raw row")
 }
 
 fn remote_observation_record() -> RemoteObservationRecord {

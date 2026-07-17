@@ -874,6 +874,439 @@ fn prepare_push_plans_pending_page_directory_rename_under_parent_scope() {
 }
 
 #[test]
+fn prepare_linear_move_lowers_title_body_and_properties_without_duplicate_title_update() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.virtual_store("linear");
+    for (id, title, path) in [
+        ("team-a", "Team A", "Team A/page.md"),
+        ("team-b", "Team B", "Team B/page.md"),
+    ] {
+        store
+            .save_entity(EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new(id),
+                EntityKind::Page,
+                title,
+                path,
+            ))
+            .expect("save team");
+    }
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("issue-1"),
+                EntityKind::Page,
+                "Original title",
+                "Team B/ENG-1-new/page.md",
+            )
+            .with_hydration(HydrationState::Dirty),
+        )
+        .expect("save moved issue");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("issue-1"), "Old body.", 8, [RemoteId::new("body-1")],
+            )
+            .expect("shadow")
+            .with_frontmatter(
+                "loc:\n  id: issue-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Original title\nstatus: Todo\n",
+            ),
+        )
+        .expect("save shadow");
+    let cache = fixture.write_virtual_page(
+        "Team B/ENG-1-new/page.md",
+        "---\nloc:\n  id: issue-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Explicit edited title\nstatus: Done\n---\nNew body.\n",
+    );
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "move:issue-1".to_string(),
+            mutation_kind: VirtualMutationKind::Move,
+            target_remote_id: Some(RemoteId::new("issue-1")),
+            parent_remote_id: Some(RemoteId::new("team-b")),
+            original_path: Some(PathBuf::from("Team A/ENG-1-old/page.md")),
+            projected_path: PathBuf::from("Team B/ENG-1-new/page.md"),
+            title: "Original title".to_string(),
+            content_path: Some(cache),
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+        })
+        .expect("save move");
+    fs::create_dir_all(fixture.root.join("Team B")).expect("visible destination team");
+
+    let validator = RecordingValidator::default();
+    let prepared = prepare_push(
+        &store,
+        &job(fixture.root.join("Team B")),
+        Some(&fixture.state_root),
+        &validator,
+    )
+    .expect("prepare move with edits");
+
+    assert!(prepared.pipeline.validation.is_clean());
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::ConfirmPlan);
+    let plan = prepared.pipeline.plan.expect("plan");
+    assert_eq!(
+        plan.operations,
+        vec![
+            PushOperation::MoveEntity {
+                entity_id: RemoteId::new("issue-1"),
+                new_parent_id: RemoteId::new("team-b"),
+                new_parent_kind: EntityKind::Page,
+                new_title: "Explicit edited title".to_string(),
+                projected_path: PathBuf::from("Team B/ENG-1-new/page.md"),
+            },
+            PushOperation::UpdateProperties {
+                entity_id: RemoteId::new("issue-1"),
+                properties: BTreeMap::from([(
+                    "status".to_string(),
+                    PropertyValue::String("Done".to_string()),
+                )]),
+            },
+            PushOperation::UpdateEntityBody {
+                entity_id: RemoteId::new("issue-1"),
+                body: "New body.\n".to_string(),
+            },
+        ]
+    );
+    assert_eq!(plan.affected_entities, vec![RemoteId::new("issue-1")]);
+    let diff = prepared.readable_diff.expect("readable diff");
+    assert_eq!(diff.files.len(), 1);
+    assert_eq!(diff.files[0].path, "Team B/ENG-1-new/page.md");
+    assert!(diff.text.contains("+status: Done"));
+    assert!(diff.text.contains("+New body."));
+    assert_eq!(validator.changed_count.get(), 1);
+    assert_eq!(
+        validator.changed_parents.borrow().as_slice(),
+        &[RemoteId::new("team-b")]
+    );
+}
+
+#[test]
+fn prepare_linear_cacheless_move_uses_shadow_but_missing_shadow_requires_materialization() {
+    let (fixture, store) = linear_move_store(None, true);
+    let prepared = prepare_push(
+        &store,
+        &job(fixture.root.join("Team B")),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare structural move");
+    assert_eq!(
+        prepared.pipeline.plan.expect("plan").operations,
+        vec![PushOperation::MoveEntity {
+            entity_id: RemoteId::new("issue-1"),
+            new_parent_id: RemoteId::new("team-b"),
+            new_parent_kind: EntityKind::Page,
+            new_title: "Original title".to_string(),
+            projected_path: PathBuf::from("Team B/ENG-1-new/page.md"),
+        }]
+    );
+    assert!(prepared.readable_diff.is_none());
+
+    let (fixture, store) = linear_move_store(None, false);
+    let error = prepare_push(
+        &store,
+        &job(fixture.root.join("Team B")),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect_err("cacheless move without shadow must fail");
+    assert!(
+        matches!(error, PushPrepareError::Core(LocalityError::InvalidState(message)) if message.contains("materialized"))
+    );
+}
+
+#[test]
+fn prepare_linear_move_fails_closed_for_invalid_cached_content() {
+    for (name, contents, code) in [
+        (
+            "parse",
+            "---\n[invalid\n---\nBody\n",
+            "canonical_invalid_frontmatter_yaml",
+        ),
+        (
+            "conflict",
+            "<<<<<<< LOCAL\nlocal\n=======\nremote\n>>>>>>> REMOTE\n",
+            "unresolved_conflict_markers",
+        ),
+        (
+            "identity",
+            "---\nloc:\n  id: another-issue\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Original title\n---\nOld body.\n",
+            "frontmatter_remote_id_mismatch",
+        ),
+    ] {
+        let (fixture, store) = linear_move_store(Some(contents), true);
+        let prepared = prepare_push(
+            &store,
+            &job(fixture.root.join("Team B")),
+            Some(&fixture.state_root),
+            &LocalSourceValidator,
+        )
+        .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        assert_eq!(
+            prepared.pipeline.action,
+            PushPipelineAction::FixValidation,
+            "{name}"
+        );
+        assert!(prepared.pipeline.plan.is_none(), "{name}");
+        assert_eq!(prepared.pipeline.validation.issues[0].code, code, "{name}");
+    }
+}
+
+#[test]
+fn prepare_linear_move_empty_body_keeps_destructive_guardrail() {
+    let contents = "---\nloc:\n  id: issue-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Original title\nstatus: Todo\n---\n";
+    let (fixture, store) = linear_move_store(Some(contents), true);
+    let prepared = prepare_push(
+        &store,
+        &job(fixture.root.join("Team B")),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare empty body move");
+    assert_eq!(
+        prepared.pipeline.action,
+        PushPipelineAction::ConfirmDangerousPlan
+    );
+    assert!(matches!(
+        prepared.pipeline.plan.expect("plan").operations.as_slice(),
+        [PushOperation::MoveEntity { .. }, PushOperation::UpdateEntityBody { body, .. }]
+            if body.is_empty()
+    ));
+}
+
+#[test]
+fn prepare_pending_scope_rejects_duplicate_remote_targets() {
+    let (fixture, mut store) = linear_move_store(None, true);
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "rename:issue-1".to_string(),
+            mutation_kind: VirtualMutationKind::Rename,
+            target_remote_id: Some(RemoteId::new("issue-1")),
+            parent_remote_id: Some(RemoteId::new("team-b")),
+            original_path: Some(PathBuf::from("Team A/ENG-1-old/page.md")),
+            projected_path: PathBuf::from("Team B/ENG-1-duplicate/page.md"),
+            title: "Original title".to_string(),
+            content_path: None,
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+        })
+        .expect("save duplicate mutation");
+
+    let prepared = prepare_push(
+        &store,
+        &job(fixture.root.join("Team B")),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare duplicate scope");
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::FixValidation);
+    assert!(prepared.pipeline.plan.is_none());
+    assert_eq!(
+        prepared.pipeline.validation.issues[0].code,
+        "duplicate_virtual_mutation_target"
+    );
+}
+
+#[test]
+fn prepare_stale_pending_move_rechecks_source_and_mount_write_policy() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.virtual_store("gmail");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("sent-folder"),
+            EntityKind::Directory,
+            "sent",
+            "sent",
+        ))
+        .expect("save sent folder");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("draft-1"),
+                EntityKind::Page,
+                "Draft subject",
+                "sent/ENG-1.md",
+            )
+            .with_hydration(HydrationState::Dirty),
+        )
+        .expect("save moved draft");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("draft-1"),
+                "Draft body",
+                8,
+                [RemoteId::new("body-1")],
+            )
+            .expect("shadow"),
+        )
+        .expect("save shadow");
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "move:draft-1".to_string(),
+            mutation_kind: VirtualMutationKind::Move,
+            target_remote_id: Some(RemoteId::new("draft-1")),
+            parent_remote_id: Some(RemoteId::new("sent-folder")),
+            original_path: Some(PathBuf::from("draft/ENG-1.md")),
+            projected_path: PathBuf::from("sent/ENG-1.md"),
+            title: "Draft subject".to_string(),
+            content_path: None,
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+        })
+        .expect("save stale move");
+    fs::create_dir_all(fixture.root.join("sent")).expect("visible sent folder");
+    let prepared = prepare_push(
+        &store,
+        &job(fixture.root.join("sent")),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare stale Gmail move");
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::FixValidation);
+    assert!(prepared.pipeline.plan.is_none());
+    assert!(
+        prepared
+            .pipeline
+            .validation
+            .issues
+            .iter()
+            .any(|issue| issue.code == "source_path_read_only")
+    );
+
+    let (fixture, mut store) = linear_move_store(None, true);
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "linear", fixture.root.clone())
+                .projection(ProjectionMode::LinuxFuse)
+                .read_only(true),
+        )
+        .expect("replace with read-only mount");
+    let prepared = prepare_push(
+        &store,
+        &job(fixture.root.join("Team B")),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare read-only move");
+    assert_eq!(
+        prepared.pipeline.action,
+        PushPipelineAction::ReadOnlyBlocked
+    );
+    assert!(prepared.pipeline.plan.is_none());
+}
+
+#[test]
+fn prepare_pending_scope_aggregates_move_create_delete_and_joins_diffs() {
+    let unchanged = "---\nloc:\n  id: issue-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Original title\nstatus: Todo\n---\nOld body.";
+    let (fixture, mut store) = linear_move_store(Some(unchanged), true);
+    let create_cache = fixture.write_virtual_page(
+        "Team B/ENG-2.md",
+        "---\ntitle: New issue\nstatus: Todo\n---\nNew issue body.\n",
+    );
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "local:new-issue".to_string(),
+            mutation_kind: VirtualMutationKind::Create,
+            target_remote_id: None,
+            parent_remote_id: Some(RemoteId::new("team-b")),
+            original_path: None,
+            projected_path: PathBuf::from("Team B/ENG-2.md"),
+            title: "New issue".to_string(),
+            content_path: Some(create_cache),
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+        })
+        .expect("save create");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("issue-old"),
+            EntityKind::Page,
+            "Obsolete",
+            "Team B/obsolete.md",
+        ))
+        .expect("save obsolete issue");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("issue-old"), "Obsolete body.", 8, [RemoteId::new("old-body")],
+            )
+            .expect("shadow")
+            .with_frontmatter(
+                "loc:\n  id: issue-old\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Obsolete\n",
+            ),
+        )
+        .expect("save obsolete shadow");
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "delete:issue-old".to_string(),
+            mutation_kind: VirtualMutationKind::Delete,
+            target_remote_id: Some(RemoteId::new("issue-old")),
+            parent_remote_id: None,
+            original_path: Some(PathBuf::from("Team B/obsolete.md")),
+            projected_path: PathBuf::from("Team B/obsolete.md"),
+            title: "Obsolete".to_string(),
+            content_path: None,
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+        })
+        .expect("save delete");
+
+    let prepared = prepare_push(
+        &store,
+        &job(fixture.root.clone()),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare mixed pending scope");
+    let plan = prepared.pipeline.plan.expect("combined plan");
+    assert!(matches!(
+        plan.operations[0],
+        PushOperation::MoveEntity { .. }
+    ));
+    assert!(matches!(
+        plan.operations[1],
+        PushOperation::CreateEntity { .. }
+    ));
+    assert_eq!(
+        plan.operations[2],
+        PushOperation::ArchiveEntity {
+            entity_id: RemoteId::new("issue-old")
+        }
+    );
+    assert_eq!(
+        plan.affected_entities,
+        vec![
+            RemoteId::new("issue-1"),
+            RemoteId::new("team-b"),
+            RemoteId::new("issue-old"),
+        ]
+    );
+    assert_eq!(prepared.shadows.len(), 2);
+    let diff = prepared.readable_diff.expect("joined diff");
+    assert_eq!(
+        diff.files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Team B/ENG-2.md", "Team B/obsolete.md"]
+    );
+}
+
+#[test]
 fn prepare_push_plans_pending_page_directory_move_as_move_entity() {
     let fixture = PrepareFixture::new();
     let mut store = fixture.virtual_store("notion");
@@ -1501,14 +1934,96 @@ fn prepare_push_uses_source_descriptor_body_diff_mode_for_existing_entities() {
     ));
 }
 
+fn linear_move_store(
+    contents: Option<&str>,
+    with_shadow: bool,
+) -> (PrepareFixture, InMemoryStateStore) {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.virtual_store("linear");
+    for (id, title, path) in [
+        ("team-a", "Team A", "Team A/page.md"),
+        ("team-b", "Team B", "Team B/page.md"),
+    ] {
+        store
+            .save_entity(EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new(id),
+                EntityKind::Page,
+                title,
+                path,
+            ))
+            .expect("save team");
+    }
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("issue-1"),
+                EntityKind::Page,
+                "Original title",
+                "Team B/ENG-1-new/page.md",
+            )
+            .with_hydration(HydrationState::Dirty),
+        )
+        .expect("save issue");
+    if with_shadow {
+        store
+            .save_shadow(
+                &fixture.mount_id,
+                ShadowDocument::from_synced_body(
+                    RemoteId::new("issue-1"), "Old body.", 8, [RemoteId::new("body-1")],
+                )
+                .expect("shadow")
+                .with_frontmatter(
+                    "loc:\n  id: issue-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Original title\nstatus: Todo\n",
+                ),
+            )
+            .expect("save shadow");
+    }
+    let content_path =
+        contents.map(|contents| fixture.write_virtual_page("Team B/ENG-1-new/page.md", contents));
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "move:issue-1".to_string(),
+            mutation_kind: VirtualMutationKind::Move,
+            target_remote_id: Some(RemoteId::new("issue-1")),
+            parent_remote_id: Some(RemoteId::new("team-b")),
+            original_path: Some(PathBuf::from("Team A/ENG-1-old/page.md")),
+            projected_path: PathBuf::from("Team B/ENG-1-new/page.md"),
+            title: "Original title".to_string(),
+            content_path,
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+        })
+        .expect("save move");
+    fs::create_dir_all(fixture.root.join("Team B")).expect("visible destination team");
+    (fixture, store)
+}
+
 #[derive(Default)]
 struct RecordingValidator {
     create_count: Cell<usize>,
+    changed_count: Cell<usize>,
+    changed_parents: RefCell<Vec<RemoteId>>,
     paths: RefCell<Vec<PathBuf>>,
     parents: RefCell<Vec<RemoteId>>,
 }
 
 impl SourcePushValidator for RecordingValidator {
+    fn validate_changed_frontmatter(
+        &self,
+        context: SourceValidationContext<'_>,
+    ) -> locality_core::LocalityResult<ValidationReport> {
+        self.changed_count.set(self.changed_count.get() + 1);
+        if let Some(parent) = context.parent {
+            self.changed_parents
+                .borrow_mut()
+                .push(parent.remote_id.clone());
+        }
+        Ok(ValidationReport::clean())
+    }
+
     fn validate_create_frontmatter(
         &self,
         context: SourceValidationContext<'_>,

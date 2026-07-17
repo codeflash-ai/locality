@@ -25,7 +25,8 @@ use crate::hydration::{
 };
 use crate::shadow_match::parsed_matches_shadow;
 use crate::source::{
-    source_create_decision_for_parent_path, source_descriptor, source_write_decision_for_path,
+    VirtualRenamePolicy, source_create_decision_for_parent_path, source_descriptor,
+    source_write_decision_for_path,
 };
 
 pub const ROOT_CONTAINER_IDENTIFIER: &str = "root";
@@ -1194,12 +1195,13 @@ where
     let mutations = store
         .list_virtual_mutations(mount_id)
         .map_err(LocalityError::from)?;
+    let rename_policy = source_descriptor(&mount.connector).virtual_rename_policy();
     let new_parent_path = container_path(&mount, &entities, &mutations, new_parent_identifier)?;
 
     if let Some(child_identifier) = identifier.strip_prefix(CHILDREN_PREFIX) {
         let new_page_dir = new_parent_path.join(new_filename);
         let new_path = page_document_path(&new_page_dir);
-        let title = title_from_filename(new_filename);
+        let filename_title = title_from_filename(new_filename);
         ensure_source_path_writable(&mount, &new_path)?;
         let new_parent =
             move_parent_remote(&mount, &entities, new_parent_identifier, &new_parent_path)?;
@@ -1226,7 +1228,15 @@ where
             )?;
             let old_path = content_path_for_relative(content_root, &mutation.projected_path)?;
             let new_content_path = content_path_for_relative(content_root, &new_path)?;
-            rename_cached_page_if_present(&old_path, &new_content_path, &title)?;
+            let title = match rename_policy {
+                VirtualRenamePolicy::FilenameDerived => filename_title.clone(),
+                VirtualRenamePolicy::PreserveCanonical => mutation.title.clone(),
+            };
+            relocate_cached_page_if_present(
+                &old_path,
+                &new_content_path,
+                (rename_policy == VirtualRenamePolicy::FilenameDerived).then_some(title.as_str()),
+            )?;
             mutation.projected_path = new_path;
             mutation.title = title;
             mutation.parent_remote_id = Some(new_parent.remote_id);
@@ -1262,7 +1272,16 @@ where
         )?;
         let old_path = content_path_for_relative(content_root, &entity.path)?;
         let new_content_path = content_path_for_relative(content_root, &new_path)?;
-        rename_cached_page_if_present(&old_path, &new_content_path, &title)?;
+        ensure_remote_move_materializable(store, mount_id, &remote_id, &old_path)?;
+        let title = match rename_policy {
+            VirtualRenamePolicy::FilenameDerived => filename_title,
+            VirtualRenamePolicy::PreserveCanonical => entity.title.clone(),
+        };
+        relocate_cached_page_if_present(
+            &old_path,
+            &new_content_path,
+            (rename_policy == VirtualRenamePolicy::FilenameDerived).then_some(title.as_str()),
+        )?;
         let original_path = existing_move_original_path(&mutations, &remote_id)
             .unwrap_or_else(|| entity.path.clone());
         entity.path = new_path.clone();
@@ -1338,7 +1357,9 @@ where
         let new_content_path = content_path_for_relative(content_root, &new_path)?;
         rename_cached_file_if_present(&old_path, &new_content_path)?;
         mutation.projected_path = new_path;
-        mutation.title = title_from_filename(new_filename);
+        if rename_policy == VirtualRenamePolicy::FilenameDerived {
+            mutation.title = title_from_filename(new_filename);
+        }
         mutation.parent_remote_id = Some(new_parent.remote_id);
         mutation.content_path = Some(new_content_path);
         mutation.updated_at = now_string();
@@ -1365,11 +1386,14 @@ where
     ensure_source_path_writable(&mount, &entity.path)?;
     let old_path = content_path_for_relative(content_root, &entity.path)?;
     let new_content_path = content_path_for_relative(content_root, &new_path)?;
+    ensure_remote_move_materializable(store, mount_id, &remote_id, &old_path)?;
     rename_cached_file_if_present(&old_path, &new_content_path)?;
     let original_path =
         existing_move_original_path(&mutations, &remote_id).unwrap_or_else(|| entity.path.clone());
     entity.path = new_path.clone();
-    entity.title = title_from_filename(new_filename);
+    if rename_policy == VirtualRenamePolicy::FilenameDerived {
+        entity.title = title_from_filename(new_filename);
+    }
     if entity.hydration.can_transition_to(&HydrationState::Dirty) {
         entity.hydration = HydrationState::Dirty;
     }
@@ -2102,9 +2126,38 @@ where
     Ok(())
 }
 
-fn rename_cached_page_if_present(from: &Path, to: &Path, title: &str) -> LocalityResult<()> {
+fn relocate_cached_page_if_present(
+    from: &Path,
+    to: &Path,
+    retitle: Option<&str>,
+) -> LocalityResult<()> {
     rename_cached_file_if_present(from, to)?;
-    retitle_cached_page_if_present(to, title)
+    match retitle {
+        Some(title) => retitle_cached_page_if_present(to, title),
+        None => Ok(()),
+    }
+}
+
+fn ensure_remote_move_materializable<S>(
+    store: &S,
+    mount_id: &MountId,
+    remote_id: &RemoteId,
+    cached_path: &Path,
+) -> LocalityResult<()>
+where
+    S: ShadowRepository,
+{
+    if cached_path.is_file() {
+        return Ok(());
+    }
+    match store.load_shadow(mount_id, remote_id) {
+        Ok(_) => Ok(()),
+        Err(StoreError::ShadowMissing { .. }) => Err(LocalityError::InvalidState(format!(
+            "entity `{}` must be materialized before it can be moved or renamed",
+            remote_id.0
+        ))),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn rename_cached_file_if_present(from: &Path, to: &Path) -> LocalityResult<()> {
@@ -3371,7 +3424,8 @@ mod tests {
     };
     use locality_store::{
         EntityRecord, EntityRepository, FreshnessStateRepository, InMemoryStateStore, MountConfig,
-        MountRepository, ProjectionMode, VirtualMutationKind, VirtualMutationRepository,
+        MountRepository, ProjectionMode, ShadowRepository, VirtualMutationKind,
+        VirtualMutationRepository,
     };
 
     use crate::hydration::{HydratedEntity, HydrationSource};
@@ -4111,6 +4165,18 @@ mod tests {
                 remote_edited_at: Some("google-docs:doc-moving:1".to_string()),
             })
             .expect("save moving doc");
+        store
+            .save_shadow(
+                &mount_id,
+                ShadowDocument::from_synced_body(
+                    RemoteId::new("doc-moving"),
+                    "",
+                    1,
+                    std::iter::empty(),
+                )
+                .expect("moving doc shadow"),
+            )
+            .expect("save moving doc shadow");
 
         let moved = rename_virtual_fs_item(
             &mut store,
@@ -5941,6 +6007,402 @@ mod tests {
         );
         assert_eq!(mutation.title, "Published");
 
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn linear_pending_page_directory_move_preserves_canonical_title_and_cached_bytes() {
+        let mount_id = MountId::new("linear-main");
+        let state_root = temp_root("loc-virtual-fs-linear-pending-dir-move");
+        let content_root = state_root.join("content/linear-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount_with_connector(&mount_id, "linear"))
+            .expect("save mount");
+        for (id, title, path) in [
+            ("team-a", "Team A", "Team A/page.md"),
+            ("team-b", "Team B", "Team B/page.md"),
+        ] {
+            store
+                .save_entity(EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new(id),
+                    EntityKind::Page,
+                    title,
+                    path,
+                ))
+                .expect("save parent");
+        }
+        let created = create_virtual_fs_directory(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "children:team-a",
+            "ENG-1-old-path",
+        )
+        .expect("create pending issue");
+        let local_id = created.identifier.strip_prefix("children:").unwrap();
+        let mut mutation = store
+            .get_virtual_mutation(&mount_id, local_id)
+            .expect("get mutation")
+            .expect("mutation");
+        mutation.title = "Explicit issue title".to_string();
+        store
+            .save_virtual_mutation(mutation)
+            .expect("save mutation");
+        let bytes = b"---\ntitle: \"Edited title in cache\"\nstatus: Started\n---\nEdited body\n";
+        std::fs::write(content_root.join("Team A/ENG-1-old-path/page.md"), bytes)
+            .expect("write cache");
+
+        rename_virtual_fs_item(
+            &mut store,
+            &content_root,
+            &mount_id,
+            &created.identifier,
+            "children:team-b",
+            "ENG-1-new-path",
+        )
+        .expect("move pending issue");
+
+        assert_eq!(
+            std::fs::read(content_root.join("Team B/ENG-1-new-path/page.md"))
+                .expect("read moved cache"),
+            bytes
+        );
+        let mutation = store
+            .get_virtual_mutation(&mount_id, local_id)
+            .expect("get mutation")
+            .expect("mutation");
+        assert_eq!(mutation.title, "Explicit issue title");
+        assert_eq!(mutation.parent_remote_id, Some(RemoteId::new("team-b")));
+        assert_eq!(
+            mutation.projected_path,
+            PathBuf::from("Team B/ENG-1-new-path/page.md")
+        );
+        assert_eq!(mutation.mutation_kind, VirtualMutationKind::Create);
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn linear_pending_flat_rename_preserves_canonical_title_and_cached_bytes() {
+        let mount_id = MountId::new("linear-main");
+        let state_root = temp_root("loc-virtual-fs-linear-pending-flat-rename");
+        let content_root = state_root.join("content/linear-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount_with_connector(&mount_id, "linear"))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("team-a"),
+                EntityKind::Page,
+                "Team A",
+                "Team A/page.md",
+            ))
+            .expect("save parent");
+        let created = create_virtual_fs_file(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "children:team-a",
+            "ENG-2-old.md",
+        )
+        .expect("create pending issue");
+        let mut mutation = store
+            .get_virtual_mutation(&mount_id, &created.identifier)
+            .expect("get mutation")
+            .expect("mutation");
+        mutation.title = "Explicit flat title".to_string();
+        store
+            .save_virtual_mutation(mutation)
+            .expect("save mutation");
+        let bytes = b"---\ntitle: \"Cache title edit\"\n---\nBody edit\n";
+        std::fs::write(content_root.join("Team A/ENG-2-old.md"), bytes).expect("write cache");
+
+        rename_virtual_fs_item(
+            &mut store,
+            &content_root,
+            &mount_id,
+            &created.identifier,
+            "children:team-a",
+            "ENG-2-new.md",
+        )
+        .expect("rename pending issue");
+
+        assert_eq!(
+            std::fs::read(content_root.join("Team A/ENG-2-new.md")).expect("read cache"),
+            bytes
+        );
+        let mutation = store
+            .get_virtual_mutation(&mount_id, &created.identifier)
+            .expect("get mutation")
+            .expect("mutation");
+        assert_eq!(mutation.title, "Explicit flat title");
+        assert_eq!(
+            mutation.projected_path,
+            PathBuf::from("Team A/ENG-2-new.md")
+        );
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn linear_remote_page_directory_move_preserves_entity_title_and_cached_bytes() {
+        let mount_id = MountId::new("linear-main");
+        let state_root = temp_root("loc-virtual-fs-linear-remote-dir-move");
+        let content_root = state_root.join("content/linear-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount_with_connector(&mount_id, "linear"))
+            .expect("save mount");
+        for (id, title, path) in [
+            ("team-a", "Team A", "Team A/page.md"),
+            ("team-b", "Team B", "Team B/page.md"),
+        ] {
+            store
+                .save_entity(EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new(id),
+                    EntityKind::Page,
+                    title,
+                    path,
+                ))
+                .expect("save parent");
+        }
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new("issue-3"),
+                    EntityKind::Page,
+                    "Canonical remote title",
+                    "Team A/ENG-3-old/page.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save issue");
+        std::fs::create_dir_all(content_root.join("Team A/ENG-3-old")).expect("cache dir");
+        let bytes = b"---\nloc:\n  id: issue-3\ntitle: \"Explicit cache title\"\n---\nBody edit\n";
+        std::fs::write(content_root.join("Team A/ENG-3-old/page.md"), bytes).expect("cache");
+
+        rename_virtual_fs_item(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "children:issue-3",
+            "children:team-b",
+            "ENG-3-new",
+        )
+        .expect("move issue");
+
+        assert_eq!(
+            std::fs::read(content_root.join("Team B/ENG-3-new/page.md")).expect("read cache"),
+            bytes
+        );
+        let entity = store
+            .get_entity(&mount_id, &RemoteId::new("issue-3"))
+            .expect("get entity")
+            .expect("entity");
+        assert_eq!(entity.title, "Canonical remote title");
+        assert_eq!(entity.path, PathBuf::from("Team B/ENG-3-new/page.md"));
+        let mutation = store
+            .get_virtual_mutation(&mount_id, "move:issue-3")
+            .expect("get mutation")
+            .expect("mutation");
+        assert_eq!(mutation.title, "Canonical remote title");
+        assert_eq!(
+            mutation.original_path,
+            Some(PathBuf::from("Team A/ENG-3-old/page.md"))
+        );
+        assert_eq!(mutation.parent_remote_id, Some(RemoteId::new("team-b")));
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn linear_remote_flat_rename_preserves_entity_title_and_cached_bytes() {
+        let mount_id = MountId::new("linear-main");
+        let state_root = temp_root("loc-virtual-fs-linear-remote-flat-rename");
+        let content_root = state_root.join("content/linear-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount_with_connector(&mount_id, "linear"))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("team-a"),
+                EntityKind::Page,
+                "Team A",
+                "Team A/page.md",
+            ))
+            .expect("save parent");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new("issue-4"),
+                    EntityKind::Page,
+                    "Canonical flat title",
+                    "Team A/ENG-4-old.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save issue");
+        std::fs::create_dir_all(content_root.join("Team A")).expect("cache dir");
+        let bytes = b"---\ntitle: \"Edited cache title\"\n---\nEdited body\n";
+        std::fs::write(content_root.join("Team A/ENG-4-old.md"), bytes).expect("cache");
+
+        rename_virtual_fs_item(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "issue-4",
+            "children:team-a",
+            "ENG-4-new.md",
+        )
+        .expect("rename issue");
+
+        assert_eq!(
+            std::fs::read(content_root.join("Team A/ENG-4-new.md")).expect("read cache"),
+            bytes
+        );
+        let entity = store
+            .get_entity(&mount_id, &RemoteId::new("issue-4"))
+            .expect("get entity")
+            .expect("entity");
+        assert_eq!(entity.title, "Canonical flat title");
+        assert_eq!(entity.path, PathBuf::from("Team A/ENG-4-new.md"));
+        let mutation = store
+            .get_virtual_mutation(&mount_id, "move:issue-4")
+            .expect("get mutation")
+            .expect("mutation");
+        assert_eq!(mutation.title, "Canonical flat title");
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn remote_move_without_cache_or_shadow_fails_before_state_changes() {
+        let mount_id = MountId::new("linear-main");
+        let state_root = temp_root("loc-virtual-fs-unmaterialized-move");
+        let content_root = state_root.join("content/linear-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount_with_connector(&mount_id, "linear"))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("team-a"),
+                EntityKind::Page,
+                "Team A",
+                "Team A/page.md",
+            ))
+            .expect("save parent");
+        let before = EntityRecord::new(
+            mount_id.clone(),
+            RemoteId::new("issue-stub"),
+            EntityKind::Page,
+            "Canonical title",
+            "Team A/ENG-5.md",
+        )
+        .with_hydration(HydrationState::Stub);
+        store.save_entity(before.clone()).expect("save issue");
+
+        let error = rename_virtual_fs_item(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "issue-stub",
+            "children:team-a",
+            "ENG-5-new.md",
+        )
+        .expect_err("unmaterialized issue must be rejected");
+
+        assert!(
+            matches!(error, LocalityError::InvalidState(message) if message.contains("materialize"))
+        );
+        assert_eq!(
+            store
+                .get_entity(&mount_id, &RemoteId::new("issue-stub"))
+                .unwrap(),
+            Some(before)
+        );
+        assert!(store.list_virtual_mutations(&mount_id).unwrap().is_empty());
+        assert!(!content_root.join("Team A/ENG-5-new.md").exists());
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn remote_structural_move_without_cache_uses_complete_shadow() {
+        let mount_id = MountId::new("linear-main");
+        let state_root = temp_root("loc-virtual-fs-shadow-backed-move");
+        let content_root = state_root.join("content/linear-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount_with_connector(&mount_id, "linear"))
+            .expect("save mount");
+        for (id, title, path) in [
+            ("team-a", "Team A", "Team A/page.md"),
+            ("team-b", "Team B", "Team B/page.md"),
+        ] {
+            store
+                .save_entity(EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new(id),
+                    EntityKind::Page,
+                    title,
+                    path,
+                ))
+                .expect("save parent");
+        }
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new("issue-shadow"),
+                    EntityKind::Page,
+                    "Shadow-backed title",
+                    "Team A/ENG-6.md",
+                )
+                .with_hydration(HydrationState::Stub),
+            )
+            .expect("save issue");
+        store
+            .save_shadow(
+                &mount_id,
+                ShadowDocument::from_synced_body(
+                    RemoteId::new("issue-shadow"),
+                    "",
+                    5,
+                    std::iter::empty(),
+                )
+                .expect("shadow")
+                .with_frontmatter("loc:\n  id: issue-shadow\ntitle: Shadow-backed title\n"),
+            )
+            .expect("save shadow");
+
+        rename_virtual_fs_item(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "issue-shadow",
+            "children:team-b",
+            "ENG-6-new.md",
+        )
+        .expect("shadow-backed structural move");
+
+        let entity = store
+            .get_entity(&mount_id, &RemoteId::new("issue-shadow"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(entity.path, PathBuf::from("Team B/ENG-6-new.md"));
+        assert_eq!(entity.title, "Shadow-backed title");
+        assert!(
+            store
+                .get_virtual_mutation(&mount_id, "move:issue-shadow")
+                .unwrap()
+                .is_some()
+        );
         let _ = std::fs::remove_dir_all(state_root);
     }
 

@@ -127,6 +127,13 @@ pub struct SourceDescriptor {
     create_entity_parent_kinds: Vec<EntityKind>,
     periodic_discovery_interval: Option<Duration>,
     body_diff_mode: BodyDiffMode,
+    virtual_rename_policy: VirtualRenamePolicy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VirtualRenamePolicy {
+    FilenameDerived,
+    PreserveCanonical,
 }
 
 impl SourceDescriptor {
@@ -172,6 +179,10 @@ impl SourceDescriptor {
 
     pub fn body_diff_mode(&self) -> BodyDiffMode {
         self.body_diff_mode
+    }
+
+    pub fn virtual_rename_policy(&self) -> VirtualRenamePolicy {
+        self.virtual_rename_policy
     }
 }
 
@@ -279,6 +290,7 @@ fn notion_source_descriptor() -> SourceDescriptor {
         create_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
         periodic_discovery_interval: None,
         body_diff_mode: BodyDiffMode::Block,
+        virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
     }
 }
 
@@ -295,6 +307,7 @@ fn google_docs_source_descriptor() -> SourceDescriptor {
         create_entity_parent_kinds: vec![EntityKind::Directory],
         periodic_discovery_interval: None,
         body_diff_mode: BodyDiffMode::Block,
+        virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
     }
 }
 
@@ -311,6 +324,7 @@ fn gmail_source_descriptor() -> SourceDescriptor {
         create_entity_parent_kinds: vec![EntityKind::Directory],
         periodic_discovery_interval: None,
         body_diff_mode: BodyDiffMode::Block,
+        virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
     }
 }
 
@@ -327,6 +341,7 @@ fn granola_source_descriptor() -> SourceDescriptor {
         create_entity_parent_kinds: Vec::new(),
         periodic_discovery_interval: Some(Duration::from_secs(300)),
         body_diff_mode: BodyDiffMode::Block,
+        virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
     }
 }
 
@@ -376,12 +391,14 @@ fn generic_source_descriptor(connector: &str) -> SourceDescriptor {
         create_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
         periodic_discovery_interval: None,
         body_diff_mode: BodyDiffMode::Block,
+        virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
     }
 }
 
 fn linear_source_descriptor() -> SourceDescriptor {
     let mut descriptor = generic_source_descriptor("linear");
     descriptor.body_diff_mode = BodyDiffMode::WholeEntity;
+    descriptor.virtual_rename_policy = VirtualRenamePolicy::PreserveCanonical;
     descriptor
 }
 

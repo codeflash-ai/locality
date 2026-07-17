@@ -16,9 +16,9 @@ use locality_store::{
 };
 use localityd::source::{
     LocalSourceValidator, ResolvedSource, ResolvedSourceSet, SourcePushValidator,
-    SourceValidationContext, resolve_source_for_mount, source_create_decision_for_parent_path,
-    source_descriptor, source_display_name, source_write_decision_for_path,
-    supported_source_connectors,
+    SourceValidationContext, VirtualRenamePolicy, resolve_source_for_mount,
+    source_create_decision_for_parent_path, source_descriptor, source_display_name,
+    source_write_decision_for_path, supported_source_connectors,
 };
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -140,6 +140,25 @@ fn generic_descriptor_preserves_source_id_in_guidance() {
     assert_eq!(
         source_descriptor("custom").body_diff_mode(),
         BodyDiffMode::Block
+    );
+}
+
+#[test]
+fn source_descriptors_declare_canonical_title_rename_policy() {
+    for connector in ["notion", "google-docs", "gmail", "granola", "custom"] {
+        assert_eq!(
+            source_descriptor(connector).virtual_rename_policy(),
+            VirtualRenamePolicy::FilenameDerived,
+            "{connector}"
+        );
+    }
+    assert_eq!(
+        source_descriptor("linear").virtual_rename_policy(),
+        VirtualRenamePolicy::PreserveCanonical
+    );
+    assert_eq!(
+        source_descriptor("linear").body_diff_mode(),
+        BodyDiffMode::WholeEntity
     );
 }
 

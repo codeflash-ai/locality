@@ -67,7 +67,8 @@ use crate::media::{render_document_with_absolute_media_hrefs, replace_hydrated_m
 use crate::projection_state;
 use crate::shadow_match::shadows_match;
 use crate::source::{
-    LocalSourceValidator, SourcePushValidator, SourceValidationContext, source_descriptor,
+    LocalSourceValidator, SourcePushValidator, SourceValidationContext,
+    source_create_decision_for_parent_path, source_descriptor, source_write_decision_for_path,
 };
 use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
 
@@ -1837,12 +1838,51 @@ where
 
     let read_path = projection_read_path(state_root, &mount, &relative_path, &absolute_path)?;
     let contents = read_to_string(&read_path)?;
+    let planned = plan_existing_document(
+        store,
+        job,
+        state_root,
+        &mount,
+        &entity,
+        &relative_path,
+        &contents,
+        validator,
+    )?;
+
+    Ok(PreparedPush {
+        absolute_path,
+        mount,
+        entity,
+        shadows: planned.shadow.into_iter().collect(),
+        pipeline: planned.pipeline,
+        readable_diff: planned.readable_diff,
+    })
+}
+
+struct ExistingDocumentPreparation {
+    shadow: Option<ShadowDocument>,
+    pipeline: PushPipelineResult,
+    readable_diff: Option<locality_core::readable_diff::ReadableDiffOutput>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_existing_document<S, Validator>(
+    store: &S,
+    job: &PushJob,
+    state_root: Option<&Path>,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+    relative_path: &Path,
+    contents: &str,
+    validator: &Validator,
+) -> Result<ExistingDocumentPreparation, PushPrepareError>
+where
+    S: EntityRepository + ShadowRepository,
+    Validator: SourcePushValidator + ?Sized,
+{
     if let Some(line) = unresolved_conflict_marker_line(&contents) {
-        return Ok(PreparedPush {
-            absolute_path,
-            mount,
-            entity,
-            shadows: Vec::new(),
+        return Ok(ExistingDocumentPreparation {
+            shadow: None,
             pipeline: validation_pipeline(unresolved_conflict_marker_issue(&relative_path, line)),
             readable_diff: None,
         });
@@ -1851,11 +1891,8 @@ where
     let parsed = match parse_canonical_markdown(&contents) {
         Ok(parsed) => parsed,
         Err(error) => {
-            return Ok(PreparedPush {
-                absolute_path,
-                mount,
-                entity,
-                shadows: Vec::new(),
+            return Ok(ExistingDocumentPreparation {
+                shadow: None,
                 pipeline: validation_pipeline(parse_error_issue(&relative_path, error)),
                 readable_diff: None,
             });
@@ -1866,11 +1903,8 @@ where
         .remote_id()
         .is_some_and(|remote_id| remote_id != &entity.remote_id)
     {
-        return Ok(PreparedPush {
-            absolute_path,
-            mount,
-            entity,
-            shadows: Vec::new(),
+        return Ok(ExistingDocumentPreparation {
+            shadow: None,
             pipeline: validation_pipeline(ValidationIssue::new(
                 "frontmatter_remote_id_mismatch",
                 relative_path,
@@ -1924,11 +1958,8 @@ where
     let readable_diff =
         readable_diff_for_existing_entity(&relative_path, &shadow, &contents, &pipeline);
 
-    Ok(PreparedPush {
-        absolute_path,
-        mount,
-        entity,
-        shadows: vec![shadow],
+    Ok(ExistingDocumentPreparation {
+        shadow: Some(shadow),
         pipeline,
         readable_diff,
     })
@@ -2443,14 +2474,42 @@ where
     };
     let mut operations = Vec::new();
     let mut affected = Vec::new();
-    let mut shadows = Vec::new();
+    let mut degradations = Vec::new();
+    let mut shadows = BTreeMap::new();
+    let mut readable_diffs = Vec::new();
+    let mut validation = ValidationReport::clean();
+    let mut seen_targets = BTreeSet::new();
     let mut representative = None;
     for mutation in &mutations {
+        if let Some(remote_id) = mutation.target_remote_id.as_ref()
+            && !seen_targets.insert(remote_id.clone())
+        {
+            validation.push(ValidationIssue::new(
+                "duplicate_virtual_mutation_target",
+                mutation.projected_path.clone(),
+                None,
+                format!(
+                    "multiple pending virtual filesystem mutations target entity `{}`",
+                    remote_id.0
+                ),
+                Some("resolve the duplicate pending move/delete before pushing".to_string()),
+            ));
+            continue;
+        }
+
         match mutation.mutation_kind {
             VirtualMutationKind::Delete => {
                 let Some(remote_id) = mutation.target_remote_id.clone() else {
                     continue;
                 };
+                append_source_write_validation(
+                    &mut validation,
+                    &mount,
+                    mutation
+                        .original_path
+                        .as_deref()
+                        .unwrap_or(&mutation.projected_path),
+                );
                 let entity = store
                     .get_entity(&mount.mount_id, &remote_id)
                     .map_err(PushPrepareError::Store)?
@@ -2460,10 +2519,26 @@ where
                     })
                     .map_err(PushPrepareError::Store)?;
                 if representative.is_none() {
-                    representative = Some(entity);
+                    representative = Some(entity.clone());
                 }
                 if let Ok(shadow) = store.load_shadow(&mount.mount_id, &remote_id) {
-                    shadows.push(shadow);
+                    let old = render_canonical_markdown(&CanonicalDocument::new(
+                        shadow.frontmatter.clone(),
+                        shadow.rendered_body.clone(),
+                    ));
+                    if let Some(diff) = locality_core::readable_diff::readable_diff_for_file(
+                        locality_platform::logical_path_display(
+                            mutation
+                                .original_path
+                                .as_deref()
+                                .unwrap_or(&mutation.projected_path),
+                        ),
+                        Some(&old),
+                        None,
+                    ) {
+                        readable_diffs.push(diff);
+                    }
+                    shadows.insert(remote_id.clone(), shadow);
                 }
                 operations.push(PushOperation::ArchiveEntity {
                     entity_id: remote_id.clone(),
@@ -2471,16 +2546,34 @@ where
                 affected.push(remote_id);
             }
             VirtualMutationKind::Create => {
+                append_source_create_validation(&mut validation, &mount, mutation);
                 let pending_path = mount.root.join(&mutation.projected_path);
-                return prepare_pending_create(
+                let prepared = prepare_pending_create(
                     store,
                     job,
                     state_root,
                     pending_path,
-                    mount,
+                    mount.clone(),
                     mutation.clone(),
                     validator,
-                );
+                )?;
+                if representative.is_none() {
+                    representative = Some(prepared.entity.clone());
+                }
+                validation.extend(prepared.pipeline.validation);
+                if let Some(plan) = prepared.pipeline.plan {
+                    for remote_id in plan.affected_entities {
+                        push_unique_remote_id(&mut affected, remote_id);
+                    }
+                    operations.extend(plan.operations);
+                    degradations.extend(plan.degradations);
+                }
+                for shadow in prepared.shadows {
+                    shadows.insert(shadow.entity_id.clone(), shadow);
+                }
+                if let Some(diff) = prepared.readable_diff {
+                    readable_diffs.push(diff);
+                }
             }
             VirtualMutationKind::Move | VirtualMutationKind::Rename => {
                 let remote_id = mutation.target_remote_id.clone().ok_or_else(|| {
@@ -2498,22 +2591,69 @@ where
                     })
                     .map_err(PushPrepareError::Store)?;
                 if representative.is_none() {
-                    representative = Some(entity);
+                    representative = Some(entity.clone());
                 }
-                shadows.push(
-                    store
-                        .load_shadow(&mount.mount_id, &remote_id)
-                        .map_err(PushPrepareError::Store)?,
+                append_source_write_validation(
+                    &mut validation,
+                    &mount,
+                    mutation.original_path.as_deref().unwrap_or(&entity.path),
                 );
+                append_source_write_validation(&mut validation, &mount, &mutation.projected_path);
                 let parent = move_parent_entity_for_mutation(store, &mount, mutation)?;
+                let mut new_title = mutation.title.clone();
+                let mut remaining_operations = Vec::new();
+                if let Some(contents) = pending_move_contents(&mount, mutation, state_root)? {
+                    let planned = plan_existing_document(
+                        store,
+                        job,
+                        state_root,
+                        &mount,
+                        &entity,
+                        &mutation.projected_path,
+                        &contents,
+                        validator,
+                    )?;
+                    validation.extend(planned.pipeline.validation);
+                    if let Some(plan) = planned.pipeline.plan {
+                        degradations.extend(plan.degradations);
+                        lower_move_document_operations(
+                            &mutation.projected_path,
+                            &remote_id,
+                            plan.operations,
+                            &mut new_title,
+                            &mut remaining_operations,
+                            &mut validation,
+                        );
+                    }
+                    if let Some(shadow) = planned.shadow {
+                        shadows.insert(remote_id.clone(), shadow);
+                    }
+                    if let Some(diff) = planned.readable_diff {
+                        readable_diffs.push(diff);
+                    }
+                } else {
+                    let shadow = store
+                        .load_shadow(&mount.mount_id, &remote_id)
+                        .map_err(|error| match error {
+                            StoreError::ShadowMissing { .. } => PushPrepareError::Core(
+                                LocalityError::InvalidState(format!(
+                                    "pending move `{}` must be materialized before it can be pushed",
+                                    mutation.local_id
+                                )),
+                            ),
+                            error => PushPrepareError::Store(error),
+                        })?;
+                    shadows.insert(remote_id.clone(), shadow);
+                }
                 operations.push(PushOperation::MoveEntity {
                     entity_id: remote_id.clone(),
                     new_parent_id: parent.remote_id,
                     new_parent_kind: parent.kind,
-                    new_title: mutation.title.clone(),
+                    new_title,
                     projected_path: mutation.projected_path.clone(),
                 });
-                affected.push(remote_id);
+                operations.extend(remaining_operations);
+                push_unique_remote_id(&mut affected, remote_id);
             }
         }
     }
@@ -2523,22 +2663,54 @@ where
             first.projected_path.display()
         )))
     })?;
-    let plan = PushPlan::new(affected, operations);
+    let readable_diff = locality_core::readable_diff::join_readable_diffs(readable_diffs);
+    if mount.read_only {
+        return Ok(PreparedPush {
+            absolute_path,
+            mount,
+            entity,
+            shadows: shadows.into_values().collect(),
+            pipeline: PushPipelineResult {
+                validation,
+                plan: None,
+                guardrail: GuardrailDecision::Proceed,
+                action: PushPipelineAction::ReadOnlyBlocked,
+                completed_stages: Vec::new(),
+            },
+            readable_diff,
+        });
+    }
+    if !validation.is_clean() {
+        return Ok(PreparedPush {
+            absolute_path,
+            mount,
+            entity,
+            shadows: shadows.into_values().collect(),
+            pipeline: validation_report_pipeline(validation),
+            readable_diff,
+        });
+    }
+
+    let plan = PushPlan::new(affected, operations).with_degradations(degradations);
     let guardrail =
         locality_core::push::evaluate_guardrails(&plan, &GuardrailPolicy::default(), None);
-    let action = match &guardrail {
-        GuardrailDecision::Proceed if job.assume_yes => PushPipelineAction::ProceedToApply,
-        GuardrailDecision::Proceed => PushPipelineAction::ConfirmPlan,
-        GuardrailDecision::ConfirmRequired { .. } if job.confirm_dangerous => {
-            PushPipelineAction::ProceedToApply
+    let action = if plan.operations.is_empty() {
+        PushPipelineAction::Noop
+    } else {
+        match &guardrail {
+            GuardrailDecision::Proceed if job.assume_yes => PushPipelineAction::ProceedToApply,
+            GuardrailDecision::Proceed => PushPipelineAction::ConfirmPlan,
+            GuardrailDecision::ConfirmRequired { .. } if job.confirm_dangerous => {
+                PushPipelineAction::ProceedToApply
+            }
+            GuardrailDecision::ConfirmRequired { .. } => PushPipelineAction::ConfirmDangerousPlan,
         }
-        GuardrailDecision::ConfirmRequired { .. } => PushPipelineAction::ConfirmDangerousPlan,
     };
     Ok(PreparedPush {
         absolute_path,
         mount,
         entity,
-        shadows,
+        shadows: shadows.into_values().collect(),
         pipeline: PushPipelineResult {
             validation: ValidationReport::clean(),
             plan: Some(plan),
@@ -2550,8 +2722,124 @@ where
                 PushStage::PlanAndConfirm,
             ],
         },
-        readable_diff: None,
+        readable_diff,
     })
+}
+
+fn push_unique_remote_id(affected: &mut Vec<RemoteId>, remote_id: RemoteId) {
+    if !affected.contains(&remote_id) {
+        affected.push(remote_id);
+    }
+}
+
+fn append_source_write_validation(
+    validation: &mut ValidationReport,
+    mount: &MountConfig,
+    path: &Path,
+) {
+    if let crate::source::SourceWriteDecision::ReadOnly { reason } =
+        source_write_decision_for_path(mount, path)
+    {
+        validation.push(ValidationIssue::new(
+            "source_path_read_only",
+            path,
+            None,
+            reason,
+            Some("remove the stale pending mutation or choose a writable source path".to_string()),
+        ));
+    }
+}
+
+fn append_source_create_validation(
+    validation: &mut ValidationReport,
+    mount: &MountConfig,
+    mutation: &VirtualMutationRecord,
+) {
+    let parent = mutation
+        .projected_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    if let crate::source::SourceWriteDecision::ReadOnly { reason } =
+        source_create_decision_for_parent_path(mount, parent)
+    {
+        validation.push(ValidationIssue::new(
+            "source_parent_read_only",
+            parent,
+            None,
+            reason,
+            Some("remove the stale pending create or choose a writable parent".to_string()),
+        ));
+    }
+}
+
+fn pending_move_contents(
+    mount: &MountConfig,
+    mutation: &VirtualMutationRecord,
+    state_root: Option<&Path>,
+) -> Result<Option<String>, PushPrepareError> {
+    let mut candidates = Vec::new();
+    if let Some(path) = mutation.content_path.clone() {
+        candidates.push(path);
+    }
+    if let Some(state_root) = state_root {
+        candidates.push(
+            virtual_fs_content_root(state_root, &mount.mount_id).join(&mutation.projected_path),
+        );
+    }
+    candidates.push(mount.root.join(&mutation.projected_path));
+    candidates.dedup();
+
+    for path in candidates {
+        if path.is_file() {
+            return read_to_string(&path).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn lower_move_document_operations(
+    path: &Path,
+    remote_id: &RemoteId,
+    document_operations: Vec<PushOperation>,
+    new_title: &mut String,
+    remaining: &mut Vec<PushOperation>,
+    validation: &mut ValidationReport,
+) {
+    for operation in document_operations {
+        match operation {
+            PushOperation::UpdateProperties {
+                entity_id,
+                mut properties,
+            } if entity_id == *remote_id => {
+                if let Some(title) = properties.remove("title") {
+                    match title {
+                        PropertyValue::String(title) => *new_title = title,
+                        PropertyValue::Null => validation.push(ValidationIssue::new(
+                            "move_title_invalid",
+                            path,
+                            None,
+                            "a moved entity title cannot be removed",
+                            Some("set a non-empty string title before pushing".to_string()),
+                        )),
+                        _ => validation.push(ValidationIssue::new(
+                            "move_title_invalid",
+                            path,
+                            None,
+                            "a moved entity title must be a string",
+                            Some("set a string title before pushing".to_string()),
+                        )),
+                    }
+                }
+                if !properties.is_empty() {
+                    remaining.push(PushOperation::UpdateProperties {
+                        entity_id,
+                        properties,
+                    });
+                }
+            }
+            operation => remaining.push(operation),
+        }
+    }
 }
 
 fn create_entity_pipeline(
@@ -2953,6 +3241,51 @@ where
             .map_err(LocalityError::from)?
             .ok_or_else(|| StoreError::MountMissing(request.mount_id.clone()))
             .map_err(LocalityError::from)?;
+        let planned_moves = request
+            .plan
+            .operations
+            .iter()
+            .enumerate()
+            .filter_map(|(operation_index, operation)| match operation {
+                PushOperation::MoveEntity {
+                    entity_id,
+                    new_parent_id,
+                    ..
+                } => Some((operation_index, entity_id, new_parent_id)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (operation_index, entity_id, new_parent_id) in planned_moves.iter().copied() {
+            if !request.changed_remote_ids.contains(entity_id) {
+                return Err(LocalityError::InvalidState(format!(
+                    "move operation for `{}` did not report the entity as changed",
+                    entity_id.0
+                )));
+            }
+            let has_matching_effect = request.apply_effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    JournalApplyEffect::MovedEntity {
+                        operation_index: effect_index,
+                        entity_id: effect_entity_id,
+                        parent_id,
+                        ..
+                    } if *effect_index == operation_index
+                        && effect_entity_id == entity_id
+                        && parent_id == new_parent_id
+                )
+            });
+            if !has_matching_effect {
+                return Err(LocalityError::InvalidState(format!(
+                    "move operation for `{}` did not report a matching moved-entity effect",
+                    entity_id.0
+                )));
+            }
+        }
+        let planned_move_ids = planned_moves
+            .into_iter()
+            .map(|(_, entity_id, _)| entity_id.clone())
+            .collect::<BTreeSet<_>>();
         let mut reconciled_remote_ids = Vec::new();
 
         for effect in request.apply_effects {
@@ -3075,21 +3408,17 @@ where
                             .save_entity(entity)
                             .map_err(LocalityError::from)?;
                     }
-                    for local_id in [
-                        format!("move:{}", entity_id.0),
-                        format!("rename:{}", entity_id.0),
-                    ] {
-                        self.store
-                            .delete_virtual_mutation(request.mount_id, &local_id)
-                            .map_err(LocalityError::from)?;
-                    }
                 }
                 _ => {}
             }
         }
 
+        let mut readback_ids = BTreeSet::new();
         for remote_id in request.changed_remote_ids {
             if reconciled_remote_ids.iter().any(|id| id == remote_id) {
+                continue;
+            }
+            if !readback_ids.insert(remote_id.clone()) {
                 continue;
             }
             let mut entity = self
@@ -3121,9 +3450,20 @@ where
                 &output_root,
                 rendered,
             )?;
-            self.store
-                .delete_virtual_mutation(request.mount_id, &format!("rename:{}", remote_id.0))
-                .map_err(LocalityError::from)?;
+            if planned_move_ids.contains(remote_id) {
+                for local_id in [
+                    format!("move:{}", remote_id.0),
+                    format!("rename:{}", remote_id.0),
+                ] {
+                    self.store
+                        .delete_virtual_mutation(request.mount_id, &local_id)
+                        .map_err(LocalityError::from)?;
+                }
+            } else {
+                self.store
+                    .delete_virtual_mutation(request.mount_id, &format!("rename:{}", remote_id.0))
+                    .map_err(LocalityError::from)?;
+            }
             reconciled_remote_ids.push(remote_id.clone());
         }
 
@@ -3466,9 +3806,15 @@ fn locality_error_code(error: &LocalityError) -> &'static str {
 
 #[cfg(test)]
 mod locality_error_code_tests {
-    use locality_core::LocalityError;
+    use std::collections::BTreeMap;
+    use std::path::Path;
 
-    use super::locality_error_code;
+    use locality_core::LocalityError;
+    use locality_core::model::RemoteId;
+    use locality_core::planner::{PropertyValue, PushOperation};
+    use locality_core::validation::ValidationReport;
+
+    use super::{locality_error_code, lower_move_document_operations};
 
     #[test]
     fn update_required_has_stable_push_error_code() {
@@ -3480,6 +3826,33 @@ mod locality_error_code_tests {
             }),
             "update_required"
         );
+    }
+
+    #[test]
+    fn move_lowering_rejects_null_and_non_string_title_values() {
+        for value in [PropertyValue::Null, PropertyValue::Bool(true)] {
+            let remote_id = RemoteId::new("issue-1");
+            let mut title = "Canonical title".to_string();
+            let mut remaining = Vec::new();
+            let mut validation = ValidationReport::clean();
+
+            lower_move_document_operations(
+                Path::new("Team/ENG-1/page.md"),
+                &remote_id,
+                vec![PushOperation::UpdateProperties {
+                    entity_id: remote_id.clone(),
+                    properties: BTreeMap::from([("title".to_string(), value)]),
+                }],
+                &mut title,
+                &mut remaining,
+                &mut validation,
+            );
+
+            assert_eq!(title, "Canonical title");
+            assert!(remaining.is_empty());
+            assert_eq!(validation.issues.len(), 1);
+            assert_eq!(validation.issues[0].code, "move_title_invalid");
+        }
     }
 }
 

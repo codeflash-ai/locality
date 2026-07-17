@@ -119,3 +119,19 @@ Page-directory renames and parent changes are represented as the connector-neutr
 `move_entity` push operation. Connectors that support it should update the
 remote parent and title as one logical operation and return a moved-entity
 journal effect so reconcile can fetch the entity at its final projected path.
+Each source descriptor also declares whether virtual renames derive the remote
+title from the destination filename or preserve the canonical title. Sources
+such as Linear preserve canonical titles: a filesystem rename relocates cached
+bytes unchanged, and an explicit title edit inside those bytes is lowered into
+the single `move_entity` title field during push planning. Pending moves with
+cached content run the same parsing, identity, source-schema, conflict, body
+diff, semantic, media, and guardrail pipeline as ordinary existing documents.
+When no bytes exist, a complete shadow permits a structural-only move; without
+either bytes or a shadow, planning fails and requires materialization.
+
+Apply results for every planned `move_entity` must include both the entity in
+`changed_remote_ids` and a matching moved-entity effect at the planned operation
+index. Reconciliation stages the destination path/title, fetches and accepts the
+remote result, and only then removes durable `move:`/`rename:` intent. Missing
+effects, missing changed IDs, or failed readback leave that intent available for
+recovery.
