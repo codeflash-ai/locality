@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   connectedSourcesReadyToMount,
+  isSourceConnectorId,
   sourceSetupIsActiveConnector,
   sourceSetupIsBusy,
   sourceSetupProgressLabel,
@@ -41,5 +42,15 @@ describe("source setup progress", () => {
         mounts: [],
       }),
     ).toEqual(["notion"]);
+  });
+
+  it("recognizes Google Calendar as ready to mount when connected", () => {
+    expect(isSourceConnectorId("google-calendar")).toBe(true);
+    expect(
+      connectedSourcesReadyToMount({
+        connections: [{ connector: "google-calendar", status: "active" }],
+        mounts: [],
+      }),
+    ).toEqual(["google-calendar"]);
   });
 });

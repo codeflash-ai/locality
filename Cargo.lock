@@ -2133,6 +2133,7 @@ dependencies = [
  "locality-connector",
  "locality-core",
  "locality-gmail",
+ "locality-google-calendar",
  "locality-google-docs",
  "locality-notion",
  "locality-platform",

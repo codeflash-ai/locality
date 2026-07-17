@@ -99,6 +99,7 @@ import {
   type SourceSetupState,
 } from "./source-setup";
 import gmailIconUrl from "./assets/connectors/gmail.svg";
+import googleCalendarIconUrl from "./assets/connectors/google-calendar.svg";
 import googleDocsIconUrl from "./assets/connectors/google-docs.svg";
 import granolaIconUrl from "./assets/connectors/granola.svg";
 import notionIconUrl from "./assets/connectors/notion.svg";
@@ -134,6 +135,7 @@ type ConnectorOption = {
 const CONNECTOR_ICON_URLS: Record<SourceConnectorId, string> = {
   notion: notionIconUrl,
   "google-docs": googleDocsIconUrl,
+  "google-calendar": googleCalendarIconUrl,
   gmail: gmailIconUrl,
   granola: granolaIconUrl,
 };
@@ -697,6 +699,8 @@ function suggestedAgentPrompt(mountPath: string, connector: OnboardingConnectorI
       return `Use Locality to read my Granola meetings. Open the files under ${mountPath}, search summaries and transcripts with normal file tools, and cite the meeting files you used. Granola is read-only in Locality, so do not try to push edits back.`;
     case "google-docs":
       return `Use Locality to edit my Google Docs workspace. Open the files under ${mountPath}, make the requested edits directly in Markdown, and leave changes pending for Locality review before pushing.`;
+    case "google-calendar":
+      return `Use Locality to inspect my Google Calendar source. Open the files under ${mountPath}, review calendar events with normal file tools, and prepare new event drafts for Locality review before creating them.`;
     case "gmail":
       return `Use Locality to inspect my Gmail source. Open the files under ${mountPath}, search mail with normal file tools, and prepare draft updates only when the mounted draft files support it. Leave outbound changes for Locality review.`;
     case "notion":
@@ -705,7 +709,7 @@ function suggestedAgentPrompt(mountPath: string, connector: OnboardingConnectorI
 }
 
 function isOnboardingConnector(value?: string | null): value is OnboardingConnectorId {
-  return value === "notion" || value === "google-docs" || value === "gmail" || value === "granola";
+  return value === "notion" || value === "google-docs" || value === "google-calendar" || value === "gmail" || value === "granola";
 }
 
 function onboardingConnectorFromSnapshot(snapshot: DesktopSnapshot): OnboardingConnectorId {
@@ -719,7 +723,7 @@ function onboardingConnectorFromSnapshot(snapshot: DesktopSnapshot): OnboardingC
 }
 
 function connectorUsesOAuth(connector: OnboardingConnectorId) {
-  return connector === "notion" || connector === "google-docs" || connector === "gmail";
+  return connector === "notion" || connector === "google-docs" || connector === "google-calendar" || connector === "gmail";
 }
 
 function connectorSkipsMountStep(connector: OnboardingConnectorId) {
@@ -754,6 +758,8 @@ function onboardingConnectorDescription(
         return `${workspaceLabel} is ready. Locality will now create the Notion folder under CloudStorage and prepare the local workspace.`;
       case "google-docs":
         return "Google Docs is ready. Locality mounted the selected Drive folder as local files under CloudStorage.";
+      case "google-calendar":
+        return "Google Calendar is ready. Locality mounted primary calendar events as local files under CloudStorage.";
       case "gmail":
         return "Gmail is ready. Locality mounted mailboxes as local files under CloudStorage.";
       case "granola":
@@ -767,6 +773,8 @@ function onboardingConnectorDescription(
         return "A browser window is open. Choose the workspace and pages Locality can access, then approve.";
       case "google-docs":
         return "A browser window is open. Approve Google Docs access, then Locality will create the local folder.";
+      case "google-calendar":
+        return "A browser window is open. Approve Google Calendar access, then Locality will create the local calendar folder.";
       case "gmail":
         return "A browser window is open. Approve Gmail access, then Locality will create the local mailbox folder.";
       case "granola":
@@ -779,6 +787,8 @@ function onboardingConnectorDescription(
       return "Connect the source you want agents to help with. Your machine talks directly to Notion, and app credentials are protected by macOS Keychain.";
     case "google-docs":
       return "Connect Google Docs during setup so agents can work with docs through the same local file workflow.";
+    case "google-calendar":
+      return "Connect Google Calendar during setup so agents can review events and prepare new event drafts through local files.";
     case "gmail":
       return "Connect Gmail during setup so agents can search mailboxes and prepare reviewed draft work from local files.";
     case "granola":
@@ -792,6 +802,8 @@ function onboardingConnectorPills(connector: OnboardingConnectorId) {
       return ["Scoped access", "Credentials in Keychain", "Direct app connection"];
     case "google-docs":
       return ["Google OAuth", "Drive folder", "Markdown edits"];
+    case "google-calendar":
+      return ["Google OAuth", "Primary calendar", "Event drafts"];
     case "gmail":
       return ["Google OAuth", "Mailbox files", "Draft review"];
     case "granola":
@@ -805,6 +817,8 @@ function onboardingReadyCopy(connector: OnboardingConnectorId) {
       return "Your local workspace is ready. Agents can open this folder, edit Markdown, and leave changes for Review Center. Open the app to review changes, manage sync, and turn on Live Mode when you want file saves to update Notion and new Notion changes to appear locally.";
     case "google-docs":
       return "Your Google Docs workspace is ready as local files. Agents can edit docs in Markdown and leave changes for Review Center before anything is pushed back.";
+    case "google-calendar":
+      return "Your Google Calendar source is ready as local files. Agents can review events and prepare new event drafts before anything is created remotely.";
     case "gmail":
       return "Your Gmail source is ready as local files. Agents can search mailbox content and prepare reviewed draft work without leaving the filesystem.";
     case "granola":
@@ -1923,7 +1937,7 @@ function Onboarding({
     );
   }
 
-  async function connectGoogleOnboarding(connector: "google-docs" | "gmail") {
+  async function connectGoogleOnboarding(connector: "google-docs" | "google-calendar" | "gmail") {
     if (selectedConnectorBusy) {
       return;
     }
@@ -1938,7 +1952,7 @@ function Onboarding({
     setOauthInFlight(true);
     setStep(3);
     try {
-      const command = connector === "google-docs" ? "connect_google_docs" : "connect_gmail";
+      const command = googleOAuthConnectCommand(connector);
       const connectReport = await callCommand<ActionReport>(
         command,
         undefined,
@@ -1987,6 +2001,7 @@ function Onboarding({
         await startConnect();
         return;
       case "google-docs":
+      case "google-calendar":
       case "gmail":
         await connectGoogleOnboarding(selectedOnboardingConnector);
         return;
@@ -3214,7 +3229,7 @@ function MountsView({
       return { ok: false, message: "Granola requires an API key." };
     }
 
-    const command = connector === "google-docs" ? "connect_google_docs" : "connect_gmail";
+    const command = googleOAuthConnectCommand(connector);
     setActionError("");
     setActionMessage("");
     const report = await callCommand<ActionReport>(
@@ -3563,6 +3578,14 @@ function AddSourceDialog({
       mounted: sourceMounted(snapshot, "google-docs"),
     },
     {
+      id: "google-calendar",
+      name: "Google Calendar",
+      description: "Primary calendar events as files, new events from reviewed drafts.",
+      status: sourceConnectorStatus(snapshot, "google-calendar"),
+      keywords: ["google", "calendar", "gcal", "events", "meet"],
+      mounted: sourceMounted(snapshot, "google-calendar"),
+    },
+    {
       id: "gmail",
       name: "Gmail",
       description: "Inbox and sent as readable files, drafts as reviewed outbound mail.",
@@ -3690,6 +3713,11 @@ function AddSourceDialog({
                         <SettingRow title="Workspace folder" value={googleDocsWorkspaceFolder || "Locality"} />
                         <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
                       </>
+                    ) : connector.id === "google-calendar" ? (
+                      <>
+                        <SettingRow title="Calendar" value="Primary calendar" />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                      </>
                     ) : connector.id === "granola" ? (
                       <>
                         <SettingRow title="Content" value="Summaries and transcripts" />
@@ -3783,6 +3811,8 @@ function sourceDisplayName(connector: SourceConnectorId) {
       return "Notion";
     case "google-docs":
       return "Google Docs";
+    case "google-calendar":
+      return "Google Calendar";
     case "gmail":
       return "Gmail";
     case "granola":
@@ -3796,6 +3826,8 @@ function sourceMountId(connector: SourceConnectorId) {
       return "notion-main";
     case "google-docs":
       return "google-docs-main";
+    case "google-calendar":
+      return "google-calendar-main";
     case "gmail":
       return "gmail-main";
     case "granola":
@@ -3855,6 +3887,8 @@ function sourceDefaultPath(snapshot: DesktopSnapshot, connector: SourceConnector
       return "~/Library/CloudStorage/Locality/notion";
     case "google-docs":
       return "~/Library/CloudStorage/Locality/google-docs-main";
+    case "google-calendar":
+      return "~/Library/CloudStorage/Locality/google-calendar-main";
     case "gmail":
       return "~/Library/CloudStorage/Locality/gmail-main";
     case "granola":
@@ -3886,6 +3920,17 @@ function sourceActionIcon(connector: SourceConnectorId, needsConnection: boolean
     return <ShieldCheck />;
   }
   return <FolderOpen />;
+}
+
+function googleOAuthConnectCommand(connector: "google-docs" | "google-calendar" | "gmail") {
+  switch (connector) {
+    case "google-docs":
+      return "connect_google_docs";
+    case "google-calendar":
+      return "connect_google_calendar";
+    case "gmail":
+      return "connect_gmail";
+  }
 }
 
 function ConnectorIcon({ connector }: { connector: SourceConnectorId }) {
@@ -7197,6 +7242,19 @@ function ConnectorOptions({
           <small>Docs and Drive folders through the same local model.</small>
         </div>
         <span>{connectedConnector === "google-docs" ? "Connected" : "OAuth"}</span>
+      </button>
+      <button
+        type="button"
+        className={`connector-option available selectable ${selected === "google-calendar" ? "selected" : ""}`}
+        disabled={busy}
+        onClick={() => onSelect("google-calendar")}
+      >
+        <ConnectorIcon connector="google-calendar" />
+        <div>
+          <strong>Google Calendar</strong>
+          <small>Primary calendar events and reviewed event drafts.</small>
+        </div>
+        <span>{connectedConnector === "google-calendar" ? "Connected" : "OAuth"}</span>
       </button>
       <button
         type="button"

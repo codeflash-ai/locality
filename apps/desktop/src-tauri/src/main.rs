@@ -22,9 +22,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use loc_cli::connect::DEFAULT_NOTION_PROFILE_ID;
 use loc_cli::connect::{
     BrokerOAuthConnectOptions, ConnectOptions, GmailBrokerOAuthConnectOptions,
-    GoogleDocsBrokerOAuthConnectOptions, HttpGranolaConnectionProbe,
-    run_connect_gmail_broker_oauth, run_connect_google_docs_broker_oauth, run_connect_granola,
-    run_connect_notion_broker_oauth, run_disconnect,
+    GoogleCalendarBrokerOAuthConnectOptions, GoogleDocsBrokerOAuthConnectOptions,
+    HttpGranolaConnectionProbe, run_connect_gmail_broker_oauth,
+    run_connect_google_calendar_broker_oauth, run_connect_google_docs_broker_oauth,
+    run_connect_granola, run_connect_notion_broker_oauth, run_disconnect,
 };
 use loc_cli::daemon::{DaemonRunState, run_daemon_control};
 use loc_cli::diff::{DiffReport, run_diff};
@@ -64,6 +65,10 @@ use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEn
 use locality_gmail::{
     DEFAULT_GMAIL_OAUTH_BROKER_URL, DEFAULT_GMAIL_OAUTH_REDIRECT_URI, GMAIL_CONNECTOR_ID,
     HttpGmailOAuthBrokerClient,
+};
+use locality_google_calendar::{
+    DEFAULT_GOOGLE_CALENDAR_OAUTH_BROKER_URL, DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI,
+    GOOGLE_CALENDAR_CONNECTOR_ID, HttpGoogleCalendarOAuthBrokerClient,
 };
 use locality_google_docs::{
     DEFAULT_GOOGLE_DOCS_OAUTH_BROKER_URL, DEFAULT_GOOGLE_DOCS_OAUTH_REDIRECT_URI,
@@ -514,6 +519,7 @@ struct MountLiveModeChange {
 
 static CONNECT_NOTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static CONNECT_GOOGLE_DOCS_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static CONNECT_GOOGLE_CALENDAR_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static CONNECT_GMAIL_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static DAEMON_LIFECYCLE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static NOTION_LOGIN_LINK: OnceLock<Mutex<Option<String>>> = OnceLock::new();
@@ -947,6 +953,11 @@ async fn connect_google_docs(app: AppHandle) -> ActionReport {
 }
 
 #[tauri::command]
+async fn connect_google_calendar(app: AppHandle) -> ActionReport {
+    run_google_calendar_connection_flow(app, true).await
+}
+
+#[tauri::command]
 async fn connect_gmail(app: AppHandle) -> ActionReport {
     run_gmail_connection_flow(app, true).await
 }
@@ -1074,6 +1085,55 @@ async fn run_google_docs_connection_flow(app: AppHandle, open_browser: bool) -> 
                 "warn",
                 "google_docs_access.failed",
                 format!("connect google docs failed: {message}"),
+            );
+            ActionReport { ok: false, message }
+        }
+    };
+    if report.ok {
+        refresh_desktop_surfaces(&app);
+    }
+    report
+}
+
+async fn run_google_calendar_connection_flow(app: AppHandle, open_browser: bool) -> ActionReport {
+    if CONNECT_GOOGLE_CALENDAR_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        return ActionReport {
+            ok: false,
+            message: "A Google Calendar connection flow is already waiting for browser approval."
+                .to_string(),
+        };
+    }
+
+    let state_root = default_state_root();
+    let activity_state_root = state_root.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        connect_google_calendar_with_broker(state_root, open_browser)
+    })
+    .await
+    .map_err(|error| format!("Google Calendar OAuth worker failed: {error}"));
+    CONNECT_GOOGLE_CALENDAR_IN_PROGRESS.store(false, Ordering::Release);
+
+    let report = match result {
+        Ok(Ok(message)) => {
+            if let Err(error) = record_desktop_activity(
+                &activity_state_root,
+                "Connected Google Calendar",
+                &message,
+                "connect",
+            ) {
+                desktop_log(
+                    "warn",
+                    "activity.record_failed",
+                    format!("could not record Google Calendar access activity: {error}"),
+                );
+            }
+            ActionReport { ok: true, message }
+        }
+        Ok(Err(message)) | Err(message) => {
+            desktop_log(
+                "warn",
+                "google_calendar_access.failed",
+                format!("connect google calendar failed: {message}"),
             );
             ActionReport { ok: false, message }
         }
@@ -4080,8 +4140,9 @@ fn connection_connector_rank(connector: &str) -> usize {
     match connector {
         "notion" => 0,
         "google-docs" => 1,
-        "gmail" => 2,
-        "granola" => 3,
+        GOOGLE_CALENDAR_CONNECTOR_ID => 2,
+        "gmail" => 3,
+        "granola" => 4,
         _ => 10,
     }
 }
@@ -5333,6 +5394,11 @@ fn mount_access_scope_label(store: Option<&SqliteStateStore>, mount: &MountConfi
             .as_ref()
             .map(|remote_id| format!("Drive folder {}", remote_id.0))
             .unwrap_or_else(|| "Google Docs workspace folder".to_string()),
+        GOOGLE_CALENDAR_CONNECTOR_ID => mount
+            .remote_root_id
+            .as_ref()
+            .map(|remote_id| format!("Calendar {}", remote_id.0))
+            .unwrap_or_else(|| "Primary calendar".to_string()),
         _ => mount
             .remote_root_id
             .as_ref()
@@ -7293,7 +7359,7 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
                 })?;
             Some(folder_id)
         }
-        "gmail" | "granola" => None,
+        GOOGLE_CALENDAR_CONNECTOR_ID | "gmail" | "granola" => None,
         other => {
             return Err(format!(
                 "Desktop mount creation does not support connector `{other}`."
@@ -9852,6 +9918,64 @@ fn connect_google_docs_with_broker(
     ))
 }
 
+fn connect_google_calendar_with_broker(
+    state_root: PathBuf,
+    open_browser: bool,
+) -> Result<String, String> {
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let credentials = open_credential_store(&state_root);
+    let broker_url = env_first(&[
+        "LOCALITY_GOOGLE_CALENDAR_OAUTH_BROKER_URL",
+        "LOCALITY_AUTH_BROKER_URL",
+    ])
+    .unwrap_or_else(|| DEFAULT_GOOGLE_CALENDAR_OAUTH_BROKER_URL.to_string());
+    let redirect_uri = env_first(&["LOCALITY_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI"])
+        .unwrap_or_else(|| DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI.to_string());
+    let broker = HttpGoogleCalendarOAuthBrokerClient::new(broker_url.clone());
+    let start = broker
+        .start(&OAuthBrokerStart {
+            connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
+            redirect_uri,
+        })
+        .map_err(|error| format!("Could not start Google Calendar OAuth broker flow: {error}"))?;
+    let authorization = run_local_oauth_authorization(
+        "Google Calendar",
+        &start.authorization_url,
+        &start.redirect_uri,
+        &start.state,
+        !open_browser,
+        true,
+    )
+    .map_err(|error| error.message)?;
+    let options = GoogleCalendarBrokerOAuthConnectOptions {
+        connection_id: Some(ConnectionId::new("google-calendar-default")),
+        broker_url,
+        client_id: start.client_id,
+        session: start.session,
+        state: start.state,
+        code: authorization.code,
+        redirect_uri: start.redirect_uri,
+    };
+
+    let report = run_connect_google_calendar_broker_oauth(
+        &mut store,
+        credentials.as_ref(),
+        options,
+        &broker,
+    )
+    .map_err(|error| error.message())?;
+    let connected_message = match report.workspace_name.or(report.account_label) {
+        Some(label) if !label.is_empty() => {
+            format!("Connected Google Calendar account {label}.")
+        }
+        _ => "Connected Google Calendar.".to_string(),
+    };
+    Ok(format!(
+        "{connected_message} Create a Google Calendar source folder to mount primary calendar events."
+    ))
+}
+
 fn connect_gmail_with_broker(state_root: PathBuf, open_browser: bool) -> Result<String, String> {
     let mut store = SqliteStateStore::open(state_root.clone())
         .map_err(|error| format!("Could not open Locality state: {error}"))?;
@@ -11603,6 +11727,87 @@ mod tests {
         let summary = super::mount_summary(None, Path::new("."), None, None, None);
 
         assert!(Path::new(&summary.local_path).is_absolute());
+    }
+
+    #[test]
+    fn source_connection_order_places_google_calendar_before_gmail() {
+        let mut connections = vec![
+            connection_for_connector("gmail", "Gmail"),
+            connection_for_connector("google-calendar", "Primary calendar"),
+            connection_for_connector("granola", "Granola"),
+            connection_for_connector("notion", "CodeFlash"),
+            connection_for_connector("google-docs", "Drive"),
+        ];
+
+        let summaries = super::connection_summaries(&connections);
+
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|connection| connection.connector.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "notion",
+                "google-docs",
+                "google-calendar",
+                "gmail",
+                "granola"
+            ]
+        );
+
+        connections.reverse();
+        let summaries = super::connection_summaries(&connections);
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|connection| connection.connector.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "notion",
+                "google-docs",
+                "google-calendar",
+                "gmail",
+                "granola"
+            ]
+        );
+    }
+
+    #[test]
+    fn desktop_snapshot_lists_google_calendar_mount_without_remote_root() {
+        let temp = TestTempDir::new("desktop-google-calendar-mount");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let calendar_connection = connection_for_connector("google-calendar", "Primary calendar");
+        let calendar_mount = MountConfig::new(
+            MountId::new("google-calendar-main"),
+            "google-calendar",
+            temp.path().join("google-calendar"),
+        )
+        .with_connection_id(calendar_connection.connection_id.clone())
+        .projection(ProjectionMode::LinuxFuse);
+
+        store
+            .save_connection(calendar_connection)
+            .expect("save calendar connection");
+        store
+            .save_mount(calendar_mount)
+            .expect("save calendar mount");
+
+        let snapshot = super::load_desktop_snapshot_from_store(&store, temp.path())
+            .expect("load snapshot from test store");
+        let calendar = snapshot
+            .mounts
+            .iter()
+            .find(|mount| mount.mount_id == "google-calendar-main")
+            .expect("calendar mount");
+
+        assert_eq!(
+            snapshot.active_mount_id.as_deref(),
+            Some("google-calendar-main")
+        );
+        assert_eq!(snapshot.connection.connector, "google-calendar");
+        assert_eq!(calendar.connector_name, "Google Calendar");
+        assert_eq!(calendar.access_scope, "Primary calendar");
+        assert_eq!(calendar.remote_root_id, None);
     }
 
     #[test]
@@ -16101,6 +16306,26 @@ mod tests {
         }
     }
 
+    fn connection_for_connector(connector: &str, workspace_name: &str) -> ConnectionRecord {
+        ConnectionRecord {
+            connection_id: ConnectionId::new(format!("{connector}-default")),
+            profile_id: None,
+            connector: connector.to_string(),
+            display_name: format!("{connector}-default"),
+            account_label: Some(workspace_name.to_string()),
+            workspace_id: None,
+            workspace_name: Some(workspace_name.to_string()),
+            auth_kind: "oauth".to_string(),
+            secret_ref: format!("connection:{connector}-default"),
+            scopes: Vec::new(),
+            capabilities_json: "{}".to_string(),
+            status: "active".to_string(),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+            expires_at: None,
+        }
+    }
+
     fn search_result(kind: &str, state: &str) -> SearchResult {
         SearchResult {
             mount_id: "notion-main".to_string(),
@@ -16915,6 +17140,7 @@ fn main() {
             connect_notion_without_browser,
             change_notion_access,
             connect_google_docs,
+            connect_google_calendar,
             connect_gmail,
             notion_login_link,
             install_state_review,
