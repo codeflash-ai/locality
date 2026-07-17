@@ -332,7 +332,7 @@ fn mount_can_persist_google_docs_workspace_folder() {
 fn slack_mount_is_read_only_by_default() {
     let fixture = MountFixture::new("loc-cli-mount-slack-read-only");
     let mut store = InMemoryStateStore::new();
-    let settings_json = r#"{"slack":{"history_limit":15,"types":["public_channel","private_channel","im","mpim"]}}"#;
+    let settings_json = r#"{"slack":{"history_limit":15,"types":["public_channel","private_channel","im","mpim"],"auto_join_public_channels":true}}"#;
 
     let report = run_mount(
         &mut store,
@@ -553,7 +553,7 @@ fn cli_mount_slack_persists_requested_read_only_registration() {
     let loc = env!("CARGO_BIN_EXE_loc");
     let mount_root = fixture.root.join("slack");
     let mount_root_arg = mount_root.display().to_string();
-    let settings_json = r#"{"slack":{"history_limit":15,"types":["public_channel","private_channel","im","mpim"]}}"#;
+    let settings_json = r#"{"slack":{"history_limit":15,"types":["public_channel","private_channel","im","mpim"],"auto_join_public_channels":true}}"#;
 
     let report = loc_json_ok(loc_command(loc, &state_root).args([
         "mount",
@@ -595,11 +595,15 @@ fn cli_mount_slack_persists_requested_read_only_registration() {
 }
 
 #[test]
-fn cli_mount_slack_rejects_auto_join_without_channels_join_scope() {
+fn cli_mount_slack_rejects_public_channel_mount_without_channels_join_scope() {
     let fixture = MountFixture::new("loc-cli-slack-auto-join-missing-scope");
     fs::create_dir_all(&fixture.root).expect("create fixture root");
     let state_root = fixture.root.join("state");
-    seed_cli_slack_connection(&state_root, "slack-work");
+    seed_cli_slack_connection_with_scopes(
+        &state_root,
+        "slack-work",
+        slack_scopes_without_auto_join(),
+    );
 
     let loc = env!("CARGO_BIN_EXE_loc");
     let mount_root = fixture.root.join("slack");
@@ -613,7 +617,6 @@ fn cli_mount_slack_rejects_auto_join_without_channels_join_scope() {
             "slack-work",
             "--projection",
             "plain-files",
-            "--auto-join-public-channels",
             "--json",
         ]),
         2,
@@ -649,7 +652,6 @@ fn cli_mount_slack_persists_auto_join_public_channels_setting() {
         "slack-main",
         "--projection",
         "plain-files",
-        "--auto-join-public-channels",
         "--json",
     ]));
 
@@ -666,6 +668,37 @@ fn cli_mount_slack_persists_auto_join_public_channels_setting() {
     assert_eq!(
         mount.settings_json,
         r#"{"slack":{"history_limit":15,"types":["public_channel","private_channel","im","mpim"],"auto_join_public_channels":true}}"#
+    );
+}
+
+#[test]
+fn cli_mount_slack_omits_auto_join_when_public_channel_type_is_excluded() {
+    let fixture = MountFixture::new("loc-cli-slack-auto-join-public-excluded");
+    fs::create_dir_all(&fixture.root).expect("create fixture root");
+    let state_root = fixture.root.join("state");
+    seed_cli_slack_connection_with_scopes(&state_root, "slack-work", slack_scopes_with_auto_join());
+
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let mount_root = fixture.root.join("slack");
+    let mount_root_arg = mount_root.display().to_string();
+    let report = loc_json_ok(loc_command(loc, &state_root).args([
+        "mount",
+        "slack",
+        mount_root_arg.as_str(),
+        "--connection",
+        "slack-work",
+        "--mount-id",
+        "slack-main",
+        "--projection",
+        "plain-files",
+        "--types",
+        "im,mpim",
+        "--json",
+    ]));
+
+    assert_eq!(
+        report["settings_json"],
+        r#"{"slack":{"history_limit":15,"types":["im","mpim"]}}"#
     );
 }
 
@@ -1454,8 +1487,22 @@ fn slack_scopes_with_auto_join() -> Vec<String> {
         .iter()
         .map(|scope| scope.to_string())
         .collect::<Vec<_>>();
-    scopes.push(SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE.to_string());
+    if !scopes
+        .iter()
+        .any(|scope| scope == SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE)
+    {
+        scopes.push(SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE.to_string());
+    }
     scopes
+}
+
+fn slack_scopes_without_auto_join() -> Vec<String> {
+    SLACK_OAUTH_SCOPES
+        .iter()
+        .copied()
+        .filter(|scope| *scope != SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE)
+        .map(str::to_string)
+        .collect()
 }
 
 fn loc_command(loc: &str, state_root: &Path) -> Command {

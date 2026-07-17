@@ -11,29 +11,22 @@ loc connect slack
 loc mount slack ~/Locality/slack-main
 ```
 
-To let Locality join public channels before reading history, opt in at both
-authorization and mount time:
-
-```bash
-loc connect slack --auto-join-public-channels
-loc mount slack ~/Locality/slack-main --auto-join-public-channels
-```
-
-This requests Slack's `channels:join` scope and mutates Slack membership by
-joining the connected app to public channels. Private channels still require an
+Locality requests Slack's `channels:join` scope. Mounts whose `--types` include
+`public_channel` join public channels before reading history. This mutates
+Slack membership for the connected app. Private channels still require an
 explicit Slack invite.
 
 The default Slack connector settings are:
 
 ```json
-{"slack":{"history_limit":15,"types":["public_channel","private_channel","im","mpim"]}}
+{"slack":{"history_limit":15,"types":["public_channel","private_channel","im","mpim"],"auto_join_public_channels":true}}
 ```
 
 ## OAuth scopes
 
-Locality requests read-only bot scopes for channel metadata and history, users
-and team metadata, and file metadata. It does not request `chat:write`, admin
-scopes, search scopes, or user email scope.
+Locality requests bot scopes for channel metadata and history, public channel
+joining, users and team metadata, and file metadata. It does not request
+`chat:write`, admin scopes, search scopes, or user email scope.
 
 ## Filesystem contract
 
@@ -55,10 +48,8 @@ slack-main/
 ```
 
 - `channels/` contains public channels whose history is readable by the
-  connected app. If a public channel is missing or `conversations.history`
-  returns `not_in_channel`, invite the Slack app to that channel and pull again.
-  Mounts created with `--auto-join-public-channels` attempt to join public
-  channels automatically instead.
+  connected app. Mounts whose types include `public_channel` attempt to join
+  public channels automatically before reading history.
 - `private-channels/` contains private channels visible to the connected bot.
 - `dms/` contains direct message conversations visible to the connected bot.
 - `group-dms/` contains multi-person direct message conversations visible to

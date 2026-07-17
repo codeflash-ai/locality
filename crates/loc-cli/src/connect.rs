@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use locality_connector::ConnectorCapabilities;
@@ -93,7 +92,6 @@ pub struct SlackBrokerOAuthConnectOptions {
     pub state: String,
     pub code: String,
     pub redirect_uri: String,
-    pub requested_scopes: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -814,12 +812,10 @@ where
         code: options.code,
         redirect_uri: options.redirect_uri,
     };
-    validate_requested_slack_oauth_scopes(&options.requested_scopes)?;
     let token = exchange.exchange_code(&exchange_request)?;
     validate_slack_oauth_scopes(&token.scopes).map_err(|error| {
         ConnectError::OAuthExchangeFailed(OAuthExchangeFailure::slack(error.to_string()))
     })?;
-    validate_granted_slack_oauth_scopes(&token.scopes, &options.requested_scopes)?;
     let acquired_at = timestamp_secs();
     let secret_ref = format!("connection:{}", connection_id.0);
     let stored = StoredSlackCredential::from_broker_token(
@@ -885,38 +881,6 @@ where
         workspace_name: token.workspace_name,
         auth_kind: "oauth".to_string(),
     })
-}
-
-fn validate_requested_slack_oauth_scopes(requested_scopes: &[String]) -> Result<(), ConnectError> {
-    let mut scopes = SLACK_OAUTH_SCOPES
-        .iter()
-        .map(|scope| scope.to_string())
-        .collect::<Vec<_>>();
-    scopes.extend(requested_scopes.iter().cloned());
-    validate_slack_oauth_scopes(&scopes).map_err(|error| {
-        ConnectError::OAuthExchangeFailed(OAuthExchangeFailure::slack(error.to_string()))
-    })
-}
-
-fn validate_granted_slack_oauth_scopes(
-    granted_scopes: &[String],
-    requested_scopes: &[String],
-) -> Result<(), ConnectError> {
-    let granted = granted_scopes
-        .iter()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
-    let missing = requested_scopes
-        .iter()
-        .find(|scope| !granted.contains(scope.as_str()));
-    if let Some(scope) = missing {
-        return Err(ConnectError::OAuthExchangeFailed(
-            OAuthExchangeFailure::slack(format!(
-                "Slack OAuth token is missing requested scope `{scope}`; reconnect with `loc connect slack --auto-join-public-channels` after reinstalling or approving the Slack app scopes"
-            )),
-        ));
-    }
-    Ok(())
 }
 
 pub fn run_profiles<S>(store: &S) -> Result<ProfilesReport, ConnectError>

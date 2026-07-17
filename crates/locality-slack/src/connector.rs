@@ -761,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn channel_folder_skips_public_channels_where_bot_is_not_a_member() {
+    fn channel_folder_auto_joins_public_channels_where_bot_is_not_a_member() {
         let api = FakeSlackApi::default().with_conversations(vec![
             SlackConversation {
                 id: "C_unjoined".to_string(),
@@ -778,7 +778,7 @@ mod tests {
                 ..SlackConversation::default()
             },
         ]);
-        let connector = connector_with_api(api);
+        let connector = connector_with_api(api.clone());
 
         let result = connector
             .list_children(ListChildrenRequest {
@@ -795,7 +795,17 @@ mod tests {
             .iter()
             .map(|entry| entry.path.clone())
             .collect::<Vec<_>>();
-        assert_eq!(paths, vec![PathBuf::from("channels/joined-C_joined")]);
+        assert_eq!(
+            *api.joined_channels.lock().expect("joined channels"),
+            vec!["C_unjoined".to_string()]
+        );
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("channels/joined-C_joined"),
+                PathBuf::from("channels/unjoined-C_unjoined")
+            ]
+        );
     }
 
     #[test]
@@ -807,10 +817,8 @@ mod tests {
             is_member: Some(false),
             ..SlackConversation::default()
         }]);
-        let settings = SlackMountSettings::from_json(
-            r#"{"slack":{"types":["public_channel"],"auto_join_public_channels":true}}"#,
-        )
-        .expect("settings");
+        let settings = SlackMountSettings::from_json(r#"{"slack":{"types":["public_channel"]}}"#)
+            .expect("settings");
         let connector = SlackConnector::with_api(
             SlackConfig::new("xoxb-token").with_settings(settings),
             Arc::new(api.clone()),
@@ -847,10 +855,8 @@ mod tests {
             is_member: Some(false),
             ..SlackConversation::default()
         }]);
-        let settings = SlackMountSettings::from_json(
-            r#"{"slack":{"types":["private_channel"],"auto_join_public_channels":true}}"#,
-        )
-        .expect("settings");
+        let settings = SlackMountSettings::from_json(r#"{"slack":{"types":["private_channel"]}}"#)
+            .expect("settings");
         let connector = SlackConnector::with_api(
             SlackConfig::new("xoxb-token").with_settings(settings),
             Arc::new(api.clone()),

@@ -65,7 +65,7 @@ impl Default for SlackSettings {
         Self {
             history_limit: DEFAULT_SLACK_HISTORY_LIMIT,
             types: default_conversation_types(),
-            auto_join_public_channels: false,
+            auto_join_public_channels: true,
         }
     }
 }
@@ -105,6 +105,10 @@ impl SlackMountSettings {
                 "Slack settings must include at least one Slack conversation type",
             ));
         }
+        self.slack.auto_join_public_channels = self
+            .slack
+            .types
+            .contains(&SlackConversationType::PublicChannel);
         Ok(())
     }
 }
@@ -161,13 +165,13 @@ mod tests {
         );
         assert!(settings.slack.types.contains(&SlackConversationType::Im));
         assert!(settings.slack.types.contains(&SlackConversationType::Mpim));
-        assert!(!settings.slack.auto_join_public_channels);
+        assert!(settings.slack.auto_join_public_channels);
     }
 
     #[test]
     fn parses_json_settings_with_clamped_history_limit() {
         let settings = SlackMountSettings::from_json(
-            r#"{"slack":{"history_limit":50,"types":["public_channel","im"],"auto_join_public_channels":true}}"#,
+            r#"{"slack":{"history_limit":50,"types":["public_channel","im"]}}"#,
         )
         .expect("parse settings");
 
@@ -176,6 +180,20 @@ mod tests {
         assert_eq!(
             settings.conversations_api_types(),
             "public_channel,im".to_string()
+        );
+    }
+
+    #[test]
+    fn derives_auto_join_from_public_channel_type() {
+        let settings = SlackMountSettings::from_json(
+            r#"{"slack":{"types":["im"],"auto_join_public_channels":true}}"#,
+        )
+        .expect("parse settings");
+
+        assert!(!settings.slack.auto_join_public_channels);
+        assert_eq!(
+            settings.to_json().expect("settings json"),
+            r#"{"slack":{"history_limit":15,"types":["im"]}}"#
         );
     }
 

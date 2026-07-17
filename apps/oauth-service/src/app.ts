@@ -25,7 +25,6 @@ const OPERATIONAL_SECRET_MIN_LENGTH = 32;
 
 interface StartRequest {
   redirect_uri?: string;
-  scopes?: string[];
 }
 
 interface ExchangeRequest {
@@ -268,7 +267,7 @@ app.post("/v1/oauth/slack/start", async (c) => {
   return c.json({
     connector: "slack",
     client_id: c.env.LOCALITY_SLACK_CLIENT_ID,
-    authorization_url: slackAuthorizeUrl(c.env, redirectUri, state, body.scopes === undefined ? [] : body.scopes),
+    authorization_url: slackAuthorizeUrl(c.env, redirectUri, state),
     redirect_uri: redirectUri,
     session,
     state,

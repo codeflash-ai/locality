@@ -9886,7 +9886,6 @@ fn connect_google_docs_with_broker(
         .start(&OAuthBrokerStart {
             connector: GOOGLE_DOCS_CONNECTOR_ID.to_string(),
             redirect_uri,
-            scopes: Vec::new(),
         })
         .map_err(|error| format!("Could not start Google Docs OAuth broker flow: {error}"))?;
     let authorization = run_local_oauth_authorization(
@@ -9939,7 +9938,6 @@ fn connect_gmail_with_broker(state_root: PathBuf, open_browser: bool) -> Result<
         .start(&OAuthBrokerStart {
             connector: GMAIL_CONNECTOR_ID.to_string(),
             redirect_uri,
-            scopes: Vec::new(),
         })
         .map_err(|error| format!("Could not start Gmail OAuth broker flow: {error}"))?;
     let authorization = run_local_oauth_authorization(
@@ -9991,7 +9989,6 @@ fn connect_slack_with_broker(state_root: PathBuf, open_browser: bool) -> Result<
         .start(&OAuthBrokerStart {
             connector: SLACK_CONNECTOR_ID.to_string(),
             redirect_uri,
-            scopes: Vec::new(),
         })
         .map_err(|error| format!("Could not start Slack OAuth broker flow: {error}"))?;
     let authorization = run_local_oauth_authorization(
@@ -10011,7 +10008,6 @@ fn connect_slack_with_broker(state_root: PathBuf, open_browser: bool) -> Result<
         state: start.state,
         code: authorization.code,
         redirect_uri: start.redirect_uri,
-        requested_scopes: Vec::new(),
     };
 
     let report = run_connect_slack_broker_oauth(&mut store, credentials.as_ref(), options, &broker)

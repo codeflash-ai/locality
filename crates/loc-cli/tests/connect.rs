@@ -301,7 +301,6 @@ fn connect_slack_broker_oauth_stores_refresh_handle_without_secrets() {
             state: "state-1".to_string(),
             code: "oauth-code".to_string(),
             redirect_uri: "http://localhost:8757/oauth/slack/callback".to_string(),
-            requested_scopes: Vec::new(),
         },
         &exchange,
     )
@@ -334,14 +333,11 @@ fn connect_slack_broker_oauth_stores_refresh_handle_without_secrets() {
 }
 
 #[test]
-fn connect_slack_broker_oauth_rejects_missing_requested_scope() {
+fn connect_slack_broker_oauth_rejects_missing_channels_join_scope() {
     let mut store = InMemoryStateStore::new();
     let credentials = InMemoryCredentialStore::new();
     let exchange = ScopedFakeSlackBrokerOAuthExchange {
-        scopes: SLACK_OAUTH_SCOPES
-            .iter()
-            .map(|scope| scope.to_string())
-            .collect(),
+        scopes: slack_scopes_without_join(),
     };
 
     let error = run_connect_slack_broker_oauth(
@@ -355,11 +351,10 @@ fn connect_slack_broker_oauth_rejects_missing_requested_scope() {
             state: "state-1".to_string(),
             code: "oauth-code".to_string(),
             redirect_uri: "http://localhost:8757/oauth/slack/callback".to_string(),
-            requested_scopes: vec![SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE.to_string()],
         },
         &exchange,
     )
-    .expect_err("missing requested scope");
+    .expect_err("missing channels:join scope");
 
     assert_eq!(error.code(), "oauth_exchange_failed");
     assert!(
@@ -1008,12 +1003,32 @@ impl SlackOAuthBrokerExchange for FakeSlackBrokerOAuthExchange {
             account_label: Some("Locality Slack".to_string()),
             workspace_id: Some("T123".to_string()),
             workspace_name: Some("Locality Slack".to_string()),
-            scopes: SLACK_OAUTH_SCOPES
-                .iter()
-                .map(|scope| scope.to_string())
-                .collect(),
+            scopes: slack_scopes_with_join(),
         })
     }
+}
+
+fn slack_scopes_with_join() -> Vec<String> {
+    let mut scopes = SLACK_OAUTH_SCOPES
+        .iter()
+        .map(|scope| scope.to_string())
+        .collect::<Vec<_>>();
+    if !scopes
+        .iter()
+        .any(|scope| scope == SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE)
+    {
+        scopes.push(SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE.to_string());
+    }
+    scopes
+}
+
+fn slack_scopes_without_join() -> Vec<String> {
+    SLACK_OAUTH_SCOPES
+        .iter()
+        .copied()
+        .filter(|scope| *scope != SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE)
+        .map(str::to_string)
+        .collect()
 }
 
 #[derive(Clone, Debug)]
