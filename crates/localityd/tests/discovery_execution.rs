@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use locality_connector::{BatchObservationChange, BatchObserveResult, ConnectorCheckpoint};
 use locality_core::LocalityError;
@@ -3965,15 +3964,33 @@ fn filesystem_snapshot(root: &std::path::Path) -> Vec<(PathBuf, bool, Vec<u8>)> 
     entries
 }
 
-fn temp_root(label: &str) -> PathBuf {
+fn temp_root(_label: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
     let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "loc-discovery-execution-{label}-{}-{timestamp}-{sequence}",
-        std::process::id()
-    ))
+    let process_id = std::process::id();
+
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("RUNNER_TEMP")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("SystemDrive")
+                    .map(PathBuf::from)
+                    .map(|drive| drive.join("loc-test"))
+            })
+            .unwrap_or_else(std::env::temp_dir);
+        return base.join(format!("lde-{process_id}-{sequence}"));
+    }
+
+    #[cfg(not(windows))]
+    {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "loc-discovery-execution-{}-{process_id}-{timestamp}-{sequence}",
+            _label
+        ))
+    }
 }
