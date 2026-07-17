@@ -3268,15 +3268,16 @@ where
                 Err(StoreError::ShadowMissing { .. }) => continue,
                 Err(error) => return Err(error.into()),
             };
-            let remote_tree_render =
-                self.source
-                    .fetch_render(&locality_core::hydration::HydrationRequest::new(
-                        request.mount_id.clone(),
-                        precondition.remote_id.clone(),
-                        entity.path.clone(),
-                        HydrationState::Hydrated,
-                        locality_core::hydration::HydrationReason::ExplicitPull,
-                    ))?;
+            let remote_tree_render = self.source.fetch_render_with_repository(
+                &locality_core::hydration::HydrationRequest::new(
+                    request.mount_id.clone(),
+                    precondition.remote_id.clone(),
+                    entity.path.clone(),
+                    HydrationState::Hydrated,
+                    locality_core::hydration::HydrationReason::ExplicitPull,
+                ),
+                &*self.store,
+            )?;
 
             if !remote_tree_matches_synced_tree(&synced_tree_shadow, &remote_tree_render.shadow) {
                 return Err(LocalityError::Guardrail(format!(
@@ -3428,7 +3429,7 @@ where
                         entity_path,
                     )
                     .with_hydration(HydrationState::Stub);
-                    let rendered = self.source.fetch_render(
+                    let rendered = self.source.fetch_render_with_repository(
                         &locality_core::hydration::HydrationRequest::new(
                             request.mount_id.clone(),
                             entity_id.clone(),
@@ -3436,6 +3437,7 @@ where
                             HydrationState::Hydrated,
                             locality_core::hydration::HydrationReason::ExplicitPull,
                         ),
+                        &*self.store,
                     )?;
                     entity.path = created_entity_reconcile_path_from_rendered(
                         self.store,
@@ -3488,15 +3490,16 @@ where
                 entity.path = projected_path.clone();
             }
             let path = projection_write_path(self.state_root.as_deref(), &mount, &entity.path);
-            let rendered =
-                self.source
-                    .fetch_render(&locality_core::hydration::HydrationRequest::new(
-                        request.mount_id.clone(),
-                        remote_id.clone(),
-                        entity.path.clone(),
-                        HydrationState::Hydrated,
-                        locality_core::hydration::HydrationReason::ExplicitPull,
-                    ))?;
+            let rendered = self.source.fetch_render_with_repository(
+                &locality_core::hydration::HydrationRequest::new(
+                    request.mount_id.clone(),
+                    remote_id.clone(),
+                    entity.path.clone(),
+                    HydrationState::Hydrated,
+                    locality_core::hydration::HydrationReason::ExplicitPull,
+                ),
+                &*self.store,
+            )?;
             entity_readbacks.push((remote_id.clone(), entity, path, rendered));
         }
 

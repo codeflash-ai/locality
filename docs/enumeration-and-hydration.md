@@ -129,6 +129,11 @@ Daemon hydration uses `fetch_render`, not the raw connector `fetch` method
 directly. The common daemon-side abstraction is `HydrationSource::fetch_render`
 in `crates/localityd/src/hydration.rs`; concrete adapters live in
 `crates/localityd/src/notion.rs` and `crates/localityd/src/google_docs.rs`.
+Stateful hydration, explicit pull, and push reconciliation call
+`fetch_render_with_repository`, which defaults to `fetch_render` but also passes
+a read-only `HydrationRepository` view of mounted entities. Connectors can use
+that view to render connector-native references as local links when the target
+entity is already mounted, without mutating daemon state during render.
 
 The persisted model lives in `crates/locality-core/src/model.rs`.
 
@@ -467,9 +472,9 @@ Implementation:
 - `hydrate_entity`
 
 When `loc pull` targets an entity path, `pull_entity_path` calls
-`hydrate_entity`. `hydrate_entity` calls `source.fetch_render` with
-`HydrationReason::ExplicitPull`, writes rendered files/assets/schema data, and
-updates the entity and shadow if the local state allows the result to be
+`hydrate_entity`. `hydrate_entity` calls `source.fetch_render_with_repository`
+with `HydrationReason::ExplicitPull`, writes rendered files/assets/schema data,
+and updates the entity and shadow if the local state allows the result to be
 accepted.
 
 Mount-root pull may also hydrate the root entity or repair missing media, as
@@ -623,7 +628,8 @@ Before applying a push, the remote guard can call `fetch_render` with
 `HydrationReason::ExplicitPull` to compare remote content against expected state.
 After applying creates or updates, push reconciliation can fetch/render the
 resulting remote entity, write assets/Markdown, save entity and shadow state,
-record observation, and clear remote hints.
+record observation, and clear remote hints. These stateful push fetch/render
+paths pass the same read-only `HydrationRepository` view as hydration.
 
 This is body fetch and local materialization, but it is owned by push execution
 rather than the runtime hydration queue.
@@ -669,9 +675,10 @@ The runtime schedules work in this order:
 
 The executor only hydrates to a `Hydrated` target state. It loads mount and
 entity records, maps virtual projections to the content root when needed, checks
-whether the target file can be replaced, calls `fetch_render`, validates shadow
-identity, writes assets/media/schema/Markdown, saves the shadow/entity, and
-clears remote hints when the rendered remote version is current.
+whether the target file can be replaced, calls `fetch_render_with_repository`,
+validates shadow identity, writes assets/media/schema/Markdown, saves the
+shadow/entity, and clears remote hints when the rendered remote version is
+current.
 
 `can_replace_file` allows replacement when:
 

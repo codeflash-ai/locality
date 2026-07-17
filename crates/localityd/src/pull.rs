@@ -1308,13 +1308,16 @@ where
 {
     let path = projection_content_path(state_root, mount, &entity.path)?;
     let can_replace = can_replace_file(store, mount, &entity, &path)?;
-    let rendered = match source.fetch_render(&HydrationRequest::new(
-        mount.mount_id.clone(),
-        entity.remote_id.clone(),
-        entity.path.clone(),
-        HydrationState::Hydrated,
-        HydrationReason::ExplicitPull,
-    )) {
+    let rendered = match source.fetch_render_with_repository(
+        &HydrationRequest::new(
+            mount.mount_id.clone(),
+            entity.remote_id.clone(),
+            entity.path.clone(),
+            HydrationState::Hydrated,
+            HydrationReason::ExplicitPull,
+        ),
+        &*store,
+    ) {
         Ok(rendered) => rendered,
         Err(error) if is_remote_not_found(&error) => {
             return reconcile_remote_not_found(store, mount, entity, &path, can_replace);

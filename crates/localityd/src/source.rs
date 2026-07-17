@@ -38,7 +38,7 @@ use crate::file_provider;
 use crate::gmail::resolve_gmail_connector_for_mount;
 use crate::google_docs::resolve_google_docs_connector_for_mount;
 use crate::granola::resolve_granola_connector_for_mount;
-use crate::hydration::{HydratedEntity, HydrationSource};
+use crate::hydration::{HydratedEntity, HydrationRepository, HydrationSource};
 use crate::notion::{ConnectorResolveError, resolve_notion_connector_for_mount};
 use crate::reconcile::ScheduledPullSource;
 
@@ -707,6 +707,19 @@ impl HydrationSource for ResolvedSource {
             Self::GoogleDocs(source) => source.fetch_render(request),
             Self::Gmail(source) => source.fetch_render(request),
             Self::Granola(source) => source.fetch_render(request),
+        }
+    }
+
+    fn fetch_render_with_repository(
+        &self,
+        request: &HydrationRequest,
+        repository: &dyn HydrationRepository,
+    ) -> LocalityResult<HydratedEntity> {
+        match self {
+            Self::Notion(source) => source.fetch_render_with_repository(request, repository),
+            Self::GoogleDocs(source) => source.fetch_render_with_repository(request, repository),
+            Self::Gmail(source) => source.fetch_render_with_repository(request, repository),
+            Self::Granola(source) => source.fetch_render_with_repository(request, repository),
         }
     }
 
