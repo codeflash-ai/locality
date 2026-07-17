@@ -16,6 +16,30 @@ For a clickable subsystem diagram grounded in code entry points, see
 
 The optional cloud relay is deliberately not implemented in v1. The local remote-truth boundary should still remain swappable so a future relay can replace direct source polling without changing the sync model.
 
+## Target Cloud-Sandbox Architecture
+
+The proposed successor to the optional relay is a continuously maintained
+backend data plane, not a thin request proxy. It ingests connected sources once,
+builds ACL-aware immutable content/catalog units and short-lived artifact grants,
+materializes ordinary files in cloud sandboxes before an agent starts, and
+applies explicitly pushed changesets through backend-held connector credentials.
+Read-only content uses a single local tree; three-way state is reserved for
+writable resources. The proposed v1 is multi-tenant and multi-connector, uses a
+modular backend with PostgreSQL jobs, and relies on local diff plus explicit push;
+human-review workflows remain a later extension.
+
+This target does not replace the filesystem path used by the desktop or
+headless `loc` CLI. `localityd` remains the shared local-host runtime for
+desktop, CLI, and sandbox clients. Direct-source and backend-replica modes are
+adapters around the same Rust domain, connector, projection, changeset, and
+apply/reconcile workflows; only persistence, credentials, scheduling, and
+remote-truth transport differ by host.
+
+See [`cloud-sandbox-data-plane.md`](cloud-sandbox-data-plane.md) for the target
+architecture, database decision, data model, replica protocol, permissions,
+security model, migration path, and implementation phases. The rest of this
+document continues to describe the currently shipped v1 architecture.
+
 ## Connector and Auth Model
 
 Locality keeps connector capability, authentication policy, account credentials,
