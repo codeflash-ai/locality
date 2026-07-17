@@ -26,6 +26,7 @@ use locality_google_docs::{
     GOOGLE_DOCS_CONNECTOR_ID, HttpGoogleDocsOAuthBrokerClient,
 };
 use locality_granola::GRANOLA_CONNECTOR_ID;
+use locality_linear::LINEAR_CONNECTOR_ID;
 use locality_notion::oauth::{
     DEFAULT_LOCALITY_NOTION_OAUTH_BROKER_URL, DEFAULT_NOTION_OAUTH_AUTHORIZE_URL,
     HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NotionOAuthBrokerStart,
@@ -57,11 +58,11 @@ use serde_json::Value;
 use crate::connect::{
     BrokerOAuthConnectOptions, ConnectError, ConnectOptions, ConnectReport, ConnectionShowReport,
     ConnectionsReport, DisconnectReport, GmailBrokerOAuthConnectOptions,
-    GoogleDocsBrokerOAuthConnectOptions, HttpGranolaConnectionProbe, HttpNotionConnectionProbe,
-    OAuthConnectOptions, ProfilesReport, run_connect_gmail_broker_oauth,
-    run_connect_google_docs_broker_oauth, run_connect_granola, run_connect_notion,
-    run_connect_notion_broker_oauth, run_connect_notion_oauth, run_connection_show,
-    run_connections, run_disconnect, run_profiles,
+    GoogleDocsBrokerOAuthConnectOptions, HttpGranolaConnectionProbe, HttpLinearConnectionProbe,
+    HttpNotionConnectionProbe, OAuthConnectOptions, ProfilesReport, run_connect_gmail_broker_oauth,
+    run_connect_google_docs_broker_oauth, run_connect_granola, run_connect_linear,
+    run_connect_notion, run_connect_notion_broker_oauth, run_connect_notion_oauth,
+    run_connection_show, run_connections, run_disconnect, run_profiles,
 };
 use crate::connector::{
     ConnectorResolveError, SourceDescriptor, resolve_notion_connector_for_mount,
@@ -228,6 +229,8 @@ enum ConnectCommand {
     Gmail(ConnectGmailArgs),
     #[command(about = "Connect Granola with an API key")]
     Granola(ConnectGranolaArgs),
+    #[command(about = "Connect Linear with an API key")]
+    Linear(ConnectLinearArgs),
 }
 
 #[derive(Debug, Args)]
@@ -239,6 +242,18 @@ struct ConnectGranolaArgs {
     )]
     name: Option<String>,
     #[arg(long, help = "Read a Granola API key from standard input.")]
+    api_key_stdin: bool,
+}
+
+#[derive(Debug, Args)]
+struct ConnectLinearArgs {
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Connection id to save. Defaults to linear-default."
+    )]
+    name: Option<String>,
+    #[arg(long, help = "Read a Linear API key from standard input.")]
     api_key_stdin: bool,
 }
 
@@ -968,6 +983,11 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                     push_optional_flag_value(&mut args, "--name", options.name.as_deref());
                     push_flag(&mut args, "--api-key-stdin", options.api_key_stdin);
                 }
+                ConnectCommand::Linear(options) => {
+                    args.push("linear".to_string());
+                    push_optional_flag_value(&mut args, "--name", options.name.as_deref());
+                    push_flag(&mut args, "--api-key-stdin", options.api_key_stdin);
+                }
             }
         }
         LocalityCommand::Connections => args.push("connections".to_string()),
@@ -1406,6 +1426,9 @@ fn reset(args: &[String], json: bool) -> i32 {
 
 fn connect(args: &[String], json: bool) -> i32 {
     let connector = first_positional(args);
+    if connector == Some(LINEAR_CONNECTOR_ID) {
+        return connect_linear(args, json);
+    }
     if connector == Some(GRANOLA_CONNECTOR_ID) {
         return connect_granola(args, json);
     }
@@ -1421,7 +1444,7 @@ fn connect(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "connect",
                 "usage",
-                "usage: loc connect <notion|google-docs|gmail|granola> [options] [--json]",
+                "usage: loc connect <notion|google-docs|gmail|granola|linear> [options] [--json]",
             ),
             EXIT_USAGE,
         );
@@ -1854,6 +1877,71 @@ fn connect_granola(args: &[String], json: bool) -> i32 {
         credentials.as_ref(),
         options,
         &HttpGranolaConnectionProbe,
+    ) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_connect_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => connect_command_error("connect", json, error),
+    }
+}
+
+fn connect_linear(args: &[String], json: bool) -> i32 {
+    if !has_flag(args, "--api-key-stdin") {
+        return command_error(
+            json,
+            CommandError::new(
+                "connect",
+                "auth_required",
+                "Linear API keys must be provided with --api-key-stdin",
+            )
+            .with_suggested_command("loc connect linear --api-key-stdin"),
+            EXIT_USAGE,
+        );
+    }
+    let mut api_key = String::new();
+    if let Err(error) = io::stdin().read_to_string(&mut api_key) {
+        return command_error(
+            json,
+            CommandError::new("connect", "stdin_read_failed", error.to_string()),
+            EXIT_INTERNAL,
+        );
+    }
+    let api_key = api_key.trim().to_string();
+    if api_key.is_empty() {
+        return command_error(
+            json,
+            CommandError::new("connect", "auth_required", "empty Linear API key")
+                .with_suggested_command("loc connect linear --api-key-stdin"),
+            EXIT_USAGE,
+        );
+    }
+
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("connect", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let credentials = open_credential_store(&state_root);
+    let options = ConnectOptions {
+        connection_id: flag_value(args, "--name").map(ConnectionId::new),
+        token: api_key,
+    };
+    match run_connect_linear(
+        &mut store,
+        credentials.as_ref(),
+        options,
+        &HttpLinearConnectionProbe,
     ) {
         Ok(report) if json => {
             print_json(&report);
@@ -7272,7 +7360,7 @@ fn command_error(json: bool, error: CommandError, exit_code: i32) -> i32 {
 fn connect_command_error(command: &'static str, json: bool, error: ConnectError) -> i32 {
     let exit_code = match &error {
         ConnectError::ConnectionNameRequired(_) => EXIT_USAGE,
-        ConnectError::ConnectionProbeFailed(_)
+        ConnectError::ConnectionProbeFailed { .. }
         | ConnectError::OAuthExchangeFailed(_)
         | ConnectError::CredentialEncode(_)
         | ConnectError::Credential(_)
@@ -8180,6 +8268,7 @@ mod tests {
                     "google-docs",
                     "gmail",
                     "granola",
+                    "linear",
                     "--json",
                 ],
             ),
@@ -8215,6 +8304,14 @@ mod tests {
                 vec![
                     "Usage: loc connect granola",
                     "Connect Granola with an API key",
+                    "--api-key-stdin",
+                ],
+            ),
+            (
+                vec!["connect", "linear", "--help"],
+                vec![
+                    "Usage: loc connect linear",
+                    "Connect Linear with an API key",
                     "--api-key-stdin",
                 ],
             ),

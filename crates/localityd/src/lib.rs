@@ -10,6 +10,7 @@ pub mod google_docs;
 pub mod granola;
 pub mod hydration;
 pub mod ipc;
+pub mod linear;
 pub mod mcp;
 pub mod media;
 pub mod notion;

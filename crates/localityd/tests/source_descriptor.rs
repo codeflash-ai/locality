@@ -8,6 +8,7 @@ use locality_core::validation::ValidationIssue;
 use locality_gmail::{GMAIL_CONNECTOR_ID, GMAIL_OAUTH_SCOPES, StoredGmailCredential};
 use locality_google_docs::{GOOGLE_DOCS_CONNECTOR_ID, StoredGoogleDocsCredential};
 use locality_granola::GRANOLA_CONNECTOR_ID;
+use locality_linear::LINEAR_CONNECTOR_ID;
 use locality_notion::client::DEFAULT_NOTION_TOKEN_ENV;
 use locality_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
@@ -120,22 +121,47 @@ fn granola_rejects_every_write_and_create_path() {
 }
 
 #[test]
-fn generic_descriptor_preserves_source_id_in_guidance() {
-    let descriptor = source_descriptor("linear");
+fn linear_allows_existing_issue_edits_but_rejects_local_creates() {
+    let mut mount = MountConfig::new(
+        MountId::new("linear-main"),
+        LINEAR_CONNECTOR_ID,
+        "/tmp/locality/linear",
+    );
+    mount.read_only = false;
+    assert!(
+        source_write_decision_for_path(&mount, std::path::Path::new("Engineering/ENG-1/page.md"))
+            .is_writable()
+    );
+    assert!(
+        !source_create_decision_for_parent_path(&mount, std::path::Path::new("Engineering"))
+            .is_writable()
+    );
+}
 
-    assert_eq!(descriptor.id(), "linear");
+#[test]
+fn linear_descriptor_comes_from_registry_and_uses_api_key_setup() {
+    let descriptor = source_descriptor(LINEAR_CONNECTOR_ID);
+
+    assert_eq!(descriptor.id(), LINEAR_CONNECTOR_ID);
     assert_eq!(descriptor.display_name(), "Linear");
     assert_eq!(descriptor.default_mount_id(), "linear-main");
-    assert_eq!(descriptor.connect_command(), None);
+    assert_eq!(
+        descriptor.connect_command(),
+        Some("loc connect linear --api-key-stdin")
+    );
     assert_eq!(descriptor.auth_env_var(), None);
     assert!(!descriptor.supports_oauth());
     assert!(
         descriptor
             .mount_guidance()
-            .contains("# Locality linear Mount")
+            .contains("# Locality Linear Mount")
     );
-    assert!(descriptor.mount_guidance().contains("to linear"));
+    assert!(descriptor.mount_guidance().contains("Linear facts"));
     assert_eq!(descriptor.body_diff_mode(), BodyDiffMode::WholeEntity);
+    assert_eq!(
+        descriptor.periodic_discovery_interval(),
+        Some(Duration::from_secs(300))
+    );
 
     assert_eq!(
         source_descriptor("custom").body_diff_mode(),
@@ -374,7 +400,60 @@ fn validate_gmail_changed(path: &str, markdown: &str) -> Vec<String> {
 fn supported_source_connectors_include_first_party_connectors() {
     assert_eq!(
         supported_source_connectors(),
-        vec!["notion", "google-docs", "gmail", "granola"]
+        vec!["notion", "google-docs", "gmail", "granola", "linear"]
+    );
+}
+
+#[test]
+fn resolving_linear_mount_uses_active_api_key_connection_credentials() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (connection_id, secret_ref) =
+        save_gmail_connection(&mut store, "linear-default", LINEAR_CONNECTOR_ID, "api_key");
+    credentials
+        .put(&secret_ref, "lin_api_secret")
+        .expect("save credential");
+    let mount = MountConfig::new(
+        MountId::new("linear-main"),
+        LINEAR_CONNECTOR_ID,
+        "/tmp/locality/linear",
+    )
+    .with_connection_id(connection_id);
+
+    let source = resolve_source_for_mount(&store, &credentials, &mount).expect("resolve linear");
+
+    let ResolvedSource::Linear(connector) = source else {
+        panic!("expected linear source");
+    };
+    assert_eq!(connector.config().token, "lin_api_secret");
+    assert_eq!(connector.kind().0, LINEAR_CONNECTOR_ID);
+    assert!(connector.capabilities().supports_batch_observation);
+}
+
+#[test]
+fn resolving_linear_mount_rejects_non_api_key_credentials() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (connection_id, secret_ref) =
+        save_gmail_connection(&mut store, "linear-oauth", LINEAR_CONNECTOR_ID, "oauth");
+    credentials
+        .put(&secret_ref, "oauth-token")
+        .expect("save credential");
+    let mount = MountConfig::new(
+        MountId::new("linear-main"),
+        LINEAR_CONNECTOR_ID,
+        "/tmp/locality/linear",
+    )
+    .with_connection_id(connection_id);
+
+    let error = resolve_source_for_mount(&store, &credentials, &mount)
+        .expect_err("reject non-api-key Linear connection");
+
+    assert_eq!(error.code(), "auth_required");
+    assert!(error.message().contains("API key"));
+    assert_eq!(
+        error.suggested_command(),
+        Some("loc connect linear --api-key-stdin")
     );
 }
 

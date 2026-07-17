@@ -27,6 +27,7 @@ use locality_core::{LocalityError, LocalityResult};
 use locality_gmail::{GMAIL_CONNECTOR_ID, GmailConnector};
 use locality_google_docs::{GOOGLE_DOCS_CONNECTOR_ID, GoogleDocsConnector};
 use locality_granola::{GRANOLA_CONNECTOR_ID, GranolaConnector};
+use locality_linear::{LINEAR_CONNECTOR_ID, LinearConnector};
 use locality_notion::NotionConnector;
 use locality_notion::client::DEFAULT_NOTION_TOKEN_ENV;
 use locality_store::{
@@ -39,6 +40,7 @@ use crate::gmail::resolve_gmail_connector_for_mount;
 use crate::google_docs::resolve_google_docs_connector_for_mount;
 use crate::granola::resolve_granola_connector_for_mount;
 use crate::hydration::{HydratedEntity, HydrationRepository, HydrationSource};
+use crate::linear::{LINEAR_CONNECT_COMMAND, resolve_linear_connector_for_mount};
 use crate::notion::{ConnectorResolveError, resolve_notion_connector_for_mount};
 use crate::reconcile::ScheduledPullSource;
 
@@ -50,6 +52,7 @@ pub enum ResolvedSource {
     GoogleDocs(GoogleDocsConnector),
     Gmail(GmailConnector),
     Granola(GranolaConnector),
+    Linear(LinearConnector),
 }
 
 pub trait SourceResolverStore:
@@ -106,6 +109,13 @@ const SOURCE_REGISTRY: &[SourceRegistration] = &[
         resolve: resolve_granola_source,
         validate_changed_frontmatter: crate::granola::validate_granola_frontmatter,
         validate_create_frontmatter: crate::granola::validate_granola_frontmatter,
+    },
+    SourceRegistration {
+        id: LINEAR_CONNECTOR_ID,
+        descriptor: linear_source_descriptor,
+        resolve: resolve_linear_source,
+        validate_changed_frontmatter: crate::linear::validate_linear_frontmatter,
+        validate_create_frontmatter: crate::linear::validate_linear_frontmatter,
     },
 ];
 
@@ -261,6 +271,11 @@ pub fn source_create_decision_for_parent_path(
             reason: "Granola meetings are read-only",
         };
     }
+    if mount.connector == LINEAR_CONNECTOR_ID {
+        return SourceWriteDecision::ReadOnly {
+            reason: "Linear issue creates are not supported yet",
+        };
+    }
     SourceWriteDecision::Writable
 }
 
@@ -378,6 +393,14 @@ fn resolve_granola_source(
     resolve_granola_connector_for_mount(store, credentials, mount).map(ResolvedSource::Granola)
 }
 
+fn resolve_linear_source(
+    store: &dyn SourceResolverStore,
+    credentials: &dyn CredentialStore,
+    mount: &MountConfig,
+) -> Result<ResolvedSource, ConnectorResolveError> {
+    resolve_linear_connector_for_mount(store, credentials, mount).map(ResolvedSource::Linear)
+}
+
 fn generic_source_descriptor(connector: &str) -> SourceDescriptor {
     SourceDescriptor {
         id: Cow::Owned(connector.to_string()),
@@ -396,10 +419,20 @@ fn generic_source_descriptor(connector: &str) -> SourceDescriptor {
 }
 
 fn linear_source_descriptor() -> SourceDescriptor {
-    let mut descriptor = generic_source_descriptor("linear");
-    descriptor.body_diff_mode = BodyDiffMode::WholeEntity;
-    descriptor.virtual_rename_policy = VirtualRenamePolicy::PreserveCanonical;
-    descriptor
+    SourceDescriptor {
+        id: Cow::Borrowed(LINEAR_CONNECTOR_ID),
+        display_name: Cow::Borrowed("Linear"),
+        default_mount_id: Cow::Borrowed("linear-main"),
+        connect_command: Some(Cow::Borrowed(LINEAR_CONNECT_COMMAND)),
+        auth_env_var: None,
+        supports_oauth: false,
+        mount_guidance: Cow::Owned(linear_mount_guidance()),
+        source_root_create_parent_kind: None,
+        create_entity_parent_kinds: Vec::new(),
+        periodic_discovery_interval: Some(Duration::from_secs(300)),
+        body_diff_mode: BodyDiffMode::WholeEntity,
+        virtual_rename_policy: VirtualRenamePolicy::PreserveCanonical,
+    }
 }
 
 fn gmail_write_decision_for_path(relative_path: &Path) -> SourceWriteDecision {
@@ -477,6 +510,18 @@ Granola meetings are projected as read-only directories containing summary.md an
 - A missing transcript can mean none was captured or Granola's retention policy deleted it.\n\
 - Use `loc info .` for mount context and `loc pull <path>` only when the user explicitly requests a refresh.\n"
         .to_string()
+}
+
+fn linear_mount_guidance() -> String {
+    format!(
+        "{}\n\
+Linear facts:\n\
+- This mount projects Linear teams as directories and issues as page.md files under their team directory.\n\
+- Issue frontmatter contains stable Linear UUID references in the `Label <id>` shape. Preserve the id when editing status, project, or assignee fields.\n\
+- Supported writes are issue description body edits plus title, Status, Project, and Assignee frontmatter updates.\n\
+- Labels, priority, estimate, team, identifier, URL, create, move, delete, and undo are not supported by the Linear connector yet.\n",
+        generic_mount_guidance("Linear")
+    )
 }
 
 pub fn resolve_source_for_path<S>(
@@ -588,6 +633,7 @@ impl Connector for ResolvedSource {
             Self::GoogleDocs(source) => source.kind(),
             Self::Gmail(source) => source.kind(),
             Self::Granola(source) => source.kind(),
+            Self::Linear(source) => source.kind(),
         }
     }
 
@@ -597,6 +643,7 @@ impl Connector for ResolvedSource {
             Self::GoogleDocs(source) => source.capabilities(),
             Self::Gmail(source) => source.capabilities(),
             Self::Granola(source) => source.capabilities(),
+            Self::Linear(source) => source.capabilities(),
         }
     }
 
@@ -606,6 +653,7 @@ impl Connector for ResolvedSource {
             Self::GoogleDocs(source) => source.supported_push_operations(),
             Self::Gmail(source) => source.supported_push_operations(),
             Self::Granola(source) => source.supported_push_operations(),
+            Self::Linear(source) => source.supported_push_operations(),
         }
     }
 
@@ -615,6 +663,7 @@ impl Connector for ResolvedSource {
             Self::GoogleDocs(source) => source.enumerate(request),
             Self::Gmail(source) => source.enumerate(request),
             Self::Granola(source) => source.enumerate(request),
+            Self::Linear(source) => source.enumerate(request),
         }
     }
 
@@ -624,6 +673,7 @@ impl Connector for ResolvedSource {
             Self::GoogleDocs(source) => source.observe(request),
             Self::Gmail(source) => source.observe(request),
             Self::Granola(source) => source.observe(request),
+            Self::Linear(source) => source.observe(request),
         }
     }
 
@@ -633,6 +683,7 @@ impl Connector for ResolvedSource {
             Self::GoogleDocs(source) => source.observe_batch(request),
             Self::Gmail(source) => source.observe_batch(request),
             Self::Granola(source) => source.observe_batch(request),
+            Self::Linear(source) => source.observe_batch(request),
         }
     }
 
@@ -642,6 +693,7 @@ impl Connector for ResolvedSource {
             Self::GoogleDocs(source) => source.list_children(request),
             Self::Gmail(source) => source.list_children(request),
             Self::Granola(source) => source.list_children(request),
+            Self::Linear(source) => source.list_children(request),
         }
     }
 
@@ -651,6 +703,7 @@ impl Connector for ResolvedSource {
             Self::GoogleDocs(source) => source.fetch(request),
             Self::Gmail(source) => source.fetch(request),
             Self::Granola(source) => source.fetch(request),
+            Self::Linear(source) => source.fetch(request),
         }
     }
 
@@ -660,6 +713,7 @@ impl Connector for ResolvedSource {
             Self::GoogleDocs(source) => source.render(entity),
             Self::Gmail(source) => source.render(entity),
             Self::Granola(source) => source.render(entity),
+            Self::Linear(source) => source.render(entity),
         }
     }
 
@@ -669,6 +723,7 @@ impl Connector for ResolvedSource {
             Self::GoogleDocs(source) => source.parse(document),
             Self::Gmail(source) => source.parse(document),
             Self::Granola(source) => source.parse(document),
+            Self::Linear(source) => source.parse(document),
         }
     }
 
@@ -678,6 +733,7 @@ impl Connector for ResolvedSource {
             Self::GoogleDocs(source) => source.check_concurrency(request),
             Self::Gmail(source) => source.check_concurrency(request),
             Self::Granola(source) => source.check_concurrency(request),
+            Self::Linear(source) => source.check_concurrency(request),
         }
     }
 
@@ -687,6 +743,7 @@ impl Connector for ResolvedSource {
             Self::GoogleDocs(source) => source.apply(request),
             Self::Gmail(source) => source.apply(request),
             Self::Granola(source) => source.apply(request),
+            Self::Linear(source) => source.apply(request),
         }
     }
 
@@ -696,6 +753,7 @@ impl Connector for ResolvedSource {
             Self::GoogleDocs(source) => source.apply_undo(request),
             Self::Gmail(source) => source.apply_undo(request),
             Self::Granola(source) => source.apply_undo(request),
+            Self::Linear(source) => source.apply_undo(request),
         }
     }
 }
@@ -707,6 +765,7 @@ impl HydrationSource for ResolvedSource {
             Self::GoogleDocs(source) => source.fetch_render(request),
             Self::Gmail(source) => source.fetch_render(request),
             Self::Granola(source) => source.fetch_render(request),
+            Self::Linear(source) => source.fetch_render(request),
         }
     }
 
@@ -720,6 +779,7 @@ impl HydrationSource for ResolvedSource {
             Self::GoogleDocs(source) => source.fetch_render_with_repository(request, repository),
             Self::Gmail(source) => source.fetch_render_with_repository(request, repository),
             Self::Granola(source) => source.fetch_render_with_repository(request, repository),
+            Self::Linear(source) => source.fetch_render_with_repository(request, repository),
         }
     }
 
@@ -729,6 +789,7 @@ impl HydrationSource for ResolvedSource {
             Self::GoogleDocs(source) => source.fetch_database_schema_yaml(database_id),
             Self::Gmail(source) => source.fetch_database_schema_yaml(database_id),
             Self::Granola(source) => source.fetch_database_schema_yaml(database_id),
+            Self::Linear(source) => source.fetch_database_schema_yaml(database_id),
         }
     }
 }
@@ -782,6 +843,7 @@ impl SourcePushValidator for ResolvedSource {
             Self::GoogleDocs(source) => source.validate_changed_frontmatter(context),
             Self::Gmail(source) => source.validate_changed_frontmatter(context),
             Self::Granola(source) => source.validate_changed_frontmatter(context),
+            Self::Linear(source) => source.validate_changed_frontmatter(context),
         }
     }
 
@@ -794,6 +856,7 @@ impl SourcePushValidator for ResolvedSource {
             Self::GoogleDocs(source) => source.validate_create_frontmatter(context),
             Self::Gmail(source) => source.validate_create_frontmatter(context),
             Self::Granola(source) => source.validate_create_frontmatter(context),
+            Self::Linear(source) => source.validate_create_frontmatter(context),
         }
     }
 }
@@ -808,6 +871,7 @@ impl SourceAdapter for ResolvedSource {
             Self::GoogleDocs(source) => Self::GoogleDocs(source.scoped_to_mount(mount)),
             Self::Gmail(source) => Self::Gmail(source.scoped_to_mount(mount)),
             Self::Granola(source) => Self::Granola(source.scoped_to_mount(mount)),
+            Self::Linear(source) => Self::Linear(source.scoped_to_mount(mount)),
         }
     }
 
@@ -817,6 +881,7 @@ impl SourceAdapter for ResolvedSource {
             Self::GoogleDocs(source) => SourceAdapter::database_schema_yaml(source, database_id),
             Self::Gmail(source) => SourceAdapter::database_schema_yaml(source, database_id),
             Self::Granola(source) => SourceAdapter::database_schema_yaml(source, database_id),
+            Self::Linear(source) => SourceAdapter::database_schema_yaml(source, database_id),
         }
     }
 }

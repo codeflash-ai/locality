@@ -71,16 +71,17 @@ fn mount_writes_agent_guidance_and_claude_alias() {
 }
 
 #[test]
-fn mount_writes_connector_specific_fallback_guidance() {
+fn mount_writes_linear_source_guidance() {
     let fixture = MountFixture::new("loc-cli-mount-generic-guidance");
     let mut store = InMemoryStateStore::new();
 
     fixture.mount_with_connector(&mut store, "linear");
 
     let agents = read_to_string(fixture.agents_file());
-    assert!(agents.contains("# Locality linear Mount"));
-    assert!(agents.contains("projects linear as local Markdown"));
-    assert!(agents.contains("push approved changes to linear"));
+    assert!(agents.contains("# Locality Linear Mount"));
+    assert!(agents.contains("projects Linear as local Markdown"));
+    assert!(agents.contains("Linear facts:"));
+    assert!(agents.contains("Supported writes are issue description body edits"));
     assert!(agents.contains("including nested directories"));
 }
 
