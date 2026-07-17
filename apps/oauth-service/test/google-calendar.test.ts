@@ -151,6 +151,70 @@ describe("Google Calendar OAuth broker", () => {
     expect(requestBody.get("code")).toBe("authorization-code");
     expect(requestBody.get("redirect_uri")).toBe("http://localhost:8757/oauth/google-calendar/callback");
   });
+
+  it("refreshes Google Calendar credentials through an opaque refresh handle", async () => {
+    const start = await startGoogleCalendarSession();
+    let calls = 0;
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => {
+      calls += 1;
+      if (calls === 1) {
+        return Response.json({
+          access_token: "calendar-access-token",
+          refresh_token: "calendar-refresh-token",
+          expires_in: 3600,
+          scope: "openid email profile https://www.googleapis.com/auth/calendar.events",
+          id_token: "calendar-id-token"
+        });
+      }
+      return Response.json({
+        access_token: "new-calendar-access-token",
+        refresh_token: "new-calendar-refresh-token",
+        expires_in: 3600,
+        scope: "openid email profile https://www.googleapis.com/auth/calendar.events"
+      });
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const exchanged = await app.request(
+      "/v1/oauth/google-calendar/exchange",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          session: start.session,
+          state: start.state,
+          code: "authorization-code",
+          redirect_uri: "http://localhost:8757/oauth/google-calendar/callback"
+        })
+      },
+      env
+    );
+    expect(exchanged.status).toBe(200);
+    const exchangeBody = (await exchanged.json()) as BrokerTokenResponse;
+
+    const refreshed = await app.request(
+      "/v1/oauth/google-calendar/refresh",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ refresh_token_handle: exchangeBody.refresh_token_handle })
+      },
+      env
+    );
+
+    expect(refreshed.status).toBe(200);
+    const refreshBody = (await refreshed.json()) as BrokerTokenResponse;
+    expect(refreshBody.connector).toBe("google-calendar");
+    expect(refreshBody.access_token).toBe("new-calendar-access-token");
+    expect(refreshBody.refresh_token).toBeUndefined();
+    expect(refreshBody.refresh_token_kind).toBe("handle");
+    expect(refreshBody.refresh_token_handle).toMatch(/^locrh_v1\./);
+    const refreshRequest = new URLSearchParams((fetchMock.mock.calls[1]?.[1] as RequestInit).body as string);
+    expect(refreshRequest.get("client_id")).toBe("google-client-id");
+    expect(refreshRequest.get("client_secret")).toBe("google-client-secret");
+    expect(refreshRequest.get("grant_type")).toBe("refresh_token");
+    expect(refreshRequest.get("refresh_token")).toBe("calendar-refresh-token");
+  });
 });
 
 async function startGoogleCalendarSession() {
