@@ -1352,10 +1352,17 @@ fn connect_granola_blocking(api_key: String) -> Result<String, String> {
     if let Some(mount) = existing_mount {
         ensure_daemon_running(&state_root)?;
         reload_daemon_mounts(&state_root)?;
+        let mut message = "Reconnected the existing Granola source.".to_string();
         if mount.projection.uses_virtual_filesystem() {
-            activate_virtual_projection_mount(&state_root, &mount, true)?;
+            if let Err(error) = activate_virtual_projection_mount(&state_root, &mount, true) {
+                if recoverable_macos_file_provider_activation_error(&error) {
+                    append_macos_file_provider_activation_warning(&mut message, &error);
+                } else {
+                    return Err(error);
+                }
+            }
         }
-        return Ok("Reconnected the existing Granola source.".to_string());
+        return Ok(message);
     }
 
     create_desktop_mount_blocking(CreateDesktopMountRequest {
@@ -1396,10 +1403,17 @@ fn connect_linear_blocking(api_key: String) -> Result<String, String> {
     if let Some(mount) = existing_mount {
         ensure_daemon_running(&state_root)?;
         reload_daemon_mounts(&state_root)?;
+        let mut message = "Reconnected the existing Linear source.".to_string();
         if mount.projection.uses_virtual_filesystem() {
-            activate_virtual_projection_mount(&state_root, &mount, true)?;
+            if let Err(error) = activate_virtual_projection_mount(&state_root, &mount, true) {
+                if recoverable_macos_file_provider_activation_error(&error) {
+                    append_macos_file_provider_activation_warning(&mut message, &error);
+                } else {
+                    return Err(error);
+                }
+            }
         }
-        return Ok("Reconnected the existing Linear source.".to_string());
+        return Ok(message);
     }
 
     create_desktop_mount_blocking(CreateDesktopMountRequest {
@@ -6974,9 +6988,15 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
         .map_err(|error| format!("Could not reload created mount: {error}"))?
         .ok_or_else(|| "Created mount was not found in Locality state.".to_string())?;
 
-    if mount.projection.uses_virtual_filesystem() {
-        activate_virtual_projection_mount(&state_root, &mount, true)?;
-    }
+    let projection_warning = if mount.projection.uses_virtual_filesystem() {
+        match activate_virtual_projection_mount(&state_root, &mount, true) {
+            Ok(()) => None,
+            Err(error) if recoverable_macos_file_provider_activation_error(&error) => Some(error),
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
 
     let mut message = format!(
         "Mounted {} at {} with {}.",
@@ -6992,8 +7012,17 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
             preserved.directory.display()
         ));
     }
+    if let Some(warning) = projection_warning {
+        append_macos_file_provider_activation_warning(&mut message, &warning);
+    }
 
     Ok(message)
+}
+
+fn append_macos_file_provider_activation_warning(message: &mut String, warning: &str) {
+    message.push_str(&format!(
+        " macOS File Provider is still preparing the visible folder; it may appear in Finder shortly. {warning}"
+    ));
 }
 
 fn desktop_mount_creation_supports_connector(connector: &str) -> bool {
@@ -9694,6 +9723,8 @@ fn recoverable_macos_file_provider_activation_error(message: &str) -> bool {
         || message.contains("registered but not enabled")
         || message.contains("did not return a CloudStorage URL")
         || message.contains("macOS has not created")
+        || (message.contains("did not produce a healthy mount root")
+            && macos_file_provider_mount_root_is_missing(message))
 }
 
 fn workspace_mount_onboarding_report(
@@ -13080,6 +13111,13 @@ mod tests {
         ));
         assert!(super::recoverable_macos_file_provider_activation_error(
             "Could not open macOS File Provider domain `loc`: File Provider domain loc exists but macOS has not created /Users/test/Library/CloudStorage/Locality"
+        ));
+    }
+
+    #[test]
+    fn file_provider_missing_child_mount_after_recovery_is_recoverable() {
+        assert!(super::recoverable_macos_file_provider_activation_error(
+            "macOS File Provider recovery did not produce a healthy mount root `/Users/codeflash/Library/CloudStorage/Locality/linear`: Could not inspect macOS File Provider mount root `/Users/codeflash/Library/CloudStorage/Locality/linear`: Error: Error Domain=NSPOSIXErrorDomain Code=2 \"Couldn't find a file for /Users/codeflash/Library/CloudStorage/Locality/linear\" UserInfo={NSDescription=Couldn't find a file for /Users/codeflash/Library/CloudStorage/Locality/linear}"
         ));
     }
 
