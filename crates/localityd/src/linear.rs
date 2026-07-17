@@ -1,8 +1,9 @@
 use locality_connector::{Connector, FetchRequest};
+use locality_core::canonical::parse_canonical_markdown;
 use locality_core::hydration::HydrationRequest;
 use locality_core::model::RemoteId;
 use locality_core::shadow::{ShadowDocument, segment_markdown_body};
-use locality_core::validation::ValidationReport;
+use locality_core::validation::{ValidationIssue, ValidationReport};
 use locality_core::{LocalityError, LocalityResult};
 use locality_linear::{
     LINEAR_CONNECTOR_ID, LinearConfig, LinearConnector, LinearNativeBundle, remote_version,
@@ -215,7 +216,58 @@ impl HydrationSource for LinearConnector {
 }
 
 pub(crate) fn validate_linear_frontmatter(
-    _context: SourceValidationContext<'_>,
+    context: SourceValidationContext<'_>,
 ) -> LocalityResult<ValidationReport> {
-    Ok(ValidationReport::clean())
+    let Some(shadow) = context.shadow else {
+        return Ok(ValidationReport::clean());
+    };
+    let mut shadow_markdown = String::from("---\n");
+    shadow_markdown.push_str(&shadow.frontmatter);
+    if !shadow_markdown.ends_with('\n') {
+        shadow_markdown.push('\n');
+    }
+    shadow_markdown.push_str("---\n");
+    let shadow_parsed = parse_canonical_markdown(&shadow_markdown).map_err(|error| {
+        LocalityError::InvalidState(format!(
+            "synced Linear shadow frontmatter is no longer parseable: {error}"
+        ))
+    })?;
+    let mut report = ValidationReport::clean();
+    for key in shadow_parsed
+        .frontmatter
+        .properties
+        .keys()
+        .chain(context.parsed.frontmatter.properties.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        if matches!(key.as_str(), "Status" | "Project" | "Assignee") {
+            continue;
+        }
+        let synced = shadow_parsed.frontmatter.properties.get(key);
+        let edited = context.parsed.frontmatter.properties.get(key);
+        if synced != edited {
+            report.push(ValidationIssue::new(
+                "linear_read_only_frontmatter",
+                context.relative_path,
+                Some(1),
+                format!("Linear frontmatter `{key}` is read-only"),
+                Some(format!("restore generated Linear `{key}` frontmatter")),
+            ));
+        }
+    }
+    Ok(report)
+}
+
+pub(crate) fn validate_linear_create_frontmatter(
+    context: SourceValidationContext<'_>,
+) -> LocalityResult<ValidationReport> {
+    let mut report = ValidationReport::clean();
+    report.push(ValidationIssue::new(
+        "linear_create_unsupported",
+        context.relative_path,
+        Some(1),
+        "Linear issue creates are not supported yet",
+        Some("create the Linear issue remotely, then refresh the mount".to_string()),
+    ));
+    Ok(report)
 }

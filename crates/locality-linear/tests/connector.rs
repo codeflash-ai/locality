@@ -70,6 +70,18 @@ fn list_team_children_returns_complete_issue_snapshot() {
 }
 
 #[test]
+fn capabilities_do_not_advertise_oauth_until_broker_flow_exists() {
+    let api = Arc::new(FakeLinearApi::with_issues(vec![issue()]));
+    let connector = LinearConnector::with_api(LinearConfig::new("secret"), api);
+
+    let capabilities = connector.capabilities();
+
+    assert!(capabilities.supports_entity_body_updates);
+    assert!(capabilities.supports_batch_observation);
+    assert!(!capabilities.supports_oauth);
+}
+
+#[test]
 fn rendering_uses_uuid_reference_frontmatter_and_description_body() {
     let document = render_linear_issue(&issue()).expect("render issue");
 

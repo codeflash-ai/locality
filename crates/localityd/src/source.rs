@@ -115,7 +115,7 @@ const SOURCE_REGISTRY: &[SourceRegistration] = &[
         descriptor: linear_source_descriptor,
         resolve: resolve_linear_source,
         validate_changed_frontmatter: crate::linear::validate_linear_frontmatter,
-        validate_create_frontmatter: crate::linear::validate_linear_frontmatter,
+        validate_create_frontmatter: crate::linear::validate_linear_create_frontmatter,
     },
 ];
 

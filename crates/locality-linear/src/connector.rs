@@ -106,7 +106,7 @@ impl Connector for LinearConnector {
     fn capabilities(&self) -> ConnectorCapabilities {
         ConnectorCapabilities {
             supports_entity_body_updates: true,
-            supports_oauth: true,
+            supports_oauth: false,
             supports_remote_observation: true,
             supports_lazy_child_enumeration: true,
             supports_batch_observation: true,
