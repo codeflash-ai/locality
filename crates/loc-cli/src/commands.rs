@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
@@ -32,7 +33,7 @@ use locality_notion::oauth::{
 };
 use locality_slack::{
     DEFAULT_SLACK_OAUTH_BROKER_URL, DEFAULT_SLACK_OAUTH_REDIRECT_URI, HttpSlackOAuthBrokerClient,
-    SLACK_CONNECTOR_ID,
+    SLACK_CONNECTOR_ID, SlackConversationType, SlackMountSettings,
 };
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
@@ -115,6 +116,7 @@ const EXIT_USAGE: i32 = 2;
 const EXIT_VALIDATION: i32 = 3;
 const DEFAULT_DAEMON_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_DAEMON_MUTATING_TIMEOUT: Duration = Duration::from_secs(60);
+const SLACK_CONVERSATION_TYPE_VALUES: &str = "public_channel,private_channel,im,mpim";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -417,6 +419,8 @@ enum MountCommand {
     GoogleDocs(MountGoogleDocsArgs),
     #[command(about = "Mount Gmail")]
     Gmail(MountGmailArgs),
+    #[command(about = "Mount Slack read-only")]
+    Slack(MountSlackArgs),
     #[command(about = "Mount Granola meeting notes read-only")]
     Granola(MountGranolaArgs),
 }
@@ -556,6 +560,41 @@ struct MountGmailArgs {
         help = "Gmail projection view. Defaults to messages."
     )]
     view: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct MountSlackArgs {
+    #[arg(
+        value_name = "path",
+        help = "Local directory where the Slack mount should be registered."
+    )]
+    path: String,
+    #[arg(long, value_name = "id", help = "Connection id to use for this mount.")]
+    connection: Option<String>,
+    #[arg(
+        long,
+        value_name = "id",
+        help = "Mount id to save. Defaults to slack-main."
+    )]
+    mount_id: Option<String>,
+    #[arg(
+        long,
+        value_name = "mode",
+        help = "Projection mode. Supported values depend on the host platform."
+    )]
+    projection: Option<String>,
+    #[arg(
+        long,
+        value_name = "1-15",
+        help = "Slack history limit from 1 to 15. Defaults to 15."
+    )]
+    history_limit: Option<String>,
+    #[arg(
+        long,
+        value_name = "types",
+        help = "Comma-separated Slack conversation types. Defaults to public_channel,private_channel,im,mpim."
+    )]
+    types: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1113,6 +1152,27 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                     push_optional_flag_value(&mut args, "--before", options.before.as_deref());
                     push_optional_flag_value(&mut args, "--view", options.view.as_deref());
                     push_flag(&mut args, "--read-only", options.read_only);
+                }
+                MountCommand::Slack(options) => {
+                    args.push("slack".to_string());
+                    args.push(options.path.clone());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--connection",
+                        options.connection.as_deref(),
+                    );
+                    push_optional_flag_value(&mut args, "--mount-id", options.mount_id.as_deref());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--projection",
+                        options.projection.as_deref(),
+                    );
+                    push_optional_flag_value(
+                        &mut args,
+                        "--history-limit",
+                        options.history_limit.as_deref(),
+                    );
+                    push_optional_flag_value(&mut args, "--types", options.types.as_deref());
                 }
                 MountCommand::Granola(options) => {
                     args.push("granola".to_string());
@@ -2648,6 +2708,9 @@ fn mount(args: &[String], json: bool) -> i32 {
             EXIT_USAGE,
         );
     };
+    if connector == SLACK_CONNECTOR_ID {
+        return mount_slack(args, json);
+    }
     let descriptor = source_descriptor(connector);
 
     let Some(root) = nth_positional(args, 1) else {
@@ -2762,6 +2825,185 @@ fn mount(args: &[String], json: bool) -> i32 {
         }
         Err(error) => mount_command_error(json, error),
     }
+}
+
+fn mount_slack(args: &[String], json: bool) -> i32 {
+    if has_flag(args, "--workspace")
+        || flag_value(args, "--root-page").is_some()
+        || flag_value(args, "--workspace-folder").is_some()
+    {
+        return command_error(
+            json,
+            CommandError::new(
+                "mount",
+                "usage",
+                "loc mount slack does not accept Notion or Google Docs root flags",
+            ),
+            EXIT_USAGE,
+        );
+    }
+
+    let Some(root) = nth_positional(args, 1) else {
+        return command_error(
+            json,
+            CommandError::new("mount", "usage", mount_usage()),
+            EXIT_USAGE,
+        );
+    };
+    let projection = match projection_mode(args) {
+        Ok(projection) => projection,
+        Err(message) => {
+            return command_error(
+                json,
+                CommandError::new("mount", "usage", message),
+                EXIT_USAGE,
+            );
+        }
+    };
+    let settings_json = match slack_settings_from_mount_args(args) {
+        Ok(settings_json) => settings_json,
+        Err(error) => return command_error(json, error, EXIT_USAGE),
+    };
+
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("mount", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let descriptor = source_descriptor(SLACK_CONNECTOR_ID);
+    let connection_id = match resolve_mount_connection(&store, args, &descriptor) {
+        Ok(connection_id) => connection_id,
+        Err(error) => return command_error(json, error, EXIT_INTERNAL),
+    };
+    let explicit_mount_id = flag_value(args, "--mount-id").map(str::to_string);
+    let mut mount_id = MountId::new(
+        explicit_mount_id
+            .clone()
+            .unwrap_or_else(|| descriptor.default_mount_id().to_string()),
+    );
+    if let Some(error) = mounted_projection_preflight_error(
+        projection.clone(),
+        std::env::consts::OS,
+        std::env::var_os("LOCALITY_DAEMON_DISABLE").is_some(),
+        || virtual_projection_daemon_is_running(&state_root),
+    ) {
+        return command_error(json, error, EXIT_INTERNAL);
+    }
+    if explicit_mount_id.is_none() {
+        mount_id =
+            match default_mount_id_for_source(&store, &descriptor, connection_id.as_ref(), None) {
+                Ok(mount_id) => mount_id,
+                Err(error) => return command_error(json, error, EXIT_INTERNAL),
+            };
+    }
+
+    let options = MountOptions {
+        mount_id,
+        connector: SLACK_CONNECTOR_ID.to_string(),
+        root: PathBuf::from(root),
+        remote_root_id: None,
+        connection_id,
+        read_only: true,
+        projection,
+        settings_json,
+    };
+    let mount_id = options.mount_id.clone();
+
+    match run_mount(&mut store, options) {
+        Ok(report) => {
+            notify_daemon_mounts_changed(&state_root);
+            if let Err(error) = auto_register_mounted_projection(&state_root, &store, &mount_id) {
+                return command_error(json, error, EXIT_INTERNAL);
+            }
+            if json {
+                print_json(&report);
+            } else {
+                print_mount_report(&report);
+            }
+            EXIT_SUCCESS
+        }
+        Err(error) => mount_command_error(json, error),
+    }
+}
+
+fn slack_settings_from_mount_args(args: &[String]) -> Result<String, CommandError> {
+    let mut settings = SlackMountSettings::default();
+    if let Some(value) = flag_value(args, "--history-limit") {
+        settings.slack.history_limit = value.parse::<u32>().map_err(|_| {
+            CommandError::new(
+                "mount",
+                "slack_history_limit_invalid",
+                "`--history-limit` must be an integer from 1 to 15",
+            )
+        })?;
+    }
+    if let Some(value) = flag_value(args, "--types") {
+        settings.slack.types = slack_conversation_types_from_mount_arg(value)?;
+    }
+
+    let settings_json = settings.to_json().map_err(|error| {
+        CommandError::new("mount", "slack_settings_encode_failed", error.to_string())
+    })?;
+    let settings = SlackMountSettings::from_json(&settings_json).map_err(|error| {
+        CommandError::new(
+            "mount",
+            "slack_settings_invalid",
+            locality_error_message(error),
+        )
+    })?;
+    settings.to_json().map_err(|error| {
+        CommandError::new("mount", "slack_settings_encode_failed", error.to_string())
+    })
+}
+
+fn slack_conversation_types_from_mount_arg(
+    value: &str,
+) -> Result<BTreeSet<SlackConversationType>, CommandError> {
+    let mut types = BTreeSet::new();
+    for raw_type in value.split(',') {
+        let raw_type = raw_type.trim();
+        if raw_type.is_empty() {
+            return Err(CommandError::new(
+                "mount",
+                "slack_types_invalid",
+                format!(
+                    "Slack conversation types must be non-empty; supported values: {SLACK_CONVERSATION_TYPE_VALUES}"
+                ),
+            ));
+        }
+        let conversation_type = match raw_type {
+            "public_channel" => SlackConversationType::PublicChannel,
+            "private_channel" => SlackConversationType::PrivateChannel,
+            "im" => SlackConversationType::Im,
+            "mpim" => SlackConversationType::Mpim,
+            unsupported => {
+                return Err(CommandError::new(
+                    "mount",
+                    "slack_types_invalid",
+                    format!(
+                        "unsupported Slack conversation type `{unsupported}`; supported values: {SLACK_CONVERSATION_TYPE_VALUES}"
+                    ),
+                ));
+            }
+        };
+        types.insert(conversation_type);
+    }
+    if types.is_empty() {
+        return Err(CommandError::new(
+            "mount",
+            "slack_types_invalid",
+            format!(
+                "Slack settings must include at least one Slack conversation type; supported values: {SLACK_CONVERSATION_TYPE_VALUES}"
+            ),
+        ));
+    }
+    Ok(types)
 }
 
 fn gmail_mount_settings_json(args: &[String]) -> Result<String, CommandError> {
@@ -7820,7 +8062,7 @@ fn projection_mode_for_target(args: &[String], target_os: &str) -> Result<Projec
 
 fn mount_usage() -> String {
     format!(
-        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--read-only] [--json]\n       loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--json]",
+        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--read-only] [--json]\n       loc mount slack <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--history-limit 1-15] [--types public_channel,private_channel,im,mpim] [--json]\n       loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--json]",
         projection_usage_options_for_target(std::env::consts::OS)
     )
 }
@@ -8025,6 +8267,8 @@ fn takes_value(arg: &str) -> bool {
             | "--connection"
             | "--name"
             | "--projection"
+            | "--history-limit"
+            | "--types"
             | "--helper"
             | "--display-name"
             | "--redirect-uri"
@@ -8435,6 +8679,7 @@ mod tests {
                     "notion",
                     "google-docs",
                     "gmail",
+                    "slack",
                     "granola",
                     "--json",
                 ],
@@ -8463,6 +8708,16 @@ mod tests {
                     "Mount Gmail",
                     "--connection",
                     "--projection",
+                ],
+            ),
+            (
+                vec!["mount", "slack", "--help"],
+                vec![
+                    "Usage: loc mount slack",
+                    "Mount Slack read-only",
+                    "--connection",
+                    "--history-limit",
+                    "--types",
                 ],
             ),
             (
@@ -8736,11 +8991,13 @@ mod tests {
     }
 
     #[test]
-    fn mount_usage_mentions_gmail_settings_flags() {
+    fn mount_usage_mentions_connector_settings_flags() {
         let usage = mount_usage();
 
         assert!(usage.contains("--after YYYY-MM-DD --before YYYY-MM-DD"));
         assert!(usage.contains("--view messages|threads"));
+        assert!(usage.contains("--history-limit 1-15"));
+        assert!(usage.contains("--types public_channel,private_channel,im,mpim"));
     }
 
     #[test]
@@ -8860,6 +9117,40 @@ mod tests {
                 "--projection",
                 "plain-files",
                 "--read-only"
+            ]
+        );
+
+        let cli = parse_cli([
+            "mount",
+            "slack",
+            "/tmp/Locality/slack-main",
+            "--connection",
+            "slack-work",
+            "--mount-id",
+            "slack-main",
+            "--projection",
+            "plain-files",
+            "--history-limit",
+            "15",
+            "--types",
+            "public_channel,private_channel,im,mpim",
+        ]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec![
+                "mount",
+                "slack",
+                "/tmp/Locality/slack-main",
+                "--connection",
+                "slack-work",
+                "--mount-id",
+                "slack-main",
+                "--projection",
+                "plain-files",
+                "--history-limit",
+                "15",
+                "--types",
+                "public_channel,private_channel,im,mpim",
             ]
         );
 
