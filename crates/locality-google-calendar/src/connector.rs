@@ -165,13 +165,15 @@ impl Connector for GoogleCalendarConnector {
             ));
         }
 
-        let Some((_calendar_id, event_id)) = parse_event_remote_id(&request.remote_id) else {
+        let Some((calendar_id, event_id)) = parse_event_remote_id(&request.remote_id) else {
             return Err(LocalityError::RemoteNotFound(format!(
                 "unknown google calendar remote id `{}`",
                 request.remote_id.as_str()
             )));
         };
+        require_primary_calendar_id(calendar_id)?;
         let event = self.api.get_event(PRIMARY_CALENDAR_ID, event_id)?;
+        let deleted = event.status.as_deref() == Some("cancelled");
         let entry = event_entry(
             &request.mount_id,
             Path::new("events"),
@@ -187,15 +189,17 @@ impl Connector for GoogleCalendarConnector {
         )
         .with_parent(RemoteId::new(EVENTS_FOLDER_ID))
         .with_remote_version(RemoteVersion::new(event.remote_version()))
+        .deleted(deleted)
         .with_raw_metadata_json(serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string())))
     }
 
     fn fetch(&self, request: FetchRequest) -> LocalityResult<NativeEntity> {
-        let Some((_calendar_id, event_id)) = parse_event_remote_id(&request.remote_id) else {
+        let Some((calendar_id, event_id)) = parse_event_remote_id(&request.remote_id) else {
             return Err(LocalityError::Unsupported(
                 "google calendar fetch remote id",
             ));
         };
+        require_primary_calendar_id(calendar_id)?;
         let event = self.api.get_event(PRIMARY_CALENDAR_ID, event_id)?;
         let bundle = GoogleCalendarNativeBundle {
             calendar_id: PRIMARY_CALENDAR_ID.to_string(),
@@ -425,6 +429,16 @@ fn parse_event_remote_id(remote_id: &RemoteId) -> Option<(&str, &str)> {
         })
 }
 
+fn require_primary_calendar_id(calendar_id: &str) -> LocalityResult<()> {
+    if calendar_id == PRIMARY_CALENDAR_ID {
+        Ok(())
+    } else {
+        Err(LocalityError::Unsupported(
+            "google calendar non-primary calendar id",
+        ))
+    }
+}
+
 fn event_id_or_fallback(event: &CalendarEvent) -> &str {
     event
         .id
@@ -641,6 +655,79 @@ mod tests {
     }
 
     #[test]
+    fn fetch_rejects_non_primary_event_remote_id_without_api_call() {
+        let api = Arc::new(FakeGoogleCalendarApi::default());
+        let connector =
+            GoogleCalendarConnector::with_api(GoogleCalendarConfig::new("token"), api.clone());
+
+        let error = connector
+            .fetch(FetchRequest {
+                remote_id: RemoteId::new("google-calendar-event:team-calendar:event-1"),
+            })
+            .expect_err("non-primary calendar should be rejected");
+
+        assert_eq!(
+            error,
+            LocalityError::Unsupported("google calendar non-primary calendar id")
+        );
+        assert!(api.calls.lock().expect("calls").get_events.is_empty());
+    }
+
+    #[test]
+    fn observe_rejects_non_primary_event_remote_id_without_api_call() {
+        let api = Arc::new(FakeGoogleCalendarApi::default());
+        let connector =
+            GoogleCalendarConnector::with_api(GoogleCalendarConfig::new("token"), api.clone());
+
+        let error = connector
+            .observe(ObserveRequest {
+                mount_id: MountId::new("calendar-main"),
+                remote_id: RemoteId::new("google-calendar-event:team-calendar:event-1"),
+            })
+            .expect_err("non-primary calendar should be rejected");
+
+        assert_eq!(
+            error,
+            LocalityError::Unsupported("google calendar non-primary calendar id")
+        );
+        assert!(api.calls.lock().expect("calls").get_events.is_empty());
+    }
+
+    #[test]
+    fn observe_cancelled_event_returns_deleted_observation() {
+        let api = Arc::new(FakeGoogleCalendarApi::default());
+        {
+            let mut cancelled = event_fixture("event-1");
+            cancelled.status = Some("cancelled".to_string());
+            api.calls
+                .lock()
+                .expect("calls")
+                .event_overrides
+                .insert("event-1".to_string(), cancelled);
+        }
+        let connector =
+            GoogleCalendarConnector::with_api(GoogleCalendarConfig::new("token"), api.clone());
+
+        let observation = connector
+            .observe(ObserveRequest {
+                mount_id: MountId::new("calendar-main"),
+                remote_id: RemoteId::new("google-calendar-event:primary:event-1"),
+            })
+            .expect("observe");
+
+        assert!(observation.deleted);
+        assert_eq!(
+            observation.parent_remote_id,
+            Some(RemoteId::new("google-calendar-folder:events"))
+        );
+        assert_eq!(
+            observation.projected_path,
+            std::path::PathBuf::from("events/20260720-100000-design-review-event-1.md")
+        );
+        assert!(observation.raw_metadata_json.contains("\"cancelled\""));
+    }
+
+    #[test]
     fn pagination_follows_tokens_and_skips_cancelled_events() {
         let api = Arc::new(FakeGoogleCalendarApi::default());
         {
@@ -847,6 +934,7 @@ google_calendar:
         get_events: Vec<(String, String)>,
         insert_events: Vec<(String, CalendarEventCreateRequest, bool)>,
         pages: BTreeMap<Option<String>, CalendarEventList>,
+        event_overrides: BTreeMap<String, CalendarEvent>,
     }
 
     impl Default for FakeCalls {
@@ -863,6 +951,7 @@ google_calendar:
                         next_sync_token: None,
                     },
                 )]),
+                event_overrides: BTreeMap::new(),
             }
         }
     }
@@ -894,11 +983,13 @@ google_calendar:
             calendar_id: &str,
             event_id: &str,
         ) -> locality_core::LocalityResult<CalendarEvent> {
-            self.calls
-                .lock()
-                .expect("calls")
+            let mut calls = self.calls.lock().expect("calls");
+            calls
                 .get_events
                 .push((calendar_id.to_string(), event_id.to_string()));
+            if let Some(event) = calls.event_overrides.get(event_id).cloned() {
+                return Ok(event);
+            }
             Ok(event_fixture(event_id))
         }
 
