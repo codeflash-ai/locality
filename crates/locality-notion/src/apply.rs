@@ -21,6 +21,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crate::client::NotionApi;
+use crate::database_create::parse_database_draft;
 use crate::dto::{
     BlockDto, BlockTreeDto, DataSourceDto, FileBlockDto, NotionPageBundle, PageDto,
     PagePropertyDto, RichTextAnnotationsDto, RichTextDto, TableBlockDto,
@@ -348,6 +349,28 @@ pub fn apply_plan(
                             entity_id: created_id,
                         });
                     }
+                    PushOperation::CreateDatabase {
+                        parent_id, schema, ..
+                    } => {
+                        let draft = parse_database_draft(schema).map_err(|error| {
+                            LocalityError::InvalidState(format!(
+                                "{}: {}",
+                                error.code, error.message
+                            ))
+                        })?;
+                        let created =
+                            api.create_database(draft.create_request_body(parent_id.as_str()))?;
+                        let created_id = RemoteId::new(created.id);
+                        if !changed_remote_ids.contains(&created_id) {
+                            changed_remote_ids.push(created_id.clone());
+                        }
+                        effects.push(JournalApplyEffect::CreatedEntity {
+                            operation_id: request.operation_ids[operation_index].clone(),
+                            operation_index,
+                            parent_id: parent_id.clone(),
+                            entity_id: created_id,
+                        });
+                    }
                     PushOperation::ArchiveEntity { entity_id } => {
                         api.delete_block(entity_id.as_str())?;
                         if !changed_remote_ids.contains(entity_id) {
@@ -590,6 +613,7 @@ fn create_parent_ids(operations: &[PushOperation]) -> BTreeSet<RemoteId> {
                 parent_workspace,
                 ..
             } if !parent_workspace => Some(parent_id.clone()),
+            PushOperation::CreateDatabase { parent_id, .. } => Some(parent_id.clone()),
             _ => None,
         })
         .collect()
@@ -619,6 +643,7 @@ fn database_create_parent_ids(operations: &[PushOperation]) -> BTreeSet<RemoteId
             {
                 Some(parent_id.clone())
             }
+            PushOperation::CreateDatabase { .. } => None,
             _ => None,
         })
         .collect()

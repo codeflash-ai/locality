@@ -772,7 +772,9 @@ fn apply_plan(
                     entity_id,
                 });
             }
-            PushOperation::MoveBlock { .. } | PushOperation::UpdateMedia { .. } => {
+            PushOperation::MoveBlock { .. }
+            | PushOperation::UpdateMedia { .. }
+            | PushOperation::CreateDatabase { .. } => {
                 return Err(LocalityError::Unsupported(
                     "google docs connector cannot apply this operation",
                 ));

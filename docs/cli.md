@@ -23,6 +23,7 @@ The `loc` command is the single supported control surface for users and coding a
 - `loc search <query> [--connector <connector>] [--limit <n>] [--json]`
 - `loc locate <query>`
 - `loc create page --title <title> [--parent <dir>] [--private] [--json]`
+- `loc create database --title <title> [--parent <page-dir>] [--json]`
 - `loc templates list|validate|new|apply [args] [--json]`
 - `loc okf export <path> --out <dir> [--json]`
 - `loc inspect <path> [--json]`
@@ -292,6 +293,34 @@ creates:
 ```text
 ~/Library/CloudStorage/Locality/notion/go-to-market/Launch Plan/page.md
 ```
+
+`loc create database --title <title> [--parent <page-dir>]` creates an
+untracked database directory containing an editable `_schema.yaml` draft. The
+parent must be an existing writable Notion page directory. This command stages
+the same shape in Locality's content cache for virtual projections.
+
+```bash
+loc create database --title "Tasks" --parent ~/Library/CloudStorage/Locality/notion/Product
+```
+
+The generated draft has one initial data source and one title property:
+
+```yaml
+loc:
+  type: notion_database_schema
+title: "Tasks"
+data_sources:
+  - name: Rows
+    properties:
+      Name:
+        type: title
+```
+
+Edit this draft to add supported properties, inspect it with `loc diff`, then
+run `loc push -y` on `_schema.yaml` or its containing directory. On success,
+Locality replaces the draft with the canonical generated schema containing the
+Notion database, data-source, property, and option IDs. Schemas for already
+tracked databases remain generated and read-only.
 
 For Notion mounts, `--private` marks the draft so `loc push` creates it with a
 workspace parent, which Notion places in the user's Private section:

@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use locality_core::model::{EntityKind, RemoteId};
 use locality_core::path_projection::{PAGE_DOCUMENT_FILENAME, page_document_path};
+use locality_notion::database_create::default_database_draft_yaml;
 use locality_store::{
     EntityRecord, EntityRepository, MountConfig, MountRepository, StoreError, VirtualMutationKind,
     VirtualMutationRecord, VirtualMutationRepository,
@@ -39,6 +40,27 @@ pub struct CreatePageReport {
     pub mount_id: String,
     pub connector: String,
     pub private: bool,
+    pub next: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateDatabaseOptions {
+    pub title: String,
+    pub parent: Option<PathBuf>,
+    pub state_root: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CreateDatabaseReport {
+    pub ok: bool,
+    pub command: &'static str,
+    pub kind: &'static str,
+    pub title: String,
+    pub parent: String,
+    pub directory: String,
+    pub path: String,
+    pub mount_id: String,
+    pub connector: String,
     pub next: Vec<String>,
 }
 
@@ -135,12 +157,112 @@ where
     })
 }
 
+pub fn run_create_database<S>(
+    store: &mut S,
+    options: CreateDatabaseOptions,
+) -> Result<CreateDatabaseReport, CreateError>
+where
+    S: EntityRepository + MountRepository + VirtualMutationRepository,
+{
+    let title = normalized_title(&options.title)?;
+    let parent = match options.parent {
+        Some(parent) => absolute_path(&parent)?,
+        None => std::env::current_dir().map_err(|error| CreateError::CurrentDir {
+            message: error.to_string(),
+        })?,
+    };
+    let mounts = store.load_mounts().map_err(CreateError::Store)?;
+    let (mount, _) = file_provider::find_mount_for_path(&mounts, &parent)
+        .ok_or_else(|| CreateError::MountNotFound(parent.clone()))?;
+    if mount.read_only {
+        return Err(CreateError::ReadOnlyMount {
+            mount_id: mount.mount_id.0.clone(),
+        });
+    }
+    if mount.connector != "notion" {
+        return Err(CreateError::DatabaseUnsupported {
+            connector: mount.connector.clone(),
+        });
+    }
+    let entities = store
+        .list_entities(&mount.mount_id)
+        .map_err(CreateError::Store)?;
+    let parent_entity = parent_entity_for_path(&relative_path(mount, &parent)?, &entities)
+        .ok_or_else(|| CreateError::InvalidParent {
+            path: parent.clone(),
+            message: "no existing page matches this parent directory".to_string(),
+        })?;
+    if parent_entity.kind != EntityKind::Page {
+        return Err(CreateError::InvalidParent {
+            path: parent.clone(),
+            message: "Notion databases must be created inside an existing page directory"
+                .to_string(),
+        });
+    }
+
+    let database_dir = parent.join(page_directory_name_for_title(&title));
+    let schema_path = database_dir.join("_schema.yaml");
+    if database_dir.exists()
+        || store
+            .find_virtual_mutation_by_path(&mount.mount_id, &relative_path(mount, &schema_path)?)
+            .map_err(CreateError::Store)?
+            .is_some()
+    {
+        return Err(CreateError::TargetExists(database_dir));
+    }
+    let schema = default_database_draft_yaml(&title);
+    if mount.projection.uses_virtual_filesystem() {
+        let state_root = options
+            .state_root
+            .as_deref()
+            .ok_or(CreateError::VirtualStateRootRequired)?;
+        stage_virtual_file(
+            store,
+            mount,
+            state_root,
+            &schema_path,
+            &schema,
+            Some(parent_entity.remote_id.clone()),
+        )?;
+    } else {
+        fs::create_dir_all(&database_dir).map_err(|error| CreateError::WriteFile {
+            path: database_dir.clone(),
+            message: error.to_string(),
+        })?;
+        fs::write(&schema_path, schema).map_err(|error| {
+            let _ = fs::remove_dir(&database_dir);
+            CreateError::WriteFile {
+                path: schema_path.clone(),
+                message: error.to_string(),
+            }
+        })?;
+    }
+
+    let path = schema_path.display().to_string();
+    Ok(CreateDatabaseReport {
+        ok: true,
+        command: "create_database",
+        kind: "database",
+        title,
+        parent: parent.display().to_string(),
+        directory: database_dir.display().to_string(),
+        path: path.clone(),
+        mount_id: mount.mount_id.0.clone(),
+        connector: mount.connector.clone(),
+        next: vec![
+            format!("loc diff {}", shell_quote_path(&path)),
+            format!("loc push {} -y", shell_quote_path(&path)),
+        ],
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CreateError {
     CurrentDir { message: String },
     InvalidTitle(String),
     MountNotFound(PathBuf),
     PrivateUnsupported { connector: String },
+    DatabaseUnsupported { connector: String },
     InvalidParent { path: PathBuf, message: String },
     ReadOnlyMount { mount_id: String },
     VirtualStateRootRequired,
@@ -156,6 +278,7 @@ impl CreateError {
             Self::InvalidTitle(_) => "invalid_title",
             Self::MountNotFound(_) => "mount_not_found",
             Self::PrivateUnsupported { .. } => "private_unsupported",
+            Self::DatabaseUnsupported { .. } => "database_unsupported",
             Self::InvalidParent { .. } => "invalid_parent",
             Self::ReadOnlyMount { .. } => "read_only_mount",
             Self::VirtualStateRootRequired => "virtual_state_root_required",
@@ -177,18 +300,21 @@ impl CreateError {
             Self::PrivateUnsupported { connector } => {
                 format!("--private is only supported for Notion mounts, not `{connector}`")
             }
+            Self::DatabaseUnsupported { connector } => {
+                format!("database creation is only supported for Notion mounts, not `{connector}`")
+            }
             Self::InvalidParent { path, message } => {
-                format!("cannot create page inside `{}`: {message}", path.display())
+                format!("cannot create inside `{}`: {message}", path.display())
             }
             Self::ReadOnlyMount { mount_id } => {
-                format!("mount `{mount_id}` is read-only and cannot accept new pages")
+                format!("mount `{mount_id}` is read-only and cannot accept new items")
             }
             Self::VirtualStateRootRequired => {
-                "creating pages in virtual mounts requires a Locality state directory".to_string()
+                "creating items in virtual mounts requires a Locality state directory".to_string()
             }
             Self::Store(error) => error.to_string(),
             Self::TargetExists(path) => {
-                format!("target page directory `{}` already exists", path.display())
+                format!("target directory `{}` already exists", path.display())
             }
             Self::WriteFile { path, message } => {
                 format!("failed to write `{}`: {message}", path.display())
@@ -209,16 +335,63 @@ where
     S: VirtualMutationRepository,
 {
     let projected_path = page_document_path(&relative_path(mount, page_dir)?);
+    stage_virtual_file_at_relative_path(
+        store,
+        mount,
+        state_root,
+        page_dir,
+        projected_path,
+        body,
+        parent_remote_id,
+    )
+}
+
+fn stage_virtual_file<S>(
+    store: &mut S,
+    mount: &MountConfig,
+    state_root: &Path,
+    file_path: &Path,
+    body: &str,
+    parent_remote_id: Option<RemoteId>,
+) -> Result<(), CreateError>
+where
+    S: VirtualMutationRepository,
+{
+    let projected_path = relative_path(mount, file_path)?;
+    stage_virtual_file_at_relative_path(
+        store,
+        mount,
+        state_root,
+        file_path,
+        projected_path,
+        body,
+        parent_remote_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_virtual_file_at_relative_path<S>(
+    store: &mut S,
+    mount: &MountConfig,
+    state_root: &Path,
+    display_path: &Path,
+    projected_path: PathBuf,
+    body: &str,
+    parent_remote_id: Option<RemoteId>,
+) -> Result<(), CreateError>
+where
+    S: VirtualMutationRepository,
+{
     if store
         .find_virtual_mutation_by_path(&mount.mount_id, &projected_path)
         .map_err(CreateError::Store)?
         .is_some()
     {
-        return Err(CreateError::TargetExists(page_dir.to_path_buf()));
+        return Err(CreateError::TargetExists(display_path.to_path_buf()));
     }
     let content_path = virtual_fs_content_path(state_root, &mount.mount_id, &projected_path)
         .map_err(|error| CreateError::WriteFile {
-            path: page_dir.to_path_buf(),
+            path: display_path.to_path_buf(),
             message: error.to_string(),
         })?;
     if let Some(parent) = content_path.parent() {
@@ -232,6 +405,13 @@ where
         message: error.to_string(),
     })?;
     let now = timestamp_string();
+    let title = if is_database_schema_path(&projected_path) {
+        projected_path.parent().and_then(Path::file_name)
+    } else {
+        display_path.file_name()
+    }
+    .map(|name| name.to_string_lossy().into_owned())
+    .unwrap_or_else(|| "Untitled".to_string());
     store
         .save_virtual_mutation(VirtualMutationRecord {
             mount_id: mount.mount_id.clone(),
@@ -241,15 +421,16 @@ where
             parent_remote_id,
             original_path: None,
             projected_path,
-            title: page_dir
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Untitled".to_string()),
+            title,
             content_path: Some(content_path),
             created_at: now.clone(),
             updated_at: now,
         })
         .map_err(CreateError::Store)
+}
+
+fn is_database_schema_path(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("_schema.yaml")
 }
 
 fn parent_remote_id_for_path<S>(

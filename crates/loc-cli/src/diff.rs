@@ -394,6 +394,12 @@ pub enum PushOperationOutput {
         body: String,
         source_path: String,
     },
+    CreateDatabase {
+        parent_id: String,
+        title: String,
+        schema: String,
+        source_path: String,
+    },
 }
 
 fn is_false(value: &bool) -> bool {
@@ -487,6 +493,17 @@ impl From<PushOperation> for PushOperationOutput {
                     })
                     .collect(),
                 body,
+                source_path: locality_platform::logical_path_display(&source_path),
+            },
+            PushOperation::CreateDatabase {
+                parent_id,
+                title,
+                schema,
+                source_path,
+            } => Self::CreateDatabase {
+                parent_id: parent_id.0,
+                title,
+                schema,
                 source_path: locality_platform::logical_path_display(&source_path),
             },
         }

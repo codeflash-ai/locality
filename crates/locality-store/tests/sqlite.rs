@@ -108,8 +108,8 @@ fn sqlite_store_seeds_state_compatibility_components() {
             (
                 "durable:journals".to_string(),
                 "durable_json".to_string(),
-                2,
-                1,
+                3,
+                3,
                 1,
                 0
             ),
@@ -1288,6 +1288,37 @@ fn sqlite_store_blocks_newer_component_versions() {
 }
 
 #[test]
+fn sqlite_store_migrates_v2_journal_component_to_v3() {
+    let fixture = SqliteFixture::new();
+    let store = fixture.open();
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    connection
+        .execute(
+            "UPDATE state_components
+             SET version = 2, min_reader_version = 1
+             WHERE component_id = 'durable:journals'",
+            [],
+        )
+        .expect("downgrade journal component fixture");
+    drop(connection);
+    drop(store);
+
+    let store = fixture.open();
+    let connection = Connection::open(&store.db_path).expect("raw reopened connection");
+    let (version, min_reader_version): (i64, i64) = connection
+        .query_row(
+            "SELECT version, min_reader_version
+             FROM state_components
+             WHERE component_id = 'durable:journals'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("journal component versions");
+
+    assert_eq!((version, min_reader_version), (3, 3));
+}
+
+#[test]
 fn sqlite_store_blocks_components_that_require_newer_readers() {
     let fixture = SqliteFixture::new();
     let store = fixture.open();
@@ -1311,7 +1342,7 @@ fn sqlite_store_blocks_components_that_require_newer_readers() {
         vec![StateCompatibilityIssue::ComponentRequiresNewerReader {
             component_id: "durable:journals".to_string(),
             min_reader_version: 999,
-            supported: 2,
+            supported: 3,
         }]
     );
 
@@ -3111,7 +3142,7 @@ fn sqlite_store_migrates_v16_journals_with_empty_edit_metadata() {
         .expect("journal");
 
     assert_eq!(user_version, 18);
-    assert_eq!(journals_component_version, 2);
+    assert_eq!(journals_component_version, 3);
     assert_eq!(
         metadata_json,
         serde_json::to_string(&JournalMetadata::default()).expect("default metadata json")

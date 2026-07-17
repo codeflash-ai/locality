@@ -72,6 +72,130 @@ fn prepare_push_blocks_notion_schema_violation_for_existing_database_row() {
 }
 
 #[test]
+fn prepare_push_plans_new_notion_database_from_schema_file_or_directory() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("notion");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("roadmap-page"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap/page.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save parent page");
+    let schema = "loc:\n  type: notion_database_schema\ntitle: Project Tasks\ndata_sources:\n  - name: Tasks\n    properties:\n      Name:\n        type: title\n      Status:\n        type: select\n        options:\n          - name: Todo\n            color: gray\n";
+    let schema_path = fixture.write_raw("Roadmap/Project Tasks/_schema.yaml", schema);
+
+    for target in [schema_path, fixture.root.join("Roadmap/Project Tasks")] {
+        let prepared = prepare_push(&store, &job(target), None, &LocalSourceValidator)
+            .expect("prepare database create");
+
+        assert_eq!(prepared.pipeline.action, PushPipelineAction::ConfirmPlan);
+        assert!(prepared.pipeline.validation.is_clean());
+        assert_eq!(
+            prepared.pipeline.plan.expect("plan").operations,
+            vec![PushOperation::CreateDatabase {
+                parent_id: RemoteId::new("roadmap-page"),
+                title: "Project Tasks".to_string(),
+                schema: schema.to_string(),
+                source_path: PathBuf::from("Roadmap/Project Tasks/_schema.yaml"),
+            }]
+        );
+    }
+}
+
+#[test]
+fn prepare_push_rejects_generated_or_unsupported_database_schema_before_plan() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("notion");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("roadmap-page"),
+            EntityKind::Page,
+            "Roadmap",
+            "Roadmap/page.md",
+        ))
+        .expect("save parent page");
+    let path = fixture.write_raw(
+        "Roadmap/Tasks/_schema.yaml",
+        "loc:\n  type: notion_database_schema\n  database_id: existing\ntitle: Tasks\ndata_sources: []\n",
+    );
+
+    let prepared = prepare_push(&store, &job(path), None, &LocalSourceValidator)
+        .expect("prepare invalid database create");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::FixValidation);
+    assert!(prepared.pipeline.plan.is_none());
+    assert_eq!(
+        prepared.pipeline.validation.issues[0].code,
+        "notion_database_schema_has_remote_id"
+    );
+}
+
+#[test]
+fn prepare_push_never_treats_tracked_database_schema_as_a_new_database() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("notion");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("database-1"),
+            EntityKind::Database,
+            "Tasks",
+            "Roadmap/Tasks",
+        ))
+        .expect("save tracked database");
+    let path = fixture.write_raw(
+        "Roadmap/Tasks/_schema.yaml",
+        "loc:\n  type: notion_database_schema\ntitle: Cloned Tasks\ndata_sources:\n  - name: Rows\n    properties:\n      Name:\n        type: title\n",
+    );
+
+    let prepared = prepare_push(&store, &job(path), None, &LocalSourceValidator)
+        .expect("prepare tracked schema");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::FixValidation);
+    assert!(prepared.pipeline.plan.is_none());
+    assert_eq!(
+        prepared.pipeline.validation.issues[0].code,
+        "notion_database_schema_read_only"
+    );
+}
+
+#[test]
+fn prepare_push_rejects_database_draft_over_a_tracked_page_directory() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("notion");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("page-1"),
+            EntityKind::Page,
+            "Tasks",
+            "Roadmap/Tasks/page.md",
+        ))
+        .expect("save tracked page");
+    let path = fixture.write_raw(
+        "Roadmap/Tasks/_schema.yaml",
+        "loc:\n  type: notion_database_schema\ntitle: Tasks\ndata_sources:\n  - name: Rows\n    properties:\n      Name:\n        type: title\n",
+    );
+
+    let prepared = prepare_push(&store, &job(path), None, &LocalSourceValidator)
+        .expect("prepare conflicting database draft");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::FixValidation);
+    assert!(prepared.pipeline.plan.is_none());
+    assert_eq!(
+        prepared.pipeline.validation.issues[0].code,
+        "notion_database_draft_path_conflict"
+    );
+}
+
+#[test]
 fn prepare_push_leaves_non_notion_database_schema_validation_clean() {
     let fixture = PrepareFixture::new();
     let mut store = fixture.store("fake");
