@@ -30,6 +30,7 @@ export function createFileProviderEnablementPoller(
   let visible = true;
   let inFlight = false;
   let transientFailures = 0;
+  let generation = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
 
   function clearTimer() {
@@ -54,9 +55,13 @@ export function createFileProviderEnablementPoller(
     if (!running || !visible || inFlight) {
       return;
     }
+    const pollGeneration = generation;
     inFlight = true;
     try {
       const next = await options.probe();
+      if (!running || generation !== pollGeneration) {
+        return;
+      }
       transientFailures = 0;
       options.onReport(next);
       if (next.state === "ready") {
@@ -70,6 +75,9 @@ export function createFileProviderEnablementPoller(
       }
       schedule(1_000);
     } catch {
+      if (!running || generation !== pollGeneration) {
+        return;
+      }
       transientFailures += 1;
       schedule(Math.min(1_000 * 2 ** (transientFailures - 1), 5_000));
     } finally {
@@ -88,10 +96,12 @@ export function createFileProviderEnablementPoller(
       if (running) {
         return;
       }
+      generation += 1;
       running = true;
       schedule(0);
     },
     stop: () => {
+      generation += 1;
       running = false;
       clearTimer();
     },

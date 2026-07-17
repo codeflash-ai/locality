@@ -65,6 +65,62 @@ describe("File Provider enablement polling", () => {
     expect(calls).toBe(2);
   });
 
+  it("drops a non-ready report that resolves after the poller stops", async () => {
+    vi.useFakeTimers();
+    let resolveProbe: ((value: FileProviderEnablementReport) => void) | undefined;
+    const seen: string[] = [];
+    const poller = createFileProviderEnablementPoller({
+      probe: () => new Promise((resolve) => {
+        resolveProbe = resolve;
+      }),
+      onReport: (next) => seen.push(next.state),
+      onReady: () => undefined,
+    });
+
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+    poller.stop();
+    resolveProbe?.(report("needs_finder_enable"));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(seen).toEqual([]);
+  });
+
+  it("drops a ready result from an older run after stop and restart", async () => {
+    vi.useFakeTimers();
+    let resolveFirstProbe: ((value: FileProviderEnablementReport) => void) | undefined;
+    let calls = 0;
+    const seen: string[] = [];
+    let completions = 0;
+    const poller = createFileProviderEnablementPoller({
+      probe: () => {
+        calls += 1;
+        if (calls === 1) {
+          return new Promise((resolve) => {
+            resolveFirstProbe = resolve;
+          });
+        }
+        return Promise.resolve(report("needs_finder_enable"));
+      },
+      onReport: (next) => seen.push(next.state),
+      onReady: () => {
+        completions += 1;
+      },
+    });
+
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+    poller.stop();
+    poller.start();
+    resolveFirstProbe?.(report("ready"));
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(seen).toEqual(["needs_finder_enable"]);
+    expect(completions).toBe(0);
+    expect(calls).toBe(2);
+  });
+
   it("pauses while hidden and probes immediately when visible again", async () => {
     vi.useFakeTimers();
     let calls = 0;
