@@ -259,13 +259,23 @@ fn ensure_reqwest_crypto_provider() {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::thread;
+
     use locality_connector::ConnectorCapabilities;
-    use locality_connector::oauth_broker::OAuthBrokerToken;
+    use locality_connector::oauth_broker::{
+        OAuthBrokerCodeExchange, OAuthBrokerRefresh, OAuthBrokerStart, OAuthBrokerToken,
+    };
+    use locality_core::LocalityError;
+    use serde_json::{Value, json};
 
     use super::{
+        DEFAULT_GOOGLE_CALENDAR_OAUTH_BROKER_URL, DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI,
         GOOGLE_CALENDAR_CONNECTOR_ID, GOOGLE_CALENDAR_OAUTH_SCOPES, GoogleCalendarOAuthScopeError,
-        StoredGoogleCalendarCredential, google_calendar_capabilities_json,
-        validate_google_calendar_oauth_scopes,
+        HttpGoogleCalendarOAuthBrokerClient, StoredGoogleCalendarCredential,
+        google_calendar_capabilities_json, validate_google_calendar_oauth_scopes,
     };
 
     fn calendar_scopes() -> Vec<String> {
@@ -287,6 +297,28 @@ mod tests {
             workspace_name: Some("Primary calendar".to_string()),
             scopes,
         }
+    }
+
+    #[test]
+    fn oauth_constants_match_google_calendar_broker_contract() {
+        assert_eq!(GOOGLE_CALENDAR_CONNECTOR_ID, "google-calendar");
+        assert_eq!(
+            DEFAULT_GOOGLE_CALENDAR_OAUTH_BROKER_URL,
+            "https://afs-oauth-broker.saurabh-b07.workers.dev"
+        );
+        assert_eq!(
+            DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI,
+            "http://localhost:8757/oauth/google-calendar/callback"
+        );
+        assert_eq!(
+            GOOGLE_CALENDAR_OAUTH_SCOPES,
+            &[
+                "openid",
+                "email",
+                "profile",
+                "https://www.googleapis.com/auth/calendar.events",
+            ]
+        );
     }
 
     #[test]
@@ -482,5 +514,334 @@ mod tests {
 
         stored.expires_at = None;
         assert!(!stored.expires_soon(u64::MAX));
+    }
+
+    #[test]
+    fn oauth_broker_start_posts_google_calendar_path_and_decodes_response() {
+        let (base_url, request_rx, server) = spawn_response_server(
+            "HTTP/1.1 200 OK",
+            json!({
+                "connector": GOOGLE_CALENDAR_CONNECTOR_ID,
+                "client_id": "client-1",
+                "authorization_url": "https://accounts.example.test/auth",
+                "redirect_uri": DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI,
+                "session": "session-1",
+                "state": "state-1",
+                "expires_in": 300,
+            })
+            .to_string(),
+        );
+        let client = HttpGoogleCalendarOAuthBrokerClient::new(format!("{base_url}/"));
+
+        let response = client
+            .start(&OAuthBrokerStart {
+                connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
+                redirect_uri: DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI.to_string(),
+            })
+            .expect("start response");
+
+        assert_eq!(response.connector, GOOGLE_CALENDAR_CONNECTOR_ID);
+        assert_eq!(response.client_id, "client-1");
+        assert_eq!(
+            response.authorization_url,
+            "https://accounts.example.test/auth"
+        );
+        assert_eq!(
+            response.redirect_uri,
+            DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI
+        );
+        assert_eq!(response.session, "session-1");
+        assert_eq!(response.state, "state-1");
+        assert_eq!(response.expires_in, 300);
+        let request = request_rx.recv().expect("request");
+        server.join().expect("server exits");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/v1/oauth/google-calendar/start");
+        assert_eq!(request.header("content-type"), Some("application/json"));
+        let body: Value = serde_json::from_str(&request.body).expect("json body");
+        assert_eq!(body["connector"], json!(GOOGLE_CALENDAR_CONNECTOR_ID));
+        assert_eq!(
+            body["redirect_uri"],
+            json!(DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI)
+        );
+    }
+
+    #[test]
+    fn oauth_broker_exchange_posts_google_calendar_path_and_decodes_token() {
+        let (base_url, request_rx, server) = spawn_response_server(
+            "HTTP/1.1 200 OK",
+            json!({
+                "access_token": "access-2",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token_handle": "handle-2",
+                "account_id": "acct-2",
+                "account_label": "sam@example.com",
+                "workspace_id": "primary",
+                "workspace_name": "Primary calendar",
+                "scopes": ["https://www.googleapis.com/auth/calendar.events"],
+            })
+            .to_string(),
+        );
+        let client = HttpGoogleCalendarOAuthBrokerClient::new(base_url);
+
+        let token = client
+            .exchange_code(&OAuthBrokerCodeExchange {
+                connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
+                session: "session-2".to_string(),
+                state: "state-2".to_string(),
+                code: "code-2".to_string(),
+                redirect_uri: DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI.to_string(),
+            })
+            .expect("exchange token");
+
+        assert_eq!(token.access_token, "access-2");
+        assert_eq!(token.token_type.as_deref(), Some("Bearer"));
+        assert_eq!(token.expires_in, Some(3600));
+        assert_eq!(token.refresh_token_handle.as_deref(), Some("handle-2"));
+        assert_eq!(token.account_id.as_deref(), Some("acct-2"));
+        assert_eq!(token.account_label.as_deref(), Some("sam@example.com"));
+        assert_eq!(token.workspace_id.as_deref(), Some("primary"));
+        assert_eq!(token.workspace_name.as_deref(), Some("Primary calendar"));
+        assert_eq!(
+            token.scopes,
+            vec!["https://www.googleapis.com/auth/calendar.events".to_string()]
+        );
+        let request = request_rx.recv().expect("request");
+        server.join().expect("server exits");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/v1/oauth/google-calendar/exchange");
+        let body: Value = serde_json::from_str(&request.body).expect("json body");
+        assert_eq!(body["connector"], json!(GOOGLE_CALENDAR_CONNECTOR_ID));
+        assert_eq!(body["session"], json!("session-2"));
+        assert_eq!(body["state"], json!("state-2"));
+        assert_eq!(body["code"], json!("code-2"));
+        assert_eq!(
+            body["redirect_uri"],
+            json!(DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI)
+        );
+    }
+
+    #[test]
+    fn oauth_broker_refresh_posts_google_calendar_path_and_decodes_token() {
+        let (base_url, request_rx, server) = spawn_response_server(
+            "HTTP/1.1 200 OK",
+            json!({
+                "access_token": "access-3",
+                "token_type": "Bearer",
+                "expires_in": 1800,
+                "refresh_token_handle": "handle-3",
+                "account_id": "acct-3",
+                "account_label": "lee@example.com",
+                "workspace_id": "primary",
+                "workspace_name": "Primary calendar",
+                "scope": "openid email profile https://www.googleapis.com/auth/calendar.events",
+            })
+            .to_string(),
+        );
+        let client = HttpGoogleCalendarOAuthBrokerClient::new(base_url);
+
+        let token = client
+            .refresh_token(&OAuthBrokerRefresh {
+                connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
+                refresh_token_handle: Some("handle-2".to_string()),
+            })
+            .expect("refresh token");
+
+        assert_eq!(token.access_token, "access-3");
+        assert_eq!(token.expires_in, Some(1800));
+        assert_eq!(token.refresh_token_handle.as_deref(), Some("handle-3"));
+        assert_eq!(token.account_id.as_deref(), Some("acct-3"));
+        assert_eq!(token.account_label.as_deref(), Some("lee@example.com"));
+        assert_eq!(
+            token.scopes,
+            vec![
+                "openid".to_string(),
+                "email".to_string(),
+                "profile".to_string(),
+                "https://www.googleapis.com/auth/calendar.events".to_string(),
+            ]
+        );
+        let request = request_rx.recv().expect("request");
+        server.join().expect("server exits");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/v1/oauth/google-calendar/refresh");
+        let body: Value = serde_json::from_str(&request.body).expect("json body");
+        assert_eq!(body["connector"], json!(GOOGLE_CALENDAR_CONNECTOR_ID));
+        assert_eq!(body["refresh_token_handle"], json!("handle-2"));
+    }
+
+    #[test]
+    fn oauth_broker_non_success_status_maps_to_io_error_with_body() {
+        let (base_url, request_rx, server) =
+            spawn_response_server("HTTP/1.1 503 Service Unavailable", "broker unavailable");
+        let client = HttpGoogleCalendarOAuthBrokerClient::new(base_url);
+
+        let error = client
+            .start(&OAuthBrokerStart {
+                connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
+                redirect_uri: DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI.to_string(),
+            })
+            .expect_err("status should fail");
+
+        request_rx.recv().expect("request");
+        server.join().expect("server exits");
+        assert!(matches!(
+            error,
+            LocalityError::Io(message)
+                if message.contains(
+                    "google calendar oauth broker returned HTTP 503 Service Unavailable: broker unavailable"
+                )
+        ));
+    }
+
+    #[test]
+    fn oauth_broker_invalid_success_json_maps_to_decode_error() {
+        let (base_url, request_rx, server) = spawn_response_server("HTTP/1.1 200 OK", "not-json");
+        let client = HttpGoogleCalendarOAuthBrokerClient::new(base_url);
+
+        let error = client
+            .start(&OAuthBrokerStart {
+                connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
+                redirect_uri: DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI.to_string(),
+            })
+            .expect_err("decode should fail");
+
+        request_rx.recv().expect("request");
+        server.join().expect("server exits");
+        assert!(matches!(
+            error,
+            LocalityError::Io(message)
+                if message.contains("google calendar oauth broker response decode failed")
+        ));
+    }
+
+    #[test]
+    fn oauth_broker_send_failure_maps_to_request_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind unused port");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        drop(listener);
+        let client = HttpGoogleCalendarOAuthBrokerClient::new(base_url);
+
+        let error = client
+            .start(&OAuthBrokerStart {
+                connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
+                redirect_uri: DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI.to_string(),
+            })
+            .expect_err("request should fail");
+
+        assert!(matches!(
+            error,
+            LocalityError::Io(message)
+                if message.contains("google calendar oauth broker request failed")
+        ));
+    }
+
+    #[derive(Debug)]
+    struct CapturedRequest {
+        method: String,
+        target: String,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    impl CapturedRequest {
+        fn parse(raw: String) -> Self {
+            let (header_block, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
+            let mut lines = header_block.lines();
+            let request_line = lines.next().unwrap_or_default();
+            let mut request_parts = request_line.split_whitespace();
+            let method = request_parts.next().unwrap_or_default().to_string();
+            let target = request_parts.next().unwrap_or_default().to_string();
+            let headers = lines
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+                .collect();
+
+            Self {
+                method,
+                target,
+                headers,
+                body: body.to_string(),
+            }
+        }
+
+        fn header(&self, name: &str) -> Option<&str> {
+            let name = name.to_ascii_lowercase();
+            self.headers
+                .iter()
+                .find(|(header_name, _)| header_name == &name)
+                .map(|(_, value)| value.as_str())
+        }
+    }
+
+    fn spawn_response_server(
+        status_line: &'static str,
+        body: impl Into<String>,
+    ) -> (
+        String,
+        mpsc::Receiver<CapturedRequest>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let body = body.into();
+        let (request_tx, request_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let request = CapturedRequest::parse(read_http_request(&mut stream));
+            request_tx.send(request).expect("send request");
+            let response = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+        (base_url, request_rx, server)
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let headers_end = loop {
+            let bytes_read = stream.read(&mut buffer).expect("read request");
+            if bytes_read == 0 {
+                break request.len();
+            }
+            request.extend_from_slice(&buffer[..bytes_read]);
+            if let Some(headers_end) = find_headers_end(&request) {
+                break headers_end;
+            }
+        };
+        let content_length = content_length(&request[..headers_end]);
+        while request.len() < headers_end + content_length {
+            let bytes_read = stream.read(&mut buffer).expect("read request body");
+            if bytes_read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..bytes_read]);
+        }
+        String::from_utf8(request).expect("utf8 request")
+    }
+
+    fn find_headers_end(request: &[u8]) -> Option<usize> {
+        request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+    }
+
+    fn content_length(headers: &[u8]) -> usize {
+        String::from_utf8_lossy(headers)
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().ok())
+                    .flatten()
+            })
+            .unwrap_or(0)
     }
 }
