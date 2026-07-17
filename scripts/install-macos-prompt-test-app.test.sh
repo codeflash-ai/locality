@@ -233,6 +233,33 @@ test_dry_run_rejects_source_app_as_target() {
   assert_not_contains "${output}" "rm -rf"
 }
 
+test_dry_run_prefers_explicit_dmg_over_built_app() {
+  local tmp isolated_root isolated_script built_app dmg app output
+  tmp="$(mktemp -d)"
+  trap '[[ -z "${tmp:-}" ]] || rm -rf "${tmp}"' RETURN
+  isolated_root="${tmp}/repo"
+  isolated_script="${isolated_root}/scripts/install-macos-prompt-test-app.sh"
+  built_app="${isolated_root}/target/release/bundle/macos/Locality.app"
+  dmg="${tmp}/explicit.dmg"
+  app="${tmp}/Applications/Locality Prompt Test.app"
+  mkdir -p "$(dirname "${isolated_script}")" "${built_app}"
+  cp "${SCRIPT}" "${isolated_script}"
+  touch "${dmg}"
+
+  output="$(
+    LOCALITY_PROMPT_TEST_TIMESTAMP=20260714130007 \
+      "${isolated_script}" \
+        --dry-run \
+        --dmg "${dmg}" \
+        --app-path "${app}" \
+        --signing-identity "Developer ID Application: Test (TEAMID)" \
+        --no-launch
+  )"
+
+  assert_contains "${output}" "+ hdiutil attach ${dmg}"
+  assert_not_contains "${output}" "source app: ${built_app}"
+}
+
 main() {
   test_dry_run_plans_fresh_prompt_test_app_installation
   test_dry_run_resets_existing_test_app_domain_by_default
@@ -241,6 +268,7 @@ main() {
   test_dry_run_rejects_production_target_path_by_default
   test_dry_run_force_allows_non_test_target_path
   test_dry_run_rejects_source_app_as_target
+  test_dry_run_prefers_explicit_dmg_over_built_app
   printf 'install-macos-prompt-test-app helper tests passed\n'
 }
 

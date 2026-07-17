@@ -254,14 +254,14 @@ resolve_source_app() {
     return 0
   fi
 
-  local bundle_app="${ROOT}/target/release/bundle/macos/Locality.app"
-  if [[ -d "${bundle_app}" ]]; then
-    SOURCE_APP="${bundle_app}"
-    validate_source_and_target_paths
-    return 0
-  fi
-
   if [[ -z "${DMG}" ]]; then
+    local bundle_app="${ROOT}/target/release/bundle/macos/Locality.app"
+    if [[ -d "${bundle_app}" ]]; then
+      SOURCE_APP="${bundle_app}"
+      validate_source_and_target_paths
+      return 0
+    fi
+
     DMG="$(default_dmg)" || fail "missing DMG under ${DEFAULT_DMG_DIR}. Run make build-tauri first or pass --dmg PATH."
     DMG="$(expand_tilde "${DMG}")"
   fi
