@@ -125,11 +125,7 @@ impl SlackConnector {
             let page =
                 self.api
                     .conversations_list(types, cursor.as_deref(), CONVERSATIONS_PAGE_SIZE)?;
-            conversations.extend(
-                page.channels
-                    .into_iter()
-                    .filter(|conversation| !conversation.is_archived),
-            );
+            conversations.extend(page.channels.into_iter().filter(projectable_conversation));
 
             let next_cursor = non_empty_cursor(page.response_metadata.next_cursor);
             let Some(next_cursor) = next_cursor else {
@@ -535,6 +531,14 @@ fn conversation_type(conversation: &SlackConversation) -> SlackConversationType 
     }
 }
 
+fn projectable_conversation(conversation: &SlackConversation) -> bool {
+    !conversation.is_archived && conversation_history_is_readable(conversation)
+}
+
+fn conversation_history_is_readable(conversation: &SlackConversation) -> bool {
+    !(conversation.is_channel && conversation.is_member == Some(false))
+}
+
 fn conversation_title(
     conversation: &SlackConversation,
     users: &BTreeMap<String, SlackUser>,
@@ -717,6 +721,44 @@ mod tests {
             PathBuf::from("channels/general-C123")
         );
         assert!(result.is_complete());
+    }
+
+    #[test]
+    fn channel_folder_skips_public_channels_where_bot_is_not_a_member() {
+        let api = FakeSlackApi::default().with_conversations(vec![
+            SlackConversation {
+                id: "C_unjoined".to_string(),
+                name: Some("unjoined".to_string()),
+                is_channel: true,
+                is_member: Some(false),
+                ..SlackConversation::default()
+            },
+            SlackConversation {
+                id: "C_joined".to_string(),
+                name: Some("joined".to_string()),
+                is_channel: true,
+                is_member: Some(true),
+                ..SlackConversation::default()
+            },
+        ]);
+        let connector = connector_with_api(api);
+
+        let result = connector
+            .list_children(ListChildrenRequest {
+                mount_id: MountId::new("slack-main"),
+                container: ChildContainer::DirectoryChildren(RemoteId::new(
+                    "slack-folder:channels",
+                )),
+                parent_path: PathBuf::from("channels"),
+            })
+            .expect("list channels");
+
+        let paths = result
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec![PathBuf::from("channels/joined-C_joined")]);
     }
 
     #[test]

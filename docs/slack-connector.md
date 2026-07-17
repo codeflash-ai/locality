@@ -42,7 +42,9 @@ slack-main/
   users.md
 ```
 
-- `channels/` contains public channels.
+- `channels/` contains public channels whose history is readable by the
+  connected app. If a public channel is missing or `conversations.history`
+  returns `not_in_channel`, invite the Slack app to that channel and pull again.
 - `private-channels/` contains private channels visible to the connected bot.
 - `dms/` contains direct message conversations visible to the connected bot.
 - `group-dms/` contains multi-person direct message conversations visible to

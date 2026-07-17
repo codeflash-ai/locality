@@ -30,6 +30,8 @@ pub struct SlackConversation {
     #[serde(default)]
     pub is_private: bool,
     #[serde(default)]
+    pub is_member: Option<bool>,
+    #[serde(default)]
     pub is_archived: bool,
     #[serde(default)]
     pub updated: Option<u64>,
