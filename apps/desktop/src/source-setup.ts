@@ -1,5 +1,5 @@
 export type SourceSetupState = "idle" | "connecting" | "creating" | "changing" | "success" | "error";
-export type SourceConnectorId = "notion" | "google-docs" | "gmail" | "granola";
+export type SourceConnectorId = "notion" | "google-docs" | "gmail" | "granola" | "slack";
 
 type SourceConnectionLike = {
   connector: string;
@@ -18,7 +18,7 @@ type SourceSnapshotLike = {
   mounts?: SourceMountLike[] | null;
 };
 
-const SOURCE_CONNECTORS: SourceConnectorId[] = ["notion", "google-docs", "gmail", "granola"];
+const SOURCE_CONNECTORS: SourceConnectorId[] = ["notion", "google-docs", "gmail", "granola", "slack"];
 
 export function sourceSetupIsBusy(state: SourceSetupState): boolean {
   return state === "connecting" || state === "creating" || state === "changing";

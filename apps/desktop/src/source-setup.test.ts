@@ -42,4 +42,16 @@ describe("source setup progress", () => {
       }),
     ).toEqual(["notion"]);
   });
+
+  it("includes Slack in ready-to-mount connector ordering", () => {
+    expect(
+      connectedSourcesReadyToMount({
+        connections: [
+          { connector: "slack", status: "active" },
+          { connector: "gmail", status: "active" },
+        ],
+        mounts: [{ connector: "gmail", status: "ready" }],
+      }),
+    ).toEqual(["slack"]);
+  });
 });
