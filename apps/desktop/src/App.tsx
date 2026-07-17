@@ -63,6 +63,12 @@ import { copyLoginLinkDisabled, loginLinkFlowMode } from "./onboarding-connect";
 import { mountRecoveryEnabled, shouldAutoCreateMount } from "./onboarding-flow";
 import { classifyMountSetupError } from "./onboarding-errors";
 import {
+  createFileProviderEnablementPoller,
+  fileProviderEnablementHeadline,
+  fileProviderEnablementStatusLabel,
+  type FileProviderEnablementReport,
+} from "./file-provider-enablement";
+import {
   failedMountOnboardingReport,
   mountOnboardingHeadline,
   mountOnboardingInstructions,
@@ -93,6 +99,7 @@ import {
   connectedSourcesReadyToMount,
   isSourceConnectorId,
   sourceConnectionReady,
+  sourceMountRetryOutcome,
   sourceMounted,
   sourceSetupIsActiveConnector,
   sourceSetupIsBusy,
@@ -1663,9 +1670,13 @@ function Onboarding({
   const [optionalGuideReturnStep, setOptionalGuideReturnStep] = useState<OnboardingStep | null>(null);
   const [mountOnboarding, setMountOnboarding] = useState<WorkspaceMountOnboardingReport | null>(null);
   const [mounting, setMounting] = useState(false);
+  const [fileProviderEnablement, setFileProviderEnablement] = useState<FileProviderEnablementReport | null>(null);
+  const [finderHelpOpen, setFinderHelpOpen] = useState(false);
+  const [finderRevealError, setFinderRevealError] = useState("");
   const [agentGuidanceReport, setAgentGuidanceReport] = useState<AgentGuidanceInstallReport | null>(null);
   const [agentGuidanceState, setAgentGuidanceState] = useState<"idle" | "installing" | "ready" | "error">("idle");
   const mountStartRequestedRef = useRef(false);
+  const finderRevealRequestedRef = useRef(false);
   const snapshotConnectionConnector = isOnboardingConnector(snapshot.connection.connector)
     ? snapshot.connection.connector
     : null;
@@ -1810,6 +1821,67 @@ function Onboarding({
     }
     void runMountOnboarding("start");
   }, [connectionReadyNow, mountOnboarding, mountPath, mounting, selectedOnboardingConnector, snapshot.mount.status, step]);
+
+  useEffect(() => {
+    const enablementActive =
+      step === 4 &&
+      (mountOnboarding?.state === "needs_finder_enable" ||
+        mountOnboarding?.state === "waiting_for_cloudstorage_root");
+    if (!enablementActive) {
+      finderRevealRequestedRef.current = false;
+      setFileProviderEnablement(null);
+      setFinderHelpOpen(false);
+      setFinderRevealError("");
+      return;
+    }
+
+    let completionTimer: number | null = null;
+    const poller = createFileProviderEnablementPoller({
+      probe: () =>
+        callCommand<FileProviderEnablementReport>(
+          "file_provider_enablement_status",
+          undefined,
+          {
+            state: "ready",
+            message: "Locality is enabled in Finder.",
+            path: mountPath,
+          },
+        ),
+      onReport: (report) => {
+        setFileProviderEnablement(report);
+        if (report.state === "unavailable") {
+          setMountOnboarding(failedMountOnboardingReport(report.message));
+        }
+      },
+      onReady: (report) => {
+        setFileProviderEnablement(report);
+        completionTimer = window.setTimeout(() => {
+          void runMountOnboarding("start");
+        }, 350);
+      },
+    });
+    const updateVisibility = () => {
+      poller.setVisible(document.visibilityState !== "hidden");
+    };
+
+    if (
+      mountOnboarding?.state === "needs_finder_enable" &&
+      !finderRevealRequestedRef.current
+    ) {
+      finderRevealRequestedRef.current = true;
+      void revealFileProviderEnablement();
+    }
+    document.addEventListener("visibilitychange", updateVisibility);
+    updateVisibility();
+    poller.start();
+    return () => {
+      poller.stop();
+      document.removeEventListener("visibilitychange", updateVisibility);
+      if (completionTimer !== null) {
+        window.clearTimeout(completionTimer);
+      }
+    };
+  }, [mountOnboarding?.state, step]);
 
   useEffect(() => {
     if (
@@ -2138,6 +2210,22 @@ function Onboarding({
     }
   }
 
+  async function revealFileProviderEnablement() {
+    setFinderRevealError("");
+    try {
+      const report = await callCommand<ActionReport>(
+        "reveal_file_provider_enablement",
+        undefined,
+        { ok: true, message: "Opened Locality in Finder." },
+      );
+      if (!report.ok) {
+        setFinderRevealError(report.message);
+      }
+    } catch (error) {
+      setFinderRevealError(errorMessage(error));
+    }
+  }
+
   async function ensureCliAvailable() {
     if (appStoreDistribution) {
       return true;
@@ -2254,6 +2342,21 @@ function Onboarding({
       ? classifyMountSetupError(mountOnboarding.message)
       : null;
   const showRecoveryChooser = mountRecoveryEnabled(mountSetupError);
+  const fileProviderGuideVisible =
+    mountOnboarding?.state === "needs_finder_enable" ||
+    mountOnboarding?.state === "waiting_for_cloudstorage_root";
+  const displayedFileProviderEnablement = fileProviderEnablement ??
+    (mountOnboarding?.state === "waiting_for_cloudstorage_root"
+      ? {
+          state: "waiting_for_root" as const,
+          message: "Finishing the Locality folder setup.",
+          path: mountPath,
+        }
+      : {
+          state: "needs_finder_enable" as const,
+          message: "In Finder, click Enable for Locality.",
+          path: mountPath,
+        });
 
   return (
     <main className="setup-shell">
@@ -2422,28 +2525,66 @@ function Onboarding({
           >
             <div>
               <div className="eyebrow">Local folder</div>
-              <h1>{mountOnboardingHeadline(mountOnboarding)}</h1>
+              <h1>
+                {fileProviderGuideVisible
+                  ? fileProviderEnablementHeadline(displayedFileProviderEnablement)
+                  : mountOnboardingHeadline(mountOnboarding)}
+              </h1>
               <p>
-                {mountOnboarding?.message ??
-                  `Locality is creating your ${selectedSourceName} folder under the default CloudStorage root and verifying that files appear locally.`}
+                {fileProviderGuideVisible
+                  ? displayedFileProviderEnablement.state === "needs_finder_enable"
+                    ? "Finder is open to the Locality location. Click Enable there; this screen will continue automatically."
+                    : displayedFileProviderEnablement.message
+                  : mountOnboarding?.message ??
+                    `Locality is creating your ${selectedSourceName} folder under the default CloudStorage root and verifying that files appear locally.`}
               </p>
             </div>
-            <div className="sync-note">
+            {fileProviderGuideVisible && (
+              <FinderEnableGuide
+                waitingForRoot={displayedFileProviderEnablement.state === "waiting_for_root"}
+              />
+            )}
+            <div className={`sync-note${displayedFileProviderEnablement.state === "ready" ? " connected" : ""}`}>
               {mounting ? (
                 <Loader2 className="spin-icon" />
               ) : mountOnboarding?.state === "failed" ? (
                 <AlertTriangle />
+              ) : fileProviderGuideVisible ? (
+                <Loader2 className="spin-icon" />
               ) : (
                 <FolderOpen />
               )}
-              {mounting
+              {fileProviderGuideVisible
+                ? fileProviderEnablementStatusLabel(displayedFileProviderEnablement)
+                : mounting
                 ? "Checking File Provider approval"
                 : mountOnboarding?.message ?? `Creating folder and preparing ${selectedSourceName} files`}
             </div>
             <div className="path-field ready-path-field">
               <span>{mountPath}</span>
             </div>
-            {showRecoveryChooser ? (
+            {fileProviderGuideVisible ? (
+              <>
+                <div className="button-row">
+                  <PrimaryButton onClick={() => void revealFileProviderEnablement()}>
+                    Reopen Finder
+                  </PrimaryButton>
+                  <SecondaryButton onClick={() => setFinderHelpOpen((open) => !open)}>
+                    Having trouble?
+                  </SecondaryButton>
+                </div>
+                {finderHelpOpen && (
+                  <div className="finder-enable-help">
+                    <strong>Look under Locations in the Finder sidebar.</strong>
+                    <span>
+                      Select Locality and click Enable. If Locality is missing, reopen Finder first,
+                      then verify Locality under File Providers in System Settings.
+                    </span>
+                  </div>
+                )}
+                {finderRevealError && <p className="field-error">{finderRevealError}</p>}
+              </>
+            ) : showRecoveryChooser ? (
               <div className="button-row">
                 <PrimaryButton
                   busy={mounting}
@@ -2465,10 +2606,10 @@ function Onboarding({
                 {mountOnboardingPrimaryLabel(mountOnboarding, mounting)}
               </PrimaryButton>
             )}
-            {mountOnboardingNeedsInstructions(mountOnboarding) && (
+            {!fileProviderGuideVisible && mountOnboardingNeedsInstructions(mountOnboarding) && (
               <p className="quiet-note">{mountOnboardingInstructions(mountOnboarding)}</p>
             )}
-            {mountOnboardingSupplementaryNote(mountOnboarding) && (
+            {!fileProviderGuideVisible && mountOnboardingSupplementaryNote(mountOnboarding) && (
               <p className="quiet-note">{mountOnboardingSupplementaryNote(mountOnboarding)}</p>
             )}
             <p className="quiet-note">
@@ -3117,9 +3258,78 @@ function MountsView({
   const [sourceDialogState, setSourceDialogState] = useState<SourceSetupState>("idle");
   const [sourceDialogConnector, setSourceDialogConnector] = useState<SourceConnectorId | null>(null);
   const [sourceDialogMessage, setSourceDialogMessage] = useState("");
+  const [sourceFileProviderEnablement, setSourceFileProviderEnablement] = useState<FileProviderEnablementReport | null>(null);
+  const [pendingMountRetry, setPendingMountRetry] = useState<{
+    connector: SourceConnectorId;
+    googleDocsWorkspaceFolder?: string;
+  } | null>(null);
+  const sourceFinderRevealRequestedRef = useRef(false);
   const sourceSetupBusy = sourceSetupIsBusy(sourceDialogState);
   const readyToMountSources = connectedSourcesReadyToMount(snapshot);
   const hasVisibleSources = rows.length > 0 || readyToMountSources.length > 0;
+
+  useEffect(() => {
+    if (!pendingMountRetry) {
+      sourceFinderRevealRequestedRef.current = false;
+      return;
+    }
+
+    let completionTimer: number | null = null;
+    const poller = createFileProviderEnablementPoller({
+      probe: () =>
+        callCommand<FileProviderEnablementReport>(
+          "file_provider_enablement_status",
+          undefined,
+          {
+            state: "ready",
+            message: "Locality is enabled in Finder.",
+            path: sourceDefaultPath(snapshot, pendingMountRetry.connector),
+          },
+        ),
+      onReport: (report) => {
+        setSourceFileProviderEnablement(report);
+        if (report.state === "unavailable") {
+          setSourceDialogMessage(report.message);
+          setSourceDialogState("error");
+        }
+      },
+      onReady: (report) => {
+        setSourceFileProviderEnablement(report);
+        completionTimer = window.setTimeout(async () => {
+          const mountReport = await createConnectorMount(
+            pendingMountRetry.connector,
+            pendingMountRetry.googleDocsWorkspaceFolder,
+          );
+          const outcome = sourceMountRetryOutcome(mountReport);
+          if (outcome.kind === "retry") {
+            return;
+          }
+          setPendingMountRetry(null);
+          setSourceFileProviderEnablement(null);
+          setSourceDialogMessage(outcome.message);
+          setSourceDialogState(outcome.kind);
+        }, 350);
+      },
+    });
+    const updateVisibility = () => {
+      poller.setVisible(document.visibilityState !== "hidden");
+    };
+
+    if (!sourceFinderRevealRequestedRef.current) {
+      sourceFinderRevealRequestedRef.current = true;
+      void revealSourceFileProviderEnablement();
+    }
+    document.addEventListener("visibilitychange", updateVisibility);
+    updateVisibility();
+    poller.start();
+    return () => {
+      poller.stop();
+      document.removeEventListener("visibilitychange", updateVisibility);
+      if (completionTimer !== null) {
+        window.clearTimeout(completionTimer);
+      }
+    };
+  }, [pendingMountRetry]);
 
   function openAddSourceDialog() {
     setActionError("");
@@ -3130,6 +3340,34 @@ function MountsView({
       setSourceDialogConnector(null);
     }
     setSourceDialogOpen(true);
+  }
+
+  function beginSourceFileProviderRecovery(
+    connector: SourceConnectorId,
+    googleDocsWorkspaceFolder: string | undefined,
+  ) {
+    setActionError("");
+    setSourceDialogOpen(true);
+    setSourceDialogConnector(connector);
+    setSourceDialogState("creating");
+    setSourceDialogMessage("");
+    setSourceFileProviderEnablement({
+      state: "needs_finder_enable",
+      message: "In Finder, click Enable for Locality.",
+      path: sourceDefaultPath(snapshot, connector),
+    });
+    setPendingMountRetry({ connector, googleDocsWorkspaceFolder });
+  }
+
+  async function revealSourceFileProviderEnablement() {
+    const report = await callCommand<ActionReport>(
+      "reveal_file_provider_enablement",
+      undefined,
+      { ok: true, message: "Opened Locality in Finder." },
+    ).catch((error) => ({ ok: false, message: errorMessage(error) }));
+    if (!report.ok) {
+      setSourceDialogMessage(report.message);
+    }
   }
 
   async function createConnectorMount(
@@ -3163,6 +3401,10 @@ function MountsView({
         { ok: true, message: "Created demo mount." },
       );
       if (!report.ok) {
+        if (classifyMountSetupError(report.message).kind === "file-provider-disabled") {
+          beginSourceFileProviderRecovery(connector, googleDocsWorkspaceFolder);
+          return report;
+        }
         setActionError(report.message);
         return report;
       }
@@ -3170,6 +3412,10 @@ function MountsView({
       return report;
     } catch (error) {
       const message = errorMessage(error);
+      if (classifyMountSetupError(message).kind === "file-provider-disabled") {
+        beginSourceFileProviderRecovery(connector, googleDocsWorkspaceFolder);
+        return { ok: false, message };
+      }
       setActionError(message);
       return { ok: false, message };
     } finally {
@@ -3260,6 +3506,9 @@ function MountsView({
     try {
       if (connectorReady && !connectorHasMount) {
         const mountReport = await createConnectorMount(connector, options?.googleDocsWorkspaceFolder);
+        if (classifyMountSetupError(mountReport.message).kind === "file-provider-disabled") {
+          return;
+        }
         setSourceDialogMessage(mountReport.message);
         setSourceDialogState(mountReport.ok ? "success" : "error");
         return;
@@ -3278,6 +3527,9 @@ function MountsView({
 
       setSourceDialogState("creating");
       const mountReport = await createConnectorMount(connector, options?.googleDocsWorkspaceFolder);
+      if (classifyMountSetupError(mountReport.message).kind === "file-provider-disabled") {
+        return;
+      }
       const message = mountReport.ok
         ? `${report.message} ${mountReport.message}`
         : `${report.message} ${mountReport.message}`;
@@ -3521,9 +3773,13 @@ function MountsView({
           state={sourceDialogState}
           activeConnector={sourceDialogConnector}
           message={sourceDialogMessage}
+          fileProviderEnablement={sourceFileProviderEnablement}
           onAction={(connector, options) => void runSourceDialogAction(connector, options)}
           onGranolaAction={(apiKey) => void connectGranolaSource(apiKey)}
-          onClose={() => setSourceDialogOpen(false)}
+          onReopenFinder={() => void revealSourceFileProviderEnablement()}
+          onClose={() => {
+            setSourceDialogOpen(false);
+          }}
         />
       )}
     </div>
@@ -3535,16 +3791,20 @@ function AddSourceDialog({
   state,
   activeConnector,
   message,
+  fileProviderEnablement,
   onAction,
   onGranolaAction,
+  onReopenFinder,
   onClose,
 }: {
   snapshot: DesktopSnapshot;
   state: SourceSetupState;
   activeConnector: SourceConnectorId | null;
   message: string;
+  fileProviderEnablement: FileProviderEnablementReport | null;
   onAction: (connector: SourceConnectorId, options?: { googleDocsWorkspaceFolder?: string }) => void;
   onGranolaAction: (apiKey: string) => void;
+  onReopenFinder: () => void;
   onClose: () => void;
 }) {
   const [query, setQuery] = useState("");
@@ -3610,6 +3870,30 @@ function AddSourceDialog({
           </button>
         </div>
 
+        {fileProviderEnablement ? (
+          <div className="source-file-provider-recovery">
+            <div>
+              <p className="label">Finder access</p>
+              <h3>{fileProviderEnablementHeadline(fileProviderEnablement)}</h3>
+              <p>
+                {fileProviderEnablement.state === "needs_finder_enable"
+                  ? "Click Enable in the Locality Finder window. Source setup will continue automatically."
+                  : fileProviderEnablement.message}
+              </p>
+            </div>
+            <FinderEnableGuide
+              waitingForRoot={fileProviderEnablement.state === "waiting_for_root"}
+            />
+            <div className="sync-note">
+              {fileProviderEnablement.state === "ready" ? <Check /> : <Loader2 className="spin-icon" />}
+              {fileProviderEnablementStatusLabel(fileProviderEnablement)}
+            </div>
+            <SecondaryButton icon={<FolderOpen />} onClick={onReopenFinder}>
+              Reopen Finder
+            </SecondaryButton>
+          </div>
+        ) : (
+          <>
         <div className="source-toolbar">
           <label className="source-search-row">
             <Search />
@@ -3776,6 +4060,8 @@ function AddSourceDialog({
             )}
           </div>
         </div>
+          </>
+        )}
 
         {busy && <p className="quiet-note inline-note">Setup continues if you close this window.</p>}
         {message && <p className={state === "error" ? "field-error" : "quiet-note inline-note"}>{message}</p>}
@@ -7361,6 +7647,51 @@ function SetupContent({
       >
         {mark ? mark : null}
         {children}
+      </div>
+    </div>
+  );
+}
+
+function FinderEnableGuide({ waitingForRoot }: { waitingForRoot: boolean }) {
+  if (waitingForRoot) {
+    return (
+      <div className="finder-enable-guide complete" role="status">
+        <Check />
+        <span>
+          <strong>Finder access enabled</strong>
+          <small>macOS is creating the Locality folder.</small>
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="finder-enable-guide">
+      <div className="finder-enable-illustration" aria-hidden="true">
+        <div className="finder-enable-toolbar">
+          <i />
+          <i />
+          <i />
+          <span>Finder</span>
+        </div>
+        <div className="finder-enable-sidebar">
+          <small>Locations</small>
+          <span className="finder-enable-location">
+            <FolderOpen />
+            <strong>Locality</strong>
+          </span>
+        </div>
+        <div className="finder-enable-content">
+          <p>
+            <strong>&quot;Locality&quot; is not enabled.</strong> To access Locality, click Enable.
+          </p>
+          <span className="finder-enable-control">Enable</span>
+          <div className="finder-enable-placeholders">
+            <i />
+            <i />
+            <i />
+          </div>
+        </div>
       </div>
     </div>
   );

@@ -1,5 +1,10 @@
+import { classifyMountSetupError } from "./onboarding-errors";
+
 export type SourceSetupState = "idle" | "connecting" | "creating" | "changing" | "success" | "error";
 export type SourceConnectorId = "notion" | "google-docs" | "gmail" | "granola";
+export type SourceMountRetryOutcome =
+  | { kind: "retry" }
+  | { kind: "success" | "error"; message: string };
 
 type SourceConnectionLike = {
   connector: string;
@@ -19,6 +24,18 @@ type SourceSnapshotLike = {
 };
 
 const SOURCE_CONNECTORS: SourceConnectorId[] = ["notion", "google-docs", "gmail", "granola"];
+
+export function sourceMountRetryOutcome(
+  report: { ok: boolean; message: string },
+): SourceMountRetryOutcome {
+  if (report.ok) {
+    return { kind: "success", message: report.message };
+  }
+  if (classifyMountSetupError(report.message).kind === "file-provider-disabled") {
+    return { kind: "retry" };
+  }
+  return { kind: "error", message: report.message };
+}
 
 export function sourceSetupIsBusy(state: SourceSetupState): boolean {
   return state === "connecting" || state === "creating" || state === "changing";
