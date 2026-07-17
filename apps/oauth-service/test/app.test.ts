@@ -636,9 +636,7 @@ describe("auth broker", () => {
     expect(body.access_token).toBe("xoxb-access-token");
     expect(body.token_type).toBe("bot");
     expect(body.expires_in).toBe(43200);
-    expect(body.scope).toBe(
-      "channels:read channels:history groups:read groups:history im:read im:history mpim:read mpim:history users:read team:read files:read"
-    );
+    expect(body.scope).toBeUndefined();
     expect(body.scopes).toEqual([
       "channels:read",
       "channels:history",

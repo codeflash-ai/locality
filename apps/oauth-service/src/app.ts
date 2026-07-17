@@ -362,7 +362,6 @@ async function shapeSlackTokenResponse(env: BrokerEnv, token: SlackTokenResponse
     access_token: token.access_token,
     token_type: token.token_type,
     expires_in: token.expires_in,
-    scope: scopes.join(" "),
     scopes,
     account_id: workspace?.id,
     account_label: workspace?.name,
