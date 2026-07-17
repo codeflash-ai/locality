@@ -104,6 +104,13 @@ pub enum PushOperation {
         #[serde(default)]
         source_path: std::path::PathBuf,
     },
+    CreateDatabase {
+        parent_id: RemoteId,
+        title: String,
+        schema: String,
+        #[serde(default)]
+        source_path: std::path::PathBuf,
+    },
 }
 
 fn is_false(value: &bool) -> bool {
@@ -123,6 +130,7 @@ pub enum PushOperationKind {
     UpdateProperties,
     MoveEntity,
     CreateEntity,
+    CreateDatabase,
 }
 
 impl PushOperationKind {
@@ -138,10 +146,11 @@ impl PushOperationKind {
             Self::UpdateProperties => "update_properties",
             Self::MoveEntity => "move_entity",
             Self::CreateEntity => "create_entity",
+            Self::CreateDatabase => "create_database",
         }
     }
 
-    pub fn all() -> [Self; 10] {
+    pub fn all() -> [Self; 11] {
         [
             Self::UpdateBlock,
             Self::ReplaceBlock,
@@ -153,6 +162,7 @@ impl PushOperationKind {
             Self::UpdateProperties,
             Self::MoveEntity,
             Self::CreateEntity,
+            Self::CreateDatabase,
         ]
     }
 }
@@ -170,6 +180,7 @@ impl PushOperation {
             Self::UpdateProperties { .. } => PushOperationKind::UpdateProperties,
             Self::MoveEntity { .. } => PushOperationKind::MoveEntity,
             Self::CreateEntity { .. } => PushOperationKind::CreateEntity,
+            Self::CreateDatabase { .. } => PushOperationKind::CreateDatabase,
         }
     }
 }
@@ -208,7 +219,9 @@ impl PlanSummary {
                     summary.properties_updated += properties.len();
                 }
                 PushOperation::MoveEntity { .. } => summary.entities_moved += 1,
-                PushOperation::CreateEntity { .. } => summary.entities_created += 1,
+                PushOperation::CreateEntity { .. } | PushOperation::CreateDatabase { .. } => {
+                    summary.entities_created += 1;
+                }
             }
         }
 

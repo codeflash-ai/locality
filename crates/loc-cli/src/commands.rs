@@ -67,7 +67,10 @@ use crate::connector::{
     ConnectorResolveError, SourceDescriptor, resolve_notion_connector_for_mount,
     resolve_source_for_mount_id, resolve_source_for_path, source_descriptor, source_display_name,
 };
-use crate::create::{CreateError, CreatePageOptions, CreatePageReport, run_create_page};
+use crate::create::{
+    CreateDatabaseOptions, CreateDatabaseReport, CreateError, CreatePageOptions, CreatePageReport,
+    run_create_database, run_create_page,
+};
 use crate::daemon::{DaemonControlError, DaemonControlReport, run_daemon_control};
 use crate::diff::{DiffError, run_diff_with_state_root};
 use crate::doctor::{DoctorOptions, doctor_exit_code, print_doctor_report, run_doctor};
@@ -649,6 +652,8 @@ struct LocateArgs {
 enum CreateCommand {
     #[command(about = "Create a page directory with page.md")]
     Page(CreatePageArgs),
+    #[command(about = "Create a Notion database directory with a draft _schema.yaml")]
+    Database(CreateDatabaseArgs),
 }
 
 #[derive(Debug, Args)]
@@ -666,6 +671,18 @@ struct CreatePageArgs {
         help = "Create the page as a Notion workspace-private page on push."
     )]
     private: bool,
+}
+
+#[derive(Debug, Args)]
+struct CreateDatabaseArgs {
+    #[arg(long, value_name = "title", help = "Title for the new database.")]
+    title: String,
+    #[arg(
+        long,
+        value_name = "dir",
+        help = "Existing Notion page directory where the database should be created. Defaults to the current directory."
+    )]
+    parent: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1138,6 +1155,11 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                     push_flag_value(&mut args, "--title", &options.title);
                     push_optional_flag_value(&mut args, "--parent", options.parent.as_deref());
                     push_flag(&mut args, "--private", options.private);
+                }
+                CreateCommand::Database(options) => {
+                    args.push("database".to_string());
+                    push_flag_value(&mut args, "--title", &options.title);
+                    push_optional_flag_value(&mut args, "--parent", options.parent.as_deref());
                 }
             }
         }
@@ -3969,15 +3991,53 @@ fn locate_command_error(json: bool, error: CommandError) -> i32 {
 fn create(args: &[String], json: bool) -> i32 {
     match first_positional(args) {
         Some("page") => create_page(args, json),
+        Some("database") => create_database(args, json),
         _ => command_error(
             json,
             CommandError::new(
                 "create",
                 "usage",
-                "usage: loc create <page> [options] [--json]",
+                "usage: loc create <page|database> [options] [--json]",
             ),
             EXIT_USAGE,
         ),
+    }
+}
+
+fn create_database(args: &[String], json: bool) -> i32 {
+    let Some(title) = flag_value(args, "--title").map(str::to_string) else {
+        return command_error(
+            json,
+            CommandError::new("create_database", "missing_title", "--title is required"),
+            EXIT_USAGE,
+        );
+    };
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("create_database", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let options = CreateDatabaseOptions {
+        title,
+        parent: flag_value(args, "--parent").map(PathBuf::from),
+        state_root: Some(state_root),
+    };
+    match run_create_database(&mut store, options) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_create_database_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => create_command_error(json, "create_database", error),
     }
 }
 
@@ -4015,7 +4075,7 @@ fn create_page(args: &[String], json: bool) -> i32 {
             print_create_page_report(&report);
             EXIT_SUCCESS
         }
-        Err(error) => create_command_error(json, error),
+        Err(error) => create_command_error(json, "create_page", error),
     }
 }
 
@@ -5545,6 +5605,17 @@ fn print_create_page_report(report: &CreatePageReport) {
     if report.private {
         println!("  notion parent: workspace private");
     }
+    println!("  next:");
+    for next in &report.next {
+        println!("    {next}");
+    }
+}
+
+fn print_create_database_report(report: &CreateDatabaseReport) {
+    println!("created {}", report.path);
+    println!("  title: {}", report.title);
+    println!("  mount: {}", report.mount_id);
+    println!("  edit `_schema.yaml` to add properties before pushing");
     println!("  next:");
     for next in &report.next {
         println!("    {next}");
@@ -7322,13 +7393,14 @@ fn history_command_error(command: &'static str, json: bool, error: HistoryError)
     )
 }
 
-fn create_command_error(json: bool, error: CreateError) -> i32 {
+fn create_command_error(json: bool, command: &'static str, error: CreateError) -> i32 {
     let exit_code = match &error {
         CreateError::CurrentDir { .. }
         | CreateError::InvalidTitle(_)
         | CreateError::InvalidParent { .. }
         | CreateError::MountNotFound(_)
         | CreateError::PrivateUnsupported { .. }
+        | CreateError::DatabaseUnsupported { .. }
         | CreateError::ReadOnlyMount { .. }
         | CreateError::TargetExists(_) => EXIT_USAGE,
         CreateError::Store(_)
@@ -7337,7 +7409,7 @@ fn create_command_error(json: bool, error: CreateError) -> i32 {
     };
     command_error(
         json,
-        CommandError::new("create_page", error.code(), error.message()),
+        CommandError::new(command, error.code(), error.message()),
         exit_code,
     )
 }

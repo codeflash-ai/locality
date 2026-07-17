@@ -17,6 +17,7 @@ use loc_cli::connect::{
     run_connect_google_docs_broker_oauth, run_connect_notion_broker_oauth, run_connection_show,
     run_connections, run_profiles,
 };
+use loc_cli::create::{CreateDatabaseOptions, run_create_database};
 use loc_cli::diff::{PushOperationOutput, run_diff, run_diff_with_state_root};
 use loc_cli::history::{LogOptions, UndoOperationOutput, run_log, run_undo, run_undo_with_applier};
 use loc_cli::inspect::{InspectOptions, run_inspect};
@@ -11174,6 +11175,156 @@ fn live_page_directory_create_pushes_child_page_and_refreshes_parent() {
     assert!(
         remote_parent.contains(&child_title),
         "remote parent should render the new child page link:\n{remote_parent}"
+    );
+}
+
+#[test]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives a scratch Notion database and row"]
+fn live_locality_database_draft_creates_reconciles_and_accepts_rows() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(live_notion_config());
+    let mut cleanup = LiveCleanup::new(api);
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("Locality live database-create parent {}", unique_suffix()),
+        vec![paragraph_child("Parent for Locality database creation.")],
+    );
+    let connector = NotionConnector::new(live_notion_config());
+    let (fixture, mut store, parent_page_path, _markdown) = pull_live_page(&connector, &scratch.id);
+    let parent_dir = parent_page_path.parent().expect("parent page directory");
+    let database_title = format!("Locality Created Database {}", unique_suffix());
+    let draft = run_create_database(
+        &mut store,
+        CreateDatabaseOptions {
+            title: database_title.clone(),
+            parent: Some(parent_dir.to_path_buf()),
+            state_root: None,
+        },
+    )
+    .expect("create Locality database draft");
+    let schema_path = PathBuf::from(&draft.path);
+    fs::write(
+        &schema_path,
+        format!(
+            "loc:\n  type: notion_database_schema\ntitle: {database_title:?}\ndata_sources:\n  - name: Tasks\n    properties:\n      Name:\n        type: title\n      Notes:\n        type: rich_text\n      Points:\n        type: number\n      Status:\n        type: select\n        options:\n          - name: Todo\n            color: gray\n          - name: Done\n            color: green\n      Done:\n        type: checkbox\n      Due:\n        type: date\n"
+        ),
+    )
+    .expect("write database draft schema");
+
+    let diff = run_diff(&store, &schema_path).expect("diff database draft");
+    assert_eq!(diff.action, "confirm_plan", "{diff:#?}");
+    assert!(matches!(
+        diff.plan.as_ref().expect("database create plan").operations[0],
+        PushOperationOutput::CreateDatabase { .. }
+    ));
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &schema_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push database draft");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+    let database_id = push
+        .changed_remote_ids
+        .first()
+        .expect("created database id")
+        .clone();
+    cleanup.block_ids.push(database_id.clone());
+
+    let database = cleanup
+        .api
+        .retrieve_database(&database_id)
+        .expect("retrieve Locality-created database");
+    assert_eq!(
+        database
+            .title
+            .iter()
+            .map(|part| part.plain_text.as_str())
+            .collect::<String>(),
+        database_title,
+        "{database:#?}"
+    );
+    assert_eq!(database.data_sources.len(), 1, "{database:#?}");
+    let data_source = cleanup
+        .api
+        .retrieve_data_source(&database.data_sources[0].id)
+        .expect("retrieve created data source");
+    for (name, kind) in [
+        ("Name", "title"),
+        ("Notes", "rich_text"),
+        ("Points", "number"),
+        ("Status", "select"),
+        ("Done", "checkbox"),
+        ("Due", "date"),
+    ] {
+        assert_eq!(
+            data_source
+                .properties
+                .get(name)
+                .map(|property| property.kind.as_str()),
+            Some(kind),
+            "{data_source:#?}"
+        );
+    }
+
+    let canonical_schema = fs::read_to_string(&schema_path).expect("canonical schema");
+    assert!(canonical_schema.contains(&format!("database_id: \"{database_id}\"")));
+    assert!(canonical_schema.contains(&database.data_sources[0].id));
+    let database_entity = store
+        .get_entity(
+            &MountId::new("notion-main"),
+            &RemoteId::new(database_id.clone()),
+        )
+        .expect("get database entity")
+        .expect("database entity");
+    assert_eq!(database_entity.kind, EntityKind::Database);
+    let reconciled_database_dir = fixture.root.join(&database_entity.path);
+    assert_eq!(
+        schema_path.parent(),
+        Some(reconciled_database_dir.as_path())
+    );
+
+    let row_path = schema_path
+        .parent()
+        .expect("database directory")
+        .join("first-row.md");
+    fs::write(
+        &row_path,
+        "---\ntitle: First row\nNotes: Created after database reconciliation\nPoints: 3\nStatus: Todo\nDone: false\n---\n# Row body\n",
+    )
+    .expect("write row draft");
+    let row_push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &row_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push row into Locality-created database");
+    assert!(row_push.ok, "{row_push:#?}");
+    let row_id = row_push
+        .changed_remote_ids
+        .first()
+        .expect("created row id")
+        .clone();
+    cleanup.block_ids.push(row_id.clone());
+    let row = cleanup
+        .api
+        .retrieve_page(&row_id)
+        .expect("retrieve created row");
+    assert_eq!(
+        row.parent
+            .as_ref()
+            .and_then(|parent| parent.data_source_id.as_deref()),
+        Some(database.data_sources[0].id.as_str())
     );
 }
 

@@ -326,6 +326,32 @@ fn create_entity_reverses_to_archive_created_entity_when_effect_is_journaled() {
 }
 
 #[test]
+fn create_database_reverses_to_archive_created_database_when_effect_is_journaled() {
+    let mut entry = journal_entry(vec![PushOperation::CreateDatabase {
+        parent_id: RemoteId::new("page-1"),
+        title: "Tasks".to_string(),
+        schema: "loc:\n  type: notion_database_schema\n".to_string(),
+        source_path: "Tasks/_schema.yaml".into(),
+    }]);
+    entry.apply_effects = vec![JournalApplyEffect::CreatedEntity {
+        operation_id: PushOperationId::for_operation(&entry.push_id, 0, &entry.plan.operations[0]),
+        operation_index: 0,
+        parent_id: RemoteId::new("page-1"),
+        entity_id: RemoteId::new("created-database-1"),
+    }];
+
+    let plan = plan_journal_undo(&entry);
+
+    assert_eq!(plan.status, UndoPlanStatus::Complete);
+    assert_eq!(
+        plan.operations,
+        vec![UndoOperation::ArchiveCreatedEntity {
+            entity_id: RemoteId::new("created-database-1"),
+        }]
+    );
+}
+
+#[test]
 fn mixed_plan_reports_partial_undo() {
     let entry = journal_entry(vec![
         PushOperation::UpdateBlock {

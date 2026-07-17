@@ -827,6 +827,73 @@ fn daemon_push_reconciles_direct_database_row_create_to_page_document_path() {
 }
 
 #[test]
+fn daemon_push_reconciles_created_database_to_canonical_schema_directory() {
+    let fixture = PushFixture::new();
+    let projection_root = fixture.root.join("loc");
+    let schema_path = projection_root.join("Roadmap/Project Tasks/_schema.yaml");
+    fs::create_dir_all(schema_path.parent().expect("schema parent")).expect("schema parent");
+    fs::write(
+        &schema_path,
+        "loc:\n  type: notion_database_schema\ntitle: Project Tasks\ndata_sources:\n  - name: Tasks\n    properties:\n      Name:\n        type: title\n",
+    )
+    .expect("write draft schema");
+
+    let parent_id = RemoteId::new("roadmap-page");
+    let database_id = RemoteId::new("created-database");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "notion",
+            &projection_root,
+        ))
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            parent_id.clone(),
+            EntityKind::Page,
+            "Roadmap",
+            "Roadmap/page.md",
+        ))
+        .expect("save parent page");
+    let canonical_schema = "loc:\n  type: notion_database_schema\n  database_id: created-database\ntitle: \"Project Tasks\"\ndata_sources:\n  - id: created-source\n    name: \"Tasks\"\n    properties:\n      \"Name\":\n        id: \"title\"\n        type: \"title\"\n";
+    let source = FakePushSource::default()
+        .with_database_schema(database_id.clone(), canonical_schema)
+        .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
+            operation_id: PushOperationId("create-database".to_string()),
+            operation_index: 0,
+            parent_id,
+            entity_id: database_id.clone(),
+        }]);
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: schema_path.clone(),
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &source,
+        None,
+    )
+    .expect("push database create");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    let database = store
+        .get_entity(&fixture.mount_id, &database_id)
+        .expect("get database")
+        .expect("database entity");
+    assert_eq!(database.kind, EntityKind::Database);
+    assert_eq!(database.path, PathBuf::from("Roadmap/Project Tasks"));
+    assert_eq!(database.hydration, HydrationState::Hydrated);
+    assert_eq!(
+        fs::read_to_string(schema_path).expect("canonical schema"),
+        canonical_schema
+    );
+}
+
+#[test]
 fn daemon_push_reconciles_sent_gmail_draft_create_to_sent_folder() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join(".state");
@@ -2014,6 +2081,7 @@ struct FakePushSource {
     created_entities: BTreeMap<RemoteId, HydratedEntity>,
     created_fetch_failures: std::cell::RefCell<BTreeMap<RemoteId, usize>>,
     apply_effects: Vec<JournalApplyEffect>,
+    database_schemas: BTreeMap<RemoteId, String>,
 }
 
 impl FakePushSource {
@@ -2068,6 +2136,11 @@ impl FakePushSource {
         self.apply_effects = effects;
         self
     }
+
+    fn with_database_schema(mut self, remote_id: RemoteId, schema: &str) -> Self {
+        self.database_schemas.insert(remote_id, schema.to_string());
+        self
+    }
 }
 
 impl HydrationSource for FakePushSource {
@@ -2102,6 +2175,10 @@ impl HydrationSource for FakePushSource {
             self.remote_after_apply.clone()
         };
         remote.ok_or_else(|| LocalityError::InvalidState("missing remote fixture".to_string()))
+    }
+
+    fn fetch_database_schema_yaml(&self, database_id: &RemoteId) -> LocalityResult<Option<String>> {
+        Ok(self.database_schemas.get(database_id).cloned())
     }
 }
 

@@ -137,6 +137,9 @@ pub fn auto_save_plan_block_reason(plan: &PushPlan) -> Option<String> {
             PushOperation::MoveEntity { .. } => {
                 return Some("entity moves require review".to_string());
             }
+            PushOperation::CreateDatabase { .. } => {
+                return Some("database creation requires review".to_string());
+            }
             PushOperation::ReplaceBlock { .. } => {
                 return Some("block replacements require review".to_string());
             }

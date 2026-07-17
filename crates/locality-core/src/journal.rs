@@ -131,7 +131,8 @@ impl PushOperationId {
             | PushOperation::UpdateMedia { block_id, .. }
             | PushOperation::ArchiveBlock { block_id } => block_id.0.as_str(),
             PushOperation::AppendBlock { parent_id, .. }
-            | PushOperation::CreateEntity { parent_id, .. } => parent_id.0.as_str(),
+            | PushOperation::CreateEntity { parent_id, .. }
+            | PushOperation::CreateDatabase { parent_id, .. } => parent_id.0.as_str(),
             PushOperation::ArchiveEntity { entity_id }
             | PushOperation::UpdateProperties { entity_id, .. }
             | PushOperation::MoveEntity { entity_id, .. } => entity_id.0.as_str(),
@@ -244,6 +245,7 @@ fn operation_kind(operation: &PushOperation) -> &'static str {
         PushOperation::UpdateProperties { .. } => "update_properties",
         PushOperation::MoveEntity { .. } => "move_entity",
         PushOperation::CreateEntity { .. } => "create_entity",
+        PushOperation::CreateDatabase { .. } => "create_database",
     }
 }
 

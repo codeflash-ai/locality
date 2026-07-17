@@ -407,8 +407,7 @@ where
             children.push(pending_listing_item(&mount, mutation, &index));
         }
         if mutation.mutation_kind == VirtualMutationKind::Create
-            && is_page_document_path(&mutation.projected_path)
-            && page_container_path(&mutation.projected_path) == container_path
+            && pending_created_directory_path(mutation) == Some(container_path.clone())
         {
             children.push(pending_item(&mount, mutation, &index));
         }
@@ -1005,9 +1004,13 @@ where
         ));
     }
     let atomic_temp = is_atomic_temp_filename(filename);
-    if !filename.ends_with(".md") && !atomic_temp {
+    if !filename.ends_with(".md")
+        && filename != "_schema.yaml"
+        && !is_database_schema_atomic_temp_filename(filename)
+        && !atomic_temp
+    {
         return Err(LocalityError::Unsupported(
-            "virtual filesystem creates currently support only Markdown files and atomic write temp files",
+            "virtual filesystem creates currently support Markdown, database draft schemas, and atomic write temp files",
         ));
     }
     let entities = store.list_entities(mount_id).map_err(LocalityError::from)?;
@@ -1015,15 +1018,24 @@ where
         .list_virtual_mutations(mount_id)
         .map_err(LocalityError::from)?;
     if let Some(mutation) = pending_page_directory_mutation(&mutations, parent_identifier)? {
-        if filename != locality_core::path_projection::PAGE_DOCUMENT_FILENAME
-            && !is_page_document_atomic_temp_filename(filename)
-        {
-            return Err(LocalityError::Unsupported(
-                "pending page directories currently accept only page.md or page.md atomic temp files",
-            ));
+        let database_draft = is_database_draft_schema_path(&mutation.projected_path);
+        let allowed = if database_draft {
+            filename == "_schema.yaml" || is_database_schema_atomic_temp_filename(filename)
+        } else {
+            filename == locality_core::path_projection::PAGE_DOCUMENT_FILENAME
+                || is_page_document_atomic_temp_filename(filename)
+        };
+        if !allowed {
+            return Err(LocalityError::Unsupported(if database_draft {
+                "pending database directories accept only _schema.yaml or its atomic temp files"
+            } else {
+                "pending page directories accept only page.md or its atomic temp files"
+            }));
         }
         let index = ProviderIndex::new(&entities);
-        let item = if filename == locality_core::path_projection::PAGE_DOCUMENT_FILENAME {
+        let item = if filename == locality_core::path_projection::PAGE_DOCUMENT_FILENAME
+            || filename == "_schema.yaml"
+        {
             pending_item(&mount, mutation, &index)
         } else {
             pending_temp_item(&mount, mutation, filename)
@@ -1091,6 +1103,13 @@ where
     let mutations = store
         .list_virtual_mutations(mount_id)
         .map_err(LocalityError::from)?;
+    if pending_page_directory_mutation(&mutations, parent_identifier)?
+        .is_some_and(|mutation| is_database_draft_schema_path(&mutation.projected_path))
+    {
+        return Err(LocalityError::Unsupported(
+            "push the database draft before creating rows inside it",
+        ));
+    }
     let parent_container_path = container_path(&mount, &entities, &mutations, parent_identifier)?;
     ensure_source_parent_accepts_create(&mount, &parent_container_path)?;
     let page_dir = parent_container_path.join(dirname);
@@ -2765,7 +2784,7 @@ fn pending_item(
     mutation: &VirtualMutationRecord,
     index: &ProviderIndex,
 ) -> VirtualFsItem {
-    let parent_identifier = if is_page_document_path(&mutation.projected_path) {
+    let parent_identifier = if pending_created_directory_path(mutation).is_some() {
         pending_page_child_dir_identifier(&mutation.local_id)
     } else {
         container_identifier_for_path(mount, parent_path(&mutation.projected_path), index)
@@ -2776,11 +2795,20 @@ fn pending_item(
         filename: filename(&mutation.projected_path),
         kind: VirtualFsItemKind::File,
         read_only: item_file_read_only(mount, &mutation.projected_path),
-        entity_kind: Some(EntityKind::Page),
+        entity_kind: Some(if is_database_draft_schema_path(&mutation.projected_path) {
+            EntityKind::Database
+        } else {
+            EntityKind::Page
+        }),
         remote_id: None,
         path: path_string(&mutation.projected_path),
         hydration: Some(HydrationState::Dirty),
-        content_type: "net.daringfireball.markdown".to_string(),
+        content_type: if is_database_draft_schema_path(&mutation.projected_path) {
+            "public.yaml"
+        } else {
+            "net.daringfireball.markdown"
+        }
+        .to_string(),
         remote_edited_at: None,
         materialized_path: None,
         byte_size: None,
@@ -2792,7 +2820,7 @@ fn pending_listing_item(
     mutation: &VirtualMutationRecord,
     index: &ProviderIndex,
 ) -> VirtualFsItem {
-    if is_page_document_path(&mutation.projected_path) {
+    if pending_created_directory_path(mutation).is_some() {
         pending_page_child_dir_item(mount, mutation, index)
     } else {
         pending_item(mount, mutation, index)
@@ -2804,7 +2832,14 @@ fn pending_page_child_dir_item(
     mutation: &VirtualMutationRecord,
     index: &ProviderIndex,
 ) -> VirtualFsItem {
-    let path = page_container_path(&mutation.projected_path);
+    let database_draft = is_database_draft_schema_path(&mutation.projected_path);
+    let path = pending_created_directory_path(mutation)
+        .unwrap_or_else(|| page_container_path(&mutation.projected_path));
+    let entity_kind = if database_draft {
+        EntityKind::Database
+    } else {
+        EntityKind::Page
+    };
     VirtualFsItem {
         identifier: pending_page_child_dir_identifier(&mutation.local_id),
         parent_identifier: Some(container_identifier_for_path(
@@ -2814,8 +2849,8 @@ fn pending_page_child_dir_item(
         )),
         filename: filename(&path),
         kind: VirtualFsItemKind::Folder,
-        read_only: item_folder_read_only(mount, &path, Some(&EntityKind::Page)),
-        entity_kind: Some(EntityKind::Page),
+        read_only: item_folder_read_only(mount, &path, Some(&entity_kind)),
+        entity_kind: Some(entity_kind),
         remote_id: None,
         path: path_string(&path),
         hydration: Some(HydrationState::Dirty),
@@ -2831,7 +2866,8 @@ fn pending_temp_item(
     mutation: &VirtualMutationRecord,
     filename: &str,
 ) -> VirtualFsItem {
-    let parent = page_container_path(&mutation.projected_path);
+    let parent = pending_created_directory_path(mutation)
+        .unwrap_or_else(|| page_container_path(&mutation.projected_path));
     let path = parent.join(filename);
     VirtualFsItem {
         identifier: mutation.local_id.clone(),
@@ -2839,7 +2875,11 @@ fn pending_temp_item(
         filename: filename.to_string(),
         kind: VirtualFsItemKind::File,
         read_only: item_file_read_only(mount, &path),
-        entity_kind: Some(EntityKind::Page),
+        entity_kind: Some(if is_database_draft_schema_path(&mutation.projected_path) {
+            EntityKind::Database
+        } else {
+            EntityKind::Page
+        }),
         remote_id: None,
         path: path_string(&path),
         hydration: Some(HydrationState::Dirty),
@@ -2855,8 +2895,8 @@ fn pending_page_child_dir_identifier(local_id: &str) -> String {
 }
 
 fn pending_listing_parent_path(mutation: &VirtualMutationRecord) -> PathBuf {
-    if is_page_document_path(&mutation.projected_path) {
-        return page_listing_parent_path(&mutation.projected_path);
+    if let Some(directory) = pending_created_directory_path(mutation) {
+        return parent_path(&directory).to_path_buf();
     }
     parent_path(&mutation.projected_path).to_path_buf()
 }
@@ -2876,10 +2916,10 @@ fn pending_page_directory_mutation<'a>(
         .find(|mutation| mutation.local_id == local_id)
         .ok_or_else(|| missing_identifier(identifier))?;
     if mutation.mutation_kind != VirtualMutationKind::Create
-        || !is_page_document_path(&mutation.projected_path)
+        || pending_created_directory_path(mutation).is_none()
     {
         return Err(LocalityError::Unsupported(
-            "only pending-created page directories can be used as local page containers",
+            "only pending-created page or database directories can be used as local containers",
         ));
     }
     Ok(Some(mutation))
@@ -2891,6 +2931,24 @@ fn is_atomic_temp_filename(filename: &str) -> bool {
 
 fn is_page_document_atomic_temp_filename(filename: &str) -> bool {
     filename.starts_with("page.md.tmp.")
+}
+
+fn is_database_schema_atomic_temp_filename(filename: &str) -> bool {
+    filename.starts_with("_schema.yaml.tmp.")
+}
+
+fn is_database_draft_schema_path(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("_schema.yaml")
+}
+
+fn pending_created_directory_path(mutation: &VirtualMutationRecord) -> Option<PathBuf> {
+    if is_page_document_path(&mutation.projected_path) {
+        return Some(page_container_path(&mutation.projected_path));
+    }
+    if is_database_draft_schema_path(&mutation.projected_path) {
+        return mutation.projected_path.parent().map(Path::to_path_buf);
+    }
+    None
 }
 
 fn schema_item(
@@ -3317,7 +3375,8 @@ fn container_path(
         if remote_id.starts_with(LOCAL_PREFIX) {
             let mutation = pending_page_directory_mutation(mutations, identifier)?
                 .ok_or_else(|| missing_identifier(identifier))?;
-            return Ok(page_container_path(&mutation.projected_path));
+            return pending_created_directory_path(mutation)
+                .ok_or_else(|| missing_identifier(identifier));
         }
         let entity = entities
             .iter()
@@ -6275,6 +6334,92 @@ mod tests {
                 .expect("list mutations")[0]
                 .mutation_kind,
             VirtualMutationKind::Create
+        );
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn pending_database_draft_projects_folder_and_writable_schema() {
+        let mount_id = MountId::new("notion-main");
+        let state_root = temp_root("loc-virtual-fs-database-draft");
+        let content_root = state_root.join("content/notion-main/files");
+        let schema_path = content_root.join("Home/Tasks/_schema.yaml");
+        std::fs::create_dir_all(schema_path.parent().expect("schema parent"))
+            .expect("create schema parent");
+        std::fs::write(&schema_path, b"loc:\n  type: notion_database_schema\n")
+            .expect("write schema");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-root"),
+                EntityKind::Page,
+                "Home",
+                "Home/page.md",
+            ))
+            .expect("save parent page");
+        store
+            .save_virtual_mutation(VirtualMutationRecord {
+                mount_id: mount_id.clone(),
+                local_id: "local:database-draft".to_string(),
+                mutation_kind: VirtualMutationKind::Create,
+                target_remote_id: None,
+                parent_remote_id: Some(RemoteId::new("page-root")),
+                original_path: None,
+                projected_path: PathBuf::from("Home/Tasks/_schema.yaml"),
+                title: "Tasks".to_string(),
+                content_path: Some(schema_path.clone()),
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            })
+            .expect("save database draft");
+
+        let parent = virtual_fs_children_with_content_root(
+            &store,
+            &content_root,
+            &mount_id,
+            "children:page-root",
+        )
+        .expect("parent children");
+        let database = parent
+            .children
+            .iter()
+            .find(|item| item.filename == "Tasks")
+            .expect("database folder");
+        assert_eq!(database.kind, VirtualFsItemKind::Folder);
+        assert_eq!(database.entity_kind, Some(EntityKind::Database));
+
+        let children = virtual_fs_children_with_content_root(
+            &store,
+            &content_root,
+            &mount_id,
+            &database.identifier,
+        )
+        .expect("database children");
+        let schema = children
+            .children
+            .iter()
+            .find(|item| item.filename == "_schema.yaml")
+            .expect("schema item");
+        assert_eq!(schema.identifier, "local:database-draft");
+        assert!(!schema.read_only);
+        assert_eq!(schema.content_type, "public.yaml");
+
+        commit_virtual_fs_write(
+            &mut store,
+            &content_root,
+            &mount_id,
+            &schema.identifier,
+            b"loc:\n  type: notion_database_schema\ntitle: Tasks\n",
+        )
+        .expect("edit draft schema");
+        assert_eq!(
+            std::fs::read_to_string(schema_path).expect("read schema"),
+            "loc:\n  type: notion_database_schema\ntitle: Tasks\n"
         );
 
         let _ = std::fs::remove_dir_all(state_root);

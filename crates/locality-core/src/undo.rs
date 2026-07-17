@@ -231,7 +231,7 @@ pub fn plan_journal_undo(entry: &JournalEntry) -> UndoPlan {
                     ),
                 ));
             }
-            PushOperation::CreateEntity { .. } => {
+            PushOperation::CreateEntity { .. } | PushOperation::CreateDatabase { .. } => {
                 match find_created_entity_effect(entry, operation_index) {
                     Some(entity_id) => {
                         operations.push(UndoOperation::ArchiveCreatedEntity { entity_id });

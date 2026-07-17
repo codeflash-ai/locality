@@ -6,6 +6,7 @@
 pub mod apply;
 pub mod client;
 pub mod database;
+pub mod database_create;
 pub mod dto;
 pub mod fetch;
 pub mod mapping;
@@ -234,6 +235,7 @@ impl Connector for NotionConnector {
             PushOperationKind::UpdateProperties,
             PushOperationKind::MoveEntity,
             PushOperationKind::CreateEntity,
+            PushOperationKind::CreateDatabase,
         ]
         .into_iter()
         .collect()
