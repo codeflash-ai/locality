@@ -164,6 +164,18 @@ Thanks for the notes. I will follow up here.
 Push is the send action. Attachments are not supported for Gmail draft sends in
 v1; `attachment` or `attachments` frontmatter is rejected.
 
+## Live E2E
+
+The live Gmail suite uses a dedicated Gmail account connected through the
+Locality OAuth broker. CI stores the broker-backed `StoredGmailCredential` JSON
+in `LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON`; the JSON must include an opaque
+`refresh_token_handle`, not a raw refresh token. The tests force token refresh
+with `LOCALITY_GOOGLE_LIVE_FORCE_REFRESH=1`, send one real message to
+`LOCALITY_GMAIL_LIVE_TEST_RECIPIENT`, verify sent-message reconciliation, and
+verify read-only mailbox guardrails. The test account must tolerate retained
+sent messages because the connector intentionally avoids broad Gmail modify or
+delete scopes.
+
 ## Useful Commands
 
 Connect with the local broker:

@@ -456,6 +456,47 @@ fn resolving_gmail_mount_with_invalid_settings_reports_validation_detail() {
 }
 
 #[test]
+fn resolving_expired_gmail_credential_refreshes_with_broker_handle() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (connection_id, secret_ref) =
+        save_gmail_connection(&mut store, "gmail-default", GMAIL_CONNECTOR_ID, "oauth");
+    let refresh_response = serde_json::json!({
+        "access_token": "new-gmail-access-token",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "refresh_token_handle": "handle-2",
+        "account_id": "acct-1",
+        "account_label": "user@example.com",
+        "workspace_id": "gmail",
+        "workspace_name": "Gmail",
+        "scopes": GMAIL_OAUTH_SCOPES,
+    })
+    .to_string();
+    let (broker_url, broker) = spawn_refresh_broker("HTTP/1.1 200 OK", refresh_response);
+    let stored = expired_gmail_credential("expired-access-token", broker_url);
+    credentials
+        .put(
+            &secret_ref,
+            &serde_json::to_string(&stored).expect("credential json"),
+        )
+        .expect("save credential");
+    let mount = gmail_mount().with_connection_id(connection_id);
+
+    let source = resolve_source_for_mount(&store, &credentials, &mount).expect("resolve gmail");
+    broker.join().expect("broker thread");
+
+    let ResolvedSource::Gmail(connector) = source else {
+        panic!("expected gmail source");
+    };
+    assert_eq!(connector.config().access_token, "new-gmail-access-token");
+    let saved = credentials.get(&secret_ref).expect("saved credential");
+    let saved = serde_json::from_str::<StoredGmailCredential>(&saved).expect("stored credential");
+    assert_eq!(saved.access_token, "new-gmail-access-token");
+    assert_eq!(saved.refresh_token_handle.as_deref(), Some("handle-2"));
+}
+
+#[test]
 fn resolving_expired_gmail_credential_rejects_refresh_missing_required_scope() {
     let mut store = InMemoryStateStore::new();
     let credentials = InMemoryCredentialStore::new();
