@@ -20,7 +20,7 @@ use crate::client::{HttpSlackApiClient, SlackApi};
 use crate::dto::{SlackConversation, SlackUser};
 use crate::render::{
     SlackNativeBundle, SlackRenderedKind, conversation_remote_id, parse_recent_remote_id,
-    recent_remote_id, render_slack_entity, users_remote_id,
+    recent_remote_id, render_slack_entity, slack_remote_version, users_remote_id,
 };
 use crate::settings::{SlackConversationType, SlackMountSettings};
 
@@ -205,9 +205,15 @@ impl Connector for SlackConnector {
     }
 
     fn enumerate(&self, request: EnumerateRequest) -> LocalityResult<Vec<TreeEntry>> {
-        let mut entries = root_entries(&request.mount_id, Path::new(""));
         let conversations = self.all_conversations()?;
-        let users = self.users_for_titles_if_needed(&conversations)?;
+        let users = self.all_users()?;
+        let users_version = users_remote_version(&users)?;
+        let users = if conversations.iter().any(conversation_needs_user_title) {
+            users_by_id(users)
+        } else {
+            BTreeMap::new()
+        };
+        let mut entries = root_entries(&request.mount_id, Path::new(""), users_version);
 
         entries.extend(conversations.iter().map(|conversation| {
             let parent_path = Path::new(conversation_type(conversation).root_folder());
@@ -218,7 +224,11 @@ impl Connector for SlackConnector {
 
     fn list_children(&self, request: ListChildrenRequest) -> LocalityResult<ListChildrenResult> {
         let entries = match request.container {
-            ChildContainer::Root => root_entries(&request.mount_id, &request.parent_path),
+            ChildContainer::Root => root_entries(
+                &request.mount_id,
+                &request.parent_path,
+                users_remote_version(&self.all_users()?)?,
+            ),
             ChildContainer::DirectoryChildren(remote_id) => {
                 if let Some(folder_type) = folder_type_for_remote_id(remote_id.as_str()) {
                     let conversations = self.conversations_for_type(&folder_type)?;
@@ -258,6 +268,8 @@ impl Connector for SlackConnector {
     fn observe(&self, request: ObserveRequest) -> LocalityResult<RemoteObservation> {
         let remote_id_value = request.remote_id.as_str().to_string();
         if remote_id_value == users_remote_id() {
+            let bundle = users_bundle(self.all_users()?);
+            let version = slack_remote_version(&bundle)?;
             return Ok(RemoteObservation::new(
                 request.mount_id,
                 request.remote_id,
@@ -265,7 +277,7 @@ impl Connector for SlackConnector {
                 "users",
                 "users.md",
             )
-            .with_remote_version(RemoteVersion::new("users"))
+            .with_remote_version(RemoteVersion::new(version))
             .with_raw_metadata_json(serde_json::json!({ "kind": "slack_users" }).to_string()));
         }
 
@@ -275,19 +287,21 @@ impl Connector for SlackConnector {
                 .into_iter()
                 .find(|conversation| conversation.id == conversation_id)
                 .ok_or_else(|| LocalityError::RemoteNotFound(conversation_id.to_string()))?;
-            let users = self.users_for_titles_if_needed(std::slice::from_ref(&conversation))?;
+            let users = self.all_users()?;
+            let users_by_id = users_by_id(users.clone());
             let conversation_entry = conversation_entry(
                 &request.mount_id,
                 Path::new(conversation_type(&conversation).root_folder()),
                 &conversation,
-                &users,
+                &users_by_id,
             );
             let history = self.api.conversations_history(
                 conversation_id,
                 None,
                 self.config.settings.slack.history_limit,
             )?;
-            let latest_ts = latest_message_ts(&history.messages);
+            let bundle = recent_bundle(conversation, users, history.messages);
+            let version = slack_remote_version(&bundle)?;
             return Ok(RemoteObservation::new(
                 request.mount_id,
                 request.remote_id,
@@ -296,7 +310,7 @@ impl Connector for SlackConnector {
                 conversation_entry.path.join("recent.md"),
             )
             .with_parent(conversation_entry.remote_id)
-            .with_remote_version(RemoteVersion::new(latest_ts))
+            .with_remote_version(RemoteVersion::new(version))
             .with_raw_metadata_json(
                 serde_json::json!({
                     "kind": "slack_recent",
@@ -313,12 +327,7 @@ impl Connector for SlackConnector {
 
     fn fetch(&self, request: FetchRequest) -> LocalityResult<NativeEntity> {
         if request.remote_id.as_str() == users_remote_id() {
-            let bundle = SlackNativeBundle {
-                kind: SlackRenderedKind::Users,
-                conversation: None,
-                users: self.all_users()?,
-                messages: Vec::new(),
-            };
+            let bundle = users_bundle(self.all_users()?);
             return native_entity(request.remote_id, "slack_users", bundle);
         }
 
@@ -335,12 +344,7 @@ impl Connector for SlackConnector {
             None,
             self.config.settings.slack.history_limit,
         )?;
-        let bundle = SlackNativeBundle {
-            kind: SlackRenderedKind::Recent,
-            conversation: Some(conversation),
-            users: self.all_users()?,
-            messages: history.messages,
-        };
+        let bundle = recent_bundle(conversation, self.all_users()?, history.messages);
         native_entity(request.remote_id, "slack_recent", bundle)
     }
 
@@ -379,6 +383,32 @@ fn native_entity(
         kind: kind.to_string(),
         raw,
     })
+}
+
+fn users_bundle(users: Vec<SlackUser>) -> SlackNativeBundle {
+    SlackNativeBundle {
+        kind: SlackRenderedKind::Users,
+        conversation: None,
+        users,
+        messages: Vec::new(),
+    }
+}
+
+fn users_remote_version(users: &[SlackUser]) -> LocalityResult<String> {
+    slack_remote_version(&users_bundle(users.to_vec()))
+}
+
+fn recent_bundle(
+    conversation: SlackConversation,
+    users: Vec<SlackUser>,
+    messages: Vec<crate::dto::SlackMessage>,
+) -> SlackNativeBundle {
+    SlackNativeBundle {
+        kind: SlackRenderedKind::Recent,
+        conversation: Some(conversation),
+        users,
+        messages,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -424,7 +454,7 @@ fn root_specs() -> [RootEntrySpec; 5] {
     ]
 }
 
-fn root_entries(mount_id: &MountId, parent_path: &Path) -> Vec<TreeEntry> {
+fn root_entries(mount_id: &MountId, parent_path: &Path, users_version: String) -> Vec<TreeEntry> {
     root_specs()
         .into_iter()
         .map(|spec| TreeEntry {
@@ -435,17 +465,17 @@ fn root_entries(mount_id: &MountId, parent_path: &Path) -> Vec<TreeEntry> {
             path: parent_path.join(spec.path),
             hydration: HydrationState::Stub,
             content_hash: None,
-            remote_edited_at: Some(root_entry_version(spec.remote_id).to_string()),
+            remote_edited_at: Some(root_entry_version(spec.remote_id, &users_version)),
             stub_frontmatter: None,
         })
         .collect()
 }
 
-fn root_entry_version(remote_id: &str) -> &str {
+fn root_entry_version(remote_id: &str, users_version: &str) -> String {
     if remote_id == users_remote_id() {
-        "users"
+        users_version.to_string()
     } else {
-        remote_id
+        remote_id.to_string()
     }
 }
 
@@ -583,15 +613,6 @@ fn conversation_version(conversation: &SlackConversation) -> String {
         Some(updated) => format!("slack:{}:{updated}", conversation.id),
         None => format!("slack:{}:", conversation.id),
     }
-}
-
-fn latest_message_ts(messages: &[crate::dto::SlackMessage]) -> String {
-    messages
-        .iter()
-        .map(|message| message.ts.as_str())
-        .max()
-        .unwrap_or("empty")
-        .to_string()
 }
 
 fn non_empty_cursor(cursor: Option<String>) -> Option<String> {
@@ -757,10 +778,7 @@ mod tests {
                 remote_id: RemoteId::new("slack-recent:C123"),
             })
             .expect("observe recent");
-        assert_eq!(
-            observation.remote_version.expect("version").as_str(),
-            "1780000000.000100"
-        );
+        assert_content_remote_version(observation.remote_version.expect("version").as_str());
     }
 
     #[test]
@@ -793,7 +811,7 @@ mod tests {
             .find(|entry| entry.remote_id.as_str() == "slack-users")
             .expect("users entry");
 
-        assert_eq!(rendered_version, "users");
+        assert_content_remote_version(rendered_version);
         assert_eq!(
             observation.remote_version.expect("version").as_str(),
             rendered_version
@@ -842,7 +860,7 @@ mod tests {
             })
             .expect("observe recent");
 
-        assert_eq!(rendered_version, "1780000001.000200");
+        assert_content_remote_version(rendered_version);
         assert_eq!(
             observation.remote_version.expect("version").as_str(),
             rendered_version
@@ -851,6 +869,143 @@ mod tests {
             observation.projected_path,
             PathBuf::from("channels/general-C123/recent.md")
         );
+    }
+
+    #[test]
+    fn remote_version_for_users_changes_when_profile_display_changes() {
+        let before = observe_version(
+            connector_with_api(FakeSlackApi::default().with_users(vec![SlackUser {
+                id: "U123".to_string(),
+                name: Some("ada".to_string()),
+                profile: Some(crate::dto::SlackUserProfile {
+                    display_name: Some("Ada".to_string()),
+                    ..crate::dto::SlackUserProfile::default()
+                }),
+                ..SlackUser::default()
+            }])),
+            "slack-users",
+        );
+        let after = observe_version(
+            connector_with_api(FakeSlackApi::default().with_users(vec![SlackUser {
+                id: "U123".to_string(),
+                name: Some("ada".to_string()),
+                profile: Some(crate::dto::SlackUserProfile {
+                    display_name: Some("Ada Byron".to_string()),
+                    ..crate::dto::SlackUserProfile::default()
+                }),
+                ..SlackUser::default()
+            }])),
+            "slack-users",
+        );
+
+        assert_content_remote_version(&before);
+        assert_content_remote_version(&after);
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn remote_version_for_recent_changes_when_message_text_changes_without_latest_timestamp_change()
+    {
+        let before = observe_version(
+            connector_with_api(
+                FakeSlackApi::default()
+                    .with_conversations(vec![SlackConversation {
+                        id: "C123".to_string(),
+                        name: Some("general".to_string()),
+                        is_channel: true,
+                        ..SlackConversation::default()
+                    }])
+                    .with_messages(vec![SlackMessage {
+                        text: "original message".to_string(),
+                        ts: "1780000000.000100".to_string(),
+                        ..SlackMessage::default()
+                    }]),
+            ),
+            "slack-recent:C123",
+        );
+        let after = observe_version(
+            connector_with_api(
+                FakeSlackApi::default()
+                    .with_conversations(vec![SlackConversation {
+                        id: "C123".to_string(),
+                        name: Some("general".to_string()),
+                        is_channel: true,
+                        ..SlackConversation::default()
+                    }])
+                    .with_messages(vec![SlackMessage {
+                        text: "edited message".to_string(),
+                        ts: "1780000000.000100".to_string(),
+                        ..SlackMessage::default()
+                    }]),
+            ),
+            "slack-recent:C123",
+        );
+
+        assert_content_remote_version(&before);
+        assert_content_remote_version(&after);
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn remote_version_for_recent_changes_when_rendered_user_display_changes() {
+        let before = observe_version(
+            connector_with_api(
+                FakeSlackApi::default()
+                    .with_conversations(vec![SlackConversation {
+                        id: "C123".to_string(),
+                        name: Some("general".to_string()),
+                        is_channel: true,
+                        ..SlackConversation::default()
+                    }])
+                    .with_users(vec![SlackUser {
+                        id: "U123".to_string(),
+                        name: Some("ada".to_string()),
+                        profile: Some(crate::dto::SlackUserProfile {
+                            display_name: Some("Ada".to_string()),
+                            ..crate::dto::SlackUserProfile::default()
+                        }),
+                        ..SlackUser::default()
+                    }])
+                    .with_messages(vec![SlackMessage {
+                        user: Some("U123".to_string()),
+                        text: "hello <@U123>".to_string(),
+                        ts: "1780000000.000100".to_string(),
+                        ..SlackMessage::default()
+                    }]),
+            ),
+            "slack-recent:C123",
+        );
+        let after = observe_version(
+            connector_with_api(
+                FakeSlackApi::default()
+                    .with_conversations(vec![SlackConversation {
+                        id: "C123".to_string(),
+                        name: Some("general".to_string()),
+                        is_channel: true,
+                        ..SlackConversation::default()
+                    }])
+                    .with_users(vec![SlackUser {
+                        id: "U123".to_string(),
+                        name: Some("ada".to_string()),
+                        profile: Some(crate::dto::SlackUserProfile {
+                            display_name: Some("Ada Byron".to_string()),
+                            ..crate::dto::SlackUserProfile::default()
+                        }),
+                        ..SlackUser::default()
+                    }])
+                    .with_messages(vec![SlackMessage {
+                        user: Some("U123".to_string()),
+                        text: "hello <@U123>".to_string(),
+                        ts: "1780000000.000100".to_string(),
+                        ..SlackMessage::default()
+                    }]),
+            ),
+            "slack-recent:C123",
+        );
+
+        assert_content_remote_version(&before);
+        assert_content_remote_version(&after);
+        assert_ne!(before, after);
     }
 
     #[test]
@@ -995,6 +1150,30 @@ mod tests {
 
     fn connector_with_api(api: FakeSlackApi) -> SlackConnector {
         SlackConnector::with_api(SlackConfig::new("xoxb-token"), Arc::new(api))
+    }
+
+    fn observe_version(connector: SlackConnector, remote_id: &str) -> String {
+        connector
+            .observe(ObserveRequest {
+                mount_id: MountId::new("slack-main"),
+                remote_id: RemoteId::new(remote_id),
+            })
+            .expect("observe")
+            .remote_version
+            .expect("remote version")
+            .as_str()
+            .to_string()
+    }
+
+    fn assert_content_remote_version(version: &str) {
+        let hash = version
+            .strip_prefix("content:")
+            .unwrap_or_else(|| panic!("expected content version, got `{version}`"));
+        assert!(!hash.is_empty(), "expected hash in `{version}`");
+        assert!(
+            hash.chars().all(|character| character.is_ascii_hexdigit()),
+            "expected hex hash in `{version}`"
+        );
     }
 
     #[derive(Clone, Debug, Default)]

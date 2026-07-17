@@ -15,6 +15,6 @@ pub use oauth::{
 };
 pub use render::{
     SlackNativeBundle, SlackRenderedKind, conversation_remote_id, recent_remote_id,
-    render_slack_entity, users_remote_id,
+    render_slack_entity, slack_remote_version, users_remote_id,
 };
 pub use settings::{SlackConversationType, SlackMountSettings};

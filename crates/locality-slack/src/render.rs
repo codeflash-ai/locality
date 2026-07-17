@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeZone, Utc};
 use locality_core::model::CanonicalDocument;
+use locality_core::shadow::stable_hash;
 use locality_core::{LocalityError, LocalityResult};
 use serde::{Deserialize, Serialize};
 
@@ -46,24 +47,26 @@ pub fn render_slack_entity(bundle: &SlackNativeBundle) -> LocalityResult<Canonic
     }
 }
 
+pub fn slack_remote_version(bundle: &SlackNativeBundle) -> LocalityResult<String> {
+    Ok(format!(
+        "content:{}",
+        stable_hash(&version_payload(bundle)?)
+    ))
+}
+
 fn render_recent(bundle: &SlackNativeBundle) -> LocalityResult<CanonicalDocument> {
     let conversation = bundle.conversation.as_ref().ok_or_else(|| {
         LocalityError::InvalidState("Slack recent bundle is missing conversation".to_string())
     })?;
     let remote_id = recent_remote_id(&conversation.id);
-    let latest = bundle
-        .messages
-        .iter()
-        .map(|message| message.ts.as_str())
-        .max()
-        .unwrap_or("empty");
+    let version = slack_remote_version(bundle)?;
     let title = conversation_title(conversation, &user_map(&bundle.users));
     let frontmatter = format!(
         "loc:\n  id: {}\n  type: page\n  connector: {}\n  synced_at: {}\n  remote_edited_at: {}\ntitle: {}\nslack:\n  conversation_id: {}\n  conversation_name: {}\n  rendered_kind: recent\n",
         yaml_scalar(&remote_id),
         SLACK_CONNECTOR_ID,
-        yaml_scalar(latest),
-        yaml_scalar(latest),
+        yaml_scalar(&version),
+        yaml_scalar(&version),
         yaml_scalar(&format!("{title} recent messages")),
         yaml_scalar(&conversation.id),
         yaml_scalar(&title),
@@ -75,16 +78,62 @@ fn render_recent(bundle: &SlackNativeBundle) -> LocalityResult<CanonicalDocument
 }
 
 fn render_users(bundle: &SlackNativeBundle) -> LocalityResult<CanonicalDocument> {
+    let version = slack_remote_version(bundle)?;
     let frontmatter = format!(
         "loc:\n  id: {}\n  type: page\n  connector: {}\n  synced_at: {}\n  remote_edited_at: {}\ntitle: {}\nslack:\n  rendered_kind: users\n",
         yaml_scalar(users_remote_id()),
         SLACK_CONNECTOR_ID,
-        yaml_scalar("users"),
-        yaml_scalar("users"),
+        yaml_scalar(&version),
+        yaml_scalar(&version),
         yaml_scalar("Slack users"),
     );
-    let mut users = bundle.users.clone();
-    users.sort_by_key(user_display_name);
+    Ok(CanonicalDocument::new(
+        frontmatter,
+        render_users_body(&bundle.users),
+    ))
+}
+
+fn version_payload(bundle: &SlackNativeBundle) -> LocalityResult<String> {
+    match bundle.kind {
+        SlackRenderedKind::Recent => recent_version_payload(bundle),
+        SlackRenderedKind::Users => Ok(users_version_payload(bundle)),
+    }
+}
+
+fn recent_version_payload(bundle: &SlackNativeBundle) -> LocalityResult<String> {
+    let conversation = bundle.conversation.as_ref().ok_or_else(|| {
+        LocalityError::InvalidState("Slack recent bundle is missing conversation".to_string())
+    })?;
+    let remote_id = recent_remote_id(&conversation.id);
+    let title = conversation_title(conversation, &user_map(&bundle.users));
+    Ok(format!(
+        "loc:\n  id: {}\n  type: page\n  connector: {}\ntitle: {}\nslack:\n  conversation_id: {}\n  conversation_name: {}\n  rendered_kind: recent\n---\n{}",
+        yaml_scalar(&remote_id),
+        SLACK_CONNECTOR_ID,
+        yaml_scalar(&format!("{title} recent messages")),
+        yaml_scalar(&conversation.id),
+        yaml_scalar(&title),
+        render_recent_body(bundle, &title),
+    ))
+}
+
+fn users_version_payload(bundle: &SlackNativeBundle) -> String {
+    format!(
+        "loc:\n  id: {}\n  type: page\n  connector: {}\ntitle: {}\nslack:\n  rendered_kind: users\n---\n{}",
+        yaml_scalar(users_remote_id()),
+        SLACK_CONNECTOR_ID,
+        yaml_scalar("Slack users"),
+        render_users_body(&bundle.users),
+    )
+}
+
+fn render_users_body(users: &[SlackUser]) -> String {
+    let mut users = users.to_vec();
+    users.sort_by(|left, right| {
+        user_display_name(left)
+            .cmp(&user_display_name(right))
+            .then_with(|| left.id.cmp(&right.id))
+    });
     let mut body = String::from(
         "| User ID | Name | Display Name | Bot | Deleted |\n| --- | --- | --- | --- | --- |\n",
     );
@@ -98,7 +147,7 @@ fn render_users(bundle: &SlackNativeBundle) -> LocalityResult<CanonicalDocument>
             user.deleted,
         ));
     }
-    Ok(CanonicalDocument::new(frontmatter, body))
+    body
 }
 
 fn render_recent_body(bundle: &SlackNativeBundle, title: &str) -> String {

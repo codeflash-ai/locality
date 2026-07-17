@@ -9,8 +9,8 @@ use locality_core::validation::{ValidationIssue, ValidationReport};
 use locality_core::{LocalityError, LocalityResult};
 use locality_slack::{
     HttpSlackOAuthBrokerClient, SLACK_CONNECTOR_ID, SlackConfig, SlackConnector,
-    SlackMountSettings, SlackNativeBundle, SlackOAuthScopeError, SlackRenderedKind,
-    StoredSlackCredential, render_slack_entity,
+    SlackMountSettings, SlackNativeBundle, SlackOAuthScopeError, StoredSlackCredential,
+    render_slack_entity, slack_remote_version,
 };
 use locality_store::{
     ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, CredentialError,
@@ -370,7 +370,7 @@ impl HydrationSource for SlackConnector {
         .map_err(|error| LocalityError::InvalidState(error.to_string()))?
         .with_frontmatter(document.frontmatter.clone());
         Ok(HydratedEntity {
-            remote_edited_at: Some(remote_version(&bundle)),
+            remote_edited_at: Some(slack_remote_version(&bundle)?),
             document,
             shadow,
             assets: Vec::new(),
@@ -382,19 +382,6 @@ impl HydrationSource for SlackConnector {
         _database_id: &RemoteId,
     ) -> LocalityResult<Option<String>> {
         Ok(None)
-    }
-}
-
-fn remote_version(bundle: &SlackNativeBundle) -> String {
-    match bundle.kind {
-        SlackRenderedKind::Users => "users".to_string(),
-        SlackRenderedKind::Recent => bundle
-            .messages
-            .iter()
-            .map(|message| message.ts.as_str())
-            .max()
-            .unwrap_or("empty")
-            .to_string(),
     }
 }
 
@@ -439,7 +426,9 @@ mod tests {
 
         let hydrated = connector.fetch_render(&request).expect("hydrate users");
 
-        assert_eq!(hydrated.remote_edited_at.as_deref(), Some("users"));
+        let rendered_version = remote_edited_at_from_frontmatter(&hydrated.document.frontmatter);
+        assert_content_remote_version(rendered_version);
+        assert_eq!(hydrated.remote_edited_at.as_deref(), Some(rendered_version));
         assert!(hydrated.assets.is_empty());
         assert!(
             hydrated
@@ -505,5 +494,24 @@ mod tests {
                 ..SlackUsersListResponse::default()
             })
         }
+    }
+
+    fn remote_edited_at_from_frontmatter(frontmatter: &str) -> &str {
+        frontmatter
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("remote_edited_at: "))
+            .expect("remote_edited_at")
+            .trim_matches('"')
+    }
+
+    fn assert_content_remote_version(version: &str) {
+        let hash = version
+            .strip_prefix("content:")
+            .unwrap_or_else(|| panic!("expected content version, got `{version}`"));
+        assert!(!hash.is_empty(), "expected hash in `{version}`");
+        assert!(
+            hash.chars().all(|character| character.is_ascii_hexdigit()),
+            "expected hex hash in `{version}`"
+        );
     }
 }
