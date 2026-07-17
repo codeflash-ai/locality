@@ -730,6 +730,11 @@ the path through Locality state, compares the current Markdown projection agains
 the synced shadow, and prints the planned connector mutations plus a readable
 unified diff when file content changed.
 
+For frontmatter reference fields rendered as hyphenated UUIDs, `loc diff`
+compares exact UUID references and `Label <uuid>` references by UUID. This keeps
+label-only reference refreshes from surfacing as user edits while still planning
+updates when the referenced UUID changes.
+
 `loc push <path>` uses the same planning path and, unless `-y`/`--yes` or
 `--confirm` already covers the plan, asks for explicit approval before applying
 remote mutations. Once a push is journaled, Locality stores linked edit metadata

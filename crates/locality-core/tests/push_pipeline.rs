@@ -272,6 +272,30 @@ fn frontmatter_property_edits_plan_property_update() {
 }
 
 #[test]
+fn frontmatter_uuid_reference_label_change_is_noop() {
+    let uuid = "11111111-1111-4111-8111-111111111111";
+    let parsed = parse_canonical_markdown(&format!(
+        "---\nloc:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\nProject: \"{uuid}\"\nRelated:\n  - \"Spec <22222222-2222-4222-8222-222222222222>\"\n---\nSame body.",
+    ))
+    .expect("canonical document");
+    let shadow = ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        "Same body.",
+        10,
+        [RemoteId::new("paragraph-1")],
+    )
+    .expect("shadow")
+    .with_frontmatter(format!(
+        "loc:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\nProject: \"Launch <{uuid}>\"\nRelated:\n  - \"Product Spec <22222222-2222-4222-8222-222222222222>\"\n",
+    ));
+
+    let output = plan_push_pipeline(request(&parsed, &shadow));
+
+    assert_eq!(output.action, PushPipelineAction::Noop);
+    assert_eq!(output.plan.expect("plan").operations, Vec::new());
+}
+
+#[test]
 fn whole_entity_body_mode_emits_one_body_update_and_keeps_property_updates() {
     let parsed = parse_canonical_markdown(
         "---\nloc:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n\"Status\": \"Done\"\n---\nFirst changed paragraph.\n\nSecond changed paragraph.",

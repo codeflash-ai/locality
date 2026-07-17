@@ -2148,6 +2148,47 @@ fn runtime_queues_child_refresh_when_remote_fast_forward_discovers_child_link_di
     runtime.shutdown();
 }
 
+#[test]
+fn runtime_queues_batch_refresh_when_linear_reference_ids_change() {
+    let config = relay_config("linear-reference-refresh");
+    let mount_root = temp_root("linear-reference-refresh-mount");
+    let old_project_id = "11111111-1111-4111-8111-111111111111";
+    let new_project_id = "22222222-2222-4222-8222-222222222222";
+    seed_clean_linear_issue_with_project_reference(&config.state_root, &mount_root, old_project_id);
+    let (hydrated_tx, hydrated_rx) = mpsc::channel();
+    let (refresh_tx, refresh_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(
+        config,
+        LinearReferenceHintRunner {
+            hydrated: hydrated_tx,
+            refresh_tx,
+            next_project_id: new_project_id.to_string(),
+        },
+    )
+    .expect("spawn runtime");
+
+    let response = runtime.handle().request(DaemonRequest::RemoteFastForward {
+        mount_id: "linear-main".to_string(),
+        remote_id: "issue-1".to_string(),
+        path: PathBuf::from("Team/ENG-1/page.md"),
+    });
+
+    assert!(
+        response.ok,
+        "remote fast-forward request failed: {response:?}"
+    );
+    hydrated_rx
+        .recv_timeout(ASYNC_EVENT_TIMEOUT)
+        .expect("remote fast-forward hydration drained");
+    assert_eq!(
+        refresh_rx
+            .recv_timeout(ASYNC_EVENT_TIMEOUT)
+            .expect("batch refresh queued from reference diff"),
+        ("linear-main".to_string(), "batch:linear-main".to_string())
+    );
+    runtime.shutdown();
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn runtime_refreshes_macos_visible_replica_after_remote_fast_forward() {
@@ -3153,6 +3194,12 @@ struct DiscoveryHintRunner {
     next_child_ids: Vec<String>,
 }
 
+struct LinearReferenceHintRunner {
+    hydrated: mpsc::Sender<HydrationRequest>,
+    refresh_tx: mpsc::Sender<(String, String)>,
+    next_project_id: String,
+}
+
 #[cfg(target_os = "macos")]
 struct MacosProjectionFastForwardRunner {
     hydrated: mpsc::Sender<HydrationRequest>,
@@ -3764,6 +3811,62 @@ impl RuntimeJobRunner for DiscoveryHintRunner {
     }
 }
 
+impl RuntimeJobRunner for LinearReferenceHintRunner {
+    fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+        DaemonResponse::error("unexpected_pull", "pull should not run")
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> locality_core::LocalityResult<ScheduledPullRuntimeReport> {
+        Err(LocalityError::InvalidState(
+            "scheduled pull should not run".to_string(),
+        ))
+    }
+
+    fn run_hydration(
+        &self,
+        state_root: PathBuf,
+        request: HydrationRequest,
+    ) -> locality_core::LocalityResult<HydrationOutcome> {
+        let mut store = SqliteStateStore::open(state_root).map_err(LocalityError::from)?;
+        let shadow = linear_reference_shadow("issue-1", &self.next_project_id);
+        store
+            .save_shadow(&request.mount_id, shadow.clone())
+            .map_err(LocalityError::from)?;
+        let mut entity = store
+            .get_entity(&request.mount_id, &request.remote_id)
+            .map_err(LocalityError::from)?
+            .expect("entity");
+        entity.hydration = HydrationState::Hydrated;
+        entity.content_hash = Some(shadow.body_hash);
+        entity.remote_edited_at = Some("remote-v2".to_string());
+        store.save_entity(entity).map_err(LocalityError::from)?;
+
+        self.hydrated.send(request).expect("notify hydrated");
+        Ok(HydrationOutcome::Hydrated)
+    }
+
+    fn run_virtual_fs_refresh_children(
+        &self,
+        _state_root: PathBuf,
+        mount_id: String,
+        container_identifier: String,
+    ) -> locality_core::LocalityResult<VirtualFsRefreshChildrenReport> {
+        self.refresh_tx
+            .send((mount_id, container_identifier))
+            .expect("send child refresh");
+        Ok(VirtualFsRefreshChildrenReport::default())
+    }
+}
+
 #[cfg(target_os = "macos")]
 impl RuntimeJobRunner for MacosProjectionFastForwardRunner {
     fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
@@ -4216,6 +4319,57 @@ fn seed_clean_page_with_child_links<const N: usize>(
     .expect("write clean virtual page");
 }
 
+fn seed_clean_linear_issue_with_project_reference(
+    state_root: &Path,
+    mount_root: &Path,
+    project_id: &str,
+) {
+    let mount_id = MountId::new("linear-main");
+    let remote_id = RemoteId::new("issue-1");
+    let shadow = linear_reference_shadow("issue-1", project_id);
+    let mut store = SqliteStateStore::open(state_root.to_path_buf()).expect("open store");
+    store
+        .save_mount(
+            MountConfig::new(mount_id.clone(), "linear", mount_root.to_path_buf())
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_shadow(&mount_id, shadow.clone())
+        .expect("save shadow");
+    store
+        .save_entity(
+            EntityRecord::new(
+                mount_id.clone(),
+                remote_id.clone(),
+                EntityKind::Page,
+                "ENG-1",
+                "Team/ENG-1/page.md",
+            )
+            .with_hydration(HydrationState::Hydrated)
+            .with_content_hash(shadow.body_hash)
+            .with_remote_edited_at("remote-v1"),
+        )
+        .expect("save entity");
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(mount_id.clone(), remote_id.clone(), FreshnessTier::Hot)
+                .remote_hint_pending(true),
+        )
+        .expect("save freshness");
+    let content_path = virtual_fs_content_root(state_root, &mount_id).join("Team/ENG-1/page.md");
+    std::fs::create_dir_all(content_path.parent().expect("content parent"))
+        .expect("create content parent");
+    std::fs::write(
+        content_path,
+        render_canonical_markdown(&CanonicalDocument::new(
+            shadow.frontmatter.clone(),
+            shadow.rendered_body.clone(),
+        )),
+    )
+    .expect("write clean virtual issue");
+}
+
 fn child_link_shadow<'a>(
     entity_id: &str,
     child_ids: impl IntoIterator<Item = &'a str>,
@@ -4251,6 +4405,16 @@ fn child_link_shadow<'a>(
     shadow.rendered_body = body;
     shadow.body_hash = format!("child-link-count-{}", shadow.blocks.len());
     shadow
+}
+
+fn linear_reference_shadow(entity_id: &str, project_id: &str) -> ShadowDocument {
+    let body = "Issue body.\n";
+    let frontmatter = format!(
+        "loc:\n  id: {entity_id}\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: ENG-1\nProject: \"Launch <{project_id}>\"\n",
+    );
+    ShadowDocument::from_synced_body(RemoteId::new(entity_id), body, 8, [RemoteId::new("body-1")])
+        .expect("linear shadow")
+        .with_frontmatter(frontmatter)
 }
 
 #[cfg(target_os = "macos")]

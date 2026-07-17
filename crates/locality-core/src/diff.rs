@@ -9,7 +9,9 @@ use std::path::PathBuf;
 
 use yaml_serde::Value;
 
-use crate::canonical::{parse_canonical_markdown, render_canonical_markdown};
+use crate::canonical::{
+    FrontmatterProperties, parse_canonical_markdown, render_canonical_markdown,
+};
 use crate::model::{CanonicalDocument, RemoteId};
 use crate::planner::{
     PlanDegradation, PlanDegradationKind, PropertyValue, PushOperation, PushPlan,
@@ -238,7 +240,7 @@ fn property_diff_operations(
     for key in keys {
         let synced_value = synced.frontmatter.properties.get(&key);
         let edited_value = edited.frontmatter.properties.get(&key);
-        if synced_value != edited_value {
+        if !frontmatter_values_semantically_equal(synced_value, edited_value) {
             updates.insert(
                 key.clone(),
                 edited_value
@@ -290,6 +292,98 @@ fn simple_frontmatter_string(value: &Value) -> Option<String> {
         Value::Bool(value) => Some(value.to_string()),
         _ => None,
     }
+}
+
+fn frontmatter_values_semantically_equal(left: Option<&Value>, right: Option<&Value>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            if left == right {
+                return true;
+            }
+            match (uuid_reference_value(left), uuid_reference_value(right)) {
+                (Some(left), Some(right)) => left == right,
+                _ => false,
+            }
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SemanticUuidReferenceValue {
+    Scalar(String),
+    Sequence(Vec<String>),
+}
+
+pub fn uuid_reference_ids_from_frontmatter(properties: &FrontmatterProperties) -> BTreeSet<String> {
+    properties
+        .values()
+        .flat_map(uuid_reference_ids_from_value)
+        .collect()
+}
+
+fn uuid_reference_ids_from_value(value: &Value) -> BTreeSet<String> {
+    match value {
+        Value::String(value) => canonical_uuid_reference(value).into_iter().collect(),
+        Value::Sequence(values) => values
+            .iter()
+            .flat_map(uuid_reference_ids_from_value)
+            .collect(),
+        Value::Tagged(tagged) => uuid_reference_ids_from_value(&tagged.value),
+        _ => BTreeSet::new(),
+    }
+}
+
+fn uuid_reference_value(value: &Value) -> Option<SemanticUuidReferenceValue> {
+    match value {
+        Value::String(value) => {
+            canonical_uuid_reference(value).map(SemanticUuidReferenceValue::Scalar)
+        }
+        Value::Sequence(values) => values
+            .iter()
+            .map(uuid_reference_scalar)
+            .collect::<Option<Vec<_>>>()
+            .map(SemanticUuidReferenceValue::Sequence),
+        Value::Tagged(tagged) => uuid_reference_value(&tagged.value),
+        _ => None,
+    }
+}
+
+fn uuid_reference_scalar(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => canonical_uuid_reference(value),
+        Value::Tagged(tagged) => uuid_reference_scalar(&tagged.value),
+        _ => None,
+    }
+}
+
+fn canonical_uuid_reference(value: &str) -> Option<String> {
+    let value = value.trim();
+    if is_hyphenated_uuid(value) {
+        return Some(value.to_ascii_lowercase());
+    }
+    let uuid = value.strip_suffix('>')?.rsplit_once('<')?.1.trim();
+    is_hyphenated_uuid(uuid).then(|| uuid.to_ascii_lowercase())
+}
+
+fn is_hyphenated_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (index, byte) in bytes.iter().enumerate() {
+        match index {
+            8 | 13 | 18 | 23 => {
+                if *byte != b'-' {
+                    return false;
+                }
+            }
+            _ if !byte.is_ascii_hexdigit() => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 fn validate_edited_directives(

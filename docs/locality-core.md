@@ -25,7 +25,7 @@
 | `push` | Explicit push pipeline request/output types, validation/diff/guardrail orchestration, journaled execution hooks, and guardrail evaluation. |
 | `pull` | Polling/relay pull scheduler configuration. |
 | `shadow` | Shadow document snapshots, Markdown block segmentation, stable block hashes, and source spans. |
-| `diff` | Initial block-aware push planner over shadow snapshots and edited canonical documents. |
+| `diff` | Initial block-aware push planner over shadow snapshots and edited canonical documents, including semantic comparison for rendered UUID references such as `Label <uuid>`. |
 | `journal` | Push journal entry and status contracts. |
 | `undo` | Connector-neutral reverse-plan derivation from journaled preimage snapshots. |
 | `error` | Core error categories. |

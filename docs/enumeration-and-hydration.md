@@ -323,8 +323,12 @@ Implementation:
 - child-refresh queuing after hydration/observation results
 
 When remote fast-forward handling detects that child links may have changed, it
-can queue background child refreshes. The actual body update remains a hydration
-decision; the child discovery part uses `list_children`.
+can queue background child refreshes. For Linear mounts, a remote fast-forward
+that changes UUID reference targets in frontmatter queues the existing
+`batch:<mount-id>` metadata refresh so dependent projected containers can be
+rediscovered. Label-only changes around the same UUID do not queue this refresh.
+The actual body update remains a hydration decision; the discovery part uses
+connector metadata refresh paths.
 
 ### `loc pull` At A Virtual Directory
 
