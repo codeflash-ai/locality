@@ -522,7 +522,7 @@ pub fn apply_undo(
                 let body = update_properties_body(&moved_page, &properties)?;
                 api.update_page(entity_id.as_str(), body)?;
             }
-            UndoOperation::RestoreArchivedEntity { entity_id } => {
+            UndoOperation::RestoreArchivedEntity { entity_id, .. } => {
                 api.update_page(entity_id.as_str(), json!({ "in_trash": false }))?;
             }
             UndoOperation::RestoreEntityBody { .. } => {
@@ -557,7 +557,7 @@ pub fn apply_undo(
             | UndoOperation::RestoreEntityBody { entity_id, .. }
             | UndoOperation::RestoreProperties { entity_id, .. }
             | UndoOperation::RestoreEntityLocation { entity_id, .. }
-            | UndoOperation::RestoreArchivedEntity { entity_id } => Some(entity_id),
+            | UndoOperation::RestoreArchivedEntity { entity_id, .. } => Some(entity_id),
             _ => None,
         };
         if let Some(entity_id) = entity_id
@@ -573,7 +573,7 @@ pub fn apply_undo(
         .filter_map(|operation| match operation {
             UndoOperation::ArchiveCreatedEntity { entity_id, .. }
             | UndoOperation::RestoreEntityLocation { entity_id, .. }
-            | UndoOperation::RestoreArchivedEntity { entity_id } => Some(entity_id.clone()),
+            | UndoOperation::RestoreArchivedEntity { entity_id, .. } => Some(entity_id.clone()),
             _ => None,
         })
         .fold(Vec::new(), |mut ids, entity_id| {

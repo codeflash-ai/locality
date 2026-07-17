@@ -93,6 +93,7 @@ pub enum UndoOperation {
     /// Restores the implicit guarded transition from archived=true to false.
     RestoreArchivedEntity {
         entity_id: RemoteId,
+        expected: EntityUndoState,
     },
 }
 
@@ -241,16 +242,18 @@ pub fn plan_journal_undo(entry: &JournalEntry) -> UndoPlan {
                 }
             }
             PushOperation::ArchiveEntity { entity_id } => {
-                if has_complete_entity_preimage(entry, entity_id) {
-                    operations.push(UndoOperation::RestoreArchivedEntity {
-                        entity_id: entity_id.clone(),
-                    });
-                } else {
-                    unsupported.push(missing_entity_preimage(
+                match entity_archive_expected_state(entry, entity_id) {
+                    Some(expected) => {
+                        operations.push(UndoOperation::RestoreArchivedEntity {
+                            entity_id: entity_id.clone(),
+                            expected,
+                        });
+                    }
+                    None => unsupported.push(missing_entity_preimage(
                         operation_index,
                         entity_id,
                         "archived entity",
-                    ));
+                    )),
                 }
             }
             PushOperation::UpdateEntityBody { entity_id, body } => {
@@ -422,25 +425,40 @@ fn parsed_entity_preimage(
     .ok()
 }
 
-fn has_complete_entity_preimage(entry: &JournalEntry, entity_id: &RemoteId) -> bool {
-    let Some(parsed) = parsed_entity_preimage(entry, entity_id) else {
-        return false;
-    };
-    let Some(loc) = parsed.frontmatter.loc else {
-        return false;
-    };
+fn entity_archive_expected_state(
+    entry: &JournalEntry,
+    entity_id: &RemoteId,
+) -> Option<EntityUndoState> {
+    let shadow = find_entity_preimage(entry, entity_id)?;
+    let parsed = parsed_entity_preimage(entry, entity_id)?;
+    let loc = parsed.frontmatter.loc?;
 
-    loc.id.as_ref() == Some(entity_id)
-        && loc.parent.is_some()
-        && loc
+    if loc.id.as_ref() != Some(entity_id)
+        || loc
             .entity_type
             .as_ref()
-            .is_some_and(|kind| !matches!(kind, crate::model::EntityKind::Unknown(_)))
-        && parsed
-            .frontmatter
-            .title
-            .as_deref()
-            .is_some_and(|title| !title.trim().is_empty())
+            .is_none_or(|kind| matches!(kind, crate::model::EntityKind::Unknown(_)))
+    {
+        return None;
+    }
+    let parent_id = loc.parent?;
+    let title = parsed.frontmatter.title?;
+    if title.trim().is_empty() {
+        return None;
+    }
+    let properties = parsed
+        .frontmatter
+        .properties
+        .into_iter()
+        .map(|(key, value)| (key, property_value_from_frontmatter(&value)))
+        .collect();
+    Some(EntityUndoState {
+        parent_id,
+        title,
+        properties,
+        body: shadow.rendered_body.clone(),
+        archived: true,
+    })
 }
 
 fn previous_property_values(

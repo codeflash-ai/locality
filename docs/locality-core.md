@@ -145,9 +145,11 @@ Journal entries now include shadow preimages for affected entities. The undo pla
   shadow frontmatter, using `Null` only when an updated key was previously absent;
 - entity moves carry expected and previous parent/title values, and block when
   either previous value is missing;
-- entity archives restore the implicit transition from archived to active, but
-  require an entity preimage so the removed local record and projection can be
-  reconstructed;
+- entity archives carry the archived postimage expected after the push
+  (`archived: true` plus the preimage parent, title, properties, and body) and
+  restore the implicit transition from archived to active; they require an
+  entity preimage so the removed local record and projection can be
+  reconstructed and connectors can drift-check before unarchive;
 - created entities reverse to archiving the created entity when apply journaled
   the created ID, with an optional expected entity state for drift checks.
 

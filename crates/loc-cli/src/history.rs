@@ -459,7 +459,7 @@ fn entity_undo_operation_id(operation: &UndoOperation) -> Option<RemoteId> {
         | UndoOperation::RestoreEntityBody { entity_id, .. }
         | UndoOperation::RestoreProperties { entity_id, .. }
         | UndoOperation::RestoreEntityLocation { entity_id, .. }
-        | UndoOperation::RestoreArchivedEntity { entity_id } => Some(entity_id.clone()),
+        | UndoOperation::RestoreArchivedEntity { entity_id, .. } => Some(entity_id.clone()),
         UndoOperation::RestoreBlockContent { .. }
         | UndoOperation::MoveBlock { .. }
         | UndoOperation::RestoreArchivedBlock { .. }
@@ -547,7 +547,10 @@ where
             if undo_plan.operations.iter().any(|operation| {
                 matches!(
                     operation,
-                    UndoOperation::RestoreArchivedEntity { entity_id: restored_id }
+                    UndoOperation::RestoreArchivedEntity {
+                        entity_id: restored_id,
+                        ..
+                    }
                         if restored_id == &entity_id
                 )
             }) {
@@ -720,7 +723,7 @@ where
             None if undo_plan.operations.iter().any(|operation| {
                 matches!(
                     operation,
-                    UndoOperation::RestoreArchivedEntity { entity_id }
+                    UndoOperation::RestoreArchivedEntity { entity_id, .. }
                         if entity_id == &preimage.entity_id
                 )
             }) =>
@@ -1096,7 +1099,7 @@ where
                         kind,
                     )
                 }
-                UndoOperation::RestoreArchivedEntity { entity_id } => (
+                UndoOperation::RestoreArchivedEntity { entity_id, .. } => (
                     entity_id,
                     false,
                     journal_preimage_parent_id(entry, entity_id),
@@ -1563,6 +1566,7 @@ pub enum UndoOperationOutput {
     },
     RestoreArchivedEntity {
         entity_id: String,
+        expected: EntityUndoStateOutput,
     },
 }
 
@@ -1651,8 +1655,12 @@ impl From<UndoOperation> for UndoOperationOutput {
                 previous_parent_id: previous_parent_id.0,
                 previous_title,
             },
-            UndoOperation::RestoreArchivedEntity { entity_id } => Self::RestoreArchivedEntity {
+            UndoOperation::RestoreArchivedEntity {
+                entity_id,
+                expected,
+            } => Self::RestoreArchivedEntity {
                 entity_id: entity_id.0,
+                expected: EntityUndoStateOutput::from(expected),
             },
         }
     }

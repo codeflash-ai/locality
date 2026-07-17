@@ -463,6 +463,19 @@ fn archive_entity_reverses_to_restore_archived_entity() {
         plan.operations,
         vec![UndoOperation::RestoreArchivedEntity {
             entity_id: RemoteId::new("page-1"),
+            expected: EntityUndoState {
+                parent_id: RemoteId::new("old-parent"),
+                title: "Roadmap".to_string(),
+                properties: BTreeMap::from([
+                    ("Points".to_string(), PropertyValue::Number("2".to_string())),
+                    (
+                        "Status".to_string(),
+                        PropertyValue::String("Todo".to_string()),
+                    ),
+                ]),
+                body: "# Roadmap\n\nOld paragraph.".to_string(),
+                archived: true,
+            },
         }]
     );
     assert_eq!(
@@ -470,6 +483,22 @@ fn archive_entity_reverses_to_restore_archived_entity() {
         serde_json::json!({
             "type": "restore_archived_entity",
             "entity_id": "page-1",
+            "expected": {
+                "parent_id": "old-parent",
+                "title": "Roadmap",
+                "properties": {
+                    "Points": {
+                        "kind": "number",
+                        "value": "2"
+                    },
+                    "Status": {
+                        "kind": "string",
+                        "value": "Todo"
+                    }
+                },
+                "body": "# Roadmap\n\nOld paragraph.",
+                "archived": true
+            }
         })
     );
 }

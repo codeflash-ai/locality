@@ -2392,6 +2392,7 @@ fn apply_undo_lowers_generic_entity_reverse_operations() {
             },
             UndoOperation::RestoreArchivedEntity {
                 entity_id: RemoteId::new("page-1"),
+                expected: archived_entity_state("new-parent", "New title"),
             },
             UndoOperation::ArchiveCreatedEntity {
                 entity_id: RemoteId::new("created-page-1"),
@@ -2517,6 +2518,7 @@ fn apply_undo_prevalidates_entire_plan_before_first_write() {
         operations: vec![
             UndoOperation::RestoreArchivedEntity {
                 entity_id: RemoteId::new("page-1"),
+                expected: archived_entity_state("page-1", "Archived"),
             },
             UndoOperation::RestoreEntityBody {
                 entity_id: RemoteId::new("page-1"),
@@ -2563,6 +2565,7 @@ fn apply_undo_observes_database_row_parent_as_database_id() {
         affected_entities: vec![RemoteId::new("page-1")],
         operations: vec![UndoOperation::RestoreArchivedEntity {
             entity_id: RemoteId::new("page-1"),
+            expected: archived_entity_state("database-1", "Archived row"),
         }],
         unsupported: vec![],
         status: UndoPlanStatus::Complete,
@@ -5007,6 +5010,16 @@ fn data_source_property(kind: &str) -> DataSourcePropertyDto {
         id: format!("{kind}-id"),
         kind: kind.to_string(),
         ..Default::default()
+    }
+}
+
+fn archived_entity_state(parent_id: &str, title: &str) -> EntityUndoState {
+    EntityUndoState {
+        parent_id: RemoteId::new(parent_id),
+        title: title.to_string(),
+        properties: BTreeMap::new(),
+        body: String::new(),
+        archived: true,
     }
 }
 
