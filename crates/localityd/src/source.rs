@@ -456,14 +456,20 @@ fn gmail_write_decision_for_path(relative_path: &Path) -> SourceWriteDecision {
 }
 
 fn google_calendar_write_decision_for_path(relative_path: &Path) -> SourceWriteDecision {
-    match relative_path
-        .components()
-        .next()
-        .and_then(|component| match component {
-            std::path::Component::Normal(value) => value.to_str(),
-            _ => None,
-        }) {
-        Some("draft") => SourceWriteDecision::Writable,
+    let mut components = relative_path.components();
+    match components.next().and_then(|component| match component {
+        std::path::Component::Normal(value) => value.to_str(),
+        _ => None,
+    }) {
+        Some("draft")
+            if matches!(components.next(), Some(std::path::Component::Normal(_)))
+                && components.next().is_none() =>
+        {
+            SourceWriteDecision::Writable
+        }
+        Some("draft") => SourceWriteDecision::ReadOnly {
+            reason: "Google Calendar writes are only supported under draft/",
+        },
         Some("events") => SourceWriteDecision::ReadOnly {
             reason: "Google Calendar event files are read-only",
         },

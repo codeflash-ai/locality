@@ -86,10 +86,20 @@ fn google_calendar_descriptor_comes_from_registry() {
             .mount_guidance()
             .contains("Google Calendar facts")
     );
+    assert!(descriptor.mount_guidance().contains("primary calendar"));
+    assert!(descriptor.mount_guidance().contains("events/"));
+    assert!(descriptor.mount_guidance().contains("draft/"));
+    assert!(descriptor.mount_guidance().contains("events/ is read-only"));
+    assert!(descriptor.mount_guidance().contains("`start`"));
+    assert!(descriptor.mount_guidance().contains("`end`"));
+    assert!(descriptor.mount_guidance().contains("`summary` or `title`"));
+    assert_eq!(descriptor.source_root_create_parent_kind(), None);
     assert_eq!(
         descriptor.create_entity_parent_kinds(),
         &[EntityKind::Directory]
     );
+    assert_eq!(descriptor.periodic_discovery_interval(), None);
+    assert_eq!(descriptor.max_background_discovery_workers(), 4);
 }
 
 #[test]
@@ -162,6 +172,10 @@ fn google_calendar_write_policy_allows_only_direct_drafts() {
     );
     assert!(
         source_write_decision_for_path(&mount, std::path::Path::new("draft/foo.md")).is_writable()
+    );
+    assert!(
+        !source_write_decision_for_path(&mount, std::path::Path::new("draft/nested/foo.md"))
+            .is_writable()
     );
     assert!(
         !source_create_decision_for_parent_path(&mount, std::path::Path::new("events"))
