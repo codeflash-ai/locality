@@ -4,6 +4,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub struct OAuthBrokerStart {
     pub connector: String,
     pub redirect_uri: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +78,7 @@ mod tests {
         let request = OAuthBrokerStart {
             connector: "google-docs".to_string(),
             redirect_uri: "http://localhost:8757/oauth/google-docs/callback".to_string(),
+            scopes: Vec::new(),
         };
 
         let json = serde_json::to_value(&request).expect("serialize request");

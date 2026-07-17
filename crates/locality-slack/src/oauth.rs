@@ -17,6 +17,8 @@ use crate::connector::SLACK_CONNECTOR_ID;
 pub const DEFAULT_SLACK_OAUTH_BROKER_URL: &str = "https://afs-oauth-broker.saurabh-b07.workers.dev";
 pub const DEFAULT_SLACK_OAUTH_REDIRECT_URI: &str = "http://localhost:8757/oauth/slack/callback";
 
+pub const SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE: &str = "channels:join";
+
 pub const SLACK_OAUTH_SCOPES: &[&str] = &[
     "channels:read",
     "channels:history",
@@ -30,6 +32,8 @@ pub const SLACK_OAUTH_SCOPES: &[&str] = &[
     "team:read",
     "files:read",
 ];
+
+pub const SLACK_OPTIONAL_OAUTH_SCOPES: &[&str] = &[SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE];
 
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 
@@ -116,6 +120,7 @@ impl StoredSlackCredential {
             self.scopes.clone()
         } else {
             validate_slack_oauth_scopes(&token.scopes)?;
+            validate_refreshed_slack_oauth_scopes(&self.scopes, &token.scopes)?;
             token.scopes
         };
         Ok(Self {
@@ -147,6 +152,7 @@ impl StoredSlackCredential {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SlackOAuthScopeError {
     MissingRequiredScope(&'static str),
+    MissingPreviouslyGrantedScope(String),
     UnsupportedScope(String),
 }
 
@@ -156,6 +162,10 @@ impl fmt::Display for SlackOAuthScopeError {
             Self::MissingRequiredScope(scope) => write!(
                 f,
                 "Slack OAuth broker response missing required Slack OAuth scope `{scope}`; reconnect with the default Slack OAuth broker configuration"
+            ),
+            Self::MissingPreviouslyGrantedScope(scope) => write!(
+                f,
+                "Slack OAuth broker refresh response missing previously granted Slack OAuth scope `{scope}`; reconnect with `loc connect slack --auto-join-public-channels` if this mount uses public channel auto-join"
             ),
             Self::UnsupportedScope(scope) => write!(
                 f,
@@ -168,7 +178,11 @@ impl fmt::Display for SlackOAuthScopeError {
 impl std::error::Error for SlackOAuthScopeError {}
 
 pub fn validate_slack_oauth_scopes(scopes: &[String]) -> Result<(), SlackOAuthScopeError> {
-    let allowed = SLACK_OAUTH_SCOPES.iter().copied().collect::<BTreeSet<_>>();
+    let allowed = SLACK_OAUTH_SCOPES
+        .iter()
+        .chain(SLACK_OPTIONAL_OAUTH_SCOPES.iter())
+        .copied()
+        .collect::<BTreeSet<_>>();
     for scope in scopes {
         if !allowed.contains(scope.as_str()) {
             return Err(SlackOAuthScopeError::UnsupportedScope(scope.clone()));
@@ -182,6 +196,24 @@ pub fn validate_slack_oauth_scopes(scopes: &[String]) -> Result<(), SlackOAuthSc
         }
     }
 
+    Ok(())
+}
+
+fn validate_refreshed_slack_oauth_scopes(
+    previous_scopes: &[String],
+    refreshed_scopes: &[String],
+) -> Result<(), SlackOAuthScopeError> {
+    let refreshed = refreshed_scopes
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for previous in previous_scopes {
+        if !refreshed.contains(previous.as_str()) {
+            return Err(SlackOAuthScopeError::MissingPreviouslyGrantedScope(
+                previous.clone(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -302,6 +334,14 @@ mod tests {
     }
 
     #[test]
+    fn accepts_optional_auto_join_scope() {
+        let mut scopes = slack_scopes();
+        scopes.push(SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE.to_string());
+
+        validate_slack_oauth_scopes(&scopes).expect("optional auto-join scope");
+    }
+
+    #[test]
     fn rejects_chat_write_scope_in_read_only_v1() {
         let mut scopes = slack_scopes();
         scopes.push("chat:write".to_string());
@@ -380,6 +420,29 @@ mod tests {
     }
 
     #[test]
+    fn refreshed_broker_credential_rejects_dropped_existing_scope() {
+        let mut original_scopes = slack_scopes();
+        original_scopes.push(SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE.to_string());
+        let credential = StoredSlackCredential::from_broker_token(
+            broker_token(original_scopes),
+            "slack-client-id".to_string(),
+            "https://auth.example.test".to_string(),
+            1780000000,
+        )
+        .expect("stored credential");
+
+        let error = credential
+            .refreshed(broker_token(slack_scopes()), 1780000300)
+            .expect_err("dropped existing scope rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains(SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE)
+        );
+    }
+
+    #[test]
     fn broker_non_success_error_does_not_echo_response_body() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test broker");
         let broker_url = format!("http://{}", listener.local_addr().expect("local addr"));
@@ -402,6 +465,7 @@ mod tests {
             .start(&OAuthBrokerStart {
                 connector: "slack".to_string(),
                 redirect_uri: DEFAULT_SLACK_OAUTH_REDIRECT_URI.to_string(),
+                scopes: Vec::new(),
             })
             .expect_err("non-success broker response");
 

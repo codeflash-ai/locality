@@ -11,7 +11,7 @@ use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 
 use crate::dto::{
-    SlackAuthTestResponse, SlackConversationsListResponse, SlackHistoryResponse,
+    SlackAuthTestResponse, SlackConversationsListResponse, SlackHistoryResponse, SlackJoinResponse,
     SlackUsersListResponse,
 };
 
@@ -45,6 +45,8 @@ pub trait SlackApi: fmt::Debug + Send + Sync {
         cursor: Option<&str>,
         limit: u32,
     ) -> LocalityResult<SlackHistoryResponse>;
+
+    fn conversations_join(&self, channel: &str) -> LocalityResult<SlackJoinResponse>;
 
     fn users_list(
         &self,
@@ -223,6 +225,15 @@ impl SlackApi for HttpSlackApiClient {
         )
     }
 
+    fn conversations_join(&self, channel: &str) -> LocalityResult<SlackJoinResponse> {
+        self.get_json(
+            Method::POST,
+            "conversations.join",
+            &[("channel", channel.to_string())],
+            SlackRateGate::Metadata,
+        )
+    }
+
     fn users_list(
         &self,
         cursor: Option<&str>,
@@ -262,6 +273,16 @@ impl SlackOk for SlackConversationsListResponse {
 }
 
 impl SlackOk for SlackHistoryResponse {
+    fn ok(&self) -> bool {
+        self.ok
+    }
+
+    fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+}
+
+impl SlackOk for SlackJoinResponse {
     fn ok(&self) -> bool {
         self.ok
     }

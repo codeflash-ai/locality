@@ -33,7 +33,8 @@ use locality_notion::oauth::{
 };
 use locality_slack::{
     DEFAULT_SLACK_OAUTH_BROKER_URL, DEFAULT_SLACK_OAUTH_REDIRECT_URI, HttpSlackOAuthBrokerClient,
-    SLACK_CONNECTOR_ID, SlackConversationType, SlackMountSettings,
+    SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE, SLACK_CONNECTOR_ID, SlackConversationType,
+    SlackMountSettings,
 };
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
@@ -338,6 +339,11 @@ struct ConnectSlackArgs {
         help = "OAuth redirect URI for the local callback listener."
     )]
     redirect_uri: Option<String>,
+    #[arg(
+        long,
+        help = "Request permission to join public channels so Slack history can be read without manual /invite."
+    )]
+    auto_join_public_channels: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -597,6 +603,11 @@ struct MountSlackArgs {
         help = "Comma-separated Slack conversation types. Defaults to public_channel,private_channel,im,mpim."
     )]
     types: Option<String>,
+    #[arg(
+        long,
+        help = "Join public channels automatically before reading history. Requires reconnecting Slack with the same flag."
+    )]
+    auto_join_public_channels: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1035,6 +1046,11 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                     args.push("slack".to_string());
                     push_optional_flag_value(&mut args, "--name", options.name.as_deref());
                     push_flag(&mut args, "--no-browser", options.no_browser);
+                    push_flag(
+                        &mut args,
+                        "--auto-join-public-channels",
+                        options.auto_join_public_channels,
+                    );
                     push_optional_flag_value(
                         &mut args,
                         "--broker-url",
@@ -1175,6 +1191,11 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                         options.history_limit.as_deref(),
                     );
                     push_optional_flag_value(&mut args, "--types", options.types.as_deref());
+                    push_flag(
+                        &mut args,
+                        "--auto-join-public-channels",
+                        options.auto_join_public_channels,
+                    );
                 }
                 MountCommand::Granola(options) => {
                     args.push("granola".to_string());
@@ -1784,6 +1805,7 @@ fn connect_google_docs(args: &[String], json: bool) -> i32 {
     let start = match broker.start(&OAuthBrokerStart {
         connector: GOOGLE_DOCS_CONNECTOR_ID.to_string(),
         redirect_uri: broker_config.redirect_uri,
+        scopes: Vec::new(),
     }) {
         Ok(start) => start,
         Err(error) => {
@@ -1859,6 +1881,7 @@ fn connect_gmail(args: &[String], json: bool) -> i32 {
     let start = match broker.start(&OAuthBrokerStart {
         connector: GMAIL_CONNECTOR_ID.to_string(),
         redirect_uri: broker_config.redirect_uri,
+        scopes: Vec::new(),
     }) {
         Ok(start) => start,
         Err(error) => {
@@ -1927,9 +1950,11 @@ fn connect_slack(args: &[String], json: bool) -> i32 {
         Err(error) => return command_error(json, error, EXIT_INTERNAL),
     };
     let broker = HttpSlackOAuthBrokerClient::new(broker_config.broker_url.clone());
+    let requested_scopes = slack_oauth_start_scopes(args);
     let start = match broker.start(&OAuthBrokerStart {
         connector: SLACK_CONNECTOR_ID.to_string(),
         redirect_uri: broker_config.redirect_uri,
+        scopes: requested_scopes.clone(),
     }) {
         Ok(start) => start,
         Err(error) => {
@@ -1966,6 +1991,7 @@ fn connect_slack(args: &[String], json: bool) -> i32 {
         state: start.state,
         code: authorization.code,
         redirect_uri: start.redirect_uri,
+        requested_scopes,
     };
     match run_connect_slack_broker_oauth(&mut store, credentials.as_ref(), options, &broker) {
         Ok(report) if json => {
@@ -2879,6 +2905,11 @@ fn mount_slack(args: &[String], json: bool) -> i32 {
         Ok(connection_id) => connection_id,
         Err(error) => return command_error(json, error, EXIT_INTERNAL),
     };
+    if has_flag(args, "--auto-join-public-channels") {
+        if let Err(error) = require_slack_auto_join_scope(&store, connection_id.as_ref()) {
+            return command_error(json, error, EXIT_USAGE);
+        }
+    }
     let explicit_mount_id = flag_value(args, "--mount-id").map(str::to_string);
     let mut mount_id = MountId::new(
         explicit_mount_id
@@ -2934,7 +2965,7 @@ fn slack_mount_missing_path_error() -> CommandError {
     CommandError::new(
         "mount",
         "usage",
-        "usage: loc mount slack <path> [--connection <id>] [--mount-id <id>] [--projection <mode>] [--history-limit 1-15] [--types public_channel,private_channel,im,mpim]",
+        "usage: loc mount slack <path> [--connection <id>] [--mount-id <id>] [--projection <mode>] [--history-limit 1-15] [--types public_channel,private_channel,im,mpim] [--auto-join-public-channels]",
     )
 }
 
@@ -2960,6 +2991,9 @@ fn slack_settings_from_mount_args(args: &[String]) -> Result<String, CommandErro
     if let Some(value) = flag_value(args, "--types") {
         settings.slack.types = slack_conversation_types_from_mount_arg(value)?;
     }
+    if has_flag(args, "--auto-join-public-channels") {
+        settings.slack.auto_join_public_channels = true;
+    }
 
     let settings_json = settings.to_json().map_err(|error| {
         CommandError::new("mount", "slack_settings_encode_failed", error.to_string())
@@ -2974,6 +3008,47 @@ fn slack_settings_from_mount_args(args: &[String]) -> Result<String, CommandErro
     settings.to_json().map_err(|error| {
         CommandError::new("mount", "slack_settings_encode_failed", error.to_string())
     })
+}
+
+fn require_slack_auto_join_scope(
+    store: &SqliteStateStore,
+    connection_id: Option<&ConnectionId>,
+) -> Result<(), CommandError> {
+    let Some(connection_id) = connection_id else {
+        return Err(CommandError::new(
+            "mount",
+            "slack_auto_join_scope_missing",
+            "Slack auto-join requires an explicit Slack connection; reconnect with `loc connect slack --auto-join-public-channels` and pass it with --connection",
+        )
+        .with_suggested_command("loc connect slack --auto-join-public-channels"));
+    };
+    let connection = store
+        .get_connection(connection_id)
+        .map_err(|error| CommandError::new("mount", "store_error", error.to_string()))?
+        .ok_or_else(|| {
+            CommandError::new(
+                "mount",
+                "missing_connection",
+                format!(
+                    "Slack connection `{}` was not found",
+                    connection_id.as_str()
+                ),
+            )
+        })?;
+    if connection
+        .scopes
+        .iter()
+        .any(|scope| scope == SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE)
+    {
+        Ok(())
+    } else {
+        Err(CommandError::new(
+            "mount",
+            "slack_auto_join_scope_missing",
+            "Slack auto-join requires OAuth scope `channels:join`; reconnect with `loc connect slack --auto-join-public-channels`",
+        )
+        .with_suggested_command("loc connect slack --auto-join-public-channels"))
+    }
 }
 
 fn slack_conversation_types_from_mount_arg(
@@ -7197,6 +7272,14 @@ fn slack_oauth_broker_config(args: &[String]) -> Result<SlackOAuthBrokerCliConfi
     })
 }
 
+fn slack_oauth_start_scopes(args: &[String]) -> Vec<String> {
+    if has_flag(args, "--auto-join-public-channels") {
+        vec![SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 fn missing_oauth_config(name: &str) -> CommandError {
     CommandError::new(
         "connect",
@@ -8077,7 +8160,7 @@ fn projection_mode_for_target(args: &[String], target_os: &str) -> Result<Projec
 
 fn mount_usage() -> String {
     format!(
-        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--read-only] [--json]\n       loc mount slack <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--history-limit 1-15] [--types public_channel,private_channel,im,mpim] [--json]\n       loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--json]",
+        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--read-only] [--json]\n       loc mount slack <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--history-limit 1-15] [--types public_channel,private_channel,im,mpim] [--auto-join-public-channels] [--json]\n       loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--json]",
         projection_usage_options_for_target(std::env::consts::OS)
     )
 }
@@ -8549,10 +8632,11 @@ mod tests {
         prompt_for_push_confirmation, pull_direct_fallback_error,
         push_confirmation_preview_matches_displayed, push_preview_plan_matches,
         should_prompt_for_push_confirmation, should_refresh_notion_url_search,
-        slack_mount_missing_path_error, slack_oauth_broker_config, spinner_config_for_command,
-        spinner_enabled, status as run_status_command, validate_virtual_projection_registration,
-        write_connect_report, write_log_report,
+        slack_mount_missing_path_error, slack_oauth_broker_config, slack_oauth_start_scopes,
+        spinner_config_for_command, spinner_enabled, status as run_status_command,
+        validate_virtual_projection_registration, write_connect_report, write_log_report,
     };
+    use locality_slack::SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE;
 
     #[test]
     fn clap_help_is_available_for_commands_and_nested_subcommands() {
@@ -8614,6 +8698,7 @@ mod tests {
                     "Connect Slack",
                     "--broker-url",
                     "--redirect-uri",
+                    "--auto-join-public-channels",
                 ],
             ),
             (
@@ -8733,6 +8818,7 @@ mod tests {
                     "--connection",
                     "--history-limit",
                     "--types",
+                    "--auto-join-public-channels",
                 ],
             ),
             (
@@ -9013,6 +9099,7 @@ mod tests {
         assert!(usage.contains("--view messages|threads"));
         assert!(usage.contains("--history-limit 1-15"));
         assert!(usage.contains("--types public_channel,private_channel,im,mpim"));
+        assert!(usage.contains("--auto-join-public-channels"));
     }
 
     #[test]
@@ -9022,11 +9109,20 @@ mod tests {
         assert_eq!(error.code, "usage");
         assert_eq!(
             error.message,
-            "usage: loc mount slack <path> [--connection <id>] [--mount-id <id>] [--projection <mode>] [--history-limit 1-15] [--types public_channel,private_channel,im,mpim]"
+            "usage: loc mount slack <path> [--connection <id>] [--mount-id <id>] [--projection <mode>] [--history-limit 1-15] [--types public_channel,private_channel,im,mpim] [--auto-join-public-channels]"
         );
         assert_eq!(
             mount_slack(&[SLACK_CONNECTOR_ID.to_string()], true),
             EXIT_USAGE
+        );
+    }
+
+    #[test]
+    fn slack_connect_auto_join_requests_channels_join_scope() {
+        assert!(slack_oauth_start_scopes(&[]).is_empty());
+        assert_eq!(
+            slack_oauth_start_scopes(&["--auto-join-public-channels".to_string()]),
+            vec![SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE.to_string()]
         );
     }
 

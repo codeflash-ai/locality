@@ -16,7 +16,9 @@ use locality_notion::oauth::{
     NotionOAuthBrokerCodeExchange, NotionOAuthCodeExchange, NotionOAuthToken,
     StoredNotionCredential,
 };
-use locality_slack::{SLACK_OAUTH_SCOPES, StoredSlackCredential};
+use locality_slack::{
+    SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE, SLACK_OAUTH_SCOPES, StoredSlackCredential,
+};
 use locality_store::{
     ConnectionId, ConnectionRepository, ConnectorProfileId, ConnectorProfileRepository,
     CredentialError, CredentialStore, InMemoryCredentialStore, InMemoryStateStore,
@@ -299,6 +301,7 @@ fn connect_slack_broker_oauth_stores_refresh_handle_without_secrets() {
             state: "state-1".to_string(),
             code: "oauth-code".to_string(),
             redirect_uri: "http://localhost:8757/oauth/slack/callback".to_string(),
+            requested_scopes: Vec::new(),
         },
         &exchange,
     )
@@ -328,6 +331,48 @@ fn connect_slack_broker_oauth_stores_refresh_handle_without_secrets() {
     assert!(!json.contains("xoxb-access-token"));
     assert!(!json.contains("opaque-refresh-handle"));
     assert!(!json.contains("secret_ref"));
+}
+
+#[test]
+fn connect_slack_broker_oauth_rejects_missing_requested_scope() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let exchange = ScopedFakeSlackBrokerOAuthExchange {
+        scopes: SLACK_OAUTH_SCOPES
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect(),
+    };
+
+    let error = run_connect_slack_broker_oauth(
+        &mut store,
+        &credentials,
+        SlackBrokerOAuthConnectOptions {
+            connection_id: Some(ConnectionId::new("slack-default")),
+            broker_url: "https://auth.example.test".to_string(),
+            client_id: "slack-client-id".to_string(),
+            session: "broker-session".to_string(),
+            state: "state-1".to_string(),
+            code: "oauth-code".to_string(),
+            redirect_uri: "http://localhost:8757/oauth/slack/callback".to_string(),
+            requested_scopes: vec![SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE.to_string()],
+        },
+        &exchange,
+    )
+    .expect_err("missing requested scope");
+
+    assert_eq!(error.code(), "oauth_exchange_failed");
+    assert!(
+        error
+            .message()
+            .contains(SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE),
+        "{}",
+        error.message()
+    );
+    assert!(matches!(
+        credentials.get("connection:slack-default"),
+        Err(CredentialError::NotFound(_))
+    ));
 }
 
 #[test]
@@ -967,6 +1012,38 @@ impl SlackOAuthBrokerExchange for FakeSlackBrokerOAuthExchange {
                 .iter()
                 .map(|scope| scope.to_string())
                 .collect(),
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ScopedFakeSlackBrokerOAuthExchange {
+    scopes: Vec<String>,
+}
+
+impl SlackOAuthBrokerExchange for ScopedFakeSlackBrokerOAuthExchange {
+    fn exchange_code(
+        &self,
+        request: &OAuthBrokerCodeExchange,
+    ) -> Result<OAuthBrokerToken, loc_cli::connect::ConnectError> {
+        assert_eq!(request.connector, "slack");
+        assert_eq!(request.session, "broker-session");
+        assert_eq!(request.state, "state-1");
+        assert_eq!(request.code, "oauth-code");
+        assert_eq!(
+            request.redirect_uri,
+            "http://localhost:8757/oauth/slack/callback"
+        );
+        Ok(OAuthBrokerToken {
+            access_token: "xoxb-access-token".to_string(),
+            token_type: Some("bot".to_string()),
+            expires_in: None,
+            refresh_token_handle: Some("opaque-refresh-handle".to_string()),
+            account_id: Some("T123".to_string()),
+            account_label: Some("Locality Slack".to_string()),
+            workspace_id: Some("T123".to_string()),
+            workspace_name: Some("Locality Slack".to_string()),
+            scopes: self.scopes.clone(),
         })
     }
 }

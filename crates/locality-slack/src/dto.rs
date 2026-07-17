@@ -108,6 +108,15 @@ pub struct SlackHistoryResponse {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlackJoinResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub channel: Option<SlackConversation>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlackUserProfile {
     #[serde(default)]
     pub real_name: Option<String>,

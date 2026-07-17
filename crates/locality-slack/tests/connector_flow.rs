@@ -13,8 +13,8 @@ use locality_core::undo::{UndoPlan, UndoPlanStatus};
 use locality_core::{LocalityError, LocalityResult};
 use locality_slack::{
     SLACK_CONNECTOR_ID, SlackApi, SlackAuthTestResponse, SlackConfig, SlackConnector,
-    SlackConversation, SlackConversationsListResponse, SlackHistoryResponse, SlackMessage,
-    SlackResponseMetadata, SlackUser, SlackUserProfile, SlackUsersListResponse,
+    SlackConversation, SlackConversationsListResponse, SlackHistoryResponse, SlackJoinResponse,
+    SlackMessage, SlackResponseMetadata, SlackUser, SlackUserProfile, SlackUsersListResponse,
 };
 
 #[test]
@@ -395,6 +395,19 @@ impl SlackApi for FakeSlackApi {
                 .cloned()
                 .unwrap_or_default(),
             ..SlackHistoryResponse::default()
+        })
+    }
+
+    fn conversations_join(&self, channel: &str) -> LocalityResult<SlackJoinResponse> {
+        let channel = self
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == channel)
+            .cloned();
+        Ok(SlackJoinResponse {
+            ok: true,
+            channel,
+            ..SlackJoinResponse::default()
         })
     }
 

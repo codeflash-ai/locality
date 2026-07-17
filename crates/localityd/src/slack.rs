@@ -407,7 +407,7 @@ mod tests {
     use locality_core::model::{HydrationState, MountId, RemoteId};
     use locality_slack::{
         SlackApi, SlackAuthTestResponse, SlackConversationsListResponse, SlackHistoryResponse,
-        SlackUser, SlackUserProfile, SlackUsersListResponse, users_remote_id,
+        SlackJoinResponse, SlackUser, SlackUserProfile, SlackUsersListResponse, users_remote_id,
     };
 
     use super::*;
@@ -472,6 +472,10 @@ mod tests {
             _limit: u32,
         ) -> LocalityResult<SlackHistoryResponse> {
             Ok(SlackHistoryResponse::default())
+        }
+
+        fn conversations_join(&self, _channel: &str) -> LocalityResult<SlackJoinResponse> {
+            Ok(SlackJoinResponse::default())
         }
 
         fn users_list(

@@ -125,7 +125,11 @@ impl SlackConnector {
             let page =
                 self.api
                     .conversations_list(types, cursor.as_deref(), CONVERSATIONS_PAGE_SIZE)?;
-            conversations.extend(page.channels.into_iter().filter(projectable_conversation));
+            for conversation in page.channels {
+                if let Some(conversation) = self.projectable_conversation(conversation)? {
+                    conversations.push(conversation);
+                }
+            }
 
             let next_cursor = non_empty_cursor(page.response_metadata.next_cursor);
             let Some(next_cursor) = next_cursor else {
@@ -177,6 +181,35 @@ impl SlackConnector {
         } else {
             Ok(BTreeMap::new())
         }
+    }
+
+    fn projectable_conversation(
+        &self,
+        conversation: SlackConversation,
+    ) -> LocalityResult<Option<SlackConversation>> {
+        if conversation.is_archived {
+            return Ok(None);
+        }
+        if conversation_history_is_readable(&conversation) {
+            return Ok(Some(conversation));
+        }
+        if self.config.settings.slack.auto_join_public_channels
+            && public_channel_auto_join_is_allowed(&conversation)
+        {
+            return Ok(Some(self.join_public_channel(conversation)?));
+        }
+        Ok(None)
+    }
+
+    fn join_public_channel(
+        &self,
+        conversation: SlackConversation,
+    ) -> LocalityResult<SlackConversation> {
+        let channel = self.api.conversations_join(&conversation.id)?;
+        Ok(channel.channel.unwrap_or(SlackConversation {
+            is_member: Some(true),
+            ..conversation
+        }))
     }
 }
 
@@ -531,12 +564,16 @@ fn conversation_type(conversation: &SlackConversation) -> SlackConversationType 
     }
 }
 
-fn projectable_conversation(conversation: &SlackConversation) -> bool {
-    !conversation.is_archived && conversation_history_is_readable(conversation)
-}
-
 fn conversation_history_is_readable(conversation: &SlackConversation) -> bool {
     !(conversation.is_channel && conversation.is_member == Some(false))
+}
+
+fn public_channel_auto_join_is_allowed(conversation: &SlackConversation) -> bool {
+    conversation.is_channel
+        && !conversation.is_private
+        && !conversation.is_group
+        && !conversation.is_im
+        && !conversation.is_mpim
 }
 
 fn conversation_title(
@@ -629,7 +666,7 @@ mod tests {
     use crate::client::SlackApi;
     use crate::dto::{
         SlackAuthTestResponse, SlackConversation, SlackConversationsListResponse,
-        SlackHistoryResponse, SlackMessage, SlackResponseMetadata, SlackUser,
+        SlackHistoryResponse, SlackJoinResponse, SlackMessage, SlackResponseMetadata, SlackUser,
         SlackUsersListResponse,
     };
     use crate::render::SlackNativeBundle;
@@ -759,6 +796,83 @@ mod tests {
             .map(|entry| entry.path.clone())
             .collect::<Vec<_>>();
         assert_eq!(paths, vec![PathBuf::from("channels/joined-C_joined")]);
+    }
+
+    #[test]
+    fn auto_join_public_channels_joins_before_projecting_unjoined_public_channels() {
+        let api = FakeSlackApi::default().with_conversations(vec![SlackConversation {
+            id: "C_unjoined".to_string(),
+            name: Some("unjoined".to_string()),
+            is_channel: true,
+            is_member: Some(false),
+            ..SlackConversation::default()
+        }]);
+        let settings = SlackMountSettings::from_json(
+            r#"{"slack":{"types":["public_channel"],"auto_join_public_channels":true}}"#,
+        )
+        .expect("settings");
+        let connector = SlackConnector::with_api(
+            SlackConfig::new("xoxb-token").with_settings(settings),
+            Arc::new(api.clone()),
+        );
+
+        let result = connector
+            .list_children(ListChildrenRequest {
+                mount_id: MountId::new("slack-main"),
+                container: ChildContainer::DirectoryChildren(RemoteId::new(
+                    "slack-folder:channels",
+                )),
+                parent_path: PathBuf::from("channels"),
+            })
+            .expect("list channels");
+
+        assert_eq!(
+            *api.joined_channels.lock().expect("joined channels"),
+            vec!["C_unjoined".to_string()]
+        );
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(
+            result.entries[0].path,
+            PathBuf::from("channels/unjoined-C_unjoined")
+        );
+    }
+
+    #[test]
+    fn auto_join_public_channels_skips_unjoined_private_channels() {
+        let api = FakeSlackApi::default().with_conversations(vec![SlackConversation {
+            id: "G_private".to_string(),
+            name: Some("private".to_string()),
+            is_channel: true,
+            is_private: true,
+            is_member: Some(false),
+            ..SlackConversation::default()
+        }]);
+        let settings = SlackMountSettings::from_json(
+            r#"{"slack":{"types":["private_channel"],"auto_join_public_channels":true}}"#,
+        )
+        .expect("settings");
+        let connector = SlackConnector::with_api(
+            SlackConfig::new("xoxb-token").with_settings(settings),
+            Arc::new(api.clone()),
+        );
+
+        let result = connector
+            .list_children(ListChildrenRequest {
+                mount_id: MountId::new("slack-main"),
+                container: ChildContainer::DirectoryChildren(RemoteId::new(
+                    "slack-folder:private-channels",
+                )),
+                parent_path: PathBuf::from("private-channels"),
+            })
+            .expect("list private channels");
+
+        assert!(
+            api.joined_channels
+                .lock()
+                .expect("joined channels")
+                .is_empty()
+        );
+        assert!(result.entries.is_empty());
     }
 
     #[test]
@@ -1225,6 +1339,7 @@ mod tests {
         messages: Arc<Mutex<Vec<SlackMessage>>>,
         history_limit: Arc<Mutex<Option<u32>>>,
         conversation_types: Arc<Mutex<Vec<String>>>,
+        joined_channels: Arc<Mutex<Vec<String>>>,
         users_calls: Arc<Mutex<usize>>,
     }
 
@@ -1284,6 +1399,29 @@ mod tests {
                 ok: true,
                 messages: self.messages.lock().expect("messages").clone(),
                 ..SlackHistoryResponse::default()
+            })
+        }
+
+        fn conversations_join(&self, channel: &str) -> LocalityResult<SlackJoinResponse> {
+            self.joined_channels
+                .lock()
+                .expect("joined channels")
+                .push(channel.to_string());
+            let joined = self
+                .conversations
+                .lock()
+                .expect("conversations")
+                .iter()
+                .find(|conversation| conversation.id == channel)
+                .cloned()
+                .map(|mut conversation| {
+                    conversation.is_member = Some(true);
+                    conversation
+                });
+            Ok(SlackJoinResponse {
+                ok: true,
+                channel: joined,
+                ..SlackJoinResponse::default()
             })
         }
 

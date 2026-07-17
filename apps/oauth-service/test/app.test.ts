@@ -597,6 +597,76 @@ describe("auth broker", () => {
     expect(body.state).toBeTruthy();
   });
 
+  it("adds channels:join to Slack OAuth when requested for public auto-join", async () => {
+    const response = await app.request(
+      "/v1/oauth/slack/start",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ scopes: ["channels:join"] })
+      },
+      env
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as StartResponse;
+    const authorizationUrl = new URL(body.authorization_url);
+    const scopes = authorizationUrl.searchParams.get("scope")?.split(",") ?? [];
+    expect(scopes).toContain("channels:history");
+    expect(scopes).toContain("channels:join");
+    expect(scopes).not.toContain("chat:write");
+  });
+
+  it("rejects malformed Slack OAuth scope requests", async () => {
+    const response = await app.request(
+      "/v1/oauth/slack/start",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ scopes: {} })
+      },
+      env
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "invalid_scope_request" }
+    });
+  });
+
+  it("rejects null Slack OAuth scope requests", async () => {
+    const response = await app.request(
+      "/v1/oauth/slack/start",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ scopes: null })
+      },
+      env
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "invalid_scope_request" }
+    });
+  });
+
+  it("rejects unsupported Slack OAuth scope requests", async () => {
+    const response = await app.request(
+      "/v1/oauth/slack/start",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ scopes: ["chat:write"] })
+      },
+      env
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "unsupported_scope" }
+    });
+  });
+
   it("exchanges a Slack authorization code without exposing the raw refresh token in handle mode", async () => {
     const start = await startSlackSession();
     const slackScope =

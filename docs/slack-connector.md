@@ -11,6 +11,18 @@ loc connect slack
 loc mount slack ~/Locality/slack-main
 ```
 
+To let Locality join public channels before reading history, opt in at both
+authorization and mount time:
+
+```bash
+loc connect slack --auto-join-public-channels
+loc mount slack ~/Locality/slack-main --auto-join-public-channels
+```
+
+This requests Slack's `channels:join` scope and mutates Slack membership by
+joining the connected app to public channels. Private channels still require an
+explicit Slack invite.
+
 The default Slack connector settings are:
 
 ```json
@@ -45,6 +57,8 @@ slack-main/
 - `channels/` contains public channels whose history is readable by the
   connected app. If a public channel is missing or `conversations.history`
   returns `not_in_channel`, invite the Slack app to that channel and pull again.
+  Mounts created with `--auto-join-public-channels` attempt to join public
+  channels automatically instead.
 - `private-channels/` contains private channels visible to the connected bot.
 - `dms/` contains direct message conversations visible to the connected bot.
 - `group-dms/` contains multi-person direct message conversations visible to

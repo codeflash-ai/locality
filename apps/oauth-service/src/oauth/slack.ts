@@ -1,4 +1,4 @@
-import { configError, upstreamError } from "../http/errors";
+import { badRequest, configError, upstreamError } from "../http/errors";
 import type { BrokerEnv } from "../types";
 
 export const SLACK_OAUTH_SCOPES = [
@@ -14,6 +14,8 @@ export const SLACK_OAUTH_SCOPES = [
   "team:read",
   "files:read"
 ];
+
+export const SLACK_OPTIONAL_OAUTH_SCOPES = ["channels:join"];
 
 export interface SlackTokenResponse {
   ok: boolean;
@@ -34,13 +36,30 @@ export interface SlackTokenResponse {
   };
 }
 
-export function slackAuthorizeUrl(env: BrokerEnv, redirectUri: string, state: string): string {
+export function slackAuthorizeUrl(env: BrokerEnv, redirectUri: string, state: string, requestedScopes: unknown = []): string {
   const url = new URL(`${slackAuthBaseUrl(env)}/oauth/v2/authorize`);
   url.searchParams.set("client_id", slackClientId(env));
-  url.searchParams.set("scope", SLACK_OAUTH_SCOPES.join(","));
+  url.searchParams.set("scope", slackOAuthScopes(requestedScopes).join(","));
   url.searchParams.set("redirect_uri", redirectUri);
   url.searchParams.set("state", state);
   return url.toString();
+}
+
+function slackOAuthScopes(requestedScopes: unknown): string[] {
+  if (!Array.isArray(requestedScopes)) {
+    throw badRequest("invalid_scope_request", "Slack OAuth scopes must be an array of strings");
+  }
+  const scopes = new Set(SLACK_OAUTH_SCOPES);
+  for (const scope of requestedScopes) {
+    if (typeof scope !== "string" || scope.trim() === "") {
+      throw badRequest("invalid_scope_request", "Slack OAuth scopes must be an array of strings");
+    }
+    if (!SLACK_OPTIONAL_OAUTH_SCOPES.includes(scope)) {
+      throw badRequest("unsupported_scope", `Slack OAuth scope ${scope} is not supported by this broker`);
+    }
+    scopes.add(scope);
+  }
+  return [...scopes];
 }
 
 export async function exchangeSlackCode(

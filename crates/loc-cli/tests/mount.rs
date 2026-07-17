@@ -11,7 +11,10 @@ use locality_connector::ConnectorCapabilities;
 use locality_core::model::{MountId, RemoteId};
 use locality_gmail::{GMAIL_OAUTH_SCOPES, gmail_capabilities_json};
 use locality_platform::{capabilities::projection_cli_value, mount_cli_capabilities};
-use locality_slack::{SLACK_CONNECTOR_ID, SLACK_OAUTH_SCOPES, slack_capabilities_json};
+use locality_slack::{
+    SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE, SLACK_CONNECTOR_ID, SLACK_OAUTH_SCOPES,
+    slack_capabilities_json,
+};
 use locality_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorProfileRepository, CredentialStore, FileCredentialStore,
@@ -589,6 +592,81 @@ fn cli_mount_slack_persists_requested_read_only_registration() {
     assert_eq!(mount.projection, ProjectionMode::PlainFiles);
     assert!(mount.read_only);
     assert_eq!(mount.settings_json, settings_json);
+}
+
+#[test]
+fn cli_mount_slack_rejects_auto_join_without_channels_join_scope() {
+    let fixture = MountFixture::new("loc-cli-slack-auto-join-missing-scope");
+    fs::create_dir_all(&fixture.root).expect("create fixture root");
+    let state_root = fixture.root.join("state");
+    seed_cli_slack_connection(&state_root, "slack-work");
+
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let mount_root = fixture.root.join("slack");
+    let mount_root_arg = mount_root.display().to_string();
+    let body = loc_json_with_exit(
+        loc_command(loc, &state_root).args([
+            "mount",
+            "slack",
+            mount_root_arg.as_str(),
+            "--connection",
+            "slack-work",
+            "--projection",
+            "plain-files",
+            "--auto-join-public-channels",
+            "--json",
+        ]),
+        2,
+    );
+
+    assert_eq!(body["code"], "slack_auto_join_scope_missing", "{body:#?}");
+    assert!(
+        body["message"]
+            .as_str()
+            .expect("message")
+            .contains("channels:join"),
+        "{body:#?}"
+    );
+}
+
+#[test]
+fn cli_mount_slack_persists_auto_join_public_channels_setting() {
+    let fixture = MountFixture::new("loc-cli-slack-auto-join-setting");
+    fs::create_dir_all(&fixture.root).expect("create fixture root");
+    let state_root = fixture.root.join("state");
+    seed_cli_slack_connection_with_scopes(&state_root, "slack-work", slack_scopes_with_auto_join());
+
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let mount_root = fixture.root.join("slack");
+    let mount_root_arg = mount_root.display().to_string();
+    let report = loc_json_ok(loc_command(loc, &state_root).args([
+        "mount",
+        "slack",
+        mount_root_arg.as_str(),
+        "--connection",
+        "slack-work",
+        "--mount-id",
+        "slack-main",
+        "--projection",
+        "plain-files",
+        "--auto-join-public-channels",
+        "--json",
+    ]));
+
+    assert_eq!(
+        report["settings_json"],
+        r#"{"slack":{"history_limit":15,"types":["public_channel","private_channel","im","mpim"],"auto_join_public_channels":true}}"#
+    );
+
+    let store = SqliteStateStore::open(state_root).expect("open state");
+    let mount = store
+        .get_mount(&MountId::new("slack-main"))
+        .expect("get mount")
+        .expect("mount");
+    assert_eq!(
+        mount.settings_json,
+        r#"{"slack":{"history_limit":15,"types":["public_channel","private_channel","im","mpim"],"auto_join_public_channels":true}}"#
+    );
 }
 
 #[test]
@@ -1306,6 +1384,21 @@ fn seed_cli_gmail_connection(state_root: &Path, connection_id: &str) {
 }
 
 fn seed_cli_slack_connection(state_root: &Path, connection_id: &str) {
+    seed_cli_slack_connection_with_scopes(
+        state_root,
+        connection_id,
+        SLACK_OAUTH_SCOPES
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect(),
+    );
+}
+
+fn seed_cli_slack_connection_with_scopes(
+    state_root: &Path,
+    connection_id: &str,
+    scopes: Vec<String>,
+) {
     fs::create_dir_all(state_root).expect("create state root");
     let profile_id = ConnectorProfileId::new("slack-oauth-default");
     let secret_ref = format!("connection:{connection_id}");
@@ -1326,10 +1419,7 @@ fn seed_cli_slack_connection(state_root: &Path, connection_id: &str) {
             connector: SLACK_CONNECTOR_ID.to_string(),
             display_name: "Slack OAuth".to_string(),
             auth_kind: "oauth".to_string(),
-            scopes: SLACK_OAUTH_SCOPES
-                .iter()
-                .map(|scope| scope.to_string())
-                .collect(),
+            scopes: scopes.clone(),
             capabilities_json: capabilities_json.clone(),
             enabled_actions_json: "[\"read\"]".to_string(),
             connector_version: "slack.v1".to_string(),
@@ -1349,10 +1439,7 @@ fn seed_cli_slack_connection(state_root: &Path, connection_id: &str) {
             workspace_name: Some("Slack".to_string()),
             auth_kind: "oauth".to_string(),
             secret_ref,
-            scopes: SLACK_OAUTH_SCOPES
-                .iter()
-                .map(|scope| scope.to_string())
-                .collect(),
+            scopes,
             capabilities_json,
             status: "active".to_string(),
             created_at: now.clone(),
@@ -1360,6 +1447,15 @@ fn seed_cli_slack_connection(state_root: &Path, connection_id: &str) {
             expires_at: None,
         })
         .expect("seed Slack connection");
+}
+
+fn slack_scopes_with_auto_join() -> Vec<String> {
+    let mut scopes = SLACK_OAUTH_SCOPES
+        .iter()
+        .map(|scope| scope.to_string())
+        .collect::<Vec<_>>();
+    scopes.push(SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE.to_string());
+    scopes
 }
 
 fn loc_command(loc: &str, state_root: &Path) -> Command {
