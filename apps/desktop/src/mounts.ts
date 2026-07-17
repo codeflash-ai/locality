@@ -23,7 +23,20 @@ export type MountSummary = {
   rootExists: boolean;
   entityCount: number;
   pendingChangeCount: number;
+  preHydration: MountPreHydrationSummary;
   provider?: ProviderRuntimeSummary | null;
+};
+
+export type MountPreHydrationSummary = {
+  supported: boolean;
+  enabled: boolean;
+  status: string;
+  label: string;
+  discoveredPages: number;
+  queuedPages: number;
+  completedPages: number;
+  remainingPages: number;
+  lastError?: string | null;
 };
 
 export type MountRow = {
@@ -150,6 +163,19 @@ export function mountStatusTone(mount: MountSummary): "ready" | "warn" | "danger
 
 export function mountEntityCountLabel(mount: MountSummary): string {
   return `${mount.entityCount} ${mount.entityCount === 1 ? "item" : "items"}`;
+}
+
+export function mountPreHydrationLabel(mount: MountSummary): string {
+  return mount.preHydration.label;
+}
+
+export function mountPreHydrationProgressValue(mount: MountSummary): number | null {
+  const preHydration = mount.preHydration;
+  if (!preHydration.supported || preHydration.queuedPages <= 0) {
+    return null;
+  }
+  const value = Math.round((preHydration.completedPages / preHydration.queuedPages) * 100);
+  return Math.max(0, Math.min(100, value));
 }
 
 export function compactPath(path: string, maxLength = 64): string {

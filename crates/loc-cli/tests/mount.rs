@@ -6,7 +6,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use loc_cli::mount::{GuidanceFileAction, MountOptions, run_mount};
+use loc_cli::mount::{GuidanceFileAction, MountOptions, request_mount_pre_hydration, run_mount};
 use locality_connector::ConnectorCapabilities;
 use locality_core::model::{MountId, RemoteId};
 use locality_gmail::{GMAIL_OAUTH_SCOPES, gmail_capabilities_json};
@@ -14,7 +14,8 @@ use locality_platform::{capabilities::projection_cli_value, mount_cli_capabiliti
 use locality_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorProfileRepository, CredentialStore, FileCredentialStore,
-    InMemoryStateStore, MountRepository, ProjectionMode, SqliteStateStore,
+    InMemoryStateStore, MountPreHydrationStatus, MountRepository, ProjectionMode, SqliteStateStore,
+    load_mount_pre_hydration_state,
 };
 use serde_json::Value;
 
@@ -68,6 +69,80 @@ fn mount_writes_agent_guidance_and_claude_alias() {
     let mounts = store.load_mounts().expect("load mounts");
     assert_eq!(mounts.len(), 1);
     assert_eq!(mounts[0].root, fixture.root);
+}
+
+#[test]
+fn pre_hydration_request_persists_requested_state_for_supported_mount() {
+    let fixture = MountFixture::new("loc-cli-mount-pre-hydrate");
+    let mut store = InMemoryStateStore::new();
+    fixture.mount(&mut store);
+
+    let state = request_mount_pre_hydration(
+        &mut store,
+        &MountId::new("notion-main"),
+        "2026-07-16T10:00:00Z",
+    )
+    .expect("request pre-hydration");
+
+    assert_eq!(state.status, MountPreHydrationStatus::Requested);
+    assert_eq!(state.requested_at, "2026-07-16T10:00:00Z");
+    let loaded = load_mount_pre_hydration_state(&store, "notion", &MountId::new("notion-main"))
+        .expect("load pre-hydration state")
+        .expect("state exists");
+    assert_eq!(loaded, state);
+}
+
+#[test]
+fn pre_hydration_request_rejects_unsupported_connectors() {
+    let fixture = MountFixture::new("loc-cli-mount-pre-hydrate-unsupported");
+    let mut store = InMemoryStateStore::new();
+    fixture.mount_with_connector(&mut store, "gmail");
+
+    let error = request_mount_pre_hydration(
+        &mut store,
+        &MountId::new("notion-main"),
+        "2026-07-16T10:00:00Z",
+    )
+    .expect_err("gmail does not support pre-hydration");
+
+    assert_eq!(error.code(), "pre_hydration_unsupported");
+    assert!(
+        error
+            .message()
+            .contains("uses connector `gmail` which does not support pre-hydration")
+    );
+}
+
+#[test]
+fn cli_mount_pre_hydrate_flag_persists_requested_state() {
+    let fixture = MountFixture::new("loc-cli-mount-pre-hydrate-flag");
+    fs::create_dir_all(&fixture.root).expect("create fixture root");
+    let state_root = fixture.root.join("state");
+    seed_cli_notion_connection(&state_root, "notion-work", "CodeFlash");
+
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let mount_root = fixture.root.join("notion");
+    let mount_root_arg = mount_root.display().to_string();
+
+    let report = loc_json_ok(loc_command(loc, &state_root).args([
+        "mount",
+        "notion",
+        mount_root_arg.as_str(),
+        "--connection",
+        "notion-work",
+        "--workspace",
+        "--projection",
+        "plain-files",
+        "--pre-hydrate",
+        "--json",
+    ]));
+
+    assert_eq!(report["mount_id"], "notion-main", "{report:#?}");
+    let store = SqliteStateStore::open(state_root).expect("open state");
+    let state = load_mount_pre_hydration_state(&store, "notion", &MountId::new("notion-main"))
+        .expect("load pre-hydration state")
+        .expect("state exists");
+    assert_eq!(state.status, MountPreHydrationStatus::Requested);
 }
 
 #[test]

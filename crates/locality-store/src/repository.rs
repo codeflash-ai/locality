@@ -170,6 +170,16 @@ pub trait HydrationJobRepository {
         Ok(())
     }
     fn list_hydration_jobs(&self) -> StoreResult<Vec<HydrationJobRecord>>;
+    fn count_prefetch_hydration_jobs(&self, mount_id: &MountId) -> StoreResult<u64> {
+        Ok(self
+            .list_hydration_jobs()?
+            .into_iter()
+            .filter(|job| job.mount_id == *mount_id)
+            .filter(|job| job.reason == locality_core::hydration::HydrationReason::Prefetch)
+            .count()
+            .try_into()
+            .unwrap_or(u64::MAX))
+    }
     fn delete_hydration_job(&mut self, mount_id: &MountId, remote_id: &RemoteId)
     -> StoreResult<()>;
     fn record_hydration_job_failure(

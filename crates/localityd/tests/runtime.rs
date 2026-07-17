@@ -15,9 +15,10 @@ use locality_core::{LocalityError, LocalityResult};
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, EntityRecord, EntityRepository,
     FreshnessStateRecord, FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository,
-    InMemoryStateStore, MountConfig, MountLiveModeRecord, MountLiveModeRepository, MountRepository,
-    ProjectionMode, ShadowRepository, SqliteStateStore, enable_mount_pre_hydration,
-    live_mode_state_change_signal_path,
+    InMemoryStateStore, MountConfig, MountLiveModeRecord, MountLiveModeRepository,
+    MountPreHydrationStatus, MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
+    enable_mount_pre_hydration, live_mode_state_change_signal_path, load_mount_pre_hydration_state,
+    mark_mount_pre_hydration_hydrating,
 };
 use localityd::DaemonConfig;
 use localityd::execution::{DaemonEventReport, PushJob};
@@ -2426,10 +2427,23 @@ fn runtime_drains_persisted_hydration_on_startup() {
 
 #[test]
 fn runtime_start_pre_hydration_returns_before_worker_finishes() {
+    let config = relay_config("pre-hydration-nonblocking");
+    let mount_root = temp_root("pre-hydration-nonblocking-mount");
+    let mount_id = MountId::new("notion-main");
+    let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
+    store
+        .save_mount(MountConfig::new(
+            mount_id.clone(),
+            "notion",
+            mount_root.clone(),
+        ))
+        .expect("save mount");
+    drop(store);
+
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let runtime = DaemonRuntime::spawn_with_runner(
-        relay_config("pre-hydration-nonblocking"),
+        config,
         BlockingPreHydrationRunner {
             started: started_tx,
             release: Mutex::new(release_rx),
@@ -2438,7 +2452,7 @@ fn runtime_start_pre_hydration_returns_before_worker_finishes() {
     .expect("spawn runtime");
 
     let response = runtime.handle().request(DaemonRequest::StartPreHydration {
-        mount_id: "notion-main".to_string(),
+        mount_id: mount_id.0.clone(),
     });
 
     assert!(response.ok, "{response:?}");
@@ -2448,9 +2462,55 @@ fn runtime_start_pre_hydration_returns_before_worker_finishes() {
         started_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("worker started"),
-        MountId::new("notion-main")
+        mount_id
     );
     release_tx.send(()).expect("release worker");
+    runtime.shutdown();
+}
+
+#[test]
+fn runtime_start_pre_hydration_rejects_missing_mount() {
+    let runtime =
+        DaemonRuntime::spawn_with_runner(relay_config("pre-hydration-missing-mount"), NoopRunner)
+            .expect("spawn runtime");
+
+    let response = runtime.handle().request(DaemonRequest::StartPreHydration {
+        mount_id: "missing".to_string(),
+    });
+
+    assert!(!response.ok, "{response:?}");
+    let error = response.error.expect("error");
+    assert_eq!(error.code, "invalid_state");
+    assert!(error.message.contains("mount `missing` does not exist"));
+    runtime.shutdown();
+}
+
+#[test]
+fn runtime_start_pre_hydration_rejects_unsupported_connector() {
+    let config = relay_config("pre-hydration-unsupported");
+    let mount_id = MountId::new("gmail-main");
+    let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
+    store
+        .save_mount(MountConfig::new(
+            mount_id.clone(),
+            "gmail",
+            temp_root("pre-hydration-unsupported-mount"),
+        ))
+        .expect("save mount");
+    drop(store);
+    let runtime = DaemonRuntime::spawn_with_runner(config, NoopRunner).expect("spawn runtime");
+
+    let response = runtime.handle().request(DaemonRequest::StartPreHydration {
+        mount_id: mount_id.0.clone(),
+    });
+
+    assert!(!response.ok, "{response:?}");
+    let error = response.error.expect("error");
+    assert_eq!(error.code, "unsupported");
+    assert_eq!(
+        error.message,
+        "unsupported feature: connector does not support pre-hydration"
+    );
     runtime.shutdown();
 }
 
@@ -2760,6 +2820,89 @@ fn runtime_pre_hydration_batch_does_not_demote_durable_file_open_job() {
     runtime.shutdown();
 }
 
+#[test]
+fn runtime_marks_pre_hydration_complete_when_prefetch_jobs_drain() {
+    let config = relay_config("pre-hydration-complete");
+    let mount_root = temp_root("pre-hydration-complete-mount");
+    let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
+    let mount_id = MountId::new("notion-main");
+    store
+        .save_mount(MountConfig::new(
+            mount_id.clone(),
+            "notion",
+            mount_root.clone(),
+        ))
+        .expect("save mount");
+    drop(store);
+
+    let (hydrated_tx, hydrated_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(
+        config.clone(),
+        CompletingPreHydrationRunner {
+            mount_root: mount_root.clone(),
+            hydrated: hydrated_tx,
+        },
+    )
+    .expect("spawn runtime");
+
+    let response = runtime.handle().request(DaemonRequest::StartPreHydration {
+        mount_id: mount_id.0.clone(),
+    });
+    assert!(response.ok, "{response:?}");
+    let hydrated = hydrated_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("hydration started");
+    assert_eq!(hydrated.reason, HydrationReason::Prefetch);
+
+    let state = wait_for_pre_hydration_status(
+        &config.state_root,
+        &mount_id,
+        MountPreHydrationStatus::Complete,
+    );
+    assert_eq!(state.queued_pages, 1);
+    assert_eq!(state.completed_pages, 1);
+    runtime.shutdown();
+}
+
+#[test]
+fn runtime_records_pre_hydration_error_when_source_resolution_fails() {
+    let config = relay_config("pre-hydration-source-error");
+    let mount_root = temp_root("pre-hydration-source-error-mount");
+    let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
+    let mount_id = MountId::new("notion-main");
+    store
+        .save_mount(MountConfig::new(
+            mount_id.clone(),
+            "notion",
+            mount_root.clone(),
+        ))
+        .expect("save mount");
+    enable_mount_pre_hydration(&mut store, "notion", &mount_id, "2026-07-16T10:00:00Z")
+        .expect("enable pre-hydration");
+    drop(store);
+
+    let runtime = DaemonRuntime::spawn(config.clone()).expect("spawn runtime");
+    let response = runtime.handle().request(DaemonRequest::StartPreHydration {
+        mount_id: mount_id.0.clone(),
+    });
+    assert!(response.ok, "{response:?}");
+
+    let state = wait_for_pre_hydration_status(
+        &config.state_root,
+        &mount_id,
+        MountPreHydrationStatus::Error,
+    );
+    assert!(
+        state
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .contains("notion")
+    );
+    runtime.shutdown();
+}
+
 fn assert_hydration_jobs_drained(state_root: PathBuf) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -2776,6 +2919,28 @@ fn assert_hydration_jobs_drained(state_root: PathBuf) {
             "hydration jobs did not drain"
         );
         thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_pre_hydration_status(
+    state_root: &Path,
+    mount_id: &MountId,
+    status: MountPreHydrationStatus,
+) -> locality_store::MountPreHydrationState {
+    let deadline = Instant::now() + ASYNC_EVENT_TIMEOUT;
+    loop {
+        let store = SqliteStateStore::open(state_root.to_path_buf()).expect("open store");
+        if let Some(state) = load_mount_pre_hydration_state(&store, "notion", mount_id)
+            .expect("load pre-hydration state")
+            && state.status == status
+        {
+            return state;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pre-hydration state did not reach {status:?}"
+        );
+        thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -3317,6 +3482,44 @@ struct PreHydrationDemotionRunner {
     release: Mutex<mpsc::Receiver<()>>,
 }
 
+struct CompletingPreHydrationRunner {
+    mount_root: PathBuf,
+    hydrated: mpsc::Sender<HydrationRequest>,
+}
+
+struct NoopRunner;
+
+impl RuntimeJobRunner for NoopRunner {
+    fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+        DaemonResponse::error("unexpected_pull", "pull should not run")
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> locality_core::LocalityResult<ScheduledPullRuntimeReport> {
+        Err(LocalityError::InvalidState(
+            "scheduled pull should not run".to_string(),
+        ))
+    }
+
+    fn run_hydration(
+        &self,
+        _state_root: PathBuf,
+        _request: HydrationRequest,
+    ) -> locality_core::LocalityResult<HydrationOutcome> {
+        Err(LocalityError::InvalidState(
+            "hydration should not run".to_string(),
+        ))
+    }
+}
+
 impl RuntimeJobRunner for BlockingPreHydrationRunner {
     fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
         DaemonResponse::error("unexpected_pull", "pull should not run")
@@ -3538,6 +3741,64 @@ impl RuntimeJobRunner for PreHydrationDemotionRunner {
                 RemoteId::new("page-a"),
                 self.mount_root.join("Prefetch.md"),
                 HydrationState::Stub,
+                HydrationReason::Prefetch,
+            )],
+            freshness_jobs: Vec::new(),
+        })
+    }
+}
+
+impl RuntimeJobRunner for CompletingPreHydrationRunner {
+    fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+        DaemonResponse::error("unexpected_pull", "pull should not run")
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> locality_core::LocalityResult<ScheduledPullRuntimeReport> {
+        Err(LocalityError::InvalidState(
+            "scheduled pull should not run".to_string(),
+        ))
+    }
+
+    fn run_hydration(
+        &self,
+        _state_root: PathBuf,
+        request: HydrationRequest,
+    ) -> locality_core::LocalityResult<HydrationOutcome> {
+        self.hydrated.send(request).expect("send hydration");
+        Ok(HydrationOutcome::Hydrated)
+    }
+
+    fn run_pre_hydration(
+        &self,
+        state_root: PathBuf,
+        mount_id: MountId,
+    ) -> LocalityResult<ScheduledPullRuntimeReport> {
+        let mut store = SqliteStateStore::open(state_root).expect("open store");
+        mark_mount_pre_hydration_hydrating(
+            &mut store,
+            "notion",
+            &mount_id,
+            1,
+            1,
+            "2026-07-16T10:00:01Z",
+        )
+        .expect("mark pre-hydration hydrating");
+        Ok(ScheduledPullRuntimeReport {
+            report: Default::default(),
+            queued_hydrations: vec![HydrationRequest::new(
+                mount_id,
+                RemoteId::new("page-a"),
+                self.mount_root.join("page-a.md"),
+                HydrationState::Hydrated,
                 HydrationReason::Prefetch,
             )],
             freshness_jobs: Vec::new(),

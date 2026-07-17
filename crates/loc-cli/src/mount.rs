@@ -9,7 +9,10 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use locality_core::model::{MountId, RemoteId};
-use locality_store::{ConnectionId, MountConfig, MountRepository, ProjectionMode, StoreError};
+use locality_store::{
+    ConnectionId, ConnectorStateRepository, MountConfig, MountPreHydrationState, MountRepository,
+    ProjectionMode, StoreError, enable_mount_pre_hydration,
+};
 use localityd::source::source_descriptor;
 use serde::Serialize;
 
@@ -133,6 +136,31 @@ where
     })
 }
 
+pub fn request_mount_pre_hydration<S>(
+    store: &mut S,
+    mount_id: &MountId,
+    now: &str,
+) -> Result<MountPreHydrationState, MountError>
+where
+    S: MountRepository + ConnectorStateRepository,
+{
+    let mount = store
+        .get_mount(mount_id)
+        .map_err(MountError::Store)?
+        .ok_or_else(|| MountError::MountNotFound {
+            mount_id: mount_id.clone(),
+        })?;
+    if !source_descriptor(&mount.connector).supports_pre_hydration() {
+        return Err(MountError::PreHydrationUnsupported {
+            connector: mount.connector,
+            mount_id: mount.mount_id,
+        });
+    }
+
+    enable_mount_pre_hydration(store, &mount.connector, &mount.mount_id, now)
+        .map_err(MountError::Store)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MountError {
     CreateRoot {
@@ -144,6 +172,13 @@ pub enum MountError {
         root: PathBuf,
         mount_point: String,
         existing_mount_id: MountId,
+    },
+    MountNotFound {
+        mount_id: MountId,
+    },
+    PreHydrationUnsupported {
+        connector: String,
+        mount_id: MountId,
     },
     UnsafeVirtualProjectionRoot {
         root: PathBuf,
@@ -167,6 +202,8 @@ impl MountError {
             Self::CreateRoot { .. } => "create_mount_root_failed",
             Self::CurrentDir(_) => "current_dir_failed",
             Self::MountPointConflict { .. } => "mount_point_conflict",
+            Self::MountNotFound { .. } => "mount_not_found",
+            Self::PreHydrationUnsupported { .. } => "pre_hydration_unsupported",
             Self::UnsafeVirtualProjectionRoot { .. } => "unsafe_virtual_projection_root",
             Self::ReadGuidance { .. } => "read_mount_guidance_failed",
             Self::Store(_) => "store_error",
@@ -191,6 +228,16 @@ impl MountError {
                 "mount `{}` already uses mount point `{mount_point}` under `{}`",
                 existing_mount_id.0,
                 root.display()
+            ),
+            Self::MountNotFound { mount_id } => {
+                format!("mount `{}` was not found", mount_id.0)
+            }
+            Self::PreHydrationUnsupported {
+                connector,
+                mount_id,
+            } => format!(
+                "mount `{}` uses connector `{connector}` which does not support pre-hydration",
+                mount_id.0
             ),
             Self::UnsafeVirtualProjectionRoot {
                 root,

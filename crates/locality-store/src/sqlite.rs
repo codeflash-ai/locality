@@ -35,7 +35,6 @@ use crate::records::{
     HydrationJobRecord, MetadataDiscoveryJobRecord, MetadataDiscoveryPriority, MountConfig,
     MountLiveModeRecord, MountLiveModeState, ProjectionMode, RemoteObservationRecord,
     ShadowBlockRecord, ShadowSnapshotRecord, VirtualMutationKind, VirtualMutationRecord,
-    merge_hydration_job_record,
 };
 use crate::repository::{
     AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, ConnectorStateRepository,
@@ -65,10 +64,65 @@ const UPSERT_HYDRATION_JOB_SQL: &str = "INSERT INTO hydration_jobs (
              )
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(mount_id, remote_id) DO UPDATE SET
-                path = excluded.path,
-                target_state_json = excluded.target_state_json,
-                reason_json = excluded.reason_json";
-const DEFAULT_NOTION_CAPABILITIES_JSON: &str = "{\"supports_block_updates\":true,\"supports_databases\":true,\"supports_oauth\":true,\"supports_remote_observation\":true,\"supports_lazy_child_enumeration\":true,\"supports_media_download\":true,\"supports_undo\":true,\"supports_batch_observation\":false}";
+                path = CASE
+                    WHEN CASE excluded.reason_json
+                        WHEN '\"explicit_pull\"' THEN 2
+                        WHEN '\"file_open\"' THEN 2
+                        WHEN '\"live_mode_remote_fast_forward\"' THEN 2
+                        WHEN '\"stub_read\"' THEN 2
+                        WHEN '\"policy\"' THEN 1
+                        WHEN '\"remote_fast_forward\"' THEN 1
+                        ELSE 0
+                    END >= CASE hydration_jobs.reason_json
+                        WHEN '\"explicit_pull\"' THEN 2
+                        WHEN '\"file_open\"' THEN 2
+                        WHEN '\"live_mode_remote_fast_forward\"' THEN 2
+                        WHEN '\"stub_read\"' THEN 2
+                        WHEN '\"policy\"' THEN 1
+                        WHEN '\"remote_fast_forward\"' THEN 1
+                        ELSE 0
+                    END THEN excluded.path
+                    ELSE hydration_jobs.path
+                END,
+                target_state_json = CASE
+                    WHEN CASE excluded.target_state_json
+                        WHEN '\"virtual\"' THEN 0
+                        WHEN '\"stub\"' THEN 1
+                        WHEN '\"hydrated\"' THEN 2
+                        WHEN '\"dirty\"' THEN 3
+                        WHEN '\"conflicted\"' THEN 4
+                        ELSE 0
+                    END > CASE hydration_jobs.target_state_json
+                        WHEN '\"virtual\"' THEN 0
+                        WHEN '\"stub\"' THEN 1
+                        WHEN '\"hydrated\"' THEN 2
+                        WHEN '\"dirty\"' THEN 3
+                        WHEN '\"conflicted\"' THEN 4
+                        ELSE 0
+                    END THEN excluded.target_state_json
+                    ELSE hydration_jobs.target_state_json
+                END,
+                reason_json = CASE
+                    WHEN CASE excluded.reason_json
+                        WHEN '\"explicit_pull\"' THEN 2
+                        WHEN '\"file_open\"' THEN 2
+                        WHEN '\"live_mode_remote_fast_forward\"' THEN 2
+                        WHEN '\"stub_read\"' THEN 2
+                        WHEN '\"policy\"' THEN 1
+                        WHEN '\"remote_fast_forward\"' THEN 1
+                        ELSE 0
+                    END >= CASE hydration_jobs.reason_json
+                        WHEN '\"explicit_pull\"' THEN 2
+                        WHEN '\"file_open\"' THEN 2
+                        WHEN '\"live_mode_remote_fast_forward\"' THEN 2
+                        WHEN '\"stub_read\"' THEN 2
+                        WHEN '\"policy\"' THEN 1
+                        WHEN '\"remote_fast_forward\"' THEN 1
+                        ELSE 0
+                    END THEN excluded.reason_json
+                    ELSE hydration_jobs.reason_json
+                END";
+const DEFAULT_NOTION_CAPABILITIES_JSON: &str = "{\"supports_block_updates\":true,\"supports_databases\":true,\"supports_oauth\":true,\"supports_remote_observation\":true,\"supports_lazy_child_enumeration\":true,\"supports_media_download\":true,\"supports_undo\":true,\"supports_batch_observation\":false,\"supports_pre_hydration\":true}";
 const DEFAULT_JOURNAL_METADATA_JSON: &str =
     "{\"author\":{\"kind\":\"anonymous\",\"display_name\":\"anonymous\"}}";
 const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
@@ -811,7 +865,6 @@ impl EntitySearchRepository for SqliteStateStore {
 impl HydrationJobRepository for SqliteStateStore {
     fn upsert_hydration_job(&mut self, job: HydrationJobRecord) -> StoreResult<()> {
         let connection = self.connection()?;
-        let job = merged_hydration_job_for_upsert(&connection, job)?;
         connection.execute(
             UPSERT_HYDRATION_JOB_SQL,
             params![
@@ -831,7 +884,6 @@ impl HydrationJobRepository for SqliteStateStore {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         for job in jobs {
-            let job = merged_hydration_job_for_upsert(&transaction, job)?;
             transaction.execute(
                 UPSERT_HYDRATION_JOB_SQL,
                 params![
@@ -859,6 +911,18 @@ impl HydrationJobRepository for SqliteStateStore {
         let rows = statement.query_map([], hydration_job_row)?;
 
         rows.map(|row| hydration_job_from_row(row?)).collect()
+    }
+
+    fn count_prefetch_hydration_jobs(&self, mount_id: &MountId) -> StoreResult<u64> {
+        let connection = self.connection()?;
+        let count = connection.query_row(
+            "SELECT COUNT(*)
+             FROM hydration_jobs
+             WHERE mount_id = ?1 AND reason_json = ?2",
+            params![mount_id.0.as_str(), to_json(&HydrationReason::Prefetch)?],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count.try_into().unwrap_or(u64::MAX))
     }
 
     fn delete_hydration_job(
@@ -2472,29 +2536,6 @@ fn hydration_job_from_row(row: HydrationJobRow) -> StoreResult<HydrationJobRecor
         attempts,
         last_error: row.6,
     })
-}
-
-fn merged_hydration_job_for_upsert(
-    connection: &Connection,
-    incoming: HydrationJobRecord,
-) -> StoreResult<HydrationJobRecord> {
-    let existing = connection
-        .query_row(
-            "SELECT mount_id, remote_id, path, target_state_json, reason_json, attempts, last_error
-             FROM hydration_jobs
-             WHERE mount_id = ?1 AND remote_id = ?2",
-            params![incoming.mount_id.0.as_str(), incoming.remote_id.0.as_str()],
-            hydration_job_row,
-        )
-        .optional()?
-        .map(hydration_job_from_row)
-        .transpose()?;
-    let Some(mut existing) = existing else {
-        return Ok(incoming);
-    };
-
-    merge_hydration_job_record(&mut existing, incoming);
-    Ok(existing)
 }
 
 fn metadata_discovery_job_row(

@@ -39,7 +39,9 @@ use locality_store::{
     MetadataDiscoveryJobRecord, MetadataDiscoveryJobRepository, MetadataDiscoveryPriority,
     MountConfig, MountLiveModeRepository, MountRepository, ProjectionMode, RemoteObservationRecord,
     RemoteObservationRepository, ShadowRepository, SqliteStateStore,
-    load_mount_pre_hydration_state, open_credential_store,
+    load_mount_pre_hydration_state, mark_mount_pre_hydration_error,
+    mark_mount_pre_hydration_hydrating, open_credential_store,
+    record_mount_pre_hydration_completed_page,
 };
 use serde_json::{Value, json};
 
@@ -671,14 +673,22 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
                 LocalityError::InvalidState(format!("mount `{}` does not exist", mount_id.0))
             })?;
         if !source_descriptor(&mount.connector).supports_pre_hydration() {
-            return Err(LocalityError::Unsupported(
-                "connector does not support pre-hydration",
-            ));
+            let error = LocalityError::Unsupported("connector does not support pre-hydration");
+            record_runtime_pre_hydration_error(&mut store, &mount, &error, &freshness_timestamp());
+            return Err(error);
         }
 
+        let now = freshness_timestamp();
         let credentials = open_credential_store(&state_root);
-        let source = resolve_source_for_mount_id(&store, credentials.as_ref(), &mount_id)
-            .map_err(LocalityError::from)?;
+        let source = match resolve_source_for_mount_id(&store, credentials.as_ref(), &mount_id)
+            .map_err(LocalityError::from)
+        {
+            Ok(source) => source,
+            Err(error) => {
+                record_runtime_pre_hydration_error(&mut store, &mount, &error, &now);
+                return Err(error);
+            }
+        };
         let mut hydration = HydrationCollector::default();
         let report = execute_mount_pre_hydration(
             &mut store,
@@ -686,7 +696,7 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             &mount,
             &source,
             Some(&state_root),
-            &freshness_timestamp(),
+            &now,
         )?;
 
         Ok(ScheduledPullRuntimeReport {
@@ -1691,6 +1701,10 @@ impl RuntimeState {
             }
             DaemonRequest::StartPreHydration { mount_id } => {
                 let mount_id = MountId::new(mount_id);
+                if let Some(error) = self.reject_pre_hydration_request(&mount_id) {
+                    let _ = respond_to.send(error);
+                    return RuntimeLoopDecision::Continue;
+                }
                 let queued = self.queue_pre_hydration_mount(mount_id.clone());
                 let _ = respond_to.send(DaemonResponse::ok(json!({
                     "queued": queued,
@@ -2035,7 +2049,7 @@ impl RuntimeState {
                 Err(error) => eprintln!("localityd scheduled pull reconcile failed: {error}"),
             },
             JobCompletion::PreHydration { mount_id, result } => match result {
-                Ok(result) => self.finish_pre_hydration(result),
+                Ok(result) => self.finish_pre_hydration(mount_id, result),
                 Err(error) => {
                     eprintln!(
                         "localityd pre-hydration failed for `{}`: {error}",
@@ -2049,7 +2063,7 @@ impl RuntimeState {
                 previous_shadow,
             } => match result {
                 Ok(outcome) => {
-                    self.delete_hydration_job(&request);
+                    self.finish_completed_hydration_job(&request);
                     if outcome == HydrationOutcome::Hydrated {
                         self.refresh_visible_projection_after_remote_fast_forward(
                             &request,
@@ -2454,8 +2468,9 @@ impl RuntimeState {
         }
     }
 
-    fn finish_pre_hydration(&mut self, result: ScheduledPullRuntimeReport) {
+    fn finish_pre_hydration(&mut self, mount_id: MountId, result: ScheduledPullRuntimeReport) {
         self.queue_hydration_batch(result.queued_hydrations);
+        self.sync_mount_pre_hydration_queued_pages(&mount_id);
         for job in result.freshness_jobs {
             self.queue_freshness(job);
         }
@@ -2491,13 +2506,23 @@ impl RuntimeState {
             }
         }
 
+        let completes_prefetch_for_progress = request.reason != HydrationReason::Prefetch
+            && hydration_priority(&request.reason) > HydrationPriority::Low
+            && self
+                .hydration
+                .pending_reason(&request.mount_id, &request.remote_id)
+                .is_some_and(|reason| *reason == HydrationReason::Prefetch);
         let queued = self.hydration.queue_request(request.clone());
 
+        let progress_mount_id = request.mount_id.clone();
         match SqliteStateStore::open(self.config.state_root.clone())
             .and_then(|mut store| store.upsert_hydration_job(HydrationJobRecord::from(request)))
         {
             Ok(()) => {}
             Err(error) => eprintln!("localityd failed to persist hydration request: {error}"),
+        }
+        if completes_prefetch_for_progress {
+            self.record_mount_pre_hydration_completed_page(&progress_mount_id);
         }
         queued
     }
@@ -2537,6 +2562,38 @@ impl RuntimeState {
         }
         self.pending_pre_hydration.push_back(mount_id);
         true
+    }
+
+    fn reject_pre_hydration_request(&self, mount_id: &MountId) -> Option<DaemonResponse> {
+        let store = match SqliteStateStore::open(self.config.state_root.clone()) {
+            Ok(store) => store,
+            Err(error) => {
+                return Some(DaemonResponse::error(
+                    "store_open_failed",
+                    error.to_string(),
+                ));
+            }
+        };
+        let mount = match store.get_mount(mount_id) {
+            Ok(Some(mount)) => mount,
+            Ok(None) => {
+                let error =
+                    LocalityError::InvalidState(format!("mount `{}` does not exist", mount_id.0));
+                return Some(DaemonResponse::error(
+                    locality_error_code(&error),
+                    error.to_string(),
+                ));
+            }
+            Err(error) => return Some(DaemonResponse::error("store_error", error.to_string())),
+        };
+        if !source_descriptor(&mount.connector).supports_pre_hydration() {
+            let error = LocalityError::Unsupported("connector does not support pre-hydration");
+            return Some(DaemonResponse::error(
+                locality_error_code(&error),
+                error.to_string(),
+            ));
+        }
+        None
     }
 
     fn remote_fast_forward_target_is_already_queued(&self, request: &HydrationRequest) -> bool {
@@ -2963,14 +3020,78 @@ impl RuntimeState {
             .unwrap_or(fallback)
     }
 
-    fn delete_hydration_job(&self, request: &HydrationRequest) {
-        match SqliteStateStore::open(self.config.state_root.clone())
-            .and_then(|mut store| store.delete_hydration_job(&request.mount_id, &request.remote_id))
-        {
-            Ok(()) => {}
-            Err(error) => {
-                eprintln!("localityd failed to remove completed hydration request: {error}")
-            }
+    fn finish_completed_hydration_job(&self, request: &HydrationRequest) {
+        let result =
+            SqliteStateStore::open(self.config.state_root.clone()).and_then(|mut store| {
+                store.delete_hydration_job(&request.mount_id, &request.remote_id)?;
+                if request.reason != HydrationReason::Prefetch {
+                    return Ok(());
+                }
+                let Some(mount) = store.get_mount(&request.mount_id)? else {
+                    return Ok(());
+                };
+                record_mount_pre_hydration_completed_page(
+                    &mut store,
+                    &mount.connector,
+                    &mount.mount_id,
+                    &freshness_timestamp(),
+                )?;
+                Ok(())
+            });
+
+        if let Err(error) = result {
+            eprintln!("localityd failed to finish completed hydration request: {error}");
+        }
+    }
+
+    fn sync_mount_pre_hydration_queued_pages(&self, mount_id: &MountId) {
+        let result =
+            SqliteStateStore::open(self.config.state_root.clone()).and_then(|mut store| {
+                let Some(mount) = store.get_mount(mount_id)? else {
+                    return Ok(());
+                };
+                let Some(state) =
+                    load_mount_pre_hydration_state(&store, &mount.connector, &mount.mount_id)?
+                else {
+                    return Ok(());
+                };
+                if status_is_finished(&state.status) {
+                    return Ok(());
+                }
+                let queued_pages = store.count_prefetch_hydration_jobs(&mount.mount_id)?;
+                mark_mount_pre_hydration_hydrating(
+                    &mut store,
+                    &mount.connector,
+                    &mount.mount_id,
+                    state.discovered_pages,
+                    queued_pages,
+                    &freshness_timestamp(),
+                )?;
+                Ok(())
+            });
+
+        if let Err(error) = result {
+            eprintln!("localityd failed to update mount pre-hydration queue count: {error}");
+        }
+    }
+
+    fn record_mount_pre_hydration_completed_page(&self, mount_id: &MountId) {
+        let result =
+            SqliteStateStore::open(self.config.state_root.clone()).and_then(|mut store| {
+                let Some(mount) = store.get_mount(mount_id)? else {
+                    return Ok(());
+                };
+                record_mount_pre_hydration_completed_page(
+                    &mut store,
+                    &mount.connector,
+                    &mount.mount_id,
+                    &freshness_timestamp(),
+                )?;
+                Ok(())
+            });
+
+        if let Err(error) = result {
+            eprintln!("localityd failed to update mount pre-hydration progress: {error}");
         }
     }
 
@@ -4456,6 +4577,26 @@ fn auto_push_job(target_path: PathBuf) -> PushJob {
         target_path,
         assume_yes: true,
         confirm_dangerous: false,
+    }
+}
+
+fn record_runtime_pre_hydration_error(
+    store: &mut SqliteStateStore,
+    mount: &MountConfig,
+    error: &LocalityError,
+    now: &str,
+) {
+    if let Err(record_error) = mark_mount_pre_hydration_error(
+        store,
+        &mount.connector,
+        &mount.mount_id,
+        &error.to_string(),
+        now,
+    ) {
+        eprintln!(
+            "localityd failed to record pre-hydration error for `{}`: {record_error}",
+            mount.mount_id.0
+        );
     }
 }
 

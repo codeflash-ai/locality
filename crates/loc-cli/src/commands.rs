@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use locality_connector::ConnectorUndoApplier;
@@ -82,7 +82,7 @@ use crate::local_oauth::{
     LocalOAuthAuthorization, LocalOAuthError, local_redirect, random_state,
     run_local_oauth_authorization,
 };
-use crate::mount::{MountError, MountOptions, MountReport, run_mount};
+use crate::mount::{MountError, MountOptions, MountReport, request_mount_pre_hydration, run_mount};
 use crate::okf::{OkfExportError, OkfExportOptions, OkfExportReport, run_okf_export};
 use crate::pull::{PullError, PullReport, run_pull_with_state_root};
 use crate::push::{
@@ -449,6 +449,11 @@ struct MountNotionArgs {
         help = "Register the mount as read-only and block push operations."
     )]
     read_only: bool,
+    #[arg(
+        long,
+        help = "Enumerate the mount and prefetch eligible pages in the background."
+    )]
+    pre_hydrate: bool,
 }
 
 #[derive(Debug, Args)]
@@ -483,6 +488,11 @@ struct MountGoogleDocsArgs {
         help = "Register the mount as read-only and block push operations."
     )]
     read_only: bool,
+    #[arg(
+        long,
+        help = "Enumerate the mount and prefetch eligible pages in the background."
+    )]
+    pre_hydrate: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1034,6 +1044,7 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                         options.projection.as_deref(),
                     );
                     push_flag(&mut args, "--read-only", options.read_only);
+                    push_flag(&mut args, "--pre-hydrate", options.pre_hydrate);
                 }
                 MountCommand::GoogleDocs(options) => {
                     args.push("google-docs".to_string());
@@ -1052,6 +1063,7 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                         options.projection.as_deref(),
                     );
                     push_flag(&mut args, "--read-only", options.read_only);
+                    push_flag(&mut args, "--pre-hydrate", options.pre_hydrate);
                 }
                 MountCommand::Gmail(options) => {
                     args.push("gmail".to_string());
@@ -2533,6 +2545,21 @@ fn mount(args: &[String], json: bool) -> i32 {
         );
     };
     let descriptor = source_descriptor(connector);
+    let pre_hydrate = has_flag(args, "--pre-hydrate");
+    if pre_hydrate && !descriptor.supports_pre_hydration() {
+        return command_error(
+            json,
+            CommandError::new(
+                "mount",
+                "pre_hydration_unsupported",
+                format!(
+                    "connector `{}` does not support pre-hydration",
+                    descriptor.id()
+                ),
+            ),
+            EXIT_USAGE,
+        );
+    }
 
     let Some(root) = nth_positional(args, 1) else {
         return command_error(
@@ -2637,10 +2664,23 @@ fn mount(args: &[String], json: bool) -> i32 {
             if let Err(error) = auto_register_mounted_projection(&state_root, &store, &mount_id) {
                 return command_error(json, error, EXIT_INTERNAL);
             }
+            if pre_hydrate {
+                if let Err(error) = request_mount_pre_hydration(
+                    &mut store,
+                    &mount_id,
+                    &mount_pre_hydration_timestamp(),
+                ) {
+                    return mount_command_error(json, error);
+                }
+                notify_daemon_pre_hydration_requested(&state_root, &mount_id);
+            }
             if json {
                 print_json(&report);
             } else {
                 print_mount_report(&report);
+                if pre_hydrate {
+                    println!("pre-hydration: requested");
+                }
             }
             EXIT_SUCCESS
         }
@@ -7241,6 +7281,43 @@ fn notify_daemon_mounts_changed(state_root: &std::path::Path) {
     }
 }
 
+fn notify_daemon_pre_hydration_requested(state_root: &std::path::Path, mount_id: &MountId) {
+    if std::env::var("LOCALITY_DAEMON_DISABLE").is_ok() {
+        return;
+    }
+
+    match send_request_with_timeout(
+        state_root,
+        &DaemonRequest::StartPreHydration {
+            mount_id: mount_id.0.clone(),
+        },
+        daemon_request_timeout(),
+    ) {
+        Ok(response) if response.ok => {}
+        Ok(response) => {
+            if let Some(error) = response.error {
+                eprintln!(
+                    "loc mount: daemon pre-hydration request failed: {}: {}",
+                    error.code, error.message
+                );
+            }
+        }
+        Err(DaemonClientError::NotAvailable(_) | DaemonClientError::TimedOut(_)) => {}
+        Err(error) => eprintln!(
+            "loc mount: daemon pre-hydration request failed: {}",
+            error.message()
+        ),
+    }
+}
+
+fn mount_pre_hydration_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string()
+}
+
 fn daemon_error_exit_code(code: &str) -> i32 {
     match code {
         "mount_not_found" | "entity_path_missing" => EXIT_USAGE,
@@ -7663,7 +7740,7 @@ fn projection_mode_for_target(args: &[String], target_os: &str) -> Result<Projec
 
 fn mount_usage() -> String {
     format!(
-        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--read-only] [--json]\n       loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--json]",
+        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--pre-hydrate] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--pre-hydrate] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--read-only] [--json]\n       loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--json]",
         projection_usage_options_for_target(std::env::consts::OS)
     )
 }
@@ -8573,6 +8650,13 @@ mod tests {
 
         assert!(usage.contains("--after YYYY-MM-DD --before YYYY-MM-DD"));
         assert!(usage.contains("--view messages|threads"));
+    }
+
+    #[test]
+    fn mount_usage_mentions_pre_hydrate_flag() {
+        let usage = mount_usage();
+
+        assert!(usage.contains("--pre-hydrate"));
     }
 
     #[test]

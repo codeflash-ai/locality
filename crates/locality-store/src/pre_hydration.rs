@@ -34,6 +34,8 @@ pub struct MountPreHydrationState {
     pub last_error: Option<String>,
     pub discovered_pages: u64,
     pub queued_pages: u64,
+    #[serde(default)]
+    pub completed_pages: u64,
 }
 
 impl MountPreHydrationState {
@@ -47,6 +49,7 @@ impl MountPreHydrationState {
             last_error: None,
             discovered_pages: 0,
             queued_pages: 0,
+            completed_pages: 0,
         }
     }
 }
@@ -138,6 +141,7 @@ pub fn mark_mount_pre_hydration_enumerating(
     state.last_error = None;
     state.discovered_pages = 0;
     state.queued_pages = 0;
+    state.completed_pages = 0;
     save_mount_pre_hydration_state_with_updated_at(store, connector, mount_id, &state, now)?;
     Ok(state)
 }
@@ -164,6 +168,7 @@ pub fn mark_mount_pre_hydration_hydrating(
     state.last_error = None;
     state.discovered_pages = discovered_pages;
     state.queued_pages = queued_pages;
+    state.completed_pages = 0;
     save_mount_pre_hydration_state_with_updated_at(store, connector, mount_id, &state, now)?;
     Ok(state)
 }
@@ -182,6 +187,50 @@ pub fn mark_mount_pre_hydration_error(
     state.started_at.get_or_insert_with(|| now.to_string());
     state.completed_at = Some(now.to_string());
     state.last_error = Some(message.to_string());
+    save_mount_pre_hydration_state_with_updated_at(store, connector, mount_id, &state, now)?;
+    Ok(state)
+}
+
+pub fn record_mount_pre_hydration_completed_page(
+    store: &mut impl ConnectorStateRepository,
+    connector: &str,
+    mount_id: &MountId,
+    now: &str,
+) -> StoreResult<Option<MountPreHydrationState>> {
+    let Some(mut state) = load_mount_pre_hydration_state(store, connector, mount_id)? else {
+        return Ok(None);
+    };
+    if state.status != MountPreHydrationStatus::Hydrating {
+        return Ok(Some(state));
+    }
+
+    if state.completed_pages < state.queued_pages {
+        state.completed_pages += 1;
+    }
+    if state.completed_pages >= state.queued_pages {
+        state.completed_pages = state.queued_pages;
+        state.status = MountPreHydrationStatus::Complete;
+        state.completed_at = Some(now.to_string());
+    }
+    state.last_error = None;
+    save_mount_pre_hydration_state_with_updated_at(store, connector, mount_id, &state, now)?;
+    Ok(Some(state))
+}
+
+pub fn mark_mount_pre_hydration_complete(
+    store: &mut impl ConnectorStateRepository,
+    connector: &str,
+    mount_id: &MountId,
+    now: &str,
+) -> StoreResult<MountPreHydrationState> {
+    let mut state = load_mount_pre_hydration_state(store, connector, mount_id)?
+        .unwrap_or_else(|| MountPreHydrationState::requested(now));
+    state.enabled = true;
+    state.status = MountPreHydrationStatus::Complete;
+    state.started_at.get_or_insert_with(|| now.to_string());
+    state.completed_at = Some(now.to_string());
+    state.last_error = None;
+    state.completed_pages = state.queued_pages;
     save_mount_pre_hydration_state_with_updated_at(store, connector, mount_id, &state, now)?;
     Ok(state)
 }

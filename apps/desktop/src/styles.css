@@ -2566,7 +2566,7 @@ button.home-stat:hover {
   border-bottom: 1px solid var(--line-soft);
 }
 
-.source-sync-grid .setting-row:nth-last-child(-n + 2) {
+.source-sync-grid .setting-row:nth-last-child(-n + 1) {
   border-bottom: 0;
 }
 
@@ -2574,11 +2574,44 @@ button.home-stat:hover {
   border-right: 1px solid var(--line-soft);
 }
 
+.source-sync-grid .setting-row:last-child:nth-child(odd) {
+  grid-column: 1 / -1;
+  border-right: 0;
+}
+
 .source-sync-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
   align-items: center;
+}
+
+.pre-hydration-progress {
+  display: grid;
+  gap: 8px;
+}
+
+.pre-hydration-progress-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: var(--type-caption);
+}
+
+.pre-hydration-meter {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--line-soft);
+}
+
+.pre-hydration-meter i {
+  display: block;
+  height: 100%;
+  min-width: 0;
+  border-radius: inherit;
+  background: var(--accent);
 }
 
 .safety-strip {

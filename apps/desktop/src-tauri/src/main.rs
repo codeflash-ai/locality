@@ -93,10 +93,12 @@ use locality_store::{
     ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository, FreshnessStateRecord,
     FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository, JournalRepository,
     MountConfig, MountLiveModeRecord, MountLiveModeRepository, MountLiveModeState,
-    MountLiveModeStateChangeError, MountRepository, ProjectionMode, RemoteObservationRecord,
-    RemoteObservationRepository, ShadowRepository, SqliteStateStore, VirtualMutationKind,
-    VirtualMutationRecord, VirtualMutationRepository, is_live_mode_state_change_signal_path,
-    open_credential_store, reset_locality_state_storage, save_mount_live_mode_and_publish_signal,
+    MountLiveModeStateChangeError, MountPreHydrationState, MountPreHydrationStatus,
+    MountRepository, ProjectionMode, RemoteObservationRecord, RemoteObservationRepository,
+    ShadowRepository, SqliteStateStore, VirtualMutationKind, VirtualMutationRecord,
+    VirtualMutationRepository, enable_mount_pre_hydration, is_live_mode_state_change_signal_path,
+    load_mount_pre_hydration_state, open_credential_store, reset_locality_state_storage,
+    save_mount_live_mode_and_publish_signal,
 };
 #[cfg(test)]
 use locality_store::{ConnectorProfileId, ConnectorProfileRecord, ConnectorProfileRepository};
@@ -113,7 +115,7 @@ use localityd::push::execute_auto_save_push_job_with_content_root;
 use localityd::runtime::repair_clean_remote_deleted_projections;
 use localityd::source::{
     ResolvedSource, SourceAdapter, resolve_source_for_mount_id, resolve_source_for_path,
-    source_display_name,
+    source_descriptor, source_display_name,
 };
 #[cfg(target_os = "macos")]
 use localityd::virtual_fs::materialize_virtual_fs_item_with_content_root;
@@ -226,7 +228,43 @@ struct MountSummary {
     root_exists: bool,
     entity_count: usize,
     pending_change_count: usize,
+    pre_hydration: MountPreHydrationSummary,
     provider: Option<ProviderRuntimeSummary>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MountPreHydrationSummary {
+    supported: bool,
+    enabled: bool,
+    status: String,
+    label: String,
+    discovered_pages: u64,
+    queued_pages: u64,
+    completed_pages: u64,
+    remaining_pages: u64,
+    last_error: Option<String>,
+}
+
+impl MountPreHydrationSummary {
+    fn off(supported: bool) -> Self {
+        Self {
+            supported,
+            enabled: false,
+            status: if supported { "off" } else { "unsupported" }.to_string(),
+            label: if supported {
+                "Pre-hydration off"
+            } else {
+                "Pre-hydration unavailable"
+            }
+            .to_string(),
+            discovered_pages: 0,
+            queued_pages: 0,
+            completed_pages: 0,
+            remaining_pages: 0,
+            last_error: None,
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -2246,6 +2284,24 @@ async fn set_mount_live_mode(app: AppHandle, change: MountLiveModeChange) -> Act
 }
 
 #[tauri::command]
+async fn start_mount_pre_hydration(app: AppHandle, mount_id: String) -> ActionReport {
+    let report = match tauri::async_runtime::spawn_blocking(move || {
+        start_mount_pre_hydration_blocking(mount_id).unwrap_or_else(action_error)
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => ActionReport {
+            ok: false,
+            message: format!("Pre-hydration worker failed: {error}"),
+        },
+    };
+
+    refresh_desktop_surfaces(&app);
+    report
+}
+
+#[tauri::command]
 async fn diff_notion_file(path: String) -> ActionReport {
     match tauri::async_runtime::spawn_blocking(move || {
         let target = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
@@ -2852,6 +2908,75 @@ fn set_mount_live_mode_blocking(change: MountLiveModeChange) -> Result<ActionRep
             "Live Mode is off for this folder.".to_string()
         },
     })
+}
+
+fn start_mount_pre_hydration_blocking(mount_id: String) -> Result<ActionReport, String> {
+    let mount_id = MountId::new(mount_id.trim().to_string());
+    if mount_id.0.is_empty() {
+        return Err("Source mount id is required.".to_string());
+    }
+
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let mount = store
+        .get_mount(&mount_id)
+        .map_err(|error| format!("Could not inspect source mount: {error}"))?
+        .ok_or_else(|| format!("Source mount `{}` was not found.", mount_id.0))?;
+    if !source_descriptor(&mount.connector).supports_pre_hydration() {
+        return Err(format!(
+            "{} sources do not support pre-hydration yet.",
+            connector_label(&mount.connector)
+        ));
+    }
+
+    enable_mount_pre_hydration(
+        &mut store,
+        &mount.connector,
+        &mount.mount_id,
+        &pre_hydration_timestamp(),
+    )
+    .map_err(|error| format!("Could not save pre-hydration request: {error}"))?;
+    drop(store);
+
+    ensure_daemon_running(&state_root)?;
+    match send_request_with_timeout(
+        &state_root,
+        &DaemonRequest::StartPreHydration {
+            mount_id: mount.mount_id.0.clone(),
+        },
+        Duration::from_secs(1),
+    ) {
+        Ok(response) if response.ok => Ok(ActionReport {
+            ok: true,
+            message: format!(
+                "Pre-hydration started for {}.",
+                connector_label(&mount.connector)
+            ),
+        }),
+        Ok(response) => Err(response
+            .error
+            .map(|error| format!("Could not start pre-hydration: {}", error.message))
+            .unwrap_or_else(|| {
+                "Could not start pre-hydration: daemon returned an unknown error.".to_string()
+            })),
+        Err(error) => Ok(ActionReport {
+            ok: true,
+            message: format!(
+                "Pre-hydration is queued for {} and will resume when the runtime is ready: {}",
+                connector_label(&mount.connector),
+                error.message()
+            ),
+        }),
+    }
+}
+
+fn pre_hydration_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string()
 }
 
 fn mark_mount_live_mode_syncing(state_root: &Path, mount_id: &MountId) -> Result<bool, String> {
@@ -3938,6 +4063,7 @@ fn degraded_snapshot(message: String) -> DesktopSnapshot {
             root_exists: false,
             entity_count: 0,
             pending_change_count: 0,
+            pre_hydration: MountPreHydrationSummary::off(true),
             provider: None,
         },
         mounts: vec![mount_summary(None, &state_root, None, None, None)],
@@ -4123,6 +4249,7 @@ fn mount_summary_with_pending_change_count(
             root_exists: false,
             entity_count: 0,
             pending_change_count: 0,
+            pre_hydration: MountPreHydrationSummary::off(true),
             provider: None,
         };
     };
@@ -4171,7 +4298,104 @@ fn mount_summary_with_pending_change_count(
                 .map(|changes| changes.len())
                 .unwrap_or(0)
         }),
+        pre_hydration: mount_pre_hydration_summary(store, mount),
         provider,
+    }
+}
+
+fn mount_pre_hydration_summary(
+    store: Option<&SqliteStateStore>,
+    mount: &MountConfig,
+) -> MountPreHydrationSummary {
+    let supported = source_descriptor(&mount.connector).supports_pre_hydration();
+    if !supported {
+        return MountPreHydrationSummary::off(false);
+    }
+    let Some(store) = store else {
+        return MountPreHydrationSummary::off(true);
+    };
+
+    let state = match load_mount_pre_hydration_state(store, &mount.connector, &mount.mount_id) {
+        Ok(Some(state)) => state,
+        Ok(None) => return MountPreHydrationSummary::off(true),
+        Err(error) => {
+            return MountPreHydrationSummary {
+                supported: true,
+                enabled: false,
+                status: "error".to_string(),
+                label: "Pre-hydration state unavailable".to_string(),
+                discovered_pages: 0,
+                queued_pages: 0,
+                completed_pages: 0,
+                remaining_pages: 0,
+                last_error: Some(error.to_string()),
+            };
+        }
+    };
+
+    let completed_pages = state.completed_pages.min(state.queued_pages);
+    let remaining_pages = if state.status == MountPreHydrationStatus::Hydrating {
+        state.queued_pages.saturating_sub(completed_pages)
+    } else {
+        0
+    };
+    let status = mount_pre_hydration_status_key(&state.status).to_string();
+    let label = mount_pre_hydration_label(&state, completed_pages, remaining_pages);
+
+    MountPreHydrationSummary {
+        supported: true,
+        enabled: state.enabled,
+        status,
+        label,
+        discovered_pages: state.discovered_pages,
+        queued_pages: state.queued_pages,
+        completed_pages,
+        remaining_pages,
+        last_error: state.last_error,
+    }
+}
+
+fn mount_pre_hydration_status_key(status: &MountPreHydrationStatus) -> &'static str {
+    match status {
+        MountPreHydrationStatus::Requested => "requested",
+        MountPreHydrationStatus::Enumerating => "enumerating",
+        MountPreHydrationStatus::Hydrating => "hydrating",
+        MountPreHydrationStatus::Complete => "complete",
+        MountPreHydrationStatus::Error => "error",
+    }
+}
+
+fn mount_pre_hydration_label(
+    state: &MountPreHydrationState,
+    completed_pages: u64,
+    _remaining_pages: u64,
+) -> String {
+    match state.status {
+        MountPreHydrationStatus::Requested => "Pre-hydration queued".to_string(),
+        MountPreHydrationStatus::Enumerating => {
+            if state.discovered_pages == 0 {
+                "Pre-hydration enumerating".to_string()
+            } else {
+                format!("Pre-hydration found {} pages", state.discovered_pages)
+            }
+        }
+        MountPreHydrationStatus::Hydrating => {
+            if state.queued_pages == 0 {
+                "Pre-hydration complete".to_string()
+            } else {
+                format!(
+                    "Pre-hydrating {} of {} pages",
+                    completed_pages, state.queued_pages
+                )
+            }
+        }
+        MountPreHydrationStatus::Complete => "Pre-hydration complete".to_string(),
+        MountPreHydrationStatus::Error => state
+            .last_error
+            .as_deref()
+            .filter(|message| !message.trim().is_empty())
+            .map(|message| format!("Pre-hydration paused: {message}"))
+            .unwrap_or_else(|| "Pre-hydration paused".to_string()),
     }
 }
 
@@ -11376,9 +11600,10 @@ mod tests {
         ConnectionRecord, ConnectionRepository, ConnectorProfileId, EntityRecord, EntityRepository,
         FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore, JournalRepository,
         LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountConfig, MountLiveModeRecord,
-        MountLiveModeRepository, MountLiveModeState, MountRepository, ProjectionMode,
-        RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
-        StoreResult,
+        MountLiveModeRepository, MountLiveModeState, MountPreHydrationState,
+        MountPreHydrationStatus, MountRepository, ProjectionMode, RemoteObservationRecord,
+        RemoteObservationRepository, ShadowRepository, SqliteStateStore, StoreResult,
+        save_mount_pre_hydration_state,
     };
     use localityd::ipc::DaemonBuildInfo;
     use tauri::{PhysicalPosition, PhysicalSize, Rect};
@@ -11745,6 +11970,47 @@ mod tests {
                 .pending_change_count,
             1
         );
+    }
+
+    #[test]
+    fn mount_summary_reports_pre_hydration_progress_from_durable_state() {
+        let temp = TestTempDir::new("desktop-pre-hydration-progress");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let mount_id = MountId::new("notion-main");
+        let mount = MountConfig::new(
+            mount_id.clone(),
+            "notion",
+            temp.path().join("codeflash-wiki"),
+        );
+        store.save_mount(mount.clone()).expect("save mount");
+        save_mount_pre_hydration_state(
+            &mut store,
+            "notion",
+            &mount_id,
+            &MountPreHydrationState {
+                enabled: true,
+                status: MountPreHydrationStatus::Hydrating,
+                requested_at: "2026-07-16T10:00:00Z".to_string(),
+                started_at: Some("2026-07-16T10:00:01Z".to_string()),
+                completed_at: None,
+                last_error: None,
+                discovered_pages: 10,
+                queued_pages: 8,
+                completed_pages: 6,
+            },
+        )
+        .expect("save pre-hydration state");
+
+        let summary = super::mount_summary(Some(&store), temp.path(), Some(&mount), None, None);
+
+        assert!(summary.pre_hydration.supported);
+        assert!(summary.pre_hydration.enabled);
+        assert_eq!(summary.pre_hydration.status, "hydrating");
+        assert_eq!(summary.pre_hydration.discovered_pages, 10);
+        assert_eq!(summary.pre_hydration.queued_pages, 8);
+        assert_eq!(summary.pre_hydration.remaining_pages, 2);
+        assert_eq!(summary.pre_hydration.completed_pages, 6);
+        assert_eq!(summary.pre_hydration.label, "Pre-hydrating 6 of 8 pages");
     }
 
     #[test]
@@ -16153,6 +16419,7 @@ fn sample_snapshot() -> DesktopSnapshot {
         root_exists: true,
         entity_count: 42,
         pending_change_count: 3,
+        pre_hydration: MountPreHydrationSummary::off(true),
         provider: None,
     };
     DesktopSnapshot {
@@ -16944,6 +17211,7 @@ fn main() {
             reset_notion_file_to_remote,
             live_mode_tick,
             set_mount_live_mode,
+            start_mount_pre_hydration,
             diff_notion_file,
             inspect_notion_file,
             read_notion_file,

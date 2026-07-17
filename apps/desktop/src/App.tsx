@@ -44,6 +44,8 @@ import {
   mountEntityCountLabel,
   mountAccessLabel,
   mountRows,
+  mountPreHydrationLabel,
+  mountPreHydrationProgressValue,
   mountStatusLabel,
   mountStatusTone,
   selectedMountIdAfterOpenViewEvent,
@@ -383,6 +385,17 @@ const sampleMount: MountSummary = {
   rootExists: true,
   entityCount: 24,
   pendingChangeCount: 3,
+  preHydration: {
+    supported: true,
+    enabled: false,
+    status: "off",
+    label: "Pre-hydration off",
+    discoveredPages: 0,
+    queuedPages: 0,
+    completedPages: 0,
+    remainingPages: 0,
+    lastError: null,
+  },
   provider: null,
 };
 
@@ -402,6 +415,17 @@ const sampleGoogleMount: MountSummary = {
   rootExists: true,
   entityCount: 8,
   pendingChangeCount: 0,
+  preHydration: {
+    supported: true,
+    enabled: true,
+    status: "hydrating",
+    label: "Pre-hydrating 3 of 8 pages",
+    discoveredPages: 8,
+    queuedPages: 8,
+    completedPages: 3,
+    remainingPages: 5,
+    lastError: null,
+  },
   provider: null,
 };
 
@@ -4187,6 +4211,8 @@ function MountDetailView({
   const [pullState, setPullState] = useState<"idle" | "pulling" | "success" | "error">("idle");
   const [backupMessage, setBackupMessage] = useState("");
   const [backupState, setBackupState] = useState<"idle" | "exporting" | "success" | "error">("idle");
+  const [preHydrationMessage, setPreHydrationMessage] = useState("");
+  const [preHydrationBusy, setPreHydrationBusy] = useState(false);
   const [sourceAction, setSourceAction] = useState<SourceDestructiveAction | null>(null);
   const [sourceConfirmation, setSourceConfirmation] = useState("");
   const [sourceActionBusy, setSourceActionBusy] = useState(false);
@@ -4204,6 +4230,9 @@ function MountDetailView({
   } = useMountLiveModeController(snapshot, onRefresh);
   const liveModeAppliesToSource = isActiveMount && mount.connector === "notion";
   const sourceSyncMode = sourceSyncModeLabel(snapshot.liveMode, liveModeAppliesToSource);
+  const preHydrationProgress = mountPreHydrationProgressValue(mount);
+  const preHydrationActive = ["requested", "enumerating", "hydrating"].includes(mount.preHydration.status);
+  const preHydrationCanStart = mount.preHydration.supported && !preHydrationActive && !preHydrationBusy;
 
   async function openFolder() {
     setActionError("");
@@ -4301,6 +4330,34 @@ function MountDetailView({
     } catch (error) {
       setBackupMessage(errorMessage(error));
       setBackupState("error");
+    }
+  }
+
+  async function startPreHydration() {
+    if (!preHydrationCanStart) {
+      return;
+    }
+
+    setActionError("");
+    setPreHydrationMessage("");
+    setPreHydrationBusy(true);
+    try {
+      const report = await callCommand<ActionReport>(
+        "start_mount_pre_hydration",
+        { mountId: mount.mountId },
+        { ok: true, message: `Pre-hydration started for ${mount.connectorName}.` },
+      );
+      setPreHydrationMessage(report.message);
+      if (!report.ok) {
+        setActionError(report.message);
+      }
+      await onRefresh().catch(() => undefined);
+    } catch (error) {
+      const message = errorMessage(error);
+      setPreHydrationMessage(message);
+      setActionError(message);
+    } finally {
+      setPreHydrationBusy(false);
     }
   }
 
@@ -4473,9 +4530,21 @@ function MountDetailView({
         <div className="source-sync-grid">
           <SettingRow title="Clean remote pulls" value={liveModeAppliesToSource && liveModeEnabled ? "Automatic when safe" : "Manual sync"} />
           <SettingRow title="Safe local pushes" value={liveModeAppliesToSource && liveModeEnabled ? "Live Mode" : "Review first"} />
+          <SettingRow title="Pre-hydration" value={mountPreHydrationLabel(mount)} />
           <SettingRow title="Review rules" value="Conflict, destructive, large plan" />
           <SettingRow title="Last run" value={snapshot.liveMode.lastRunAt ?? "Not available"} />
         </div>
+        {mount.preHydration.supported && (
+          <div className="pre-hydration-progress">
+            <div className="pre-hydration-progress-top">
+              <span>{mountPreHydrationLabel(mount)}</span>
+              {preHydrationProgress !== null && <span>{preHydrationProgress}%</span>}
+            </div>
+            <div className="pre-hydration-meter" aria-hidden="true">
+              <i style={{ width: `${preHydrationProgress ?? 0}%` }} />
+            </div>
+          </div>
+        )}
         <div className="source-sync-actions">
           <button
             className={`live-mode-control has-tooltip ${liveModeEnabled && liveModeAppliesToSource ? "active" : ""}`}
@@ -4504,10 +4573,24 @@ function MountDetailView({
               {pullState === "pulling" ? "Syncing" : "Sync Now"}
             </SecondaryButton>
           )}
+          {mount.preHydration.supported && (
+            <SecondaryButton
+              compact
+              busy={preHydrationBusy}
+              disabled={!preHydrationCanStart}
+              icon={preHydrationBusy ? <Loader2 className="spin-icon" /> : <Download />}
+              onClick={() => void startPreHydration()}
+            >
+              {preHydrationActive ? "Pre-hydration Running" : "Pre-hydrate Pages"}
+            </SecondaryButton>
+          )}
           <SecondaryButton compact disabled>
             Use Global Default
           </SecondaryButton>
         </div>
+        {preHydrationMessage && (
+          <p className="quiet-note inline-note">{preHydrationMessage}</p>
+        )}
         {liveModeMessage && liveModeAppliesToSource && (
           <p className={liveModeState === "error" ? "field-error" : "quiet-note inline-note"}>
             {liveModeMessage}

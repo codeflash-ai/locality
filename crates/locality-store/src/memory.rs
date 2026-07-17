@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use locality_core::LocalityResult;
+use locality_core::hydration::HydrationReason;
 use locality_core::journal::{
     JournalApplyEffect, JournalEntry, JournalStatus, JournalStore, PushId,
 };
@@ -606,6 +607,17 @@ impl HydrationJobRepository for InMemoryStateStore {
 
     fn list_hydration_jobs(&self) -> StoreResult<Vec<HydrationJobRecord>> {
         Ok(self.hydration_jobs.values().cloned().collect())
+    }
+
+    fn count_prefetch_hydration_jobs(&self, mount_id: &MountId) -> StoreResult<u64> {
+        Ok(self
+            .hydration_jobs
+            .values()
+            .filter(|job| job.mount_id == *mount_id)
+            .filter(|job| job.reason == HydrationReason::Prefetch)
+            .count()
+            .try_into()
+            .unwrap_or(u64::MAX))
     }
 
     fn delete_hydration_job(

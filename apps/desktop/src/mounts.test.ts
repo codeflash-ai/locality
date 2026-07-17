@@ -3,6 +3,8 @@ import {
   compactPath,
   mountEntityCountLabel,
   mountAccessLabel,
+  mountPreHydrationLabel,
+  mountPreHydrationProgressValue,
   mountRows,
   mountStatusLabel,
   mountStatusTone,
@@ -31,6 +33,17 @@ function mount(overrides: Partial<MountSummary>): MountSummary {
     rootExists: true,
     entityCount: 24,
     pendingChangeCount: 3,
+    preHydration: {
+      supported: true,
+      enabled: false,
+      status: "off",
+      label: "Pre-hydration off",
+      discoveredPages: 0,
+      queuedPages: 0,
+      completedPages: 0,
+      remainingPages: 0,
+      lastError: null,
+    },
     provider: null,
     ...overrides,
   };
@@ -94,6 +107,41 @@ describe("mount display helpers", () => {
   it("labels indexed mount entities as items, not physical files", () => {
     expect(mountEntityCountLabel(mount({ entityCount: 1 }))).toBe("1 item");
     expect(mountEntityCountLabel(mount({ entityCount: 260 }))).toBe("260 items");
+  });
+
+  it("labels pre-hydration progress without scanning mounted files", () => {
+    const hydrating = mount({
+      preHydration: {
+        supported: true,
+        enabled: true,
+        status: "hydrating",
+        label: "Pre-hydrating 6 of 8 pages",
+        discoveredPages: 10,
+        queuedPages: 8,
+        completedPages: 6,
+        remainingPages: 2,
+        lastError: null,
+      },
+    });
+    const unsupported = mount({
+      connector: "gmail",
+      preHydration: {
+        supported: false,
+        enabled: false,
+        status: "unsupported",
+        label: "Pre-hydration unavailable",
+        discoveredPages: 0,
+        queuedPages: 0,
+        completedPages: 0,
+        remainingPages: 0,
+        lastError: null,
+      },
+    });
+
+    expect(mountPreHydrationLabel(hydrating)).toBe("Pre-hydrating 6 of 8 pages");
+    expect(mountPreHydrationProgressValue(hydrating)).toBe(75);
+    expect(mountPreHydrationLabel(unsupported)).toBe("Pre-hydration unavailable");
+    expect(mountPreHydrationProgressValue(unsupported)).toBeNull();
   });
 
   it("compacts long paths from the middle so filenames remain visible", () => {

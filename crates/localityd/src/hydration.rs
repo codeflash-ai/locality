@@ -614,6 +614,16 @@ impl HydrationQueue {
             .contains_key(&HydrationKey::new(mount_id.clone(), remote_id.clone()))
     }
 
+    pub fn pending_reason(
+        &self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> Option<&HydrationReason> {
+        self.pending
+            .get(&HydrationKey::new(mount_id.clone(), remote_id.clone()))
+            .map(|pending| &pending.request.reason)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }

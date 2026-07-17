@@ -525,6 +525,23 @@ Current local-only implementation:
   child refreshes queue discovered folder containers at background priority so
   mount-time indexing can continue traversing the tree without blocking
   interactive directory opens.
+- Mount pre-hydration is an opt-in full enumeration for connectors that expose
+  `supports_pre_hydration`. Enabling it records per-mount durable state, then
+  `localityd` enumerates the remote tree in the background, projects discovered
+  stubs, and queues eligible pages as low-priority `prefetch` hydration jobs.
+  Progress is stored as discovered, queued, and completed counters on the
+  pre-hydration state, not as a mounted-file scan, so desktop refreshes stay
+  cheap on large workspaces. The daemon resumes
+  enabled unfinished pre-hydration on startup or mount reload, records setup or
+  enumeration failures as durable errors, and marks the run complete when the
+  mount's prefetch queue drains.
+- Current pre-hydration reconciliation runs on the daemon's exclusive mutation
+  lane because it writes connector state, entities, freshness, observations, and
+  virtual projection state. The IPC request and desktop action are nonblocking,
+  and foreground requests can still be accepted and persisted, but actual
+  foreground hydration/materialization waits while a pre-hydration enumeration is
+  actively reconciling. Splitting enumeration fetches from bounded reconcile
+  chunks is the next scalability step if large mounts need stronger preemption.
 - Relay/webhook delivery remains intentionally unimplemented; Stage 10 only
   improves local scheduling and connector contracts.
 

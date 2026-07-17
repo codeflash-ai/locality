@@ -23,8 +23,9 @@ use locality_store::{
     PRE_HYDRATION_STATE_VERSION, RemoteObservationRecord, RemoteObservationRepository,
     ShadowRepository, SqliteStateStore, StoreError, VirtualMutationKind, VirtualMutationRecord,
     VirtualMutationRepository, enable_mount_pre_hydration, load_mount_pre_hydration_state,
-    mark_mount_pre_hydration_enumerating, mark_mount_pre_hydration_error,
-    mark_mount_pre_hydration_hydrating, save_mount_pre_hydration_state,
+    mark_mount_pre_hydration_complete, mark_mount_pre_hydration_enumerating,
+    mark_mount_pre_hydration_error, mark_mount_pre_hydration_hydrating,
+    record_mount_pre_hydration_completed_page, save_mount_pre_hydration_state,
 };
 
 #[test]
@@ -81,6 +82,7 @@ fn pre_hydration_state_round_trips_through_connector_state() {
     assert_eq!(loaded.status, MountPreHydrationStatus::Hydrating);
     assert_eq!(loaded.discovered_pages, 12);
     assert_eq!(loaded.queued_pages, 12);
+    assert_eq!(loaded.completed_pages, 0);
     assert_eq!(loaded.started_at.as_deref(), Some("2026-07-16T10:00:01Z"));
 }
 
@@ -162,6 +164,100 @@ fn pre_hydration_hydrating_with_empty_queue_completes() {
     assert_eq!(state.completed_at.as_deref(), Some("2026-07-16T10:00:02Z"));
     assert_eq!(state.discovered_pages, 12);
     assert_eq!(state.queued_pages, 0);
+    assert_eq!(state.completed_pages, 0);
+}
+
+#[test]
+fn pre_hydration_complete_preserves_page_counters() {
+    let mut store = InMemoryStateStore::new();
+    let mount_id = MountId::new("notion-main");
+    enable_mount_pre_hydration(&mut store, "notion", &mount_id, "2026-07-16T10:00:00Z")
+        .expect("enable");
+    mark_mount_pre_hydration_hydrating(
+        &mut store,
+        "notion",
+        &mount_id,
+        13,
+        11,
+        "2026-07-16T10:00:01Z",
+    )
+    .expect("mark hydrating");
+
+    let state =
+        mark_mount_pre_hydration_complete(&mut store, "notion", &mount_id, "2026-07-16T10:00:02Z")
+            .expect("mark complete");
+
+    assert_eq!(state.status, MountPreHydrationStatus::Complete);
+    assert_eq!(state.discovered_pages, 13);
+    assert_eq!(state.queued_pages, 11);
+    assert_eq!(state.completed_pages, 11);
+    assert_eq!(state.completed_at.as_deref(), Some("2026-07-16T10:00:02Z"));
+}
+
+#[test]
+fn pre_hydration_completed_pages_progress_to_complete() {
+    let mut store = InMemoryStateStore::new();
+    let mount_id = MountId::new("notion-main");
+    mark_mount_pre_hydration_hydrating(
+        &mut store,
+        "notion",
+        &mount_id,
+        3,
+        2,
+        "2026-07-16T10:00:00Z",
+    )
+    .expect("mark hydrating");
+
+    let state = record_mount_pre_hydration_completed_page(
+        &mut store,
+        "notion",
+        &mount_id,
+        "2026-07-16T10:00:01Z",
+    )
+    .expect("record completed page")
+    .expect("state exists");
+
+    assert_eq!(state.status, MountPreHydrationStatus::Hydrating);
+    assert_eq!(state.completed_pages, 1);
+    assert_eq!(state.completed_at, None);
+
+    let state = record_mount_pre_hydration_completed_page(
+        &mut store,
+        "notion",
+        &mount_id,
+        "2026-07-16T10:00:02Z",
+    )
+    .expect("record completed page")
+    .expect("state exists");
+
+    assert_eq!(state.status, MountPreHydrationStatus::Complete);
+    assert_eq!(state.completed_pages, 2);
+    assert_eq!(state.completed_at.as_deref(), Some("2026-07-16T10:00:02Z"));
+}
+
+#[test]
+fn pre_hydration_legacy_state_defaults_completed_pages_to_zero() {
+    let mut store = InMemoryStateStore::new();
+    let mount_id = MountId::new("notion-main");
+    store
+        .save_connector_state(ConnectorStateRecord {
+            connector: "notion".to_string(),
+            scope_kind: PRE_HYDRATION_SCOPE_KIND.to_string(),
+            scope_id: mount_id.as_str().to_string(),
+            state_version: PRE_HYDRATION_STATE_VERSION,
+            min_reader_version: PRE_HYDRATION_MIN_READER_VERSION,
+            state_json: r#"{"enabled":true,"status":"hydrating","requested_at":"2026-07-16T10:00:00Z","started_at":"2026-07-16T10:00:01Z","completed_at":null,"last_error":null,"discovered_pages":9,"queued_pages":7}"#.to_string(),
+            updated_at: "2026-07-16T10:00:01Z".to_string(),
+        })
+        .expect("save legacy state");
+
+    let state = load_mount_pre_hydration_state(&store, "notion", &mount_id)
+        .expect("load legacy state")
+        .expect("state exists");
+
+    assert_eq!(state.status, MountPreHydrationStatus::Hydrating);
+    assert_eq!(state.queued_pages, 7);
+    assert_eq!(state.completed_pages, 0);
 }
 
 #[test]
@@ -216,6 +312,7 @@ fn pre_hydration_enumerating_starts_new_run_and_resets_stale_state() {
     assert_eq!(state.status, MountPreHydrationStatus::Enumerating);
     assert_eq!(state.discovered_pages, 0);
     assert_eq!(state.queued_pages, 0);
+    assert_eq!(state.completed_pages, 0);
     assert_eq!(state.started_at.as_deref(), Some("2026-07-16T10:00:04Z"));
     assert_eq!(state.completed_at, None);
     assert_eq!(state.last_error, None);

@@ -657,7 +657,8 @@ fn hydration_state_rank(state: &HydrationState) -> u8 {
         HydrationState::Virtual => 0,
         HydrationState::Stub => 1,
         HydrationState::Hydrated => 2,
-        HydrationState::Dirty | HydrationState::Conflicted => 3,
+        HydrationState::Dirty => 3,
+        HydrationState::Conflicted => 4,
     }
 }
 

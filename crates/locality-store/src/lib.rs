@@ -34,8 +34,9 @@ pub use memory::InMemoryStateStore;
 pub use pre_hydration::{
     MountPreHydrationState, MountPreHydrationStatus, PRE_HYDRATION_MIN_READER_VERSION,
     PRE_HYDRATION_SCOPE_KIND, PRE_HYDRATION_STATE_VERSION, enable_mount_pre_hydration,
-    load_mount_pre_hydration_state, mark_mount_pre_hydration_enumerating,
-    mark_mount_pre_hydration_error, mark_mount_pre_hydration_hydrating,
+    load_mount_pre_hydration_state, mark_mount_pre_hydration_complete,
+    mark_mount_pre_hydration_enumerating, mark_mount_pre_hydration_error,
+    mark_mount_pre_hydration_hydrating, record_mount_pre_hydration_completed_page,
     save_mount_pre_hydration_state,
 };
 pub use records::{

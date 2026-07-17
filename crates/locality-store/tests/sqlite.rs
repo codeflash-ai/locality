@@ -32,7 +32,7 @@ use locality_store::{
 use rusqlite::{Connection, params};
 use serde_json::json;
 
-const DEFAULT_NOTION_CAPABILITIES_JSON: &str = "{\"supports_block_updates\":true,\"supports_databases\":true,\"supports_oauth\":true,\"supports_remote_observation\":true,\"supports_lazy_child_enumeration\":true,\"supports_media_download\":true,\"supports_undo\":true,\"supports_batch_observation\":false}";
+const DEFAULT_NOTION_CAPABILITIES_JSON: &str = "{\"supports_block_updates\":true,\"supports_databases\":true,\"supports_oauth\":true,\"supports_remote_observation\":true,\"supports_lazy_child_enumeration\":true,\"supports_media_download\":true,\"supports_undo\":true,\"supports_batch_observation\":false,\"supports_pre_hydration\":true}";
 
 #[test]
 fn sqlite_store_initializes_idempotently() {
@@ -2088,12 +2088,11 @@ fn connections_round_trip_without_storing_secret_value() {
         reopened.list_connections().expect("list connections"),
         vec![connection]
     );
-    assert_eq!(
-        reopened
-            .get_connector_profile(&ConnectorProfileId::new("notion-token-default"))
-            .expect("get profile"),
-        Some(default_profile())
-    );
+    let profile = reopened
+        .get_connector_profile(&ConnectorProfileId::new("notion-token-default"))
+        .expect("get profile");
+    assert_eq!(profile, Some(default_profile()));
+    assert_default_profile_supports_pre_hydration(&profile.expect("profile"));
 
     let sqlite_bytes = fs::read(fixture.state_root.join("state.sqlite3")).expect("read db");
     let sqlite_text = String::from_utf8_lossy(&sqlite_bytes);
@@ -2304,6 +2303,76 @@ fn hydration_jobs_batch_upsert_promotes_existing_lower_priority_job() {
             reason: HydrationReason::ExplicitPull,
             attempts: 1,
             last_error: Some("network timeout".to_string()),
+            ..hydration_job_record()
+        }]
+    );
+}
+
+#[test]
+fn hydration_jobs_batch_upsert_does_not_demote_conflicted_target_state() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config())
+        .expect("save mount");
+    store
+        .upsert_hydration_job(HydrationJobRecord {
+            target_state: HydrationState::Conflicted,
+            reason: HydrationReason::FileOpen,
+            ..hydration_job_record()
+        })
+        .expect("save conflicted hydration job");
+
+    store
+        .upsert_hydration_jobs(vec![HydrationJobRecord {
+            target_state: HydrationState::Dirty,
+            reason: HydrationReason::FileOpen,
+            ..hydration_job_record()
+        }])
+        .expect("batch upsert dirty hydration job");
+    drop(store);
+
+    let reopened = fixture.open();
+    assert_eq!(
+        reopened.list_hydration_jobs().expect("list hydration jobs"),
+        vec![HydrationJobRecord {
+            target_state: HydrationState::Conflicted,
+            reason: HydrationReason::FileOpen,
+            ..hydration_job_record()
+        }]
+    );
+}
+
+#[test]
+fn hydration_jobs_batch_upsert_promotes_dirty_to_conflicted_target_state() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config())
+        .expect("save mount");
+    store
+        .upsert_hydration_job(HydrationJobRecord {
+            target_state: HydrationState::Dirty,
+            reason: HydrationReason::FileOpen,
+            ..hydration_job_record()
+        })
+        .expect("save dirty hydration job");
+
+    store
+        .upsert_hydration_jobs(vec![HydrationJobRecord {
+            target_state: HydrationState::Conflicted,
+            reason: HydrationReason::FileOpen,
+            ..hydration_job_record()
+        }])
+        .expect("batch upsert conflicted hydration job");
+    drop(store);
+
+    let reopened = fixture.open();
+    assert_eq!(
+        reopened.list_hydration_jobs().expect("list hydration jobs"),
+        vec![HydrationJobRecord {
+            target_state: HydrationState::Conflicted,
+            reason: HydrationReason::FileOpen,
             ..hydration_job_record()
         }]
     );
@@ -2628,12 +2697,11 @@ fn sqlite_store_migrates_v8_connections_to_default_connector_profile() {
         migrated_connection.profile_id,
         Some(ConnectorProfileId::new("notion-token-default"))
     );
-    assert_eq!(
-        store
-            .get_connector_profile(&ConnectorProfileId::new("notion-token-default"))
-            .expect("get profile"),
-        Some(default_profile())
-    );
+    let profile = store
+        .get_connector_profile(&ConnectorProfileId::new("notion-token-default"))
+        .expect("get profile");
+    assert_eq!(profile, Some(default_profile()));
+    assert_default_profile_supports_pre_hydration(&profile.expect("profile"));
 }
 
 #[test]
@@ -3929,6 +3997,12 @@ fn default_profile() -> ConnectorProfileRecord {
         created_at: "0".to_string(),
         updated_at: "0".to_string(),
     }
+}
+
+fn assert_default_profile_supports_pre_hydration(profile: &ConnectorProfileRecord) {
+    let capabilities: serde_json::Value =
+        serde_json::from_str(&profile.capabilities_json).expect("parse capabilities");
+    assert_eq!(capabilities["supports_pre_hydration"], json!(true));
 }
 
 fn shadow_document(body: &str) -> ShadowDocument {
