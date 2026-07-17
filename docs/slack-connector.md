@@ -28,16 +28,16 @@ scopes, search scopes, or user email scope.
 ```text
 slack-main/
   channels/
-    product/
+    product-C123/
       recent.md
   private-channels/
-    leadership/
+    leadership-G123/
       recent.md
   dms/
-    jane-doe/
+    jane-doe-D123/
       recent.md
   group-dms/
-    design-triage/
+    design-triage-G456/
       recent.md
   users.md
 ```
@@ -47,6 +47,8 @@ slack-main/
 - `dms/` contains direct message conversations visible to the connected bot.
 - `group-dms/` contains multi-person direct message conversations visible to
   the connected bot.
+- Conversation directory names include the Slack conversation id suffix for
+  stable disambiguation.
 - `users.md` contains workspace user metadata.
 - Each conversation directory contains `recent.md` with the latest projected
   messages for that conversation.

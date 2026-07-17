@@ -34,16 +34,16 @@ Default settings:
 ```text
 slack-main/
   channels/
-    product/
+    product-C123/
       recent.md
   private-channels/
-    leadership/
+    leadership-G123/
       recent.md
   dms/
-    jane-doe/
+    jane-doe-D123/
       recent.md
   group-dms/
-    design-triage/
+    design-triage-G456/
       recent.md
   users.md
 ```
@@ -52,6 +52,8 @@ slack-main/
 - private channels live under `private-channels/`;
 - direct messages live under `dms/`;
 - multi-person direct messages live under `group-dms/`;
+- conversation directory names include the Slack conversation id suffix for
+  stable disambiguation;
 - workspace user metadata lives in `users.md`;
 - each conversation directory contains `recent.md`.
 
