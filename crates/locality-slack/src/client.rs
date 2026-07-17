@@ -23,11 +23,13 @@ const SLACK_METADATA_MAX_IN_FLIGHT: usize = 2;
 const SLACK_HISTORY_REQUESTS_PER_SECOND: f64 = 1.0 / 60.0;
 const SLACK_HISTORY_BURST: f64 = 1.0;
 const SLACK_HISTORY_MAX_IN_FLIGHT: usize = 1;
+const SLACK_REPLIES_BURST: f64 = 15.0;
 const SLACK_RATE_LIMIT_RETRIES: usize = 4;
 
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 static SLACK_METADATA_GATE: OnceLock<ConnectorNetworkGate> = OnceLock::new();
 static SLACK_HISTORY_GATE: OnceLock<ConnectorNetworkGate> = OnceLock::new();
+static SLACK_REPLIES_GATE: OnceLock<ConnectorNetworkGate> = OnceLock::new();
 
 pub trait SlackApi: fmt::Debug + Send + Sync {
     fn auth_test(&self) -> LocalityResult<SlackAuthTestResponse>;
@@ -252,7 +254,7 @@ impl SlackApi for HttpSlackApiClient {
             Method::GET,
             "conversations.replies",
             &query,
-            SlackRateGate::History,
+            SlackRateGate::Replies,
         )
     }
 
@@ -337,6 +339,7 @@ impl SlackOk for SlackUsersListResponse {
 enum SlackRateGate {
     Metadata,
     History,
+    Replies,
 }
 
 fn decode_slack_response<T>(method: &str, response: Response) -> LocalityResult<T>
@@ -430,12 +433,30 @@ fn slack_history_config() -> ConnectorNetworkConfig {
     ))
 }
 
+fn slack_replies_config() -> ConnectorNetworkConfig {
+    ConnectorNetworkConfig::new(
+        "slack-replies",
+        SLACK_HISTORY_REQUESTS_PER_SECOND,
+        SLACK_REPLIES_BURST,
+    )
+    .max_in_flight(SLACK_HISTORY_MAX_IN_FLIGHT)
+    .request_timeout(SLACK_HTTP_TIMEOUT)
+    .retry(RetryConfig::exponential(
+        SLACK_RATE_LIMIT_RETRIES,
+        Duration::from_secs(15),
+        Duration::from_secs(60),
+    ))
+}
+
 fn slack_rate_gate(rate_gate: SlackRateGate) -> &'static ConnectorNetworkGate {
     match rate_gate {
         SlackRateGate::Metadata => SLACK_METADATA_GATE
             .get_or_init(|| ConnectorNetworkGate::global(slack_metadata_config())),
         SlackRateGate::History => {
             SLACK_HISTORY_GATE.get_or_init(|| ConnectorNetworkGate::global(slack_history_config()))
+        }
+        SlackRateGate::Replies => {
+            SLACK_REPLIES_GATE.get_or_init(|| ConnectorNetworkGate::global(slack_replies_config()))
         }
     }
 }
@@ -444,6 +465,7 @@ fn slack_backoff(rate_gate: SlackRateGate, attempt: usize) -> Duration {
     match rate_gate {
         SlackRateGate::Metadata => slack_metadata_config().retry.backoff(attempt),
         SlackRateGate::History => slack_history_config().retry.backoff(attempt),
+        SlackRateGate::Replies => slack_replies_config().retry.backoff(attempt),
     }
 }
 
@@ -534,6 +556,28 @@ mod tests {
         assert!(request.contains("channel=C123"));
         assert!(request.contains("ts=1780000000.000100"));
         assert!(request.contains("limit=15"));
+    }
+
+    #[test]
+    fn conversations_replies_uses_separate_quota_scope_from_history() {
+        let history_scope = slack_rate_gate(SlackRateGate::History)
+            .config()
+            .quota_scope
+            .clone();
+        let replies_scope = slack_rate_gate(SlackRateGate::Replies)
+            .config()
+            .quota_scope
+            .clone();
+        let replies_burst = slack_rate_gate(SlackRateGate::Replies).config().burst;
+        let replies_max_in_flight = slack_rate_gate(SlackRateGate::Replies)
+            .config()
+            .max_in_flight;
+
+        assert_eq!(history_scope, "slack-history");
+        assert_eq!(replies_scope, "slack-replies");
+        assert_ne!(history_scope, replies_scope);
+        assert_eq!(replies_burst, 15.0);
+        assert_eq!(replies_max_in_flight, 1);
     }
 
     #[test]

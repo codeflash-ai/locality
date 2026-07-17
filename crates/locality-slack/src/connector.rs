@@ -372,8 +372,7 @@ impl Connector for SlackConnector {
                 None,
                 self.config.settings.slack.history_limit,
             )?;
-            let threads = self.recent_thread_replies(conversation_id, &history.messages)?;
-            let bundle = recent_bundle(conversation, users, history.messages, threads);
+            let bundle = recent_bundle(conversation, users, history.messages, BTreeMap::new());
             let version = slack_remote_version(&bundle)?;
             return Ok(RemoteObservation::new(
                 request.mount_id,
@@ -1056,6 +1055,51 @@ mod tests {
     }
 
     #[test]
+    fn observe_recent_does_not_fetch_thread_replies() {
+        let parent_ts = "1780000000.000100";
+        let api = FakeSlackApi::default()
+            .with_conversations(vec![SlackConversation {
+                id: "C123".to_string(),
+                name: Some("general".to_string()),
+                is_channel: true,
+                ..SlackConversation::default()
+            }])
+            .with_messages(vec![SlackMessage {
+                text: "Parent message".to_string(),
+                ts: parent_ts.to_string(),
+                thread_ts: Some(parent_ts.to_string()),
+                reply_count: Some(1),
+                ..SlackMessage::default()
+            }])
+            .with_thread_replies(
+                parent_ts,
+                vec![SlackMessage {
+                    text: "Thread reply body".to_string(),
+                    ts: "1780000001.000200".to_string(),
+                    thread_ts: Some(parent_ts.to_string()),
+                    ..SlackMessage::default()
+                }],
+            );
+        let connector = connector_with_api(api.clone());
+
+        let observation = connector
+            .observe(ObserveRequest {
+                mount_id: MountId::new("slack-main"),
+                remote_id: RemoteId::new("slack-recent:C123"),
+            })
+            .expect("observe recent");
+
+        assert_content_remote_version(observation.remote_version.expect("version").as_str());
+        assert!(
+            api.thread_requests
+                .lock()
+                .expect("thread requests")
+                .is_empty(),
+            "freshness observation must not block on conversations.replies"
+        );
+    }
+
+    #[test]
     fn users_fetch_render_and_observe_versions_match_renderer_frontmatter() {
         let connector = connector_with_api(FakeSlackApi::default());
 
@@ -1221,7 +1265,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_version_for_recent_changes_when_thread_reply_text_changes() {
+    fn rendered_recent_version_matches_observe_version_with_thread_replies() {
         let parent = SlackMessage {
             text: "parent message".to_string(),
             ts: "1780000000.000100".to_string(),
@@ -1229,54 +1273,30 @@ mod tests {
             reply_count: Some(1),
             ..SlackMessage::default()
         };
-        let before = observe_version(
-            connector_with_api(
-                FakeSlackApi::default()
-                    .with_conversations(vec![SlackConversation {
-                        id: "C123".to_string(),
-                        name: Some("general".to_string()),
-                        is_channel: true,
-                        ..SlackConversation::default()
-                    }])
-                    .with_messages(vec![parent.clone()])
-                    .with_thread_replies(
-                        "1780000000.000100",
-                        vec![SlackMessage {
-                            text: "original reply".to_string(),
-                            ts: "1780000001.000200".to_string(),
-                            thread_ts: Some("1780000000.000100".to_string()),
-                            ..SlackMessage::default()
-                        }],
-                    ),
-            ),
-            "slack-recent:C123",
-        );
-        let after = observe_version(
-            connector_with_api(
-                FakeSlackApi::default()
-                    .with_conversations(vec![SlackConversation {
-                        id: "C123".to_string(),
-                        name: Some("general".to_string()),
-                        is_channel: true,
-                        ..SlackConversation::default()
-                    }])
-                    .with_messages(vec![parent])
-                    .with_thread_replies(
-                        "1780000000.000100",
-                        vec![SlackMessage {
-                            text: "edited reply".to_string(),
-                            ts: "1780000001.000200".to_string(),
-                            thread_ts: Some("1780000000.000100".to_string()),
-                            ..SlackMessage::default()
-                        }],
-                    ),
-            ),
-            "slack-recent:C123",
-        );
+        let api = FakeSlackApi::default()
+            .with_conversations(vec![SlackConversation {
+                id: "C123".to_string(),
+                name: Some("general".to_string()),
+                is_channel: true,
+                ..SlackConversation::default()
+            }])
+            .with_messages(vec![parent])
+            .with_thread_replies(
+                "1780000000.000100",
+                vec![SlackMessage {
+                    text: "Thread reply body".to_string(),
+                    ts: "1780000001.000200".to_string(),
+                    thread_ts: Some("1780000000.000100".to_string()),
+                    ..SlackMessage::default()
+                }],
+            );
 
-        assert_content_remote_version(&before);
-        assert_content_remote_version(&after);
-        assert_ne!(before, after);
+        let rendered = rendered_recent_version(connector_with_api(api.clone()));
+        let observed = observe_version(connector_with_api(api), "slack-recent:C123");
+
+        assert_content_remote_version(&rendered);
+        assert_content_remote_version(&observed);
+        assert_eq!(rendered, observed);
     }
 
     #[test]
@@ -1496,6 +1516,16 @@ mod tests {
             .expect("remote version")
             .as_str()
             .to_string()
+    }
+
+    fn rendered_recent_version(connector: SlackConnector) -> String {
+        let native = connector
+            .fetch(FetchRequest {
+                remote_id: RemoteId::new("slack-recent:C123"),
+            })
+            .expect("fetch recent");
+        let document = connector.render(&native).expect("render recent");
+        remote_edited_at_from_frontmatter(&document.frontmatter).to_string()
     }
 
     fn assert_content_remote_version(version: &str) {

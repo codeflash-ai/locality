@@ -474,6 +474,16 @@ mod tests {
             Ok(SlackHistoryResponse::default())
         }
 
+        fn conversations_replies(
+            &self,
+            _channel: &str,
+            _thread_ts: &str,
+            _cursor: Option<&str>,
+            _limit: u32,
+        ) -> LocalityResult<SlackHistoryResponse> {
+            Ok(SlackHistoryResponse::default())
+        }
+
         fn conversations_join(&self, _channel: &str) -> LocalityResult<SlackJoinResponse> {
             Ok(SlackJoinResponse::default())
         }

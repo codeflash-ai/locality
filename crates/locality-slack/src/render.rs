@@ -97,7 +97,11 @@ fn render_users(bundle: &SlackNativeBundle) -> LocalityResult<CanonicalDocument>
 
 fn version_payload(bundle: &SlackNativeBundle) -> LocalityResult<String> {
     match bundle.kind {
-        SlackRenderedKind::Recent => recent_version_payload(bundle),
+        SlackRenderedKind::Recent => {
+            let mut observed_bundle = bundle.clone();
+            observed_bundle.threads.clear();
+            recent_version_payload(&observed_bundle)
+        }
         SlackRenderedKind::Users => Ok(users_version_payload(bundle)),
     }
 }

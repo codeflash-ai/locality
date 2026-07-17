@@ -63,15 +63,22 @@ slack-main/
 
 ## Sync and limits
 
-Slack uses separate connector-owned quota scopes for metadata and history.
-Metadata calls cover conversation and user listings. History calls cover
-`conversations.history` and related history fetches.
+Slack uses separate connector-owned quota scopes for metadata, conversation
+history, and thread replies. Metadata calls cover conversation and user
+listings. History calls cover `conversations.history`; thread reply calls cover
+bounded `conversations.replies` expansion for threaded parent messages.
 
-Locality defaults to `history_limit: 15` and a 1 request/minute history gate.
-That default follows Slack's strictest documented history policy for newly
-created or installed commercially distributed non-Marketplace apps. Marketplace
-apps and internal customer-built apps may have different provider limits, but
-Locality keeps the default conservative so read-only sync stays provider-safe.
+Locality defaults to `history_limit: 15`, a 1 request/minute history gate, and
+a bounded one-at-a-time reply expansion scope. That default follows Slack's
+strictest documented history page size while keeping FUSE reads bounded enough
+to open threaded conversations. Marketplace apps and internal customer-built
+apps may have different provider limits, but Locality still treats Slack 429
+responses as provider cooldowns.
+
+Freshness checks use the bounded conversation history and user metadata payload.
+Thread reply bodies are expanded when `recent.md` hydrates, so reply-only edits
+become visible on the next hydration or explicit pull without making background
+freshness block on `conversations.replies`.
 
 ## Write policy
 
