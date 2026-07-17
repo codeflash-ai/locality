@@ -30,6 +30,10 @@ use locality_notion::oauth::{
     DEFAULT_LOCALITY_NOTION_OAUTH_BROKER_URL, DEFAULT_NOTION_OAUTH_AUTHORIZE_URL,
     HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NotionOAuthBrokerStart,
 };
+use locality_slack::{
+    DEFAULT_SLACK_OAUTH_BROKER_URL, DEFAULT_SLACK_OAUTH_REDIRECT_URI, HttpSlackOAuthBrokerClient,
+    SLACK_CONNECTOR_ID,
+};
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
     ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, EntityRecord,
@@ -58,10 +62,11 @@ use crate::connect::{
     BrokerOAuthConnectOptions, ConnectError, ConnectOptions, ConnectReport, ConnectionShowReport,
     ConnectionsReport, DisconnectReport, GmailBrokerOAuthConnectOptions,
     GoogleDocsBrokerOAuthConnectOptions, HttpGranolaConnectionProbe, HttpNotionConnectionProbe,
-    OAuthConnectOptions, ProfilesReport, run_connect_gmail_broker_oauth,
-    run_connect_google_docs_broker_oauth, run_connect_granola, run_connect_notion,
-    run_connect_notion_broker_oauth, run_connect_notion_oauth, run_connection_show,
-    run_connections, run_disconnect, run_profiles,
+    OAuthConnectOptions, ProfilesReport, SlackBrokerOAuthConnectOptions,
+    run_connect_gmail_broker_oauth, run_connect_google_docs_broker_oauth, run_connect_granola,
+    run_connect_notion, run_connect_notion_broker_oauth, run_connect_notion_oauth,
+    run_connect_slack_broker_oauth, run_connection_show, run_connections, run_disconnect,
+    run_profiles,
 };
 use crate::connector::{
     ConnectorResolveError, SourceDescriptor, resolve_notion_connector_for_mount,
@@ -226,6 +231,8 @@ enum ConnectCommand {
     GoogleDocs(ConnectGoogleDocsArgs),
     #[command(about = "Connect Gmail")]
     Gmail(ConnectGmailArgs),
+    #[command(about = "Connect Slack")]
+    Slack(ConnectSlackArgs),
     #[command(about = "Connect Granola with an API key")]
     Granola(ConnectGranolaArgs),
 }
@@ -295,6 +302,26 @@ struct ConnectGmailArgs {
         long,
         value_name = "ID",
         help = "Connection id to save. Defaults to gmail-default."
+    )]
+    name: Option<String>,
+    #[arg(long, help = "Print the OAuth URL instead of opening a browser.")]
+    no_browser: bool,
+    #[arg(long, value_name = "URL", help = "OAuth broker base URL.")]
+    broker_url: Option<String>,
+    #[arg(
+        long,
+        value_name = "URI",
+        help = "OAuth redirect URI for the local callback listener."
+    )]
+    redirect_uri: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ConnectSlackArgs {
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Connection id to save. Defaults to slack-default."
     )]
     name: Option<String>,
     #[arg(long, help = "Print the OAuth URL instead of opening a browser.")]
@@ -963,6 +990,21 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                         options.redirect_uri.as_deref(),
                     );
                 }
+                ConnectCommand::Slack(options) => {
+                    args.push("slack".to_string());
+                    push_optional_flag_value(&mut args, "--name", options.name.as_deref());
+                    push_flag(&mut args, "--no-browser", options.no_browser);
+                    push_optional_flag_value(
+                        &mut args,
+                        "--broker-url",
+                        options.broker_url.as_deref(),
+                    );
+                    push_optional_flag_value(
+                        &mut args,
+                        "--redirect-uri",
+                        options.redirect_uri.as_deref(),
+                    );
+                }
                 ConnectCommand::Granola(options) => {
                     args.push("granola".to_string());
                     push_optional_flag_value(&mut args, "--name", options.name.as_deref());
@@ -1415,13 +1457,16 @@ fn connect(args: &[String], json: bool) -> i32 {
     if connector == Some(GOOGLE_DOCS_CONNECTOR_ID) {
         return connect_google_docs(args, json);
     }
+    if connector == Some(SLACK_CONNECTOR_ID) {
+        return connect_slack(args, json);
+    }
     if connector != Some("notion") {
         return command_error(
             json,
             CommandError::new(
                 "connect",
                 "usage",
-                "usage: loc connect <notion|google-docs|gmail|granola> [options] [--json]",
+                "usage: loc connect <notion|google-docs|gmail|slack|granola> [options] [--json]",
             ),
             EXIT_USAGE,
         );
@@ -1790,6 +1835,77 @@ fn connect_gmail(args: &[String], json: bool) -> i32 {
         redirect_uri: start.redirect_uri,
     };
     match run_connect_gmail_broker_oauth(&mut store, credentials.as_ref(), options, &broker) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_connect_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => connect_command_error("connect", json, error),
+    }
+}
+
+fn connect_slack(args: &[String], json: bool) -> i32 {
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("connect", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let credentials = open_credential_store(&state_root);
+    let broker_config = match slack_oauth_broker_config(args) {
+        Ok(config) => config,
+        Err(error) => return command_error(json, error, EXIT_INTERNAL),
+    };
+    let broker = HttpSlackOAuthBrokerClient::new(broker_config.broker_url.clone());
+    let start = match broker.start(&OAuthBrokerStart {
+        connector: SLACK_CONNECTOR_ID.to_string(),
+        redirect_uri: broker_config.redirect_uri,
+    }) {
+        Ok(start) => start,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new(
+                    "connect",
+                    "oauth_broker_start_failed",
+                    format!("Slack OAuth broker start failed: {error}"),
+                )
+                .with_suggested_command("loc connect slack"),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let authorization = match run_local_oauth_authorization(
+        "Slack",
+        &start.authorization_url,
+        &start.redirect_uri,
+        &start.state,
+        has_flag(args, "--no-browser"),
+        json,
+    ) {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            return command_error(json, slack_local_oauth_command_error(error), EXIT_INTERNAL);
+        }
+    };
+    let options = SlackBrokerOAuthConnectOptions {
+        connection_id: flag_value(args, "--name").map(ConnectionId::new),
+        broker_url: broker_config.broker_url,
+        client_id: start.client_id,
+        session: start.session,
+        state: start.state,
+        code: authorization.code,
+        redirect_uri: start.redirect_uri,
+    };
+    match run_connect_slack_broker_oauth(&mut store, credentials.as_ref(), options, &broker) {
         Ok(report) if json => {
             print_json(&report);
             EXIT_SUCCESS
@@ -6678,6 +6794,12 @@ struct GmailOAuthBrokerCliConfig {
     redirect_uri: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SlackOAuthBrokerCliConfig {
+    broker_url: String,
+    redirect_uri: String,
+}
+
 fn notion_oauth_config(args: &[String]) -> Result<NotionOAuthCliConfig, CommandError> {
     let client_id = env_first(&["LOCALITY_NOTION_OAUTH_CLIENT_ID", "NOTION_OAUTH_CLIENT_ID"])
         .ok_or_else(|| missing_oauth_config("LOCALITY_NOTION_OAUTH_CLIENT_ID"))?;
@@ -6793,6 +6915,32 @@ fn gmail_oauth_broker_config(args: &[String]) -> Result<GmailOAuthBrokerCliConfi
     })
 }
 
+fn slack_oauth_broker_config(args: &[String]) -> Result<SlackOAuthBrokerCliConfig, CommandError> {
+    let broker_url = flag_value(args, "--broker-url")
+        .map(str::to_string)
+        .or_else(|| {
+            env_first(&[
+                "LOCALITY_SLACK_OAUTH_BROKER_URL",
+                "LOCALITY_AUTH_BROKER_URL",
+            ])
+        })
+        .unwrap_or_else(|| DEFAULT_SLACK_OAUTH_BROKER_URL.to_string());
+    let redirect_uri = flag_value(args, "--redirect-uri")
+        .map(str::to_string)
+        .or_else(|| env_first(&["LOCALITY_SLACK_OAUTH_REDIRECT_URI"]))
+        .unwrap_or_else(|| DEFAULT_SLACK_OAUTH_REDIRECT_URI.to_string());
+
+    local_redirect(&redirect_uri).map_err(|error| {
+        CommandError::new("connect", error.code, error.message)
+            .with_suggested_command("loc connect slack")
+    })?;
+
+    Ok(SlackOAuthBrokerCliConfig {
+        broker_url,
+        redirect_uri,
+    })
+}
+
 fn missing_oauth_config(name: &str) -> CommandError {
     CommandError::new(
         "connect",
@@ -6872,6 +7020,15 @@ fn gmail_local_oauth_command_error(error: LocalOAuthError) -> CommandError {
     let command_error = CommandError::new("connect", error.code, error.message);
     if command_error.code == "invalid_redirect_uri" {
         command_error.with_suggested_command("loc connect gmail")
+    } else {
+        command_error
+    }
+}
+
+fn slack_local_oauth_command_error(error: LocalOAuthError) -> CommandError {
+    let command_error = CommandError::new("connect", error.code, error.message);
+    if command_error.code == "invalid_redirect_uri" {
+        command_error.with_suggested_command("loc connect slack")
     } else {
         command_error
     }
@@ -8133,8 +8290,9 @@ mod tests {
         prompt_for_push_confirmation, pull_direct_fallback_error,
         push_confirmation_preview_matches_displayed, push_preview_plan_matches,
         should_prompt_for_push_confirmation, should_refresh_notion_url_search,
-        spinner_config_for_command, spinner_enabled, status as run_status_command,
-        validate_virtual_projection_registration, write_connect_report, write_log_report,
+        slack_oauth_broker_config, spinner_config_for_command, spinner_enabled,
+        status as run_status_command, validate_virtual_projection_registration,
+        write_connect_report, write_log_report,
     };
 
     #[test]
@@ -8158,6 +8316,7 @@ mod tests {
                     "notion",
                     "google-docs",
                     "gmail",
+                    "slack",
                     "granola",
                     "--json",
                 ],
@@ -8185,6 +8344,15 @@ mod tests {
                 vec![
                     "Usage: loc connect gmail",
                     "Connect Gmail",
+                    "--broker-url",
+                    "--redirect-uri",
+                ],
+            ),
+            (
+                vec!["connect", "slack", "--help"],
+                vec![
+                    "Usage: loc connect slack",
+                    "Connect Slack",
                     "--broker-url",
                     "--redirect-uri",
                 ],
@@ -9887,6 +10055,25 @@ mod tests {
         assert_eq!(
             config.redirect_uri,
             "http://localhost:8757/oauth/google-docs/callback"
+        );
+    }
+
+    #[test]
+    fn slack_oauth_broker_config_accepts_explicit_broker_url() {
+        let args = vec![
+            "slack".to_string(),
+            "--broker-url".to_string(),
+            "https://auth.example.test".to_string(),
+            "--redirect-uri".to_string(),
+            "http://localhost:8757/oauth/slack/callback".to_string(),
+        ];
+
+        let config = slack_oauth_broker_config(&args).expect("broker config");
+
+        assert_eq!(config.broker_url, "https://auth.example.test");
+        assert_eq!(
+            config.redirect_uri,
+            "http://localhost:8757/oauth/slack/callback"
         );
     }
 

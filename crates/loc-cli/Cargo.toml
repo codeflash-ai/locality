@@ -23,6 +23,7 @@ locality-notion.workspace = true
 locality-gmail.workspace = true
 locality-granola.workspace = true
 locality-google-docs.workspace = true
+locality-slack.workspace = true
 localityd = { path = "../localityd" }
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }

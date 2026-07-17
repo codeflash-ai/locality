@@ -2081,6 +2081,7 @@ dependencies = [
  "locality-granola",
  "locality-notion",
  "locality-platform",
+ "locality-slack",
  "locality-store",
  "localityd",
  "serde",
