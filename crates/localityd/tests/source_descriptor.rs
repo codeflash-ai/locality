@@ -170,6 +170,7 @@ fn google_calendar_write_policy_allows_only_direct_drafts() {
         !source_write_decision_for_path(&mount, std::path::Path::new("events/foo.md"))
             .is_writable()
     );
+    assert!(source_write_decision_for_path(&mount, std::path::Path::new("draft")).is_writable());
     assert!(
         source_write_decision_for_path(&mount, std::path::Path::new("draft/foo.md")).is_writable()
     );
