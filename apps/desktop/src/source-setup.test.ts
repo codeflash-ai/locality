@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  connectedSourcesReadyToMount,
   sourceConnectorIds,
   sourceRequiresApiKey,
   sourceSkipsManualMountStep,
+  sourceMountRetryOutcome,
   sourceSetupIsActiveConnector,
   sourceSetupIsBusy,
   sourceSetupProgressLabel,
@@ -29,5 +31,53 @@ describe("source setup progress", () => {
     expect(sourceRequiresApiKey("granola")).toBe(true);
     expect(sourceRequiresApiKey("gmail")).toBe(false);
     expect(sourceSkipsManualMountStep("linear")).toBe(true);
+  });
+
+  it("keeps connected but unmounted sources visible when another source is mounted", () => {
+    expect(
+      connectedSourcesReadyToMount({
+        connection: { connector: "granola", status: "active" },
+        connections: [
+          { connector: "granola", status: "active" },
+          { connector: "notion", status: "active" },
+        ],
+        mounts: [{ connector: "granola", status: "ready" }],
+      }),
+    ).toEqual(["notion"]);
+  });
+
+  it("falls back to the selected connection when older snapshots do not include all connections", () => {
+    expect(
+      connectedSourcesReadyToMount({
+        connection: { connector: "notion", status: "active" },
+        mounts: [],
+      }),
+    ).toEqual(["notion"]);
+  });
+});
+
+describe("source File Provider mount retry", () => {
+  it("completes a successful automatic mount retry", () => {
+    expect(sourceMountRetryOutcome({ ok: true, message: "Mounted Notion." })).toEqual({
+      kind: "success",
+      message: "Mounted Notion.",
+    });
+  });
+
+  it("continues recovery when File Provider is still disabled", () => {
+    expect(sourceMountRetryOutcome({
+      ok: false,
+      message: "The Locality File Provider is registered but not enabled.",
+    })).toEqual({ kind: "retry" });
+  });
+
+  it("turns another automatic mount failure into a visible dialog error", () => {
+    expect(sourceMountRetryOutcome({
+      ok: false,
+      message: "Could not load the top-level Notion folder.",
+    })).toEqual({
+      kind: "error",
+      message: "Could not load the top-level Notion folder.",
+    });
   });
 });

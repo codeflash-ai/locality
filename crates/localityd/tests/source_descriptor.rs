@@ -38,6 +38,7 @@ fn notion_descriptor_exposes_cli_and_mount_metadata() {
     assert!(descriptor.supports_oauth());
     assert!(descriptor.mount_guidance().contains("Notion facts:"));
     assert_eq!(descriptor.periodic_discovery_interval(), None);
+    assert_eq!(descriptor.max_background_discovery_workers(), 3);
 }
 
 #[test]
@@ -100,6 +101,7 @@ fn granola_descriptor_is_read_only_and_uses_api_key_setup() {
         descriptor.periodic_discovery_interval(),
         Some(Duration::from_secs(300))
     );
+    assert_eq!(descriptor.max_background_discovery_workers(), 3);
 }
 
 #[test]

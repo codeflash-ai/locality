@@ -179,6 +179,7 @@ const DESKTOP_BACKGROUND_LAUNCH_ARG: &str = "--background";
 struct DesktopSnapshot {
     health: AppHealth,
     connection: ConnectionSummary,
+    connections: Vec<ConnectionSummary>,
     mount: MountSummary,
     mounts: Vec<MountSummary>,
     active_mount_id: Option<String>,
@@ -224,8 +225,17 @@ struct MountSummary {
     status: String,
     root_exists: bool,
     entity_count: usize,
+    hydration_progress: Option<MountHydrationProgress>,
     pending_change_count: usize,
     provider: Option<ProviderRuntimeSummary>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MountHydrationProgress {
+    indexed_files: usize,
+    remaining_files: usize,
+    total_files: usize,
 }
 
 #[derive(Clone, Serialize)]
@@ -347,6 +357,14 @@ struct WorkspaceMountOnboardingReport {
     launch_strategy: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileProviderEnablementReport {
+    state: String,
+    message: String,
+    path: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MacosWorkspaceMountOnboardingState {
     Created,
@@ -359,7 +377,7 @@ impl MacosWorkspaceMountOnboardingState {
     fn as_str(self) -> &'static str {
         match self {
             Self::Created => "created",
-            Self::ApprovalRequired => "approval_required",
+            Self::ApprovalRequired => "needs_finder_enable",
             Self::WaitingForCloudStorageRoot => "waiting_for_cloudstorage_root",
             Self::Failed => "failed",
         }
@@ -1571,6 +1589,388 @@ fn disconnect_source_blocking(mount_id: String, confirmation: String) -> Result<
     Ok(message)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceBackupManifest {
+    generated_at: String,
+    mount_id: String,
+    connector: String,
+    connector_name: String,
+    source_path: String,
+    backup_path: String,
+    files_path: String,
+    file_count: usize,
+    directory_count: usize,
+    bytes: u64,
+    skipped: Vec<SourceBackupSkippedItem>,
+    note: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceBackupSkippedItem {
+    path: String,
+    reason: String,
+}
+
+#[derive(Default)]
+struct SourceBackupStats {
+    files: usize,
+    directories: usize,
+    bytes: u64,
+    skipped: Vec<SourceBackupSkippedItem>,
+}
+
+struct SourceBackupExport {
+    directory: PathBuf,
+    stats: SourceBackupStats,
+    mount: MountConfig,
+}
+
+impl SourceBackupExport {
+    fn skipped_count(&self) -> usize {
+        self.stats.skipped.len()
+    }
+}
+
+#[tauri::command]
+async fn export_source_backup(app: AppHandle, mount_id: String) -> ActionReport {
+    let report =
+        tauri::async_runtime::spawn_blocking(move || export_source_backup_blocking(mount_id))
+            .await
+            .map_err(|error| format!("Source backup worker failed: {error}"))
+            .and_then(|result| result)
+            .map(|message| ActionReport { ok: true, message })
+            .unwrap_or_else(|message| ActionReport { ok: false, message });
+    if report.ok {
+        refresh_desktop_surfaces(&app);
+    }
+    report
+}
+
+fn export_source_backup_blocking(mount_id: String) -> Result<String, String> {
+    let state_root = default_state_root();
+    let store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let backup_root = source_backup_root()?;
+    let export = export_source_backup_to_root(&store, &backup_root, &mount_id)?;
+    let skipped = export.skipped_count();
+    let skipped_note = if skipped > 0 {
+        format!(
+            " {skipped} item{} could not be copied; see manifest.json.",
+            if skipped == 1 { "" } else { "s" }
+        )
+    } else {
+        String::new()
+    };
+    let message = format!(
+        "Exported {} source backup to `{}` ({} file{}).{}",
+        connector_label(&export.mount.connector),
+        display_path(&export.directory),
+        export.stats.files,
+        if export.stats.files == 1 { "" } else { "s" },
+        skipped_note
+    );
+    if let Err(error) = record_desktop_activity(
+        &state_root,
+        "Exported source backup",
+        &format!(
+            "{} source `{}` was exported to `{}`.",
+            connector_label(&export.mount.connector),
+            export.mount.mount_id.0,
+            display_path(&export.directory)
+        ),
+        "backup",
+    ) {
+        desktop_log(
+            "warn",
+            "source_backup.activity_failed",
+            format!("could not record source backup activity: {error}"),
+        );
+    }
+    Ok(message)
+}
+
+fn export_source_backup_to_root(
+    store: &SqliteStateStore,
+    backup_root: &Path,
+    mount_id: &str,
+) -> Result<SourceBackupExport, String> {
+    let mount_id = MountId::new(mount_id.trim().to_string());
+    if mount_id.0.is_empty() {
+        return Err("Source mount id is required.".to_string());
+    }
+    let mount = store
+        .get_mount(&mount_id)
+        .map_err(|error| format!("Could not inspect source mount: {error}"))?
+        .ok_or_else(|| format!("Source mount `{}` was not found.", mount_id.0))?;
+    let source_root = mount_access_root(&mount);
+    if !source_root.exists() {
+        return Err(format!(
+            "Source folder `{}` does not exist yet. Open or sync the source before exporting a backup.",
+            display_path(&source_root)
+        ));
+    }
+    if !source_root.is_dir() {
+        return Err(format!(
+            "Source folder `{}` is not a directory.",
+            display_path(&source_root)
+        ));
+    }
+
+    let backup_dir = unique_source_backup_dir(backup_root, &mount_id.0);
+    let files_dir = backup_dir.join("files");
+    fs::create_dir_all(&files_dir)
+        .map_err(|error| format!("Could not create source backup folder: {error}"))?;
+    let stats = copy_source_backup_tree(&source_root, &files_dir)?;
+    write_source_backup_readme(&backup_dir, &mount, &source_root, &files_dir, &stats)?;
+    write_source_backup_manifest(&backup_dir, &mount, &source_root, &files_dir, &stats)?;
+
+    Ok(SourceBackupExport {
+        directory: backup_dir,
+        stats,
+        mount,
+    })
+}
+
+fn source_backup_root() -> Result<PathBuf, String> {
+    home_dir()
+        .map(|home| home.join("Locality Backups"))
+        .map_err(|error| format!("Could not find a home folder for source backups: {error}"))
+}
+
+fn unique_source_backup_dir(backup_root: &Path, mount_id: &str) -> PathBuf {
+    let source_root = backup_root.join(safe_backup_segment(mount_id));
+    let timestamp = source_backup_timestamp();
+    let mut candidate = source_root.join(&timestamp);
+    let mut suffix = 2;
+    while candidate.exists() {
+        candidate = source_root.join(format!("{timestamp}-{suffix}"));
+        suffix += 1;
+    }
+    candidate
+}
+
+fn source_backup_timestamp() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!("backup-{millis}")
+}
+
+fn safe_backup_segment(value: &str) -> String {
+    let mut output = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while output.contains("--") {
+        output = output.replace("--", "-");
+    }
+    let output = output.trim_matches('-').to_string();
+    if output.is_empty() {
+        "source".to_string()
+    } else {
+        output
+    }
+}
+
+fn copy_source_backup_tree(
+    source_root: &Path,
+    files_dir: &Path,
+) -> Result<SourceBackupStats, String> {
+    let mut stats = SourceBackupStats::default();
+    let entries = fs::read_dir(source_root).map_err(|error| {
+        format!(
+            "Could not read source folder `{}` for backup: {error}",
+            display_path(source_root)
+        )
+    })?;
+    for entry in entries {
+        match entry {
+            Ok(entry) => {
+                let destination = files_dir.join(entry.file_name());
+                copy_source_backup_entry(source_root, &entry.path(), &destination, &mut stats);
+            }
+            Err(error) => stats.skipped.push(SourceBackupSkippedItem {
+                path: ".".to_string(),
+                reason: format!("Could not read source folder entry: {error}"),
+            }),
+        }
+    }
+    Ok(stats)
+}
+
+fn copy_source_backup_entry(
+    source_root: &Path,
+    source_path: &Path,
+    destination_path: &Path,
+    stats: &mut SourceBackupStats,
+) {
+    let relative_path = source_backup_relative_path(source_root, source_path);
+    let metadata = match fs::symlink_metadata(source_path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            stats.skipped.push(SourceBackupSkippedItem {
+                path: relative_path,
+                reason: format!("Could not inspect item: {error}"),
+            });
+            return;
+        }
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        stats.skipped.push(SourceBackupSkippedItem {
+            path: relative_path,
+            reason: "Symbolic links are skipped so backups stay self-contained.".to_string(),
+        });
+        return;
+    }
+    if metadata.is_dir() {
+        if let Err(error) = fs::create_dir_all(destination_path) {
+            stats.skipped.push(SourceBackupSkippedItem {
+                path: relative_path,
+                reason: format!("Could not create backup directory: {error}"),
+            });
+            return;
+        }
+        stats.directories += 1;
+        let entries = match fs::read_dir(source_path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                stats.skipped.push(SourceBackupSkippedItem {
+                    path: relative_path,
+                    reason: format!("Could not read directory: {error}"),
+                });
+                return;
+            }
+        };
+        for entry in entries {
+            match entry {
+                Ok(entry) => {
+                    copy_source_backup_entry(
+                        source_root,
+                        &entry.path(),
+                        &destination_path.join(entry.file_name()),
+                        stats,
+                    );
+                }
+                Err(error) => stats.skipped.push(SourceBackupSkippedItem {
+                    path: relative_path.clone(),
+                    reason: format!("Could not read directory entry: {error}"),
+                }),
+            }
+        }
+        return;
+    }
+    if metadata.is_file() {
+        if let Some(parent) = destination_path.parent() {
+            if let Err(error) = fs::create_dir_all(parent) {
+                stats.skipped.push(SourceBackupSkippedItem {
+                    path: relative_path,
+                    reason: format!("Could not create backup parent folder: {error}"),
+                });
+                return;
+            }
+        }
+        match fs::copy(source_path, destination_path) {
+            Ok(bytes) => {
+                stats.files += 1;
+                stats.bytes = stats.bytes.saturating_add(bytes);
+            }
+            Err(error) => stats.skipped.push(SourceBackupSkippedItem {
+                path: relative_path,
+                reason: format!("Could not copy file: {error}"),
+            }),
+        }
+        return;
+    }
+
+    stats.skipped.push(SourceBackupSkippedItem {
+        path: relative_path,
+        reason: "Unsupported filesystem item type.".to_string(),
+    });
+}
+
+fn source_backup_relative_path(source_root: &Path, source_path: &Path) -> String {
+    source_path
+        .strip_prefix(source_root)
+        .ok()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| ".".to_string())
+}
+
+fn write_source_backup_readme(
+    backup_dir: &Path,
+    mount: &MountConfig,
+    source_root: &Path,
+    files_dir: &Path,
+    stats: &SourceBackupStats,
+) -> Result<(), String> {
+    let skipped_note = if stats.skipped.is_empty() {
+        "No items were skipped.".to_string()
+    } else {
+        format!(
+            "{} item{} could not be copied. See `manifest.json` for details.",
+            stats.skipped.len(),
+            if stats.skipped.len() == 1 { "" } else { "s" }
+        )
+    };
+    let contents = format!(
+        "# Locality Source Backup\n\n\
+This folder is a point-in-time export of the `{}` source mounted at `{}`.\n\n\
+- Files are copied under `files/`.\n\
+- `manifest.json` records the source, destination, copied file count, and skipped items.\n\
+- Editing this backup does not sync back to {}. Use the mounted source folder for live work.\n\n\
+Copied {} file{} from `{}` into `{}`.\n{}\n",
+        mount.mount_id.0,
+        display_path(source_root),
+        connector_label(&mount.connector),
+        stats.files,
+        if stats.files == 1 { "" } else { "s" },
+        display_path(source_root),
+        display_path(files_dir),
+        skipped_note
+    );
+    fs::write(backup_dir.join("README.md"), contents)
+        .map_err(|error| format!("Could not write source backup README: {error}"))
+}
+
+fn write_source_backup_manifest(
+    backup_dir: &Path,
+    mount: &MountConfig,
+    source_root: &Path,
+    files_dir: &Path,
+    stats: &SourceBackupStats,
+) -> Result<(), String> {
+    let manifest = SourceBackupManifest {
+        generated_at: activity_timestamp(),
+        mount_id: mount.mount_id.0.clone(),
+        connector: mount.connector.clone(),
+        connector_name: connector_label(&mount.connector),
+        source_path: source_root.display().to_string(),
+        backup_path: backup_dir.display().to_string(),
+        files_path: files_dir.display().to_string(),
+        file_count: stats.files,
+        directory_count: stats.directories,
+        bytes: stats.bytes,
+        skipped: stats.skipped.clone(),
+        note: "This backup is a local export only. It does not sync back to the remote source."
+            .to_string(),
+    };
+    let contents = serde_json::to_string_pretty(&manifest)
+        .map_err(|error| format!("Could not serialize source backup manifest: {error}"))?;
+    fs::write(backup_dir.join("manifest.json"), contents)
+        .map_err(|error| format!("Could not write source backup manifest: {error}"))
+}
+
 fn validate_source_action_confirmation(
     action: &str,
     mount_id: &MountId,
@@ -1607,6 +2007,33 @@ async fn run_workspace_mount_onboarding(
         refresh_desktop_surfaces(&app);
     }
     report
+}
+
+#[tauri::command]
+async fn file_provider_enablement_status() -> FileProviderEnablementReport {
+    tauri::async_runtime::spawn_blocking(macos_file_provider_enablement_status_blocking)
+        .await
+        .unwrap_or_else(|error| FileProviderEnablementReport {
+            state: "unavailable".to_string(),
+            message: format!("File Provider status worker failed: {error}"),
+            path: None,
+        })
+}
+
+#[tauri::command]
+async fn reveal_file_provider_enablement() -> ActionReport {
+    tauri::async_runtime::spawn_blocking(reveal_file_provider_enablement_blocking)
+        .await
+        .map_or_else(
+            |error| ActionReport {
+                ok: false,
+                message: format!("Finder worker failed: {error}"),
+            },
+            |result| match result {
+                Ok(message) => ActionReport { ok: true, message },
+                Err(message) => ActionReport { ok: false, message },
+            },
+        )
 }
 
 async fn create_desktop_mount_command(
@@ -3567,6 +3994,7 @@ fn load_desktop_snapshot_from_store(
             attention_count: pending_changes.len(),
         },
         connection: connection_summary(connection.as_ref()),
+        connections: connection_summaries(&connections),
         mount: mount_summary_with_pending_change_count(
             Some(store),
             state_root,
@@ -3604,6 +4032,12 @@ fn degraded_snapshot(message: String) -> DesktopSnapshot {
             account_label: "Open Settings to repair".to_string(),
             status: "error".to_string(),
         },
+        connections: vec![ConnectionSummary {
+            connector: "notion".to_string(),
+            workspace_name: "Locality state unavailable".to_string(),
+            account_label: "Open Settings to repair".to_string(),
+            status: "error".to_string(),
+        }],
         mount: MountSummary {
             mount_id: String::new(),
             connector: "notion".to_string(),
@@ -3619,6 +4053,7 @@ fn degraded_snapshot(message: String) -> DesktopSnapshot {
             status: "error".to_string(),
             root_exists: false,
             entity_count: 0,
+            hydration_progress: None,
             pending_change_count: 0,
             provider: None,
         },
@@ -3744,6 +4179,30 @@ fn connection_summary(connection: Option<&ConnectionRecord>) -> ConnectionSummar
     }
 }
 
+fn connection_summaries(connections: &[ConnectionRecord]) -> Vec<ConnectionSummary> {
+    let mut summaries = connections
+        .iter()
+        .map(|connection| connection_summary(Some(connection)))
+        .collect::<Vec<_>>();
+    summaries.sort_by(|left, right| {
+        connection_connector_rank(&left.connector)
+            .cmp(&connection_connector_rank(&right.connector))
+            .then_with(|| left.connector.cmp(&right.connector))
+            .then_with(|| left.workspace_name.cmp(&right.workspace_name))
+    });
+    summaries
+}
+
+fn connection_connector_rank(connector: &str) -> usize {
+    match connector {
+        "notion" => 0,
+        "google-docs" => 1,
+        "gmail" => 2,
+        "granola" => 3,
+        _ => 10,
+    }
+}
+
 fn mount_summary(
     store: Option<&SqliteStateStore>,
     state_root: &Path,
@@ -3780,6 +4239,7 @@ fn mount_summary_with_pending_change_count(
             status: "not_mounted".to_string(),
             root_exists: false,
             entity_count: 0,
+            hydration_progress: None,
             pending_change_count: 0,
             provider: None,
         };
@@ -3791,6 +4251,7 @@ fn mount_summary_with_pending_change_count(
         .unwrap_or("ready");
     let access_root = mount_access_root(mount);
     let root_exists = mount_root_exists_for_desktop_summary(mount, &access_root);
+    let entities = store.and_then(|store| store.list_entities(&mount.mount_id).ok());
 
     MountSummary {
         mount_id: mount.mount_id.0.clone(),
@@ -3818,10 +4279,13 @@ fn mount_summary_with_pending_change_count(
         read_only: mount.read_only,
         status: mount_status.to_string(),
         root_exists,
-        entity_count: store
-            .and_then(|store| store.list_entities(&mount.mount_id).ok())
+        entity_count: entities
+            .as_ref()
             .map(|entities| entities.len())
             .unwrap_or(0),
+        hydration_progress: entities
+            .as_ref()
+            .and_then(|entities| mount_hydration_progress(entities)),
         pending_change_count: pending_change_count.unwrap_or_else(|| {
             store
                 .map(|store| pending_changes_for_mount(store, state_root, &mount.mount_id))
@@ -3831,6 +4295,33 @@ fn mount_summary_with_pending_change_count(
         }),
         provider,
     }
+}
+
+fn mount_hydration_progress(entities: &[EntityRecord]) -> Option<MountHydrationProgress> {
+    let mut indexed_files = 0usize;
+    let mut remaining_files = 0usize;
+
+    for entity in entities {
+        if entity.kind != EntityKind::Page {
+            continue;
+        }
+        match entity.hydration {
+            HydrationState::Hydrated | HydrationState::Dirty | HydrationState::Conflicted => {
+                indexed_files += 1;
+            }
+            HydrationState::Stub => {
+                remaining_files += 1;
+            }
+            HydrationState::Virtual => {}
+        }
+    }
+
+    let total_files = indexed_files + remaining_files;
+    (total_files > 0).then_some(MountHydrationProgress {
+        indexed_files,
+        remaining_files,
+        total_files,
+    })
 }
 
 fn mount_live_mode_summary(
@@ -9746,7 +10237,7 @@ fn workspace_mount_onboarding_curated_message(
 ) -> Option<&'static str> {
     match state {
         MacosWorkspaceMountOnboardingState::ApprovalRequired => {
-            Some("Enable Locality in Finder, then return here and click Check again.")
+            Some("In Finder, click Enable for Locality. Locality will continue automatically.")
         }
         MacosWorkspaceMountOnboardingState::WaitingForCloudStorageRoot => {
             Some("Locality is still waiting for the CloudStorage folder to appear.")
@@ -9836,6 +10327,142 @@ fn macos_workspace_mount_domain_user_enabled() -> Result<bool, String> {
         .and_then(|domain| domain.get("userEnabled"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false))
+}
+
+fn classify_macos_file_provider_enablement(
+    user_enabled: Option<bool>,
+    fallback_path: Option<PathBuf>,
+    resolved_root: Result<Option<PathBuf>, String>,
+) -> FileProviderEnablementReport {
+    let path = |value: Option<PathBuf>| value.map(|path| path.display().to_string());
+    match user_enabled {
+        None => FileProviderEnablementReport {
+            state: "not_registered".to_string(),
+            message: "Locality is preparing the Finder location.".to_string(),
+            path: path(fallback_path),
+        },
+        Some(false) => FileProviderEnablementReport {
+            state: "needs_finder_enable".to_string(),
+            message: "In Finder, click Enable for Locality.".to_string(),
+            path: path(fallback_path),
+        },
+        Some(true) => match resolved_root {
+            Ok(Some(root)) => FileProviderEnablementReport {
+                state: "ready".to_string(),
+                message: "Locality is enabled in Finder.".to_string(),
+                path: path(Some(root)),
+            },
+            Ok(None) => FileProviderEnablementReport {
+                state: "waiting_for_root".to_string(),
+                message: "Finishing the Locality folder setup.".to_string(),
+                path: path(fallback_path),
+            },
+            Err(message) => FileProviderEnablementReport {
+                state: "unavailable".to_string(),
+                message,
+                path: path(fallback_path),
+            },
+        },
+    }
+}
+
+fn macos_file_provider_domain_status(
+    report: &serde_json::Value,
+) -> (Option<bool>, Option<PathBuf>) {
+    let domain = report
+        .get("domains")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|domains| {
+            domains.iter().find(|domain| {
+                domain.get("identifier").and_then(serde_json::Value::as_str)
+                    == Some(localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
+            })
+        });
+    let user_enabled = domain
+        .and_then(|domain| domain.get("userEnabled"))
+        .and_then(serde_json::Value::as_bool);
+    let path = domain
+        .and_then(|domain| domain.get("url"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|url| !url.is_empty())
+        .map(PathBuf::from);
+    (user_enabled, path)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_provider_enablement_status_blocking() -> FileProviderEnablementReport {
+    let provider_roots = macos_file_provider_cloud_storage_roots();
+    let report = match run_macos_file_provider_helper("list", Vec::new()) {
+        Ok(report) => report,
+        Err(error) => {
+            return FileProviderEnablementReport {
+                state: "unavailable".to_string(),
+                message: error.message(),
+                path: provider_roots
+                    .first()
+                    .map(|path| path.display().to_string()),
+            };
+        }
+    };
+    let (user_enabled, reported_path) = macos_file_provider_domain_status(&report.helper_report);
+    let fallback_path = reported_path.or_else(|| provider_roots.first().cloned());
+
+    let resolved_root = if user_enabled == Some(true) {
+        match macos_file_provider_domain_url(
+            localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
+        ) {
+            Ok(root) => Ok(Some(root)),
+            Err(error) if recoverable_macos_file_provider_activation_error(&error.message()) => {
+                Ok(None)
+            }
+            Err(error) => Err(error.message()),
+        }
+    } else {
+        Ok(None)
+    };
+    classify_macos_file_provider_enablement(user_enabled, fallback_path, resolved_root)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_file_provider_enablement_status_blocking() -> FileProviderEnablementReport {
+    FileProviderEnablementReport {
+        state: "unavailable".to_string(),
+        message: "File Provider enablement is only available on macOS.".to_string(),
+        path: None,
+    }
+}
+
+fn macos_file_provider_reveal_path(
+    domain_path: Option<&Path>,
+    candidates: &[PathBuf],
+) -> Option<PathBuf> {
+    domain_path
+        .into_iter()
+        .chain(candidates.iter().map(PathBuf::as_path))
+        .find_map(|candidate| {
+            candidate
+                .ancestors()
+                .find(|ancestor| ancestor.is_dir())
+                .map(Path::to_path_buf)
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn reveal_file_provider_enablement_blocking() -> Result<String, String> {
+    let report = macos_file_provider_enablement_status_blocking();
+    let domain_path = report.path.as_deref().map(Path::new);
+    let path =
+        macos_file_provider_reveal_path(domain_path, &macos_file_provider_cloud_storage_roots())
+            .ok_or_else(|| {
+                "Could not find the Locality location or its CloudStorage parent.".to_string()
+            })?;
+    open_in_file_manager(&path)?;
+    Ok(format!("Opened {} in Finder.", path.display()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn reveal_file_provider_enablement_blocking() -> Result<String, String> {
+    Err("File Provider enablement is only available on macOS.".to_string())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -11290,6 +11917,7 @@ mod tests {
         let summary = super::mount_summary(None, Path::new("."), None, None, None);
 
         assert!(Path::new(&summary.local_path).is_absolute());
+        assert!(summary.hydration_progress.is_none());
     }
 
     #[test]
@@ -11392,6 +12020,14 @@ mod tests {
         assert_eq!(snapshot.mount.mount_id, "notion-main");
         assert_eq!(
             snapshot
+                .connections
+                .iter()
+                .map(|connection| connection.connector.as_str())
+                .collect::<Vec<_>>(),
+            vec!["notion", "google-docs"]
+        );
+        assert_eq!(
+            snapshot
                 .mounts
                 .iter()
                 .map(|mount| mount.mount_id.as_str())
@@ -11473,6 +12109,95 @@ mod tests {
     }
 
     #[test]
+    fn desktop_snapshot_reports_hydratable_file_progress() {
+        let temp = TestTempDir::new("desktop-file-progress");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let connection = test_connection("workspace-1", "CodeFlash");
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            temp.path().join("codeflash-wiki"),
+        )
+        .with_connection_id(connection.connection_id.clone())
+        .projection(ProjectionMode::LinuxFuse);
+
+        store.save_connection(connection).expect("save connection");
+        store.save_mount(mount).expect("save mount");
+
+        for (remote_id, title, path, hydration) in [
+            (
+                "hydrated-page",
+                "Hydrated",
+                "Hydrated/page.md",
+                HydrationState::Hydrated,
+            ),
+            (
+                "dirty-page",
+                "Dirty",
+                "Dirty/page.md",
+                HydrationState::Dirty,
+            ),
+            (
+                "conflicted-page",
+                "Conflicted",
+                "Conflicted/page.md",
+                HydrationState::Conflicted,
+            ),
+            ("stub-page", "Stub", "Stub/page.md", HydrationState::Stub),
+            (
+                "virtual-page",
+                "Virtual",
+                "Virtual/page.md",
+                HydrationState::Virtual,
+            ),
+        ] {
+            store
+                .save_entity(
+                    EntityRecord::new(
+                        MountId::new("notion-main"),
+                        RemoteId::new(remote_id),
+                        EntityKind::Page,
+                        title,
+                        path,
+                    )
+                    .with_hydration(hydration),
+                )
+                .expect("save page entity");
+        }
+
+        for (remote_id, kind, path) in [
+            ("directory-1", EntityKind::Directory, "Directory"),
+            ("database-1", EntityKind::Database, "Database"),
+            ("asset-1", EntityKind::Asset, "asset.png"),
+        ] {
+            store
+                .save_entity(
+                    EntityRecord::new(
+                        MountId::new("notion-main"),
+                        RemoteId::new(remote_id),
+                        kind,
+                        remote_id,
+                        path,
+                    )
+                    .with_hydration(HydrationState::Stub),
+                )
+                .expect("save non-page entity");
+        }
+
+        let snapshot = super::load_desktop_snapshot_from_store(&store, temp.path())
+            .expect("load snapshot from test store");
+        let progress = snapshot
+            .mount
+            .hydration_progress
+            .expect("file progress is reported");
+
+        assert_eq!(snapshot.mount.entity_count, 8);
+        assert_eq!(progress.indexed_files, 3);
+        assert_eq!(progress.remaining_files, 1);
+        assert_eq!(progress.total_files, 4);
+    }
+
+    #[test]
     fn desktop_snapshot_prefers_active_granola_over_stale_notion_mount() {
         let temp = TestTempDir::new("desktop-granola-first");
         let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
@@ -11528,6 +12253,14 @@ mod tests {
         assert_eq!(snapshot.active_mount_id.as_deref(), Some("granola-main"));
         assert_eq!(snapshot.mount.connector, "granola");
         assert_eq!(snapshot.connection.connector, "granola");
+        assert_eq!(
+            snapshot
+                .connections
+                .iter()
+                .map(|connection| connection.connector.as_str())
+                .collect::<Vec<_>>(),
+            vec!["notion", "granola"]
+        );
         assert!(!snapshot.needs_onboarding);
     }
 
@@ -12937,6 +13670,73 @@ mod tests {
     }
 
     #[test]
+    fn source_backup_exports_current_files_manifest_and_readme() {
+        let temp = TestTempDir::new("source-backup");
+        let state_root = temp.path().join("state");
+        let source_root = temp.path().join("source");
+        let backup_root = temp.path().join("backups");
+        fs::create_dir_all(source_root.join("Engineering Wiki/Standups"))
+            .expect("create source tree");
+        fs::write(
+            source_root.join("Engineering Wiki/Standups/page.md"),
+            "# Standups\n\nToday we shipped backup export.\n",
+        )
+        .expect("write source page");
+        fs::write(source_root.join("README.md"), "# Source\n").expect("write source readme");
+
+        let mut store = SqliteStateStore::open(state_root).expect("open state store");
+        store
+            .save_mount(MountConfig::new(
+                MountId::new("notion-main"),
+                "notion",
+                &source_root,
+            ))
+            .expect("save mount");
+
+        let export = super::export_source_backup_to_root(&store, &backup_root, "notion-main")
+            .expect("export backup");
+
+        assert!(
+            export
+                .directory
+                .starts_with(backup_root.join("notion-main"))
+        );
+        assert_eq!(
+            fs::read_to_string(
+                export
+                    .directory
+                    .join("files/Engineering Wiki/Standups/page.md")
+            )
+            .expect("read exported page"),
+            "# Standups\n\nToday we shipped backup export.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(export.directory.join("files/README.md"))
+                .expect("read exported readme"),
+            "# Source\n"
+        );
+        assert!(export.directory.join("README.md").is_file());
+        let manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(export.directory.join("manifest.json"))
+                .expect("read backup manifest"),
+        )
+        .expect("parse backup manifest");
+        assert_eq!(manifest["mountId"], "notion-main");
+        assert_eq!(manifest["connector"], "notion");
+        assert_eq!(manifest["connectorName"], "Notion");
+        assert_eq!(manifest["fileCount"], 2);
+        assert_eq!(
+            manifest["skipped"].as_array().expect("skipped array").len(),
+            0
+        );
+        assert!(
+            fs::read_to_string(export.directory.join("README.md"))
+                .expect("read backup readme")
+                .contains("Editing this backup does not sync back to Notion.")
+        );
+    }
+
+    #[test]
     fn windows_cloud_files_mount_access_root_stays_at_sync_root() {
         let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/Locality")
             .projection(ProjectionMode::WindowsCloudFiles);
@@ -13122,6 +13922,100 @@ mod tests {
     }
 
     #[test]
+    fn file_provider_enablement_report_distinguishes_registration_and_approval() {
+        let missing = super::classify_macos_file_provider_enablement(None, None, Ok(None));
+        assert_eq!(missing.state, "not_registered");
+
+        let disabled = super::classify_macos_file_provider_enablement(
+            Some(false),
+            Some(PathBuf::from("/Users/test/Library/CloudStorage/Locality")),
+            Ok(None),
+        );
+        assert_eq!(disabled.state, "needs_finder_enable");
+        assert_eq!(
+            disabled.path.as_deref(),
+            Some("/Users/test/Library/CloudStorage/Locality")
+        );
+    }
+
+    #[test]
+    fn file_provider_domain_status_reads_helper_url_while_disabled() {
+        let helper_report = serde_json::json!({
+            "domains": [{
+                "identifier": "loc",
+                "userEnabled": false,
+                "url": "/Users/test/Library/CloudStorage/LocalityPromptTest"
+            }]
+        });
+
+        let (user_enabled, path) = super::macos_file_provider_domain_status(&helper_report);
+
+        assert_eq!(user_enabled, Some(false));
+        assert_eq!(
+            path,
+            Some(PathBuf::from(
+                "/Users/test/Library/CloudStorage/LocalityPromptTest"
+            ))
+        );
+    }
+
+    #[test]
+    fn file_provider_enablement_report_waits_for_enabled_root() {
+        let report = super::classify_macos_file_provider_enablement(
+            Some(true),
+            Some(PathBuf::from("/Users/test/Library/CloudStorage/Locality")),
+            Ok(None),
+        );
+
+        assert_eq!(report.state, "waiting_for_root");
+        assert!(report.message.contains("Finishing"));
+    }
+
+    #[test]
+    fn file_provider_enablement_report_is_ready_only_with_resolved_root() {
+        let root = PathBuf::from("/Users/test/Library/CloudStorage/Locality");
+        let report = super::classify_macos_file_provider_enablement(
+            Some(true),
+            Some(root.clone()),
+            Ok(Some(root.clone())),
+        );
+
+        assert_eq!(report.state, "ready");
+        assert_eq!(report.path.as_deref(), root.to_str());
+    }
+
+    #[test]
+    fn file_provider_enablement_report_exposes_unavailable_errors() {
+        let report = super::classify_macos_file_provider_enablement(
+            Some(true),
+            None,
+            Err("File Provider helper unavailable".to_string()),
+        );
+
+        assert_eq!(report.state, "unavailable");
+        assert_eq!(report.message, "File Provider helper unavailable");
+    }
+
+    #[test]
+    fn file_provider_reveal_path_prefers_domain_then_existing_parent() {
+        let temp = TestTempDir::new("file-provider-reveal");
+        let cloud_storage = temp.path().join("Library/CloudStorage");
+        fs::create_dir_all(&cloud_storage).expect("create CloudStorage parent");
+        let domain = cloud_storage.join("Locality");
+
+        assert_eq!(
+            super::macos_file_provider_reveal_path(Some(&domain), &[domain.clone()]),
+            Some(cloud_storage)
+        );
+
+        fs::create_dir_all(&domain).expect("create domain root");
+        assert_eq!(
+            super::macos_file_provider_reveal_path(Some(&domain), &[domain.clone()]),
+            Some(domain)
+        );
+    }
+
+    #[test]
     fn macos_file_provider_approval_surface_path_uses_first_existing_candidate() {
         let temp = TestTempDir::new("approval-surface");
         let missing = temp.path().join("Library/CloudStorage/Locality");
@@ -13155,6 +14049,9 @@ mod tests {
             ),
             expected
         );
+        if let Some(state) = expected {
+            assert_eq!(state.as_str(), "needs_finder_enable");
+        }
     }
 
     #[test]
@@ -13195,7 +14092,7 @@ mod tests {
             super::workspace_mount_onboarding_curated_message(
                 super::MacosWorkspaceMountOnboardingState::ApprovalRequired
             ),
-            Some("Enable Locality in Finder, then return here and click Check again.")
+            Some("In Finder, click Enable for Locality. Locality will continue automatically.")
         );
         assert_eq!(
             super::workspace_mount_onboarding_curated_message(
@@ -15770,6 +16667,11 @@ fn sample_snapshot() -> DesktopSnapshot {
         status: "ready".to_string(),
         root_exists: true,
         entity_count: 42,
+        hydration_progress: Some(MountHydrationProgress {
+            indexed_files: 16,
+            remaining_files: 4,
+            total_files: 20,
+        }),
         pending_change_count: 3,
         provider: None,
     };
@@ -15784,6 +16686,12 @@ fn sample_snapshot() -> DesktopSnapshot {
             account_label: "saurabh@codeflash.ai".to_string(),
             status: "ready".to_string(),
         },
+        connections: vec![ConnectionSummary {
+            connector: "notion".to_string(),
+            workspace_name: "CodeFlash".to_string(),
+            account_label: "saurabh@codeflash.ai".to_string(),
+            status: "ready".to_string(),
+        }],
         mount: mount.clone(),
         mounts: vec![mount],
         active_mount_id: Some("notion-main".to_string()),
@@ -16543,7 +17451,10 @@ fn main() {
             connect_linear,
             reset_source_state,
             disconnect_source,
+            export_source_backup,
             run_workspace_mount_onboarding,
+            file_provider_enablement_status,
+            reveal_file_provider_enablement,
             install_agent_guidance,
             locate_notion_page,
             search_notion_pages,

@@ -221,7 +221,10 @@ Recommended first deployment target: Cloudflare Workers.
 This service is stateless, TypeScript-native, latency-insensitive, and only
 needs provider secrets plus outbound HTTPS. Workers fit that shape well. Use
 `wrangler secret put` for secrets, keep only non-sensitive defaults in
-`wrangler.toml`, and deploy from GitHub Actions once the repository is pushed.
+`wrangler.toml`, and let
+`.github/workflows/oauth-service-deploy.yml` deploy on `main` once
+`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` are configured. See
+`docs/deployment.md` for the full CD setup.
 
 Alternatives:
 

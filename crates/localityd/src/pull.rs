@@ -38,7 +38,9 @@ use crate::shadow_match::{
     contents_changes_retain_current_shadow_blocks, parsed_matches_shadow, shadows_match,
 };
 use crate::source::SourceAdapter;
-use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
+use crate::virtual_fs::{
+    repair_legacy_macos_content_root, virtual_fs_content_path, virtual_fs_content_root,
+};
 
 const DATABASE_DIRECTORY_ROW_HYDRATION_LIMIT: isize = 5;
 
@@ -705,8 +707,7 @@ where
             .database_schema_yaml(&database_id)
             .map_err(PullError::Connector)?
     {
-        let directory =
-            virtual_fs_content_root(state_root, &mount.mount_id).join(&target.parent_path);
+        let directory = projection_output_root(Some(state_root), mount)?.join(&target.parent_path);
         write_atomic(&directory.join("_schema.yaml"), schema)?;
     }
 
@@ -1168,7 +1169,7 @@ where
         if entry.kind == EntityKind::Database
             && let Some(state_root) = state_root
         {
-            let directory = virtual_fs_content_root(state_root, &mount.mount_id).join(&entry.path);
+            let directory = projection_output_root(Some(state_root), mount)?.join(&entry.path);
             if let Some(schema) = source
                 .database_schema_yaml(&entry.remote_id)
                 .map_err(PullError::Connector)?
@@ -1482,6 +1483,8 @@ fn projection_content_path(
     if mount.projection.uses_virtual_filesystem()
         && let Some(state_root) = state_root
     {
+        repair_legacy_macos_content_root(state_root, &mount.mount_id)
+            .map_err(PullError::Projection)?;
         return virtual_fs_content_path(state_root, &mount.mount_id, relative_path).map_err(
             |error| PullError::WriteFile {
                 path: relative_path.to_path_buf(),
@@ -1500,6 +1503,8 @@ fn projection_output_root(
     if mount.projection.uses_virtual_filesystem()
         && let Some(state_root) = state_root
     {
+        repair_legacy_macos_content_root(state_root, &mount.mount_id)
+            .map_err(PullError::Projection)?;
         return Ok(virtual_fs_content_root(state_root, &mount.mount_id));
     }
 
@@ -2118,6 +2123,7 @@ impl PullError {
             Self::Connector(locality_core::LocalityError::UpdateRequired { .. }) => {
                 "update_required"
             }
+            Self::Connector(locality_core::LocalityError::RateLimited { .. }) => "rate_limited",
             Self::Connector(_) => "connector_error",
             Self::CurrentDir(_) => "current_dir_failed",
             Self::MountNotFound(_) => "mount_not_found",
@@ -2376,6 +2382,66 @@ mod tests {
         assert_eq!(
             std::fs::read(&absolute_media_path).expect("repaired media"),
             b"image bytes"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn explicit_virtual_pull_repairs_legacy_dirty_cache_before_replace_check() {
+        let fixture = PullFixture::new();
+        let home = fixture.root.join("home");
+        let state_root = home.join(".loc");
+        let visible_root = fixture.root.join("visible");
+        let mount = MountConfig::new(fixture.mount_id.clone(), "notion", &visible_root)
+            .projection(ProjectionMode::LinuxFuse);
+        let entity = EntityRecord::new(
+            fixture.mount_id.clone(),
+            fixture.remote_id.clone(),
+            EntityKind::Page,
+            "Roadmap",
+            "Roadmap.md",
+        )
+        .with_hydration(HydrationState::Dirty);
+        let mut store = InMemoryStateStore::new();
+        store.save_mount(mount.clone()).expect("save mount");
+        store.save_entity(entity.clone()).expect("save entity");
+        let rendered = hydrated_entity(
+            &fixture.remote_id,
+            "Roadmap",
+            "Original remote body.\n",
+            Vec::new(),
+        );
+        store
+            .save_shadow(&fixture.mount_id, rendered.shadow.clone())
+            .expect("save shadow");
+        let legacy_path = home
+            .join("Library")
+            .join("Group Containers")
+            .join("C484HB7Q6S.group.ai.codeflash.locality")
+            .join("content")
+            .join(&fixture.mount_id.0)
+            .join("files")
+            .join("Roadmap.md");
+        std::fs::create_dir_all(legacy_path.parent().expect("legacy parent"))
+            .expect("legacy parent");
+        std::fs::write(
+            &legacy_path,
+            render_canonical_markdown(&fixture.document("Roadmap", "Legacy dirty body.\n")),
+        )
+        .expect("write legacy cache");
+        let current_path =
+            crate::virtual_fs::virtual_fs_content_root(&state_root, &fixture.mount_id)
+                .join("Roadmap.md");
+        assert!(!current_path.exists());
+        let source = FakePullSource::new(Vec::new(), vec![rendered]);
+
+        let outcome = super::hydrate_entity(&mut store, &source, &mount, entity, Some(&state_root))
+            .expect("hydrate entity");
+
+        assert_eq!(outcome, super::HydrationOutcome::SkippedDirty);
+        assert_eq!(
+            std::fs::read_to_string(&current_path).expect("read current cache"),
+            render_canonical_markdown(&fixture.document("Roadmap", "Legacy dirty body.\n"))
         );
     }
 

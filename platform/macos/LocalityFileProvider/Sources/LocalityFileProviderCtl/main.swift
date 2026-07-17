@@ -273,6 +273,7 @@ private struct DomainReport: Encodable {
   let userEnabled: Bool
   let disconnected: Bool
   let hidden: Bool
+  let url: String?
 
   init(_ domain: NSFileProviderDomain) {
     self.identifier = domain.identifier.rawValue
@@ -280,6 +281,12 @@ private struct DomainReport: Encodable {
     self.userEnabled = domain.userEnabled
     self.disconnected = domain.isDisconnected
     self.hidden = domain.isHidden
+    let managerURL = try? userVisibleDomainURLFromManager(for: domain)
+    let fallbackURL = realHomeDirectoryURL()
+      .appendingPathComponent("Library", isDirectory: true)
+      .appendingPathComponent("CloudStorage", isDirectory: true)
+      .appendingPathComponent(fileProviderDirectoryName(for: domain.displayName), isDirectory: true)
+    self.url = (managerURL ?? fallbackURL).path
   }
 }
 

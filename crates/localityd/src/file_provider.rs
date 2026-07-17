@@ -422,6 +422,7 @@ where
         };
 
         let content_root = virtual_fs::virtual_fs_content_root(state_root, &mount.mount_id);
+        virtual_fs::repair_legacy_macos_content_root(state_root, &mount.mount_id)?;
         let target_remote_id = target_visible_remote_id(&target);
         let entities = scoped_page_entities(
             store,
@@ -1705,6 +1706,7 @@ where
     }
 
     let content_root = virtual_fs::virtual_fs_content_root(state_root, &mount.mount_id);
+    virtual_fs::repair_legacy_macos_content_root(state_root, &mount.mount_id)?;
     let mut report = ProjectionRefreshReport::default();
     let candidates = existing_projection_paths(&mount, &entity.path);
     if candidates.is_empty() {
@@ -1797,6 +1799,7 @@ where
         };
 
         let content_root = virtual_fs::virtual_fs_content_root(state_root, &mount.mount_id);
+        virtual_fs::repair_legacy_macos_content_root(state_root, &mount.mount_id)?;
         let target_remote_id = target_visible_remote_id(&target);
         let entities = scoped_page_entities(
             store,

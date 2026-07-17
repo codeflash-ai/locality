@@ -7,12 +7,12 @@ The documented public install path is GitHub Releases. Download the asset for yo
 
 ## Recommended paths
 
-| OS | Release asset | Download |
+| OS or supported distro | Release asset | Download |
 | --- | --- | --- |
 | macOS | `Locality_Mac.dmg` | <a href="https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Mac.dmg" target="_blank" rel="noopener noreferrer">Download DMG</a> |
-| Debian or Ubuntu | `Locality_Linux.deb` | <a href="https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.deb" target="_blank" rel="noopener noreferrer">Download DEB</a> |
-| Fedora, RHEL, or compatible | `Locality_Linux.rpm` | <a href="https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.rpm" target="_blank" rel="noopener noreferrer">Download RPM</a> |
-| Linux desktop self-update | `Locality_Linux.AppImage` | <a href="https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.AppImage" target="_blank" rel="noopener noreferrer">Download AppImage</a> |
+| Ubuntu 24.04+, Debian 13+, Linux Mint 22+ | `Locality_Linux.deb` | <a href="https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.deb" target="_blank" rel="noopener noreferrer">Download DEB</a> |
+| Fedora 40+, openSUSE Tumbleweed | `Locality_Linux.rpm` | <a href="https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.rpm" target="_blank" rel="noopener noreferrer">Download RPM</a> |
+| Supported Linux distros, desktop self-update | `Locality_Linux.AppImage` | <a href="https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.AppImage" target="_blank" rel="noopener noreferrer">Download AppImage</a> |
 | Windows | `Locality_Windows.exe` | <a href="https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Windows.exe" target="_blank" rel="noopener noreferrer">Download EXE</a> |
 
 Release assets also include updater manifests such as `latest-macos.json`, `latest-linux.json`, and `latest-windows.json`, plus checksums and signatures where available.
@@ -32,25 +32,49 @@ The public macOS build is currently Apple Silicon focused.
 
 ## Linux
 
-On Debian or Ubuntu, download the `.deb` release asset and install it locally:
+Locality for Linux is supported only on these distributions:
+
+- Ubuntu 24.04 or newer;
+- Debian 13 or newer;
+- Fedora 40 or newer;
+- openSUSE Tumbleweed;
+- Linux Mint 22 or newer.
+
+Other Linux distributions and older versions are unsupported, even if a package
+can be installed there.
+
+On Ubuntu 24.04+, Debian 13+, or Linux Mint 22+, download the `.deb` release
+asset and install it locally:
 
 ```bash
 curl -L -o /tmp/locality.deb https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.deb
 sudo apt install /tmp/locality.deb
 ```
 
-On Fedora, RHEL, or compatible distributions, download the `.rpm` release asset and install it locally:
+On Fedora 40+, download the `.rpm` release asset and install it locally:
 
 ```bash
 curl -L -o /tmp/locality.rpm https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.rpm
 sudo dnf install /tmp/locality.rpm
 ```
 
-Linux packages require `fuse3` and `systemd`. The packages include the desktop app plus `loc`, `localityd`, and the FUSE projection helper.
+On openSUSE Tumbleweed, use the same `.rpm` release asset with `zypper`:
+
+```bash
+curl -L -o /tmp/locality.rpm https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.rpm
+sudo zypper install /tmp/locality.rpm
+```
+
+Linux FUSE mounts require `fuse3`, `fusermount3`, `/dev/fuse`, and a user
+`systemd` session. The package installers declare `fuse3` and `systemd`
+dependencies; AppImage users may need to install those dependencies separately.
+The Linux artifacts include the desktop app plus `loc`, `localityd`, and the
+FUSE projection helper.
 
 ### AppImage
 
-Use AppImage when you want a single-file Linux desktop artifact:
+Use AppImage on the supported Linux distributions when you want a single-file
+desktop artifact with Tauri-managed self-update:
 
 ```bash
 mkdir -p ~/.local/bin

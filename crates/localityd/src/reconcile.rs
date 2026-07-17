@@ -25,7 +25,7 @@ use locality_store::{
 
 use crate::hydration::HydrationEngine;
 use crate::scheduler::PullSchedulerTick;
-use crate::virtual_fs::virtual_fs_content_root;
+use crate::virtual_fs::{repair_legacy_macos_content_root, virtual_fs_content_root};
 
 pub trait ScheduledPullSource {
     fn enumerate_mount(&self, mount: &MountConfig) -> LocalityResult<Vec<TreeEntry>>;
@@ -434,12 +434,17 @@ where
     if mount.projection.uses_virtual_filesystem() {
         if entry.kind == EntityKind::Database
             && let Some(state_root) = state_root
-            && let Some(schema) = source.database_schema_yaml(mount, &entry.remote_id)?
         {
+            repair_legacy_macos_content_root(state_root, &mount.mount_id)?;
             let directory = virtual_fs_content_root(state_root, &mount.mount_id).join(&entry.path);
-            create_dir_all(&directory)?;
-            write_atomic(&directory.join("_schema.yaml"), schema)?;
-            return Ok(ProjectionWrite::Schema);
+            if directory.join("_schema.yaml").exists() {
+                return Ok(ProjectionWrite::Schema);
+            }
+            if let Some(schema) = source.database_schema_yaml(mount, &entry.remote_id)? {
+                create_dir_all(&directory)?;
+                write_atomic(&directory.join("_schema.yaml"), schema)?;
+                return Ok(ProjectionWrite::Schema);
+            }
         }
         return Ok(ProjectionWrite::None);
     }
@@ -450,7 +455,6 @@ where
             if path.exists() && !is_stub_file(&path)? {
                 return Ok(ProjectionWrite::None);
             }
-
             write_atomic(&path, stub_markdown(entry)?)?;
             Ok(ProjectionWrite::Stub)
         }
@@ -682,4 +686,77 @@ fn rename_projected_path(from: &Path, to: &Path) -> LocalityResult<()> {
 fn read_to_string(path: &Path) -> LocalityResult<String> {
     std::fs::read_to_string(path)
         .map_err(|error| LocalityError::Io(format!("failed to read `{}`: {error}", path.display())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn virtual_schema_refresh_repairs_legacy_app_group_cache_before_write() {
+        use locality_core::model::MountId;
+        use locality_store::ProjectionMode;
+
+        struct SchemaSource;
+
+        impl ScheduledPullSource for SchemaSource {
+            fn enumerate_mount(&self, _mount: &MountConfig) -> LocalityResult<Vec<TreeEntry>> {
+                Ok(Vec::new())
+            }
+
+            fn database_schema_yaml(
+                &self,
+                _mount: &MountConfig,
+                _remote_id: &RemoteId,
+            ) -> LocalityResult<Option<String>> {
+                Ok(Some("remote schema\n".to_string()))
+            }
+        }
+
+        let home = std::env::temp_dir().join(format!(
+            "loc-reconcile-schema-legacy-home-{}",
+            std::process::id()
+        ));
+        let state_root = home.join(".loc");
+        let visible_root = home.join("visible");
+        let mount_id = MountId::new("notion-main");
+        let mount = MountConfig::new(mount_id.clone(), "notion", &visible_root)
+            .projection(ProjectionMode::LinuxFuse);
+        let entry = TreeEntry {
+            mount_id: mount_id.clone(),
+            remote_id: RemoteId::new("database-1"),
+            kind: EntityKind::Database,
+            title: "Tasks".to_string(),
+            path: PathBuf::from("Tasks"),
+            hydration: HydrationState::Stub,
+            content_hash: None,
+            remote_edited_at: None,
+            stub_frontmatter: None,
+        };
+        let legacy_schema_path = home
+            .join("Library")
+            .join("Group Containers")
+            .join("C484HB7Q6S.group.ai.codeflash.locality")
+            .join("content")
+            .join(&mount_id.0)
+            .join("files")
+            .join("Tasks/_schema.yaml");
+        std::fs::create_dir_all(legacy_schema_path.parent().expect("legacy parent"))
+            .expect("legacy parent");
+        std::fs::write(&legacy_schema_path, "legacy schema\n").expect("write legacy schema");
+        let current_schema_path =
+            virtual_fs_content_root(&state_root, &mount_id).join("Tasks/_schema.yaml");
+        assert!(!current_schema_path.exists());
+
+        let write = refresh_projection(&SchemaSource, &mount, &entry, Some(&state_root))
+            .expect("refresh projection");
+
+        assert_eq!(write, ProjectionWrite::Schema);
+        assert_eq!(
+            std::fs::read_to_string(&current_schema_path).expect("read current schema"),
+            "legacy schema\n"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
 }

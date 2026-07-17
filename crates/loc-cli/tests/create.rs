@@ -4,7 +4,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use loc_cli::create::{CreateError, CreatePageOptions, run_create_page};
+use loc_cli::create::{
+    CreateDatabaseOptions, CreateError, CreatePageOptions, run_create_database, run_create_page,
+};
 use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
@@ -45,6 +47,71 @@ fn create_page_writes_page_directory_from_title() {
             .next
             .iter()
             .any(|next| next.contains("loc diff") && next.contains("page.md"))
+    );
+}
+
+#[test]
+fn create_database_writes_editable_schema_draft_inside_notion_page() {
+    let fixture = CreateFixture::new("loc-create-database");
+    let mut store = fixture.store(false);
+    seed_parent_page(&mut store, "parent-page", "Roadmap", "Roadmap/page.md");
+    let parent = fixture.root.join("Roadmap");
+    fs::create_dir_all(&parent).expect("parent");
+
+    let report = run_create_database(
+        &mut store,
+        CreateDatabaseOptions {
+            title: "Project Tasks".to_string(),
+            parent: Some(parent),
+            state_root: None,
+        },
+    )
+    .expect("create database draft");
+
+    let schema_path = fixture.root.join("Roadmap/Project Tasks/_schema.yaml");
+    assert_eq!(report.command, "create_database");
+    assert_eq!(report.kind, "database");
+    assert_eq!(Path::new(&report.path), schema_path);
+    assert_eq!(
+        fs::read_to_string(schema_path).expect("schema"),
+        "loc:\n  type: notion_database_schema\ntitle: \"Project Tasks\"\ndata_sources:\n  - name: Rows\n    properties:\n      Name:\n        type: title\n"
+    );
+}
+
+#[test]
+fn create_database_in_virtual_mount_stages_schema_and_parent_identity() {
+    let fixture = CreateFixture::new("loc-create-database-virtual");
+    let mut store = fixture.store_with_projection(ProjectionMode::MacosFileProvider, false);
+    seed_parent_page(&mut store, "parent-page", "Roadmap", "Roadmap/page.md");
+    fs::create_dir_all(fixture.root.join("Roadmap")).expect("visible parent");
+    let state_root = fixture.temp.path("state");
+
+    let report = run_create_database(
+        &mut store,
+        CreateDatabaseOptions {
+            title: "Project Tasks".to_string(),
+            parent: Some(fixture.root.join("Roadmap")),
+            state_root: Some(state_root),
+        },
+    )
+    .expect("stage database draft");
+
+    let projected_path = PathBuf::from("Roadmap/Project Tasks/_schema.yaml");
+    assert_eq!(Path::new(&report.path), fixture.root.join(&projected_path));
+    assert!(!fixture.root.join("Roadmap/Project Tasks").exists());
+    let mutation = store
+        .find_virtual_mutation_by_path(&MountId::new("notion-main"), &projected_path)
+        .expect("find mutation")
+        .expect("database mutation");
+    assert_eq!(
+        mutation.parent_remote_id,
+        Some(RemoteId::new("parent-page"))
+    );
+    assert_eq!(mutation.projected_path, projected_path);
+    assert!(
+        fs::read_to_string(mutation.content_path.expect("content"))
+            .expect("schema")
+            .contains("type: notion_database_schema")
     );
 }
 

@@ -1589,6 +1589,84 @@ fn check_concurrency_uses_database_metadata_for_row_create_parent() {
 }
 
 #[test]
+fn apply_creates_database_from_validated_schema_draft() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let schema = r#"loc:
+  type: notion_database_schema
+title: Project Tasks
+data_sources:
+  - name: Tasks
+    properties:
+      Name:
+        type: title
+      Status:
+        type: select
+        options:
+          - name: Todo
+            color: gray
+          - name: Done
+            color: green
+"#;
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::CreateDatabase {
+            parent_id: RemoteId::new("page-1"),
+            title: "Project Tasks".to_string(),
+            schema: schema.to_string(),
+            source_path: "Project Tasks/_schema.yaml".into(),
+        }],
+    );
+    let push_id = PushId("push-create-database".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let result = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("create database");
+
+    assert_eq!(
+        result.changed_remote_ids,
+        vec![RemoteId::new("created-database-1")]
+    );
+    assert_eq!(
+        result.effects,
+        vec![JournalApplyEffect::CreatedEntity {
+            operation_id: operation_ids[0].clone(),
+            operation_index: 0,
+            parent_id: RemoteId::new("page-1"),
+            entity_id: RemoteId::new("created-database-1"),
+        }]
+    );
+    assert_eq!(
+        api.writes.lock().expect("writes").as_slice(),
+        [WriteCall::CreateDatabase {
+            body: json!({
+                "parent": { "type": "page_id", "page_id": "page-1" },
+                "title": rich_text_json("Project Tasks"),
+                "initial_data_source": {
+                    "title": rich_text_json("Tasks"),
+                    "properties": {
+                        "Name": { "title": {} },
+                        "Status": { "select": { "options": [
+                            { "name": "Todo", "color": "gray" },
+                            { "name": "Done", "color": "green" }
+                        ] } }
+                    }
+                }
+            })
+        }]
+    );
+}
+
+#[test]
 fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
     let api = Arc::new(RecordingNotionApi::with_paragraph_rich_text(
         "2026-06-10T00:00:00.000Z",
@@ -4876,6 +4954,21 @@ impl NotionApi for RecordingNotionApi {
         })
     }
 
+    fn create_database(&self, body: Value) -> LocalityResult<DatabaseDto> {
+        self.writes
+            .lock()
+            .expect("writes")
+            .push(WriteCall::CreateDatabase { body });
+        Ok(DatabaseDto {
+            id: "created-database-1".to_string(),
+            data_sources: vec![DataSourceSummaryDto {
+                id: "created-source-1".to_string(),
+                name: Some("Tasks".to_string()),
+            }],
+            ..Default::default()
+        })
+    }
+
     fn update_block(&self, block_id: &str, body: Value) -> LocalityResult<BlockDto> {
         self.writes.lock().expect("writes").push(WriteCall::Update {
             block_id: block_id.to_string(),
@@ -4961,6 +5054,9 @@ enum WriteCall {
         parent: Value,
     },
     CreatePage {
+        body: Value,
+    },
+    CreateDatabase {
         body: Value,
     },
     Update {

@@ -261,6 +261,7 @@ fn connector_from_connection(
         root_page_id: mount.remote_root_id.clone(),
         token: Some(token),
         token_key: DEFAULT_NOTION_TOKEN_ENV.to_string(),
+        execution_policy: locality_connector::ConnectorExecutionPolicy::Inline,
     };
     Ok(NotionConnector::new(config))
 }

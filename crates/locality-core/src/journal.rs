@@ -153,7 +153,8 @@ impl PushOperationId {
             | PushOperation::UpdateMedia { block_id, .. }
             | PushOperation::ArchiveBlock { block_id } => block_id.0.as_str(),
             PushOperation::AppendBlock { parent_id, .. }
-            | PushOperation::CreateEntity { parent_id, .. } => parent_id.0.as_str(),
+            | PushOperation::CreateEntity { parent_id, .. }
+            | PushOperation::CreateDatabase { parent_id, .. } => parent_id.0.as_str(),
             PushOperation::ArchiveEntity { entity_id }
             | PushOperation::UpdateEntityBody { entity_id, .. }
             | PushOperation::UpdateProperties { entity_id, .. }
@@ -282,6 +283,7 @@ fn operation_kind(operation: &PushOperation) -> &'static str {
         PushOperation::UpdateProperties { .. } => "update_properties",
         PushOperation::MoveEntity { .. } => "move_entity",
         PushOperation::CreateEntity { .. } => "create_entity",
+        PushOperation::CreateDatabase { .. } => "create_database",
     }
 }
 
@@ -296,6 +298,7 @@ fn operation_touches_any_entity(operation: &PushOperation, remote_ids: &[RemoteI
             ..
         } => remote_ids.contains(entity_id) || remote_ids.contains(new_parent_id),
         PushOperation::CreateEntity { parent_id, .. }
+        | PushOperation::CreateDatabase { parent_id, .. }
         | PushOperation::AppendBlock { parent_id, .. } => remote_ids.contains(parent_id),
         PushOperation::UpdateBlock { .. }
         | PushOperation::ReplaceBlock { .. }

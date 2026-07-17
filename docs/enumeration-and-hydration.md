@@ -144,6 +144,12 @@ The persisted model lives in `crates/locality-core/src/model.rs`.
 - `CanonicalDocument` can carry a stub marker, which is how plain-file stubs
   are recognized without needing body content.
 
+Desktop file-preparation progress is derived from these persisted entity states:
+page entities in `Hydrated`, `Dirty`, or `Conflicted` count as indexed files,
+page entities in `Stub` count as files left, and `Virtual` pages, directories,
+databases, and assets are excluded. This is a durable summary of known
+hydratable files, not a live daemon-queue counter.
+
 Hydration requests live in `crates/locality-core/src/hydration.rs`.
 
 - `HydrationRequest` identifies the mount, remote entity, target state, and

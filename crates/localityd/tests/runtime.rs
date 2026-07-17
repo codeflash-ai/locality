@@ -25,8 +25,8 @@ use localityd::hydration::HydrationOutcome;
 use localityd::ipc::{DaemonDebugQueueStatus, DaemonRequest, DaemonResponse, DaemonRuntimeStatus};
 use localityd::runtime::{
     DaemonRuntime, DaemonRuntimeHandle, DefaultRuntimeJobRunner, FileEventRuntimeReport,
-    FreshnessRuntimeReport, RuntimeJobRunner, ScheduledPullRuntimeReport,
-    workspace_virtual_freshness_jobs,
+    FreshnessRuntimeReport, RuntimeJobRunner, ScheduledPullFetchOutcome,
+    ScheduledPullRuntimeReport, workspace_virtual_freshness_jobs,
 };
 use localityd::scheduler::PullSchedulerTick;
 use localityd::virtual_fs::{
@@ -76,6 +76,61 @@ fn runtime_answers_ping_while_pull_worker_is_blocked() {
     release_blocked_runner(&release);
     let pull = pull_thread.join().expect("pull thread");
     assert!(pull.ok);
+    runtime.shutdown();
+}
+
+#[test]
+fn repeated_file_events_coalesce_behind_blocked_work() {
+    let (started_tx, started_rx) = mpsc::channel();
+    let (event_tx, event_rx) = mpsc::channel();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let runtime = DaemonRuntime::spawn_with_runner(
+        relay_config("coalesce-file-events"),
+        BlockingPullAndEventRunner {
+            started: started_tx,
+            events: event_tx,
+            release: Arc::clone(&release),
+        },
+    )
+    .expect("spawn runtime");
+    let pull_handle = runtime.handle();
+    let pull_thread = thread::spawn(move || {
+        pull_handle.request(DaemonRequest::Pull {
+            path: PathBuf::from("notion"),
+        })
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("pull started");
+
+    let event = FileEvent {
+        path: PathBuf::from("notion"),
+        kind: FileEventKind::Write,
+    };
+    for _ in 0..20 {
+        runtime
+            .handle()
+            .file_event(event.clone())
+            .expect("queue event");
+    }
+    wait_until(Duration::from_secs(1), || {
+        runtime
+            .handle()
+            .status()
+            .expect("runtime status")
+            .pending_requests
+            == 1
+    });
+
+    release_blocked_runner(&release);
+    assert!(pull_thread.join().expect("pull thread").ok);
+    assert_eq!(
+        event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("coalesced event"),
+        event
+    );
+    assert!(event_rx.recv_timeout(Duration::from_millis(100)).is_err());
     runtime.shutdown();
 }
 
@@ -351,6 +406,112 @@ fn runtime_scheduler_queues_and_drains_hydration() {
     assert_eq!(request.mount_id, MountId::new("notion-main"));
     assert_eq!(request.remote_id, RemoteId::new("page-1"));
     assert_eq!(request.reason, HydrationReason::Policy);
+    runtime.shutdown();
+}
+
+#[test]
+fn rate_limited_scheduled_pull_is_parked_and_does_not_block_file_events() {
+    let (scheduled_tx, scheduled_rx) = mpsc::channel();
+    let (event_tx, event_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(
+        polling_config("scheduled-rate-limit-deferred"),
+        RateLimitedScheduledRunner {
+            scheduled: scheduled_tx,
+            file_events: event_tx,
+            attempts: AtomicUsize::new(0),
+        },
+    )
+    .expect("spawn runtime");
+
+    assert_eq!(
+        scheduled_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first scheduled attempt"),
+        1
+    );
+    wait_until(Duration::from_secs(1), || {
+        runtime
+            .handle()
+            .status()
+            .expect("runtime status")
+            .provider_cooldown
+            .is_some()
+    });
+    let status = runtime.handle().status().expect("deferred status");
+    assert!(
+        !status.active_job,
+        "cooldown must release the active worker"
+    );
+    let cooldown = status.provider_cooldown.expect("provider cooldown");
+    assert_eq!(cooldown.provider, "notion");
+    assert_eq!(cooldown.operation, "scheduled_pull");
+    assert_eq!(cooldown.attempt, 1);
+
+    let event = FileEvent {
+        path: PathBuf::from("notion"),
+        kind: FileEventKind::Write,
+    };
+    runtime.handle().file_event(event).expect("file event");
+    event_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("file event ran during cooldown");
+
+    assert_eq!(
+        scheduled_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("scheduled retry"),
+        2
+    );
+    wait_until(Duration::from_secs(1), || {
+        runtime
+            .handle()
+            .status()
+            .expect("runtime status")
+            .provider_cooldown
+            .is_none()
+    });
+    runtime.shutdown();
+}
+
+#[test]
+fn scheduled_pull_fetch_does_not_occupy_the_local_mutation_slot() {
+    let (fetch_started_tx, fetch_started_rx) = mpsc::channel();
+    let (event_tx, event_rx) = mpsc::channel();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let runtime = DaemonRuntime::spawn_with_runner(
+        polling_config("scheduled-fetch-nonexclusive"),
+        BlockingScheduledFetchRunner {
+            fetch_started: fetch_started_tx,
+            events: event_tx,
+            release: Arc::clone(&release),
+        },
+    )
+    .expect("spawn runtime");
+    fetch_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("scheduled fetch started");
+
+    let event = FileEvent {
+        path: PathBuf::from("notion/page.md"),
+        kind: FileEventKind::Write,
+    };
+    runtime
+        .handle()
+        .file_event(event.clone())
+        .expect("file event");
+    assert_eq!(
+        event_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("event ran while fetch blocked"),
+        event
+    );
+    let status = runtime.handle().status().expect("runtime status");
+    assert_eq!(
+        status.active_job_detail.expect("fetch activity").kind,
+        "scheduled_pull_fetch"
+    );
+
+    release_blocked_runner(&release);
     runtime.shutdown();
 }
 
@@ -2830,6 +2991,183 @@ struct BlockingHydrationRunner {
     release: Arc<(Mutex<bool>, Condvar)>,
 }
 
+#[derive(Clone)]
+struct BlockingPullAndEventRunner {
+    started: mpsc::Sender<()>,
+    events: mpsc::Sender<FileEvent>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl RuntimeJobRunner for BlockingPullAndEventRunner {
+    fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+        self.started.send(()).expect("notify started");
+        let (lock, condvar) = &*self.release;
+        let mut released = lock.lock().expect("lock release");
+        while !*released {
+            released = condvar.wait(released).expect("wait release");
+        }
+        DaemonResponse::ok(json!({ "command": "pull" }))
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> locality_core::LocalityResult<ScheduledPullRuntimeReport> {
+        Err(LocalityError::InvalidState(
+            "scheduled pull should not run".to_string(),
+        ))
+    }
+
+    fn run_hydration(
+        &self,
+        _state_root: PathBuf,
+        _request: HydrationRequest,
+    ) -> locality_core::LocalityResult<HydrationOutcome> {
+        Err(LocalityError::InvalidState(
+            "hydration should not run".to_string(),
+        ))
+    }
+
+    fn run_file_event(
+        &self,
+        _state_root: PathBuf,
+        event: FileEvent,
+    ) -> locality_core::LocalityResult<FileEventRuntimeReport> {
+        self.events.send(event).expect("notify event");
+        Ok(FileEventRuntimeReport::default())
+    }
+}
+
+struct RateLimitedScheduledRunner {
+    scheduled: mpsc::Sender<usize>,
+    file_events: mpsc::Sender<FileEvent>,
+    attempts: AtomicUsize,
+}
+
+struct BlockingScheduledFetchRunner {
+    fetch_started: mpsc::Sender<()>,
+    events: mpsc::Sender<FileEvent>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl RuntimeJobRunner for BlockingScheduledFetchRunner {
+    fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+        DaemonResponse::error("unexpected_pull", "pull should not run")
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> locality_core::LocalityResult<ScheduledPullRuntimeReport> {
+        Err(LocalityError::InvalidState(
+            "legacy scheduled pull should not run".to_string(),
+        ))
+    }
+
+    fn run_scheduled_pull_fetch(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> locality_core::LocalityResult<ScheduledPullFetchOutcome> {
+        self.fetch_started.send(()).expect("notify fetch");
+        let (lock, condvar) = &*self.release;
+        let mut released = lock.lock().expect("lock release");
+        while !*released {
+            released = condvar.wait(released).expect("wait release");
+        }
+        Ok(ScheduledPullFetchOutcome::Complete(
+            ScheduledPullRuntimeReport {
+                report: Default::default(),
+                queued_hydrations: Vec::new(),
+                freshness_jobs: Vec::new(),
+            },
+        ))
+    }
+
+    fn run_hydration(
+        &self,
+        _state_root: PathBuf,
+        _request: HydrationRequest,
+    ) -> locality_core::LocalityResult<HydrationOutcome> {
+        Err(LocalityError::InvalidState(
+            "hydration should not run".to_string(),
+        ))
+    }
+
+    fn run_file_event(
+        &self,
+        _state_root: PathBuf,
+        event: FileEvent,
+    ) -> locality_core::LocalityResult<FileEventRuntimeReport> {
+        self.events.send(event).expect("notify event");
+        Ok(FileEventRuntimeReport::default())
+    }
+}
+
+impl RuntimeJobRunner for RateLimitedScheduledRunner {
+    fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+        DaemonResponse::error("unexpected_pull", "pull should not run")
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> locality_core::LocalityResult<ScheduledPullRuntimeReport> {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        self.scheduled.send(attempt).expect("notify scheduled");
+        if attempt == 1 {
+            return Err(LocalityError::RateLimited {
+                provider: "notion".to_string(),
+                retry_after: Duration::ZERO,
+                message: "HTTP 429 rate_limited".to_string(),
+            });
+        }
+        Ok(ScheduledPullRuntimeReport {
+            report: Default::default(),
+            queued_hydrations: Vec::new(),
+            freshness_jobs: Vec::new(),
+        })
+    }
+
+    fn run_hydration(
+        &self,
+        _state_root: PathBuf,
+        _request: HydrationRequest,
+    ) -> locality_core::LocalityResult<HydrationOutcome> {
+        Err(LocalityError::InvalidState(
+            "hydration should not run".to_string(),
+        ))
+    }
+
+    fn run_file_event(
+        &self,
+        _state_root: PathBuf,
+        event: FileEvent,
+    ) -> locality_core::LocalityResult<FileEventRuntimeReport> {
+        self.file_events.send(event).expect("notify file event");
+        Ok(FileEventRuntimeReport::default())
+    }
+}
+
 impl RuntimeJobRunner for BlockingPullRunner {
     fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
         self.started.send(()).expect("notify started");
@@ -4082,6 +4420,14 @@ fn wait_until_pending_requests(handle: &DaemonRuntimeHandle, minimum: usize) {
         thread::sleep(Duration::from_millis(25));
     }
     panic!("runtime did not queue {minimum} pending request(s)");
+}
+
+fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !condition() {
+        assert!(Instant::now() < deadline, "timed out waiting for condition");
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn min_position<const N: usize>(

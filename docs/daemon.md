@@ -214,6 +214,29 @@ remote pull, hydration, or push reconciliation. Runtime status includes the
 current active job kind, target, start time, and elapsed time so wedged workers
 are visible through `loc daemon status`.
 
+Provider rate limits are a scheduling boundary. Scheduled discovery requests a
+deferred-cooldown execution policy from every connector instead of naming a
+provider in the runtime. When a connector returns a structured cooldown, the
+runtime releases the worker, records the provider, attempt, error, and retry
+timestamp, and retries automatically with bounded exponential backoff and
+jitter while honoring a longer `Retry-After`. `loc daemon status`, the desktop
+Activity queue, logs, and `loc doctor` expose this state. An explicit daemon
+`loc pull` returns an actionable `rate_limited` error rather than monopolizing
+the worker; the background scheduler remains responsible for automatic
+recovery.
+
+Scheduled pulls run in two phases. Remote enumeration and schema reads execute
+as a non-mutating fetch job, allowing local filesystem events, hydration, and
+status work to continue. The fetched snapshot is then queued for a short
+serialized reconciliation phase that writes SQLite observations and projection
+metadata. Push and explicit pull requests wait until that snapshot has either
+been reconciled or discarded, preventing a remote mutation from making the
+fetched snapshot stale before commit.
+
+Repeated watcher events with the same path and kind coalesce while one is active
+or queued. This bounds root-event growth when projection writes or sandbox file
+scanners repeatedly touch a mount during provider downtime.
+
 ## Virtual Filesystem Projections
 
 Product-grade online-only mounts must use a virtual filesystem projection, not
@@ -249,6 +272,16 @@ Linux equivalent because Locality directly serves the read.
 Virtual projection contents are materialized under `~/.loc/content/<mount-id>/`
 instead of under the mounted root. This avoids recursive FUSE calls when the root
 is itself a virtual mount and gives macOS/Linux adapters one stable byte source.
+Sandboxed macOS builds may instead use the Locality app-group container for this
+content root; direct Developer ID builds keep the cache in `~/.loc/content` so
+normal startup and sync do not touch protected app-container data.
+When older pending virtual mutations still store app-group cache paths, daemon
+read paths recompute the current content-cache location outside the sandbox
+instead of reopening the legacy app-group file. On upgrade, daemon-owned
+materialization, push, and File Provider reconciliation copy any missing files
+from the legacy app-group content tree into the current content root before
+reading or writing the new root; existing current-root files are never
+overwritten.
 
 Scheduled reconciliation skips writing placeholder Markdown files for virtual
 filesystem projection modes such as `macos_file_provider` and `linux_fuse`; it

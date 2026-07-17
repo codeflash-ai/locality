@@ -44,6 +44,7 @@ use locality_core::{LocalityError, LocalityResult};
 use locality_google_docs::render::{
     GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND, GOOGLE_DOCS_TABLE_NATIVE_KIND,
 };
+use locality_notion::database_create::parse_database_draft;
 use locality_notion::markdown_table::parse_markdown_table_shape;
 use locality_notion::media::{
     load_media_manifest, media_manifest_entry, resolve_media_href_with_content_root, sha256_hex,
@@ -70,7 +71,10 @@ use crate::source::{
     LocalSourceValidator, SourcePushValidator, SourceValidationContext,
     source_create_decision_for_parent_path, source_descriptor, source_write_decision_for_path,
 };
-use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
+use crate::virtual_fs::{
+    repair_legacy_macos_content_root, virtual_fs_content_path, virtual_fs_content_root,
+    virtual_mutation_content_path_for_read,
+};
 
 pub fn execute_push_job<S, Source>(
     store: &mut S,
@@ -357,11 +361,11 @@ where
                 .collect(),
         );
     } else if prepared.pipeline.action == PushPipelineAction::ProceedToApply
-        && !prepared.pipeline.plan.as_ref().is_some_and(|plan| {
-            plan.operations
-                .iter()
-                .all(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
-        })
+        && !prepared
+            .pipeline
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.operations.iter().all(is_create_operation))
     {
         return Err(LocalityError::InvalidState(
             "push pipeline approved apply without a shadow preimage".to_string(),
@@ -642,16 +646,18 @@ fn resumable_plan_matches(journal: &JournalEntry, plan: &PushPlan, connector: &s
     }
 
     connector == "gmail"
-        && plan
-            .operations
-            .iter()
-            .all(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
-        && journal
-            .plan
-            .operations
-            .iter()
-            .all(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
+        && resumable_created_entity_effects(journal)
+        && plan.operations.iter().all(is_create_operation)
+        && journal.plan.operations.iter().all(is_create_operation)
         && journal_created_entity_sources_match(journal, plan)
+}
+
+fn resumable_created_entity_effects(journal: &JournalEntry) -> bool {
+    !journal.apply_effects.is_empty()
+        && journal
+            .apply_effects
+            .iter()
+            .all(|effect| matches!(effect, JournalApplyEffect::CreatedEntity { .. }))
 }
 
 fn resumable_entity_effect_ids(journal: &JournalEntry, connector: &str) -> Option<Vec<RemoteId>> {
@@ -671,10 +677,11 @@ fn resumable_entity_effect_ids(journal: &JournalEntry, connector: &str) -> Optio
                 entity_id,
                 ..
             } => {
-                let Some(PushOperation::CreateEntity {
-                    parent_id: planned_parent_id,
-                    ..
-                }) = journal.plan.operations.get(*operation_index)
+                let Some((planned_parent_id, _source_path)) = journal
+                    .plan
+                    .operations
+                    .get(*operation_index)
+                    .and_then(create_operation_source)
                 else {
                     return None;
                 };
@@ -754,11 +761,11 @@ fn journal_created_entity_sources_match(journal: &JournalEntry, plan: &PushPlan)
         else {
             return false;
         };
-        let Some(PushOperation::CreateEntity {
-            parent_id,
-            source_path,
-            ..
-        }) = journal.plan.operations.get(*operation_index)
+        let Some((parent_id, source_path)) = journal
+            .plan
+            .operations
+            .get(*operation_index)
+            .and_then(create_operation_source)
         else {
             return false;
         };
@@ -795,6 +802,11 @@ fn plan_create_entity_sources(plan: &PushPlan) -> Vec<(&RemoteId, &PathBuf)> {
                 source_path,
                 ..
             } => Some((parent_id, source_path)),
+            PushOperation::CreateDatabase {
+                parent_id,
+                source_path,
+                ..
+            } => Some((parent_id, source_path)),
             _ => None,
         })
         .collect()
@@ -823,11 +835,37 @@ fn auto_save_relative_path(prepared: &PreparedPush) -> PathBuf {
             plan.operations
                 .iter()
                 .find_map(|operation| match operation {
-                    PushOperation::CreateEntity { source_path, .. } => Some(source_path.clone()),
+                    PushOperation::CreateEntity { source_path, .. }
+                    | PushOperation::CreateDatabase { source_path, .. } => {
+                        Some(source_path.clone())
+                    }
                     _ => None,
                 })
         })
         .unwrap_or_else(|| prepared.entity.path.clone())
+}
+
+fn is_create_operation(operation: &PushOperation) -> bool {
+    matches!(
+        operation,
+        PushOperation::CreateEntity { .. } | PushOperation::CreateDatabase { .. }
+    )
+}
+
+fn create_operation_source(operation: &PushOperation) -> Option<(&RemoteId, &PathBuf)> {
+    match operation {
+        PushOperation::CreateEntity {
+            parent_id,
+            source_path,
+            ..
+        }
+        | PushOperation::CreateDatabase {
+            parent_id,
+            source_path,
+            ..
+        } => Some((parent_id, source_path)),
+        _ => None,
+    }
 }
 
 fn auto_save_block_reason_for_prepared(prepared: &PreparedPush) -> Option<String> {
@@ -1904,6 +1942,13 @@ where
             validator,
         );
     }
+    if absolute_path.is_dir() {
+        let schema_path = absolute_path.join("_schema.yaml");
+        if schema_path.is_file() {
+            absolute_path = schema_path;
+            relative_path = relative_path.join("_schema.yaml");
+        }
+    }
     let mut entity = store
         .find_entity_by_path(&mount.mount_id, &relative_path)
         .map_err(PushPrepareError::Store)?;
@@ -1930,6 +1975,45 @@ where
                 relative_path,
                 validator,
             );
+        }
+        if is_database_draft_schema_path(&relative_path) {
+            if let Some(database_dir) = relative_path.parent()
+                && let Some(existing_entity) =
+                    existing_entity_for_database_dir(store, &mount.mount_id, database_dir)?
+            {
+                let (code, message, remediation) = if existing_entity.kind == EntityKind::Database {
+                    (
+                        "notion_database_schema_read_only",
+                        "schemas for existing Notion databases are generated and read-only",
+                        Some(
+                            "run `loc create database` under an existing page to create a new database"
+                                .to_string(),
+                        ),
+                    )
+                } else {
+                    (
+                        "notion_database_draft_path_conflict",
+                        "the database draft directory already belongs to another tracked entity",
+                        Some("choose a new database title or directory name".to_string()),
+                    )
+                };
+                return Ok(PreparedPush {
+                    absolute_path,
+                    mount,
+                    entity: existing_entity,
+                    shadows: Vec::new(),
+                    pipeline: validation_pipeline(ValidationIssue::new(
+                        code,
+                        &relative_path,
+                        Some(1),
+                        message,
+                        remediation,
+                    )),
+                    readable_diff: None,
+                });
+            }
+            let parent = required_database_parent_entity(store, &mount, &relative_path)?;
+            return prepare_database_create(job, absolute_path, mount, relative_path, parent);
         }
         return prepare_direct_create(
             store,
@@ -2071,6 +2155,189 @@ where
     })
 }
 
+fn is_database_draft_schema_path(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("_schema.yaml")
+}
+
+fn existing_entity_for_database_dir<S>(
+    store: &S,
+    mount_id: &MountId,
+    database_dir: &Path,
+) -> Result<Option<EntityRecord>, PushPrepareError>
+where
+    S: EntityRepository,
+{
+    if let Some(entity) = store
+        .find_entity_by_path(mount_id, database_dir)
+        .map_err(PushPrepareError::Store)?
+    {
+        return Ok(Some(entity));
+    }
+    store
+        .find_entity_by_path(mount_id, &page_document_path(database_dir))
+        .map_err(PushPrepareError::Store)
+}
+
+fn required_database_parent_entity<S>(
+    store: &S,
+    mount: &MountConfig,
+    schema_path: &Path,
+) -> Result<EntityRecord, PushPrepareError>
+where
+    S: EntityRepository,
+{
+    let database_dir = schema_path.parent().ok_or_else(|| {
+        PushPrepareError::Core(LocalityError::InvalidState(
+            "database draft schema must be inside a database directory".to_string(),
+        ))
+    })?;
+    let parent_container = database_dir.parent().unwrap_or_else(|| Path::new(""));
+    let parent = if parent_container.as_os_str().is_empty() {
+        let descriptor = source_descriptor(&mount.connector);
+        mount.remote_root_id.as_ref().and_then(|remote_id| {
+            descriptor.source_root_create_parent_kind().map(|kind| {
+                EntityRecord::new(
+                    mount.mount_id.clone(),
+                    remote_id.clone(),
+                    kind,
+                    descriptor.display_name(),
+                    PathBuf::new(),
+                )
+            })
+        })
+    } else {
+        store
+            .find_entity_by_path(&mount.mount_id, &page_document_path(parent_container))
+            .map_err(PushPrepareError::Store)?
+            .or(store
+                .find_entity_by_path(&mount.mount_id, parent_container)
+                .map_err(PushPrepareError::Store)?)
+    };
+    let Some(parent) = parent else {
+        return Err(PushPrepareError::Store(StoreError::EntityPathMissing {
+            mount_id: mount.mount_id.clone(),
+            path: parent_container.to_path_buf(),
+        }));
+    };
+    if parent.kind != EntityKind::Page {
+        return Err(PushPrepareError::Core(LocalityError::InvalidState(
+            format!(
+                "Notion databases must be created inside an existing page directory; `{}` is {:?}",
+                parent_container.display(),
+                parent.kind
+            ),
+        )));
+    }
+    Ok(parent)
+}
+
+fn prepare_database_create(
+    job: &PushJob,
+    absolute_path: PathBuf,
+    mount: MountConfig,
+    relative_path: PathBuf,
+    parent: EntityRecord,
+) -> Result<PreparedPush, PushPrepareError> {
+    let schema = read_to_string(&absolute_path)?;
+    let draft = match parse_database_draft(&schema) {
+        Ok(draft) => draft,
+        Err(error) => {
+            return Ok(PreparedPush {
+                absolute_path,
+                mount,
+                entity: parent,
+                shadows: Vec::new(),
+                pipeline: validation_pipeline(ValidationIssue::new(
+                    error.code,
+                    &relative_path,
+                    Some(1),
+                    error.message,
+                    Some(
+                        "edit the untracked `_schema.yaml` draft and rerun `loc diff`".to_string(),
+                    ),
+                )),
+                readable_diff: None,
+            });
+        }
+    };
+    if mount.connector != "notion" {
+        return Ok(PreparedPush {
+            absolute_path,
+            mount,
+            entity: parent,
+            shadows: Vec::new(),
+            pipeline: validation_pipeline(ValidationIssue::new(
+                "database_create_connector_unsupported",
+                &relative_path,
+                Some(1),
+                "database drafts are currently supported only for Notion mounts",
+                None,
+            )),
+            readable_diff: None,
+        });
+    }
+    if mount.read_only {
+        return Ok(PreparedPush {
+            absolute_path,
+            mount,
+            entity: parent,
+            shadows: Vec::new(),
+            pipeline: PushPipelineResult {
+                validation: ValidationReport::clean(),
+                plan: None,
+                guardrail: GuardrailDecision::Proceed,
+                action: PushPipelineAction::ReadOnlyBlocked,
+                completed_stages: Vec::new(),
+            },
+            readable_diff: None,
+        });
+    }
+
+    let plan = PushPlan::new(
+        vec![parent.remote_id.clone()],
+        vec![PushOperation::CreateDatabase {
+            parent_id: parent.remote_id.clone(),
+            title: draft.title,
+            schema: schema.clone(),
+            source_path: relative_path.clone(),
+        }],
+    );
+    let guardrail =
+        locality_core::push::evaluate_guardrails(&plan, &GuardrailPolicy::default(), None);
+    let action = match &guardrail {
+        GuardrailDecision::Proceed if job.assume_yes => PushPipelineAction::ProceedToApply,
+        GuardrailDecision::Proceed => PushPipelineAction::ConfirmPlan,
+        GuardrailDecision::ConfirmRequired { .. } if job.confirm_dangerous => {
+            PushPipelineAction::ProceedToApply
+        }
+        GuardrailDecision::ConfirmRequired { .. } => PushPipelineAction::ConfirmDangerousPlan,
+    };
+    let pipeline = PushPipelineResult {
+        validation: ValidationReport::clean(),
+        plan: Some(plan),
+        guardrail,
+        action,
+        completed_stages: vec![
+            PushStage::ParseAndValidate,
+            PushStage::Diff,
+            PushStage::PlanAndConfirm,
+        ],
+    };
+    let readable_diff = locality_core::readable_diff::readable_diff_for_file(
+        locality_platform::logical_path_display(&relative_path),
+        None,
+        Some(&schema),
+    );
+    Ok(PreparedPush {
+        absolute_path,
+        mount,
+        entity: parent,
+        shadows: Vec::new(),
+        pipeline,
+        readable_diff,
+    })
+}
+
 fn prepare_direct_create<S, Validator>(
     store: &S,
     job: &PushJob,
@@ -2190,6 +2457,7 @@ where
         let Some(state_root) = state_root else {
             return Ok(());
         };
+        repair_legacy_macos_content_root(state_root, &mount.mount_id)?;
         virtual_fs_content_root(state_root, &mount.mount_id)
     } else {
         mount.root.clone()
@@ -2290,6 +2558,10 @@ where
         );
     }
     let read_path = pending_create_read_path(&mount, &pending, state_root, &absolute_path)?;
+    if is_database_draft_schema_path(&pending.projected_path) {
+        let parent = pending_create_parent_for_private_marker(store, &mount, &pending, false)?;
+        return prepare_database_create(job, read_path, mount, pending.projected_path, parent);
+    }
     let contents = read_to_string(&read_path)?;
     let parsed = match parse_canonical_markdown(&contents) {
         Ok(parsed) => parsed,
@@ -2512,13 +2784,18 @@ fn pending_create_read_path(
     state_root: Option<&Path>,
     absolute_path: &Path,
 ) -> Result<PathBuf, PushPrepareError> {
-    let content_path = pending.content_path.clone().or_else(|| {
-        state_root.map(|root| {
-            virtual_fs_content_root(root, &mount.mount_id).join(&pending.projected_path)
-        })
-    });
+    if mount.projection.uses_virtual_filesystem()
+        && let Some(state_root) = state_root
+    {
+        repair_legacy_macos_content_root(state_root, &mount.mount_id)
+            .map_err(PushPrepareError::Core)?;
+    }
+    let content_path = virtual_mutation_content_path_for_read(state_root, &mount.mount_id, pending)
+        .map_err(PushPrepareError::Core)?;
 
-    if mount.projection.uses_virtual_filesystem() && state_root.is_none() && absolute_path.is_file()
+    if mount.projection.uses_virtual_filesystem()
+        && absolute_path.is_file()
+        && (state_root.is_none() || content_path.as_ref().is_some_and(|path| !path.is_file()))
     {
         return Ok(absolute_path.to_path_buf());
     }
@@ -3185,6 +3462,7 @@ fn projection_read_path(
     if mount.projection.uses_virtual_filesystem()
         && let Some(state_root) = state_root
     {
+        repair_legacy_macos_content_root(state_root, &mount.mount_id)?;
         return virtual_fs_content_path(state_root, &mount.mount_id, relative_path);
     }
 
@@ -3395,6 +3673,7 @@ where
             .collect::<BTreeSet<_>>();
         let mut effect_readback_ids = BTreeSet::new();
         let mut created_readbacks = Vec::new();
+        let mut database_reconciled_ids = Vec::new();
         for effect in request.apply_effects {
             match effect {
                 JournalApplyEffect::CreatedEntity {
@@ -3403,6 +3682,53 @@ where
                     entity_id,
                     ..
                 } => {
+                    if let Some(PushOperation::CreateDatabase {
+                        title, source_path, ..
+                    }) = request.plan.operations.get(*operation_index)
+                    {
+                        let entity_path =
+                            source_path.parent().map(Path::to_path_buf).ok_or_else(|| {
+                                LocalityError::InvalidState(format!(
+                                    "created database schema `{}` has no containing directory",
+                                    source_path.display()
+                                ))
+                            })?;
+                        let entity = EntityRecord::new(
+                            request.mount_id.clone(),
+                            entity_id.clone(),
+                            EntityKind::Database,
+                            title.clone(),
+                            entity_path.clone(),
+                        )
+                        .with_hydration(HydrationState::Hydrated);
+                        self.store
+                            .save_entity(entity)
+                            .map_err(LocalityError::from)?;
+                        let schema = self
+                            .source
+                            .fetch_database_schema_yaml(entity_id)?
+                            .ok_or_else(|| {
+                                LocalityError::InvalidState(format!(
+                                    "created database `{}` did not return a schema",
+                                    entity_id.0
+                                ))
+                            })?;
+                        let output_root =
+                            projection_output_root(self.state_root.as_deref(), &mount)?;
+                        write_atomic(&output_root.join(&entity_path).join("_schema.yaml"), schema)?;
+                        if let Some(mutation) = self
+                            .store
+                            .find_virtual_mutation_by_path(request.mount_id, source_path)
+                            .map_err(LocalityError::from)?
+                        {
+                            self.store
+                                .delete_virtual_mutation(request.mount_id, &mutation.local_id)
+                                .map_err(LocalityError::from)?;
+                        }
+                        effect_readback_ids.insert(entity_id.clone());
+                        database_reconciled_ids.push(entity_id.clone());
+                        continue;
+                    }
                     let Some(PushOperation::CreateEntity {
                         title,
                         properties: _,
@@ -3504,7 +3830,7 @@ where
         }
 
         let output_root = projection_output_root(self.state_root.as_deref(), &mount)?;
-        let mut reconciled_remote_ids = Vec::new();
+        let mut reconciled_remote_ids = database_reconciled_ids;
         for (_, entity_id, entity, rendered) in &mut created_readbacks {
             let path = projection_write_path(self.state_root.as_deref(), &mount, &entity.path);
             accept_post_apply_remote(
@@ -3921,6 +4247,7 @@ fn locality_error_code(error: &LocalityError) -> &'static str {
         LocalityError::Conflict(_) => "conflict",
         LocalityError::Guardrail(_) => "guardrail",
         LocalityError::RemoteNotFound(_) => "remote_not_found",
+        LocalityError::RateLimited { .. } => "rate_limited",
         LocalityError::InvalidState(_) => "invalid_state",
         LocalityError::UpdateRequired { .. } => "update_required",
         LocalityError::Unsupported(_) => "unsupported",
@@ -4290,6 +4617,7 @@ fn projection_output_root(
     if mount.projection.uses_virtual_filesystem()
         && let Some(state_root) = state_root
     {
+        repair_legacy_macos_content_root(state_root, &mount.mount_id)?;
         return Ok(virtual_fs_content_root(state_root, &mount.mount_id));
     }
 
@@ -4302,6 +4630,98 @@ fn generate_push_id() -> PushId {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     PushId(format!("push-{timestamp}-{}", std::process::id()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn schema_preflight_repairs_legacy_app_group_cache_before_remote_fetch() {
+        use locality_core::hydration::HydrationRequest;
+        use locality_store::{InMemoryStateStore, ProjectionMode};
+
+        struct SchemaSource;
+
+        impl HydrationSource for SchemaSource {
+            fn fetch_render(
+                &self,
+                _request: &HydrationRequest,
+            ) -> locality_core::LocalityResult<HydratedEntity> {
+                panic!("schema preflight should not hydrate")
+            }
+
+            fn fetch_database_schema_yaml(
+                &self,
+                _database_id: &RemoteId,
+            ) -> locality_core::LocalityResult<Option<String>> {
+                Ok(Some("remote schema\n".to_string()))
+            }
+        }
+
+        let home = std::env::temp_dir().join(format!(
+            "loc-push-schema-legacy-home-{}",
+            std::process::id()
+        ));
+        let state_root = home.join(".loc");
+        let visible_root = home.join("visible");
+        let mount_id = MountId::new("notion-main");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(mount_id.clone(), "notion", &visible_root)
+                    .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("database-1"),
+                EntityKind::Database,
+                "Tasks",
+                "Tasks",
+            ))
+            .expect("save database");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Existing task",
+                "Tasks/Existing task.md",
+            ))
+            .expect("save page");
+        let legacy_schema_path = home
+            .join("Library")
+            .join("Group Containers")
+            .join("C484HB7Q6S.group.ai.codeflash.locality")
+            .join("content")
+            .join(&mount_id.0)
+            .join("files")
+            .join("Tasks/_schema.yaml");
+        std::fs::create_dir_all(legacy_schema_path.parent().expect("legacy parent"))
+            .expect("legacy parent");
+        std::fs::write(&legacy_schema_path, "legacy schema\n").expect("write legacy schema");
+        let current_schema_path =
+            virtual_fs_content_root(&state_root, &mount_id).join("Tasks/_schema.yaml");
+        assert!(!current_schema_path.exists());
+
+        repair_missing_database_schema_for_target(
+            &store,
+            &SchemaSource,
+            &visible_root.join("Tasks/Existing task.md"),
+            Some(&state_root),
+        )
+        .expect("schema preflight");
+
+        assert_eq!(
+            std::fs::read_to_string(&current_schema_path).expect("read current schema"),
+            "legacy schema\n"
+        );
+
+        let _ = std::fs::remove_dir_all(home);
+    }
 }
 
 fn push_timestamp() -> String {

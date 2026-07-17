@@ -168,6 +168,7 @@ impl DiffError {
             Self::Prepare(LocalityError::Conflict(_)) => "conflict",
             Self::Prepare(LocalityError::Guardrail(_)) => "guardrail",
             Self::Prepare(LocalityError::RemoteNotFound(_)) => "remote_not_found",
+            Self::Prepare(LocalityError::RateLimited { .. }) => "rate_limited",
             Self::Prepare(LocalityError::InvalidState(_)) => "invalid_state",
             Self::Prepare(LocalityError::UpdateRequired { .. }) => "update_required",
             Self::Prepare(LocalityError::Unsupported(_)) => "unsupported",
@@ -418,6 +419,12 @@ pub enum PushOperationOutput {
         body: String,
         source_path: String,
     },
+    CreateDatabase {
+        parent_id: String,
+        title: String,
+        schema: String,
+        source_path: String,
+    },
 }
 
 fn is_false(value: &bool) -> bool {
@@ -515,6 +522,17 @@ impl From<PushOperation> for PushOperationOutput {
                     })
                     .collect(),
                 body,
+                source_path: locality_platform::logical_path_display(&source_path),
+            },
+            PushOperation::CreateDatabase {
+                parent_id,
+                title,
+                schema,
+                source_path,
+            } => Self::CreateDatabase {
+                parent_id: parent_id.0,
+                title,
+                schema,
                 source_path: locality_platform::logical_path_display(&source_path),
             },
         }

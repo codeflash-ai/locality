@@ -21,6 +21,8 @@ import {
   List,
   Loader2,
   Minus,
+  Monitor,
+  Moon,
   Plus,
   Power,
   RefreshCw,
@@ -29,6 +31,7 @@ import {
   Settings,
   ShieldCheck,
   Square,
+  Sun,
   PanelLeftClose,
   PanelLeftOpen,
   Trash2,
@@ -39,6 +42,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   compactPath,
   mountEntityCountLabel,
+  mountFileIndexProgressLabel,
+  mountFileIndexProgressValue,
   mountAccessLabel,
   mountRows,
   mountStatusLabel,
@@ -57,6 +62,12 @@ import { connectionMissing, connectionReady } from "./connection-state";
 import { copyLoginLinkDisabled, loginLinkFlowMode } from "./onboarding-connect";
 import { mountRecoveryEnabled, shouldAutoCreateMount } from "./onboarding-flow";
 import { classifyMountSetupError } from "./onboarding-errors";
+import {
+  createFileProviderEnablementPoller,
+  fileProviderEnablementHeadline,
+  fileProviderEnablementStatusLabel,
+  type FileProviderEnablementReport,
+} from "./file-provider-enablement";
 import {
   failedMountOnboardingReport,
   mountOnboardingHeadline,
@@ -85,7 +96,12 @@ import {
   type UpdateStatus,
 } from "./updater";
 import {
+  connectedSourcesReadyToMount,
+  isSourceConnectorId,
+  sourceConnectionReady,
   sourceConnectorIds,
+  sourceMountRetryOutcome,
+  sourceMounted,
   sourceRequiresApiKey,
   sourceSkipsManualMountStep,
   sourceSetupIsActiveConnector,
@@ -115,6 +131,10 @@ type FileStatusFilter = "all" | "review" | "conflict" | "synced";
 type DestructiveSettingsAction = "reset" | "uninstall";
 type SettingsSection = "general" | "sources" | "sync" | "activity" | "agents" | "advanced" | "about";
 type SourceListViewMode = "list" | "tiles";
+type AppTheme = "system" | "light" | "dark";
+
+const APP_THEME_STORAGE_KEY = "locality.desktop.theme";
+
 type ConnectorOption = {
   id: SourceConnectorId;
   name: string;
@@ -152,12 +172,8 @@ type DesktopSnapshot = {
     state: string;
     attentionCount: number;
   };
-  connection: {
-    connector: string;
-    workspaceName: string;
-    accountLabel: string;
-    status: string;
-  };
+  connection: ConnectionSummary;
+  connections?: ConnectionSummary[];
   mount: MountSummary;
   mounts: MountSummary[];
   activeMountId?: string | null;
@@ -171,6 +187,13 @@ type DesktopSnapshot = {
   recentFiles: LocatedItem[];
   activity: ActivityItem[];
   suggestions: ConnectorSuggestion[];
+};
+
+type ConnectionSummary = {
+  connector: string;
+  workspaceName: string;
+  accountLabel: string;
+  status: string;
 };
 
 type MountLiveMode = {
@@ -373,6 +396,11 @@ const sampleMount: MountSummary = {
   status: "ready",
   rootExists: true,
   entityCount: 24,
+  hydrationProgress: {
+    indexedFiles: 16,
+    remainingFiles: 4,
+    totalFiles: 20,
+  },
   pendingChangeCount: 3,
   provider: null,
 };
@@ -405,8 +433,16 @@ const sampleSnapshot: DesktopSnapshot = {
     connector: "notion",
     workspaceName: "CodeFlash",
     accountLabel: "saurabh@codeflash.ai",
-    status: "ready",
+    status: "active",
   },
+  connections: [
+    {
+      connector: "notion",
+      workspaceName: "CodeFlash",
+      accountLabel: "saurabh@codeflash.ai",
+      status: "active",
+    },
+  ],
   mount: sampleMount,
   mounts: [sampleMount, sampleGoogleMount],
   activeMountId: sampleMount.mountId,
@@ -605,6 +641,7 @@ const loadingSnapshot: DesktopSnapshot = {
     accountLabel: "",
     status: "loading",
   },
+  connections: [],
   mount: {
     ...sampleSnapshot.mount,
     workspaceName: "Loading",
@@ -924,7 +961,7 @@ function sourceSyncModeLabel(liveMode: MountLiveMode, active: boolean) {
 }
 
 function reviewQueueCounts(changes: PendingChange[]) {
-  const problems = changes.filter((change) => change.state === "conflict" || change.state === "blocked").length;
+  const problems = changes.filter(isProblemReviewChange).length;
   return {
     total: changes.length,
     approvals: changes.length - problems,
@@ -946,8 +983,12 @@ function changeMatchesReviewFilter(change: PendingChange, filter: ReviewFilter) 
   if (filter === "all") {
     return true;
   }
-  const isProblem = change.state === "conflict" || change.state === "blocked";
+  const isProblem = isProblemReviewChange(change);
   return filter === "problems" ? isProblem : !isProblem;
+}
+
+function isProblemReviewChange(change: PendingChange) {
+  return change.state === "conflict" || change.state === "blocked";
 }
 
 function fileStatusFilterLabel(filter: FileStatusFilter) {
@@ -1084,6 +1125,29 @@ function useNotionSearchResults(query: string, enabled = true) {
   return { results, searching };
 }
 
+function initialAppTheme(): AppTheme {
+  try {
+    const saved = window.localStorage.getItem(APP_THEME_STORAGE_KEY);
+    return saved === "light" || saved === "dark" || saved === "system" ? saved : "system";
+  } catch {
+    return "system";
+  }
+}
+
+function resolvedAppTheme(theme: AppTheme): "light" | "dark" {
+  if (theme !== "system") {
+    return theme;
+  }
+  return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function applyAppTheme(theme: AppTheme) {
+  const resolved = resolvedAppTheme(theme);
+  document.documentElement.dataset.theme = resolved;
+  document.documentElement.dataset.themePreference = theme;
+  document.documentElement.style.colorScheme = resolved;
+}
+
 export default function App() {
   const initialRoute = window.location.hash;
   const [snapshot, setSnapshot] = useState<DesktopSnapshot>(() =>
@@ -1091,6 +1155,8 @@ export default function App() {
   );
   const [snapshotLoaded, setSnapshotLoaded] = useState(() => !isTauriRuntime());
   const [view, setView] = useState<AppView>("home");
+  const [reviewInitialFilter, setReviewInitialFilter] = useState<ReviewFilter>("all");
+  const [theme, setTheme] = useState<AppTheme>(() => initialAppTheme());
   const [route, setRoute] = useState(initialRoute);
   const [showOnboarding, setShowOnboarding] = useState(() =>
     routeForcesOnboarding(initialRoute) || previewRouteStartsOnboarding(initialRoute),
@@ -1108,6 +1174,27 @@ export default function App() {
   useEffect(() => {
     updateStatusRef.current = updateStatus;
   }, [updateStatus]);
+
+  useEffect(() => {
+    applyAppTheme(theme);
+    try {
+      window.localStorage.setItem(APP_THEME_STORAGE_KEY, theme);
+    } catch {
+      // Keep the in-memory theme even when storage is unavailable.
+    }
+
+    if (theme !== "system") {
+      return undefined;
+    }
+
+    const media = window.matchMedia?.("(prefers-color-scheme: dark)");
+    if (!media) {
+      return undefined;
+    }
+    const syncSystemTheme = () => applyAppTheme("system");
+    media.addEventListener("change", syncSystemTheme);
+    return () => media.removeEventListener("change", syncSystemTheme);
+  }, [theme]);
 
   async function loadDesktopSnapshot() {
     const nextSnapshot = await callCommand<DesktopSnapshot>("desktop_snapshot", undefined, sampleSnapshot);
@@ -1517,12 +1604,19 @@ export default function App() {
   }
 
   return (
-    <MainShell
-      snapshot={snapshot}
-      view={view}
-      onViewChange={setView}
-      onRefresh={refreshSnapshot}
-      updateStatus={updateStatus}
+            <MainShell
+              snapshot={snapshot}
+              view={view}
+              onViewChange={setView}
+              reviewInitialFilter={reviewInitialFilter}
+              onOpenReview={(filter = "all") => {
+                setReviewInitialFilter(filter);
+                setView("pending");
+              }}
+              theme={theme}
+              onThemeChange={setTheme}
+              onRefresh={refreshSnapshot}
+              updateStatus={updateStatus}
       onCheckForUpdate={checkForAppUpdate}
       onInstallUpdate={installAppUpdate}
       appStoreDistribution={appStoreDistribution}
@@ -1594,9 +1688,13 @@ function Onboarding({
   const [optionalGuideReturnStep, setOptionalGuideReturnStep] = useState<OnboardingStep | null>(null);
   const [mountOnboarding, setMountOnboarding] = useState<WorkspaceMountOnboardingReport | null>(null);
   const [mounting, setMounting] = useState(false);
+  const [fileProviderEnablement, setFileProviderEnablement] = useState<FileProviderEnablementReport | null>(null);
+  const [finderHelpOpen, setFinderHelpOpen] = useState(false);
+  const [finderRevealError, setFinderRevealError] = useState("");
   const [agentGuidanceReport, setAgentGuidanceReport] = useState<AgentGuidanceInstallReport | null>(null);
   const [agentGuidanceState, setAgentGuidanceState] = useState<"idle" | "installing" | "ready" | "error">("idle");
   const mountStartRequestedRef = useRef(false);
+  const finderRevealRequestedRef = useRef(false);
   const snapshotConnectionConnector = isOnboardingConnector(snapshot.connection.connector)
     ? snapshot.connection.connector
     : null;
@@ -1742,6 +1840,67 @@ function Onboarding({
     }
     void runMountOnboarding("start");
   }, [connectionReadyNow, mountOnboarding, mountPath, mounting, selectedOnboardingConnector, snapshot.mount.status, step]);
+
+  useEffect(() => {
+    const enablementActive =
+      step === 4 &&
+      (mountOnboarding?.state === "needs_finder_enable" ||
+        mountOnboarding?.state === "waiting_for_cloudstorage_root");
+    if (!enablementActive) {
+      finderRevealRequestedRef.current = false;
+      setFileProviderEnablement(null);
+      setFinderHelpOpen(false);
+      setFinderRevealError("");
+      return;
+    }
+
+    let completionTimer: number | null = null;
+    const poller = createFileProviderEnablementPoller({
+      probe: () =>
+        callCommand<FileProviderEnablementReport>(
+          "file_provider_enablement_status",
+          undefined,
+          {
+            state: "ready",
+            message: "Locality is enabled in Finder.",
+            path: mountPath,
+          },
+        ),
+      onReport: (report) => {
+        setFileProviderEnablement(report);
+        if (report.state === "unavailable") {
+          setMountOnboarding(failedMountOnboardingReport(report.message));
+        }
+      },
+      onReady: (report) => {
+        setFileProviderEnablement(report);
+        completionTimer = window.setTimeout(() => {
+          void runMountOnboarding("start");
+        }, 350);
+      },
+    });
+    const updateVisibility = () => {
+      poller.setVisible(document.visibilityState !== "hidden");
+    };
+
+    if (
+      mountOnboarding?.state === "needs_finder_enable" &&
+      !finderRevealRequestedRef.current
+    ) {
+      finderRevealRequestedRef.current = true;
+      void revealFileProviderEnablement();
+    }
+    document.addEventListener("visibilitychange", updateVisibility);
+    updateVisibility();
+    poller.start();
+    return () => {
+      poller.stop();
+      document.removeEventListener("visibilitychange", updateVisibility);
+      if (completionTimer !== null) {
+        window.clearTimeout(completionTimer);
+      }
+    };
+  }, [mountOnboarding?.state, step]);
 
   useEffect(() => {
     if (
@@ -2082,6 +2241,22 @@ function Onboarding({
     }
   }
 
+  async function revealFileProviderEnablement() {
+    setFinderRevealError("");
+    try {
+      const report = await callCommand<ActionReport>(
+        "reveal_file_provider_enablement",
+        undefined,
+        { ok: true, message: "Opened Locality in Finder." },
+      );
+      if (!report.ok) {
+        setFinderRevealError(report.message);
+      }
+    } catch (error) {
+      setFinderRevealError(errorMessage(error));
+    }
+  }
+
   async function ensureCliAvailable() {
     if (appStoreDistribution) {
       return true;
@@ -2198,6 +2373,21 @@ function Onboarding({
       ? classifyMountSetupError(mountOnboarding.message)
       : null;
   const showRecoveryChooser = mountRecoveryEnabled(mountSetupError);
+  const fileProviderGuideVisible =
+    mountOnboarding?.state === "needs_finder_enable" ||
+    mountOnboarding?.state === "waiting_for_cloudstorage_root";
+  const displayedFileProviderEnablement = fileProviderEnablement ??
+    (mountOnboarding?.state === "waiting_for_cloudstorage_root"
+      ? {
+          state: "waiting_for_root" as const,
+          message: "Finishing the Locality folder setup.",
+          path: mountPath,
+        }
+      : {
+          state: "needs_finder_enable" as const,
+          message: "In Finder, click Enable for Locality.",
+          path: mountPath,
+        });
 
   return (
     <main className="setup-shell">
@@ -2372,28 +2562,66 @@ function Onboarding({
           >
             <div>
               <div className="eyebrow">Local folder</div>
-              <h1>{mountOnboardingHeadline(mountOnboarding)}</h1>
+              <h1>
+                {fileProviderGuideVisible
+                  ? fileProviderEnablementHeadline(displayedFileProviderEnablement)
+                  : mountOnboardingHeadline(mountOnboarding)}
+              </h1>
               <p>
-                {mountOnboarding?.message ??
-                  `Locality is creating your ${selectedSourceName} folder under the default CloudStorage root and verifying that files appear locally.`}
+                {fileProviderGuideVisible
+                  ? displayedFileProviderEnablement.state === "needs_finder_enable"
+                    ? "Finder is open to the Locality location. Click Enable there; this screen will continue automatically."
+                    : displayedFileProviderEnablement.message
+                  : mountOnboarding?.message ??
+                    `Locality is creating your ${selectedSourceName} folder under the default CloudStorage root and verifying that files appear locally.`}
               </p>
             </div>
-            <div className="sync-note">
+            {fileProviderGuideVisible && (
+              <FinderEnableGuide
+                waitingForRoot={displayedFileProviderEnablement.state === "waiting_for_root"}
+              />
+            )}
+            <div className={`sync-note${displayedFileProviderEnablement.state === "ready" ? " connected" : ""}`}>
               {mounting ? (
                 <Loader2 className="spin-icon" />
               ) : mountOnboarding?.state === "failed" ? (
                 <AlertTriangle />
+              ) : fileProviderGuideVisible ? (
+                <Loader2 className="spin-icon" />
               ) : (
                 <FolderOpen />
               )}
-              {mounting
+              {fileProviderGuideVisible
+                ? fileProviderEnablementStatusLabel(displayedFileProviderEnablement)
+                : mounting
                 ? "Checking File Provider approval"
                 : mountOnboarding?.message ?? `Creating folder and preparing ${selectedSourceName} files`}
             </div>
             <div className="path-field ready-path-field">
               <span>{mountPath}</span>
             </div>
-            {showRecoveryChooser ? (
+            {fileProviderGuideVisible ? (
+              <>
+                <div className="button-row">
+                  <PrimaryButton onClick={() => void revealFileProviderEnablement()}>
+                    Reopen Finder
+                  </PrimaryButton>
+                  <SecondaryButton onClick={() => setFinderHelpOpen((open) => !open)}>
+                    Having trouble?
+                  </SecondaryButton>
+                </div>
+                {finderHelpOpen && (
+                  <div className="finder-enable-help">
+                    <strong>Look under Locations in the Finder sidebar.</strong>
+                    <span>
+                      Select Locality and click Enable. If Locality is missing, reopen Finder first,
+                      then verify Locality under File Providers in System Settings.
+                    </span>
+                  </div>
+                )}
+                {finderRevealError && <p className="field-error">{finderRevealError}</p>}
+              </>
+            ) : showRecoveryChooser ? (
               <div className="button-row">
                 <PrimaryButton
                   busy={mounting}
@@ -2415,10 +2643,10 @@ function Onboarding({
                 {mountOnboardingPrimaryLabel(mountOnboarding, mounting)}
               </PrimaryButton>
             )}
-            {mountOnboardingNeedsInstructions(mountOnboarding) && (
+            {!fileProviderGuideVisible && mountOnboardingNeedsInstructions(mountOnboarding) && (
               <p className="quiet-note">{mountOnboardingInstructions(mountOnboarding)}</p>
             )}
-            {mountOnboardingSupplementaryNote(mountOnboarding) && (
+            {!fileProviderGuideVisible && mountOnboardingSupplementaryNote(mountOnboarding) && (
               <p className="quiet-note">{mountOnboardingSupplementaryNote(mountOnboarding)}</p>
             )}
             <p className="quiet-note">
@@ -2545,6 +2773,10 @@ function MainShell({
   snapshot,
   view,
   onViewChange,
+  reviewInitialFilter,
+  onOpenReview,
+  theme,
+  onThemeChange,
   onRefresh,
   updateStatus,
   onCheckForUpdate,
@@ -2555,6 +2787,10 @@ function MainShell({
   snapshot: DesktopSnapshot;
   view: AppView;
   onViewChange: (view: AppView) => void;
+  reviewInitialFilter: ReviewFilter;
+  onOpenReview: (filter?: ReviewFilter) => void;
+  theme: AppTheme;
+  onThemeChange: (theme: AppTheme) => void;
   onRefresh: () => Promise<void>;
   updateStatus: UpdateStatus;
   onCheckForUpdate: (options?: AppUpdateCheckOptions) => Promise<void>;
@@ -2604,8 +2840,17 @@ function MainShell({
     onViewChange("mount");
   }
 
+  function openReviewCenter(filter: ReviewFilter = "all") {
+    setSelectedMountId(null);
+    onOpenReview(filter);
+  }
+
   function openStatusTarget() {
     if (statusTarget) {
+      if (statusTarget === "pending") {
+        openReviewCenter();
+        return;
+      }
       onViewChange(statusTarget);
       return;
     }
@@ -2618,7 +2863,7 @@ function MainShell({
         title="Locality"
         meta={meta}
         metaTitle={statusTitle}
-        onMetaClick={statusTarget ? () => onViewChange(statusTarget) : undefined}
+        onMetaClick={statusTarget ? openStatusTarget : undefined}
       />
       <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
         <aside className="sidebar">
@@ -2648,7 +2893,7 @@ function MainShell({
             <SidebarButton
               active={view === "pending" || view === "review"}
               icon={<ListChecks />}
-              onClick={() => onViewChange("pending")}
+              onClick={() => openReviewCenter()}
             >
               {PRODUCT_TERMS.reviewCenter}
             </SidebarButton>
@@ -2683,7 +2928,7 @@ function MainShell({
               snapshot={snapshot}
               onMount={openMountsView}
               onFiles={() => onViewChange("files")}
-              onReview={() => onViewChange("pending")}
+              onReview={openReviewCenter}
               onRefresh={onRefresh}
             />
           )}
@@ -2694,7 +2939,7 @@ function MainShell({
               onHome={() => onViewChange("home")}
               onMounts={() => setSelectedMountId(null)}
               onRefresh={onRefresh}
-              onReview={() => onViewChange("pending")}
+              onReview={() => openReviewCenter()}
             />
           )}
           {view === "files" && (
@@ -2702,7 +2947,7 @@ function MainShell({
               snapshot={snapshot}
               onHome={() => onViewChange("home")}
               onRefresh={onRefresh}
-              onReview={() => onViewChange("pending")}
+              onReview={() => openReviewCenter()}
             />
           )}
           {view === "mount" && !selectedMount && (
@@ -2720,13 +2965,14 @@ function MainShell({
               onHome={() => onViewChange("home")}
               onReview={() => onViewChange("review")}
               onRefresh={onRefresh}
+              initialFilter={reviewInitialFilter}
             />
           )}
           {view === "review" && (
             <ReviewView
               snapshot={snapshot}
               onHome={() => onViewChange("home")}
-              onPending={() => onViewChange("pending")}
+              onPending={() => openReviewCenter()}
               onRefresh={onRefresh}
               onDone={() => onViewChange("activity")}
             />
@@ -2741,6 +2987,8 @@ function MainShell({
               onCheckForUpdate={onCheckForUpdate}
               onInstallUpdate={onInstallUpdate}
               appStoreDistribution={appStoreDistribution}
+              theme={theme}
+              onThemeChange={onThemeChange}
               onActivity={() => onViewChange("activity")}
               onSources={openMountsView}
               onResetComplete={onResetComplete}
@@ -2795,7 +3043,7 @@ function HomeView({
   snapshot: DesktopSnapshot;
   onMount: () => void;
   onFiles: () => void;
-  onReview: () => void;
+  onReview: (filter?: ReviewFilter) => void;
   onRefresh: () => Promise<void>;
 }) {
   const [url, setUrl] = useState("");
@@ -2924,16 +3172,16 @@ function HomeView({
               <span>Sources</span>
               <strong>{snapshot.mounts.length || 1}</strong>
             </button>
-            <button type="button" className="home-stat" onClick={onReview}>
+            <button type="button" className="home-stat" onClick={() => onReview()}>
               <span>Awaiting review</span>
               <strong className={homeReviewCounts.total > 0 ? "warn" : ""}>{homeReviewCounts.total}</strong>
             </button>
-            <div className="home-stat passive">
+            <button type="button" className="home-stat" onClick={() => onReview("problems")}>
               <span>Problems</span>
               <strong className={homeReviewCounts.problems > 0 ? "danger" : ""}>
                 {homeReviewCounts.problems > 0 ? homeReviewCounts.problems : "0"}
               </strong>
-            </div>
+            </button>
           </section>
           <section className="workspace-card">
             <div className="workspace-summary">
@@ -3039,22 +3287,124 @@ function MountsView({
   onSelectMount: (mountId: string) => void;
 }) {
   const [actionError, setActionError] = useState("");
+  const [actionMessage, setActionMessage] = useState("");
   const [creating, setCreating] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [backupMountId, setBackupMountId] = useState<string | null>(null);
   const [sourceDialogOpen, setSourceDialogOpen] = useState(false);
   const [sourceDialogState, setSourceDialogState] = useState<SourceSetupState>("idle");
   const [sourceDialogConnector, setSourceDialogConnector] = useState<SourceConnectorId | null>(null);
   const [sourceDialogMessage, setSourceDialogMessage] = useState("");
+  const [sourceFileProviderEnablement, setSourceFileProviderEnablement] = useState<FileProviderEnablementReport | null>(null);
+  const [pendingMountRetry, setPendingMountRetry] = useState<{
+    connector: SourceConnectorId;
+    googleDocsWorkspaceFolder?: string;
+  } | null>(null);
+  const sourceFinderRevealRequestedRef = useRef(false);
   const sourceSetupBusy = sourceSetupIsBusy(sourceDialogState);
+  const readyToMountSources = connectedSourcesReadyToMount(snapshot);
+  const hasVisibleSources = rows.length > 0 || readyToMountSources.length > 0;
+
+  useEffect(() => {
+    if (!pendingMountRetry) {
+      sourceFinderRevealRequestedRef.current = false;
+      return;
+    }
+
+    let completionTimer: number | null = null;
+    const poller = createFileProviderEnablementPoller({
+      probe: () =>
+        callCommand<FileProviderEnablementReport>(
+          "file_provider_enablement_status",
+          undefined,
+          {
+            state: "ready",
+            message: "Locality is enabled in Finder.",
+            path: sourceDefaultPath(snapshot, pendingMountRetry.connector),
+          },
+        ),
+      onReport: (report) => {
+        setSourceFileProviderEnablement(report);
+        if (report.state === "unavailable") {
+          setSourceDialogMessage(report.message);
+          setSourceDialogState("error");
+        }
+      },
+      onReady: (report) => {
+        setSourceFileProviderEnablement(report);
+        completionTimer = window.setTimeout(async () => {
+          const mountReport = await createConnectorMount(
+            pendingMountRetry.connector,
+            pendingMountRetry.googleDocsWorkspaceFolder,
+          );
+          const outcome = sourceMountRetryOutcome(mountReport);
+          if (outcome.kind === "retry") {
+            return;
+          }
+          setPendingMountRetry(null);
+          setSourceFileProviderEnablement(null);
+          setSourceDialogMessage(outcome.message);
+          setSourceDialogState(outcome.kind);
+        }, 350);
+      },
+    });
+    const updateVisibility = () => {
+      poller.setVisible(document.visibilityState !== "hidden");
+    };
+
+    if (!sourceFinderRevealRequestedRef.current) {
+      sourceFinderRevealRequestedRef.current = true;
+      void revealSourceFileProviderEnablement();
+    }
+    document.addEventListener("visibilitychange", updateVisibility);
+    updateVisibility();
+    poller.start();
+    return () => {
+      poller.stop();
+      document.removeEventListener("visibilitychange", updateVisibility);
+      if (completionTimer !== null) {
+        window.clearTimeout(completionTimer);
+      }
+    };
+  }, [pendingMountRetry]);
 
   function openAddSourceDialog() {
     setActionError("");
+    setActionMessage("");
     if (!sourceSetupBusy) {
       setSourceDialogMessage("");
       setSourceDialogState("idle");
       setSourceDialogConnector(null);
     }
     setSourceDialogOpen(true);
+  }
+
+  function beginSourceFileProviderRecovery(
+    connector: SourceConnectorId,
+    googleDocsWorkspaceFolder: string | undefined,
+  ) {
+    setActionError("");
+    setSourceDialogOpen(true);
+    setSourceDialogConnector(connector);
+    setSourceDialogState("creating");
+    setSourceDialogMessage("");
+    setSourceFileProviderEnablement({
+      state: "needs_finder_enable",
+      message: "In Finder, click Enable for Locality.",
+      path: sourceDefaultPath(snapshot, connector),
+    });
+    setPendingMountRetry({ connector, googleDocsWorkspaceFolder });
+  }
+
+  async function revealSourceFileProviderEnablement() {
+    const report = await callCommand<ActionReport>(
+      "reveal_file_provider_enablement",
+      undefined,
+      { ok: true, message: "Opened Locality in Finder." },
+    ).catch((error) => ({ ok: false, message: errorMessage(error) }));
+    if (!report.ok) {
+      setSourceDialogMessage(report.message);
+    }
   }
 
   async function createConnectorMount(
@@ -3065,6 +3415,7 @@ function MountsView({
       return { ok: false, message: "Source setup is already running." };
     }
     setActionError("");
+    setActionMessage("");
     setCreating(true);
     try {
       const report = await callCommand<ActionReport>(
@@ -3087,6 +3438,10 @@ function MountsView({
         { ok: true, message: "Created demo mount." },
       );
       if (!report.ok) {
+        if (classifyMountSetupError(report.message).kind === "file-provider-disabled") {
+          beginSourceFileProviderRecovery(connector, googleDocsWorkspaceFolder);
+          return report;
+        }
         setActionError(report.message);
         return report;
       }
@@ -3094,6 +3449,10 @@ function MountsView({
       return report;
     } catch (error) {
       const message = errorMessage(error);
+      if (classifyMountSetupError(message).kind === "file-provider-disabled") {
+        beginSourceFileProviderRecovery(connector, googleDocsWorkspaceFolder);
+        return { ok: false, message };
+      }
       setActionError(message);
       return { ok: false, message };
     } finally {
@@ -3107,6 +3466,7 @@ function MountsView({
 
   async function connectNotionSource(): Promise<ActionReport> {
     setActionError("");
+    setActionMessage("");
     const report = await callCommand<ActionReport>(
       "connect_notion",
       undefined,
@@ -3122,6 +3482,7 @@ function MountsView({
 
   async function changeNotionSourceAccess(): Promise<ActionReport> {
     setActionError("");
+    setActionMessage("");
     const report = await callCommand<ActionReport>(
       "change_notion_access",
       undefined,
@@ -3145,6 +3506,7 @@ function MountsView({
 
     const command = connector === "google-docs" ? "connect_google_docs" : "connect_gmail";
     setActionError("");
+    setActionMessage("");
     const report = await callCommand<ActionReport>(
       command,
       undefined,
@@ -3168,21 +3530,31 @@ function MountsView({
 
     setSourceDialogMessage("");
     setSourceDialogConnector(connector);
-    const nextState = connector === "notion"
-      ? connectionMissing(snapshot)
-        ? "connecting"
-        : mountMissing(snapshot)
-          ? "creating"
-          : "changing"
-      : "connecting";
+    const connectorReady = sourceConnectionReady(snapshot, connector);
+    const connectorHasMount = sourceMounted(snapshot, connector);
+    const nextState = !connectorReady
+      ? "connecting"
+      : !connectorHasMount
+        ? "creating"
+        : connector === "notion"
+          ? "changing"
+          : "success";
     setSourceDialogState(nextState);
     try {
+      if (connectorReady && !connectorHasMount) {
+        const mountReport = await createConnectorMount(connector, options?.googleDocsWorkspaceFolder);
+        if (classifyMountSetupError(mountReport.message).kind === "file-provider-disabled") {
+          return;
+        }
+        setSourceDialogMessage(mountReport.message);
+        setSourceDialogState(mountReport.ok ? "success" : "error");
+        return;
+      }
+
       const report = connector === "notion"
-        ? connectionMissing(snapshot)
-          ? await connectNotionSource()
-          : mountMissing(snapshot)
-            ? await createMount()
-            : await changeNotionSourceAccess()
+        ? connectorReady
+          ? await changeNotionSourceAccess()
+          : await connectNotionSource()
         : await connectConnectorSource(connector);
       if (!report.ok || connector === "notion") {
         setSourceDialogMessage(report.message);
@@ -3192,6 +3564,9 @@ function MountsView({
 
       setSourceDialogState("creating");
       const mountReport = await createConnectorMount(connector, options?.googleDocsWorkspaceFolder);
+      if (classifyMountSetupError(mountReport.message).kind === "file-provider-disabled") {
+        return;
+      }
       const message = mountReport.ok
         ? `${report.message} ${mountReport.message}`
         : `${report.message} ${mountReport.message}`;
@@ -3212,6 +3587,7 @@ function MountsView({
     }
     const sourceName = sourceDisplayName(connector);
     setSourceDialogMessage("");
+    setActionMessage("");
     setSourceDialogConnector(connector);
     setSourceDialogState("connecting");
     try {
@@ -3241,6 +3617,7 @@ function MountsView({
       return;
     }
     setActionError("");
+    setActionMessage("");
     setRefreshing(true);
     try {
       await onRefresh();
@@ -3253,6 +3630,7 @@ function MountsView({
 
   async function openMountFolder(path: string) {
     setActionError("");
+    setActionMessage("");
     const report = await callCommand<ActionReport>(
       "open_path",
       { path },
@@ -3260,6 +3638,32 @@ function MountsView({
     );
     if (!report.ok) {
       setActionError(report.message);
+    }
+  }
+
+  async function exportSourceBackup(mountId: string) {
+    if (backupMountId) {
+      return;
+    }
+    setActionError("");
+    setActionMessage("");
+    setBackupMountId(mountId);
+    try {
+      const report = await callCommand<ActionReport>(
+        "export_source_backup",
+        { mountId },
+        { ok: true, message: `Exported demo backup for ${mountId}.` },
+      );
+      if (!report.ok) {
+        setActionError(report.message);
+        return;
+      }
+      setActionMessage(report.message);
+      await onRefresh().catch(() => undefined);
+    } catch (error) {
+      setActionError(errorMessage(error));
+    } finally {
+      setBackupMountId(null);
     }
   }
 
@@ -3285,7 +3689,7 @@ function MountsView({
         </SecondaryButton>
       </ViewHeader>
 
-      {rows.length === 0 ? (
+      {!hasVisibleSources ? (
         <section className="empty-action-panel">
           <BrandTile variant="folder" />
           <div>
@@ -3303,8 +3707,35 @@ function MountsView({
       ) : (
         <>
           <p className="view-copy">
-            {rows.length} connected {rows.length === 1 ? "source" : "sources"} registered for this Locality state.
+            {rows.length} mounted {rows.length === 1 ? "source" : "sources"}
+            {readyToMountSources.length > 0
+              ? ` · ${readyToMountSources.length} ready to mount`
+              : ""}.
           </p>
+          {readyToMountSources.length > 0 && (
+            <section className="source-ready-strip" aria-label="Sources ready to mount">
+              {readyToMountSources.map((connector) => (
+                <article className="source-ready-card" key={connector}>
+                  <ConnectorIcon connector={connector} />
+                  <div>
+                    <strong>{sourceDisplayName(connector)}</strong>
+                    <span>Connected. Create the local folder to use it from Files and agents.</span>
+                  </div>
+                  <StatusPill tone="warn" title="Connection is ready but no local folder exists yet.">
+                    Folder needed
+                  </StatusPill>
+                  <SecondaryButton
+                    compact
+                    busy={creating}
+                    icon={<FolderOpen />}
+                    onClick={() => void createConnectorMount(connector)}
+                  >
+                    Create Folder
+                  </SecondaryButton>
+                </article>
+              ))}
+            </section>
+          )}
           <section className="mounts-grid" aria-label="Connected sources">
             {rows.map((row) => (
               <article className={`mount-card ${row.active ? "active" : ""}`} key={row.id}>
@@ -3353,6 +3784,15 @@ function MountsView({
                 </div>
                 <div className="mount-card-footer">
                   <span>{row.mount.mountId}</span>
+                  <button
+                    className="mount-details-button"
+                    type="button"
+                    disabled={backupMountId !== null}
+                    onClick={() => void exportSourceBackup(row.id)}
+                  >
+                    {backupMountId === row.id ? "Exporting" : "Backup"}
+                    {backupMountId === row.id ? <Loader2 className="spin-icon" /> : <Download />}
+                  </button>
                   <button className="mount-details-button" type="button" onClick={() => onSelectMount(row.id)}>
                     Details
                     <ChevronRight />
@@ -3364,15 +3804,20 @@ function MountsView({
         </>
       )}
       {actionError && <p className="field-error">{actionError}</p>}
+      {actionMessage && <p className="quiet-note inline-note">{actionMessage}</p>}
       {sourceDialogOpen && (
         <AddSourceDialog
           snapshot={snapshot}
           state={sourceDialogState}
           activeConnector={sourceDialogConnector}
           message={sourceDialogMessage}
+          fileProviderEnablement={sourceFileProviderEnablement}
           onAction={(connector, options) => void runSourceDialogAction(connector, options)}
           onApiKeyAction={(connector, apiKey) => void connectApiKeySource(connector, apiKey)}
-          onClose={() => setSourceDialogOpen(false)}
+          onReopenFinder={() => void revealSourceFileProviderEnablement()}
+          onClose={() => {
+            setSourceDialogOpen(false);
+          }}
         />
       )}
     </div>
@@ -3384,16 +3829,20 @@ function AddSourceDialog({
   state,
   activeConnector,
   message,
+  fileProviderEnablement,
   onAction,
   onApiKeyAction,
+  onReopenFinder,
   onClose,
 }: {
   snapshot: DesktopSnapshot;
   state: SourceSetupState;
   activeConnector: SourceConnectorId | null;
   message: string;
+  fileProviderEnablement: FileProviderEnablementReport | null;
   onAction: (connector: SourceConnectorId, options?: { googleDocsWorkspaceFolder?: string }) => void;
   onApiKeyAction: (connector: "granola" | "linear", apiKey: string) => void;
+  onReopenFinder: () => void;
   onClose: () => void;
 }) {
   const [query, setQuery] = useState("");
@@ -3401,55 +3850,47 @@ function AddSourceDialog({
   const [googleDocsWorkspaceFolder, setGoogleDocsWorkspaceFolder] = useState("Locality");
   const [granolaApiKey, setGranolaApiKey] = useState("");
   const [linearApiKey, setLinearApiKey] = useState("");
-  const needsConnection = connectionMissing(snapshot);
-  const needsFolder = !needsConnection && mountMissing(snapshot);
   const busy = sourceSetupIsBusy(state);
-  const sourceStatus = needsConnection
-    ? "Not connected"
-    : needsFolder
-      ? "Connected, folder needed"
-      : "Ready";
-  const mountedConnectors = new Set(snapshot.mounts.map((mount) => mount.connector));
   const connectors: ConnectorOption[] = [
     {
       id: "notion",
       name: "Notion",
       description: "Pages and databases as folders with page.md files.",
-      status: sourceStatus,
+      status: sourceConnectorStatus(snapshot, "notion"),
       keywords: ["notion", "wiki", "pages", "database", "docs"],
-      mounted: mountedConnectors.has("notion") || !mountMissing(snapshot),
+      mounted: sourceMounted(snapshot, "notion"),
     },
     {
       id: "google-docs",
       name: "Google Docs",
       description: "Docs and Drive folders through the same local file workflow.",
-      status: mountedConnectors.has("google-docs") ? "Mounted" : "Ready to connect",
+      status: sourceConnectorStatus(snapshot, "google-docs"),
       keywords: ["google", "docs", "gdocs", "drive", "documents"],
-      mounted: mountedConnectors.has("google-docs"),
+      mounted: sourceMounted(snapshot, "google-docs"),
     },
     {
       id: "gmail",
       name: "Gmail",
       description: "Inbox and sent as readable files, drafts as reviewed outbound mail.",
-      status: mountedConnectors.has("gmail") ? "Mounted" : "Ready to connect",
+      status: sourceConnectorStatus(snapshot, "gmail"),
       keywords: ["gmail", "mail", "email", "inbox", "drafts"],
-      mounted: mountedConnectors.has("gmail"),
+      mounted: sourceMounted(snapshot, "gmail"),
     },
     {
       id: "granola",
       name: "Granola",
       description: "Meeting summaries and raw transcripts as read-only files.",
-      status: mountedConnectors.has("granola") ? "Mounted" : "API key required",
+      status: sourceConnectorStatus(snapshot, "granola"),
       keywords: ["granola", "meetings", "notes", "transcripts", "summaries"],
-      mounted: mountedConnectors.has("granola"),
+      mounted: sourceMounted(snapshot, "granola"),
     },
     {
       id: "linear",
       name: "Linear",
       description: "Issues and teams as editable Markdown files.",
-      status: mountedConnectors.has("linear") ? "Mounted" : "API key required",
+      status: sourceConnectorStatus(snapshot, "linear"),
       keywords: ["linear", "issues", "tickets", "projects", "teams"],
-      mounted: mountedConnectors.has("linear"),
+      mounted: sourceMounted(snapshot, "linear"),
     },
   ];
   const normalizedQuery = query.trim().toLowerCase();
@@ -3476,6 +3917,30 @@ function AddSourceDialog({
           </button>
         </div>
 
+        {fileProviderEnablement ? (
+          <div className="source-file-provider-recovery">
+            <div>
+              <p className="label">Finder access</p>
+              <h3>{fileProviderEnablementHeadline(fileProviderEnablement)}</h3>
+              <p>
+                {fileProviderEnablement.state === "needs_finder_enable"
+                  ? "Click Enable in the Locality Finder window. Source setup will continue automatically."
+                  : fileProviderEnablement.message}
+              </p>
+            </div>
+            <FinderEnableGuide
+              waitingForRoot={fileProviderEnablement.state === "waiting_for_root"}
+            />
+            <div className="sync-note">
+              {fileProviderEnablement.state === "ready" ? <Check /> : <Loader2 className="spin-icon" />}
+              {fileProviderEnablementStatusLabel(fileProviderEnablement)}
+            </div>
+            <SecondaryButton icon={<FolderOpen />} onClick={onReopenFinder}>
+              Reopen Finder
+            </SecondaryButton>
+          </div>
+        ) : (
+          <>
         <div className="source-toolbar">
           <label className="source-search-row">
             <Search />
@@ -3512,6 +3977,12 @@ function AddSourceDialog({
           <div className={`connector-choice-grid ${viewMode}`}>
             {visibleConnectors.map((connector) => {
               const connectorBusy = sourceSetupIsActiveConnector(state, activeConnector, connector.id);
+              const apiKeyConnector = sourceRequiresApiKey(connector.id) ? connector.id : null;
+              const connected = sourceConnectionReady(snapshot, connector.id);
+              const needsConnection = !connected;
+              const needsFolder = connected && !connector.mounted;
+              const connectionDetails = sourceConnectionDetails(snapshot, connector.id);
+              const mountDetails = sourceMountDetails(snapshot, connector.id);
               const disabled = busy || (connector.id !== "notion" && connector.mounted);
               const displayedStatus = connectorBusy
                 ? sourceSetupProgressLabel(state, connector.mounted)
@@ -3549,9 +4020,9 @@ function AddSourceDialog({
                   <div className="connector-choice-facts">
                     {connector.id === "notion" ? (
                       <>
-                        <SettingRow title="Workspace" value={snapshot.connection.workspaceName || "Not connected"} />
+                        <SettingRow title="Workspace" value={connectionDetails?.workspaceName || "Not connected"} />
                         <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
-                        <SettingRow title="Access" value={snapshot.mount.accessScope || "Not requested"} />
+                        <SettingRow title="Access" value={mountDetails?.accessScope || (connected ? "Ready to mount" : "Not requested")} />
                       </>
                     ) : connector.id === "google-docs" ? (
                       <>
@@ -3586,18 +4057,18 @@ function AddSourceDialog({
                       />
                     </label>
                   )}
-                  {sourceRequiresApiKey(connector.id) && !connector.mounted && (
+                  {apiKeyConnector && !connector.mounted && needsConnection && (
                     <>
                       <label className="source-inline-field">
                         <span>{connector.name} API key</span>
                         <input
                           type="password"
                           autoComplete="off"
-                          value={connector.id === "linear" ? linearApiKey : granolaApiKey}
+                          value={apiKeyConnector === "linear" ? linearApiKey : granolaApiKey}
                           placeholder="Paste API key"
                           disabled={busy}
                           onChange={(event) => {
-                            if (connector.id === "linear") {
+                            if (apiKeyConnector === "linear") {
                               setLinearApiKey(event.target.value);
                             } else {
                               setGranolaApiKey(event.target.value);
@@ -3606,7 +4077,7 @@ function AddSourceDialog({
                         />
                       </label>
                       <p className="quiet-note">
-                        {connector.id === "linear"
+                        {apiKeyConnector === "linear"
                           ? "Create a key in Linear Settings > API > Personal API keys."
                           : "Create a key in Granola Settings > Connectors > API keys. Business or Enterprise is required."}
                       </p>
@@ -3616,28 +4087,27 @@ function AddSourceDialog({
                     <SecondaryButton compact disabled icon={<Check />}>
                       Mounted
                     </SecondaryButton>
-                  ) : sourceRequiresApiKey(connector.id) ? (
+                  ) : apiKeyConnector ? (
                     <PrimaryButton
                       compact
                       busy={connectorBusy}
                       disabled={
                         disabled ||
-                        (
-                          !connector.mounted &&
-                          !(connector.id === "linear" ? linearApiKey : granolaApiKey).trim()
-                        )
+                        (needsConnection && !(apiKeyConnector === "linear" ? linearApiKey : granolaApiKey).trim())
                       }
-                      icon={<ShieldCheck />}
+                      icon={needsConnection ? <ShieldCheck /> : <FolderOpen />}
                       onClick={() => {
-                        if (connector.id === "linear" || connector.id === "granola") {
+                        if (needsConnection) {
                           onApiKeyAction(
-                            connector.id,
-                            connector.id === "linear" ? linearApiKey : granolaApiKey,
+                            apiKeyConnector,
+                            apiKeyConnector === "linear" ? linearApiKey : granolaApiKey,
                           );
+                        } else {
+                          onAction(connector.id);
                         }
                       }}
                     >
-                      {connectorBusy ? sourceSetupProgressLabel(state, connector.mounted) : `Connect ${connector.name}`}
+                      {connectorBusy ? sourceSetupProgressLabel(state, connector.mounted) : actionLabel}
                     </PrimaryButton>
                   ) : (
                     <PrimaryButton
@@ -3658,6 +4128,8 @@ function AddSourceDialog({
             )}
           </div>
         </div>
+          </>
+        )}
 
         {busy && <p className="quiet-note inline-note">Setup continues if you close this window.</p>}
         {message && <p className={state === "error" ? "field-error" : "quiet-note inline-note"}>{message}</p>}
@@ -3696,12 +4168,51 @@ function sourceMountId(connector: SourceConnectorId) {
   }
 }
 
+function sourceConnectionDetails(snapshot: DesktopSnapshot, connector: SourceConnectorId): ConnectionSummary | null {
+  const connections = snapshot.connections?.length ? snapshot.connections : [snapshot.connection];
+  return (
+    connections.find((connection) => connection.connector === connector && sourceConnectionStatusReady(connection.status)) ??
+    connections.find((connection) => connection.connector === connector) ??
+    null
+  );
+}
+
+function sourceMountDetails(snapshot: DesktopSnapshot, connector: SourceConnectorId): MountSummary | null {
+  return (
+    snapshot.mounts.find((mount) => mount.connector === connector) ??
+    (snapshot.mount.connector === connector && snapshot.mount.status !== "not_mounted" ? snapshot.mount : null)
+  );
+}
+
+function sourceConnectorStatus(snapshot: DesktopSnapshot, connector: SourceConnectorId) {
+  if (sourceMounted(snapshot, connector)) {
+    return "Mounted";
+  }
+  if (sourceConnectionReady(snapshot, connector)) {
+    return "Folder needed";
+  }
+  if (sourceRequiresApiKey(connector)) {
+    return "API key required";
+  }
+  return "Ready to connect";
+}
+
+function sourceConnectionStatusReady(status: string) {
+  const normalized = status.trim().toLowerCase();
+  return normalized === "active" || normalized === "ready";
+}
+
 function sourceDefaultPath(snapshot: DesktopSnapshot, connector: SourceConnectorId) {
   const existing = snapshot.mounts.find((mount) => mount.connector === connector)?.localPath;
   if (existing?.trim()) {
     return existing;
   }
-  if (connector === "notion" && snapshot.mount.localPath.trim()) {
+  if (
+    connector === "notion" &&
+    snapshot.mount.connector === "notion" &&
+    snapshot.mount.status !== "not_mounted" &&
+    snapshot.mount.localPath.trim()
+  ) {
     return snapshot.mount.localPath;
   }
   switch (connector) {
@@ -3723,7 +4234,10 @@ function sourceActionLabel(
   state: { needsConnection: boolean; needsFolder: boolean; mounted: boolean },
 ) {
   if (connector !== "notion") {
-    return state.mounted ? "Mounted" : "Connect & Mount";
+    if (state.mounted) {
+      return "Mounted";
+    }
+    return state.needsFolder ? "Create Folder" : "Connect & Mount";
   }
   if (state.needsConnection) {
     return "Connect Notion";
@@ -3859,6 +4373,7 @@ function CurrentWorkspacePanel({
   const [pullState, setPullState] = useState<"idle" | "pulling" | "success" | "error">("idle");
   const accountLabel = snapshot.connection.accountLabel.trim();
   const showAccount = accountLabel.length > 0 && accountLabel !== snapshot.connection.workspaceName;
+  const fileProgressLabel = mountFileIndexProgressLabel(snapshot.mount);
 
   async function openFolder() {
     setActionError("");
@@ -3997,7 +4512,7 @@ function CurrentWorkspacePanel({
       <div className="workspace-facts">
         <span>Permission: {snapshot.mount.readOnly ? "Read only" : "Edit enabled"}</span>
         <span>Projection: {snapshot.mount.projection}</span>
-        <span>Indexed: {mountEntityCountLabel(snapshot.mount)}</span>
+        <span>{fileProgressLabel ?? `Indexed: ${mountEntityCountLabel(snapshot.mount)}`}</span>
         {showAccount && <span>Account: {accountLabel}</span>}
       </div>
 
@@ -4038,6 +4553,8 @@ function MountDetailView({
   const [accessState, setAccessState] = useState<"idle" | "changing" | "success" | "error">("idle");
   const [pullMessage, setPullMessage] = useState("");
   const [pullState, setPullState] = useState<"idle" | "pulling" | "success" | "error">("idle");
+  const [backupMessage, setBackupMessage] = useState("");
+  const [backupState, setBackupState] = useState<"idle" | "exporting" | "success" | "error">("idle");
   const [sourceAction, setSourceAction] = useState<SourceDestructiveAction | null>(null);
   const [sourceConfirmation, setSourceConfirmation] = useState("");
   const [sourceActionBusy, setSourceActionBusy] = useState(false);
@@ -4055,9 +4572,11 @@ function MountDetailView({
   } = useMountLiveModeController(snapshot, onRefresh);
   const liveModeAppliesToSource = isActiveMount && mount.connector === "notion";
   const sourceSyncMode = sourceSyncModeLabel(snapshot.liveMode, liveModeAppliesToSource);
+  const fileProgressValue = mountFileIndexProgressValue(mount);
 
   async function openFolder() {
     setActionError("");
+    setBackupMessage("");
     const report = await callCommand<ActionReport>(
       "open_path",
       { path: mount.localPath },
@@ -4070,6 +4589,7 @@ function MountDetailView({
 
   async function openVsCode() {
     setActionError("");
+    setBackupMessage("");
     const report = await callCommand<ActionReport>(
       "open_in_vs_code",
       { path: mount.localPath },
@@ -4086,6 +4606,7 @@ function MountDetailView({
     }
 
     setAccessMessage("");
+    setBackupMessage("");
     setAccessState("changing");
     const report = await callCommand<ActionReport>(
       "change_notion_access",
@@ -4109,6 +4630,7 @@ function MountDetailView({
 
     setActionError("");
     setPullMessage("");
+    setBackupMessage("");
     setPullState("pulling");
 
     try {
@@ -4123,6 +4645,31 @@ function MountDetailView({
     } catch (error) {
       setPullMessage(errorMessage(error));
       setPullState("error");
+    }
+  }
+
+  async function exportBackup() {
+    if (backupState === "exporting") {
+      return;
+    }
+
+    setActionError("");
+    setBackupMessage("");
+    setBackupState("exporting");
+    try {
+      const report = await callCommand<ActionReport>(
+        "export_source_backup",
+        { mountId: mount.mountId },
+        { ok: true, message: `Exported demo backup for ${mount.mountId}.` },
+      );
+      setBackupMessage(report.message);
+      setBackupState(report.ok ? "success" : "error");
+      if (report.ok) {
+        await onRefresh().catch(() => undefined);
+      }
+    } catch (error) {
+      setBackupMessage(errorMessage(error));
+      setBackupState("error");
     }
   }
 
@@ -4207,6 +4754,15 @@ function MountDetailView({
           <SecondaryButton compact icon={<Code2 />} onClick={() => void openVsCode()}>
             Open in VS Code
           </SecondaryButton>
+          <SecondaryButton
+            compact
+            busy={backupState === "exporting"}
+            disabled={!mount.localPath.trim()}
+            icon={<Download />}
+            onClick={() => void exportBackup()}
+          >
+            {backupState === "exporting" ? "Exporting" : "Export Backup"}
+          </SecondaryButton>
           {showNotionAccessAction && (
             <SecondaryButton
               compact
@@ -4238,6 +4794,11 @@ function MountDetailView({
       {pullMessage && (
         <p className={pullState === "error" ? "field-error" : "quiet-note inline-note"}>{pullMessage}</p>
       )}
+      {backupMessage && (
+        <p className={backupState === "error" ? "field-error" : "quiet-note inline-note"}>
+          {backupMessage}
+        </p>
+      )}
 
       <section className="detail-grid">
         <div className="panel">
@@ -4257,6 +4818,7 @@ function MountDetailView({
           <SettingRow title="Location" value={mount.localPath} />
           <SettingRow title="Projection" value={mount.projection} />
           <SettingRow title="Mounted content" value={`${mount.entityCount} items`} />
+          {fileProgressValue && <SettingRow title="Files indexed" value={fileProgressValue} />}
           <SettingRow title="Root exists" value={mount.rootExists ? "Yes" : "No"} />
         </div>
       </section>
@@ -4636,18 +5198,24 @@ function PendingView({
   onHome,
   onReview,
   onRefresh,
+  initialFilter,
 }: {
   snapshot: DesktopSnapshot;
   onHome: () => void;
   onReview: () => void;
   onRefresh: () => Promise<void>;
+  initialFilter: ReviewFilter;
 }) {
   const hasPendingChanges = snapshot.pendingChanges.length > 0;
-  const [filter, setFilter] = useState<ReviewFilter>("all");
+  const [filter, setFilter] = useState<ReviewFilter>(initialFilter);
   const [pushState, setPushState] = useState<"idle" | "pushing" | "success" | "error">("idle");
   const [pushMessage, setPushMessage] = useState("");
   const reviewCounts = reviewQueueCounts(snapshot.pendingChanges);
   const visibleChanges = snapshot.pendingChanges.filter((change) => changeMatchesReviewFilter(change, filter));
+
+  useEffect(() => {
+    setFilter(initialFilter);
+  }, [initialFilter]);
 
   async function pushAll() {
     if (!hasPendingChanges || pushState === "pushing") {
@@ -4686,16 +5254,16 @@ function PendingView({
       <Breadcrumbs items={[{ label: PRODUCT_TERMS.home, onClick: onHome }, { label: PRODUCT_TERMS.reviewCenter }]} />
       <ViewHeader title={PRODUCT_TERMS.reviewCenter}>
         <div className="button-row">
-          <SecondaryButton
+          <PrimaryButton
             disabled={!hasPendingChanges || isPushing}
             icon={isPushing ? <Loader2 className="spin-icon" /> : <ShieldCheck />}
             onClick={() => void pushAll()}
           >
             {isPushing ? "Pushing..." : "Push Safe Changes"}
-          </SecondaryButton>
-          <PrimaryButton disabled={!hasPendingChanges || isPushing} icon={<ListChecks />} onClick={onReview}>
-            Review Push
           </PrimaryButton>
+          <SecondaryButton disabled={!hasPendingChanges || isPushing} icon={<ListChecks />} onClick={onReview}>
+            Review Push
+          </SecondaryButton>
         </div>
       </ViewHeader>
       {pushMessage && (
@@ -5267,6 +5835,8 @@ function SettingsView({
   onCheckForUpdate,
   onInstallUpdate,
   appStoreDistribution,
+  theme,
+  onThemeChange,
   onActivity,
   onSources,
   onResetComplete,
@@ -5278,6 +5848,8 @@ function SettingsView({
   onCheckForUpdate: (options?: AppUpdateCheckOptions) => Promise<void>;
   onInstallUpdate: () => Promise<void>;
   appStoreDistribution: boolean;
+  theme: AppTheme;
+  onThemeChange: (theme: AppTheme) => void;
   onActivity: () => void;
   onSources: () => void;
   onResetComplete: () => void;
@@ -5517,6 +6089,7 @@ function SettingsView({
           {settingsSection === "general" && (
             <section className="panel settings-section-panel">
               <PanelTitle title="Desktop behavior" />
+              <ThemeRow value={theme} onChange={onThemeChange} />
               <ToggleRow
                 title="Launch Locality at login"
                 enabled={localSettings.launchAtLogin}
@@ -7057,7 +7630,7 @@ function WindowChrome({
       onMouseDown={handleChromeMouseDown}
     >
       <div className="native-traffic-space" aria-hidden="true" />
-      <div data-tauri-drag-region>{title}</div>
+      <div className="window-title" data-tauri-drag-region>{title}</div>
       <div
         className="window-chrome-actions"
         data-tauri-drag-region={(!onMetaClick && !showWindowControls) || undefined}
@@ -7161,6 +7734,51 @@ function SetupContent({
       >
         {mark ? mark : null}
         {children}
+      </div>
+    </div>
+  );
+}
+
+function FinderEnableGuide({ waitingForRoot }: { waitingForRoot: boolean }) {
+  if (waitingForRoot) {
+    return (
+      <div className="finder-enable-guide complete" role="status">
+        <Check />
+        <span>
+          <strong>Finder access enabled</strong>
+          <small>macOS is creating the Locality folder.</small>
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="finder-enable-guide">
+      <div className="finder-enable-illustration" aria-hidden="true">
+        <div className="finder-enable-toolbar">
+          <i />
+          <i />
+          <i />
+          <span>Finder</span>
+        </div>
+        <div className="finder-enable-sidebar">
+          <small>Locations</small>
+          <span className="finder-enable-location">
+            <FolderOpen />
+            <strong>Locality</strong>
+          </span>
+        </div>
+        <div className="finder-enable-content">
+          <p>
+            <strong>&quot;Locality&quot; is not enabled.</strong> To access Locality, click Enable.
+          </p>
+          <span className="finder-enable-control">Enable</span>
+          <div className="finder-enable-placeholders">
+            <i />
+            <i />
+            <i />
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -7383,6 +8001,41 @@ function ToggleRow({
   );
 }
 
+function ThemeRow({
+  value,
+  onChange,
+}: {
+  value: AppTheme;
+  onChange: (theme: AppTheme) => void;
+}) {
+  const options: Array<{ value: AppTheme; label: string; icon: React.ReactNode }> = [
+    { value: "system", label: "System", icon: <Monitor /> },
+    { value: "light", label: "Light", icon: <Sun /> },
+    { value: "dark", label: "Dark", icon: <Moon /> },
+  ];
+
+  return (
+    <div className="setting-row theme-setting-row">
+      <span>Appearance</span>
+      <div className="theme-segmented" role="radiogroup" aria-label="Appearance">
+        {options.map((option) => (
+          <button
+            key={option.value}
+            type="button"
+            className={value === option.value ? "active" : ""}
+            role="radio"
+            aria-checked={value === option.value}
+            onClick={() => onChange(option.value)}
+          >
+            {option.icon}
+            <span>{option.label}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function PathRow({ path }: { path: string }) {
   return (
     <div className="path-row">
@@ -7428,12 +8081,36 @@ function chromeStatusLabel(snapshot: DesktopSnapshot) {
 
 function sidebarStatusLabel(snapshot: DesktopSnapshot) {
   if (snapshot.health.state === "ready") {
-    return "Notion Ready";
+    const mountedSources = snapshot.mounts.filter((mount) => mount.status !== "not_mounted");
+    if (mountedSources.length > 1) {
+      return "Sources Ready";
+    }
+    if (mountedSources.length === 1) {
+      return `${sourceDisplayNameFromConnector(mountedSources[0].connector)} Ready`;
+    }
+    const readyToMountSources = connectedSourcesReadyToMount(snapshot);
+    if (readyToMountSources.length > 1) {
+      return "Sources Connected";
+    }
+    if (readyToMountSources.length === 1) {
+      return `${sourceDisplayName(readyToMountSources[0])} Connected`;
+    }
+    return "Ready";
   }
   if (snapshot.health.state === "needs_review") {
     return PRODUCT_TERMS.reviewNeeded;
   }
   return healthLabel(snapshot.health.state);
+}
+
+function sourceDisplayNameFromConnector(connector: string) {
+  return isSourceConnectorId(connector)
+    ? sourceDisplayName(connector)
+    : connector
+        .split(/[-_\s]+/)
+        .filter(Boolean)
+        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(" ") || "Source";
 }
 
 function chromeStatusTarget(snapshot: DesktopSnapshot): AppView | null {

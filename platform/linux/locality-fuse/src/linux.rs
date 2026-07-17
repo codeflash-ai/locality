@@ -35,6 +35,11 @@ const ROOT_PATH: &str = "/";
 const DIRECTORY_METADATA_FILENAME: &str = ".directory";
 const DIRECTORY_METADATA_IDENTIFIER: &str = "locality:shared-root-directory-metadata";
 const DIRECTORY_METADATA_CONTENT: &str = "[Desktop Entry]\nIcon=locality-mount-logo\n";
+// Online-only entries are listed with an unknown size before open hydrates them.
+// Direct I/O makes the kernel forward reads after open instead of treating the
+// pre-hydration zero-length inode as EOF. This is FOPEN_DIRECT_IO from the FUSE
+// protocol; fuse3 exposes ReplyOpen flags as the raw protocol bitset.
+const FOPEN_DIRECT_IO: u32 = 1 << 0;
 const STAGING_HINT_MAX_BYTES: usize = 48;
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -1066,7 +1071,7 @@ where
                     temp_path: None,
                 },
             );
-            return Ok(ReplyOpen { fh, flags: 0 });
+            return Ok(direct_io_reply(fh));
         }
 
         let truncating = flags & libc::O_TRUNC as u32 != 0;
@@ -1108,7 +1113,7 @@ where
             .lock()
             .expect("fuse handles")
             .insert(fh, handle);
-        Ok(ReplyOpen { fh, flags: 0 })
+        Ok(direct_io_reply(fh))
     }
 
     async fn read(
@@ -1539,6 +1544,13 @@ fn open_is_writable(flags: u32) -> bool {
     access == libc::O_WRONLY || access == libc::O_RDWR || flags & libc::O_TRUNC as u32 != 0
 }
 
+fn direct_io_reply(fh: u64) -> ReplyOpen {
+    ReplyOpen {
+        fh,
+        flags: FOPEN_DIRECT_IO,
+    }
+}
+
 fn ensure_writable_item(item: &VirtualFsItem) -> Result<(), FuseError> {
     if item.read_only {
         return Err(FuseError::ReadOnly);
@@ -1651,6 +1663,15 @@ fn attr_time_for_item(item: &VirtualFsItem) -> SystemTime {
 mod tests {
     use super::*;
     use locality_store::InMemoryStateStore;
+
+    #[test]
+    fn open_replies_use_direct_io_for_online_only_hydration() {
+        let reply = direct_io_reply(42);
+
+        assert_eq!(reply.fh, 42);
+        assert_eq!(reply.flags, FOPEN_DIRECT_IO);
+    }
+
     #[test]
     fn folder_attrs_do_not_stat_materialized_path() {
         let path = std::env::temp_dir().join(format!(

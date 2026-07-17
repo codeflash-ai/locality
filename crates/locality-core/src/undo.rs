@@ -348,6 +348,32 @@ pub fn plan_journal_undo(entry: &JournalEntry) -> UndoPlan {
                     )),
                 }
             }
+            PushOperation::CreateDatabase {
+                parent_id,
+                title,
+                schema,
+                ..
+            } => {
+                match find_created_entity_effect(entry, operation_index) {
+                    Some(entity_id) => {
+                        operations.push(UndoOperation::ArchiveCreatedEntity {
+                            entity_id,
+                            expected: Some(EntityUndoState {
+                                parent_id: parent_id.clone(),
+                                title: title.clone(),
+                                properties: BTreeMap::new(),
+                                body: schema.clone(),
+                                archived: false,
+                            }),
+                        });
+                    }
+                    None => unsupported.push(UnsupportedUndoOperation::new(
+                        operation_index,
+                        "create_entity_missing_created_id",
+                        "cannot remove a created entity until apply journals the created remote entity id",
+                    )),
+                }
+            }
         }
     }
 

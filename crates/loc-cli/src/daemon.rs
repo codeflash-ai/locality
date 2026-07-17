@@ -965,6 +965,7 @@ mod tests {
                             freshness_budget_units: 0,
                             ready_freshness_budget_units: 0,
                             pending_scheduled_pull: false,
+                            provider_cooldown: None,
                             scheduler_mode: "polling".to_string(),
                             active_interval_ms: 15_000,
                             cold_interval_ms: 300_000,

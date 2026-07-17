@@ -300,7 +300,27 @@ fn daemon_status(state_root: &Path, findings: &mut Vec<DoctorFinding>) -> Option
         state_root.display().to_string(),
     ];
     match run_daemon_control(&args) {
-        Ok(report) => Some(daemon_from_report(&report)),
+        Ok(report) => {
+            if let Some(cooldown) = report
+                .daemon_status
+                .as_ref()
+                .and_then(|status| status.runtime.provider_cooldown.as_ref())
+            {
+                findings.push(DoctorFinding::global(
+                    DoctorSeverity::Warning,
+                    "provider_rate_limited",
+                    format!(
+                        "{} {} is temporarily rate limited; automatic retry attempt {} is scheduled at unix_ms {}.",
+                        cooldown.provider,
+                        cooldown.operation,
+                        cooldown.attempt,
+                        cooldown.retry_at_unix_ms
+                    ),
+                    None,
+                ));
+            }
+            Some(daemon_from_report(&report))
+        }
         Err(error) => {
             findings.push(DoctorFinding::global(
                 DoctorSeverity::Error,

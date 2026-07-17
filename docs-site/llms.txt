@@ -5,7 +5,7 @@
 ## Get Started
 
 - [Overview](overview.mdx): Product model, core surfaces, and safety model.
-- [Install Locality](install.mdx): OS-specific GitHub release assets, verification, and updates.
+- [Install Locality](install.mdx): OS-specific GitHub release assets, supported Linux distributions, verification, and updates.
 - [Quickstart](quickstart.mdx): Install, connect, mount, edit, diff, and push.
 
 ## Core Concepts

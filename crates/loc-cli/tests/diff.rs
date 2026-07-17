@@ -1253,6 +1253,7 @@ impl OperationOutputExt for loc_cli::diff::PushOperationOutput {
             Self::UpdateProperties { .. } => "update_properties",
             Self::MoveEntity { .. } => "move_entity",
             Self::CreateEntity { .. } => "create_entity",
+            Self::CreateDatabase { .. } => "create_database",
             Self::UpdateMedia { .. } => "update_media",
         }
     }
