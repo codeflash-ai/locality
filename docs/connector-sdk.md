@@ -127,7 +127,11 @@ the single `move_entity` title field during push planning. Pending moves with
 cached content run the same parsing, identity, source-schema, conflict, body
 diff, semantic, media, and guardrail pipeline as ordinary existing documents.
 When no bytes exist, a complete shadow permits a structural-only move; without
-either bytes or a shadow, planning fails and requires materialization.
+either bytes or a shadow, planning fails and requires materialization. During
+virtual filesystem move publication, `VirtualMutationRecord.content_path` can
+temporarily point at the source cache while `projected_path` already names the
+destination. Push planners must prefer `content_path` when present so an
+interrupted cache publication remains retryable without losing local edits.
 
 Apply results for every planned `move_entity` must include both the entity in
 `changed_remote_ids` and a matching moved-entity effect at the planned operation

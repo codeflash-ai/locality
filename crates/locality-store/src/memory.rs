@@ -31,7 +31,9 @@ use crate::repository::{
     AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, ConnectorStateRepository,
     EntityRepository, EntitySearchRepository, FreshnessStateRepository, HydrationJobRepository,
     JournalRepository, MetadataDiscoveryJobRepository, MountLiveModeRepository, MountRepository,
-    RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
+    RemoteObservationRepository, ShadowRepository, VirtualMoveRepository, VirtualMoveTransition,
+    VirtualMutationRepository, validate_virtual_move_transition, virtual_move_content_changed,
+    virtual_move_missing,
 };
 
 type EntityKey = (MountId, RemoteId);
@@ -907,6 +909,51 @@ impl VirtualMutationRepository for InMemoryStateStore {
         self.virtual_mutations
             .remove(&Self::virtual_mutation_key(mount_id, local_id));
         Ok(())
+    }
+}
+
+impl VirtualMoveRepository for InMemoryStateStore {
+    fn begin_virtual_move(&mut self, transition: VirtualMoveTransition) -> StoreResult<()> {
+        validate_virtual_move_transition(&transition)?;
+        let mut staged = self.clone();
+        let mount_id = transition.mutation.mount_id.clone();
+        for local_id in &transition.superseded_local_ids {
+            staged.delete_virtual_mutation(&mount_id, local_id)?;
+        }
+        if let Some(entity) = transition.entity {
+            staged.save_entity(entity)?;
+        }
+        if let Some(freshness) = transition.freshness {
+            staged.save_freshness_state(freshness)?;
+        }
+        staged.save_virtual_mutation(transition.mutation)?;
+        *self = staged;
+        Ok(())
+    }
+
+    fn finalize_virtual_move_content(
+        &mut self,
+        mount_id: &MountId,
+        local_id: &str,
+        expected_content_path: Option<&Path>,
+        content_path: PathBuf,
+        updated_at: &str,
+    ) -> StoreResult<VirtualMutationRecord> {
+        let mut mutation = self
+            .get_virtual_mutation(mount_id, local_id)?
+            .ok_or_else(|| virtual_move_missing(mount_id, local_id))?;
+        if mutation.content_path.as_deref() != expected_content_path {
+            return Err(virtual_move_content_changed(
+                mount_id,
+                local_id,
+                expected_content_path,
+                mutation.content_path.as_deref(),
+            ));
+        }
+        mutation.content_path = Some(content_path);
+        mutation.updated_at = updated_at.to_string();
+        self.save_virtual_mutation(mutation.clone())?;
+        Ok(mutation)
     }
 }
 

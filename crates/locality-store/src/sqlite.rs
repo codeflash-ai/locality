@@ -49,7 +49,8 @@ use crate::repository::{
     EntityRepository, EntitySearchCandidate, EntitySearchRepository, FreshnessStateRepository,
     HydrationJobRepository, JournalRepository, MetadataDiscoveryJobRepository,
     MountLiveModeRepository, MountRepository, RemoteObservationRepository, ShadowRepository,
-    VirtualMutationRepository,
+    VirtualMoveRepository, VirtualMoveTransition, VirtualMutationRepository,
+    validate_virtual_move_transition, virtual_move_content_changed, virtual_move_missing,
 };
 
 const DB_FILE: &str = "state.sqlite3";
@@ -1939,6 +1940,174 @@ impl VirtualMutationRepository for SqliteStateStore {
             params![mount_id.0, local_id],
         )?;
         Ok(())
+    }
+}
+
+impl VirtualMoveRepository for SqliteStateStore {
+    fn begin_virtual_move(&mut self, transition: VirtualMoveTransition) -> StoreResult<()> {
+        validate_virtual_move_transition(&transition)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mount_id = transition.mutation.mount_id.clone();
+
+        for local_id in &transition.superseded_local_ids {
+            transaction.execute(
+                "DELETE FROM virtual_mutations WHERE mount_id = ?1 AND local_id = ?2",
+                params![mount_id.0, local_id],
+            )?;
+        }
+
+        if let Some(entity) = &transition.entity {
+            let path = logical_path_to_text(&entity.path);
+            let existing_remote_id: Option<String> = transaction
+                .query_row(
+                    "SELECT remote_id FROM entities WHERE mount_id = ?1 AND path = ?2",
+                    params![entity.mount_id.0, path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if existing_remote_id
+                .as_deref()
+                .is_some_and(|remote_id| remote_id != entity.remote_id.0)
+            {
+                return Err(StoreError::DuplicateEntityPath {
+                    mount_id: entity.mount_id.clone(),
+                    path: entity.path.clone(),
+                });
+            }
+            transaction.execute(
+                "INSERT INTO entities (
+                    mount_id, remote_id, kind_json, title, path, hydration_json,
+                    content_hash, remote_edited_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(mount_id, remote_id) DO UPDATE SET
+                    kind_json = excluded.kind_json,
+                    title = excluded.title,
+                    path = excluded.path,
+                    hydration_json = excluded.hydration_json,
+                    content_hash = excluded.content_hash,
+                    remote_edited_at = excluded.remote_edited_at",
+                params![
+                    entity.mount_id.0,
+                    entity.remote_id.0,
+                    to_json(&entity.kind)?,
+                    entity.title,
+                    path,
+                    to_json(&entity.hydration)?,
+                    entity.content_hash,
+                    entity.remote_edited_at,
+                ],
+            )?;
+            upsert_entity_search_index(&transaction, &entity.mount_id, &entity.remote_id)?;
+        }
+
+        if let Some(freshness) = &transition.freshness {
+            transaction.execute(
+                "INSERT INTO freshness_states (
+                    mount_id, remote_id, tier_json, last_checked_at, next_check_at,
+                    last_opened_at, last_local_change_at, remote_hint_pending
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(mount_id, remote_id) DO UPDATE SET
+                    tier_json = excluded.tier_json,
+                    last_checked_at = excluded.last_checked_at,
+                    next_check_at = excluded.next_check_at,
+                    last_opened_at = excluded.last_opened_at,
+                    last_local_change_at = excluded.last_local_change_at,
+                    remote_hint_pending = excluded.remote_hint_pending",
+                params![
+                    freshness.mount_id.0,
+                    freshness.remote_id.0,
+                    to_json(&freshness.tier)?,
+                    freshness.last_checked_at,
+                    freshness.next_check_at,
+                    freshness.last_opened_at,
+                    freshness.last_local_change_at,
+                    bool_to_int(freshness.remote_hint_pending),
+                ],
+            )?;
+        }
+
+        let mutation = &transition.mutation;
+        transaction.execute(
+            "INSERT INTO virtual_mutations (
+                mount_id, local_id, mutation_kind_json, target_remote_id,
+                parent_remote_id, original_path, projected_path, title,
+                content_path, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(mount_id, local_id) DO UPDATE SET
+                mutation_kind_json = excluded.mutation_kind_json,
+                target_remote_id = excluded.target_remote_id,
+                parent_remote_id = excluded.parent_remote_id,
+                original_path = excluded.original_path,
+                projected_path = excluded.projected_path,
+                title = excluded.title,
+                content_path = excluded.content_path,
+                updated_at = excluded.updated_at",
+            params![
+                mutation.mount_id.0,
+                mutation.local_id,
+                to_json(&mutation.mutation_kind)?,
+                mutation.target_remote_id.as_ref().map(|id| id.0.as_str()),
+                mutation.parent_remote_id.as_ref().map(|id| id.0.as_str()),
+                mutation
+                    .original_path
+                    .as_ref()
+                    .map(|path| logical_path_to_text(path)),
+                logical_path_to_text(&mutation.projected_path),
+                mutation.title,
+                mutation
+                    .content_path
+                    .as_ref()
+                    .map(|path| path_to_text(path)),
+                mutation.created_at,
+                mutation.updated_at,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn finalize_virtual_move_content(
+        &mut self,
+        mount_id: &MountId,
+        local_id: &str,
+        expected_content_path: Option<&Path>,
+        content_path: PathBuf,
+        updated_at: &str,
+    ) -> StoreResult<VirtualMutationRecord> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let sql =
+            VIRTUAL_MUTATION_SELECT_WITH_WHERE.to_owned() + "WHERE mount_id = ?1 AND local_id = ?2";
+        let mut mutation = transaction
+            .query_row(&sql, params![mount_id.0, local_id], virtual_mutation_row)
+            .optional()?
+            .map(virtual_mutation_from_row)
+            .transpose()?
+            .ok_or_else(|| virtual_move_missing(mount_id, local_id))?;
+        if mutation.content_path.as_deref() != expected_content_path {
+            return Err(virtual_move_content_changed(
+                mount_id,
+                local_id,
+                expected_content_path,
+                mutation.content_path.as_deref(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE virtual_mutations
+             SET content_path = ?3, updated_at = ?4
+             WHERE mount_id = ?1 AND local_id = ?2",
+            params![
+                mount_id.0,
+                local_id,
+                path_to_text(&content_path),
+                updated_at
+            ],
+        )?;
+        mutation.content_path = Some(content_path);
+        mutation.updated_at = updated_at.to_string();
+        transaction.commit()?;
+        Ok(mutation)
     }
 }
 

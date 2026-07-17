@@ -107,9 +107,14 @@ Pending virtual mutations are durable write intent, not a projection cache.
 Their semantic component is versioned independently of SQLite's physical
 schema. Version 3 requires move/rename planning to preserve coexisting cached
 document edits and to clear structural intent only after successful remote
-readback. The v1/v2 to v3 migration changes component metadata only and leaves
-every pending row byte-for-byte intact; a newer component version is
-update-required and must not mutate state.
+readback. It also permits an in-flight move/rename mutation's `content_path` to
+point at the source cache after the projected path has already moved; the daemon
+uses that source pointer while copying the cache to the destination, then
+finalizes `content_path` to the destination in a compare-and-set store update.
+Push planning and repair must therefore read `content_path` before falling back
+to the projected destination. The v1/v2 to v3 migration changes component
+metadata only and leaves every pending row byte-for-byte intact; a newer
+component version is update-required and must not mutate state.
 
 Before returning filesystem actions, the planner runs the store's read-only
 `DiscoveryCommit` preflight against the state it read, so final entity paths,

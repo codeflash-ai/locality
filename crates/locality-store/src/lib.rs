@@ -49,7 +49,7 @@ pub use repository::{
     EntityRepository, EntitySearchCandidate, EntitySearchRepository, FreshnessStateRepository,
     HydrationJobRepository, JournalRepository, MetadataDiscoveryJobRepository,
     MountLiveModeRepository, MountRepository, RemoteObservationRepository, ShadowRepository,
-    VirtualMutationRepository,
+    VirtualMoveRepository, VirtualMoveTransition, VirtualMutationRepository,
 };
 pub use reset::{
     LocalStateResetCredentialError, LocalStateResetError, LocalStateResetStorageReport,

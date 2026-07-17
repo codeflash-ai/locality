@@ -2074,7 +2074,7 @@ fn moved_entity_reconciliation_requires_effect_and_changed_id_and_retains_intent
 }
 
 #[test]
-fn moved_entity_fetch_failure_retains_durable_intent() {
+fn moved_entity_fetch_failure_resumes_same_journal_without_reapplying() {
     let (fixture, state_root, mut store) = pending_move_execution_store();
     let source = FakePushSource::with_remote_transition(
         rendered_entity("page-1", "Old body."),
@@ -2098,12 +2098,156 @@ fn moved_entity_fetch_failure_retains_durable_intent() {
 
     assert_eq!(report.action, PushJobAction::Failed);
     assert_eq!(source.applied_count(), 1);
+    let push_id = report.push_id.expect("first push id");
     assert!(
         store
             .get_virtual_mutation(&fixture.mount_id, "move:page-1")
             .unwrap()
             .is_some()
     );
+
+    let retried = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join("Team B/Roadmap.md"),
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &source,
+        Some(&state_root),
+    )
+    .expect("resume move reconciliation");
+
+    assert_eq!(retried.action, PushJobAction::Reconciled);
+    assert_eq!(retried.push_id.as_ref(), Some(&push_id));
+    assert_eq!(source.applied_count(), 1, "retry must not reapply the move");
+    assert!(
+        store
+            .get_virtual_mutation(&fixture.mount_id, "move:page-1")
+            .unwrap()
+            .is_none(),
+        "move intent clears only after accepted readback"
+    );
+    let journal = store.list_journal().expect("journal");
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].push_id, push_id);
+    assert_eq!(journal[0].status, JournalStatus::Reconciled);
+}
+
+#[test]
+fn mixed_create_move_late_fetch_failure_resumes_without_duplicate_create() {
+    let (fixture, state_root, mut store) = pending_move_execution_store();
+    let create_path = Path::new("Team B/ENG-2.md");
+    let created_id = RemoteId::new("issue-new");
+    let cache = virtual_fs_content_path(&state_root, &fixture.mount_id, create_path)
+        .expect("create cache path");
+    fs::create_dir_all(cache.parent().expect("cache parent")).expect("cache parent");
+    fs::write(
+        &cache,
+        "---\ntitle: New issue\nstatus: Todo\n---\nNew issue body.\n",
+    )
+    .expect("create cache");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:new-issue",
+            VirtualMutationKind::Create,
+            None,
+            Some(RemoteId::new("team-b")),
+            "Team B/ENG-2.md",
+            Some(cache),
+        ))
+        .expect("save create mutation");
+    let source = FakePushSource::with_remote_transition(
+        rendered_entity("page-1", "Old body."),
+        rendered_entity("page-1", "Remote accepted body."),
+    )
+    .with_created_entity(
+        created_id.clone(),
+        rendered_entity("issue-new", "New issue body."),
+    )
+    .with_post_apply_fetch_failures(fixture.remote_id.clone(), 1)
+    .with_changed_remote_ids(vec![created_id.clone(), fixture.remote_id.clone()])
+    .with_apply_effects(vec![
+        JournalApplyEffect::CreatedEntity {
+            operation_id: PushOperationId("create-issue".to_string()),
+            operation_index: 0,
+            parent_id: RemoteId::new("team-b"),
+            entity_id: created_id.clone(),
+        },
+        JournalApplyEffect::MovedEntity {
+            operation_id: PushOperationId("move-page-1".to_string()),
+            operation_index: 1,
+            entity_id: fixture.remote_id.clone(),
+            parent_id: RemoteId::new("team-b"),
+        },
+    ]);
+    let job = || PushJob {
+        target_path: fixture.root.clone(),
+        assume_yes: true,
+        confirm_dangerous: true,
+    };
+
+    let first = execute_push_job_with_content_root(&mut store, job(), &source, Some(&state_root))
+        .expect("first mixed push");
+
+    assert_eq!(first.action, PushJobAction::Failed);
+    assert_eq!(source.applied_count(), 1, "first report: {first:#?}");
+    let push_id = first.push_id.expect("first push id");
+    assert!(
+        store
+            .find_virtual_mutation_by_path(&fixture.mount_id, create_path)
+            .expect("create mutation")
+            .is_some()
+    );
+    assert!(
+        store
+            .get_virtual_mutation(&fixture.mount_id, "move:page-1")
+            .expect("move mutation")
+            .is_some(),
+        "no intent may clear before every readback succeeds"
+    );
+
+    let second = execute_push_job_with_content_root(&mut store, job(), &source, Some(&state_root))
+        .expect("resume mixed reconciliation");
+
+    assert_eq!(second.action, PushJobAction::Reconciled);
+    assert_eq!(second.push_id.as_ref(), Some(&push_id));
+    assert_eq!(
+        source.applied_count(),
+        1,
+        "retry must not duplicate the create"
+    );
+    assert!(
+        store
+            .find_virtual_mutation_by_path(&fixture.mount_id, create_path)
+            .expect("create mutation")
+            .is_none()
+    );
+    assert!(
+        store
+            .get_virtual_mutation(&fixture.mount_id, "move:page-1")
+            .expect("move mutation")
+            .is_none()
+    );
+    assert!(
+        store
+            .get_entity(&fixture.mount_id, &created_id)
+            .expect("created entity")
+            .is_some()
+    );
+    assert_eq!(
+        store
+            .get_entity(&fixture.mount_id, &fixture.remote_id)
+            .expect("moved entity")
+            .expect("moved entity present")
+            .path,
+        PathBuf::from("Team B/Roadmap.md")
+    );
+    let journal = store.list_journal().expect("journal");
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].push_id, push_id);
+    assert_eq!(journal[0].status, JournalStatus::Reconciled);
 }
 
 fn pending_move_execution_store() -> (PushFixture, PathBuf, InMemoryStateStore) {

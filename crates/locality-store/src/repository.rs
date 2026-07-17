@@ -10,7 +10,7 @@ use locality_core::journal::{JournalApplyEffect, JournalEntry, JournalStatus, Pu
 use locality_core::model::{MountId, RemoteId};
 use locality_core::shadow::ShadowDocument;
 
-use crate::error::StoreResult;
+use crate::error::{StoreError, StoreResult};
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorStateRecord, EntityRecord, FreshnessStateRecord,
@@ -104,6 +104,77 @@ pub trait VirtualMutationRepository {
     fn list_virtual_mutations(&self, mount_id: &MountId)
     -> StoreResult<Vec<VirtualMutationRecord>>;
     fn delete_virtual_mutation(&mut self, mount_id: &MountId, local_id: &str) -> StoreResult<()>;
+}
+
+/// One durable state transition for a virtual filesystem move.
+///
+/// `mutation.content_path` points at the source cache until the filesystem
+/// publishes the destination cache. This makes an interrupted move readable
+/// through either its durable source pointer or its projected destination.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VirtualMoveTransition {
+    pub mutation: VirtualMutationRecord,
+    pub entity: Option<EntityRecord>,
+    pub freshness: Option<FreshnessStateRecord>,
+    pub superseded_local_ids: Vec<String>,
+}
+
+pub trait VirtualMoveRepository {
+    fn begin_virtual_move(&mut self, transition: VirtualMoveTransition) -> StoreResult<()>;
+
+    fn finalize_virtual_move_content(
+        &mut self,
+        mount_id: &MountId,
+        local_id: &str,
+        expected_content_path: Option<&Path>,
+        content_path: std::path::PathBuf,
+        updated_at: &str,
+    ) -> StoreResult<VirtualMutationRecord>;
+}
+
+pub(crate) fn validate_virtual_move_transition(
+    transition: &VirtualMoveTransition,
+) -> StoreResult<()> {
+    let mount_id = &transition.mutation.mount_id;
+    let target_id = transition.mutation.target_remote_id.as_ref();
+    if let Some(entity) = &transition.entity
+        && (&entity.mount_id != mount_id || target_id != Some(&entity.remote_id))
+    {
+        return Err(StoreError::InvalidState(
+            "virtual move entity does not match its mutation target".to_string(),
+        ));
+    }
+    if let Some(freshness) = &transition.freshness
+        && (&freshness.mount_id != mount_id
+            || target_id != Some(&freshness.remote_id)
+            || transition.entity.is_none())
+    {
+        return Err(StoreError::InvalidState(
+            "virtual move freshness does not match its entity".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn virtual_move_missing(mount_id: &MountId, local_id: &str) -> StoreError {
+    StoreError::InvalidState(format!(
+        "virtual move `{local_id}` is missing from mount `{}`",
+        mount_id.0
+    ))
+}
+
+pub(crate) fn virtual_move_content_changed(
+    mount_id: &MountId,
+    local_id: &str,
+    expected: Option<&Path>,
+    actual: Option<&Path>,
+) -> StoreError {
+    StoreError::InvalidState(format!(
+        "virtual move `{local_id}` in mount `{}` changed content path from `{}` to `{}`",
+        mount_id.0,
+        expected.map_or_else(|| "<none>".to_string(), |path| path.display().to_string()),
+        actual.map_or_else(|| "<none>".to_string(), |path| path.display().to_string()),
+    ))
 }
 
 pub trait AutoSaveRepository {

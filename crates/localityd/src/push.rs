@@ -310,7 +310,7 @@ where
         return Ok(report);
     }
     if let Some(report) =
-        resume_failed_created_entity_reconciliation(store, source, &prepared, state_root)?
+        resume_failed_applied_reconciliation(store, source, &prepared, state_root)?
     {
         return Ok(report);
     }
@@ -488,7 +488,7 @@ fn ambiguous_gmail_send_status(status: &JournalStatus) -> bool {
     }
 }
 
-fn resume_failed_created_entity_reconciliation<S, Source>(
+fn resume_failed_applied_reconciliation<S, Source>(
     store: &mut S,
     source: &Source,
     prepared: &PreparedPush,
@@ -511,13 +511,23 @@ where
     let Some(plan) = prepared.pipeline.plan.as_ref() else {
         return Ok(None);
     };
-    let Some(journal) =
-        latest_resumable_created_entity_journal(store, &prepared.mount.mount_id, plan)?
+    let Some(journal) = latest_resumable_entity_journal(
+        store,
+        &prepared.mount.mount_id,
+        &prepared.mount.connector,
+        plan,
+    )?
     else {
         return Ok(None);
     };
 
-    let changed_remote_ids = created_entity_effect_ids(&journal.apply_effects);
+    let changed_remote_ids = resumable_entity_effect_ids(&journal, &prepared.mount.connector)
+        .ok_or_else(|| {
+            LocalityError::InvalidState(format!(
+                "journal `{}` no longer has complete entity-operation effects",
+                journal.push_id.0
+            ))
+        })?;
     let mut completed_stages = prepared.pipeline.completed_stages.clone();
     completed_stages.push(PushStage::ConcurrencyCheckAndApply);
     completed_stages.push(PushStage::JournalAndReconcile);
@@ -583,9 +593,10 @@ where
     }
 }
 
-fn latest_resumable_created_entity_journal<S>(
+fn latest_resumable_entity_journal<S>(
     store: &S,
     mount_id: &MountId,
+    connector: &str,
     plan: &PushPlan,
 ) -> LocalityResult<Option<JournalEntry>>
 where
@@ -598,12 +609,7 @@ where
                 journal.status,
                 JournalStatus::Failed(_) | JournalStatus::Applied
             )
-            || !resumable_created_entity_effects(&journal)
-            || !plan
-                .operations
-                .iter()
-                .all(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
-            || !journal_created_entity_sources_match(&journal, plan)
+            || !resumable_plan_matches(&journal, plan, connector)
         {
             continue;
         }
@@ -615,15 +621,127 @@ where
         }
     }
 
-    Ok(latest)
+    let Some(journal) = latest else {
+        return Ok(None);
+    };
+    if resumable_entity_effect_ids(&journal, connector).is_some() {
+        return Ok(Some(journal));
+    }
+    if journal.status == JournalStatus::Applied || !journal.apply_effects.is_empty() {
+        return Err(LocalityError::InvalidState(format!(
+            "journal `{}` was applied but its effects do not safely cover the prepared plan; refusing to apply again",
+            journal.push_id.0
+        )));
+    }
+    Ok(None)
 }
 
-fn resumable_created_entity_effects(journal: &JournalEntry) -> bool {
-    !journal.apply_effects.is_empty()
-        && journal
-            .apply_effects
+fn resumable_plan_matches(journal: &JournalEntry, plan: &PushPlan, connector: &str) -> bool {
+    if journal.plan == *plan {
+        return true;
+    }
+
+    connector == "gmail"
+        && plan
+            .operations
             .iter()
-            .all(|effect| matches!(effect, JournalApplyEffect::CreatedEntity { .. }))
+            .all(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
+        && journal
+            .plan
+            .operations
+            .iter()
+            .all(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
+        && journal_created_entity_sources_match(journal, plan)
+}
+
+fn resumable_entity_effect_ids(journal: &JournalEntry, connector: &str) -> Option<Vec<RemoteId>> {
+    if journal.plan.operations.is_empty()
+        || journal.apply_effects.len() != journal.plan.operations.len()
+    {
+        return None;
+    }
+
+    let mut seen_operations = BTreeSet::new();
+    let mut changed_remote_ids = Vec::new();
+    for effect in &journal.apply_effects {
+        let (operation_index, changed_remote_id) = match effect {
+            JournalApplyEffect::CreatedEntity {
+                operation_index,
+                parent_id,
+                entity_id,
+                ..
+            } => {
+                let Some(PushOperation::CreateEntity {
+                    parent_id: planned_parent_id,
+                    ..
+                }) = journal.plan.operations.get(*operation_index)
+                else {
+                    return None;
+                };
+                if entity_id.0.trim().is_empty() {
+                    return None;
+                }
+                if parent_id != planned_parent_id
+                    && !gmail_create_only_effects_may_change_parent(connector, &journal.plan)
+                {
+                    return None;
+                }
+                (*operation_index, entity_id)
+            }
+            JournalApplyEffect::MovedEntity {
+                operation_index,
+                entity_id,
+                parent_id,
+                ..
+            } => {
+                let Some(PushOperation::MoveEntity {
+                    entity_id: planned_entity_id,
+                    new_parent_id,
+                    ..
+                }) = journal.plan.operations.get(*operation_index)
+                else {
+                    return None;
+                };
+                if entity_id != planned_entity_id || parent_id != new_parent_id {
+                    return None;
+                }
+                (*operation_index, entity_id)
+            }
+            JournalApplyEffect::ArchivedEntity {
+                operation_index,
+                entity_id,
+                ..
+            } => {
+                let Some(PushOperation::ArchiveEntity {
+                    entity_id: planned_entity_id,
+                }) = journal.plan.operations.get(*operation_index)
+                else {
+                    return None;
+                };
+                if entity_id != planned_entity_id {
+                    return None;
+                }
+                (*operation_index, entity_id)
+            }
+            _ => return None,
+        };
+        if !seen_operations.insert(operation_index) {
+            return None;
+        }
+        if !changed_remote_ids.contains(changed_remote_id) {
+            changed_remote_ids.push(changed_remote_id.clone());
+        }
+    }
+
+    (seen_operations.len() == journal.plan.operations.len()).then_some(changed_remote_ids)
+}
+
+fn gmail_create_only_effects_may_change_parent(connector: &str, plan: &PushPlan) -> bool {
+    connector == "gmail"
+        && plan
+            .operations
+            .iter()
+            .all(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
 }
 
 fn journal_created_entity_sources_match(journal: &JournalEntry, plan: &PushPlan) -> bool {
@@ -680,18 +798,6 @@ fn plan_create_entity_sources(plan: &PushPlan) -> Vec<(&RemoteId, &PathBuf)> {
             _ => None,
         })
         .collect()
-}
-
-fn created_entity_effect_ids(effects: &[JournalApplyEffect]) -> Vec<RemoteId> {
-    let mut ids = Vec::new();
-    for effect in effects {
-        if let JournalApplyEffect::CreatedEntity { entity_id, .. } = effect
-            && !ids.iter().any(|id| id == entity_id)
-        {
-            ids.push(entity_id.clone());
-        }
-    }
-    ids
 }
 
 fn journal_is_newer(candidate: &JournalEntry, current: &JournalEntry) -> bool {
@@ -3286,8 +3392,8 @@ where
             .into_iter()
             .map(|(_, entity_id, _)| entity_id.clone())
             .collect::<BTreeSet<_>>();
-        let mut reconciled_remote_ids = Vec::new();
-
+        let mut effect_readback_ids = BTreeSet::new();
+        let mut created_readbacks = Vec::new();
         for effect in request.apply_effects {
             match effect {
                 JournalApplyEffect::CreatedEntity {
@@ -3298,8 +3404,8 @@ where
                 } => {
                     let Some(PushOperation::CreateEntity {
                         title,
-                        properties,
-                        body,
+                        properties: _,
+                        body: _,
                         source_path,
                         parent_kind,
                         ..
@@ -3340,82 +3446,20 @@ where
                         entity_id,
                         &rendered,
                     )?;
-                    let path =
-                        projection_write_path(self.state_root.as_deref(), &mount, &entity.path);
-                    let output_root = projection_output_root(self.state_root.as_deref(), &mount)?;
-                    accept_post_apply_remote(
-                        self.store,
-                        &mount,
-                        &mut entity,
-                        &path,
-                        &output_root,
-                        rendered,
-                    )?;
-                    let clear_source_mutation = remove_stale_created_entity_source_path(
-                        self.state_root.as_deref(),
-                        &mount,
-                        title,
-                        properties,
-                        body,
-                        source_path,
-                        &entity.path,
-                    )?;
-                    if clear_source_mutation
-                        && let Some(mutation) = self
-                            .store
-                            .find_virtual_mutation_by_path(request.mount_id, source_path)
-                            .map_err(LocalityError::from)?
-                    {
-                        self.store
-                            .delete_virtual_mutation(request.mount_id, &mutation.local_id)
-                            .map_err(LocalityError::from)?;
-                    }
-                    reconciled_remote_ids.push(entity_id.clone());
+                    effect_readback_ids.insert(entity_id.clone());
+                    created_readbacks.push((*operation_index, entity_id.clone(), entity, rendered));
                 }
                 JournalApplyEffect::ArchivedEntity { entity_id, .. } => {
-                    self.store
-                        .delete_entity(request.mount_id, entity_id)
-                        .map_err(LocalityError::from)?;
-                    self.store
-                        .delete_virtual_mutation(
-                            request.mount_id,
-                            &format!("delete:{}", entity_id.0),
-                        )
-                        .map_err(LocalityError::from)?;
-                    reconciled_remote_ids.push(entity_id.clone());
-                }
-                JournalApplyEffect::MovedEntity {
-                    operation_index,
-                    entity_id,
-                    ..
-                } => {
-                    let Some(PushOperation::MoveEntity {
-                        new_title,
-                        projected_path,
-                        ..
-                    }) = request.plan.operations.get(*operation_index)
-                    else {
-                        continue;
-                    };
-                    if let Some(mut entity) = self
-                        .store
-                        .get_entity(request.mount_id, entity_id)
-                        .map_err(LocalityError::from)?
-                    {
-                        entity.title = new_title.clone();
-                        entity.path = projected_path.clone();
-                        self.store
-                            .save_entity(entity)
-                            .map_err(LocalityError::from)?;
-                    }
+                    effect_readback_ids.insert(entity_id.clone());
                 }
                 _ => {}
             }
         }
 
         let mut readback_ids = BTreeSet::new();
+        let mut entity_readbacks = Vec::new();
         for remote_id in request.changed_remote_ids {
-            if reconciled_remote_ids.iter().any(|id| id == remote_id) {
+            if effect_readback_ids.contains(remote_id) {
                 continue;
             }
             if !readback_ids.insert(remote_id.clone()) {
@@ -3430,6 +3474,19 @@ where
                     remote_id: remote_id.clone(),
                 })
                 .map_err(LocalityError::from)?;
+            if let Some(PushOperation::MoveEntity {
+                new_title,
+                projected_path,
+                ..
+            }) = request.plan.operations.iter().find(|operation| {
+                matches!(
+                    operation,
+                    PushOperation::MoveEntity { entity_id, .. } if entity_id == remote_id
+                )
+            }) {
+                entity.title = new_title.clone();
+                entity.path = projected_path.clone();
+            }
             let path = projection_write_path(self.state_root.as_deref(), &mount, &entity.path);
             let rendered =
                 self.source
@@ -3440,7 +3497,24 @@ where
                         HydrationState::Hydrated,
                         locality_core::hydration::HydrationReason::ExplicitPull,
                     ))?;
+            entity_readbacks.push((remote_id.clone(), entity, path, rendered));
+        }
 
+        let output_root = projection_output_root(self.state_root.as_deref(), &mount)?;
+        let mut reconciled_remote_ids = Vec::new();
+        for (_, entity_id, entity, rendered) in &mut created_readbacks {
+            let path = projection_write_path(self.state_root.as_deref(), &mount, &entity.path);
+            accept_post_apply_remote(
+                self.store,
+                &mount,
+                entity,
+                &path,
+                &output_root,
+                rendered.clone(),
+            )?;
+            reconciled_remote_ids.push(entity_id.clone());
+        }
+        for (remote_id, mut entity, path, rendered) in entity_readbacks {
             let output_root = projection_output_root(self.state_root.as_deref(), &mount)?;
             accept_post_apply_remote(
                 self.store,
@@ -3450,6 +3524,55 @@ where
                 &output_root,
                 rendered,
             )?;
+            reconciled_remote_ids.push(remote_id);
+        }
+
+        for (operation_index, _, entity, _) in &created_readbacks {
+            let Some(PushOperation::CreateEntity {
+                title,
+                properties,
+                body,
+                source_path,
+                ..
+            }) = request.plan.operations.get(*operation_index)
+            else {
+                continue;
+            };
+            let clear_source_mutation = remove_stale_created_entity_source_path(
+                self.state_root.as_deref(),
+                &mount,
+                title,
+                properties,
+                body,
+                source_path,
+                &entity.path,
+            )?;
+            if clear_source_mutation
+                && let Some(mutation) = self
+                    .store
+                    .find_virtual_mutation_by_path(request.mount_id, source_path)
+                    .map_err(LocalityError::from)?
+            {
+                self.store
+                    .delete_virtual_mutation(request.mount_id, &mutation.local_id)
+                    .map_err(LocalityError::from)?;
+            }
+        }
+        for effect in request.apply_effects {
+            if let JournalApplyEffect::ArchivedEntity { entity_id, .. } = effect {
+                self.store
+                    .delete_entity(request.mount_id, entity_id)
+                    .map_err(LocalityError::from)?;
+                self.store
+                    .delete_virtual_mutation(request.mount_id, &format!("delete:{}", entity_id.0))
+                    .map_err(LocalityError::from)?;
+                reconciled_remote_ids.push(entity_id.clone());
+            }
+        }
+        for remote_id in request.changed_remote_ids {
+            if effect_readback_ids.contains(remote_id) {
+                continue;
+            }
             if planned_move_ids.contains(remote_id) {
                 for local_id in [
                     format!("move:{}", remote_id.0),
@@ -3464,7 +3587,6 @@ where
                     .delete_virtual_mutation(request.mount_id, &format!("rename:{}", remote_id.0))
                     .map_err(LocalityError::from)?;
             }
-            reconciled_remote_ids.push(remote_id.clone());
         }
 
         Ok(PushReconcileResult {
@@ -3829,8 +3951,21 @@ mod locality_error_code_tests {
     }
 
     #[test]
-    fn move_lowering_rejects_null_and_non_string_title_values() {
-        for value in [PropertyValue::Null, PropertyValue::Bool(true)] {
+    fn move_lowering_rejects_null_non_string_and_blank_title_values() {
+        for (value, message) in [
+            (
+                PropertyValue::Null,
+                "a moved entity title cannot be removed",
+            ),
+            (
+                PropertyValue::Bool(true),
+                "a moved entity title must be a string",
+            ),
+            (
+                PropertyValue::String("   \t".to_string()),
+                "a moved entity title cannot be blank",
+            ),
+        ] {
             let remote_id = RemoteId::new("issue-1");
             let mut title = "Canonical title".to_string();
             let mut remaining = Vec::new();
@@ -3852,6 +3987,7 @@ mod locality_error_code_tests {
             assert!(remaining.is_empty());
             assert_eq!(validation.issues.len(), 1);
             assert_eq!(validation.issues[0].code, "move_title_invalid");
+            assert_eq!(validation.issues[0].message, message);
         }
     }
 }
