@@ -1843,6 +1843,99 @@ fn auto_save_push_blocks_pending_virtual_delete_without_applying() {
 }
 
 #[test]
+fn auto_save_push_blocks_slack_recent_edit_before_journaled_apply() {
+    let fixture = PushFixture::new();
+    let mount_id = MountId::new("slack-main");
+    let remote_id = RemoteId::new("slack-recent:C123");
+    let relative_path = Path::new("channels/general-C123/recent.md");
+    let page_path = fixture.root.join(relative_path);
+    if let Some(parent) = page_path.parent() {
+        fs::create_dir_all(parent).expect("create Slack conversation directory");
+    }
+    let document = CanonicalDocument::new(
+        format!(
+            "loc:\n  id: {}\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: recent\n",
+            remote_id.0
+        ),
+        markdown_body("Edited Slack line."),
+    );
+    fs::write(&page_path, render_canonical_markdown(&document)).expect("write Slack edit");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(MountConfig::new(
+            mount_id.clone(),
+            "slack",
+            fixture.root.clone(),
+        ))
+        .expect("save Slack mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                mount_id.clone(),
+                remote_id.clone(),
+                EntityKind::Page,
+                "recent",
+                relative_path,
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save Slack recent entity");
+    store
+        .save_shadow(&mount_id, shadow(&remote_id.0, "Original Slack line."))
+        .expect("save Slack shadow");
+    store
+        .save_auto_save_enrollment(
+            AutoSaveEnrollmentRecord::new(
+                mount_id.clone(),
+                relative_path,
+                AutoSaveOrigin::UserEnabled,
+                "now",
+            )
+            .active("now"),
+        )
+        .expect("save Slack auto-save enrollment");
+    let source = FakePushSource::default();
+
+    let report = execute_auto_save_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: page_path,
+            assume_yes: false,
+            confirm_dangerous: false,
+        },
+        &source,
+        None,
+    )
+    .expect("auto-save Slack edit");
+
+    assert_eq!(report.action, PushJobAction::NotReady);
+    assert_eq!(source.applied_count(), 0);
+    assert_eq!(
+        report.error.as_ref().expect("error").code,
+        "auto_save_blocked"
+    );
+    assert_eq!(
+        report.error.as_ref().expect("error").message,
+        "local Markdown needs review before auto-save"
+    );
+    assert!(report.pipeline.plan.is_none());
+    assert_eq!(report.pipeline.validation.issues.len(), 1);
+    assert_eq!(report.pipeline.validation.issues[0].code, "slack_read_only");
+    assert_eq!(report.push_id, None);
+    assert_eq!(report.journal_status, None);
+    let enrollment = store
+        .get_auto_save_enrollment(&mount_id, relative_path)
+        .expect("get Slack auto-save enrollment")
+        .expect("Slack auto-save enrollment");
+    assert_eq!(enrollment.state, AutoSaveState::Blocked);
+    assert_eq!(
+        enrollment.last_reason.as_deref(),
+        Some("local Markdown needs review before auto-save")
+    );
+    assert!(store.list_journal().expect("journal").is_empty());
+}
+
+#[test]
 fn daemon_push_job_plans_normal_update_for_pending_virtual_rename_path() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join(".state");

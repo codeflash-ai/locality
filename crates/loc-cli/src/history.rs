@@ -21,6 +21,7 @@ use locality_store::{
     ShadowRepository, StoreError,
 };
 use localityd::file_provider;
+use localityd::source::source_write_decision_for_path;
 use localityd::virtual_fs::virtual_fs_content_path;
 use serde::Serialize;
 
@@ -224,6 +225,19 @@ where
             entry: Some(JournalEntryOutput::from_entry(entry, false)),
         });
     }
+    if let Some(reason) = undo_read_only_reason(store, &entry)? {
+        return Ok(UndoReport {
+            ok: false,
+            command: "undo",
+            push_id: push_id.0,
+            status: status_name(&entry.status).to_string(),
+            action: "undo_read_only_blocked".to_string(),
+            message: reason,
+            changed_remote_ids: Vec::new(),
+            undo_plan: Some(UndoPlanOutput::from(undo_plan)),
+            entry: Some(JournalEntryOutput::from_entry(entry, false)),
+        });
+    }
 
     let apply_result = match applier.apply_undo(UndoApplyRequest {
         target_push_id: &push_id,
@@ -274,6 +288,29 @@ where
         undo_plan: Some(UndoPlanOutput::from(undo_plan)),
         entry: Some(JournalEntryOutput::from_entry(reverted, false)),
     })
+}
+
+fn undo_read_only_reason<S>(store: &S, entry: &JournalEntry) -> Result<Option<String>, HistoryError>
+where
+    S: MountRepository + EntityRepository,
+{
+    let mount = store
+        .get_mount(&entry.mount_id)
+        .map_err(HistoryError::Store)?
+        .ok_or_else(|| HistoryError::MountNotFound(PathBuf::from(entry.mount_id.0.clone())))?;
+    let relative_path = entry
+        .remote_ids
+        .first()
+        .map(|remote_id| store.get_entity(&entry.mount_id, remote_id))
+        .transpose()
+        .map_err(HistoryError::Store)?
+        .flatten()
+        .map(|entity| entity.path)
+        .unwrap_or_default();
+
+    Ok(source_write_decision_for_path(&mount, &relative_path)
+        .reason()
+        .map(str::to_string))
 }
 
 fn reconcile_undo_preimages<S>(

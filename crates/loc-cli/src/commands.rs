@@ -7743,6 +7743,7 @@ fn create_command_error(json: bool, error: CreateError) -> i32 {
         | CreateError::MountNotFound(_)
         | CreateError::PrivateUnsupported { .. }
         | CreateError::ReadOnlyMount { .. }
+        | CreateError::ReadOnlySource { .. }
         | CreateError::TargetExists(_) => EXIT_USAGE,
         CreateError::Store(_)
         | CreateError::VirtualStateRootRequired

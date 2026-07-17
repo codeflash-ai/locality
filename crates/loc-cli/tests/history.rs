@@ -313,6 +313,76 @@ fn undo_with_applier_reverses_complete_plan_and_marks_journal_reverted() {
 }
 
 #[test]
+fn undo_with_applier_blocks_slack_mount_before_reverse_apply() {
+    let fixture = HistoryFixture::new();
+    let mount_id = MountId::new("slack-main");
+    let remote_id = RemoteId::new("slack-recent:C123");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(MountConfig::new(
+            mount_id.clone(),
+            "slack",
+            fixture.root.clone(),
+        ))
+        .expect("save Slack mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                mount_id.clone(),
+                remote_id.clone(),
+                EntityKind::Page,
+                "recent",
+                "channels/general-C123/recent.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save Slack recent entity");
+    let operation = PushOperation::UpdateBlock {
+        block_id: RemoteId::new("slack-recent:C123-paragraph-1"),
+        content: "Edited Slack line.".to_string(),
+    };
+    let push_id = PushId("push-slack".to_string());
+    store
+        .append_journal(
+            JournalEntry::new(
+                push_id.clone(),
+                mount_id.clone(),
+                vec![remote_id.clone()],
+                PushPlan::new(vec![remote_id.clone()], vec![operation]),
+                JournalStatus::Reconciled,
+            )
+            .with_preimages(vec![JournalPreimage::from_shadow(shadow(&remote_id.0))]),
+        )
+        .expect("append Slack journal");
+    let mut applier = FakeUndoApplier::default();
+
+    let report =
+        run_undo_with_applier(&mut store, push_id.0.clone(), &mut applier).expect("undo report");
+
+    assert!(!report.ok);
+    assert_eq!(report.action, "undo_read_only_blocked");
+    assert_eq!(report.status, "reconciled");
+    assert_eq!(report.message, "Slack conversations are read-only");
+    assert_eq!(report.changed_remote_ids, Vec::<String>::new());
+    assert_eq!(
+        report.undo_plan.as_ref().expect("undo plan").status,
+        "complete"
+    );
+    assert!(
+        applier.applied_push_ids.is_empty(),
+        "Slack undo must not call connector reverse apply"
+    );
+    assert_eq!(
+        store
+            .get_journal(&push_id)
+            .expect("get Slack journal")
+            .expect("Slack journal")
+            .status,
+        JournalStatus::Reconciled
+    );
+}
+
+#[test]
 fn undo_with_applier_restores_local_projection_from_preimage() {
     let fixture = HistoryFixture::new();
     let mut store = fixture.store();

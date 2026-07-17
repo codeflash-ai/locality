@@ -326,6 +326,45 @@ fn create_page_refuses_read_only_mount() {
 }
 
 #[test]
+fn create_page_refuses_slack_parent_even_when_mount_flag_allows_writes() {
+    let fixture = CreateFixture::new("loc-create-page-slack-read-only");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(MountConfig {
+            mount_id: MountId::new("slack-main"),
+            connector: "slack".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("slack-root")),
+            connection_id: None,
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
+        })
+        .expect("save Slack mount");
+
+    let error = run_create_page(
+        &mut store,
+        CreatePageOptions {
+            title: "Launch Plan".to_string(),
+            parent: Some(fixture.root.clone()),
+            private: false,
+            state_root: None,
+        },
+    )
+    .expect_err("Slack creates must be blocked by source policy");
+
+    assert_eq!(error.code(), "read_only_source");
+    assert_eq!(
+        error.message(),
+        "Slack mount `slack-main` cannot accept new pages: Slack conversations are read-only"
+    );
+    assert!(
+        !fixture.root.join("Launch Plan").exists(),
+        "blocked Slack create must not write a local draft"
+    );
+}
+
+#[test]
 fn create_page_rejects_titles_that_are_paths() {
     let fixture = CreateFixture::new("loc-create-page-invalid-title");
     let mut store = fixture.store(false);
