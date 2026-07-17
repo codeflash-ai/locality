@@ -2205,6 +2205,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "locality-linear"
+version = "0.3.0"
+dependencies = [
+ "chrono",
+ "locality-connector",
+ "locality-core",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "yaml_serde",
+]
+
+[[package]]
 name = "locality-notion"
 version = "0.3.0"
 dependencies = [
