@@ -3196,7 +3196,16 @@ fn lower_move_document_operations(
             } if entity_id == *remote_id => {
                 if let Some(title) = properties.remove("title") {
                     match title {
-                        PropertyValue::String(title) => *new_title = title,
+                        PropertyValue::String(title) if !title.trim().is_empty() => {
+                            *new_title = title
+                        }
+                        PropertyValue::String(_) => validation.push(ValidationIssue::new(
+                            "move_title_invalid",
+                            path,
+                            None,
+                            "a moved entity title cannot be blank",
+                            Some("set a non-empty string title before pushing".to_string()),
+                        )),
                         PropertyValue::Null => validation.push(ValidationIssue::new(
                             "move_title_invalid",
                             path,

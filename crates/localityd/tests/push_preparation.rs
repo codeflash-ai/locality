@@ -1332,7 +1332,7 @@ fn prepare_stale_pending_move_rechecks_source_and_mount_write_policy() {
 #[test]
 fn prepare_pending_scope_aggregates_move_create_delete_and_joins_diffs() {
     let unchanged = "---\nloc:\n  id: issue-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Original title\nstatus: Todo\n---\nOld body.";
-    let (fixture, mut store) = linear_move_store(Some(unchanged), true);
+    let (fixture, mut store) = move_store("fake", Some(unchanged), true);
     let create_cache = fixture.write_virtual_page(
         "Team B/ENG-2.md",
         "---\ntitle: New issue\nstatus: Todo\n---\nNew issue body.\n",
@@ -2222,8 +2222,16 @@ fn linear_move_store(
     contents: Option<&str>,
     with_shadow: bool,
 ) -> (PrepareFixture, InMemoryStateStore) {
+    move_store("linear", contents, with_shadow)
+}
+
+fn move_store(
+    connector: &str,
+    contents: Option<&str>,
+    with_shadow: bool,
+) -> (PrepareFixture, InMemoryStateStore) {
     let fixture = PrepareFixture::new();
-    let mut store = fixture.virtual_store("linear");
+    let mut store = fixture.virtual_store(connector);
     for (id, title, path) in [
         ("team-a", "Team A", "Team A/page.md"),
         ("team-b", "Team B", "Team B/page.md"),

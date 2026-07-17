@@ -147,6 +147,7 @@ pub struct SourceDescriptor {
     mount_guidance: Cow<'static, str>,
     source_root_create_parent_kind: Option<EntityKind>,
     create_entity_parent_kinds: Vec<EntityKind>,
+    move_entity_parent_kinds: Vec<EntityKind>,
     periodic_discovery_interval: Option<Duration>,
     body_diff_mode: BodyDiffMode,
     virtual_rename_policy: VirtualRenamePolicy,
@@ -194,6 +195,10 @@ impl SourceDescriptor {
 
     pub fn create_entity_parent_kinds(&self) -> &[EntityKind] {
         &self.create_entity_parent_kinds
+    }
+
+    pub fn move_entity_parent_kinds(&self) -> &[EntityKind] {
+        &self.move_entity_parent_kinds
     }
 
     pub fn periodic_discovery_interval(&self) -> Option<Duration> {
@@ -296,6 +301,32 @@ pub fn source_create_decision_for_parent_path(
     SourceWriteDecision::Writable
 }
 
+pub fn source_move_decision_for_parent_path(
+    mount: &MountConfig,
+    parent_path: &Path,
+) -> SourceWriteDecision {
+    if mount.read_only {
+        return SourceWriteDecision::ReadOnly {
+            reason: "mount is read-only",
+        };
+    }
+    if mount.connector == "gmail" {
+        return if parent_path == Path::new("draft") {
+            SourceWriteDecision::Writable
+        } else {
+            SourceWriteDecision::ReadOnly {
+                reason: "Gmail moves are only supported directly inside draft/",
+            }
+        };
+    }
+    if mount.connector == GRANOLA_CONNECTOR_ID {
+        return SourceWriteDecision::ReadOnly {
+            reason: "Granola meetings are read-only",
+        };
+    }
+    SourceWriteDecision::Writable
+}
+
 pub fn supported_source_connectors() -> Vec<&'static str> {
     SOURCE_REGISTRY
         .iter()
@@ -320,6 +351,7 @@ fn notion_source_descriptor() -> SourceDescriptor {
         mount_guidance: Cow::Borrowed(NOTION_AGENT_GUIDANCE),
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
+        move_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
         periodic_discovery_interval: None,
         body_diff_mode: BodyDiffMode::Block,
         virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
@@ -338,6 +370,7 @@ fn google_docs_source_descriptor() -> SourceDescriptor {
         mount_guidance: Cow::Owned(google_docs_mount_guidance()),
         source_root_create_parent_kind: Some(EntityKind::Directory),
         create_entity_parent_kinds: vec![EntityKind::Directory],
+        move_entity_parent_kinds: vec![EntityKind::Directory],
         periodic_discovery_interval: None,
         body_diff_mode: BodyDiffMode::Block,
         virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
@@ -356,6 +389,7 @@ fn gmail_source_descriptor() -> SourceDescriptor {
         mount_guidance: Cow::Owned(gmail_mount_guidance()),
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Directory],
+        move_entity_parent_kinds: vec![EntityKind::Directory],
         periodic_discovery_interval: None,
         body_diff_mode: BodyDiffMode::Block,
         virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
@@ -374,6 +408,7 @@ fn granola_source_descriptor() -> SourceDescriptor {
         mount_guidance: Cow::Owned(granola_mount_guidance()),
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: Vec::new(),
+        move_entity_parent_kinds: Vec::new(),
         periodic_discovery_interval: Some(Duration::from_secs(300)),
         body_diff_mode: BodyDiffMode::Block,
         virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
@@ -433,6 +468,7 @@ fn generic_source_descriptor(connector: &str) -> SourceDescriptor {
         mount_guidance: Cow::Owned(generic_mount_guidance(connector)),
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
+        move_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
         periodic_discovery_interval: None,
         body_diff_mode: BodyDiffMode::Block,
         virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
@@ -451,6 +487,7 @@ fn linear_source_descriptor() -> SourceDescriptor {
         mount_guidance: Cow::Owned(linear_mount_guidance()),
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: Vec::new(),
+        move_entity_parent_kinds: vec![EntityKind::Page],
         periodic_discovery_interval: Some(Duration::from_secs(300)),
         body_diff_mode: BodyDiffMode::WholeEntity,
         virtual_rename_policy: VirtualRenamePolicy::PreserveCanonical,

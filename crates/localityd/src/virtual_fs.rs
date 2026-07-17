@@ -31,7 +31,7 @@ use crate::hydration::{
 use crate::shadow_match::parsed_matches_shadow;
 use crate::source::{
     VirtualRenamePolicy, source_create_decision_for_parent_path, source_descriptor,
-    source_write_decision_for_path,
+    source_move_decision_for_parent_path, source_write_decision_for_path,
 };
 
 pub const ROOT_CONTAINER_IDENTIFIER: &str = "root";
@@ -2265,7 +2265,7 @@ fn move_parent_remote(
     parent_identifier: &str,
     parent_path: &Path,
 ) -> LocalityResult<MoveParent> {
-    ensure_source_parent_accepts_create(mount, parent_path)?;
+    ensure_source_move_parent_writable(mount, parent_path)?;
 
     if let Some(remote_id) = parent_identifier.strip_prefix(CHILDREN_PREFIX) {
         if remote_id.starts_with(LOCAL_PREFIX) {
@@ -2283,7 +2283,7 @@ fn move_parent_remote(
                 "children containers can only target page parents",
             ));
         }
-        let remote_id = create_parent_remote_id_for_entity(mount, remote_id, entity)?;
+        let remote_id = move_parent_remote_id_for_entity(mount, remote_id, entity)?;
         return Ok(MoveParent { remote_id });
     }
 
@@ -2311,8 +2311,22 @@ fn move_parent_remote(
         .iter()
         .find(|entity| entity.remote_id == remote_id)
         .ok_or_else(|| missing_identifier(parent_identifier))?;
-    let remote_id = create_parent_remote_id_for_entity(mount, remote_id, entity)?;
+    let remote_id = move_parent_remote_id_for_entity(mount, remote_id, entity)?;
     Ok(MoveParent { remote_id })
+}
+
+fn move_parent_remote_id_for_entity(
+    mount: &MountConfig,
+    remote_id: RemoteId,
+    entity: &EntityRecord,
+) -> LocalityResult<RemoteId> {
+    if source_accepts_move_parent_kind(mount, &entity.kind) {
+        Ok(remote_id)
+    } else {
+        Err(LocalityError::Unsupported(
+            "virtual filesystem pages cannot be moved under this source item",
+        ))
+    }
 }
 
 fn existing_move_original_path(
@@ -2996,6 +3010,12 @@ fn item_folder_read_only(
 fn source_accepts_create_parent_kind(mount: &MountConfig, kind: &EntityKind) -> bool {
     source_descriptor(&mount.connector)
         .create_entity_parent_kinds()
+        .contains(kind)
+}
+
+fn source_accepts_move_parent_kind(mount: &MountConfig, kind: &EntityKind) -> bool {
+    source_descriptor(&mount.connector)
+        .move_entity_parent_kinds()
         .contains(kind)
 }
 
@@ -3815,6 +3835,18 @@ fn ensure_source_parent_accepts_create(
     }
 }
 
+fn ensure_source_move_parent_writable(
+    mount: &MountConfig,
+    parent_path: &Path,
+) -> LocalityResult<()> {
+    match source_move_decision_for_parent_path(mount, parent_path) {
+        crate::source::SourceWriteDecision::Writable => Ok(()),
+        crate::source::SourceWriteDecision::ReadOnly { reason } => {
+            Err(LocalityError::Unsupported(reason))
+        }
+    }
+}
+
 fn is_missing_identifier_error(error: &LocalityError) -> bool {
     matches!(
         error,
@@ -3973,7 +4005,7 @@ impl ProviderIndex {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use locality_connector::{
         ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
@@ -7146,6 +7178,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(state_root);
     }
 
+    fn seed_pending_linear_issue(
+        store: &mut InMemoryStateStore,
+        content_root: &Path,
+        mount_id: &MountId,
+        local_id: &str,
+        parent_remote_id: &str,
+        projected_path: &str,
+        title: &str,
+    ) -> String {
+        let projected_path = PathBuf::from(projected_path);
+        let content_path = content_root.join(&projected_path);
+        if let Some(parent) = content_path.parent() {
+            std::fs::create_dir_all(parent).expect("create pending content parent");
+        }
+        std::fs::write(&content_path, b"").expect("write pending issue cache");
+        store
+            .save_virtual_mutation(VirtualMutationRecord {
+                mount_id: mount_id.clone(),
+                local_id: local_id.to_string(),
+                mutation_kind: VirtualMutationKind::Create,
+                target_remote_id: None,
+                parent_remote_id: Some(RemoteId::new(parent_remote_id)),
+                original_path: None,
+                projected_path: projected_path.clone(),
+                title: title.to_string(),
+                content_path: Some(content_path),
+                created_at: "before".to_string(),
+                updated_at: "before".to_string(),
+            })
+            .expect("save pending issue mutation");
+
+        if projected_path.file_name().and_then(|name| name.to_str())
+            == Some(locality_core::path_projection::PAGE_DOCUMENT_FILENAME)
+        {
+            format!("children:{local_id}")
+        } else {
+            local_id.to_string()
+        }
+    }
+
     #[test]
     fn linear_pending_page_directory_move_preserves_canonical_title_and_cached_bytes() {
         let mount_id = MountId::new("linear-main");
@@ -7169,15 +7241,16 @@ mod tests {
                 ))
                 .expect("save parent");
         }
-        let created = create_virtual_fs_directory(
+        let local_id = "local:linear-dir-move";
+        let created_identifier = seed_pending_linear_issue(
             &mut store,
             &content_root,
             &mount_id,
-            "children:team-a",
+            local_id,
+            "team-a",
+            "Team A/ENG-1-old-path/page.md",
             "ENG-1-old-path",
-        )
-        .expect("create pending issue");
-        let local_id = created.identifier.strip_prefix("children:").unwrap();
+        );
         let mut mutation = store
             .get_virtual_mutation(&mount_id, local_id)
             .expect("get mutation")
@@ -7194,7 +7267,7 @@ mod tests {
             &mut store,
             &content_root,
             &mount_id,
-            &created.identifier,
+            &created_identifier,
             "children:team-b",
             "ENG-1-new-path",
         )
@@ -7237,16 +7310,17 @@ mod tests {
                 "Team A/page.md",
             ))
             .expect("save parent");
-        let created = create_virtual_fs_file(
+        let created_identifier = seed_pending_linear_issue(
             &mut store,
             &content_root,
             &mount_id,
-            "children:team-a",
-            "ENG-2-old.md",
-        )
-        .expect("create pending issue");
+            "local:linear-flat-rename",
+            "team-a",
+            "Team A/ENG-2-old.md",
+            "ENG-2-old",
+        );
         let mut mutation = store
-            .get_virtual_mutation(&mount_id, &created.identifier)
+            .get_virtual_mutation(&mount_id, &created_identifier)
             .expect("get mutation")
             .expect("mutation");
         mutation.title = "Explicit flat title".to_string();
@@ -7260,7 +7334,7 @@ mod tests {
             &mut store,
             &content_root,
             &mount_id,
-            &created.identifier,
+            &created_identifier,
             "children:team-a",
             "ENG-2-new.md",
         )
@@ -7271,7 +7345,7 @@ mod tests {
             bytes
         );
         let mutation = store
-            .get_virtual_mutation(&mount_id, &created.identifier)
+            .get_virtual_mutation(&mount_id, &created_identifier)
             .expect("get mutation")
             .expect("mutation");
         assert_eq!(mutation.title, "Explicit flat title");
@@ -7300,18 +7374,16 @@ mod tests {
                 "Team A/page.md",
             ))
             .expect("save parent");
-        let created = create_virtual_fs_directory(
+        let local_id = "local:linear-dir-missing-cache";
+        let created_identifier = seed_pending_linear_issue(
             &mut store,
             &content_root,
             &mount_id,
-            "children:team-a",
+            local_id,
+            "team-a",
+            "Team A/ENG-7-old/page.md",
             "ENG-7-old",
-        )
-        .expect("create pending issue");
-        let local_id = created
-            .identifier
-            .strip_prefix("children:")
-            .expect("pending local id");
+        );
         let old_cache = content_root.join("Team A/ENG-7-old/page.md");
         std::fs::remove_file(&old_cache).expect("remove pending cache");
         let before_entities = store.list_entities(&mount_id).expect("list entities");
@@ -7324,7 +7396,7 @@ mod tests {
             &mut store,
             &content_root,
             &mount_id,
-            &created.identifier,
+            &created_identifier,
             "children:team-a",
             "ENG-7-new",
         )
@@ -7369,19 +7441,20 @@ mod tests {
                 "Team A/page.md",
             ))
             .expect("save parent");
-        let created = create_virtual_fs_file(
+        let created_identifier = seed_pending_linear_issue(
             &mut store,
             &content_root,
             &mount_id,
-            "children:team-a",
-            "ENG-8-old.md",
-        )
-        .expect("create pending issue");
+            "local:linear-flat-missing-cache",
+            "team-a",
+            "Team A/ENG-8-old.md",
+            "ENG-8-old",
+        );
         let old_cache = content_root.join("Team A/ENG-8-old.md");
         std::fs::remove_file(&old_cache).expect("remove pending cache");
         let before_entities = store.list_entities(&mount_id).expect("list entities");
         let before_mutation = store
-            .get_virtual_mutation(&mount_id, &created.identifier)
+            .get_virtual_mutation(&mount_id, &created_identifier)
             .expect("get mutation")
             .expect("mutation");
 
@@ -7389,7 +7462,7 @@ mod tests {
             &mut store,
             &content_root,
             &mount_id,
-            &created.identifier,
+            &created_identifier,
             "children:team-a",
             "ENG-8-new.md",
         )
@@ -7399,7 +7472,7 @@ mod tests {
             error,
             LocalityError::InvalidState(format!(
                 "pending create `{}` must be materialized before it can be moved or renamed",
-                created.identifier
+                created_identifier
             ))
         );
         assert_eq!(
@@ -7408,7 +7481,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .get_virtual_mutation(&mount_id, &created.identifier)
+                .get_virtual_mutation(&mount_id, &created_identifier)
                 .expect("get mutation"),
             Some(before_mutation)
         );
@@ -7577,29 +7650,31 @@ mod tests {
                     .expect("save parent");
             }
 
-            let created = if page_directory {
-                create_virtual_fs_directory(
+            let created_identifier = if page_directory {
+                seed_pending_linear_issue(
                     &mut store,
                     &content_root,
                     &mount_id,
-                    "children:team-a",
+                    &format!("local:linear-pending-{shape}"),
+                    "team-a",
+                    "Team A/ENG-20-old/page.md",
                     "ENG-20-old",
                 )
-                .expect("create pending directory")
             } else {
-                create_virtual_fs_file(
+                seed_pending_linear_issue(
                     &mut store,
                     &content_root,
                     &mount_id,
-                    "children:team-a",
-                    "ENG-20-old.md",
+                    &format!("local:linear-pending-{shape}"),
+                    "team-a",
+                    "Team A/ENG-20-old.md",
+                    "ENG-20-old",
                 )
-                .expect("create pending file")
             };
-            let local_id = created
-                .identifier
+            let local_id = created_identifier
                 .strip_prefix("children:")
-                .unwrap_or(&created.identifier);
+                .unwrap_or(&created_identifier)
+                .to_string();
             let source_relative = if page_directory {
                 "Team A/ENG-20-old/page.md"
             } else {
@@ -7621,7 +7696,7 @@ mod tests {
                 &mut store,
                 &content_root,
                 &mount_id,
-                &created.identifier,
+                &created_identifier,
                 "children:team-b",
                 if page_directory {
                     "ENG-20-new"
@@ -7632,7 +7707,7 @@ mod tests {
             .expect_err("cache publication fails");
             assert!(matches!(error, LocalityError::Io(_)));
             let interrupted = store
-                .get_virtual_mutation(&mount_id, local_id)
+                .get_virtual_mutation(&mount_id, &local_id)
                 .expect("get interrupted mutation")
                 .expect("interrupted mutation");
             assert_eq!(interrupted.projected_path, PathBuf::from(target_relative));
@@ -7651,7 +7726,7 @@ mod tests {
                 &mut store,
                 &content_root,
                 &mount_id,
-                &created.identifier,
+                &created_identifier,
                 "children:team-b",
                 if page_directory {
                     "ENG-20-new"
@@ -7664,7 +7739,7 @@ mod tests {
             assert!(!source_cache.exists());
             assert_eq!(std::fs::read(&target_cache).expect("target cache"), bytes);
             let finalized = store
-                .get_virtual_mutation(&mount_id, local_id)
+                .get_virtual_mutation(&mount_id, &local_id)
                 .expect("get finalized mutation")
                 .expect("finalized mutation");
             assert_eq!(

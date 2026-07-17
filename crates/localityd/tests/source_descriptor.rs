@@ -138,6 +138,10 @@ fn linear_allows_existing_issue_edits_but_rejects_local_creates() {
         !source_create_decision_for_parent_path(&mount, std::path::Path::new("Engineering"))
             .is_writable()
     );
+    assert_eq!(
+        source_descriptor(LINEAR_CONNECTOR_ID).move_entity_parent_kinds(),
+        &[EntityKind::Page]
+    );
 }
 
 #[test]
