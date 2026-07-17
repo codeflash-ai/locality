@@ -516,11 +516,19 @@ fn require_primary_calendar_id(calendar_id: &str) -> LocalityResult<()> {
 
 fn is_direct_draft_child(path: &Path) -> bool {
     let mut components = path.components();
-    matches!(
-        components.next(),
-        Some(Component::Normal(component)) if component == OsStr::new("draft")
-    ) && matches!(components.next(), Some(Component::Normal(_)))
-        && components.next().is_none()
+    let Some(Component::Normal(folder)) = components.next() else {
+        return false;
+    };
+    if folder != OsStr::new("draft") {
+        return false;
+    }
+    let Some(Component::Normal(file_name)) = components.next() else {
+        return false;
+    };
+    if components.next().is_some() {
+        return false;
+    }
+    Path::new(file_name).extension() == Some(OsStr::new("md"))
 }
 
 fn locality_event_id(push_id: &PushId, operation_id: &PushOperationId) -> String {
@@ -1475,30 +1483,35 @@ google_calendar:
     }
 
     #[test]
-    fn apply_rejects_nested_draft_source_path() {
-        let api = Arc::new(FakeGoogleCalendarApi::default());
-        let connector =
-            GoogleCalendarConnector::with_api(GoogleCalendarConfig::new("token"), api.clone());
-        let plan = draft_create_plan("draft/nested/design-review.md");
+    fn apply_rejects_invalid_draft_source_paths() {
+        for source_path in [
+            "draft/nested/design-review.md",
+            "draft/design-review.txt",
+            "draft/design-review",
+        ] {
+            let api = Arc::new(FakeGoogleCalendarApi::default());
+            let connector =
+                GoogleCalendarConnector::with_api(GoogleCalendarConfig::new("token"), api.clone());
+            let plan = draft_create_plan(source_path);
 
-        let error = connector
-            .apply(ApplyPlanRequest {
+            let result = connector.apply(ApplyPlanRequest {
                 push_id: &PushId("push-1".to_string()),
                 mount_id: &MountId::new("calendar-main"),
                 plan: &plan,
                 operation_ids: &[PushOperationId("op-1".to_string())],
                 remote_preconditions: &[] as &[RemotePrecondition],
                 local_root: None,
-            })
-            .expect_err("nested draft source should be unsupported");
+            });
+            let error = result.unwrap_err();
 
-        assert_eq!(
-            error,
-            LocalityError::Unsupported("google calendar draft source path")
-        );
-        let calls = api.calls.lock().expect("calls");
-        assert!(calls.get_events.is_empty());
-        assert!(calls.insert_events.is_empty());
+            assert_eq!(
+                error,
+                LocalityError::Unsupported("google calendar draft source path")
+            );
+            let calls = api.calls.lock().expect("calls");
+            assert!(calls.get_events.is_empty(), "{source_path}");
+            assert!(calls.insert_events.is_empty(), "{source_path}");
+        }
     }
 
     #[test]
