@@ -727,22 +727,24 @@ fn auto_save_relative_path(prepared: &PreparedPush) -> PathBuf {
 }
 
 fn auto_save_block_reason_for_prepared(prepared: &PreparedPush) -> Option<String> {
-    gmail_auto_save_block_reason(prepared).or_else(|| auto_save_block_reason(&prepared.pipeline))
+    draft_create_auto_save_block_reason(prepared)
+        .or_else(|| auto_save_block_reason(&prepared.pipeline))
 }
 
-fn gmail_auto_save_block_reason(prepared: &PreparedPush) -> Option<String> {
-    if prepared.mount.connector != "gmail" {
-        return None;
-    }
+fn draft_create_auto_save_block_reason(prepared: &PreparedPush) -> Option<String> {
     let plan = prepared.pipeline.plan.as_ref()?;
-    if plan
+    if !plan
         .operations
         .iter()
         .any(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
     {
-        return Some("Gmail draft sends require review".to_string());
+        return None;
     }
-    None
+    match prepared.mount.connector.as_str() {
+        "gmail" => Some("Gmail draft sends require review".to_string()),
+        "google-calendar" => Some("Google Calendar event creates require review".to_string()),
+        _ => None,
+    }
 }
 
 fn created_entity_id(report: &PushJobReport) -> Option<RemoteId> {
@@ -2721,12 +2723,14 @@ fn create_entity_title_required(
     parsed: &locality_core::canonical::ParsedCanonicalDocument,
     mount: &MountConfig,
 ) -> bool {
-    mount.connector != "gmail"
-        && parsed
-            .frontmatter
-            .title
-            .as_ref()
-            .is_none_or(|title| title.trim().is_empty())
+    if matches!(mount.connector.as_str(), "gmail" | "google-calendar") {
+        return false;
+    }
+    parsed
+        .frontmatter
+        .title
+        .as_ref()
+        .is_none_or(|title| title.trim().is_empty())
 }
 
 fn create_entity_title(
@@ -2744,6 +2748,12 @@ fn create_entity_title(
         && !subject.trim().is_empty()
     {
         return subject.trim().to_string();
+    }
+    if mount.connector == "google-calendar"
+        && let Some(summary) = frontmatter_string(&parsed.frontmatter.properties, "summary")
+        && !summary.trim().is_empty()
+    {
+        return summary.trim().to_string();
     }
     relative_path
         .file_stem()
@@ -3295,8 +3305,9 @@ fn google_calendar_rendered_event_filename(
 fn google_calendar_frontmatter_event_id(
     properties: &locality_core::canonical::FrontmatterProperties,
 ) -> Option<String> {
-    let PropertyValue::Object(google_calendar) =
-        properties.get("google_calendar").map(property_value_from_frontmatter)?
+    let PropertyValue::Object(google_calendar) = properties
+        .get("google_calendar")
+        .map(property_value_from_frontmatter)?
     else {
         return None;
     };
@@ -3311,7 +3322,9 @@ fn google_calendar_frontmatter_event_id(
 fn google_calendar_start_value(
     properties: &locality_core::canonical::FrontmatterProperties,
 ) -> Option<String> {
-    let PropertyValue::Object(start) = properties.get("start").map(property_value_from_frontmatter)?
+    let PropertyValue::Object(start) = properties
+        .get("start")
+        .map(property_value_from_frontmatter)?
     else {
         return None;
     };
@@ -3382,9 +3395,9 @@ fn remove_stale_created_entity_source_path(
         return Ok(true);
     }
 
-    // A Gmail draft may have been edited after the send succeeded but before
-    // reconciliation finished. Preserve that edited draft as a new pending send.
-    if mount.connector == "gmail"
+    // Draft creates may have been edited after apply succeeded but before
+    // reconciliation finished. Preserve edited drafts as new pending creates.
+    if preserves_edited_created_entity_source(mount)
         && !created_entity_source_matches_plan(
             mount,
             source_path,
@@ -3402,6 +3415,10 @@ fn remove_stale_created_entity_source_path(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(error.into()),
     }
+}
+
+fn preserves_edited_created_entity_source(mount: &MountConfig) -> bool {
+    matches!(mount.connector.as_str(), "gmail" | "google-calendar")
 }
 
 fn created_entity_source_matches_plan(

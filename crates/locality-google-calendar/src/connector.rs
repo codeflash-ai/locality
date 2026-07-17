@@ -1487,7 +1487,10 @@ google_calendar:
             "description".to_string(),
             PropertyValue::String("Frontmatter description".to_string()),
         );
-        properties.insert("colorId".to_string(), PropertyValue::String("7".to_string()));
+        properties.insert(
+            "colorId".to_string(),
+            PropertyValue::String("7".to_string()),
+        );
 
         connector
             .apply(ApplyPlanRequest {
