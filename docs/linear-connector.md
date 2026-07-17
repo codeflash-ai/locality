@@ -21,6 +21,12 @@ mount. The default connection id is `linear-default`; Linear mounts default to
 `linear-main`. OAuth is intentionally not advertised by the source descriptor
 until a Locality OAuth broker flow exists for Linear.
 
+The desktop **Add Source** dialog and first-run onboarding support the same API
+key flow. Pasting a Linear API key creates or reconnects the default
+`linear-main` mount under the desktop CloudStorage root. Unlike Granola, the
+desktop Linear mount is editable by default because the connector supports
+approved issue updates.
+
 The initial projection groups issues by team:
 
 ```text
