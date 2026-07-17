@@ -626,6 +626,99 @@ fn cli_mount_slack_rejects_out_of_range_history_limit_before_state_open() {
 }
 
 #[test]
+fn cli_mount_slack_rejects_non_integer_history_limit_before_state_open() {
+    let fixture = MountFixture::new("loc-cli-slack-non-integer-history-limit");
+    let state_root = fixture.root.join("state");
+
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let mount_root = fixture.root.join("slack");
+    let mount_root_arg = mount_root.display().to_string();
+
+    let body = loc_json_with_exit(
+        loc_command(loc, &state_root).args([
+            "mount",
+            "slack",
+            mount_root_arg.as_str(),
+            "--connection",
+            "slack-work",
+            "--projection",
+            "plain-files",
+            "--history-limit",
+            "abc",
+            "--json",
+        ]),
+        2,
+    );
+
+    assert_eq!(body["code"], "slack_history_limit_invalid", "{body:#?}");
+    assert!(
+        body["message"]
+            .as_str()
+            .expect("message")
+            .contains("integer from 1 to 15"),
+        "{body:#?}"
+    );
+    assert!(
+        !state_root.exists(),
+        "non-integer Slack history limit should fail before opening state"
+    );
+}
+
+#[test]
+fn cli_mount_slack_rejects_invalid_types_before_state_open() {
+    for (types, expected_message) in [
+        (
+            "bogus",
+            "unsupported Slack conversation type `bogus`; supported values:",
+        ),
+        ("", "Slack conversation types must be non-empty"),
+    ] {
+        let fixture = MountFixture::new("loc-cli-slack-invalid-types");
+        let state_root = fixture.root.join("state");
+
+        let loc = env!("CARGO_BIN_EXE_loc");
+        let mount_root = fixture.root.join("slack");
+        let mount_root_arg = mount_root.display().to_string();
+
+        let body = loc_json_with_exit(
+            loc_command(loc, &state_root).args([
+                "mount",
+                "slack",
+                mount_root_arg.as_str(),
+                "--connection",
+                "slack-work",
+                "--projection",
+                "plain-files",
+                "--types",
+                types,
+                "--json",
+            ]),
+            2,
+        );
+
+        assert_eq!(body["code"], "slack_types_invalid", "{body:#?}");
+        assert!(
+            body["message"]
+                .as_str()
+                .expect("message")
+                .contains(expected_message),
+            "{body:#?}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .expect("message")
+                .contains("public_channel,private_channel,im,mpim"),
+            "{body:#?}"
+        );
+        assert!(
+            !state_root.exists(),
+            "invalid Slack types `{types}` should fail before opening state"
+        );
+    }
+}
+
+#[test]
 fn cli_mount_slack_rejects_remote_root_selectors() {
     let cases: &[&[&str]] = &[
         &["--workspace"],
