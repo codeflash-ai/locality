@@ -132,7 +132,16 @@ fn connection_access_token(
         .get(&connection.secret_ref)
         .map_err(|error| credential_error(connection, error))?;
     let mut stored = serde_json::from_str::<StoredSlackCredential>(&secret)
-        .map_err(|error| ConnectorResolveError::CredentialStoreUnavailable(error.to_string()))?;
+        .map_err(|error| invalid_slack_credential(connection, error.to_string()))?;
+    if stored.connector != SLACK_CONNECTOR_ID || stored.kind != "oauth" {
+        return Err(invalid_slack_credential(
+            connection,
+            format!(
+                "expected Slack OAuth credential, got connector `{}` kind `{}`",
+                stored.connector, stored.kind
+            ),
+        ));
+    }
     if stored.expires_soon(timestamp_secs()) {
         let refreshed = refresh_oauth_credential(connection, &stored)?;
         stored = stored
@@ -146,6 +155,20 @@ fn connection_access_token(
             .map_err(|error| credential_error(connection, error))?;
     }
     Ok(stored.access_token)
+}
+
+fn invalid_slack_credential(
+    connection: &ConnectionRecord,
+    detail: impl std::fmt::Display,
+) -> ConnectorResolveError {
+    ConnectorResolveError::AuthRequired {
+        connection_id: connection.connection_id.0.clone(),
+        message: Some(format!(
+            "Slack credential for connection `{}` is invalid; reconnect with `loc connect slack`: {detail}",
+            connection.connection_id.0
+        )),
+        suggested_command: SLACK_CONNECT_COMMAND.to_string(),
+    }
 }
 
 fn refresh_oauth_credential(
@@ -387,4 +410,100 @@ pub(crate) fn validate_slack_frontmatter(
         Some("do not edit files under Slack mounts".to_string()),
     ));
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use locality_core::hydration::{HydrationReason, HydrationRequest};
+    use locality_core::model::{HydrationState, MountId, RemoteId};
+    use locality_slack::{
+        SlackApi, SlackAuthTestResponse, SlackConversationsListResponse, SlackHistoryResponse,
+        SlackUser, SlackUserProfile, SlackUsersListResponse, users_remote_id,
+    };
+
+    use super::*;
+
+    #[test]
+    fn slack_hydration_builds_shadow_for_users_bundle() {
+        let connector =
+            SlackConnector::with_api(SlackConfig::new("xoxb-token"), Arc::new(FakeSlackApi));
+        let request = HydrationRequest::new(
+            MountId::new("slack-main"),
+            RemoteId::new(users_remote_id()),
+            "users.md",
+            HydrationState::Hydrated,
+            HydrationReason::ExplicitPull,
+        );
+
+        let hydrated = connector.fetch_render(&request).expect("hydrate users");
+
+        assert_eq!(hydrated.remote_edited_at.as_deref(), Some("users"));
+        assert!(hydrated.assets.is_empty());
+        assert!(
+            hydrated
+                .document
+                .body
+                .contains("| User ID | Name | Display Name | Bot | Deleted |")
+        );
+        assert_eq!(hydrated.shadow.entity_id, request.remote_id);
+        assert_eq!(hydrated.shadow.frontmatter, hydrated.document.frontmatter);
+        assert_eq!(hydrated.shadow.rendered_body, hydrated.document.body);
+        assert!(!hydrated.shadow.blocks.is_empty());
+        assert!(
+            hydrated
+                .shadow
+                .block_ids()
+                .contains(&RemoteId::new("slack-users:body:0"))
+        );
+    }
+
+    #[derive(Debug)]
+    struct FakeSlackApi;
+
+    impl SlackApi for FakeSlackApi {
+        fn auth_test(&self) -> LocalityResult<SlackAuthTestResponse> {
+            Ok(SlackAuthTestResponse::default())
+        }
+
+        fn conversations_list(
+            &self,
+            _types: &str,
+            _cursor: Option<&str>,
+            _limit: u32,
+        ) -> LocalityResult<SlackConversationsListResponse> {
+            Ok(SlackConversationsListResponse::default())
+        }
+
+        fn conversations_history(
+            &self,
+            _channel: &str,
+            _cursor: Option<&str>,
+            _limit: u32,
+        ) -> LocalityResult<SlackHistoryResponse> {
+            Ok(SlackHistoryResponse::default())
+        }
+
+        fn users_list(
+            &self,
+            _cursor: Option<&str>,
+            _limit: u32,
+        ) -> LocalityResult<SlackUsersListResponse> {
+            Ok(SlackUsersListResponse {
+                ok: true,
+                members: vec![SlackUser {
+                    id: "U123".to_string(),
+                    name: Some("ada".to_string()),
+                    real_name: Some("Ada Lovelace".to_string()),
+                    profile: Some(SlackUserProfile {
+                        display_name: Some("Ada".to_string()),
+                        ..SlackUserProfile::default()
+                    }),
+                    ..SlackUser::default()
+                }],
+                ..SlackUsersListResponse::default()
+            })
+        }
+    }
 }

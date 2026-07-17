@@ -384,6 +384,31 @@ fn stored_slack_credential(access_token: &str) -> StoredSlackCredential {
     .expect("stored slack credential")
 }
 
+fn expired_slack_credential(access_token: &str, broker_url: String) -> StoredSlackCredential {
+    let mut stored = StoredSlackCredential::from_broker_token(
+        OAuthBrokerToken {
+            access_token: access_token.to_string(),
+            token_type: Some("Bearer".to_string()),
+            expires_in: Some(1),
+            refresh_token_handle: Some("handle-1".to_string()),
+            account_id: Some("acct-1".to_string()),
+            account_label: Some("user@example.com".to_string()),
+            workspace_id: Some("slack-workspace".to_string()),
+            workspace_name: Some("Slack Workspace".to_string()),
+            scopes: SLACK_OAUTH_SCOPES
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect(),
+        },
+        "client-id".to_string(),
+        broker_url,
+        1,
+    )
+    .expect("expired slack credential");
+    stored.expires_at = Some(1);
+    stored
+}
+
 fn expired_gmail_credential(access_token: &str, broker_url: String) -> StoredGmailCredential {
     let mut stored = StoredGmailCredential::from_broker_token(
         OAuthBrokerToken {
@@ -586,6 +611,187 @@ fn resolving_slack_mount_without_connection_suggests_connect_slack() {
 
     assert_eq!(error.code(), "missing_connection");
     assert_eq!(error.suggested_command(), Some("loc connect slack"));
+}
+
+#[test]
+fn resolving_slack_mount_with_invalid_settings_reports_validation_detail() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (connection_id, secret_ref) = save_slack_oauth_connection(&mut store);
+    credentials
+        .put(
+            &secret_ref,
+            &serde_json::to_string(&stored_slack_credential("slack-access-token"))
+                .expect("credential json"),
+        )
+        .expect("save credential");
+    let mount = MountConfig::new(
+        MountId::new("slack-main"),
+        SLACK_CONNECTOR_ID,
+        "/tmp/locality/slack",
+    )
+    .with_connection_id(connection_id)
+    .with_settings_json(r#"{"slack":{"types":[]}}"#);
+
+    let error = resolve_source_for_mount(&store, &credentials, &mount)
+        .expect_err("invalid Slack settings should reject resolver");
+
+    assert_eq!(error.code(), "credential_store_unavailable");
+    let message = error.message();
+    assert!(message.contains("Slack mount `slack-main` settings are invalid"));
+    assert!(message.contains("Slack settings must include at least one Slack conversation type"));
+}
+
+#[test]
+fn resolving_slack_mount_with_corrupted_credential_suggests_reconnect() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (connection_id, secret_ref) = save_slack_oauth_connection(&mut store);
+    credentials
+        .put(&secret_ref, "{not-json")
+        .expect("save corrupted credential");
+    let mount = MountConfig::new(
+        MountId::new("slack-main"),
+        SLACK_CONNECTOR_ID,
+        "/tmp/locality/slack",
+    )
+    .with_connection_id(connection_id);
+
+    let error = resolve_source_for_mount(&store, &credentials, &mount)
+        .expect_err("corrupted Slack credential should reject resolver");
+
+    assert_eq!(error.code(), "auth_required");
+    assert_eq!(error.suggested_command(), Some("loc connect slack"));
+    let message = error.message();
+    assert!(message.contains("Slack credential for connection `slack-default` is invalid"));
+    assert!(message.contains("reconnect with `loc connect slack`"));
+}
+
+#[test]
+fn resolving_slack_mount_with_non_slack_credential_suggests_reconnect() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (connection_id, secret_ref) = save_slack_oauth_connection(&mut store);
+    let mut stored = stored_slack_credential("wrong-connector-token");
+    stored.connector = "gmail".to_string();
+    credentials
+        .put(
+            &secret_ref,
+            &serde_json::to_string(&stored).expect("credential json"),
+        )
+        .expect("save wrong connector credential");
+    let mount = MountConfig::new(
+        MountId::new("slack-main"),
+        SLACK_CONNECTOR_ID,
+        "/tmp/locality/slack",
+    )
+    .with_connection_id(connection_id);
+
+    let error = resolve_source_for_mount(&store, &credentials, &mount)
+        .expect_err("non-Slack credential should reject resolver");
+
+    assert_eq!(error.code(), "auth_required");
+    assert_eq!(error.suggested_command(), Some("loc connect slack"));
+    let message = error.message();
+    assert!(message.contains("Slack credential for connection `slack-default` is invalid"));
+    assert!(message.contains("reconnect with `loc connect slack`"));
+}
+
+#[test]
+fn resolving_expired_slack_credential_refreshes_with_broker_handle() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (connection_id, secret_ref) = save_slack_oauth_connection(&mut store);
+    let refresh_response = serde_json::json!({
+        "access_token": "new-slack-access-token",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "refresh_token_handle": "handle-2",
+        "account_id": "acct-1",
+        "account_label": "user@example.com",
+        "workspace_id": "slack-workspace",
+        "workspace_name": "Slack Workspace",
+        "scopes": SLACK_OAUTH_SCOPES,
+    })
+    .to_string();
+    let (broker_url, broker) = spawn_refresh_broker("HTTP/1.1 200 OK", refresh_response);
+    let stored = expired_slack_credential("expired-slack-access-token", broker_url);
+    credentials
+        .put(
+            &secret_ref,
+            &serde_json::to_string(&stored).expect("credential json"),
+        )
+        .expect("save credential");
+    let mount = MountConfig::new(
+        MountId::new("slack-main"),
+        SLACK_CONNECTOR_ID,
+        "/tmp/locality/slack",
+    )
+    .with_connection_id(connection_id);
+
+    let source = resolve_source_for_mount(&store, &credentials, &mount).expect("resolve slack");
+    broker.join().expect("broker thread");
+
+    let ResolvedSource::Slack(connector) = source else {
+        panic!("expected slack source");
+    };
+    assert_eq!(connector.config().access_token, "new-slack-access-token");
+    let saved = credentials.get(&secret_ref).expect("saved credential");
+    let saved = serde_json::from_str::<StoredSlackCredential>(&saved).expect("stored credential");
+    assert_eq!(saved.access_token, "new-slack-access-token");
+    assert_eq!(saved.refresh_token_handle.as_deref(), Some("handle-2"));
+}
+
+#[test]
+fn resolving_expired_slack_credential_rejects_refresh_missing_required_scope() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (connection_id, secret_ref) = save_slack_oauth_connection(&mut store);
+    let refresh_scopes = SLACK_OAUTH_SCOPES
+        .iter()
+        .filter(|scope| **scope != "files:read")
+        .collect::<Vec<_>>();
+    let refresh_response = serde_json::json!({
+        "access_token": "new-slack-access-token",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "refresh_token_handle": "handle-2",
+        "account_id": "acct-1",
+        "account_label": "user@example.com",
+        "workspace_id": "slack-workspace",
+        "workspace_name": "Slack Workspace",
+        "scopes": refresh_scopes,
+    })
+    .to_string();
+    let (broker_url, broker) = spawn_refresh_broker("HTTP/1.1 200 OK", refresh_response);
+    let stored = expired_slack_credential("expired-slack-access-token", broker_url);
+    let original_secret = serde_json::to_string(&stored).expect("credential json");
+    credentials
+        .put(&secret_ref, &original_secret)
+        .expect("save credential");
+    let mount = MountConfig::new(
+        MountId::new("slack-main"),
+        SLACK_CONNECTOR_ID,
+        "/tmp/locality/slack",
+    )
+    .with_connection_id(connection_id);
+
+    let error = resolve_source_for_mount(&store, &credentials, &mount)
+        .expect_err("missing refreshed Slack scope must be rejected");
+    broker.join().expect("broker thread");
+
+    assert_eq!(error.code(), "auth_required");
+    assert!(
+        error
+            .message()
+            .contains("missing required Slack OAuth scope")
+    );
+    assert!(error.message().contains("files:read"));
+    assert_eq!(error.suggested_command(), Some("loc connect slack"));
+    assert_eq!(
+        credentials.get(&secret_ref).expect("saved credential"),
+        original_secret
+    );
 }
 
 #[test]
