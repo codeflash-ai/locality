@@ -2,11 +2,13 @@ use locality_connector::Connector;
 use locality_connector::oauth_broker::OAuthBrokerToken;
 use locality_core::canonical::parse_canonical_markdown;
 use locality_core::model::{EntityKind, MountId, RemoteId};
+use locality_core::push::BodyDiffMode;
 use locality_core::shadow::ShadowDocument;
 use locality_core::validation::ValidationIssue;
 use locality_gmail::{GMAIL_CONNECTOR_ID, GMAIL_OAUTH_SCOPES, StoredGmailCredential};
 use locality_google_docs::{GOOGLE_DOCS_CONNECTOR_ID, StoredGoogleDocsCredential};
 use locality_granola::GRANOLA_CONNECTOR_ID;
+use locality_linear::LINEAR_CONNECTOR_ID;
 use locality_notion::client::DEFAULT_NOTION_TOKEN_ENV;
 use locality_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
@@ -15,9 +17,9 @@ use locality_store::{
 };
 use localityd::source::{
     LocalSourceValidator, ResolvedSource, ResolvedSourceSet, SourcePushValidator,
-    SourceValidationContext, resolve_source_for_mount, source_create_decision_for_parent_path,
-    source_descriptor, source_display_name, source_write_decision_for_path,
-    supported_source_connectors,
+    SourceValidationContext, VirtualRenamePolicy, resolve_source_for_mount,
+    source_create_decision_for_parent_path, source_descriptor, source_display_name,
+    source_write_decision_for_path, supported_source_connectors,
 };
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -121,21 +123,75 @@ fn granola_rejects_every_write_and_create_path() {
 }
 
 #[test]
-fn generic_descriptor_preserves_source_id_in_guidance() {
-    let descriptor = source_descriptor("linear");
+fn linear_allows_existing_issue_edits_but_rejects_local_creates() {
+    let mut mount = MountConfig::new(
+        MountId::new("linear-main"),
+        LINEAR_CONNECTOR_ID,
+        "/tmp/locality/linear",
+    );
+    mount.read_only = false;
+    assert!(
+        source_write_decision_for_path(&mount, std::path::Path::new("Engineering/ENG-1/page.md"))
+            .is_writable()
+    );
+    assert!(
+        !source_create_decision_for_parent_path(&mount, std::path::Path::new("Engineering"))
+            .is_writable()
+    );
+    assert_eq!(
+        source_descriptor(LINEAR_CONNECTOR_ID).move_entity_parent_kinds(),
+        &[EntityKind::Page]
+    );
+}
 
-    assert_eq!(descriptor.id(), "linear");
+#[test]
+fn linear_descriptor_comes_from_registry_and_uses_api_key_setup() {
+    let descriptor = source_descriptor(LINEAR_CONNECTOR_ID);
+
+    assert_eq!(descriptor.id(), LINEAR_CONNECTOR_ID);
     assert_eq!(descriptor.display_name(), "Linear");
     assert_eq!(descriptor.default_mount_id(), "linear-main");
-    assert_eq!(descriptor.connect_command(), None);
+    assert_eq!(
+        descriptor.connect_command(),
+        Some("loc connect linear --api-key-stdin")
+    );
     assert_eq!(descriptor.auth_env_var(), None);
     assert!(!descriptor.supports_oauth());
     assert!(
         descriptor
             .mount_guidance()
-            .contains("# Locality linear Mount")
+            .contains("# Locality Linear Mount")
     );
-    assert!(descriptor.mount_guidance().contains("to linear"));
+    assert!(descriptor.mount_guidance().contains("Linear facts"));
+    assert_eq!(descriptor.body_diff_mode(), BodyDiffMode::WholeEntity);
+    assert_eq!(
+        descriptor.periodic_discovery_interval(),
+        Some(Duration::from_secs(300))
+    );
+
+    assert_eq!(
+        source_descriptor("custom").body_diff_mode(),
+        BodyDiffMode::Block
+    );
+}
+
+#[test]
+fn source_descriptors_declare_canonical_title_rename_policy() {
+    for connector in ["notion", "google-docs", "gmail", "granola", "custom"] {
+        assert_eq!(
+            source_descriptor(connector).virtual_rename_policy(),
+            VirtualRenamePolicy::FilenameDerived,
+            "{connector}"
+        );
+    }
+    assert_eq!(
+        source_descriptor("linear").virtual_rename_policy(),
+        VirtualRenamePolicy::PreserveCanonical
+    );
+    assert_eq!(
+        source_descriptor("linear").body_diff_mode(),
+        BodyDiffMode::WholeEntity
+    );
 }
 
 #[test]
@@ -346,11 +402,243 @@ fn validate_gmail_changed(path: &str, markdown: &str) -> Vec<String> {
         .collect()
 }
 
+fn validate_linear_changed(markdown: &str, shadow_frontmatter: &str) -> Vec<ValidationIssue> {
+    let mount = MountConfig::new(
+        MountId::new("linear-main"),
+        LINEAR_CONNECTOR_ID,
+        "/tmp/linear",
+    );
+    let parsed = parse_canonical_markdown(markdown).expect("parse linear markdown");
+    let shadow = ShadowDocument::from_synced_body(
+        RemoteId::new("issue-1"),
+        "Body\n",
+        1,
+        vec![RemoteId::new("issue-1:body:0")],
+    )
+    .expect("linear shadow")
+    .with_frontmatter(shadow_frontmatter);
+
+    LocalSourceValidator
+        .validate_changed_frontmatter(SourceValidationContext {
+            state_root: None,
+            mount: &mount,
+            parent: None,
+            relative_path: std::path::Path::new("Engineering/ENG-1/page.md"),
+            parsed: &parsed,
+            shadow: Some(&shadow),
+        })
+        .expect("validate linear changed")
+        .issues
+}
+
+fn validate_linear_create(markdown: &str) -> Vec<ValidationIssue> {
+    let mount = MountConfig::new(
+        MountId::new("linear-main"),
+        LINEAR_CONNECTOR_ID,
+        "/tmp/linear",
+    );
+    let parsed = parse_canonical_markdown(markdown).expect("parse linear markdown");
+
+    LocalSourceValidator
+        .validate_create_frontmatter(SourceValidationContext {
+            state_root: None,
+            mount: &mount,
+            parent: None,
+            relative_path: std::path::Path::new("Engineering/ENG-2/page.md"),
+            parsed: &parsed,
+            shadow: None,
+        })
+        .expect("validate linear create")
+        .issues
+}
+
 #[test]
 fn supported_source_connectors_include_first_party_connectors() {
     assert_eq!(
         supported_source_connectors(),
-        vec!["notion", "google-docs", "gmail", "granola"]
+        vec!["notion", "google-docs", "gmail", "granola", "linear"]
+    );
+}
+
+#[test]
+fn resolving_implicit_linear_mount_uses_single_active_api_key_connection() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (_connection_id, secret_ref) =
+        save_gmail_connection(&mut store, "linear-default", LINEAR_CONNECTOR_ID, "api_key");
+    credentials
+        .put(&secret_ref, "lin_api_secret")
+        .expect("save credential");
+    let mount = MountConfig::new(
+        MountId::new("linear-main"),
+        LINEAR_CONNECTOR_ID,
+        "/tmp/locality/linear",
+    );
+
+    let source = resolve_source_for_mount(&store, &credentials, &mount).expect("resolve linear");
+
+    let ResolvedSource::Linear(connector) = source else {
+        panic!("expected linear source");
+    };
+    assert_eq!(connector.config().token, "lin_api_secret");
+}
+
+#[test]
+fn resolving_implicit_linear_mount_requires_exactly_one_active_api_key_connection() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let mount = MountConfig::new(
+        MountId::new("linear-main"),
+        LINEAR_CONNECTOR_ID,
+        "/tmp/locality/linear",
+    );
+
+    let missing =
+        resolve_source_for_mount(&store, &credentials, &mount).expect_err("missing connection");
+    assert_eq!(missing.code(), "missing_connection");
+    assert_eq!(
+        missing.suggested_command(),
+        Some("loc connect linear --api-key-stdin")
+    );
+
+    let (_first_id, first_secret_ref) =
+        save_gmail_connection(&mut store, "linear-a", LINEAR_CONNECTOR_ID, "api_key");
+    let (_second_id, second_secret_ref) =
+        save_gmail_connection(&mut store, "linear-b", LINEAR_CONNECTOR_ID, "api_key");
+    credentials
+        .put(&first_secret_ref, "lin_first")
+        .expect("save first credential");
+    credentials
+        .put(&second_secret_ref, "lin_second")
+        .expect("save second credential");
+
+    let multiple =
+        resolve_source_for_mount(&store, &credentials, &mount).expect_err("multiple connections");
+
+    assert_eq!(multiple.code(), "missing_connection");
+    assert!(
+        multiple
+            .message()
+            .contains("multiple Linear connections exist")
+    );
+    assert_eq!(
+        multiple.suggested_command(),
+        Some("loc connect linear --api-key-stdin")
+    );
+}
+
+#[test]
+fn resolving_linear_mount_uses_active_api_key_connection_credentials() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (connection_id, secret_ref) =
+        save_gmail_connection(&mut store, "linear-default", LINEAR_CONNECTOR_ID, "api_key");
+    credentials
+        .put(&secret_ref, "lin_api_secret")
+        .expect("save credential");
+    let mount = MountConfig::new(
+        MountId::new("linear-main"),
+        LINEAR_CONNECTOR_ID,
+        "/tmp/locality/linear",
+    )
+    .with_connection_id(connection_id);
+
+    let source = resolve_source_for_mount(&store, &credentials, &mount).expect("resolve linear");
+
+    let ResolvedSource::Linear(connector) = source else {
+        panic!("expected linear source");
+    };
+    assert_eq!(connector.config().token, "lin_api_secret");
+    assert_eq!(connector.kind().0, LINEAR_CONNECTOR_ID);
+    assert!(connector.capabilities().supports_batch_observation);
+}
+
+#[test]
+fn local_linear_validator_allows_supported_frontmatter_updates() {
+    let shadow_frontmatter = "loc:\n  id: issue-1\n  type: page\n  connector: linear\n  synced_at: \"2026-07-15T12:00:00Z\"\n  remote_edited_at: \"2026-07-15T12:00:00Z\"\ntitle: \"Improve sync\"\nidentifier: ENG-1\nurl: \"https://linear.app/acme/issue/ENG-1/improve-sync\"\nStatus: \"Todo <state-1>\"\nTeam: \"Engineering <team-1>\"\nProject: \"Launch <project-1>\"\nAssignee: \"Ada <user-1>\"\nPriority: High\nEstimate: 3\nLabels:\n  - \"Bug <label-1>\"\n";
+    let edited = "---\nloc:\n  id: issue-1\n  type: page\n  connector: linear\n  synced_at: \"2026-07-15T12:00:00Z\"\n  remote_edited_at: \"2026-07-15T12:00:00Z\"\ntitle: \"New title\"\nidentifier: ENG-1\nurl: \"https://linear.app/acme/issue/ENG-1/improve-sync\"\nStatus: \"Done <state-2>\"\nTeam: \"Engineering <team-1>\"\nProject: null\nAssignee: \"Grace <user-2>\"\nPriority: High\nEstimate: 3\nLabels:\n  - \"Bug <label-1>\"\n---\nBody\n";
+
+    let issues = validate_linear_changed(edited, shadow_frontmatter);
+
+    assert!(issues.is_empty());
+}
+
+#[test]
+fn local_linear_validator_blocks_read_only_frontmatter_changes() {
+    let shadow_frontmatter = "loc:\n  id: issue-1\n  type: page\n  connector: linear\n  synced_at: \"2026-07-15T12:00:00Z\"\n  remote_edited_at: \"2026-07-15T12:00:00Z\"\ntitle: \"Improve sync\"\nidentifier: ENG-1\nurl: \"https://linear.app/acme/issue/ENG-1/improve-sync\"\nStatus: \"Todo <state-1>\"\nTeam: \"Engineering <team-1>\"\nProject: \"Launch <project-1>\"\nAssignee: \"Ada <user-1>\"\nPriority: High\nEstimate: 3\nLabels:\n  - \"Bug <label-1>\"\n";
+    for (field, old, new) in [
+        ("identifier", "identifier: ENG-1", "identifier: ENG-2"),
+        (
+            "url",
+            "url: \"https://linear.app/acme/issue/ENG-1/improve-sync\"",
+            "url: \"https://linear.app/acme/issue/ENG-2/new\"",
+        ),
+        (
+            "Team",
+            "Team: \"Engineering <team-1>\"",
+            "Team: \"Platform <team-2>\"",
+        ),
+        ("Priority", "Priority: High", "Priority: Low"),
+        ("Estimate", "Estimate: 3", "Estimate: 5"),
+        (
+            "Labels",
+            "Labels:\n  - \"Bug <label-1>\"",
+            "Labels:\n  - \"Feature <label-2>\"",
+        ),
+    ] {
+        let edited_frontmatter = shadow_frontmatter.replace(old, new);
+        let markdown = format!("---\n{edited_frontmatter}---\nBody\n");
+
+        let issues = validate_linear_changed(&markdown, shadow_frontmatter);
+
+        assert_eq!(issues.len(), 1, "{field}");
+        assert_eq!(issues[0].code, "linear_read_only_frontmatter", "{field}");
+        assert!(
+            issues[0].message.contains(field),
+            "message should mention {field}: {}",
+            issues[0].message
+        );
+    }
+}
+
+#[test]
+fn local_linear_validator_blocks_creates() {
+    let issues = validate_linear_create(
+        "---\ntitle: \"New issue\"\nStatus: \"Todo <state-1>\"\n---\nBody\n",
+    );
+
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0].code, "linear_create_unsupported");
+    assert_eq!(
+        issues[0].suggested_fix.as_deref(),
+        Some("create the Linear issue remotely, then refresh the mount")
+    );
+}
+
+#[test]
+fn resolving_linear_mount_rejects_non_api_key_credentials() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (connection_id, secret_ref) =
+        save_gmail_connection(&mut store, "linear-oauth", LINEAR_CONNECTOR_ID, "oauth");
+    credentials
+        .put(&secret_ref, "oauth-token")
+        .expect("save credential");
+    let mount = MountConfig::new(
+        MountId::new("linear-main"),
+        LINEAR_CONNECTOR_ID,
+        "/tmp/locality/linear",
+    )
+    .with_connection_id(connection_id);
+
+    let error = resolve_source_for_mount(&store, &credentials, &mount)
+        .expect_err("reject non-api-key Linear connection");
+
+    assert_eq!(error.code(), "auth_required");
+    assert!(error.message().contains("API key"));
+    assert_eq!(
+        error.suggested_command(),
+        Some("loc connect linear --api-key-stdin")
     );
 }
 

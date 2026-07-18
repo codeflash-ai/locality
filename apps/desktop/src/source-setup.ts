@@ -1,7 +1,9 @@
 import { classifyMountSetupError } from "./onboarding-errors";
 
 export type SourceSetupState = "idle" | "connecting" | "creating" | "changing" | "success" | "error";
-export type SourceConnectorId = "notion" | "google-docs" | "gmail" | "granola";
+const SOURCE_CONNECTORS = ["notion", "google-docs", "gmail", "granola", "linear"] as const;
+export type SourceConnectorId = (typeof SOURCE_CONNECTORS)[number];
+export type ApiKeySourceConnectorId = Extract<SourceConnectorId, "granola" | "linear">;
 export type SourceMountRetryOutcome =
   | { kind: "retry" }
   | { kind: "success" | "error"; message: string };
@@ -23,7 +25,17 @@ type SourceSnapshotLike = {
   mounts?: SourceMountLike[] | null;
 };
 
-const SOURCE_CONNECTORS: SourceConnectorId[] = ["notion", "google-docs", "gmail", "granola"];
+export function sourceConnectorIds(): SourceConnectorId[] {
+  return [...SOURCE_CONNECTORS];
+}
+
+export function sourceRequiresApiKey(connector: SourceConnectorId): connector is ApiKeySourceConnectorId {
+  return connector === "granola" || connector === "linear";
+}
+
+export function sourceSkipsManualMountStep(connector: SourceConnectorId): boolean {
+  return connector !== "notion";
+}
 
 export function sourceMountRetryOutcome(
   report: { ok: boolean; message: string },

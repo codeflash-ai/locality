@@ -3,7 +3,7 @@
 //! This store is intentionally deterministic and cloneable. It is suitable for
 //! unit tests and for wiring CLI/daemon flows before the SQLite schema is built.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use locality_core::LocalityResult;
@@ -12,7 +12,14 @@ use locality_core::journal::{
 };
 use locality_core::model::{MountId, RemoteId};
 use locality_core::shadow::ShadowDocument;
+use serde_json::Value;
 
+use crate::discovery::{
+    DiscoveryCommit, DiscoveryPreflight, DiscoveryRepository, DiscoveryReservation,
+    DiscoveryTransactionId, DiscoveryTransactionRecord, DiscoveryTransactionStatus,
+    PreparedDiscoveryTransaction, prepared_matches_record, record_from_prepared,
+    require_transaction_status, reservation_changed, transaction_missing,
+};
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
@@ -24,7 +31,9 @@ use crate::repository::{
     AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, ConnectorStateRepository,
     EntityRepository, EntitySearchRepository, FreshnessStateRepository, HydrationJobRepository,
     JournalRepository, MetadataDiscoveryJobRepository, MountLiveModeRepository, MountRepository,
-    RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
+    RemoteObservationRepository, ShadowRepository, VirtualMoveRepository, VirtualMoveTransition,
+    VirtualMutationRepository, validate_virtual_move_transition, virtual_move_content_changed,
+    virtual_move_missing,
 };
 
 type EntityKey = (MountId, RemoteId);
@@ -37,6 +46,19 @@ type RemoteObservationKey = (MountId, RemoteId);
 type FreshnessStateKey = (MountId, RemoteId);
 type MetadataDiscoveryJobKey = (MountId, String);
 type ConnectorStateKey = (String, String, String);
+
+fn illegal_transition(
+    transaction_id: &DiscoveryTransactionId,
+    from: DiscoveryTransactionStatus,
+    to: DiscoveryTransactionStatus,
+) -> StoreError {
+    StoreError::InvalidState(format!(
+        "discovery transaction `{}` cannot transition from `{}` to `{}`",
+        transaction_id.0,
+        from.as_str(),
+        to.as_str()
+    ))
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryStateStore {
@@ -55,6 +77,7 @@ pub struct InMemoryStateStore {
     freshness_states: BTreeMap<FreshnessStateKey, FreshnessStateRecord>,
     metadata_discovery_jobs: BTreeMap<MetadataDiscoveryJobKey, MetadataDiscoveryJobRecord>,
     journals: BTreeMap<String, JournalEntry>,
+    discovery_transactions: BTreeMap<DiscoveryTransactionId, DiscoveryTransactionRecord>,
 }
 
 impl InMemoryStateStore {
@@ -253,6 +276,466 @@ impl ConnectorStateRepository for InMemoryStateStore {
     }
 }
 
+impl DiscoveryRepository for InMemoryStateStore {
+    fn capture_discovery_reservation(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<DiscoveryReservation> {
+        let mount = self
+            .mounts
+            .get(mount_id)
+            .cloned()
+            .ok_or_else(|| StoreError::MountMissing(mount_id.clone()))?;
+        let checkpoint = self
+            .connector_states
+            .get(&(
+                mount.connector.clone(),
+                "mount".to_string(),
+                mount_id.0.clone(),
+            ))
+            .cloned();
+        Ok(DiscoveryReservation {
+            mount,
+            mount_live_mode: self.mount_live_modes.get(mount_id).cloned(),
+            checkpoint,
+            entities: self
+                .entities
+                .values()
+                .filter(|record| record.mount_id == *mount_id)
+                .cloned()
+                .collect(),
+            shadows: self
+                .shadows
+                .values()
+                .filter(|record| record.mount_id == *mount_id)
+                .cloned()
+                .collect(),
+            hydration_jobs: self
+                .hydration_jobs
+                .values()
+                .filter(|record| record.mount_id == *mount_id)
+                .cloned()
+                .collect(),
+            virtual_mutations: self
+                .virtual_mutations
+                .values()
+                .filter(|record| record.mount_id == *mount_id)
+                .cloned()
+                .collect(),
+            auto_save_enrollments: self
+                .auto_save_enrollments
+                .values()
+                .filter(|record| record.mount_id == *mount_id)
+                .cloned()
+                .collect(),
+            remote_observations: self
+                .remote_observations
+                .values()
+                .filter(|record| record.mount_id == *mount_id)
+                .cloned()
+                .collect(),
+            freshness_states: self
+                .freshness_states
+                .values()
+                .filter(|record| record.mount_id == *mount_id)
+                .cloned()
+                .collect(),
+            metadata_discovery_jobs: self
+                .metadata_discovery_jobs
+                .values()
+                .filter(|record| record.mount_id == *mount_id)
+                .cloned()
+                .collect(),
+            unsettled_journals: self
+                .journals
+                .values()
+                .filter(|record| record.mount_id == *mount_id && record.status.is_unsettled())
+                .cloned()
+                .collect(),
+        })
+    }
+
+    fn reserve_discovery_transaction(
+        &mut self,
+        prepared: PreparedDiscoveryTransaction,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        let transaction_id = prepared.commit.transaction_id.clone();
+        if let Some(existing) = self.discovery_transactions.get(&transaction_id) {
+            return if prepared_matches_record(&prepared, existing) {
+                Ok(existing.clone())
+            } else {
+                Err(StoreError::InvalidState(format!(
+                    "discovery transaction `{}` reservation retry does not match its immutable payload",
+                    transaction_id.0
+                )))
+            };
+        }
+        let mount_id = prepared.commit.commit.mount_id.clone();
+        if let Some(active) = self
+            .discovery_transactions
+            .values()
+            .find(|record| record.mount_id == mount_id && record.active)
+        {
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` already has active discovery transaction `{}`",
+                mount_id.0, active.transaction_id.0
+            )));
+        }
+        let current = self.capture_discovery_reservation(&mount_id)?;
+        let record = record_from_prepared(prepared, &current)?;
+        self.discovery_transactions
+            .insert(transaction_id, record.clone());
+        Ok(record)
+    }
+
+    fn get_discovery_transaction(
+        &self,
+        transaction_id: &DiscoveryTransactionId,
+    ) -> StoreResult<Option<DiscoveryTransactionRecord>> {
+        Ok(self.discovery_transactions.get(transaction_id).cloned())
+    }
+
+    fn list_active_discovery_transactions(&self) -> StoreResult<Vec<DiscoveryTransactionRecord>> {
+        let mut records = self
+            .discovery_transactions
+            .values()
+            .filter(|record| record.active)
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            (&left.mount_id, &left.transaction_id).cmp(&(&right.mount_id, &right.transaction_id))
+        });
+        Ok(records)
+    }
+
+    fn mark_discovery_transaction_applying(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        updated_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        self.transition_discovery_transaction(
+            transaction_id,
+            DiscoveryTransactionStatus::Reserved,
+            DiscoveryTransactionStatus::Applying,
+            updated_at,
+        )
+    }
+
+    fn record_discovery_transaction_effects(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        expected_status: DiscoveryTransactionStatus,
+        effects: Value,
+        updated_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        let record = self
+            .discovery_transactions
+            .get_mut(transaction_id)
+            .ok_or_else(|| transaction_missing(transaction_id))?;
+        require_transaction_status(record, expected_status)?;
+        record.effects = crate::discovery::canonicalize_json_value(effects);
+        record.updated_at = updated_at.to_string();
+        Ok(record.clone())
+    }
+
+    fn mark_discovery_transaction_projected(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        expected_status: DiscoveryTransactionStatus,
+        updated_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        if !matches!(
+            expected_status,
+            DiscoveryTransactionStatus::Applying | DiscoveryTransactionStatus::RepairPending
+        ) {
+            return Err(illegal_transition(
+                transaction_id,
+                expected_status,
+                DiscoveryTransactionStatus::Projected,
+            ));
+        }
+        self.transition_discovery_transaction(
+            transaction_id,
+            expected_status,
+            DiscoveryTransactionStatus::Projected,
+            updated_at,
+        )
+    }
+
+    fn commit_discovery_transaction(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        committed_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        let record = self
+            .discovery_transactions
+            .get(transaction_id)
+            .cloned()
+            .ok_or_else(|| transaction_missing(transaction_id))?;
+        require_transaction_status(&record, DiscoveryTransactionStatus::Projected)?;
+        if record.commit.transaction_id != *transaction_id {
+            return Err(StoreError::InvalidState(format!(
+                "discovery transaction `{}` stored commit identifier does not match its row",
+                transaction_id.0
+            )));
+        }
+        let current = self.capture_discovery_reservation(&record.mount_id)?;
+        if let Some(category) = record.reservation.changed_category(&current) {
+            return Err(reservation_changed(transaction_id, category));
+        }
+
+        let mut next = self.clone();
+        next.apply_discovery(record.commit.commit)?;
+        let committed = next
+            .discovery_transactions
+            .get_mut(transaction_id)
+            .expect("cloned discovery transaction exists");
+        committed.status = DiscoveryTransactionStatus::Committed;
+        committed.active = true;
+        committed.updated_at = committed_at.to_string();
+        committed.committed_at = Some(committed_at.to_string());
+        committed.error = None;
+        let committed = committed.clone();
+        *self = next;
+        Ok(committed)
+    }
+
+    fn mark_discovery_transaction_repair_pending(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        expected_status: DiscoveryTransactionStatus,
+        error: Value,
+        updated_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        if !matches!(
+            expected_status,
+            DiscoveryTransactionStatus::Applying | DiscoveryTransactionStatus::Projected
+        ) {
+            return Err(illegal_transition(
+                transaction_id,
+                expected_status,
+                DiscoveryTransactionStatus::RepairPending,
+            ));
+        }
+        let record = self
+            .discovery_transactions
+            .get_mut(transaction_id)
+            .ok_or_else(|| transaction_missing(transaction_id))?;
+        require_transaction_status(record, expected_status)?;
+        record.status = DiscoveryTransactionStatus::RepairPending;
+        record.error = Some(crate::discovery::canonicalize_json_value(error));
+        record.updated_at = updated_at.to_string();
+        Ok(record.clone())
+    }
+
+    fn mark_discovery_transaction_aborted(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        expected_status: DiscoveryTransactionStatus,
+        updated_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        if !matches!(
+            expected_status,
+            DiscoveryTransactionStatus::Reserved
+                | DiscoveryTransactionStatus::Applying
+                | DiscoveryTransactionStatus::Projected
+                | DiscoveryTransactionStatus::RepairPending
+        ) {
+            return Err(illegal_transition(
+                transaction_id,
+                expected_status,
+                DiscoveryTransactionStatus::Aborted,
+            ));
+        }
+        self.transition_discovery_transaction(
+            transaction_id,
+            expected_status,
+            DiscoveryTransactionStatus::Aborted,
+            updated_at,
+        )
+    }
+
+    fn mark_discovery_transaction_finalized(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        finalized_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        let mut record = self.transition_discovery_transaction(
+            transaction_id,
+            DiscoveryTransactionStatus::Committed,
+            DiscoveryTransactionStatus::Finalized,
+            finalized_at,
+        )?;
+        record.finalized_at = Some(finalized_at.to_string());
+        self.discovery_transactions
+            .insert(transaction_id.clone(), record.clone());
+        Ok(record)
+    }
+}
+
+impl InMemoryStateStore {
+    fn transition_discovery_transaction(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        expected_status: DiscoveryTransactionStatus,
+        next_status: DiscoveryTransactionStatus,
+        updated_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        let record = self
+            .discovery_transactions
+            .get_mut(transaction_id)
+            .ok_or_else(|| transaction_missing(transaction_id))?;
+        require_transaction_status(record, expected_status)?;
+        record.status = next_status;
+        record.active = next_status.is_active();
+        record.updated_at = updated_at.to_string();
+        Ok(record.clone())
+    }
+
+    fn apply_discovery(&mut self, commit: DiscoveryCommit) -> StoreResult<()> {
+        let mount_id = &commit.mount_id;
+        let existing_mount_entities = self
+            .entities
+            .values()
+            .filter(|entity| entity.mount_id == *mount_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mount_enrollments = self
+            .auto_save_enrollments
+            .values()
+            .filter(|enrollment| enrollment.mount_id == *mount_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mount_mutations = self
+            .virtual_mutations
+            .values()
+            .filter(|mutation| mutation.mount_id == *mount_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let connector = &self
+            .mounts
+            .get(mount_id)
+            .ok_or_else(|| StoreError::MountMissing(mount_id.clone()))?
+            .connector;
+        let DiscoveryPreflight {
+            final_entities: final_mount_entities,
+            entity_deletes,
+            deleted_paths,
+            path_moves,
+            auto_save_rehomes,
+        } = commit.preflight_details(
+            connector,
+            &existing_mount_entities,
+            &mount_enrollments,
+            &mount_mutations,
+        )?;
+        let deleted_paths = deleted_paths.into_values().collect::<BTreeSet<_>>();
+
+        let mut final_entities = self.entities.clone();
+        final_entities.retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
+        for entity in final_mount_entities.values() {
+            final_entities.insert(
+                Self::entity_key(&entity.mount_id, &entity.remote_id),
+                entity.clone(),
+            );
+        }
+        let final_paths = final_entities
+            .values()
+            .map(|entity| {
+                (
+                    Self::path_key(&entity.mount_id, &entity.path),
+                    entity.remote_id.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        for remote_id in &commit.entity_deletes {
+            let key = Self::entity_key(mount_id, remote_id);
+            self.shadows.remove(&Self::shadow_key(mount_id, remote_id));
+            self.hydration_jobs
+                .remove(&Self::hydration_job_key(mount_id, remote_id));
+            self.remote_observations
+                .remove(&Self::remote_observation_key(mount_id, remote_id));
+            self.freshness_states
+                .remove(&Self::freshness_state_key(mount_id, remote_id));
+            self.entities.remove(&key);
+        }
+        self.auto_save_enrollments
+            .retain(|(entry_mount_id, path), enrollment| {
+                entry_mount_id != mount_id
+                    || (!enrollment
+                        .remote_id
+                        .as_ref()
+                        .is_some_and(|remote_id| entity_deletes.contains(remote_id))
+                        && !deleted_paths.contains(path))
+            });
+        for identifier in &commit.metadata_discovery_deletes {
+            self.metadata_discovery_jobs
+                .remove(&Self::metadata_discovery_job_key(mount_id, identifier));
+        }
+        for local_id in &commit.virtual_mutation_deletes {
+            self.virtual_mutations
+                .remove(&Self::virtual_mutation_key(mount_id, local_id));
+        }
+
+        for (remote_id, _, new_path) in &path_moves {
+            if let Some(job) = self
+                .hydration_jobs
+                .get_mut(&Self::hydration_job_key(mount_id, remote_id))
+            {
+                job.path = new_path.clone();
+            }
+        }
+        for rehome in &auto_save_rehomes {
+            self.auto_save_enrollments
+                .remove(&Self::auto_save_key(mount_id, &rehome.old_path));
+        }
+        for rehome in auto_save_rehomes {
+            let enrollment = rehome.enrollment;
+            let key = Self::auto_save_key(mount_id, &enrollment.path);
+            if self.auto_save_enrollments.contains_key(&key) {
+                return Err(StoreError::InvalidState(format!(
+                    "cannot rehome auto-save enrollment to occupied path `{}`",
+                    enrollment.path.display()
+                )));
+            }
+            self.auto_save_enrollments.insert(key, enrollment);
+        }
+        for enrollment in commit.auto_save_upserts {
+            self.auto_save_enrollments.insert(
+                Self::auto_save_key(&enrollment.mount_id, &enrollment.path),
+                enrollment,
+            );
+        }
+
+        self.entities = final_entities;
+        self.entities_by_path = final_paths;
+        for observation in commit.observation_upserts {
+            self.remote_observations.insert(
+                Self::remote_observation_key(&observation.mount_id, &observation.remote_id),
+                observation,
+            );
+        }
+        for freshness in commit.freshness_upserts {
+            self.freshness_states.insert(
+                Self::freshness_state_key(&freshness.mount_id, &freshness.remote_id),
+                freshness,
+            );
+        }
+
+        let checkpoint = commit.checkpoint;
+        self.connector_states.insert(
+            (
+                checkpoint.connector.clone(),
+                checkpoint.scope_kind.clone(),
+                checkpoint.scope_id.clone(),
+            ),
+            checkpoint,
+        );
+        Ok(())
+    }
+}
+
 impl EntityRepository for InMemoryStateStore {
     fn save_entity(&mut self, entity: EntityRecord) -> StoreResult<()> {
         let entity_key = Self::entity_key(&entity.mount_id, &entity.remote_id);
@@ -426,6 +909,51 @@ impl VirtualMutationRepository for InMemoryStateStore {
         self.virtual_mutations
             .remove(&Self::virtual_mutation_key(mount_id, local_id));
         Ok(())
+    }
+}
+
+impl VirtualMoveRepository for InMemoryStateStore {
+    fn begin_virtual_move(&mut self, transition: VirtualMoveTransition) -> StoreResult<()> {
+        validate_virtual_move_transition(&transition)?;
+        let mut staged = self.clone();
+        let mount_id = transition.mutation.mount_id.clone();
+        for local_id in &transition.superseded_local_ids {
+            staged.delete_virtual_mutation(&mount_id, local_id)?;
+        }
+        if let Some(entity) = transition.entity {
+            staged.save_entity(entity)?;
+        }
+        if let Some(freshness) = transition.freshness {
+            staged.save_freshness_state(freshness)?;
+        }
+        staged.save_virtual_mutation(transition.mutation)?;
+        *self = staged;
+        Ok(())
+    }
+
+    fn finalize_virtual_move_content(
+        &mut self,
+        mount_id: &MountId,
+        local_id: &str,
+        expected_content_path: Option<&Path>,
+        content_path: PathBuf,
+        updated_at: &str,
+    ) -> StoreResult<VirtualMutationRecord> {
+        let mut mutation = self
+            .get_virtual_mutation(mount_id, local_id)?
+            .ok_or_else(|| virtual_move_missing(mount_id, local_id))?;
+        if mutation.content_path.as_deref() != expected_content_path {
+            return Err(virtual_move_content_changed(
+                mount_id,
+                local_id,
+                expected_content_path,
+                mutation.content_path.as_deref(),
+            ));
+        }
+        mutation.content_path = Some(content_path);
+        mutation.updated_at = updated_at.to_string();
+        self.save_virtual_mutation(mutation.clone())?;
+        Ok(mutation)
     }
 }
 

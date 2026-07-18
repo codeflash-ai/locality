@@ -10,13 +10,13 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::canonical::ParsedCanonicalDocument;
-use crate::diff::{BlockDiffEngine, DiffEngine};
+use crate::diff::{BlockDiffEngine, DiffEngine, plan_whole_entity_diff};
 use crate::journal::{
     JournalApplyEffect, JournalEntry, JournalMetadata, JournalPreimage, JournalStatus,
     JournalStore, PushId, PushOperationId,
 };
 use crate::model::{MountId, RemoteId};
-use crate::planner::{GuardrailDecision, GuardrailPolicy, PushPlan};
+use crate::planner::{GuardrailDecision, GuardrailPolicy, PushOperation, PushPlan};
 use crate::readable_diff::ReadableDiffOutput;
 use crate::shadow::ShadowDocument;
 use crate::validation::{
@@ -72,6 +72,8 @@ pub struct PushPipelineRequest<'a> {
     pub approval: PushApproval,
     /// Whether this target belongs to a read-only mount.
     pub read_only: bool,
+    /// How body edits are represented in the connector-neutral plan.
+    pub body_diff_mode: BodyDiffMode,
 }
 
 impl<'a> PushPipelineRequest<'a> {
@@ -88,6 +90,7 @@ impl<'a> PushPipelineRequest<'a> {
             total_mount_entities: None,
             approval: PushApproval::default(),
             read_only: false,
+            body_diff_mode: BodyDiffMode::Block,
         }
     }
 
@@ -110,6 +113,19 @@ impl<'a> PushPipelineRequest<'a> {
         self.read_only = read_only;
         self
     }
+
+    pub fn with_body_diff_mode(mut self, mode: BodyDiffMode) -> Self {
+        self.body_diff_mode = mode;
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BodyDiffMode {
+    #[default]
+    Block,
+    WholeEntity,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,11 +183,26 @@ pub fn evaluate_guardrails(
 ) -> GuardrailDecision {
     let mut reasons = Vec::new();
     let archive_count = plan.summary.destructive_archive_count();
+    let entity_body_erase_count = plan
+        .operations
+        .iter()
+        .filter(|operation| {
+            matches!(operation, PushOperation::UpdateEntityBody { body, .. } if body.trim().is_empty())
+        })
+        .count();
 
     if archive_count > policy.max_archives_without_confirm {
         reasons.push(format!(
             "{archive_count} blocks or pages would be archived or replaced"
         ));
+    }
+    if entity_body_erase_count > 0 {
+        let noun = if entity_body_erase_count == 1 {
+            "entity body"
+        } else {
+            "entity bodies"
+        };
+        reasons.push(format!("{entity_body_erase_count} {noun} would be cleared"));
     }
 
     if let Some(total_mount_entities) = total_mount_entities
@@ -210,10 +241,12 @@ pub fn plan_push_pipeline(request: PushPipelineRequest<'_>) -> PushPipelineResul
         request.edited,
         request.target_path.clone(),
     ));
-    validation.extend(validate_directive_syntax(
-        request.edited,
-        request.target_path.clone(),
-    ));
+    if request.body_diff_mode == BodyDiffMode::Block {
+        validation.extend(validate_directive_syntax(
+            request.edited,
+            request.target_path.clone(),
+        ));
+    }
     completed_stages.push(PushStage::ParseAndValidate);
 
     if !validation.is_clean() {
@@ -226,9 +259,15 @@ pub fn plan_push_pipeline(request: PushPipelineRequest<'_>) -> PushPipelineResul
         };
     }
 
-    let diff_engine =
-        BlockDiffEngine::new().with_edited_body_start_line(request.edited.body_start_line);
-    let plan = match diff_engine.plan_push(request.shadow, &request.edited.document) {
+    let plan_result = match request.body_diff_mode {
+        BodyDiffMode::Block => BlockDiffEngine::new()
+            .with_edited_body_start_line(request.edited.body_start_line)
+            .plan_push(request.shadow, &request.edited.document),
+        BodyDiffMode::WholeEntity => {
+            plan_whole_entity_diff(request.shadow, &request.edited.document)
+        }
+    };
+    let plan = match plan_result {
         Ok(plan) => plan,
         Err(crate::LocalityError::Validation(issues)) => {
             validation

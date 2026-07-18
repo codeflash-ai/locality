@@ -9,7 +9,7 @@ use locality_core::journal::{JournalApplyEffect, PushId, PushOperationId};
 use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind, PushPlan};
 use locality_core::push::RemotePrecondition;
-use locality_core::undo::{UndoOperation, UndoPlan, UndoPlanStatus};
+use locality_core::undo::{EntityUndoState, UndoOperation, UndoPlan, UndoPlanStatus};
 use locality_core::{LocalityError, LocalityResult};
 use locality_notion::client::NotionApi;
 use locality_notion::dto::{
@@ -2303,6 +2303,7 @@ fn apply_undo_restores_archived_block_by_appending_replacement() {
         .expect("apply undo");
 
     assert_eq!(result.changed_remote_ids, vec![RemoteId::new("page-1")]);
+    assert!(result.observations.is_empty());
     let writes = api.writes.lock().expect("writes");
     assert_eq!(
         *writes,
@@ -2429,6 +2430,292 @@ fn apply_undo_restores_archived_directive_by_appending_replacement() {
                 },
             }),
         )]
+    );
+}
+
+#[test]
+fn apply_undo_lowers_generic_entity_reverse_operations() {
+    let api = Arc::new(RecordingNotionApi::with_page_properties(
+        "2026-06-10T00:00:00.000Z",
+        BTreeMap::from([
+            ("Name".to_string(), page_property("title")),
+            ("Status".to_string(), page_property("select")),
+        ]),
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let push_id = PushId("push-1".to_string());
+    let mount_id = MountId::new("notion-main");
+    let undo_plan = UndoPlan {
+        target_push_id: push_id.clone(),
+        mount_id: mount_id.clone(),
+        affected_entities: vec![RemoteId::new("page-1")],
+        operations: vec![
+            UndoOperation::RestoreProperties {
+                entity_id: RemoteId::new("page-1"),
+                expected_current: BTreeMap::from([(
+                    "Status".to_string(),
+                    PropertyValue::String("Done".to_string()),
+                )]),
+                previous: BTreeMap::from([(
+                    "Status".to_string(),
+                    PropertyValue::String("Todo".to_string()),
+                )]),
+            },
+            UndoOperation::RestoreEntityLocation {
+                entity_id: RemoteId::new("page-1"),
+                expected_parent_id: RemoteId::new("new-parent"),
+                expected_title: "New title".to_string(),
+                previous_parent_id: RemoteId::new("old-parent"),
+                previous_title: "Old title".to_string(),
+            },
+            UndoOperation::RestoreArchivedEntity {
+                entity_id: RemoteId::new("page-1"),
+                expected: archived_entity_state("new-parent", "New title"),
+            },
+            UndoOperation::ArchiveCreatedEntity {
+                entity_id: RemoteId::new("created-page-1"),
+                expected: Some(EntityUndoState {
+                    parent_id: RemoteId::new("page-1"),
+                    title: "Created".to_string(),
+                    properties: BTreeMap::new(),
+                    body: String::new(),
+                    archived: false,
+                }),
+            },
+        ],
+        unsupported: vec![],
+        status: UndoPlanStatus::Complete,
+    };
+
+    let result = connector
+        .apply_undo(ApplyUndoRequest {
+            target_push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &undo_plan,
+        })
+        .expect("apply undo");
+
+    assert_eq!(
+        result.changed_remote_ids,
+        vec![RemoteId::new("page-1"), RemoteId::new("created-page-1")]
+    );
+    assert_eq!(
+        result
+            .observations
+            .iter()
+            .map(|observation| (&observation.remote_id, observation.deleted))
+            .collect::<Vec<_>>(),
+        vec![
+            (&RemoteId::new("page-1"), false),
+            (&RemoteId::new("created-page-1"), true),
+        ]
+    );
+
+    assert_eq!(
+        *api.writes.lock().expect("writes"),
+        vec![
+            WriteCall::UpdatePage {
+                page_id: "page-1".to_string(),
+                body: json!({
+                    "properties": {
+                        "Status": {
+                            "select": { "name": "Todo" },
+                        },
+                    },
+                }),
+            },
+            WriteCall::MovePage {
+                page_id: "page-1".to_string(),
+                parent: json!({
+                    "type": "page_id",
+                    "page_id": "old-parent",
+                }),
+            },
+            WriteCall::UpdatePage {
+                page_id: "page-1".to_string(),
+                body: json!({
+                    "properties": {
+                        "Name": {
+                            "title": rich_text_json("Old title"),
+                        },
+                    },
+                }),
+            },
+            WriteCall::UpdatePage {
+                page_id: "page-1".to_string(),
+                body: json!({ "in_trash": false }),
+            },
+            WriteCall::Delete {
+                block_id: "created-page-1".to_string(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn apply_undo_restores_moved_database_row_to_data_source_parent() {
+    let api = Arc::new(RecordingNotionApi::with_page_properties(
+        "2026-06-10T00:00:00.000Z",
+        BTreeMap::from([("Name".to_string(), page_property("title"))]),
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let push_id = PushId("push-1".to_string());
+    let mount_id = MountId::new("notion-main");
+    let undo_plan = UndoPlan {
+        target_push_id: push_id.clone(),
+        mount_id: mount_id.clone(),
+        affected_entities: vec![RemoteId::new("page-1")],
+        operations: vec![UndoOperation::RestoreEntityLocation {
+            entity_id: RemoteId::new("page-1"),
+            expected_parent_id: RemoteId::new("new-parent"),
+            expected_title: "New title".to_string(),
+            previous_parent_id: RemoteId::new("database-1"),
+            previous_title: "Old row title".to_string(),
+        }],
+        unsupported: vec![],
+        status: UndoPlanStatus::Complete,
+    };
+
+    connector
+        .apply_undo(ApplyUndoRequest {
+            target_push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &undo_plan,
+        })
+        .expect("apply database row move undo");
+
+    assert_eq!(
+        *api.writes.lock().expect("writes"),
+        vec![
+            WriteCall::MovePage {
+                page_id: "page-1".to_string(),
+                parent: json!({
+                    "type": "data_source_id",
+                    "data_source_id": "source-1",
+                }),
+            },
+            WriteCall::UpdatePage {
+                page_id: "page-1".to_string(),
+                body: json!({
+                    "properties": {
+                        "Name": {
+                            "title": rich_text_json("Old row title"),
+                        },
+                    },
+                }),
+            },
+        ]
+    );
+}
+
+#[test]
+fn apply_undo_rejects_whole_entity_body_restore_for_notion() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let push_id = PushId("push-1".to_string());
+    let mount_id = MountId::new("notion-main");
+    let undo_plan = UndoPlan {
+        target_push_id: push_id.clone(),
+        mount_id: mount_id.clone(),
+        affected_entities: vec![RemoteId::new("page-1")],
+        operations: vec![UndoOperation::RestoreEntityBody {
+            entity_id: RemoteId::new("page-1"),
+            expected_current: "New body".to_string(),
+            previous: "Old body".to_string(),
+        }],
+        unsupported: vec![],
+        status: UndoPlanStatus::Complete,
+    };
+
+    let error = connector
+        .apply_undo(ApplyUndoRequest {
+            target_push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &undo_plan,
+        })
+        .expect_err("Notion has no whole-entity body API");
+
+    assert!(matches!(error, LocalityError::Unsupported(_)));
+    assert!(api.writes.lock().expect("writes").is_empty());
+}
+
+#[test]
+fn apply_undo_prevalidates_entire_plan_before_first_write() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let push_id = PushId("push-1".to_string());
+    let mount_id = MountId::new("notion-main");
+    let undo_plan = UndoPlan {
+        target_push_id: push_id.clone(),
+        mount_id: mount_id.clone(),
+        affected_entities: vec![RemoteId::new("page-1")],
+        operations: vec![
+            UndoOperation::RestoreArchivedEntity {
+                entity_id: RemoteId::new("page-1"),
+                expected: archived_entity_state("page-1", "Archived"),
+            },
+            UndoOperation::RestoreEntityBody {
+                entity_id: RemoteId::new("page-1"),
+                expected_current: "New body".to_string(),
+                previous: "Old body".to_string(),
+            },
+        ],
+        unsupported: vec![],
+        status: UndoPlanStatus::Complete,
+    };
+
+    let error = connector
+        .apply_undo(ApplyUndoRequest {
+            target_push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &undo_plan,
+        })
+        .expect_err("later unsupported operation must reject the whole plan");
+
+    assert!(matches!(error, LocalityError::Unsupported(_)));
+    assert!(api.writes.lock().expect("writes").is_empty());
+}
+
+#[test]
+fn apply_undo_observes_database_row_parent_as_database_id() {
+    let mut recording = RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false);
+    recording.page.parent = Some(ParentDto {
+        kind: "data_source_id".to_string(),
+        data_source_id: Some("source-1".to_string()),
+        ..Default::default()
+    });
+    recording.data_source.parent = Some(ParentDto {
+        kind: "database_id".to_string(),
+        database_id: Some("database-1".to_string()),
+        ..Default::default()
+    });
+    let api = Arc::new(recording);
+    let connector = NotionConnector::with_api(NotionConfig::default(), api);
+    let push_id = PushId("push-row-archive".to_string());
+    let mount_id = MountId::new("notion-main");
+    let plan = UndoPlan {
+        target_push_id: push_id.clone(),
+        mount_id: mount_id.clone(),
+        affected_entities: vec![RemoteId::new("page-1")],
+        operations: vec![UndoOperation::RestoreArchivedEntity {
+            entity_id: RemoteId::new("page-1"),
+            expected: archived_entity_state("database-1", "Archived row"),
+        }],
+        unsupported: vec![],
+        status: UndoPlanStatus::Complete,
+    };
+
+    let result = connector
+        .apply_undo(ApplyUndoRequest {
+            target_push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+        })
+        .expect("restore database row");
+
+    assert_eq!(
+        result.observations[0].parent_remote_id,
+        Some(RemoteId::new("database-1"))
     );
 }
 
@@ -4623,13 +4910,19 @@ impl NotionApi for RecordingNotionApi {
         if page_id == self.page.id {
             Ok(self.page.clone())
         } else if page_id == "created-page-1" {
+            let deleted = self.writes.lock().expect("writes").iter().any(|write| {
+                matches!(
+                    write,
+                    WriteCall::Delete { block_id } if block_id == "created-page-1"
+                )
+            });
             Ok(PageDto {
                 id: "created-page-1".to_string(),
                 parent: None,
                 created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
                 last_edited_time: Some("2026-06-10T00:00:00.000Z".to_string()),
-                archived: false,
-                in_trash: false,
+                archived: deleted,
+                in_trash: deleted,
                 properties: BTreeMap::from([("Name".to_string(), page_property("title"))]),
             })
         } else {
@@ -4869,6 +5162,16 @@ fn data_source_property(kind: &str) -> DataSourcePropertyDto {
         id: format!("{kind}-id"),
         kind: kind.to_string(),
         ..Default::default()
+    }
+}
+
+fn archived_entity_state(parent_id: &str, title: &str) -> EntityUndoState {
+    EntityUndoState {
+        parent_id: RemoteId::new(parent_id),
+        title: title.to_string(),
+        properties: BTreeMap::new(),
+        body: String::new(),
+        archived: true,
     }
 }
 

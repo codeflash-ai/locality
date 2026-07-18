@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   connectedSourcesReadyToMount,
+  sourceConnectorIds,
+  sourceRequiresApiKey,
+  sourceSkipsManualMountStep,
+  sourceMountRetryOutcome,
   sourceSetupIsActiveConnector,
   sourceSetupIsBusy,
-  sourceMountRetryOutcome,
   sourceSetupProgressLabel,
 } from "./source-setup";
 
@@ -20,6 +23,14 @@ describe("source setup progress", () => {
     expect(sourceSetupProgressLabel("creating", false)).toBe("Mounting");
     expect(sourceSetupProgressLabel("connecting", true)).toBe("Finishing setup");
     expect(sourceSetupProgressLabel("changing", true)).toBe("Updating access");
+  });
+
+  it("includes Linear in the desktop source catalog as an API-key connector", () => {
+    expect(sourceConnectorIds()).toContain("linear");
+    expect(sourceRequiresApiKey("linear")).toBe(true);
+    expect(sourceRequiresApiKey("granola")).toBe(true);
+    expect(sourceRequiresApiKey("gmail")).toBe(false);
+    expect(sourceSkipsManualMountStep("linear")).toBe(true);
   });
 
   it("keeps connected but unmounted sources visible when another source is mounted", () => {

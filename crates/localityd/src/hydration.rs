@@ -36,11 +36,60 @@ pub trait HydrationEngine {
 pub trait HydrationSource {
     fn fetch_render(&self, request: &HydrationRequest) -> LocalityResult<HydratedEntity>;
 
+    fn fetch_render_with_repository(
+        &self,
+        request: &HydrationRequest,
+        _repository: &dyn HydrationRepository,
+    ) -> LocalityResult<HydratedEntity> {
+        self.fetch_render(request)
+    }
+
     fn fetch_database_schema_yaml(
         &self,
         _database_id: &RemoteId,
     ) -> LocalityResult<Option<String>> {
         Ok(None)
+    }
+}
+
+pub trait HydrationRepository {
+    fn entity_record(
+        &self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> LocalityResult<Option<EntityRecord>>;
+
+    fn entity_record_by_path(
+        &self,
+        mount_id: &MountId,
+        path: &Path,
+    ) -> LocalityResult<Option<EntityRecord>>;
+
+    fn entity_records(&self, mount_id: &MountId) -> LocalityResult<Vec<EntityRecord>>;
+}
+
+impl<T> HydrationRepository for T
+where
+    T: EntityRepository,
+{
+    fn entity_record(
+        &self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> LocalityResult<Option<EntityRecord>> {
+        EntityRepository::get_entity(self, mount_id, remote_id).map_err(LocalityError::from)
+    }
+
+    fn entity_record_by_path(
+        &self,
+        mount_id: &MountId,
+        path: &Path,
+    ) -> LocalityResult<Option<EntityRecord>> {
+        EntityRepository::find_entity_by_path(self, mount_id, path).map_err(LocalityError::from)
+    }
+
+    fn entity_records(&self, mount_id: &MountId) -> LocalityResult<Vec<EntityRecord>> {
+        EntityRepository::list_entities(self, mount_id).map_err(LocalityError::from)
     }
 }
 
@@ -147,7 +196,10 @@ where
 
         let mut render_request = request.clone();
         render_request.path = entity.path.clone();
-        let rendered = match self.source.fetch_render(&render_request) {
+        let rendered = match self
+            .source
+            .fetch_render_with_repository(&render_request, &*self.store)
+        {
             Ok(rendered) => rendered,
             Err(error) if is_remote_not_found(&error) => {
                 return self.reconcile_remote_not_found(&mount, entity, &path, can_replace);

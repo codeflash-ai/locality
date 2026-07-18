@@ -21,14 +21,16 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use locality_connector::ConnectorExecutionPolicy;
 use locality_connector::{Connector, ObserveRequest};
 use locality_core::LocalityError;
-use locality_core::canonical::parse_canonical_markdown;
-use locality_core::diff::{BlockDiffEngine, DiffEngine};
+use locality_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
+use locality_core::diff::{BlockDiffEngine, DiffEngine, uuid_reference_ids_from_frontmatter};
 use locality_core::freshness::{
     ChangeHintKind, FreshnessOptimizationPolicy, FreshnessTier, RemoteObservation, SyncJob,
     SyncJobKind,
 };
 use locality_core::hydration::{HydrationPolicy, HydrationReason, HydrationRequest};
-use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
+use locality_core::model::{
+    CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
+};
 use locality_core::planner::PushOperation;
 use locality_core::pull::PullMode;
 use locality_core::shadow::{ShadowDocument, rendered_bodies_equivalent};
@@ -2733,6 +2735,9 @@ impl RuntimeState {
         container_identifier: &str,
         parent_depth: u32,
     ) {
+        if container_identifier.starts_with("batch:") {
+            return;
+        }
         let child_containers = match self
             .child_container_identifiers(mount_id, container_identifier)
         {
@@ -2895,7 +2900,7 @@ impl RuntimeState {
             }
         };
 
-        for hint in remote_fast_forward_discovery_hints(previous_shadow, &current_shadow) {
+        for hint in remote_fast_forward_discovery_hints(&mount, previous_shadow, &current_shadow) {
             match hint {
                 RemoteDiscoveryHint::RefreshChildren {
                     container_identifier,
@@ -3405,16 +3410,28 @@ enum RemoteDiscoveryHint {
 }
 
 fn remote_fast_forward_discovery_hints(
+    mount: &MountConfig,
     previous_shadow: &ShadowDocument,
     current_shadow: &ShadowDocument,
 ) -> Vec<RemoteDiscoveryHint> {
-    if child_page_link_ids(previous_shadow) == child_page_link_ids(current_shadow) {
-        return Vec::new();
+    let mut hints = Vec::new();
+
+    if child_page_link_ids(previous_shadow) != child_page_link_ids(current_shadow) {
+        hints.push(RemoteDiscoveryHint::RefreshChildren {
+            container_identifier: format!("children:{}", current_shadow.entity_id.0),
+        });
     }
 
-    vec![RemoteDiscoveryHint::RefreshChildren {
-        container_identifier: format!("children:{}", current_shadow.entity_id.0),
-    }]
+    if mount.connector == "linear"
+        && frontmatter_uuid_reference_ids(previous_shadow)
+            != frontmatter_uuid_reference_ids(current_shadow)
+    {
+        hints.push(RemoteDiscoveryHint::RefreshChildren {
+            container_identifier: format!("batch:{}", mount.mount_id.0),
+        });
+    }
+
+    hints
 }
 
 fn child_page_link_ids(shadow: &ShadowDocument) -> BTreeSet<RemoteId> {
@@ -3424,6 +3441,13 @@ fn child_page_link_ids(shadow: &ShadowDocument) -> BTreeSet<RemoteId> {
         .filter(|block| block.native_kind.as_deref() == Some("child_page"))
         .map(|block| block.remote_id.clone())
         .collect()
+}
+
+fn frontmatter_uuid_reference_ids(shadow: &ShadowDocument) -> BTreeSet<String> {
+    let document = CanonicalDocument::new(shadow.frontmatter.clone(), shadow.rendered_body.clone());
+    parse_canonical_markdown(&render_canonical_markdown(&document))
+        .map(|parsed| uuid_reference_ids_from_frontmatter(&parsed.frontmatter.properties))
+        .unwrap_or_default()
 }
 
 fn load_persisted_hydrations(state_root: &Path) -> HydrationQueue {
@@ -5432,6 +5456,7 @@ fn locality_error_code(error: &LocalityError) -> &'static str {
         LocalityError::RemoteNotFound(_) => "remote_not_found",
         LocalityError::RateLimited { .. } => "rate_limited",
         LocalityError::InvalidState(_) => "invalid_state",
+        LocalityError::UpdateRequired { .. } => "update_required",
         LocalityError::Unsupported(_) => "unsupported",
         LocalityError::NotImplemented(_) => "not_implemented",
         LocalityError::Io(_) => "io_error",
@@ -5471,9 +5496,22 @@ mod tests {
         ActiveChildRefresh, ActiveRuntimeJob, ChildRefreshPriority, ChildRefreshQueue,
         ChildRefreshRequest, DaemonRequest, DefaultRuntimeJobRunner, JobCompletion,
         RemoteDiscoveryHint, RuntimeJobRunner, RuntimeState, child_refresh_retry_delay,
-        execute_file_event, execute_observe_entity_job, observable_remote_identifier,
-        remote_fast_forward_discovery_hints, repair_clean_remote_deleted_projections,
+        execute_file_event, execute_observe_entity_job, locality_error_code,
+        observable_remote_identifier, remote_fast_forward_discovery_hints,
+        repair_clean_remote_deleted_projections,
     };
+
+    #[test]
+    fn update_required_has_stable_runtime_error_code() {
+        assert_eq!(
+            locality_error_code(&LocalityError::UpdateRequired {
+                component: "linear:discovery".to_string(),
+                found: 2,
+                supported: 1,
+            }),
+            "update_required"
+        );
+    }
 
     #[test]
     fn child_refresh_queue_promotes_existing_requests() {
@@ -6355,11 +6393,12 @@ mod tests {
 
     #[test]
     fn remote_fast_forward_hints_refresh_parent_children_when_child_links_change() {
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/notion-main");
         let previous = shadow_with_child_page_links("page-1", ["child-a"]);
         let current = shadow_with_child_page_links("page-1", ["child-a", "child-b"]);
 
         assert_eq!(
-            remote_fast_forward_discovery_hints(&previous, &current),
+            remote_fast_forward_discovery_hints(&mount, &previous, &current),
             vec![RemoteDiscoveryHint::RefreshChildren {
                 container_identifier: "children:page-1".to_string(),
             }]
@@ -6368,10 +6407,11 @@ mod tests {
 
     #[test]
     fn remote_fast_forward_hints_ignore_unchanged_child_links() {
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/notion-main");
         let previous = shadow_with_child_page_links("page-1", ["child-a"]);
         let current = shadow_with_child_page_links("page-1", ["child-a"]);
 
-        assert!(remote_fast_forward_discovery_hints(&previous, &current).is_empty());
+        assert!(remote_fast_forward_discovery_hints(&mount, &previous, &current).is_empty());
     }
 
     #[test]

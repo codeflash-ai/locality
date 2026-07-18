@@ -2456,7 +2456,7 @@ fn database_row_scalar_property_shapes_block_before_journaled_apply() {
 }
 
 #[test]
-fn property_only_push_journals_and_undo_reports_blocked_property_preimage() {
+fn property_only_push_journals_complete_property_undo_payload() {
     let fixture = E2eFixture::new();
     let mut store = InMemoryStateStore::new();
     let original_frontmatter = "loc:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\nStatus: Todo\n";
@@ -2551,15 +2551,26 @@ fn property_only_push_journals_and_undo_reports_blocked_property_preimage() {
 
     let undo = run_undo(&mut store, &push_id).expect("undo property-only push");
     assert!(!undo.ok, "{undo:#?}");
-    assert_eq!(undo.action, "undo_plan_blocked", "{undo:#?}");
+    assert_eq!(undo.action, "reverse_apply_not_implemented", "{undo:#?}");
     assert_eq!(undo.status, "reconciled", "{undo:#?}");
     let undo_plan = undo.undo_plan.as_ref().expect("property-only undo plan");
-    assert_eq!(undo_plan.status, "blocked", "{undo:#?}");
-    assert!(undo_plan.operations.is_empty(), "{undo:#?}");
+    assert_eq!(undo_plan.status, "complete", "{undo:#?}");
     assert_eq!(
-        undo_plan.unsupported[0].code,
-        "update_properties_missing_property_preimage"
+        serde_json::to_value(&undo_plan.operations).expect("serialize property undo"),
+        json!([{
+            "type": "restore_properties",
+            "entity_id": "page-1",
+            "expected_current": [{
+                "key": "Status",
+                "value": { "kind": "string", "value": "Done" },
+            }],
+            "previous": [{
+                "key": "Status",
+                "value": { "kind": "string", "value": "Todo" },
+            }],
+        }])
     );
+    assert!(undo_plan.unsupported.is_empty(), "{undo:#?}");
     assert_eq!(
         store
             .get_journal(&PushId(push_id))
@@ -11533,7 +11544,7 @@ fn live_undo_database_row_create_archives_remote_row() {
     assert!(
         undo_plan.operations.iter().any(|operation| matches!(
             operation,
-            UndoOperationOutput::ArchiveCreatedEntity { entity_id }
+            UndoOperationOutput::ArchiveCreatedEntity { entity_id, .. }
                 if entity_id == &created_row_id
         )),
         "{undo:#?}"
@@ -15639,6 +15650,7 @@ fn seed_cli_live_connection(state_root: &Path, connection_id: &ConnectionId, sto
 fn notion_capabilities_json_for_live_test() -> String {
     serde_json::to_string(&ConnectorCapabilities {
         supports_block_updates: true,
+        supports_entity_body_updates: false,
         supports_databases: true,
         supports_oauth: true,
         supports_remote_observation: true,
@@ -17305,6 +17317,7 @@ impl Connector for BlockingGuardrailConnector {
     fn capabilities(&self) -> ConnectorCapabilities {
         ConnectorCapabilities {
             supports_block_updates: true,
+            supports_entity_body_updates: false,
             supports_databases: false,
             supports_oauth: false,
             supports_remote_observation: false,
@@ -17413,6 +17426,7 @@ impl Connector for PropertyOnlyConnector {
     fn capabilities(&self) -> ConnectorCapabilities {
         ConnectorCapabilities {
             supports_block_updates: true,
+            supports_entity_body_updates: false,
             supports_databases: true,
             supports_oauth: false,
             supports_remote_observation: false,

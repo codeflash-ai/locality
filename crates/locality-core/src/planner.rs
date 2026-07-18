@@ -78,6 +78,10 @@ pub enum PushOperation {
     ArchiveEntity {
         entity_id: RemoteId,
     },
+    UpdateEntityBody {
+        entity_id: RemoteId,
+        body: String,
+    },
     UpdateProperties {
         entity_id: RemoteId,
         #[serde(default)]
@@ -127,6 +131,7 @@ pub enum PushOperationKind {
     UpdateMedia,
     ArchiveBlock,
     ArchiveEntity,
+    UpdateEntityBody,
     UpdateProperties,
     MoveEntity,
     CreateEntity,
@@ -143,6 +148,7 @@ impl PushOperationKind {
             Self::UpdateMedia => "update_media",
             Self::ArchiveBlock => "archive_block",
             Self::ArchiveEntity => "archive_entity",
+            Self::UpdateEntityBody => "update_entity_body",
             Self::UpdateProperties => "update_properties",
             Self::MoveEntity => "move_entity",
             Self::CreateEntity => "create_entity",
@@ -150,7 +156,7 @@ impl PushOperationKind {
         }
     }
 
-    pub fn all() -> [Self; 11] {
+    pub fn all() -> [Self; 12] {
         [
             Self::UpdateBlock,
             Self::ReplaceBlock,
@@ -159,6 +165,7 @@ impl PushOperationKind {
             Self::UpdateMedia,
             Self::ArchiveBlock,
             Self::ArchiveEntity,
+            Self::UpdateEntityBody,
             Self::UpdateProperties,
             Self::MoveEntity,
             Self::CreateEntity,
@@ -177,6 +184,7 @@ impl PushOperation {
             Self::UpdateMedia { .. } => PushOperationKind::UpdateMedia,
             Self::ArchiveBlock { .. } => PushOperationKind::ArchiveBlock,
             Self::ArchiveEntity { .. } => PushOperationKind::ArchiveEntity,
+            Self::UpdateEntityBody { .. } => PushOperationKind::UpdateEntityBody,
             Self::UpdateProperties { .. } => PushOperationKind::UpdateProperties,
             Self::MoveEntity { .. } => PushOperationKind::MoveEntity,
             Self::CreateEntity { .. } => PushOperationKind::CreateEntity,
@@ -198,6 +206,8 @@ pub struct PlanSummary {
     pub entities_created: usize,
     pub entities_archived: usize,
     #[serde(default)]
+    pub entity_bodies_updated: usize,
+    #[serde(default)]
     pub entities_moved: usize,
     pub properties_updated: usize,
 }
@@ -215,6 +225,7 @@ impl PlanSummary {
                 PushOperation::UpdateMedia { .. } => summary.media_updated += 1,
                 PushOperation::ArchiveBlock { .. } => summary.blocks_archived += 1,
                 PushOperation::ArchiveEntity { .. } => summary.entities_archived += 1,
+                PushOperation::UpdateEntityBody { .. } => summary.entity_bodies_updated += 1,
                 PushOperation::UpdateProperties { properties, .. } => {
                     summary.properties_updated += properties.len();
                 }

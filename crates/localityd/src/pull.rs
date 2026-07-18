@@ -18,7 +18,7 @@ use locality_core::hydration::{HydrationReason, HydrationRequest};
 use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, RemoteId, TreeEntry};
 use locality_core::path_projection::{
     is_page_document_path, named_markdown_page_workspace_entity_path, page_container_path,
-    page_listing_parent_path,
+    page_listing_parent_path, projection_namespace_root,
 };
 use locality_core::shadow::ShadowDocument;
 use locality_store::{
@@ -1054,8 +1054,8 @@ where
             continue;
         }
 
-        let source_root = projection_subtree_path(&existing.kind, &existing.path);
-        let destination_root = projection_subtree_path(&entry.kind, &entry.path);
+        let source_root = projection_namespace_root(&existing.kind, &existing.path);
+        let destination_root = projection_namespace_root(&entry.kind, &entry.path);
         let blockers =
             remote_move_blockers(store, mount, state_root, &existing_entities, &source_root)?;
         if blockers.is_empty() {
@@ -1101,7 +1101,7 @@ where
 {
     let mut blockers = Vec::new();
     for entity in existing_entities {
-        let candidate_root = projection_subtree_path(&entity.kind, &entity.path);
+        let candidate_root = projection_namespace_root(&entity.kind, &entity.path);
         if !path_in_projection_subtree(&candidate_root, source_root) {
             continue;
         }
@@ -1144,22 +1144,12 @@ fn should_preserve_for_blocked_move(
         return false;
     }
 
-    let existing_root = projection_subtree_path(&existing.kind, &existing.path);
-    let entry_root = projection_subtree_path(&entry.kind, &entry.path);
+    let existing_root = projection_namespace_root(&existing.kind, &existing.path);
+    let entry_root = projection_namespace_root(&entry.kind, &entry.path);
     blocked_moves.iter().any(|blocked| {
         path_in_projection_subtree(&existing_root, &blocked.source_root)
             && path_in_projection_subtree(&entry_root, &blocked.destination_root)
     })
-}
-
-fn projection_subtree_path(kind: &EntityKind, path: &Path) -> PathBuf {
-    match kind {
-        EntityKind::Page => page_container_path(path),
-        EntityKind::Database
-        | EntityKind::Directory
-        | EntityKind::Asset
-        | EntityKind::Unknown(_) => path.to_path_buf(),
-    }
 }
 
 fn path_in_projection_subtree(path: &Path, subtree: &Path) -> bool {
@@ -1319,13 +1309,16 @@ where
 {
     let path = projection_content_path(state_root, mount, &entity.path)?;
     let can_replace = can_replace_file(store, mount, &entity, &path)?;
-    let rendered = match source.fetch_render(&HydrationRequest::new(
-        mount.mount_id.clone(),
-        entity.remote_id.clone(),
-        entity.path.clone(),
-        HydrationState::Hydrated,
-        HydrationReason::ExplicitPull,
-    )) {
+    let rendered = match source.fetch_render_with_repository(
+        &HydrationRequest::new(
+            mount.mount_id.clone(),
+            entity.remote_id.clone(),
+            entity.path.clone(),
+            HydrationState::Hydrated,
+            HydrationReason::ExplicitPull,
+        ),
+        &*store,
+    ) {
         Ok(rendered) => rendered,
         Err(error) if is_remote_not_found(&error) => {
             return reconcile_remote_not_found(store, mount, entity, &path, can_replace);
@@ -2127,10 +2120,16 @@ impl PullError {
         match self {
             Self::Connector(locality_core::LocalityError::NotImplemented(_)) => "not_implemented",
             Self::Connector(locality_core::LocalityError::RemoteNotFound(_)) => "remote_not_found",
+            Self::Connector(locality_core::LocalityError::UpdateRequired { .. }) => {
+                "update_required"
+            }
             Self::Connector(locality_core::LocalityError::RateLimited { .. }) => "rate_limited",
             Self::Connector(_) => "connector_error",
             Self::CurrentDir(_) => "current_dir_failed",
             Self::MountNotFound(_) => "mount_not_found",
+            Self::Projection(locality_core::LocalityError::UpdateRequired { .. }) => {
+                "update_required"
+            }
             Self::Projection(_) => "projection_refresh_failed",
             Self::ReadFile { .. } => "read_file_failed",
             Self::Store(StoreError::EntityPathMissing { .. }) => "entity_path_missing",
@@ -2155,6 +2154,24 @@ impl PullError {
                 format!("failed to write `{}`: {message}", path.display())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod update_required_error_code_tests {
+    use locality_core::LocalityError;
+
+    use super::PullError;
+
+    #[test]
+    fn update_required_has_stable_pull_error_code() {
+        let error = PullError::Connector(LocalityError::UpdateRequired {
+            component: "linear:discovery".to_string(),
+            found: 2,
+            supported: 1,
+        });
+
+        assert_eq!(error.code(), "update_required");
     }
 }
 

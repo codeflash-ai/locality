@@ -22,9 +22,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use loc_cli::connect::DEFAULT_NOTION_PROFILE_ID;
 use loc_cli::connect::{
     BrokerOAuthConnectOptions, ConnectOptions, GmailBrokerOAuthConnectOptions,
-    GoogleDocsBrokerOAuthConnectOptions, HttpGranolaConnectionProbe,
+    GoogleDocsBrokerOAuthConnectOptions, HttpGranolaConnectionProbe, HttpLinearConnectionProbe,
     run_connect_gmail_broker_oauth, run_connect_google_docs_broker_oauth, run_connect_granola,
-    run_connect_notion_broker_oauth, run_disconnect,
+    run_connect_linear, run_connect_notion_broker_oauth, run_disconnect,
 };
 use loc_cli::daemon::{DaemonRunState, run_daemon_control};
 use loc_cli::diff::{DiffReport, run_diff};
@@ -1329,6 +1329,20 @@ async fn connect_granola(app: AppHandle, api_key: String) -> ActionReport {
     report
 }
 
+#[tauri::command]
+async fn connect_linear(app: AppHandle, api_key: String) -> ActionReport {
+    let report = tauri::async_runtime::spawn_blocking(move || connect_linear_blocking(api_key))
+        .await
+        .map_err(|error| format!("Linear connection worker failed: {error}"))
+        .and_then(|result| result)
+        .map(|message| ActionReport { ok: true, message })
+        .unwrap_or_else(|message| ActionReport { ok: false, message });
+    if report.ok {
+        refresh_desktop_surfaces(&app);
+    }
+    report
+}
+
 fn connect_granola_blocking(api_key: String) -> Result<String, String> {
     let api_key = api_key.trim().to_string();
     if api_key.is_empty() {
@@ -1356,10 +1370,17 @@ fn connect_granola_blocking(api_key: String) -> Result<String, String> {
     if let Some(mount) = existing_mount {
         ensure_daemon_running(&state_root)?;
         reload_daemon_mounts(&state_root)?;
+        let mut message = "Reconnected the existing Granola source.".to_string();
         if mount.projection.uses_virtual_filesystem() {
-            activate_virtual_projection_mount(&state_root, &mount, true)?;
+            if let Err(error) = activate_virtual_projection_mount(&state_root, &mount, true) {
+                if recoverable_macos_file_provider_activation_error(&error) {
+                    append_macos_file_provider_activation_warning(&mut message, &error);
+                } else {
+                    return Err(error);
+                }
+            }
         }
-        return Ok("Reconnected the existing Granola source.".to_string());
+        return Ok(message);
     }
 
     create_desktop_mount_blocking(CreateDesktopMountRequest {
@@ -1367,7 +1388,58 @@ fn connect_granola_blocking(api_key: String) -> Result<String, String> {
         path: "granola".to_string(),
         mount_id: "granola-main".to_string(),
         connection_id: Some(report.connection_id),
-        read_only: true,
+        read_only: !desktop_mount_is_editable_by_default("granola"),
+        notion_root_page: None,
+        google_docs_workspace_folder: None,
+    })
+}
+
+fn connect_linear_blocking(api_key: String) -> Result<String, String> {
+    let api_key = api_key.trim().to_string();
+    if api_key.is_empty() {
+        return Err("Enter a Linear API key.".to_string());
+    }
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let credentials = open_credential_store(&state_root);
+    let report = run_connect_linear(
+        &mut store,
+        credentials.as_ref(),
+        ConnectOptions {
+            connection_id: Some(ConnectionId::new("linear-default")),
+            token: api_key,
+        },
+        &HttpLinearConnectionProbe,
+    )
+    .map_err(|error| error.message())?;
+    let existing_mount = store
+        .get_mount(&MountId::new("linear-main"))
+        .map_err(|error| format!("Could not inspect Linear mount: {error}"))?
+        .filter(|mount| mount.connector == "linear");
+    drop(store);
+    if let Some(mount) = existing_mount {
+        ensure_daemon_running(&state_root)?;
+        reload_daemon_mounts(&state_root)?;
+        let mut message = "Reconnected the existing Linear source.".to_string();
+        if mount.projection.uses_virtual_filesystem() {
+            if let Err(error) = activate_virtual_projection_mount(&state_root, &mount, true) {
+                if recoverable_macos_file_provider_activation_error(&error) {
+                    append_macos_file_provider_activation_warning(&mut message, &error);
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+        return Ok(message);
+    }
+
+    create_desktop_mount_blocking(CreateDesktopMountRequest {
+        connector: "linear".to_string(),
+        path: "linear".to_string(),
+        mount_id: "linear-main".to_string(),
+        connection_id: Some(report.connection_id),
+        read_only: !desktop_mount_is_editable_by_default("linear"),
         notion_root_page: None,
         google_docs_workspace_folder: None,
     })
@@ -3942,7 +4014,7 @@ fn load_desktop_snapshot_from_store(
         suggestions: vec![ConnectorSuggestion {
             connector: "Linear".to_string(),
             description: "Mount issues and projects as local files.".to_string(),
-            state: "planned".to_string(),
+            state: "available".to_string(),
         }],
     })
 }
@@ -4002,7 +4074,7 @@ fn degraded_snapshot(message: String) -> DesktopSnapshot {
         suggestions: vec![ConnectorSuggestion {
             connector: "Linear".to_string(),
             description: "Mount issues and projects as local files.".to_string(),
-            state: "planned".to_string(),
+            state: "available".to_string(),
         }],
     }
 }
@@ -7308,6 +7380,11 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
     if mount_id.is_empty() {
         return Err("Mount id is required.".to_string());
     }
+    if !desktop_mount_creation_supports_connector(&connector) {
+        return Err(format!(
+            "Desktop mount creation does not support connector `{connector}`."
+        ));
+    }
     ensure_virtual_projection_domain_available(&projection)?;
     let root = resolve_desktop_mount_root(&request.path)?;
     validate_desktop_mount_root(&root, &state_root, &projection)?;
@@ -7370,12 +7447,8 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
                 })?;
             Some(folder_id)
         }
-        "gmail" | "granola" => None,
-        other => {
-            return Err(format!(
-                "Desktop mount creation does not support connector `{other}`."
-            ));
-        }
+        "gmail" | "granola" | "linear" => None,
+        _ => unreachable!("unsupported desktop connector should be rejected before mount setup"),
     };
     let preserved = if can_remount_existing_workspace {
         prepare_existing_workspace_mount_for_remount(&mut store, &state_root, &mount_id)?
@@ -7406,9 +7479,15 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
         .map_err(|error| format!("Could not reload created mount: {error}"))?
         .ok_or_else(|| "Created mount was not found in Locality state.".to_string())?;
 
-    if mount.projection.uses_virtual_filesystem() {
-        activate_virtual_projection_mount(&state_root, &mount, true)?;
-    }
+    let projection_warning = if mount.projection.uses_virtual_filesystem() {
+        match activate_virtual_projection_mount(&state_root, &mount, true) {
+            Ok(()) => None,
+            Err(error) if recoverable_macos_file_provider_activation_error(&error) => Some(error),
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
 
     let mut message = format!(
         "Mounted {} at {} with {}.",
@@ -7424,8 +7503,28 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
             preserved.directory.display()
         ));
     }
+    if let Some(warning) = projection_warning {
+        append_macos_file_provider_activation_warning(&mut message, &warning);
+    }
 
     Ok(message)
+}
+
+fn append_macos_file_provider_activation_warning(message: &mut String, warning: &str) {
+    message.push_str(&format!(
+        " macOS File Provider is still preparing the visible folder; it may appear in Finder shortly. {warning}"
+    ));
+}
+
+fn desktop_mount_creation_supports_connector(connector: &str) -> bool {
+    matches!(
+        connector,
+        "notion" | "google-docs" | "gmail" | "granola" | "linear"
+    )
+}
+
+fn desktop_mount_is_editable_by_default(connector: &str) -> bool {
+    connector != "granola"
 }
 
 fn desktop_mount_by_id(store: &SqliteStateStore, mount_id: &str) -> Result<MountConfig, String> {
@@ -10115,6 +10214,8 @@ fn recoverable_macos_file_provider_activation_error(message: &str) -> bool {
         || message.contains("registered but not enabled")
         || message.contains("did not return a CloudStorage URL")
         || message.contains("macOS has not created")
+        || (message.contains("did not produce a healthy mount root")
+            && macos_file_provider_mount_root_is_missing(message))
 }
 
 fn workspace_mount_onboarding_report(
@@ -13814,6 +13915,13 @@ mod tests {
     }
 
     #[test]
+    fn file_provider_missing_child_mount_after_recovery_is_recoverable() {
+        assert!(super::recoverable_macos_file_provider_activation_error(
+            "macOS File Provider recovery did not produce a healthy mount root `/Users/codeflash/Library/CloudStorage/Locality/linear`: Could not inspect macOS File Provider mount root `/Users/codeflash/Library/CloudStorage/Locality/linear`: Error: Error Domain=NSPOSIXErrorDomain Code=2 \"Couldn't find a file for /Users/codeflash/Library/CloudStorage/Locality/linear\" UserInfo={NSDescription=Couldn't find a file for /Users/codeflash/Library/CloudStorage/Locality/linear}"
+        ));
+    }
+
+    #[test]
     fn file_provider_enablement_report_distinguishes_registration_and_approval() {
         let missing = super::classify_macos_file_provider_enablement(None, None, Ok(None));
         assert_eq!(missing.state, "not_registered");
@@ -14399,6 +14507,13 @@ mod tests {
             virtual_projection_source_ready_timeout_message("notion", "last error")
                 .contains("at least one page is selected")
         );
+    }
+
+    #[test]
+    fn desktop_mount_creation_supports_linear_as_editable_source() {
+        assert!(super::desktop_mount_creation_supports_connector("linear"));
+        assert!(super::desktop_mount_is_editable_by_default("linear"));
+        assert!(!super::desktop_mount_creation_supports_connector("slack"));
     }
 
     #[test]
@@ -16621,7 +16736,7 @@ fn sample_snapshot() -> DesktopSnapshot {
         suggestions: vec![ConnectorSuggestion {
             connector: "Linear".to_string(),
             description: "Mount issues and projects as local files.".to_string(),
-            state: "planned".to_string(),
+            state: "available".to_string(),
         }],
     }
 }
@@ -16878,6 +16993,7 @@ fn live_mode_e2e_seed_notion_connection(state_root: &Path, token: &str) {
 fn live_mode_e2e_notion_capabilities_json() -> String {
     serde_json::to_string(&ConnectorCapabilities {
         supports_block_updates: true,
+        supports_entity_body_updates: false,
         supports_databases: true,
         supports_oauth: true,
         supports_remote_observation: true,
@@ -17332,6 +17448,7 @@ fn main() {
             create_workspace_mount,
             create_desktop_mount,
             connect_granola,
+            connect_linear,
             reset_source_state,
             disconnect_source,
             export_source_backup,

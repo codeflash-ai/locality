@@ -7,6 +7,12 @@ use locality_core::model::CanonicalDocument;
 use locality_core::planner::PushOperation;
 use locality_core::shadow::{ShadowDocument, rendered_bodies_equivalent};
 
+pub fn contents_match_shadow(contents: &str, shadow: &ShadowDocument) -> bool {
+    parse_canonical_markdown(contents)
+        .ok()
+        .is_some_and(|parsed| parsed_matches_shadow(&parsed, shadow))
+}
+
 pub(crate) fn parsed_matches_shadow(
     parsed: &ParsedCanonicalDocument,
     shadow: &ShadowDocument,

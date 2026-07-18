@@ -26,6 +26,7 @@ use locality_google_docs::{
     GOOGLE_DOCS_CONNECTOR_ID, HttpGoogleDocsOAuthBrokerClient,
 };
 use locality_granola::GRANOLA_CONNECTOR_ID;
+use locality_linear::LINEAR_CONNECTOR_ID;
 use locality_notion::oauth::{
     DEFAULT_LOCALITY_NOTION_OAUTH_BROKER_URL, DEFAULT_NOTION_OAUTH_AUTHORIZE_URL,
     HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NotionOAuthBrokerStart,
@@ -45,6 +46,7 @@ use localityd::google_docs::resolve_google_docs_connector_for_mount;
 use localityd::granola::resolve_granola_connector_for_mount;
 use localityd::hydration::write_parent_database_schema_cache;
 use localityd::ipc::{DaemonClientError, DaemonRequest, send_request_with_timeout};
+use localityd::linear::resolve_linear_connector_for_mount;
 use localityd::runtime::repair_clean_remote_deleted_projections;
 use localityd::virtual_fs::{
     VirtualFsChildrenReport, mount_point_identifier, virtual_fs_ancestor_container_identifiers,
@@ -57,11 +59,11 @@ use serde_json::Value;
 use crate::connect::{
     BrokerOAuthConnectOptions, ConnectError, ConnectOptions, ConnectReport, ConnectionShowReport,
     ConnectionsReport, DisconnectReport, GmailBrokerOAuthConnectOptions,
-    GoogleDocsBrokerOAuthConnectOptions, HttpGranolaConnectionProbe, HttpNotionConnectionProbe,
-    OAuthConnectOptions, ProfilesReport, run_connect_gmail_broker_oauth,
-    run_connect_google_docs_broker_oauth, run_connect_granola, run_connect_notion,
-    run_connect_notion_broker_oauth, run_connect_notion_oauth, run_connection_show,
-    run_connections, run_disconnect, run_profiles,
+    GoogleDocsBrokerOAuthConnectOptions, HttpGranolaConnectionProbe, HttpLinearConnectionProbe,
+    HttpNotionConnectionProbe, OAuthConnectOptions, ProfilesReport, run_connect_gmail_broker_oauth,
+    run_connect_google_docs_broker_oauth, run_connect_granola, run_connect_linear,
+    run_connect_notion, run_connect_notion_broker_oauth, run_connect_notion_oauth,
+    run_connection_show, run_connections, run_disconnect, run_profiles,
 };
 use crate::connector::{
     ConnectorResolveError, SourceDescriptor, resolve_notion_connector_for_mount,
@@ -231,6 +233,8 @@ enum ConnectCommand {
     Gmail(ConnectGmailArgs),
     #[command(about = "Connect Granola with an API key")]
     Granola(ConnectGranolaArgs),
+    #[command(about = "Connect Linear with an API key")]
+    Linear(ConnectLinearArgs),
 }
 
 #[derive(Debug, Args)]
@@ -242,6 +246,18 @@ struct ConnectGranolaArgs {
     )]
     name: Option<String>,
     #[arg(long, help = "Read a Granola API key from standard input.")]
+    api_key_stdin: bool,
+}
+
+#[derive(Debug, Args)]
+struct ConnectLinearArgs {
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Connection id to save. Defaults to linear-default."
+    )]
+    name: Option<String>,
+    #[arg(long, help = "Read a Linear API key from standard input.")]
     api_key_stdin: bool,
 }
 
@@ -395,6 +411,8 @@ enum MountCommand {
     Gmail(MountGmailArgs),
     #[command(about = "Mount Granola meeting notes read-only")]
     Granola(MountGranolaArgs),
+    #[command(about = "Mount Linear issues")]
+    Linear(MountLinearArgs),
 }
 
 #[derive(Debug, Args)]
@@ -411,6 +429,31 @@ struct MountGranolaArgs {
     mount_id: Option<String>,
     #[arg(long, value_name = "mode", help = "Projection mode.")]
     projection: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct MountLinearArgs {
+    #[arg(value_name = "path", help = "Local directory for the Linear mount.")]
+    path: String,
+    #[arg(long, value_name = "id", help = "Connection id to use for this mount.")]
+    connection: Option<String>,
+    #[arg(
+        long,
+        value_name = "id",
+        help = "Mount id to save. Defaults to linear-main."
+    )]
+    mount_id: Option<String>,
+    #[arg(
+        long,
+        value_name = "mode",
+        help = "Projection mode. Supported values depend on the host platform."
+    )]
+    projection: Option<String>,
+    #[arg(
+        long,
+        help = "Register the mount as read-only and block push operations."
+    )]
+    read_only: bool,
 }
 
 #[derive(Debug, Args)]
@@ -985,6 +1028,11 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                     push_optional_flag_value(&mut args, "--name", options.name.as_deref());
                     push_flag(&mut args, "--api-key-stdin", options.api_key_stdin);
                 }
+                ConnectCommand::Linear(options) => {
+                    args.push("linear".to_string());
+                    push_optional_flag_value(&mut args, "--name", options.name.as_deref());
+                    push_flag(&mut args, "--api-key-stdin", options.api_key_stdin);
+                }
             }
         }
         LocalityCommand::Connections => args.push("connections".to_string()),
@@ -1103,6 +1151,22 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                         "--projection",
                         options.projection.as_deref(),
                     );
+                }
+                MountCommand::Linear(options) => {
+                    args.push("linear".to_string());
+                    args.push(options.path.clone());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--connection",
+                        options.connection.as_deref(),
+                    );
+                    push_optional_flag_value(&mut args, "--mount-id", options.mount_id.as_deref());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--projection",
+                        options.projection.as_deref(),
+                    );
+                    push_flag(&mut args, "--read-only", options.read_only);
                 }
             }
         }
@@ -1428,6 +1492,9 @@ fn reset(args: &[String], json: bool) -> i32 {
 
 fn connect(args: &[String], json: bool) -> i32 {
     let connector = first_positional(args);
+    if connector == Some(LINEAR_CONNECTOR_ID) {
+        return connect_linear(args, json);
+    }
     if connector == Some(GRANOLA_CONNECTOR_ID) {
         return connect_granola(args, json);
     }
@@ -1443,7 +1510,7 @@ fn connect(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "connect",
                 "usage",
-                "usage: loc connect <notion|google-docs|gmail|granola> [options] [--json]",
+                "usage: loc connect <notion|google-docs|gmail|granola|linear> [options] [--json]",
             ),
             EXIT_USAGE,
         );
@@ -1876,6 +1943,71 @@ fn connect_granola(args: &[String], json: bool) -> i32 {
         credentials.as_ref(),
         options,
         &HttpGranolaConnectionProbe,
+    ) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_connect_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => connect_command_error("connect", json, error),
+    }
+}
+
+fn connect_linear(args: &[String], json: bool) -> i32 {
+    if !has_flag(args, "--api-key-stdin") {
+        return command_error(
+            json,
+            CommandError::new(
+                "connect",
+                "auth_required",
+                "Linear API keys must be provided with --api-key-stdin",
+            )
+            .with_suggested_command("loc connect linear --api-key-stdin"),
+            EXIT_USAGE,
+        );
+    }
+    let mut api_key = String::new();
+    if let Err(error) = io::stdin().read_to_string(&mut api_key) {
+        return command_error(
+            json,
+            CommandError::new("connect", "stdin_read_failed", error.to_string()),
+            EXIT_INTERNAL,
+        );
+    }
+    let api_key = api_key.trim().to_string();
+    if api_key.is_empty() {
+        return command_error(
+            json,
+            CommandError::new("connect", "auth_required", "empty Linear API key")
+                .with_suggested_command("loc connect linear --api-key-stdin"),
+            EXIT_USAGE,
+        );
+    }
+
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("connect", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let credentials = open_credential_store(&state_root);
+    let options = ConnectOptions {
+        connection_id: flag_value(args, "--name").map(ConnectionId::new),
+        token: api_key,
+    };
+    match run_connect_linear(
+        &mut store,
+        credentials.as_ref(),
+        options,
+        &HttpLinearConnectionProbe,
     ) {
         Ok(report) if json => {
             print_json(&report);
@@ -2845,6 +2977,32 @@ fn mount_remote_root_id(
             };
             let credentials = open_credential_store(state_root);
             resolve_granola_connector_for_mount(store, credentials.as_ref(), &temp_mount)
+                .map_err(|error| connector_resolve_command_error("mount", error))?;
+            Ok(None)
+        }
+        LINEAR_CONNECTOR_ID => {
+            if has_flag(args, "--workspace")
+                || flag_value(args, "--root-page").is_some()
+                || flag_value(args, "--workspace-folder").is_some()
+            {
+                return Err(CommandError::new(
+                    "mount",
+                    "usage",
+                    "loc mount linear does not accept source root flags",
+                ));
+            }
+            let temp_mount = MountConfig {
+                mount_id: mount_id.clone(),
+                connector: descriptor.id().to_string(),
+                root: PathBuf::from(root),
+                remote_root_id: None,
+                connection_id: connection_id.clone(),
+                read_only,
+                projection: projection.clone(),
+                settings_json: "{}".to_string(),
+            };
+            let credentials = open_credential_store(state_root);
+            resolve_linear_connector_for_mount(store, credentials.as_ref(), &temp_mount)
                 .map_err(|error| connector_resolve_command_error("mount", error))?;
             Ok(None)
         }
@@ -5223,8 +5381,9 @@ fn write_log_report<W: Write>(report: &LogReport, output: &mut W) -> io::Result<
         }
         writeln!(
             output,
-            "  summary: {} updated, {} replaced, {} media updated, {} created, {} moved, {} archived",
+            "  summary: {} blocks updated, {} entity bodies updated, {} replaced, {} media updated, {} created, {} moved, {} archived",
             entry.plan_summary.blocks_updated,
+            entry.plan_summary.entity_bodies_updated,
             entry.plan_summary.blocks_replaced,
             entry.plan_summary.media_updated,
             entry.plan_summary.blocks_created,
@@ -6663,9 +6822,15 @@ fn write_diff_report_fields<W: Write>(
 
     writeln!(
         output,
-        "{} block{} updated, {} replaced, {} media updated, {} block{} created, {} entit{} created, {} moved, {} block{} archived, {} entit{} archived",
+        "{} block{} updated, {} entity bod{} updated, {} replaced, {} media updated, {} block{} created, {} entit{} created, {} moved, {} block{} archived, {} entit{} archived",
         plan.summary.blocks_updated,
         plural(plan.summary.blocks_updated),
+        plan.summary.entity_bodies_updated,
+        if plan.summary.entity_bodies_updated == 1 {
+            "y"
+        } else {
+            "ies"
+        },
         plan.summary.blocks_replaced,
         plan.summary.media_updated,
         plan.summary.blocks_created,
@@ -7342,7 +7507,7 @@ fn command_error(json: bool, error: CommandError, exit_code: i32) -> i32 {
 fn connect_command_error(command: &'static str, json: bool, error: ConnectError) -> i32 {
     let exit_code = match &error {
         ConnectError::ConnectionNameRequired(_) => EXIT_USAGE,
-        ConnectError::ConnectionProbeFailed(_)
+        ConnectError::ConnectionProbeFailed { .. }
         | ConnectError::OAuthExchangeFailed(_)
         | ConnectError::CredentialEncode(_)
         | ConnectError::Credential(_)
@@ -7617,6 +7782,12 @@ fn history_error_exit_code(error: &HistoryError) -> i32 {
         HistoryError::MountNotFound(_)
         | HistoryError::JournalNotFound(_)
         | HistoryError::Store(locality_store::StoreError::EntityPathMissing { .. }) => EXIT_USAGE,
+        HistoryError::UnsafeUndoLocalState { .. } | HistoryError::UndoNotLatest { .. } => {
+            EXIT_VALIDATION
+        }
+        HistoryError::InvalidUndoObservation { .. }
+        | HistoryError::IncompleteUndoApplyResult { .. }
+        | HistoryError::UndoProjectionRefreshFailed { .. } => EXIT_INTERNAL,
         HistoryError::Store(_) => EXIT_INTERNAL,
     }
 }
@@ -7638,6 +7809,7 @@ fn locality_error_code(error: &LocalityError) -> &'static str {
         LocalityError::RemoteNotFound(_) => "remote_not_found",
         LocalityError::RateLimited { .. } => "rate_limited",
         LocalityError::InvalidState(_) => "invalid_state",
+        LocalityError::UpdateRequired { .. } => "update_required",
         LocalityError::Unsupported(_) => "unsupported",
         LocalityError::NotImplemented(_) => "not_implemented",
         LocalityError::Io(_) => "io_error",
@@ -7735,7 +7907,7 @@ fn projection_mode_for_target(args: &[String], target_os: &str) -> Result<Projec
 
 fn mount_usage() -> String {
     format!(
-        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--read-only] [--json]\n       loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--json]",
+        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--read-only] [--json]\n       loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--json]\n       loc mount linear <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]",
         projection_usage_options_for_target(std::env::consts::OS)
     )
 }
@@ -8171,6 +8343,7 @@ mod tests {
     use clap::Parser;
     use clap::error::ErrorKind;
 
+    use locality_core::LocalityError;
     use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
     use locality_core::shadow::ShadowDocument;
     use locality_google_docs::GOOGLE_DOCS_CONNECTOR_ID;
@@ -8199,15 +8372,28 @@ mod tests {
         guard_linux_fuse_shared_root_unregister, guard_unresolved_linux_fuse_unregister,
         guard_unresolved_windows_cloud_files_unregister,
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
-        locate_result_from_report, mount_usage, mounted_projection_preflight_error,
-        notion_authorize_url, notion_oauth_broker_config, print_push_confirmation_preview,
-        projection_mode_for_target, projection_usage_options_for_target,
-        prompt_for_push_confirmation, pull_direct_fallback_error,
-        push_confirmation_preview_matches_displayed, push_preview_plan_matches,
-        should_prompt_for_push_confirmation, should_refresh_notion_url_search,
-        spinner_config_for_command, spinner_enabled, status as run_status_command,
-        validate_virtual_projection_registration, write_connect_report, write_log_report,
+        locality_error_code, locate_result_from_report, mount_usage,
+        mounted_projection_preflight_error, notion_authorize_url, notion_oauth_broker_config,
+        print_push_confirmation_preview, projection_mode_for_target,
+        projection_usage_options_for_target, prompt_for_push_confirmation,
+        pull_direct_fallback_error, push_confirmation_preview_matches_displayed,
+        push_preview_plan_matches, should_prompt_for_push_confirmation,
+        should_refresh_notion_url_search, spinner_config_for_command, spinner_enabled,
+        status as run_status_command, validate_virtual_projection_registration,
+        write_connect_report, write_log_report,
     };
+
+    #[test]
+    fn update_required_has_stable_command_error_code() {
+        assert_eq!(
+            locality_error_code(&LocalityError::UpdateRequired {
+                component: "linear:discovery".to_string(),
+                found: 2,
+                supported: 1,
+            }),
+            "update_required"
+        );
+    }
 
     #[test]
     fn clap_help_is_available_for_commands_and_nested_subcommands() {
@@ -8231,6 +8417,7 @@ mod tests {
                     "google-docs",
                     "gmail",
                     "granola",
+                    "linear",
                     "--json",
                 ],
             ),
@@ -8266,6 +8453,14 @@ mod tests {
                 vec![
                     "Usage: loc connect granola",
                     "Connect Granola with an API key",
+                    "--api-key-stdin",
+                ],
+            ),
+            (
+                vec!["connect", "linear", "--help"],
+                vec![
+                    "Usage: loc connect linear",
+                    "Connect Linear with an API key",
                     "--api-key-stdin",
                 ],
             ),
@@ -8340,6 +8535,7 @@ mod tests {
                     "google-docs",
                     "gmail",
                     "granola",
+                    "linear",
                     "--json",
                 ],
             ),
@@ -8374,6 +8570,15 @@ mod tests {
                 vec![
                     "Usage: loc mount granola",
                     "Mount Granola meeting notes read-only",
+                    "--connection",
+                    "--projection",
+                ],
+            ),
+            (
+                vec!["mount", "linear", "--help"],
+                vec![
+                    "Usage: loc mount linear",
+                    "Mount Linear issues",
                     "--connection",
                     "--projection",
                 ],
@@ -8645,6 +8850,7 @@ mod tests {
 
         assert!(usage.contains("--after YYYY-MM-DD --before YYYY-MM-DD"));
         assert!(usage.contains("--view messages|threads"));
+        assert!(usage.contains("loc mount linear <path>"));
     }
 
     #[test]
@@ -8893,6 +9099,7 @@ mod tests {
                     blocks_archived: 0,
                     entities_created: 0,
                     entities_archived: 0,
+                    entity_bodies_updated: 0,
                     entities_moved: 0,
                     properties_updated: 0,
                 },
@@ -8905,7 +9112,7 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(output).expect("utf8 output"),
-            "push push-1\n  status: reconciled\n  mount: notion-main\n  entities: page-1\n  author: anonymous\n  created_at_unix_ms: 1783612800000\n  previous: push-0\n  summary: 1 updated, 0 replaced, 0 media updated, 0 created, 0 moved, 0 archived\n  operations: 1\n\ndiff --locality a/Roadmap.md b/Roadmap.md\n"
+            "push push-1\n  status: reconciled\n  mount: notion-main\n  entities: page-1\n  author: anonymous\n  created_at_unix_ms: 1783612800000\n  previous: push-0\n  summary: 1 blocks updated, 0 entity bodies updated, 0 replaced, 0 media updated, 0 created, 0 moved, 0 archived\n  operations: 1\n\ndiff --locality a/Roadmap.md b/Roadmap.md\n"
         );
     }
 
@@ -8959,6 +9166,7 @@ mod tests {
                 blocks_archived: 0,
                 entities_created: 0,
                 entities_archived: 0,
+                entity_bodies_updated: 0,
                 entities_moved: 0,
                 properties_updated: 0,
             },
@@ -10024,6 +10232,7 @@ mod tests {
                 blocks_archived: 0,
                 entities_created: 0,
                 entities_archived: 0,
+                entity_bodies_updated: 0,
                 entities_moved: 0,
                 properties_updated: 0,
             },

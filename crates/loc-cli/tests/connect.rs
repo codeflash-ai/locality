@@ -1,16 +1,19 @@
 use loc_cli::connect::{
     BrokerOAuthConnectOptions, ConnectOptions, CredentialEncodeFailure, CredentialStorageFailure,
     DEFAULT_GMAIL_OAUTH_PROFILE_ID, DEFAULT_GOOGLE_DOCS_OAUTH_PROFILE_ID,
-    DEFAULT_NOTION_OAUTH_PROFILE_ID, DEFAULT_NOTION_PROFILE_ID, GmailBrokerOAuthConnectOptions,
-    GmailOAuthBrokerExchange, GoogleDocsBrokerOAuthConnectOptions, GoogleDocsOAuthBrokerExchange,
-    NotionConnectionProbe, NotionConnectionProbeResult, NotionOAuthBrokerExchange,
-    NotionOAuthExchange, OAuthConnectOptions, OAuthExchangeFailure, run_connect_gmail_broker_oauth,
-    run_connect_google_docs_broker_oauth, run_connect_notion, run_connect_notion_broker_oauth,
-    run_connect_notion_oauth, run_disconnect, run_profiles,
+    DEFAULT_LINEAR_API_KEY_PROFILE_ID, DEFAULT_NOTION_OAUTH_PROFILE_ID, DEFAULT_NOTION_PROFILE_ID,
+    GmailBrokerOAuthConnectOptions, GmailOAuthBrokerExchange, GoogleDocsBrokerOAuthConnectOptions,
+    GoogleDocsOAuthBrokerExchange, LinearConnectionProbe, NotionConnectionProbe,
+    NotionConnectionProbeResult, NotionOAuthBrokerExchange, NotionOAuthExchange,
+    OAuthConnectOptions, OAuthExchangeFailure, run_connect_gmail_broker_oauth,
+    run_connect_google_docs_broker_oauth, run_connect_linear, run_connect_notion,
+    run_connect_notion_broker_oauth, run_connect_notion_oauth, run_disconnect, run_profiles,
 };
+use locality_connector::ConnectorCapabilities;
 use locality_connector::oauth_broker::{OAuthBrokerCodeExchange, OAuthBrokerToken};
 use locality_gmail::{GMAIL_OAUTH_SCOPES, StoredGmailCredential};
 use locality_google_docs::{GOOGLE_DOCS_OAUTH_SCOPES, StoredGoogleDocsCredential};
+use locality_linear::LINEAR_CONNECTOR_ID;
 use locality_notion::oauth::{
     NotionOAuthBrokerCodeExchange, NotionOAuthCodeExchange, NotionOAuthToken,
     StoredNotionCredential,
@@ -67,6 +70,92 @@ fn connect_notion_stores_metadata_and_secret_separately() {
     let json = serde_json::to_string(&report).expect("json");
     assert!(!json.contains("ntn_secret_test_token"));
     assert!(!json.contains("secret_ref"));
+}
+
+#[test]
+fn connect_linear_stores_api_key_outside_connection_metadata() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+
+    let report = run_connect_linear(
+        &mut store,
+        &credentials,
+        ConnectOptions {
+            connection_id: Some(ConnectionId::new("linear-work")),
+            token: "lin_api_secret".to_string(),
+        },
+        &FakeLinearProbe,
+    )
+    .expect("connect Linear");
+
+    assert_eq!(report.connection_id, "linear-work");
+    assert_eq!(report.profile_id, DEFAULT_LINEAR_API_KEY_PROFILE_ID);
+    assert_eq!(report.connector, LINEAR_CONNECTOR_ID);
+    assert_eq!(report.auth_kind, "api_key");
+
+    let connection = store
+        .get_connection(&ConnectionId::new("linear-work"))
+        .expect("get connection")
+        .expect("connection");
+    assert_eq!(connection.connector, LINEAR_CONNECTOR_ID);
+    assert_eq!(connection.auth_kind, "api_key");
+    assert_eq!(connection.secret_ref, "connection:linear-work");
+    assert!(!format!("{connection:?}").contains("lin_api_secret"));
+
+    let profile = store
+        .get_connector_profile(&ConnectorProfileId::new(DEFAULT_LINEAR_API_KEY_PROFILE_ID))
+        .expect("get profile")
+        .expect("profile");
+    assert_eq!(profile.connector, LINEAR_CONNECTOR_ID);
+    assert_eq!(profile.auth_kind, "api_key");
+    assert_eq!(profile.enabled_actions_json, "[\"read\",\"write\"]");
+    let capabilities = serde_json::from_str::<ConnectorCapabilities>(&profile.capabilities_json)
+        .expect("linear capabilities");
+    assert!(capabilities.supports_entity_body_updates);
+    assert!(capabilities.supports_batch_observation);
+    assert!(!capabilities.supports_oauth);
+
+    assert_eq!(
+        credentials
+            .get("connection:linear-work")
+            .expect("credential saved"),
+        "lin_api_secret"
+    );
+
+    let json = serde_json::to_string(&report).expect("json");
+    assert!(!json.contains("lin_api_secret"));
+    assert!(!json.contains("secret_ref"));
+}
+
+#[test]
+fn connect_linear_probe_errors_report_linear_guidance() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+
+    let error = run_connect_linear(
+        &mut store,
+        &credentials,
+        ConnectOptions {
+            connection_id: Some(ConnectionId::new("linear-work")),
+            token: "lin_api_secret".to_string(),
+        },
+        &FailingLinearProbe,
+    )
+    .expect_err("probe failure");
+
+    assert_eq!(error.code(), "connection_probe_failed");
+    assert!(error.message().contains("Linear connection probe failed"));
+    assert_eq!(
+        error.suggested_command(),
+        Some("loc connect linear --api-key-stdin")
+    );
+    assert!(credentials.get("connection:linear-work").is_err());
+    assert!(
+        store
+            .get_connection(&ConnectionId::new("linear-work"))
+            .expect("lookup connection")
+            .is_none()
+    );
 }
 
 #[test]
@@ -729,6 +818,28 @@ impl NotionConnectionProbe for FakeProbe {
             workspace_id: Some("workspace-1".to_string()),
             workspace_name: Some("Locality".to_string()),
         })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FakeLinearProbe;
+
+impl LinearConnectionProbe for FakeLinearProbe {
+    fn probe(&self, api_key: &str) -> Result<(), loc_cli::connect::ConnectError> {
+        assert_eq!(api_key, "lin_api_secret");
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FailingLinearProbe;
+
+impl LinearConnectionProbe for FailingLinearProbe {
+    fn probe(&self, _api_key: &str) -> Result<(), loc_cli::connect::ConnectError> {
+        Err(loc_cli::connect::ConnectError::connection_probe_failed(
+            LINEAR_CONNECTOR_ID,
+            "invalid Linear key",
+        ))
     }
 }
 

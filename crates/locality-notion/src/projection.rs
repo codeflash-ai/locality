@@ -135,7 +135,27 @@ pub fn observe_entity(
     remote_id: &RemoteId,
 ) -> LocalityResult<RemoteObservation> {
     match api.retrieve_page(remote_id.as_str()) {
-        Ok(page) => Ok(page_observation(mount_id, &page)),
+        Ok(page) => {
+            let mut observation = page_observation(mount_id, &page);
+            if let Some(data_source_id) = page
+                .parent
+                .as_ref()
+                .and_then(|parent| parent.data_source_id.as_deref())
+            {
+                let data_source = api.retrieve_data_source(data_source_id)?;
+                let database_id = data_source
+                    .parent
+                    .as_ref()
+                    .and_then(|parent| parent.database_id.as_deref())
+                    .ok_or_else(|| {
+                        LocalityError::InvalidState(format!(
+                            "notion data source `{data_source_id}` did not expose a parent database"
+                        ))
+                    })?;
+                observation.parent_remote_id = Some(RemoteId::new(database_id));
+            }
+            Ok(observation)
+        }
         Err(page_error) => match api.retrieve_database(remote_id.as_str()) {
             Ok(database) => Ok(database_observation(mount_id, &database)),
             Err(database_error) => Err(LocalityError::InvalidState(format!(
