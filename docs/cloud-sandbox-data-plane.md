@@ -52,8 +52,10 @@ The main decisions are:
 7. Treat a local edit as an explicit changeset. The agent can inspect it with
    `loc status` and `loc diff`, then submit it with `loc push`. The backend
    re-authorizes, re-plans, checks provider concurrency, applies, reads back,
-   journals, and publishes the new version. Human review workflows can be added
-   later without changing the changeset boundary.
+   journals, and publishes the new version. `loc push` waits for the terminal
+   outcome by default; `--no-wait` is the explicit asynchronous mode.
+   Human review workflows can be added later without changing the changeset
+   boundary.
 8. Separate an administrator's read-disclosure ceiling (`DataGrant`) from a
    job's filesystem selection and write request (`WorkspaceProfile`). V1 may use
    broad, explicit grants for selected source scopes; profiles narrow the exact
@@ -1617,12 +1619,13 @@ rg "rate limit" /mnt/locality
 $EDITOR /mnt/locality/notion/Projects/Agent\ Work/Design/page.md
 loc status /mnt/locality/notion
 loc diff /mnt/locality/notion/Projects/Agent\ Work/Design/page.md
-loc push /mnt/locality/notion/Projects/Agent\ Work/Design/page.md --wait
+loc push /mnt/locality/notion/Projects/Agent\ Work/Design/page.md
 ```
 
 In backend mode, `loc diff` is the agent-accessible review step and `loc push`
 means "submit this explicitly selected local plan to the Locality changeset
-service." V1 does not wait for a separate human reviewer. The result can be:
+service and wait for its terminal result." V1 does not wait for a separate human
+reviewer. The result can be:
 
 ```text
 no_op
@@ -1635,8 +1638,17 @@ rejected
 failed
 ```
 
-It does not imply that the provider was mutated synchronously. Existing scripts
-can request `--wait` and receive a final reconciled/conflict/rejected outcome.
+`received`, `applying`, and `applied` are intermediate states. `applied` means
+provider operations ran but read-back/publication has not necessarily completed.
+The default command returns success only for `no_op` or `reconciled`; conflict,
+rejection, and failure are non-success outcomes with structured details.
+
+`--no-wait` returns after the backend durably records `received`, prints the
+changeset ID, and reports submission rather than provider-mutation success. A
+bounded default client wait prevents an indefinite command; `--timeout <duration>`
+overrides it. Reaching that timeout does not cancel the backend changeset: the
+command returns a distinct timed-out/pending outcome with the changeset ID so a
+later client can inspect it.
 
 ### Changeset Contents
 
@@ -2371,8 +2383,10 @@ limited.
 - Move journaled provider precondition, apply, and read-back into backend workers
   using the shared engine and connector changeset contract. Re-plan with the same
   preparation function used by `loc`.
-- Implement explicit `loc push`, wait, conflict, another-push-after-replan,
-  idempotent resume, create-ID mapping, and reconciliation states.
+- Implement explicit `loc push` with terminal reconciliation as the default,
+  `--no-wait` durable submission, bounded `--timeout`, conflict,
+  another-push-after-replan, idempotent resume, create-ID mapping, and
+  reconciliation states.
 - Apply only deterministic bounded classes after explicit push. Deny destructive,
   broad, or uncertain plans; do not build human-review endpoints or UI.
 - After provider read-back, transactionally publish the new source/content/
@@ -2524,7 +2538,8 @@ and dedicated-cell operational runbooks are complete.
   before/after read-back, and before/after publication of the new queryable
   revision.
 - Operation idempotency, duplicate job execution, explicit push after semantic
-  replan, undo, and no silent partial success.
+  replan, default terminal wait, `--no-wait` receipt, timeout without backend
+  cancellation, later status lookup, undo, and no silent partial success.
 - Parallel-session edits preserve provider-precondition correctness without
   advisory claims.
 
