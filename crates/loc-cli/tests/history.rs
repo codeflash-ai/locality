@@ -1423,6 +1423,40 @@ fn undo_with_applier_archives_clean_created_entity_and_removes_projection() {
 }
 
 #[test]
+fn log_finds_reverted_created_entity_journal_after_undo_removed_entity_index() {
+    let fixture = HistoryFixture::new();
+    let mut store = fixture.store();
+    let created_path = seed_created_entity_undo(&fixture, &mut store);
+    let observation = created_entity_observation(&fixture).deleted(true);
+    let mut applier = FakeUndoApplier::default()
+        .with_changed_remote_ids(vec![RemoteId::new("created-page-1")])
+        .with_observations(vec![observation]);
+
+    run_undo_with_applier(&mut store, "push-create", &mut applier).expect("undo created entity");
+
+    assert!(!fixture.root.join(&created_path).exists());
+    assert!(
+        store
+            .get_entity(&fixture.mount_id, &RemoteId::new("created-page-1"))
+            .expect("read entity")
+            .is_none()
+    );
+
+    let report = run_log(
+        &store,
+        LogOptions {
+            path: Some(fixture.root.join(&created_path)),
+            ..LogOptions::default()
+        },
+    )
+    .expect("log reverted created entity");
+
+    assert_eq!(report.entries.len(), 1);
+    assert_eq!(report.entries[0].push_id, "push-create");
+    assert_eq!(report.entries[0].status, "reverted");
+}
+
+#[test]
 fn windows_cloud_files_undo_archive_removes_clean_visible_projection_without_local_mutation() {
     let fixture = HistoryFixture::new();
     let mut store = fixture.store();

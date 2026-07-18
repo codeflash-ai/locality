@@ -14,6 +14,7 @@ use locality_core::freshness::RemoteObservation;
 use locality_core::journal::{JournalApplyEffect, JournalEntry, JournalStatus, PushId};
 use locality_core::model::{CanonicalDocument, HydrationState, MountId, RemoteId};
 use locality_core::path_projection::{page_container_path, page_document_path};
+use locality_core::planner::PushOperation;
 use locality_core::undo::{
     EntityUndoState, UndoApplier, UndoApplyRequest, UndoOperation, UndoPlan, UndoPlanStatus,
     UnsupportedUndoOperation, plan_journal_undo,
@@ -55,8 +56,14 @@ where
         .transpose()?;
     let mut entries = store.list_journal().map_err(HistoryError::Store)?;
 
-    if let Some(filter) = filter {
-        entries.retain(|entry| entry_matches_filter(entry, &filter));
+    if let Some(filter) = &filter {
+        entries.retain(|entry| entry_matches_filter(entry, filter));
+        if filter.remote_id.is_none() && entries.is_empty() {
+            return Err(HistoryError::Store(StoreError::EntityPathMissing {
+                mount_id: filter.mount_id.clone(),
+                path: filter.relative_path.clone(),
+            }));
+        }
     }
 
     if let Some(push_id) = &options.push_id {
@@ -1795,7 +1802,8 @@ impl HistoryError {
 
 struct PathFilter {
     mount_id: MountId,
-    remote_id: RemoteId,
+    remote_id: Option<RemoteId>,
+    relative_path: PathBuf,
 }
 
 fn resolve_path_filter<S>(store: &S, path: &Path) -> Result<PathFilter, HistoryError>
@@ -1820,34 +1828,59 @@ where
             entity = Some(page_entity);
         }
     }
-    let entity = entity.ok_or_else(|| {
-        HistoryError::Store(StoreError::EntityPathMissing {
-            mount_id: mount.mount_id.clone(),
-            path: relative_path,
-        })
-    })?;
 
     Ok(PathFilter {
         mount_id: mount.mount_id.clone(),
-        remote_id: entity.remote_id,
+        remote_id: entity.map(|entity| entity.remote_id),
+        relative_path,
     })
 }
 
 fn entry_matches_filter(entry: &JournalEntry, filter: &PathFilter) -> bool {
-    entry.mount_id == filter.mount_id
-        && (entry
+    if entry.mount_id != filter.mount_id {
+        return false;
+    }
+
+    if let Some(remote_id) = &filter.remote_id {
+        return entry
             .remote_ids
             .iter()
-            .any(|remote_id| remote_id == &filter.remote_id)
+            .any(|entry_remote_id| entry_remote_id == remote_id)
             || entry
                 .plan
                 .affected_entities
                 .iter()
-                .any(|remote_id| remote_id == &filter.remote_id)
+                .any(|entry_remote_id| entry_remote_id == remote_id)
             || entry
                 .apply_effects
                 .iter()
-                .any(|effect| apply_effect_matches_remote(effect, &filter.remote_id)))
+                .any(|effect| apply_effect_matches_remote(effect, remote_id));
+    }
+
+    entry
+        .plan
+        .operations
+        .iter()
+        .any(|operation| operation_matches_source_path(operation, &filter.relative_path))
+}
+
+fn operation_matches_source_path(operation: &PushOperation, relative_path: &Path) -> bool {
+    match operation {
+        PushOperation::CreateEntity { source_path, .. }
+        | PushOperation::CreateDatabase { source_path, .. } => {
+            source_path.as_path() == relative_path
+        }
+        PushOperation::UpdateBlock { .. }
+        | PushOperation::ReplaceBlock { .. }
+        | PushOperation::AppendBlock { .. }
+        | PushOperation::MoveBlock { .. }
+        | PushOperation::UpdateMedia { .. }
+        | PushOperation::ArchiveBlock { .. } => false,
+        PushOperation::ArchiveEntity { .. }
+        | PushOperation::UpdateEntityBody { .. }
+        | PushOperation::UpdateProperties { .. }
+        | PushOperation::MoveEntity { .. } => false,
+    }
 }
 
 fn apply_effect_matches_remote(effect: &JournalApplyEffect, remote_id: &RemoteId) -> bool {
