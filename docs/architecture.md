@@ -20,13 +20,15 @@ The optional cloud relay is deliberately not implemented in v1. The local remote
 
 The proposed successor to the optional relay is a continuously maintained
 backend data plane, not a thin request proxy. It ingests connected sources once,
-builds ACL-aware immutable content/catalog units and short-lived artifact grants,
-materializes ordinary files in cloud sandboxes before an agent starts, and
-applies explicitly pushed changesets through backend-held connector credentials.
+maintains immutable versions and current projections in PostgreSQL, runs exact
+ACL/profile filtering in one server query, streams a transient standard tar, and
+materializes ordinary files before an agent starts. Large opaque attachments and
+backups use object storage; v1 has no persistent content-pack/catalog layer.
 Read-only content uses a single local tree; three-way state is reserved for
 writable resources. The proposed v1 is multi-tenant and multi-connector, uses a
-modular backend with PostgreSQL jobs, and relies on local diff plus explicit push;
-human-review workflows remain a later extension.
+modular backend with PostgreSQL jobs/read serving, and relies on local diff plus
+explicit push. A PostgreSQL read replica and then ClickHouse are measured future
+scale paths; human-review workflows remain later extensions.
 
 This target does not replace the filesystem path used by the desktop or
 headless `loc` CLI. `localityd` remains the shared local-host runtime for
