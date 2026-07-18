@@ -28,11 +28,12 @@ describe("source setup progress", () => {
         connection: { connector: "granola", status: "active" },
         connections: [
           { connector: "granola", status: "active" },
+          { connector: "slack", status: "active" },
           { connector: "notion", status: "active" },
         ],
         mounts: [{ connector: "granola", status: "ready" }],
       }),
-    ).toEqual(["notion"]);
+    ).toEqual(["notion", "slack"]);
   });
 
   it("falls back to the selected connection when older snapshots do not include all connections", () => {

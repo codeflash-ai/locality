@@ -30,6 +30,10 @@ use locality_notion::oauth::{
     DEFAULT_LOCALITY_NOTION_OAUTH_BROKER_URL, DEFAULT_NOTION_OAUTH_AUTHORIZE_URL,
     HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NotionOAuthBrokerStart,
 };
+use locality_slack::{
+    DEFAULT_SLACK_OAUTH_BROKER_URL, DEFAULT_SLACK_OAUTH_REDIRECT_URI, HttpSlackOAuthBrokerClient,
+    SLACK_CONNECTOR_ID, SlackMountSettings,
+};
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
     ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, EntityRecord,
@@ -58,10 +62,11 @@ use crate::connect::{
     BrokerOAuthConnectOptions, ConnectError, ConnectOptions, ConnectReport, ConnectionShowReport,
     ConnectionsReport, DisconnectReport, GmailBrokerOAuthConnectOptions,
     GoogleDocsBrokerOAuthConnectOptions, HttpGranolaConnectionProbe, HttpNotionConnectionProbe,
-    OAuthConnectOptions, ProfilesReport, run_connect_gmail_broker_oauth,
-    run_connect_google_docs_broker_oauth, run_connect_granola, run_connect_notion,
-    run_connect_notion_broker_oauth, run_connect_notion_oauth, run_connection_show,
-    run_connections, run_disconnect, run_profiles,
+    OAuthConnectOptions, ProfilesReport, SlackBrokerOAuthConnectOptions,
+    run_connect_gmail_broker_oauth, run_connect_google_docs_broker_oauth, run_connect_granola,
+    run_connect_notion, run_connect_notion_broker_oauth, run_connect_notion_oauth,
+    run_connect_slack_broker_oauth, run_connection_show, run_connections, run_disconnect,
+    run_profiles,
 };
 use crate::connector::{
     ConnectorResolveError, SourceDescriptor, resolve_notion_connector_for_mount,
@@ -229,6 +234,8 @@ enum ConnectCommand {
     GoogleDocs(ConnectGoogleDocsArgs),
     #[command(about = "Connect Gmail")]
     Gmail(ConnectGmailArgs),
+    #[command(about = "Connect Slack")]
+    Slack(ConnectSlackArgs),
     #[command(about = "Connect Granola with an API key")]
     Granola(ConnectGranolaArgs),
 }
@@ -298,6 +305,26 @@ struct ConnectGmailArgs {
         long,
         value_name = "ID",
         help = "Connection id to save. Defaults to gmail-default."
+    )]
+    name: Option<String>,
+    #[arg(long, help = "Print the OAuth URL instead of opening a browser.")]
+    no_browser: bool,
+    #[arg(long, value_name = "URL", help = "OAuth broker base URL.")]
+    broker_url: Option<String>,
+    #[arg(
+        long,
+        value_name = "URI",
+        help = "OAuth redirect URI for the local callback listener."
+    )]
+    redirect_uri: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ConnectSlackArgs {
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Connection id to save. Defaults to slack-default."
     )]
     name: Option<String>,
     #[arg(long, help = "Print the OAuth URL instead of opening a browser.")]
@@ -393,6 +420,8 @@ enum MountCommand {
     GoogleDocs(MountGoogleDocsArgs),
     #[command(about = "Mount Gmail")]
     Gmail(MountGmailArgs),
+    #[command(about = "Mount Slack read-only public channels")]
+    Slack(MountSlackArgs),
     #[command(about = "Mount Granola meeting notes read-only")]
     Granola(MountGranolaArgs),
 }
@@ -532,6 +561,35 @@ struct MountGmailArgs {
         help = "Gmail projection view. Defaults to messages."
     )]
     view: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct MountSlackArgs {
+    #[arg(
+        value_name = "path",
+        help = "Local directory where the Slack mount should be registered."
+    )]
+    path: String,
+    #[arg(long, value_name = "id", help = "Connection id to use for this mount.")]
+    connection: Option<String>,
+    #[arg(
+        long,
+        value_name = "id",
+        help = "Mount id to save. Defaults to slack-main."
+    )]
+    mount_id: Option<String>,
+    #[arg(
+        long,
+        value_name = "mode",
+        help = "Projection mode. Supported values depend on the host platform."
+    )]
+    projection: Option<String>,
+    #[arg(
+        long,
+        value_name = "n",
+        help = "Number of recent channel messages to hydrate, 1-15. Defaults to 15."
+    )]
+    recent_limit: Option<u32>,
 }
 
 #[derive(Debug, Args)]
@@ -980,6 +1038,21 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                         options.redirect_uri.as_deref(),
                     );
                 }
+                ConnectCommand::Slack(options) => {
+                    args.push("slack".to_string());
+                    push_optional_flag_value(&mut args, "--name", options.name.as_deref());
+                    push_flag(&mut args, "--no-browser", options.no_browser);
+                    push_optional_flag_value(
+                        &mut args,
+                        "--broker-url",
+                        options.broker_url.as_deref(),
+                    );
+                    push_optional_flag_value(
+                        &mut args,
+                        "--redirect-uri",
+                        options.redirect_uri.as_deref(),
+                    );
+                }
                 ConnectCommand::Granola(options) => {
                     args.push("granola".to_string());
                     push_optional_flag_value(&mut args, "--name", options.name.as_deref());
@@ -1088,6 +1161,24 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                     push_optional_flag_value(&mut args, "--before", options.before.as_deref());
                     push_optional_flag_value(&mut args, "--view", options.view.as_deref());
                     push_flag(&mut args, "--read-only", options.read_only);
+                }
+                MountCommand::Slack(options) => {
+                    args.push("slack".to_string());
+                    args.push(options.path.clone());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--connection",
+                        options.connection.as_deref(),
+                    );
+                    push_optional_flag_value(&mut args, "--mount-id", options.mount_id.as_deref());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--projection",
+                        options.projection.as_deref(),
+                    );
+                    if let Some(recent_limit) = options.recent_limit {
+                        push_flag_value(&mut args, "--recent-limit", &recent_limit.to_string());
+                    }
                 }
                 MountCommand::Granola(options) => {
                     args.push("granola".to_string());
@@ -1434,6 +1525,9 @@ fn connect(args: &[String], json: bool) -> i32 {
     if connector == Some(GMAIL_CONNECTOR_ID) {
         return connect_gmail(args, json);
     }
+    if connector == Some(SLACK_CONNECTOR_ID) {
+        return connect_slack(args, json);
+    }
     if connector == Some(GOOGLE_DOCS_CONNECTOR_ID) {
         return connect_google_docs(args, json);
     }
@@ -1443,7 +1537,7 @@ fn connect(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "connect",
                 "usage",
-                "usage: loc connect <notion|google-docs|gmail|granola> [options] [--json]",
+                "usage: loc connect <notion|google-docs|gmail|slack|granola> [options] [--json]",
             ),
             EXIT_USAGE,
         );
@@ -1812,6 +1906,77 @@ fn connect_gmail(args: &[String], json: bool) -> i32 {
         redirect_uri: start.redirect_uri,
     };
     match run_connect_gmail_broker_oauth(&mut store, credentials.as_ref(), options, &broker) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_connect_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => connect_command_error("connect", json, error),
+    }
+}
+
+fn connect_slack(args: &[String], json: bool) -> i32 {
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("connect", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let credentials = open_credential_store(&state_root);
+    let broker_config = match slack_oauth_broker_config(args) {
+        Ok(config) => config,
+        Err(error) => return command_error(json, error, EXIT_INTERNAL),
+    };
+    let broker = HttpSlackOAuthBrokerClient::new(broker_config.broker_url.clone());
+    let start = match broker.start(&OAuthBrokerStart {
+        connector: SLACK_CONNECTOR_ID.to_string(),
+        redirect_uri: broker_config.redirect_uri,
+    }) {
+        Ok(start) => start,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new(
+                    "connect",
+                    "oauth_broker_start_failed",
+                    format!("Slack OAuth broker start failed: {error}"),
+                )
+                .with_suggested_command("loc connect slack"),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let authorization = match run_local_oauth_authorization(
+        "Slack",
+        &start.authorization_url,
+        &start.redirect_uri,
+        &start.state,
+        has_flag(args, "--no-browser"),
+        json,
+    ) {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            return command_error(json, slack_local_oauth_command_error(error), EXIT_INTERNAL);
+        }
+    };
+    let options = SlackBrokerOAuthConnectOptions {
+        connection_id: flag_value(args, "--name").map(ConnectionId::new),
+        broker_url: broker_config.broker_url,
+        client_id: start.client_id,
+        session: start.session,
+        state: start.state,
+        code: authorization.code,
+        redirect_uri: start.redirect_uri,
+    };
+    match run_connect_slack_broker_oauth(&mut store, credentials.as_ref(), options, &broker) {
         Ok(report) if json => {
             print_json(&report);
             EXIT_SUCCESS
@@ -2573,13 +2738,16 @@ fn mount(args: &[String], json: bool) -> i32 {
             );
         }
     };
-    let settings_json = if descriptor.id() == GMAIL_CONNECTOR_ID {
-        match gmail_mount_settings_json(args) {
+    let settings_json = match descriptor.id() {
+        GMAIL_CONNECTOR_ID => match gmail_mount_settings_json(args) {
             Ok(settings_json) => settings_json,
             Err(error) => return command_error(json, error, EXIT_USAGE),
-        }
-    } else {
-        "{}".to_string()
+        },
+        SLACK_CONNECTOR_ID => match slack_mount_settings_json(args) {
+            Ok(settings_json) => settings_json,
+            Err(error) => return command_error(json, error, EXIT_USAGE),
+        },
+        _ => "{}".to_string(),
     };
 
     let state_root = default_state_root();
@@ -2603,7 +2771,9 @@ fn mount(args: &[String], json: bool) -> i32 {
             .clone()
             .unwrap_or_else(|| descriptor.default_mount_id().to_string()),
     );
-    let read_only = has_flag(args, "--read-only") || descriptor.id() == GRANOLA_CONNECTOR_ID;
+    let read_only = has_flag(args, "--read-only")
+        || descriptor.id() == GRANOLA_CONNECTOR_ID
+        || descriptor.id() == SLACK_CONNECTOR_ID;
     if let Some(error) = mounted_projection_preflight_error(
         projection.clone(),
         std::env::consts::OS,
@@ -2707,6 +2877,35 @@ fn gmail_mount_settings_json(args: &[String]) -> Result<String, CommandError> {
 
     settings.to_json().map_err(|error| {
         CommandError::new("mount", "gmail_settings_encode_failed", error.to_string())
+    })
+}
+
+fn slack_mount_settings_json(args: &[String]) -> Result<String, CommandError> {
+    let Some(recent_limit) = flag_value(args, "--recent-limit") else {
+        return Ok("{}".to_string());
+    };
+    let recent_limit = recent_limit.parse::<u32>().map_err(|_| {
+        CommandError::new(
+            "mount",
+            "slack_recent_limit_invalid",
+            "Slack --recent-limit must be an integer from 1 to 15",
+        )
+    })?;
+    let default = SlackMountSettings::default();
+    if recent_limit == default.recent_limit {
+        return Ok("{}".to_string());
+    }
+    SlackMountSettings {
+        recent_limit,
+        ..default
+    }
+    .to_json()
+    .map_err(|error| {
+        CommandError::new(
+            "mount",
+            "slack_settings_invalid",
+            locality_error_message(error),
+        )
     })
 }
 
@@ -2818,6 +3017,19 @@ fn mount_remote_root_id(
                     "mount",
                     "usage",
                     "loc mount gmail does not accept Notion or Google Docs root flags",
+                ));
+            }
+            Ok(None)
+        }
+        SLACK_CONNECTOR_ID => {
+            if has_flag(args, "--workspace")
+                || flag_value(args, "--root-page").is_some()
+                || flag_value(args, "--workspace-folder").is_some()
+            {
+                return Err(CommandError::new(
+                    "mount",
+                    "usage",
+                    "loc mount slack does not accept source root flags",
                 ));
             }
             Ok(None)
@@ -6749,6 +6961,12 @@ struct GmailOAuthBrokerCliConfig {
     redirect_uri: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SlackOAuthBrokerCliConfig {
+    broker_url: String,
+    redirect_uri: String,
+}
+
 fn notion_oauth_config(args: &[String]) -> Result<NotionOAuthCliConfig, CommandError> {
     let client_id = env_first(&["LOCALITY_NOTION_OAUTH_CLIENT_ID", "NOTION_OAUTH_CLIENT_ID"])
         .ok_or_else(|| missing_oauth_config("LOCALITY_NOTION_OAUTH_CLIENT_ID"))?;
@@ -6864,6 +7082,32 @@ fn gmail_oauth_broker_config(args: &[String]) -> Result<GmailOAuthBrokerCliConfi
     })
 }
 
+fn slack_oauth_broker_config(args: &[String]) -> Result<SlackOAuthBrokerCliConfig, CommandError> {
+    let broker_url = flag_value(args, "--broker-url")
+        .map(str::to_string)
+        .or_else(|| {
+            env_first(&[
+                "LOCALITY_SLACK_OAUTH_BROKER_URL",
+                "LOCALITY_AUTH_BROKER_URL",
+            ])
+        })
+        .unwrap_or_else(|| DEFAULT_SLACK_OAUTH_BROKER_URL.to_string());
+    let redirect_uri = flag_value(args, "--redirect-uri")
+        .map(str::to_string)
+        .or_else(|| env_first(&["LOCALITY_SLACK_OAUTH_REDIRECT_URI"]))
+        .unwrap_or_else(|| DEFAULT_SLACK_OAUTH_REDIRECT_URI.to_string());
+
+    local_redirect(&redirect_uri).map_err(|error| {
+        CommandError::new("connect", error.code, error.message)
+            .with_suggested_command("loc connect slack")
+    })?;
+
+    Ok(SlackOAuthBrokerCliConfig {
+        broker_url,
+        redirect_uri,
+    })
+}
+
 fn missing_oauth_config(name: &str) -> CommandError {
     CommandError::new(
         "connect",
@@ -6943,6 +7187,15 @@ fn gmail_local_oauth_command_error(error: LocalOAuthError) -> CommandError {
     let command_error = CommandError::new("connect", error.code, error.message);
     if command_error.code == "invalid_redirect_uri" {
         command_error.with_suggested_command("loc connect gmail")
+    } else {
+        command_error
+    }
+}
+
+fn slack_local_oauth_command_error(error: LocalOAuthError) -> CommandError {
+    let command_error = CommandError::new("connect", error.code, error.message);
+    if command_error.code == "invalid_redirect_uri" {
+        command_error.with_suggested_command("loc connect slack")
     } else {
         command_error
     }
@@ -7735,7 +7988,7 @@ fn projection_mode_for_target(args: &[String], target_os: &str) -> Result<Projec
 
 fn mount_usage() -> String {
     format!(
-        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--read-only] [--json]\n       loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--json]",
+        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--read-only] [--json]\n       loc mount slack <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--recent-limit n] [--json]\n       loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--json]",
         projection_usage_options_for_target(std::env::consts::OS)
     )
 }
@@ -8645,6 +8898,14 @@ mod tests {
 
         assert!(usage.contains("--after YYYY-MM-DD --before YYYY-MM-DD"));
         assert!(usage.contains("--view messages|threads"));
+    }
+
+    #[test]
+    fn mount_usage_mentions_slack_settings_flags() {
+        let usage = mount_usage();
+
+        assert!(usage.contains("loc mount slack <path>"));
+        assert!(usage.contains("--recent-limit n"));
     }
 
     #[test]

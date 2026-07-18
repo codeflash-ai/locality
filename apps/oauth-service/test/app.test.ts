@@ -15,6 +15,11 @@ interface StartResponse {
 interface BrokerTokenResponse {
   access_token: string;
   scope?: string;
+  scopes?: string[];
+  account_id?: string;
+  account_label?: string;
+  workspace_id?: string;
+  workspace_name?: string;
   refresh_token?: string;
   refresh_token_kind?: string;
   refresh_token_handle?: string;
@@ -36,7 +41,12 @@ const env: BrokerEnv = {
   LOCALITY_GOOGLE_DOCS_REDIRECT_URIS: "http://localhost:8757/oauth/google-docs/callback",
   LOCALITY_GMAIL_API_BASE_URL: "https://oauth2.example.test",
   LOCALITY_GMAIL_AUTH_BASE_URL: "https://accounts.example.test",
-  LOCALITY_GMAIL_REDIRECT_URIS: "http://localhost:8757/oauth/gmail/callback"
+  LOCALITY_GMAIL_REDIRECT_URIS: "http://localhost:8757/oauth/gmail/callback",
+  LOCALITY_SLACK_CLIENT_ID: "slack-client-id",
+  LOCALITY_SLACK_CLIENT_SECRET: "slack-client-secret",
+  LOCALITY_SLACK_API_BASE_URL: "https://slack.example.test",
+  LOCALITY_SLACK_AUTH_BASE_URL: "https://slack.example.test",
+  LOCALITY_SLACK_REDIRECT_URIS: "http://localhost:8757/oauth/slack/callback"
 };
 
 describe("auth broker", () => {
@@ -61,6 +71,38 @@ describe("auth broker", () => {
         gmail: {
           oauth: "brokered_confidential",
           session_ttl_seconds: 600,
+          refresh_token_modes: ["handle"]
+        }
+      }
+    });
+  });
+
+  it("publishes Slack in broker discovery", async () => {
+    const response = await app.request("/.well-known/loc-auth-broker", { method: "GET" }, env);
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      connectors: {
+        slack: {
+          oauth: "brokered_confidential",
+          session_ttl_seconds: 600,
+          refresh_token_modes: ["handle"]
+        }
+      }
+    });
+  });
+
+  it("keeps Slack discovery handle-only when other connectors use raw refresh tokens", async () => {
+    const rawEnv = { ...env, LOCALITY_TOKEN_MODE: "raw" as const };
+
+    const response = await app.request("/.well-known/loc-auth-broker", { method: "GET" }, rawEnv);
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      connectors: {
+        gmail: {
+          refresh_token_modes: ["raw"]
+        },
+        slack: {
           refresh_token_modes: ["handle"]
         }
       }
@@ -546,6 +588,197 @@ describe("auth broker", () => {
     });
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it("creates a Slack OAuth session and authorization URL", async () => {
+    const response = await app.request("/v1/oauth/slack/start", { method: "POST" }, env);
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as StartResponse;
+    expect(body.connector).toBe("slack");
+    expect(body.client_id).toBe("slack-client-id");
+    const authorizationUrl = new URL(body.authorization_url);
+    expect(`${authorizationUrl.origin}${authorizationUrl.pathname}`).toBe("https://slack.example.test/oauth/v2/authorize");
+    expect(authorizationUrl.searchParams.get("client_id")).toBe("slack-client-id");
+    expect(authorizationUrl.searchParams.get("redirect_uri")).toBe("http://localhost:8757/oauth/slack/callback");
+    expect(authorizationUrl.searchParams.get("scope")).toBe("channels:read,channels:history,users:read");
+    expect(authorizationUrl.searchParams.get("state")).toBe(body.state);
+    expect(body.redirect_uri).toBe("http://localhost:8757/oauth/slack/callback");
+    expect(body.session).toBeTruthy();
+    expect(body.state).toBeTruthy();
+  });
+
+  it("exchanges a Slack authorization code without exposing the raw refresh token in handle mode", async () => {
+    const start = await startSlackSession();
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      Response.json({
+        ok: true,
+        access_token: "xoxb-slack-access-token",
+        refresh_token: "slack-refresh-token",
+        token_type: "bot",
+        expires_in: 43200,
+        scope: "channels:read,channels:history,users:read",
+        bot_user_id: "B123",
+        team: { id: "T123", name: "CodeFlash" },
+        authed_user: { id: "U123" }
+      })
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const response = await app.request(
+      "/v1/oauth/slack/exchange",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          session: start.session,
+          state: start.state,
+          code: "authorization-code",
+          redirect_uri: "http://localhost:8757/oauth/slack/callback"
+        })
+      },
+      env
+    );
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as BrokerTokenResponse;
+    expect(body.access_token).toBe("xoxb-slack-access-token");
+    expect(body.scopes).toEqual(["channels:history", "channels:read", "users:read"]);
+    expect(body.account_id).toBe("U123");
+    expect(body.workspace_id).toBe("T123");
+    expect(body.workspace_name).toBe("CodeFlash");
+    expect(body.refresh_token).toBeUndefined();
+    expect(body.refresh_token_kind).toBe("handle");
+    expect(body.refresh_token_handle).toMatch(/^locrh_v1\./);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://slack.example.test/api/oauth.v2.access",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          "Content-Type": "application/x-www-form-urlencoded"
+        })
+      })
+    );
+    const requestBody = new URLSearchParams((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
+    expect(requestBody.get("client_id")).toBe("slack-client-id");
+    expect(requestBody.get("client_secret")).toBe("slack-client-secret");
+    expect(requestBody.get("code")).toBe("authorization-code");
+    expect(requestBody.get("redirect_uri")).toBe("http://localhost:8757/oauth/slack/callback");
+  });
+
+  it("exchanges Slack authorization codes with refresh handles even when broker raw mode is enabled", async () => {
+    const rawEnv = { ...env, LOCALITY_TOKEN_MODE: "raw" as const };
+    const start = await startSlackSession(rawEnv);
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      Response.json({
+        ok: true,
+        access_token: "xoxb-slack-access-token",
+        refresh_token: "slack-refresh-token",
+        token_type: "bot",
+        expires_in: 43200,
+        scope: "channels:read,channels:history,users:read",
+        bot_user_id: "B123",
+        team: { id: "T123", name: "CodeFlash" },
+        authed_user: { id: "U123" }
+      })
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const response = await app.request(
+      "/v1/oauth/slack/exchange",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          session: start.session,
+          state: start.state,
+          code: "authorization-code",
+          redirect_uri: "http://localhost:8757/oauth/slack/callback"
+        })
+      },
+      rawEnv
+    );
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as BrokerTokenResponse;
+    expect(body.refresh_token).toBeUndefined();
+    expect(body.refresh_token_kind).toBe("handle");
+    expect(body.refresh_token_handle).toMatch(/^locrh_v1\./);
+  });
+
+  it("refreshes Slack credentials through an opaque refresh handle", async () => {
+    const start = await startSlackSession();
+    let calls = 0;
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => {
+      calls += 1;
+      if (calls === 1) {
+        return Response.json({
+          ok: true,
+          access_token: "slack-access-token",
+          refresh_token: "slack-refresh-token",
+          expires_in: 43200,
+          scope: "channels:read,channels:history,users:read"
+        });
+      }
+      return Response.json({
+        ok: true,
+        access_token: "new-slack-access-token",
+        refresh_token: "new-slack-refresh-token",
+        expires_in: 43200,
+        scope: "channels:read channels:history users:read"
+      });
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const exchanged = await app.request(
+      "/v1/oauth/slack/exchange",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          session: start.session,
+          state: start.state,
+          code: "authorization-code",
+          redirect_uri: "http://localhost:8757/oauth/slack/callback"
+        })
+      },
+      env
+    );
+    const exchangeBody = (await exchanged.json()) as BrokerTokenResponse;
+
+    const refreshed = await app.request(
+      "/v1/oauth/slack/refresh",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ refresh_token_handle: exchangeBody.refresh_token_handle })
+      },
+      env
+    );
+
+    expect(refreshed.status).toBe(200);
+    const refreshBody = (await refreshed.json()) as BrokerTokenResponse;
+    expect(refreshBody.access_token).toBe("new-slack-access-token");
+    expect(refreshBody.scopes).toEqual(["channels:history", "channels:read", "users:read"]);
+    expect(refreshBody.refresh_token_handle).toMatch(/^locrh_v1\./);
+    const refreshRequest = new URLSearchParams((fetchMock.mock.calls[1]?.[1] as RequestInit).body as string);
+    expect(refreshRequest.get("grant_type")).toBe("refresh_token");
+    expect(refreshRequest.get("refresh_token")).toBe("slack-refresh-token");
+  });
+
+  it("rejects unconfigured Slack redirect URIs", async () => {
+    const response = await app.request(
+      "/v1/oauth/slack/start",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ redirect_uri: "http://localhost:9999/oauth/slack/callback" })
+      },
+      env
+    );
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "redirect_uri_not_allowed" }
+    });
+  });
 });
 
 async function startSession() {
@@ -562,6 +795,12 @@ async function startGoogleDocsSession() {
 
 async function startGmailSession() {
   const response = await app.request("/v1/oauth/gmail/start", { method: "POST" }, env);
+  expect(response.status).toBe(200);
+  return response.json() as Promise<StartResponse>;
+}
+
+async function startSlackSession(testEnv: BrokerEnv = env) {
+  const response = await app.request("/v1/oauth/slack/start", { method: "POST" }, testEnv);
   expect(response.status).toBe(200);
   return response.json() as Promise<StartResponse>;
 }

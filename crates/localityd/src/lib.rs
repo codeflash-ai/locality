@@ -18,6 +18,7 @@ pub mod runtime;
 pub mod scheduler;
 pub mod server;
 mod shadow_match;
+pub mod slack;
 pub mod source;
 pub mod supervisor;
 pub mod virtual_fs;

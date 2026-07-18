@@ -70,6 +70,10 @@ pub fn auto_save_target_for_write<S>(
 where
     S: AutoSaveRepository + MountLiveModeRepository,
 {
+    if mount.read_only {
+        return Ok(None);
+    }
+
     if auto_save_enabled_for_path(store, &mount.mount_id, &entity.path)?.is_none()
         && !mount_live_mode_enabled_for_write(store, &mount.mount_id)?
     {
@@ -292,10 +296,42 @@ pub fn auto_save_timestamp() -> String {
 
 #[cfg(test)]
 mod tests {
-    use locality_core::model::RemoteId;
+    use locality_core::model::{EntityKind, MountId, RemoteId};
     use locality_core::planner::{PlanDegradation, PlanDegradationKind, PushOperation, PushPlan};
+    use locality_store::{
+        EntityRecord, InMemoryStateStore, MountConfig, MountLiveModeRecord, MountLiveModeRepository,
+    };
+    use std::path::Path;
 
-    use super::auto_save_plan_block_reason;
+    use super::{auto_save_plan_block_reason, auto_save_target_for_write};
+
+    #[test]
+    fn read_only_mount_is_not_auto_save_target_even_when_mount_live_mode_enabled() {
+        let mount_id = MountId::new("slack-main");
+        let mount =
+            MountConfig::new(mount_id.clone(), "slack", "/tmp/locality/slack").read_only(true);
+        let entity = EntityRecord::new(
+            mount_id.clone(),
+            RemoteId::new("slack-recent:C123"),
+            EntityKind::Page,
+            "Recent",
+            "channels/general/recent.md",
+        );
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount_live_mode(MountLiveModeRecord::new(mount_id, true, "1"))
+            .expect("save mount Live Mode");
+
+        let target = auto_save_target_for_write(
+            &store,
+            &mount,
+            &entity,
+            Path::new("/tmp/locality/slack/channels/general/recent.md"),
+        )
+        .expect("auto-save target");
+
+        assert_eq!(target, None);
+    }
 
     #[test]
     fn auto_save_policy_allows_create_and_safe_edits() {

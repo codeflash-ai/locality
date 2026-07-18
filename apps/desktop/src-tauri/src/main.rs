@@ -23,8 +23,9 @@ use loc_cli::connect::DEFAULT_NOTION_PROFILE_ID;
 use loc_cli::connect::{
     BrokerOAuthConnectOptions, ConnectOptions, GmailBrokerOAuthConnectOptions,
     GoogleDocsBrokerOAuthConnectOptions, HttpGranolaConnectionProbe,
-    run_connect_gmail_broker_oauth, run_connect_google_docs_broker_oauth, run_connect_granola,
-    run_connect_notion_broker_oauth, run_disconnect,
+    SlackBrokerOAuthConnectOptions, run_connect_gmail_broker_oauth,
+    run_connect_google_docs_broker_oauth, run_connect_granola, run_connect_notion_broker_oauth,
+    run_connect_slack_broker_oauth, run_disconnect,
 };
 use loc_cli::daemon::{DaemonRunState, run_daemon_control};
 use loc_cli::diff::{DiffReport, run_diff};
@@ -87,6 +88,10 @@ use locality_platform::{
     DAEMON_PID_FILENAME, append_service_log, bundled_binary_next_to_current_exe,
     default_state_root as platform_default_state_root, logs_dir as platform_logs_dir,
     user_home as platform_user_home,
+};
+use locality_slack::{
+    DEFAULT_SLACK_OAUTH_BROKER_URL, DEFAULT_SLACK_OAUTH_REDIRECT_URI, HttpSlackOAuthBrokerClient,
+    SLACK_CONNECTOR_ID,
 };
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
@@ -532,6 +537,7 @@ struct MountLiveModeChange {
 static CONNECT_NOTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static CONNECT_GOOGLE_DOCS_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static CONNECT_GMAIL_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static CONNECT_SLACK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static DAEMON_LIFECYCLE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static NOTION_LOGIN_LINK: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static DESKTOP_SNAPSHOT_CACHE: OnceLock<Mutex<DesktopSnapshotCache>> = OnceLock::new();
@@ -968,6 +974,11 @@ async fn connect_gmail(app: AppHandle) -> ActionReport {
     run_gmail_connection_flow(app, true).await
 }
 
+#[tauri::command]
+async fn connect_slack(app: AppHandle) -> ActionReport {
+    run_slack_connection_flow(app, true).await
+}
+
 #[derive(Clone, Copy)]
 enum NotionConnectionAction {
     Connect,
@@ -1139,6 +1150,54 @@ async fn run_gmail_connection_flow(app: AppHandle, open_browser: bool) -> Action
                 "warn",
                 "gmail_access.failed",
                 format!("connect gmail failed: {message}"),
+            );
+            ActionReport { ok: false, message }
+        }
+    };
+    if report.ok {
+        refresh_desktop_surfaces(&app);
+    }
+    report
+}
+
+async fn run_slack_connection_flow(app: AppHandle, open_browser: bool) -> ActionReport {
+    if CONNECT_SLACK_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        return ActionReport {
+            ok: false,
+            message: "A Slack connection flow is already waiting for browser approval.".to_string(),
+        };
+    }
+
+    let state_root = default_state_root();
+    let activity_state_root = state_root.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        connect_slack_with_broker(state_root, open_browser)
+    })
+    .await
+    .map_err(|error| format!("Slack OAuth worker failed: {error}"));
+    CONNECT_SLACK_IN_PROGRESS.store(false, Ordering::Release);
+
+    let report = match result {
+        Ok(Ok(message)) => {
+            if let Err(error) = record_desktop_activity(
+                &activity_state_root,
+                "Connected Slack",
+                &message,
+                "connect",
+            ) {
+                desktop_log(
+                    "warn",
+                    "activity.record_failed",
+                    format!("could not record Slack access activity: {error}"),
+                );
+            }
+            ActionReport { ok: true, message }
+        }
+        Ok(Err(message)) | Err(message) => {
+            desktop_log(
+                "warn",
+                "slack_access.failed",
+                format!("connect slack failed: {message}"),
             );
             ActionReport { ok: false, message }
         }
@@ -2862,6 +2921,9 @@ fn set_mount_live_mode_blocking(change: MountLiveModeChange) -> Result<ActionRep
         .map_err(|error| format!("Could not inspect connections: {error}"))?;
     let mount = choose_mount(&mounts, &connections)
         .ok_or_else(|| "Create a Notion folder before turning on Live Mode.".to_string())?;
+    if let Some(message) = live_mode_read_only_mount_error(change.enabled, &mount) {
+        return Err(message);
+    }
     let now = live_mode_timestamp();
     let existing = store
         .get_mount_live_mode(&mount.mount_id)
@@ -2896,6 +2958,11 @@ fn set_mount_live_mode_blocking(change: MountLiveModeChange) -> Result<ActionRep
             "Live Mode is off for this folder.".to_string()
         },
     })
+}
+
+fn live_mode_read_only_mount_error(enabled: bool, mount: &MountConfig) -> Option<String> {
+    (enabled && mount.read_only)
+        .then(|| "Live Mode cannot be enabled for read-only mounts.".to_string())
 }
 
 fn mark_mount_live_mode_syncing(state_root: &Path, mount_id: &MountId) -> Result<bool, String> {
@@ -4126,7 +4193,8 @@ fn connection_connector_rank(connector: &str) -> usize {
         "notion" => 0,
         "google-docs" => 1,
         "gmail" => 2,
-        "granola" => 3,
+        "slack" => 3,
+        "granola" => 4,
         _ => 10,
     }
 }
@@ -7304,6 +7372,7 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
     let state_root = default_state_root();
     let projection = desktop_projection_mode();
     let connector = request.connector.trim().to_string();
+    let read_only = request.read_only || connector == "slack";
     let mount_id = request.mount_id.trim().to_string();
     if mount_id.is_empty() {
         return Err("Mount id is required.".to_string());
@@ -7355,7 +7424,7 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
                 root: root.clone(),
                 remote_root_id: None,
                 connection_id: connection_id.clone(),
-                read_only: request.read_only,
+                read_only,
                 projection: projection.clone(),
                 settings_json: "{}".to_string(),
             };
@@ -7370,7 +7439,7 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
                 })?;
             Some(folder_id)
         }
-        "gmail" | "granola" => None,
+        "gmail" | "granola" | "slack" => None,
         other => {
             return Err(format!(
                 "Desktop mount creation does not support connector `{other}`."
@@ -7391,7 +7460,7 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
             root,
             remote_root_id,
             connection_id,
-            read_only: request.read_only,
+            read_only,
             projection: projection.clone(),
             settings_json: "{}".to_string(),
         },
@@ -9980,6 +10049,57 @@ fn connect_gmail_with_broker(state_root: PathBuf, open_browser: bool) -> Result<
     ))
 }
 
+fn connect_slack_with_broker(state_root: PathBuf, open_browser: bool) -> Result<String, String> {
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let credentials = open_credential_store(&state_root);
+    let broker_url = env_first(&[
+        "LOCALITY_SLACK_OAUTH_BROKER_URL",
+        "LOCALITY_AUTH_BROKER_URL",
+    ])
+    .unwrap_or_else(|| DEFAULT_SLACK_OAUTH_BROKER_URL.to_string());
+    let redirect_uri = env_first(&[
+        "LOCALITY_SLACK_OAUTH_REDIRECT_URI",
+        "SLACK_OAUTH_REDIRECT_URI",
+    ])
+    .unwrap_or_else(|| DEFAULT_SLACK_OAUTH_REDIRECT_URI.to_string());
+    let broker = HttpSlackOAuthBrokerClient::new(broker_url.clone());
+    let start = broker
+        .start(&OAuthBrokerStart {
+            connector: SLACK_CONNECTOR_ID.to_string(),
+            redirect_uri,
+        })
+        .map_err(|error| format!("Could not start Slack OAuth broker flow: {error}"))?;
+    let authorization = run_local_oauth_authorization(
+        "Slack",
+        &start.authorization_url,
+        &start.redirect_uri,
+        &start.state,
+        !open_browser,
+        true,
+    )
+    .map_err(|error| error.message)?;
+    let options = SlackBrokerOAuthConnectOptions {
+        connection_id: None,
+        broker_url,
+        client_id: start.client_id,
+        session: start.session,
+        state: start.state,
+        code: authorization.code,
+        redirect_uri: start.redirect_uri,
+    };
+
+    let report = run_connect_slack_broker_oauth(&mut store, credentials.as_ref(), options, &broker)
+        .map_err(|error| error.message())?;
+    let connected_message = match report.workspace_name.or(report.account_label) {
+        Some(label) if !label.is_empty() => format!("Connected Slack workspace {label}."),
+        _ => "Connected Slack.".to_string(),
+    };
+    Ok(format!(
+        "{connected_message} Create a Slack source folder to mount read-only public channels."
+    ))
+}
+
 fn notion_login_link_slot() -> &'static Mutex<Option<String>> {
     NOTION_LOGIN_LINK.get_or_init(|| Mutex::new(None))
 }
@@ -10936,6 +11056,9 @@ fn set_live_mode_for_file_blocking(change: LiveModeFileChange) -> Result<ActionR
     let target = expand_tilde(&change.path).unwrap_or_else(|_| PathBuf::from(&change.path));
     let target = absolute_path(&target)?;
     let (mount, relative_path) = resolve_desktop_mount_path(&store, &target)?;
+    if let Some(message) = live_mode_read_only_mount_error(change.enabled, &mount) {
+        return Err(message);
+    }
     let existing = store
         .get_auto_save_enrollment(&mount.mount_id, &relative_path)
         .map_err(|error| error.to_string())?;
@@ -14643,6 +14766,26 @@ mod tests {
     }
 
     #[test]
+    fn live_mode_read_only_mount_guard_blocks_enable_only() {
+        let read_only =
+            MountConfig::new(MountId::new("slack-main"), "slack", "/tmp/slack").read_only(true);
+        let writable = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/notion");
+
+        assert_eq!(
+            super::live_mode_read_only_mount_error(true, &read_only).as_deref(),
+            Some("Live Mode cannot be enabled for read-only mounts.")
+        );
+        assert_eq!(
+            super::live_mode_read_only_mount_error(false, &read_only),
+            None
+        );
+        assert_eq!(
+            super::live_mode_read_only_mount_error(true, &writable),
+            None
+        );
+    }
+
+    #[test]
     fn push_action_message_explains_remote_changed_recovery() {
         let message = push_action_message(
             "apply_failed",
@@ -17321,6 +17464,7 @@ fn main() {
             change_notion_access,
             connect_google_docs,
             connect_gmail,
+            connect_slack,
             notion_login_link,
             install_state_review,
             acknowledge_install_state,

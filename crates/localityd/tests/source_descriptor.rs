@@ -8,6 +8,7 @@ use locality_gmail::{GMAIL_CONNECTOR_ID, GMAIL_OAUTH_SCOPES, StoredGmailCredenti
 use locality_google_docs::{GOOGLE_DOCS_CONNECTOR_ID, StoredGoogleDocsCredential};
 use locality_granola::GRANOLA_CONNECTOR_ID;
 use locality_notion::client::DEFAULT_NOTION_TOKEN_ENV;
+use locality_slack::{SLACK_CONNECTOR_ID, SLACK_OAUTH_SCOPES, StoredSlackCredential};
 use locality_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorProfileRepository, CredentialStore, InMemoryCredentialStore,
@@ -103,6 +104,26 @@ fn granola_descriptor_is_read_only_and_uses_api_key_setup() {
 }
 
 #[test]
+fn slack_descriptor_is_oauth_read_only_and_public_channel_scoped() {
+    let descriptor = source_descriptor(SLACK_CONNECTOR_ID);
+
+    assert_eq!(descriptor.id(), SLACK_CONNECTOR_ID);
+    assert_eq!(descriptor.display_name(), "Slack");
+    assert_eq!(descriptor.default_mount_id(), "slack-main");
+    assert_eq!(descriptor.connect_command(), Some("loc connect slack"));
+    assert_eq!(descriptor.auth_env_var(), None);
+    assert!(descriptor.supports_oauth());
+    assert!(descriptor.create_entity_parent_kinds().is_empty());
+    assert!(
+        descriptor
+            .mount_guidance()
+            .contains("Slack connector is read-only in v1")
+    );
+    assert!(descriptor.mount_guidance().contains("public channels only"));
+    assert!(descriptor.mount_guidance().contains("lazy hydrated"));
+}
+
+#[test]
 fn granola_rejects_every_write_and_create_path() {
     let mut mount = MountConfig::new(
         MountId::new("granola-main"),
@@ -118,6 +139,26 @@ fn granola_rejects_every_write_and_create_path() {
         !source_create_decision_for_parent_path(&mount, std::path::Path::new("meeting"))
             .is_writable()
     );
+}
+
+#[test]
+fn slack_rejects_every_write_and_create_path() {
+    let mut mount = MountConfig::new(
+        MountId::new("slack-main"),
+        SLACK_CONNECTOR_ID,
+        "/tmp/locality/slack",
+    );
+    mount.read_only = false;
+
+    let write =
+        source_write_decision_for_path(&mount, std::path::Path::new("channels/general/recent.md"));
+    assert!(!write.is_writable());
+    assert_eq!(write.reason(), Some("Slack connector is read-only in v1"));
+
+    let create =
+        source_create_decision_for_parent_path(&mount, std::path::Path::new("channels/general"));
+    assert!(!create.is_writable());
+    assert_eq!(create.reason(), Some("Slack connector is read-only in v1"));
 }
 
 #[test]
@@ -255,6 +296,59 @@ fn save_gmail_connection(
     (connection_id, secret_ref)
 }
 
+fn save_slack_connection(
+    store: &mut InMemoryStateStore,
+    connection_id: &str,
+    auth_kind: &str,
+) -> (ConnectionId, String) {
+    let profile_id = ConnectorProfileId::new(format!("{connection_id}-profile"));
+    let connection_id = ConnectionId::new(connection_id);
+    let secret_ref = format!("connection:{}", connection_id.0);
+
+    store
+        .save_connector_profile(ConnectorProfileRecord {
+            profile_id: profile_id.clone(),
+            connector: SLACK_CONNECTOR_ID.to_string(),
+            display_name: "Slack OAuth".to_string(),
+            auth_kind: auth_kind.to_string(),
+            scopes: SLACK_OAUTH_SCOPES
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect(),
+            capabilities_json: "{}".to_string(),
+            enabled_actions_json: "[]".to_string(),
+            connector_version: "1".to_string(),
+            status: "active".to_string(),
+            created_at: "2026-06-25T10:00:00Z".to_string(),
+            updated_at: "2026-06-25T10:00:00Z".to_string(),
+        })
+        .expect("save profile");
+    store
+        .save_connection(ConnectionRecord {
+            connection_id: connection_id.clone(),
+            profile_id: Some(profile_id),
+            connector: SLACK_CONNECTOR_ID.to_string(),
+            display_name: "Slack".to_string(),
+            account_label: Some("user@example.com".to_string()),
+            workspace_id: Some("T123".to_string()),
+            workspace_name: Some("Example Slack".to_string()),
+            auth_kind: auth_kind.to_string(),
+            secret_ref: secret_ref.clone(),
+            scopes: SLACK_OAUTH_SCOPES
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect(),
+            capabilities_json: "{}".to_string(),
+            status: "active".to_string(),
+            created_at: "2026-06-25T10:00:00Z".to_string(),
+            updated_at: "2026-06-25T10:00:00Z".to_string(),
+            expires_at: None,
+        })
+        .expect("save connection");
+
+    (connection_id, secret_ref)
+}
+
 fn stored_gmail_credential(access_token: &str) -> StoredGmailCredential {
     StoredGmailCredential::from_broker_token(
         OAuthBrokerToken {
@@ -298,8 +392,34 @@ fn expired_gmail_credential(access_token: &str, broker_url: String) -> StoredGma
     stored
 }
 
+fn stored_slack_credential(access_token: &str) -> StoredSlackCredential {
+    StoredSlackCredential::from_broker_token(
+        OAuthBrokerToken {
+            access_token: access_token.to_string(),
+            token_type: Some("bot".to_string()),
+            expires_in: Some(3600),
+            refresh_token_handle: Some("handle-1".to_string()),
+            account_id: Some("U123".to_string()),
+            account_label: Some("user@example.com".to_string()),
+            workspace_id: Some("T123".to_string()),
+            workspace_name: Some("Example Slack".to_string()),
+            scopes: SLACK_OAUTH_SCOPES
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect(),
+        },
+        "client-id".to_string(),
+        "https://auth.example.test".to_string(),
+        4_102_444_800,
+    )
+}
+
 fn gmail_mount() -> MountConfig {
     MountConfig::new(MountId::new("gmail-main"), GMAIL_CONNECTOR_ID, "/tmp/gmail")
+}
+
+fn slack_mount() -> MountConfig {
+    MountConfig::new(MountId::new("slack-main"), SLACK_CONNECTOR_ID, "/tmp/slack")
 }
 
 fn validate_gmail_create_issues(path: &str, markdown: &str) -> Vec<ValidationIssue> {
@@ -350,7 +470,7 @@ fn validate_gmail_changed(path: &str, markdown: &str) -> Vec<String> {
 fn supported_source_connectors_include_first_party_connectors() {
     assert_eq!(
         supported_source_connectors(),
-        vec!["notion", "google-docs", "gmail", "granola"]
+        vec!["notion", "google-docs", "gmail", "granola", "slack"]
     );
 }
 
@@ -427,6 +547,54 @@ fn resolving_gmail_mount_uses_active_oauth_connection_credentials() {
         panic!("expected gmail source");
     };
     assert_eq!(connector.config().access_token, "gmail-access-token");
+}
+
+#[test]
+fn resolving_slack_mount_uses_active_oauth_connection_credentials() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (_connection_id, secret_ref) = save_slack_connection(&mut store, "slack-default", "oauth");
+    credentials
+        .put(
+            &secret_ref,
+            &serde_json::to_string(&stored_slack_credential("slack-access-token"))
+                .expect("credential json"),
+        )
+        .expect("save credential");
+
+    let source =
+        resolve_source_for_mount(&store, &credentials, &slack_mount()).expect("resolve slack");
+
+    let ResolvedSource::Slack(connector) = source else {
+        panic!("expected slack source");
+    };
+    assert_eq!(connector.config().access_token, "slack-access-token");
+    assert_eq!(connector.config().settings.recent_limit, 15);
+}
+
+#[test]
+fn resolving_slack_mount_with_invalid_settings_reports_validation_detail() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (connection_id, secret_ref) = save_slack_connection(&mut store, "slack-default", "oauth");
+    credentials
+        .put(
+            &secret_ref,
+            &serde_json::to_string(&stored_slack_credential("slack-access-token"))
+                .expect("credential json"),
+        )
+        .expect("save credential");
+    let mount = slack_mount()
+        .with_connection_id(connection_id)
+        .with_settings_json(r#"{"recent_limit":30}"#);
+
+    let error = resolve_source_for_mount(&store, &credentials, &mount)
+        .expect_err("invalid Slack settings should reject resolver");
+
+    assert_eq!(error.code(), "credential_store_unavailable");
+    let message = error.message();
+    assert!(message.contains("Slack mount `slack-main` settings are invalid"));
+    assert!(message.contains("recent_limit must be between 1 and 15"));
 }
 
 #[test]

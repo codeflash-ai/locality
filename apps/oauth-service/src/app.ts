@@ -9,8 +9,20 @@ import {
 import { exchangeGmailCode, gmailAuthorizeUrl, refreshGmailToken, type GmailTokenResponse } from "./oauth/gmail";
 import { googleClientId } from "./oauth/google";
 import { exchangeNotionCode, notionAuthorizeUrl, refreshNotionToken, type NotionTokenResponse } from "./oauth/notion";
+import {
+  exchangeSlackCode,
+  refreshSlackToken,
+  slackAuthorizeUrl,
+  slackTokenScopes,
+  type SlackTokenResponse
+} from "./oauth/slack";
 import { randomBase64Url, decryptJsonHandle, encryptJsonHandle } from "./security/crypto";
-import { validateGmailRedirectUri, validateGoogleDocsRedirectUri, validateNotionRedirectUri } from "./security/redirects";
+import {
+  validateGmailRedirectUri,
+  validateGoogleDocsRedirectUri,
+  validateNotionRedirectUri,
+  validateSlackRedirectUri
+} from "./security/redirects";
 import { nowSeconds, signSession, verifySession } from "./security/session";
 import type { ApiErrorBody, BrokerEnv, ConnectorId } from "./types";
 
@@ -63,6 +75,11 @@ app.get("/.well-known/loc-auth-broker", (c) =>
         oauth: "brokered_confidential",
         session_ttl_seconds: SESSION_TTL_SECONDS,
         refresh_token_modes: [tokenMode(c.env)]
+      },
+      slack: {
+        oauth: "brokered_confidential",
+        session_ttl_seconds: SESSION_TTL_SECONDS,
+        refresh_token_modes: ["handle"]
       }
     }
   })
@@ -233,6 +250,61 @@ app.post("/v1/oauth/gmail/refresh", async (c) => {
   return c.json(await shapeGmailTokenResponse(c.env, token));
 });
 
+app.post("/v1/oauth/slack/start", async (c) => {
+  const body = await optionalJson<StartRequest>(c.req.raw);
+  const redirectUri = validateSlackRedirectUri(
+    c.env,
+    body.redirect_uri ?? "http://localhost:8757/oauth/slack/callback"
+  );
+  const now = nowSeconds();
+  const state = randomBase64Url();
+  const session = await signSession(
+    {
+      v: 1,
+      connector: "slack",
+      state,
+      redirect_uri: redirectUri,
+      iat: now,
+      exp: now + SESSION_TTL_SECONDS,
+      nonce: randomBase64Url()
+    },
+    requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
+  );
+  return c.json({
+    connector: "slack",
+    client_id: requireSlackClientId(c.env),
+    authorization_url: slackAuthorizeUrl(c.env, redirectUri, state),
+    redirect_uri: redirectUri,
+    session,
+    state,
+    expires_in: SESSION_TTL_SECONDS
+  });
+});
+
+app.post("/v1/oauth/slack/exchange", async (c) => {
+  const body = await requiredJson<ExchangeRequest>(c.req.raw);
+  const session = requireString(body.session, "session");
+  const state = requireString(body.state, "state");
+  const code = requireString(body.code, "code");
+  const redirectUri = validateSlackRedirectUri(c.env, requireString(body.redirect_uri, "redirect_uri"));
+  const payload = await verifySession(
+    session,
+    requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
+  );
+  if (payload.connector !== "slack" || payload.state !== state || payload.redirect_uri !== redirectUri) {
+    throw badRequest("oauth_session_mismatch", "OAuth callback did not match the broker session");
+  }
+  const token = await exchangeSlackCode(c.env, code, redirectUri);
+  return c.json(await shapeSlackTokenResponse(c.env, token));
+});
+
+app.post("/v1/oauth/slack/refresh", async (c) => {
+  const body = await requiredJson<RefreshRequest>(c.req.raw);
+  const refreshToken = await resolveRefreshToken(c.env, "slack", body, "handle");
+  const token = await refreshSlackToken(c.env, refreshToken);
+  return c.json(await shapeSlackTokenResponse(c.env, token));
+});
+
 app.onError((error, c) => {
   const httpError = error instanceof HttpError ? error : new HttpError(500, "internal_error", "internal server error");
   const body: ApiErrorBody = {
@@ -287,6 +359,24 @@ async function shapeGmailTokenResponse(env: BrokerEnv, token: GmailTokenResponse
   };
 }
 
+async function shapeSlackTokenResponse(env: BrokerEnv, token: SlackTokenResponse) {
+  const refresh = await shapeRefreshTokenHandle(env, "slack", token.refresh_token);
+  const workspaceId = token.team?.id ?? token.enterprise?.id;
+  const workspaceName = token.team?.name ?? token.enterprise?.name;
+  return {
+    connector: "slack",
+    access_token: token.access_token,
+    token_type: token.token_type,
+    expires_in: token.expires_in,
+    scopes: slackTokenScopes(token),
+    account_id: token.authed_user?.id ?? token.bot_user_id,
+    account_label: token.authed_user?.id ?? token.bot_user_id,
+    workspace_id: workspaceId,
+    workspace_name: workspaceName,
+    ...refresh
+  };
+}
+
 async function shapeRefreshToken(env: BrokerEnv, connector: ConnectorId, refreshToken: string | undefined) {
   if (!refreshToken) {
     return {};
@@ -313,7 +403,32 @@ async function shapeRefreshToken(env: BrokerEnv, connector: ConnectorId, refresh
   };
 }
 
-async function resolveRefreshToken(env: BrokerEnv, connector: ConnectorId, body: RefreshRequest): Promise<string> {
+async function shapeRefreshTokenHandle(env: BrokerEnv, connector: ConnectorId, refreshToken: string | undefined) {
+  if (!refreshToken) {
+    return {};
+  }
+  const secret = requireOperationalSecret(env.LOCALITY_REFRESH_HANDLE_KEY, "LOCALITY_REFRESH_HANDLE_KEY");
+  const handle = await encryptJsonHandle(
+    {
+      v: 1,
+      connector,
+      refresh_token: refreshToken,
+      issued_at: nowSeconds()
+    } satisfies RefreshHandlePayload,
+    secret
+  );
+  return {
+    refresh_token_kind: "handle",
+    refresh_token_handle: handle
+  };
+}
+
+async function resolveRefreshToken(
+  env: BrokerEnv,
+  connector: ConnectorId,
+  body: RefreshRequest,
+  mode: "handle" | "raw" = tokenMode(env)
+): Promise<string> {
   if (body.refresh_token_handle) {
     try {
       const payload = await decryptJsonHandle<RefreshHandlePayload>(
@@ -328,7 +443,7 @@ async function resolveRefreshToken(env: BrokerEnv, connector: ConnectorId, body:
       throw badRequest("invalid_refresh_handle", "refresh_token_handle is invalid");
     }
   }
-  if (tokenMode(env) !== "raw") {
+  if (mode !== "raw") {
     throw badRequest("missing_refresh_handle", "refresh_token_handle is required");
   }
   return requireString(body.refresh_token, "refresh_token");
@@ -369,6 +484,13 @@ function requireOperationalSecret(value: string | undefined, name: string): stri
     throw configError(`${name} must be configured`);
   }
   return value;
+}
+
+function requireSlackClientId(env: BrokerEnv): string {
+  if (!env.LOCALITY_SLACK_CLIENT_ID) {
+    throw configError("LOCALITY_SLACK_CLIENT_ID is required");
+  }
+  return env.LOCALITY_SLACK_CLIENT_ID;
 }
 
 export default app;

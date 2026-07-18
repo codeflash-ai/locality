@@ -28,14 +28,16 @@ The broker supports two refresh modes:
   accepted by the refresh endpoint.
 - `raw`: development compatibility mode. The broker returns the provider refresh
   token directly. The CLI must still store it only in the OS credential store.
+  Slack remains handle-only because the Rust Slack client requires an opaque
+  broker refresh handle for expiring OAuth credentials.
 
 ## Current Controls
 
 - OAuth sessions are short-lived HMAC-signed payloads.
 - Session verification checks state, connector, redirect URI, expiry, and payload
   shape before exchanging a code.
-- Notion, Google Docs, and Gmail redirect URIs are restricted to configured
-  loopback callback URLs.
+- Notion, Google Docs, Gmail, and Slack redirect URIs are restricted to
+  configured loopback callback URLs.
 - Production handle mode keeps provider refresh tokens inside encrypted opaque
   handles before returning them to local clients.
 - Upstream OAuth error bodies are not returned to callers.
@@ -57,5 +59,5 @@ Deployment controls to add before public launch:
 ## Redirects
 
 The broker accepts only configured loopback redirect URIs for Notion, Google
-Docs, and Gmail. The Locality CLI should use stable localhost callbacks so each
-provider integration can keep a small static redirect allowlist.
+Docs, Gmail, and Slack. The Locality CLI should use stable localhost callbacks
+so each provider integration can keep a small static redirect allowlist.

@@ -1,12 +1,13 @@
 use loc_cli::connect::{
     BrokerOAuthConnectOptions, ConnectOptions, CredentialEncodeFailure, CredentialStorageFailure,
     DEFAULT_GMAIL_OAUTH_PROFILE_ID, DEFAULT_GOOGLE_DOCS_OAUTH_PROFILE_ID,
-    DEFAULT_NOTION_OAUTH_PROFILE_ID, DEFAULT_NOTION_PROFILE_ID, GmailBrokerOAuthConnectOptions,
-    GmailOAuthBrokerExchange, GoogleDocsBrokerOAuthConnectOptions, GoogleDocsOAuthBrokerExchange,
-    NotionConnectionProbe, NotionConnectionProbeResult, NotionOAuthBrokerExchange,
-    NotionOAuthExchange, OAuthConnectOptions, OAuthExchangeFailure, run_connect_gmail_broker_oauth,
+    DEFAULT_NOTION_OAUTH_PROFILE_ID, DEFAULT_NOTION_PROFILE_ID, DEFAULT_SLACK_OAUTH_PROFILE_ID,
+    GmailBrokerOAuthConnectOptions, GmailOAuthBrokerExchange, GoogleDocsBrokerOAuthConnectOptions,
+    GoogleDocsOAuthBrokerExchange, NotionConnectionProbe, NotionConnectionProbeResult,
+    NotionOAuthBrokerExchange, NotionOAuthExchange, OAuthConnectOptions, OAuthExchangeFailure,
+    SlackBrokerOAuthConnectOptions, SlackOAuthBrokerExchange, run_connect_gmail_broker_oauth,
     run_connect_google_docs_broker_oauth, run_connect_notion, run_connect_notion_broker_oauth,
-    run_connect_notion_oauth, run_disconnect, run_profiles,
+    run_connect_notion_oauth, run_connect_slack_broker_oauth, run_disconnect, run_profiles,
 };
 use locality_connector::oauth_broker::{OAuthBrokerCodeExchange, OAuthBrokerToken};
 use locality_gmail::{GMAIL_OAUTH_SCOPES, StoredGmailCredential};
@@ -15,6 +16,7 @@ use locality_notion::oauth::{
     NotionOAuthBrokerCodeExchange, NotionOAuthCodeExchange, NotionOAuthToken,
     StoredNotionCredential,
 };
+use locality_slack::{SLACK_CONNECTOR_ID, SLACK_OAUTH_SCOPES, StoredSlackCredential};
 use locality_store::{
     ConnectionId, ConnectionRepository, ConnectorProfileId, ConnectorProfileRepository,
     CredentialError, CredentialStore, InMemoryCredentialStore, InMemoryStateStore,
@@ -281,6 +283,117 @@ fn connect_gmail_broker_oauth_stores_refresh_handle_without_secrets() {
 }
 
 #[test]
+fn connect_slack_broker_oauth_stores_refresh_handle_without_secrets() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let exchange = FakeSlackBrokerOAuthExchange;
+
+    let report = run_connect_slack_broker_oauth(
+        &mut store,
+        &credentials,
+        SlackBrokerOAuthConnectOptions {
+            connection_id: Some(ConnectionId::new("slack-default")),
+            broker_url: "https://auth.example.test".to_string(),
+            client_id: "slack-client-id".to_string(),
+            session: "broker-session".to_string(),
+            state: "state-1".to_string(),
+            code: "oauth-code".to_string(),
+            redirect_uri: "http://localhost:8757/oauth/slack/callback".to_string(),
+        },
+        &exchange,
+    )
+    .expect("connect slack oauth");
+
+    assert_eq!(report.connection_id, "slack-default");
+    assert_eq!(report.profile_id, DEFAULT_SLACK_OAUTH_PROFILE_ID);
+    assert_eq!(report.connector, SLACK_CONNECTOR_ID);
+    assert_eq!(report.auth_kind, "oauth");
+    assert_eq!(report.workspace_name.as_deref(), Some("Example Slack"));
+
+    let secret = credentials
+        .get("connection:slack-default")
+        .expect("credential saved");
+    let stored = serde_json::from_str::<StoredSlackCredential>(&secret).expect("stored oauth");
+    assert_eq!(
+        stored.refresh_token_handle.as_deref(),
+        Some("opaque-refresh-handle")
+    );
+    assert_eq!(
+        stored.oauth_broker_url.as_deref(),
+        Some("https://auth.example.test")
+    );
+    assert_eq!(stored.oauth_client_id.as_deref(), Some("slack-client-id"));
+    assert_eq!(stored.scopes, slack_scopes());
+
+    let json = serde_json::to_string(&report).expect("json");
+    assert!(!json.contains("oauth-access-token"));
+    assert!(!json.contains("opaque-refresh-handle"));
+    assert!(!json.contains("client-secret"));
+    assert!(!json.contains("secret_ref"));
+}
+
+#[test]
+fn connect_slack_broker_oauth_rejects_missing_required_scope() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let exchange = ScopedFakeSlackBrokerOAuthExchange {
+        scopes: SLACK_OAUTH_SCOPES
+            .iter()
+            .filter(|scope| **scope != "channels:history")
+            .map(|scope| scope.to_string())
+            .collect(),
+    };
+
+    let error = run_connect_slack_broker_oauth(
+        &mut store,
+        &credentials,
+        slack_connect_options(),
+        &exchange,
+    )
+    .expect_err("missing Slack history scope must be rejected");
+
+    assert_eq!(error.code(), "oauth_exchange_failed");
+    assert!(
+        error
+            .message()
+            .contains("missing required Slack OAuth scope")
+    );
+    assert!(error.message().contains("channels:history"));
+    assert_eq!(error.suggested_command(), Some("loc connect slack"));
+    assert!(credentials.get("connection:slack-default").is_err());
+    assert!(
+        store
+            .get_connection(&ConnectionId::new("slack-default"))
+            .expect("lookup connection")
+            .is_none()
+    );
+}
+
+#[test]
+fn connect_slack_broker_oauth_rejects_expiring_token_without_refresh_handle() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let exchange = SlackBrokerOAuthExchangeWithoutRefreshHandle;
+
+    let error = run_connect_slack_broker_oauth(
+        &mut store,
+        &credentials,
+        slack_connect_options(),
+        &exchange,
+    )
+    .expect_err("missing Slack refresh handle must be rejected");
+
+    assert_eq!(error.code(), "oauth_exchange_failed");
+    assert!(
+        error
+            .message()
+            .contains("expiring Slack OAuth broker response did not include refresh_token_handle")
+    );
+    assert_eq!(error.suggested_command(), Some("loc connect slack"));
+    assert!(credentials.get("connection:slack-default").is_err());
+}
+
+#[test]
 fn connect_gmail_broker_oauth_accepts_worker_scope_string() {
     let mut store = InMemoryStateStore::new();
     let credentials = InMemoryCredentialStore::new();
@@ -432,6 +545,17 @@ fn connect_oauth_exchange_errors_report_connector_guidance() {
     );
     assert!(!gmail_message.contains("Notion OAuth"));
     assert_eq!(gmail.suggested_command(), Some("loc connect gmail"));
+
+    let slack = loc_cli::connect::ConnectError::OAuthExchangeFailed(OAuthExchangeFailure::slack(
+        "authorization code was rejected",
+    ));
+    let slack_message = slack.message();
+    assert_eq!(
+        slack_message,
+        "Slack OAuth exchange failed: authorization code was rejected"
+    );
+    assert!(!slack_message.contains("Notion OAuth"));
+    assert_eq!(slack.suggested_command(), Some("loc connect slack"));
 }
 
 #[test]
@@ -497,6 +621,15 @@ fn connect_credential_encode_errors_report_connector_guidance() {
         "failed to encode Gmail credential: serialization failed"
     );
     assert_eq!(gmail.suggested_command(), Some("loc connect gmail"));
+
+    let slack = loc_cli::connect::ConnectError::CredentialEncode(CredentialEncodeFailure::slack(
+        "serialization failed",
+    ));
+    assert_eq!(
+        slack.message(),
+        "failed to encode Slack credential: serialization failed"
+    );
+    assert_eq!(slack.suggested_command(), Some("loc connect slack"));
 }
 
 #[test]
@@ -531,6 +664,15 @@ fn connect_credential_store_errors_report_connector_guidance() {
         "failed to store Gmail credential: credential store unavailable: keychain locked"
     );
     assert_eq!(gmail.suggested_command(), Some("loc connect gmail"));
+
+    let slack = loc_cli::connect::ConnectError::Credential(CredentialStorageFailure::slack(
+        CredentialError::Unavailable("keychain locked".to_string()),
+    ));
+    assert_eq!(
+        slack.message(),
+        "failed to store Slack credential: credential store unavailable: keychain locked"
+    );
+    assert_eq!(slack.suggested_command(), Some("loc connect slack"));
 }
 
 #[test]
@@ -860,6 +1002,63 @@ impl GmailOAuthBrokerExchange for FakeGmailBrokerOAuthExchange {
 }
 
 #[derive(Clone, Debug)]
+struct FakeSlackBrokerOAuthExchange;
+
+impl SlackOAuthBrokerExchange for FakeSlackBrokerOAuthExchange {
+    fn exchange_code(
+        &self,
+        request: &OAuthBrokerCodeExchange,
+    ) -> Result<OAuthBrokerToken, loc_cli::connect::ConnectError> {
+        assert_eq!(request.connector, SLACK_CONNECTOR_ID);
+        assert_eq!(request.session, "broker-session");
+        assert_eq!(request.state, "state-1");
+        assert_eq!(request.code, "oauth-code");
+        assert_eq!(
+            request.redirect_uri,
+            "http://localhost:8757/oauth/slack/callback"
+        );
+        Ok(slack_broker_token(slack_scopes()))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SlackBrokerOAuthExchangeWithoutRefreshHandle;
+
+impl SlackOAuthBrokerExchange for SlackBrokerOAuthExchangeWithoutRefreshHandle {
+    fn exchange_code(
+        &self,
+        request: &OAuthBrokerCodeExchange,
+    ) -> Result<OAuthBrokerToken, loc_cli::connect::ConnectError> {
+        assert_eq!(request.connector, SLACK_CONNECTOR_ID);
+        let mut token = slack_broker_token(slack_scopes());
+        token.refresh_token_handle = None;
+        Ok(token)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ScopedFakeSlackBrokerOAuthExchange {
+    scopes: Vec<String>,
+}
+
+impl SlackOAuthBrokerExchange for ScopedFakeSlackBrokerOAuthExchange {
+    fn exchange_code(
+        &self,
+        request: &OAuthBrokerCodeExchange,
+    ) -> Result<OAuthBrokerToken, loc_cli::connect::ConnectError> {
+        assert_eq!(request.connector, SLACK_CONNECTOR_ID);
+        assert_eq!(request.session, "broker-session");
+        assert_eq!(request.state, "state-1");
+        assert_eq!(request.code, "oauth-code");
+        assert_eq!(
+            request.redirect_uri,
+            "http://localhost:8757/oauth/slack/callback"
+        );
+        Ok(slack_broker_token(self.scopes.clone()))
+    }
+}
+
+#[derive(Clone, Debug)]
 struct ScopedFakeGmailBrokerOAuthExchange {
     scopes: Vec<String>,
 }
@@ -934,6 +1133,18 @@ fn gmail_connect_options() -> GmailBrokerOAuthConnectOptions {
     }
 }
 
+fn slack_connect_options() -> SlackBrokerOAuthConnectOptions {
+    SlackBrokerOAuthConnectOptions {
+        connection_id: Some(ConnectionId::new("slack-default")),
+        broker_url: "https://auth.example.test".to_string(),
+        client_id: "slack-client-id".to_string(),
+        session: "broker-session".to_string(),
+        state: "state-1".to_string(),
+        code: "oauth-code".to_string(),
+        redirect_uri: "http://localhost:8757/oauth/slack/callback".to_string(),
+    }
+}
+
 fn gmail_broker_token(scopes: Vec<String>) -> OAuthBrokerToken {
     OAuthBrokerToken {
         access_token: "oauth-access-token".to_string(),
@@ -946,6 +1157,27 @@ fn gmail_broker_token(scopes: Vec<String>) -> OAuthBrokerToken {
         workspace_name: Some("Gmail".to_string()),
         scopes,
     }
+}
+
+fn slack_broker_token(scopes: Vec<String>) -> OAuthBrokerToken {
+    OAuthBrokerToken {
+        access_token: "oauth-access-token".to_string(),
+        token_type: Some("bot".to_string()),
+        expires_in: Some(3600),
+        refresh_token_handle: Some("opaque-refresh-handle".to_string()),
+        account_id: Some("U123".to_string()),
+        account_label: Some("ada@example.com".to_string()),
+        workspace_id: Some("T123".to_string()),
+        workspace_name: Some("Example Slack".to_string()),
+        scopes,
+    }
+}
+
+fn slack_scopes() -> Vec<String> {
+    SLACK_OAUTH_SCOPES
+        .iter()
+        .map(|scope| scope.to_string())
+        .collect()
 }
 
 fn gmail_worker_token_payload(scope: String) -> serde_json::Value {

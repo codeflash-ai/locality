@@ -1,7 +1,7 @@
 import { classifyMountSetupError } from "./onboarding-errors";
 
 export type SourceSetupState = "idle" | "connecting" | "creating" | "changing" | "success" | "error";
-export type SourceConnectorId = "notion" | "google-docs" | "gmail" | "granola";
+export type SourceConnectorId = "notion" | "google-docs" | "gmail" | "slack" | "granola";
 export type SourceMountRetryOutcome =
   | { kind: "retry" }
   | { kind: "success" | "error"; message: string };
@@ -23,7 +23,7 @@ type SourceSnapshotLike = {
   mounts?: SourceMountLike[] | null;
 };
 
-const SOURCE_CONNECTORS: SourceConnectorId[] = ["notion", "google-docs", "gmail", "granola"];
+const SOURCE_CONNECTORS: SourceConnectorId[] = ["notion", "google-docs", "gmail", "slack", "granola"];
 
 export function sourceMountRetryOutcome(
   report: { ok: boolean; message: string },

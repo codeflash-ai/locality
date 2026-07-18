@@ -185,6 +185,57 @@ Request:
 }
 ```
 
+### `POST /v1/oauth/slack/start`
+
+Request:
+
+```json
+{
+  "redirect_uri": "http://localhost:8757/oauth/slack/callback"
+}
+```
+
+Response:
+
+```json
+{
+  "connector": "slack",
+  "client_id": "public-client-id",
+  "authorization_url": "https://slack.com/oauth/v2/authorize?...",
+  "redirect_uri": "http://localhost:8757/oauth/slack/callback",
+  "session": "signed-session",
+  "state": "opaque-state",
+  "expires_in": 600
+}
+```
+
+### `POST /v1/oauth/slack/exchange`
+
+Request:
+
+```json
+{
+  "session": "signed-session",
+  "state": "opaque-state",
+  "code": "provider-authorization-code",
+  "redirect_uri": "http://localhost:8757/oauth/slack/callback"
+}
+```
+
+Response includes the Slack bot access token, granted bot scopes, workspace
+metadata, and `refresh_token_handle`. Slack is handle-only even when other
+connectors use `LOCALITY_TOKEN_MODE=raw` for local development.
+
+### `POST /v1/oauth/slack/refresh`
+
+Request:
+
+```json
+{
+  "refresh_token_handle": "locrh_v1..."
+}
+```
+
 ## Local Development
 
 ```sh
@@ -207,12 +258,14 @@ npm run check
 - `LOCALITY_NOTION_CLIENT_SECRET`: Notion OAuth client secret.
 - `LOCALITY_GOOGLE_CLIENT_ID`: Google OAuth client ID shared by Google Docs and Gmail.
 - `LOCALITY_GOOGLE_CLIENT_SECRET`: Google OAuth client secret shared by Google Docs and Gmail.
+- `LOCALITY_SLACK_CLIENT_ID`: Slack OAuth client ID.
+- `LOCALITY_SLACK_CLIENT_SECRET`: Slack OAuth client secret.
 
 Optional connector overrides:
 
-- `LOCALITY_NOTION_REDIRECT_URIS`, `LOCALITY_GOOGLE_DOCS_REDIRECT_URIS`, `LOCALITY_GMAIL_REDIRECT_URIS`: comma-separated allowed loopback redirect URIs.
-- `LOCALITY_NOTION_AUTH_BASE_URL`, `LOCALITY_GOOGLE_DOCS_AUTH_BASE_URL`, `LOCALITY_GMAIL_AUTH_BASE_URL`: provider authorization base URL.
-- `LOCALITY_NOTION_API_BASE_URL`, `LOCALITY_GOOGLE_DOCS_API_BASE_URL`, `LOCALITY_GMAIL_API_BASE_URL`: provider token API base URL.
+- `LOCALITY_NOTION_REDIRECT_URIS`, `LOCALITY_GOOGLE_DOCS_REDIRECT_URIS`, `LOCALITY_GMAIL_REDIRECT_URIS`, `LOCALITY_SLACK_REDIRECT_URIS`: comma-separated allowed loopback redirect URIs.
+- `LOCALITY_NOTION_AUTH_BASE_URL`, `LOCALITY_GOOGLE_DOCS_AUTH_BASE_URL`, `LOCALITY_GMAIL_AUTH_BASE_URL`, `LOCALITY_SLACK_AUTH_BASE_URL`: provider authorization base URL.
+- `LOCALITY_NOTION_API_BASE_URL`, `LOCALITY_GOOGLE_DOCS_API_BASE_URL`, `LOCALITY_GMAIL_API_BASE_URL`, `LOCALITY_SLACK_API_BASE_URL`: provider token API base URL.
 
 ## Deployment
 
