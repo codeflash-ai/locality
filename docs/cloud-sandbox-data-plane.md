@@ -40,8 +40,9 @@ The main decisions are:
    at a time.
 4. Resolve authorization and job filters once in an indexed PostgreSQL query
    against a complete ready revision. Stream exactly the selected ordinary files
-   as a transient standard tar response; do not build, compact, authorize, or
-   retain profile-specific packs or client-side catalogs.
+   as a transient standard tar response with negotiated Zstandard wire
+   compression; do not build, compact, authorize, or retain profile-specific
+   packs or client-side catalogs.
 5. Materialize selected content as ordinary files on task-local disk before the
    agent starts. `rg`, `grep`, compilers, editors, and ordinary POSIX calls then
    operate at local filesystem speed with no read-time network calls.
@@ -92,8 +93,8 @@ a single-tenant or Notion-only pilot. It includes:
   usable in the same profile before the release is called generally usable;
 - coarse administrator-selected scopes such as roots, shared drives, channels,
   mailboxes, teams, or projects, plus explicit broad pilot groups/grants;
-- exact server-side authorization/profile filtering and one streaming file
-  export per session;
+- exact server-side authorization/profile filtering and one negotiated
+  Zstd-or-identity streaming file export per session;
 - ordinary task-local files, including read-only and explicitly writable paths;
 - replica-at-start freshness with no live sandbox delta stream;
 - no read-only metadata import; a small SQLite session store tracks only
@@ -284,7 +285,7 @@ flowchart LR
   APP <--> PG
   APP <--> BS
   APP --> SM
-  APP -->|short-lived capability + filtered tar stream| LC
+  APP -->|short-lived capability + filtered Zstd(tar) stream| LC
   LC --> FS
   FS <--> AG
   LC -->|immutable changeset| APP
@@ -444,7 +445,7 @@ provider watermark
 
 sandbox session + current grants + profile/runtime filters
   -> one exact PostgreSQL selection query
-  -> one transient tar stream
+  -> one transient Zstd-compressed tar stream
 ```
 
 The session row records the tenant, principal/workload, profile and policy
@@ -1068,7 +1069,15 @@ for each source, the exporter opens a read-only `REPEATABLE READ` transaction.
 The revision lookup and row stream share that database snapshot. Updates that
 commit while the stream is running are not mixed into the response.
 
-V1 returns `application/x-tar` over TLS:
+The client advertises `Accept-Encoding: zstd, identity`. The preferred v1
+response is a standard streaming tar with:
+
+```http
+Content-Type: application/x-tar
+Content-Encoding: zstd
+```
+
+`identity` remains a required fallback and benchmark control. In either mode:
 
 - the tar is generated on demand and is never stored as a canonical artifact;
 - each selected projection becomes one ordinary tar member with its logical path,
@@ -1080,16 +1089,33 @@ V1 returns `application/x-tar` over TLS:
 - read-only entries create no local metadata or shadow rows;
 - selected large attachment references are fetched by the exporter and appended
   to the same stream under bounded size/scanning policy; and
-- the client extracts into a staging directory with path, link, device, case,
-  Unicode, entry-count, byte, and disk limits, then atomically publishes the tree
-  only after the response terminates cleanly.
+- the client validates and extracts into a staging directory with path, link,
+  device, case, Unicode, entry-count, byte, and disk limits, then atomically
+  publishes the tree only after the HTTP response, Zstd frame, tar stream, and
+  file writes terminate cleanly.
 
-Uncompressed tar is the portable v1 default: it has negligible client CPU,
-eliminates a custom archive/manifest lifecycle, and lets throughput be measured
-without conflating database and codec performance. Add negotiated LZ4 or another
-low-CPU content encoding only if real sandbox links are slower than both server
-query throughput and client decode/disk throughput. Do not prebuild multiple
-encodings.
+Start with Zstd level 1. It normally reduces Locality's Markdown/JSON-heavy wire
+bytes substantially while retaining fast, bounded-memory streaming decode.
+Use one ordinary Zstd frame with no dictionary, seek table, per-tenant tuning,
+prebuilt encodings, or custom container. Already-compressed attachments may
+reduce the aggregate compression ratio, which is a measurement input rather than
+a reason to introduce per-entry transport rules.
+
+The sandbox implements a bounded concurrent pipeline:
+
+```text
+HTTP receive -> Zstd decoder -> tar validator/extractor -> staging filesystem
+```
+
+Separate tasks or threads and bounded ring buffers let network receive, decode,
+tar parsing, and file writes overlap with backpressure. On a one-vCPU sandbox
+this still overlaps network and disk waits; on a multi-vCPU sandbox decode and
+extraction may run on separate cores. The tar parser does not buffer the corpus
+or expose completed files to the agent early. A single Zstd frame is mostly
+sequential to decode, so v1 does not add independent compressed chunks, a writer
+farm, or another manifest merely to claim parallel decompression. Add such
+framing only if the decoder is the measured bottleneck rather than PostgreSQL,
+the network, or filesystem entry creation.
 
 An interrupted v1 export is discarded and restarted against a newly authorized
 session snapshot. Add a logical resume cursor only when measured corpus size or
@@ -1122,8 +1148,9 @@ sequenceDiagram
   L->>A: GET session file stream
   A->>P: REPEATABLE READ authorized selection + COPY/row stream
   A->>B: fetch selected large attachments only
-  A-->>L: transient tar stream
-  L->>F: safe staged extraction; writable metadata to SQLite
+  A-->>L: transient Zstd(tar) stream
+  L->>F: concurrent decode + safe staged extraction
+  L->>F: writable metadata to SQLite
   L->>F: atomic publish
   L-->>O: ready(path, revisions, file/byte counts)
   O->>F: start agent
@@ -1842,19 +1869,19 @@ source-controlled namespaces.
 
 ### Threats And Controls
 
-| Threat                               | Required controls                                                                                                                                                                        |
-| ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Cross-tenant query or content access | Tenant cell routing, default-deny RLS, tenant-leading keys/predicates, non-owner application role, fixed parameterized export repositories, automated isolation tests.                   |
-| Prompt injection and exfiltration    | No provider credentials in sandbox, deny-by-default egress, source content never becomes instructions, explicit bounded changesets, destructive-plan denial, narrow session capability.  |
-| Stolen sandbox capability            | Short TTL, exact profile/filter/revision binding, one-session quotas, revocation, current-policy/freshness checks, no provider/database/cloud credential, and audit.                     |
-| Database credential compromise       | Private networking, TLS, managed encryption, narrowly scoped non-owner roles, RLS, secret rotation, no standing human data-reader role, query/access audit, and time-bound break-glass.  |
-| Object-store credential compromise   | Large attachments/backups only, SSE-KMS, separate object/KMS roles, opaque tenant-scoped keys, no sandbox credentials, provider audit events.                                            |
-| Malicious stream/path                | Backend-generated tar only, bounded response, safe `openat` extraction, no links/devices, path/collision/reserved-name validation, staged atomic publish.                                |
-| Forged/replayed webhook              | Provider signature validation, timestamp/body limits, durable unique event ID, current-state fetch.                                                                                      |
-| TOCTOU between planning and write    | Immutable changeset/plan digest and provider precondition immediately before apply; changed plans require another explicit push.                                                         |
-| Partial provider apply               | Journal-first deterministic operation IDs, per-effect persistence, idempotent resume/read-back, explicit failed/ambiguous state.                                                         |
-| Revoked/deleted source data          | New session/export/search denial, active-session revocation, tombstones in subsequent ready revisions, retention/deletion workflow. Already delivered bytes require sandbox destruction. |
-| Search leakage                       | Authorization prefilter, no global cross-tenant index, policy-aware counts, opaque result IDs, derived-index deletion tests.                                                             |
+| Threat                               | Required controls                                                                                                                                                                                             |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Cross-tenant query or content access | Tenant cell routing, default-deny RLS, tenant-leading keys/predicates, non-owner application role, fixed parameterized export repositories, automated isolation tests.                                        |
+| Prompt injection and exfiltration    | No provider credentials in sandbox, deny-by-default egress, source content never becomes instructions, explicit bounded changesets, destructive-plan denial, narrow session capability.                       |
+| Stolen sandbox capability            | Short TTL, exact profile/filter/revision binding, one-session quotas, revocation, current-policy/freshness checks, no provider/database/cloud credential, and audit.                                          |
+| Database credential compromise       | Private networking, TLS, managed encryption, narrowly scoped non-owner roles, RLS, secret rotation, no standing human data-reader role, query/access audit, and time-bound break-glass.                       |
+| Object-store credential compromise   | Large attachments/backups only, SSE-KMS, separate object/KMS roles, opaque tenant-scoped keys, no sandbox credentials, provider audit events.                                                                 |
+| Malicious stream/path                | Backend-generated tar only, compressed/wire and decoded-byte limits, bounded Zstd window/buffers, safe `openat` extraction, no links/devices, path/collision/reserved-name validation, staged atomic publish. |
+| Forged/replayed webhook              | Provider signature validation, timestamp/body limits, durable unique event ID, current-state fetch.                                                                                                           |
+| TOCTOU between planning and write    | Immutable changeset/plan digest and provider precondition immediately before apply; changed plans require another explicit push.                                                                              |
+| Partial provider apply               | Journal-first deterministic operation IDs, per-effect persistence, idempotent resume/read-back, explicit failed/ambiguous state.                                                                              |
+| Revoked/deleted source data          | New session/export/search denial, active-session revocation, tombstones in subsequent ready revisions, retention/deletion workflow. Already delivered bytes require sandbox destruction.                      |
+| Search leakage                       | Authorization prefilter, no global cross-tenant index, policy-aware counts, opaque result IDs, derived-index deletion tests.                                                                                  |
 
 ### Privacy
 
@@ -1942,17 +1969,22 @@ For a ready source, startup is a streaming pipeline rather than a build job:
 ```text
 session authorization + freshness/revision resolution + query startup
 + max(
-    selected PostgreSQL bytes / database-to-exporter throughput,
-    selected response bytes / exporter-to-sandbox throughput,
+    selected decoded bytes / database-to-exporter throughput,
+    selected decoded bytes / server tar-and-Zstd throughput,
+    compressed wire bytes / exporter-to-sandbox throughput,
+    selected decoded bytes / client Zstd-and-tar throughput,
     selected entries / client filesystem creation throughput
   )
 ```
 
-The stages overlap under bounded backpressure. Let `B` be the raw sustained
-exporter-to-sandbox throughput measured with an uncompressed byte stream on the
-smallest supported platform. PostgreSQL and the exporter must together deliver
-faster than `B` at expected concurrency; otherwise the backend, not the client
-link, is the bottleneck.
+The stages overlap under bounded backpressure; the Zstd terms disappear for an
+`identity` response. Let `B` be raw sustained wire throughput measured with an
+incompressible stream on the smallest supported platform, `D` the decoded tar
+bytes, `W` the wire bytes, and `R = D / W` the observed compression ratio. The
+effective content ingress is approximately `E = B * R`. PostgreSQL, Zstd encode,
+and client decode must each exceed `E` at expected concurrency or that stage,
+not the link, becomes the bottleneck. Filesystem creation can still dominate a
+corpus containing many small files.
 
 ### Performance Targets
 
@@ -1961,16 +1993,18 @@ promises:
 
 - ready-session authorization, freshness check, revision selection, and query
   planning: P95 below 500 ms in-region;
-- first tar byte: P95 below one second for a warm ready revision, excluding
-  orchestrator scheduling;
-- single-session database/exporter production: at least `1.25 * B` with a
-  bounded warm representative corpus, so the client path is normally limiting;
-- end-to-end stream plus staged materialization: at least 80% of `B` until inode
-  creation becomes the measured limiter;
+- first decoded tar byte: P95 below one second for a warm ready revision,
+  excluding orchestrator scheduling;
+- single-session database/exporter/Zstd production: at least `1.25 * E` in
+  decoded bytes with a bounded warm representative corpus, so the client path is
+  normally limiting;
+- end-to-end stream plus staged materialization: at least 80% of `E` in decoded
+  bytes until inode creation becomes the measured limiter;
 - export API memory: bounded independently of corpus size by row/response
   backpressure; no complete-result buffering;
-- smallest 1-vCPU/1-GiB client: uncompressed extraction must not sustain more
-  than 70% of one CPU solely for transport framing/hashing;
+- smallest 1-vCPU/1-GiB client: Zstd level-1 decode plus tar validation must
+  sustain at least `1.25 * E` without saturating the CPU. Use `identity` for a
+  supported platform/corpus where this is not true;
 - startup performs no O(read-only entry count) SQLite inserts; and
 - local `rg` after publication stays within 10% of the same ordinary-file
   control tree.
@@ -1979,8 +2013,8 @@ Measure cold and warm PostgreSQL/storage state, 1%/10%/80% selectivity,
 1/10/50 concurrent sessions, broad and high-cardinality ACL sets, 10k/100k/1M
 entries, large TOAST values, attachment mixes, primary versus read-replica
 routing, and representative sandbox regions. Do not choose ClickHouse,
-compression, cache, partitioning, or a resume protocol from synthetic peak
-bandwidth alone.
+custom parallel compression framing, cache, partitioning, or a resume protocol
+from synthetic peak bandwidth alone.
 
 ### Unit Economics And Retention
 
@@ -1992,7 +2026,7 @@ PostgreSQL bytes = current + retained native/content/projection versions
 
 attachment bytes = current + retained object versions + backups
 
-session egress   = exact selected response bytes
+session egress   = exact compressed wire bytes
                  + protocol/TLS overhead
 
 client disk      = materialized files + writable baselines + dirty/conflict data
@@ -2030,20 +2064,20 @@ extraction leaves the prior tree untouched.
 
 ### Bottleneck Matrix
 
-| Bottleneck              | Failure mode                                                              | V1 mitigation                                                                                                                                                  |
-| ----------------------- | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ACL/filter query        | Large joins or JSON evaluation delay first byte.                          | Precompute indexed `access_set_id`/subject facts; materialize common filter columns; fixed parameterized query; inspect plans on representative cardinalities. |
-| Metadata/body coupling  | Rejected rows still fetch large text/TOAST values.                        | Keep narrow projection-version rows separate from immutable bodies and join bodies only after exact selection.                                                 |
-| PostgreSQL storage      | Cold/random TOAST reads cannot feed the link.                             | Favor source/root-local access patterns, provision storage/cache, measure `EXPLAIN (ANALYZE, BUFFERS)`, and add a read replica before a new database.          |
-| Long export transaction | Vacuum pressure or connection starvation.                                 | Bounded session/result limits, statement/idle timeouts, dedicated export pool, cancellation on disconnect, concurrency quotas, and monitoring.                 |
-| Exporter network/CPU    | TLS/tar framing or internal hop limits throughput.                        | Colocate database/exporter, stream `COPY`/rows without buffering, reuse buffers, scale stateless exporter processes, and keep v1 uncompressed.                 |
-| Tiny client             | Extraction or hashing saturates one vCPU.                                 | Uncompressed tar, one streaming extractor, bounded buffers, no metadata import, and benchmark-gated optional LZ4.                                              |
-| Many small files        | Inode and directory creation dominate bytes.                              | Report entry count, stage locally, create bounded parallel directories/files only if measured safe, and consider an image fast path later.                     |
-| Large attachments       | Database or gateway spends resources on opaque binaries.                  | Store individual immutable attachments in object storage, enforce size/scanning limits, and stream only selected references with backpressure.                 |
-| Concurrent sessions     | Exports starve ingestion, search, or mutations.                           | Separate connection pools/worker quotas, per-tenant/cell admission control, read replica routing, and ClickHouse only after the measured trigger.              |
-| Replica lag             | Read replica serves older projection/policy or lacks the new session row. | Bind revision/policy/session state to commit LSNs and route only after replay covers all of them; wait or use primary, never silently downgrade.               |
-| Source lag              | Fast database export serves an old provider view.                         | Freshness gate, pending-event awareness, profile-priority sync, bounded wait/fail behavior, and provider preconditions for every write.                        |
-| Repeat-session work     | Similar jobs repeatedly read/transmit the same bytes.                     | Measure first; later cache an exact immutable export under its full policy/profile/source/filter key with TTL and revocation checks.                           |
+| Bottleneck              | Failure mode                                                              | V1 mitigation                                                                                                                                                                |
+| ----------------------- | ------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ACL/filter query        | Large joins or JSON evaluation delay first byte.                          | Precompute indexed `access_set_id`/subject facts; materialize common filter columns; fixed parameterized query; inspect plans on representative cardinalities.               |
+| Metadata/body coupling  | Rejected rows still fetch large text/TOAST values.                        | Keep narrow projection-version rows separate from immutable bodies and join bodies only after exact selection.                                                               |
+| PostgreSQL storage      | Cold/random TOAST reads cannot feed the link.                             | Favor source/root-local access patterns, provision storage/cache, measure `EXPLAIN (ANALYZE, BUFFERS)`, and add a read replica before a new database.                        |
+| Long export transaction | Vacuum pressure or connection starvation.                                 | Bounded session/result limits, statement/idle timeouts, dedicated export pool, cancellation on disconnect, concurrency quotas, and monitoring.                               |
+| Exporter network/CPU    | TLS/tar/Zstd framing or internal hop limits throughput.                   | Colocate database/exporter, stream `COPY`/rows without buffering, use Zstd level 1 with bounded buffers, scale stateless exporter processes, and retain `identity` fallback. |
+| Tiny client             | Zstd decode, extraction, or hashing saturates one vCPU.                   | Concurrent single-frame decode and staged extraction with bounded ring buffers, no metadata import, CPU qualification on the smallest sandbox, and `identity` fallback.      |
+| Many small files        | Inode and directory creation dominate bytes.                              | Report entry count, stage locally, create bounded parallel directories/files only if measured safe, and consider an image fast path later.                                   |
+| Large attachments       | Database or gateway spends resources on opaque binaries.                  | Store individual immutable attachments in object storage, enforce size/scanning limits, and stream only selected references with backpressure.                               |
+| Concurrent sessions     | Exports starve ingestion, search, or mutations.                           | Separate connection pools/worker quotas, per-tenant/cell admission control, read replica routing, and ClickHouse only after the measured trigger.                            |
+| Replica lag             | Read replica serves older projection/policy or lacks the new session row. | Bind revision/policy/session state to commit LSNs and route only after replay covers all of them; wait or use primary, never silently downgrade.                             |
+| Source lag              | Fast database export serves an old provider view.                         | Freshness gate, pending-event awareness, profile-priority sync, bounded wait/fail behavior, and provider preconditions for every write.                                      |
+| Repeat-session work     | Similar jobs repeatedly read/transmit the same bytes.                     | Measure first; later cache an exact immutable export under its full policy/profile/source/filter key with TTL and revocation checks.                                         |
 
 Millions of small files can remain materialization-limited even when PostgreSQL
 and the network are idle. That is a filesystem/product constraint, not evidence
@@ -2064,7 +2098,7 @@ POST /v1/workspace-profiles/{id}/plan
 
 POST /v1/sessions                            # consumes one-time bootstrap token
 GET  /v1/sessions/{id}
-GET  /v1/sessions/{id}/export               # exact authorized tar stream
+GET  /v1/sessions/{id}/export               # exact authorized Zstd(tar) stream
 POST /v1/sessions/{id}/cancel
 
 POST /v1/changesets                         # submits immutable changeset
@@ -2149,9 +2183,10 @@ valid.
 
 The backend owns a narrow `ReplicaExporter` port whose PostgreSQL implementation
 accepts only an authorized session/query plan and returns ordered export rows.
-The HTTP adapter adds tar framing; `localityd` performs bounded safe extraction.
-Keep path validation and export metadata versioning shared, but do not create a
-general pack/container framework. Split policy, export, search, jobs, or
+The HTTP adapter adds negotiated Zstd/tar framing; `localityd` performs bounded
+streaming decode and safe extraction. Keep path validation and export metadata
+versioning shared, but do not create a general pack/container framework. Split
+policy, export, search, jobs, or
 infrastructure into independent services only after ownership or scaling
 requires it.
 
@@ -2238,8 +2273,9 @@ paths.
   expansion for representative hierarchical-document and message/thread
   connectors on 1k/10k/100k-resource fixtures.
 - Measure raw exporter-to-sandbox bandwidth `B`; PostgreSQL metadata selection,
-  body join, `COPY`/row stream, tar framing, staged extraction, inode creation,
-  and peak RSS on 1-vCPU/1-GiB and 2-vCPU/2-GiB sandboxes.
+  body join, `COPY`/row stream, identity versus Zstd-level-1 framing and ratio,
+  concurrent decode/staged extraction, inode creation, CPU, and peak RSS on
+  1-vCPU/1-GiB and 2-vCPU/2-GiB sandboxes.
 - Define the source/content/projection-version, access-set/subject, ready-revision,
   authorized-session-query, delivered-count, and writable-metadata contracts and
   exact golden fixtures.
@@ -2281,8 +2317,9 @@ streams without O(read-only entry count) SQLite writes.
   immutable version creation, complete ready-revision publication, and the
   freshness wait/fail gate.
 - Implement the exact parameterized ACL/profile/runtime selection query,
-  streaming tar endpoint, bounded attachment resolution, safe staged extractor,
-  and atomic tree publication.
+  negotiated Zstd-or-identity streaming tar endpoint, bounded attachment
+  resolution, concurrent bounded decoder/safe staged extractor, and atomic tree
+  publication.
 - Create SQLite state only for writable entries and session/journal state;
   read-only files create no local metadata or three-tree baseline.
 - Implement the explicit `locality-pilot` group/DataGrant preset. A guided Web UI
@@ -2356,8 +2393,9 @@ rejection pass. Phases 1-3 are the v1 product boundary.
   ClickHouse serving replica only when measured PostgreSQL throughput,
   concurrency isolation, or cost fails the documented gate. PostgreSQL remains
   authoritative and feeds it through an idempotent outbox/applied watermark.
-- Add low-CPU compression, logical resume, or an exact TTL export cache only when
-  measured bandwidth, failure rate, or repeated-query cost justifies each one.
+- Add independently compressed/seekable chunks, logical resume, or an exact TTL
+  export cache only when measured decoder throughput, failure rate, or
+  repeated-query cost justifies each one.
 - Move large search corpora to a dedicated engine only when PostgreSQL search
   violates its SLO.
 - Reconsider administrator-export seeding only when profile-prioritized API
@@ -2439,9 +2477,11 @@ and dedicated-cell operational runbooks are complete.
 - Real non-owner RLS tests cover cross-tenant IDs/content/search/session queries,
   owner/`BYPASSRLS` regressions, transaction-pool context leakage, and repository
   predicates.
-- Tar golden stream plus truncation, path traversal, absolute path, link/device,
-  case collision, Unicode normalization, reserved metadata path, entry/byte/disk
-  limits, disconnect cancellation, and atomic rollback.
+- Identity and Zstd golden streams plus negotiation, corrupt/truncated Zstd
+  frame, truncated tar, path traversal, absolute path, link/device, case
+  collision, Unicode normalization, reserved metadata path, entry/byte/disk
+  limits, disconnect cancellation, bounded pipeline backpressure, and atomic
+  rollback.
 - Reserved writable metadata creates SQLite rows/baselines only for exact
   write-enabled entries; read-only entries create no shadow/three-tree/entity
   state and cannot become changeset operations.
@@ -2450,9 +2490,10 @@ and dedicated-cell operational runbooks are complete.
 - Managed encryption/TLS, private networking, database/object role separation,
   backup/restore encryption, secret/log redaction, and audited time-bound
   break-glass access.
-- 10k/100k export, extraction, `rg`, and disk benchmarks on the smallest
-  supported sandboxes; cold/warm 1%/10%/80% selection and 1/10/50 concurrent
-  sessions validate database/exporter-to-`B`, memory, connection-pool, vacuum,
+- 10k/100k export, Zstd decode/extraction, `rg`, and disk benchmarks on the
+  smallest supported sandboxes; cold/warm 1%/10%/80% selection and 1/10/50
+  concurrent sessions validate compression ratio, database/exporter/decode
+  throughput against `B`/`E`, CPU, memory, connection-pool, vacuum,
   cancellation, and inode limits. Run 1M-entry/read-replica/cache/ClickHouse
   qualifications only when those scales/features are targeted.
 - When a read replica is enabled, exports wait/use primary until replay LSN
@@ -2508,11 +2549,12 @@ At minimum, measure by cell, connector, and tenant-safe bounded category:
   connection-pool wait, active export transactions/age, WAL/replication lag,
   vacuum pressure, cancellations, and query timeouts;
 - exporter CPU/RSS, active streams, backpressure, database-to-exporter and
-  exporter-to-sandbox throughput relative to `B`, TLS/tar overhead, disconnects,
-  and attachment-fetch throughput;
+  exporter-to-sandbox throughput relative to `B`/`E`, Zstd ratio/encode
+  throughput, TLS/tar overhead, disconnects, and attachment-fetch throughput;
 - client transferred/materialized bytes, entries, time-to-first-file/time-to-
-  ready, extraction CPU/RSS, inode/directory creation, disk expansion/failures,
-  atomic publish, and `rg` throughput;
+  ready, Zstd decode throughput/CPU, bounded-pipeline high-water marks,
+  extraction CPU/RSS, inode/directory creation, disk expansion/failures, atomic
+  publish, and `rg` throughput;
 - current/retained native, canonical, projected, attachment, index, changeset,
   database/WAL/replica/backup bytes plus lifecycle-deletion lag;
 - session cache hit/miss/bytes only after a cache exists, and future ClickHouse
@@ -2596,8 +2638,9 @@ architecture:
   supported client ingress without harming transactional SLOs;
 - whether vertical PostgreSQL scaling or a replay-gated read replica is
   sufficient, and only then whether ClickHouse is justified;
-- whether uncompressed tar remains client/network efficient or measured links
-  justify negotiated low-CPU LZ4;
+- whether Zstd level 1 meets encode/decode CPU targets on every supported
+  sandbox, when to select `identity`, and whether a future parallel framing
+  format is ever justified;
 - whether interrupted-transfer rate/corpus size justifies a logical resume
   protocol instead of restart;
 - whether repeat query cost/latency justifies an exact tenant export cache and,
@@ -2621,8 +2664,9 @@ architecture:
 The architectural baseline is central continuous ingestion; complete ready
 revisions with explicit freshness; one managed PostgreSQL correctness and v1
 read-serving plane; exact server-side ACL/profile filtering; a transient
-streaming tar rather than stored packs; object storage only for large
-attachments/backups; ordinary local files; writable-only three-tree state;
-backend-held credentials; changeset-based writes; and one shared Rust
-core/engine/provider implementation across local and backend hosts. ClickHouse,
-compression, resume, and caches remain measured extensions.
+Zstd-compressed streaming tar with `identity` fallback rather than stored packs;
+object storage only for large attachments/backups; ordinary local files;
+writable-only three-tree state; backend-held credentials; changeset-based
+writes; and one shared Rust core/engine/provider implementation across local and
+backend hosts. ClickHouse, parallel compression framing, resume, and caches
+remain measured extensions.

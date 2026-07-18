@@ -21,9 +21,11 @@ The optional cloud relay is deliberately not implemented in v1. The local remote
 The proposed successor to the optional relay is a continuously maintained
 backend data plane, not a thin request proxy. It ingests connected sources once,
 maintains immutable versions and current projections in PostgreSQL, runs exact
-ACL/profile filtering in one server query, streams a transient standard tar, and
-materializes ordinary files before an agent starts. Large opaque attachments and
-backups use object storage; v1 has no persistent content-pack/catalog layer.
+ACL/profile filtering in one server query, and streams a transient standard tar
+with negotiated Zstandard compression. The client concurrently decodes and
+materializes ordinary files in a staging tree, then publishes it atomically
+before the agent starts. Large opaque attachments and backups use object storage;
+v1 has no persistent content-pack/catalog layer.
 Read-only content uses a single local tree; three-way state is reserved for
 writable resources. The proposed v1 is multi-tenant and multi-connector, uses a
 modular backend with PostgreSQL jobs/read serving, and relies on local diff plus
