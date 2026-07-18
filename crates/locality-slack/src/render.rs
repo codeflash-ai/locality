@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::dto::{SlackMessage, SlackUser};
 use crate::oauth::SLACK_CONNECTOR_ID;
 
+const LOCALITY_DIRECTIVE_PREFIXES: [&str; 2] = ["::loc", "::afs"];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SlackContentKind {
@@ -223,8 +225,7 @@ fn message_markdown(message: &SlackMessage) -> String {
             Some(text) if !text.trim().is_empty() => {
                 parts.push(escape_locality_directive_lines(&text));
             }
-            _ => parts
-                .push("::loc{{unsupported source=\"slack\" kind=\"rich_block\"}}\n".to_string()),
+            _ => parts.push("[Unsupported Slack rich block]\n".to_string()),
         }
     }
     if parts.is_empty() {
@@ -313,7 +314,10 @@ fn escape_locality_directive_lines(value: &str) -> String {
     value
         .lines()
         .map(|line| {
-            if line.trim_start().starts_with("::loc{") {
+            if LOCALITY_DIRECTIVE_PREFIXES
+                .iter()
+                .any(|prefix| line.trim_start().starts_with(prefix))
+            {
                 format!("\\{line}")
             } else {
                 line.to_string()

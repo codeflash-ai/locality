@@ -9,6 +9,7 @@ use locality_core::LocalityError;
 use locality_core::journal::PushId;
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use locality_core::planner::PushPlan;
+use locality_core::shadow::{ShadowDocument, segment_markdown_body};
 use locality_core::undo::{UndoPlan, UndoPlanStatus};
 use locality_slack::client::SlackApi;
 use locality_slack::connector::{SlackConfig, SlackConnector};
@@ -154,10 +155,10 @@ fn fetch_recent_and_thread_render_as_canonical_markdown() {
     assert!(
         thread.body.find("Hello from Slack").unwrap() < thread.body.find("Thread reply").unwrap()
     );
-    assert!(
-        thread
-            .body
-            .contains("::loc{{unsupported source=\"slack\" kind=\"rich_block\"}}")
+    assert!(thread.body.contains("[Unsupported Slack rich block]"));
+    assert_shadow_builds(
+        &slack_thread_remote_id("C123", "1784301730.000100"),
+        &thread.body,
     );
 }
 
@@ -278,6 +279,54 @@ fn render_preserves_slack_ids_and_readable_block_fallbacks() {
     assert!(document.body.contains("Ada Lovelace"));
     assert!(document.body.contains("*Block* text"));
     assert!(document.body.contains("Slack ID: `C123/1784301730.000100`"));
+}
+
+#[test]
+fn render_escapes_locality_directive_prefixes_from_slack_text() {
+    let bundle = SlackNativeBundle {
+        content_kind: SlackContentKind::Recent,
+        channel_id: "C123".to_string(),
+        channel_name: "general".to_string(),
+        recent_limit: 15,
+        thread_ts: None,
+        messages: vec![SlackMessage {
+            ts: "1784301730.000100".to_string(),
+            user: Some("U123".to_string()),
+            text: "::loc not a Locality directive\n::afs not a legacy directive".to_string(),
+            permalink: None,
+            reply_count: None,
+            thread_ts: None,
+            latest_reply: None,
+            blocks: vec![serde_json::json!({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "::loc{still just Slack-authored text}"
+                }
+            })],
+        }],
+        users: [(
+            "U123".to_string(),
+            SlackUser {
+                id: "U123".to_string(),
+                name: "ada".to_string(),
+                real_name: Some("Ada Lovelace".to_string()),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    };
+
+    let document = render_slack_document(&bundle).expect("render");
+
+    assert!(document.body.contains("\\::loc not a Locality directive"));
+    assert!(document.body.contains("\\::afs not a legacy directive"));
+    assert!(
+        document
+            .body
+            .contains("\\::loc{still just Slack-authored text}")
+    );
+    assert_shadow_builds(&slack_recent_remote_id("C123"), &document.body);
 }
 
 #[test]
@@ -474,4 +523,16 @@ fn reply_message() -> SlackMessage {
         latest_reply: None,
         blocks: vec![serde_json::json!({"type": "file", "file_id": "F123"})],
     }
+}
+
+fn assert_shadow_builds(remote_id: &RemoteId, body: &str) {
+    let native_block_ids = segment_markdown_body(body, 1)
+        .into_iter()
+        .filter(|block| !block.is_directive())
+        .enumerate()
+        .map(|(index, _)| RemoteId::new(format!("{}:body:{index}", remote_id.0)))
+        .collect::<Vec<_>>();
+
+    ShadowDocument::from_synced_body(remote_id.clone(), body.to_string(), 1, native_block_ids)
+        .expect("shadow should build from rendered Slack body");
 }
