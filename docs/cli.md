@@ -919,7 +919,7 @@ hint for each entry that has a saved diff.
 
 Undo plans are `complete`, `partial`, or `blocked`. Complete plans can include reverse operations for block updates, block moves, archived blocks, appended blocks with journaled created IDs, whole-entity body updates, property updates, entity moves, archived entities with complete identity preimages and expected archived postimages, and created entities with journaled created IDs. Whole-entity body reverse apply is connector-specific and remains unsupported by Notion's block API.
 
-Notion entity-location undo currently records the previous parent ID and title but not the previous parent kind. Current real Notion shadows also omit `loc.parent`, so ordinary real move journals are blocked while deriving the undo plan. A synthetic or future preimage with an explicit parent can be lowered only when that parent is known to be a page; database, data-source, and workspace parents remain unsupported until the journal payload carries the parent kind.
+Notion entity-location undo currently records the previous parent ID and title but not the previous parent kind. Current real Notion shadows also omit `loc.parent`, so ordinary real move journals are blocked while deriving the undo plan. When a complete preimage carries a previous parent ID, Notion reverse apply restores page parents directly and database-row parents by resolving the database's single data source; workspace parents remain unsupported until the journal payload carries enough parent context.
 
 ## Manual / Live Verification
 

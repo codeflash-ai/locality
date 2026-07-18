@@ -2553,6 +2553,62 @@ fn apply_undo_lowers_generic_entity_reverse_operations() {
 }
 
 #[test]
+fn apply_undo_restores_moved_database_row_to_data_source_parent() {
+    let api = Arc::new(RecordingNotionApi::with_page_properties(
+        "2026-06-10T00:00:00.000Z",
+        BTreeMap::from([("Name".to_string(), page_property("title"))]),
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let push_id = PushId("push-1".to_string());
+    let mount_id = MountId::new("notion-main");
+    let undo_plan = UndoPlan {
+        target_push_id: push_id.clone(),
+        mount_id: mount_id.clone(),
+        affected_entities: vec![RemoteId::new("page-1")],
+        operations: vec![UndoOperation::RestoreEntityLocation {
+            entity_id: RemoteId::new("page-1"),
+            expected_parent_id: RemoteId::new("new-parent"),
+            expected_title: "New title".to_string(),
+            previous_parent_id: RemoteId::new("database-1"),
+            previous_title: "Old row title".to_string(),
+        }],
+        unsupported: vec![],
+        status: UndoPlanStatus::Complete,
+    };
+
+    connector
+        .apply_undo(ApplyUndoRequest {
+            target_push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &undo_plan,
+        })
+        .expect("apply database row move undo");
+
+    assert_eq!(
+        *api.writes.lock().expect("writes"),
+        vec![
+            WriteCall::MovePage {
+                page_id: "page-1".to_string(),
+                parent: json!({
+                    "type": "data_source_id",
+                    "data_source_id": "source-1",
+                }),
+            },
+            WriteCall::UpdatePage {
+                page_id: "page-1".to_string(),
+                body: json!({
+                    "properties": {
+                        "Name": {
+                            "title": rich_text_json("Old row title"),
+                        },
+                    },
+                }),
+            },
+        ]
+    );
+}
+
+#[test]
 fn apply_undo_rejects_whole_entity_body_restore_for_notion() {
     let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
     let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());

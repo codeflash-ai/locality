@@ -533,10 +533,7 @@ pub fn apply_undo(
                 previous_title,
                 ..
             } => {
-                let parent = json!({
-                    "type": "page_id",
-                    "page_id": previous_parent_id.0,
-                });
+                let parent = undo_move_page_parent_body(api, previous_parent_id)?;
                 let moved_page = api.move_page(entity_id.as_str(), parent)?;
                 let properties = BTreeMap::from([(
                     "title".to_string(),
@@ -1540,6 +1537,36 @@ fn move_page_parent_body(
     Err(LocalityError::Unsupported(
         "Notion pages can only be moved into page or database parents",
     ))
+}
+
+fn undo_move_page_parent_body(api: &dyn NotionApi, parent_id: &RemoteId) -> LocalityResult<Value> {
+    match api.retrieve_database(parent_id.as_str()) {
+        Ok(database) => {
+            let [data_source] = database.data_sources.as_slice() else {
+                return Err(LocalityError::Unsupported(
+                    "moving Notion pages into a database requires exactly one data source",
+                ));
+            };
+            Ok(json!({
+                "type": "data_source_id",
+                "data_source_id": data_source.id,
+            }))
+        }
+        Err(error) if is_notion_database_lookup_miss(&error) => Ok(json!({
+            "type": "page_id",
+            "page_id": parent_id.0,
+        })),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_notion_database_lookup_miss(error: &LocalityError) -> bool {
+    match error {
+        LocalityError::RemoteNotFound(_) | LocalityError::NotImplemented(_) => true,
+        LocalityError::InvalidState(message) => message.starts_with("missing database "),
+        LocalityError::Io(message) => message.contains("notion api returned HTTP 404:"),
+        _ => false,
+    }
 }
 
 fn page_parent_matches_requested(
