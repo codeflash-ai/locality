@@ -24,7 +24,8 @@ maintains immutable versions and current projections in PostgreSQL, runs exact
 ACL/profile filtering in one server query, and streams a transient standard tar
 with negotiated Zstandard compression. The client concurrently decodes and
 materializes ordinary files in a staging tree, then publishes it atomically
-before the agent starts. Large opaque attachments and backups use object storage;
+before the agent starts. Large opaque attachments and explicit exports use
+object storage, while database snapshots/PITR stay with the managed database;
 v1 has no persistent content-pack/catalog layer. The three high-volume serving
 tables use a small identical tenant/source hash layout, monotonic locality keys,
 and ordered export reads; broader indexing and physical reorganization remain
@@ -41,6 +42,14 @@ desktop, CLI, and sandbox clients. Direct-source and backend-replica modes are
 adapters around the same Rust domain, connector, projection, changeset, and
 apply/reconcile workflows; only persistence, credentials, scheduling, and
 remote-truth transport differ by host.
+
+The first hosted cell binds this portable design to AWS ECS Fargate, RDS
+PostgreSQL Multi-AZ, S3, Secrets Manager, KMS, ALB/WAF, and
+CloudWatch/CloudTrail. Its infrastructure lives in the private backend
+repository as self-managed OpenTofu, with separate provider modules reserved for
+future GCP/Azure cells. Shared domain, connector, engine, protocol, and client
+crates remain public; private backend/PostgreSQL/AWS crates depend on exact
+public revisions, never the reverse.
 
 See [`cloud-sandbox-data-plane.md`](cloud-sandbox-data-plane.md) for the target
 architecture, database decision, data model, replica protocol, permissions,

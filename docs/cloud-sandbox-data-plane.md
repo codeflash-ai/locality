@@ -30,9 +30,11 @@ The main decisions are:
    projections, policies, sessions, search, changesets, journals, and audit
    metadata.
 2. Store canonical text and normal projected-file bodies in PostgreSQL. Keep
-   large opaque attachments and backups in regional object storage with managed
-   encryption; the exporter resolves them behind the same session stream. V1
-   has no persistent content-pack layer or custom client-side encryption.
+   large opaque attachments and explicit logical/audit exports in regional
+   object storage with managed encryption; managed database snapshots/PITR stay
+   with the database service. The exporter resolves attachments behind the same
+   session stream. V1 has no persistent content-pack layer or custom client-side
+   encryption.
 3. In backend mode, run provider connector code only in backend workers.
    Provider credentials stay in a backend secret manager and never enter an
    agent sandbox. The existing direct connector mode remains available to the
@@ -85,6 +87,15 @@ The main decisions are:
     ordered backfill writes. Do not depend on periodic heap clustering; tune
     partition count, secondary indexes, and physical rewrites only from measured
     usage.
+14. Deploy the first managed cell on AWS as one container image in separate ECS
+    Fargate process modes behind narrowly scoped IAM task roles, with RDS
+    PostgreSQL Multi-AZ, S3, Secrets Manager, KMS, CloudWatch/CloudTrail, and an
+    ALB for streaming. Define it in free, self-managed OpenTofu rather than CDK;
+    provider-specific future Azure/GCP modules implement the same cell contract.
+15. Keep shared correctness and interoperability crates in the public Locality
+    repository and hosted infrastructure/server implementations in a private
+    backend repository. Dependencies flow only from private backend crates to
+    versioned public crates; shared code is never copied into both repositories.
 
 ### Pragmatic Delivery Contract
 
@@ -95,7 +106,8 @@ that would be expensive to change later.
 The first generally usable cloud-sandbox release is a multi-tenant product, not
 a single-tenant or Notion-only pilot. It includes:
 
-- one Locality-managed regional cell serving multiple customers;
+- one Locality-managed AWS regional cell serving multiple customers, provisioned
+  from private self-managed OpenTofu;
 - a small production connector set implemented through one connector-neutral
   synchronization contract, with at least two structurally different sources
   usable in the same profile before the release is called generally usable;
@@ -123,7 +135,8 @@ access-set, and policy identities.
 
 The first release does not need every high-cardinality personal-file or DM ACL
 shape, a dedicated search/serving database, a custom mmap file format,
-multi-region active/active operation, WORM export, or an operated BYOC product.
+multi-region active/active operation, Azure/GCP modules, WORM export, or an
+operated BYOC product.
 It must, however, version replica/changeset/export protocols, use logical content
 references, and keep export, storage, and secret access behind narrow boundaries
 so a read replica or cache can be added without replacing the domain model.
@@ -276,7 +289,7 @@ flowchart LR
   subgraph Cell[Regional Locality data cell]
     APP[Modular backend<br/>API, sync, render, export, apply]
     PG[(PostgreSQL<br/>content, policy, jobs, search)]
-    BS[(Encrypted object storage<br/>large attachments and backups)]
+    BS[(Encrypted object storage<br/>large attachments and exports)]
     SM[Secret manager]
   end
 
@@ -304,11 +317,13 @@ flowchart LR
 The first production deployment is a modular monolith. It has:
 
 - one backend binary containing API, optional webhook ingress, connector sync,
-  shared engine/provider execution, streaming export, search-index, and apply
-  modules. It may run API and worker process modes independently for scaling,
-  but they are not separate services;
+  shared engine/provider execution, streaming export, search-index, OAuth, and
+  apply modules. The same image runs as separately permissioned API/exporter,
+  connector-worker, OAuth, and one-shot migrator process modes; this is an IAM
+  and scaling boundary, not four independently designed products;
 - one managed PostgreSQL cluster per regional cell;
-- one regional object-store namespace for large attachments and backups;
+- one regional object-store namespace for large attachments and explicit
+  logical/audit exports;
 - one managed secret store; and
 - one PostgreSQL `jobs` table processed with leases and `FOR UPDATE SKIP LOCKED`.
 
@@ -326,6 +341,74 @@ It does not run a separate global control-plane service. Customer content,
 provider credentials, search documents, projected content, and mutation journals
 stay in the tenant's home cell. Split the control plane only when multiple cells,
 residency routing, or independent scaling makes that operationally useful.
+
+### AWS V1 Cell Binding
+
+AWS is the first hosted implementation, not a dependency of the portable domain
+model. Run production, staging, and development in separate AWS accounts and
+declare each cell through OpenTofu:
+
+| Cell concern            | AWS v1 binding                                                                                                                                                                                                                                          |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Public ingress          | Route 53/ACM plus an internet-facing ALB and WAF. The ALB streams exports directly; API Gateway and CloudFront are not in the v1 data path.                                                                                                             |
+| API/export              | ECS Fargate in private subnets, with PostgreSQL/session access and selected S3 reads but no provider-secret access. Run at least two tasks across availability zones.                                                                                   |
+| Connector/apply workers | ECS Fargate without a load balancer, with PostgreSQL, provider-secret, KMS, selected S3 read/write, and provider-network permissions.                                                                                                                   |
+| OAuth callback          | The same image in a separate ECS process/service whose task role can exchange provider codes and write only the applicable credential namespace.                                                                                                        |
+| Migrations              | One-shot ECS task/CI role with schema-owner privileges; application tasks never run owner migrations at startup.                                                                                                                                        |
+| Database                | RDS PostgreSQL Multi-AZ with encryption, TLS verification, automated backups/PITR, deletion protection, bounded direct application pools, and no RDS Proxy initially.                                                                                   |
+| Attachments             | Private per-cell S3 namespace with Block Public Access, TLS-only policy, versioning/lifecycle policy, and SSE-KMS. Sandboxes receive no S3 URLs or credentials.                                                                                         |
+| Provider credentials    | One Secrets Manager secret per broad organization connection in v1, fetched just in time by workers rather than injected into task environment variables. Track cost/cardinality and preserve the adapter for a later encrypted high-cardinality store. |
+| Jobs                    | PostgreSQL leased jobs plus idempotency and connection ownership. Start with fixed workers and publish backlog/age for later autoscaling; do not add SQS merely for AWS integration.                                                                    |
+| Observability/audit     | Redacted CloudWatch logs/metrics, manual Rust OpenTelemetry where useful, CloudTrail for AWS control/data access, and durable product audit events in PostgreSQL.                                                                                       |
+
+Fargate uses `awsvpc` networking. Application task roles are distinct from ECS
+execution roles used to pull ECR images, retrieve launch-time infrastructure
+configuration, and deliver logs. Keep RDS and tasks private. External provider
+APIs require controlled NAT/egress; add S3/ECR/Logs/Secrets/KMS/SSM VPC endpoints
+where they reduce cost or remove a NAT dependency without complicating v1.
+
+ALB idle timeout, target deregistration delay, task shutdown, and maximum export
+duration/bytes are one contract: deployments must drain active exports instead
+of truncating them. Connector workers checkpoint before provider calls where
+possible, handle termination, and rely on durable journals/idempotency for
+resume. Enable ECS deployment rollback/circuit breakers and ECR scan-on-push.
+
+RDS-managed snapshots and PITR are the authoritative database backup path; do
+not copy routine physical database backups into the attachment bucket. Before
+production, declare RPO/RTO, restore a cell into an isolated environment, and
+verify PostgreSQL, attachment, secret-reference, and tenant-deletion behavior.
+
+### OpenTofu Infrastructure Contract
+
+OpenTofu is the infrastructure-as-code standard. The CLI and state backend are
+self-managed; no paid Terraform/OpenTofu control plane is required. The private
+backend repository owns provider modules and environment stacks:
+
+```text
+infra/
+  modules/
+    aws-cell/
+    gcp-cell/       # later
+    azure-cell/     # later
+  stacks/
+    aws/dev-<region>/
+    aws/staging-<region>/
+    aws/prod-<region>/
+```
+
+Each provider module exposes the same logical outputs—cell ID/region, API
+endpoint, database/attachment/secret references, workload identities, and
+observability destinations—but owns provider-specific resources and semantics.
+Do not build one module full of `cloud == ...` conditionals or pretend resource
+definitions are portable.
+
+Store OpenTofu state in a private, encrypted, versioned remote backend per
+environment with locking and narrowly scoped CI access. State may contain
+sensitive metadata: do not pass provider credentials or plaintext customer
+secrets through variables/outputs. Commit provider lock files. CI authenticates
+to each cloud through workload identity/OIDC, runs `fmt`, `validate`, security
+policy checks, and a saved `plan`, then applies that exact reviewed plan after
+the environment's approval gate.
 
 ### Deployment Modes And Region Affinity
 
@@ -678,8 +761,9 @@ contract.
 
 V1 stores bounded native payloads, canonical forms, and projected text in
 PostgreSQL. It stores large opaque attachments as individual object-storage
-objects and uses encrypted object storage for database backups. It does not
-create transport objects, content packs, or a second content catalog.
+objects. Managed database snapshots/PITR stay in the database service; only an
+explicit logical backup or audit export uses separate encrypted object storage.
+V1 does not create transport objects, content packs, or a second content catalog.
 
 - Content identities are tenant-scoped. Do not deduplicate across tenants;
   cross-tenant hashes create existence side channels and complicate deletion.
@@ -695,7 +779,10 @@ create transport objects, content packs, or a second content catalog.
   receive no bucket or KMS credentials in v1.
 - Provider credentials live in a secret manager behind opaque
   `credential_ref` values. Database rows and job payloads never contain bearer
-  or refresh tokens.
+  or refresh tokens. AWS v1 uses one Secrets Manager secret for each broad
+  organization connection and records secret count/cost; delegated-user scale
+  must cross an explicit threshold before this becomes the high-cardinality
+  credential design.
 - Logs contain opaque IDs, sizes, states, provider request IDs, and timings—not
   bodies, SQL parameters containing user data, authorization headers, provider
   payloads, or credentials.
@@ -1909,6 +1996,11 @@ source-controlled namespaces.
 - The common v1 sandbox path is an orchestrator-injected, single-use bootstrap
   token with a very short TTL. Its exchange is audited, consumes the token, and
   returns a narrower session capability; durable tenant API keys are not used.
+- Bootstrap and session capabilities are opaque cryptographically random values,
+  not self-authorizing JWTs. PostgreSQL stores only their hashes, expiry,
+  one-time/usage state, tenant, principal, profile, action, and revocation
+  bindings. This keeps key distribution and claim-verification logic out of v1;
+  every use already reaches the authoritative backend.
 - Sandboxes use workload identity federation instead where the platform exposes
   a trustworthy identity. This is preferred but not assumed to be universally
   available.
@@ -1967,7 +2059,7 @@ source-controlled namespaces.
 | Prompt injection and exfiltration    | No provider credentials in sandbox, deny-by-default egress, source content never becomes instructions, explicit bounded changesets, destructive-plan denial, narrow session capability.                       |
 | Stolen sandbox capability            | Short TTL, exact profile/filter/revision binding, one-session quotas, revocation, current-policy/freshness checks, no provider/database/cloud credential, and audit.                                          |
 | Database credential compromise       | Private networking, TLS, managed encryption, narrowly scoped non-owner roles, RLS, secret rotation, no standing human data-reader role, query/access audit, and time-bound break-glass.                       |
-| Object-store credential compromise   | Large attachments/backups only, SSE-KMS, separate object/KMS roles, opaque tenant-scoped keys, no sandbox credentials, provider audit events.                                                                 |
+| Object-store credential compromise   | Large attachments/explicit exports only, SSE-KMS, separate object/KMS roles, opaque tenant-scoped keys, no sandbox credentials, provider audit events.                                                        |
 | Malicious stream/path                | Backend-generated tar only, compressed/wire and decoded-byte limits, bounded Zstd window/buffers, safe `openat` extraction, no links/devices, path/collision/reserved-name validation, staged atomic publish. |
 | Forged/replayed webhook              | Provider signature validation, timestamp/body limits, durable unique event ID, current-state fetch.                                                                                                           |
 | TOCTOU between planning and write    | Immutable changeset/plan digest and provider precondition immediately before apply; changed plans require another explicit push.                                                                              |
@@ -2241,19 +2333,19 @@ transport adapters.
 The arrows denote inward dependencies. The desktop and backend never depend on
 one another; both compose lower shared crates.
 
-| Component                      | Target treatment                                                                                                                                                                                                                                                                                                                                                                   |
-| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `locality-core`                | Preserve as deterministic, connector-agnostic, I/O-free domain code: portable identities and logical paths, writable-entry three-tree classification, diff/planning rules, validation, guardrails, merge/conflict, journal states, readable diff, and undo planning. Read-only entries do not instantiate three-tree/shadow state.                                                 |
-| `locality-connector`           | Define host-neutral provider ports and transfer values. It may depend on `locality-core`, but not local storage, daemon, UI, backend, or cloud infrastructure.                                                                                                                                                                                                                     |
-| First-party connector crates   | Own API clients/DTOs, OAuth metadata, provider retry classification, checkpoint/change observation, native fetch, render/parse/projection, attachment capture, ACL observations, source-specific validation, concurrency checks, apply, and read-back. The same crates run locally or in backend workers.                                                                          |
-| `locality-engine` (new)        | Own only the shared application workflows described below. It depends on `locality-core` and connector ports, but not SQLite, PostgreSQL, Tauri, filesystem watchers, cloud SDKs, or concrete HTTP transports.                                                                                                                                                                     |
-| `locality-protocol` (new)      | Own versioned session, export-metadata, freshness/revision, and changeset wire envelopes. Reuse or wrap domain values; do not create a second canonical identity, operation, or policy model.                                                                                                                                                                                      |
-| `locality-store` SQLite        | Remain the durable local-host store. Add the small writable-session repository and replica/profile/changeset component versions; do not import read-only entries or make PostgreSQL implement every local repository trait.                                                                                                                                                        |
-| `localityd`                    | Remain the shared local-host runtime for desktop, headless `loc`, and sandbox use. In direct mode it schedules connectors; in backend mode it bootstraps replicas and submits changesets. In both modes it owns watchers, atomic-write handling, local working-copy safety, status/diff acceleration, local journals, and platform projections. Sandbox v1 has no live-delta loop. |
-| `loc-cli`                      | Remain the common command/reporting library and `loc` binary. Commands call local-host/application boundaries and do not duplicate workflows for desktop, direct, or backend mode. The desktop UI may invoke the same library where appropriate.                                                                                                                                   |
-| File Provider/FUSE/Cloud Files | Remain local-host projection adapters. Cloud sandbox default is a fully materialized plain tree or local image overlay, never remote-on-read FUSE.                                                                                                                                                                                                                                 |
-| `locality-backend` (new)       | Compose shared engine/provider/protocol crates with tenant auth, DataGrants, the PostgreSQL `ReplicaExporter`, repositories/jobs/search, attachment storage, secret manager, web/API endpoints, and audit. Keep it as one modular backend binary in v1.                                                                                                                            |
-| OAuth service                  | Evolve from a stateless exchange broker into the edge of an account/control-plane module backed by tenant identity and a backend token vault. Direct local credentials remain in the local credential store; backend credentials never reach a client.                                                                                                                             |
+| Component                         | Target treatment                                                                                                                                                                                                                                                                                                                                                                   |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `locality-core`                   | Preserve as deterministic, connector-agnostic, I/O-free domain code: portable identities and logical paths, writable-entry three-tree classification, diff/planning rules, validation, guardrails, merge/conflict, journal states, readable diff, and undo planning. Read-only entries do not instantiate three-tree/shadow state.                                                 |
+| `locality-connector`              | Define host-neutral provider ports and transfer values. It may depend on `locality-core`, but not local storage, daemon, UI, backend, or cloud infrastructure.                                                                                                                                                                                                                     |
+| First-party connector crates      | Own API clients/DTOs, OAuth metadata, provider retry classification, checkpoint/change observation, native fetch, render/parse/projection, attachment capture, ACL observations, source-specific validation, concurrency checks, apply, and read-back. The same crates run locally or in backend workers.                                                                          |
+| `locality-engine` (new)           | Own only the shared application workflows described below. It depends on `locality-core` and connector ports, but not SQLite, PostgreSQL, Tauri, filesystem watchers, cloud SDKs, or concrete HTTP transports.                                                                                                                                                                     |
+| `locality-protocol` (new)         | Own versioned session, export-metadata, freshness/revision, and changeset wire envelopes. Reuse or wrap domain values; do not create a second canonical identity, operation, or policy model.                                                                                                                                                                                      |
+| `locality-store` SQLite           | Remain the durable local-host store. Add the small writable-session repository and replica/profile/changeset component versions; do not import read-only entries or make PostgreSQL implement every local repository trait.                                                                                                                                                        |
+| `localityd`                       | Remain the shared local-host runtime for desktop, headless `loc`, and sandbox use. In direct mode it schedules connectors; in backend mode it bootstraps replicas and submits changesets. In both modes it owns watchers, atomic-write handling, local working-copy safety, status/diff acceleration, local journals, and platform projections. Sandbox v1 has no live-delta loop. |
+| `loc-cli`                         | Remain the common command/reporting library and `loc` binary. Commands call local-host/application boundaries and do not duplicate workflows for desktop, direct, or backend mode. The desktop UI may invoke the same library where appropriate.                                                                                                                                   |
+| File Provider/FUSE/Cloud Files    | Remain local-host projection adapters. Cloud sandbox default is a fully materialized plain tree or local image overlay, never remote-on-read FUSE.                                                                                                                                                                                                                                 |
+| `locality-backend` (new, private) | Compose shared engine/provider/protocol crates with tenant auth, DataGrants, the PostgreSQL `ReplicaExporter`, repositories/jobs/search, attachment storage, secret manager, web/API endpoints, and audit. Keep it as one modular backend binary in v1.                                                                                                                            |
+| OAuth service                     | Keep direct/local OAuth broker behavior compatible, but implement backend OAuth exchange as a private cell process mode backed by tenant identity and the backend token vault. Direct local credentials remain in the local credential store; backend credentials never reach a client.                                                                                            |
 
 `locality-engine` starts with exactly three workflow families:
 
@@ -2292,6 +2384,70 @@ Do not hide these differences behind a giant repository interface or
 `cfg(backend)` branches throughout core code. Use narrow ports at workflow
 edges. This preserves useful code sharing without coupling SQLite migrations to
 the server schema or making local operation require cloud infrastructure.
+
+### Public And Private Repository Boundary
+
+The public repository owns behavior that clients, desktop, direct mode, and the
+hosted backend must share or interoperate with:
+
+- `locality-core`, portable domain values, validation, diffs, journals,
+  conflicts, guardrails, changeset planning, and undo semantics;
+- `locality-connector`, portable connector ports, execution values, and
+  connector conformance fixtures;
+- first-party provider crates and their native/canonical rendering, observation,
+  retry, concurrency, apply, and read-back behavior;
+- `locality-engine`, containing only the shared synchronize/project,
+  prepare-changeset, and apply/reconcile workflows;
+- `locality-protocol`, containing versioned session, freshness, export metadata,
+  status, error, and changeset wire values plus golden fixtures; and
+- `localityd`, `loc-cli`, the desktop, local SQLite store, safe Zstd/tar client
+  extraction, and platform projections.
+
+The private backend repository owns hosted implementation and operations:
+
+```text
+private-backend/
+  crates/
+    locality-backend/    # API plus api/worker/oauth/migrator modes
+    locality-postgres/   # schema, migrations, RLS, repositories, jobs
+    locality-aws/        # ECS runtime, S3, KMS, Secrets, CloudWatch adapters
+  infra/
+    modules/aws-cell/
+    stacks/aws/<environment-region>/
+```
+
+Keep tenant/control-plane APIs, server DataGrant compilation/enforcement,
+session-token issuance, billing, PostgreSQL physical schema, cloud adapters,
+audit export, deployment tooling, and Web administration implementation private.
+Public crates may define the narrow repository/object/secret/clock interfaces
+needed by shared workflows, but contain no AWS SDK, PostgreSQL, private API, or
+private crate dependency.
+
+The dependency direction is one-way:
+
+```text
+private backend/postgres/aws crates
+                 |
+                 v
+public engine/protocol/connectors/core
+                 ^
+                 |
+public loc/localityd/desktop clients
+```
+
+Never copy shared source files into the private repository and never use a
+private Git submodule inside the public repository. Initially, the private Cargo
+workspace pins public crates to an exact public Git revision and commits
+`Cargo.lock`. Local development may use uncommitted Cargo `[patch]` path
+overrides to a sibling public checkout.
+
+Cross-repository changes are public-interface-first: land a backwards-compatible
+public change and tag/revision it, update the private pin, then remove old
+compatibility only after supported clients have rolled forward. Public golden
+protocol/connector/engine fixtures run in private CI. Private CI also performs a
+scheduled compatibility build against public `main`, while production releases
+always use the reviewed exact revision. Apache-2.0 public code may be consumed by
+the private backend without changing the public license.
 
 ### Connector Trait Evolution
 
@@ -2382,6 +2538,10 @@ paths.
 - Add `locality-engine`, define its three workflow families, and first extract
   changeset preparation. Extract synchronize/project and apply/reconcile only as
   phases 1 and 3 need them.
+- Establish the public/private repository boundary. Land portable
+  `locality-engine` and `locality-protocol` plus golden fixtures publicly; create
+  the private `locality-backend`, `locality-postgres`, and `locality-aws`
+  workspace pinned to an exact public revision.
 - Define the compact PostgreSQL physical schema with tenant/resource/version/
   projection/access-set/checkpoint/revision/idempotency boundaries, narrow
   selection rows, separate body rows, source/root/export/storage locality keys,
@@ -2391,7 +2551,13 @@ paths.
   migrations ship.
 - Keep synchronous provider implementations and run them through bounded backend
   workers. Use PostgreSQL jobs and one-time bootstrap tokens directly; do not
-  build generic KMS, queue, pack, cache, resume, or workload-identity frameworks.
+  build a generic multi-cloud KMS/queue/workload-identity framework, pack, cache,
+  or resume protocol.
+- In the private repository, create the OpenTofu AWS module and development
+  stack, define separate ECS execution/task roles for API, worker, OAuth, and
+  migrator modes, select the human OIDC/SAML provider, and specify opaque
+  bootstrap/session capability lifecycles, ALB export limits/draining, RPO/RTO,
+  and provider-secret cardinality thresholds.
 
 Exit: direct-mode tests pass through the new boundaries; dependency checks keep
 shared crates free of host infrastructure; the exact export fixture proves no
@@ -2400,9 +2566,11 @@ streams without O(read-only entry count) SQLite writes.
 
 ### Phase 1: Multi-Tenant Read Data Plane And First Connector
 
-- Deploy one regional modular backend with managed PostgreSQL, a private
-  attachment/backup bucket, and a secret manager. Run API and worker modes
-  separately only when useful for scaling.
+- Deploy one development then production regional AWS cell through reviewed
+  OpenTofu: private-subnet ECS Fargate process modes, ALB/ACM/WAF ingress, RDS
+  PostgreSQL Multi-AZ, a private attachment/export S3 namespace, Secrets Manager,
+  KMS, ECR, CloudWatch, and CloudTrail. Keep application task roles separate from
+  ECS execution roles and from the schema-owner migrator.
 - Implement tenants, real non-owner RLS, principals/groups, broad pilot
   DataGrants, WorkspaceProfiles, access sets/subjects, content/projection
   versions, ready revisions, sessions, PostgreSQL jobs, audit, and retention.
@@ -2427,6 +2595,10 @@ streams without O(read-only entry count) SQLite writes.
   limits.
 - Exchange a one-time orchestrator bootstrap token for a short-lived capability
   and ship `loc sandbox init --profile ...` with a plain-file cloud mount.
+- Enable RDS automated backups/PITR and S3 versioning/lifecycle, declare RPO/RTO,
+  and complete an isolated restore drill before storing production customer
+  data. Recovery verifies database state, attachments, secret references,
+  capabilities, and documented tenant-deletion/backup-expiry behavior.
 
 Exit: a fresh sandbox receives a complete exact tree from the first connector
 with no provider API calls, can run `rg` immediately, and fails rather than
@@ -2511,14 +2683,17 @@ None of these extensions blocks v1.
 
 - SIEM/WORM audit export, advanced retention/legal holds, enterprise export and
   deletion workflows, SCIM groups, and customer-managed keys.
-- Tenant sharding/move tooling, dedicated cells, residency controls, disaster
-  recovery, and capacity isolation.
+- Tenant sharding/move tooling, dedicated cells, residency controls,
+  cross-region disaster recovery, and capacity isolation.
 - Package the portable data cell for a customer cloud/VPC; verify there are no
   Locality-account database, KMS, object, identity, or DNS assumptions.
+- Implement separate `gcp-cell` and/or `azure-cell` OpenTofu modules only when a
+  real deployment is committed; conform to the cell inputs/outputs without
+  emulating AWS resource shapes.
 - Optional application encryption and local filesystem-image modes.
 
-Exit: tenant-isolation penetration tests, restore drills, deletion verification,
-and dedicated-cell operational runbooks are complete.
+Exit: tenant-isolation penetration tests, cross-region recovery drills, deletion
+verification, and dedicated-cell operational runbooks are complete.
 
 ## Test And Release Gates
 
@@ -2529,6 +2704,9 @@ and dedicated-cell operational runbooks are complete.
 - Backend serves current and previous negotiated export readers during rollout.
 - Direct-to-backend cutover preserves dirty/conflicted files, journals, virtual
   creates/moves/deletes, writable baselines, and apply effects.
+- The private backend builds against its exact public Git revision/Cargo lock;
+  scheduled CI also detects upcoming incompatibility against public `main`
+  without changing the production pin.
 
 ### Shared-Code Conformance
 
@@ -2548,6 +2726,33 @@ and dedicated-cell operational runbooks are complete.
   provider crates import no `localityd`, local store, or backend; engine imports
   no SQLite, PostgreSQL, Tauri, watcher, or cloud SDK; and local-host/backend
   crates depend on shared crates rather than one another.
+- Repository checks additionally prove no public manifest/source references a
+  private crate or repository, no shared source file is copied into the private
+  tree, and private protocol/connector/engine conformance uses the public golden
+  fixtures.
+
+### AWS Cell And OpenTofu
+
+- `tofu fmt -check`, initialization, validation, provider lock verification,
+  security/policy scanning, and a saved plan run for every environment change;
+  production applies exactly the reviewed plan through OIDC, never static CI
+  credentials.
+- Plan/policy tests enforce private RDS/ECS placement, S3 Block Public Access and
+  TLS/SSE-KMS, encrypted remote state, RDS encryption/backups/deletion
+  protection, ALB TLS/WAF, ECR scanning, and CloudTrail/CloudWatch configuration.
+- IAM tests distinguish ECS execution roles from API/export, connector/apply,
+  OAuth, and migrator task roles. API/export cannot read provider secrets;
+  application roles cannot perform owner DDL; sandbox capabilities cannot call
+  AWS APIs.
+- Integration tests exercise ALB streaming and disconnects, maximum export
+  limits, deployment connection draining, ECS task termination during leased
+  sync/apply jobs, and idempotent recovery on replacement tasks.
+- A pre-production restore drill reconstructs an isolated cell from RDS PITR and
+  S3 state, validates secret references without exporting plaintext, and proves
+  the declared RPO/RTO and tenant deletion/backup-expiry contract.
+- Cost tests/alerts track RDS, Fargate, NAT/data transfer, Secrets Manager count,
+  KMS, S3, and CloudWatch as separate drivers; environment/resource tags make
+  cell and tenant-safe cost attribution possible.
 
 ### Ingestion And Freshness
 
@@ -2741,6 +2946,17 @@ queries, channel names, source content, or runtime filter values.
   clustered heap order after new writes, and rewrites compete with ingestion.
   Preserve useful initial locality through ordered batches and add online
   physical maintenance only after measured correlation loss.
+- **Use AWS CDK or a paid infrastructure control plane for v1:** the hosted
+  product needs provider-portable, self-managed infrastructure definitions.
+  Use OpenTofu modules and encrypted remote state; paid orchestration remains an
+  optional operational choice, not a build requirement.
+- **Put AWS, GCP, and Azure branches in one infrastructure module:** portability
+  is a shared cell contract implemented by separate provider modules, not a
+  forest of conditionals over incompatible resources.
+- **Copy shared Rust code between public and private repositories:** private
+  backend crates pin and consume public crates. Public crates never reference a
+  private repository, and security never depends on hiding the wire/domain
+  contract.
 - **Add ClickHouse before PostgreSQL fails a benchmark gate:** it creates CDC,
   publication lag, cross-store retention/deletion, and another sensitive system.
   It is a future read-serving replica, never the provider-mutation authority.
@@ -2780,6 +2996,11 @@ architecture:
 - whether physical-order correlation degrades enough to justify an online
   rewrite for a specific table; routine clustering remains unnecessary until
   that threshold is observed;
+- the provider-connection count/cost at which one AWS Secrets Manager secret per
+  connection should move, behind the same adapter, to an encrypted
+  high-cardinality credential store;
+- the measured ALB idle/drain/export limits and ECS task sizes for supported
+  sandbox bandwidth/concurrency;
 - whether a concrete customer requires human approval, advisory multi-agent
   claims, exact delivered-entry retention, or audited filesystem reads;
 - provider-specific ACL fidelity and organization-bot versus delegated-user
@@ -2790,8 +3011,11 @@ The architectural baseline is central continuous ingestion; complete ready
 revisions with explicit freshness; one managed PostgreSQL correctness and v1
 read-serving plane; exact server-side ACL/profile filtering; a transient
 Zstd-compressed streaming tar with `identity` fallback rather than stored packs;
-object storage only for large attachments/backups; ordinary local files;
-writable-only three-tree state; backend-held credentials; changeset-based
-writes; and one shared Rust core/engine/provider implementation across local and
-backend hosts. ClickHouse, parallel compression framing, resume, and caches
-remain measured extensions.
+object storage only for large attachments/explicit exports; managed database
+snapshots/PITR; ordinary local files; writable-only three-tree state;
+backend-held credentials; changeset-based writes; one shared public Rust
+core/engine/protocol/provider implementation consumed by private backend crates;
+and separate OpenTofu provider modules implementing one portable cell contract.
+AWS ECS/RDS/S3/Secrets/KMS is the v1 hosted binding. ClickHouse, parallel
+compression framing, resume, caches, and Azure/GCP cells remain measured or
+customer-driven extensions.
