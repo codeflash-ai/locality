@@ -79,6 +79,12 @@ The main decisions are:
     read-serving replica only when measured PostgreSQL scan, concurrency, or
     isolation limits prevent the service from saturating supported sandbox
     links. ClickHouse is not a v1 dependency or mutation authority.
+13. Make the three high-volume PostgreSQL serving tables locality-aware from the
+    beginning: identical small tenant/source hash partitions, monotonic
+    source/root export and content-storage IDs, a minimal baseline index set, and
+    ordered backfill writes. Do not depend on periodic heap clustering; tune
+    partition count, secondary indexes, and physical rewrites only from measured
+    usage.
 
 ### Pragmatic Delivery Contract
 
@@ -418,11 +424,19 @@ source resource:
 - a Gmail thread can aggregate messages and attachments;
 - a database can emit a directory, row entries, `_schema.yaml`, and views.
 
-Each projection entry has a stable projection ID, relative path, content reference,
-input resource versions, file kind, format version, and connector-supported
-action set. Effective actions are session policy, not intrinsic content
-metadata. The many-to-many `projection_inputs` relationship lets connectors
-aggregate or split resources without corrupting remote identity.
+Each projection entry has a stable projection ID, relative path, content
+reference, input resource versions, file kind, format version, and
+connector-supported action set. Effective actions are session policy, not
+intrinsic content metadata. The many-to-many `projection_inputs` relationship
+lets connectors aggregate or split resources without corrupting remote identity.
+
+The backend also assigns physical-serving hints: a stable `scope_root_id`, a
+monotonic `export_order` within that source/root, and a monotonic internal
+`content_storage_id` for each content version. These are not provider identity
+or wire-format fields. They let ingestion place related rows together and let
+exports read bodies in storage-friendly order without changing filesystem paths.
+Allocate ID ranges through ordinary connection-scoped database state; do not
+create a PostgreSQL sequence or partition for every tenant, source, or root.
 
 Its `LogicalPath` is a normalized portable relative path, not a Rust `PathBuf`
 or an OS-specific absolute path. The same `ProjectionEntry` can therefore be
@@ -517,8 +531,10 @@ tenant-scoped objects.
 ## PostgreSQL Data Model
 
 Every content-bearing table includes `tenant_id` in its primary or leading
-unique key. The complete logical model is intentionally richer than the first
-physical schema:
+unique key. Serving content also carries `source_connection_id`, even when its
+opaque content ID is already tenant-unique, so partition pruning and joins share
+one leading key. The complete logical model is intentionally richer than the
+first physical schema:
 
 | Group        | Tables and purpose                                                                                                                              |
 | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -537,6 +553,7 @@ High-value constraints include:
 ```text
 UNIQUE (tenant_id, source_connection_id, provider_resource_id)
 UNIQUE (tenant_id, source_resource_id, internal_version)
+UNIQUE (tenant_id, source_connection_id, content_storage_id)
 UNIQUE (tenant_id, source_connection_id, replica_revision)
 UNIQUE (tenant_id, source_connection_id, checkpoint_kind, scope_id)
 UNIQUE (tenant_id, source_connection_id, provider_event_id)
@@ -549,47 +566,62 @@ filter fields. Use JSONB only for connector-owned metadata and policy extensions
 Store bounded provider payloads, canonical Markdown, and projected text in
 ordinary PostgreSQL `jsonb`, `text`, or `bytea` columns. Split narrow selection
 metadata from body rows so an ACL/filter query can reject entries before fetching
-content. Do not use PostgreSQL's large-object subsystem or store unbounded binary
-attachments in the database; those use tenant-scoped object references.
+content. Keep the opaque content ID for logical references and use a monotonic
+`content_storage_id` only as the internal body lookup/export-order key. Do not
+use PostgreSQL's large-object subsystem or store unbounded binary attachments in
+the database; those use tenant-scoped object references.
 
 The v1 physical schema should stay near twenty generic tables rather than
 materializing every logical subtype:
 
-| V1 record                                                                                  | Consolidation rule                                                                                                                                                               |
-| ------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `tenants`                                                                                  | Includes home-cell and basic billing/identity configuration.                                                                                                                     |
-| `principals`, `groups`, `group_memberships`                                                | A typed principal represents a human, service account, or workload; split subtypes only when their lifecycle differs.                                                            |
-| `source_connections`                                                                       | Includes credential reference, connector version, optional webhook state, health, and connector-owned configuration.                                                             |
-| `source_checkpoints`                                                                       | Durable cursor/fingerprint and completeness per root, channel, drive, mailbox, or other resumable connector scope.                                                               |
-| `source_resources`, `source_edges`, `source_versions`                                      | Preserve stable provider identity, hierarchy/membership, immutable versions, current pointer, provider precondition, tombstone, and ACL observations.                            |
-| `access_sets`, `access_set_subjects`                                                       | Normalizes equivalent observed reader sets so indexed authorization joins do not evaluate provider ACL JSON per file.                                                            |
-| `content_versions`, `projection_entries`, `projection_entry_versions`, `projection_inputs` | Separates immutable bodies from narrow current/versioned selection rows and preserves the many-to-many source-to-filesystem mapping.                                             |
-| `policies`, `policy_revisions`                                                             | Stores both `DataGrant` and `WorkspaceProfile` documents by kind; compiled results are rebuildable cache fields or objects.                                                      |
-| `replica_revisions`                                                                        | Records source watermark, coverage, freshness observation, projection sequence, ready state, and PostgreSQL commit/replay position.                                              |
-| `sandbox_sessions`, `session_deliveries`                                                   | Includes capability hash/claims, pinned revisions, filter/query digest, selected/delivered counts and bytes, plus an optional exact delivered inventory when policy requires it. |
-| `jobs`                                                                                     | Durable leased work, provider-event dedupe, retry, cooldown, and idempotency state.                                                                                              |
-| `search_documents`                                                                         | Rebuildable PostgreSQL full-text projection.                                                                                                                                     |
-| `changesets`, `change_operations`                                                          | Operations hold attempt, effect, reconciliation, and error JSON until scale or retention justifies separate tables.                                                              |
-| `audit_events`                                                                             | Append-only security and lifecycle events; large delivery inventories may use partitioned database rows or an encrypted audit export when required.                              |
+| V1 record                                                                                  | Consolidation rule                                                                                                                                                                      |
+| ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tenants`                                                                                  | Includes home-cell and basic billing/identity configuration.                                                                                                                            |
+| `principals`, `groups`, `group_memberships`                                                | A typed principal represents a human, service account, or workload; split subtypes only when their lifecycle differs.                                                                   |
+| `source_connections`                                                                       | Includes credential reference, connector version, optional webhook state, health, and connector-owned configuration.                                                                    |
+| `source_checkpoints`                                                                       | Durable cursor/fingerprint and completeness per root, channel, drive, mailbox, or other resumable connector scope.                                                                      |
+| `source_resources`, `source_edges`, `source_versions`                                      | Preserve stable provider identity, hierarchy/membership, immutable versions, current pointer, provider precondition, tombstone, and ACL observations.                                   |
+| `access_sets`, `access_set_subjects`                                                       | Normalizes equivalent observed reader sets so indexed authorization joins do not evaluate provider ACL JSON per file.                                                                   |
+| `content_versions`, `projection_entries`, `projection_entry_versions`, `projection_inputs` | Separates immutable bodies from narrow current/versioned selection rows; carries source/root/export/storage locality keys; and preserves the many-to-many source-to-filesystem mapping. |
+| `policies`, `policy_revisions`                                                             | Stores both `DataGrant` and `WorkspaceProfile` documents by kind; compiled results are rebuildable cache fields or objects.                                                             |
+| `replica_revisions`                                                                        | Records source watermark, coverage, freshness observation, projection sequence, ready state, and PostgreSQL commit/replay position.                                                     |
+| `sandbox_sessions`, `session_deliveries`                                                   | Includes capability hash/claims, pinned revisions, filter/query digest, selected/delivered counts and bytes, plus an optional exact delivered inventory when policy requires it.        |
+| `jobs`                                                                                     | Durable leased work, provider-event dedupe, retry, cooldown, and idempotency state.                                                                                                     |
+| `search_documents`                                                                         | Rebuildable PostgreSQL full-text projection.                                                                                                                                            |
+| `changesets`, `change_operations`                                                          | Operations hold attempt, effect, reconciliation, and error JSON until scale or retention justifies separate tables.                                                                     |
+| `audit_events`                                                                             | Append-only security and lifecycle events; large delivery inventories may use partitioned database rows or an encrypted audit export when required.                                     |
 
 This mapping is an implementation choice, not a weaker domain model. Bake in
 the boundaries that are expensive to retrofit: tenant-leading keys and RLS,
 stable provider IDs, immutable versions/provider preconditions, resource versus
 projection identity, projection inputs, access-set IDs, policy/replica/format
 revisions, resumable checkpoint identity, idempotency keys, and audit correlation
-IDs. It is safe to normalize typed principal subtypes, webhook subscriptions, compiled
-policy bindings, receipts, approvals, apply attempts/effects, holds, exports, or
-partitions later through ordinary migrations.
+IDs. Also bake `source_connection_id`, `scope_root_id`, `export_order`, and
+`content_storage_id` into the serving schema because adding physical locality
+after a large corpus exists is expensive. It is safe to normalize typed
+principal subtypes, webhook subscriptions, compiled policy bindings, receipts,
+approvals, apply attempts/effects, holds, or exports later through ordinary
+migrations.
 
-### Isolation And Partitioning
+### Isolation And Physical Layout
 
 - Enable row-level security with default-deny policies on every tenant table.
 - Run the application as a non-owner role without `BYPASSRLS`; use a separate
   migration role. RLS is defense in depth in addition to mandatory `tenant_id`
   predicates in repositories.
-- Do not partition v1 tables preemptively. Add tenant-hash and/or time
-  partitioning to measured high-volume tables when index size, vacuum, retention,
-  or tenant isolation requires it.
+- Hash-partition only `projection_entries`, `projection_entry_versions`, and
+  `content_versions` by `(tenant_id, source_connection_id)`, using the same small
+  fixed partition count in one cell. Use 16 as the schema default unless Phase 0
+  fixtures show a regression before the first production migration ships. All
+  other v1 tables remain unpartitioned.
+- Include both partition columns in primary/unique keys, foreign-key targets,
+  body joins, and repository predicates. Identical partition keys allow pruning
+  for every export and leave partition-wise joins available when measurements
+  justify enabling them.
+- Do not create partitions per tenant, connection, root, profile, or time window.
+  A small fixed hash layout bounds index/maintenance scope without creating an
+  unbounded schema object count. Partitioning improves pruning but does not
+  guarantee heap order inside a partition.
 - Route a tenant to one database shard/cell. Reshard by moving whole tenants,
   not individual resources.
 - Keep foreign keys within a shard and transaction. Do not create cross-cell
@@ -945,14 +977,15 @@ The read path separates narrow selection rows from immutable bodies:
 
 ```text
 projection_entries
-  stable projection identity and current pointer
+  stable projection identity, current pointer, source/root/export order
 
 projection_entry_versions
   source/revision validity, logical path, root, kind, ACL set,
-  filter columns, actions, provider precondition, content ID, deletion
+  filter columns, actions, provider precondition, content/storage IDs, deletion
 
 content_versions
-  tenant-scoped immutable canonical/projected bytes, hash, size, encoding
+  source-scoped internal storage ID plus immutable canonical/projected bytes,
+  opaque content ID, hash, size, encoding
 
 access_set_subjects
   observed provider/Locality subjects allowed by each access-set expression
@@ -969,6 +1002,12 @@ and closes or supersedes affected prior rows. A query for a pinned revision sees
 exactly the entries valid at that revision; it does not copy an entire physical
 snapshot.
 
+The ordinary fast path reads the narrow current-head fields when the pinned
+revision is still the source's current ready revision. If publication advanced
+between session creation and export, the same repository falls back to the
+version-validity rows. Both paths run in the export's repeatable-read snapshot
+and must return identical logical rows for the same revision.
+
 A session export is logically one fixed query:
 
 ```sql
@@ -977,11 +1016,13 @@ WITH selected AS MATERIALIZED (
   SELECT e.tenant_id,
          e.source_connection_id,
          e.projection_id,
+         e.scope_root_id,
+         e.export_order,
          e.logical_path,
          e.file_kind,
          e.effective_actions,
          e.provider_version,
-         e.content_id,
+         e.content_storage_id,
          e.large_attachment_id
   FROM authorized_projection_entries(:session_id, :replica_revisions) AS e
   WHERE profile_predicates_match(e, :validated_runtime_values)
@@ -997,8 +1038,12 @@ SELECT e.logical_path,
 FROM selected AS e
 LEFT JOIN content_versions AS c
   ON c.tenant_id = e.tenant_id
- AND c.content_id = e.content_id
-ORDER BY e.source_connection_id, e.projection_id;
+ AND c.source_connection_id = e.source_connection_id
+ AND c.content_storage_id = e.content_storage_id
+ORDER BY e.source_connection_id,
+         e.scope_root_id,
+         e.export_order,
+         e.content_storage_id;
 ```
 
 The real implementation expresses supported predicates as parameterized SQL and
@@ -1011,6 +1056,26 @@ For throughput, the exporter may use `COPY (SELECT ...) TO STDOUT (FORMAT
 BINARY)` internally and translate rows incrementally into the HTTP file stream.
 This is one database query and one response, not one query or HTTP request per
 file. Rejected metadata rows never fetch their content body.
+
+The baseline physical indexes are deliberately small:
+
+- current projection selection on `(tenant_id, source_connection_id,
+scope_root_id, export_order)` including only the narrow ACL, filter,
+  current-version, and `content_storage_id` fields required before body fetch;
+- historical revision lookup on `(tenant_id, source_connection_id,
+scope_root_id, projection_id, valid_from_sequence DESC)` with the closing
+  sequence available for filtering;
+- authorization lookup on `(tenant_id, subject_id, access_set_id)`; and
+- immutable body lookup on `(tenant_id, source_connection_id,
+content_storage_id)`.
+
+Do not add one broad covering index containing paths, bodies, and every optional
+filter. Add a time/kind/provider-specific index only after real query plans show
+that it avoids enough heap work to repay its write, WAL, vacuum, and cache cost.
+Use a custom plan for each export query shape because a broad root and a narrow
+filter can require very different plans. Session creation uses statistics for
+estimates; it does not run an exact full `COUNT(*)` pass before streaming. Hard
+entry/byte limits are enforced as rows are produced.
 
 ### Revision Publication And Source Freshness
 
@@ -1170,18 +1235,33 @@ than supported sandbox ingress at expected launch concurrency. Optimize the
 simple path before adding another data store:
 
 - keep authorization/filter columns narrow and separately indexed from bodies;
-- use tenant-leading repository predicates and indexes appropriate to measured
-  source/root/access-set/profile queries;
+- prune the three serving tables by tenant/source, select through the narrow
+  current-head or historical-revision index, and fetch bodies in
+  `(scope_root_id, export_order, content_storage_id)` order;
 - join immutable bodies only after selection and use a bounded streaming
   transaction with backpressure;
+- assign locality keys and insert initial backfill batches in export order. New
+  versions append; correctness never depends on physical heap position;
+- use LZ4 TOAST compression for new text/JSON/bytea body values when the managed
+  PostgreSQL build supports it. This storage compression is transparent and
+  separate from Zstd wire compression;
+- use append-friendly `fillfactor = 100` for immutable version/body tables and a
+  modest update reserve such as `fillfactor = 85` for mutable current-head
+  tables. Run `ANALYZE` after large backfills before making a profile ready;
 - avoid N+1 reads, application buffering, per-file authorization calls, and
-  JSON-policy evaluation in the hot row loop;
+  JSON-policy evaluation or a duplicate exact-count scan in the hot row loop;
 - colocate PostgreSQL and exporter, provision database/exporter network headroom,
   and cap concurrent exports per cell/tenant so bootstrap cannot starve ingestion
   or mutations; and
 - benchmark cold/warm storage, 1/10/50 concurrent sessions, 1%/10%/80%
   selectivity, broad and high-cardinality ACLs, large text values, and
   10k/100k/1M-entry filesystem creation.
+
+PostgreSQL heap order is not automatically maintained by an index. Do not make
+periodic `CLUSTER`, `VACUUM FULL`, or an online-repack extension part of v1
+correctness or publication. Monitor heap/index block reads, index bloat, and
+`pg_stats.correlation`; schedule an online physical rewrite later only when a
+specific serving table crosses a measured degradation threshold.
 
 A PostgreSQL read replica is the first scale-out step when it provides sufficient
 isolation. The session API routes an export to a replica only after its replay
@@ -2025,8 +2105,8 @@ Measure cold and warm PostgreSQL/storage state, 1%/10%/80% selectivity,
 1/10/50 concurrent sessions, broad and high-cardinality ACL sets, 10k/100k/1M
 entries, large TOAST values, attachment mixes, primary versus read-replica
 routing, and representative sandbox regions. Do not choose ClickHouse,
-custom parallel compression framing, cache, partitioning, or a resume protocol
-from synthetic peak bandwidth alone.
+custom parallel compression framing, cache, additional partition layers, or a
+resume protocol from synthetic peak bandwidth alone.
 
 ### Unit Economics And Retention
 
@@ -2078,9 +2158,9 @@ extraction leaves the prior tree untouched.
 
 | Bottleneck              | Failure mode                                                              | V1 mitigation                                                                                                                                                                |
 | ----------------------- | ------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ACL/filter query        | Large joins or JSON evaluation delay first byte.                          | Precompute indexed `access_set_id`/subject facts; materialize common filter columns; fixed parameterized query; inspect plans on representative cardinalities.               |
+| ACL/filter query        | Large joins, generic plans, or JSON evaluation delay first byte.          | Precompute indexed `access_set_id`/subject facts; materialize common filter columns; use a custom fixed query shape; inspect plans on representative cardinalities.          |
 | Metadata/body coupling  | Rejected rows still fetch large text/TOAST values.                        | Keep narrow projection-version rows separate from immutable bodies and join bodies only after exact selection.                                                               |
-| PostgreSQL storage      | Cold/random TOAST reads cannot feed the link.                             | Favor source/root-local access patterns, provision storage/cache, measure `EXPLAIN (ANALYZE, BUFFERS)`, and add a read replica before a new database.                        |
+| PostgreSQL storage      | Cold/random body reads cannot feed the link.                              | Prune identical tenant/source hash partitions, batch/order by root/export/storage IDs, use LZ4 TOAST, measure `EXPLAIN (ANALYZE, BUFFERS)`, and add a read replica first.    |
 | Long export transaction | Vacuum pressure or connection starvation.                                 | Bounded session/result limits, statement/idle timeouts, dedicated export pool, cancellation on disconnect, concurrency quotas, and monitoring.                               |
 | Exporter network/CPU    | TLS/tar/Zstd framing or internal hop limits throughput.                   | Colocate database/exporter, stream `COPY`/rows without buffering, use Zstd level 1 with bounded buffers, scale stateless exporter processes, and retain `identity` fallback. |
 | Tiny client             | Zstd decode, extraction, or hashing saturates one vCPU.                   | Concurrent single-frame decode and staged extraction with bounded ring buffers, no metadata import, CPU qualification on the smallest sandbox, and `identity` fallback.      |
@@ -2304,7 +2384,11 @@ paths.
   phases 1 and 3 need them.
 - Define the compact PostgreSQL physical schema with tenant/resource/version/
   projection/access-set/checkpoint/revision/idempotency boundaries, narrow
-  selection rows, separate body rows, and no preemptive partitioning.
+  selection rows, separate body rows, source/root/export/storage locality keys,
+  the four baseline index shapes, and identical tenant/source hash partitioning
+  for only the three serving tables. Compare unpartitioned and small
+  partition-count fixtures and record the initial cell default before production
+  migrations ship.
 - Keep synchronous provider implementations and run them through bounded backend
   workers. Use PostgreSQL jobs and one-time bootstrap tokens directly; do not
   build generic KMS, queue, pack, cache, resume, or workload-identity frameworks.
@@ -2322,12 +2406,16 @@ streams without O(read-only entry count) SQLite writes.
 - Implement tenants, real non-owner RLS, principals/groups, broad pilot
   DataGrants, WorkspaceProfiles, access sets/subjects, content/projection
   versions, ready revisions, sessions, PostgreSQL jobs, audit, and retention.
+  Create the three serving tables with the selected fixed hash partitions,
+  baseline indexes, LZ4 body compression where available, and table-specific
+  fillfactor defaults; leave all other tables unpartitioned.
 - Move the first connector's bootstrap/sync/fetch/render path into the common
   backend connector contract. Notion is a useful hierarchical vertical slice,
   but this phase is not the generally usable product boundary.
 - Implement resumable profile-prioritized backfill, scheduled sync/repair,
   immutable version creation, complete ready-revision publication, and the
-  freshness wait/fail gate.
+  freshness wait/fail gate. Batch initial projection/content inserts by
+  source/root/export order and analyze large completed backfills.
 - Implement the exact parameterized ACL/profile/runtime selection query,
   negotiated Zstd-or-identity streaming tar endpoint, bounded attachment
   resolution, concurrent bounded decoder/safe staged extractor, and atomic tree
@@ -2482,6 +2570,14 @@ and dedicated-cell operational runbooks are complete.
 - Exact query golden fixtures across broad grants, per-resource access sets,
   multiple groups/acting principals, roots, path/time/kind filters, exclusions,
   multiple sources, moves, tombstones, and profile revisions.
+- Schema/plan fixtures prove every serving-table access carries tenant/source,
+  prunes the expected hash partitions, uses current-head versus historical
+  revision paths correctly, and joins bodies by `content_storage_id` only after
+  authorization/filter selection.
+- Ordered-ingest/export fixtures prove related source/root rows receive monotonic
+  export/storage IDs and the tar's entry order does not change logical paths or
+  canonical bytes. LZ4-storage and default-storage fixtures return identical
+  plaintext.
 - Query-plan tests prove authorization precedes limit/ranking/body fetch and
   rejected entries do not disclose path, title, size, count, timing-dependent
   top-K membership, or plaintext.
@@ -2507,9 +2603,10 @@ and dedicated-cell operational runbooks are complete.
 - 10k/100k export, Zstd decode/extraction, `rg`, and disk benchmarks on the
   smallest supported sandboxes; cold/warm 1%/10%/80% selection and 1/10/50
   concurrent sessions validate compression ratio, database/exporter/decode
-  throughput against `B`/`E`, CPU, memory, connection-pool, vacuum,
-  cancellation, and inode limits. Run 1M-entry/read-replica/cache/ClickHouse
-  qualifications only when those scales/features are targeted.
+  throughput against `B`/`E`, partition skew/pruning, heap/index/TOAST block
+  reads, CPU, memory, connection-pool, vacuum, cancellation, and inode limits.
+  Run 1M-entry/read-replica/cache/ClickHouse qualifications only when those
+  scales/features are targeted.
 - When a read replica is enabled, exports wait/use primary until replay LSN
   covers selected revision/policy and session-creation commits; they never
   silently serve older state or miss the session row.
@@ -2562,7 +2659,9 @@ At minimum, measure by cell, connector, and tenant-safe bounded category:
   primary/read-replica routing;
 - PostgreSQL CPU, memory, buffer hit/read bytes, TOAST reads, storage latency,
   connection-pool wait, active export transactions/age, WAL/replication lag,
-  vacuum pressure, cancellations, and query timeouts;
+  partition size/skew/pruning, heap/index block reads, index bloat,
+  heap/index-order correlation, vacuum pressure, cancellations, and query
+  timeouts;
 - exporter CPU/RSS, active streams, backpressure, database-to-exporter and
   exporter-to-sandbox throughput relative to `B`/`E`, Zstd ratio/encode
   throughput, TLS/tar overhead, disconnects, and attachment-fetch throughput;
@@ -2634,6 +2733,14 @@ queries, channel names, source content, or runtime filter values.
 - **Turn every logical component into a v1 service/table:** start with one modular
   backend and compact physical schema. Split only for measured scale, retention,
   isolation, or ownership.
+- **Create a partition per tenant, source, root, profile, or time window:** that
+  turns customer growth into schema-object growth and increases planning,
+  migration, and vacuum complexity. Use the small fixed tenant/source hash only
+  on the three serving tables.
+- **Depend on periodic `CLUSTER` for export speed:** PostgreSQL does not maintain
+  clustered heap order after new writes, and rewrites compete with ingestion.
+  Preserve useful initial locality through ordered batches and add online
+  physical maintenance only after measured correlation loss.
 - **Add ClickHouse before PostgreSQL fails a benchmark gate:** it creates CDC,
   publication lag, cross-store retention/deletion, and another sensitive system.
   It is a future read-serving replica, never the provider-mutation authority.
@@ -2668,8 +2775,11 @@ architecture:
   wins;
 - when PostgreSQL search should move a tenant/cell to a dedicated engine;
 - when PostgreSQL job contention justifies an external broker/outbox publisher;
-- which records need partitions/separate tables based on measured query, vacuum,
-  retention, or isolation behavior;
+- whether serving-table partition count or a later tenant/cell migration needs
+  to change based on measured skew, planning, vacuum, and index size;
+- whether physical-order correlation degrades enough to justify an online
+  rewrite for a specific table; routine clustering remains unnecessary until
+  that threshold is observed;
 - whether a concrete customer requires human approval, advisory multi-agent
   claims, exact delivered-entry retention, or audited filesystem reads;
 - provider-specific ACL fidelity and organization-bot versus delegated-user

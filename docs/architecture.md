@@ -25,7 +25,10 @@ ACL/profile filtering in one server query, and streams a transient standard tar
 with negotiated Zstandard compression. The client concurrently decodes and
 materializes ordinary files in a staging tree, then publishes it atomically
 before the agent starts. Large opaque attachments and backups use object storage;
-v1 has no persistent content-pack/catalog layer.
+v1 has no persistent content-pack/catalog layer. The three high-volume serving
+tables use a small identical tenant/source hash layout, monotonic locality keys,
+and ordered export reads; broader indexing and physical reorganization remain
+measurement-driven.
 Read-only content uses a single local tree; three-way state is reserved for
 writable resources. The proposed v1 is multi-tenant and multi-connector, uses a
 modular backend with PostgreSQL jobs/read serving, and relies on local diff plus
