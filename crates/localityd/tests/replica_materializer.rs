@@ -5,8 +5,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 use localityd::replica_materializer::{
-    ReplicaMaterializationLimits, ReplicaMaterializationSummary, materialize_replica_archive,
+    ExpectedReplicaMaterializationReceipt, ReplicaMaterializationLimits,
+    ReplicaMaterializationSummary, materialize_replica_archive,
+    materialize_replica_archive_with_expected_receipt,
 };
+use sha2::{Digest, Sha256};
 use tar::{Builder, EntryType, Header};
 
 static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -118,6 +121,22 @@ fn materialize_identity(
     .map_err(|error| error.to_string())
 }
 
+fn expected_receipt(decoded_tar: &[u8], entries: u64) -> ExpectedReplicaMaterializationReceipt {
+    ExpectedReplicaMaterializationReceipt {
+        decoded_tar_sha256: Sha256::digest(decoded_tar).into(),
+        decoded_bytes: decoded_tar.len() as u64,
+        entries,
+    }
+}
+
+fn sha256_label(digest: [u8; 32]) -> String {
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("sha256:{hex}")
+}
+
 fn rejected_identity(label: &str, bytes: Vec<u8>, limits: ReplicaMaterializationLimits) -> String {
     let root = TestDirectory::new(label);
     let error = materialize_identity(bytes, &root.destination(), limits)
@@ -166,6 +185,28 @@ fn identity_archive_publishes_only_read_only_files_and_directories() {
     assert_modes(&root.destination().join("top.txt"), 0o444);
 }
 
+#[test]
+fn exact_receipt_identity_archive_publishes_after_decoded_tar_verification() {
+    let root = TestDirectory::new("identity-receipt");
+    let tar = tar_archive(&[TestMember::file("verified.txt", "identity\n")]);
+    let expected = expected_receipt(&tar, 1);
+
+    let summary = materialize_replica_archive_with_expected_receipt(
+        ReplicaArchive::new(ReplicaArchiveEncoding::Identity, Cursor::new(tar)),
+        &root.destination(),
+        ReplicaMaterializationLimits::default(),
+        expected,
+    )
+    .expect("materialize identity tar with exact receipt");
+
+    assert_eq!(summary.entries, 1);
+    assert_eq!(summary.decoded_bytes, expected.decoded_bytes);
+    assert_eq!(
+        fs::read(root.destination().join("verified.txt")).expect("read verified file"),
+        b"identity\n"
+    );
+}
+
 struct ChunkedReader<R> {
     inner: R,
     chunk_size: usize,
@@ -202,6 +243,119 @@ fn single_frame_zstd_stream_materializes_from_small_chunks() {
         fs::read(root.destination().join("answer.txt")).expect("read zstd result"),
         b"42\n"
     );
+}
+
+#[test]
+fn exact_receipt_zstd_archive_hashes_the_decoded_tar_bytes() {
+    let root = TestDirectory::new("zstd-receipt");
+    let tar = tar_archive(&[TestMember::file("verified.txt", "zstd\n")]);
+    let expected = expected_receipt(&tar, 1);
+    let compressed = zstd::stream::encode_all(tar.as_slice(), 1).expect("encode zstd fixture");
+
+    let summary = materialize_replica_archive_with_expected_receipt(
+        ReplicaArchive::new(ReplicaArchiveEncoding::Zstd, Cursor::new(compressed)),
+        &root.destination(),
+        ReplicaMaterializationLimits::default(),
+        expected,
+    )
+    .expect("materialize Zstd tar with decoded receipt");
+
+    assert_eq!(summary.entries, 1);
+    assert_eq!(summary.decoded_bytes, tar.len() as u64);
+    assert_eq!(
+        fs::read(root.destination().join("verified.txt")).expect("read verified file"),
+        b"zstd\n"
+    );
+}
+
+#[test]
+fn exact_receipt_mismatches_each_roll_back_staging_and_destination() {
+    let tar = tar_archive(&[TestMember::file("never-published.txt", "body")]);
+    let actual_digest: [u8; 32] = Sha256::digest(&tar).into();
+    let cases = [
+        (
+            "digest-mismatch",
+            ExpectedReplicaMaterializationReceipt {
+                decoded_tar_sha256: [0_u8; 32],
+                decoded_bytes: tar.len() as u64,
+                entries: 1,
+            },
+            format!(
+                "replica decoded tar digest mismatch: expected {}, actual {}",
+                sha256_label([0_u8; 32]),
+                sha256_label(actual_digest)
+            ),
+        ),
+        (
+            "decoded-byte-mismatch",
+            ExpectedReplicaMaterializationReceipt {
+                decoded_tar_sha256: actual_digest,
+                decoded_bytes: tar.len() as u64 + 1,
+                entries: 1,
+            },
+            format!(
+                "replica decoded-byte receipt mismatch: expected {}, actual {}",
+                tar.len() + 1,
+                tar.len()
+            ),
+        ),
+        (
+            "entry-count-mismatch",
+            ExpectedReplicaMaterializationReceipt {
+                decoded_tar_sha256: actual_digest,
+                decoded_bytes: tar.len() as u64,
+                entries: 2,
+            },
+            "replica entry-count receipt mismatch: expected 2, actual 1".to_string(),
+        ),
+    ];
+
+    for (label, expected, expected_error) in cases {
+        let root = TestDirectory::new(label);
+        let error = materialize_replica_archive_with_expected_receipt(
+            ReplicaArchive::new(ReplicaArchiveEncoding::Identity, Cursor::new(tar.clone())),
+            &root.destination(),
+            ReplicaMaterializationLimits::default(),
+            expected,
+        )
+        .expect_err("receipt mismatch must fail before publish")
+        .to_string();
+
+        assert_eq!(error, expected_error, "case {label}");
+        root.assert_no_staging_or_destination();
+    }
+}
+
+#[test]
+fn zstd_receipt_digest_mismatch_rolls_back_staging_and_destination() {
+    let root = TestDirectory::new("zstd-digest-mismatch");
+    let tar = tar_archive(&[TestMember::file("never-published.txt", "body")]);
+    let compressed = zstd::stream::encode_all(tar.as_slice(), 1).expect("encode zstd fixture");
+    let actual_digest: [u8; 32] = Sha256::digest(&tar).into();
+    let expected = ExpectedReplicaMaterializationReceipt {
+        decoded_tar_sha256: [0_u8; 32],
+        decoded_bytes: tar.len() as u64,
+        entries: 1,
+    };
+
+    let error = materialize_replica_archive_with_expected_receipt(
+        ReplicaArchive::new(ReplicaArchiveEncoding::Zstd, Cursor::new(compressed)),
+        &root.destination(),
+        ReplicaMaterializationLimits::default(),
+        expected,
+    )
+    .expect_err("decoded Zstd digest mismatch must fail before publish")
+    .to_string();
+
+    assert_eq!(
+        error,
+        format!(
+            "replica decoded tar digest mismatch: expected {}, actual {}",
+            sha256_label([0_u8; 32]),
+            sha256_label(actual_digest)
+        )
+    );
+    root.assert_no_staging_or_destination();
 }
 
 #[test]

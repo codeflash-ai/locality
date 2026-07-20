@@ -20,6 +20,7 @@ use locality_protocol::{
     SessionProtocolError, StaleSessionBehavior, TarContentEncoding, TarExportOffer,
 };
 use localityd::replica_materializer::ReplicaMaterializationLimits;
+use sha2::{Digest, Sha256};
 use tar::{Builder, EntryType, Header};
 
 static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -103,7 +104,12 @@ impl MockServer {
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
                 let mut stream = loop {
                     match listener.accept() {
-                        Ok((stream, _)) => break stream,
+                        Ok((stream, _)) => {
+                            stream
+                                .set_nonblocking(false)
+                                .expect("set accepted mock socket blocking");
+                            break stream;
+                        }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             assert!(std::time::Instant::now() < deadline, "request timed out");
                             thread::sleep(Duration::from_millis(5));
@@ -128,6 +134,13 @@ impl MockServer {
             .recv_timeout(Duration::from_secs(5))
             .expect("receive captured request")
     }
+
+    fn assert_no_request(&self) {
+        match self.requests.recv_timeout(Duration::from_millis(100)) {
+            Ok(request) => panic!("unexpected request: {request:?}"),
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+    }
 }
 
 impl Drop for MockServer {
@@ -139,14 +152,14 @@ impl Drop for MockServer {
 }
 
 #[test]
-fn identity_bootstrap_sends_only_sealed_requests_and_materializes() {
+fn loopback_identity_bootstrap_sends_only_sealed_requests_and_materializes() {
     let directory = TestDirectory::new("identity");
     let tar = tar_file(b"docs/readme.md", b"hello\n");
     let capability = capability();
     let status = ready_status(
         capability.session_id.clone(),
         COMPONENT_VERSIONS,
-        tar.len() as u64,
+        &tar,
         BTreeSet::from([TarContentEncoding::Identity, TarContentEncoding::Zstd]),
     );
     let server = MockServer::start(vec![
@@ -235,7 +248,7 @@ fn zstd_bootstrap_streams_into_the_shared_materializer() {
     let status = ready_status(
         capability.session_id.clone(),
         COMPONENT_VERSIONS,
-        tar.len() as u64,
+        &tar,
         BTreeSet::from([TarContentEncoding::Identity, TarContentEncoding::Zstd]),
     );
     let server = MockServer::start(vec![
@@ -269,6 +282,199 @@ fn zstd_bootstrap_streams_into_the_shared_materializer() {
 }
 
 #[test]
+fn export_receipt_mismatches_roll_back_without_leaking_tokens() {
+    let tar = tar_file(b"never-published.txt", b"body");
+    let wrong_digest = format!("sha256:{}", "0".repeat(64));
+    let cases = [
+        (
+            "digest",
+            Some(wrong_digest.as_str()),
+            None,
+            None,
+            "digest mismatch",
+        ),
+        (
+            "decoded-bytes",
+            None,
+            Some(tar.len() as u64 + 1),
+            None,
+            "decoded-byte receipt mismatch",
+        ),
+        (
+            "entries",
+            None,
+            None,
+            Some(2),
+            "entry-count receipt mismatch",
+        ),
+    ];
+
+    for (label, digest, decoded_bytes, entries, expected_detail) in cases {
+        let directory = TestDirectory::new(label);
+        let capability = capability();
+        let mut status = ready_status(
+            capability.session_id.clone(),
+            COMPONENT_VERSIONS,
+            &tar,
+            BTreeSet::from([TarContentEncoding::Identity]),
+        );
+        if let Some(digest) = digest {
+            status = status.with_decoded_tar_sha256(digest);
+        }
+        if let Some(decoded_bytes) = decoded_bytes {
+            status = status.with_decoded_bytes(decoded_bytes);
+        }
+        if let Some(entries) = entries {
+            status = status.with_selected_entries(entries);
+        }
+        let server = MockServer::start(vec![
+            ResponseFixture::json(&capability),
+            ResponseFixture::json(&status),
+            ResponseFixture::export("identity", tar.clone()),
+        ]);
+
+        let error = run_sandbox_init(
+            SandboxInitOptions {
+                api_url: server.api_url.clone(),
+                root: directory.root(),
+            },
+            SandboxBootstrapToken::new("bootstrap-secret").expect("token"),
+        )
+        .expect_err("receipt mismatch must fail before publish");
+
+        assert_eq!(error.code(), "materialization_failed", "case {label}");
+        assert!(
+            error.to_string().contains(expected_detail),
+            "case {label}: {error}"
+        );
+        assert!(!directory.root().exists(), "case {label}");
+        assert!(!error.to_string().contains("bootstrap-secret"));
+        assert!(!error.to_string().contains("capability-secret"));
+        assert!(!format!("{error:?}").contains("bootstrap-secret"));
+        assert!(!format!("{error:?}").contains("capability-secret"));
+        let _ = server.request();
+        let _ = server.request();
+        let _ = server.request();
+    }
+}
+
+#[test]
+fn malformed_offer_digests_fail_before_the_export_request() {
+    let malformed = [
+        ("empty", ""),
+        ("short", "sha256:abcd"),
+        (
+            "uppercase",
+            "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ),
+        (
+            "wrong-prefix",
+            "SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        (
+            "non-hex",
+            "sha256:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+        ),
+    ];
+    let tar = tar_file(b"safe.txt", b"safe");
+
+    for (label, digest) in malformed {
+        let directory = TestDirectory::new(label);
+        let capability = capability();
+        let status = ready_status(
+            capability.session_id.clone(),
+            COMPONENT_VERSIONS,
+            &tar,
+            BTreeSet::from([TarContentEncoding::Identity]),
+        )
+        .with_decoded_tar_sha256(digest);
+        let server = MockServer::start(vec![
+            ResponseFixture::json(&capability),
+            ResponseFixture::json(&status),
+        ]);
+
+        let error = run_sandbox_init(
+            SandboxInitOptions {
+                api_url: server.api_url.clone(),
+                root: directory.root(),
+            },
+            SandboxBootstrapToken::new("bootstrap-secret").expect("token"),
+        )
+        .expect_err("malformed digest must fail before export");
+
+        assert_eq!(error.code(), "backend_protocol_invalid", "case {label}");
+        assert_eq!(
+            error.to_string(),
+            "sandbox export offer is invalid: decoded tar digest must use canonical sha256:<64 lowercase hex>",
+            "case {label}"
+        );
+        assert!(!directory.root().exists(), "case {label}");
+        let _ = server.request();
+        let _ = server.request();
+        server.assert_no_request();
+    }
+}
+
+#[test]
+fn non_loopback_http_api_is_rejected_before_any_request() {
+    let directory = TestDirectory::new("non-loopback-http");
+    let error = run_sandbox_init(
+        SandboxInitOptions {
+            api_url: "http://bootstrap-secret.example".to_string(),
+            root: directory.root(),
+        },
+        SandboxBootstrapToken::new("bootstrap-secret").expect("token"),
+    )
+    .expect_err("non-loopback HTTP must fail before a request");
+
+    assert_eq!(error.code(), "api_url_invalid");
+    assert_eq!(
+        error.to_string(),
+        "invalid API URL: http scheme is allowed only for loopback hosts"
+    );
+    assert!(!error.to_string().contains("bootstrap-secret"));
+    assert!(!format!("{error:?}").contains("bootstrap-secret"));
+    assert!(!directory.root().exists());
+}
+
+#[test]
+fn bearer_authenticated_redirect_is_not_followed() {
+    let directory = TestDirectory::new("redirect");
+    let capability = capability();
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&capability),
+        ResponseFixture {
+            status: "302 Found",
+            headers: vec![("Location", "/redirected")],
+            body: Vec::new(),
+        },
+    ]);
+
+    let error = run_sandbox_init(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: directory.root(),
+        },
+        SandboxBootstrapToken::new("bootstrap-secret").expect("token"),
+    )
+    .expect_err("redirects must fail closed");
+
+    assert_eq!(error.code(), "backend_request_failed");
+    assert_eq!(error.to_string(), "session status returned HTTP 302 Found");
+    assert!(!error.to_string().contains("bootstrap-secret"));
+    assert!(!error.to_string().contains("capability-secret"));
+    let _ = server.request();
+    let status = server.request();
+    assert_eq!(status.path, "/v1/sessions/session-7");
+    assert_eq!(
+        status.headers.get("authorization").unwrap(),
+        "Bearer capability-secret"
+    );
+    server.assert_no_request();
+    assert!(!directory.root().exists());
+}
+
+#[test]
 fn hostile_and_truncated_exports_roll_back_the_destination() {
     let fixtures = [
         ("hostile", tar_file(b"../escape.txt", b"escape")),
@@ -285,7 +491,7 @@ fn hostile_and_truncated_exports_roll_back_the_destination() {
         let status = ready_status(
             capability.session_id.clone(),
             COMPONENT_VERSIONS,
-            tar.len() as u64,
+            &tar,
             BTreeSet::from([TarContentEncoding::Identity]),
         );
         let server = MockServer::start(vec![
@@ -314,6 +520,7 @@ fn hostile_and_truncated_exports_roll_back_the_destination() {
 
 #[test]
 fn non_ready_and_oversize_sessions_fail_before_export() {
+    let tar = tar_file(b"safe.txt", b"safe");
     let cases = [
         (
             "not-ready",
@@ -326,7 +533,7 @@ fn non_ready_and_oversize_sessions_fail_before_export() {
             ready_status(
                 SessionId::new("session-7"),
                 COMPONENT_VERSIONS,
-                1024,
+                &tar,
                 BTreeSet::from([TarContentEncoding::Identity]),
             )
             .with_selected_entries(ReplicaMaterializationLimits::default().max_entries + 1),
@@ -370,7 +577,7 @@ fn version_session_offer_media_and_response_encoding_are_validated() {
                     session: COMPONENT_VERSIONS.session + 1,
                     ..COMPONENT_VERSIONS
                 },
-                tar.len() as u64,
+                &tar,
                 BTreeSet::from([TarContentEncoding::Identity]),
             ),
             None,
@@ -381,7 +588,7 @@ fn version_session_offer_media_and_response_encoding_are_validated() {
             ready_status(
                 SessionId::new("different-session"),
                 COMPONENT_VERSIONS,
-                tar.len() as u64,
+                &tar,
                 BTreeSet::from([TarContentEncoding::Identity]),
             ),
             None,
@@ -392,7 +599,7 @@ fn version_session_offer_media_and_response_encoding_are_validated() {
             ready_status(
                 SessionId::new("session-7"),
                 COMPONENT_VERSIONS,
-                tar.len() as u64,
+                &tar,
                 BTreeSet::from([TarContentEncoding::Identity]),
             )
             .with_media_type("application/octet-stream"),
@@ -404,7 +611,7 @@ fn version_session_offer_media_and_response_encoding_are_validated() {
             ready_status(
                 SessionId::new("session-7"),
                 COMPONENT_VERSIONS,
-                tar.len() as u64,
+                &tar,
                 BTreeSet::from([TarContentEncoding::Identity]),
             ),
             Some(ResponseFixture {
@@ -419,7 +626,7 @@ fn version_session_offer_media_and_response_encoding_are_validated() {
             ready_status(
                 SessionId::new("session-7"),
                 COMPONENT_VERSIONS,
-                tar.len() as u64,
+                &tar,
                 BTreeSet::from([TarContentEncoding::Identity]),
             ),
             Some(ResponseFixture::export("gzip", tar.clone())),
@@ -494,7 +701,7 @@ fn cli_environment_token_never_appears_in_output() {
     let status = ready_status(
         capability.session_id.clone(),
         COMPONENT_VERSIONS,
-        tar.len() as u64,
+        &tar,
         BTreeSet::from([TarContentEncoding::Identity]),
     );
     let server = MockServer::start(vec![
@@ -548,6 +755,8 @@ fn cli_environment_token_never_appears_in_output() {
 
 trait StatusFixtureExt {
     fn with_selected_entries(self, selected_entries: u64) -> Self;
+    fn with_decoded_bytes(self, decoded_bytes: u64) -> Self;
+    fn with_decoded_tar_sha256(self, decoded_tar_sha256: &str) -> Self;
     fn with_media_type(self, media_type: &str) -> Self;
 }
 
@@ -557,6 +766,22 @@ impl StatusFixtureExt for SandboxSessionStatus {
             .as_mut()
             .expect("ready offer")
             .selected_entries = selected_entries;
+        self
+    }
+
+    fn with_decoded_bytes(mut self, decoded_bytes: u64) -> Self {
+        self.export_offer
+            .as_mut()
+            .expect("ready offer")
+            .decoded_bytes = decoded_bytes;
+        self
+    }
+
+    fn with_decoded_tar_sha256(mut self, decoded_tar_sha256: &str) -> Self {
+        self.export_offer
+            .as_mut()
+            .expect("ready offer")
+            .decoded_tar_sha256 = decoded_tar_sha256.to_string();
         self
     }
 
@@ -577,7 +802,7 @@ fn capability() -> SessionCapability {
 fn ready_status(
     session_id: SessionId,
     versions: ComponentVersions,
-    decoded_bytes: u64,
+    decoded_tar: &[u8],
     encodings: BTreeSet<TarContentEncoding>,
 ) -> SandboxSessionStatus {
     SandboxSessionStatus {
@@ -590,12 +815,21 @@ fn ready_status(
             media_type: "application/x-tar".to_string(),
             supported_content_encodings: encodings,
             selected_entries: 1,
-            decoded_bytes,
-            decoded_tar_sha256: "sha256:decoded-tar".to_string(),
+            decoded_bytes: decoded_tar.len() as u64,
+            decoded_tar_sha256: sha256_label(decoded_tar),
         }),
         error: None,
         updated_at: "2026-07-20T11:00:00Z".to_string(),
     }
+}
+
+fn sha256_label(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("sha256:{hex}")
 }
 
 fn non_ready_status() -> SandboxSessionStatus {

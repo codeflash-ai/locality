@@ -11,6 +11,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use locality_core::portable::LogicalPath;
+use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
@@ -52,6 +53,14 @@ pub struct ReplicaMaterializationSummary {
     pub decoded_bytes: u64,
 }
 
+/// Exact decoded-tar receipt required before a staged tree may be published.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpectedReplicaMaterializationReceipt {
+    pub decoded_tar_sha256: [u8; 32],
+    pub decoded_bytes: u64,
+    pub entries: u64,
+}
+
 #[derive(Debug)]
 pub enum ReplicaMaterializationError {
     InvalidDestination,
@@ -63,22 +72,73 @@ pub enum ReplicaMaterializationError {
     MissingTarEndMarker,
     TrailingTarData,
     TrailingZstdData,
-    EntryLimit { limit: u64 },
-    FileLimit { path: String, size: u64, limit: u64 },
-    DecodedLimit { limit: u64 },
-    DiskLimit { size: u64, limit: u64 },
+    EntryLimit {
+        limit: u64,
+    },
+    FileLimit {
+        path: String,
+        size: u64,
+        limit: u64,
+    },
+    DecodedLimit {
+        limit: u64,
+    },
+    DiskLimit {
+        size: u64,
+        limit: u64,
+    },
+    ReceiptDigestMismatch {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+    ReceiptDecodedBytesMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    ReceiptEntryCountMismatch {
+        expected: u64,
+        actual: u64,
+    },
     NonUtf8Path,
-    InvalidPath { path: String, reason: String },
-    UnsupportedEntryType { path: String },
-    LinkMetadata { path: String },
-    InvalidFileMode { path: String, mode: u32 },
-    InvalidDirectoryMode { path: String, mode: u32 },
-    NonEmptyDirectory { path: String },
-    DuplicatePath { path: String },
-    UnicodeCollision { first: String, second: String },
-    CaseCollision { first: String, second: String },
-    PathTypeCollision { path: String },
-    Write { path: PathBuf, source: io::Error },
+    InvalidPath {
+        path: String,
+        reason: String,
+    },
+    UnsupportedEntryType {
+        path: String,
+    },
+    LinkMetadata {
+        path: String,
+    },
+    InvalidFileMode {
+        path: String,
+        mode: u32,
+    },
+    InvalidDirectoryMode {
+        path: String,
+        mode: u32,
+    },
+    NonEmptyDirectory {
+        path: String,
+    },
+    DuplicatePath {
+        path: String,
+    },
+    UnicodeCollision {
+        first: String,
+        second: String,
+    },
+    CaseCollision {
+        first: String,
+        second: String,
+    },
+    PathTypeCollision {
+        path: String,
+    },
+    Write {
+        path: PathBuf,
+        source: io::Error,
+    },
     Publish(io::Error),
 }
 
@@ -128,6 +188,20 @@ impl Display for ReplicaMaterializationError {
             Self::DiskLimit { size, limit } => write!(
                 formatter,
                 "replica materialized bytes {size} exceed disk limit {limit}"
+            ),
+            Self::ReceiptDigestMismatch { expected, actual } => {
+                formatter.write_str("replica decoded tar digest mismatch: expected sha256:")?;
+                write_sha256(formatter, expected)?;
+                formatter.write_str(", actual sha256:")?;
+                write_sha256(formatter, actual)
+            }
+            Self::ReceiptDecodedBytesMismatch { expected, actual } => write!(
+                formatter,
+                "replica decoded-byte receipt mismatch: expected {expected}, actual {actual}"
+            ),
+            Self::ReceiptEntryCountMismatch { expected, actual } => write!(
+                formatter,
+                "replica entry-count receipt mismatch: expected {expected}, actual {actual}"
             ),
             Self::NonUtf8Path => formatter.write_str("replica tar entry path is not valid UTF-8"),
             Self::InvalidPath { path, reason } => {
@@ -199,6 +273,29 @@ pub fn materialize_replica_archive<Body: Read>(
     destination: &Path,
     limits: ReplicaMaterializationLimits,
 ) -> Result<ReplicaMaterializationSummary, ReplicaMaterializationError> {
+    materialize_replica_archive_inner(archive, destination, limits, None)
+}
+
+/// Validate, extract, receipt-check, and atomically publish one replica archive.
+///
+/// The SHA-256 identity is computed over the decoded tar bytes for both identity
+/// and single-frame Zstd transports. A receipt mismatch removes staging and
+/// leaves `destination` absent.
+pub fn materialize_replica_archive_with_expected_receipt<Body: Read>(
+    archive: ReplicaArchive<Body>,
+    destination: &Path,
+    limits: ReplicaMaterializationLimits,
+    expected: ExpectedReplicaMaterializationReceipt,
+) -> Result<ReplicaMaterializationSummary, ReplicaMaterializationError> {
+    materialize_replica_archive_inner(archive, destination, limits, Some(expected))
+}
+
+fn materialize_replica_archive_inner<Body: Read>(
+    archive: ReplicaArchive<Body>,
+    destination: &Path,
+    limits: ReplicaMaterializationLimits,
+    expected: Option<ExpectedReplicaMaterializationReceipt>,
+) -> Result<ReplicaMaterializationSummary, ReplicaMaterializationError> {
     let parent = destination
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -221,12 +318,13 @@ pub fn materialize_replica_archive<Body: Read>(
     }
 
     let mut staging = StagingDirectory::create(parent)?;
-    let summary = match archive.encoding {
+    let (summary, decoded_tar_sha256) = match archive.encoding {
         ReplicaArchiveEncoding::Identity => {
             let mut decoded = DecodedLimitReader::new(archive.body, limits.max_decoded_bytes);
             let result = extract_tar(&mut decoded, staging.path(), limits);
             let exceeded = decoded.exceeded();
             let decoded_bytes = decoded.consumed();
+            let decoded_tar_sha256 = decoded.finish_sha256();
             if exceeded {
                 return Err(ReplicaMaterializationError::DecodedLimit {
                     limit: limits.max_decoded_bytes,
@@ -234,7 +332,7 @@ pub fn materialize_replica_archive<Body: Read>(
             }
             let mut summary = result?;
             summary.decoded_bytes = decoded_bytes;
-            summary
+            (summary, decoded_tar_sha256)
         }
         ReplicaArchiveEncoding::Zstd => {
             let mut decoder = zstd::stream::read::Decoder::new(archive.body)
@@ -243,10 +341,13 @@ pub fn materialize_replica_archive<Body: Read>(
                 .window_log_max(limits.max_zstd_window_log)
                 .map_err(|error| ReplicaMaterializationError::Decode(error.to_string()))?;
             let mut decoder = decoder.single_frame();
-            let (result, exceeded, decoded_bytes) = {
+            let (result, exceeded, decoded_bytes, decoded_tar_sha256) = {
                 let mut decoded = DecodedLimitReader::new(&mut decoder, limits.max_decoded_bytes);
                 let result = extract_tar(&mut decoded, staging.path(), limits);
-                (result, decoded.exceeded(), decoded.consumed())
+                let exceeded = decoded.exceeded();
+                let decoded_bytes = decoded.consumed();
+                let decoded_tar_sha256 = decoded.finish_sha256();
+                (result, exceeded, decoded_bytes, decoded_tar_sha256)
             };
             if exceeded {
                 return Err(ReplicaMaterializationError::DecodedLimit {
@@ -262,9 +363,13 @@ pub fn materialize_replica_archive<Body: Read>(
                 return Err(ReplicaMaterializationError::TrailingZstdData);
             }
             summary.decoded_bytes = decoded_bytes;
-            summary
+            (summary, decoded_tar_sha256)
         }
     };
+
+    if let Some(expected) = expected {
+        validate_receipt(expected, summary, decoded_tar_sha256)?;
+    }
 
     make_tree_read_only(staging.path()).map_err(|source| ReplicaMaterializationError::Write {
         path: staging.path().to_path_buf(),
@@ -277,6 +382,39 @@ pub fn materialize_replica_archive<Body: Read>(
     }
     staging.publish(destination)?;
     Ok(summary)
+}
+
+fn validate_receipt(
+    expected: ExpectedReplicaMaterializationReceipt,
+    actual: ReplicaMaterializationSummary,
+    actual_digest: [u8; 32],
+) -> Result<(), ReplicaMaterializationError> {
+    if actual_digest != expected.decoded_tar_sha256 {
+        return Err(ReplicaMaterializationError::ReceiptDigestMismatch {
+            expected: expected.decoded_tar_sha256,
+            actual: actual_digest,
+        });
+    }
+    if actual.decoded_bytes != expected.decoded_bytes {
+        return Err(ReplicaMaterializationError::ReceiptDecodedBytesMismatch {
+            expected: expected.decoded_bytes,
+            actual: actual.decoded_bytes,
+        });
+    }
+    if actual.entries != expected.entries {
+        return Err(ReplicaMaterializationError::ReceiptEntryCountMismatch {
+            expected: expected.entries,
+            actual: actual.entries,
+        });
+    }
+    Ok(())
+}
+
+fn write_sha256(formatter: &mut Formatter<'_>, digest: &[u8; 32]) -> std::fmt::Result {
+    for byte in digest {
+        write!(formatter, "{byte:02x}")?;
+    }
+    Ok(())
 }
 
 fn extract_tar<R: Read>(
@@ -577,13 +715,18 @@ fn set_directory_read_only(path: &Path) -> io::Result<()> {
 }
 
 fn make_tree_removable(root: &Path) {
-    let mut directories = Vec::new();
-    if collect_directories(root, &mut directories).is_err() {
+    let Ok(metadata) = fs::symlink_metadata(root) else {
         return;
-    }
-    directories.sort_by_key(|path| path.components().count());
-    for directory in directories {
-        let _ = make_directory_writable(&directory);
+    };
+    if metadata.is_dir() {
+        let _ = make_directory_writable(root);
+        if let Ok(entries) = fs::read_dir(root) {
+            for entry in entries.flatten() {
+                make_tree_removable(&entry.path());
+            }
+        }
+    } else {
+        let _ = make_file_writable(root);
     }
 }
 
@@ -595,6 +738,19 @@ fn make_directory_writable(path: &Path) -> io::Result<()> {
 
 #[cfg(not(unix))]
 fn make_directory_writable(path: &Path) -> io::Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_readonly(false);
+    fs::set_permissions(path, permissions)
+}
+
+#[cfg(unix)]
+fn make_file_writable(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn make_file_writable(path: &Path) -> io::Result<()> {
     let mut permissions = fs::metadata(path)?.permissions();
     permissions.set_readonly(false);
     fs::set_permissions(path, permissions)
@@ -668,6 +824,7 @@ struct DecodedLimitReader<R> {
     limit: u64,
     consumed: u64,
     exceeded: bool,
+    sha256: Sha256,
 }
 
 impl<R> DecodedLimitReader<R> {
@@ -677,6 +834,7 @@ impl<R> DecodedLimitReader<R> {
             limit,
             consumed: 0,
             exceeded: false,
+            sha256: Sha256::new(),
         }
     }
 
@@ -686,6 +844,10 @@ impl<R> DecodedLimitReader<R> {
 
     fn exceeded(&self) -> bool {
         self.exceeded
+    }
+
+    fn finish_sha256(self) -> [u8; 32] {
+        self.sha256.finalize().into()
     }
 }
 
@@ -708,6 +870,7 @@ impl<R: Read> Read for DecodedLimitReader<R> {
             .min(buffer.len());
         let read = self.inner.read(&mut buffer[..allowed])?;
         self.consumed += read as u64;
+        self.sha256.update(&buffer[..read]);
         Ok(read)
     }
 }

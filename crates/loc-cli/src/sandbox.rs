@@ -8,6 +8,7 @@ use std::ffi::OsString;
 use std::fmt::{Debug, Display, Formatter};
 use std::fs;
 use std::io::{self, Read};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -18,7 +19,8 @@ use locality_protocol::{
 };
 use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 use localityd::replica_materializer::{
-    ReplicaMaterializationLimits, ReplicaMaterializationSummary, materialize_replica_archive,
+    ExpectedReplicaMaterializationReceipt, ReplicaMaterializationLimits,
+    ReplicaMaterializationSummary, materialize_replica_archive_with_expected_receipt,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
@@ -304,12 +306,13 @@ pub fn run_sandbox_init(
     let capability = client.exchange_bootstrap(&bootstrap_token)?;
     validate_capability(&capability)?;
     let status = client.session_status(&capability)?;
-    let offer = validate_status(&capability, &status)?;
+    let (offer, expected_receipt) = validate_status(&capability, &status)?;
     let limits = limits_for_offer(offer)?;
     let (encoding, response) = client.open_export(&capability, offer)?;
     let archive = ReplicaArchive::new(encoding, response);
-    let summary = materialize_replica_archive(archive, &root, limits)
-        .map_err(|error| SandboxInitError::Materialization(error.to_string()))?;
+    let summary =
+        materialize_replica_archive_with_expected_receipt(archive, &root, limits, expected_receipt)
+            .map_err(|error| SandboxInitError::Materialization(error.to_string()))?;
 
     Ok(report(&root, &capability, encoding, summary))
 }
@@ -364,7 +367,7 @@ fn validate_capability(capability: &SessionCapability) -> Result<(), SandboxInit
 fn validate_status<'a>(
     capability: &SessionCapability,
     status: &'a SandboxSessionStatus,
-) -> Result<&'a TarExportOffer, SandboxInitError> {
+) -> Result<(&'a TarExportOffer, ExpectedReplicaMaterializationReceipt), SandboxInitError> {
     status
         .versions
         .validate_required()
@@ -387,11 +390,13 @@ fn validate_status<'a>(
         .ok_or(SandboxInitError::InvalidReadySession(
             "export offer is missing",
         ))?;
-    validate_offer(offer)?;
-    Ok(offer)
+    let expected_receipt = validate_offer(offer)?;
+    Ok((offer, expected_receipt))
 }
 
-fn validate_offer(offer: &TarExportOffer) -> Result<(), SandboxInitError> {
+fn validate_offer(
+    offer: &TarExportOffer,
+) -> Result<ExpectedReplicaMaterializationReceipt, SandboxInitError> {
     if offer.media_type != TAR_MEDIA_TYPE {
         return Err(SandboxInitError::InvalidExportOffer(
             "media type must be application/x-tar",
@@ -405,9 +410,57 @@ fn validate_offer(offer: &TarExportOffer) -> Result<(), SandboxInitError> {
             "identity encoding fallback is missing",
         ));
     }
-    if offer.decoded_tar_sha256.is_empty() {
-        return Err(SandboxInitError::InvalidExportOffer(
-            "decoded tar digest is empty",
+    let decoded_tar_sha256 =
+        parse_sha256(&offer.decoded_tar_sha256).ok_or(SandboxInitError::InvalidExportOffer(
+            "decoded tar digest must use canonical sha256:<64 lowercase hex>",
+        ))?;
+    Ok(ExpectedReplicaMaterializationReceipt {
+        decoded_tar_sha256,
+        decoded_bytes: offer.decoded_bytes,
+        entries: offer.selected_entries,
+    })
+}
+
+fn parse_sha256(value: &str) -> Option<[u8; 32]> {
+    let hex = value.strip_prefix("sha256:")?;
+    if hex.len() != 64
+        || !hex
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return None;
+    }
+    let mut digest = [0_u8; 32];
+    for (output, pair) in digest.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+        *output = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
+    }
+    Some(digest)
+}
+
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => unreachable!("canonical lowercase hexadecimal was validated"),
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+}
+
+fn require_api_host(api_url: &reqwest::Url) -> Result<(), SandboxInitError> {
+    let host = api_url
+        .host_str()
+        .ok_or(SandboxInitError::InvalidApiUrl("host is required"))?;
+    if api_url.scheme() == "http" && !is_loopback_host(host) {
+        return Err(SandboxInitError::InvalidApiUrl(
+            "http scheme is allowed only for loopback hosts",
         ));
     }
     Ok(())
@@ -475,6 +528,7 @@ impl SandboxHttpClient {
                 "scheme must be http or https",
             ));
         }
+        require_api_host(&api_url)?;
         if !api_url.username().is_empty() || api_url.password().is_some() {
             return Err(SandboxInitError::InvalidApiUrl(
                 "embedded credentials are not allowed",
