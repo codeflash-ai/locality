@@ -1,11 +1,12 @@
 use std::sync::{Arc, Mutex};
 
 use locality_connector::{
-    ApplyPlanRequest, ChildContainer, Connector, EnumerateRequest, ListChildrenRequest,
+    ApplyPlanRequest, BatchObserveRequest, ChildContainer, Connector, ConnectorCheckpoint,
+    EnumerateRequest, ListChildrenRequest, ObserveRequest,
 };
-use locality_core::journal::{PushId, PushOperationId};
+use locality_core::journal::{JournalApplyEffect, PushId, PushOperationId};
 use locality_core::model::{EntityKind, MountId, RemoteId};
-use locality_core::planner::{PropertyValue, PushOperation, PushPlan};
+use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind, PushPlan};
 use locality_core::push::RemotePrecondition;
 use locality_linear::{
     LinearApi, LinearConfig, LinearConnector, LinearIssue, LinearIssuePage, LinearIssuePriority,
@@ -14,7 +15,7 @@ use locality_linear::{
 };
 
 #[test]
-fn enumeration_projects_teams_and_issues_into_stable_paths() {
+fn enumeration_projects_teams_statuses_and_issues_into_stable_paths() {
     let api = Arc::new(FakeLinearApi::with_issues(vec![issue()]));
     let connector = LinearConnector::with_api(LinearConfig::new("secret"), api);
 
@@ -25,22 +26,50 @@ fn enumeration_projects_teams_and_issues_into_stable_paths() {
         })
         .expect("enumerate");
 
-    assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0].kind, EntityKind::Directory);
-    assert_eq!(entries[0].remote_id, RemoteId::new("team:team-1"));
-    assert_eq!(entries[0].path.to_string_lossy(), "Engineering");
-    assert_eq!(entries[1].kind, EntityKind::Page);
-    assert_eq!(entries[1].remote_id, RemoteId::new("issue-1"));
     assert_eq!(
-        entries[1].path.to_string_lossy(),
-        "Engineering/ENG-1/page.md"
+        entries
+            .iter()
+            .map(|entry| (
+                entry.remote_id.as_str().to_string(),
+                entry.kind.clone(),
+                entry.path.to_string_lossy().to_string()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "linear:teams".to_string(),
+                EntityKind::Directory,
+                "Teams".to_string()
+            ),
+            (
+                "team:team-1".to_string(),
+                EntityKind::Directory,
+                "Teams/Engineering".to_string()
+            ),
+            (
+                "team-issues:team-1".to_string(),
+                EntityKind::Directory,
+                "Teams/Engineering/Issues".to_string()
+            ),
+            (
+                "team-state:team-1:state-1".to_string(),
+                EntityKind::Directory,
+                "Teams/Engineering/Issues/Todo".to_string()
+            ),
+            (
+                "issue-1".to_string(),
+                EntityKind::Page,
+                "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/page.md".to_string()
+            ),
+        ]
     );
+    assert_eq!(entries[4].title, "Improve sync");
     assert_eq!(
-        entries[1].remote_edited_at.as_deref(),
+        entries[4].remote_edited_at.as_deref(),
         Some("linear:issue-1:2026-07-15T12:00:00Z")
     );
     assert!(
-        entries[1]
+        entries[4]
             .stub_frontmatter
             .as_deref()
             .unwrap()
@@ -49,23 +78,67 @@ fn enumeration_projects_teams_and_issues_into_stable_paths() {
 }
 
 #[test]
-fn list_team_children_returns_complete_issue_snapshot() {
+fn list_hierarchical_children_returns_complete_snapshots() {
     let api = Arc::new(FakeLinearApi::with_issues(vec![issue()]));
     let connector = LinearConnector::with_api(LinearConfig::new("secret"), api);
+
+    let root = connector
+        .list_children(ListChildrenRequest {
+            mount_id: MountId::new("linear-main"),
+            container: ChildContainer::Root,
+            parent_path: "".into(),
+        })
+        .expect("list root");
+    assert!(root.is_complete());
+    assert_eq!(entry_paths(&root.entries), vec!["Teams"]);
+
+    let teams = connector
+        .list_children(ListChildrenRequest {
+            mount_id: MountId::new("linear-main"),
+            container: ChildContainer::DirectoryChildren(RemoteId::new("linear:teams")),
+            parent_path: "Teams".into(),
+        })
+        .expect("list teams");
+    assert!(teams.is_complete());
+    assert_eq!(entry_paths(&teams.entries), vec!["Teams/Engineering"]);
+
+    let team = connector
+        .list_children(ListChildrenRequest {
+            mount_id: MountId::new("linear-main"),
+            container: ChildContainer::DirectoryChildren(RemoteId::new("team:team-1")),
+            parent_path: "Teams/Engineering".into(),
+        })
+        .expect("list team");
+    assert!(team.is_complete());
+    assert_eq!(entry_paths(&team.entries), vec!["Teams/Engineering/Issues"]);
+
+    let issues = connector
+        .list_children(ListChildrenRequest {
+            mount_id: MountId::new("linear-main"),
+            container: ChildContainer::DirectoryChildren(RemoteId::new("team-issues:team-1")),
+            parent_path: "Teams/Engineering/Issues".into(),
+        })
+        .expect("list issue statuses");
+    assert!(issues.is_complete());
+    assert_eq!(
+        entry_paths(&issues.entries),
+        vec!["Teams/Engineering/Issues/Todo"]
+    );
 
     let result = connector
         .list_children(ListChildrenRequest {
             mount_id: MountId::new("linear-main"),
-            container: ChildContainer::DirectoryChildren(RemoteId::new("team:team-1")),
-            parent_path: "Engineering".into(),
+            container: ChildContainer::DirectoryChildren(RemoteId::new(
+                "team-state:team-1:state-1",
+            )),
+            parent_path: "Teams/Engineering/Issues/Todo".into(),
         })
-        .expect("list team issues");
+        .expect("list status issues");
 
     assert!(result.is_complete());
-    assert_eq!(result.entries.len(), 1);
     assert_eq!(
-        result.entries[0].path.to_string_lossy(),
-        "Engineering/ENG-1/page.md"
+        entry_paths(&result.entries),
+        vec!["Teams/Engineering/Issues/Todo/ENG-1 Improve sync/page.md"]
     );
 }
 
@@ -79,6 +152,54 @@ fn capabilities_do_not_advertise_oauth_until_broker_flow_exists() {
     assert!(capabilities.supports_entity_body_updates);
     assert!(capabilities.supports_batch_observation);
     assert!(!capabilities.supports_oauth);
+    assert!(
+        connector
+            .supported_push_operations()
+            .contains(&PushOperationKind::MoveEntity)
+    );
+}
+
+#[test]
+fn observe_and_observe_batch_use_hierarchical_issue_path() {
+    let api = Arc::new(FakeLinearApi::with_issues(vec![issue()]));
+    let connector = LinearConnector::with_api(LinearConfig::new("secret"), api);
+
+    let observed = connector
+        .observe(ObserveRequest {
+            mount_id: MountId::new("linear-main"),
+            remote_id: RemoteId::new("issue-1"),
+        })
+        .expect("observe");
+    assert_eq!(
+        observed.projected_path.to_string_lossy(),
+        "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/page.md"
+    );
+    assert_eq!(
+        observed.parent_remote_id,
+        Some(RemoteId::new("team-state:team-1:state-1"))
+    );
+
+    let batch = connector
+        .observe_batch(BatchObserveRequest {
+            mount_id: MountId::new("linear-main"),
+            checkpoint: Some(ConnectorCheckpoint {
+                state_version: 1,
+                min_reader_version: 1,
+                state_json: serde_json::json!({ "updated_after": "2026-07-14T00:00:00Z" })
+                    .to_string(),
+            }),
+        })
+        .expect("observe batch");
+    let entry = match &batch.changes[0] {
+        locality_connector::BatchObservationChange::Upsert(entry) => entry,
+        locality_connector::BatchObservationChange::Tombstone { .. } => {
+            panic!("expected issue upsert")
+        }
+    };
+    assert_eq!(
+        entry.path.to_string_lossy(),
+        "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/page.md"
+    );
 }
 
 #[test]
@@ -156,11 +277,75 @@ fn apply_updates_description_title_status_project_and_assignee() {
             issue_id: "issue-1".to_string(),
             title: Some("New title".to_string()),
             description: Some("Updated description.\n".to_string()),
+            team_id: None,
             state_id: Some("state-2".to_string()),
             project_id: Some(Some("project-2".to_string())),
             assignee_id: Some(Some("user-2".to_string())),
         }]
     );
+}
+
+#[test]
+fn apply_move_updates_issue_team_and_status_and_reports_moved_effect() {
+    let api = Arc::new(FakeLinearApi::with_issues(vec![issue()]));
+    let connector = LinearConnector::with_api(LinearConfig::new("secret"), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("issue-1")],
+        vec![PushOperation::MoveEntity {
+            entity_id: RemoteId::new("issue-1"),
+            new_parent_id: RemoteId::new("team-state:team-2:state-2"),
+            new_parent_kind: EntityKind::Directory,
+            new_title: "Edited issue title".to_string(),
+            projected_path: "Teams/Platform/Issues/Done/ENG-1 Edited issue title/page.md".into(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = [PushOperationId("op-move".to_string())];
+    let preconditions = [RemotePrecondition {
+        remote_id: RemoteId::new("issue-1"),
+        remote_edited_at: Some("linear:issue-1:2026-07-15T12:00:00Z".to_string()),
+    }];
+
+    let result = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &MountId::new("linear-main"),
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &preconditions,
+            local_root: None,
+        })
+        .expect("apply move");
+
+    assert_eq!(result.changed_remote_ids, vec![RemoteId::new("issue-1")]);
+    assert_eq!(
+        result.effects,
+        vec![JournalApplyEffect::MovedEntity {
+            operation_id: PushOperationId("op-move".to_string()),
+            operation_index: 0,
+            entity_id: RemoteId::new("issue-1"),
+            parent_id: RemoteId::new("team-state:team-2:state-2"),
+        }]
+    );
+    assert_eq!(
+        api.updates.lock().unwrap().as_slice(),
+        &[LinearIssueUpdateInput {
+            issue_id: "issue-1".to_string(),
+            title: Some("Edited issue title".to_string()),
+            description: None,
+            team_id: Some("team-2".to_string()),
+            state_id: Some("state-2".to_string()),
+            project_id: None,
+            assignee_id: None,
+        }]
+    );
+}
+
+fn entry_paths(entries: &[locality_core::model::TreeEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| entry.path.to_string_lossy().to_string())
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -221,6 +406,14 @@ impl LinearApi for FakeLinearApi {
         }
         if let Some(description) = &input.description {
             issue.description = Some(description.clone());
+        }
+        if let Some(team_id) = &input.team_id {
+            issue.team = LinearTeam {
+                id: team_id.clone(),
+                key: "PLAT".to_string(),
+                name: "Platform".to_string(),
+            };
+            issue.identifier = "PLAT-1".to_string();
         }
         if let Some(state_id) = &input.state_id {
             issue.state.id = state_id.clone();

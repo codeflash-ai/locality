@@ -599,16 +599,16 @@ function toolNameFor(object, parent) {
 
 function toolCallIdFor(object, parent) {
   const candidate =
-    object.id ??
-    object.tool_use_id ??
-    object.toolUseId ??
     object.call_id ??
     object.callId ??
-    parent?.id ??
+    object.tool_use_id ??
+    object.toolUseId ??
+    object.id ??
+    parent?.call_id ??
+    parent?.callId ??
     parent?.tool_use_id ??
     parent?.toolUseId ??
-    parent?.call_id ??
-    parent?.callId;
+    parent?.id;
   if (typeof candidate === "string" && candidate.trim() !== "") {
     return candidate.trim();
   }

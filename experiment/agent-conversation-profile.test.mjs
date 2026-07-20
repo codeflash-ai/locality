@@ -314,6 +314,109 @@ test("accepts JSON array inputs", () => {
   assert.equal(summary.conversations[1].totals_by_kind.reasoning, 250);
 });
 
+test("matches Codex function call outputs by call_id before item id", () => {
+  const temp = mkdtempSync(join(tmpdir(), "agent-profile-call-id-"));
+  const leftPath = join(temp, "codex.json");
+  const rightPath = join(temp, "baseline.json");
+  const outDir = join(temp, "out");
+
+  writeFileSync(
+    leftPath,
+    JSON.stringify(
+      {
+        events: [
+          {
+            created_at: "2026-07-20T10:00:00.000Z",
+            item: {
+              type: "function_call",
+              id: "item-1",
+              call_id: "call-1",
+              name: "first_tool",
+            },
+          },
+          {
+            created_at: "2026-07-20T10:00:01.000Z",
+            item: {
+              type: "function_call",
+              id: "item-2",
+              call_id: "call-2",
+              name: "second_tool",
+            },
+          },
+          {
+            created_at: "2026-07-20T10:00:04.000Z",
+            item: {
+              type: "function_call_output",
+              call_id: "call-1",
+              output: "first ok",
+            },
+          },
+          {
+            created_at: "2026-07-20T10:00:07.000Z",
+            item: {
+              type: "function_call_output",
+              call_id: "call-2",
+              output: "second ok",
+            },
+          },
+        ],
+      },
+      null,
+      2,
+    ),
+  );
+  writeFileSync(
+    rightPath,
+    JSON.stringify([{ timestamp: "2026-07-20T10:00:00Z", role: "user" }]),
+  );
+
+  const result = runProfiler([
+    "--left",
+    leftPath,
+    "--left-label",
+    "codex",
+    "--right",
+    rightPath,
+    "--out",
+    outDir,
+  ]);
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+
+  const summary = JSON.parse(readFileSync(join(outDir, "summary.json"), "utf8"));
+  const codex = summary.conversations.find(
+    (conversation) => conversation.label === "codex",
+  );
+  assert.equal(codex.totals_by_activity.tool, 10000);
+  assert.deepEqual(codex.tool_groups, [
+    { tool_group: "second_tool", count: 1, duration_ms: 6000 },
+    { tool_group: "first_tool", count: 1, duration_ms: 4000 },
+  ]);
+  assert.equal(codex.longest_profile_entries[0].activity, "tool");
+  assert.equal(codex.longest_profile_entries[0].kind, "tool_call");
+  assert.equal(codex.longest_profile_entries[0].tool_group, "second_tool");
+  assert.equal(codex.longest_profile_entries[0].duration_ms, 6000);
+  assert.equal(codex.longest_profile_entries[0].timing_quality, "inferred");
+  assert.equal(codex.longest_profile_entries[0].source_index, 1);
+  assert.match(codex.longest_profile_entries[0].excerpt, /call-2/);
+  assert.match(codex.longest_profile_entries[0].excerpt, /second_tool/);
+
+  const codexSpeedscope = JSON.parse(
+    readFileSync(join(outDir, "codex.speedscope.json"), "utf8"),
+  );
+  assertSpeedscopeSample(
+    codexSpeedscope,
+    ["conversation:codex", "activity:tool", "tool:second_tool", "timing:inferred"],
+    6000,
+  );
+
+  const folded = readFileSync(join(outDir, "codex.folded"), "utf8");
+  assert.match(
+    folded,
+    /^conversation:codex;activity:tool;tool:second_tool;timing:inferred 6000000$/m,
+  );
+});
+
 test("profiles nested events even when the wrapper has metadata timestamps", () => {
   const temp = mkdtempSync(join(tmpdir(), "agent-profile-wrapper-"));
   const leftPath = join(temp, "left.json");
