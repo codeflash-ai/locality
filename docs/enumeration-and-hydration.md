@@ -270,10 +270,12 @@ Local metadata response:
 - `virtual_fs_children`
 - `virtual_fs_item`
 
-The daemon answers `VirtualFsChildren` and `FileProviderChildren` from the local
-store first. If that local response succeeds, runtime queues an interactive
-child refresh for the same container. The queued refresh is the part that may
-call the remote connector.
+The daemon answers `VirtualFsChildren` from the local store first. If that local
+response succeeds, runtime queues an interactive child refresh for the same
+container. `FileProviderChildren` returns cached listings immediately when they
+already contain content, but waits for an interactive refresh when discovery is
+already queued/active or when a discoverable virtual container only has guidance
+files. The queued refresh is the part that may call the remote connector.
 
 The local response does not hydrate bodies. It only projects the current store
 state, local mutations, and virtual entries into a children report.
