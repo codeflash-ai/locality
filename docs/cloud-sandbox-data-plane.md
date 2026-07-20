@@ -1294,7 +1294,7 @@ sequenceDiagram
   participant B as Attachment storage
   participant F as Task-local filesystem
 
-  O->>L: one-time bootstrap token + profile/runtime values
+  O->>L: one-time bootstrap token with profile/runtime scope already sealed
   L->>A: create session
   A->>P: authorize identity, grants, profile, freshness
   P-->>A: acceptable ready revisions + estimates
@@ -1509,7 +1509,7 @@ creates a task-local VM/volume and before it launches the agent:
 | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Locality-controlled, E2B, Modal, Daytona, or self-hosted sandbox | A host-side bootstrap streams the authorized export into a per-task volume. A host-side Locality sidecar owns the session capability and exposes a scoped Unix socket for changeset submission.                                                                                       |
 | GitHub Actions/Copilot-style ephemeral runner                    | Setup workflow installs `loc`, exchanges OIDC or an Agents secret for a job-scoped capability, stages the replica outside the repo, then deletes the bootstrap credential. Egress is allowlisted to Locality.                                                                         |
-| Codex cloud                                                      | The generic cached setup installs the binary only. Tenant content must be injected after cache restore through a task-scoped integration. Until such a hook exists, `loc bootstrap` can be the first task command, but must not write content into a shared cached environment layer. |
+| Codex cloud                                                      | The generic cached setup installs the binary only. Tenant content must be injected after cache restore through a task-scoped integration. Until such a hook exists, `loc sandbox init --bootstrap-token-stdin` can be the first task command, but must not write content into a shared cached environment layer. |
 | Claude Code on the web                                           | Do not place content in the seven-day environment cache. Prefer a per-session hook/connector or host-side artifact injection. Claude's current environment configuration is not a dedicated secrets store.                                                                            |
 
 A later platform integration may cache a completed immutable export on a
@@ -1781,7 +1781,7 @@ delivered until sandbox destruction, but:
 ### User Experience
 
 ```text
-loc sandbox init --profile engineering-agent
+loc sandbox init --bootstrap-token-stdin --root /mnt/locality
 rg "rate limit" /mnt/locality
 $EDITOR /mnt/locality/notion/Projects/Agent\ Work/Design/page.md
 loc status /mnt/locality/notion
@@ -2594,7 +2594,9 @@ streams without O(read-only entry count) SQLite writes.
   previews grant ceiling, exact selected files/bytes, write scope, freshness, and
   limits.
 - Exchange a one-time orchestrator bootstrap token for a short-lived capability
-  and ship `loc sandbox init --profile ...` with a plain-file cloud mount.
+  and ship token-only `loc sandbox init` with a plain-file cloud mount. Profile,
+  actor, workload, roots, actions, and runtime narrowing are sealed before token
+  issuance and cannot be supplied again by the sandbox command.
 - Enable RDS automated backups/PITR and S3 versioning/lifecycle, declare RPO/RTO,
   and complete an isolated restore drill before storing production customer
   data. Recovery verifies database state, attachments, secret references,
