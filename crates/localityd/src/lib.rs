@@ -15,6 +15,7 @@ pub mod pull;
 pub mod push;
 pub mod reconcile;
 pub mod remote_truth;
+pub mod replica_materializer;
 pub mod runtime;
 pub mod scheduler;
 pub mod server;

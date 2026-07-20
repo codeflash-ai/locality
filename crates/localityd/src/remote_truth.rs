@@ -4,6 +4,8 @@
 //! mode exposes a connector-neutral replica service; callers select one
 //! authority and never fall back between them.
 
+use std::io::Read;
+
 use locality_connector::Connector;
 use locality_protocol::{
     ChangesetEnvelope, ChangesetReceipt, ChangesetStatus, ChangesetStatusRequest,
@@ -43,6 +45,45 @@ pub trait ReplicaService {
         &self,
         request: ChangesetStatusRequest,
     ) -> Result<ChangesetStatus, Self::Error>;
+}
+
+/// Wire encodings accepted by the bounded replica archive materializer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplicaArchiveEncoding {
+    Identity,
+    Zstd,
+}
+
+/// A transport-neutral byte stream selected by a replica service.
+///
+/// The stream contains one standard tar archive, optionally wrapped in one
+/// Zstd frame. HTTP adapters can map this directly to `Content-Encoding`,
+/// while tests and non-HTTP hosts can provide any [`Read`] implementation.
+#[derive(Debug)]
+pub struct ReplicaArchive<Body> {
+    pub encoding: ReplicaArchiveEncoding,
+    pub body: Body,
+}
+
+impl<Body> ReplicaArchive<Body> {
+    pub fn new(encoding: ReplicaArchiveEncoding, body: Body) -> Self {
+        Self { encoding, body }
+    }
+}
+
+/// Additive raw-archive extension for replica services.
+///
+/// This deliberately leaves [`ReplicaService::open_export`] intact for older
+/// frame transports. Backend clients opt into this extension when they can
+/// negotiate and stream the Phase 1 tar representation.
+pub trait ReplicaArchiveService: ReplicaService {
+    type Archive: Read;
+
+    fn open_archive(
+        &self,
+        request: ReplicaExportRequest,
+        accepted_encodings: &[ReplicaArchiveEncoding],
+    ) -> Result<ReplicaArchive<Self::Archive>, Self::Error>;
 }
 
 /// Direct-mode provider that preserves the existing connector path.
