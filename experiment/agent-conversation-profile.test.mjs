@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -106,6 +106,15 @@ test("profiles Claude JSONL and Codex JSON object conversations into combined an
     "combined.perfetto.json",
     "claude.perfetto.json",
     "codex.perfetto.json",
+    "combined.snakeviz.prof",
+    "claude.snakeviz.prof",
+    "codex.snakeviz.prof",
+    "combined.speedscope.json",
+    "claude.speedscope.json",
+    "codex.speedscope.json",
+    "combined.folded",
+    "claude.folded",
+    "codex.folded",
     "summary.json",
     "summary.md",
   ]) {
@@ -147,6 +156,31 @@ test("profiles Claude JSONL and Codex JSON object conversations into combined an
   );
 
   const summary = JSON.parse(readFileSync(join(outDir, "summary.json"), "utf8"));
+  assert.equal(
+    summary.outputs.snakeviz.combined,
+    join(outDir, "combined.snakeviz.prof"),
+  );
+  assert.equal(
+    summary.outputs.flamegraph.combined,
+    join(outDir, "combined.folded"),
+  );
+  assert.equal(
+    summary.outputs.speedscope.combined,
+    join(outDir, "combined.speedscope.json"),
+  );
+  assert.deepEqual(
+    summary.outputs.snakeviz.split.map((output) => basename(output.path)),
+    ["claude.snakeviz.prof", "codex.snakeviz.prof"],
+  );
+  assert.deepEqual(
+    summary.outputs.speedscope.split.map((output) => basename(output.path)),
+    ["claude.speedscope.json", "codex.speedscope.json"],
+  );
+  assert.deepEqual(
+    summary.outputs.flamegraph.split.map((output) => basename(output.path)),
+    ["claude.folded", "codex.folded"],
+  );
+
   const claude = summary.conversations.find(
     (conversation) => conversation.label === "claude",
   );
@@ -156,18 +190,96 @@ test("profiles Claude JSONL and Codex JSON object conversations into combined an
 
   assert.equal(claude.totals_by_kind.reasoning, 1200);
   assert.equal(claude.totals_by_kind.tool_call, 2000);
+  assert.equal(claude.totals_by_activity.reasoning, 1200);
+  assert.equal(claude.totals_by_activity.tool, 2000);
   assert.equal(
     claude.tools.find((tool) => tool.tool_name === "exec_command").count,
     1,
   );
+  assert.equal(
+    claude.tool_groups.find((tool) => tool.tool_group === "exec_command")
+      .duration_ms,
+    2000,
+  );
   assert.equal(codex.totals_by_kind.reasoning, 1000);
   assert.equal(codex.totals_by_kind.tool_call, 1500);
+  assert.equal(codex.totals_by_activity.reasoning, 1000);
+  assert.equal(codex.totals_by_activity.tool, 1500);
   assert.ok(claude.inferred_duration_ms > 0);
 
   const summaryMarkdown = readFileSync(join(outDir, "summary.md"), "utf8");
   assert.match(summaryMarkdown, /claude/);
   assert.match(summaryMarkdown, /codex/);
   assert.match(summaryMarkdown, /exec_command/);
+  assert.match(summaryMarkdown, /## Viewer Files/);
+  assert.match(summaryMarkdown, /speedscope <file>\.speedscope\.json/);
+  assert.match(summaryMarkdown, /snakeviz <file>\.snakeviz\.prof/);
+  assert.match(summaryMarkdown, /flamegraph\.pl --countname=us/);
+
+  const combinedSpeedscope = JSON.parse(
+    readFileSync(join(outDir, "combined.speedscope.json"), "utf8"),
+  );
+  assert.equal(
+    combinedSpeedscope.$schema,
+    "https://www.speedscope.app/file-format-schema.json",
+  );
+  assert.equal(combinedSpeedscope.exporter, "agent-conversation-profile");
+  assert.equal(combinedSpeedscope.profiles.length, 1);
+  assert.equal(combinedSpeedscope.profiles[0].type, "sampled");
+  assert.equal(combinedSpeedscope.profiles[0].unit, "milliseconds");
+  assert.equal(
+    combinedSpeedscope.profiles[0].samples.length,
+    combinedSpeedscope.profiles[0].weights.length,
+  );
+  assertSpeedscopeSample(
+    combinedSpeedscope,
+    [
+      "agent-conversation-profile",
+      "conversation:claude",
+      "activity:tool",
+      "tool:exec_command",
+      "timing:measured",
+    ],
+    2000,
+  );
+
+  const claudeSpeedscope = JSON.parse(
+    readFileSync(join(outDir, "claude.speedscope.json"), "utf8"),
+  );
+  assertSpeedscopeSample(
+    claudeSpeedscope,
+    [
+      "conversation:claude",
+      "activity:tool",
+      "tool:exec_command",
+      "timing:measured",
+    ],
+    2000,
+  );
+  assert.ok(
+    !claudeSpeedscope.shared.frames.some(
+      (frame) => frame.name === "agent-conversation-profile",
+    ),
+  );
+
+  const combinedFolded = readFileSync(join(outDir, "combined.folded"), "utf8");
+  assert.match(
+    combinedFolded,
+    /^agent-conversation-profile;conversation:claude;activity:tool;tool:exec_command;timing:measured 2000000$/m,
+  );
+  assert.doesNotMatch(combinedFolded, /activity:tool_result/);
+  for (const line of combinedFolded.trim().split("\n")) {
+    assert.match(line, / \d+$/, "folded stack weights should be integers");
+  }
+
+  const claudeFolded = readFileSync(join(outDir, "claude.folded"), "utf8");
+  assert.match(
+    claudeFolded,
+    /^conversation:claude;activity:tool;tool:exec_command;timing:measured 2000000$/m,
+  );
+  assert.doesNotMatch(claudeFolded, /^agent-conversation-profile;/m);
+
+  assertPstatsLoads(join(outDir, "combined.snakeviz.prof"));
 });
 
 test("accepts JSON array inputs", () => {
@@ -271,8 +383,212 @@ test("deconflicts split trace outputs when labels sanitize to the same filename"
   const summary = JSON.parse(readFileSync(join(outDir, "summary.json"), "utf8"));
   assert.equal(summary.outputs.split.length, 2);
   assert.notEqual(summary.outputs.split[0].path, summary.outputs.split[1].path);
-  assert.ok(existsSync(summary.outputs.split[0].path));
-  assert.ok(existsSync(summary.outputs.split[1].path));
+  assert.deepEqual(
+    summary.outputs.split.map((output) => basename(output.path)),
+    ["a_b.perfetto.json", "right-a_b.perfetto.json"],
+  );
+  assert.deepEqual(
+    summary.outputs.snakeviz.split.map((output) => basename(output.path)),
+    ["a_b.snakeviz.prof", "right-a_b.snakeviz.prof"],
+  );
+  assert.deepEqual(
+    summary.outputs.flamegraph.split.map((output) => basename(output.path)),
+    ["a_b.folded", "right-a_b.folded"],
+  );
+  assert.deepEqual(
+    summary.outputs.speedscope.split.map((output) => basename(output.path)),
+    ["a_b.speedscope.json", "right-a_b.speedscope.json"],
+  );
+  for (const output of [
+    ...summary.outputs.split,
+    ...summary.outputs.snakeviz.split,
+    ...summary.outputs.flamegraph.split,
+    ...summary.outputs.speedscope.split,
+  ]) {
+    assert.ok(existsSync(output.path), `${output.path} should be written`);
+  }
+});
+
+test("sanitizes folded stack frame separators", () => {
+  const temp = mkdtempSync(join(tmpdir(), "agent-profile-folded-sanitize-"));
+  const leftPath = join(temp, "left.json");
+  const rightPath = join(temp, "right.json");
+  const outDir = join(temp, "out");
+
+  writeFileSync(
+    leftPath,
+    JSON.stringify([
+      {
+        timestamp: "2026-07-20T10:00:00Z",
+        type: "tool_use",
+        name: "shell;exec\nrun",
+        duration_ms: 25,
+      },
+    ]),
+  );
+  writeFileSync(
+    rightPath,
+    JSON.stringify([{ timestamp: "2026-07-20T10:00:00Z", role: "user" }]),
+  );
+
+  const result = runProfiler([
+    "--left",
+    leftPath,
+    "--left-label",
+    "left;run",
+    "--right",
+    rightPath,
+    "--out",
+    outDir,
+  ]);
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+
+  const folded = readFileSync(join(outDir, "combined.folded"), "utf8");
+  assert.match(
+    folded,
+    /^agent-conversation-profile;conversation:left_run;activity:tool;tool:shell_exec_run;timing:measured 25000$/m,
+  );
+  assert.doesNotMatch(folded, /conversation:left;run/);
+  assert.doesNotMatch(folded, /tool:shell;exec/);
+});
+
+test("groups Bash loc invocations separately from other Bash calls", () => {
+  const temp = mkdtempSync(join(tmpdir(), "agent-profile-bash-loc-"));
+  const leftPath = join(temp, "left.json");
+  const rightPath = join(temp, "right.json");
+  const outDir = join(temp, "out");
+
+  const records = [
+    {
+      timestamp: "2026-07-20T10:00:00Z",
+      type: "tool_use",
+      name: "Bash",
+      input: { command: "loc status" },
+      duration_ms: 100,
+    },
+    {
+      timestamp: "2026-07-20T10:00:01Z",
+      type: "tool_use",
+      name: "Bash",
+      input: { command: "echo loc" },
+      duration_ms: 200,
+    },
+    {
+      timestamp: "2026-07-20T10:00:02Z",
+      type: "tool_use",
+      name: "Bash",
+      input: { command: "cd repo && /usr/bin/loc diff" },
+      duration_ms: 300,
+    },
+  ];
+  writeFileSync(leftPath, JSON.stringify(records));
+  writeFileSync(rightPath, JSON.stringify(records));
+
+  const result = runProfiler([
+    "--left",
+    leftPath,
+    "--right",
+    rightPath,
+    "--out",
+    outDir,
+  ]);
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+
+  const summary = JSON.parse(readFileSync(join(outDir, "summary.json"), "utf8"));
+  const left = summary.conversations[0];
+  assert.equal(left.totals_by_activity.tool, 600);
+  assert.deepEqual(left.tool_groups, [
+    { tool_group: "bash_loc", count: 2, duration_ms: 400 },
+    { tool_group: "bash_other", count: 1, duration_ms: 200 },
+  ]);
+
+  const folded = readFileSync(join(outDir, "left.folded"), "utf8");
+  assert.match(
+    folded,
+    /^conversation:left;activity:tool;tool:bash_loc;timing:measured 400000$/m,
+  );
+  assert.match(
+    folded,
+    /^conversation:left;activity:tool;tool:bash_other;timing:measured 200000$/m,
+  );
+});
+
+test("excludes harness metadata from high-level activity profiles", () => {
+  const temp = mkdtempSync(join(tmpdir(), "agent-profile-metadata-"));
+  const leftPath = join(temp, "left.json");
+  const rightPath = join(temp, "right.json");
+  const outDir = join(temp, "out");
+
+  const records = [
+    {
+      timestamp: "2026-07-20T10:00:00Z",
+      role: "user",
+      content: "Start.",
+    },
+    {
+      timestamp: "2026-07-20T10:00:01Z",
+      type: "system",
+      subtype: "turn_duration",
+      durationMs: 5000,
+      isMeta: true,
+    },
+    {
+      timestamp: "2026-07-20T10:00:02Z",
+      type: "attachment",
+      attachment: { type: "task_reminder", content: [] },
+    },
+    {
+      timestamp: "2026-07-20T10:00:03Z",
+      role: "assistant",
+      content: "Done.",
+      duration_ms: 250,
+    },
+  ];
+  writeFileSync(leftPath, JSON.stringify(records));
+  writeFileSync(rightPath, JSON.stringify(records));
+
+  const result = runProfiler([
+    "--left",
+    leftPath,
+    "--right",
+    rightPath,
+    "--out",
+    outDir,
+  ]);
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+
+  const summary = JSON.parse(readFileSync(join(outDir, "summary.json"), "utf8"));
+  const left = summary.conversations[0];
+  assert.equal(left.totals_by_kind.unknown, 6000);
+  assert.equal(left.metadata_duration_ms, 6000);
+  assert.equal(left.totals_by_activity.other, undefined);
+  assert.deepEqual(left.metadata, [
+    {
+      category: "system:turn_duration",
+      count: 1,
+      duration_ms: 5000,
+      measured_duration_ms: 5000,
+      inferred_duration_ms: 0,
+    },
+    {
+      category: "attachment:task_reminder",
+      count: 1,
+      duration_ms: 1000,
+      measured_duration_ms: 0,
+      inferred_duration_ms: 1000,
+    },
+  ]);
+
+  const folded = readFileSync(join(outDir, "left.folded"), "utf8");
+  assert.doesNotMatch(folded, /activity:metadata/);
+  assert.doesNotMatch(folded, /activity:other/);
+
+  const summaryMarkdown = readFileSync(join(outDir, "summary.md"), "utf8");
+  assert.match(summaryMarkdown, /## Excluded Metadata/);
+  assert.match(summaryMarkdown, /system:turn_duration/);
 });
 
 test("uses timestamps from nested item or message wrappers", () => {
@@ -430,6 +746,45 @@ test("fails with exit code 2 for malformed input", () => {
   assert.equal(result.status, 2);
   assert.match(result.stderr, /malformed|invalid|parse/i);
 });
+
+function assertPstatsLoads(path) {
+  const result = spawnSync(
+    "python3",
+    [
+      "-c",
+      "import pstats, sys; stats = pstats.Stats(sys.argv[1]); assert stats.stats",
+      path,
+    ],
+    {
+      encoding: "utf8",
+    },
+  );
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+}
+
+function assertSpeedscopeSample(profileFile, expectedStack, expectedWeight) {
+  const frameNames = profileFile.shared.frames.map((frame) => frame.name);
+  const profile = profileFile.profiles[0];
+  const sampleIndex = profile.samples.findIndex((sample) =>
+    arrayEquals(
+      sample.map((frameIndex) => frameNames[frameIndex]),
+      expectedStack,
+    ),
+  );
+  assert.notEqual(
+    sampleIndex,
+    -1,
+    `expected Speedscope stack ${expectedStack.join(";")}`,
+  );
+  assert.equal(profile.weights[sampleIndex], expectedWeight);
+}
+
+function arrayEquals(left, right) {
+  return (
+    left.length === right.length &&
+    left.every((value, index) => value === right[index])
+  );
+}
 
 function runProfiler(args) {
   return spawnSync(process.execPath, [scriptPath, ...args], {
