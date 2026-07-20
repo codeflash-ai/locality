@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-sol}"
+CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-luna}"
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-low}"
 AZURE_OPENAI_BASE_URL="${AZURE_OPENAI_BASE_URL:-https://aseem-mp32maxp-eastus2.openai.azure.com/openai/v1}"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"

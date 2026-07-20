@@ -19,7 +19,7 @@ Important environment:
   LOC_BIN                  loc binary. Default: $REPO_DIR/target/debug/loc
   TARGET_URL               Notion page URL for benchmark output parent.
   CONTEXT_URLS             Newline-delimited Notion URLs to hydrate as directories.
-  CODEX_MODEL              Model passed to codex exec. Default: gpt-5.6-sol
+  CODEX_MODEL              Model passed to codex exec. Default: gpt-5.6-luna
   CODEX_REASONING_EFFORT   Codex reasoning effort. Default: low
   SINCE                    Git window. Default: 24 hours ago
   BASE_REF                 Git ref. Default: origin/main
@@ -54,7 +54,7 @@ REPORT_DATE="${REPORT_DATE:-$(TZ="$REPORT_TZ" date +%F)}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 REPORT_TITLE="${REPORT_TITLE:-Launch Readiness Benchmark $RUN_ID}"
 OUT_DIR="${OUT_DIR:-$REPO_DIR/experiment/runs/$RUN_ID}"
-CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-sol}"
+CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-luna}"
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-low}"
 METRICS_TSV="$OUT_DIR/metrics.tsv"
 SUMMARY_JSON="$OUT_DIR/summary.json"

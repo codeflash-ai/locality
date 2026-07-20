@@ -3,7 +3,7 @@ set -euo pipefail
 
 RUNS="${RUNS:-5}"
 REPO_DIR="${REPO_DIR:-/home/amika/workspace/locality}"
-CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-sol}"
+CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-luna}"
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-low}"
 BASE_OUT_DIR="${BASE_OUT_DIR:-$REPO_DIR/experiment/runs}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -68,7 +68,7 @@ ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
   export PATH="$HOME/.cargo/bin:$PATH"
   cd /home/amika/workspace/locality
   cargo build -p loc-cli -p localityd
-  CODEX_MODEL=gpt-5.6-sol CODEX_REASONING_EFFORT=low ./experiment/locality-mcp-comparison/setup-codex-azure.sh
+  CODEX_MODEL=gpt-5.6-luna CODEX_REASONING_EFFORT=low ./experiment/locality-mcp-comparison/setup-codex-azure.sh
 '
 ```
 
@@ -90,7 +90,7 @@ ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
 ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
   export PATH="$HOME/.cargo/bin:$PATH"
   cd /home/amika/workspace/locality
-  CODEX_MODEL=gpt-5.6-sol CODEX_REASONING_EFFORT=low ./experiment/locality-mcp-comparison/run-agent-comparison.sh
+  CODEX_MODEL=gpt-5.6-luna CODEX_REASONING_EFFORT=low ./experiment/locality-mcp-comparison/run-agent-comparison.sh
 '
 ```
 
@@ -102,7 +102,7 @@ To publish:
 ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
   export PATH="$HOME/.cargo/bin:$PATH"
   cd /home/amika/workspace/locality
-  CODEX_MODEL=gpt-5.6-sol CODEX_REASONING_EFFORT=low ./experiment/locality-mcp-comparison/run-agent-comparison.sh --push
+  CODEX_MODEL=gpt-5.6-luna CODEX_REASONING_EFFORT=low ./experiment/locality-mcp-comparison/run-agent-comparison.sh --push
 '
 ```
 
@@ -112,7 +112,7 @@ ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
 ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
   export PATH="$HOME/.cargo/bin:$PATH"
   cd /home/amika/workspace/locality
-  RUNS=5 CODEX_MODEL=gpt-5.6-sol CODEX_REASONING_EFFORT=low ./experiment/locality-mcp-comparison/run-repeated.sh
+  RUNS=5 CODEX_MODEL=gpt-5.6-luna CODEX_REASONING_EFFORT=low ./experiment/locality-mcp-comparison/run-repeated.sh
 '
 ```
 
@@ -138,7 +138,14 @@ Important artifacts:
 
 ## Model Notes
 
-The prior baseline used `gpt-5.5` with `xhigh` reasoning. This package defaults to `gpt-5.6-sol` with low reasoning because Luna and Terra were visible in the model list but were not deployed at the configured Azure Responses endpoint during setup.
+The prior baseline used `gpt-5.5` with `xhigh` reasoning. This package defaults to `gpt-5.6-luna` with low reasoning for faster repeated benchmark runs.
+
+In the current Azure resource, the working deployment names are the short names:
+
+- `gpt-5.6-luna`
+- `gpt-5.6-terra`
+
+The dated names, such as `gpt-5.6-luna-2026-07-09`, returned deployment-not-found errors during setup.
 
 Change the model with:
 
