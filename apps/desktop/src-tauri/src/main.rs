@@ -3899,9 +3899,42 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
 }
 
 fn load_desktop_snapshot_at_state_root(state_root: &Path) -> Result<DesktopSnapshot, String> {
+    ensure_dev_sidecars_match_desktop_before_state_open(state_root)?;
     let store =
         SqliteStateStore::open(state_root.to_path_buf()).map_err(|error| error.to_string())?;
     load_desktop_snapshot_from_store(&store, &state_root)
+}
+
+fn ensure_dev_sidecars_match_desktop_before_state_open(state_root: &Path) -> Result<(), String> {
+    #[cfg(debug_assertions)]
+    {
+        if !state_root.join("state.sqlite3").exists() {
+            return Ok(());
+        }
+        let desktop_build_id = current_desktop_build_id();
+        let daemon_build_id = current_daemon_build_id();
+        if let Some(message) = dev_sidecar_build_skew_message(&desktop_build_id, &daemon_build_id) {
+            desktop_log("warn", "daemon.dev_sidecar_build_skew", message.clone());
+            return Err(message);
+        }
+    }
+    let _ = state_root;
+    Ok(())
+}
+
+fn dev_sidecar_build_skew_message(desktop_build_id: &str, daemon_build_id: &str) -> Option<String> {
+    if desktop_build_id.is_empty()
+        || daemon_build_id.is_empty()
+        || desktop_build_id == "unknown"
+        || daemon_build_id == "unknown"
+        || desktop_build_id == daemon_build_id
+    {
+        return None;
+    }
+
+    Some(format!(
+        "Locality debug sidecars are stale: desktop build {desktop_build_id} but bundled localityd build {daemon_build_id}. Run `make prepare-desktop-dev-sidecars` and relaunch Locality; do not delete ~/.loc/state.sqlite3."
+    ))
 }
 
 fn load_desktop_snapshot_for_surface() -> Result<DesktopSnapshot, String> {
@@ -11865,6 +11898,29 @@ mod tests {
                 version: "0.1.3".to_string(),
                 build_id: "build-123".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn dev_sidecar_build_skew_message_reports_known_mismatch_only() {
+        let message = super::dev_sidecar_build_skew_message("desktop-build", "daemon-build")
+            .expect("known mismatch should report");
+
+        assert!(message.contains("desktop build desktop-build"));
+        assert!(message.contains("bundled localityd build daemon-build"));
+        assert!(message.contains("make prepare-desktop-dev-sidecars"));
+        assert!(message.contains("do not delete ~/.loc/state.sqlite3"));
+        assert_eq!(
+            super::dev_sidecar_build_skew_message("same-build", "same-build"),
+            None
+        );
+        assert_eq!(
+            super::dev_sidecar_build_skew_message("unknown", "daemon-build"),
+            None
+        );
+        assert_eq!(
+            super::dev_sidecar_build_skew_message("desktop-build", "unknown"),
+            None
         );
     }
 
