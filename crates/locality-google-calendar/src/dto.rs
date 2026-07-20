@@ -62,24 +62,38 @@ pub struct CalendarEvent {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventDateTime {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub date_time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub time_zone: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventAttendee {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub response_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub optional: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub additional_guests: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub resource: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub organizer: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub self_: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub async_operation: Option<String>,
     #[serde(default, flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -88,20 +102,28 @@ pub struct EventAttendee {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CalendarEventCreateRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
     pub start: EventDateTime,
     pub end: EventDateTime,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attendees: Vec<EventAttendee>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recurrence: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reminders: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub transparency: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub visibility: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub conference_data: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub extended_properties: Option<Value>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -156,7 +178,7 @@ impl EventDateTime {
 mod tests {
     use serde_json::json;
 
-    use super::{CalendarEvent, EventAttendee};
+    use super::{CalendarEvent, CalendarEventCreateRequest, EventAttendee, EventDateTime};
 
     #[test]
     fn event_uses_google_ical_uid_field_spelling() {
@@ -195,6 +217,78 @@ mod tests {
         assert_eq!(
             encoded.get("futureNested"),
             Some(&json!({"id": "future-1"}))
+        );
+    }
+
+    #[test]
+    fn create_request_omits_unset_optional_fields() {
+        let request = CalendarEventCreateRequest {
+            id: Some("locality-event-1".to_string()),
+            summary: "Locality invite test".to_string(),
+            description: Some("Testing Calendar invite creation from Locality.".to_string()),
+            location: Some("Test location".to_string()),
+            start: EventDateTime {
+                date: None,
+                date_time: Some("2026-07-21T15:00:00+03:00".to_string()),
+                time_zone: Some("Africa/Cairo".to_string()),
+            },
+            end: EventDateTime {
+                date: None,
+                date_time: Some("2026-07-21T15:30:00+03:00".to_string()),
+                time_zone: Some("Africa/Cairo".to_string()),
+            },
+            attendees: vec![EventAttendee {
+                email: Some("mohammed18200118@gmail.com".to_string()),
+                ..EventAttendee::default()
+            }],
+            conference_data: Some(json!({
+                "createRequest": {
+                    "requestId": "conference-request-1",
+                    "conferenceSolutionKey": { "type": "hangoutsMeet" }
+                }
+            })),
+            extended_properties: Some(json!({
+                "private": {
+                    "locality_event_id": "locality-event-1"
+                }
+            })),
+            ..CalendarEventCreateRequest::default()
+        };
+
+        let encoded = serde_json::to_value(&request).expect("json");
+
+        assert_eq!(
+            encoded,
+            json!({
+                "id": "locality-event-1",
+                "summary": "Locality invite test",
+                "description": "Testing Calendar invite creation from Locality.",
+                "location": "Test location",
+                "start": {
+                    "dateTime": "2026-07-21T15:00:00+03:00",
+                    "timeZone": "Africa/Cairo"
+                },
+                "end": {
+                    "dateTime": "2026-07-21T15:30:00+03:00",
+                    "timeZone": "Africa/Cairo"
+                },
+                "attendees": [
+                    {
+                        "email": "mohammed18200118@gmail.com"
+                    }
+                ],
+                "conferenceData": {
+                    "createRequest": {
+                        "requestId": "conference-request-1",
+                        "conferenceSolutionKey": { "type": "hangoutsMeet" }
+                    }
+                },
+                "extendedProperties": {
+                    "private": {
+                        "locality_event_id": "locality-event-1"
+                    }
+                }
+            })
         );
     }
 }
