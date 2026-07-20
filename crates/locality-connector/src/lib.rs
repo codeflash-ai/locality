@@ -14,6 +14,7 @@ use locality_core::portable::{ProjectionEntry, SourceConnectionId, SourceObject}
 use locality_core::push::RemotePrecondition;
 use locality_core::undo::{UndoApplier, UndoApplyRequest, UndoApplyResult, UndoPlan};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 pub mod network;
@@ -88,6 +89,213 @@ pub struct PortableEnumerateResult {
     pub source_objects: Vec<SourceObject>,
     pub projections: Vec<ProjectionEntry>,
     pub next_cursor: Option<String>,
+}
+
+/// One explicit provider scope for portable bootstrap and synchronization.
+///
+/// Roots are provider identities, not titles or projected paths. An empty root
+/// list is invalid for connectors, such as Notion, whose provider inventory API
+/// cannot prove exhaustive coverage.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableSourceScope {
+    pub root_remote_ids: Vec<RemoteId>,
+}
+
+impl PortableSourceScope {
+    pub fn explicit_roots(root_remote_ids: impl IntoIterator<Item = RemoteId>) -> Self {
+        Self {
+            root_remote_ids: root_remote_ids.into_iter().collect(),
+        }
+    }
+}
+
+/// Opaque, connector-owned progress state.
+///
+/// Hosts persist and return this value without interpreting `opaque`. The
+/// format version lets a connector fail cleanly instead of silently opening a
+/// newer or obsolete checkpoint representation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableCheckpoint {
+    pub format_version: u16,
+    pub opaque: String,
+}
+
+/// Stable identity for a rendered artifact.
+///
+/// Artifact keys must be independent of mutable titles and projected paths.
+/// Backend and direct-mode hosts may bind this key to their own durable IDs.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PortableArtifactKey(String);
+
+impl PortableArtifactKey {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_valid(&self) -> bool {
+        !self.0.is_empty() && !self.0.chars().any(char::is_control)
+    }
+}
+
+/// A reason a connector cannot claim exhaustive coverage for a batch.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PortableIncompleteReason {
+    CheckpointContinuation,
+    UnsupportedSourceKind {
+        remote_id: RemoteId,
+        source_kind: String,
+    },
+    UnsupportedArtifact {
+        artifact_key: PortableArtifactKey,
+        artifact_kind: String,
+    },
+    ConnectorLimitation {
+        code: String,
+        remote_id: Option<RemoteId>,
+    },
+}
+
+/// Explicit coverage state for bootstrap, sync, fetch, and render results.
+///
+/// The default is deliberately incomplete so a newly added connector cannot
+/// accidentally authorize publication by forgetting to set completeness.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableCompleteness {
+    #[serde(default)]
+    incomplete_reasons: Vec<PortableIncompleteReason>,
+    complete: bool,
+}
+
+impl PortableCompleteness {
+    pub fn complete() -> Self {
+        Self {
+            incomplete_reasons: Vec::new(),
+            complete: true,
+        }
+    }
+
+    pub fn incomplete(reason: PortableIncompleteReason) -> Self {
+        Self {
+            incomplete_reasons: vec![reason],
+            complete: false,
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.complete && self.incomplete_reasons.is_empty()
+    }
+
+    pub fn incomplete_reasons(&self) -> &[PortableIncompleteReason] {
+        &self.incomplete_reasons
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.complete &= other.complete;
+        self.incomplete_reasons.extend(other.incomplete_reasons);
+        self.incomplete_reasons.sort();
+        self.incomplete_reasons.dedup();
+    }
+}
+
+/// One provider object discovered by bootstrap or synchronization.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableSourceChange {
+    pub source_object: SourceObject,
+    /// Current projection hint. It may change after a provider rename and is
+    /// never used as source or artifact identity.
+    pub logical_path: Option<locality_core::portable::LogicalPath>,
+    /// Whether this object has a supported native fetch/render path.
+    pub requires_fetch: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableChangeBatch {
+    pub changes: Vec<PortableSourceChange>,
+    pub next_checkpoint: PortableCheckpoint,
+    pub completeness: PortableCompleteness,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableBootstrapRequest {
+    pub source_connection_id: SourceConnectionId,
+    pub scope: PortableSourceScope,
+    pub checkpoint: Option<PortableCheckpoint>,
+    pub max_changes: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableSyncHint {
+    pub remote_id: RemoteId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableSyncRequest {
+    pub source_connection_id: SourceConnectionId,
+    pub scope: PortableSourceScope,
+    pub checkpoint: PortableCheckpoint,
+    #[serde(default)]
+    pub hints: Vec<PortableSyncHint>,
+    pub max_changes: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortableFetchReason {
+    Bootstrap,
+    Synchronization,
+    Repair,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableFetchRequest {
+    pub source_connection_id: SourceConnectionId,
+    pub remote_id: RemoteId,
+    pub reason: PortableFetchReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortableFetchResult {
+    pub native: NativeEntity,
+    pub provider_version: Option<String>,
+    pub completeness: PortableCompleteness,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortableRenderRequest {
+    pub source_connection_id: SourceConnectionId,
+    pub logical_path: locality_core::portable::LogicalPath,
+    pub native: NativeEntity,
+    pub format_version: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableContentArtifact {
+    pub artifact_key: PortableArtifactKey,
+    pub media_type: String,
+    pub body: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableProjectionArtifact {
+    pub artifact: PortableContentArtifact,
+    pub logical_path: locality_core::portable::LogicalPath,
+    pub file_kind: locality_core::portable::ProjectionFileKind,
+    pub format_version: u32,
+    #[serde(default)]
+    pub supported_actions: BTreeSet<locality_core::portable::SourceAction>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableRenderResult {
+    pub canonical: PortableContentArtifact,
+    pub projections: Vec<PortableProjectionArtifact>,
+    pub completeness: PortableCompleteness,
 }
 
 /// Cheap metadata request for one known source object.
@@ -243,6 +451,39 @@ pub trait Connector {
     ) -> LocalityResult<PortableEnumerateResult> {
         Err(locality_core::LocalityError::Unsupported(
             "connector does not support portable enumeration",
+        ))
+    }
+    /// Start or resume an exhaustive provider inventory for an explicit scope.
+    fn bootstrap_portable(
+        &self,
+        _request: PortableBootstrapRequest,
+    ) -> LocalityResult<PortableChangeBatch> {
+        Err(locality_core::LocalityError::Unsupported(
+            "connector does not support portable bootstrap",
+        ))
+    }
+    /// Observe changes since a connector-owned checkpoint.
+    fn sync_portable(&self, _request: PortableSyncRequest) -> LocalityResult<PortableChangeBatch> {
+        Err(locality_core::LocalityError::Unsupported(
+            "connector does not support portable synchronization",
+        ))
+    }
+    /// Fetch one authoritative native provider object.
+    fn fetch_portable(
+        &self,
+        _request: PortableFetchRequest,
+    ) -> LocalityResult<PortableFetchResult> {
+        Err(locality_core::LocalityError::Unsupported(
+            "connector does not support portable fetch",
+        ))
+    }
+    /// Render one native object into canonical and projected artifacts.
+    fn render_portable(
+        &self,
+        _request: &PortableRenderRequest,
+    ) -> LocalityResult<PortableRenderResult> {
+        Err(locality_core::LocalityError::Unsupported(
+            "connector does not support portable render",
         ))
     }
     /// Observe one entity without hydrating its body.

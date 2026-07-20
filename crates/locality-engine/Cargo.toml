@@ -13,3 +13,4 @@ path = "src/lib.rs"
 [dependencies]
 locality-core.workspace = true
 locality-connector.workspace = true
+sha2 = "0.10"

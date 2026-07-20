@@ -314,6 +314,153 @@ pub struct BootstrapExchangeRequest {
     pub bootstrap_token: String,
 }
 
+/// One-time bootstrap exchange containing no client-selected scope.
+///
+/// This is the Phase 1 token-only request. [`BootstrapExchangeRequest`] remains
+/// available for version-negotiating legacy transports.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpaqueBootstrapExchangeRequest {
+    pub bootstrap_token: String,
+}
+
+impl Debug for OpaqueBootstrapExchangeRequest {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpaqueBootstrapExchangeRequest")
+            .field("bootstrap_token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Status lookup authorized only by the opaque session capability.
+///
+/// Tenant, principal, workload, roots, filters, and requested actions were
+/// sealed before bootstrap issuance and cannot be supplied again here.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpaqueSessionStatusRequest {
+    pub opaque_capability: String,
+}
+
+impl Debug for OpaqueSessionStatusRequest {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpaqueSessionStatusRequest")
+            .field("opaque_capability", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StaleSessionBehavior {
+    Fail,
+    WaitThenFail,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreshnessRequirement {
+    pub max_age_seconds: u64,
+    pub on_stale: StaleSessionBehavior,
+    pub wait_timeout_seconds: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicaFreshnessState {
+    Bootstrapping,
+    Fresh,
+    Stale,
+    Unavailable,
+}
+
+/// Explicit freshness and coverage facts for one pinned source replica.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicaFreshnessStatus {
+    pub source_connection_id: SourceConnectionId,
+    pub state: ReplicaFreshnessState,
+    pub coverage_complete: bool,
+    pub provider_observed_through: Option<String>,
+    pub last_successful_sync_at: Option<String>,
+    pub last_repair_at: Option<String>,
+    pub pending_events: u64,
+    pub backlog: u64,
+    pub provider_cooldown_until: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TarContentEncoding {
+    Identity,
+    Zstd,
+}
+
+/// Encodings and exact decoded bounds available for one immutable tar export.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TarExportOffer {
+    pub media_type: String,
+    pub supported_content_encodings: BTreeSet<TarContentEncoding>,
+    pub selected_entries: u64,
+    pub decoded_bytes: u64,
+    pub decoded_tar_sha256: String,
+}
+
+/// Metadata accompanying a negotiated identity or Zstd tar response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TarExportMetadata {
+    pub versions: ComponentVersions,
+    pub session_id: SessionId,
+    pub media_type: String,
+    pub content_encoding: TarContentEncoding,
+    pub delivered_entries: u64,
+    pub decoded_bytes: u64,
+    pub wire_bytes: u64,
+    pub decoded_tar_sha256: String,
+    pub inventory_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxSessionState {
+    Bootstrapping,
+    Ready,
+    Failed,
+    Expired,
+    Revoked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionErrorCode {
+    NeedsUpdate,
+    Bootstrapping,
+    Stale,
+    Incomplete,
+    Unavailable,
+    Unauthorized,
+    Expired,
+    LimitExceeded,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionProtocolError {
+    pub code: SessionErrorCode,
+    pub message: String,
+    pub retriable: bool,
+    pub retry_after_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxSessionStatus {
+    pub versions: ComponentVersions,
+    pub session_id: SessionId,
+    pub state: SandboxSessionState,
+    pub freshness_requirement: FreshnessRequirement,
+    pub replicas: Vec<ReplicaFreshnessStatus>,
+    pub export_offer: Option<TarExportOffer>,
+    pub error: Option<SessionProtocolError>,
+    pub updated_at: String,
+}
+
 impl Debug for BootstrapExchangeRequest {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -563,3 +710,13 @@ pub const WRITABLE_EXPORT_METADATA_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/writable-export-metadata.json");
 pub const CHANGESET_ENVELOPE_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/changeset-envelope.json");
+pub const BOOTSTRAP_EXCHANGE_GOLDEN_JSON: &[u8] =
+    include_bytes!("../fixtures/bootstrap-exchange.json");
+pub const FRESHNESS_STATUS_GOLDEN_JSON: &[u8] = include_bytes!("../fixtures/freshness-status.json");
+pub const SANDBOX_SESSION_STATUS_GOLDEN_JSON: &[u8] =
+    include_bytes!("../fixtures/sandbox-session-status.json");
+pub const SESSION_PROTOCOL_ERROR_GOLDEN_JSON: &[u8] =
+    include_bytes!("../fixtures/session-protocol-error.json");
+pub const TAR_EXPORT_OFFER_GOLDEN_JSON: &[u8] = include_bytes!("../fixtures/tar-export-offer.json");
+pub const TAR_EXPORT_METADATA_GOLDEN_JSON: &[u8] =
+    include_bytes!("../fixtures/tar-export-metadata.json");

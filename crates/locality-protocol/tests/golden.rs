@@ -12,15 +12,21 @@ use locality_core::portable::{
 use locality_core::readable_diff::readable_diff_for_file;
 use locality_protocol::{
     ACCESS_SET_GOLDEN_JSON, AUTHORIZED_SESSION_QUERY_GOLDEN_JSON, AccessSetContract, AccessSubject,
-    AuditReference, AuthorizedChangesetUpload, AuthorizedSessionQuery, BootstrapExchangeRequest,
-    CHANGESET_ENVELOPE_GOLDEN_JSON, COMPONENT_VERSIONS, COMPONENT_VERSIONS_GOLDEN_JSON,
-    CONTENT_VERSION_GOLDEN_JSON, ChangesetContent, ChangesetEnvelope, ChangesetSourceObject,
-    ClientValidationResult, ComponentVersions, ContentVersionContract, DELIVERED_COUNT_GOLDEN_JSON,
-    DeliveredChangesetBase, DeliveredCount, EditedCanonicalBody, ORDERED_EXPORT_ROWS_GOLDEN_JSON,
+    AuditReference, AuthorizedChangesetUpload, AuthorizedSessionQuery,
+    BOOTSTRAP_EXCHANGE_GOLDEN_JSON, BootstrapExchangeRequest, CHANGESET_ENVELOPE_GOLDEN_JSON,
+    COMPONENT_VERSIONS, COMPONENT_VERSIONS_GOLDEN_JSON, CONTENT_VERSION_GOLDEN_JSON,
+    ChangesetContent, ChangesetEnvelope, ChangesetSourceObject, ClientValidationResult,
+    ComponentVersions, ContentVersionContract, DELIVERED_COUNT_GOLDEN_JSON, DeliveredChangesetBase,
+    DeliveredCount, EditedCanonicalBody, FRESHNESS_STATUS_GOLDEN_JSON, FreshnessRequirement,
+    ORDERED_EXPORT_ROWS_GOLDEN_JSON, OpaqueBootstrapExchangeRequest, OpaqueSessionStatusRequest,
     OrderedExportRow, PROJECTION_VERSION_GOLDEN_JSON, ProjectionVersionContract,
-    READY_REPLICA_REVISION_GOLDEN_JSON, ReadyReplicaRevision, SOURCE_VERSION_GOLDEN_JSON,
-    SessionCapability, SessionReplicaRevision, SourceVersionContract,
-    WRITABLE_EXPORT_METADATA_GOLDEN_JSON, WritableExportMetadata, WritableMetadataEntry,
+    READY_REPLICA_REVISION_GOLDEN_JSON, ReadyReplicaRevision, ReplicaFreshnessState,
+    ReplicaFreshnessStatus, SANDBOX_SESSION_STATUS_GOLDEN_JSON, SESSION_PROTOCOL_ERROR_GOLDEN_JSON,
+    SOURCE_VERSION_GOLDEN_JSON, SandboxSessionState, SandboxSessionStatus, SessionCapability,
+    SessionErrorCode, SessionProtocolError, SessionReplicaRevision, SourceVersionContract,
+    StaleSessionBehavior, TAR_EXPORT_METADATA_GOLDEN_JSON, TAR_EXPORT_OFFER_GOLDEN_JSON,
+    TarContentEncoding, TarExportMetadata, TarExportOffer, WRITABLE_EXPORT_METADATA_GOLDEN_JSON,
+    WritableExportMetadata, WritableMetadataEntry,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -96,6 +102,19 @@ fn portable_changeset_is_exact_golden_bytes() {
 }
 
 #[test]
+fn freshness_session_and_tar_export_values_are_exact_golden_bytes() {
+    assert_exact_round_trip(BOOTSTRAP_EXCHANGE_GOLDEN_JSON, &bootstrap_exchange());
+    assert_exact_round_trip(FRESHNESS_STATUS_GOLDEN_JSON, &freshness_status());
+    assert_exact_round_trip(TAR_EXPORT_OFFER_GOLDEN_JSON, &tar_export_offer());
+    assert_exact_round_trip(TAR_EXPORT_METADATA_GOLDEN_JSON, &tar_export_metadata());
+    assert_exact_round_trip(
+        SANDBOX_SESSION_STATUS_GOLDEN_JSON,
+        &sandbox_session_status(),
+    );
+    assert_exact_round_trip(SESSION_PROTOCOL_ERROR_GOLDEN_JSON, &needs_update_error());
+}
+
+#[test]
 fn capability_debug_output_is_redacted() {
     let bootstrap = BootstrapExchangeRequest {
         versions: COMPONENT_VERSIONS,
@@ -112,11 +131,19 @@ fn capability_debug_output_is_redacted() {
         content_sha256: "sha256:upload".to_string(),
         byte_length: 99,
     };
+    let status = OpaqueSessionStatusRequest {
+        opaque_capability: "status-secret".to_string(),
+    };
+    let token_only_bootstrap = OpaqueBootstrapExchangeRequest {
+        bootstrap_token: "token-only-secret".to_string(),
+    };
 
     for (debug, secret) in [
         (format!("{bootstrap:?}"), "bootstrap-secret"),
         (format!("{session:?}"), "session-secret"),
         (format!("{upload:?}"), "upload-secret"),
+        (format!("{status:?}"), "status-secret"),
+        (format!("{token_only_bootstrap:?}"), "token-only-secret"),
     ] {
         assert!(debug.contains("<redacted>"), "{debug}");
         assert!(!debug.contains(secret), "{debug}");
@@ -136,9 +163,88 @@ fn public_goldens_never_expose_physical_serving_identifiers() {
         DELIVERED_COUNT_GOLDEN_JSON,
         WRITABLE_EXPORT_METADATA_GOLDEN_JSON,
         CHANGESET_ENVELOPE_GOLDEN_JSON,
+        BOOTSTRAP_EXCHANGE_GOLDEN_JSON,
+        FRESHNESS_STATUS_GOLDEN_JSON,
+        SANDBOX_SESSION_STATUS_GOLDEN_JSON,
+        SESSION_PROTOCOL_ERROR_GOLDEN_JSON,
+        TAR_EXPORT_OFFER_GOLDEN_JSON,
+        TAR_EXPORT_METADATA_GOLDEN_JSON,
     ] {
         let value: serde_json::Value = serde_json::from_slice(golden).expect("valid golden JSON");
         assert_forbidden_physical_keys_absent(&value);
+    }
+}
+
+fn bootstrap_exchange() -> OpaqueBootstrapExchangeRequest {
+    OpaqueBootstrapExchangeRequest {
+        bootstrap_token: "opaque-bootstrap-token".to_string(),
+    }
+}
+
+fn freshness_status() -> ReplicaFreshnessStatus {
+    ReplicaFreshnessStatus {
+        source_connection_id: SourceConnectionId::new("source-notion"),
+        state: ReplicaFreshnessState::Fresh,
+        coverage_complete: true,
+        provider_observed_through: Some("notion-repair:108".to_string()),
+        last_successful_sync_at: Some("2026-07-19T11:58:00Z".to_string()),
+        last_repair_at: Some("2026-07-19T11:55:00Z".to_string()),
+        pending_events: 0,
+        backlog: 0,
+        provider_cooldown_until: None,
+    }
+}
+
+fn tar_export_offer() -> TarExportOffer {
+    TarExportOffer {
+        media_type: "application/x-tar".to_string(),
+        supported_content_encodings: BTreeSet::from([
+            TarContentEncoding::Identity,
+            TarContentEncoding::Zstd,
+        ]),
+        selected_entries: 2,
+        decoded_bytes: 3072,
+        decoded_tar_sha256: "sha256:decoded-tar".to_string(),
+    }
+}
+
+fn tar_export_metadata() -> TarExportMetadata {
+    TarExportMetadata {
+        versions: COMPONENT_VERSIONS,
+        session_id: SessionId::new("session-7"),
+        media_type: "application/x-tar".to_string(),
+        content_encoding: TarContentEncoding::Zstd,
+        delivered_entries: 2,
+        decoded_bytes: 3072,
+        wire_bytes: 384,
+        decoded_tar_sha256: "sha256:decoded-tar".to_string(),
+        inventory_sha256: "sha256:delivered-inventory".to_string(),
+    }
+}
+
+fn sandbox_session_status() -> SandboxSessionStatus {
+    SandboxSessionStatus {
+        versions: COMPONENT_VERSIONS,
+        session_id: SessionId::new("session-7"),
+        state: SandboxSessionState::Ready,
+        freshness_requirement: FreshnessRequirement {
+            max_age_seconds: 300,
+            on_stale: StaleSessionBehavior::WaitThenFail,
+            wait_timeout_seconds: 30,
+        },
+        replicas: vec![freshness_status()],
+        export_offer: Some(tar_export_offer()),
+        error: None,
+        updated_at: "2026-07-19T12:00:00Z".to_string(),
+    }
+}
+
+fn needs_update_error() -> SessionProtocolError {
+    SessionProtocolError {
+        code: SessionErrorCode::NeedsUpdate,
+        message: "session protocol version 2 requires a newer client".to_string(),
+        retriable: false,
+        retry_after_seconds: None,
     }
 }
 
@@ -309,7 +415,13 @@ fn assert_forbidden_physical_keys_absent(value: &serde_json::Value) {
                 assert!(
                     !matches!(
                         key.as_str(),
-                        "scope_root_id" | "export_order" | "content_storage_id"
+                        "scope_root_id"
+                            | "export_order"
+                            | "content_storage_id"
+                            | "mount_id"
+                            | "host_path"
+                            | "local_root"
+                            | "credential"
                     ),
                     "public golden exposed backend-only field `{key}`"
                 );

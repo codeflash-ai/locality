@@ -13,6 +13,7 @@ pub mod mapping;
 pub mod markdown_table;
 pub mod media;
 pub mod oauth;
+mod portable;
 pub mod projection;
 pub mod render;
 pub mod schema;
@@ -25,6 +26,8 @@ use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
     ConnectorCapabilities, ConnectorExecutionPolicy, ConnectorKind, EnumerateRequest, FetchRequest,
     ListChildrenRequest, ListChildrenResult, NativeEntity, ObserveRequest, ParsedEntity,
+    PortableBootstrapRequest, PortableChangeBatch, PortableFetchRequest, PortableFetchResult,
+    PortableRenderRequest, PortableRenderResult, PortableSyncRequest,
 };
 use locality_core::freshness::RemoteObservation;
 use locality_core::model::{CanonicalDocument, RemoteId, TreeEntry};
@@ -247,6 +250,36 @@ impl Connector for NotionConnector {
         } else {
             enumerate_shared_pages(self.api.as_ref(), request.mount_id)
         }
+    }
+
+    fn bootstrap_portable(
+        &self,
+        request: PortableBootstrapRequest,
+    ) -> LocalityResult<PortableChangeBatch> {
+        portable::bootstrap(
+            self.api.as_ref(),
+            self.config.root_page_id.as_ref(),
+            request,
+        )
+    }
+
+    fn sync_portable(&self, request: PortableSyncRequest) -> LocalityResult<PortableChangeBatch> {
+        portable::synchronize(
+            self.api.as_ref(),
+            self.config.root_page_id.as_ref(),
+            request,
+        )
+    }
+
+    fn fetch_portable(&self, request: PortableFetchRequest) -> LocalityResult<PortableFetchResult> {
+        portable::fetch(self.api.as_ref(), request)
+    }
+
+    fn render_portable(
+        &self,
+        request: &PortableRenderRequest,
+    ) -> LocalityResult<PortableRenderResult> {
+        portable::render(request)
     }
 
     fn list_children(&self, request: ListChildrenRequest) -> LocalityResult<ListChildrenResult> {

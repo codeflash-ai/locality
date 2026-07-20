@@ -1,0 +1,19 @@
+{
+  "versions": {
+    "session": 1,
+    "replica": 1,
+    "export_metadata": 1,
+    "writable_session_store": 1,
+    "canonical": 1,
+    "path": 1,
+    "changeset": 1
+  },
+  "session_id": "session-7",
+  "media_type": "application/x-tar",
+  "content_encoding": "zstd",
+  "delivered_entries": 2,
+  "decoded_bytes": 3072,
+  "wire_bytes": 384,
+  "decoded_tar_sha256": "sha256:decoded-tar",
+  "inventory_sha256": "sha256:delivered-inventory"
+}
