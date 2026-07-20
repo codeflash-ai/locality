@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   connectedSourcesReadyToMount,
+  isSourceConnectorId,
   sourceConnectorIds,
   sourceRequiresApiKey,
   sourceSkipsManualMountStep,
@@ -27,8 +28,10 @@ describe("source setup progress", () => {
 
   it("includes Linear in the desktop source catalog as an API-key connector", () => {
     expect(sourceConnectorIds()).toContain("linear");
+    expect(sourceConnectorIds()).toContain("google-calendar");
     expect(sourceRequiresApiKey("linear")).toBe(true);
     expect(sourceRequiresApiKey("granola")).toBe(true);
+    expect(sourceRequiresApiKey("google-calendar")).toBe(false);
     expect(sourceRequiresApiKey("gmail")).toBe(false);
     expect(sourceSkipsManualMountStep("linear")).toBe(true);
   });
@@ -53,6 +56,16 @@ describe("source setup progress", () => {
         mounts: [],
       }),
     ).toEqual(["notion"]);
+  });
+
+  it("recognizes Google Calendar as ready to mount when connected", () => {
+    expect(isSourceConnectorId("google-calendar")).toBe(true);
+    expect(
+      connectedSourcesReadyToMount({
+        connections: [{ connector: "google-calendar", status: "active" }],
+        mounts: [],
+      }),
+    ).toEqual(["google-calendar"]);
   });
 });
 

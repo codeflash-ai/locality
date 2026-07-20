@@ -1050,6 +1050,418 @@ fn daemon_push_reconciles_sent_gmail_draft_create_to_sent_folder() {
 }
 
 #[test]
+fn daemon_push_reconciles_google_calendar_draft_create_to_canonical_event_filename() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let source_path = Path::new("draft/design-review.md");
+    let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(
+        &cache_path,
+        "---\ntitle: Design review\nsummary: Design review\nstart:\n  dateTime: \"2026-07-20T10:00:00-07:00\"\nend:\n  dateTime: \"2026-07-20T10:30:00-07:00\"\n---\nAgenda\n",
+    )
+    .expect("cache file");
+
+    let draft_folder_id = RemoteId::new("google-calendar-folder:draft");
+    let events_folder_id = RemoteId::new("google-calendar-folder:events");
+    let created_remote_id = RemoteId::new("google-calendar-event:primary:created-event");
+    let expected_path = PathBuf::from("events/20260720-100000-design-review-created-event.md");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "google-calendar", &fixture.root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            draft_folder_id.clone(),
+            EntityKind::Directory,
+            "draft",
+            "draft",
+        ))
+        .expect("save draft folder");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            events_folder_id.clone(),
+            EntityKind::Directory,
+            "events",
+            "events",
+        ))
+        .expect("save events folder");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:calendar-draft",
+            VirtualMutationKind::Create,
+            None,
+            Some(draft_folder_id),
+            "draft/design-review.md",
+            Some(cache_path),
+        ))
+        .expect("save mutation");
+    let source = FakePushSource::default()
+        .with_created_entity(
+            created_remote_id.clone(),
+            rendered_google_calendar_entity(
+                "google-calendar-event:primary:created-event",
+                "Design review",
+                "2026-07-20T10:00:00-07:00",
+                "Agenda",
+            ),
+        )
+        .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
+            operation_id: PushOperationId("create-calendar-draft".to_string()),
+            operation_index: 0,
+            parent_id: events_folder_id,
+            entity_id: created_remote_id.clone(),
+        }]);
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join(source_path),
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &source,
+        Some(&state_root),
+    )
+    .expect("push google calendar draft");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    let event = store
+        .get_entity(&fixture.mount_id, &created_remote_id)
+        .expect("get created event")
+        .expect("created event entity");
+    assert_eq!(event.path, expected_path);
+    let requested_paths = source.requested_paths();
+    assert_eq!(
+        requested_paths,
+        vec![
+            PathBuf::from("events/design-review.md"),
+            expected_path.clone()
+        ]
+    );
+    assert_eq!(requested_paths.last(), Some(&expected_path));
+    assert!(content_root.join(&expected_path).exists());
+    assert!(!content_root.join(source_path).exists());
+    assert!(
+        store
+            .find_virtual_mutation_by_path(&fixture.mount_id, source_path)
+            .expect("find mutation")
+            .is_none()
+    );
+}
+
+#[test]
+fn daemon_push_accepts_google_calendar_summary_only_draft_create() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let source_path = Path::new("draft/summary-only.md");
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(
+        &cache_path,
+        "---\nsummary: Summary only review\nstart:\n  dateTime: \"2026-07-20T10:00:00-07:00\"\nend:\n  dateTime: \"2026-07-20T10:30:00-07:00\"\n---\nAgenda\n",
+    )
+    .expect("cache file");
+
+    let draft_folder_id = RemoteId::new("google-calendar-folder:draft");
+    let events_folder_id = RemoteId::new("google-calendar-folder:events");
+    let created_remote_id = RemoteId::new("google-calendar-event:primary:summary-only-event");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "google-calendar", &fixture.root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            draft_folder_id.clone(),
+            EntityKind::Directory,
+            "draft",
+            "draft",
+        ))
+        .expect("save draft folder");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            events_folder_id.clone(),
+            EntityKind::Directory,
+            "events",
+            "events",
+        ))
+        .expect("save events folder");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:calendar-summary-only-draft",
+            VirtualMutationKind::Create,
+            None,
+            Some(draft_folder_id),
+            "draft/summary-only.md",
+            Some(cache_path),
+        ))
+        .expect("save mutation");
+    let source = FakePushSource::default()
+        .with_created_entity(
+            created_remote_id.clone(),
+            rendered_google_calendar_entity(
+                "google-calendar-event:primary:summary-only-event",
+                "Summary only review",
+                "2026-07-20T10:00:00-07:00",
+                "Agenda",
+            ),
+        )
+        .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
+            operation_id: PushOperationId("create-calendar-summary-only-draft".to_string()),
+            operation_index: 0,
+            parent_id: events_folder_id,
+            entity_id: created_remote_id,
+        }]);
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join(source_path),
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &source,
+        Some(&state_root),
+    )
+    .expect("push summary-only google calendar draft");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    let journal = store.list_journal().expect("journal");
+    assert_eq!(journal.len(), 1);
+    let PushOperation::CreateEntity { title, .. } = &journal[0].plan.operations[0] else {
+        panic!("expected create entity operation");
+    };
+    assert_eq!(title, "Summary only review");
+}
+
+#[test]
+fn daemon_push_preserves_edited_google_calendar_draft_after_create_reconcile_retry() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let source_path = Path::new("draft/design-review.md");
+    let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    let edited_draft = "---\nsummary: Follow-up design review\nstart:\n  dateTime: \"2026-07-20T10:00:00-07:00\"\nend:\n  dateTime: \"2026-07-20T10:30:00-07:00\"\n---\nUpdated agenda\n";
+    fs::write(
+        &cache_path,
+        "---\nsummary: Design review\nstart:\n  dateTime: \"2026-07-20T10:00:00-07:00\"\nend:\n  dateTime: \"2026-07-20T10:30:00-07:00\"\n---\nAgenda\n",
+    )
+    .expect("cache file");
+
+    let draft_folder_id = RemoteId::new("google-calendar-folder:draft");
+    let events_folder_id = RemoteId::new("google-calendar-folder:events");
+    let created_remote_id = RemoteId::new("google-calendar-event:primary:created-event");
+    let expected_path = PathBuf::from("events/20260720-100000-design-review-created-event.md");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "google-calendar", &fixture.root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            draft_folder_id.clone(),
+            EntityKind::Directory,
+            "draft",
+            "draft",
+        ))
+        .expect("save draft folder");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            events_folder_id.clone(),
+            EntityKind::Directory,
+            "events",
+            "events",
+        ))
+        .expect("save events folder");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:calendar-draft",
+            VirtualMutationKind::Create,
+            None,
+            Some(draft_folder_id),
+            "draft/design-review.md",
+            Some(cache_path.clone()),
+        ))
+        .expect("save mutation");
+    let source = FakePushSource::default()
+        .with_created_entity(
+            created_remote_id.clone(),
+            rendered_google_calendar_entity(
+                "google-calendar-event:primary:created-event",
+                "Design review",
+                "2026-07-20T10:00:00-07:00",
+                "Agenda",
+            ),
+        )
+        .with_created_fetch_failures(created_remote_id.clone(), 1)
+        .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
+            operation_id: PushOperationId("create-calendar-draft".to_string()),
+            operation_index: 0,
+            parent_id: events_folder_id,
+            entity_id: created_remote_id.clone(),
+        }]);
+    let job = || PushJob {
+        target_path: fixture.root.join(source_path),
+        assume_yes: true,
+        confirm_dangerous: false,
+    };
+
+    let first = execute_push_job_with_content_root(&mut store, job(), &source, Some(&state_root))
+        .expect("first push");
+
+    assert_eq!(first.action, PushJobAction::Failed);
+    assert_eq!(source.applied_count(), 1);
+    let first_push_id = first.push_id.expect("first push id");
+    fs::write(&cache_path, edited_draft).expect("edit stale draft");
+
+    let second = execute_push_job_with_content_root(&mut store, job(), &source, Some(&state_root))
+        .expect("retry push");
+
+    assert_eq!(second.action, PushJobAction::Reconciled);
+    assert_eq!(
+        source.applied_count(),
+        1,
+        "retry must not recreate Calendar event"
+    );
+    assert_eq!(second.push_id.as_ref(), Some(&first_push_id));
+    let event = store
+        .get_entity(&fixture.mount_id, &created_remote_id)
+        .expect("get created event")
+        .expect("created event entity");
+    assert_eq!(event.path, expected_path);
+    assert!(content_root.join(&expected_path).exists());
+    assert_eq!(
+        fs::read_to_string(content_root.join(source_path)).expect("preserved edited draft"),
+        edited_draft
+    );
+    assert!(
+        store
+            .find_virtual_mutation_by_path(&fixture.mount_id, source_path)
+            .expect("find mutation")
+            .is_some()
+    );
+}
+
+#[test]
+fn auto_save_push_blocks_google_calendar_draft_create_without_applying() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let source_path = Path::new("draft/design-review.md");
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(
+        &cache_path,
+        "---\nsummary: Design review\nstart:\n  dateTime: \"2026-07-20T10:00:00-07:00\"\nend:\n  dateTime: \"2026-07-20T10:30:00-07:00\"\n---\nAgenda\n",
+    )
+    .expect("cache file");
+
+    let draft_folder_id = RemoteId::new("google-calendar-folder:draft");
+    let created_remote_id = RemoteId::new("google-calendar-event:primary:created-event");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "google-calendar", &fixture.root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            draft_folder_id.clone(),
+            EntityKind::Directory,
+            "draft",
+            "draft",
+        ))
+        .expect("save draft folder");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:calendar-draft",
+            VirtualMutationKind::Create,
+            None,
+            Some(draft_folder_id),
+            "draft/design-review.md",
+            Some(cache_path),
+        ))
+        .expect("save mutation");
+    store
+        .save_auto_save_enrollment(AutoSaveEnrollmentRecord::new(
+            fixture.mount_id.clone(),
+            source_path,
+            AutoSaveOrigin::LocalityCreated,
+            "now",
+        ))
+        .expect("save enrollment");
+    let source =
+        FakePushSource::default().with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
+            operation_id: PushOperationId("create-calendar-draft".to_string()),
+            operation_index: 0,
+            parent_id: RemoteId::new("google-calendar-folder:events"),
+            entity_id: created_remote_id,
+        }]);
+
+    let report = execute_auto_save_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join(source_path),
+            assume_yes: false,
+            confirm_dangerous: false,
+        },
+        &source,
+        Some(&state_root),
+    )
+    .expect("auto-save google calendar draft");
+
+    assert_eq!(report.action, PushJobAction::NotReady);
+    assert_eq!(
+        source.applied_count(),
+        0,
+        "auto-save must not create Calendar events"
+    );
+    assert_eq!(
+        report.error.as_ref().expect("error").code,
+        "auto_save_blocked"
+    );
+    assert_eq!(
+        report.error.as_ref().expect("error").message,
+        "Google Calendar event creates require review"
+    );
+    let enrollment = store
+        .get_auto_save_enrollment(&fixture.mount_id, source_path)
+        .expect("get enrollment")
+        .expect("enrollment");
+    assert_eq!(enrollment.state, AutoSaveState::Blocked);
+    assert_eq!(
+        enrollment.last_reason.as_deref(),
+        Some("Google Calendar event creates require review")
+    );
+    assert!(store.list_journal().expect("journal").is_empty());
+}
+
+#[test]
 fn auto_save_push_blocks_gmail_draft_send_without_applying() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join(".state");
@@ -2721,6 +3133,31 @@ fn rendered_gmail_entity(
     let document = CanonicalDocument::new(
         format!(
             "loc:\n  id: {remote_id}\n  type: page\n  connector: gmail\n  synced_at: {remote_version}\n  remote_edited_at: {remote_version}\ntitle: {subject}\ngmail:\n  mailbox: sent\n  message_id: {remote_id}\n  thread_id: thread-{remote_id}\n  labels: [SENT]\nfrom: sender@example.com\nto: [user@example.com]\ncc: []\nbcc: []\nsubject: {subject}\ndate: Tue, 14 Jul 2026 10:00:00 +0000\n"
+        ),
+        body.clone(),
+    );
+    HydratedEntity {
+        document,
+        shadow: shadow(remote_id, plain_body),
+        remote_edited_at: Some(remote_version),
+        assets: Vec::new(),
+    }
+}
+
+fn rendered_google_calendar_entity(
+    remote_id: &str,
+    summary: &str,
+    start_date_time: &str,
+    plain_body: &str,
+) -> HydratedEntity {
+    let body = markdown_body(plain_body);
+    let event_id = remote_id
+        .strip_prefix("google-calendar-event:primary:")
+        .expect("primary event remote id");
+    let remote_version = format!("google-calendar:created-event:2026-07-20T17:30:00Z:\"etag\"");
+    let document = CanonicalDocument::new(
+        format!(
+            "loc:\n  id: {remote_id}\n  type: page\n  connector: google-calendar\n  synced_at: {remote_version}\n  remote_edited_at: {remote_version}\ntitle: {summary}\nsummary: {summary}\nstart:\n  dateTime: \"{start_date_time}\"\ngoogle_calendar:\n  calendar_id: primary\n  event_id: {event_id}\n"
         ),
         body.clone(),
     );

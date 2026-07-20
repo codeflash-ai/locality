@@ -25,6 +25,7 @@ use locality_core::shadow::ShadowDocument;
 use locality_core::validation::ValidationReport;
 use locality_core::{LocalityError, LocalityResult};
 use locality_gmail::{GMAIL_CONNECTOR_ID, GmailConnector};
+use locality_google_calendar::{GOOGLE_CALENDAR_CONNECTOR_ID, GoogleCalendarConnector};
 use locality_google_docs::{GOOGLE_DOCS_CONNECTOR_ID, GoogleDocsConnector};
 use locality_granola::{GRANOLA_CONNECTOR_ID, GranolaConnector};
 use locality_linear::{LINEAR_CONNECTOR_ID, LinearConnector};
@@ -37,6 +38,7 @@ use locality_store::{
 
 use crate::file_provider;
 use crate::gmail::resolve_gmail_connector_for_mount;
+use crate::google_calendar::resolve_google_calendar_connector_for_mount;
 use crate::google_docs::resolve_google_docs_connector_for_mount;
 use crate::granola::resolve_granola_connector_for_mount;
 use crate::hydration::{HydratedEntity, HydrationRepository, HydrationSource};
@@ -50,6 +52,7 @@ const NOTION_AGENT_GUIDANCE: &str = include_str!("../../../templates/mount/AGENT
 pub enum ResolvedSource {
     Notion(NotionConnector),
     GoogleDocs(GoogleDocsConnector),
+    GoogleCalendar(GoogleCalendarConnector),
     Gmail(GmailConnector),
     Granola(GranolaConnector),
     Linear(LinearConnector),
@@ -60,6 +63,9 @@ impl ResolvedSource {
         match self {
             Self::Notion(source) => Self::Notion(source.with_execution_policy(policy)),
             Self::GoogleDocs(source) => Self::GoogleDocs(source.with_execution_policy(policy)),
+            Self::GoogleCalendar(source) => {
+                Self::GoogleCalendar(source.with_execution_policy(policy))
+            }
             Self::Gmail(source) => Self::Gmail(source.with_execution_policy(policy)),
             Self::Granola(source) => Self::Granola(source.with_execution_policy(policy)),
             Self::Linear(source) => Self::Linear(source.with_execution_policy(policy)),
@@ -107,6 +113,15 @@ const SOURCE_REGISTRY: &[SourceRegistration] = &[
         resolve: resolve_google_docs_source,
         validate_changed_frontmatter: crate::google_docs::validate_google_docs_frontmatter,
         validate_create_frontmatter: crate::google_docs::validate_google_docs_frontmatter,
+    },
+    SourceRegistration {
+        id: GOOGLE_CALENDAR_CONNECTOR_ID,
+        descriptor: google_calendar_source_descriptor,
+        resolve: resolve_google_calendar_source,
+        validate_changed_frontmatter:
+            crate::google_calendar::validate_google_calendar_changed_frontmatter,
+        validate_create_frontmatter:
+            crate::google_calendar::validate_google_calendar_create_frontmatter,
     },
     SourceRegistration {
         id: GMAIL_CONNECTOR_ID,
@@ -262,6 +277,9 @@ pub fn source_write_decision_for_path(
     if mount.connector == "gmail" {
         return gmail_write_decision_for_path(relative_path);
     }
+    if mount.connector == GOOGLE_CALENDAR_CONNECTOR_ID {
+        return google_calendar_write_decision_for_path(relative_path);
+    }
     if mount.connector == GRANOLA_CONNECTOR_ID {
         return SourceWriteDecision::ReadOnly {
             reason: "Granola meetings are read-only",
@@ -285,6 +303,15 @@ pub fn source_create_decision_for_parent_path(
         } else {
             SourceWriteDecision::ReadOnly {
                 reason: "Gmail creates are only supported directly inside draft/",
+            }
+        };
+    }
+    if mount.connector == GOOGLE_CALENDAR_CONNECTOR_ID {
+        return if parent_path == Path::new("draft") {
+            SourceWriteDecision::Writable
+        } else {
+            SourceWriteDecision::ReadOnly {
+                reason: "Google Calendar creates are only supported directly inside draft/",
             }
         };
     }
@@ -378,6 +405,25 @@ fn google_docs_source_descriptor() -> SourceDescriptor {
     }
 }
 
+fn google_calendar_source_descriptor() -> SourceDescriptor {
+    SourceDescriptor {
+        id: Cow::Borrowed(GOOGLE_CALENDAR_CONNECTOR_ID),
+        display_name: Cow::Borrowed("Google Calendar"),
+        default_mount_id: Cow::Borrowed("google-calendar-main"),
+        connect_command: Some(Cow::Borrowed("loc connect google-calendar")),
+        auth_env_var: None,
+        supports_oauth: true,
+        mount_guidance: Cow::Owned(google_calendar_mount_guidance()),
+        source_root_create_parent_kind: None,
+        create_entity_parent_kinds: vec![EntityKind::Directory],
+        move_entity_parent_kinds: Vec::new(),
+        periodic_discovery_interval: None,
+        body_diff_mode: BodyDiffMode::Block,
+        virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
+        max_background_discovery_workers: 4,
+    }
+}
+
 fn gmail_source_descriptor() -> SourceDescriptor {
     SourceDescriptor {
         id: Cow::Borrowed(GMAIL_CONNECTOR_ID),
@@ -431,6 +477,15 @@ fn resolve_google_docs_source(
 ) -> Result<ResolvedSource, ConnectorResolveError> {
     resolve_google_docs_connector_for_mount(store, credentials, mount)
         .map(ResolvedSource::GoogleDocs)
+}
+
+fn resolve_google_calendar_source(
+    store: &dyn SourceResolverStore,
+    credentials: &dyn CredentialStore,
+    mount: &MountConfig,
+) -> Result<ResolvedSource, ConnectorResolveError> {
+    resolve_google_calendar_connector_for_mount(store, credentials, mount)
+        .map(ResolvedSource::GoogleCalendar)
 }
 
 fn resolve_gmail_source(
@@ -513,6 +568,30 @@ fn gmail_write_decision_for_path(relative_path: &Path) -> SourceWriteDecision {
     }
 }
 
+fn google_calendar_write_decision_for_path(relative_path: &Path) -> SourceWriteDecision {
+    let mut components = relative_path.components();
+    match components.next().and_then(|component| match component {
+        std::path::Component::Normal(value) => value.to_str(),
+        _ => None,
+    }) {
+        Some("draft") => match components.next() {
+            None => SourceWriteDecision::Writable,
+            Some(std::path::Component::Normal(_)) if components.next().is_none() => {
+                SourceWriteDecision::Writable
+            }
+            _ => SourceWriteDecision::ReadOnly {
+                reason: "Google Calendar writes are only supported under draft/",
+            },
+        },
+        Some("events") => SourceWriteDecision::ReadOnly {
+            reason: "Google Calendar event files are read-only",
+        },
+        _ => SourceWriteDecision::ReadOnly {
+            reason: "Google Calendar writes are only supported under draft/",
+        },
+    }
+}
+
 fn generic_display_name(connector: &str) -> String {
     match connector {
         "linear" => "Linear".to_string(),
@@ -557,6 +636,17 @@ Gmail facts:\n\
 - inbox/ and sent/ are read-only. Create a Markdown file directly under draft/ to send mail.\n\
 - Draft creates require `to` frontmatter and either `subject` or `title` frontmatter.\n",
         generic_mount_guidance("Gmail")
+    )
+}
+
+fn google_calendar_mount_guidance() -> String {
+    format!(
+        "{}\n\
+Google Calendar facts:\n\
+- This mount projects the primary calendar as events/ and draft/ folders.\n\
+- events/ is read-only. Create a Markdown file directly under draft/ to create an event.\n\
+- Draft creates require `start`, `end`, and either `summary` or `title` frontmatter.\n",
+        generic_mount_guidance("Google Calendar")
     )
 }
 
@@ -709,6 +799,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.kind(),
             Self::GoogleDocs(source) => source.kind(),
+            Self::GoogleCalendar(source) => source.kind(),
             Self::Gmail(source) => source.kind(),
             Self::Granola(source) => source.kind(),
             Self::Linear(source) => source.kind(),
@@ -719,6 +810,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.capabilities(),
             Self::GoogleDocs(source) => source.capabilities(),
+            Self::GoogleCalendar(source) => source.capabilities(),
             Self::Gmail(source) => source.capabilities(),
             Self::Granola(source) => source.capabilities(),
             Self::Linear(source) => source.capabilities(),
@@ -729,6 +821,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.supported_push_operations(),
             Self::GoogleDocs(source) => source.supported_push_operations(),
+            Self::GoogleCalendar(source) => source.supported_push_operations(),
             Self::Gmail(source) => source.supported_push_operations(),
             Self::Granola(source) => source.supported_push_operations(),
             Self::Linear(source) => source.supported_push_operations(),
@@ -739,6 +832,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.enumerate(request),
             Self::GoogleDocs(source) => source.enumerate(request),
+            Self::GoogleCalendar(source) => source.enumerate(request),
             Self::Gmail(source) => source.enumerate(request),
             Self::Granola(source) => source.enumerate(request),
             Self::Linear(source) => source.enumerate(request),
@@ -749,6 +843,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.observe(request),
             Self::GoogleDocs(source) => source.observe(request),
+            Self::GoogleCalendar(source) => source.observe(request),
             Self::Gmail(source) => source.observe(request),
             Self::Granola(source) => source.observe(request),
             Self::Linear(source) => source.observe(request),
@@ -759,6 +854,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.observe_batch(request),
             Self::GoogleDocs(source) => source.observe_batch(request),
+            Self::GoogleCalendar(source) => source.observe_batch(request),
             Self::Gmail(source) => source.observe_batch(request),
             Self::Granola(source) => source.observe_batch(request),
             Self::Linear(source) => source.observe_batch(request),
@@ -769,6 +865,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.list_children(request),
             Self::GoogleDocs(source) => source.list_children(request),
+            Self::GoogleCalendar(source) => source.list_children(request),
             Self::Gmail(source) => source.list_children(request),
             Self::Granola(source) => source.list_children(request),
             Self::Linear(source) => source.list_children(request),
@@ -779,6 +876,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.fetch(request),
             Self::GoogleDocs(source) => source.fetch(request),
+            Self::GoogleCalendar(source) => source.fetch(request),
             Self::Gmail(source) => source.fetch(request),
             Self::Granola(source) => source.fetch(request),
             Self::Linear(source) => source.fetch(request),
@@ -789,6 +887,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.render(entity),
             Self::GoogleDocs(source) => source.render(entity),
+            Self::GoogleCalendar(source) => source.render(entity),
             Self::Gmail(source) => source.render(entity),
             Self::Granola(source) => source.render(entity),
             Self::Linear(source) => source.render(entity),
@@ -799,6 +898,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.parse(document),
             Self::GoogleDocs(source) => source.parse(document),
+            Self::GoogleCalendar(source) => source.parse(document),
             Self::Gmail(source) => source.parse(document),
             Self::Granola(source) => source.parse(document),
             Self::Linear(source) => source.parse(document),
@@ -809,6 +909,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.check_concurrency(request),
             Self::GoogleDocs(source) => source.check_concurrency(request),
+            Self::GoogleCalendar(source) => source.check_concurrency(request),
             Self::Gmail(source) => source.check_concurrency(request),
             Self::Granola(source) => source.check_concurrency(request),
             Self::Linear(source) => source.check_concurrency(request),
@@ -819,6 +920,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.apply(request),
             Self::GoogleDocs(source) => source.apply(request),
+            Self::GoogleCalendar(source) => source.apply(request),
             Self::Gmail(source) => source.apply(request),
             Self::Granola(source) => source.apply(request),
             Self::Linear(source) => source.apply(request),
@@ -829,6 +931,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.apply_undo(request),
             Self::GoogleDocs(source) => source.apply_undo(request),
+            Self::GoogleCalendar(source) => source.apply_undo(request),
             Self::Gmail(source) => source.apply_undo(request),
             Self::Granola(source) => source.apply_undo(request),
             Self::Linear(source) => source.apply_undo(request),
@@ -841,6 +944,7 @@ impl HydrationSource for ResolvedSource {
         match self {
             Self::Notion(source) => source.fetch_render(request),
             Self::GoogleDocs(source) => source.fetch_render(request),
+            Self::GoogleCalendar(source) => source.fetch_render(request),
             Self::Gmail(source) => source.fetch_render(request),
             Self::Granola(source) => source.fetch_render(request),
             Self::Linear(source) => source.fetch_render(request),
@@ -855,6 +959,9 @@ impl HydrationSource for ResolvedSource {
         match self {
             Self::Notion(source) => source.fetch_render_with_repository(request, repository),
             Self::GoogleDocs(source) => source.fetch_render_with_repository(request, repository),
+            Self::GoogleCalendar(source) => {
+                source.fetch_render_with_repository(request, repository)
+            }
             Self::Gmail(source) => source.fetch_render_with_repository(request, repository),
             Self::Granola(source) => source.fetch_render_with_repository(request, repository),
             Self::Linear(source) => source.fetch_render_with_repository(request, repository),
@@ -865,6 +972,7 @@ impl HydrationSource for ResolvedSource {
         match self {
             Self::Notion(source) => source.fetch_database_schema_yaml(database_id),
             Self::GoogleDocs(source) => source.fetch_database_schema_yaml(database_id),
+            Self::GoogleCalendar(source) => source.fetch_database_schema_yaml(database_id),
             Self::Gmail(source) => source.fetch_database_schema_yaml(database_id),
             Self::Granola(source) => source.fetch_database_schema_yaml(database_id),
             Self::Linear(source) => source.fetch_database_schema_yaml(database_id),
@@ -919,6 +1027,7 @@ impl SourcePushValidator for ResolvedSource {
         match self {
             Self::Notion(source) => source.validate_changed_frontmatter(context),
             Self::GoogleDocs(source) => source.validate_changed_frontmatter(context),
+            Self::GoogleCalendar(source) => source.validate_changed_frontmatter(context),
             Self::Gmail(source) => source.validate_changed_frontmatter(context),
             Self::Granola(source) => source.validate_changed_frontmatter(context),
             Self::Linear(source) => source.validate_changed_frontmatter(context),
@@ -932,6 +1041,7 @@ impl SourcePushValidator for ResolvedSource {
         match self {
             Self::Notion(source) => source.validate_create_frontmatter(context),
             Self::GoogleDocs(source) => source.validate_create_frontmatter(context),
+            Self::GoogleCalendar(source) => source.validate_create_frontmatter(context),
             Self::Gmail(source) => source.validate_create_frontmatter(context),
             Self::Granola(source) => source.validate_create_frontmatter(context),
             Self::Linear(source) => source.validate_create_frontmatter(context),
@@ -947,6 +1057,7 @@ impl SourceAdapter for ResolvedSource {
         match self {
             Self::Notion(source) => Self::Notion(source.scoped_to_mount(mount)),
             Self::GoogleDocs(source) => Self::GoogleDocs(source.scoped_to_mount(mount)),
+            Self::GoogleCalendar(source) => Self::GoogleCalendar(source.scoped_to_mount(mount)),
             Self::Gmail(source) => Self::Gmail(source.scoped_to_mount(mount)),
             Self::Granola(source) => Self::Granola(source.scoped_to_mount(mount)),
             Self::Linear(source) => Self::Linear(source.scoped_to_mount(mount)),
@@ -957,6 +1068,9 @@ impl SourceAdapter for ResolvedSource {
         match self {
             Self::Notion(source) => SourceAdapter::database_schema_yaml(source, database_id),
             Self::GoogleDocs(source) => SourceAdapter::database_schema_yaml(source, database_id),
+            Self::GoogleCalendar(source) => {
+                SourceAdapter::database_schema_yaml(source, database_id)
+            }
             Self::Gmail(source) => SourceAdapter::database_schema_yaml(source, database_id),
             Self::Granola(source) => SourceAdapter::database_schema_yaml(source, database_id),
             Self::Linear(source) => SourceAdapter::database_schema_yaml(source, database_id),

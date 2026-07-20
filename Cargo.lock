@@ -2077,6 +2077,7 @@ dependencies = [
  "locality-connector",
  "locality-core",
  "locality-gmail",
+ "locality-google-calendar",
  "locality-google-docs",
  "locality-granola",
  "locality-linear",
@@ -2133,6 +2134,7 @@ dependencies = [
  "locality-connector",
  "locality-core",
  "locality-gmail",
+ "locality-google-calendar",
  "locality-google-docs",
  "locality-notion",
  "locality-platform",
@@ -2171,6 +2173,20 @@ name = "locality-gmail"
 version = "0.3.4"
 dependencies = [
  "base64 0.22.1",
+ "locality-connector",
+ "locality-core",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "yaml_serde",
+]
+
+[[package]]
+name = "locality-google-calendar"
+version = "0.3.2"
+dependencies = [
+ "chrono",
  "locality-connector",
  "locality-core",
  "reqwest",
@@ -2266,6 +2282,7 @@ dependencies = [
  "locality-connector",
  "locality-core",
  "locality-gmail",
+ "locality-google-calendar",
  "locality-google-docs",
  "locality-granola",
  "locality-linear",

@@ -1,7 +1,7 @@
 import { classifyMountSetupError } from "./onboarding-errors";
 
 export type SourceSetupState = "idle" | "connecting" | "creating" | "changing" | "success" | "error";
-const SOURCE_CONNECTORS = ["notion", "google-docs", "gmail", "granola", "linear"] as const;
+const SOURCE_CONNECTORS = ["notion", "google-docs", "google-calendar", "gmail", "granola", "linear"] as const;
 export type SourceConnectorId = (typeof SOURCE_CONNECTORS)[number];
 export type ApiKeySourceConnectorId = Extract<SourceConnectorId, "granola" | "linear">;
 export type SourceMountRetryOutcome =

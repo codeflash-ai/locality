@@ -4426,6 +4426,56 @@ mod tests {
     }
 
     #[test]
+    fn google_calendar_folder_read_only_metadata_reflects_direct_draft_create_policy() {
+        let mount_id = MountId::new("google-calendar-main");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount_with_connector(&mount_id, "google-calendar"))
+            .expect("save mount");
+        for (remote_id, title, path) in [
+            ("google-calendar-folder:draft", "draft", "draft"),
+            ("google-calendar-folder:events", "events", "events"),
+            (
+                "google-calendar-folder:draft/nested",
+                "nested",
+                "draft/nested",
+            ),
+        ] {
+            store
+                .save_entity(EntityRecord {
+                    mount_id: mount_id.clone(),
+                    remote_id: RemoteId::new(remote_id),
+                    kind: EntityKind::Directory,
+                    title: title.to_string(),
+                    path: path.into(),
+                    hydration: HydrationState::Stub,
+                    content_hash: None,
+                    remote_edited_at: Some(format!("folder:{path}")),
+                })
+                .expect("save folder");
+        }
+
+        assert!(
+            !virtual_fs_item(&store, &mount_id, "google-calendar-folder:draft")
+                .expect("draft item")
+                .item
+                .read_only
+        );
+        assert!(
+            virtual_fs_item(&store, &mount_id, "google-calendar-folder:events")
+                .expect("events item")
+                .item
+                .read_only
+        );
+        assert!(
+            virtual_fs_item(&store, &mount_id, "google-calendar-folder:draft/nested")
+                .expect("nested draft folder item")
+                .item
+                .read_only
+        );
+    }
+
+    #[test]
     fn source_folder_read_only_metadata_reflects_create_parent_kinds() {
         let notion_mount_id = MountId::new("notion-main");
         let mut notion_store = InMemoryStateStore::new();

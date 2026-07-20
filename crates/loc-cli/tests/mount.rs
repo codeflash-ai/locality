@@ -10,6 +10,8 @@ use loc_cli::mount::{GuidanceFileAction, MountOptions, run_mount};
 use locality_connector::ConnectorCapabilities;
 use locality_core::model::{MountId, RemoteId};
 use locality_gmail::{GMAIL_OAUTH_SCOPES, gmail_capabilities_json};
+use locality_google_calendar::oauth::google_calendar_capabilities_json;
+use locality_google_calendar::{GOOGLE_CALENDAR_OAUTH_SCOPES, StoredGoogleCalendarCredential};
 use locality_platform::{capabilities::projection_cli_value, mount_cli_capabilities};
 use locality_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
@@ -556,6 +558,95 @@ fn cli_mount_gmail_persists_date_window_and_thread_view() {
 }
 
 #[test]
+fn cli_mount_google_calendar_persists_explicit_date_window_settings() {
+    let fixture = MountFixture::new("loc-cli-google-calendar-mount-settings");
+    fs::create_dir_all(&fixture.root).expect("create fixture root");
+    let state_root = fixture.root.join("state");
+    seed_cli_google_calendar_connection(&state_root, "calendar-work");
+
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let mount_root = fixture.root.join("calendar");
+    let mount_root_arg = mount_root.display().to_string();
+
+    let report = loc_json_ok(loc_command(loc, &state_root).args([
+        "mount",
+        "google-calendar",
+        mount_root_arg.as_str(),
+        "--connection",
+        "calendar-work",
+        "--mount-id",
+        "calendar-main",
+        "--projection",
+        "plain-files",
+        "--after",
+        "2026-07-01",
+        "--before",
+        "2026-07-31",
+        "--json",
+    ]));
+
+    assert_eq!(report["connector"], "google-calendar", "{report:#?}");
+    assert_eq!(
+        report["settings_json"],
+        r#"{"google_calendar":{"date_window":{"after":"2026-07-01","before":"2026-07-31"}}}"#,
+        "{report:#?}"
+    );
+
+    let store = SqliteStateStore::open(state_root).expect("open state");
+    let mount = store
+        .get_mount(&MountId::new("calendar-main"))
+        .expect("load mount")
+        .expect("mount exists");
+    assert_eq!(mount.connector, "google-calendar");
+    assert_eq!(mount.remote_root_id, None);
+    assert_eq!(
+        mount.connection_id,
+        Some(ConnectionId::new("calendar-work"))
+    );
+    assert_eq!(
+        mount.settings_json,
+        r#"{"google_calendar":{"date_window":{"after":"2026-07-01","before":"2026-07-31"}}}"#
+    );
+}
+
+#[test]
+fn cli_mount_google_calendar_rejects_partial_date_window() {
+    for args in [
+        vec!["--after", "2026-07-01"],
+        vec!["--before", "2026-07-31"],
+    ] {
+        let fixture = MountFixture::new("loc-cli-google-calendar-partial-date-window");
+        fs::create_dir_all(&fixture.root).expect("create fixture root");
+        let state_root = fixture.root.join("state");
+        seed_cli_google_calendar_connection(&state_root, "calendar-work");
+        let loc = env!("CARGO_BIN_EXE_loc");
+        let mount_root = fixture.root.join("calendar");
+        let mount_root_arg = mount_root.display().to_string();
+        let mut command = loc_command(loc, &state_root);
+        command.args([
+            "mount",
+            "google-calendar",
+            mount_root_arg.as_str(),
+            "--connection",
+            "calendar-work",
+            "--projection",
+            "plain-files",
+            "--json",
+        ]);
+        command.args(args);
+
+        let output = command.output().expect("run loc mount google-calendar");
+        assert!(!output.status.success());
+        let body: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("json error response");
+        assert_eq!(
+            body["code"],
+            "google_calendar_date_window_requires_after_and_before"
+        );
+    }
+}
+
+#[test]
 fn cli_mount_gmail_rejects_partial_date_window() {
     for args in [
         vec!["--after", "2026-07-01"],
@@ -822,6 +913,54 @@ fn cli_mount_gmail_rejects_remote_root_selectors() {
 }
 
 #[test]
+fn cli_mount_google_calendar_rejects_remote_root_selectors() {
+    let cases: &[&[&str]] = &[
+        &["--workspace"],
+        &["--root-page", "root-page"],
+        &["--workspace-folder", "workspace-folder"],
+    ];
+
+    for forbidden_args in cases {
+        let fixture = MountFixture::new("loc-cli-google-calendar-mount-root-rejection");
+        fs::create_dir_all(&fixture.root).expect("create fixture root");
+        let state_root = fixture.root.join("state");
+        seed_cli_google_calendar_connection(&state_root, "calendar-work");
+
+        let loc = env!("CARGO_BIN_EXE_loc");
+        let mount_root = fixture.root.join("calendar");
+        let mount_root_arg = mount_root.display().to_string();
+        let mut command = loc_command(loc, &state_root);
+        command.args([
+            "mount",
+            "google-calendar",
+            mount_root_arg.as_str(),
+            "--connection",
+            "calendar-work",
+            "--mount-id",
+            "calendar-main",
+            "--projection",
+            "plain-files",
+            "--json",
+        ]);
+        command.args(*forbidden_args);
+
+        let output = command.output().expect("run loc mount google-calendar");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            !output.status.success(),
+            "Google Calendar mount accepted forbidden args {forbidden_args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+
+        let store = SqliteStateStore::open(state_root).expect("open state");
+        assert!(
+            store.load_mounts().expect("load mounts").is_empty(),
+            "Google Calendar mount with forbidden args {forbidden_args:?} must not be persisted"
+        );
+    }
+}
+
+#[test]
 fn virtual_mount_rejects_duplicate_mount_point_under_same_root() {
     let fixture = MountFixture::new("loc-cli-duplicate-mount-point");
     let mut store = InMemoryStateStore::new();
@@ -1045,6 +1184,81 @@ fn seed_cli_gmail_connection(state_root: &Path, connection_id: &str) {
             expires_at: None,
         })
         .expect("seed Gmail connection");
+}
+
+fn seed_cli_google_calendar_connection(state_root: &Path, connection_id: &str) {
+    fs::create_dir_all(state_root).expect("create state root");
+    let profile_id = ConnectorProfileId::new("google-calendar-oauth-default");
+    let secret_ref = format!("connection:{connection_id}");
+    let credentials = FileCredentialStore::new(state_root);
+    let credential = StoredGoogleCalendarCredential {
+        kind: "oauth".to_string(),
+        connector: "google-calendar".to_string(),
+        access_token: "access-token".to_string(),
+        token_type: Some("Bearer".to_string()),
+        oauth_client_id: Some("google-client-id".to_string()),
+        oauth_broker_url: Some("https://auth.example.test".to_string()),
+        account_id: Some("acct-1".to_string()),
+        account_label: Some(format!("{connection_id}@example.com")),
+        workspace_id: Some("primary".to_string()),
+        workspace_name: Some("Primary Calendar".to_string()),
+        scopes: GOOGLE_CALENDAR_OAUTH_SCOPES
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect(),
+        refresh_token_handle: Some("refresh-handle".to_string()),
+        acquired_at: 1_783_036_800,
+        expires_at: None,
+    };
+    credentials
+        .put(
+            &secret_ref,
+            &serde_json::to_string(&credential).expect("credential json"),
+        )
+        .expect("seed credential");
+
+    let now = "2026-07-03T00:00:00Z".to_string();
+    let capabilities_json =
+        google_calendar_capabilities_json().expect("google calendar capabilities");
+    let scopes = GOOGLE_CALENDAR_OAUTH_SCOPES
+        .iter()
+        .map(|scope| scope.to_string())
+        .collect::<Vec<_>>();
+    let mut store = SqliteStateStore::open(state_root.to_path_buf()).expect("open state");
+    store
+        .save_connector_profile(ConnectorProfileRecord {
+            profile_id: profile_id.clone(),
+            connector: "google-calendar".to_string(),
+            display_name: "Google Calendar OAuth".to_string(),
+            auth_kind: "oauth".to_string(),
+            scopes: scopes.clone(),
+            capabilities_json: capabilities_json.clone(),
+            enabled_actions_json: "[\"read\",\"create\"]".to_string(),
+            connector_version: "google-calendar.v1".to_string(),
+            status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        })
+        .expect("seed Google Calendar profile");
+    store
+        .save_connection(ConnectionRecord {
+            connection_id: ConnectionId::new(connection_id),
+            profile_id: Some(profile_id),
+            connector: "google-calendar".to_string(),
+            display_name: "Google Calendar".to_string(),
+            account_label: Some(format!("{connection_id}@example.com")),
+            workspace_id: Some("primary".to_string()),
+            workspace_name: Some("Primary Calendar".to_string()),
+            auth_kind: "oauth".to_string(),
+            secret_ref,
+            scopes,
+            capabilities_json,
+            status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            expires_at: None,
+        })
+        .expect("seed Google Calendar connection");
 }
 
 fn loc_command(loc: &str, state_root: &Path) -> Command {

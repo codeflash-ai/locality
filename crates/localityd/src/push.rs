@@ -645,7 +645,7 @@ fn resumable_plan_matches(journal: &JournalEntry, plan: &PushPlan, connector: &s
         return true;
     }
 
-    connector == "gmail"
+    create_only_effects_may_change_parent_for_connector(connector)
         && resumable_created_entity_effects(journal)
         && plan.operations.iter().all(is_create_operation)
         && journal.plan.operations.iter().all(is_create_operation)
@@ -689,7 +689,7 @@ fn resumable_entity_effect_ids(journal: &JournalEntry, connector: &str) -> Optio
                     return None;
                 }
                 if parent_id != planned_parent_id
-                    && !gmail_create_only_effects_may_change_parent(connector, &journal.plan)
+                    && !create_only_effects_may_change_parent(connector, &journal.plan)
                 {
                     return None;
                 }
@@ -743,12 +743,16 @@ fn resumable_entity_effect_ids(journal: &JournalEntry, connector: &str) -> Optio
     (seen_operations.len() == journal.plan.operations.len()).then_some(changed_remote_ids)
 }
 
-fn gmail_create_only_effects_may_change_parent(connector: &str, plan: &PushPlan) -> bool {
-    connector == "gmail"
+fn create_only_effects_may_change_parent(connector: &str, plan: &PushPlan) -> bool {
+    create_only_effects_may_change_parent_for_connector(connector)
         && plan
             .operations
             .iter()
             .all(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
+}
+
+fn create_only_effects_may_change_parent_for_connector(connector: &str) -> bool {
+    matches!(connector, "gmail" | "google-calendar")
 }
 
 fn journal_created_entity_sources_match(journal: &JournalEntry, plan: &PushPlan) -> bool {
@@ -869,22 +873,24 @@ fn create_operation_source(operation: &PushOperation) -> Option<(&RemoteId, &Pat
 }
 
 fn auto_save_block_reason_for_prepared(prepared: &PreparedPush) -> Option<String> {
-    gmail_auto_save_block_reason(prepared).or_else(|| auto_save_block_reason(&prepared.pipeline))
+    draft_create_auto_save_block_reason(prepared)
+        .or_else(|| auto_save_block_reason(&prepared.pipeline))
 }
 
-fn gmail_auto_save_block_reason(prepared: &PreparedPush) -> Option<String> {
-    if prepared.mount.connector != "gmail" {
-        return None;
-    }
+fn draft_create_auto_save_block_reason(prepared: &PreparedPush) -> Option<String> {
     let plan = prepared.pipeline.plan.as_ref()?;
-    if plan
+    if !plan
         .operations
         .iter()
         .any(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
     {
-        return Some("Gmail draft sends require review".to_string());
+        return None;
     }
-    None
+    match prepared.mount.connector.as_str() {
+        "gmail" => Some("Gmail draft sends require review".to_string()),
+        "google-calendar" => Some("Google Calendar event creates require review".to_string()),
+        _ => None,
+    }
 }
 
 fn created_entity_id(report: &PushJobReport) -> Option<RemoteId> {
@@ -3393,12 +3399,14 @@ fn create_entity_title_required(
     parsed: &locality_core::canonical::ParsedCanonicalDocument,
     mount: &MountConfig,
 ) -> bool {
-    mount.connector != "gmail"
-        && parsed
-            .frontmatter
-            .title
-            .as_ref()
-            .is_none_or(|title| title.trim().is_empty())
+    if matches!(mount.connector.as_str(), "gmail" | "google-calendar") {
+        return false;
+    }
+    parsed
+        .frontmatter
+        .title
+        .as_ref()
+        .is_none_or(|title| title.trim().is_empty())
 }
 
 fn create_entity_title(
@@ -3416,6 +3424,12 @@ fn create_entity_title(
         && !subject.trim().is_empty()
     {
         return subject.trim().to_string();
+    }
+    if mount.connector == "google-calendar"
+        && let Some(summary) = frontmatter_string(&parsed.frontmatter.properties, "summary")
+        && !summary.trim().is_empty()
+    {
+        return summary.trim().to_string();
     }
     relative_path
         .file_stem()
@@ -3764,7 +3778,7 @@ where
                         entity_path,
                     )
                     .with_hydration(HydrationState::Stub);
-                    let rendered = self.source.fetch_render_with_repository(
+                    let mut rendered = self.source.fetch_render_with_repository(
                         &locality_core::hydration::HydrationRequest::new(
                             request.mount_id.clone(),
                             entity_id.clone(),
@@ -3774,7 +3788,7 @@ where
                         ),
                         &*self.store,
                     )?;
-                    entity.path = created_entity_reconcile_path_from_rendered(
+                    let rendered_path = created_entity_reconcile_path_from_rendered(
                         self.store,
                         request.mount_id,
                         &entity.path,
@@ -3783,6 +3797,21 @@ where
                         entity_id,
                         &rendered,
                     )?;
+                    if rendered_path != entity.path {
+                        entity.path = rendered_path;
+                        rendered = self.source.fetch_render_with_repository(
+                            &locality_core::hydration::HydrationRequest::new(
+                                request.mount_id.clone(),
+                                entity_id.clone(),
+                                entity.path.clone(),
+                                HydrationState::Hydrated,
+                                locality_core::hydration::HydrationReason::ExplicitPull,
+                            ),
+                            &*self.store,
+                        )?;
+                    } else {
+                        entity.path = rendered_path;
+                    }
                     effect_readback_ids.insert(entity_id.clone());
                     created_readbacks.push((*operation_index, entity_id.clone(), entity, rendered));
                 }
@@ -3989,6 +4018,9 @@ where
     if let Some(filename) = gmail_rendered_message_filename(entity_id, rendered) {
         return Ok(parent.path.join(filename));
     }
+    if let Some(filename) = google_calendar_rendered_event_filename(entity_id, rendered) {
+        return Ok(parent.path.join(filename));
+    }
 
     Ok(current_path.to_path_buf())
 }
@@ -4021,9 +4053,9 @@ fn gmail_rendered_message_filename(
 
     Some(format!(
         "{}-{}-{}.md",
-        gmail_safe_slug(internal_date),
-        gmail_safe_slug(title),
-        gmail_safe_slug(entity_id.as_str())
+        created_entity_safe_slug(internal_date),
+        created_entity_safe_slug(title),
+        created_entity_safe_slug(entity_id.as_str())
     ))
 }
 
@@ -4039,7 +4071,88 @@ fn gmail_internal_date<'a>(entity_id: &RemoteId, remote_version: &'a str) -> Opt
     })
 }
 
-fn gmail_safe_slug(value: &str) -> String {
+fn google_calendar_rendered_event_filename(
+    entity_id: &RemoteId,
+    rendered: &HydratedEntity,
+) -> Option<String> {
+    let rendered_markdown = render_canonical_markdown(&rendered.document);
+    let parsed = parse_canonical_markdown(&rendered_markdown).ok()?;
+    let event_id = google_calendar_frontmatter_event_id(&parsed.frontmatter.properties)
+        .or_else(|| google_calendar_event_id_from_remote_id(entity_id))?;
+    let start = google_calendar_start_value(&parsed.frontmatter.properties)?;
+    let summary = frontmatter_string(&parsed.frontmatter.properties, "summary");
+    let title = parsed
+        .frontmatter
+        .title
+        .as_deref()
+        .or(summary.as_deref())
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or("untitled");
+
+    Some(format!(
+        "{}-{}-{}.md",
+        google_calendar_compact_start_prefix(&start),
+        created_entity_safe_slug(title),
+        created_entity_safe_slug(&event_id)
+    ))
+}
+
+fn google_calendar_frontmatter_event_id(
+    properties: &locality_core::canonical::FrontmatterProperties,
+) -> Option<String> {
+    let PropertyValue::Object(google_calendar) = properties
+        .get("google_calendar")
+        .map(property_value_from_frontmatter)?
+    else {
+        return None;
+    };
+    match google_calendar.get("event_id") {
+        Some(PropertyValue::String(value)) if !value.trim().is_empty() => {
+            Some(value.trim().to_string())
+        }
+        _ => None,
+    }
+}
+
+fn google_calendar_start_value(
+    properties: &locality_core::canonical::FrontmatterProperties,
+) -> Option<String> {
+    let PropertyValue::Object(start) = properties
+        .get("start")
+        .map(property_value_from_frontmatter)?
+    else {
+        return None;
+    };
+    match start.get("dateTime").or_else(|| start.get("date")) {
+        Some(PropertyValue::String(value)) if !value.trim().is_empty() => {
+            Some(value.trim().to_string())
+        }
+        _ => None,
+    }
+}
+
+fn google_calendar_event_id_from_remote_id(entity_id: &RemoteId) -> Option<String> {
+    entity_id
+        .as_str()
+        .strip_prefix("google-calendar-event:")
+        .and_then(|rest| rest.split_once(':'))
+        .and_then(|(_, event_id)| (!event_id.is_empty()).then(|| event_id.to_string()))
+}
+
+fn google_calendar_compact_start_prefix(sort_start_key: &str) -> String {
+    let mut digits = sort_start_key
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .take(14)
+        .collect::<String>();
+    while digits.len() < 14 {
+        digits.push('0');
+    }
+    format!("{}-{}", &digits[..8], &digits[8..14])
+}
+
+fn created_entity_safe_slug(value: &str) -> String {
     let mut slug = String::new();
     let mut last_was_dash = false;
     for ch in value.chars().flat_map(char::to_lowercase) {
@@ -4078,9 +4191,9 @@ fn remove_stale_created_entity_source_path(
         return Ok(true);
     }
 
-    // A Gmail draft may have been edited after the send succeeded but before
-    // reconciliation finished. Preserve that edited draft as a new pending send.
-    if mount.connector == "gmail"
+    // Draft creates may have been edited after apply succeeded but before
+    // reconciliation finished. Preserve edited drafts as new pending creates.
+    if preserves_edited_created_entity_source(mount)
         && !created_entity_source_matches_plan(
             mount,
             source_path,
@@ -4098,6 +4211,10 @@ fn remove_stale_created_entity_source_path(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(error.into()),
     }
+}
+
+fn preserves_edited_created_entity_source(mount: &MountConfig) -> bool {
+    matches!(mount.connector.as_str(), "gmail" | "google-calendar")
 }
 
 fn created_entity_source_matches_plan(

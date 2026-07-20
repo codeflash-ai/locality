@@ -252,6 +252,7 @@ pub enum PropertyValue {
     Number(String),
     String(String),
     List(Vec<String>),
+    Array(Vec<PropertyValue>),
     Object(BTreeMap<String, PropertyValue>),
 }
 

@@ -9,6 +9,7 @@ members = [
   "crates/locality-store",
   "crates/locality-notion",
   "crates/locality-google-docs",
+  "crates/locality-google-calendar",
   "crates/locality-gmail",
   "crates/locality-granola",
   "crates/locality-linear",
@@ -30,6 +31,7 @@ locality-platform = { path = "crates/locality-platform" }
 locality-store = { path = "crates/locality-store" }
 locality-notion = { path = "crates/locality-notion" }
 locality-google-docs = { path = "crates/locality-google-docs" }
+locality-google-calendar = { path = "crates/locality-google-calendar" }
 locality-gmail = { path = "crates/locality-gmail" }
 locality-granola = { path = "crates/locality-granola" }
 locality-linear = { path = "crates/locality-linear" }

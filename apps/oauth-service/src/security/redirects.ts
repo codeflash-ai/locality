@@ -11,6 +11,11 @@ const DEFAULT_GOOGLE_DOCS_REDIRECT_URIS = [
   "http://127.0.0.1:8757/oauth/google-docs/callback"
 ];
 
+const DEFAULT_GOOGLE_CALENDAR_REDIRECT_URIS = [
+  "http://localhost:8757/oauth/google-calendar/callback",
+  "http://127.0.0.1:8757/oauth/google-calendar/callback"
+];
+
 const DEFAULT_GMAIL_REDIRECT_URIS = [
   "http://localhost:8757/oauth/gmail/callback",
   "http://127.0.0.1:8757/oauth/gmail/callback"
@@ -30,6 +35,14 @@ export function allowedGoogleDocsRedirectUris(env: BrokerEnv): string[] {
 
 export function validateGoogleDocsRedirectUri(env: BrokerEnv, redirectUri: string): string {
   return validateLoopbackRedirectUri("Google Docs", allowedGoogleDocsRedirectUris(env), redirectUri);
+}
+
+export function allowedGoogleCalendarRedirectUris(env: BrokerEnv): string[] {
+  return splitList(env.LOCALITY_GOOGLE_CALENDAR_REDIRECT_URIS) ?? DEFAULT_GOOGLE_CALENDAR_REDIRECT_URIS;
+}
+
+export function validateGoogleCalendarRedirectUri(env: BrokerEnv, redirectUri: string): string {
+  return validateLoopbackRedirectUri("Google Calendar", allowedGoogleCalendarRedirectUris(env), redirectUri);
 }
 
 export function allowedGmailRedirectUris(env: BrokerEnv): string[] {
