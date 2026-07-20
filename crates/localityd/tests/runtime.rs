@@ -345,6 +345,70 @@ fn runtime_file_provider_children_bypasses_active_background_refreshes() {
 }
 
 #[test]
+fn file_provider_children_waits_for_initial_mount_point_discovery() {
+    let config = relay_config("file-provider-initial-mount-point-discovery");
+    let mount_id = MountId::new("linear-main");
+    let container_identifier = "mount:linear-main".to_string();
+    let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
+    store
+        .save_mount(
+            MountConfig::new(
+                mount_id.clone(),
+                "linear",
+                temp_root("file-provider-initial-mount-point-discovery-root"),
+            )
+            .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    drop(store);
+
+    let (background_tx, background_rx) = mpsc::channel();
+    let (foreground_tx, foreground_rx) = mpsc::channel();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let runtime = DaemonRuntime::spawn_with_runner(
+        config,
+        BlockingBackgroundRefreshRunner {
+            background_tx,
+            foreground_tx,
+            release: Arc::clone(&release),
+        },
+    )
+    .expect("spawn runtime");
+
+    let handle = runtime.handle();
+    let request_container_identifier = container_identifier.clone();
+    let response_thread = thread::spawn(move || {
+        handle.request(DaemonRequest::FileProviderChildren {
+            mount_id: mount_id.0,
+            container_identifier: request_container_identifier,
+        })
+    });
+
+    assert_eq!(
+        background_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("interactive discovery refresh"),
+        ("linear-main".to_string(), container_identifier.clone())
+    );
+    assert!(
+        foreground_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "children should wait until initial discovery completes"
+    );
+
+    release_blocked_runner(&release);
+    assert_eq!(
+        foreground_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("children after discovery"),
+        ("linear-main".to_string(), container_identifier)
+    );
+    assert!(response_thread.join().expect("response").ok);
+    runtime.shutdown();
+}
+
+#[test]
 fn runtime_serializes_mutating_requests() {
     let state = Arc::new(SerialState::default());
     let runtime = DaemonRuntime::spawn_with_runner(
