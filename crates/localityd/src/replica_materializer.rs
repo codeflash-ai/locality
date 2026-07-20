@@ -570,8 +570,10 @@ fn set_directory_read_only(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_directory_read_only(_path: &Path) -> io::Result<()> {
-    Ok(())
+fn set_directory_read_only(path: &Path) -> io::Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions)
 }
 
 fn make_tree_removable(root: &Path) {

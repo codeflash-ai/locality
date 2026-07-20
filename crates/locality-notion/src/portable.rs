@@ -235,12 +235,20 @@ fn inventory(
     let mut changes = entries
         .into_iter()
         .map(|entry| {
-            let logical_path = entry.path.to_str().ok_or_else(|| {
-                LocalityError::InvalidState(
-                    "Notion portable projection produced a non-UTF-8 relative path".to_string(),
-                )
-            })?;
-            let logical_path = LogicalPath::new(logical_path.to_string()).map_err(|error| {
+            let logical_path = entry
+                .path
+                .iter()
+                .map(|component| {
+                    component.to_str().ok_or_else(|| {
+                        LocalityError::InvalidState(
+                            "Notion portable projection produced a non-UTF-8 relative path"
+                                .to_string(),
+                        )
+                    })
+                })
+                .collect::<LocalityResult<Vec<_>>>()?
+                .join("/");
+            let logical_path = LogicalPath::new(logical_path).map_err(|error| {
                 LocalityError::InvalidState(format!(
                     "Notion portable projection produced an invalid logical path: {error}"
                 ))
