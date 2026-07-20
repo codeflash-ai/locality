@@ -9,43 +9,108 @@
     "changeset": 1
   },
   "changeset_id": "changeset-3",
+  "tenant_id": "tenant-acme",
   "session_id": "session-7",
+  "acting_principal_id": "principal-agent",
+  "workload_id": "workload-sandbox",
+  "authorization_revision": 42,
+  "policy_revision": 17,
+  "profile_revision": 9,
   "parent_changeset_id": null,
-  "base_revisions": [
+  "replica_revisions": [
     {
       "source_connection_id": "source-notion",
       "replica_revision_id": "replica-108"
     }
   ],
-  "operations": {
-    "affected_entities": [],
+  "affected_projection_ids": [
+    "projection-roadmap"
+  ],
+  "affected_source_objects": [
+    {
+      "source_connection_id": "source-notion",
+      "remote_id": "page-roadmap"
+    }
+  ],
+  "delivered_bases": [
+    {
+      "projection_id": "projection-roadmap",
+      "source_object": {
+        "source_connection_id": "source-notion",
+        "remote_id": "page-roadmap"
+      },
+      "provider_precondition": "opaque-v4",
+      "delivered_content_sha256": "sha256:roadmap",
+      "delivered_shadow_sha256": "sha256:roadmap-shadow"
+    }
+  ],
+  "content": {
+    "kind": "inline",
+    "edited_canonical_bodies": [
+      {
+        "projection_id": "projection-roadmap",
+        "logical_path": "Projects/Roadmap/page.md",
+        "canonical_sha256": "sha256:edited-roadmap",
+        "canonical_markdown": "---\nloc:\n  id: page-roadmap\n  type: page\ntitle: Roadmap\n---\nChanged paragraph.\n"
+      }
+    ]
+  },
+  "advisory_operations": {
+    "affected_entities": [
+      "page-roadmap"
+    ],
     "operations": [
       {
-        "type": "create_entity",
-        "parent_id": "page-parent",
-        "parent_kind": "directory",
-        "parent_workspace": false,
-        "title": "Agent draft",
-        "properties": {},
-        "body": "Draft body.\n",
-        "source_path": "Projects/Agent draft/page.md"
+        "type": "update_block",
+        "block_id": "block-1",
+        "content": "Changed paragraph."
       }
     ],
     "summary": {
       "blocks_created": 0,
-      "blocks_updated": 0,
+      "blocks_updated": 1,
       "blocks_replaced": 0,
       "blocks_moved": 0,
       "media_updated": 0,
       "blocks_archived": 0,
-      "entities_created": 1,
+      "entities_created": 0,
       "entities_archived": 0,
       "entities_moved": 0,
       "properties_updated": 0
     },
     "degradations": []
   },
+  "readable_diff": {
+    "files": [
+      {
+        "path": "Projects/Roadmap/page.md",
+        "old_label": "a/Projects/Roadmap/page.md",
+        "new_label": "b/Projects/Roadmap/page.md",
+        "status": "modified",
+        "patch": "diff --locality a/Projects/Roadmap/page.md b/Projects/Roadmap/page.md\n--- a/Projects/Roadmap/page.md\n+++ b/Projects/Roadmap/page.md\n@@ -1 +1 @@\n-Old paragraph.\n+Changed paragraph.\n"
+      }
+    ],
+    "text": "diff --locality a/Projects/Roadmap/page.md b/Projects/Roadmap/page.md\n--- a/Projects/Roadmap/page.md\n+++ b/Projects/Roadmap/page.md\n@@ -1 +1 @@\n-Old paragraph.\n+Changed paragraph.\n"
+  },
   "readable_diff_sha256": "sha256:diff",
+  "operation_ids": [
+    "changeset-3:0:update_block:block-1"
+  ],
+  "idempotency_key": "changeset-3",
+  "client_validation_results": [
+    {
+      "code": "validated",
+      "projection_id": "projection-roadmap",
+      "logical_path": "Projects/Roadmap/page.md",
+      "line": null,
+      "message": "client validation passed",
+      "suggested_fix": null
+    }
+  ],
+  "audit_reference": {
+    "kind": "git_commit",
+    "reference": "0123456789abcdef"
+  },
   "content_digest": "sha256:changeset",
   "submitted_at": "2026-07-19T12:00:00Z"
 }

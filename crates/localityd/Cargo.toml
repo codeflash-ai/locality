@@ -16,7 +16,9 @@ path = "src/main.rs"
 
 [dependencies]
 locality-core.workspace = true
+locality-engine.workspace = true
 locality-platform.workspace = true
+locality-protocol.workspace = true
 locality-store.workspace = true
 locality-connector.workspace = true
 locality-notion.workspace = true

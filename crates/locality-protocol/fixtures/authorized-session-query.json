@@ -11,8 +11,14 @@
   "tenant_id": "tenant-acme",
   "session_id": "session-7",
   "acting_principal_id": "principal-agent",
+  "workload_id": "workload-sandbox",
   "authorization_revision": 42,
+  "policy_revision": 17,
   "profile_revision": 9,
+  "effective_actions": [
+    "read",
+    "update"
+  ],
   "replica_revisions": [
     {
       "source_connection_id": "source-notion",

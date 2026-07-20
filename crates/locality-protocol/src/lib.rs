@@ -5,14 +5,16 @@
 //! contains no HTTP client, database repository, cloud SDK, or host path.
 
 use std::collections::BTreeSet;
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 
+use locality_core::journal::PushOperationId;
 use locality_core::model::RemoteId;
 use locality_core::portable::{
     AccessSetId, ChangesetId, ContentVersionId, LogicalPath, PrincipalId, ProjectionEntry,
     ProjectionFileKind, ProjectionId, ProjectionVersionId, ReplicaRevisionId, SessionId,
     SourceAction, SourceConnectionId, SourceOperationPlan, SourceVersionId, TenantId,
 };
+use locality_core::readable_diff::ReadableDiffOutput;
 use serde::{Deserialize, Serialize};
 
 pub use locality_core::portable::RESERVED_EXPORT_METADATA_PATH;
@@ -227,8 +229,11 @@ pub struct AuthorizedSessionQuery {
     pub tenant_id: TenantId,
     pub session_id: SessionId,
     pub acting_principal_id: PrincipalId,
+    pub workload_id: String,
     pub authorization_revision: u64,
+    pub policy_revision: u64,
     pub profile_revision: u64,
+    pub effective_actions: BTreeSet<SourceAction>,
     pub replica_revisions: Vec<SessionReplicaRevision>,
     pub validated_filter_digest: String,
     pub max_entries: u64,
@@ -303,17 +308,166 @@ pub struct WritableSessionState {
     pub pending_changeset_ids: BTreeSet<ChangesetId>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BootstrapExchangeRequest {
     pub versions: ComponentVersions,
     pub bootstrap_token: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+impl Debug for BootstrapExchangeRequest {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BootstrapExchangeRequest")
+            .field("versions", &self.versions)
+            .field("bootstrap_token", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCapability {
     pub session_id: SessionId,
     pub opaque_capability: String,
     pub expires_at: String,
+}
+
+impl Debug for SessionCapability {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionCapability")
+            .field("session_id", &self.session_id)
+            .field("opaque_capability", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// Versioned request for a backend-authorized working session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRequest {
+    pub versions: ComponentVersions,
+    pub tenant_id: TenantId,
+    pub profile_revision: u64,
+    pub acting_principal_id: PrincipalId,
+    pub workload_id: String,
+    pub requested_actions: BTreeSet<SourceAction>,
+    pub narrowing_filter_digest: Option<String>,
+}
+
+/// Backend decision returned after intersecting tenant, actor, workload, and
+/// profile authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGrant {
+    pub versions: ComponentVersions,
+    pub session_id: SessionId,
+    pub capability: SessionCapability,
+    pub authorization_revision: u64,
+    pub policy_revision: u64,
+    pub profile_revision: u64,
+    pub replica_revisions: Vec<SessionReplicaRevision>,
+    pub effective_actions: BTreeSet<SourceAction>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicaExportRequest {
+    pub versions: ComponentVersions,
+    pub capability: SessionCapability,
+}
+
+/// One versioned frame in an ordered replica export. Transports may encode
+/// frames as HTTP records, tar members, or another bounded streaming format.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicaExportFrame {
+    pub versions: ComponentVersions,
+    pub sequence: u64,
+    pub payload: ReplicaExportPayload,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ReplicaExportPayload {
+    Started {
+        session_id: SessionId,
+        replica_revisions: Vec<SessionReplicaRevision>,
+    },
+    Entry(OrderedExportRow),
+    WritableMetadata(WritableExportMetadata),
+    Completed(DeliveredCount),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ChangesetSourceObject {
+    pub source_connection_id: SourceConnectionId,
+    pub remote_id: RemoteId,
+}
+
+/// Base facts delivered with one writable projection. These are sufficient for
+/// a server to retrieve the same base, verify its preconditions, and re-plan.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveredChangesetBase {
+    pub projection_id: ProjectionId,
+    pub source_object: ChangesetSourceObject,
+    pub provider_precondition: String,
+    pub delivered_content_sha256: String,
+    pub delivered_shadow_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditedCanonicalBody {
+    pub projection_id: ProjectionId,
+    pub logical_path: LogicalPath,
+    pub canonical_sha256: String,
+    pub canonical_markdown: String,
+}
+
+/// An upload capability is secret-bearing. Its custom Debug implementation
+/// keeps logs and assertion failures from revealing it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizedChangesetUpload {
+    pub upload_id: String,
+    pub opaque_capability: String,
+    pub content_sha256: String,
+    pub byte_length: u64,
+}
+
+impl Debug for AuthorizedChangesetUpload {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorizedChangesetUpload")
+            .field("upload_id", &self.upload_id)
+            .field("opaque_capability", &"<redacted>")
+            .field("content_sha256", &self.content_sha256)
+            .field("byte_length", &self.byte_length)
+            .finish()
+    }
+}
+
+/// The enum makes inline bodies and an authorized upload mutually exclusive.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ChangesetContent {
+    Inline {
+        edited_canonical_bodies: Vec<EditedCanonicalBody>,
+    },
+    AuthorizedUpload {
+        upload: AuthorizedChangesetUpload,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientValidationResult {
+    pub code: String,
+    pub projection_id: Option<ProjectionId>,
+    pub logical_path: LogicalPath,
+    pub line: Option<usize>,
+    pub message: String,
+    pub suggested_fix: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditReference {
+    pub kind: String,
+    pub reference: String,
 }
 
 /// Portable immutable changeset envelope.
@@ -324,13 +478,71 @@ pub struct SessionCapability {
 pub struct ChangesetEnvelope {
     pub versions: ComponentVersions,
     pub changeset_id: ChangesetId,
+    pub tenant_id: TenantId,
     pub session_id: SessionId,
+    pub acting_principal_id: PrincipalId,
+    pub workload_id: String,
+    pub authorization_revision: u64,
+    pub policy_revision: u64,
+    pub profile_revision: u64,
     pub parent_changeset_id: Option<ChangesetId>,
-    pub base_revisions: Vec<SessionReplicaRevision>,
-    pub operations: SourceOperationPlan,
+    pub replica_revisions: Vec<SessionReplicaRevision>,
+    pub affected_projection_ids: BTreeSet<ProjectionId>,
+    pub affected_source_objects: BTreeSet<ChangesetSourceObject>,
+    pub delivered_bases: Vec<DeliveredChangesetBase>,
+    pub content: ChangesetContent,
+    pub advisory_operations: SourceOperationPlan,
+    pub readable_diff: ReadableDiffOutput,
     pub readable_diff_sha256: String,
+    pub operation_ids: Vec<PushOperationId>,
+    pub idempotency_key: String,
+    pub client_validation_results: Vec<ClientValidationResult>,
+    pub audit_reference: Option<AuditReference>,
     pub content_digest: String,
     pub submitted_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangesetReceipt {
+    pub versions: ComponentVersions,
+    pub changeset_id: ChangesetId,
+    pub state: ChangesetState,
+    pub received_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangesetStatusRequest {
+    pub versions: ComponentVersions,
+    pub changeset_id: ChangesetId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangesetStatus {
+    pub versions: ComponentVersions,
+    pub changeset_id: ChangesetId,
+    pub state: ChangesetState,
+    pub updated_at: String,
+    pub detail: Option<ChangesetStatusDetail>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangesetState {
+    NoOp,
+    Received,
+    Applying,
+    Applied,
+    Reconciled,
+    Conflicted,
+    Rejected,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangesetStatusDetail {
+    pub code: String,
+    pub message: String,
+    pub retriable: bool,
 }
 
 pub const COMPONENT_VERSIONS_GOLDEN_JSON: &[u8] =

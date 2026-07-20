@@ -1,3 +1,5 @@
+use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use locality_connector::{
@@ -9,16 +11,28 @@ use locality_core::LocalityResult;
 use locality_core::model::{
     CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
 };
-use localityd::remote_truth::{DirectSourceReplica, RemoteTruthAuthority, RemoteTruthProvider};
+use locality_core::portable::{ChangesetId, PrincipalId, SessionId, SourceAction, TenantId};
+use locality_protocol::{
+    CHANGESET_ENVELOPE_GOLDEN_JSON, COMPONENT_VERSIONS, ChangesetEnvelope, ChangesetReceipt,
+    ChangesetState, ChangesetStatus, ChangesetStatusRequest, ReplicaExportFrame,
+    ReplicaExportRequest, SessionCapability, SessionGrant, SessionRequest,
+};
+use localityd::remote_truth::{
+    BackendReplica, DirectSourceReplica, RemoteTruthAuthority, RemoteTruthProvider, ReplicaService,
+};
 
 #[derive(Clone)]
 struct RecordingDirectConnector {
     execution_policy: ConnectorExecutionPolicy,
+    enumerations: Cell<usize>,
 }
 
 impl Connector for RecordingDirectConnector {
     fn with_execution_policy(&self, execution_policy: ConnectorExecutionPolicy) -> Self {
-        Self { execution_policy }
+        Self {
+            execution_policy,
+            enumerations: Cell::new(self.enumerations.get()),
+        }
     }
 
     fn kind(&self) -> ConnectorKind {
@@ -30,6 +44,7 @@ impl Connector for RecordingDirectConnector {
     }
 
     fn enumerate(&self, request: EnumerateRequest) -> LocalityResult<Vec<TreeEntry>> {
+        self.enumerations.set(self.enumerations.get() + 1);
         Ok(vec![TreeEntry {
             mount_id: request.mount_id,
             remote_id: RemoteId::new("page-1"),
@@ -88,6 +103,7 @@ impl Connector for RecordingDirectConnector {
 fn direct_source_replica_declares_authority_and_delegates_without_fallback() {
     let connector = RecordingDirectConnector {
         execution_policy: ConnectorExecutionPolicy::Inline,
+        enumerations: Cell::new(0),
     }
     .with_execution_policy(ConnectorExecutionPolicy::DeferProviderCooldown);
     let provider = DirectSourceReplica::new(&connector);
@@ -107,4 +123,120 @@ fn direct_source_replica_declares_authority_and_delegates_without_fallback() {
         .expect("direct enumeration");
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].remote_id, RemoteId::new("page-1"));
+    assert_eq!(connector.enumerations.get(), 1);
+}
+
+struct RecordingReplicaService {
+    calls: Cell<usize>,
+}
+
+impl ReplicaService for RecordingReplicaService {
+    type Error = &'static str;
+    type Export = std::vec::IntoIter<Result<ReplicaExportFrame, Self::Error>>;
+
+    fn create_session(&self, request: SessionRequest) -> Result<SessionGrant, Self::Error> {
+        self.calls.set(self.calls.get() + 1);
+        Ok(SessionGrant {
+            versions: request.versions,
+            session_id: SessionId::new("backend-session"),
+            capability: SessionCapability {
+                session_id: SessionId::new("backend-session"),
+                opaque_capability: "secret-capability".to_string(),
+                expires_at: "2026-07-19T13:00:00Z".to_string(),
+            },
+            authorization_revision: 42,
+            policy_revision: 17,
+            profile_revision: request.profile_revision,
+            replica_revisions: Vec::new(),
+            effective_actions: request.requested_actions,
+        })
+    }
+
+    fn open_export(&self, _request: ReplicaExportRequest) -> Result<Self::Export, Self::Error> {
+        self.calls.set(self.calls.get() + 1);
+        Ok(Vec::new().into_iter())
+    }
+
+    fn submit_changeset(
+        &self,
+        changeset: ChangesetEnvelope,
+    ) -> Result<ChangesetReceipt, Self::Error> {
+        self.calls.set(self.calls.get() + 1);
+        Ok(ChangesetReceipt {
+            versions: changeset.versions,
+            changeset_id: changeset.changeset_id,
+            state: ChangesetState::Received,
+            received_at: "2026-07-19T12:00:01Z".to_string(),
+        })
+    }
+
+    fn changeset_status(
+        &self,
+        request: ChangesetStatusRequest,
+    ) -> Result<ChangesetStatus, Self::Error> {
+        self.calls.set(self.calls.get() + 1);
+        Ok(ChangesetStatus {
+            versions: request.versions,
+            changeset_id: request.changeset_id,
+            state: ChangesetState::Reconciled,
+            updated_at: "2026-07-19T12:00:02Z".to_string(),
+            detail: None,
+        })
+    }
+}
+
+#[test]
+fn backend_replica_uses_only_replica_service_authority() {
+    let connector = RecordingDirectConnector {
+        execution_policy: ConnectorExecutionPolicy::Inline,
+        enumerations: Cell::new(0),
+    };
+    let service = RecordingReplicaService {
+        calls: Cell::new(0),
+    };
+    let provider = BackendReplica::new(&service);
+
+    assert_eq!(provider.authority(), RemoteTruthAuthority::BackendReplica);
+    let grant = provider
+        .service()
+        .create_session(SessionRequest {
+            versions: COMPONENT_VERSIONS,
+            tenant_id: TenantId::new("tenant-acme"),
+            profile_revision: 9,
+            acting_principal_id: PrincipalId::new("principal-agent"),
+            workload_id: "workload-sandbox".to_string(),
+            requested_actions: BTreeSet::from([SourceAction::Read, SourceAction::Update]),
+            narrowing_filter_digest: None,
+        })
+        .expect("backend session");
+    assert_eq!(grant.session_id, SessionId::new("backend-session"));
+
+    provider
+        .service()
+        .open_export(ReplicaExportRequest {
+            versions: COMPONENT_VERSIONS,
+            capability: grant.capability,
+        })
+        .expect("backend export");
+    let envelope = serde_json::from_slice::<ChangesetEnvelope>(CHANGESET_ENVELOPE_GOLDEN_JSON)
+        .expect("changeset golden");
+    let receipt = provider
+        .service()
+        .submit_changeset(envelope)
+        .expect("backend changeset");
+    provider
+        .service()
+        .changeset_status(ChangesetStatusRequest {
+            versions: COMPONENT_VERSIONS,
+            changeset_id: ChangesetId::new("changeset-3"),
+        })
+        .expect("backend status");
+
+    assert_eq!(receipt.state, ChangesetState::Received);
+    assert_eq!(service.calls.get(), 4);
+    assert_eq!(
+        connector.enumerations.get(),
+        0,
+        "backend must not fall back"
+    );
 }

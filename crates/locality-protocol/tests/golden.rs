@@ -1,6 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-use locality_core::model::{EntityKind, RemoteId};
+use locality_core::journal::PushOperationId;
+use locality_core::model::RemoteId;
 use locality_core::planner::PlanSummary;
 use locality_core::portable::{
     AccessSetId, ChangesetId, ContentVersionId, LogicalPath, PrincipalId, ProjectionEntry,
@@ -8,14 +9,17 @@ use locality_core::portable::{
     SessionId, SourceAction, SourceConnectionId, SourceOperation, SourceOperationPlan,
     SourceVersionId, TenantId,
 };
+use locality_core::readable_diff::readable_diff_for_file;
 use locality_protocol::{
     ACCESS_SET_GOLDEN_JSON, AUTHORIZED_SESSION_QUERY_GOLDEN_JSON, AccessSetContract, AccessSubject,
-    AuthorizedSessionQuery, CHANGESET_ENVELOPE_GOLDEN_JSON, COMPONENT_VERSIONS,
-    COMPONENT_VERSIONS_GOLDEN_JSON, CONTENT_VERSION_GOLDEN_JSON, ChangesetEnvelope,
-    ComponentVersions, ContentVersionContract, DELIVERED_COUNT_GOLDEN_JSON, DeliveredCount,
-    ORDERED_EXPORT_ROWS_GOLDEN_JSON, OrderedExportRow, PROJECTION_VERSION_GOLDEN_JSON,
-    ProjectionVersionContract, READY_REPLICA_REVISION_GOLDEN_JSON, ReadyReplicaRevision,
-    SOURCE_VERSION_GOLDEN_JSON, SessionReplicaRevision, SourceVersionContract,
+    AuditReference, AuthorizedChangesetUpload, AuthorizedSessionQuery, BootstrapExchangeRequest,
+    CHANGESET_ENVELOPE_GOLDEN_JSON, COMPONENT_VERSIONS, COMPONENT_VERSIONS_GOLDEN_JSON,
+    CONTENT_VERSION_GOLDEN_JSON, ChangesetContent, ChangesetEnvelope, ChangesetSourceObject,
+    ClientValidationResult, ComponentVersions, ContentVersionContract, DELIVERED_COUNT_GOLDEN_JSON,
+    DeliveredChangesetBase, DeliveredCount, EditedCanonicalBody, ORDERED_EXPORT_ROWS_GOLDEN_JSON,
+    OrderedExportRow, PROJECTION_VERSION_GOLDEN_JSON, ProjectionVersionContract,
+    READY_REPLICA_REVISION_GOLDEN_JSON, ReadyReplicaRevision, SOURCE_VERSION_GOLDEN_JSON,
+    SessionCapability, SessionReplicaRevision, SourceVersionContract,
     WRITABLE_EXPORT_METADATA_GOLDEN_JSON, WritableExportMetadata, WritableMetadataEntry,
 };
 use serde::Serialize;
@@ -82,7 +86,41 @@ fn ordered_export_rows_are_exact_golden_bytes() {
 
 #[test]
 fn portable_changeset_is_exact_golden_bytes() {
-    assert_exact_round_trip(CHANGESET_ENVELOPE_GOLDEN_JSON, &changeset());
+    let changeset = changeset();
+    assert!(matches!(changeset.content, ChangesetContent::Inline { .. }));
+    assert_eq!(
+        changeset.operation_ids.len(),
+        changeset.advisory_operations.operations.len()
+    );
+    assert_exact_round_trip(CHANGESET_ENVELOPE_GOLDEN_JSON, &changeset);
+}
+
+#[test]
+fn capability_debug_output_is_redacted() {
+    let bootstrap = BootstrapExchangeRequest {
+        versions: COMPONENT_VERSIONS,
+        bootstrap_token: "bootstrap-secret".to_string(),
+    };
+    let session = SessionCapability {
+        session_id: SessionId::new("session-7"),
+        opaque_capability: "session-secret".to_string(),
+        expires_at: "2026-07-19T13:00:00Z".to_string(),
+    };
+    let upload = AuthorizedChangesetUpload {
+        upload_id: "upload-1".to_string(),
+        opaque_capability: "upload-secret".to_string(),
+        content_sha256: "sha256:upload".to_string(),
+        byte_length: 99,
+    };
+
+    for (debug, secret) in [
+        (format!("{bootstrap:?}"), "bootstrap-secret"),
+        (format!("{session:?}"), "session-secret"),
+        (format!("{upload:?}"), "upload-secret"),
+    ] {
+        assert!(debug.contains("<redacted>"), "{debug}");
+        assert!(!debug.contains(secret), "{debug}");
+    }
 }
 
 #[test]
@@ -137,8 +175,11 @@ fn authorized_query() -> AuthorizedSessionQuery {
         tenant_id: TenantId::new("tenant-acme"),
         session_id: SessionId::new("session-7"),
         acting_principal_id: PrincipalId::new("principal-agent"),
+        workload_id: "workload-sandbox".to_string(),
         authorization_revision: 42,
+        policy_revision: 17,
         profile_revision: 9,
+        effective_actions: BTreeSet::from([SourceAction::Read, SourceAction::Update]),
         replica_revisions: vec![SessionReplicaRevision {
             source_connection_id: SourceConnectionId::new("source-notion"),
             replica_revision_id: ReplicaRevisionId::new("replica-108"),
@@ -315,33 +356,76 @@ fn ordered_rows() -> Vec<OrderedExportRow> {
 
 fn changeset() -> ChangesetEnvelope {
     let summary = PlanSummary {
-        entities_created: 1,
+        blocks_updated: 1,
         ..PlanSummary::default()
     };
+    let source_object = ChangesetSourceObject {
+        source_connection_id: SourceConnectionId::new("source-notion"),
+        remote_id: RemoteId::new("page-roadmap"),
+    };
+    let readable_diff = readable_diff_for_file(
+        "Projects/Roadmap/page.md",
+        Some("Old paragraph.\n"),
+        Some("Changed paragraph.\n"),
+    )
+    .expect("diff");
     ChangesetEnvelope {
         versions: COMPONENT_VERSIONS,
         changeset_id: ChangesetId::new("changeset-3"),
+        tenant_id: TenantId::new("tenant-acme"),
         session_id: SessionId::new("session-7"),
+        acting_principal_id: PrincipalId::new("principal-agent"),
+        workload_id: "workload-sandbox".to_string(),
+        authorization_revision: 42,
+        policy_revision: 17,
+        profile_revision: 9,
         parent_changeset_id: None,
-        base_revisions: vec![SessionReplicaRevision {
+        replica_revisions: vec![SessionReplicaRevision {
             source_connection_id: SourceConnectionId::new("source-notion"),
             replica_revision_id: ReplicaRevisionId::new("replica-108"),
         }],
-        operations: SourceOperationPlan {
-            affected_entities: Vec::new(),
-            operations: vec![SourceOperation::CreateEntity {
-                parent_id: RemoteId::new("page-parent"),
-                parent_kind: Some(EntityKind::Directory),
-                parent_workspace: false,
-                title: "Agent draft".to_string(),
-                properties: BTreeMap::new(),
-                body: "Draft body.\n".to_string(),
-                source_path: LogicalPath::new("Projects/Agent draft/page.md").expect("path"),
+        affected_projection_ids: BTreeSet::from([ProjectionId::new("projection-roadmap")]),
+        affected_source_objects: BTreeSet::from([source_object.clone()]),
+        delivered_bases: vec![DeliveredChangesetBase {
+            projection_id: ProjectionId::new("projection-roadmap"),
+            source_object,
+            provider_precondition: "opaque-v4".to_string(),
+            delivered_content_sha256: "sha256:roadmap".to_string(),
+            delivered_shadow_sha256: "sha256:roadmap-shadow".to_string(),
+        }],
+        content: ChangesetContent::Inline {
+            edited_canonical_bodies: vec![EditedCanonicalBody {
+                projection_id: ProjectionId::new("projection-roadmap"),
+                logical_path: LogicalPath::new("Projects/Roadmap/page.md").expect("path"),
+                canonical_sha256: "sha256:edited-roadmap".to_string(),
+                canonical_markdown: "---\nloc:\n  id: page-roadmap\n  type: page\ntitle: Roadmap\n---\nChanged paragraph.\n".to_string(),
+            }],
+        },
+        advisory_operations: SourceOperationPlan {
+            affected_entities: vec![RemoteId::new("page-roadmap")],
+            operations: vec![SourceOperation::UpdateBlock {
+                block_id: RemoteId::new("block-1"),
+                content: "Changed paragraph.".to_string(),
             }],
             summary,
             degradations: Vec::new(),
         },
+        readable_diff,
         readable_diff_sha256: "sha256:diff".to_string(),
+        operation_ids: vec![PushOperationId("changeset-3:0:update_block:block-1".to_string())],
+        idempotency_key: "changeset-3".to_string(),
+        client_validation_results: vec![ClientValidationResult {
+            code: "validated".to_string(),
+            projection_id: Some(ProjectionId::new("projection-roadmap")),
+            logical_path: LogicalPath::new("Projects/Roadmap/page.md").expect("path"),
+            line: None,
+            message: "client validation passed".to_string(),
+            suggested_fix: None,
+        }],
+        audit_reference: Some(AuditReference {
+            kind: "git_commit".to_string(),
+            reference: "0123456789abcdef".to_string(),
+        }),
         content_digest: "sha256:changeset".to_string(),
         submitted_at: "2026-07-19T12:00:00Z".to_string(),
     }
