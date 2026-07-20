@@ -34,7 +34,7 @@ Teams/
   Engineering/
     Issues/
       Todo/
-        ENG-1/
+        ENG-1 Improve sync/
           page.md
 ```
 
@@ -42,10 +42,11 @@ Teams/
 directories preserve the Linear team identity; status directories are keyed by
 team and Linear state id. Only statuses present in fetched issue metadata are
 shown, so empty workflow states are omitted. Issue directories are named by the
-Linear issue identifier, and each issue `page.md` is canonical Markdown with
-Linear reference fields in frontmatter and the Linear issue description as the
-body. Rendered references use the `Label <id>` shape so local diff can ignore
-label-only refreshes while preserving the stable Linear UUID.
+Linear issue identifier followed by the issue title, and each issue `page.md` is
+canonical Markdown with Linear reference fields in frontmatter and the Linear
+issue description as the body. Rendered references use the `Label <id>` shape so
+local diff can ignore label-only refreshes while preserving the stable Linear
+UUID.
 
 The connector currently supports:
 

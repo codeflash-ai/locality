@@ -524,13 +524,13 @@ fn issue_entry(mount_id: &MountId, parent: &Path, issue: &LinearIssue) -> TreeEn
         mount_id: mount_id.clone(),
         remote_id: RemoteId::new(issue.id.clone()),
         kind: EntityKind::Page,
-        title: issue.identifier.clone(),
+        title: issue.title.clone(),
         path: parent
             .join(TEAMS_DIRECTORY_NAME)
             .join(team_directory_name(&issue.team))
             .join(ISSUES_DIRECTORY_NAME)
             .join(status_directory_name(&issue.state))
-            .join(safe_filename(&issue.identifier, 80))
+            .join(issue_directory_name(issue))
             .join("page.md"),
         hydration: HydrationState::Stub,
         content_hash: None,
@@ -541,9 +541,7 @@ fn issue_entry(mount_id: &MountId, parent: &Path, issue: &LinearIssue) -> TreeEn
 
 fn status_child_issue_entry(mount_id: &MountId, parent: &Path, issue: &LinearIssue) -> TreeEntry {
     let mut entry = issue_entry(mount_id, Path::new(""), issue);
-    entry.path = parent
-        .join(safe_filename(&issue.identifier, 80))
-        .join("page.md");
+    entry.path = parent.join(issue_directory_name(issue)).join("page.md");
     entry
 }
 
@@ -686,6 +684,24 @@ fn team_directory_name(team: &LinearTeam) -> String {
 
 fn status_directory_name(state: &LinearIssueState) -> String {
     safe_filename(&state.name, 120)
+}
+
+fn issue_directory_name(issue: &LinearIssue) -> String {
+    let identifier = safe_filename(&issue.identifier, 48);
+    if issue.title.trim().is_empty() {
+        return identifier;
+    }
+    let separator = " ";
+    let title_limit = 120usize.saturating_sub(identifier.len() + separator.len());
+    if title_limit == 0 {
+        return identifier;
+    }
+    let title = safe_filename(&issue.title, title_limit);
+    if title.is_empty() {
+        identifier
+    } else {
+        format!("{identifier}{separator}{title}")
+    }
 }
 
 fn safe_filename(value: &str, byte_limit: usize) -> String {

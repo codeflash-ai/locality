@@ -722,7 +722,7 @@ fn linear_mount_guidance() -> String {
     format!(
         "{}\n\
 Linear facts:\n\
-- This mount projects Linear issues as Teams/<team>/Issues/<status>/<identifier>/page.md.\n\
+- This mount projects Linear issues as Teams/<team>/Issues/<status>/<identifier> <title>/page.md.\n\
 - Issue frontmatter contains stable Linear UUID references in the `Label <id>` shape. Preserve the id when editing status, project, or assignee fields.\n\
 - Supported writes are issue description body edits plus title, Status, Project, and Assignee frontmatter updates.\n\
 - Moving an issue folder into another Teams/<team>/Issues/<status>/ folder updates the Linear team and status. Linear may assign a new identifier after cross-team moves; refresh/reconciliation will follow the canonical path.\n\

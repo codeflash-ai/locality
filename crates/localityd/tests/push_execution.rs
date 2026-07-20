@@ -2646,14 +2646,14 @@ fn linear_move_reconciliation_uses_refreshed_canonical_path() {
             "Teams/Platform/Issues/Done",
         ))
         .expect("save status");
-    let projected_path = PathBuf::from("Teams/Platform/Issues/Done/ENG-1/page.md");
+    let projected_path = PathBuf::from("Teams/Platform/Issues/Done/ENG-1 Improve sync/page.md");
     store
         .save_entity(
             EntityRecord::new(
                 mount_id.clone(),
                 issue_id.clone(),
                 EntityKind::Page,
-                "ENG-1",
+                "Improve sync",
                 projected_path.clone(),
             )
             .with_hydration(HydrationState::Dirty)
@@ -2689,9 +2689,11 @@ fn linear_move_reconciliation_uses_refreshed_canonical_path() {
             mutation_kind: VirtualMutationKind::Move,
             target_remote_id: Some(issue_id.clone()),
             parent_remote_id: Some(RemoteId::new("team-state:team-2:state-2")),
-            original_path: Some(PathBuf::from("Teams/Engineering/Issues/Todo/ENG-1/page.md")),
+            original_path: Some(PathBuf::from(
+                "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/page.md",
+            )),
             projected_path: projected_path.clone(),
-            title: "ENG-1".to_string(),
+            title: "Improve sync".to_string(),
             content_path: Some(cache),
             created_at: "2026-06-12T00:00:00Z".to_string(),
             updated_at: "2026-06-12T00:00:00Z".to_string(),
@@ -2731,7 +2733,7 @@ fn linear_move_reconciliation_uses_refreshed_canonical_path() {
         .expect("issue");
     assert_eq!(
         entity.path,
-        PathBuf::from("Teams/Platform/Issues/Done/PLAT-9/page.md")
+        PathBuf::from("Teams/Platform/Issues/Done/PLAT-9 Improve sync/page.md")
     );
     assert!(
         store

@@ -59,10 +59,11 @@ fn enumeration_projects_teams_statuses_and_issues_into_stable_paths() {
             (
                 "issue-1".to_string(),
                 EntityKind::Page,
-                "Teams/Engineering/Issues/Todo/ENG-1/page.md".to_string()
+                "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/page.md".to_string()
             ),
         ]
     );
+    assert_eq!(entries[4].title, "Improve sync");
     assert_eq!(
         entries[4].remote_edited_at.as_deref(),
         Some("linear:issue-1:2026-07-15T12:00:00Z")
@@ -137,7 +138,7 @@ fn list_hierarchical_children_returns_complete_snapshots() {
     assert!(result.is_complete());
     assert_eq!(
         entry_paths(&result.entries),
-        vec!["Teams/Engineering/Issues/Todo/ENG-1/page.md"]
+        vec!["Teams/Engineering/Issues/Todo/ENG-1 Improve sync/page.md"]
     );
 }
 
@@ -171,7 +172,7 @@ fn observe_and_observe_batch_use_hierarchical_issue_path() {
         .expect("observe");
     assert_eq!(
         observed.projected_path.to_string_lossy(),
-        "Teams/Engineering/Issues/Todo/ENG-1/page.md"
+        "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/page.md"
     );
     assert_eq!(
         observed.parent_remote_id,
@@ -197,7 +198,7 @@ fn observe_and_observe_batch_use_hierarchical_issue_path() {
     };
     assert_eq!(
         entry.path.to_string_lossy(),
-        "Teams/Engineering/Issues/Todo/ENG-1/page.md"
+        "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/page.md"
     );
 }
 
@@ -294,8 +295,8 @@ fn apply_move_updates_issue_team_and_status_and_reports_moved_effect() {
             entity_id: RemoteId::new("issue-1"),
             new_parent_id: RemoteId::new("team-state:team-2:state-2"),
             new_parent_kind: EntityKind::Directory,
-            new_title: "ENG-1".to_string(),
-            projected_path: "Teams/Platform/Issues/Done/ENG-1/page.md".into(),
+            new_title: "Improve sync".to_string(),
+            projected_path: "Teams/Platform/Issues/Done/ENG-1 Improve sync/page.md".into(),
         }],
     );
     let push_id = PushId("push-1".to_string());

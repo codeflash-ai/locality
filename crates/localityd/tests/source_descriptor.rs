@@ -201,7 +201,7 @@ fn linear_allows_existing_issue_edits_but_rejects_local_creates() {
     assert!(
         source_write_decision_for_path(
             &mount,
-            std::path::Path::new("Teams/Engineering/Issues/Todo/ENG-1/page.md")
+            std::path::Path::new("Teams/Engineering/Issues/Todo/ENG-1 Improve sync/page.md")
         )
         .is_writable()
     );

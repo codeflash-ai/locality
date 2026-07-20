@@ -1022,7 +1022,7 @@ fn prepare_linear_move_lowers_title_body_and_properties_without_duplicate_title_
                 RemoteId::new("issue-1"),
                 EntityKind::Page,
                 "Original title",
-                "Teams/Team B/Issues/Done/ENG-1/page.md",
+                "Teams/Team B/Issues/Done/ENG-1 Original title/page.md",
             )
             .with_hydration(HydrationState::Dirty),
         )
@@ -1040,7 +1040,7 @@ fn prepare_linear_move_lowers_title_body_and_properties_without_duplicate_title_
         )
         .expect("save shadow");
     let cache = fixture.write_virtual_page(
-        "Teams/Team B/Issues/Done/ENG-1/page.md",
+        "Teams/Team B/Issues/Done/ENG-1 Original title/page.md",
         "---\nloc:\n  id: issue-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Explicit edited title\nstatus: Done\n---\nNew body.\n",
     );
     store
@@ -1050,8 +1050,10 @@ fn prepare_linear_move_lowers_title_body_and_properties_without_duplicate_title_
             mutation_kind: VirtualMutationKind::Move,
             target_remote_id: Some(RemoteId::new("issue-1")),
             parent_remote_id: Some(RemoteId::new("team-state:team-b:done")),
-            original_path: Some(PathBuf::from("Teams/Team A/Issues/Todo/ENG-1/page.md")),
-            projected_path: PathBuf::from("Teams/Team B/Issues/Done/ENG-1/page.md"),
+            original_path: Some(PathBuf::from(
+                "Teams/Team A/Issues/Todo/ENG-1 Original title/page.md",
+            )),
+            projected_path: PathBuf::from("Teams/Team B/Issues/Done/ENG-1 Original title/page.md"),
             title: "Original title".to_string(),
             content_path: Some(cache),
             created_at: "2026-06-12T00:00:00Z".to_string(),
@@ -1081,7 +1083,9 @@ fn prepare_linear_move_lowers_title_body_and_properties_without_duplicate_title_
                 new_parent_id: RemoteId::new("team-state:team-b:done"),
                 new_parent_kind: EntityKind::Directory,
                 new_title: "Explicit edited title".to_string(),
-                projected_path: PathBuf::from("Teams/Team B/Issues/Done/ENG-1/page.md"),
+                projected_path: PathBuf::from(
+                    "Teams/Team B/Issues/Done/ENG-1 Original title/page.md",
+                ),
             },
             PushOperation::UpdateProperties {
                 entity_id: RemoteId::new("issue-1"),
@@ -1099,7 +1103,10 @@ fn prepare_linear_move_lowers_title_body_and_properties_without_duplicate_title_
     assert_eq!(plan.affected_entities, vec![RemoteId::new("issue-1")]);
     let diff = prepared.readable_diff.expect("readable diff");
     assert_eq!(diff.files.len(), 1);
-    assert_eq!(diff.files[0].path, "Teams/Team B/Issues/Done/ENG-1/page.md");
+    assert_eq!(
+        diff.files[0].path,
+        "Teams/Team B/Issues/Done/ENG-1 Original title/page.md"
+    );
     assert!(diff.text.contains("+status: Done"));
     assert!(diff.text.contains("+New body."));
     assert_eq!(validator.changed_count.get(), 1);
@@ -1126,7 +1133,7 @@ fn prepare_linear_cacheless_move_uses_shadow_but_missing_shadow_requires_materia
             new_parent_id: RemoteId::new("team-state:team-b:done"),
             new_parent_kind: EntityKind::Directory,
             new_title: "Original title".to_string(),
-            projected_path: PathBuf::from("Teams/Team B/Issues/Done/ENG-1/page.md"),
+            projected_path: PathBuf::from("Teams/Team B/Issues/Done/ENG-1 Original title/page.md"),
         }]
     );
     assert!(prepared.readable_diff.is_none());
@@ -1213,7 +1220,9 @@ fn prepare_pending_scope_rejects_duplicate_remote_targets() {
             mutation_kind: VirtualMutationKind::Rename,
             target_remote_id: Some(RemoteId::new("issue-1")),
             parent_remote_id: Some(RemoteId::new("team-state:team-b:done")),
-            original_path: Some(PathBuf::from("Teams/Team A/Issues/Todo/ENG-1/page.md")),
+            original_path: Some(PathBuf::from(
+                "Teams/Team A/Issues/Todo/ENG-1 Original title/page.md",
+            )),
             projected_path: PathBuf::from("Teams/Team B/Issues/Done/ENG-1-duplicate/page.md"),
             title: "Original title".to_string(),
             content_path: None,
@@ -2266,12 +2275,12 @@ fn move_store(
         }
     }
     let original_path = if linear {
-        PathBuf::from("Teams/Team A/Issues/Todo/ENG-1/page.md")
+        PathBuf::from("Teams/Team A/Issues/Todo/ENG-1 Original title/page.md")
     } else {
         PathBuf::from("Team A/ENG-1-old/page.md")
     };
     let projected_path = if linear {
-        PathBuf::from("Teams/Team B/Issues/Done/ENG-1/page.md")
+        PathBuf::from("Teams/Team B/Issues/Done/ENG-1 Original title/page.md")
     } else {
         PathBuf::from("Team B/ENG-1-new/page.md")
     };
