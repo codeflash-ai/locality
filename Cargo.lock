@@ -2149,6 +2149,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "locality-engine"
+version = "0.3.3"
+dependencies = [
+ "locality-connector",
+ "locality-core",
+]
+
+[[package]]
 name = "locality-fuse"
 version = "0.3.3"
 dependencies = [
@@ -2228,6 +2236,15 @@ dependencies = [
  "locality-store",
  "serde",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "locality-protocol"
+version = "0.3.3"
+dependencies = [
+ "locality-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

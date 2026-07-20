@@ -1,0 +1,51 @@
+{
+  "versions": {
+    "session": 1,
+    "replica": 1,
+    "export_metadata": 1,
+    "writable_session_store": 1,
+    "canonical": 1,
+    "path": 1,
+    "changeset": 1
+  },
+  "changeset_id": "changeset-3",
+  "session_id": "session-7",
+  "parent_changeset_id": null,
+  "base_revisions": [
+    {
+      "source_connection_id": "source-notion",
+      "replica_revision_id": "replica-108"
+    }
+  ],
+  "operations": {
+    "affected_entities": [],
+    "operations": [
+      {
+        "type": "create_entity",
+        "parent_id": "page-parent",
+        "parent_kind": "directory",
+        "parent_workspace": false,
+        "title": "Agent draft",
+        "properties": {},
+        "body": "Draft body.\n",
+        "source_path": "Projects/Agent draft/page.md"
+      }
+    ],
+    "summary": {
+      "blocks_created": 0,
+      "blocks_updated": 0,
+      "blocks_replaced": 0,
+      "blocks_moved": 0,
+      "media_updated": 0,
+      "blocks_archived": 0,
+      "entities_created": 1,
+      "entities_archived": 0,
+      "entities_moved": 0,
+      "properties_updated": 0
+    },
+    "degradations": []
+  },
+  "readable_diff_sha256": "sha256:diff",
+  "content_digest": "sha256:changeset",
+  "submitted_at": "2026-07-19T12:00:00Z"
+}

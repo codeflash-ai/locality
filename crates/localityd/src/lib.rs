@@ -14,6 +14,7 @@ pub mod projection_state;
 pub mod pull;
 pub mod push;
 pub mod reconcile;
+pub mod remote_truth;
 pub mod runtime;
 pub mod scheduler;
 pub mod server;

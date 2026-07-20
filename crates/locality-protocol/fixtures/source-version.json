@@ -1,0 +1,10 @@
+{
+  "tenant_id": "tenant-acme",
+  "source_connection_id": "source-notion",
+  "source_version_id": "source-version-roadmap-v4",
+  "remote_id": "page-roadmap",
+  "provider_version": "opaque-v4",
+  "native_sha256": "sha256:native-roadmap",
+  "canonical_sha256": "sha256:canonical-roadmap",
+  "observed_at": "2026-07-19T11:58:00Z"
+}

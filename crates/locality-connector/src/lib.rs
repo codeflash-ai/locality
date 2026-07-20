@@ -10,6 +10,7 @@ use locality_core::freshness::RemoteObservation;
 use locality_core::journal::PushId;
 use locality_core::model::{CanonicalDocument, MountId, RemoteId, TreeEntry};
 use locality_core::planner::{PushOperationKind, PushPlan};
+use locality_core::portable::{ProjectionEntry, SourceConnectionId, SourceObject};
 use locality_core::push::RemotePrecondition;
 use locality_core::undo::{UndoApplier, UndoApplyRequest, UndoApplyResult, UndoPlan};
 use serde::{Deserialize, Serialize};
@@ -69,6 +70,24 @@ impl ConnectorCapabilities {
 pub struct EnumerateRequest {
     pub mount_id: MountId,
     pub cursor: Option<String>,
+}
+
+/// Host-neutral request for portable connector enumeration.
+///
+/// Unlike [`EnumerateRequest`], this carries no local mount or filesystem
+/// state. Connectors may adopt it incrementally while the legacy method remains
+/// available to direct-mode hosts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortableEnumerateRequest {
+    pub source_connection_id: SourceConnectionId,
+    pub cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableEnumerateResult {
+    pub source_objects: Vec<SourceObject>,
+    pub projections: Vec<ProjectionEntry>,
+    pub next_cursor: Option<String>,
 }
 
 /// Cheap metadata request for one known source object.
@@ -212,6 +231,20 @@ pub trait Connector {
         PushOperationKind::all().into_iter().collect()
     }
     fn enumerate(&self, request: EnumerateRequest) -> LocalityResult<Vec<TreeEntry>>;
+    /// Enumerate provider state without binding it to local mount semantics.
+    ///
+    /// The default is intentionally explicit: a host must use the legacy
+    /// `enumerate` API until a connector supplies stable projection and source
+    /// version identities. Falling back by deriving identity from title or path
+    /// would corrupt remote identity.
+    fn enumerate_portable(
+        &self,
+        _request: PortableEnumerateRequest,
+    ) -> LocalityResult<PortableEnumerateResult> {
+        Err(locality_core::LocalityError::Unsupported(
+            "connector does not support portable enumeration",
+        ))
+    }
     /// Observe one entity without hydrating its body.
     ///
     /// Implementations should return identity, display metadata, parent/path

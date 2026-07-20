@@ -1,0 +1,35 @@
+{
+  "versions": {
+    "session": 1,
+    "replica": 1,
+    "export_metadata": 1,
+    "writable_session_store": 1,
+    "canonical": 1,
+    "path": 1,
+    "changeset": 1
+  },
+  "session_id": "session-7",
+  "replica_revisions": [
+    {
+      "source_connection_id": "source-notion",
+      "replica_revision_id": "replica-108"
+    }
+  ],
+  "writable_entries": [
+    {
+      "projection_id": "projection-roadmap",
+      "logical_path": "Projects/Roadmap/page.md",
+      "source_remote_ids": [
+        "page-roadmap"
+      ],
+      "delivered_content_sha256": "sha256:roadmap",
+      "provider_precondition": "opaque-v4",
+      "effective_actions": [
+        "read",
+        "update",
+        "update_properties"
+      ],
+      "baseline_required": true
+    }
+  ]
+}

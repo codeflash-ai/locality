@@ -66,6 +66,7 @@ use crate::file_provider;
 use crate::hydration::{HydratedEntity, HydrationSource};
 use crate::media::{render_document_with_absolute_media_hrefs, replace_hydrated_media_manifest};
 use crate::projection_state;
+use crate::remote_truth::{DirectSourceReplica, RemoteTruthProvider};
 use crate::shadow_match::shadows_match;
 use crate::source::{
     LocalSourceValidator, SourcePushValidator, SourceValidationContext, source_descriptor,
@@ -113,6 +114,8 @@ where
         + VirtualMutationRepository,
     Source: Connector + HydrationSource + ?Sized,
 {
+    let remote_truth = DirectSourceReplica::new(source);
+    let source = remote_truth.source();
     let validator = LocalSourceValidator;
     if let Some(state_root) = state_root {
         file_provider::reconcile_visible_projection(store, state_root, Some(&job.target_path))?;
@@ -148,6 +151,8 @@ where
         + AutoSaveRepository,
     Source: Connector + HydrationSource + ?Sized,
 {
+    let remote_truth = DirectSourceReplica::new(source);
+    let source = remote_truth.source();
     job.assume_yes = true;
     job.confirm_dangerous = false;
 

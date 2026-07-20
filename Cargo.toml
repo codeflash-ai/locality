@@ -5,6 +5,8 @@ members = [
   "crates/localityd",
   "crates/locality-core",
   "crates/locality-connector",
+  "crates/locality-engine",
+  "crates/locality-protocol",
   "crates/locality-platform",
   "crates/locality-store",
   "crates/locality-notion",
@@ -25,6 +27,8 @@ rust-version = "1.96"
 [workspace.dependencies]
 locality-core = { path = "crates/locality-core" }
 locality-connector = { path = "crates/locality-connector" }
+locality-engine = { path = "crates/locality-engine" }
+locality-protocol = { path = "crates/locality-protocol" }
 locality-platform = { path = "crates/locality-platform" }
 locality-store = { path = "crates/locality-store" }
 locality-notion = { path = "crates/locality-notion" }
