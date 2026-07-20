@@ -2105,13 +2105,19 @@ fn portable_bootstrap_requires_the_configured_explicit_root_without_search_fallb
         .expect("direct explicit-root enumeration");
     assert!(batch.completeness.is_complete());
     assert_eq!(batch.changes.len(), 1);
+    let direct_logical_path = direct[0]
+        .path
+        .iter()
+        .map(|component| component.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
     assert_eq!(
         batch.changes[0]
             .logical_path
             .as_ref()
             .expect("portable path")
             .as_str(),
-        direct[0].path.to_str().expect("direct relative path")
+        direct_logical_path
     );
 
     let workspace_connector = NotionConnector::with_api(
