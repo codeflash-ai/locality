@@ -2093,11 +2093,16 @@ dependencies = [
  "locality-granola",
  "locality-notion",
  "locality-platform",
+ "locality-protocol",
  "locality-store",
  "localityd",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
+ "tar",
  "yaml_serde",
+ "zstd",
 ]
 
 [[package]]

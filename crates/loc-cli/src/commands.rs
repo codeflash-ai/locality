@@ -93,6 +93,9 @@ use crate::push::{
     run_push_with_state_root, select_push_targets,
 };
 use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
+use crate::sandbox::{
+    SandboxInitOptions, SandboxInitReport, resolve_bootstrap_token, run_sandbox_init,
+};
 use crate::search::{
     SearchError, SearchOptions, SearchReport, SearchResult, is_notion_url_host, notion_id_from_url,
     run_search, run_search_with_access_roots, source_url_host,
@@ -172,6 +175,11 @@ enum LocalityCommand {
     },
     #[command(about = "Run read-only diagnostics for daemon, mounts, providers, and auth")]
     Doctor,
+    #[command(about = "Bootstrap a sealed read-only sandbox replica")]
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommand,
+    },
     #[command(about = "Search local mount metadata without contacting remote sources")]
     Search(SearchArgs),
     #[command(about = "Locate a mounted Notion page or database and print its local path")]
@@ -219,6 +227,26 @@ enum LocalityCommand {
         #[command(subcommand)]
         command: FileProviderCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum SandboxCommand {
+    #[command(about = "Initialize a sealed read-only sandbox replica")]
+    Init(SandboxInitArgs),
+}
+
+#[derive(Debug, Args)]
+struct SandboxInitArgs {
+    #[arg(long, value_name = "URL", help = "Locality backend API origin")]
+    api_url: String,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Absent destination path for the read-only replica"
+    )]
+    root: String,
+    #[arg(long, help = "Read the one-time bootstrap token from standard input")]
+    bootstrap_token_stdin: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -872,6 +900,17 @@ impl Drop for TerminalSpinner {
 }
 
 pub fn dispatch(args: &[String]) -> i32 {
+    if forbidden_bootstrap_token_argument(args) {
+        return command_error(
+            args.iter().any(|arg| arg == "--json"),
+            CommandError::new(
+                "sandbox init",
+                "bootstrap_token_argv_forbidden",
+                "bootstrap tokens are accepted only through LOCALITY_BOOTSTRAP_TOKEN or --bootstrap-token-stdin",
+            ),
+            EXIT_USAGE,
+        );
+    }
     let cli = match parse_cli(args) {
         Ok(cli) => cli,
         Err(error) => {
@@ -900,6 +939,9 @@ pub fn dispatch(args: &[String]) -> i32 {
         LocalityCommand::Status(_) => status(&legacy_args[1..], json),
         LocalityCommand::LiveMode { .. } => live_mode(&legacy_args[1..], json),
         LocalityCommand::Doctor => doctor(json),
+        LocalityCommand::Sandbox {
+            command: SandboxCommand::Init(options),
+        } => sandbox_init(options, json),
         LocalityCommand::Search(_) => search(&legacy_args[1..], json),
         LocalityCommand::Locate(_) => locate(&legacy_args[1..], json),
         LocalityCommand::Create { .. } => create(&legacy_args[1..], json),
@@ -917,6 +959,11 @@ pub fn dispatch(args: &[String]) -> i32 {
         LocalityCommand::Mcp => mcp(),
         LocalityCommand::FileProvider { .. } => file_provider(&legacy_args[1..], json),
     }
+}
+
+fn forbidden_bootstrap_token_argument(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "--bootstrap-token" || arg.starts_with("--bootstrap-token="))
 }
 
 fn parse_cli(args: &[String]) -> Result<Cli, clap::Error> {
@@ -1132,6 +1179,21 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
             }
         }
         LocalityCommand::Doctor => args.push("doctor".to_string()),
+        LocalityCommand::Sandbox { command } => {
+            args.push("sandbox".to_string());
+            match command {
+                SandboxCommand::Init(options) => {
+                    args.push("init".to_string());
+                    push_flag_value(&mut args, "--api-url", &options.api_url);
+                    push_flag_value(&mut args, "--root", &options.root);
+                    push_flag(
+                        &mut args,
+                        "--bootstrap-token-stdin",
+                        options.bootstrap_token_stdin,
+                    );
+                }
+            }
+        }
         LocalityCommand::Search(options) => {
             args.push("search".to_string());
             for query_part in &options.query {
@@ -1277,6 +1339,62 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
         }
     }
     args
+}
+
+fn sandbox_init(options: SandboxInitArgs, json: bool) -> i32 {
+    let token = {
+        let mut stdin = io::stdin().lock();
+        match resolve_bootstrap_token(
+            options.bootstrap_token_stdin,
+            std::env::var_os("LOCALITY_BOOTSTRAP_TOKEN"),
+            &mut stdin,
+        ) {
+            Ok(token) => token,
+            Err(error) => return sandbox_init_command_error(json, error),
+        }
+    };
+    match run_sandbox_init(
+        SandboxInitOptions {
+            api_url: options.api_url,
+            root: PathBuf::from(options.root),
+        },
+        token,
+    ) {
+        Ok(report) => {
+            if json {
+                print_json(&report);
+            } else {
+                print_sandbox_init_report(&report);
+            }
+            EXIT_SUCCESS
+        }
+        Err(error) => sandbox_init_command_error(json, error),
+    }
+}
+
+fn sandbox_init_command_error(json: bool, error: crate::sandbox::SandboxInitError) -> i32 {
+    let exit_code = if error.is_usage_error() {
+        EXIT_USAGE
+    } else {
+        match error.code() {
+            "backend_request_failed" | "materialization_failed" => EXIT_INTERNAL,
+            _ => EXIT_VALIDATION,
+        }
+    };
+    command_error(
+        json,
+        CommandError::new("sandbox init", error.code(), error.to_string()),
+        exit_code,
+    )
+}
+
+fn print_sandbox_init_report(report: &SandboxInitReport) {
+    println!("sandbox ready at {}", report.root);
+    println!("session: {}", report.session_id);
+    println!(
+        "materialized: {} files, {} directories, {} bytes ({})",
+        report.files, report.directories, report.materialized_bytes, report.content_encoding
+    );
 }
 
 fn mcp() -> i32 {
@@ -8396,6 +8514,16 @@ mod tests {
                 vec!["Usage: loc doctor", "Run read-only diagnostics", "--json"],
             ),
             (
+                vec!["sandbox", "init", "--help"],
+                vec![
+                    "Usage: loc sandbox init",
+                    "--api-url <URL>",
+                    "--root <PATH>",
+                    "--bootstrap-token-stdin",
+                    "--json",
+                ],
+            ),
+            (
                 vec!["search", "--help"],
                 vec![
                     "Usage: loc search",
@@ -8670,6 +8798,28 @@ mod tests {
         );
 
         let cli = parse_cli([
+            "sandbox",
+            "init",
+            "--api-url",
+            "https://api.locality.test",
+            "--root",
+            "/mnt/locality",
+            "--bootstrap-token-stdin",
+        ]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec![
+                "sandbox",
+                "init",
+                "--api-url",
+                "https://api.locality.test",
+                "--root",
+                "/mnt/locality",
+                "--bootstrap-token-stdin"
+            ]
+        );
+
+        let cli = parse_cli([
             "daemon",
             "start",
             "--session",
@@ -8862,6 +9012,26 @@ mod tests {
             legacy_args_for_command(cli.command.as_ref().expect("command")),
             vec!["log", "Roadmap.md", "--push-id", "push-1", "--diff"]
         );
+    }
+
+    #[test]
+    fn sandbox_scope_and_bootstrap_token_are_not_accepted_from_argv() {
+        for args in [
+            vec!["sandbox", "init", "--profile", "pilot"],
+            vec!["sandbox", "init", "--bootstrap-token", "argv-secret"],
+            vec!["sandbox", "init", "--bootstrap-token=argv-secret"],
+        ] {
+            let owned = args
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .collect::<Vec<_>>();
+            if args.iter().any(|arg| arg.starts_with("--bootstrap-token")) {
+                assert!(super::forbidden_bootstrap_token_argument(&owned));
+            } else {
+                let error = Cli::try_parse_from(argv(args)).expect_err("scope flag rejected");
+                assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+            }
+        }
     }
 
     #[test]
