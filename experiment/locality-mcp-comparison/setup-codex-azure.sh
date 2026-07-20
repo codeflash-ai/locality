@@ -18,6 +18,9 @@ name = "Azure OpenAI"
 base_url = "$AZURE_OPENAI_BASE_URL"
 env_key = "AZURE_OPENAI_API_KEY"
 wire_api = "responses"
+
+[mcp_servers.notion]
+url = "https://mcp.notion.com/mcp"
 TOML
 
 chmod 700 "$CODEX_HOME"
