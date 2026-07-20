@@ -184,6 +184,9 @@ fn issue_update_input(input: &LinearIssueUpdateInput) -> Option<Value> {
     if let Some(description) = &input.description {
         map.insert("description".to_string(), json!(description));
     }
+    if let Some(team_id) = &input.team_id {
+        map.insert("teamId".to_string(), json!(team_id));
+    }
     if let Some(state_id) = &input.state_id {
         map.insert("stateId".to_string(), json!(state_id));
     }

@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use locality_connector::{ApplyPlanRequest, ApplyPlanResult, Connector};
+use locality_connector::{ApplyPlanRequest, ApplyPlanResult, Connector, ObserveRequest};
 
 use locality_core::canonical::{
     CanonicalParseError, CanonicalParseErrorKind, parse_canonical_markdown,
@@ -44,6 +44,7 @@ use locality_core::{LocalityError, LocalityResult};
 use locality_google_docs::render::{
     GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND, GOOGLE_DOCS_TABLE_NATIVE_KIND,
 };
+use locality_linear::LINEAR_CONNECTOR_ID;
 use locality_notion::database_create::parse_database_draft;
 use locality_notion::markdown_table::parse_markdown_table_shape;
 use locality_notion::media::{
@@ -507,7 +508,7 @@ where
         + RemoteObservationRepository
         + FreshnessStateRepository
         + VirtualMutationRepository,
-    Source: HydrationSource + ?Sized,
+    Source: Connector + HydrationSource + ?Sized,
 {
     if prepared.pipeline.action != PushPipelineAction::ProceedToApply {
         return Ok(None);
@@ -3541,7 +3542,7 @@ where
 impl<S, Source> DaemonPushHost<'_, S, Source>
 where
     S: MountRepository + EntityRepository + ShadowRepository,
-    Source: HydrationSource + ?Sized,
+    Source: Connector + HydrationSource + ?Sized,
 {
     fn check_remote_tree_content(
         &mut self,
@@ -3637,7 +3638,7 @@ where
         + RemoteObservationRepository
         + FreshnessStateRepository
         + VirtualMutationRepository,
-    Source: HydrationSource + ?Sized,
+    Source: Connector + HydrationSource + ?Sized,
 {
     fn reconcile(
         &mut self,
@@ -3852,6 +3853,18 @@ where
             }) {
                 entity.title = new_title.clone();
                 entity.path = projected_path.clone();
+                if mount.connector == LINEAR_CONNECTOR_ID
+                    && self.source.kind().0 == LINEAR_CONNECTOR_ID
+                {
+                    let observed = self.source.observe(ObserveRequest {
+                        mount_id: request.mount_id.clone(),
+                        remote_id: remote_id.clone(),
+                    })?;
+                    if !observed.deleted {
+                        entity.title = observed.title;
+                        entity.path = observed.projected_path;
+                    }
+                }
             }
             let path = projection_write_path(self.state_root.as_deref(), &mount, &entity.path);
             let rendered = self.source.fetch_render_with_repository(

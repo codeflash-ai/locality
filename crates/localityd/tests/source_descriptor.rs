@@ -22,7 +22,8 @@ use localityd::source::{
     LocalSourceValidator, ResolvedSource, ResolvedSourceSet, SourcePushValidator,
     SourceValidationContext, VirtualRenamePolicy, resolve_source_for_mount,
     source_create_decision_for_parent_path, source_descriptor, source_display_name,
-    source_write_decision_for_path, supported_source_connectors,
+    source_move_decision_for_parent_path, source_write_decision_for_path,
+    supported_source_connectors,
 };
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -198,16 +199,42 @@ fn linear_allows_existing_issue_edits_but_rejects_local_creates() {
     );
     mount.read_only = false;
     assert!(
-        source_write_decision_for_path(&mount, std::path::Path::new("Engineering/ENG-1/page.md"))
-            .is_writable()
+        source_write_decision_for_path(
+            &mount,
+            std::path::Path::new("Teams/Engineering/Issues/Todo/ENG-1/page.md")
+        )
+        .is_writable()
     );
     assert!(
-        !source_create_decision_for_parent_path(&mount, std::path::Path::new("Engineering"))
-            .is_writable()
+        !source_create_decision_for_parent_path(
+            &mount,
+            std::path::Path::new("Teams/Engineering/Issues/Todo")
+        )
+        .is_writable()
     );
+    assert!(!source_write_decision_for_path(&mount, std::path::Path::new("Teams")).is_writable());
+    assert!(
+        source_move_decision_for_parent_path(
+            &mount,
+            std::path::Path::new("Teams/Engineering/Issues/Done")
+        )
+        .is_writable()
+    );
+    for invalid_parent in [
+        "Teams",
+        "Teams/Engineering",
+        "Teams/Engineering/Issues",
+        "Teams/Engineering/Issues/Done/ENG-1",
+    ] {
+        assert!(
+            !source_move_decision_for_parent_path(&mount, std::path::Path::new(invalid_parent))
+                .is_writable(),
+            "{invalid_parent}"
+        );
+    }
     assert_eq!(
         source_descriptor(LINEAR_CONNECTOR_ID).move_entity_parent_kinds(),
-        &[EntityKind::Page]
+        &[EntityKind::Directory]
     );
 }
 

@@ -285,6 +285,9 @@ pub fn source_write_decision_for_path(
             reason: "Granola meetings are read-only",
         };
     }
+    if mount.connector == LINEAR_CONNECTOR_ID {
+        return linear_write_decision_for_path(relative_path);
+    }
     SourceWriteDecision::Writable
 }
 
@@ -350,6 +353,9 @@ pub fn source_move_decision_for_parent_path(
         return SourceWriteDecision::ReadOnly {
             reason: "Granola meetings are read-only",
         };
+    }
+    if mount.connector == LINEAR_CONNECTOR_ID {
+        return linear_move_decision_for_parent_path(parent_path);
     }
     SourceWriteDecision::Writable
 }
@@ -542,7 +548,7 @@ fn linear_source_descriptor() -> SourceDescriptor {
         mount_guidance: Cow::Owned(linear_mount_guidance()),
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: Vec::new(),
-        move_entity_parent_kinds: vec![EntityKind::Page],
+        move_entity_parent_kinds: vec![EntityKind::Directory],
         periodic_discovery_interval: Some(Duration::from_secs(300)),
         body_diff_mode: BodyDiffMode::WholeEntity,
         virtual_rename_policy: VirtualRenamePolicy::PreserveCanonical,
@@ -590,6 +596,56 @@ fn google_calendar_write_decision_for_path(relative_path: &Path) -> SourceWriteD
             reason: "Google Calendar writes are only supported under draft/",
         },
     }
+}
+
+fn linear_write_decision_for_path(relative_path: &Path) -> SourceWriteDecision {
+    if is_linear_issue_page_path(relative_path) {
+        SourceWriteDecision::Writable
+    } else {
+        SourceWriteDecision::ReadOnly {
+            reason: "Linear writes are only supported on issue page.md files under Teams/<team>/Issues/<status>/",
+        }
+    }
+}
+
+fn linear_move_decision_for_parent_path(parent_path: &Path) -> SourceWriteDecision {
+    if is_linear_status_folder_path(parent_path) {
+        SourceWriteDecision::Writable
+    } else {
+        SourceWriteDecision::ReadOnly {
+            reason: "Linear issue moves are only supported into Teams/<team>/Issues/<status>/",
+        }
+    }
+}
+
+fn is_linear_issue_page_path(path: &Path) -> bool {
+    let Some(components) = normal_path_components(path) else {
+        return false;
+    };
+    matches!(
+        components.as_slice(),
+        ["Teams", team, "Issues", status, issue, "page.md"]
+            if !team.is_empty() && !status.is_empty() && !issue.is_empty()
+    )
+}
+
+fn is_linear_status_folder_path(path: &Path) -> bool {
+    let Some(components) = normal_path_components(path) else {
+        return false;
+    };
+    matches!(
+        components.as_slice(),
+        ["Teams", team, "Issues", status] if !team.is_empty() && !status.is_empty()
+    )
+}
+
+fn normal_path_components(path: &Path) -> Option<Vec<&str>> {
+    path.components()
+        .map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect()
 }
 
 fn generic_display_name(connector: &str) -> String {
@@ -666,10 +722,11 @@ fn linear_mount_guidance() -> String {
     format!(
         "{}\n\
 Linear facts:\n\
-- This mount projects Linear teams as directories and issues as page.md files under their team directory.\n\
+- This mount projects Linear issues as Teams/<team>/Issues/<status>/<identifier>/page.md.\n\
 - Issue frontmatter contains stable Linear UUID references in the `Label <id>` shape. Preserve the id when editing status, project, or assignee fields.\n\
 - Supported writes are issue description body edits plus title, Status, Project, and Assignee frontmatter updates.\n\
-- Labels, priority, estimate, team, identifier, URL, create, move, delete, and undo are not supported by the Linear connector yet.\n",
+- Moving an issue folder into another Teams/<team>/Issues/<status>/ folder updates the Linear team and status. Linear may assign a new identifier after cross-team moves; refresh/reconciliation will follow the canonical path.\n\
+- Labels, priority, estimate, identifier, URL, create, delete, and undo are not supported by the Linear connector yet.\n",
         generic_mount_guidance("Linear")
     )
 }

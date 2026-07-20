@@ -70,6 +70,7 @@ pub struct LinearIssueUpdateInput {
     pub issue_id: String,
     pub title: Option<String>,
     pub description: Option<String>,
+    pub team_id: Option<String>,
     pub state_id: Option<String>,
     pub project_id: Option<Option<String>>,
     pub assignee_id: Option<Option<String>>,

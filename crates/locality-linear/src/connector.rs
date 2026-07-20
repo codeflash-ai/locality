@@ -18,10 +18,16 @@ use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind};
 use locality_core::{LocalityError, LocalityResult};
 
 use crate::client::{HttpLinearApiClient, LinearApi};
-use crate::dto::{LinearIssue, LinearIssueUpdateInput, LinearTeam};
+use crate::dto::{LinearIssue, LinearIssueState, LinearIssueUpdateInput, LinearTeam};
 use crate::render::{LinearNativeBundle, remote_version, render_linear_issue};
 
 pub const LINEAR_CONNECTOR_ID: &str = "linear";
+const TEAMS_DIRECTORY_NAME: &str = "Teams";
+const ISSUES_DIRECTORY_NAME: &str = "Issues";
+const TEAMS_ROOT_REMOTE_ID: &str = "linear:teams";
+const TEAM_REMOTE_ID_PREFIX: &str = "team:";
+const TEAM_ISSUES_REMOTE_ID_PREFIX: &str = "team-issues:";
+const TEAM_STATE_REMOTE_ID_PREFIX: &str = "team-state:";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct LinearConfig {
@@ -118,6 +124,7 @@ impl Connector for LinearConnector {
         [
             PushOperationKind::UpdateEntityBody,
             PushOperationKind::UpdateProperties,
+            PushOperationKind::MoveEntity,
         ]
         .into_iter()
         .collect()
@@ -171,22 +178,22 @@ impl Connector for LinearConnector {
 
     fn list_children(&self, request: ListChildrenRequest) -> LocalityResult<ListChildrenResult> {
         let entries = match request.container {
-            ChildContainer::Root => team_entries(
+            ChildContainer::Root => vec![teams_root_entry(&request.mount_id, &request.parent_path)],
+            ChildContainer::DirectoryChildren(remote_id)
+                if remote_id.as_str() == TEAMS_ROOT_REMOTE_ID =>
+            {
+                team_entries(
+                    &request.mount_id,
+                    &request.parent_path,
+                    &self.all_issues(None, None)?,
+                )
+            }
+            ChildContainer::DirectoryChildren(remote_id) => list_linear_directory_children(
+                self,
                 &request.mount_id,
                 &request.parent_path,
-                &self.all_issues(None, None)?,
-            ),
-            ChildContainer::DirectoryChildren(remote_id) => {
-                let Some(team_id) = team_id_from_remote_id(&remote_id) else {
-                    return Ok(ListChildrenResult::complete(Vec::new()));
-                };
-                self.all_issues(None, Some(team_id))?
-                    .into_iter()
-                    .map(|issue| {
-                        team_child_issue_entry(&request.mount_id, &request.parent_path, &issue)
-                    })
-                    .collect()
-            }
+                &remote_id,
+            )?,
             _ => Vec::new(),
         };
         Ok(ListChildrenResult::complete(entries))
@@ -259,6 +266,28 @@ impl Connector for LinearConnector {
                         operation_index: index,
                         entity_id: entity_id.clone(),
                         keys: properties.keys().cloned().collect(),
+                    });
+                }
+                PushOperation::MoveEntity {
+                    entity_id,
+                    new_parent_id,
+                    ..
+                } => {
+                    let (team_id, state_id) =
+                        team_state_from_remote_id(new_parent_id).ok_or_else(|| {
+                            validation_error(
+                                "Linear issues can only be moved into a Linear status folder"
+                                    .to_string(),
+                            )
+                        })?;
+                    let update = update_for(&mut updates, entity_id);
+                    update.team_id = Some(team_id.to_string());
+                    update.state_id = Some(state_id.to_string());
+                    effects.push(JournalApplyEffect::MovedEntity {
+                        operation_id,
+                        operation_index: index,
+                        entity_id: entity_id.clone(),
+                        parent_id: new_parent_id.clone(),
                     });
                 }
                 _ => {
@@ -378,7 +407,22 @@ fn entries_for_issues(
     parent: &Path,
     issues: Vec<LinearIssue>,
 ) -> Vec<TreeEntry> {
-    let mut entries = team_entries(mount_id, parent, &issues);
+    let mut entries = vec![teams_root_entry(mount_id, parent)];
+    let teams_parent = parent.join(TEAMS_DIRECTORY_NAME);
+    for team in unique_teams(&issues) {
+        let team_path = teams_parent.join(team_directory_name(&team));
+        entries.push(team_entry(mount_id, &teams_parent, &team));
+        entries.push(team_issues_entry(mount_id, &team_path, &team.id));
+    }
+    for (team_id, state) in unique_states(&issues) {
+        let Some(team) = issues.iter().find(|issue| issue.team.id == team_id) else {
+            continue;
+        };
+        let issues_path = teams_parent
+            .join(team_directory_name(&team.team))
+            .join(ISSUES_DIRECTORY_NAME);
+        entries.push(status_entry(mount_id, &issues_path, &team_id, &state));
+    }
     entries.extend(
         issues
             .iter()
@@ -393,27 +437,83 @@ fn entries_for_issues(
 }
 
 fn team_entries(mount_id: &MountId, parent: &Path, issues: &[LinearIssue]) -> Vec<TreeEntry> {
-    let mut teams = issues
-        .iter()
-        .map(|issue| (issue.team.id.clone(), issue.team.clone()))
-        .collect::<BTreeMap<_, _>>()
-        .into_values()
-        .collect::<Vec<_>>();
-    teams.sort_by(|left, right| team_directory_name(left).cmp(&team_directory_name(right)));
-    teams
+    unique_teams(issues)
         .into_iter()
-        .map(|team| TreeEntry {
-            mount_id: mount_id.clone(),
-            remote_id: RemoteId::new(format!("team:{}", team.id)),
-            kind: EntityKind::Directory,
-            title: team.name.clone(),
-            path: parent.join(team_directory_name(&team)),
-            hydration: HydrationState::Stub,
-            content_hash: None,
-            remote_edited_at: None,
-            stub_frontmatter: None,
-        })
+        .map(|team| team_entry(mount_id, parent, &team))
         .collect()
+}
+
+fn teams_root_entry(mount_id: &MountId, parent: &Path) -> TreeEntry {
+    directory_entry(
+        mount_id,
+        RemoteId::new(TEAMS_ROOT_REMOTE_ID),
+        TEAMS_DIRECTORY_NAME,
+        parent.join(TEAMS_DIRECTORY_NAME),
+    )
+}
+
+fn team_entry(mount_id: &MountId, parent: &Path, team: &LinearTeam) -> TreeEntry {
+    directory_entry(
+        mount_id,
+        RemoteId::new(team_remote_id(&team.id)),
+        team.name.clone(),
+        parent.join(team_directory_name(team)),
+    )
+}
+
+fn team_issues_entry(mount_id: &MountId, parent: &Path, team_id: &str) -> TreeEntry {
+    directory_entry(
+        mount_id,
+        RemoteId::new(team_issues_remote_id(team_id)),
+        ISSUES_DIRECTORY_NAME,
+        parent.join(ISSUES_DIRECTORY_NAME),
+    )
+}
+
+fn status_entries(
+    mount_id: &MountId,
+    parent: &Path,
+    team_id: &str,
+    issues: &[LinearIssue],
+) -> Vec<TreeEntry> {
+    unique_states(issues)
+        .into_iter()
+        .filter(|(state_team_id, _)| state_team_id == team_id)
+        .map(|(_, state)| status_entry(mount_id, parent, team_id, &state))
+        .collect()
+}
+
+fn status_entry(
+    mount_id: &MountId,
+    parent: &Path,
+    team_id: &str,
+    state: &LinearIssueState,
+) -> TreeEntry {
+    directory_entry(
+        mount_id,
+        RemoteId::new(team_state_remote_id(team_id, &state.id)),
+        state.name.clone(),
+        parent.join(status_directory_name(state)),
+    )
+}
+
+fn directory_entry(
+    mount_id: &MountId,
+    remote_id: RemoteId,
+    title: impl Into<String>,
+    path: impl Into<std::path::PathBuf>,
+) -> TreeEntry {
+    TreeEntry {
+        mount_id: mount_id.clone(),
+        remote_id,
+        kind: EntityKind::Directory,
+        title: title.into(),
+        path: path.into(),
+        hydration: HydrationState::Stub,
+        content_hash: None,
+        remote_edited_at: None,
+        stub_frontmatter: None,
+    }
 }
 
 fn issue_entry(mount_id: &MountId, parent: &Path, issue: &LinearIssue) -> TreeEntry {
@@ -426,7 +526,10 @@ fn issue_entry(mount_id: &MountId, parent: &Path, issue: &LinearIssue) -> TreeEn
         kind: EntityKind::Page,
         title: issue.identifier.clone(),
         path: parent
+            .join(TEAMS_DIRECTORY_NAME)
             .join(team_directory_name(&issue.team))
+            .join(ISSUES_DIRECTORY_NAME)
+            .join(status_directory_name(&issue.state))
             .join(safe_filename(&issue.identifier, 80))
             .join("page.md"),
         hydration: HydrationState::Stub,
@@ -436,7 +539,7 @@ fn issue_entry(mount_id: &MountId, parent: &Path, issue: &LinearIssue) -> TreeEn
     }
 }
 
-fn team_child_issue_entry(mount_id: &MountId, parent: &Path, issue: &LinearIssue) -> TreeEntry {
+fn status_child_issue_entry(mount_id: &MountId, parent: &Path, issue: &LinearIssue) -> TreeEntry {
     let mut entry = issue_entry(mount_id, Path::new(""), issue);
     entry.path = parent
         .join(safe_filename(&issue.identifier, 80))
@@ -453,14 +556,63 @@ fn observation_from_issue(mount_id: &MountId, issue: LinearIssue) -> RemoteObser
         entry.title,
         entry.path,
     )
-    .with_parent(RemoteId::new(format!("team:{}", issue.team.id)))
+    .with_parent(RemoteId::new(team_state_remote_id(
+        &issue.team.id,
+        &issue.state.id,
+    )))
     .with_remote_version(RemoteVersion::new(remote_version(&issue)))
     .deleted(issue.archived_at.is_some())
     .with_raw_metadata_json(serde_json::to_string(&issue).unwrap_or_else(|_| "{}".to_string()))
 }
 
+fn list_linear_directory_children(
+    connector: &LinearConnector,
+    mount_id: &MountId,
+    parent_path: &Path,
+    remote_id: &RemoteId,
+) -> LocalityResult<Vec<TreeEntry>> {
+    if let Some(team_id) = team_id_from_remote_id(remote_id) {
+        return Ok(vec![team_issues_entry(mount_id, parent_path, team_id)]);
+    }
+    if let Some(team_id) = team_issues_team_id_from_remote_id(remote_id) {
+        let issues = connector.all_issues(None, Some(team_id))?;
+        return Ok(status_entries(mount_id, parent_path, team_id, &issues));
+    }
+    if let Some((team_id, state_id)) = team_state_from_remote_id(remote_id) {
+        return Ok(connector
+            .all_issues(None, Some(team_id))?
+            .into_iter()
+            .filter(|issue| issue.state.id == state_id)
+            .map(|issue| status_child_issue_entry(mount_id, parent_path, &issue))
+            .collect());
+    }
+    Ok(Vec::new())
+}
+
 fn team_id_from_remote_id(remote_id: &RemoteId) -> Option<&str> {
-    remote_id.0.strip_prefix("team:")
+    remote_id.0.strip_prefix(TEAM_REMOTE_ID_PREFIX)
+}
+
+fn team_issues_team_id_from_remote_id(remote_id: &RemoteId) -> Option<&str> {
+    remote_id.0.strip_prefix(TEAM_ISSUES_REMOTE_ID_PREFIX)
+}
+
+fn team_state_from_remote_id(remote_id: &RemoteId) -> Option<(&str, &str)> {
+    let value = remote_id.0.strip_prefix(TEAM_STATE_REMOTE_ID_PREFIX)?;
+    let (team_id, state_id) = value.split_once(':')?;
+    (!team_id.is_empty() && !state_id.is_empty()).then_some((team_id, state_id))
+}
+
+fn team_remote_id(team_id: &str) -> String {
+    format!("{TEAM_REMOTE_ID_PREFIX}{team_id}")
+}
+
+fn team_issues_remote_id(team_id: &str) -> String {
+    format!("{TEAM_ISSUES_REMOTE_ID_PREFIX}{team_id}")
+}
+
+fn team_state_remote_id(team_id: &str, state_id: &str) -> String {
+    format!("{TEAM_STATE_REMOTE_ID_PREFIX}{team_id}:{state_id}")
 }
 
 fn checkpoint_updated_after(checkpoint: &ConnectorCheckpoint) -> Option<String> {
@@ -482,14 +634,58 @@ fn dedupe_sort_issues(issues: Vec<LinearIssue>) -> LocalityResult<Vec<LinearIssu
     issues.sort_by(|left, right| {
         team_directory_name(&left.team)
             .cmp(&team_directory_name(&right.team))
+            .then_with(|| {
+                status_directory_name(&left.state).cmp(&status_directory_name(&right.state))
+            })
             .then_with(|| left.identifier.cmp(&right.identifier))
             .then_with(|| left.id.cmp(&right.id))
     });
     Ok(issues)
 }
 
+fn unique_teams(issues: &[LinearIssue]) -> Vec<LinearTeam> {
+    let mut teams = issues
+        .iter()
+        .map(|issue| (issue.team.id.clone(), issue.team.clone()))
+        .collect::<BTreeMap<_, _>>()
+        .into_values()
+        .collect::<Vec<_>>();
+    teams.sort_by(|left, right| {
+        team_directory_name(left)
+            .cmp(&team_directory_name(right))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    teams
+}
+
+fn unique_states(issues: &[LinearIssue]) -> Vec<(String, LinearIssueState)> {
+    let mut states = issues
+        .iter()
+        .map(|issue| {
+            (
+                (issue.team.id.clone(), issue.state.id.clone()),
+                issue.state.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .map(|((team_id, _), state)| (team_id, state))
+        .collect::<Vec<_>>();
+    states.sort_by(|(left_team_id, left), (right_team_id, right)| {
+        left_team_id
+            .cmp(right_team_id)
+            .then_with(|| status_directory_name(left).cmp(&status_directory_name(right)))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    states
+}
+
 fn team_directory_name(team: &LinearTeam) -> String {
     safe_filename(&team.name, 120)
+}
+
+fn status_directory_name(state: &LinearIssueState) -> String {
+    safe_filename(&state.name, 120)
 }
 
 fn safe_filename(value: &str, byte_limit: usize) -> String {
