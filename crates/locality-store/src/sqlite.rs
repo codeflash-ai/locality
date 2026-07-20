@@ -5,6 +5,7 @@
 //! columns, while shadow block arrays and journal plans are stored as JSON blobs
 //! until query needs justify normalization.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,7 +19,7 @@ use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use locality_core::planner::{PlanSummary, PushOperation, PushPlan};
 use locality_core::readable_diff::ReadableDiffOutput;
 use locality_core::shadow::ShadowDocument;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -26,6 +27,14 @@ use serde_json::Value;
 use crate::compatibility::{
     StateCompatibilityIssue, StateCompatibilityReport, StateCompatibilityStatus,
     StateComponentDefinition, StateComponentRecord,
+};
+use crate::discovery::{
+    DISCOVERY_TRANSACTION_MIN_READER_VERSION, DISCOVERY_TRANSACTION_STATE_VERSION, DiscoveryCommit,
+    DiscoveryPreflight, DiscoveryRepository, DiscoveryReservation, DiscoveryTransactionId,
+    DiscoveryTransactionRecord, DiscoveryTransactionStatus, PreparedDiscoveryTransaction,
+    TransactionalDiscoveryCommit, canonical_envelope_json, canonical_json, canonicalize_json_value,
+    decode_envelope, prepared_matches_record, record_from_prepared, require_transaction_status,
+    reservation_changed, transaction_missing, validate_envelope_version,
 };
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
@@ -40,11 +49,13 @@ use crate::repository::{
     EntityRepository, EntitySearchCandidate, EntitySearchRepository, FreshnessStateRepository,
     HydrationJobRepository, JournalRepository, MetadataDiscoveryJobRepository,
     MountLiveModeRepository, MountRepository, RemoteObservationRepository, ShadowRepository,
-    VirtualMutationRepository,
+    VirtualMoveRepository, VirtualMoveTransition, VirtualMutationRepository,
+    validate_virtual_move_transition, virtual_move_content_changed, virtual_move_missing,
 };
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
+const JOURNALS_COMPONENT_VERSION: i64 = 3;
 const LINUX_FUSE_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const WINDOWS_CLOUD_FILES_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const RETIRED_NOTION_WORKSPACE_ROOTS_COMPONENT_ID: &str = "projection:notion_workspace_roots";
@@ -122,8 +133,8 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
     StateComponentDefinition {
         component_id: "durable:journals",
         component_kind: "durable_json",
-        current_version: 3,
-        min_reader_version: 1,
+        current_version: JOURNALS_COMPONENT_VERSION,
+        min_reader_version: JOURNALS_COMPONENT_VERSION,
         required: true,
         rebuildable: false,
         data_json: "{}",
@@ -131,8 +142,8 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
     StateComponentDefinition {
         component_id: "durable:virtual_mutations",
         component_kind: "durable_json",
-        current_version: 2,
-        min_reader_version: 1,
+        current_version: 3,
+        min_reader_version: 3,
         required: true,
         rebuildable: false,
         data_json: "{}",
@@ -162,6 +173,15 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
         min_reader_version: 1,
         required: true,
         rebuildable: true,
+        data_json: "{}",
+    },
+    StateComponentDefinition {
+        component_id: "durable:discovery_projection",
+        component_kind: "durable_transaction",
+        current_version: 1,
+        min_reader_version: 1,
+        required: true,
+        rebuildable: false,
         data_json: "{}",
     },
     StateComponentDefinition {
@@ -621,6 +641,784 @@ impl ConnectorStateRepository for SqliteStateStore {
             )
             .optional()
             .map_err(StoreError::from)
+    }
+}
+
+fn apply_discovery_commit(transaction: &Connection, commit: &DiscoveryCommit) -> StoreResult<()> {
+    commit.validate()?;
+    let connector = transaction
+        .query_row(
+            "SELECT connector FROM mounts WHERE mount_id = ?1",
+            params![commit.mount_id.0.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::MountMissing(commit.mount_id.clone()))?;
+    commit.validate_connector(&connector)?;
+
+    let existing_entities = discovery_entities(&transaction, &commit.mount_id)?;
+    let auto_save_enrollments = discovery_auto_save_enrollments(&transaction, &commit.mount_id)?;
+    let virtual_mutations = discovery_virtual_mutations(&transaction, &commit.mount_id)?;
+    let DiscoveryPreflight {
+        final_entities: _,
+        entity_deletes: _,
+        deleted_paths,
+        path_moves,
+        auto_save_rehomes,
+    } = commit.preflight_details(
+        &connector,
+        &existing_entities,
+        &auto_save_enrollments,
+        &virtual_mutations,
+    )?;
+
+    let final_path_texts = commit
+        .entity_upserts
+        .iter()
+        .map(|entity| logical_path_to_text(&entity.path))
+        .collect::<BTreeSet<_>>();
+    for (index, (remote_id, _, _)) in path_moves.iter().enumerate() {
+        let staging_path =
+            discovery_staging_path(&transaction, &commit.mount_id, index, &final_path_texts)?;
+        transaction.execute(
+            "UPDATE entities SET path = ?3 WHERE mount_id = ?1 AND remote_id = ?2",
+            params![
+                commit.mount_id.0.as_str(),
+                remote_id.0.as_str(),
+                staging_path
+            ],
+        )?;
+    }
+
+    for rehome in &auto_save_rehomes {
+        transaction.execute(
+            "DELETE FROM auto_save_enrollments WHERE mount_id = ?1 AND path = ?2",
+            params![commit.mount_id.0.as_str(), path_to_text(&rehome.old_path)],
+        )?;
+    }
+
+    for remote_id in &commit.entity_deletes {
+        transaction.execute(
+            "DELETE FROM shadows WHERE mount_id = ?1 AND entity_id = ?2",
+            params![commit.mount_id.0.as_str(), remote_id.0.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM hydration_jobs WHERE mount_id = ?1 AND remote_id = ?2",
+            params![commit.mount_id.0.as_str(), remote_id.0.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM freshness_states WHERE mount_id = ?1 AND remote_id = ?2",
+            params![commit.mount_id.0.as_str(), remote_id.0.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM remote_observations WHERE mount_id = ?1 AND remote_id = ?2",
+            params![commit.mount_id.0.as_str(), remote_id.0.as_str()],
+        )?;
+        if let Some(path) = deleted_paths.get(remote_id) {
+            let path = logical_path_to_text(path);
+            transaction.execute(
+                "DELETE FROM auto_save_enrollments
+                     WHERE mount_id = ?1 AND (remote_id = ?2 OR path = ?3)",
+                params![commit.mount_id.0.as_str(), remote_id.0.as_str(), path],
+            )?;
+        } else {
+            transaction.execute(
+                "DELETE FROM auto_save_enrollments
+                     WHERE mount_id = ?1 AND remote_id = ?2",
+                params![commit.mount_id.0.as_str(), remote_id.0.as_str()],
+            )?;
+        }
+        delete_entity_search_index(&transaction, &commit.mount_id, remote_id)?;
+        transaction.execute(
+            "DELETE FROM entities WHERE mount_id = ?1 AND remote_id = ?2",
+            params![commit.mount_id.0.as_str(), remote_id.0.as_str()],
+        )?;
+    }
+    for identifier in &commit.metadata_discovery_deletes {
+        transaction.execute(
+            "DELETE FROM metadata_discovery_jobs
+                 WHERE mount_id = ?1 AND container_identifier = ?2",
+            params![commit.mount_id.0.as_str(), identifier],
+        )?;
+    }
+    for local_id in &commit.virtual_mutation_deletes {
+        transaction.execute(
+            "DELETE FROM virtual_mutations WHERE mount_id = ?1 AND local_id = ?2",
+            params![commit.mount_id.0.as_str(), local_id],
+        )?;
+    }
+
+    for (remote_id, _, new_path) in &path_moves {
+        transaction.execute(
+            "UPDATE hydration_jobs SET path = ?3
+                 WHERE mount_id = ?1 AND remote_id = ?2",
+            params![
+                commit.mount_id.0.as_str(),
+                remote_id.0.as_str(),
+                path_to_text(new_path),
+            ],
+        )?;
+    }
+    for entity in &commit.entity_upserts {
+        upsert_discovery_entity(&transaction, entity)?;
+    }
+    for observation in &commit.observation_upserts {
+        upsert_discovery_observation(&transaction, observation)?;
+    }
+    for freshness in &commit.freshness_upserts {
+        upsert_discovery_freshness(&transaction, freshness)?;
+    }
+    for rehome in auto_save_rehomes {
+        upsert_discovery_auto_save(&transaction, &rehome.enrollment)?;
+    }
+    for enrollment in &commit.auto_save_upserts {
+        upsert_discovery_auto_save(&transaction, enrollment)?;
+    }
+
+    let search_updates = commit
+        .entity_deletes
+        .iter()
+        .chain(commit.entity_upserts.iter().map(|entity| &entity.remote_id))
+        .chain(
+            commit
+                .observation_upserts
+                .iter()
+                .map(|observation| &observation.remote_id),
+        )
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for remote_id in search_updates {
+        upsert_entity_search_index(&transaction, &commit.mount_id, &remote_id)?;
+    }
+
+    let checkpoint = &commit.checkpoint;
+    transaction.execute(
+        "INSERT INTO connector_state (
+                connector, scope_kind, scope_id, state_version,
+                min_reader_version, state_json, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(connector, scope_kind, scope_id) DO UPDATE SET
+                state_version = excluded.state_version,
+                min_reader_version = excluded.min_reader_version,
+                state_json = excluded.state_json,
+                updated_at = excluded.updated_at",
+        params![
+            checkpoint.connector.as_str(),
+            checkpoint.scope_kind.as_str(),
+            checkpoint.scope_id.as_str(),
+            checkpoint.state_version,
+            checkpoint.min_reader_version,
+            checkpoint.state_json.as_str(),
+            checkpoint.updated_at.as_str(),
+        ],
+    )?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct DiscoveryTransactionDbRow {
+    transaction_id: String,
+    mount_id: String,
+    projection_json: String,
+    status: String,
+    active: i64,
+    state_version: i64,
+    min_reader_version: i64,
+    plan_json: String,
+    commit_json: String,
+    reservation_json: String,
+    effects_json: String,
+    error_json: Option<String>,
+    created_at: String,
+    updated_at: String,
+    committed_at: Option<String>,
+    finalized_at: Option<String>,
+}
+
+fn discovery_transaction_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<DiscoveryTransactionDbRow> {
+    Ok(DiscoveryTransactionDbRow {
+        transaction_id: row.get(0)?,
+        mount_id: row.get(1)?,
+        projection_json: row.get(2)?,
+        status: row.get(3)?,
+        active: row.get(4)?,
+        state_version: row.get(5)?,
+        min_reader_version: row.get(6)?,
+        plan_json: row.get(7)?,
+        commit_json: row.get(8)?,
+        reservation_json: row.get(9)?,
+        effects_json: row.get(10)?,
+        error_json: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+        committed_at: row.get(14)?,
+        finalized_at: row.get(15)?,
+    })
+}
+
+const DISCOVERY_TRANSACTION_SELECT: &str = "
+    SELECT transaction_id, mount_id, projection_json, status, active,
+           state_version, min_reader_version, plan_json, commit_json,
+           reservation_json, effects_json, error_json, created_at, updated_at,
+           committed_at, finalized_at
+    FROM discovery_projection_transactions
+    ";
+
+fn discovery_transaction_from_row(
+    row: DiscoveryTransactionDbRow,
+) -> StoreResult<DiscoveryTransactionRecord> {
+    validate_envelope_version(row.state_version, row.min_reader_version, "record")?;
+    let transaction_id = DiscoveryTransactionId::new(row.transaction_id);
+    let mount_id = MountId::new(row.mount_id);
+    let projection = from_json::<ProjectionMode>(&row.projection_json)?;
+    let status = DiscoveryTransactionStatus::parse(&row.status)?;
+    let active = row.active != 0;
+    if active != status.is_active() {
+        return Err(StoreError::InvalidState(format!(
+            "discovery transaction `{}` status and active marker disagree",
+            transaction_id.0
+        )));
+    }
+    let plan = decode_envelope::<Value>(&row.plan_json, "plan")?;
+    let commit = decode_envelope::<TransactionalDiscoveryCommit>(&row.commit_json, "commit")?;
+    let reservation =
+        decode_envelope::<DiscoveryReservation>(&row.reservation_json, "reservation")?;
+    let effects = decode_envelope::<Value>(&row.effects_json, "effects")?;
+    if commit.transaction_id != transaction_id {
+        return Err(StoreError::InvalidState(format!(
+            "discovery transaction `{}` stored commit identifier does not match its row",
+            transaction_id.0
+        )));
+    }
+    if commit.commit.mount_id != mount_id || reservation.mount.mount_id != mount_id {
+        return Err(StoreError::InvalidState(format!(
+            "discovery transaction `{}` stored mount identifiers disagree",
+            transaction_id.0
+        )));
+    }
+    if reservation.mount.projection != projection {
+        return Err(StoreError::InvalidState(format!(
+            "discovery transaction `{}` stored projection identifiers disagree",
+            transaction_id.0
+        )));
+    }
+    Ok(DiscoveryTransactionRecord {
+        transaction_id,
+        mount_id,
+        projection,
+        status,
+        active,
+        plan: canonicalize_json_value(plan),
+        commit,
+        reservation,
+        effects: canonicalize_json_value(effects),
+        error: row
+            .error_json
+            .map(|value| serde_json::from_str::<Value>(&value))
+            .transpose()?
+            .map(canonicalize_json_value),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        committed_at: row.committed_at,
+        finalized_at: row.finalized_at,
+    })
+}
+
+fn select_discovery_transaction(
+    connection: &Connection,
+    transaction_id: &DiscoveryTransactionId,
+) -> StoreResult<Option<DiscoveryTransactionRecord>> {
+    connection
+        .query_row(
+            &(DISCOVERY_TRANSACTION_SELECT.to_owned() + "WHERE transaction_id = ?1"),
+            params![transaction_id.0.as_str()],
+            discovery_transaction_row,
+        )
+        .optional()?
+        .map(discovery_transaction_from_row)
+        .transpose()
+}
+
+fn capture_discovery_reservation_from_connection(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<DiscoveryReservation> {
+    let mount = connection
+        .query_row(
+            "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json,
+                    connection_id, settings_json
+             FROM mounts WHERE mount_id = ?1",
+            params![mount_id.0.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(mount_from_row)
+        .transpose()?
+        .ok_or_else(|| StoreError::MountMissing(mount_id.clone()))?;
+    let mount_live_mode = connection
+        .query_row(
+            &(MOUNT_LIVE_MODE_SELECT_WITH_WHERE.to_owned() + "WHERE mount_id = ?1"),
+            params![mount_id.0.as_str()],
+            mount_live_mode_row,
+        )
+        .optional()?
+        .map(mount_live_mode_from_row)
+        .transpose()?;
+    let checkpoint = connection
+        .query_row(
+            "SELECT connector, scope_kind, scope_id, state_version, min_reader_version,
+                    state_json, updated_at
+             FROM connector_state
+             WHERE connector = ?1 AND scope_kind = 'mount' AND scope_id = ?2",
+            params![mount.connector.as_str(), mount_id.0.as_str()],
+            |row| {
+                Ok(ConnectorStateRecord {
+                    connector: row.get(0)?,
+                    scope_kind: row.get(1)?,
+                    scope_id: row.get(2)?,
+                    state_version: row.get(3)?,
+                    min_reader_version: row.get(4)?,
+                    state_json: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+
+    let shadows = {
+        let mut statement = connection.prepare(
+            "SELECT mount_id, entity_id, frontmatter, body_hash, rendered_body, blocks_json
+             FROM shadows WHERE mount_id = ?1 ORDER BY entity_id",
+        )?;
+        let rows = statement.query_map(params![mount_id.0.as_str()], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?;
+        rows.map(|row| shadow_from_row(row?))
+            .collect::<StoreResult<Vec<_>>>()?
+    };
+    let hydration_jobs = {
+        let mut statement = connection.prepare(
+            "SELECT mount_id, remote_id, path, target_state_json, reason_json, attempts, last_error
+             FROM hydration_jobs WHERE mount_id = ?1 ORDER BY remote_id",
+        )?;
+        let rows = statement.query_map(params![mount_id.0.as_str()], hydration_job_row)?;
+        rows.map(|row| hydration_job_from_row(row?))
+            .collect::<StoreResult<Vec<_>>>()?
+    };
+    let remote_observations = {
+        let mut statement = connection.prepare(
+            &(REMOTE_OBSERVATION_SELECT_WITH_WHERE.to_owned()
+                + "WHERE mount_id = ?1 ORDER BY remote_id"),
+        )?;
+        let rows = statement.query_map(params![mount_id.0.as_str()], remote_observation_row)?;
+        rows.map(|row| remote_observation_from_row(row?))
+            .collect::<StoreResult<Vec<_>>>()?
+    };
+    let freshness_states = {
+        let mut statement = connection.prepare(
+            &(FRESHNESS_STATE_SELECT_WITH_WHERE.to_owned()
+                + "WHERE mount_id = ?1 ORDER BY remote_id"),
+        )?;
+        let rows = statement.query_map(params![mount_id.0.as_str()], freshness_state_row)?;
+        rows.map(|row| freshness_state_from_row(row?))
+            .collect::<StoreResult<Vec<_>>>()?
+    };
+    let metadata_discovery_jobs = {
+        let mut statement = connection.prepare(
+            &(METADATA_DISCOVERY_JOB_SELECT_WITH_WHERE.to_owned()
+                + "WHERE mount_id = ?1 ORDER BY container_identifier"),
+        )?;
+        let rows = statement.query_map(params![mount_id.0.as_str()], metadata_discovery_job_row)?;
+        rows.map(|row| metadata_discovery_job_from_row(row?))
+            .collect::<StoreResult<Vec<_>>>()?
+    };
+    let unsettled_journals = {
+        let mut statement = connection.prepare(
+            "SELECT push_id, mount_id, remote_ids_json, plan_json, preimages_json,
+                    apply_effects_json, status_json, metadata_json, readable_diff_json
+             FROM journals WHERE mount_id = ?1 ORDER BY push_id",
+        )?;
+        let rows = statement.query_map(params![mount_id.0.as_str()], journal_row)?;
+        rows.map(|row| journal_from_row(row?))
+            .collect::<StoreResult<Vec<_>>>()?
+            .into_iter()
+            .filter(|entry| entry.status.is_unsettled())
+            .collect()
+    };
+
+    Ok(DiscoveryReservation {
+        mount,
+        mount_live_mode,
+        checkpoint,
+        entities: discovery_entities(connection, mount_id)?,
+        shadows,
+        hydration_jobs,
+        virtual_mutations: discovery_virtual_mutations(connection, mount_id)?,
+        auto_save_enrollments: discovery_auto_save_enrollments(connection, mount_id)?,
+        remote_observations,
+        freshness_states,
+        metadata_discovery_jobs,
+        unsettled_journals,
+    })
+}
+
+fn illegal_discovery_transition(
+    transaction_id: &DiscoveryTransactionId,
+    from: DiscoveryTransactionStatus,
+    to: DiscoveryTransactionStatus,
+) -> StoreError {
+    StoreError::InvalidState(format!(
+        "discovery transaction `{}` cannot transition from `{}` to `{}`",
+        transaction_id.0,
+        from.as_str(),
+        to.as_str()
+    ))
+}
+
+fn transition_discovery_transaction(
+    store: &mut SqliteStateStore,
+    transaction_id: &DiscoveryTransactionId,
+    expected_status: DiscoveryTransactionStatus,
+    next_status: DiscoveryTransactionStatus,
+    updated_at: &str,
+    error: Option<Value>,
+) -> StoreResult<DiscoveryTransactionRecord> {
+    let mut connection = store.connection()?;
+    let transaction = connection.transaction()?;
+    let record = select_discovery_transaction(&transaction, transaction_id)?
+        .ok_or_else(|| transaction_missing(transaction_id))?;
+    require_transaction_status(&record, expected_status)?;
+    let error_json = error
+        .map(canonicalize_json_value)
+        .as_ref()
+        .map(canonical_json)
+        .transpose()?;
+    let finalized_at = (next_status == DiscoveryTransactionStatus::Finalized).then_some(updated_at);
+    let changed = transaction.execute(
+        "UPDATE discovery_projection_transactions
+         SET status = ?3,
+             active = ?4,
+             updated_at = ?5,
+             error_json = COALESCE(?6, error_json),
+             finalized_at = COALESCE(?7, finalized_at)
+         WHERE transaction_id = ?1 AND status = ?2 AND active = 1",
+        params![
+            transaction_id.0.as_str(),
+            expected_status.as_str(),
+            next_status.as_str(),
+            bool_to_int(next_status.is_active()),
+            updated_at,
+            error_json.as_deref(),
+            finalized_at,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::InvalidState(format!(
+            "discovery transaction `{}` changed during transition",
+            transaction_id.0
+        )));
+    }
+    let updated = select_discovery_transaction(&transaction, transaction_id)?
+        .ok_or_else(|| transaction_missing(transaction_id))?;
+    transaction.commit()?;
+    Ok(updated)
+}
+
+impl DiscoveryRepository for SqliteStateStore {
+    fn capture_discovery_reservation(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<DiscoveryReservation> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let reservation = capture_discovery_reservation_from_connection(&transaction, mount_id)?;
+        transaction.commit()?;
+        Ok(reservation)
+    }
+
+    fn reserve_discovery_transaction(
+        &mut self,
+        prepared: PreparedDiscoveryTransaction,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        let transaction_id = prepared.commit.transaction_id.clone();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = select_discovery_transaction(&transaction, &transaction_id)? {
+            if prepared_matches_record(&prepared, &existing) {
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            return Err(StoreError::InvalidState(format!(
+                "discovery transaction `{}` reservation retry does not match its immutable payload",
+                transaction_id.0
+            )));
+        }
+
+        let mount_id = prepared.commit.commit.mount_id.clone();
+        let active_transaction = transaction
+            .query_row(
+                "SELECT transaction_id
+                 FROM discovery_projection_transactions
+                 WHERE mount_id = ?1 AND active = 1",
+                params![mount_id.0.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(active_transaction) = active_transaction {
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` already has active discovery transaction `{active_transaction}`",
+                mount_id.0
+            )));
+        }
+        let current = capture_discovery_reservation_from_connection(&transaction, &mount_id)?;
+        let record = record_from_prepared(prepared, &current)?;
+        transaction.execute(
+            "INSERT INTO discovery_projection_transactions (
+                transaction_id, mount_id, projection_json, status, active,
+                state_version, min_reader_version, plan_json, commit_json,
+                reservation_json, effects_json, error_json, created_at, updated_at,
+                committed_at, finalized_at
+             ) VALUES (?1, ?2, ?3, 'reserved', 1, ?4, ?5, ?6, ?7, ?8, ?9,
+                       NULL, ?10, ?10, NULL, NULL)",
+            params![
+                record.transaction_id.0.as_str(),
+                record.mount_id.0.as_str(),
+                to_json(&record.projection)?,
+                DISCOVERY_TRANSACTION_STATE_VERSION,
+                DISCOVERY_TRANSACTION_MIN_READER_VERSION,
+                canonical_envelope_json(&record.plan)?,
+                canonical_envelope_json(&record.commit)?,
+                canonical_envelope_json(&record.reservation)?,
+                canonical_envelope_json(&record.effects)?,
+                record.created_at.as_str(),
+            ],
+        )?;
+        let stored = select_discovery_transaction(&transaction, &transaction_id)?
+            .ok_or_else(|| transaction_missing(&transaction_id))?;
+        transaction.commit()?;
+        Ok(stored)
+    }
+
+    fn get_discovery_transaction(
+        &self,
+        transaction_id: &DiscoveryTransactionId,
+    ) -> StoreResult<Option<DiscoveryTransactionRecord>> {
+        let connection = self.connection()?;
+        select_discovery_transaction(&connection, transaction_id)
+    }
+
+    fn list_active_discovery_transactions(&self) -> StoreResult<Vec<DiscoveryTransactionRecord>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            &(DISCOVERY_TRANSACTION_SELECT.to_owned()
+                + "WHERE active = 1 ORDER BY mount_id, transaction_id"),
+        )?;
+        let rows = statement.query_map([], discovery_transaction_row)?;
+        rows.map(|row| discovery_transaction_from_row(row?))
+            .collect()
+    }
+
+    fn mark_discovery_transaction_applying(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        updated_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        transition_discovery_transaction(
+            self,
+            transaction_id,
+            DiscoveryTransactionStatus::Reserved,
+            DiscoveryTransactionStatus::Applying,
+            updated_at,
+            None,
+        )
+    }
+
+    fn record_discovery_transaction_effects(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        expected_status: DiscoveryTransactionStatus,
+        effects: Value,
+        updated_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let record = select_discovery_transaction(&transaction, transaction_id)?
+            .ok_or_else(|| transaction_missing(transaction_id))?;
+        require_transaction_status(&record, expected_status)?;
+        let changed = transaction.execute(
+            "UPDATE discovery_projection_transactions
+             SET effects_json = ?3, updated_at = ?4
+             WHERE transaction_id = ?1 AND status = ?2 AND active = 1",
+            params![
+                transaction_id.0.as_str(),
+                expected_status.as_str(),
+                canonical_envelope_json(&canonicalize_json_value(effects))?,
+                updated_at,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidState(format!(
+                "discovery transaction `{}` changed during effects update",
+                transaction_id.0
+            )));
+        }
+        let updated = select_discovery_transaction(&transaction, transaction_id)?
+            .ok_or_else(|| transaction_missing(transaction_id))?;
+        transaction.commit()?;
+        Ok(updated)
+    }
+
+    fn mark_discovery_transaction_projected(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        expected_status: DiscoveryTransactionStatus,
+        updated_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        if !matches!(
+            expected_status,
+            DiscoveryTransactionStatus::Applying | DiscoveryTransactionStatus::RepairPending
+        ) {
+            return Err(illegal_discovery_transition(
+                transaction_id,
+                expected_status,
+                DiscoveryTransactionStatus::Projected,
+            ));
+        }
+        transition_discovery_transaction(
+            self,
+            transaction_id,
+            expected_status,
+            DiscoveryTransactionStatus::Projected,
+            updated_at,
+            None,
+        )
+    }
+
+    fn commit_discovery_transaction(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        committed_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record = select_discovery_transaction(&transaction, transaction_id)?
+            .ok_or_else(|| transaction_missing(transaction_id))?;
+        require_transaction_status(&record, DiscoveryTransactionStatus::Projected)?;
+        let current =
+            capture_discovery_reservation_from_connection(&transaction, &record.mount_id)?;
+        if let Some(category) = record.reservation.changed_category(&current) {
+            return Err(reservation_changed(transaction_id, category));
+        }
+        apply_discovery_commit(&transaction, &record.commit.commit)?;
+        let changed = transaction.execute(
+            "UPDATE discovery_projection_transactions
+             SET status = 'committed', updated_at = ?2, committed_at = ?2,
+                 error_json = NULL
+             WHERE transaction_id = ?1 AND status = 'projected' AND active = 1",
+            params![transaction_id.0.as_str(), committed_at],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidState(format!(
+                "discovery transaction `{}` changed during commit",
+                transaction_id.0
+            )));
+        }
+        let committed = select_discovery_transaction(&transaction, transaction_id)?
+            .ok_or_else(|| transaction_missing(transaction_id))?;
+        transaction.commit()?;
+        Ok(committed)
+    }
+
+    fn mark_discovery_transaction_repair_pending(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        expected_status: DiscoveryTransactionStatus,
+        error: Value,
+        updated_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        if !matches!(
+            expected_status,
+            DiscoveryTransactionStatus::Applying | DiscoveryTransactionStatus::Projected
+        ) {
+            return Err(illegal_discovery_transition(
+                transaction_id,
+                expected_status,
+                DiscoveryTransactionStatus::RepairPending,
+            ));
+        }
+        transition_discovery_transaction(
+            self,
+            transaction_id,
+            expected_status,
+            DiscoveryTransactionStatus::RepairPending,
+            updated_at,
+            Some(error),
+        )
+    }
+
+    fn mark_discovery_transaction_aborted(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        expected_status: DiscoveryTransactionStatus,
+        updated_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        if !matches!(
+            expected_status,
+            DiscoveryTransactionStatus::Reserved
+                | DiscoveryTransactionStatus::Applying
+                | DiscoveryTransactionStatus::Projected
+                | DiscoveryTransactionStatus::RepairPending
+        ) {
+            return Err(illegal_discovery_transition(
+                transaction_id,
+                expected_status,
+                DiscoveryTransactionStatus::Aborted,
+            ));
+        }
+        transition_discovery_transaction(
+            self,
+            transaction_id,
+            expected_status,
+            DiscoveryTransactionStatus::Aborted,
+            updated_at,
+            None,
+        )
+    }
+
+    fn mark_discovery_transaction_finalized(
+        &mut self,
+        transaction_id: &DiscoveryTransactionId,
+        finalized_at: &str,
+    ) -> StoreResult<DiscoveryTransactionRecord> {
+        transition_discovery_transaction(
+            self,
+            transaction_id,
+            DiscoveryTransactionStatus::Committed,
+            DiscoveryTransactionStatus::Finalized,
+            finalized_at,
+            None,
+        )
     }
 }
 
@@ -1142,6 +1940,174 @@ impl VirtualMutationRepository for SqliteStateStore {
             params![mount_id.0, local_id],
         )?;
         Ok(())
+    }
+}
+
+impl VirtualMoveRepository for SqliteStateStore {
+    fn begin_virtual_move(&mut self, transition: VirtualMoveTransition) -> StoreResult<()> {
+        validate_virtual_move_transition(&transition)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mount_id = transition.mutation.mount_id.clone();
+
+        for local_id in &transition.superseded_local_ids {
+            transaction.execute(
+                "DELETE FROM virtual_mutations WHERE mount_id = ?1 AND local_id = ?2",
+                params![mount_id.0, local_id],
+            )?;
+        }
+
+        if let Some(entity) = &transition.entity {
+            let path = logical_path_to_text(&entity.path);
+            let existing_remote_id: Option<String> = transaction
+                .query_row(
+                    "SELECT remote_id FROM entities WHERE mount_id = ?1 AND path = ?2",
+                    params![entity.mount_id.0, path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if existing_remote_id
+                .as_deref()
+                .is_some_and(|remote_id| remote_id != entity.remote_id.0)
+            {
+                return Err(StoreError::DuplicateEntityPath {
+                    mount_id: entity.mount_id.clone(),
+                    path: entity.path.clone(),
+                });
+            }
+            transaction.execute(
+                "INSERT INTO entities (
+                    mount_id, remote_id, kind_json, title, path, hydration_json,
+                    content_hash, remote_edited_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(mount_id, remote_id) DO UPDATE SET
+                    kind_json = excluded.kind_json,
+                    title = excluded.title,
+                    path = excluded.path,
+                    hydration_json = excluded.hydration_json,
+                    content_hash = excluded.content_hash,
+                    remote_edited_at = excluded.remote_edited_at",
+                params![
+                    entity.mount_id.0,
+                    entity.remote_id.0,
+                    to_json(&entity.kind)?,
+                    entity.title,
+                    path,
+                    to_json(&entity.hydration)?,
+                    entity.content_hash,
+                    entity.remote_edited_at,
+                ],
+            )?;
+            upsert_entity_search_index(&transaction, &entity.mount_id, &entity.remote_id)?;
+        }
+
+        if let Some(freshness) = &transition.freshness {
+            transaction.execute(
+                "INSERT INTO freshness_states (
+                    mount_id, remote_id, tier_json, last_checked_at, next_check_at,
+                    last_opened_at, last_local_change_at, remote_hint_pending
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(mount_id, remote_id) DO UPDATE SET
+                    tier_json = excluded.tier_json,
+                    last_checked_at = excluded.last_checked_at,
+                    next_check_at = excluded.next_check_at,
+                    last_opened_at = excluded.last_opened_at,
+                    last_local_change_at = excluded.last_local_change_at,
+                    remote_hint_pending = excluded.remote_hint_pending",
+                params![
+                    freshness.mount_id.0,
+                    freshness.remote_id.0,
+                    to_json(&freshness.tier)?,
+                    freshness.last_checked_at,
+                    freshness.next_check_at,
+                    freshness.last_opened_at,
+                    freshness.last_local_change_at,
+                    bool_to_int(freshness.remote_hint_pending),
+                ],
+            )?;
+        }
+
+        let mutation = &transition.mutation;
+        transaction.execute(
+            "INSERT INTO virtual_mutations (
+                mount_id, local_id, mutation_kind_json, target_remote_id,
+                parent_remote_id, original_path, projected_path, title,
+                content_path, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(mount_id, local_id) DO UPDATE SET
+                mutation_kind_json = excluded.mutation_kind_json,
+                target_remote_id = excluded.target_remote_id,
+                parent_remote_id = excluded.parent_remote_id,
+                original_path = excluded.original_path,
+                projected_path = excluded.projected_path,
+                title = excluded.title,
+                content_path = excluded.content_path,
+                updated_at = excluded.updated_at",
+            params![
+                mutation.mount_id.0,
+                mutation.local_id,
+                to_json(&mutation.mutation_kind)?,
+                mutation.target_remote_id.as_ref().map(|id| id.0.as_str()),
+                mutation.parent_remote_id.as_ref().map(|id| id.0.as_str()),
+                mutation
+                    .original_path
+                    .as_ref()
+                    .map(|path| logical_path_to_text(path)),
+                logical_path_to_text(&mutation.projected_path),
+                mutation.title,
+                mutation
+                    .content_path
+                    .as_ref()
+                    .map(|path| path_to_text(path)),
+                mutation.created_at,
+                mutation.updated_at,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn finalize_virtual_move_content(
+        &mut self,
+        mount_id: &MountId,
+        local_id: &str,
+        expected_content_path: Option<&Path>,
+        content_path: PathBuf,
+        updated_at: &str,
+    ) -> StoreResult<VirtualMutationRecord> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let sql =
+            VIRTUAL_MUTATION_SELECT_WITH_WHERE.to_owned() + "WHERE mount_id = ?1 AND local_id = ?2";
+        let mut mutation = transaction
+            .query_row(&sql, params![mount_id.0, local_id], virtual_mutation_row)
+            .optional()?
+            .map(virtual_mutation_from_row)
+            .transpose()?
+            .ok_or_else(|| virtual_move_missing(mount_id, local_id))?;
+        if mutation.content_path.as_deref() != expected_content_path {
+            return Err(virtual_move_content_changed(
+                mount_id,
+                local_id,
+                expected_content_path,
+                mutation.content_path.as_deref(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE virtual_mutations
+             SET content_path = ?3, updated_at = ?4
+             WHERE mount_id = ?1 AND local_id = ?2",
+            params![
+                mount_id.0,
+                local_id,
+                path_to_text(&content_path),
+                updated_at
+            ],
+        )?;
+        mutation.content_path = Some(content_path);
+        mutation.updated_at = updated_at.to_string();
+        transaction.commit()?;
+        Ok(mutation)
     }
 }
 
@@ -1763,17 +2729,19 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         });
     }
     if user_version == SCHEMA_VERSION {
+        ensure_state_components_safe_before_mutation(connection, user_version)?;
         retire_removed_state_components(connection)?;
         repair_missing_state_components(connection)?;
         ensure_state_components_allow_schema_migration(connection, user_version)?;
         migrate_linux_fuse_projection_layout_to_v2(connection, false)?;
         migrate_windows_cloud_files_projection_layout_to_v2(connection, false)?;
         migrate_journals_component_to_v3(connection)?;
-        migrate_virtual_mutations_component_to_v2(connection)?;
+        migrate_virtual_mutations_component_to_v3(connection)?;
         return Ok(());
     }
 
     if user_version >= 13 {
+        ensure_state_components_safe_before_mutation(connection, user_version)?;
         retire_removed_state_components(connection)?;
         ensure_state_components_allow_schema_migration(connection, user_version)?;
     }
@@ -1794,6 +2762,55 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             connection_id TEXT,
             settings_json TEXT NOT NULL DEFAULT '{}'
         );
+
+        CREATE TABLE IF NOT EXISTS discovery_projection_transactions (
+            transaction_id TEXT PRIMARY KEY,
+            mount_id TEXT NOT NULL,
+            projection_json TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (
+                status IN (
+                    'reserved', 'applying', 'projected', 'committed',
+                    'repair_pending', 'aborted', 'finalized'
+                )
+            ),
+            active INTEGER NOT NULL CHECK (active IN (0, 1)),
+            state_version INTEGER NOT NULL CHECK (state_version > 0),
+            min_reader_version INTEGER NOT NULL CHECK (
+                min_reader_version > 0 AND min_reader_version <= state_version
+            ),
+            plan_json TEXT NOT NULL,
+            commit_json TEXT NOT NULL,
+            reservation_json TEXT NOT NULL,
+            effects_json TEXT NOT NULL,
+            error_json TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            committed_at TEXT,
+            finalized_at TEXT,
+            CHECK (
+                (active = 0 AND status IN ('aborted', 'finalized'))
+                OR
+                (active = 1 AND status IN (
+                    'reserved', 'applying', 'projected', 'committed', 'repair_pending'
+                ))
+            ),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS discovery_projection_one_active_per_mount
+        ON discovery_projection_transactions(mount_id)
+        WHERE active = 1;
+
+        CREATE TRIGGER IF NOT EXISTS discovery_projection_block_active_mount_delete
+        BEFORE DELETE ON mounts
+        WHEN EXISTS (
+            SELECT 1
+            FROM discovery_projection_transactions
+            WHERE mount_id = OLD.mount_id AND active = 1
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'mount has an active discovery projection transaction');
+        END;
 
         CREATE TABLE IF NOT EXISTS connections (
             connection_id TEXT PRIMARY KEY,
@@ -2223,6 +3240,10 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         }
     }
 
+    if user_version < 19 && user_version >= 13 {
+        record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
+    }
+
     if user_version < SCHEMA_VERSION {
         seed_default_notion_profile(connection)?;
         migrate_linux_fuse_projection_layout_to_v2(connection, user_version < 13)?;
@@ -2232,6 +3253,33 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
     }
 
     Ok(())
+}
+
+fn ensure_state_components_safe_before_mutation(
+    connection: &Connection,
+    user_version: i64,
+) -> StoreResult<()> {
+    let blocking_issues = inspect_state_component_issues(connection)?
+        .into_iter()
+        .filter(|issue| {
+            let current_schema_repair = user_version == SCHEMA_VERSION
+                && matches!(
+                    issue,
+                    StateCompatibilityIssue::MissingComponent { component_id }
+                        if repairable_missing_state_component(component_id)
+                );
+            !current_schema_repair
+                && !state_component_issue_allows_schema_migration(issue, user_version)
+        })
+        .collect::<Vec<_>>();
+
+    if blocking_issues.is_empty() {
+        Ok(())
+    } else {
+        Err(StoreError::StateCompatibility(format!(
+            "state components are not safe to mutate: {blocking_issues:?}",
+        )))
+    }
 }
 
 fn ensure_state_components_allow_schema_migration(
@@ -2282,15 +3330,15 @@ fn state_component_issue_allows_schema_migration(
         StateCompatibilityIssue::OlderComponent {
             component_id,
             found,
-            current: 3,
-        } if component_id == "durable:journals" && *found >= 1 && *found < 3
+            current: JOURNALS_COMPONENT_VERSION,
+        } if component_id == "durable:journals" && matches!(*found, 1 | 2)
     ) || matches!(
         issue,
         StateCompatibilityIssue::OlderComponent {
             component_id,
-            found: 1,
-            current: 2,
-        } if component_id == "durable:virtual_mutations"
+            found,
+            current: 3,
+        } if component_id == "durable:virtual_mutations" && matches!(*found, 1 | 2)
     ) || matches!(
         issue,
         StateCompatibilityIssue::MissingComponent { component_id }
@@ -2307,6 +3355,10 @@ fn state_component_issue_allows_schema_migration(
         issue,
         StateCompatibilityIssue::MissingComponent { component_id }
             if user_version < 16 && component_id == "durable:metadata_discovery"
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::MissingComponent { component_id }
+            if user_version < 19 && component_id == "durable:discovery_projection"
     )
 }
 
@@ -2753,6 +3805,9 @@ fn remap_apply_effect_operation_index(
         | JournalApplyEffect::ArchivedEntity {
             operation_index, ..
         }
+        | JournalApplyEffect::UpdatedEntityBody {
+            operation_index, ..
+        }
         | JournalApplyEffect::UpdatedProperties {
             operation_index, ..
         }
@@ -3033,7 +4088,7 @@ fn migrate_windows_cloud_files_projection_layout_to_v2(
     )
 }
 
-fn migrate_virtual_mutations_component_to_v2(connection: &Connection) -> StoreResult<()> {
+fn migrate_virtual_mutations_component_to_v3(connection: &Connection) -> StoreResult<()> {
     migrate_state_component_to_current(connection, "durable:virtual_mutations")
 }
 
@@ -3760,6 +4815,193 @@ fn delete_entity_search_index(
     connection.execute(
         "DELETE FROM entity_search_fts WHERE mount_id = ?1 AND remote_id = ?2",
         params![mount_id.0, remote_id.0],
+    )?;
+    Ok(())
+}
+
+fn discovery_entities(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<Vec<EntityRecord>> {
+    let mut statement = connection.prepare(
+        &(ENTITY_SELECT_WITH_WHERE.to_owned() + "WHERE mount_id = ?1 ORDER BY remote_id"),
+    )?;
+    let rows = statement.query_map(params![mount_id.0.as_str()], entity_row)?;
+    rows.map(|row| entity_from_row(row?)).collect()
+}
+
+fn discovery_virtual_mutations(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<Vec<VirtualMutationRecord>> {
+    let mut statement = connection.prepare(
+        &(VIRTUAL_MUTATION_SELECT_WITH_WHERE.to_owned() + "WHERE mount_id = ?1 ORDER BY local_id"),
+    )?;
+    let rows = statement.query_map(params![mount_id.0.as_str()], virtual_mutation_row)?;
+    rows.map(|row| virtual_mutation_from_row(row?)).collect()
+}
+
+fn discovery_auto_save_enrollments(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<Vec<AutoSaveEnrollmentRecord>> {
+    let mut statement = connection
+        .prepare(&(AUTO_SAVE_SELECT_WITH_WHERE.to_owned() + "WHERE mount_id = ?1 ORDER BY path"))?;
+    let rows = statement.query_map(params![mount_id.0.as_str()], auto_save_enrollment_row)?;
+    rows.map(|row| auto_save_enrollment_from_row(row?))
+        .collect()
+}
+
+fn discovery_staging_path(
+    connection: &Connection,
+    mount_id: &MountId,
+    index: usize,
+    final_paths: &BTreeSet<String>,
+) -> StoreResult<String> {
+    for nonce in 0_u64.. {
+        let candidate = format!(".locality-discovery-staging/{index}-{nonce}");
+        if final_paths.contains(&candidate) {
+            continue;
+        }
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM entities WHERE mount_id = ?1 AND path = ?2",
+                params![mount_id.0.as_str(), candidate.as_str()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(candidate);
+        }
+    }
+    unreachable!("u64 staging path space exhausted")
+}
+
+fn upsert_discovery_entity(connection: &Connection, entity: &EntityRecord) -> StoreResult<()> {
+    connection.execute(
+        "INSERT INTO entities (
+            mount_id, remote_id, kind_json, title, path, hydration_json,
+            content_hash, remote_edited_at
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(mount_id, remote_id) DO UPDATE SET
+            kind_json = excluded.kind_json,
+            title = excluded.title,
+            path = excluded.path,
+            hydration_json = excluded.hydration_json,
+            content_hash = excluded.content_hash,
+            remote_edited_at = excluded.remote_edited_at",
+        params![
+            entity.mount_id.0.as_str(),
+            entity.remote_id.0.as_str(),
+            to_json(&entity.kind)?,
+            entity.title.as_str(),
+            logical_path_to_text(&entity.path),
+            to_json(&entity.hydration)?,
+            entity.content_hash.as_deref(),
+            entity.remote_edited_at.as_deref(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_discovery_observation(
+    connection: &Connection,
+    observation: &RemoteObservationRecord,
+) -> StoreResult<()> {
+    connection.execute(
+        "INSERT INTO remote_observations (
+            mount_id, remote_id, kind_json, title, parent_remote_id, projected_path,
+            remote_version_json, observed_at, deleted, raw_metadata_json
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(mount_id, remote_id) DO UPDATE SET
+            kind_json = excluded.kind_json,
+            title = excluded.title,
+            parent_remote_id = excluded.parent_remote_id,
+            projected_path = excluded.projected_path,
+            remote_version_json = excluded.remote_version_json,
+            observed_at = excluded.observed_at,
+            deleted = excluded.deleted,
+            raw_metadata_json = excluded.raw_metadata_json",
+        params![
+            observation.mount_id.0.as_str(),
+            observation.remote_id.0.as_str(),
+            to_json(&observation.kind)?,
+            observation.title.as_str(),
+            observation.parent_remote_id.as_ref().map(RemoteId::as_str),
+            logical_path_to_text(&observation.projected_path),
+            to_json(&observation.remote_version)?,
+            observation.observed_at.as_str(),
+            bool_to_int(observation.deleted),
+            observation.raw_metadata_json.as_str(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_discovery_freshness(
+    connection: &Connection,
+    state: &FreshnessStateRecord,
+) -> StoreResult<()> {
+    connection.execute(
+        "INSERT INTO freshness_states (
+            mount_id, remote_id, tier_json, last_checked_at, next_check_at,
+            last_opened_at, last_local_change_at, remote_hint_pending
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(mount_id, remote_id) DO UPDATE SET
+            tier_json = excluded.tier_json,
+            last_checked_at = excluded.last_checked_at,
+            next_check_at = excluded.next_check_at,
+            last_opened_at = excluded.last_opened_at,
+            last_local_change_at = excluded.last_local_change_at,
+            remote_hint_pending = excluded.remote_hint_pending",
+        params![
+            state.mount_id.0.as_str(),
+            state.remote_id.0.as_str(),
+            to_json(&state.tier)?,
+            state.last_checked_at.as_deref(),
+            state.next_check_at.as_deref(),
+            state.last_opened_at.as_deref(),
+            state.last_local_change_at.as_deref(),
+            bool_to_int(state.remote_hint_pending),
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_discovery_auto_save(
+    connection: &Connection,
+    enrollment: &AutoSaveEnrollmentRecord,
+) -> StoreResult<()> {
+    connection.execute(
+        "INSERT INTO auto_save_enrollments (
+            mount_id, path, remote_id, enabled, origin_json, state_json,
+            last_reason, last_push_id, created_at, updated_at
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(mount_id, path) DO UPDATE SET
+            remote_id = excluded.remote_id,
+            enabled = excluded.enabled,
+            origin_json = excluded.origin_json,
+            state_json = excluded.state_json,
+            last_reason = excluded.last_reason,
+            last_push_id = excluded.last_push_id,
+            updated_at = excluded.updated_at",
+        params![
+            enrollment.mount_id.0.as_str(),
+            path_to_text(&enrollment.path),
+            enrollment.remote_id.as_ref().map(RemoteId::as_str),
+            bool_to_int(enrollment.enabled),
+            to_json(&enrollment.origin)?,
+            to_json(&enrollment.state)?,
+            enrollment.last_reason.as_deref(),
+            enrollment.last_push_id.as_deref(),
+            enrollment.created_at.as_str(),
+            enrollment.updated_at.as_str(),
+        ],
     )?;
     Ok(())
 }

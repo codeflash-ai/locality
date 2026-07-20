@@ -196,6 +196,36 @@ Timed-out `push` requests do not fall back because the daemon may already own an
 in-flight remote mutation. Stop or recover the daemon before retrying the push.
 Set `LOCALITY_DAEMON_DISABLE=1` to force direct execution without the fallback warning.
 
+### Development Schema Skew
+
+The SQLite state under `~/.loc` is durable user state. Do not delete it as the
+first response to a daemon startup failure. In development, a common failure is
+version skew between a freshly rebuilt desktop app and stale debug sidecars under
+`target/debug/`. A newer desktop can migrate `~/.loc/state.sqlite3`; an older
+`target/debug/localityd` can then fail with an unsupported schema or component
+version.
+
+The dev sidecar prep path builds fresh `loc` and `localityd` binaries before it
+uses `loc daemon stop`, then terminates any remaining `localityd` process. This
+keeps the stop/restart path from relying on an old CLI that may no longer be able
+to open the upgraded state database.
+
+Use these checks before assuming state corruption:
+
+```bash
+./target/debug/localityd --build-info
+./target/debug/loc daemon status
+tail -50 ~/.loc/logs/localityd.err.log
+tail -50 ~/.loc/logs/desktop.log
+```
+
+Recovery should rebuild the debug sidecars and relaunch the desktop app:
+
+```bash
+make prepare-desktop-dev-sidecars
+make dev-tauri
+```
+
 ## Runtime Loop
 
 `DaemonRuntime` is the foreground daemon's control plane. It owns the scheduler

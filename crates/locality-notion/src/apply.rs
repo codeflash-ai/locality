@@ -15,12 +15,13 @@ use locality_core::journal::JournalApplyEffect;
 use locality_core::model::RemoteId;
 use locality_core::planner::{PropertyValue, PushOperation};
 use locality_core::shadow::{rendered_bodies_equivalent, segment_markdown_body};
-use locality_core::undo::{UndoOperation, UndoPlanStatus};
+use locality_core::undo::{UndoOperation, UndoPlan, UndoPlanStatus};
 use locality_core::{LocalityError, LocalityResult};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crate::client::NotionApi;
+use crate::database_create::parse_database_draft;
 use crate::dto::{
     BlockDto, BlockTreeDto, DataSourceDto, FileBlockDto, NotionPageBundle, PageDto,
     PagePropertyDto, RichTextAnnotationsDto, RichTextDto, TableBlockDto,
@@ -30,6 +31,7 @@ use crate::markdown_table::{
     parse_markdown_table_row, parse_markdown_table_shape, validate_markdown_table_separator,
 };
 use crate::media::{resolve_media_href_with_content_root, unescape_markdown_href};
+use crate::projection::observe_entity;
 
 const NOTION_RICH_TEXT_CONTENT_LIMIT: usize = 2000;
 const NOTION_RICH_TEXT_SENTENCE_SPLIT_LOOKBACK: usize = 400;
@@ -348,6 +350,28 @@ pub fn apply_plan(
                             entity_id: created_id,
                         });
                     }
+                    PushOperation::CreateDatabase {
+                        parent_id, schema, ..
+                    } => {
+                        let draft = parse_database_draft(schema).map_err(|error| {
+                            LocalityError::InvalidState(format!(
+                                "{}: {}",
+                                error.code, error.message
+                            ))
+                        })?;
+                        let created =
+                            api.create_database(draft.create_request_body(parent_id.as_str()))?;
+                        let created_id = RemoteId::new(created.id);
+                        if !changed_remote_ids.contains(&created_id) {
+                            changed_remote_ids.push(created_id.clone());
+                        }
+                        effects.push(JournalApplyEffect::CreatedEntity {
+                            operation_id: request.operation_ids[operation_index].clone(),
+                            operation_index,
+                            parent_id: parent_id.clone(),
+                            entity_id: created_id,
+                        });
+                    }
                     PushOperation::ArchiveEntity { entity_id } => {
                         api.delete_block(entity_id.as_str())?;
                         if !changed_remote_ids.contains(entity_id) {
@@ -358,6 +382,11 @@ pub fn apply_plan(
                             operation_index,
                             entity_id: entity_id.clone(),
                         });
+                    }
+                    PushOperation::UpdateEntityBody { .. } => {
+                        return Err(LocalityError::Unsupported(
+                            "whole-entity body updates for Notion",
+                        ));
                     }
                 }
             }
@@ -450,6 +479,8 @@ pub fn apply_undo(
         ));
     }
 
+    prevalidate_undo_plan(api, request.plan)?;
+
     for operation in &request.plan.operations {
         match operation {
             UndoOperation::RestoreBlockContent { block_id, content } => {
@@ -484,8 +515,40 @@ pub fn apply_undo(
                 let child = restore_archived_block_child(api, content, native_kind.as_deref())?;
                 api.append_block_children(parent_id.as_str(), append_body(child, after.as_ref()))?;
             }
-            UndoOperation::ArchiveCreatedEntity { entity_id } => {
+            UndoOperation::ArchiveCreatedEntity { entity_id, .. } => {
                 api.delete_block(entity_id.as_str())?;
+            }
+            UndoOperation::RestoreProperties {
+                entity_id,
+                previous,
+                ..
+            } => {
+                let page = api.retrieve_page(entity_id.as_str())?;
+                let body = update_properties_body(&page, previous)?;
+                api.update_page(entity_id.as_str(), body)?;
+            }
+            UndoOperation::RestoreEntityLocation {
+                entity_id,
+                previous_parent_id,
+                previous_title,
+                ..
+            } => {
+                let parent = undo_move_page_parent_body(api, previous_parent_id)?;
+                let moved_page = api.move_page(entity_id.as_str(), parent)?;
+                let properties = BTreeMap::from([(
+                    "title".to_string(),
+                    PropertyValue::String(previous_title.clone()),
+                )]);
+                let body = update_properties_body(&moved_page, &properties)?;
+                api.update_page(entity_id.as_str(), body)?;
+            }
+            UndoOperation::RestoreArchivedEntity { entity_id, .. } => {
+                api.update_page(entity_id.as_str(), json!({ "in_trash": false }))?;
+            }
+            UndoOperation::RestoreEntityBody { .. } => {
+                return Err(LocalityError::Unsupported(
+                    "restoring whole-entity bodies in Notion",
+                ));
             }
             unsupported => {
                 return Err(LocalityError::Unsupported(unsupported_undo_name(
@@ -495,9 +558,164 @@ pub fn apply_undo(
         }
     }
 
+    let has_block_operations = request.plan.operations.iter().any(|operation| {
+        matches!(
+            operation,
+            UndoOperation::RestoreBlockContent { .. }
+                | UndoOperation::MoveBlock { .. }
+                | UndoOperation::RestoreArchivedBlock { .. }
+                | UndoOperation::ArchiveCreatedBlock { .. }
+        )
+    });
+    let mut changed_remote_ids = Vec::new();
+    if has_block_operations {
+        changed_remote_ids.extend(request.plan.affected_entities.iter().cloned());
+    }
+    for operation in &request.plan.operations {
+        let entity_id = match operation {
+            UndoOperation::ArchiveCreatedEntity { entity_id, .. }
+            | UndoOperation::RestoreEntityBody { entity_id, .. }
+            | UndoOperation::RestoreProperties { entity_id, .. }
+            | UndoOperation::RestoreEntityLocation { entity_id, .. }
+            | UndoOperation::RestoreArchivedEntity { entity_id, .. } => Some(entity_id),
+            _ => None,
+        };
+        if let Some(entity_id) = entity_id
+            && !changed_remote_ids.contains(entity_id)
+        {
+            changed_remote_ids.push(entity_id.clone());
+        }
+    }
+    let observation_ids = request
+        .plan
+        .operations
+        .iter()
+        .filter_map(|operation| match operation {
+            UndoOperation::ArchiveCreatedEntity { entity_id, .. }
+            | UndoOperation::RestoreEntityLocation { entity_id, .. }
+            | UndoOperation::RestoreArchivedEntity { entity_id, .. } => Some(entity_id.clone()),
+            _ => None,
+        })
+        .fold(Vec::new(), |mut ids, entity_id| {
+            if !ids.contains(&entity_id) {
+                ids.push(entity_id);
+            }
+            ids
+        });
+    let observations = observation_ids
+        .iter()
+        .map(|remote_id| observe_entity(api, request.mount_id.clone(), remote_id))
+        .collect::<LocalityResult<Vec<_>>>()?;
+
     Ok(ApplyUndoResult {
-        changed_remote_ids: request.plan.affected_entities.clone(),
+        changed_remote_ids,
+        observations,
     })
+}
+
+fn prevalidate_undo_plan(api: &dyn NotionApi, plan: &UndoPlan) -> LocalityResult<()> {
+    for operation in &plan.operations {
+        match operation {
+            UndoOperation::RestoreBlockContent { block_id, content } => {
+                if looks_like_markdown_table(content) {
+                    let bundles =
+                        fetch_affected_bundles(api, &plan.affected_entities, &BTreeSet::new())?;
+                    let current_blocks = block_map(&bundles);
+                    if let Ok(current) = current_block(&current_blocks, block_id)
+                        && current.kind == "table"
+                    {
+                        prevalidate_table_update(&bundles, block_id, current, content)?;
+                        continue;
+                    }
+                }
+                parse_supported_block(content, None, None)?;
+            }
+            UndoOperation::RestoreArchivedBlock {
+                content,
+                native_kind,
+                ..
+            } => {
+                restore_archived_block_child(api, content, native_kind.as_deref())?;
+            }
+            UndoOperation::RestoreProperties {
+                entity_id,
+                previous,
+                ..
+            } => {
+                let page = api.retrieve_page(entity_id.as_str())?;
+                update_properties_body(&page, previous)?;
+            }
+            UndoOperation::RestoreEntityLocation {
+                entity_id,
+                previous_title,
+                ..
+            } => {
+                let page = api.retrieve_page(entity_id.as_str())?;
+                update_properties_body(
+                    &page,
+                    &BTreeMap::from([(
+                        "title".to_string(),
+                        PropertyValue::String(previous_title.clone()),
+                    )]),
+                )?;
+            }
+            UndoOperation::RestoreEntityBody { .. } => {
+                return Err(LocalityError::Unsupported(
+                    "restoring whole-entity bodies in Notion",
+                ));
+            }
+            UndoOperation::MoveBlock { .. } => {
+                return Err(LocalityError::Unsupported(unsupported_undo_name(operation)));
+            }
+            UndoOperation::ArchiveCreatedBlock { .. }
+            | UndoOperation::ArchiveCreatedEntity { .. }
+            | UndoOperation::RestoreArchivedEntity { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn prevalidate_table_update(
+    bundles: &[NotionPageBundle],
+    table_id: &RemoteId,
+    current: &BlockDto,
+    markdown: &str,
+) -> LocalityResult<()> {
+    let table = current.table.as_ref().ok_or_else(|| {
+        LocalityError::InvalidState(format!(
+            "notion table block `{}` is missing its `table` payload",
+            current.id
+        ))
+    })?;
+    let current_rows = current_table_rows(bundles, table_id)?;
+    let parsed = parse_markdown_table(markdown, table)?;
+
+    for (row_block, cells) in current_rows.iter().zip(&parsed.rows) {
+        let current_row = row_block.table_row.as_ref().ok_or_else(|| {
+            LocalityError::InvalidState(format!(
+                "notion table row block `{}` is missing its `table_row` payload",
+                row_block.id
+            ))
+        })?;
+        if cells.len() != current_row.cells.len() {
+            return Err(LocalityError::Unsupported(
+                "writing Notion table width changes",
+            ));
+        }
+        for (index, cell) in cells.iter().enumerate() {
+            rich_text_payload(
+                cell,
+                current_row.cells.get(index).map(|cell| cell.as_slice()),
+            )?;
+        }
+    }
+    for cells in parsed.rows.iter().skip(current_rows.len()) {
+        for cell in cells {
+            rich_text_payload(cell, None)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn restore_archived_block_child(
@@ -590,6 +808,7 @@ fn create_parent_ids(operations: &[PushOperation]) -> BTreeSet<RemoteId> {
                 parent_workspace,
                 ..
             } if !parent_workspace => Some(parent_id.clone()),
+            PushOperation::CreateDatabase { parent_id, .. } => Some(parent_id.clone()),
             _ => None,
         })
         .collect()
@@ -619,6 +838,7 @@ fn database_create_parent_ids(operations: &[PushOperation]) -> BTreeSet<RemoteId
             {
                 Some(parent_id.clone())
             }
+            PushOperation::CreateDatabase { .. } => None,
             _ => None,
         })
         .collect()
@@ -1317,6 +1537,36 @@ fn move_page_parent_body(
     Err(LocalityError::Unsupported(
         "Notion pages can only be moved into page or database parents",
     ))
+}
+
+fn undo_move_page_parent_body(api: &dyn NotionApi, parent_id: &RemoteId) -> LocalityResult<Value> {
+    match api.retrieve_database(parent_id.as_str()) {
+        Ok(database) => {
+            let [data_source] = database.data_sources.as_slice() else {
+                return Err(LocalityError::Unsupported(
+                    "moving Notion pages into a database requires exactly one data source",
+                ));
+            };
+            Ok(json!({
+                "type": "data_source_id",
+                "data_source_id": data_source.id,
+            }))
+        }
+        Err(error) if is_notion_database_lookup_miss(&error) => Ok(json!({
+            "type": "page_id",
+            "page_id": parent_id.0,
+        })),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_notion_database_lookup_miss(error: &LocalityError) -> bool {
+    match error {
+        LocalityError::RemoteNotFound(_) | LocalityError::NotImplemented(_) => true,
+        LocalityError::InvalidState(message) => message.starts_with("missing database "),
+        LocalityError::Io(message) => message.contains("notion api returned HTTP 404:"),
+        _ => false,
+    }
 }
 
 fn page_parent_matches_requested(
@@ -3951,10 +4201,14 @@ fn looks_like_markdown_table(markdown: &str) -> bool {
 fn unsupported_undo_name(operation: &UndoOperation) -> &'static str {
     match operation {
         UndoOperation::MoveBlock { .. } => "undoing Notion block moves",
+        UndoOperation::RestoreEntityBody { .. } => "restoring whole-entity bodies in Notion",
         UndoOperation::RestoreArchivedBlock { .. } => "restoring archived Notion blocks",
         UndoOperation::RestoreBlockContent { .. }
         | UndoOperation::ArchiveCreatedBlock { .. }
-        | UndoOperation::ArchiveCreatedEntity { .. } => "unsupported Notion undo operation",
+        | UndoOperation::ArchiveCreatedEntity { .. }
+        | UndoOperation::RestoreProperties { .. }
+        | UndoOperation::RestoreEntityLocation { .. }
+        | UndoOperation::RestoreArchivedEntity { .. } => "unsupported Notion undo operation",
     }
 }
 

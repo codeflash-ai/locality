@@ -42,6 +42,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   compactPath,
   mountEntityCountLabel,
+  mountFileIndexProgressLabel,
+  mountFileIndexProgressValue,
   mountAccessLabel,
   mountRows,
   mountStatusLabel,
@@ -60,6 +62,12 @@ import { connectionMissing, connectionReady } from "./connection-state";
 import { copyLoginLinkDisabled, loginLinkFlowMode } from "./onboarding-connect";
 import { mountRecoveryEnabled, shouldAutoCreateMount } from "./onboarding-flow";
 import { classifyMountSetupError } from "./onboarding-errors";
+import {
+  createFileProviderEnablementPoller,
+  fileProviderEnablementHeadline,
+  fileProviderEnablementStatusLabel,
+  type FileProviderEnablementReport,
+} from "./file-provider-enablement";
 import {
   failedMountOnboardingReport,
   mountOnboardingHeadline,
@@ -91,7 +99,11 @@ import {
   connectedSourcesReadyToMount,
   isSourceConnectorId,
   sourceConnectionReady,
+  sourceConnectorIds,
+  sourceMountRetryOutcome,
   sourceMounted,
+  sourceRequiresApiKey,
+  sourceSkipsManualMountStep,
   sourceSetupIsActiveConnector,
   sourceSetupIsBusy,
   sourceSetupProgressLabel,
@@ -102,6 +114,7 @@ import gmailIconUrl from "./assets/connectors/gmail.svg";
 import googleCalendarIconUrl from "./assets/connectors/google-calendar.svg";
 import googleDocsIconUrl from "./assets/connectors/google-docs.svg";
 import granolaIconUrl from "./assets/connectors/granola.svg";
+import linearIconUrl from "./assets/connectors/linear.svg";
 import notionIconUrl from "./assets/connectors/notion.svg";
 import localityShortDarkUrl from "./assets/brand/locality-short-dark.svg";
 import localityShortLightUrl from "./assets/brand/locality-short-light.svg";
@@ -138,6 +151,7 @@ const CONNECTOR_ICON_URLS: Record<SourceConnectorId, string> = {
   "google-calendar": googleCalendarIconUrl,
   gmail: gmailIconUrl,
   granola: granolaIconUrl,
+  linear: linearIconUrl,
 };
 
 const PRODUCT_TERMS = {
@@ -384,6 +398,11 @@ const sampleMount: MountSummary = {
   status: "ready",
   rootExists: true,
   entityCount: 24,
+  hydrationProgress: {
+    indexedFiles: 16,
+    remainingFiles: 4,
+    totalFiles: 20,
+  },
   pendingChangeCount: 3,
   provider: null,
 };
@@ -416,14 +435,14 @@ const sampleSnapshot: DesktopSnapshot = {
     connector: "notion",
     workspaceName: "CodeFlash",
     accountLabel: "saurabh@codeflash.ai",
-    status: "ready",
+    status: "active",
   },
   connections: [
     {
       connector: "notion",
       workspaceName: "CodeFlash",
       accountLabel: "saurabh@codeflash.ai",
-      status: "ready",
+      status: "active",
     },
   ],
   mount: sampleMount,
@@ -517,7 +536,7 @@ const sampleSnapshot: DesktopSnapshot = {
     {
       connector: "Linear",
       description: "Mount issues and projects as local files.",
-      state: "planned",
+      state: "available",
     },
   ],
 };
@@ -703,13 +722,15 @@ function suggestedAgentPrompt(mountPath: string, connector: OnboardingConnectorI
       return `Use Locality to inspect my Google Calendar source. Open the files under ${mountPath}, review calendar events with normal file tools, and prepare new event drafts for Locality review before creating them.`;
     case "gmail":
       return `Use Locality to inspect my Gmail source. Open the files under ${mountPath}, search mail with normal file tools, and prepare draft updates only when the mounted draft files support it. Leave outbound changes for Locality review.`;
+    case "linear":
+      return `Use Locality to edit my Linear issues. Open the files under ${mountPath}, update issue Markdown and editable frontmatter, and leave changes pending for Locality review before pushing.`;
     case "notion":
       return `Use Locality to edit my Notion workspace. Open the files under ${mountPath}, make the requested edits directly in Markdown, and leave changes pending for Locality review.`;
   }
 }
 
 function isOnboardingConnector(value?: string | null): value is OnboardingConnectorId {
-  return value === "notion" || value === "google-docs" || value === "google-calendar" || value === "gmail" || value === "granola";
+  return sourceConnectorIds().includes(value as SourceConnectorId);
 }
 
 function onboardingConnectorFromSnapshot(snapshot: DesktopSnapshot): OnboardingConnectorId {
@@ -723,11 +744,11 @@ function onboardingConnectorFromSnapshot(snapshot: DesktopSnapshot): OnboardingC
 }
 
 function connectorUsesOAuth(connector: OnboardingConnectorId) {
-  return connector === "notion" || connector === "google-docs" || connector === "google-calendar" || connector === "gmail";
+  return !sourceRequiresApiKey(connector);
 }
 
 function connectorSkipsMountStep(connector: OnboardingConnectorId) {
-  return connector !== "notion";
+  return sourceSkipsManualMountStep(connector);
 }
 
 function onboardingConnectorTitle(
@@ -739,8 +760,8 @@ function onboardingConnectorTitle(
     return `Your ${sourceDisplayName(connector)} source is connected`;
   }
   if (busy) {
-    return connector === "granola"
-      ? "Checking Granola access."
+    return sourceRequiresApiKey(connector)
+      ? `Checking ${sourceDisplayName(connector)} access.`
       : `Finish connecting in ${sourceDisplayName(connector)}.`;
   }
   return `Start with ${sourceDisplayName(connector)}.`;
@@ -764,6 +785,8 @@ function onboardingConnectorDescription(
         return "Gmail is ready. Locality mounted mailboxes as local files under CloudStorage.";
       case "granola":
         return "Granola is ready. Locality mounted meeting summaries and transcripts as read-only files under CloudStorage.";
+      case "linear":
+        return "Linear is ready. Locality mounted issues by team as editable local files under CloudStorage.";
     }
   }
 
@@ -779,6 +802,8 @@ function onboardingConnectorDescription(
         return "A browser window is open. Approve Gmail access, then Locality will create the local mailbox folder.";
       case "granola":
         return "Locality is validating the API key and creating a read-only Granola folder.";
+      case "linear":
+        return "Locality is validating the API key and creating an editable Linear folder.";
     }
   }
 
@@ -793,6 +818,8 @@ function onboardingConnectorDescription(
       return "Connect Gmail during setup so agents can search mailboxes and prepare reviewed draft work from local files.";
     case "granola":
       return "Paste a Granola API key to mount meeting summaries and transcripts as local read-only files. Keys are stored in your local credential store.";
+    case "linear":
+      return "Paste a Linear API key to mount issues by team as editable local files. Keys are stored in your local credential store.";
   }
 }
 
@@ -808,6 +835,8 @@ function onboardingConnectorPills(connector: OnboardingConnectorId) {
       return ["Google OAuth", "Mailbox files", "Draft review"];
     case "granola":
       return ["Read-only", "Meeting summaries", "Transcripts"];
+    case "linear":
+      return ["API key", "Issues by team", "Review before push"];
   }
 }
 
@@ -823,6 +852,8 @@ function onboardingReadyCopy(connector: OnboardingConnectorId) {
       return "Your Gmail source is ready as local files. Agents can search mailbox content and prepare reviewed draft work without leaving the filesystem.";
     case "granola":
       return "Your Granola meetings are ready as local read-only files. Agents can search summaries and transcripts with normal file tools, while Locality keeps the remote notes protected from edits.";
+    case "linear":
+      return "Your Linear issues are ready as local files. Agents can edit issue descriptions and supported fields in Markdown, then leave changes for Review Center before anything is pushed back.";
   }
 }
 
@@ -1658,6 +1689,7 @@ function Onboarding({
     return connectionReady(snapshot) && !mountMissing(snapshot) ? connector : null;
   });
   const [granolaApiKey, setGranolaApiKey] = useState("");
+  const [linearApiKey, setLinearApiKey] = useState("");
   const [googleDocsWorkspaceFolder, setGoogleDocsWorkspaceFolder] = useState("Locality");
   const [connectorConnecting, setConnectorConnecting] = useState(false);
   const [connectedWorkspace, setConnectedWorkspace] = useState(snapshot.connection.workspaceName);
@@ -1670,9 +1702,13 @@ function Onboarding({
   const [optionalGuideReturnStep, setOptionalGuideReturnStep] = useState<OnboardingStep | null>(null);
   const [mountOnboarding, setMountOnboarding] = useState<WorkspaceMountOnboardingReport | null>(null);
   const [mounting, setMounting] = useState(false);
+  const [fileProviderEnablement, setFileProviderEnablement] = useState<FileProviderEnablementReport | null>(null);
+  const [finderHelpOpen, setFinderHelpOpen] = useState(false);
+  const [finderRevealError, setFinderRevealError] = useState("");
   const [agentGuidanceReport, setAgentGuidanceReport] = useState<AgentGuidanceInstallReport | null>(null);
   const [agentGuidanceState, setAgentGuidanceState] = useState<"idle" | "installing" | "ready" | "error">("idle");
   const mountStartRequestedRef = useRef(false);
+  const finderRevealRequestedRef = useRef(false);
   const snapshotConnectionConnector = isOnboardingConnector(snapshot.connection.connector)
     ? snapshot.connection.connector
     : null;
@@ -1690,6 +1726,7 @@ function Onboarding({
       );
   const selectedSourceName = sourceDisplayName(selectedOnboardingConnector);
   const selectedConnectorBusy = oauthInFlight || connectorConnecting;
+  const selectedApiKey = selectedOnboardingConnector === "linear" ? linearApiKey : granolaApiKey;
 
   async function installAgentGuidance(path: string) {
     setAgentGuidanceState("installing");
@@ -1817,6 +1854,67 @@ function Onboarding({
     }
     void runMountOnboarding("start");
   }, [connectionReadyNow, mountOnboarding, mountPath, mounting, selectedOnboardingConnector, snapshot.mount.status, step]);
+
+  useEffect(() => {
+    const enablementActive =
+      step === 4 &&
+      (mountOnboarding?.state === "needs_finder_enable" ||
+        mountOnboarding?.state === "waiting_for_cloudstorage_root");
+    if (!enablementActive) {
+      finderRevealRequestedRef.current = false;
+      setFileProviderEnablement(null);
+      setFinderHelpOpen(false);
+      setFinderRevealError("");
+      return;
+    }
+
+    let completionTimer: number | null = null;
+    const poller = createFileProviderEnablementPoller({
+      probe: () =>
+        callCommand<FileProviderEnablementReport>(
+          "file_provider_enablement_status",
+          undefined,
+          {
+            state: "ready",
+            message: "Locality is enabled in Finder.",
+            path: mountPath,
+          },
+        ),
+      onReport: (report) => {
+        setFileProviderEnablement(report);
+        if (report.state === "unavailable") {
+          setMountOnboarding(failedMountOnboardingReport(report.message));
+        }
+      },
+      onReady: (report) => {
+        setFileProviderEnablement(report);
+        completionTimer = window.setTimeout(() => {
+          void runMountOnboarding("start");
+        }, 350);
+      },
+    });
+    const updateVisibility = () => {
+      poller.setVisible(document.visibilityState !== "hidden");
+    };
+
+    if (
+      mountOnboarding?.state === "needs_finder_enable" &&
+      !finderRevealRequestedRef.current
+    ) {
+      finderRevealRequestedRef.current = true;
+      void revealFileProviderEnablement();
+    }
+    document.addEventListener("visibilitychange", updateVisibility);
+    updateVisibility();
+    poller.start();
+    return () => {
+      poller.stop();
+      document.removeEventListener("visibilitychange", updateVisibility);
+      if (completionTimer !== null) {
+        window.clearTimeout(completionTimer);
+      }
+    };
+  }, [mountOnboarding?.state, step]);
 
   useEffect(() => {
     if (
@@ -2007,6 +2105,9 @@ function Onboarding({
         return;
       case "granola":
         await connectGranolaOnboarding();
+        return;
+      case "linear":
+        await connectLinearOnboarding();
     }
   }
 
@@ -2021,9 +2122,18 @@ function Onboarding({
   }
 
   async function connectGranolaOnboarding() {
-    if (connectorConnecting || !granolaApiKey.trim()) {
-      if (!granolaApiKey.trim()) {
-        setOauthError("Enter a Granola API key.");
+    await connectApiKeyOnboarding("granola", granolaApiKey);
+  }
+
+  async function connectLinearOnboarding() {
+    await connectApiKeyOnboarding("linear", linearApiKey);
+  }
+
+  async function connectApiKeyOnboarding(connector: "granola" | "linear", apiKey: string) {
+    const sourceName = sourceDisplayName(connector);
+    if (connectorConnecting || !apiKey.trim()) {
+      if (!apiKey.trim()) {
+        setOauthError(`Enter a ${sourceName} API key.`);
       }
       return;
     }
@@ -2035,9 +2145,9 @@ function Onboarding({
     setStep(3);
     try {
       const report = await callCommand<ActionReport>(
-        "connect_granola",
-        { apiKey: granolaApiKey },
-        { ok: true, message: "Connected demo Granola source." },
+        connector === "linear" ? "connect_linear" : "connect_granola",
+        { apiKey },
+        { ok: true, message: `Connected demo ${sourceName} source.` },
       );
       if (!report.ok) {
         setOauthError(report.message);
@@ -2049,17 +2159,17 @@ function Onboarding({
         undefined,
         sampleSnapshot,
       );
-      const granolaMount = nextSnapshot.mounts.find((mount) => mount.connector === "granola")
-        ?? (nextSnapshot.mount.connector === "granola" ? nextSnapshot.mount : null);
-      const nextMountPath = granolaMount?.localPath || sourceDefaultPath(nextSnapshot, "granola");
+      const sourceMount = nextSnapshot.mounts.find((mount) => mount.connector === connector)
+        ?? (nextSnapshot.mount.connector === connector ? nextSnapshot.mount : null);
+      const nextMountPath = sourceMount?.localPath || sourceDefaultPath(nextSnapshot, connector);
       setMountPathDirty(false);
       setMountPath(nextMountPath);
-      setConnectedWorkspace("Granola");
-      setConnectedOnboardingConnector("granola");
+      setConnectedWorkspace(sourceName);
+      setConnectedOnboardingConnector(connector);
       const cliReady = await ensureCliAvailable();
       if (!cliReady) {
         setOauthError(
-          "Granola is connected, but Locality could not prepare the terminal command. Open Settings to repair Locality, then open the app.",
+          `${sourceName} is connected, but Locality could not prepare the terminal command. Open Settings to repair Locality, then open the app.`,
         );
         return;
       }
@@ -2143,6 +2253,22 @@ function Onboarding({
     } finally {
       mountStartRequestedRef.current = false;
       setMounting(false);
+    }
+  }
+
+  async function revealFileProviderEnablement() {
+    setFinderRevealError("");
+    try {
+      const report = await callCommand<ActionReport>(
+        "reveal_file_provider_enablement",
+        undefined,
+        { ok: true, message: "Opened Locality in Finder." },
+      );
+      if (!report.ok) {
+        setFinderRevealError(report.message);
+      }
+    } catch (error) {
+      setFinderRevealError(errorMessage(error));
     }
   }
 
@@ -2262,6 +2388,21 @@ function Onboarding({
       ? classifyMountSetupError(mountOnboarding.message)
       : null;
   const showRecoveryChooser = mountRecoveryEnabled(mountSetupError);
+  const fileProviderGuideVisible =
+    mountOnboarding?.state === "needs_finder_enable" ||
+    mountOnboarding?.state === "waiting_for_cloudstorage_root";
+  const displayedFileProviderEnablement = fileProviderEnablement ??
+    (mountOnboarding?.state === "waiting_for_cloudstorage_root"
+      ? {
+          state: "waiting_for_root" as const,
+          message: "Finishing the Locality folder setup.",
+          path: mountPath,
+        }
+      : {
+          state: "needs_finder_enable" as const,
+          message: "In Finder, click Enable for Locality.",
+          path: mountPath,
+        });
 
   return (
     <main className="setup-shell">
@@ -2355,16 +2496,22 @@ function Onboarding({
                     ]}
               />
             )}
-            {selectedOnboardingConnector === "granola" && !connectionReadyNow && (
+            {sourceRequiresApiKey(selectedOnboardingConnector) && !connectionReadyNow && (
               <label className="source-inline-field onboarding-source-field">
-                <span>Granola API key</span>
+                <span>{selectedSourceName} API key</span>
                 <input
                   type="password"
                   autoComplete="off"
-                  value={granolaApiKey}
+                  value={selectedApiKey}
                   placeholder="Paste API key"
                   disabled={connectorConnecting}
-                  onChange={(event) => setGranolaApiKey(event.target.value)}
+                  onChange={(event) => {
+                    if (selectedOnboardingConnector === "linear") {
+                      setLinearApiKey(event.target.value);
+                    } else {
+                      setGranolaApiKey(event.target.value);
+                    }
+                  }}
                 />
               </label>
             )}
@@ -2385,7 +2532,7 @@ function Onboarding({
                 disabled={
                   !connectionReadyNow &&
                   (
-                    (selectedOnboardingConnector === "granola" && !granolaApiKey.trim()) ||
+                    (sourceRequiresApiKey(selectedOnboardingConnector) && !selectedApiKey.trim()) ||
                     (selectedOnboardingConnector === "google-docs" && !googleDocsWorkspaceFolder.trim())
                   )
                 }
@@ -2430,28 +2577,66 @@ function Onboarding({
           >
             <div>
               <div className="eyebrow">Local folder</div>
-              <h1>{mountOnboardingHeadline(mountOnboarding)}</h1>
+              <h1>
+                {fileProviderGuideVisible
+                  ? fileProviderEnablementHeadline(displayedFileProviderEnablement)
+                  : mountOnboardingHeadline(mountOnboarding)}
+              </h1>
               <p>
-                {mountOnboarding?.message ??
-                  `Locality is creating your ${selectedSourceName} folder under the default CloudStorage root and verifying that files appear locally.`}
+                {fileProviderGuideVisible
+                  ? displayedFileProviderEnablement.state === "needs_finder_enable"
+                    ? "Finder is open to the Locality location. Click Enable there; this screen will continue automatically."
+                    : displayedFileProviderEnablement.message
+                  : mountOnboarding?.message ??
+                    `Locality is creating your ${selectedSourceName} folder under the default CloudStorage root and verifying that files appear locally.`}
               </p>
             </div>
-            <div className="sync-note">
+            {fileProviderGuideVisible && (
+              <FinderEnableGuide
+                waitingForRoot={displayedFileProviderEnablement.state === "waiting_for_root"}
+              />
+            )}
+            <div className={`sync-note${displayedFileProviderEnablement.state === "ready" ? " connected" : ""}`}>
               {mounting ? (
                 <Loader2 className="spin-icon" />
               ) : mountOnboarding?.state === "failed" ? (
                 <AlertTriangle />
+              ) : fileProviderGuideVisible ? (
+                <Loader2 className="spin-icon" />
               ) : (
                 <FolderOpen />
               )}
-              {mounting
+              {fileProviderGuideVisible
+                ? fileProviderEnablementStatusLabel(displayedFileProviderEnablement)
+                : mounting
                 ? "Checking File Provider approval"
                 : mountOnboarding?.message ?? `Creating folder and preparing ${selectedSourceName} files`}
             </div>
             <div className="path-field ready-path-field">
               <span>{mountPath}</span>
             </div>
-            {showRecoveryChooser ? (
+            {fileProviderGuideVisible ? (
+              <>
+                <div className="button-row">
+                  <PrimaryButton onClick={() => void revealFileProviderEnablement()}>
+                    Reopen Finder
+                  </PrimaryButton>
+                  <SecondaryButton onClick={() => setFinderHelpOpen((open) => !open)}>
+                    Having trouble?
+                  </SecondaryButton>
+                </div>
+                {finderHelpOpen && (
+                  <div className="finder-enable-help">
+                    <strong>Look under Locations in the Finder sidebar.</strong>
+                    <span>
+                      Select Locality and click Enable. If Locality is missing, reopen Finder first,
+                      then verify Locality under File Providers in System Settings.
+                    </span>
+                  </div>
+                )}
+                {finderRevealError && <p className="field-error">{finderRevealError}</p>}
+              </>
+            ) : showRecoveryChooser ? (
               <div className="button-row">
                 <PrimaryButton
                   busy={mounting}
@@ -2473,10 +2658,10 @@ function Onboarding({
                 {mountOnboardingPrimaryLabel(mountOnboarding, mounting)}
               </PrimaryButton>
             )}
-            {mountOnboardingNeedsInstructions(mountOnboarding) && (
+            {!fileProviderGuideVisible && mountOnboardingNeedsInstructions(mountOnboarding) && (
               <p className="quiet-note">{mountOnboardingInstructions(mountOnboarding)}</p>
             )}
-            {mountOnboardingSupplementaryNote(mountOnboarding) && (
+            {!fileProviderGuideVisible && mountOnboardingSupplementaryNote(mountOnboarding) && (
               <p className="quiet-note">{mountOnboardingSupplementaryNote(mountOnboarding)}</p>
             )}
             <p className="quiet-note">
@@ -3125,9 +3310,78 @@ function MountsView({
   const [sourceDialogState, setSourceDialogState] = useState<SourceSetupState>("idle");
   const [sourceDialogConnector, setSourceDialogConnector] = useState<SourceConnectorId | null>(null);
   const [sourceDialogMessage, setSourceDialogMessage] = useState("");
+  const [sourceFileProviderEnablement, setSourceFileProviderEnablement] = useState<FileProviderEnablementReport | null>(null);
+  const [pendingMountRetry, setPendingMountRetry] = useState<{
+    connector: SourceConnectorId;
+    googleDocsWorkspaceFolder?: string;
+  } | null>(null);
+  const sourceFinderRevealRequestedRef = useRef(false);
   const sourceSetupBusy = sourceSetupIsBusy(sourceDialogState);
   const readyToMountSources = connectedSourcesReadyToMount(snapshot);
   const hasVisibleSources = rows.length > 0 || readyToMountSources.length > 0;
+
+  useEffect(() => {
+    if (!pendingMountRetry) {
+      sourceFinderRevealRequestedRef.current = false;
+      return;
+    }
+
+    let completionTimer: number | null = null;
+    const poller = createFileProviderEnablementPoller({
+      probe: () =>
+        callCommand<FileProviderEnablementReport>(
+          "file_provider_enablement_status",
+          undefined,
+          {
+            state: "ready",
+            message: "Locality is enabled in Finder.",
+            path: sourceDefaultPath(snapshot, pendingMountRetry.connector),
+          },
+        ),
+      onReport: (report) => {
+        setSourceFileProviderEnablement(report);
+        if (report.state === "unavailable") {
+          setSourceDialogMessage(report.message);
+          setSourceDialogState("error");
+        }
+      },
+      onReady: (report) => {
+        setSourceFileProviderEnablement(report);
+        completionTimer = window.setTimeout(async () => {
+          const mountReport = await createConnectorMount(
+            pendingMountRetry.connector,
+            pendingMountRetry.googleDocsWorkspaceFolder,
+          );
+          const outcome = sourceMountRetryOutcome(mountReport);
+          if (outcome.kind === "retry") {
+            return;
+          }
+          setPendingMountRetry(null);
+          setSourceFileProviderEnablement(null);
+          setSourceDialogMessage(outcome.message);
+          setSourceDialogState(outcome.kind);
+        }, 350);
+      },
+    });
+    const updateVisibility = () => {
+      poller.setVisible(document.visibilityState !== "hidden");
+    };
+
+    if (!sourceFinderRevealRequestedRef.current) {
+      sourceFinderRevealRequestedRef.current = true;
+      void revealSourceFileProviderEnablement();
+    }
+    document.addEventListener("visibilitychange", updateVisibility);
+    updateVisibility();
+    poller.start();
+    return () => {
+      poller.stop();
+      document.removeEventListener("visibilitychange", updateVisibility);
+      if (completionTimer !== null) {
+        window.clearTimeout(completionTimer);
+      }
+    };
+  }, [pendingMountRetry]);
 
   function openAddSourceDialog() {
     setActionError("");
@@ -3138,6 +3392,34 @@ function MountsView({
       setSourceDialogConnector(null);
     }
     setSourceDialogOpen(true);
+  }
+
+  function beginSourceFileProviderRecovery(
+    connector: SourceConnectorId,
+    googleDocsWorkspaceFolder: string | undefined,
+  ) {
+    setActionError("");
+    setSourceDialogOpen(true);
+    setSourceDialogConnector(connector);
+    setSourceDialogState("creating");
+    setSourceDialogMessage("");
+    setSourceFileProviderEnablement({
+      state: "needs_finder_enable",
+      message: "In Finder, click Enable for Locality.",
+      path: sourceDefaultPath(snapshot, connector),
+    });
+    setPendingMountRetry({ connector, googleDocsWorkspaceFolder });
+  }
+
+  async function revealSourceFileProviderEnablement() {
+    const report = await callCommand<ActionReport>(
+      "reveal_file_provider_enablement",
+      undefined,
+      { ok: true, message: "Opened Locality in Finder." },
+    ).catch((error) => ({ ok: false, message: errorMessage(error) }));
+    if (!report.ok) {
+      setSourceDialogMessage(report.message);
+    }
   }
 
   async function createConnectorMount(
@@ -3171,6 +3453,10 @@ function MountsView({
         { ok: true, message: "Created demo mount." },
       );
       if (!report.ok) {
+        if (classifyMountSetupError(report.message).kind === "file-provider-disabled") {
+          beginSourceFileProviderRecovery(connector, googleDocsWorkspaceFolder);
+          return report;
+        }
         setActionError(report.message);
         return report;
       }
@@ -3178,6 +3464,10 @@ function MountsView({
       return report;
     } catch (error) {
       const message = errorMessage(error);
+      if (classifyMountSetupError(message).kind === "file-provider-disabled") {
+        beginSourceFileProviderRecovery(connector, googleDocsWorkspaceFolder);
+        return { ok: false, message };
+      }
       setActionError(message);
       return { ok: false, message };
     } finally {
@@ -3225,8 +3515,8 @@ function MountsView({
     if (connector === "notion") {
       return connectNotionSource();
     }
-    if (connector === "granola") {
-      return { ok: false, message: "Granola requires an API key." };
+    if (sourceRequiresApiKey(connector)) {
+      return { ok: false, message: `${sourceDisplayName(connector)} requires an API key.` };
     }
 
     const command = googleOAuthConnectCommand(connector);
@@ -3268,6 +3558,9 @@ function MountsView({
     try {
       if (connectorReady && !connectorHasMount) {
         const mountReport = await createConnectorMount(connector, options?.googleDocsWorkspaceFolder);
+        if (classifyMountSetupError(mountReport.message).kind === "file-provider-disabled") {
+          return;
+        }
         setSourceDialogMessage(mountReport.message);
         setSourceDialogState(mountReport.ok ? "success" : "error");
         return;
@@ -3286,6 +3579,9 @@ function MountsView({
 
       setSourceDialogState("creating");
       const mountReport = await createConnectorMount(connector, options?.googleDocsWorkspaceFolder);
+      if (classifyMountSetupError(mountReport.message).kind === "file-provider-disabled") {
+        return;
+      }
       const message = mountReport.ok
         ? `${report.message} ${mountReport.message}`
         : `${report.message} ${mountReport.message}`;
@@ -3300,19 +3596,20 @@ function MountsView({
     }
   }
 
-  async function connectGranolaSource(apiKey: string) {
+  async function connectApiKeySource(connector: "granola" | "linear", apiKey: string) {
     if (sourceSetupBusy) {
       return;
     }
+    const sourceName = sourceDisplayName(connector);
     setSourceDialogMessage("");
     setActionMessage("");
-    setSourceDialogConnector("granola");
+    setSourceDialogConnector(connector);
     setSourceDialogState("connecting");
     try {
       const report = await callCommand<ActionReport>(
-        "connect_granola",
+        connector === "linear" ? "connect_linear" : "connect_granola",
         { apiKey },
-        { ok: true, message: "Connected demo Granola source." },
+        { ok: true, message: `Connected demo ${sourceName} source.` },
       );
       setSourceDialogMessage(report.message);
       setSourceDialogState(report.ok ? "success" : "error");
@@ -3529,9 +3826,13 @@ function MountsView({
           state={sourceDialogState}
           activeConnector={sourceDialogConnector}
           message={sourceDialogMessage}
+          fileProviderEnablement={sourceFileProviderEnablement}
           onAction={(connector, options) => void runSourceDialogAction(connector, options)}
-          onGranolaAction={(apiKey) => void connectGranolaSource(apiKey)}
-          onClose={() => setSourceDialogOpen(false)}
+          onApiKeyAction={(connector, apiKey) => void connectApiKeySource(connector, apiKey)}
+          onReopenFinder={() => void revealSourceFileProviderEnablement()}
+          onClose={() => {
+            setSourceDialogOpen(false);
+          }}
         />
       )}
     </div>
@@ -3543,22 +3844,27 @@ function AddSourceDialog({
   state,
   activeConnector,
   message,
+  fileProviderEnablement,
   onAction,
-  onGranolaAction,
+  onApiKeyAction,
+  onReopenFinder,
   onClose,
 }: {
   snapshot: DesktopSnapshot;
   state: SourceSetupState;
   activeConnector: SourceConnectorId | null;
   message: string;
+  fileProviderEnablement: FileProviderEnablementReport | null;
   onAction: (connector: SourceConnectorId, options?: { googleDocsWorkspaceFolder?: string }) => void;
-  onGranolaAction: (apiKey: string) => void;
+  onApiKeyAction: (connector: "granola" | "linear", apiKey: string) => void;
+  onReopenFinder: () => void;
   onClose: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [viewMode, setViewMode] = useState<SourceListViewMode>("list");
   const [googleDocsWorkspaceFolder, setGoogleDocsWorkspaceFolder] = useState("Locality");
   const [granolaApiKey, setGranolaApiKey] = useState("");
+  const [linearApiKey, setLinearApiKey] = useState("");
   const busy = sourceSetupIsBusy(state);
   const connectors: ConnectorOption[] = [
     {
@@ -3601,6 +3907,14 @@ function AddSourceDialog({
       keywords: ["granola", "meetings", "notes", "transcripts", "summaries"],
       mounted: sourceMounted(snapshot, "granola"),
     },
+    {
+      id: "linear",
+      name: "Linear",
+      description: "Issues and teams as editable Markdown files.",
+      status: sourceConnectorStatus(snapshot, "linear"),
+      keywords: ["linear", "issues", "tickets", "projects", "teams"],
+      mounted: sourceMounted(snapshot, "linear"),
+    },
   ];
   const normalizedQuery = query.trim().toLowerCase();
   const visibleConnectors = normalizedQuery
@@ -3626,6 +3940,30 @@ function AddSourceDialog({
           </button>
         </div>
 
+        {fileProviderEnablement ? (
+          <div className="source-file-provider-recovery">
+            <div>
+              <p className="label">Finder access</p>
+              <h3>{fileProviderEnablementHeadline(fileProviderEnablement)}</h3>
+              <p>
+                {fileProviderEnablement.state === "needs_finder_enable"
+                  ? "Click Enable in the Locality Finder window. Source setup will continue automatically."
+                  : fileProviderEnablement.message}
+              </p>
+            </div>
+            <FinderEnableGuide
+              waitingForRoot={fileProviderEnablement.state === "waiting_for_root"}
+            />
+            <div className="sync-note">
+              {fileProviderEnablement.state === "ready" ? <Check /> : <Loader2 className="spin-icon" />}
+              {fileProviderEnablementStatusLabel(fileProviderEnablement)}
+            </div>
+            <SecondaryButton icon={<FolderOpen />} onClick={onReopenFinder}>
+              Reopen Finder
+            </SecondaryButton>
+          </div>
+        ) : (
+          <>
         <div className="source-toolbar">
           <label className="source-search-row">
             <Search />
@@ -3662,6 +4000,7 @@ function AddSourceDialog({
           <div className={`connector-choice-grid ${viewMode}`}>
             {visibleConnectors.map((connector) => {
               const connectorBusy = sourceSetupIsActiveConnector(state, activeConnector, connector.id);
+              const apiKeyConnector = sourceRequiresApiKey(connector.id) ? connector.id : null;
               const connected = sourceConnectionReady(snapshot, connector.id);
               const needsConnection = !connected;
               const needsFolder = connected && !connector.mounted;
@@ -3723,6 +4062,12 @@ function AddSourceDialog({
                         <SettingRow title="Content" value="Summaries and transcripts" />
                         <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
                       </>
+                    ) : connector.id === "linear" ? (
+                      <>
+                        <SettingRow title="Content" value="Issues by team" />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                        <SettingRow title="Access" value="Issue edits" />
+                      </>
                     ) : (
                       <>
                         <SettingRow title="Mailboxes" value="Inbox, Sent, Draft" />
@@ -3740,21 +4085,29 @@ function AddSourceDialog({
                       />
                     </label>
                   )}
-                  {connector.id === "granola" && !connector.mounted && needsConnection && (
+                  {apiKeyConnector && !connector.mounted && needsConnection && (
                     <>
                       <label className="source-inline-field">
-                        <span>Granola API key</span>
+                        <span>{connector.name} API key</span>
                         <input
                           type="password"
                           autoComplete="off"
-                          value={granolaApiKey}
+                          value={apiKeyConnector === "linear" ? linearApiKey : granolaApiKey}
                           placeholder="Paste API key"
                           disabled={busy}
-                          onChange={(event) => setGranolaApiKey(event.target.value)}
+                          onChange={(event) => {
+                            if (apiKeyConnector === "linear") {
+                              setLinearApiKey(event.target.value);
+                            } else {
+                              setGranolaApiKey(event.target.value);
+                            }
+                          }}
                         />
                       </label>
                       <p className="quiet-note">
-                        Create a key in Granola Settings → Connectors → API keys. Business or Enterprise is required.
+                        {apiKeyConnector === "linear"
+                          ? "Create a key in Linear Settings > API > Personal API keys."
+                          : "Create a key in Granola Settings > Connectors > API keys. Business or Enterprise is required."}
                       </p>
                     </>
                   )}
@@ -3762,15 +4115,21 @@ function AddSourceDialog({
                     <SecondaryButton compact disabled icon={<Check />}>
                       Mounted
                     </SecondaryButton>
-                  ) : connector.id === "granola" ? (
+                  ) : apiKeyConnector ? (
                     <PrimaryButton
                       compact
                       busy={connectorBusy}
-                      disabled={disabled || (needsConnection && !granolaApiKey.trim())}
+                      disabled={
+                        disabled ||
+                        (needsConnection && !(apiKeyConnector === "linear" ? linearApiKey : granolaApiKey).trim())
+                      }
                       icon={needsConnection ? <ShieldCheck /> : <FolderOpen />}
                       onClick={() => {
                         if (needsConnection) {
-                          onGranolaAction(granolaApiKey);
+                          onApiKeyAction(
+                            apiKeyConnector,
+                            apiKeyConnector === "linear" ? linearApiKey : granolaApiKey,
+                          );
                         } else {
                           onAction(connector.id);
                         }
@@ -3797,6 +4156,8 @@ function AddSourceDialog({
             )}
           </div>
         </div>
+          </>
+        )}
 
         {busy && <p className="quiet-note inline-note">Setup continues if you close this window.</p>}
         {message && <p className={state === "error" ? "field-error" : "quiet-note inline-note"}>{message}</p>}
@@ -3817,6 +4178,8 @@ function sourceDisplayName(connector: SourceConnectorId) {
       return "Gmail";
     case "granola":
       return "Granola";
+    case "linear":
+      return "Linear";
   }
 }
 
@@ -3832,6 +4195,8 @@ function sourceMountId(connector: SourceConnectorId) {
       return "gmail-main";
     case "granola":
       return "granola-main";
+    case "linear":
+      return "linear-main";
   }
 }
 
@@ -3858,7 +4223,7 @@ function sourceConnectorStatus(snapshot: DesktopSnapshot, connector: SourceConne
   if (sourceConnectionReady(snapshot, connector)) {
     return "Folder needed";
   }
-  if (connector === "granola") {
+  if (sourceRequiresApiKey(connector)) {
     return "API key required";
   }
   return "Ready to connect";
@@ -3893,6 +4258,8 @@ function sourceDefaultPath(snapshot: DesktopSnapshot, connector: SourceConnector
       return "~/Library/CloudStorage/Locality/gmail-main";
     case "granola":
       return "~/Library/CloudStorage/Locality/granola";
+    case "linear":
+      return "~/Library/CloudStorage/Locality/linear";
   }
 }
 
@@ -4051,6 +4418,7 @@ function CurrentWorkspacePanel({
   const [pullState, setPullState] = useState<"idle" | "pulling" | "success" | "error">("idle");
   const accountLabel = snapshot.connection.accountLabel.trim();
   const showAccount = accountLabel.length > 0 && accountLabel !== snapshot.connection.workspaceName;
+  const fileProgressLabel = mountFileIndexProgressLabel(snapshot.mount);
 
   async function openFolder() {
     setActionError("");
@@ -4189,7 +4557,7 @@ function CurrentWorkspacePanel({
       <div className="workspace-facts">
         <span>Permission: {snapshot.mount.readOnly ? "Read only" : "Edit enabled"}</span>
         <span>Projection: {snapshot.mount.projection}</span>
-        <span>Indexed: {mountEntityCountLabel(snapshot.mount)}</span>
+        <span>{fileProgressLabel ?? `Indexed: ${mountEntityCountLabel(snapshot.mount)}`}</span>
         {showAccount && <span>Account: {accountLabel}</span>}
       </div>
 
@@ -4249,6 +4617,7 @@ function MountDetailView({
   } = useMountLiveModeController(snapshot, onRefresh);
   const liveModeAppliesToSource = isActiveMount && mount.connector === "notion";
   const sourceSyncMode = sourceSyncModeLabel(snapshot.liveMode, liveModeAppliesToSource);
+  const fileProgressValue = mountFileIndexProgressValue(mount);
 
   async function openFolder() {
     setActionError("");
@@ -4494,6 +4863,7 @@ function MountDetailView({
           <SettingRow title="Location" value={mount.localPath} />
           <SettingRow title="Projection" value={mount.projection} />
           <SettingRow title="Mounted content" value={`${mount.entityCount} items`} />
+          {fileProgressValue && <SettingRow title="Files indexed" value={fileProgressValue} />}
           <SettingRow title="Root exists" value={mount.rootExists ? "Yes" : "No"} />
         </div>
       </section>
@@ -5570,9 +5940,11 @@ function SettingsView({
 
   function copyDiagnostics() {
     const summary = [
+      `Health: ${healthLabel(snapshot.health.state)}`,
       `Locality process: ${daemonStopped ? "Stopped" : "Running"}`,
       snapshot.mount.provider ? `Provider: ${providerStatusLabel(snapshot.mount.provider)}` : null,
       "State folder: ~/.loc",
+      "Logs folder: ~/.loc/logs",
       `Projection: ${snapshot.mount.projection}`,
       `Connection: ${snapshot.connection.status}`,
       `Mount: ${snapshot.mount.status}`,
@@ -5873,6 +6245,7 @@ function SettingsView({
                   <SettingRow title="Provider" value={providerStatusLabel(snapshot.mount.provider)} />
                 )}
                 <SettingRow title="State folder" value="~/.loc" />
+                <SettingRow title="Logs folder" value="~/.loc/logs" />
                 <SettingRow title="Projection" value={snapshot.mount.projection} />
                 <div className="button-row">
                   <SecondaryButton compact onClick={copyDiagnostics}>
@@ -7282,6 +7655,19 @@ function ConnectorOptions({
         </div>
         <span>{connectedConnector === "granola" ? "Connected" : "API key"}</span>
       </button>
+      <button
+        type="button"
+        className={`connector-option available selectable ${selected === "linear" ? "selected" : ""}`}
+        disabled={busy}
+        onClick={() => onSelect("linear")}
+      >
+        <ConnectorIcon connector="linear" />
+        <div>
+          <strong>Linear</strong>
+          <small>Issues and teams as editable Markdown files.</small>
+        </div>
+        <span>{connectedConnector === "linear" ? "Connected" : "API key"}</span>
+      </button>
     </div>
   );
 }
@@ -7409,6 +7795,51 @@ function SetupContent({
       >
         {mark ? mark : null}
         {children}
+      </div>
+    </div>
+  );
+}
+
+function FinderEnableGuide({ waitingForRoot }: { waitingForRoot: boolean }) {
+  if (waitingForRoot) {
+    return (
+      <div className="finder-enable-guide complete" role="status">
+        <Check />
+        <span>
+          <strong>Finder access enabled</strong>
+          <small>macOS is creating the Locality folder.</small>
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="finder-enable-guide">
+      <div className="finder-enable-illustration" aria-hidden="true">
+        <div className="finder-enable-toolbar">
+          <i />
+          <i />
+          <i />
+          <span>Finder</span>
+        </div>
+        <div className="finder-enable-sidebar">
+          <small>Locations</small>
+          <span className="finder-enable-location">
+            <FolderOpen />
+            <strong>Locality</strong>
+          </span>
+        </div>
+        <div className="finder-enable-content">
+          <p>
+            <strong>&quot;Locality&quot; is not enabled.</strong> To access Locality, click Enable.
+          </p>
+          <span className="finder-enable-control">Enable</span>
+          <div className="finder-enable-placeholders">
+            <i />
+            <i />
+            <i />
+          </div>
+        </div>
       </div>
     </div>
   );

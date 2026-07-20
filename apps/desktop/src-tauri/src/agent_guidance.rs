@@ -432,6 +432,7 @@ Locality projects connected company sources, including Notion, into the local fi
 
 - Read `{mount_path}/AGENTS.md` for connector-specific creation rules.
 - Prefer `loc create page --title "New Page" --parent <parent-directory>` for new pages.
+- Create a Notion database with `loc create database --title "Tasks" --parent <page-dir>`, edit its draft `_schema.yaml`, inspect with `loc diff`, then push explicitly.
 - Pages are directories; edit or create the `page.md` inside the page directory.
 - To create a child page, create `parent-page/new-page/page.md`.
 - New `page.md` files need YAML frontmatter with `title: "..."` and no `loc:` identity block.

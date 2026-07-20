@@ -19,7 +19,7 @@ use locality_store::{
 };
 use localityd::hydration::{
     HydratedAsset, HydratedEntity, HydrationExecutor, HydrationOutcome, HydrationQueue,
-    HydrationSource,
+    HydrationRepository, HydrationSource,
 };
 
 #[test]
@@ -71,6 +71,33 @@ fn executor_fetches_render_using_projected_entity_path() {
         vec![PathBuf::from("Roadmap/page.md")]
     );
     assert!(fixture.page_path().exists());
+}
+
+#[test]
+fn executor_passes_entity_repository_to_hydration_source() {
+    let fixture = HydrationFixture::new();
+    let mut store = fixture.store(HydrationState::Stub);
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("project-1"),
+            EntityKind::Page,
+            "Launch",
+            "projects/Launch/page.md",
+        ))
+        .expect("save related entity");
+    fixture.write_stub();
+    let source = RepositoryAwareHydrationSource::default();
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    executor
+        .hydrate_request(fixture.request())
+        .expect("hydrate request");
+
+    assert_eq!(
+        source.related_paths.borrow().as_slice(),
+        &[PathBuf::from("projects/Launch/page.md")]
+    );
 }
 
 #[test]
@@ -1176,6 +1203,31 @@ impl HydrationSource for FakeHydrationSource {
             .get(&request.remote_id)
             .cloned()
             .ok_or_else(|| LocalityError::InvalidState("missing fake entity".to_string()))
+    }
+}
+
+#[derive(Debug, Default)]
+struct RepositoryAwareHydrationSource {
+    related_paths: RefCell<Vec<PathBuf>>,
+}
+
+impl HydrationSource for RepositoryAwareHydrationSource {
+    fn fetch_render(&self, _request: &HydrationRequest) -> LocalityResult<HydratedEntity> {
+        Err(LocalityError::InvalidState(
+            "repository-aware fetch path was not used".to_string(),
+        ))
+    }
+
+    fn fetch_render_with_repository(
+        &self,
+        request: &HydrationRequest,
+        repository: &dyn HydrationRepository,
+    ) -> LocalityResult<HydratedEntity> {
+        let related = repository
+            .entity_record(&request.mount_id, &RemoteId::new("project-1"))?
+            .expect("related entity");
+        self.related_paths.borrow_mut().push(related.path);
+        Ok(rendered_entity("Remote body."))
     }
 }
 

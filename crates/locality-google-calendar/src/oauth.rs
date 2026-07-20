@@ -238,6 +238,7 @@ pub fn google_calendar_capabilities_json() -> Result<String, serde_json::Error> 
         supports_databases: false,
         supports_oauth: true,
         supports_remote_observation: true,
+        supports_entity_body_updates: false,
         supports_lazy_child_enumeration: true,
         supports_media_download: false,
         supports_undo: false,

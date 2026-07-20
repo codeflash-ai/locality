@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   compactPath,
   mountEntityCountLabel,
+  mountFileIndexProgressLabel,
   mountAccessLabel,
   mountRows,
   mountStatusLabel,
@@ -119,6 +120,68 @@ describe("mount display helpers", () => {
   it("labels indexed mount entities as items, not physical files", () => {
     expect(mountEntityCountLabel(mount({ entityCount: 1 }))).toBe("1 item");
     expect(mountEntityCountLabel(mount({ entityCount: 260 }))).toBe("260 items");
+  });
+
+  it("labels hydratable file indexing progress", () => {
+    expect(
+      mountFileIndexProgressLabel(
+        mount({
+          hydrationProgress: {
+            indexedFiles: 1,
+            remainingFiles: 2,
+            totalFiles: 3,
+          },
+        }),
+      ),
+    ).toBe("Indexed: 1 of 3 files, 2 left");
+    expect(
+      mountFileIndexProgressLabel(
+        mount({
+          hydrationProgress: {
+            indexedFiles: 1,
+            remainingFiles: 0,
+            totalFiles: 1,
+          },
+        }),
+      ),
+    ).toBe("Indexed: 1 of 1 file");
+    expect(mountFileIndexProgressLabel(mount({}))).toBeNull();
+  });
+
+  it("uses hydratable file progress as source card content while files remain", () => {
+    const rows = mountRows(
+      [
+        mount({
+          hydrationProgress: {
+            indexedFiles: 12,
+            remainingFiles: 68,
+            totalFiles: 80,
+          },
+        }),
+      ],
+      mount({}),
+      "notion-main",
+    );
+
+    expect(rows[0].content).toBe("Indexed: 12 of 80 files, 68 left");
+  });
+
+  it("keeps compact source card content once file indexing is complete", () => {
+    const rows = mountRows(
+      [
+        mount({
+          hydrationProgress: {
+            indexedFiles: 80,
+            remainingFiles: 0,
+            totalFiles: 80,
+          },
+        }),
+      ],
+      mount({}),
+      "notion-main",
+    );
+
+    expect(rows[0].content).toBe("24 items, 3 pending");
   });
 
   it("compacts long paths from the middle so filenames remain visible", () => {

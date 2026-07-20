@@ -10,15 +10,17 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use locality_connector::{
-    ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
-    ConnectorCapabilities, ConnectorExecutionPolicy, ConnectorKind, EnumerateRequest, FetchRequest,
-    ListChildrenRequest, ListChildrenResult, NativeEntity, ObserveRequest, ParsedEntity,
+    ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, BatchObserveRequest,
+    BatchObserveResult, Connector, ConnectorCapabilities, ConnectorExecutionPolicy, ConnectorKind,
+    EnumerateRequest, FetchRequest, ListChildrenRequest, ListChildrenResult, NativeEntity,
+    ObserveRequest, ParsedEntity,
 };
 use locality_core::canonical::ParsedCanonicalDocument;
 use locality_core::freshness::RemoteObservation;
 use locality_core::hydration::HydrationRequest;
 use locality_core::model::{CanonicalDocument, EntityKind, MountId, RemoteId, TreeEntry};
 use locality_core::planner::PushOperationKind;
+use locality_core::push::BodyDiffMode;
 use locality_core::shadow::ShadowDocument;
 use locality_core::validation::ValidationReport;
 use locality_core::{LocalityError, LocalityResult};
@@ -26,6 +28,7 @@ use locality_gmail::{GMAIL_CONNECTOR_ID, GmailConnector};
 use locality_google_calendar::{GOOGLE_CALENDAR_CONNECTOR_ID, GoogleCalendarConnector};
 use locality_google_docs::{GOOGLE_DOCS_CONNECTOR_ID, GoogleDocsConnector};
 use locality_granola::{GRANOLA_CONNECTOR_ID, GranolaConnector};
+use locality_linear::{LINEAR_CONNECTOR_ID, LinearConnector};
 use locality_notion::NotionConnector;
 use locality_notion::client::DEFAULT_NOTION_TOKEN_ENV;
 use locality_store::{
@@ -38,7 +41,8 @@ use crate::gmail::resolve_gmail_connector_for_mount;
 use crate::google_calendar::resolve_google_calendar_connector_for_mount;
 use crate::google_docs::resolve_google_docs_connector_for_mount;
 use crate::granola::resolve_granola_connector_for_mount;
-use crate::hydration::{HydratedEntity, HydrationSource};
+use crate::hydration::{HydratedEntity, HydrationRepository, HydrationSource};
+use crate::linear::{LINEAR_CONNECT_COMMAND, resolve_linear_connector_for_mount};
 use crate::notion::{ConnectorResolveError, resolve_notion_connector_for_mount};
 use crate::reconcile::ScheduledPullSource;
 
@@ -51,6 +55,7 @@ pub enum ResolvedSource {
     GoogleCalendar(GoogleCalendarConnector),
     Gmail(GmailConnector),
     Granola(GranolaConnector),
+    Linear(LinearConnector),
 }
 
 impl ResolvedSource {
@@ -63,6 +68,7 @@ impl ResolvedSource {
             }
             Self::Gmail(source) => Self::Gmail(source.with_execution_policy(policy)),
             Self::Granola(source) => Self::Granola(source.with_execution_policy(policy)),
+            Self::Linear(source) => Self::Linear(source.with_execution_policy(policy)),
         }
     }
 }
@@ -131,6 +137,13 @@ const SOURCE_REGISTRY: &[SourceRegistration] = &[
         validate_changed_frontmatter: crate::granola::validate_granola_frontmatter,
         validate_create_frontmatter: crate::granola::validate_granola_frontmatter,
     },
+    SourceRegistration {
+        id: LINEAR_CONNECTOR_ID,
+        descriptor: linear_source_descriptor,
+        resolve: resolve_linear_source,
+        validate_changed_frontmatter: crate::linear::validate_linear_frontmatter,
+        validate_create_frontmatter: crate::linear::validate_linear_create_frontmatter,
+    },
 ];
 
 #[derive(Clone, Debug, Default)]
@@ -149,8 +162,17 @@ pub struct SourceDescriptor {
     mount_guidance: Cow<'static, str>,
     source_root_create_parent_kind: Option<EntityKind>,
     create_entity_parent_kinds: Vec<EntityKind>,
+    move_entity_parent_kinds: Vec<EntityKind>,
     periodic_discovery_interval: Option<Duration>,
+    body_diff_mode: BodyDiffMode,
+    virtual_rename_policy: VirtualRenamePolicy,
     max_background_discovery_workers: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VirtualRenamePolicy {
+    FilenameDerived,
+    PreserveCanonical,
 }
 
 impl SourceDescriptor {
@@ -190,8 +212,20 @@ impl SourceDescriptor {
         &self.create_entity_parent_kinds
     }
 
+    pub fn move_entity_parent_kinds(&self) -> &[EntityKind] {
+        &self.move_entity_parent_kinds
+    }
+
     pub fn periodic_discovery_interval(&self) -> Option<Duration> {
         self.periodic_discovery_interval
+    }
+
+    pub fn body_diff_mode(&self) -> BodyDiffMode {
+        self.body_diff_mode
+    }
+
+    pub fn virtual_rename_policy(&self) -> VirtualRenamePolicy {
+        self.virtual_rename_policy
     }
 
     pub fn max_background_discovery_workers(&self) -> usize {
@@ -202,7 +236,10 @@ impl SourceDescriptor {
 pub fn source_descriptor(connector: &str) -> SourceDescriptor {
     source_registration(connector)
         .map(|registration| (registration.descriptor)())
-        .unwrap_or_else(|| generic_source_descriptor(connector))
+        .unwrap_or_else(|| match connector {
+            "linear" => linear_source_descriptor(),
+            _ => generic_source_descriptor(connector),
+        })
 }
 
 pub fn source_display_name(connector: &str) -> String {
@@ -283,6 +320,37 @@ pub fn source_create_decision_for_parent_path(
             reason: "Granola meetings are read-only",
         };
     }
+    if mount.connector == LINEAR_CONNECTOR_ID {
+        return SourceWriteDecision::ReadOnly {
+            reason: "Linear issue creates are not supported yet",
+        };
+    }
+    SourceWriteDecision::Writable
+}
+
+pub fn source_move_decision_for_parent_path(
+    mount: &MountConfig,
+    parent_path: &Path,
+) -> SourceWriteDecision {
+    if mount.read_only {
+        return SourceWriteDecision::ReadOnly {
+            reason: "mount is read-only",
+        };
+    }
+    if mount.connector == "gmail" {
+        return if parent_path == Path::new("draft") {
+            SourceWriteDecision::Writable
+        } else {
+            SourceWriteDecision::ReadOnly {
+                reason: "Gmail moves are only supported directly inside draft/",
+            }
+        };
+    }
+    if mount.connector == GRANOLA_CONNECTOR_ID {
+        return SourceWriteDecision::ReadOnly {
+            reason: "Granola meetings are read-only",
+        };
+    }
     SourceWriteDecision::Writable
 }
 
@@ -310,7 +378,10 @@ fn notion_source_descriptor() -> SourceDescriptor {
         mount_guidance: Cow::Borrowed(NOTION_AGENT_GUIDANCE),
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
+        move_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
         periodic_discovery_interval: None,
+        body_diff_mode: BodyDiffMode::Block,
+        virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
         max_background_discovery_workers: 3,
     }
 }
@@ -326,7 +397,10 @@ fn google_docs_source_descriptor() -> SourceDescriptor {
         mount_guidance: Cow::Owned(google_docs_mount_guidance()),
         source_root_create_parent_kind: Some(EntityKind::Directory),
         create_entity_parent_kinds: vec![EntityKind::Directory],
+        move_entity_parent_kinds: vec![EntityKind::Directory],
         periodic_discovery_interval: None,
+        body_diff_mode: BodyDiffMode::Block,
+        virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
         max_background_discovery_workers: 4,
     }
 }
@@ -342,7 +416,10 @@ fn google_calendar_source_descriptor() -> SourceDescriptor {
         mount_guidance: Cow::Owned(google_calendar_mount_guidance()),
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Directory],
+        move_entity_parent_kinds: Vec::new(),
         periodic_discovery_interval: None,
+        body_diff_mode: BodyDiffMode::Block,
+        virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
         max_background_discovery_workers: 4,
     }
 }
@@ -358,7 +435,10 @@ fn gmail_source_descriptor() -> SourceDescriptor {
         mount_guidance: Cow::Owned(gmail_mount_guidance()),
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Directory],
+        move_entity_parent_kinds: vec![EntityKind::Directory],
         periodic_discovery_interval: None,
+        body_diff_mode: BodyDiffMode::Block,
+        virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
         max_background_discovery_workers: 4,
     }
 }
@@ -374,7 +454,10 @@ fn granola_source_descriptor() -> SourceDescriptor {
         mount_guidance: Cow::Owned(granola_mount_guidance()),
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: Vec::new(),
+        move_entity_parent_kinds: Vec::new(),
         periodic_discovery_interval: Some(Duration::from_secs(300)),
+        body_diff_mode: BodyDiffMode::Block,
+        virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
         max_background_discovery_workers: 3,
     }
 }
@@ -421,6 +504,14 @@ fn resolve_granola_source(
     resolve_granola_connector_for_mount(store, credentials, mount).map(ResolvedSource::Granola)
 }
 
+fn resolve_linear_source(
+    store: &dyn SourceResolverStore,
+    credentials: &dyn CredentialStore,
+    mount: &MountConfig,
+) -> Result<ResolvedSource, ConnectorResolveError> {
+    resolve_linear_connector_for_mount(store, credentials, mount).map(ResolvedSource::Linear)
+}
+
 fn generic_source_descriptor(connector: &str) -> SourceDescriptor {
     SourceDescriptor {
         id: Cow::Owned(connector.to_string()),
@@ -432,8 +523,30 @@ fn generic_source_descriptor(connector: &str) -> SourceDescriptor {
         mount_guidance: Cow::Owned(generic_mount_guidance(connector)),
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
+        move_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
         periodic_discovery_interval: None,
+        body_diff_mode: BodyDiffMode::Block,
+        virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
         max_background_discovery_workers: 1,
+    }
+}
+
+fn linear_source_descriptor() -> SourceDescriptor {
+    SourceDescriptor {
+        id: Cow::Borrowed(LINEAR_CONNECTOR_ID),
+        display_name: Cow::Borrowed("Linear"),
+        default_mount_id: Cow::Borrowed("linear-main"),
+        connect_command: Some(Cow::Borrowed(LINEAR_CONNECT_COMMAND)),
+        auth_env_var: None,
+        supports_oauth: false,
+        mount_guidance: Cow::Owned(linear_mount_guidance()),
+        source_root_create_parent_kind: None,
+        create_entity_parent_kinds: Vec::new(),
+        move_entity_parent_kinds: vec![EntityKind::Page],
+        periodic_discovery_interval: Some(Duration::from_secs(300)),
+        body_diff_mode: BodyDiffMode::WholeEntity,
+        virtual_rename_policy: VirtualRenamePolicy::PreserveCanonical,
+        max_background_discovery_workers: 3,
     }
 }
 
@@ -547,6 +660,18 @@ Granola meetings are projected as read-only directories containing summary.md an
 - A missing transcript can mean none was captured or Granola's retention policy deleted it.\n\
 - Use `loc info .` for mount context and `loc pull <path>` only when the user explicitly requests a refresh.\n"
         .to_string()
+}
+
+fn linear_mount_guidance() -> String {
+    format!(
+        "{}\n\
+Linear facts:\n\
+- This mount projects Linear teams as directories and issues as page.md files under their team directory.\n\
+- Issue frontmatter contains stable Linear UUID references in the `Label <id>` shape. Preserve the id when editing status, project, or assignee fields.\n\
+- Supported writes are issue description body edits plus title, Status, Project, and Assignee frontmatter updates.\n\
+- Labels, priority, estimate, team, identifier, URL, create, move, delete, and undo are not supported by the Linear connector yet.\n",
+        generic_mount_guidance("Linear")
+    )
 }
 
 pub fn resolve_source_for_path<S>(
@@ -677,6 +802,7 @@ impl Connector for ResolvedSource {
             Self::GoogleCalendar(source) => source.kind(),
             Self::Gmail(source) => source.kind(),
             Self::Granola(source) => source.kind(),
+            Self::Linear(source) => source.kind(),
         }
     }
 
@@ -687,6 +813,7 @@ impl Connector for ResolvedSource {
             Self::GoogleCalendar(source) => source.capabilities(),
             Self::Gmail(source) => source.capabilities(),
             Self::Granola(source) => source.capabilities(),
+            Self::Linear(source) => source.capabilities(),
         }
     }
 
@@ -697,6 +824,7 @@ impl Connector for ResolvedSource {
             Self::GoogleCalendar(source) => source.supported_push_operations(),
             Self::Gmail(source) => source.supported_push_operations(),
             Self::Granola(source) => source.supported_push_operations(),
+            Self::Linear(source) => source.supported_push_operations(),
         }
     }
 
@@ -707,6 +835,7 @@ impl Connector for ResolvedSource {
             Self::GoogleCalendar(source) => source.enumerate(request),
             Self::Gmail(source) => source.enumerate(request),
             Self::Granola(source) => source.enumerate(request),
+            Self::Linear(source) => source.enumerate(request),
         }
     }
 
@@ -717,6 +846,18 @@ impl Connector for ResolvedSource {
             Self::GoogleCalendar(source) => source.observe(request),
             Self::Gmail(source) => source.observe(request),
             Self::Granola(source) => source.observe(request),
+            Self::Linear(source) => source.observe(request),
+        }
+    }
+
+    fn observe_batch(&self, request: BatchObserveRequest) -> LocalityResult<BatchObserveResult> {
+        match self {
+            Self::Notion(source) => source.observe_batch(request),
+            Self::GoogleDocs(source) => source.observe_batch(request),
+            Self::GoogleCalendar(source) => source.observe_batch(request),
+            Self::Gmail(source) => source.observe_batch(request),
+            Self::Granola(source) => source.observe_batch(request),
+            Self::Linear(source) => source.observe_batch(request),
         }
     }
 
@@ -727,6 +868,7 @@ impl Connector for ResolvedSource {
             Self::GoogleCalendar(source) => source.list_children(request),
             Self::Gmail(source) => source.list_children(request),
             Self::Granola(source) => source.list_children(request),
+            Self::Linear(source) => source.list_children(request),
         }
     }
 
@@ -737,6 +879,7 @@ impl Connector for ResolvedSource {
             Self::GoogleCalendar(source) => source.fetch(request),
             Self::Gmail(source) => source.fetch(request),
             Self::Granola(source) => source.fetch(request),
+            Self::Linear(source) => source.fetch(request),
         }
     }
 
@@ -747,6 +890,7 @@ impl Connector for ResolvedSource {
             Self::GoogleCalendar(source) => source.render(entity),
             Self::Gmail(source) => source.render(entity),
             Self::Granola(source) => source.render(entity),
+            Self::Linear(source) => source.render(entity),
         }
     }
 
@@ -757,6 +901,7 @@ impl Connector for ResolvedSource {
             Self::GoogleCalendar(source) => source.parse(document),
             Self::Gmail(source) => source.parse(document),
             Self::Granola(source) => source.parse(document),
+            Self::Linear(source) => source.parse(document),
         }
     }
 
@@ -767,6 +912,7 @@ impl Connector for ResolvedSource {
             Self::GoogleCalendar(source) => source.check_concurrency(request),
             Self::Gmail(source) => source.check_concurrency(request),
             Self::Granola(source) => source.check_concurrency(request),
+            Self::Linear(source) => source.check_concurrency(request),
         }
     }
 
@@ -777,6 +923,7 @@ impl Connector for ResolvedSource {
             Self::GoogleCalendar(source) => source.apply(request),
             Self::Gmail(source) => source.apply(request),
             Self::Granola(source) => source.apply(request),
+            Self::Linear(source) => source.apply(request),
         }
     }
 
@@ -787,6 +934,7 @@ impl Connector for ResolvedSource {
             Self::GoogleCalendar(source) => source.apply_undo(request),
             Self::Gmail(source) => source.apply_undo(request),
             Self::Granola(source) => source.apply_undo(request),
+            Self::Linear(source) => source.apply_undo(request),
         }
     }
 }
@@ -799,6 +947,24 @@ impl HydrationSource for ResolvedSource {
             Self::GoogleCalendar(source) => source.fetch_render(request),
             Self::Gmail(source) => source.fetch_render(request),
             Self::Granola(source) => source.fetch_render(request),
+            Self::Linear(source) => source.fetch_render(request),
+        }
+    }
+
+    fn fetch_render_with_repository(
+        &self,
+        request: &HydrationRequest,
+        repository: &dyn HydrationRepository,
+    ) -> LocalityResult<HydratedEntity> {
+        match self {
+            Self::Notion(source) => source.fetch_render_with_repository(request, repository),
+            Self::GoogleDocs(source) => source.fetch_render_with_repository(request, repository),
+            Self::GoogleCalendar(source) => {
+                source.fetch_render_with_repository(request, repository)
+            }
+            Self::Gmail(source) => source.fetch_render_with_repository(request, repository),
+            Self::Granola(source) => source.fetch_render_with_repository(request, repository),
+            Self::Linear(source) => source.fetch_render_with_repository(request, repository),
         }
     }
 
@@ -809,6 +975,7 @@ impl HydrationSource for ResolvedSource {
             Self::GoogleCalendar(source) => source.fetch_database_schema_yaml(database_id),
             Self::Gmail(source) => source.fetch_database_schema_yaml(database_id),
             Self::Granola(source) => source.fetch_database_schema_yaml(database_id),
+            Self::Linear(source) => source.fetch_database_schema_yaml(database_id),
         }
     }
 }
@@ -863,6 +1030,7 @@ impl SourcePushValidator for ResolvedSource {
             Self::GoogleCalendar(source) => source.validate_changed_frontmatter(context),
             Self::Gmail(source) => source.validate_changed_frontmatter(context),
             Self::Granola(source) => source.validate_changed_frontmatter(context),
+            Self::Linear(source) => source.validate_changed_frontmatter(context),
         }
     }
 
@@ -876,6 +1044,7 @@ impl SourcePushValidator for ResolvedSource {
             Self::GoogleCalendar(source) => source.validate_create_frontmatter(context),
             Self::Gmail(source) => source.validate_create_frontmatter(context),
             Self::Granola(source) => source.validate_create_frontmatter(context),
+            Self::Linear(source) => source.validate_create_frontmatter(context),
         }
     }
 }
@@ -891,6 +1060,7 @@ impl SourceAdapter for ResolvedSource {
             Self::GoogleCalendar(source) => Self::GoogleCalendar(source.scoped_to_mount(mount)),
             Self::Gmail(source) => Self::Gmail(source.scoped_to_mount(mount)),
             Self::Granola(source) => Self::Granola(source.scoped_to_mount(mount)),
+            Self::Linear(source) => Self::Linear(source.scoped_to_mount(mount)),
         }
     }
 
@@ -903,6 +1073,7 @@ impl SourceAdapter for ResolvedSource {
             }
             Self::Gmail(source) => SourceAdapter::database_schema_yaml(source, database_id),
             Self::Granola(source) => SourceAdapter::database_schema_yaml(source, database_id),
+            Self::Linear(source) => SourceAdapter::database_schema_yaml(source, database_id),
         }
     }
 }
