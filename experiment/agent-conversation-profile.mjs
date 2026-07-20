@@ -134,7 +134,7 @@ function readFlagValue(argv, index, flag) {
 
 function printUsage() {
   console.error(`Usage:
-  node scripts/agent-conversation-profile.mjs \\
+  node experiment/agent-conversation-profile.mjs \\
     --left claude.jsonl --left-label claude \\
     --right codex.jsonl --right-label codex \\
     --out target/agent-profiles/run-1

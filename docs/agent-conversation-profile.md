@@ -1,6 +1,6 @@
 # Agent Conversation Profile Script
 
-`scripts/agent-conversation-profile.mjs` compares two Claude or Codex
+`experiment/agent-conversation-profile.mjs` compares two Claude or Codex
 conversation exports and writes Perfetto-readable traces plus summary reports.
 It is intended for local investigation of where an agent run spent time:
 reasoning, assistant text, tool calls, tool results, and unsupported or unknown
@@ -9,7 +9,7 @@ records.
 ## Usage
 
 ```bash
-node scripts/agent-conversation-profile.mjs \
+node experiment/agent-conversation-profile.mjs \
   --left claude.jsonl --left-label claude \
   --right codex.jsonl --right-label codex \
   --out target/agent-profiles/run-1

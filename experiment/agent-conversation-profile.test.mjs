@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const scriptPath = join(repoRoot, "scripts", "agent-conversation-profile.mjs");
+const scriptPath = join(repoRoot, "experiment", "agent-conversation-profile.mjs");
 
 test("profiles Claude JSONL and Codex JSON object conversations into combined and split traces", () => {
   const temp = mkdtempSync(join(tmpdir(), "agent-profile-"));
