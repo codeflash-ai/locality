@@ -5895,9 +5895,11 @@ function SettingsView({
 
   function copyDiagnostics() {
     const summary = [
+      `Health: ${healthLabel(snapshot.health.state)}`,
       `Locality process: ${daemonStopped ? "Stopped" : "Running"}`,
       snapshot.mount.provider ? `Provider: ${providerStatusLabel(snapshot.mount.provider)}` : null,
       "State folder: ~/.loc",
+      "Logs folder: ~/.loc/logs",
       `Projection: ${snapshot.mount.projection}`,
       `Connection: ${snapshot.connection.status}`,
       `Mount: ${snapshot.mount.status}`,
@@ -6198,6 +6200,7 @@ function SettingsView({
                   <SettingRow title="Provider" value={providerStatusLabel(snapshot.mount.provider)} />
                 )}
                 <SettingRow title="State folder" value="~/.loc" />
+                <SettingRow title="Logs folder" value="~/.loc/logs" />
                 <SettingRow title="Projection" value={snapshot.mount.projection} />
                 <div className="button-row">
                   <SecondaryButton compact onClick={copyDiagnostics}>

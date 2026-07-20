@@ -837,6 +837,7 @@ Diagnostics
 
 Locality process        Running
 State folder       ~/.loc
+Logs folder        ~/.loc/logs
 Mounts watched     1
 Projection         macOS File Provider
 
@@ -890,7 +891,7 @@ The UI needs desktop-facing data shaped around product concepts:
 
 ```text
 app_health
-  state: ready | preparing | needs_review | reconnect_needed | stopped
+  state: ready | preparing | needs_review | reconnect_needed | stopped | runtime_stopped
   attention_count
 
 connection

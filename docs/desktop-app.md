@@ -142,6 +142,35 @@ write localityd logs in the same folder. The UI should point support and power u
 to that one directory instead of asking them to inspect terminal output,
 launchd, and helper logs separately.
 
+Desktop health labels map to separate runtime layers:
+
+- `Stopped` means the `localityd` daemon is not ready. Background sync, hydration,
+  and Live Mode are paused until the daemon starts again.
+- `Runtime Needs Repair` means the platform projection is stopped, unregistered,
+  or otherwise unavailable. On macOS this is usually File Provider; on Windows it
+  is Cloud Files; on Linux it is the FUSE projection.
+- `Reconnect Needed` means a connector credential or workspace connection needs
+  repair before sync can continue.
+- `Needs Review` means Locality is running, but one or more files require human
+  review before push or automatic sync.
+
+The Settings diagnostics surface should include both `~/.loc` and
+`~/.loc/logs`. `desktop.log`, `localityd.log`, `localityd.err.log`, and projection
+helper logs belong in that one logs directory so support does not have to collect
+terminal output, LaunchAgent output, and helper output separately.
+
+In development, schema skew usually means the desktop process and the
+`localityd` sidecar were built at different times. `make dev-tauri` runs
+`prepare-dev-sidecars`, which must build fresh `loc` and `localityd` binaries
+before restarting the daemon. Direct background launches, LaunchAgent starts, and
+`LOCALITY_DESKTOP_SKIP_DEV_SIDECARS=1` bypass that protection, so recovery should
+be a sidecar rebuild, not deletion of `~/.loc/state.sqlite3`:
+
+```bash
+make prepare-desktop-dev-sidecars
+make dev-tauri
+```
+
 ### 4. Create Workspace Mount
 
 The desktop product target is a workspace-level Notion mount using the access
