@@ -4,7 +4,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use loc_cli::diff::{DiffError, run_diff, run_diff_with_state_root};
+use loc_cli::diff::{DiffError, PushOperationOutput, run_diff, run_diff_with_state_root};
 use locality_core::canonical::render_canonical_markdown;
 use locality_core::conflict::{
     CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, CONFLICT_SEPARATOR_MARKER,
@@ -39,6 +39,58 @@ fn diff_reports_noop_plan() {
     assert_eq!(report.mount_id, "notion-main");
     assert_eq!(report.entity_id, "page-1");
     assert_eq!(report.plan.unwrap().operations.len(), 0);
+}
+
+#[test]
+fn diff_uses_linear_whole_entity_body_policy() {
+    let fixture = DiffFixture::new();
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "linear",
+            fixture.root.clone(),
+        ))
+        .expect("save mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save entity");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("page-1"),
+                "Old body.",
+                8,
+                [RemoteId::new("paragraph-1")],
+            )
+            .expect("shadow"),
+        )
+        .expect("save shadow");
+    let path = fixture.write_page(
+        "Roadmap.md",
+        "New body with two paragraphs.\n\nSecond paragraph.",
+    );
+
+    let report = run_diff(&store, &path).expect("diff report");
+
+    assert_eq!(report.action, "confirm_plan");
+    assert_eq!(
+        report.plan.expect("plan").operations,
+        vec![PushOperationOutput::UpdateEntityBody {
+            entity_id: "page-1".to_string(),
+            body: "New body with two paragraphs.\n\nSecond paragraph.".to_string(),
+        }]
+    );
 }
 
 #[test]
@@ -1257,9 +1309,11 @@ impl OperationOutputExt for loc_cli::diff::PushOperationOutput {
             Self::MoveBlock { .. } => "move_block",
             Self::ArchiveBlock { .. } => "archive_block",
             Self::ArchiveEntity { .. } => "archive_entity",
+            Self::UpdateEntityBody { .. } => "update_entity_body",
             Self::UpdateProperties { .. } => "update_properties",
             Self::MoveEntity { .. } => "move_entity",
             Self::CreateEntity { .. } => "create_entity",
+            Self::CreateDatabase { .. } => "create_database",
             Self::UpdateMedia { .. } => "update_media",
         }
     }

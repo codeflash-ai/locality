@@ -182,6 +182,7 @@ impl Connector for GoogleDocsConnector {
     fn capabilities(&self) -> ConnectorCapabilities {
         ConnectorCapabilities {
             supports_block_updates: true,
+            supports_entity_body_updates: false,
             supports_databases: false,
             supports_oauth: true,
             supports_remote_observation: true,
@@ -692,6 +693,11 @@ fn apply_plan(
                     entity_id: entity_id.clone(),
                 });
             }
+            PushOperation::UpdateEntityBody { .. } => {
+                return Err(LocalityError::Unsupported(
+                    "whole-entity body updates for Google Docs",
+                ));
+            }
             PushOperation::UpdateProperties {
                 entity_id,
                 properties,
@@ -772,7 +778,9 @@ fn apply_plan(
                     entity_id,
                 });
             }
-            PushOperation::MoveBlock { .. } | PushOperation::UpdateMedia { .. } => {
+            PushOperation::MoveBlock { .. }
+            | PushOperation::UpdateMedia { .. }
+            | PushOperation::CreateDatabase { .. } => {
                 return Err(LocalityError::Unsupported(
                     "google docs connector cannot apply this operation",
                 ));

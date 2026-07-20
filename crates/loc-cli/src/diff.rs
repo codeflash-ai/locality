@@ -170,6 +170,7 @@ impl DiffError {
             Self::Prepare(LocalityError::RemoteNotFound(_)) => "remote_not_found",
             Self::Prepare(LocalityError::RateLimited { .. }) => "rate_limited",
             Self::Prepare(LocalityError::InvalidState(_)) => "invalid_state",
+            Self::Prepare(LocalityError::UpdateRequired { .. }) => "update_required",
             Self::Prepare(LocalityError::Unsupported(_)) => "unsupported",
             Self::Prepare(LocalityError::Io(_)) => "io_error",
         }
@@ -186,6 +187,24 @@ impl DiffError {
             Self::Store(error) => error.to_string(),
             Self::Prepare(error) => error.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod update_required_error_code_tests {
+    use locality_core::LocalityError;
+
+    use super::DiffError;
+
+    #[test]
+    fn update_required_has_stable_diff_error_code() {
+        let error = DiffError::Prepare(LocalityError::UpdateRequired {
+            component: "linear:discovery".to_string(),
+            found: 2,
+            supported: 1,
+        });
+
+        assert_eq!(error.code(), "update_required");
     }
 }
 
@@ -320,6 +339,7 @@ pub struct PlanSummaryOutput {
     pub blocks_archived: usize,
     pub entities_created: usize,
     pub entities_archived: usize,
+    pub entity_bodies_updated: usize,
     pub entities_moved: usize,
     pub properties_updated: usize,
 }
@@ -335,6 +355,7 @@ impl From<PlanSummary> for PlanSummaryOutput {
             blocks_archived: value.blocks_archived,
             entities_created: value.entities_created,
             entities_archived: value.entities_archived,
+            entity_bodies_updated: value.entity_bodies_updated,
             entities_moved: value.entities_moved,
             properties_updated: value.properties_updated,
         }
@@ -372,6 +393,10 @@ pub enum PushOperationOutput {
     ArchiveEntity {
         entity_id: String,
     },
+    UpdateEntityBody {
+        entity_id: String,
+        body: String,
+    },
     UpdateProperties {
         entity_id: String,
         keys: Vec<String>,
@@ -392,6 +417,12 @@ pub enum PushOperationOutput {
         keys: Vec<String>,
         properties: Vec<PropertyUpdateOutput>,
         body: String,
+        source_path: String,
+    },
+    CreateDatabase {
+        parent_id: String,
+        title: String,
+        schema: String,
         source_path: String,
     },
 }
@@ -438,6 +469,10 @@ impl From<PushOperation> for PushOperationOutput {
             },
             PushOperation::ArchiveEntity { entity_id } => Self::ArchiveEntity {
                 entity_id: entity_id.0,
+            },
+            PushOperation::UpdateEntityBody { entity_id, body } => Self::UpdateEntityBody {
+                entity_id: entity_id.0,
+                body,
             },
             PushOperation::UpdateProperties {
                 entity_id,
@@ -487,6 +522,17 @@ impl From<PushOperation> for PushOperationOutput {
                     })
                     .collect(),
                 body,
+                source_path: locality_platform::logical_path_display(&source_path),
+            },
+            PushOperation::CreateDatabase {
+                parent_id,
+                title,
+                schema,
+                source_path,
+            } => Self::CreateDatabase {
+                parent_id: parent_id.0,
+                title,
+                schema,
                 source_path: locality_platform::logical_path_display(&source_path),
             },
         }

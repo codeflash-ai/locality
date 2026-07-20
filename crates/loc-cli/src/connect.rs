@@ -11,6 +11,7 @@ use locality_google_docs::{
     StoredGoogleDocsCredential, google_docs_capabilities_json,
 };
 use locality_granola::{GRANOLA_CONNECTOR_ID, GranolaApi, HttpGranolaApiClient};
+use locality_linear::{HttpLinearApiClient, LINEAR_CONNECTOR_ID, LinearApi};
 use locality_notion::NotionConfig;
 use locality_notion::client::{DEFAULT_NOTION_TOKEN_ENV, HttpNotionApi, NotionApi};
 use locality_notion::oauth::{
@@ -34,6 +35,7 @@ pub const DEFAULT_GOOGLE_DOCS_OAUTH_PROFILE_ID: &str = "google-docs-oauth-defaul
 pub const DEFAULT_GMAIL_OAUTH_PROFILE_ID: &str = "gmail-oauth-default";
 pub const DEFAULT_SLACK_OAUTH_PROFILE_ID: &str = "slack-oauth-default";
 pub const DEFAULT_GRANOLA_API_KEY_PROFILE_ID: &str = "granola-api-key-default";
+pub const DEFAULT_LINEAR_API_KEY_PROFILE_ID: &str = "linear-api-key-default";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectOptions {
@@ -183,6 +185,10 @@ pub trait GranolaConnectionProbe {
     fn probe(&self, api_key: &str) -> Result<(), ConnectError>;
 }
 
+pub trait LinearConnectionProbe {
+    fn probe(&self, api_key: &str) -> Result<(), ConnectError>;
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct HttpGranolaConnectionProbe;
 
@@ -191,7 +197,23 @@ impl GranolaConnectionProbe for HttpGranolaConnectionProbe {
         HttpGranolaApiClient::new(api_key)
             .list_notes(None, 1, None, None, None)
             .map(|_| ())
-            .map_err(|error| ConnectError::ConnectionProbeFailed(error.to_string()))
+            .map_err(|error| {
+                ConnectError::connection_probe_failed(GRANOLA_CONNECTOR_ID, error.to_string())
+            })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct HttpLinearConnectionProbe;
+
+impl LinearConnectionProbe for HttpLinearConnectionProbe {
+    fn probe(&self, api_key: &str) -> Result<(), ConnectError> {
+        HttpLinearApiClient::new(api_key)
+            .list_issues(None, None, None)
+            .map(|_| ())
+            .map_err(|error| {
+                ConnectError::connection_probe_failed(LINEAR_CONNECTOR_ID, error.to_string())
+            })
     }
 }
 
@@ -244,7 +266,7 @@ impl NotionConnectionProbe for HttpNotionConnectionProbe {
         });
         let user = api
             .retrieve_current_user()
-            .map_err(|error| ConnectError::ConnectionProbeFailed(error.to_string()))?;
+            .map_err(|error| ConnectError::connection_probe_failed("notion", error.to_string()))?;
         Ok(NotionConnectionProbeResult {
             account_label: user_label(&user),
             workspace_id: string_field(&user, "/bot/workspace_id"),
@@ -427,6 +449,71 @@ where
         connection_id: connection_id.0,
         profile_id: profile_id.0,
         connector: GRANOLA_CONNECTOR_ID.to_string(),
+        display_name,
+        account_label: None,
+        workspace_id: None,
+        workspace_name: None,
+        auth_kind: "api_key".to_string(),
+    })
+}
+
+pub fn run_connect_linear<S, P>(
+    store: &mut S,
+    credentials: &dyn CredentialStore,
+    options: ConnectOptions,
+    probe: &P,
+) -> Result<ConnectReport, ConnectError>
+where
+    S: ConnectionRepository + ConnectorProfileRepository,
+    P: LinearConnectionProbe,
+{
+    let connection_id = match options.connection_id {
+        Some(connection_id) => connection_id,
+        None => default_connection_id_for_connector(
+            store,
+            LINEAR_CONNECTOR_ID,
+            "linear-default",
+            "Linear",
+        )?,
+    };
+    probe.probe(&options.token)?;
+    let secret_ref = format!("connection:{}", connection_id.0);
+    credentials
+        .put(&secret_ref, &options.token)
+        .map_err(|error| ConnectError::Credential(CredentialStorageFailure::linear(error)))?;
+
+    let now = timestamp();
+    let profile_id = ConnectorProfileId::new(DEFAULT_LINEAR_API_KEY_PROFILE_ID);
+    store
+        .save_connector_profile(default_linear_api_key_profile(now.clone()))
+        .map_err(ConnectError::Store)?;
+    let display_name = connection_id.0.clone();
+    store
+        .save_connection(ConnectionRecord {
+            connection_id: connection_id.clone(),
+            profile_id: Some(profile_id.clone()),
+            connector: LINEAR_CONNECTOR_ID.to_string(),
+            display_name: display_name.clone(),
+            account_label: None,
+            workspace_id: None,
+            workspace_name: None,
+            auth_kind: "api_key".to_string(),
+            secret_ref,
+            scopes: vec!["issues:read".to_string(), "issues:write".to_string()],
+            capabilities_json: linear_capabilities_json()?,
+            status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            expires_at: None,
+        })
+        .map_err(ConnectError::Store)?;
+
+    Ok(ConnectReport {
+        ok: true,
+        command: "connect",
+        connection_id: connection_id.0,
+        profile_id: profile_id.0,
+        connector: LINEAR_CONNECTOR_ID.to_string(),
         display_name,
         account_label: None,
         workspace_id: None,
@@ -1051,6 +1138,7 @@ enum CredentialFailureConnector {
     Gmail,
     Slack,
     Granola,
+    Linear,
 }
 
 impl CredentialEncodeFailure {
@@ -1072,6 +1160,10 @@ impl CredentialEncodeFailure {
 
     pub fn granola(message: impl Into<String>) -> Self {
         Self::new(CredentialFailureConnector::Granola, message)
+    }
+
+    pub fn linear(message: impl Into<String>) -> Self {
+        Self::new(CredentialFailureConnector::Linear, message)
     }
 
     fn new(connector: CredentialFailureConnector, message: impl Into<String>) -> Self {
@@ -1115,6 +1207,10 @@ impl CredentialStorageFailure {
         Self::new(CredentialFailureConnector::Granola, error)
     }
 
+    pub fn linear(error: CredentialError) -> Self {
+        Self::new(CredentialFailureConnector::Linear, error)
+    }
+
     fn new(connector: CredentialFailureConnector, error: CredentialError) -> Self {
         Self { connector, error }
     }
@@ -1153,6 +1249,7 @@ impl CredentialFailureConnector {
             GMAIL_CONNECTOR_ID => Self::Gmail,
             SLACK_CONNECTOR_ID => Self::Slack,
             GRANOLA_CONNECTOR_ID => Self::Granola,
+            LINEAR_CONNECTOR_ID => Self::Linear,
             _ => Self::Notion,
         }
     }
@@ -1164,6 +1261,7 @@ impl CredentialFailureConnector {
             Self::Gmail => "Gmail",
             Self::Slack => "Slack",
             Self::Granola => "Granola",
+            Self::Linear => "Linear",
         }
     }
 
@@ -1174,6 +1272,7 @@ impl CredentialFailureConnector {
             Self::Gmail => "loc connect gmail",
             Self::Slack => "loc connect slack",
             Self::Granola => "loc connect granola --api-key-stdin",
+            Self::Linear => "loc connect linear --api-key-stdin",
         }
     }
 }
@@ -1182,7 +1281,10 @@ impl CredentialFailureConnector {
 pub enum ConnectError {
     ConnectionMissing(String),
     ConnectionNameRequired(String),
-    ConnectionProbeFailed(String),
+    ConnectionProbeFailed {
+        connector: &'static str,
+        message: String,
+    },
     OAuthExchangeFailed(OAuthExchangeFailure),
     CredentialEncode(CredentialEncodeFailure),
     Credential(CredentialStorageFailure),
@@ -1190,11 +1292,18 @@ pub enum ConnectError {
 }
 
 impl ConnectError {
+    pub fn connection_probe_failed(connector: &'static str, message: impl Into<String>) -> Self {
+        Self::ConnectionProbeFailed {
+            connector,
+            message: message.into(),
+        }
+    }
+
     pub fn code(&self) -> &'static str {
         match self {
             Self::ConnectionMissing(_) => "missing_connection",
             Self::ConnectionNameRequired(_) => "usage",
-            Self::ConnectionProbeFailed(_) => "connection_probe_failed",
+            Self::ConnectionProbeFailed { .. } => "connection_probe_failed",
             Self::OAuthExchangeFailed(_) => "oauth_exchange_failed",
             Self::CredentialEncode(_) => "credential_store_unavailable",
             Self::Credential(failure) => failure.code(),
@@ -1210,9 +1319,10 @@ impl ConnectError {
             Self::ConnectionNameRequired(connector) => {
                 format!("multiple {connector} connections exist; pass --name <id>")
             }
-            Self::ConnectionProbeFailed(message) => {
-                format!("Notion connection probe failed: {message}")
-            }
+            Self::ConnectionProbeFailed { connector, message } => format!(
+                "{} connection probe failed: {message}",
+                CredentialFailureConnector::from_connector_id(connector).display_name()
+            ),
             Self::OAuthExchangeFailed(failure) => {
                 format!(
                     "{} OAuth exchange failed: {}",
@@ -1228,8 +1338,9 @@ impl ConnectError {
 
     pub fn suggested_command(&self) -> Option<&'static str> {
         match self {
-            Self::ConnectionMissing(_) | Self::ConnectionProbeFailed(_) => {
-                Some("loc connect notion")
+            Self::ConnectionMissing(_) => Some("loc connect notion"),
+            Self::ConnectionProbeFailed { connector, .. } => {
+                Some(CredentialFailureConnector::from_connector_id(connector).suggested_command())
             }
             Self::OAuthExchangeFailed(failure) => Some(failure.suggested_command()),
             Self::Credential(failure) => Some(failure.suggested_command()),
@@ -1381,15 +1492,46 @@ fn default_granola_api_key_profile(now: String) -> ConnectorProfileRecord {
     }
 }
 
+fn default_linear_api_key_profile(now: String) -> ConnectorProfileRecord {
+    ConnectorProfileRecord {
+        profile_id: ConnectorProfileId::new(DEFAULT_LINEAR_API_KEY_PROFILE_ID),
+        connector: LINEAR_CONNECTOR_ID.to_string(),
+        display_name: "Linear API key".to_string(),
+        auth_kind: "api_key".to_string(),
+        scopes: vec!["issues:read".to_string(), "issues:write".to_string()],
+        capabilities_json: linear_capabilities_json().unwrap_or_else(|_| "{}".to_string()),
+        enabled_actions_json: "[\"read\",\"write\"]".to_string(),
+        connector_version: "linear.v1".to_string(),
+        status: "active".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
 fn granola_capabilities_json() -> Result<String, ConnectError> {
     serde_json::to_string(&ConnectorCapabilities::read_only()).map_err(|error| {
         ConnectError::CredentialEncode(CredentialEncodeFailure::granola(error.to_string()))
     })
 }
 
+fn linear_capabilities_json() -> Result<String, ConnectError> {
+    let capabilities = ConnectorCapabilities {
+        supports_entity_body_updates: true,
+        supports_oauth: false,
+        supports_remote_observation: true,
+        supports_lazy_child_enumeration: true,
+        supports_batch_observation: true,
+        ..ConnectorCapabilities::default()
+    };
+    serde_json::to_string(&capabilities).map_err(|error| {
+        ConnectError::CredentialEncode(CredentialEncodeFailure::linear(error.to_string()))
+    })
+}
+
 fn notion_capabilities_json() -> Result<String, ConnectError> {
     let capabilities = ConnectorCapabilities {
         supports_block_updates: true,
+        supports_entity_body_updates: false,
         supports_databases: true,
         supports_oauth: true,
         supports_remote_observation: true,

@@ -89,3 +89,35 @@ New page and row creation supports the same common block shapes as appends, plus
 simple Markdown tables. Header text creates a Notion column-header row; an empty
 Markdown header row creates a headerless Notion table. Table cell rich text uses
 the same inline Markdown parser as paragraphs.
+
+## New Databases
+
+An untracked database directory is represented by an editable `_schema.yaml`
+without generated IDs. Create it with `loc create database` rather than copying
+the canonical schema of an existing database:
+
+```yaml
+loc:
+  type: notion_database_schema
+title: Tasks
+data_sources:
+  - name: Tasks
+    properties:
+      Name:
+        type: title
+      Status:
+        type: select
+        options:
+          - name: Todo
+            color: gray
+          - name: Done
+            color: green
+      Due:
+        type: date
+```
+
+The directory containing the database draft determines the existing Notion
+page parent. A draft must define exactly one initial data source and exactly one
+title property.
+After a successful push Locality reads the database back and atomically replaces
+the draft with the normal canonical `_schema.yaml` containing assigned IDs.

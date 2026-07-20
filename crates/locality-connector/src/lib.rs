@@ -42,12 +42,15 @@ impl ConnectorExecutionPolicy {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorCapabilities {
     pub supports_block_updates: bool,
+    #[serde(default)]
+    pub supports_entity_body_updates: bool,
     pub supports_databases: bool,
     pub supports_oauth: bool,
     pub supports_remote_observation: bool,
     pub supports_lazy_child_enumeration: bool,
     pub supports_media_download: bool,
     pub supports_undo: bool,
+    #[serde(default)]
     pub supports_batch_observation: bool,
 }
 
@@ -61,7 +64,9 @@ impl ConnectorCapabilities {
     }
 
     pub fn supports_local_only_stage10(&self) -> bool {
-        self.supports_remote_observation || self.supports_lazy_child_enumeration
+        self.supports_remote_observation
+            || self.supports_lazy_child_enumeration
+            || self.supports_batch_observation
     }
 }
 
@@ -76,6 +81,69 @@ pub struct EnumerateRequest {
 pub struct ObserveRequest {
     pub mount_id: MountId,
     pub remote_id: RemoteId,
+}
+
+/// Opaque connector-owned state for the next mount-wide observation batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectorCheckpoint {
+    pub state_version: i64,
+    pub min_reader_version: i64,
+    pub state_json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchObserveRequest {
+    pub mount_id: MountId,
+    pub checkpoint: Option<ConnectorCheckpoint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BatchObservationChange {
+    Upsert(TreeEntry),
+    Tombstone { remote_id: RemoteId },
+}
+
+/// Whether omitted entities are authoritative for the configured mount scope.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BatchObservationCompleteness {
+    Complete,
+    #[default]
+    Incremental,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchObserveResult {
+    pub changes: Vec<BatchObservationChange>,
+    pub completeness: BatchObservationCompleteness,
+    pub next_checkpoint: ConnectorCheckpoint,
+}
+
+impl BatchObserveResult {
+    pub fn complete(
+        changes: Vec<BatchObservationChange>,
+        next_checkpoint: ConnectorCheckpoint,
+    ) -> Self {
+        Self {
+            changes,
+            completeness: BatchObservationCompleteness::Complete,
+            next_checkpoint,
+        }
+    }
+
+    pub fn incremental(
+        changes: Vec<BatchObservationChange>,
+        next_checkpoint: ConnectorCheckpoint,
+    ) -> Self {
+        Self {
+            changes,
+            completeness: BatchObservationCompleteness::Incremental,
+            next_checkpoint,
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.completeness == BatchObservationCompleteness::Complete
+    }
 }
 
 /// A source-side container whose immediate children can be listed lazily.
@@ -196,6 +264,7 @@ pub struct ApplyUndoRequest<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApplyUndoResult {
     pub changed_remote_ids: Vec<RemoteId>,
+    pub observations: Vec<RemoteObservation>,
 }
 
 pub trait Connector {
@@ -209,7 +278,13 @@ pub trait Connector {
     fn kind(&self) -> ConnectorKind;
     fn capabilities(&self) -> ConnectorCapabilities;
     fn supported_push_operations(&self) -> std::collections::BTreeSet<PushOperationKind> {
-        PushOperationKind::all().into_iter().collect()
+        let mut operations = PushOperationKind::all()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        if !self.capabilities().supports_entity_body_updates {
+            operations.remove(&PushOperationKind::UpdateEntityBody);
+        }
+        operations
     }
     fn enumerate(&self, request: EnumerateRequest) -> LocalityResult<Vec<TreeEntry>>;
     /// Observe one entity without hydrating its body.
@@ -221,6 +296,12 @@ pub trait Connector {
     fn observe(&self, _request: ObserveRequest) -> LocalityResult<RemoteObservation> {
         Err(locality_core::LocalityError::Unsupported(
             "connector does not support remote observation",
+        ))
+    }
+    /// Observe a mount-wide batch of metadata changes without hydrating bodies.
+    fn observe_batch(&self, _request: BatchObserveRequest) -> LocalityResult<BatchObserveResult> {
+        Err(locality_core::LocalityError::Unsupported(
+            "connector does not support batch observation",
         ))
     }
     /// List immediate child metadata for a single filesystem container.
@@ -277,6 +358,7 @@ where
 
         Ok(UndoApplyResult {
             changed_remote_ids: result.changed_remote_ids,
+            observations: result.observations,
         })
     }
 }

@@ -34,6 +34,7 @@ pub enum StoreError {
     },
     JournalMissing(PushId),
     JournalAlreadyExists(PushId),
+    InvalidState(String),
     NotImplemented(&'static str),
     SchemaVersion {
         found: i64,
@@ -83,6 +84,7 @@ impl Display for StoreError {
             Self::JournalAlreadyExists(push_id) => {
                 write!(f, "journal entry `{}` already exists", push_id.0)
             }
+            Self::InvalidState(message) => write!(f, "invalid state: {message}"),
             Self::NotImplemented(feature) => write!(f, "not implemented: {feature}"),
             Self::SchemaVersion { found, supported } => write!(
                 f,
@@ -119,6 +121,7 @@ impl From<serde_json::Error> for StoreError {
 impl From<StoreError> for LocalityError {
     fn from(value: StoreError) -> Self {
         match value {
+            StoreError::InvalidState(message) => Self::InvalidState(message),
             StoreError::NotImplemented(feature) => Self::NotImplemented(feature),
             StoreError::SchemaVersion { found, supported } => Self::Io(format!(
                 "unsupported schema version {found}; this binary supports up to {supported}"

@@ -22,8 +22,8 @@ function report(
   overrides: Partial<WorkspaceMountOnboardingReport>,
 ): WorkspaceMountOnboardingReport {
   return {
-    state: "approval_required",
-    message: "Enable Locality in Finder, then return here and click Check again.",
+    state: "needs_finder_enable",
+    message: "In Finder, click Enable for Locality. Locality will continue automatically.",
     primaryAction: "allow_in_macos",
     launchStrategy: "instructions_only",
     ...overrides,
@@ -43,7 +43,7 @@ describe("mount onboarding helpers", () => {
     );
   });
 
-  it("switches to progress copy while the action is running", () => {
+  it("switches to Finder progress copy while the action is running", () => {
     expect(mountOnboardingPrimaryLabel(report({ primaryAction: "allow_in_macos" }), true)).toBe(
       "Opening Finder",
     );
@@ -70,19 +70,17 @@ describe("mount onboarding helpers", () => {
     ).toBe(false);
   });
 
-  it("keeps the System Settings fallback in the approval instructions", () => {
+  it("explains automatic continuation without a confirmation click", () => {
     expect(
       mountOnboardingInstructions?.(report({ launchStrategy: "instructions_only" })) ?? null,
     ).toBe(
-      "Open Finder, choose Locality under Locations, enable the File Provider, then return here " +
-        "and click Check again. If Finder does not show Locality, open System Settings, go to " +
-        "Privacy & Security, then enable Locality under Extensions or File Providers.",
+      "Finder is open to Locality. Click Enable there; this screen will continue automatically.",
     );
   });
 
   it("maps backend states to the step 4 headline", () => {
-    expect(mountOnboardingHeadline(report({ state: "approval_required" }))).toBe(
-      "Allow Locality in Finder.",
+    expect(mountOnboardingHeadline(report({ state: "needs_finder_enable" }))).toBe(
+      "Enable Locality in Finder",
     );
     expect(mountOnboardingHeadline(report({ state: "waiting_for_cloudstorage_root" }))).toBe(
       "Waiting for the Locality folder to appear.",
@@ -97,7 +95,7 @@ describe("mount onboarding helpers", () => {
     expect(
       mountOnboardingSupplementaryNote(report({ state: "waiting_for_cloudstorage_root" })),
     ).toContain("CloudStorage");
-    expect(mountOnboardingSupplementaryNote(report({ state: "approval_required" }))).toBeNull();
+    expect(mountOnboardingSupplementaryNote(report({ state: "needs_finder_enable" }))).toBeNull();
     expect(mountOnboardingSupplementaryNote(null)).toBeNull();
   });
 

@@ -16,7 +16,7 @@ Sources used for the baseline:
 |---|---:|---|---|
 | Page | Read, render, edit supported blocks, edit supported properties | fixture, live | Page body is block content; page metadata/properties are frontmatter. |
 | Block | Recursive read/render; write subset | fixture, live | Unsupported/lossy blocks render as anchored directives and are protected by directive validation. |
-| Database | Read/enumerate as directory | fixture, live | Database containers project to directories. |
+| Database | Read/enumerate as directory; create one-data-source databases from an untracked `_schema.yaml` draft | fixture, live, mounted live | Database containers project to directories. Existing generated schemas remain read-only. |
 | Data source | Read/query rows, render `_schema.yaml`, validate row property writes, create rows when database has exactly one data source | fixture, live, mounted live | Multi-data-source row writes are intentionally blocked until path/schema selection exists. |
 | User | Read when embedded in mentions/properties; writable by explicit ID in people properties | fixture, live property write | User objects are not mounted as standalone files in v1. |
 | Comment | Unsupported | none | Comments are not in the v1 filesystem model from `plan.md`; adding them needs a thread representation and write policy. |
@@ -127,6 +127,8 @@ Sources used for the baseline:
 - People writes currently require explicit user IDs; name/email resolution is
   deferred. Relation writes currently require explicit related page IDs;
   path/title resolution is deferred.
+- New database drafts currently create exactly one data source. Relations,
+  formulas, rollups, unique IDs, views, and additional data sources are deferred.
 
 ## Next Block Work
 

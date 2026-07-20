@@ -303,6 +303,60 @@ sync-root filesystem watcher, converted to placeholders after the daemon records
 the virtual mutation, and then tracked through the same placeholder identity path
 as existing cloud items.
 
+Remote reconciliation changes durable entity and cache state before touching an
+existing Cloud Files namespace entry. Undo never creates destination ancestors
+or writes a restored visible file directly. It atomically moves the verified
+source leaf, or an otherwise-empty page container, to durable same-volume
+recovery storage outside the watched provider root. Provider enumeration later
+rematerializes the authoritative path. Child or untracked page-container content
+makes quarantine fail closed before the namespace move.
+
+Each quarantine has immutable, atomically written recovery manifests with
+`state_version` and `min_reader_version`. A prepared manifest is durable before
+the namespace rename; final records include payload path, size, fingerprint, and
+review state. Next-run repair distinguishes an untouched source from a completed
+quarantine, detects changed or missing recovery bytes, and indexes orphan
+payloads. Recovery payloads are durable user state and are never overwritten or
+deleted by reconciliation.
+
+Manifest publication syncs the temporary file before its atomic rename and then
+uses the platform durability barrier for the containing namespace: Unix flushes
+new manifest-directory ancestry back to the durable state root and flushes the
+manifest directory after a no-replace rename, while Windows uses
+`MoveFileExW(MOVEFILE_WRITE_THROUGH)` because Windows does not expose a portable
+directory-fsync contract. Both paths reject an existing immutable revision
+instead of replacing it. Publication failures propagate without deleting an
+already-renamed recovery record.
+
+The quarantine payload rename is interpreted through the prepared manifest on
+restart. If filesystem recovery rolls that namespace move back, repair reports
+the untouched source or a review-required missing quarantine while preserving
+the source bytes; provider admission remains blocked for the latter state.
+
+Provider startup waits for daemon readiness, discovers every active Cloud Files
+mount access root under the shared projection root, and repairs recovery state
+for each root before registering Cloud Filter callbacks. A repair failure or a
+`needs_review`, `missing`, or `orphaned` record fails startup with a recovery
+error before placeholder seeding or filesystem-watcher admission. A repaired
+`source_present` record is nonblocking because the namespace rename never
+occurred and the original projection bytes remain intact.
+
+Orphan recovery records retain the shared provider-root scope derived from their
+quarantine namespace. They block every mount served by that provider root, but
+do not block a separate Cloud Files projection root using the same state store.
+
+Detached lifecycle start runs the same recovery gate synchronously through the
+helper's `preflight` command so review-required errors reach the CLI or desktop
+caller before it reports a running provider. The spawned `run` command repeats
+the gate immediately before callback registration.
+
+Short-lived, one-shot provider acknowledgements are keyed by mount, access root,
+normalized identity, exact source path, and callback channel. Quarantine tokens
+are also bound to the unique recovery target and cannot be consumed until it
+exists; Cloud Filter rename-out callbacks must report that exact target. Ordinary,
+malformed, expired, unmatched, and pre-rename user events use the normal mutation
+path.
+
 Current implementation direction: Windows uses the Rust `locality-cloud-files.exe`
 helper. The CLI exposes `loc file-provider start|stop|status|restart` as the
 shared lifecycle surface for the provider runtime; the desktop app should call

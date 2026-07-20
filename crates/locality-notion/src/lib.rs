@@ -6,6 +6,7 @@
 pub mod apply;
 pub mod client;
 pub mod database;
+pub mod database_create;
 pub mod dto;
 pub mod fetch;
 pub mod mapping;
@@ -212,6 +213,7 @@ impl Connector for NotionConnector {
     fn capabilities(&self) -> ConnectorCapabilities {
         ConnectorCapabilities {
             supports_block_updates: true,
+            supports_entity_body_updates: false,
             supports_databases: true,
             supports_oauth: true,
             supports_remote_observation: true,
@@ -234,6 +236,7 @@ impl Connector for NotionConnector {
             PushOperationKind::UpdateProperties,
             PushOperationKind::MoveEntity,
             PushOperationKind::CreateEntity,
+            PushOperationKind::CreateDatabase,
         ]
         .into_iter()
         .collect()

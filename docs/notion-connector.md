@@ -134,13 +134,14 @@ Nested children are fetched recursively and rendered after their parent, except 
 
 The first Notion apply path is intentionally conservative:
 
-- supported operations: block update, block append, safe childless directive block move, block archive, local file-like media update, supported page property update, and database row creation;
+- supported operations: block update, block append, safe childless directive block move, block archive, local file-like media update, supported page property update, database creation, and database row creation;
 - supported writable block forms: paragraphs, headings 1-4, bulleted list items, numbered list items, to-dos, quotes, callouts, code fences, dividers, display equations, existing stable-width/header-mode tables including cell edits, row appends, and trailing row deletes, existing bookmark/embed URL blocks, existing URL-backed media blocks, existing local image/video/file/pdf/audio media blocks, and new local media block appends;
 - supported rich-text spans: bold, italic, strikethrough, underline, code, external links, inline equations, Notion page links, database links whose target ID matches a rendered database mention, explicit `@page(...)` page mentions, explicit `@database(...)` database mentions, explicit `@date(...)` date mentions, explicit `@user(...)` user mentions, legacy `loc://` page links, and unchanged preimage mentions such as dates/users;
 - supported page property writes: title, rich text with the same inline Markdown parser used by page bodies, number, select, status, multi-select, checkbox, date, URL, email, phone, external file URLs, explicit people user IDs, and explicit relation page IDs;
 - supported entity moves: page-directory renames, parent changes, and combined rename-plus-parent changes plan as `move_entity`; apply moves the Notion page to the requested page or data-source parent, then updates title/properties when needed;
 - new row creation accepts a new Markdown file under a projected database directory, uses the file's `title` as the row title, maps supported frontmatter properties through the live data source schema, creates initial children from directly supported Markdown blocks, and then reconciles the created page into its stable `Exact Row Title/page.md` path, using `Exact Row Title shortid/page.md` only when a sibling name collision requires it;
-- unsupported write forms fail before API mutation, including table width or header-mode changes, detected non-trailing table row deletes, page/database creation outside database-row files, computed/read-only properties, local media uploads larger than the 20 MB direct-upload limit, multi-data-source row creation, and rich inline shapes that cannot be represented by the current Markdown parser;
+- new database creation accepts an untracked `Database Name/_schema.yaml` draft created by `loc create database`, requires an existing page parent, exactly one initial data source, exactly one title property, and supported property schemas, then reconciles the returned database and generated IDs back into the same directory;
+- unsupported write forms fail before API mutation, including table width or header-mode changes, detected non-trailing table row deletes, arbitrary database directories without a schema draft, computed/relation/unique-ID database creation schemas, local media uploads larger than the 20 MB direct-upload limit, multi-data-source creation or row creation, and rich inline shapes that cannot be represented by the current Markdown parser;
 - appends use Notion's current position object, with `start` for prepends and `after_block` for inserts after a known block;
 - directive block moves use the same append positioning, then archive the old
   block, because the public Notion API rejects direct existing-block
@@ -158,6 +159,14 @@ This gives the end-to-end write loop while preserving the rich inline shapes tha
 ## Schema-Backed Property Validation
 
 Projected database directories carry `_schema.yaml`, generated from the live Notion database data source schema. Before `loc diff` or daemon-backed `loc push` accepts a database row property change, Locality reads that file and validates the frontmatter keys that would actually be written.
+
+For database creation only, an untracked `_schema.yaml` is an editable draft.
+The initial create contract supports `title`, `rich_text`, `number`, `select`,
+`multi_select`, `status` with Notion's default configuration, `checkbox`,
+`date`, `url`, `email`, `phone_number`, `files`, and `people`. It rejects all
+generated IDs so an existing canonical schema cannot accidentally clone or
+overwrite a database. Relations, formulas, rollups, unique IDs, multiple data
+sources, views, and post-create schema editing are intentionally deferred.
 
 For existing rows, only changed frontmatter properties are validated, so read-only values rendered from Notion, such as formulas or rollups, can remain in the file unchanged. For new row files, every non-identity frontmatter property is validated because all of them become create-page payload fields.
 

@@ -14,7 +14,9 @@ use locality_core::hydration::{
     HydrationPolicy, HydrationReason, HydrationRequest, should_eager_hydrate,
 };
 use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, RemoteId, TreeEntry};
-use locality_core::path_projection::{is_page_document_path, page_container_path};
+use locality_core::path_projection::{
+    is_page_document_path, page_container_path, projection_namespace_root,
+};
 use locality_core::{LocalityError, LocalityResult};
 use locality_store::{
     EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository, MountConfig,
@@ -363,11 +365,11 @@ where
             continue;
         }
 
-        let source_root = projection_subtree_path(&existing.kind, &existing.path);
+        let source_root = projection_namespace_root(&existing.kind, &existing.path);
         if scheduled_move_subtree_is_dirty(&existing_entities, &source_root) {
             blocked_moves.push(BlockedProjectionMove {
                 source_root,
-                destination_root: projection_subtree_path(&entry.kind, &entry.path),
+                destination_root: projection_namespace_root(&entry.kind, &entry.path),
             });
         }
     }
@@ -390,7 +392,7 @@ where
 fn scheduled_move_subtree_is_dirty(existing_entities: &[EntityRecord], source_root: &Path) -> bool {
     existing_entities.iter().any(|entity| {
         path_in_projection_subtree(
-            &projection_subtree_path(&entity.kind, &entity.path),
+            &projection_namespace_root(&entity.kind, &entity.path),
             source_root,
         ) && matches!(
             entity.hydration,
@@ -408,22 +410,12 @@ fn should_preserve_for_blocked_move(
         return false;
     }
 
-    let existing_root = projection_subtree_path(&existing.kind, &existing.path);
-    let entry_root = projection_subtree_path(&entry.kind, &entry.path);
+    let existing_root = projection_namespace_root(&existing.kind, &existing.path);
+    let entry_root = projection_namespace_root(&entry.kind, &entry.path);
     blocked_moves.iter().any(|blocked| {
         path_in_projection_subtree(&existing_root, &blocked.source_root)
             && path_in_projection_subtree(&entry_root, &blocked.destination_root)
     })
-}
-
-fn projection_subtree_path(kind: &EntityKind, path: &Path) -> PathBuf {
-    match kind {
-        EntityKind::Page => page_container_path(path),
-        EntityKind::Database
-        | EntityKind::Directory
-        | EntityKind::Asset
-        | EntityKind::Unknown(_) => path.to_path_buf(),
-    }
 }
 
 fn path_in_projection_subtree(path: &Path, subtree: &Path) -> bool {

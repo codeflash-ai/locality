@@ -7,6 +7,7 @@
 
 pub mod compatibility;
 pub mod credentials;
+pub mod discovery;
 pub mod error;
 pub mod live_mode;
 pub mod memory;
@@ -22,6 +23,11 @@ pub use compatibility::{
 pub use credentials::{
     CredentialError, CredentialResult, CredentialStore, FileCredentialStore,
     InMemoryCredentialStore, open_credential_store,
+};
+pub use discovery::{
+    DiscoveryCommit, DiscoveryRepository, DiscoveryReservation, DiscoveryTransactionEnvelope,
+    DiscoveryTransactionId, DiscoveryTransactionRecord, DiscoveryTransactionStatus,
+    PreparedDiscoveryTransaction, TransactionalDiscoveryCommit, discovery_auto_save_candidate,
 };
 pub use error::{StoreError, StoreResult};
 pub use live_mode::{
@@ -43,7 +49,7 @@ pub use repository::{
     EntityRepository, EntitySearchCandidate, EntitySearchRepository, FreshnessStateRepository,
     HydrationJobRepository, JournalRepository, MetadataDiscoveryJobRepository,
     MountLiveModeRepository, MountRepository, RemoteObservationRepository, ShadowRepository,
-    VirtualMutationRepository,
+    VirtualMoveRepository, VirtualMoveTransition, VirtualMutationRepository,
 };
 pub use reset::{
     LocalStateResetCredentialError, LocalStateResetError, LocalStateResetStorageReport,

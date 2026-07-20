@@ -142,6 +142,35 @@ write localityd logs in the same folder. The UI should point support and power u
 to that one directory instead of asking them to inspect terminal output,
 launchd, and helper logs separately.
 
+Desktop health labels map to separate runtime layers:
+
+- `Stopped` means the `localityd` daemon is not ready. Background sync, hydration,
+  and Live Mode are paused until the daemon starts again.
+- `Runtime Needs Repair` means the platform projection is stopped, unregistered,
+  or otherwise unavailable. On macOS this is usually File Provider; on Windows it
+  is Cloud Files; on Linux it is the FUSE projection.
+- `Reconnect Needed` means a connector credential or workspace connection needs
+  repair before sync can continue.
+- `Needs Review` means Locality is running, but one or more files require human
+  review before push or automatic sync.
+
+The Settings diagnostics surface should include both `~/.loc` and
+`~/.loc/logs`. `desktop.log`, `localityd.log`, `localityd.err.log`, and projection
+helper logs belong in that one logs directory so support does not have to collect
+terminal output, LaunchAgent output, and helper output separately.
+
+In development, schema skew usually means the desktop process and the
+`localityd` sidecar were built at different times. `make dev-tauri` runs
+`prepare-dev-sidecars`, which must build fresh `loc` and `localityd` binaries
+before restarting the daemon. Direct background launches, LaunchAgent starts, and
+`LOCALITY_DESKTOP_SKIP_DEV_SIDECARS=1` bypass that protection, so recovery should
+be a sidecar rebuild, not deletion of `~/.loc/state.sqlite3`:
+
+```bash
+make prepare-desktop-dev-sidecars
+make dev-tauri
+```
+
 ### 4. Create Workspace Mount
 
 The desktop product target is a workspace-level Notion mount using the access
@@ -169,10 +198,16 @@ The app can track setup internally with human concepts:
 
 On macOS, this step is a blocked File Provider gate. If the Locality File
 Provider is registered but not yet enabled, the onboarding screen stays on step
-4, offers an `Allow in macOS` action, and opens Finder at the Locality File
-Provider root when possible. If macOS has accepted approval but has not yet
-materialized `~/Library/CloudStorage/Locality`, the screen remains blocked with
-`Check again` until the folder exists and the mount root passes verification.
+4 and opens Finder at the Locality File Provider root when possible. The screen
+shows the Finder `Enable` control, checks `NSFileProviderDomain.userEnabled`
+automatically, and offers `Reopen Finder` without requiring a confirmation or
+`Check again` action. Once enabled, Locality keeps checking until macOS
+materializes `~/Library/CloudStorage/Locality`, then retries mount creation once
+and continues automatically.
+
+The same readiness probe and automatic retry handle a disabled File Provider
+encountered during later source setup. Slow approval remains a guided waiting
+state; missing helpers or extensions remain explicit setup failures.
 
 The final ready screen must not appear until File Provider approval, the
 CloudStorage root, and the mount root are all verified successfully.
@@ -185,6 +220,11 @@ point feels populated quickly. The UI should not show an extra checklist screen
 where most items complete instantly; once the folder and agent instructions are
 ready, route directly to the final ready screen and show background sync as a
 short supporting detail rather than a task the user waits on.
+
+After the mount exists, the main app may show file preparation progress as a
+plain count, for example files indexed and files left. This progress is derived
+from durable hydration state for page-like Markdown files, not from daemon queue
+internals, and it must not block the ready screen.
 
 ### 5. Ready
 

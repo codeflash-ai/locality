@@ -116,6 +116,29 @@ fn daemon_push_job_applies_and_reconciles_through_single_store_owner() {
 }
 
 #[test]
+fn explicit_push_uses_linear_whole_entity_body_policy() {
+    let fixture = PushFixture::new();
+    let mut store = fixture.store_with_connector("Old body.", "linear");
+    fixture.write_page("New body.");
+    let source = FakePushSource::with_remote_transition(
+        rendered_entity("page-1", "Old body."),
+        rendered_entity("page-1", "New body."),
+    );
+
+    let report =
+        execute_push_job_with_content_root(&mut store, fixture.push_job(true), &source, None)
+            .expect("execute push");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    assert!(matches!(
+        report.pipeline.plan.expect("plan").operations.as_slice(),
+        [PushOperation::UpdateEntityBody { entity_id, body }]
+            if entity_id == &fixture.remote_id
+                && body == "# Roadmap\n\nNew body.\n"
+    ));
+}
+
+#[test]
 fn auto_save_push_applies_safe_update_and_keeps_enrollment_active() {
     let fixture = PushFixture::new();
     let mut store = fixture.store("Old body.");
@@ -154,6 +177,44 @@ fn auto_save_push_applies_safe_update_and_keeps_enrollment_active() {
     assert_eq!(enrollment.state, AutoSaveState::Active);
     assert_eq!(enrollment.remote_id, Some(fixture.remote_id.clone()));
     assert!(enrollment.last_push_id.is_some());
+}
+
+#[test]
+fn auto_save_push_uses_linear_whole_entity_body_policy() {
+    let fixture = PushFixture::new();
+    let mut store = fixture.store_with_connector("Old body.", "linear");
+    store
+        .save_auto_save_enrollment(
+            AutoSaveEnrollmentRecord::new(
+                fixture.mount_id.clone(),
+                "Roadmap.md",
+                AutoSaveOrigin::LocalityCreated,
+                "now",
+            )
+            .active("now"),
+        )
+        .expect("save enrollment");
+    fixture.write_page("New body.");
+    let source = FakePushSource::with_remote_transition(
+        rendered_entity("page-1", "Old body."),
+        rendered_entity("page-1", "New body."),
+    );
+
+    let report = execute_auto_save_push_job_with_content_root(
+        &mut store,
+        fixture.push_job(false),
+        &source,
+        None,
+    )
+    .expect("auto-save push");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    assert!(matches!(
+        report.pipeline.plan.expect("plan").operations.as_slice(),
+        [PushOperation::UpdateEntityBody { entity_id, body }]
+            if entity_id == &fixture.remote_id
+                && body == "# Roadmap\n\nNew body.\n"
+    ));
 }
 
 #[test]
@@ -824,6 +885,73 @@ fn daemon_push_reconciles_direct_database_row_create_to_page_document_path() {
     assert_eq!(source.requested_paths(), vec![row.path.clone()]);
     assert!(content_root.join("Tasks/new-task/page.md").exists());
     assert!(!content_root.join(source_path).exists());
+}
+
+#[test]
+fn daemon_push_reconciles_created_database_to_canonical_schema_directory() {
+    let fixture = PushFixture::new();
+    let projection_root = fixture.root.join("loc");
+    let schema_path = projection_root.join("Roadmap/Project Tasks/_schema.yaml");
+    fs::create_dir_all(schema_path.parent().expect("schema parent")).expect("schema parent");
+    fs::write(
+        &schema_path,
+        "loc:\n  type: notion_database_schema\ntitle: Project Tasks\ndata_sources:\n  - name: Tasks\n    properties:\n      Name:\n        type: title\n",
+    )
+    .expect("write draft schema");
+
+    let parent_id = RemoteId::new("roadmap-page");
+    let database_id = RemoteId::new("created-database");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "notion",
+            &projection_root,
+        ))
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            parent_id.clone(),
+            EntityKind::Page,
+            "Roadmap",
+            "Roadmap/page.md",
+        ))
+        .expect("save parent page");
+    let canonical_schema = "loc:\n  type: notion_database_schema\n  database_id: created-database\ntitle: \"Project Tasks\"\ndata_sources:\n  - id: created-source\n    name: \"Tasks\"\n    properties:\n      \"Name\":\n        id: \"title\"\n        type: \"title\"\n";
+    let source = FakePushSource::default()
+        .with_database_schema(database_id.clone(), canonical_schema)
+        .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
+            operation_id: PushOperationId("create-database".to_string()),
+            operation_index: 0,
+            parent_id,
+            entity_id: database_id.clone(),
+        }]);
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: schema_path.clone(),
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &source,
+        None,
+    )
+    .expect("push database create");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    let database = store
+        .get_entity(&fixture.mount_id, &database_id)
+        .expect("get database")
+        .expect("database entity");
+    assert_eq!(database.kind, EntityKind::Database);
+    assert_eq!(database.path, PathBuf::from("Roadmap/Project Tasks"));
+    assert_eq!(database.hydration, HydrationState::Hydrated);
+    assert_eq!(
+        fs::read_to_string(schema_path).expect("canonical schema"),
+        canonical_schema
+    );
 }
 
 #[test]
@@ -1999,6 +2127,366 @@ fn daemon_push_job_plans_normal_update_for_pending_virtual_rename_path() {
     ));
 }
 
+#[test]
+fn moved_entity_reconciliation_clears_intent_only_after_accepted_readback() {
+    let (fixture, state_root, mut store) = pending_move_execution_store();
+    let effect = moved_page_effect();
+    let source = FakePushSource::with_remote_transition(
+        rendered_entity("page-1", "Old body."),
+        rendered_entity("page-1", "Remote accepted body."),
+    )
+    .with_apply_effects(vec![effect])
+    .with_changed_remote_ids(vec![fixture.remote_id.clone()]);
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join("Team B/Roadmap.md"),
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &source,
+        Some(&state_root),
+    )
+    .expect("execute move");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    assert!(
+        store
+            .get_virtual_mutation(&fixture.mount_id, "move:page-1")
+            .unwrap()
+            .is_none()
+    );
+    let entity = store
+        .get_entity(&fixture.mount_id, &fixture.remote_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(entity.path, PathBuf::from("Team B/Roadmap.md"));
+    assert_eq!(entity.title, "Roadmap");
+    assert_eq!(entity.hydration, HydrationState::Hydrated);
+    assert_eq!(
+        store
+            .load_shadow(&fixture.mount_id, &fixture.remote_id)
+            .unwrap()
+            .rendered_body,
+        markdown_body("Remote accepted body.")
+    );
+    assert!(
+        fs::read_to_string(
+            virtual_fs_content_path(
+                &state_root,
+                &fixture.mount_id,
+                Path::new("Team B/Roadmap.md"),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .contains("Remote accepted body.")
+    );
+}
+
+#[test]
+fn moved_entity_reconciliation_requires_effect_and_changed_id_and_retains_intent() {
+    for (name, source) in [
+        (
+            "missing changed id",
+            FakePushSource::with_remote_transition(
+                rendered_entity("page-1", "Old body."),
+                rendered_entity("page-1", "Remote accepted body."),
+            )
+            .with_apply_effects(vec![moved_page_effect()])
+            .with_changed_remote_ids(Vec::new()),
+        ),
+        (
+            "missing moved effect",
+            FakePushSource::with_remote_transition(
+                rendered_entity("page-1", "Old body."),
+                rendered_entity("page-1", "Remote accepted body."),
+            )
+            .with_changed_remote_ids(vec![RemoteId::new("page-1")]),
+        ),
+    ] {
+        let (fixture, state_root, mut store) = pending_move_execution_store();
+        let report = execute_push_job_with_content_root(
+            &mut store,
+            PushJob {
+                target_path: fixture.root.join("Team B/Roadmap.md"),
+                assume_yes: true,
+                confirm_dangerous: false,
+            },
+            &source,
+            Some(&state_root),
+        )
+        .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        assert_eq!(report.action, PushJobAction::Failed, "{name}");
+        assert!(
+            store
+                .get_virtual_mutation(&fixture.mount_id, "move:page-1")
+                .unwrap()
+                .is_some(),
+            "{name}"
+        );
+        assert!(matches!(
+            store.list_journal().unwrap()[0].status,
+            JournalStatus::Failed(_)
+        ));
+    }
+}
+
+#[test]
+fn moved_entity_fetch_failure_resumes_same_journal_without_reapplying() {
+    let (fixture, state_root, mut store) = pending_move_execution_store();
+    let source = FakePushSource::with_remote_transition(
+        rendered_entity("page-1", "Old body."),
+        rendered_entity("page-1", "Remote accepted body."),
+    )
+    .with_apply_effects(vec![moved_page_effect()])
+    .with_changed_remote_ids(vec![fixture.remote_id.clone()])
+    .with_post_apply_fetch_failures(fixture.remote_id.clone(), 1);
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join("Team B/Roadmap.md"),
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &source,
+        Some(&state_root),
+    )
+    .expect("execute move with failed readback");
+
+    assert_eq!(report.action, PushJobAction::Failed);
+    assert_eq!(source.applied_count(), 1);
+    let push_id = report.push_id.expect("first push id");
+    assert!(
+        store
+            .get_virtual_mutation(&fixture.mount_id, "move:page-1")
+            .unwrap()
+            .is_some()
+    );
+
+    let retried = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join("Team B/Roadmap.md"),
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &source,
+        Some(&state_root),
+    )
+    .expect("resume move reconciliation");
+
+    assert_eq!(retried.action, PushJobAction::Reconciled);
+    assert_eq!(retried.push_id.as_ref(), Some(&push_id));
+    assert_eq!(source.applied_count(), 1, "retry must not reapply the move");
+    assert!(
+        store
+            .get_virtual_mutation(&fixture.mount_id, "move:page-1")
+            .unwrap()
+            .is_none(),
+        "move intent clears only after accepted readback"
+    );
+    let journal = store.list_journal().expect("journal");
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].push_id, push_id);
+    assert_eq!(journal[0].status, JournalStatus::Reconciled);
+}
+
+#[test]
+fn mixed_create_move_late_fetch_failure_resumes_without_duplicate_create() {
+    let (fixture, state_root, mut store) = pending_move_execution_store_for_connector("notion");
+    let create_path = Path::new("Team B/ENG-2.md");
+    let created_id = RemoteId::new("issue-new");
+    let cache = virtual_fs_content_path(&state_root, &fixture.mount_id, create_path)
+        .expect("create cache path");
+    fs::create_dir_all(cache.parent().expect("cache parent")).expect("cache parent");
+    fs::write(
+        &cache,
+        "---\ntitle: New issue\nstatus: Todo\n---\nNew issue body.\n",
+    )
+    .expect("create cache");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:new-issue",
+            VirtualMutationKind::Create,
+            None,
+            Some(RemoteId::new("team-b")),
+            "Team B/ENG-2.md",
+            Some(cache),
+        ))
+        .expect("save create mutation");
+    let source = FakePushSource::with_remote_transition(
+        rendered_entity("page-1", "Old body."),
+        rendered_entity("page-1", "Remote accepted body."),
+    )
+    .with_created_entity(
+        created_id.clone(),
+        rendered_entity("issue-new", "New issue body."),
+    )
+    .with_post_apply_fetch_failures(fixture.remote_id.clone(), 1)
+    .with_changed_remote_ids(vec![created_id.clone(), fixture.remote_id.clone()])
+    .with_apply_effects(vec![
+        JournalApplyEffect::CreatedEntity {
+            operation_id: PushOperationId("create-issue".to_string()),
+            operation_index: 0,
+            parent_id: RemoteId::new("team-b"),
+            entity_id: created_id.clone(),
+        },
+        JournalApplyEffect::MovedEntity {
+            operation_id: PushOperationId("move-page-1".to_string()),
+            operation_index: 1,
+            entity_id: fixture.remote_id.clone(),
+            parent_id: RemoteId::new("team-b"),
+        },
+    ]);
+    let job = || PushJob {
+        target_path: fixture.root.clone(),
+        assume_yes: true,
+        confirm_dangerous: true,
+    };
+
+    let first = execute_push_job_with_content_root(&mut store, job(), &source, Some(&state_root))
+        .expect("first mixed push");
+
+    assert_eq!(first.action, PushJobAction::Failed);
+    assert_eq!(source.applied_count(), 1, "first report: {first:#?}");
+    let push_id = first.push_id.expect("first push id");
+    assert!(
+        store
+            .find_virtual_mutation_by_path(&fixture.mount_id, create_path)
+            .expect("create mutation")
+            .is_some()
+    );
+    assert!(
+        store
+            .get_virtual_mutation(&fixture.mount_id, "move:page-1")
+            .expect("move mutation")
+            .is_some(),
+        "no intent may clear before every readback succeeds"
+    );
+
+    let second = execute_push_job_with_content_root(&mut store, job(), &source, Some(&state_root))
+        .expect("resume mixed reconciliation");
+
+    assert_eq!(second.action, PushJobAction::Reconciled);
+    assert_eq!(second.push_id.as_ref(), Some(&push_id));
+    assert_eq!(
+        source.applied_count(),
+        1,
+        "retry must not duplicate the create"
+    );
+    assert!(
+        store
+            .find_virtual_mutation_by_path(&fixture.mount_id, create_path)
+            .expect("create mutation")
+            .is_none()
+    );
+    assert!(
+        store
+            .get_virtual_mutation(&fixture.mount_id, "move:page-1")
+            .expect("move mutation")
+            .is_none()
+    );
+    assert!(
+        store
+            .get_entity(&fixture.mount_id, &created_id)
+            .expect("created entity")
+            .is_some()
+    );
+    assert_eq!(
+        store
+            .get_entity(&fixture.mount_id, &fixture.remote_id)
+            .expect("moved entity")
+            .expect("moved entity present")
+            .path,
+        PathBuf::from("Team B/Roadmap.md")
+    );
+    let journal = store.list_journal().expect("journal");
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].push_id, push_id);
+    assert_eq!(journal[0].status, JournalStatus::Reconciled);
+}
+
+fn pending_move_execution_store() -> (PushFixture, PathBuf, InMemoryStateStore) {
+    pending_move_execution_store_for_connector("linear")
+}
+
+fn pending_move_execution_store_for_connector(
+    connector: &str,
+) -> (PushFixture, PathBuf, InMemoryStateStore) {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), connector, fixture.root.clone())
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("team-b"),
+            EntityKind::Page,
+            "Team B",
+            "Team B/page.md",
+        ))
+        .expect("save team");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                fixture.remote_id.clone(),
+                EntityKind::Page,
+                "Roadmap",
+                "Team B/Roadmap.md",
+            )
+            .with_hydration(HydrationState::Dirty)
+            .with_remote_edited_at("2026-06-10T00:00:00Z"),
+        )
+        .expect("save moved issue");
+    store
+        .save_shadow(&fixture.mount_id, shadow("page-1", "Old body."))
+        .expect("save shadow");
+    let cache = virtual_fs_content_path(
+        &state_root,
+        &fixture.mount_id,
+        Path::new("Team B/Roadmap.md"),
+    )
+    .expect("cache path");
+    fs::create_dir_all(cache.parent().unwrap()).expect("cache parent");
+    fixture.write_page_to(&cache, "Old body.");
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "move:page-1".to_string(),
+            mutation_kind: VirtualMutationKind::Move,
+            target_remote_id: Some(fixture.remote_id.clone()),
+            parent_remote_id: Some(RemoteId::new("team-b")),
+            original_path: Some(PathBuf::from("Team A/Roadmap.md")),
+            projected_path: PathBuf::from("Team B/Roadmap.md"),
+            title: "Roadmap".to_string(),
+            content_path: Some(cache),
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+        })
+        .expect("save move");
+    fs::create_dir_all(fixture.root.join("Team B")).expect("visible team");
+    (fixture, state_root, store)
+}
+
+fn moved_page_effect() -> JournalApplyEffect {
+    JournalApplyEffect::MovedEntity {
+        operation_id: PushOperationId("move-page-1".to_string()),
+        operation_index: 0,
+        entity_id: RemoteId::new("page-1"),
+        parent_id: RemoteId::new("team-b"),
+    }
+}
+
 struct PushFixture {
     root: PathBuf,
     mount_id: MountId,
@@ -2036,8 +2524,12 @@ impl PushFixture {
     }
 
     fn store(&self, synced_body: &str) -> InMemoryStateStore {
+        self.store_with_connector(synced_body, "notion")
+    }
+
+    fn store_with_connector(&self, synced_body: &str, connector: &str) -> InMemoryStateStore {
         let mut store = InMemoryStateStore::new();
-        let mount = MountConfig::new(self.mount_id.clone(), "notion", self.root.clone());
+        let mount = MountConfig::new(self.mount_id.clone(), connector, self.root.clone());
         store.save_mount(mount).expect("save mount");
         store
             .save_entity(
@@ -2106,7 +2598,10 @@ struct FakePushSource {
     supported_operations: Option<BTreeSet<PushOperationKind>>,
     created_entities: BTreeMap<RemoteId, HydratedEntity>,
     created_fetch_failures: std::cell::RefCell<BTreeMap<RemoteId, usize>>,
+    post_apply_fetch_failures: std::cell::RefCell<BTreeMap<RemoteId, usize>>,
     apply_effects: Vec<JournalApplyEffect>,
+    apply_changed_remote_ids: Option<Vec<RemoteId>>,
+    database_schemas: BTreeMap<RemoteId, String>,
 }
 
 impl FakePushSource {
@@ -2157,8 +2652,25 @@ impl FakePushSource {
         self
     }
 
+    fn with_post_apply_fetch_failures(mut self, remote_id: RemoteId, failures: usize) -> Self {
+        self.post_apply_fetch_failures
+            .get_mut()
+            .insert(remote_id, failures);
+        self
+    }
+
     fn with_apply_effects(mut self, effects: Vec<JournalApplyEffect>) -> Self {
         self.apply_effects = effects;
+        self
+    }
+
+    fn with_changed_remote_ids(mut self, remote_ids: Vec<RemoteId>) -> Self {
+        self.apply_changed_remote_ids = Some(remote_ids);
+        self
+    }
+
+    fn with_database_schema(mut self, remote_id: RemoteId, schema: &str) -> Self {
+        self.database_schemas.insert(remote_id, schema.to_string());
         self
     }
 }
@@ -2180,6 +2692,18 @@ impl HydrationSource for FakePushSource {
                 "injected created entity fetch failure".to_string(),
             ));
         }
+        if self.applied.get() > 0
+            && let Some(remaining) = self
+                .post_apply_fetch_failures
+                .borrow_mut()
+                .get_mut(&request.remote_id)
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            return Err(LocalityError::InvalidState(
+                "injected post-apply fetch failure".to_string(),
+            ));
+        }
         if let Some(rendered) = self.created_entities.get(&request.remote_id) {
             return Ok(rendered.clone());
         }
@@ -2196,6 +2720,10 @@ impl HydrationSource for FakePushSource {
         };
         remote.ok_or_else(|| LocalityError::InvalidState("missing remote fixture".to_string()))
     }
+
+    fn fetch_database_schema_yaml(&self, database_id: &RemoteId) -> LocalityResult<Option<String>> {
+        Ok(self.database_schemas.get(database_id).cloned())
+    }
 }
 
 impl Connector for FakePushSource {
@@ -2206,6 +2734,7 @@ impl Connector for FakePushSource {
     fn capabilities(&self) -> ConnectorCapabilities {
         ConnectorCapabilities {
             supports_block_updates: true,
+            supports_entity_body_updates: true,
             supports_databases: false,
             supports_oauth: false,
             ..ConnectorCapabilities::default()
@@ -2240,11 +2769,13 @@ impl Connector for FakePushSource {
 
     fn apply(&self, request: ApplyPlanRequest<'_>) -> LocalityResult<ApplyPlanResult> {
         self.applied.set(self.applied.get() + 1);
-        let changed_remote_ids = if self.apply_effects.is_empty() {
-            request.plan.affected_entities.clone()
-        } else {
-            Vec::new()
-        };
+        let changed_remote_ids = self.apply_changed_remote_ids.clone().unwrap_or_else(|| {
+            if self.apply_effects.is_empty() {
+                request.plan.affected_entities.clone()
+            } else {
+                Vec::new()
+            }
+        });
         Ok(ApplyPlanResult {
             changed_remote_ids,
             effects: self.apply_effects.clone(),

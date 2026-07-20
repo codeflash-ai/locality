@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   connectedSourcesReadyToMount,
+  sourceConnectorIds,
+  sourceRequiresApiKey,
+  sourceSkipsManualMountStep,
+  sourceMountRetryOutcome,
   sourceSetupIsActiveConnector,
   sourceSetupIsBusy,
   sourceSetupProgressLabel,
@@ -19,6 +23,17 @@ describe("source setup progress", () => {
     expect(sourceSetupProgressLabel("creating", false)).toBe("Mounting");
     expect(sourceSetupProgressLabel("connecting", true)).toBe("Finishing setup");
     expect(sourceSetupProgressLabel("changing", true)).toBe("Updating access");
+  });
+
+  it("includes Linear and Slack in the desktop source catalog with their auth modes", () => {
+    expect(sourceConnectorIds()).toContain("linear");
+    expect(sourceConnectorIds()).toContain("slack");
+    expect(sourceRequiresApiKey("linear")).toBe(true);
+    expect(sourceRequiresApiKey("granola")).toBe(true);
+    expect(sourceRequiresApiKey("slack")).toBe(false);
+    expect(sourceRequiresApiKey("gmail")).toBe(false);
+    expect(sourceSkipsManualMountStep("linear")).toBe(true);
+    expect(sourceSkipsManualMountStep("slack")).toBe(true);
   });
 
   it("keeps connected but unmounted sources visible when another source is mounted", () => {
@@ -53,5 +68,31 @@ describe("source setup progress", () => {
         mounts: [{ connector: "gmail", status: "ready" }],
       }),
     ).toEqual(["slack"]);
+  });
+});
+
+describe("source File Provider mount retry", () => {
+  it("completes a successful automatic mount retry", () => {
+    expect(sourceMountRetryOutcome({ ok: true, message: "Mounted Notion." })).toEqual({
+      kind: "success",
+      message: "Mounted Notion.",
+    });
+  });
+
+  it("continues recovery when File Provider is still disabled", () => {
+    expect(sourceMountRetryOutcome({
+      ok: false,
+      message: "The Locality File Provider is registered but not enabled.",
+    })).toEqual({ kind: "retry" });
+  });
+
+  it("turns another automatic mount failure into a visible dialog error", () => {
+    expect(sourceMountRetryOutcome({
+      ok: false,
+      message: "Could not load the top-level Notion folder.",
+    })).toEqual({
+      kind: "error",
+      message: "Could not load the top-level Notion folder.",
+    });
   });
 });

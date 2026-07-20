@@ -49,7 +49,7 @@ fn sqlite_store_initializes_idempotently() {
 
     assert!(first.db_path.exists());
     assert_eq!(first.db_path, second.db_path);
-    assert_eq!(user_version, 18);
+    assert_eq!(user_version, 19);
     assert_eq!(journal_mode, "wal");
 }
 
@@ -96,7 +96,7 @@ fn sqlite_store_seeds_state_compatibility_components() {
                 1,
                 0
             ),
-            ("core:schema".to_string(), "schema".to_string(), 18, 1, 1, 0),
+            ("core:schema".to_string(), "schema".to_string(), 19, 1, 1, 0),
             (
                 "durable:auto_save".to_string(),
                 "durable_json".to_string(),
@@ -106,10 +106,18 @@ fn sqlite_store_seeds_state_compatibility_components() {
                 0
             ),
             (
+                "durable:discovery_projection".to_string(),
+                "durable_transaction".to_string(),
+                1,
+                1,
+                1,
+                0
+            ),
+            (
                 "durable:journals".to_string(),
                 "durable_json".to_string(),
-                2,
-                1,
+                3,
+                3,
                 1,
                 0
             ),
@@ -132,8 +140,8 @@ fn sqlite_store_seeds_state_compatibility_components() {
             (
                 "durable:virtual_mutations".to_string(),
                 "durable_json".to_string(),
-                2,
-                1,
+                3,
+                3,
                 1,
                 0,
             ),
@@ -390,12 +398,12 @@ fn sqlite_store_retires_removed_notion_workspace_roots_component() {
 }
 
 #[test]
-fn sqlite_schema_snapshot_matches_v18_contract() {
+fn sqlite_schema_snapshot_matches_v19_contract() {
     let fixture = SqliteFixture::new();
     let store = fixture.open();
     let connection = Connection::open(&store.db_path).expect("raw connection");
 
-    assert_eq!(SqliteStateStore::current_schema_version(), 18);
+    assert_eq!(SqliteStateStore::current_schema_version(), 19);
     assert_eq!(
         schema_column_snapshot(&connection),
         "\
@@ -403,6 +411,7 @@ auto_save_enrollments: mount_id, path, remote_id, enabled, origin_json, state_js
 connections: connection_id, profile_id, connector, display_name, account_label, workspace_id, workspace_name, auth_kind, secret_ref, scopes_json, capabilities_json, status, created_at, updated_at, expires_at
 connector_profiles: profile_id, connector, display_name, auth_kind, scopes_json, capabilities_json, enabled_actions_json, connector_version, status, created_at, updated_at
 connector_state: connector, scope_kind, scope_id, state_version, min_reader_version, state_json, updated_at
+discovery_projection_transactions: transaction_id, mount_id, projection_json, status, active, state_version, min_reader_version, plan_json, commit_json, reservation_json, effects_json, error_json, created_at, updated_at, committed_at, finalized_at
 entities: mount_id, remote_id, kind_json, title, path, hydration_json, content_hash, remote_edited_at
 entity_search_fts: mount_id, remote_id, title, path, observed_title, observed_path
 freshness_states: mount_id, remote_id, tier_json, last_checked_at, next_check_at, last_opened_at, last_local_change_at, remote_hint_pending
@@ -421,6 +430,112 @@ virtual_mutations: mount_id, local_id, mutation_kind_json, target_remote_id, par
 }
 
 #[test]
+fn sqlite_store_migrates_v18_to_v19_without_discarding_pending_work() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config())
+        .expect("save mount");
+    store.save_entity(entity_record()).expect("save entity");
+    let metadata_job = metadata_discovery_job(
+        fixture.mount_id.clone(),
+        "children:page-1",
+        MetadataDiscoveryPriority::Interactive,
+        1,
+    );
+    store
+        .upsert_metadata_discovery_job(metadata_job.clone())
+        .expect("save pending metadata job");
+    let pending_journal = journal_entry("push-v18-pending", JournalStatus::Prepared);
+    store
+        .append_journal(pending_journal.clone())
+        .expect("save pending journal");
+    let pending_mutation = virtual_mutation_record();
+    store
+        .save_virtual_mutation(pending_mutation.clone())
+        .expect("save pending virtual mutation");
+    let db_path = store.db_path.clone();
+    drop(store);
+
+    let connection = Connection::open(&db_path).expect("raw v19 connection");
+    connection
+        .execute_batch(
+            "DROP TRIGGER discovery_projection_block_active_mount_delete;
+             DROP TABLE discovery_projection_transactions;
+             DELETE FROM state_components
+             WHERE component_id = 'durable:discovery_projection';
+             UPDATE state_components SET version = 18
+             WHERE component_id = 'core:schema';
+             PRAGMA user_version = 18;",
+        )
+        .expect("downgrade fixture to released v18 shape");
+    drop(connection);
+
+    let reopened = fixture.open();
+    let connection = Connection::open(&reopened.db_path).expect("raw migrated connection");
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("user version");
+    let component: (String, i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT component_kind, version, min_reader_version, required, rebuildable
+             FROM state_components
+             WHERE component_id = 'durable:discovery_projection'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .expect("discovery component");
+    let migration_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM state_migrations
+             WHERE migration_id = 'schema-18-to-19'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("migration history");
+
+    assert_eq!(user_version, 19);
+    assert_eq!(component, ("durable_transaction".to_string(), 1, 1, 1, 0));
+    assert_eq!(migration_count, 1);
+    assert!(sqlite_table_exists(
+        &connection,
+        "discovery_projection_transactions"
+    ));
+    assert_eq!(
+        reopened
+            .get_entity(&fixture.mount_id, &RemoteId::new("page-1"))
+            .expect("preserved entity"),
+        Some(entity_record())
+    );
+    assert_eq!(
+        reopened
+            .list_metadata_discovery_jobs()
+            .expect("preserved metadata job"),
+        vec![metadata_job]
+    );
+    assert_eq!(
+        reopened
+            .get_journal(&pending_journal.push_id)
+            .expect("load preserved pending journal"),
+        Some(pending_journal)
+    );
+    assert_eq!(
+        reopened
+            .get_virtual_mutation(&fixture.mount_id, &pending_mutation.local_id)
+            .expect("load preserved pending virtual mutation"),
+        Some(pending_mutation)
+    );
+}
+
+#[test]
 fn sqlite_store_reports_v12_state_as_migratable_then_migrates() {
     let fixture = SqliteFixture::new();
     create_minimal_v12_state(&fixture);
@@ -432,7 +547,7 @@ fn sqlite_store_reports_v12_state_as_migratable_then_migrates() {
         before.issues,
         vec![StateCompatibilityIssue::OlderSchema {
             found: 12,
-            current: 18,
+            current: 19,
         }]
     );
 
@@ -443,13 +558,13 @@ fn sqlite_store_reports_v12_state_as_migratable_then_migrates() {
         .expect("user version");
     let migration_count: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM state_migrations WHERE migration_id = 'schema-12-to-18'",
+            "SELECT COUNT(*) FROM state_migrations WHERE migration_id = 'schema-12-to-19'",
             [],
             |row| row.get(0),
         )
         .expect("migration row count");
 
-    assert_eq!(user_version, 18);
+    assert_eq!(user_version, 19);
     assert_eq!(migration_count, 1);
     assert_eq!(
         store.get_mount(&fixture.mount_id).expect("get mount"),
@@ -464,7 +579,7 @@ fn sqlite_store_reports_v12_state_as_migratable_then_migrates() {
     );
 
     let after =
-        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect v18");
+        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect v19");
     assert_eq!(after.status, StateCompatibilityStatus::Ready);
 }
 
@@ -484,7 +599,7 @@ fn sqlite_store_rejects_newer_schema_version() {
         error,
         StoreError::SchemaVersion {
             found: 999,
-            supported: 18,
+            supported: 19,
         }
     );
 }
@@ -507,7 +622,7 @@ fn sqlite_store_reports_newer_schema_as_needing_update() {
         report.issues,
         vec![StateCompatibilityIssue::NewerSchema {
             found: 999,
-            supported: 18,
+            supported: 19,
         }]
     );
 }
@@ -582,45 +697,368 @@ fn sqlite_store_does_not_rewrite_v2_linux_fuse_mount_point_roots() {
 }
 
 #[test]
-fn sqlite_store_migrates_virtual_mutations_component_v1_to_v2() {
+fn sqlite_store_migrates_virtual_mutations_v1_and_v2_to_v3_without_rewriting_rows() {
+    for old_version in [1, 2] {
+        let fixture = SqliteFixture::new();
+        let mut store = fixture.open();
+        store
+            .save_mount(fixture.mount_config())
+            .expect("save mount");
+        store
+            .save_virtual_mutation(virtual_mutation_record())
+            .expect("save mutation");
+        let connection = Connection::open(&store.db_path).expect("raw connection");
+        connection
+            .execute(
+                "UPDATE state_components
+                 SET version = ?1, min_reader_version = 1
+                 WHERE component_id = 'durable:virtual_mutations'",
+                [old_version],
+            )
+            .expect("downgrade virtual mutations component");
+        let before_row = virtual_mutation_raw_row(&connection);
+        let before_user_version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user version");
+        drop(connection);
+        drop(store);
+
+        let before = SqliteStateStore::inspect_compatibility(fixture.state_root.clone())
+            .expect("inspect state");
+        assert_eq!(before.status, StateCompatibilityStatus::Migratable);
+        assert_eq!(
+            before.issues,
+            vec![StateCompatibilityIssue::OlderComponent {
+                component_id: "durable:virtual_mutations".to_string(),
+                found: old_version,
+                current: 3,
+            }]
+        );
+
+        let reopened = fixture.open();
+        let connection = Connection::open(&reopened.db_path).expect("raw reopened connection");
+        let component: (i64, i64) = connection
+            .query_row(
+                "SELECT version, min_reader_version
+                 FROM state_components
+                 WHERE component_id = 'durable:virtual_mutations'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("virtual mutations component version");
+        let after_user_version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user version");
+        assert_eq!(component, (3, 3));
+        assert_eq!(virtual_mutation_raw_row(&connection), before_row);
+        assert_eq!(after_user_version, before_user_version);
+    }
+}
+
+#[test]
+fn sqlite_store_reports_virtual_mutations_v4_without_mutating_state() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config())
+        .expect("save mount");
+    store
+        .save_virtual_mutation(virtual_mutation_record())
+        .expect("save mutation");
+    let db_path = store.db_path.clone();
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    connection
+        .execute(
+            "UPDATE state_components
+             SET version = 4, min_reader_version = 4
+             WHERE component_id = 'durable:virtual_mutations'",
+            [],
+        )
+        .expect("mark future virtual mutation component");
+    let before_row = virtual_mutation_raw_row(&connection);
+    drop(connection);
+    drop(store);
+
+    let report =
+        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect v4");
+    assert_eq!(report.status, StateCompatibilityStatus::NeedsUpdate);
+    assert_eq!(
+        report.issues,
+        vec![StateCompatibilityIssue::NewerComponent {
+            component_id: "durable:virtual_mutations".to_string(),
+            found: 4,
+            supported: 3,
+        }]
+    );
+    assert!(matches!(
+        SqliteStateStore::open(fixture.state_root.clone()),
+        Err(StoreError::StateCompatibility(_))
+    ));
+    let connection = Connection::open(db_path).expect("raw reopen");
+    assert_eq!(virtual_mutation_raw_row(&connection), before_row);
+    let component: (i64, i64) = connection
+        .query_row(
+            "SELECT version, min_reader_version FROM state_components
+             WHERE component_id = 'durable:virtual_mutations'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("component metadata");
+    assert_eq!(component, (4, 4));
+}
+
+#[test]
+fn sqlite_store_migrates_journals_component_v2_to_v3_without_rewriting_rows() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config())
+        .expect("save mount");
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    insert_released_v2_journal(&connection);
+    connection
+        .execute(
+            "UPDATE state_components
+             SET version = 2, min_reader_version = 1
+             WHERE component_id = 'durable:journals'",
+            [],
+        )
+        .expect("mark journal component v2");
+    let before_row = journal_json_row(&connection, "push-v2");
+    let before_user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("user version");
+    drop(connection);
+    drop(store);
+
+    let before =
+        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect v2");
+    assert_eq!(before.status, StateCompatibilityStatus::Migratable);
+    assert_eq!(
+        before.issues,
+        vec![StateCompatibilityIssue::OlderComponent {
+            component_id: "durable:journals".to_string(),
+            found: 2,
+            current: 3,
+        }]
+    );
+
+    let reopened = fixture.open();
+    let connection = Connection::open(&reopened.db_path).expect("raw reopened connection");
+    let (version, min_reader_version): (i64, i64) = connection
+        .query_row(
+            "SELECT version, min_reader_version
+             FROM state_components
+             WHERE component_id = 'durable:journals'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("journal component metadata");
+    let after_user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("user version");
+    let after_row = journal_json_row(&connection, "push-v2");
+    let loaded = reopened
+        .get_journal(&PushId("push-v2".to_string()))
+        .expect("read migrated journal")
+        .expect("journal");
+
+    assert_eq!((version, min_reader_version), (3, 3));
+    assert_eq!(before_user_version, 19);
+    assert_eq!(after_user_version, before_user_version);
+    assert_eq!(after_row, before_row);
+    assert_eq!(
+        loaded,
+        journal_entry("push-v2", JournalStatus::Reconciled)
+            .with_apply_effects(apply_effects("push-v2"))
+    );
+}
+
+#[test]
+fn sqlite_store_migrates_journals_component_v1_to_v3_at_current_schema() {
+    let fixture = SqliteFixture::new();
+    let store = fixture.open();
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    let before_user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("user version");
+    connection
+        .execute(
+            "UPDATE state_components
+             SET version = 1, min_reader_version = 1
+             WHERE component_id = 'durable:journals'",
+            [],
+        )
+        .expect("mark journal component v1");
+    drop(connection);
+    drop(store);
+
+    let before =
+        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect v1");
+    assert_eq!(before.status, StateCompatibilityStatus::Migratable);
+    assert_eq!(
+        before.issues,
+        vec![StateCompatibilityIssue::OlderComponent {
+            component_id: "durable:journals".to_string(),
+            found: 1,
+            current: 3,
+        }]
+    );
+
+    let reopened = fixture.open();
+    let connection = Connection::open(&reopened.db_path).expect("raw reopened connection");
+    let component: (i64, i64) = connection
+        .query_row(
+            "SELECT version, min_reader_version
+             FROM state_components
+             WHERE component_id = 'durable:journals'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("journal component metadata");
+    let after_user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("user version");
+
+    assert_eq!(component, (3, 3));
+    assert_eq!(before_user_version, 19);
+    assert_eq!(after_user_version, before_user_version);
+}
+
+#[test]
+fn sqlite_store_reports_journals_component_v4_as_needs_update() {
     let fixture = SqliteFixture::new();
     let store = fixture.open();
     let connection = Connection::open(&store.db_path).expect("raw connection");
     connection
         .execute(
             "UPDATE state_components
-             SET version = 1
-             WHERE component_id = 'durable:virtual_mutations'",
+             SET version = 4, min_reader_version = 4
+             WHERE component_id = 'durable:journals'",
             [],
         )
-        .expect("downgrade virtual mutations component");
+        .expect("mark future journal component");
     drop(connection);
     drop(store);
 
-    let before =
-        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect state");
-    assert_eq!(before.status, StateCompatibilityStatus::Migratable);
+    let report =
+        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect v4");
+    assert_eq!(report.status, StateCompatibilityStatus::NeedsUpdate);
     assert_eq!(
-        before.issues,
-        vec![StateCompatibilityIssue::OlderComponent {
-            component_id: "durable:virtual_mutations".to_string(),
-            found: 1,
-            current: 2,
+        report.issues,
+        vec![StateCompatibilityIssue::NewerComponent {
+            component_id: "durable:journals".to_string(),
+            found: 4,
+            supported: 3,
         }]
     );
+    let error = SqliteStateStore::open(fixture.state_root.clone()).expect_err("v4 open blocked");
+    assert!(matches!(error, StoreError::StateCompatibility(_)));
+}
 
-    let reopened = fixture.open();
-    let connection = Connection::open(&reopened.db_path).expect("raw reopened connection");
-    let version: i64 = connection
+#[test]
+fn sqlite_store_reports_newer_discovery_transaction_component_as_needs_update() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(MountConfig {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.mount_root.clone(),
+            remote_root_id: None,
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+            connection_id: None,
+            settings_json: "{}".to_string(),
+        })
+        .expect("save mount with legacy workspace roots");
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    insert_state_component(
+        &connection,
+        "projection:notion_workspace_roots",
+        "projection_layout",
+        2,
+        1,
+        true,
+        false,
+        "{}",
+    );
+    connection
+        .execute(
+            "INSERT INTO entities (
+                mount_id, remote_id, kind_json, title, path, hydration_json,
+                content_hash, remote_edited_at
+             ) VALUES (
+                ?1, 'notion-root:workspace', '\"directory\"', 'Workspace',
+                'Workspace', '\"virtual\"', NULL, NULL
+             )",
+            params![fixture.mount_id.0.as_str()],
+        )
+        .expect("insert legacy synthetic root");
+    connection
+        .execute(
+            "DELETE FROM state_components
+             WHERE component_id = 'cache:entity_search'",
+            [],
+        )
+        .expect("remove repairable component");
+    connection
+        .execute(
+            "UPDATE state_components
+             SET version = 2, min_reader_version = 2
+             WHERE component_id = 'durable:discovery_projection'",
+            [],
+        )
+        .expect("mark future discovery component");
+    let db_path = store.db_path.clone();
+    drop(connection);
+    drop(store);
+
+    let report = SqliteStateStore::inspect_compatibility(fixture.state_root.clone())
+        .expect("inspect future discovery component");
+    assert_eq!(report.status, StateCompatibilityStatus::NeedsUpdate);
+    assert_eq!(
+        report.issues,
+        vec![
+            StateCompatibilityIssue::NewerComponent {
+                component_id: "durable:discovery_projection".to_string(),
+                found: 2,
+                supported: 1,
+            },
+            StateCompatibilityIssue::MissingComponent {
+                component_id: "cache:entity_search".to_string(),
+            },
+        ]
+    );
+    assert!(matches!(
+        SqliteStateStore::open(fixture.state_root.clone()),
+        Err(StoreError::StateCompatibility(_))
+    ));
+
+    let connection = Connection::open(db_path).expect("raw connection after blocked open");
+    let component_markers: (i64, i64, i64) = connection
         .query_row(
-            "SELECT version
-             FROM state_components
-             WHERE component_id = 'durable:virtual_mutations'",
+            "SELECT
+                (SELECT version FROM state_components
+                 WHERE component_id = 'durable:discovery_projection'),
+                (SELECT COUNT(*) FROM state_components
+                 WHERE component_id = 'projection:notion_workspace_roots'),
+                (SELECT COUNT(*) FROM state_components
+                 WHERE component_id = 'cache:entity_search')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("component markers after blocked open");
+    let synthetic_root_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM entities
+             WHERE remote_id = 'notion-root:workspace'",
             [],
             |row| row.get(0),
         )
-        .expect("virtual mutations component version");
-    assert_eq!(version, 2);
+        .expect("synthetic root count after blocked open");
+    assert_eq!(component_markers, (2, 1, 0));
+    assert_eq!(synthetic_root_count, 1);
 }
 
 #[test]
@@ -821,7 +1259,7 @@ fn sqlite_store_v13_valid_linux_fuse_v1_component_migrates_to_v2() {
 }
 
 #[test]
-fn sqlite_store_v14_missing_live_mode_component_migrates_to_v18() {
+fn sqlite_store_v14_missing_live_mode_component_migrates_to_v19() {
     let fixture = SqliteFixture::new();
     let mount_point_root = fixture
         .state_root
@@ -868,7 +1306,7 @@ fn sqlite_store_v14_missing_live_mode_component_migrates_to_v18() {
         )
         .expect("live mode component version");
 
-    assert_eq!(user_version, 18);
+    assert_eq!(user_version, 19);
     assert!(sqlite_table_exists(&connection, "mount_live_modes"));
     assert_eq!(component_version, 1);
     assert_eq!(query_state_migration_count(&connection), 1);
@@ -1288,6 +1726,37 @@ fn sqlite_store_blocks_newer_component_versions() {
 }
 
 #[test]
+fn sqlite_store_migrates_v2_journal_component_to_v3() {
+    let fixture = SqliteFixture::new();
+    let store = fixture.open();
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    connection
+        .execute(
+            "UPDATE state_components
+             SET version = 2, min_reader_version = 1
+             WHERE component_id = 'durable:journals'",
+            [],
+        )
+        .expect("downgrade journal component fixture");
+    drop(connection);
+    drop(store);
+
+    let store = fixture.open();
+    let connection = Connection::open(&store.db_path).expect("raw reopened connection");
+    let (version, min_reader_version): (i64, i64) = connection
+        .query_row(
+            "SELECT version, min_reader_version
+             FROM state_components
+             WHERE component_id = 'durable:journals'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("journal component versions");
+
+    assert_eq!((version, min_reader_version), (3, 3));
+}
+
+#[test]
 fn sqlite_store_blocks_components_that_require_newer_readers() {
     let fixture = SqliteFixture::new();
     let store = fixture.open();
@@ -1311,7 +1780,7 @@ fn sqlite_store_blocks_components_that_require_newer_readers() {
         vec![StateCompatibilityIssue::ComponentRequiresNewerReader {
             component_id: "durable:journals".to_string(),
             min_reader_version: 999,
-            supported: 2,
+            supported: 3,
         }]
     );
 
@@ -2172,7 +2641,7 @@ fn sqlite_store_migrates_v5_projection_and_connections_schema() {
         )
         .expect("connections table");
 
-    assert_eq!(user_version, 18);
+    assert_eq!(user_version, 19);
     assert_eq!(connection_column_count, 1);
     assert_eq!(projection_column_count, 1);
     assert_eq!(connection_table_count, 1);
@@ -2247,7 +2716,7 @@ fn sqlite_store_migrates_v6_projection_schema_to_connections() {
         )
         .expect("connections table");
 
-    assert_eq!(user_version, 18);
+    assert_eq!(user_version, 19);
     assert_eq!(connection_column_count, 1);
     assert_eq!(connection_table_count, 1);
     assert_eq!(
@@ -2332,7 +2801,7 @@ fn sqlite_store_migrates_v7_hydration_jobs_schema() {
         )
         .expect("hydration_jobs table");
 
-    assert_eq!(user_version, 18);
+    assert_eq!(user_version, 19);
     assert_eq!(hydration_jobs_table_count, 1);
     assert!(
         store
@@ -2419,7 +2888,7 @@ fn sqlite_store_migrates_v8_connections_to_default_connector_profile() {
         )
         .expect("profile_id column");
 
-    assert_eq!(user_version, 18);
+    assert_eq!(user_version, 19);
     assert_eq!(profile_column_count, 1);
     let migrated_connection = store
         .get_connection(&ConnectionId::new("notion-work"))
@@ -2538,7 +3007,7 @@ fn sqlite_store_migrates_v11_entity_search_index() {
         )
         .expect("entity search table");
 
-    assert_eq!(user_version, 18);
+    assert_eq!(user_version, 19);
     assert_eq!(search_table_count, 1);
     let matches = store
         .list_entity_search_candidates(&fixture.mount_id, "launch", None)
@@ -2903,6 +3372,53 @@ fn journal_reader_remaps_mixed_legacy_operation_indexes_for_undo() {
 }
 
 #[test]
+fn sqlite_store_round_trips_v3_entity_body_journal_rows() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config())
+        .expect("save mount");
+    let operation = PushOperation::UpdateEntityBody {
+        entity_id: RemoteId::new("page-1"),
+        body: "Updated first paragraph.\n\nUpdated second paragraph.".to_string(),
+    };
+    let push_id = PushId("push-body".to_string());
+    let entry = JournalEntry::new(
+        push_id.clone(),
+        fixture.mount_id.clone(),
+        vec![RemoteId::new("page-1")],
+        PushPlan::new(vec![RemoteId::new("page-1")], vec![operation.clone()]),
+        JournalStatus::Reconciled,
+    )
+    .with_apply_effects(vec![JournalApplyEffect::UpdatedEntityBody {
+        operation_id: PushOperationId::for_operation(&push_id, 0, &operation),
+        operation_index: 0,
+        entity_id: RemoteId::new("page-1"),
+    }]);
+
+    store
+        .append_journal(entry.clone())
+        .expect("append body journal");
+    let loaded = store
+        .get_journal(&push_id)
+        .expect("read body journal")
+        .expect("journal");
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    let component: (i64, i64) = connection
+        .query_row(
+            "SELECT version, min_reader_version
+             FROM state_components
+             WHERE component_id = 'durable:journals'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("journal component metadata");
+
+    assert_eq!(loaded, entry);
+    assert_eq!(component, (3, 3));
+}
+
+#[test]
 fn sqlite_store_migrates_v1_journals_with_empty_preimages() {
     let fixture = SqliteFixture::new();
     fs::create_dir_all(&fixture.state_root).expect("state root");
@@ -2966,7 +3482,7 @@ fn sqlite_store_migrates_v1_journals_with_empty_preimages() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 18);
+    assert_eq!(user_version, 19);
     assert!(entry.preimages.is_empty());
     assert!(entry.apply_effects.is_empty());
 }
@@ -3037,7 +3553,7 @@ fn sqlite_store_migrates_v2_journals_with_empty_apply_effects() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 18);
+    assert_eq!(user_version, 19);
     assert!(entry.apply_effects.is_empty());
 }
 
@@ -3100,7 +3616,7 @@ fn sqlite_store_migrates_v16_journals_with_empty_edit_metadata() {
         .query_row(
             "SELECT COUNT(*)
              FROM state_migrations
-             WHERE migration_id = 'schema-16-to-18'",
+             WHERE migration_id = 'schema-16-to-19'",
             [],
             |row| row.get(0),
         )
@@ -3110,8 +3626,8 @@ fn sqlite_store_migrates_v16_journals_with_empty_edit_metadata() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 18);
-    assert_eq!(journals_component_version, 2);
+    assert_eq!(user_version, 19);
+    assert_eq!(journals_component_version, 3);
     assert_eq!(
         metadata_json,
         serde_json::to_string(&JournalMetadata::default()).expect("default metadata json")
@@ -3178,15 +3694,25 @@ fn sqlite_store_migrates_v17_mounts_with_default_settings_json() {
         .query_row(
             "SELECT COUNT(*)
              FROM state_migrations
-             WHERE migration_id = 'schema-17-to-18'",
+             WHERE migration_id = 'schema-17-to-19'",
             [],
             |row| row.get(0),
         )
         .expect("schema migration count");
+    let journal_component: (i64, i64) = connection
+        .query_row(
+            "SELECT version, min_reader_version
+             FROM state_components
+             WHERE component_id = 'durable:journals'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("journal component metadata");
 
-    assert_eq!(user_version, 18);
+    assert_eq!(user_version, 19);
     assert_eq!(settings_json, "{}");
     assert_eq!(migration_count, 1);
+    assert_eq!(journal_component, (3, 3));
 }
 
 fn query_state_components(connection: &Connection) -> Vec<(String, String, i64, i64, i64, i64)> {
@@ -3436,17 +3962,17 @@ fn create_minimal_v16_journal_state(connection: &Connection, fixture: &SqliteFix
 
 fn insert_current_state_components_for_v16(connection: &Connection) {
     for definition in SqliteStateStore::current_component_definitions() {
-        let version = match definition.component_id {
-            "core:schema" => 16,
-            "durable:journals" => 1,
-            _ => definition.current_version,
+        let (version, min_reader_version) = match definition.component_id {
+            "core:schema" => (16, definition.min_reader_version),
+            "durable:journals" => (1, 1),
+            _ => (definition.current_version, definition.min_reader_version),
         };
         insert_state_component(
             connection,
             definition.component_id,
             definition.component_kind,
             version,
-            definition.min_reader_version,
+            min_reader_version,
             definition.required,
             definition.rebuildable,
             definition.data_json,
@@ -3456,16 +3982,17 @@ fn insert_current_state_components_for_v16(connection: &Connection) {
 
 fn insert_current_state_components_for_v17(connection: &Connection) {
     for definition in SqliteStateStore::current_component_definitions() {
-        let version = match definition.component_id {
-            "core:schema" => 17,
-            _ => definition.current_version,
+        let (version, min_reader_version) = match definition.component_id {
+            "core:schema" => (17, definition.min_reader_version),
+            "durable:journals" => (2, 1),
+            _ => (definition.current_version, definition.min_reader_version),
         };
         insert_state_component(
             connection,
             definition.component_id,
             definition.component_kind,
             version,
-            definition.min_reader_version,
+            min_reader_version,
             definition.required,
             definition.rebuildable,
             definition.data_json,
@@ -3559,6 +4086,72 @@ fn sqlite_table_exists(connection: &Connection, table_name: &str) -> bool {
         )
         .expect("sqlite table count");
     table_count > 0
+}
+
+fn insert_released_v2_journal(connection: &Connection) {
+    let remote_ids_json = r#"["page-1"]"#;
+    let plan_json = r#"{"affected_entities":["page-1"],"operations":[{"type":"update_block","block_id":"paragraph-1","content":"Updated paragraph."}],"summary":{"blocks_created":0,"blocks_updated":1,"blocks_replaced":0,"blocks_moved":0,"media_updated":0,"blocks_archived":0,"entities_created":0,"entities_archived":0,"entities_moved":0,"properties_updated":0},"degradations":[]}"#;
+    let preimages_json = r##"[{"entity_id":"page-1","shadow":{"entity_id":"page-1","frontmatter":"","body_hash":"d05d9331a801383f","rendered_body":"# Roadmap\n\nOriginal paragraph.","blocks":[{"remote_id":"heading-1","kind":{"kind":"heading"},"source_span":{"start_line":9,"end_line":9},"content_hash":"5257459b6984ca92","text":"# Roadmap"},{"remote_id":"paragraph-1","kind":{"kind":"paragraph"},"source_span":{"start_line":11,"end_line":11},"content_hash":"4133f128f2b4432a","text":"Original paragraph."}]}}]"##;
+    let apply_effects_json = r#"[{"type":"updated_block","operation_id":"push-v2:0:update_block:paragraph-1","operation_index":0,"block_id":"paragraph-1"}]"#;
+    let status_json = r#""reconciled""#;
+    let metadata_json = r#"{"author":{"kind":"anonymous","display_name":"anonymous"}}"#;
+
+    connection
+        .execute(
+            "INSERT INTO journals (
+                push_id, mount_id, remote_ids_json, plan_json, preimages_json,
+                apply_effects_json, status_json, metadata_json, readable_diff_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+            params![
+                "push-v2",
+                "notion-main",
+                remote_ids_json,
+                plan_json,
+                preimages_json,
+                apply_effects_json,
+                status_json,
+                metadata_json,
+            ],
+        )
+        .expect("insert released v2 journal");
+}
+
+fn journal_json_row(
+    connection: &Connection,
+    push_id: &str,
+) -> (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+) {
+    connection
+        .query_row(
+            "SELECT push_id, mount_id, remote_ids_json, plan_json, preimages_json,
+                    apply_effects_json, status_json, metadata_json, readable_diff_json
+             FROM journals
+             WHERE push_id = ?1",
+            params![push_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .expect("journal json row")
 }
 
 struct SqliteFixture {
@@ -3667,6 +4260,48 @@ fn virtual_mutation_record() -> VirtualMutationRecord {
         created_at: "2026-06-12T00:00:00Z".to_string(),
         updated_at: "2026-06-12T00:00:00Z".to_string(),
     }
+}
+
+type VirtualMutationRawRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+);
+
+fn virtual_mutation_raw_row(connection: &Connection) -> VirtualMutationRawRow {
+    connection
+        .query_row(
+            "SELECT mount_id, local_id, mutation_kind_json, target_remote_id,
+                    parent_remote_id, original_path, projected_path, title,
+                    content_path, created_at, updated_at
+             FROM virtual_mutations
+             WHERE mount_id = 'notion-main' AND local_id = 'local:draft'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            },
+        )
+        .expect("virtual mutation raw row")
 }
 
 fn remote_observation_record() -> RemoteObservationRecord {

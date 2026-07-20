@@ -22,10 +22,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use loc_cli::connect::DEFAULT_NOTION_PROFILE_ID;
 use loc_cli::connect::{
     BrokerOAuthConnectOptions, ConnectOptions, GmailBrokerOAuthConnectOptions,
-    GoogleDocsBrokerOAuthConnectOptions, HttpGranolaConnectionProbe,
+    GoogleDocsBrokerOAuthConnectOptions, HttpGranolaConnectionProbe, HttpLinearConnectionProbe,
     SlackBrokerOAuthConnectOptions, run_connect_gmail_broker_oauth,
-    run_connect_google_docs_broker_oauth, run_connect_granola, run_connect_notion_broker_oauth,
-    run_connect_slack_broker_oauth, run_disconnect,
+    run_connect_google_docs_broker_oauth, run_connect_granola, run_connect_linear,
+    run_connect_notion_broker_oauth, run_connect_slack_broker_oauth, run_disconnect,
 };
 use loc_cli::daemon::{DaemonRunState, run_daemon_control};
 use loc_cli::diff::{DiffReport, run_diff};
@@ -230,8 +230,17 @@ struct MountSummary {
     status: String,
     root_exists: bool,
     entity_count: usize,
+    hydration_progress: Option<MountHydrationProgress>,
     pending_change_count: usize,
     provider: Option<ProviderRuntimeSummary>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MountHydrationProgress {
+    indexed_files: usize,
+    remaining_files: usize,
+    total_files: usize,
 }
 
 #[derive(Clone, Serialize)]
@@ -353,6 +362,14 @@ struct WorkspaceMountOnboardingReport {
     launch_strategy: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileProviderEnablementReport {
+    state: String,
+    message: String,
+    path: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MacosWorkspaceMountOnboardingState {
     Created,
@@ -365,7 +382,7 @@ impl MacosWorkspaceMountOnboardingState {
     fn as_str(self) -> &'static str {
         match self {
             Self::Created => "created",
-            Self::ApprovalRequired => "approval_required",
+            Self::ApprovalRequired => "needs_finder_enable",
             Self::WaitingForCloudStorageRoot => "waiting_for_cloudstorage_root",
             Self::Failed => "failed",
         }
@@ -1371,6 +1388,20 @@ async fn connect_granola(app: AppHandle, api_key: String) -> ActionReport {
     report
 }
 
+#[tauri::command]
+async fn connect_linear(app: AppHandle, api_key: String) -> ActionReport {
+    let report = tauri::async_runtime::spawn_blocking(move || connect_linear_blocking(api_key))
+        .await
+        .map_err(|error| format!("Linear connection worker failed: {error}"))
+        .and_then(|result| result)
+        .map(|message| ActionReport { ok: true, message })
+        .unwrap_or_else(|message| ActionReport { ok: false, message });
+    if report.ok {
+        refresh_desktop_surfaces(&app);
+    }
+    report
+}
+
 fn connect_granola_blocking(api_key: String) -> Result<String, String> {
     let api_key = api_key.trim().to_string();
     if api_key.is_empty() {
@@ -1398,10 +1429,17 @@ fn connect_granola_blocking(api_key: String) -> Result<String, String> {
     if let Some(mount) = existing_mount {
         ensure_daemon_running(&state_root)?;
         reload_daemon_mounts(&state_root)?;
+        let mut message = "Reconnected the existing Granola source.".to_string();
         if mount.projection.uses_virtual_filesystem() {
-            activate_virtual_projection_mount(&state_root, &mount, true)?;
+            if let Err(error) = activate_virtual_projection_mount(&state_root, &mount, true) {
+                if recoverable_macos_file_provider_activation_error(&error) {
+                    append_macos_file_provider_activation_warning(&mut message, &error);
+                } else {
+                    return Err(error);
+                }
+            }
         }
-        return Ok("Reconnected the existing Granola source.".to_string());
+        return Ok(message);
     }
 
     create_desktop_mount_blocking(CreateDesktopMountRequest {
@@ -1409,7 +1447,58 @@ fn connect_granola_blocking(api_key: String) -> Result<String, String> {
         path: "granola".to_string(),
         mount_id: "granola-main".to_string(),
         connection_id: Some(report.connection_id),
-        read_only: true,
+        read_only: !desktop_mount_is_editable_by_default("granola"),
+        notion_root_page: None,
+        google_docs_workspace_folder: None,
+    })
+}
+
+fn connect_linear_blocking(api_key: String) -> Result<String, String> {
+    let api_key = api_key.trim().to_string();
+    if api_key.is_empty() {
+        return Err("Enter a Linear API key.".to_string());
+    }
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let credentials = open_credential_store(&state_root);
+    let report = run_connect_linear(
+        &mut store,
+        credentials.as_ref(),
+        ConnectOptions {
+            connection_id: Some(ConnectionId::new("linear-default")),
+            token: api_key,
+        },
+        &HttpLinearConnectionProbe,
+    )
+    .map_err(|error| error.message())?;
+    let existing_mount = store
+        .get_mount(&MountId::new("linear-main"))
+        .map_err(|error| format!("Could not inspect Linear mount: {error}"))?
+        .filter(|mount| mount.connector == "linear");
+    drop(store);
+    if let Some(mount) = existing_mount {
+        ensure_daemon_running(&state_root)?;
+        reload_daemon_mounts(&state_root)?;
+        let mut message = "Reconnected the existing Linear source.".to_string();
+        if mount.projection.uses_virtual_filesystem() {
+            if let Err(error) = activate_virtual_projection_mount(&state_root, &mount, true) {
+                if recoverable_macos_file_provider_activation_error(&error) {
+                    append_macos_file_provider_activation_warning(&mut message, &error);
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+        return Ok(message);
+    }
+
+    create_desktop_mount_blocking(CreateDesktopMountRequest {
+        connector: "linear".to_string(),
+        path: "linear".to_string(),
+        mount_id: "linear-main".to_string(),
+        connection_id: Some(report.connection_id),
+        read_only: !desktop_mount_is_editable_by_default("linear"),
         notion_root_page: None,
         google_docs_workspace_folder: None,
     })
@@ -1977,6 +2066,33 @@ async fn run_workspace_mount_onboarding(
         refresh_desktop_surfaces(&app);
     }
     report
+}
+
+#[tauri::command]
+async fn file_provider_enablement_status() -> FileProviderEnablementReport {
+    tauri::async_runtime::spawn_blocking(macos_file_provider_enablement_status_blocking)
+        .await
+        .unwrap_or_else(|error| FileProviderEnablementReport {
+            state: "unavailable".to_string(),
+            message: format!("File Provider status worker failed: {error}"),
+            path: None,
+        })
+}
+
+#[tauri::command]
+async fn reveal_file_provider_enablement() -> ActionReport {
+    tauri::async_runtime::spawn_blocking(reveal_file_provider_enablement_blocking)
+        .await
+        .map_or_else(
+            |error| ActionReport {
+                ok: false,
+                message: format!("Finder worker failed: {error}"),
+            },
+            |result| match result {
+                Ok(message) => ActionReport { ok: true, message },
+                Err(message) => ActionReport { ok: false, message },
+            },
+        )
 }
 
 async fn create_desktop_mount_command(
@@ -3842,9 +3958,42 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
 }
 
 fn load_desktop_snapshot_at_state_root(state_root: &Path) -> Result<DesktopSnapshot, String> {
+    ensure_dev_sidecars_match_desktop_before_state_open(state_root)?;
     let store =
         SqliteStateStore::open(state_root.to_path_buf()).map_err(|error| error.to_string())?;
     load_desktop_snapshot_from_store(&store, &state_root)
+}
+
+fn ensure_dev_sidecars_match_desktop_before_state_open(state_root: &Path) -> Result<(), String> {
+    #[cfg(debug_assertions)]
+    {
+        if !state_root.join("state.sqlite3").exists() {
+            return Ok(());
+        }
+        let desktop_build_id = current_desktop_build_id();
+        let daemon_build_id = current_daemon_build_id();
+        if let Some(message) = dev_sidecar_build_skew_message(&desktop_build_id, &daemon_build_id) {
+            desktop_log("warn", "daemon.dev_sidecar_build_skew", message.clone());
+            return Err(message);
+        }
+    }
+    let _ = state_root;
+    Ok(())
+}
+
+fn dev_sidecar_build_skew_message(desktop_build_id: &str, daemon_build_id: &str) -> Option<String> {
+    if desktop_build_id.is_empty()
+        || daemon_build_id.is_empty()
+        || desktop_build_id == "unknown"
+        || daemon_build_id == "unknown"
+        || desktop_build_id == daemon_build_id
+    {
+        return None;
+    }
+
+    Some(format!(
+        "Locality debug sidecars are stale: desktop build {desktop_build_id} but bundled localityd build {daemon_build_id}. Run `make prepare-desktop-dev-sidecars` and relaunch Locality; do not delete ~/.loc/state.sqlite3."
+    ))
 }
 
 fn load_desktop_snapshot_for_surface() -> Result<DesktopSnapshot, String> {
@@ -3957,7 +4106,7 @@ fn load_desktop_snapshot_from_store(
         suggestions: vec![ConnectorSuggestion {
             connector: "Linear".to_string(),
             description: "Mount issues and projects as local files.".to_string(),
-            state: "planned".to_string(),
+            state: "available".to_string(),
         }],
     })
 }
@@ -3996,6 +4145,7 @@ fn degraded_snapshot(message: String) -> DesktopSnapshot {
             status: "error".to_string(),
             root_exists: false,
             entity_count: 0,
+            hydration_progress: None,
             pending_change_count: 0,
             provider: None,
         },
@@ -4016,7 +4166,7 @@ fn degraded_snapshot(message: String) -> DesktopSnapshot {
         suggestions: vec![ConnectorSuggestion {
             connector: "Linear".to_string(),
             description: "Mount issues and projects as local files.".to_string(),
-            state: "planned".to_string(),
+            state: "available".to_string(),
         }],
     }
 }
@@ -4181,6 +4331,7 @@ fn mount_summary_with_pending_change_count(
             status: "not_mounted".to_string(),
             root_exists: false,
             entity_count: 0,
+            hydration_progress: None,
             pending_change_count: 0,
             provider: None,
         };
@@ -4192,6 +4343,7 @@ fn mount_summary_with_pending_change_count(
         .unwrap_or("ready");
     let access_root = mount_access_root(mount);
     let root_exists = mount_root_exists_for_desktop_summary(mount, &access_root);
+    let entities = store.and_then(|store| store.list_entities(&mount.mount_id).ok());
 
     MountSummary {
         mount_id: mount.mount_id.0.clone(),
@@ -4219,10 +4371,13 @@ fn mount_summary_with_pending_change_count(
         read_only: mount.read_only,
         status: mount_status.to_string(),
         root_exists,
-        entity_count: store
-            .and_then(|store| store.list_entities(&mount.mount_id).ok())
+        entity_count: entities
+            .as_ref()
             .map(|entities| entities.len())
             .unwrap_or(0),
+        hydration_progress: entities
+            .as_ref()
+            .and_then(|entities| mount_hydration_progress(entities)),
         pending_change_count: pending_change_count.unwrap_or_else(|| {
             store
                 .map(|store| pending_changes_for_mount(store, state_root, &mount.mount_id))
@@ -4232,6 +4387,33 @@ fn mount_summary_with_pending_change_count(
         }),
         provider,
     }
+}
+
+fn mount_hydration_progress(entities: &[EntityRecord]) -> Option<MountHydrationProgress> {
+    let mut indexed_files = 0usize;
+    let mut remaining_files = 0usize;
+
+    for entity in entities {
+        if entity.kind != EntityKind::Page {
+            continue;
+        }
+        match entity.hydration {
+            HydrationState::Hydrated | HydrationState::Dirty | HydrationState::Conflicted => {
+                indexed_files += 1;
+            }
+            HydrationState::Stub => {
+                remaining_files += 1;
+            }
+            HydrationState::Virtual => {}
+        }
+    }
+
+    let total_files = indexed_files + remaining_files;
+    (total_files > 0).then_some(MountHydrationProgress {
+        indexed_files,
+        remaining_files,
+        total_files,
+    })
 }
 
 fn mount_live_mode_summary(
@@ -7290,6 +7472,11 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
     if mount_id.is_empty() {
         return Err("Mount id is required.".to_string());
     }
+    if !desktop_mount_creation_supports_connector(&connector) {
+        return Err(format!(
+            "Desktop mount creation does not support connector `{connector}`."
+        ));
+    }
     ensure_virtual_projection_domain_available(&projection)?;
     let root = resolve_desktop_mount_root(&request.path)?;
     validate_desktop_mount_root(&root, &state_root, &projection)?;
@@ -7353,12 +7540,8 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
                 })?;
             Some(folder_id)
         }
-        "gmail" | "granola" | "slack" => None,
-        other => {
-            return Err(format!(
-                "Desktop mount creation does not support connector `{other}`."
-            ));
-        }
+        "gmail" | "granola" | "linear" | "slack" => None,
+        _ => unreachable!("unsupported desktop connector should be rejected before mount setup"),
     };
     let preserved = if can_remount_existing_workspace {
         prepare_existing_workspace_mount_for_remount(&mut store, &state_root, &mount_id)?
@@ -7396,9 +7579,15 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
         .map_err(|error| format!("Could not reload created mount: {error}"))?
         .ok_or_else(|| "Created mount was not found in Locality state.".to_string())?;
 
-    if mount.projection.uses_virtual_filesystem() {
-        activate_virtual_projection_mount(&state_root, &mount, true)?;
-    }
+    let projection_warning = if mount.projection.uses_virtual_filesystem() {
+        match activate_virtual_projection_mount(&state_root, &mount, true) {
+            Ok(()) => None,
+            Err(error) if recoverable_macos_file_provider_activation_error(&error) => Some(error),
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
 
     let mut message = format!(
         "Mounted {} at {} with {}.",
@@ -7414,8 +7603,28 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
             preserved.directory.display()
         ));
     }
+    if let Some(warning) = projection_warning {
+        append_macos_file_provider_activation_warning(&mut message, &warning);
+    }
 
     Ok(message)
+}
+
+fn append_macos_file_provider_activation_warning(message: &mut String, warning: &str) {
+    message.push_str(&format!(
+        " macOS File Provider is still preparing the visible folder; it may appear in Finder shortly. {warning}"
+    ));
+}
+
+fn desktop_mount_creation_supports_connector(connector: &str) -> bool {
+    matches!(
+        connector,
+        "notion" | "google-docs" | "gmail" | "granola" | "linear" | "slack"
+    )
+}
+
+fn desktop_mount_is_editable_by_default(connector: &str) -> bool {
+    !matches!(connector, "granola" | "slack")
 }
 
 fn desktop_mount_by_id(store: &SqliteStateStore, mount_id: &str) -> Result<MountConfig, String> {
@@ -10156,6 +10365,8 @@ fn recoverable_macos_file_provider_activation_error(message: &str) -> bool {
         || message.contains("registered but not enabled")
         || message.contains("did not return a CloudStorage URL")
         || message.contains("macOS has not created")
+        || (message.contains("did not produce a healthy mount root")
+            && macos_file_provider_mount_root_is_missing(message))
 }
 
 fn workspace_mount_onboarding_report(
@@ -10177,7 +10388,7 @@ fn workspace_mount_onboarding_curated_message(
 ) -> Option<&'static str> {
     match state {
         MacosWorkspaceMountOnboardingState::ApprovalRequired => {
-            Some("Enable Locality in Finder, then return here and click Check again.")
+            Some("In Finder, click Enable for Locality. Locality will continue automatically.")
         }
         MacosWorkspaceMountOnboardingState::WaitingForCloudStorageRoot => {
             Some("Locality is still waiting for the CloudStorage folder to appear.")
@@ -10267,6 +10478,142 @@ fn macos_workspace_mount_domain_user_enabled() -> Result<bool, String> {
         .and_then(|domain| domain.get("userEnabled"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false))
+}
+
+fn classify_macos_file_provider_enablement(
+    user_enabled: Option<bool>,
+    fallback_path: Option<PathBuf>,
+    resolved_root: Result<Option<PathBuf>, String>,
+) -> FileProviderEnablementReport {
+    let path = |value: Option<PathBuf>| value.map(|path| path.display().to_string());
+    match user_enabled {
+        None => FileProviderEnablementReport {
+            state: "not_registered".to_string(),
+            message: "Locality is preparing the Finder location.".to_string(),
+            path: path(fallback_path),
+        },
+        Some(false) => FileProviderEnablementReport {
+            state: "needs_finder_enable".to_string(),
+            message: "In Finder, click Enable for Locality.".to_string(),
+            path: path(fallback_path),
+        },
+        Some(true) => match resolved_root {
+            Ok(Some(root)) => FileProviderEnablementReport {
+                state: "ready".to_string(),
+                message: "Locality is enabled in Finder.".to_string(),
+                path: path(Some(root)),
+            },
+            Ok(None) => FileProviderEnablementReport {
+                state: "waiting_for_root".to_string(),
+                message: "Finishing the Locality folder setup.".to_string(),
+                path: path(fallback_path),
+            },
+            Err(message) => FileProviderEnablementReport {
+                state: "unavailable".to_string(),
+                message,
+                path: path(fallback_path),
+            },
+        },
+    }
+}
+
+fn macos_file_provider_domain_status(
+    report: &serde_json::Value,
+) -> (Option<bool>, Option<PathBuf>) {
+    let domain = report
+        .get("domains")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|domains| {
+            domains.iter().find(|domain| {
+                domain.get("identifier").and_then(serde_json::Value::as_str)
+                    == Some(localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
+            })
+        });
+    let user_enabled = domain
+        .and_then(|domain| domain.get("userEnabled"))
+        .and_then(serde_json::Value::as_bool);
+    let path = domain
+        .and_then(|domain| domain.get("url"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|url| !url.is_empty())
+        .map(PathBuf::from);
+    (user_enabled, path)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_provider_enablement_status_blocking() -> FileProviderEnablementReport {
+    let provider_roots = macos_file_provider_cloud_storage_roots();
+    let report = match run_macos_file_provider_helper("list", Vec::new()) {
+        Ok(report) => report,
+        Err(error) => {
+            return FileProviderEnablementReport {
+                state: "unavailable".to_string(),
+                message: error.message(),
+                path: provider_roots
+                    .first()
+                    .map(|path| path.display().to_string()),
+            };
+        }
+    };
+    let (user_enabled, reported_path) = macos_file_provider_domain_status(&report.helper_report);
+    let fallback_path = reported_path.or_else(|| provider_roots.first().cloned());
+
+    let resolved_root = if user_enabled == Some(true) {
+        match macos_file_provider_domain_url(
+            localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
+        ) {
+            Ok(root) => Ok(Some(root)),
+            Err(error) if recoverable_macos_file_provider_activation_error(&error.message()) => {
+                Ok(None)
+            }
+            Err(error) => Err(error.message()),
+        }
+    } else {
+        Ok(None)
+    };
+    classify_macos_file_provider_enablement(user_enabled, fallback_path, resolved_root)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_file_provider_enablement_status_blocking() -> FileProviderEnablementReport {
+    FileProviderEnablementReport {
+        state: "unavailable".to_string(),
+        message: "File Provider enablement is only available on macOS.".to_string(),
+        path: None,
+    }
+}
+
+fn macos_file_provider_reveal_path(
+    domain_path: Option<&Path>,
+    candidates: &[PathBuf],
+) -> Option<PathBuf> {
+    domain_path
+        .into_iter()
+        .chain(candidates.iter().map(PathBuf::as_path))
+        .find_map(|candidate| {
+            candidate
+                .ancestors()
+                .find(|ancestor| ancestor.is_dir())
+                .map(Path::to_path_buf)
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn reveal_file_provider_enablement_blocking() -> Result<String, String> {
+    let report = macos_file_provider_enablement_status_blocking();
+    let domain_path = report.path.as_deref().map(Path::new);
+    let path =
+        macos_file_provider_reveal_path(domain_path, &macos_file_provider_cloud_storage_roots())
+            .ok_or_else(|| {
+                "Could not find the Locality location or its CloudStorage parent.".to_string()
+            })?;
+    open_in_file_manager(&path)?;
+    Ok(format!("Opened {} in Finder.", path.display()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn reveal_file_provider_enablement_blocking() -> Result<String, String> {
+    Err("File Provider enablement is only available on macOS.".to_string())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -11675,6 +12022,29 @@ mod tests {
     }
 
     #[test]
+    fn dev_sidecar_build_skew_message_reports_known_mismatch_only() {
+        let message = super::dev_sidecar_build_skew_message("desktop-build", "daemon-build")
+            .expect("known mismatch should report");
+
+        assert!(message.contains("desktop build desktop-build"));
+        assert!(message.contains("bundled localityd build daemon-build"));
+        assert!(message.contains("make prepare-desktop-dev-sidecars"));
+        assert!(message.contains("do not delete ~/.loc/state.sqlite3"));
+        assert_eq!(
+            super::dev_sidecar_build_skew_message("same-build", "same-build"),
+            None
+        );
+        assert_eq!(
+            super::dev_sidecar_build_skew_message("unknown", "daemon-build"),
+            None
+        );
+        assert_eq!(
+            super::dev_sidecar_build_skew_message("desktop-build", "unknown"),
+            None
+        );
+    }
+
+    #[test]
     fn daemon_process_started_before_bundled_binary_compares_modified_times() {
         let pid_modified = UNIX_EPOCH + Duration::from_secs(10);
         let binary_modified = UNIX_EPOCH + Duration::from_secs(20);
@@ -11723,6 +12093,7 @@ mod tests {
         let summary = super::mount_summary(None, Path::new("."), None, None, None);
 
         assert!(Path::new(&summary.local_path).is_absolute());
+        assert!(summary.hydration_progress.is_none());
     }
 
     #[test]
@@ -11911,6 +12282,95 @@ mod tests {
 
         assert!(snapshot.needs_onboarding);
         assert!(snapshot.recent_files.is_empty());
+    }
+
+    #[test]
+    fn desktop_snapshot_reports_hydratable_file_progress() {
+        let temp = TestTempDir::new("desktop-file-progress");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let connection = test_connection("workspace-1", "CodeFlash");
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            temp.path().join("codeflash-wiki"),
+        )
+        .with_connection_id(connection.connection_id.clone())
+        .projection(ProjectionMode::LinuxFuse);
+
+        store.save_connection(connection).expect("save connection");
+        store.save_mount(mount).expect("save mount");
+
+        for (remote_id, title, path, hydration) in [
+            (
+                "hydrated-page",
+                "Hydrated",
+                "Hydrated/page.md",
+                HydrationState::Hydrated,
+            ),
+            (
+                "dirty-page",
+                "Dirty",
+                "Dirty/page.md",
+                HydrationState::Dirty,
+            ),
+            (
+                "conflicted-page",
+                "Conflicted",
+                "Conflicted/page.md",
+                HydrationState::Conflicted,
+            ),
+            ("stub-page", "Stub", "Stub/page.md", HydrationState::Stub),
+            (
+                "virtual-page",
+                "Virtual",
+                "Virtual/page.md",
+                HydrationState::Virtual,
+            ),
+        ] {
+            store
+                .save_entity(
+                    EntityRecord::new(
+                        MountId::new("notion-main"),
+                        RemoteId::new(remote_id),
+                        EntityKind::Page,
+                        title,
+                        path,
+                    )
+                    .with_hydration(hydration),
+                )
+                .expect("save page entity");
+        }
+
+        for (remote_id, kind, path) in [
+            ("directory-1", EntityKind::Directory, "Directory"),
+            ("database-1", EntityKind::Database, "Database"),
+            ("asset-1", EntityKind::Asset, "asset.png"),
+        ] {
+            store
+                .save_entity(
+                    EntityRecord::new(
+                        MountId::new("notion-main"),
+                        RemoteId::new(remote_id),
+                        kind,
+                        remote_id,
+                        path,
+                    )
+                    .with_hydration(HydrationState::Stub),
+                )
+                .expect("save non-page entity");
+        }
+
+        let snapshot = super::load_desktop_snapshot_from_store(&store, temp.path())
+            .expect("load snapshot from test store");
+        let progress = snapshot
+            .mount
+            .hydration_progress
+            .expect("file progress is reported");
+
+        assert_eq!(snapshot.mount.entity_count, 8);
+        assert_eq!(progress.indexed_files, 3);
+        assert_eq!(progress.remaining_files, 1);
+        assert_eq!(progress.total_files, 4);
     }
 
     #[test]
@@ -13673,6 +14133,107 @@ mod tests {
     }
 
     #[test]
+    fn file_provider_missing_child_mount_after_recovery_is_recoverable() {
+        assert!(super::recoverable_macos_file_provider_activation_error(
+            "macOS File Provider recovery did not produce a healthy mount root `/Users/codeflash/Library/CloudStorage/Locality/linear`: Could not inspect macOS File Provider mount root `/Users/codeflash/Library/CloudStorage/Locality/linear`: Error: Error Domain=NSPOSIXErrorDomain Code=2 \"Couldn't find a file for /Users/codeflash/Library/CloudStorage/Locality/linear\" UserInfo={NSDescription=Couldn't find a file for /Users/codeflash/Library/CloudStorage/Locality/linear}"
+        ));
+    }
+
+    #[test]
+    fn file_provider_enablement_report_distinguishes_registration_and_approval() {
+        let missing = super::classify_macos_file_provider_enablement(None, None, Ok(None));
+        assert_eq!(missing.state, "not_registered");
+
+        let disabled = super::classify_macos_file_provider_enablement(
+            Some(false),
+            Some(PathBuf::from("/Users/test/Library/CloudStorage/Locality")),
+            Ok(None),
+        );
+        assert_eq!(disabled.state, "needs_finder_enable");
+        assert_eq!(
+            disabled.path.as_deref(),
+            Some("/Users/test/Library/CloudStorage/Locality")
+        );
+    }
+
+    #[test]
+    fn file_provider_domain_status_reads_helper_url_while_disabled() {
+        let helper_report = serde_json::json!({
+            "domains": [{
+                "identifier": "loc",
+                "userEnabled": false,
+                "url": "/Users/test/Library/CloudStorage/LocalityPromptTest"
+            }]
+        });
+
+        let (user_enabled, path) = super::macos_file_provider_domain_status(&helper_report);
+
+        assert_eq!(user_enabled, Some(false));
+        assert_eq!(
+            path,
+            Some(PathBuf::from(
+                "/Users/test/Library/CloudStorage/LocalityPromptTest"
+            ))
+        );
+    }
+
+    #[test]
+    fn file_provider_enablement_report_waits_for_enabled_root() {
+        let report = super::classify_macos_file_provider_enablement(
+            Some(true),
+            Some(PathBuf::from("/Users/test/Library/CloudStorage/Locality")),
+            Ok(None),
+        );
+
+        assert_eq!(report.state, "waiting_for_root");
+        assert!(report.message.contains("Finishing"));
+    }
+
+    #[test]
+    fn file_provider_enablement_report_is_ready_only_with_resolved_root() {
+        let root = PathBuf::from("/Users/test/Library/CloudStorage/Locality");
+        let report = super::classify_macos_file_provider_enablement(
+            Some(true),
+            Some(root.clone()),
+            Ok(Some(root.clone())),
+        );
+
+        assert_eq!(report.state, "ready");
+        assert_eq!(report.path.as_deref(), root.to_str());
+    }
+
+    #[test]
+    fn file_provider_enablement_report_exposes_unavailable_errors() {
+        let report = super::classify_macos_file_provider_enablement(
+            Some(true),
+            None,
+            Err("File Provider helper unavailable".to_string()),
+        );
+
+        assert_eq!(report.state, "unavailable");
+        assert_eq!(report.message, "File Provider helper unavailable");
+    }
+
+    #[test]
+    fn file_provider_reveal_path_prefers_domain_then_existing_parent() {
+        let temp = TestTempDir::new("file-provider-reveal");
+        let cloud_storage = temp.path().join("Library/CloudStorage");
+        fs::create_dir_all(&cloud_storage).expect("create CloudStorage parent");
+        let domain = cloud_storage.join("Locality");
+
+        assert_eq!(
+            super::macos_file_provider_reveal_path(Some(&domain), &[domain.clone()]),
+            Some(cloud_storage)
+        );
+
+        fs::create_dir_all(&domain).expect("create domain root");
+        assert_eq!(
+            super::macos_file_provider_reveal_path(Some(&domain), &[domain.clone()]),
+            Some(domain)
+        );
+    }
+
+    #[test]
     fn macos_file_provider_approval_surface_path_uses_first_existing_candidate() {
         let temp = TestTempDir::new("approval-surface");
         let missing = temp.path().join("Library/CloudStorage/Locality");
@@ -13706,6 +14267,9 @@ mod tests {
             ),
             expected
         );
+        if let Some(state) = expected {
+            assert_eq!(state.as_str(), "needs_finder_enable");
+        }
     }
 
     #[test]
@@ -13746,7 +14310,7 @@ mod tests {
             super::workspace_mount_onboarding_curated_message(
                 super::MacosWorkspaceMountOnboardingState::ApprovalRequired
             ),
-            Some("Enable Locality in Finder, then return here and click Check again.")
+            Some("In Finder, click Enable for Locality. Locality will continue automatically.")
         );
         assert_eq!(
             super::workspace_mount_onboarding_curated_message(
@@ -14161,6 +14725,14 @@ mod tests {
             virtual_projection_source_ready_timeout_message("notion", "last error")
                 .contains("at least one page is selected")
         );
+    }
+
+    #[test]
+    fn desktop_mount_creation_supports_linear_as_editable_source() {
+        assert!(super::desktop_mount_creation_supports_connector("linear"));
+        assert!(super::desktop_mount_is_editable_by_default("linear"));
+        assert!(super::desktop_mount_creation_supports_connector("slack"));
+        assert!(!super::desktop_mount_is_editable_by_default("slack"));
     }
 
     #[test]
@@ -16354,6 +16926,11 @@ fn sample_snapshot() -> DesktopSnapshot {
         status: "ready".to_string(),
         root_exists: true,
         entity_count: 42,
+        hydration_progress: Some(MountHydrationProgress {
+            indexed_files: 16,
+            remaining_files: 4,
+            total_files: 20,
+        }),
         pending_change_count: 3,
         provider: None,
     };
@@ -16418,7 +16995,7 @@ fn sample_snapshot() -> DesktopSnapshot {
         suggestions: vec![ConnectorSuggestion {
             connector: "Linear".to_string(),
             description: "Mount issues and projects as local files.".to_string(),
-            state: "planned".to_string(),
+            state: "available".to_string(),
         }],
     }
 }
@@ -16675,6 +17252,7 @@ fn live_mode_e2e_seed_notion_connection(state_root: &Path, token: &str) {
 fn live_mode_e2e_notion_capabilities_json() -> String {
     serde_json::to_string(&ConnectorCapabilities {
         supports_block_updates: true,
+        supports_entity_body_updates: false,
         supports_databases: true,
         supports_oauth: true,
         supports_remote_observation: true,
@@ -17130,10 +17708,13 @@ fn main() {
             create_workspace_mount,
             create_desktop_mount,
             connect_granola,
+            connect_linear,
             reset_source_state,
             disconnect_source,
             export_source_backup,
             run_workspace_mount_onboarding,
+            file_provider_enablement_status,
+            reveal_file_provider_enablement,
             install_agent_guidance,
             locate_notion_page,
             search_notion_pages,

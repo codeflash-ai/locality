@@ -23,6 +23,7 @@ The `loc` command is the single supported control surface for users and coding a
 - `loc search <query> [--connector <connector>] [--limit <n>] [--json]`
 - `loc locate <query>`
 - `loc create page --title <title> [--parent <dir>] [--private] [--json]`
+- `loc create database --title <title> [--parent <page-dir>] [--json]`
 - `loc templates list|validate|new|apply [args] [--json]`
 - `loc okf export <path> --out <dir> [--json]`
 - `loc inspect <path> [--json]`
@@ -292,6 +293,34 @@ creates:
 ```text
 ~/Library/CloudStorage/Locality/notion/go-to-market/Launch Plan/page.md
 ```
+
+`loc create database --title <title> [--parent <page-dir>]` creates an
+untracked database directory containing an editable `_schema.yaml` draft. The
+parent must be an existing writable Notion page directory. This command stages
+the same shape in Locality's content cache for virtual projections.
+
+```bash
+loc create database --title "Tasks" --parent ~/Library/CloudStorage/Locality/notion/Product
+```
+
+The generated draft has one initial data source and one title property:
+
+```yaml
+loc:
+  type: notion_database_schema
+title: "Tasks"
+data_sources:
+  - name: Rows
+    properties:
+      Name:
+        type: title
+```
+
+Edit this draft to add supported properties, inspect it with `loc diff`, then
+run `loc push -y` on `_schema.yaml` or its containing directory. On success,
+Locality replaces the draft with the canonical generated schema containing the
+Notion database, data-source, property, and option IDs. Schemas for already
+tracked databases remain generated and read-only.
 
 For Notion mounts, `--private` marks the draft so `loc push` creates it with a
 workspace parent, which Notion places in the user's Private section:
@@ -730,6 +759,11 @@ the path through Locality state, compares the current Markdown projection agains
 the synced shadow, and prints the planned connector mutations plus a readable
 unified diff when file content changed.
 
+For frontmatter reference fields rendered as hyphenated UUIDs, `loc diff`
+compares exact UUID references and `Label <uuid>` references by UUID. This keeps
+label-only reference refreshes from surfacing as user edits while still planning
+updates when the referenced UUID changes.
+
 `loc push <path>` uses the same planning path and, unless `-y`/`--yes` or
 `--confirm` already covers the plan, asks for explicit approval before applying
 remote mutations. Once a push is journaled, Locality stores linked edit metadata
@@ -877,11 +911,15 @@ hint for each entry that has a saved diff.
 - `prepared` entries become `reverted` because no remote mutation has started;
 - `reverted` entries return `already_reverted`;
 - `applied` and `reconciled` entries derive an `undo_plan` from journaled preimages and apply effects;
-- complete plans are handed to the connector reverse-apply hook, then marked `reverted` on success;
-- Notion reverse apply supports block content restore, archiving journaled created blocks/entities, and restoring archived block content by appending a replacement at the original position when the public API cannot unarchive the original block;
+- complete plans are handed to the connector reverse-apply hook only when the target is still the latest non-reverted journal for every affected, preimage, and entity-operation ID;
+- connector apply results must report every entity required for local reconciliation as changed. Missing IDs, invalid entity observations, dirty local projections, pending virtual mutations, and cache or visible-provider destination collisions fail closed without marking the journal reverted;
+- successful virtual-projection undo updates the daemon cache and entity index, then refreshes the old and new provider containers instead of replaying the remote undo as a local filesystem move or delete;
+- Notion reverse apply supports block content and property restore, archiving journaled created blocks/entities, restoring archived entities when a complete identity preimage is available, and restoring archived block content by appending a replacement at the original position when the public API cannot unarchive the original block;
 - `applying` and `failed` entries return `undo_unsafe_journal_status` because partial remote effects may still be in flight or unknown.
 
-Undo plans are `complete`, `partial`, or `blocked`. Complete plans currently include reverse operations for block updates, block moves, archived blocks, appended blocks with journaled created IDs, and created entities with journaled created IDs. Property updates and archived entities remain explicitly unsupported until richer property/entity preimages are journaled.
+Undo plans are `complete`, `partial`, or `blocked`. Complete plans can include reverse operations for block updates, block moves, archived blocks, appended blocks with journaled created IDs, whole-entity body updates, property updates, entity moves, archived entities with complete identity preimages and expected archived postimages, and created entities with journaled created IDs. Whole-entity body reverse apply is connector-specific and remains unsupported by Notion's block API.
+
+Notion entity-location undo currently records the previous parent ID and title but not the previous parent kind. Current real Notion shadows also omit `loc.parent`, so ordinary real move journals are blocked while deriving the undo plan. When a complete preimage carries a previous parent ID, Notion reverse apply restores page parents directly and database-row parents by resolving the database's single data source; workspace parents remain unsupported until the journal payload carries enough parent context.
 
 ## Manual / Live Verification
 
