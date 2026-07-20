@@ -295,8 +295,8 @@ fn apply_move_updates_issue_team_and_status_and_reports_moved_effect() {
             entity_id: RemoteId::new("issue-1"),
             new_parent_id: RemoteId::new("team-state:team-2:state-2"),
             new_parent_kind: EntityKind::Directory,
-            new_title: "Improve sync".to_string(),
-            projected_path: "Teams/Platform/Issues/Done/ENG-1 Improve sync/page.md".into(),
+            new_title: "Edited issue title".to_string(),
+            projected_path: "Teams/Platform/Issues/Done/ENG-1 Edited issue title/page.md".into(),
         }],
     );
     let push_id = PushId("push-1".to_string());
@@ -331,7 +331,7 @@ fn apply_move_updates_issue_team_and_status_and_reports_moved_effect() {
         api.updates.lock().unwrap().as_slice(),
         &[LinearIssueUpdateInput {
             issue_id: "issue-1".to_string(),
-            title: None,
+            title: Some("Edited issue title".to_string()),
             description: None,
             team_id: Some("team-2".to_string()),
             state_id: Some("state-2".to_string()),

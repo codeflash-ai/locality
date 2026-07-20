@@ -2677,9 +2677,12 @@ fn linear_move_reconciliation_uses_refreshed_canonical_path() {
     let cache =
         virtual_fs_content_path(&state_root, &mount_id, &projected_path).expect("cache path");
     fs::create_dir_all(cache.parent().expect("cache parent")).expect("cache parent");
+    let edited_frontmatter = rendered
+        .frontmatter
+        .replace("title: \"Improve sync\"", "title: \"Improve sync renamed\"");
     fs::write(
         &cache,
-        render_canonical_markdown(&CanonicalDocument::new(rendered.frontmatter, rendered.body)),
+        render_canonical_markdown(&CanonicalDocument::new(edited_frontmatter, rendered.body)),
     )
     .expect("write cache");
     store
@@ -2719,7 +2722,7 @@ fn linear_move_reconciliation_uses_refreshed_canonical_path() {
         api.updates.lock().unwrap().as_slice(),
         &[LinearIssueUpdateInput {
             issue_id: "issue-1".to_string(),
-            title: None,
+            title: Some("Improve sync renamed".to_string()),
             description: None,
             team_id: Some("team-2".to_string()),
             state_id: Some("state-2".to_string()),
@@ -2733,7 +2736,7 @@ fn linear_move_reconciliation_uses_refreshed_canonical_path() {
         .expect("issue");
     assert_eq!(
         entity.path,
-        PathBuf::from("Teams/Platform/Issues/Done/PLAT-9 Improve sync/page.md")
+        PathBuf::from("Teams/Platform/Issues/Done/PLAT-9 Improve sync renamed/page.md")
     );
     assert!(
         store

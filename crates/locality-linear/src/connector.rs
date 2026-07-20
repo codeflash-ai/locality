@@ -271,6 +271,7 @@ impl Connector for LinearConnector {
                 PushOperation::MoveEntity {
                     entity_id,
                     new_parent_id,
+                    new_title,
                     ..
                 } => {
                     let (team_id, state_id) =
@@ -281,6 +282,7 @@ impl Connector for LinearConnector {
                             )
                         })?;
                     let update = update_for(&mut updates, entity_id);
+                    update.title = Some(new_title.clone());
                     update.team_id = Some(team_id.to_string());
                     update.state_id = Some(state_id.to_string());
                     effects.push(JournalApplyEffect::MovedEntity {
