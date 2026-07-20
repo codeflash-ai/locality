@@ -14,11 +14,14 @@ use locality_core::model::{
 use locality_core::portable::{ChangesetId, PrincipalId, SessionId, SourceAction, TenantId};
 use locality_protocol::{
     CHANGESET_ENVELOPE_GOLDEN_JSON, COMPONENT_VERSIONS, ChangesetEnvelope, ChangesetReceipt,
-    ChangesetState, ChangesetStatus, ChangesetStatusRequest, ReplicaExportFrame,
-    ReplicaExportRequest, SessionCapability, SessionGrant, SessionRequest,
+    ChangesetState, ChangesetStatus, ChangesetStatusRequest, FreshnessRequirement,
+    OpaqueBootstrapExchangeRequest, OpaqueSessionStatusRequest, ReplicaExportFrame,
+    ReplicaExportRequest, SandboxSessionState, SandboxSessionStatus, SessionCapability,
+    SessionGrant, SessionRequest, StaleSessionBehavior,
 };
 use localityd::remote_truth::{
-    BackendReplica, DirectSourceReplica, RemoteTruthAuthority, RemoteTruthProvider, ReplicaService,
+    BackendReplica, DirectSourceReplica, OpaqueReplicaSessionService, RemoteTruthAuthority,
+    RemoteTruthProvider, ReplicaService,
 };
 
 #[derive(Clone)]
@@ -185,6 +188,43 @@ impl ReplicaService for RecordingReplicaService {
     }
 }
 
+impl OpaqueReplicaSessionService for RecordingReplicaService {
+    type Error = &'static str;
+
+    fn exchange_bootstrap(
+        &self,
+        _request: OpaqueBootstrapExchangeRequest,
+    ) -> Result<SessionCapability, Self::Error> {
+        self.calls.set(self.calls.get() + 1);
+        Ok(SessionCapability {
+            session_id: SessionId::new("backend-session"),
+            opaque_capability: "secret-capability".to_string(),
+            expires_at: "2026-07-19T13:00:00Z".to_string(),
+        })
+    }
+
+    fn session_status(
+        &self,
+        _request: OpaqueSessionStatusRequest,
+    ) -> Result<SandboxSessionStatus, Self::Error> {
+        self.calls.set(self.calls.get() + 1);
+        Ok(SandboxSessionStatus {
+            versions: COMPONENT_VERSIONS,
+            session_id: SessionId::new("backend-session"),
+            state: SandboxSessionState::Ready,
+            freshness_requirement: FreshnessRequirement {
+                max_age_seconds: 300,
+                on_stale: StaleSessionBehavior::WaitThenFail,
+                wait_timeout_seconds: 30,
+            },
+            replicas: Vec::new(),
+            export_offer: None,
+            error: None,
+            updated_at: "2026-07-19T12:00:00Z".to_string(),
+        })
+    }
+}
+
 #[test]
 fn backend_replica_uses_only_replica_service_authority() {
     let connector = RecordingDirectConnector {
@@ -234,6 +274,40 @@ fn backend_replica_uses_only_replica_service_authority() {
 
     assert_eq!(receipt.state, ChangesetState::Received);
     assert_eq!(service.calls.get(), 4);
+    assert_eq!(
+        connector.enumerations.get(),
+        0,
+        "backend must not fall back"
+    );
+}
+
+#[test]
+fn backend_replica_exchanges_only_opaque_session_authority() {
+    let connector = RecordingDirectConnector {
+        execution_policy: ConnectorExecutionPolicy::Inline,
+        enumerations: Cell::new(0),
+    };
+    let service = RecordingReplicaService {
+        calls: Cell::new(0),
+    };
+    let provider = BackendReplica::new(&service);
+
+    let capability = provider
+        .service()
+        .exchange_bootstrap(OpaqueBootstrapExchangeRequest {
+            bootstrap_token: "one-time-secret".to_string(),
+        })
+        .expect("token-only exchange");
+    let status = provider
+        .service()
+        .session_status(OpaqueSessionStatusRequest {
+            opaque_capability: capability.opaque_capability,
+        })
+        .expect("capability-only status");
+
+    assert_eq!(status.session_id, SessionId::new("backend-session"));
+    assert_eq!(status.state, SandboxSessionState::Ready);
+    assert_eq!(service.calls.get(), 2);
     assert_eq!(
         connector.enumerations.get(),
         0,

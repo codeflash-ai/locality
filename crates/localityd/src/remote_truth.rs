@@ -9,7 +9,8 @@ use std::io::Read;
 use locality_connector::Connector;
 use locality_protocol::{
     ChangesetEnvelope, ChangesetReceipt, ChangesetStatus, ChangesetStatusRequest,
-    ReplicaExportFrame, ReplicaExportRequest, SessionGrant, SessionRequest,
+    OpaqueBootstrapExchangeRequest, OpaqueSessionStatusRequest, ReplicaExportFrame,
+    ReplicaExportRequest, SandboxSessionStatus, SessionCapability, SessionGrant, SessionRequest,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +46,27 @@ pub trait ReplicaService {
         &self,
         request: ChangesetStatusRequest,
     ) -> Result<ChangesetStatus, Self::Error>;
+}
+
+/// Token-only Phase 1 session port for an untrusted sandbox client.
+///
+/// This is additive to [`ReplicaService`] so older desktop and headless hosts
+/// keep compiling while hosted clients migrate away from the legacy
+/// client-constructed [`SessionRequest`]. Tenant, actor, workload, profile,
+/// roots, filters, and actions are sealed before the bootstrap token is issued
+/// and cannot be supplied through this port.
+pub trait OpaqueReplicaSessionService {
+    type Error;
+
+    fn exchange_bootstrap(
+        &self,
+        request: OpaqueBootstrapExchangeRequest,
+    ) -> Result<SessionCapability, Self::Error>;
+
+    fn session_status(
+        &self,
+        request: OpaqueSessionStatusRequest,
+    ) -> Result<SandboxSessionStatus, Self::Error>;
 }
 
 /// Wire encodings accepted by the bounded replica archive materializer.
