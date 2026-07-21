@@ -83,7 +83,8 @@ fn mount_writes_linear_source_guidance() {
     assert!(agents.contains("# Locality Linear Mount"));
     assert!(agents.contains("projects Linear as local Markdown"));
     assert!(agents.contains("Linear facts:"));
-    assert!(agents.contains("Supported writes are issue description body edits"));
+    assert!(agents.contains("read-only lifecycle/date metadata"));
+    assert!(agents.contains("Supported writes are only issue description body edits"));
     assert!(agents.contains("including nested directories"));
 }
 
