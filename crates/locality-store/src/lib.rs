@@ -46,10 +46,11 @@ pub use records::{
 };
 pub use repository::{
     AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, ConnectorStateRepository,
-    EntityRepository, EntitySearchCandidate, EntitySearchRepository, FreshnessStateRepository,
-    HydrationJobRepository, JournalRepository, MetadataDiscoveryJobRepository,
-    MountLiveModeRepository, MountRepository, RemoteObservationRepository, ShadowRepository,
-    VirtualMoveRepository, VirtualMoveTransition, VirtualMutationRepository,
+    EntityRepository, EntitySearchCandidate, EntitySearchDocument, EntitySearchRepository,
+    FreshnessStateRepository, HydrationJobRepository, JournalRepository,
+    MetadataDiscoveryJobRepository, MountLiveModeRepository, MountRepository,
+    RemoteObservationRepository, ShadowRepository, VirtualMoveRepository, VirtualMoveTransition,
+    VirtualMutationRepository,
 };
 pub use reset::{
     LocalStateResetCredentialError, LocalStateResetError, LocalStateResetStorageReport,
