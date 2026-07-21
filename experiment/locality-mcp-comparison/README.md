@@ -96,6 +96,14 @@ ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
 
 By default this is a dry run. It writes a mounted page and runs `loc diff`, but does not push.
 
+Each Codex strategy has a hard timeout so a stalled `codex exec` records a failed phase instead of hanging the benchmark indefinitely. The default is 900 seconds per strategy. Override it with:
+
+```bash
+CODEX_EXEC_TIMEOUT_SECONDS=300 ./experiment/locality-mcp-comparison/run-agent-comparison.sh
+```
+
+Use `CODEX_EXEC_TIMEOUT_SECONDS=0` to disable the timeout.
+
 To publish:
 
 ```bash
@@ -130,11 +138,27 @@ Important artifacts:
 - `notion-mcp-report-body.md` - MCP report.
 - `locality-codex-events.jsonl` - timestamped Codex JSON events.
 - `notion-mcp-codex-events.jsonl` - timestamped Codex JSON events.
+- `locality-prompt.md` and `notion-mcp-prompt.md` - exact prompts used for the run.
+- `locality-codex-command.txt` and `notion-mcp-codex-command.txt` - exact `codex exec` command and timeout wrapper.
 - `locality-codex-summary.json` - event counts, usage, errors.
 - `notion-mcp-codex-summary.json` - event counts, usage, errors.
+- `locality-speedscope.json` and `notion-mcp-speedscope.json` - Speedscope-compatible flame graph files generated from the JSON events.
+- `locality-transcript.md` and `notion-mcp-transcript.md` - readable Codex event transcripts generated from the JSON events.
 - `locality-agent-trace.md` - agent-reported trace.
 - `notion-mcp-agent-trace.md` - agent-reported trace.
 - `loc-diff.out` - Locality push plan.
+
+Generate flame graph artifacts for a completed run with:
+
+```bash
+python3 experiment/locality-mcp-comparison/scripts/codex-events-to-trace.py \
+  experiment/runs/<run-id>/locality-codex-events.jsonl \
+  experiment/runs/<run-id>/locality
+
+python3 experiment/locality-mcp-comparison/scripts/codex-events-to-trace.py \
+  experiment/runs/<run-id>/notion-mcp-codex-events.jsonl \
+  experiment/runs/<run-id>/notion-mcp
+```
 
 ## Model Notes
 
