@@ -11,19 +11,21 @@ use locality_core::shadow::{ShadowDocument, rendered_bodies_equivalent, segment_
 use locality_core::validation::{ValidationIssue, ValidationReport};
 use locality_core::{LocalityError, LocalityResult};
 use locality_linear::{
-    LINEAR_CONNECTOR_ID, LinearConfig, LinearConnector, LinearNativeBundle, remote_version,
-    render_linear_issue,
+    LINEAR_CONNECTOR_ID, LinearAttachmentDownload, LinearConfig, LinearConnector,
+    LinearIssueContext, LinearIssueContextKind, LinearNativeBundle, attachment_local_path,
+    context_remote_version, remote_version, render_linear_issue, render_linear_issue_context,
 };
 use locality_store::{
     ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, CredentialError,
     CredentialStore, MountConfig,
 };
 
-use crate::hydration::{HydratedEntity, HydrationSource};
+use crate::hydration::{HydratedAsset, HydratedEntity, HydrationSource};
 use crate::notion::ConnectorResolveError;
 use crate::source::{SourceAdapter, SourcePushValidator, SourceValidationContext};
 
 pub(crate) const LINEAR_CONNECT_COMMAND: &str = "loc connect linear --api-key-stdin";
+const MAX_LINEAR_ATTACHMENT_DOWNLOAD_BYTES: u64 = 25 * 1024 * 1024;
 
 pub fn resolve_linear_connector_for_mount<S>(
     store: &S,
@@ -189,27 +191,28 @@ impl HydrationSource for LinearConnector {
         })?;
         let bundle = serde_json::from_slice::<LinearNativeBundle>(&native.raw)
             .map_err(|error| LocalityError::Io(format!("Linear native decode failed: {error}")))?;
-        let document = render_linear_issue(&bundle.issue)?;
-        let block_ids: Vec<RemoteId> = segment_markdown_body(&document.body, 1)
-            .into_iter()
-            .filter(|block| !block.is_directive())
-            .enumerate()
-            .map(|(index, _)| RemoteId::new(format!("{}:body:{index}", request.remote_id.0)))
-            .collect();
-        let shadow = ShadowDocument::from_synced_body(
-            request.remote_id.clone(),
-            document.body.clone(),
-            1,
-            block_ids,
+        if let Some(context) = bundle.context {
+            let mut context_value = context.context;
+            let assets = if context.kind == LinearIssueContextKind::Attachments {
+                download_linear_attachment_assets(self, &mut context_value)
+            } else {
+                Vec::new()
+            };
+            let document = render_linear_issue_context(&context_value, context.kind)?;
+            return hydrated_linear_document(
+                request,
+                document,
+                Some(context_remote_version(&context_value, context.kind)),
+                assets,
+            );
+        }
+
+        hydrated_linear_document(
+            request,
+            render_linear_issue(&bundle.issue)?,
+            Some(remote_version(&bundle.issue)),
+            Vec::new(),
         )
-        .map_err(|error| LocalityError::InvalidState(error.to_string()))?
-        .with_frontmatter(document.frontmatter.clone());
-        Ok(HydratedEntity {
-            document,
-            shadow,
-            remote_edited_at: Some(remote_version(&bundle.issue)),
-            assets: Vec::new(),
-        })
     }
 
     fn fetch_database_schema_yaml(
@@ -217,6 +220,326 @@ impl HydrationSource for LinearConnector {
         _database_id: &RemoteId,
     ) -> LocalityResult<Option<String>> {
         Ok(None)
+    }
+}
+
+fn hydrated_linear_document(
+    request: &HydrationRequest,
+    document: CanonicalDocument,
+    remote_edited_at: Option<String>,
+    assets: Vec<HydratedAsset>,
+) -> LocalityResult<HydratedEntity> {
+    let block_ids: Vec<RemoteId> = segment_markdown_body(&document.body, 1)
+        .into_iter()
+        .filter(|block| !block.is_directive())
+        .enumerate()
+        .map(|(index, _)| RemoteId::new(format!("{}:body:{index}", request.remote_id.0)))
+        .collect();
+    let shadow = ShadowDocument::from_synced_body(
+        request.remote_id.clone(),
+        document.body.clone(),
+        1,
+        block_ids,
+    )
+    .map_err(|error| LocalityError::InvalidState(error.to_string()))?
+    .with_frontmatter(document.frontmatter.clone());
+    Ok(HydratedEntity {
+        document,
+        shadow,
+        remote_edited_at,
+        assets,
+    })
+}
+
+fn download_linear_attachment_assets(
+    connector: &LinearConnector,
+    context: &mut LinearIssueContext,
+) -> Vec<HydratedAsset> {
+    let mut assets = Vec::new();
+    for attachment in &mut context.attachments {
+        if !is_http_url(&attachment.url) {
+            attachment.download = Some(LinearAttachmentDownload {
+                status: "skipped".to_string(),
+                local_path: None,
+                error: Some("only HTTP(S) attachment URLs can be downloaded".to_string()),
+            });
+            continue;
+        }
+        let local_path = attachment_local_path(
+            &context.issue_id,
+            &attachment.id,
+            &attachment.title,
+            &attachment.url,
+        );
+        match connector.download_attachment(&attachment.url, MAX_LINEAR_ATTACHMENT_DOWNLOAD_BYTES) {
+            Ok(bytes) => {
+                attachment.download = Some(LinearAttachmentDownload {
+                    status: "downloaded".to_string(),
+                    local_path: Some(local_path.to_string_lossy().replace('\\', "/")),
+                    error: None,
+                });
+                assets.push(HydratedAsset {
+                    path: local_path,
+                    bytes,
+                    media: None,
+                });
+            }
+            Err(error) => {
+                attachment.download = Some(LinearAttachmentDownload {
+                    status: if matches!(
+                        error,
+                        LocalityError::Guardrail(_) | LocalityError::Unsupported(_)
+                    ) {
+                        "skipped".to_string()
+                    } else {
+                        "failed".to_string()
+                    },
+                    local_path: None,
+                    error: Some(error.to_string()),
+                });
+            }
+        }
+    }
+    assets
+}
+
+fn is_http_url(url: &str) -> bool {
+    let lower = url.trim_start().to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    use locality_core::hydration::{HydrationReason, HydrationRequest};
+    use locality_core::model::{HydrationState, MountId};
+    use locality_linear::{
+        LinearApi, LinearAttachment, LinearComment, LinearIssue, LinearIssueContext,
+        LinearIssueHistoryEntry, LinearIssuePage, LinearIssuePriority, LinearIssueState,
+        LinearIssueUpdateInput, LinearLabel, LinearProject, LinearTeam, LinearUser,
+    };
+
+    use super::*;
+
+    #[test]
+    fn linear_hydration_downloads_attachment_sidecar_assets_and_renders_status() {
+        let issue = issue();
+        let context = issue_context(&issue);
+        let api = Arc::new(
+            FakeLinearApi::new(issue, context)
+                .with_download("https://files.linear.app/spec.pdf", b"pdf-bytes"),
+        );
+        let connector = LinearConnector::with_api(LinearConfig::new("secret"), api.clone());
+        let request = HydrationRequest::new(
+            MountId::new("linear-main"),
+            RemoteId::new("linear-context:issue-1:attachments"),
+            "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/attachments.md",
+            HydrationState::Hydrated,
+            HydrationReason::ExplicitPull,
+        );
+
+        let hydrated = connector.fetch_render(&request).expect("hydrate sidecar");
+
+        assert_eq!(hydrated.assets.len(), 1);
+        assert_eq!(hydrated.assets[0].bytes, b"pdf-bytes");
+        assert_eq!(
+            hydrated.assets[0].path,
+            attachment_local_path(
+                "issue-1",
+                "attach-file",
+                "Spec PDF",
+                "https://files.linear.app/spec.pdf"
+            )
+        );
+        assert!(
+            hydrated
+                .document
+                .body
+                .contains("- download_status: downloaded")
+        );
+        assert!(
+            hydrated
+                .document
+                .body
+                .contains("- download_status: skipped")
+        );
+        assert!(
+            hydrated
+                .document
+                .body
+                .contains("only HTTP(S) attachment URLs can be downloaded")
+        );
+        assert_eq!(
+            api.download_calls.lock().unwrap().as_slice(),
+            &["https://files.linear.app/spec.pdf".to_string()]
+        );
+    }
+
+    #[derive(Debug)]
+    struct FakeLinearApi {
+        issue: LinearIssue,
+        context: LinearIssueContext,
+        downloads: Mutex<BTreeMap<String, Vec<u8>>>,
+        download_calls: Mutex<Vec<String>>,
+    }
+
+    impl FakeLinearApi {
+        fn new(issue: LinearIssue, context: LinearIssueContext) -> Self {
+            Self {
+                issue,
+                context,
+                downloads: Mutex::new(BTreeMap::new()),
+                download_calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_download(self, url: &str, bytes: &[u8]) -> Self {
+            self.downloads
+                .lock()
+                .unwrap()
+                .insert(url.to_string(), bytes.to_vec());
+            self
+        }
+    }
+
+    impl LinearApi for FakeLinearApi {
+        fn list_issues(
+            &self,
+            _cursor: Option<&str>,
+            _updated_after: Option<&str>,
+            _team_id: Option<&str>,
+        ) -> LocalityResult<LinearIssuePage> {
+            Ok(LinearIssuePage {
+                issues: vec![self.issue.clone()],
+                has_next_page: false,
+                end_cursor: None,
+            })
+        }
+
+        fn get_issue(&self, issue_id: &str) -> LocalityResult<LinearIssue> {
+            if self.issue.id == issue_id {
+                Ok(self.issue.clone())
+            } else {
+                Err(LocalityError::RemoteNotFound(issue_id.to_string()))
+            }
+        }
+
+        fn get_issue_context(&self, issue_id: &str) -> LocalityResult<LinearIssueContext> {
+            if self.context.issue_id == issue_id {
+                Ok(self.context.clone())
+            } else {
+                Err(LocalityError::RemoteNotFound(issue_id.to_string()))
+            }
+        }
+
+        fn download_attachment(&self, url: &str, _max_bytes: u64) -> LocalityResult<Vec<u8>> {
+            self.download_calls.lock().unwrap().push(url.to_string());
+            self.downloads
+                .lock()
+                .unwrap()
+                .get(url)
+                .cloned()
+                .ok_or_else(|| LocalityError::Io("missing fake download".to_string()))
+        }
+
+        fn update_issue(&self, _input: LinearIssueUpdateInput) -> LocalityResult<LinearIssue> {
+            Err(LocalityError::Unsupported("fake Linear update"))
+        }
+    }
+
+    fn issue() -> LinearIssue {
+        LinearIssue {
+            id: "issue-1".to_string(),
+            identifier: "ENG-1".to_string(),
+            title: "Improve sync".to_string(),
+            description: Some("Existing description.".to_string()),
+            url: "https://linear.app/acme/issue/ENG-1/improve-sync".to_string(),
+            created_at: "2026-07-14T12:00:00Z".to_string(),
+            updated_at: "2026-07-15T12:00:00Z".to_string(),
+            archived_at: None,
+            started_at: None,
+            completed_at: None,
+            canceled_at: None,
+            auto_archived_at: None,
+            auto_closed_at: None,
+            started_triage_at: None,
+            triaged_at: None,
+            snoozed_until_at: None,
+            added_to_cycle_at: None,
+            added_to_project_at: None,
+            added_to_team_at: None,
+            due_date: None,
+            priority: Some(LinearIssuePriority {
+                value: 3,
+                label: "High".to_string(),
+            }),
+            estimate: Some(3.0),
+            team: LinearTeam {
+                id: "team-1".to_string(),
+                key: "ENG".to_string(),
+                name: "Engineering".to_string(),
+            },
+            state: LinearIssueState {
+                id: "state-1".to_string(),
+                name: "Todo".to_string(),
+                state_type: Some("unstarted".to_string()),
+            },
+            project: Some(LinearProject {
+                id: "project-1".to_string(),
+                name: "Launch".to_string(),
+            }),
+            assignee: Some(LinearUser {
+                id: "user-1".to_string(),
+                name: "Ada".to_string(),
+                email: Some("ada@example.com".to_string()),
+            }),
+            labels: vec![LinearLabel {
+                id: "label-1".to_string(),
+                name: "Bug".to_string(),
+            }],
+        }
+    }
+
+    fn issue_context(issue: &LinearIssue) -> LinearIssueContext {
+        LinearIssueContext {
+            issue_id: issue.id.clone(),
+            issue_identifier: issue.identifier.clone(),
+            issue_title: issue.title.clone(),
+            issue_updated_at: issue.updated_at.clone(),
+            branch_name: "eng-1-improve-sync".to_string(),
+            comments: Vec::<LinearComment>::new(),
+            attachments: vec![
+                LinearAttachment {
+                    id: "attach-file".to_string(),
+                    title: "Spec PDF".to_string(),
+                    url: "https://files.linear.app/spec.pdf".to_string(),
+                    created_at: "2026-07-15T14:00:00Z".to_string(),
+                    updated_at: "2026-07-15T14:00:00Z".to_string(),
+                    source_type: Some("url".to_string()),
+                    subtitle: Some("Spec".to_string()),
+                    creator: issue.assignee.clone(),
+                    external_user_creator: None,
+                    metadata: serde_json::json!({ "kind": "file" }),
+                    download: None,
+                },
+                LinearAttachment {
+                    id: "attach-skip".to_string(),
+                    title: "Local file".to_string(),
+                    url: "file:///tmp/spec.pdf".to_string(),
+                    created_at: "2026-07-15T15:00:00Z".to_string(),
+                    updated_at: "2026-07-15T15:00:00Z".to_string(),
+                    source_type: Some("url".to_string()),
+                    subtitle: None,
+                    creator: None,
+                    external_user_creator: None,
+                    metadata: serde_json::json!({}),
+                    download: None,
+                },
+            ],
+            history: Vec::<LinearIssueHistoryEntry>::new(),
+        }
     }
 }
 

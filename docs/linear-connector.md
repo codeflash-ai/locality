@@ -36,6 +36,10 @@ Teams/
       Todo/
         ENG-1 Improve sync/
           page.md
+          comments.md
+          attachments.md
+          pull-requests.md
+          history.md
 ```
 
 `Teams`, `Issues`, and status directories are metadata containers. Team
@@ -47,6 +51,25 @@ canonical Markdown with Linear reference fields in frontmatter and the Linear
 issue description as the body. Rendered references use the `Label <id>` shape so
 local diff can ignore label-only refreshes while preserving the stable Linear
 UUID.
+
+`page.md` remains the only editable issue body. The generated sidecars are
+read-only `loc.type: asset` Markdown files with `loc.connector: linear`,
+`linear.issue_id`, `linear.issue_identifier`, `linear.context`, and
+`linear.read_only: true` frontmatter:
+
+- `comments.md` contains all paginated issue comments in creation order,
+  including author, URL, timestamps, parent/resolution metadata when present,
+  and the comment Markdown body.
+- `attachments.md` contains all paginated issue attachments in creation order,
+  including title, URL, source type, timestamps, creator, subtitle, download
+  status, and stable pretty-printed raw metadata JSON.
+- `pull-requests.md` is derived from GitHub/GitLab-like attachments and
+  pull-request-shaped attachment metadata. It also renders Linear's suggested
+  `branchName` even when no pull request attachment exists.
+- `history.md` contains all paginated issue history entries in creation order,
+  not only status changes. It renders actor, state, title, assignee, project,
+  team, labels, due date, estimate, priority, description updates, attachment
+  changes, and raw `changes` JSON when Linear provides it.
 
 Rendered issue frontmatter also includes read-only lifecycle and date metadata:
 `created_at`, `updated_at`, `archived_at`, `started_at`, `completed_at`,
@@ -61,8 +84,11 @@ The connector currently supports:
 
 - full issue enumeration;
 - lazy root/team child listing;
+- lazy issue sidecar listing;
 - single-issue observation and batch observation;
 - issue fetch/render;
+- generated comments, attachments, pull request, and history sidecar
+  fetch/render;
 - whole-entity body updates mapped to Linear issue descriptions;
 - property updates for title, status, project, and assignee;
 - moving issue folders into another `Teams/<team>/Issues/<status>/` folder to
@@ -71,6 +97,30 @@ The connector currently supports:
 Unsupported properties, including lifecycle/date metadata, fail closed before
 remote mutation. Undo, issue creates, and deletes remain future work for the
 native connector.
+
+Sidecar remote ids use `linear-context:<issue_id>:comments`,
+`linear-context:<issue_id>:attachments`,
+`linear-context:<issue_id>:pull-requests`, and
+`linear-context:<issue_id>:history`. Apply and concurrency checks reject these
+ids as read-only before any `issueUpdate` mutation is attempted.
+
+## Attachments
+
+Linear issue attachments are external links. During hydration of
+`attachments.md`, Locality best-effort downloads HTTP(S) attachment URLs capped
+at 25 MB per attachment into:
+
+```text
+.loc/linear/attachments/<issue-id>/<stable-file-name>
+```
+
+Download failures and skipped downloads do not fail hydration. The attachment
+entry keeps the remote URL and renders `download_status`, `local_path` when a
+download succeeds, and `download_error` when a download is skipped or fails.
+Linear-hosted and same-GraphQL-host download URLs receive the Linear API key;
+third-party URLs are fetched without sending the Linear token.
+Stale files in the same issue attachment cache are pruned when a later
+hydration writes replacement assets for that issue.
 
 ## Daemon Integration
 
@@ -82,9 +132,10 @@ and tells agents to preserve UUID references in editable frontmatter.
 The descriptor uses whole-entity body diffs because Linear issue descriptions
 are updated as a single remote field. Local creates are rejected by the source
 policy for now; edits to existing issue files remain writable unless the mount
-itself is read-only. Moves are writable only when the destination parent is a
-status folder shaped as `Teams/<team>/Issues/<status>/`; arbitrary creates,
-renames, and moves at grouping levels stay read-only.
+itself is read-only. Generated sidecars are read-only even when the mount is
+writable. Moves are writable only when the destination parent is a status folder
+shaped as `Teams/<team>/Issues/<status>/`; arbitrary creates, renames, and
+moves at grouping levels stay read-only.
 
 Folder moves are applied through the same GraphQL `issueUpdate` mutation as
 frontmatter updates. The connector parses the destination status-folder remote
