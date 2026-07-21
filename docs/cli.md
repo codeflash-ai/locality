@@ -353,12 +353,8 @@ The flag is only valid for Notion mounts. Internal Notion integrations may still
 be rejected by Notion during push because workspace-private page creation
 requires a user-associated token.
 
-In virtual Notion workspace mounts, moving a projected page directory directly
-to the mount root records a normal pending page move with a workspace parent.
-This gives agents and file managers a safe root-move path without editing
-`.loc/state.sqlite3` or content-cache paths by hand. Direct non-private creates
-at the Notion mount root are still rejected; use `loc create page --private` for
-new workspace-private root pages.
+Direct filesystem creates and page moves at the Notion mount root are rejected;
+use `loc create page --private` for new workspace-private root pages.
 
 New page drafts are initialized with only new-page frontmatter:
 

@@ -4617,7 +4617,7 @@ fn apply_moves_page_then_updates_title() {
 }
 
 #[test]
-fn apply_moves_page_to_workspace_root_then_updates_title() {
+fn apply_rejects_move_page_to_workspace_root() {
     let api = Arc::new(RecordingNotionApi::with_page_properties(
         "2026-06-10T00:00:00.000Z",
         BTreeMap::from([("Name".to_string(), page_property("title"))]),
@@ -4637,7 +4637,7 @@ fn apply_moves_page_to_workspace_root_then_updates_title() {
     let operation_ids = operation_ids(&push_id, &plan);
     let mount_id = MountId::new("notion-main");
 
-    let result = connector
+    let error = connector
         .apply(ApplyPlanRequest {
             push_id: &push_id,
             mount_id: &mount_id,
@@ -4646,41 +4646,16 @@ fn apply_moves_page_to_workspace_root_then_updates_title() {
             remote_preconditions: &[],
             local_root: None,
         })
-        .expect("apply workspace root move");
+        .expect_err("workspace root move is unsupported");
 
-    assert_eq!(result.changed_remote_ids, vec![RemoteId::new("page-1")]);
-    assert_eq!(
-        result.effects,
-        vec![JournalApplyEffect::MovedEntity {
-            operation_id: operation_ids[0].clone(),
-            operation_index: 0,
-            entity_id: RemoteId::new("page-1"),
-            parent_id: RemoteId::new("workspace"),
-        }]
-    );
+    assert!(matches!(
+        error,
+        LocalityError::Unsupported(
+            "Notion pages cannot be moved to the workspace root through the Notion move API"
+        )
+    ));
     let writes = api.writes.lock().expect("writes").clone();
-    assert_eq!(
-        writes,
-        vec![
-            WriteCall::MovePage {
-                page_id: "page-1".to_string(),
-                parent: json!({
-                    "type": "workspace",
-                    "workspace": true,
-                }),
-            },
-            WriteCall::UpdatePage {
-                page_id: "page-1".to_string(),
-                body: json!({
-                    "properties": {
-                        "Name": {
-                            "title": rich_text_json("Grocery SF Checklist"),
-                        },
-                    },
-                }),
-            },
-        ]
-    );
+    assert!(writes.is_empty());
 }
 
 #[test]

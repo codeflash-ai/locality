@@ -1516,10 +1516,7 @@ fn move_page_parent_body(
     parent_kind: &locality_core::model::EntityKind,
 ) -> LocalityResult<Value> {
     if is_workspace_root_parent(parent_id, parent_kind) {
-        return Ok(json!({
-            "type": "workspace",
-            "workspace": true,
-        }));
+        return Err(unsupported_workspace_root_move());
     }
 
     if matches!(parent_kind, locality_core::model::EntityKind::Page) {
@@ -1549,10 +1546,7 @@ fn move_page_parent_body(
 
 fn undo_move_page_parent_body(api: &dyn NotionApi, parent_id: &RemoteId) -> LocalityResult<Value> {
     if parent_id.as_str() == WORKSPACE_ROOT_PARENT_ID {
-        return Ok(json!({
-            "type": "workspace",
-            "workspace": true,
-        }));
+        return Err(unsupported_workspace_root_move());
     }
 
     match api.retrieve_database(parent_id.as_str()) {
@@ -1595,7 +1589,7 @@ fn page_parent_matches_requested(
     };
 
     if is_workspace_root_parent(parent_id, parent_kind) {
-        return Ok(parent.workspace == Some(true) || parent.kind == "workspace");
+        return Err(unsupported_workspace_root_move());
     }
 
     if matches!(parent_kind, locality_core::model::EntityKind::Page) {
@@ -1624,6 +1618,12 @@ fn is_workspace_root_parent(
 ) -> bool {
     matches!(parent_kind, locality_core::model::EntityKind::Directory)
         && parent_id.as_str() == WORKSPACE_ROOT_PARENT_ID
+}
+
+fn unsupported_workspace_root_move() -> LocalityError {
+    LocalityError::Unsupported(
+        "Notion pages cannot be moved to the workspace root through the Notion move API",
+    )
 }
 
 fn create_properties_body(

@@ -1540,7 +1540,7 @@ fn prepare_push_plans_pending_page_directory_move_as_move_entity() {
 }
 
 #[test]
-fn prepare_push_plans_notion_workspace_root_move_as_move_entity() {
+fn prepare_push_rejects_notion_workspace_root_move_mutation() {
     let fixture = PrepareFixture::new();
     let mut store = fixture.virtual_store("notion");
     store
@@ -1607,26 +1607,20 @@ fn prepare_push_plans_notion_workspace_root_move_as_move_entity() {
         })
         .expect("save root move mutation");
 
-    let prepared = prepare_push(
+    let error = prepare_push(
         &store,
         &job(fixture.root.join("Grocery SF Checklist")),
         Some(&fixture.state_root),
         &LocalSourceValidator,
     )
-    .expect("prepare root move");
-    let plan = prepared.pipeline.plan.expect("plan");
+    .expect_err("prepare root move is rejected");
 
-    assert_eq!(
-        plan.operations,
-        vec![PushOperation::MoveEntity {
-            entity_id: RemoteId::new("page-grocery"),
-            new_parent_id: RemoteId::new("workspace"),
-            new_parent_kind: EntityKind::Directory,
-            new_title: "Grocery SF Checklist".to_string(),
-            projected_path: PathBuf::from("Grocery SF Checklist/page.md"),
-        }]
-    );
-    assert_eq!(plan.summary.entities_moved, 1);
+    assert!(matches!(
+        error,
+        PushPrepareError::Core(LocalityError::Unsupported(
+            "Notion pages cannot be moved to the workspace root through the Notion move API"
+        ))
+    ));
 }
 
 #[test]

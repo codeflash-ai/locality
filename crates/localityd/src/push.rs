@@ -2670,8 +2670,10 @@ fn pending_create_parent_entity<S>(
 where
     S: EntityRepository,
 {
-    if let Some(parent) = workspace_root_move_parent_entity(mount, parent_id) {
-        return Ok(parent);
+    if is_unsupported_notion_workspace_root_parent(mount, parent_id) {
+        return Err(PushPrepareError::Core(LocalityError::Unsupported(
+            "Notion pages cannot be moved to the workspace root through the Notion move API",
+        )));
     }
 
     if let Some(parent) = store
@@ -2700,19 +2702,10 @@ where
     }))
 }
 
-fn workspace_root_move_parent_entity(
-    mount: &MountConfig,
-    parent_id: &RemoteId,
-) -> Option<EntityRecord> {
-    if mount.remote_root_id.is_none()
+fn is_unsupported_notion_workspace_root_parent(mount: &MountConfig, parent_id: &RemoteId) -> bool {
+    mount.connector == "notion"
+        && mount.remote_root_id.is_none()
         && parent_id == &workspace_parent_id(mount)
-        && source_descriptor(&mount.connector)
-            .workspace_root_move_parent_kind()
-            .is_some()
-    {
-        return Some(workspace_create_parent(mount));
-    }
-    None
 }
 
 fn move_parent_entity_for_mutation<S>(

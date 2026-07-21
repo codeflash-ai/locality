@@ -4087,7 +4087,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_macos_file_provider_domain_children_reflect_source_root_write_policy() {
+    fn shared_macos_file_provider_domain_children_reflect_source_root_create_policy() {
         let mut store = InMemoryStateStore::new();
         store
             .save_mount(
@@ -4124,7 +4124,7 @@ mod tests {
             .iter()
             .find(|child| child.mount_id == "google-docs-main")
             .expect("google docs mount");
-        assert!(!notion.item.read_only);
+        assert!(notion.item.read_only);
         assert!(!google_docs.item.read_only);
     }
 
