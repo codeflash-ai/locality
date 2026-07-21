@@ -53,6 +53,7 @@ fn mount_writes_agent_guidance_and_claude_alias() {
     assert!(agents.contains("Locality hydrates online-only files on open"));
     assert!(agents.contains("loc status <path>"));
     assert!(agents.contains("loc diff <path>"));
+    assert!(agents.contains("loc mv <source> <dest>"));
     assert!(agents.contains("Use `loc push <path>` to make Notion match local edits"));
     assert!(agents.contains("If desktop Live Mode is on"));
     assert!(agents.contains("Do not run routine `loc pull` or `loc push`"));

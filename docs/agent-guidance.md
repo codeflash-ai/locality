@@ -31,6 +31,7 @@ The skill tells agents:
 - Agents should edit Markdown files directly and leave changes pending for Locality review unless the user asks them to sync back to Notion.
 - Agents should not edit Locality identity frontmatter, block IDs, `::loc{...}` directives, `_schema.yaml`, `AGENTS.md`, or `CLAUDE.md` unless explicitly asked.
 - For Notion, agents should read the mount-local `AGENTS.md` for the concrete page and row creation contract. Prefer `loc create page --title "New Page" --parent <parent-directory>` for new pages, and add `--private` when the remote page should be created in Notion's Private section; manually, pages are directories, a new child page is created by writing `parent-page/new-page/page.md`, new page frontmatter needs `title: "..."`, and generated `loc:` identity frontmatter is omitted until Locality adds it after push.
+- Agents should use `loc mv <source> <dest>` for intentional page/file moves or renames in mounted Locality content, then inspect with `loc status` or `loc diff`.
 - `loc status` is optional and only needed when the agent needs to inspect pending changes.
 - If desktop Live Mode is on, agents should expect safe local edits and clean remote changes to sync in the background. They should not run routine `loc pull` or `loc push` after every edit.
 - If the user asks the agent to sync back to Notion, update Notion, publish, or apply the edit remotely, the agent should not stop after local edits. The safe sequence is `loc diff <file>`, then `loc push <file> -y` for safe plans.

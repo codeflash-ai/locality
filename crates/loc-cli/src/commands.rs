@@ -101,6 +101,7 @@ use crate::local_oauth::{
     run_local_oauth_authorization,
 };
 use crate::mount::{MountError, MountOptions, MountReport, run_mount};
+use crate::mv::{MvError, MvOptions, MvReport, run_mv_with_daemon_at_state_root};
 use crate::okf::{OkfExportError, OkfExportOptions, OkfExportReport, run_okf_export};
 use crate::pull::{PullError, PullReport, run_pull_with_state_root};
 use crate::push::{
@@ -217,6 +218,8 @@ enum LocalityCommand {
     Push(PushArgs),
     #[command(about = "Preview the push plan for local changes")]
     Diff(RequiredPathArg),
+    #[command(about = "Move or rename mounted content locally without pushing")]
+    Mv(MvArgs),
     #[command(about = "Undo a reconciled push using its journal entry")]
     Undo(UndoArgs),
     #[command(about = "List push journal entries")]
@@ -732,6 +735,17 @@ struct RequiredPathArg {
 }
 
 #[derive(Debug, Args)]
+struct MvArgs {
+    #[arg(value_name = "source", help = "Source path inside a Locality mount.")]
+    source: String,
+    #[arg(
+        value_name = "dest",
+        help = "Destination path inside the same Locality mount."
+    )]
+    destination: String,
+}
+
+#[derive(Debug, Args)]
 struct PushArgs {
     #[arg(value_name = "path", help = "File or directory scope to push.")]
     path: String,
@@ -1091,6 +1105,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         LocalityCommand::Pull(_) => pull(&legacy_args[1..], json),
         LocalityCommand::Push(_) => push(&legacy_args[1..], json),
         LocalityCommand::Diff(_) => diff(&legacy_args[1..], json),
+        LocalityCommand::Mv(_) => mv(&legacy_args[1..], json),
         LocalityCommand::Restore(_) => restore(&legacy_args[1..], json),
         LocalityCommand::Reset(_) => reset(&legacy_args[1..], json),
         LocalityCommand::Undo(_) => undo(&legacy_args[1..], json),
@@ -1486,6 +1501,11 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
         LocalityCommand::Diff(options) => {
             args.push("diff".to_string());
             args.push(options.path.clone());
+        }
+        LocalityCommand::Mv(options) => {
+            args.push("mv".to_string());
+            args.push(options.source.clone());
+            args.push(options.destination.clone());
         }
         LocalityCommand::Undo(options) => {
             args.push("undo".to_string());
@@ -6010,6 +6030,54 @@ fn diff(args: &[String], json: bool) -> i32 {
     }
 }
 
+fn mv(args: &[String], json: bool) -> i32 {
+    let positionals = positional_args(args);
+    if positionals.len() != 2 {
+        return command_error(
+            json,
+            CommandError::new("mv", "usage", "usage: loc mv <source> <dest> [--json]"),
+            EXIT_USAGE,
+        );
+    }
+
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("mv", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let options = MvOptions {
+        source: PathBuf::from(&positionals[0]),
+        destination: PathBuf::from(&positionals[1]),
+        state_root: Some(state_root),
+    };
+
+    match run_mv_with_daemon_at_state_root(&mut store, options) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_mv_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => mv_command_error(json, error),
+    }
+}
+
+fn print_mv_report(report: &MvReport) {
+    println!("{}", report.message);
+    println!("next:");
+    for next in &report.next {
+        println!("  {next}");
+    }
+}
+
 fn print_log_report(report: &LogReport) {
     let mut output = io::stdout();
     let _ = write_log_report(report, &mut output);
@@ -8366,6 +8434,34 @@ fn mount_command_error(json: bool, error: MountError) -> i32 {
     command_error(
         json,
         CommandError::new("mount", error.code(), error.message()),
+        exit_code,
+    )
+}
+
+fn mv_command_error(json: bool, error: MvError) -> i32 {
+    let exit_code = match &error {
+        MvError::CurrentDir { .. }
+        | MvError::Store(_)
+        | MvError::Io { .. }
+        | MvError::DaemonError { .. }
+        | MvError::DaemonTimeout { .. }
+        | MvError::VirtualStateRootRequired => EXIT_INTERNAL,
+        MvError::ReadOnlyMount { .. } => 4,
+        MvError::MountNotFound { .. }
+        | MvError::CrossMount { .. }
+        | MvError::MountRootMove { .. }
+        | MvError::MissingSource(_)
+        | MvError::MissingDestinationParent(_)
+        | MvError::InvalidFilename { .. }
+        | MvError::DestinationExists(_)
+        | MvError::UnsupportedVirtualTarget { .. } => EXIT_VALIDATION,
+        MvError::Locality(LocalityError::NotImplemented(_))
+        | MvError::Locality(LocalityError::Unsupported(_)) => 5,
+        MvError::Locality(error) => locality_error_exit_code(error),
+    };
+    command_error(
+        json,
+        CommandError::new("mv", error.code(), error.message()),
         exit_code,
     )
 }
