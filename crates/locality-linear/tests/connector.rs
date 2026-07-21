@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use locality_connector::{
@@ -9,9 +10,11 @@ use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind, PushPlan};
 use locality_core::push::RemotePrecondition;
 use locality_linear::{
-    LinearApi, LinearConfig, LinearConnector, LinearIssue, LinearIssuePage, LinearIssuePriority,
-    LinearIssueState, LinearIssueUpdateInput, LinearLabel, LinearProject, LinearTeam, LinearUser,
-    render_linear_issue,
+    LinearApi, LinearAttachment, LinearAttachmentDownload, LinearComment, LinearConfig,
+    LinearConnector, LinearIssue, LinearIssueContext, LinearIssueContextKind,
+    LinearIssueHistoryEntry, LinearIssuePage, LinearIssuePriority, LinearIssueState,
+    LinearIssueUpdateInput, LinearLabel, LinearProject, LinearTeam, LinearUser,
+    linear_context_remote_id, render_linear_issue, render_linear_issue_context,
 };
 
 #[test]
@@ -57,19 +60,43 @@ fn enumeration_projects_teams_statuses_and_issues_into_stable_paths() {
                 "Teams/Engineering/Issues/Todo".to_string()
             ),
             (
+                "linear-context:issue-1:attachments".to_string(),
+                EntityKind::Asset,
+                "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/attachments.md".to_string()
+            ),
+            (
+                "linear-context:issue-1:comments".to_string(),
+                EntityKind::Asset,
+                "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/comments.md".to_string()
+            ),
+            (
+                "linear-context:issue-1:history".to_string(),
+                EntityKind::Asset,
+                "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/history.md".to_string()
+            ),
+            (
                 "issue-1".to_string(),
                 EntityKind::Page,
                 "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/page.md".to_string()
             ),
+            (
+                "linear-context:issue-1:pull-requests".to_string(),
+                EntityKind::Asset,
+                "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/pull-requests.md".to_string()
+            ),
         ]
     );
-    assert_eq!(entries[4].title, "Improve sync");
+    let issue_entry = entries
+        .iter()
+        .find(|entry| entry.remote_id.as_str() == "issue-1")
+        .expect("issue entry");
+    assert_eq!(issue_entry.title, "Improve sync");
     assert_eq!(
-        entries[4].remote_edited_at.as_deref(),
+        issue_entry.remote_edited_at.as_deref(),
         Some("linear:issue-1:2026-07-15T12:00:00Z")
     );
     assert!(
-        entries[4]
+        issue_entry
             .stub_frontmatter
             .as_deref()
             .unwrap()
@@ -140,6 +167,48 @@ fn list_hierarchical_children_returns_complete_snapshots() {
         entry_paths(&result.entries),
         vec!["Teams/Engineering/Issues/Todo/ENG-1 Improve sync/page.md"]
     );
+
+    let sidecars = connector
+        .list_children(ListChildrenRequest {
+            mount_id: MountId::new("linear-main"),
+            container: ChildContainer::PageChildren(RemoteId::new("issue-1")),
+            parent_path: "Teams/Engineering/Issues/Todo/ENG-1 Improve sync".into(),
+        })
+        .expect("list issue sidecars");
+    assert!(sidecars.is_complete());
+    assert_eq!(
+        sidecars
+            .entries
+            .iter()
+            .map(|entry| (
+                entry.remote_id.as_str().to_string(),
+                entry.kind.clone(),
+                entry.path.to_string_lossy().to_string()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "linear-context:issue-1:comments".to_string(),
+                EntityKind::Asset,
+                "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/comments.md".to_string()
+            ),
+            (
+                "linear-context:issue-1:attachments".to_string(),
+                EntityKind::Asset,
+                "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/attachments.md".to_string()
+            ),
+            (
+                "linear-context:issue-1:pull-requests".to_string(),
+                EntityKind::Asset,
+                "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/pull-requests.md".to_string()
+            ),
+            (
+                "linear-context:issue-1:history".to_string(),
+                EntityKind::Asset,
+                "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/history.md".to_string()
+            ),
+        ]
+    );
 }
 
 #[test]
@@ -151,6 +220,7 @@ fn capabilities_do_not_advertise_oauth_until_broker_flow_exists() {
 
     assert!(capabilities.supports_entity_body_updates);
     assert!(capabilities.supports_batch_observation);
+    assert!(capabilities.supports_media_download);
     assert!(!capabilities.supports_oauth);
     assert!(
         connector
@@ -235,6 +305,68 @@ fn rendering_quotes_populated_lifecycle_and_date_frontmatter() {
     assert_eq!(
         document.frontmatter,
         "loc:\n  id: issue-1\n  type: page\n  connector: linear\n  synced_at: \"2026-07-15T12:00:00Z\"\n  remote_edited_at: \"2026-07-15T12:00:00Z\"\ntitle: \"Improve sync\"\nidentifier: ENG-1\nurl: \"https://linear.app/acme/issue/ENG-1/improve-sync\"\ncreated_at: \"2026-07-14T12:00:00Z\"\nupdated_at: \"2026-07-15T12:00:00Z\"\narchived_at: \"2026-08-01T12:00:00Z\"\nstarted_at: \"2026-07-15T13:00:00Z\"\ncompleted_at: \"2026-07-20T10:00:00Z\"\ncanceled_at: \"2026-07-21T10:00:00Z\"\nauto_archived_at: \"2026-08-15T00:00:00Z\"\nauto_closed_at: \"2026-07-25T00:00:00Z\"\nstarted_triage_at: \"2026-07-14T13:00:00Z\"\ntriaged_at: \"2026-07-14T14:00:00Z\"\nsnoozed_until_at: \"2026-07-22T09:00:00Z\"\nadded_to_cycle_at: \"2026-07-14T15:00:00Z\"\nadded_to_project_at: \"2026-07-14T16:00:00Z\"\nadded_to_team_at: \"2026-07-14T17:00:00Z\"\ndue_date: \"2026-07-31\"\nStatus: \"Todo <state-1>\"\nTeam: \"Engineering <team-1>\"\nProject: \"Launch <project-1>\"\nAssignee: \"Ada <user-1>\"\nPriority: High\nEstimate: 3\nLabels:\n  - \"Bug <label-1>\"\n"
+    );
+}
+
+#[test]
+fn rendering_context_sidecars_uses_read_only_asset_frontmatter() {
+    let context = issue_context(&issue());
+
+    let document = render_linear_issue_context(&context, LinearIssueContextKind::Comments)
+        .expect("render comments");
+
+    assert_eq!(
+        document.frontmatter,
+        "loc:\n  id: \"linear-context:issue-1:comments\"\n  type: asset\n  connector: linear\n  synced_at: \"2026-07-15T12:00:00Z\"\n  remote_edited_at: \"2026-07-15T12:00:00Z\"\ntitle: \"ENG-1 Comments\"\nlinear:\n  issue_id: issue-1\n  issue_identifier: ENG-1\n  context: comments\n  read_only: true\n"
+    );
+    assert_eq!(
+        document.body,
+        "# Comments\n\n## 2026-07-15T13:00:00Z - Ada <user-1>\n\n- id: `comment-1`\n- url: https://linear.app/acme/issue/ENG-1/improve-sync#comment-comment-1\n- updated_at: 2026-07-15T13:05:00Z\n- edited_at: 2026-07-15T13:05:00Z\n\nLooks good.\n\n"
+    );
+}
+
+#[test]
+fn rendering_attachments_includes_download_status_and_metadata() {
+    let mut context = issue_context(&issue());
+    context.attachments[0].download = Some(LinearAttachmentDownload {
+        status: "failed".to_string(),
+        local_path: None,
+        error: Some("Linear attachment download returned HTTP 403".to_string()),
+    });
+
+    let document = render_linear_issue_context(&context, LinearIssueContextKind::Attachments)
+        .expect("render attachments");
+
+    assert_eq!(
+        document.body,
+        "# Attachments\n\n## GitHub PR #42\n\n- id: `attach-1`\n- url: https://github.com/acme/app/pull/42\n- source_type: github\n- created_at: 2026-07-15T14:00:00Z\n- updated_at: 2026-07-15T14:10:00Z\n- creator: Ada <user-1>\n- subtitle: Open pull request\n- download_status: failed\n- download_error: Linear attachment download returned HTTP 403\n- metadata:\n\n```json\n{\n  \"branch\": \"eng-1-improve-sync\",\n  \"number\": 42,\n  \"repository\": \"acme/app\",\n  \"status\": \"open\"\n}\n```\n\n"
+    );
+}
+
+#[test]
+fn rendering_pull_requests_includes_branch_even_without_pr_attachments() {
+    let mut context = issue_context(&issue());
+    context.attachments.clear();
+
+    let document = render_linear_issue_context(&context, LinearIssueContextKind::PullRequests)
+        .expect("render pull requests");
+
+    assert_eq!(
+        document.body,
+        "# Pull Requests\n\nSuggested branch: `eng-1-improve-sync`\n\n_No pull request attachments found._\n"
+    );
+}
+
+#[test]
+fn rendering_history_includes_all_supported_change_fields_and_raw_changes() {
+    let context = issue_context(&issue());
+
+    let document = render_linear_issue_context(&context, LinearIssueContextKind::History)
+        .expect("render history");
+
+    assert_eq!(
+        document.body,
+        "# History\n\n## 2026-07-15T15:00:00Z - Ada <user-1>\n\n- id: `history-1`\n- updated_at: 2026-07-15T15:01:00Z\n- status: Todo <state-1> -> Done <state-2>\n- title: Improve sync -> Improve sync quickly\n- assignee: null -> Ada <user-1>\n- project: null -> Launch <project-1>\n- due_date: null -> 2026-07-31\n- estimate: null -> 3\n- priority: null -> 3\n- description_updated: true\n- labels_added: Bug <label-1>\n- attachment: GitHub PR #42 <attach-1>\n- attachment_url: https://github.com/acme/app/pull/42\n- changes:\n\n```json\n{\n  \"description\": true\n}\n```\n\n"
     );
 }
 
@@ -366,6 +498,43 @@ fn apply_move_updates_issue_team_and_status_and_reports_moved_effect() {
     );
 }
 
+#[test]
+fn apply_rejects_linear_context_remote_ids_as_read_only() {
+    let api = Arc::new(FakeLinearApi::with_issues(vec![issue()]));
+    let connector = LinearConnector::with_api(LinearConfig::new("secret"), api.clone());
+    let context_id = RemoteId::new(linear_context_remote_id(
+        "issue-1",
+        LinearIssueContextKind::Comments,
+    ));
+    let plan = PushPlan::new(
+        vec![context_id.clone()],
+        vec![PushOperation::UpdateEntityBody {
+            entity_id: context_id.clone(),
+            body: "Edited comments.\n".to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = [PushOperationId("op-body".to_string())];
+    let preconditions = [RemotePrecondition {
+        remote_id: context_id,
+        remote_edited_at: Some("linear-context:issue-1:comments:2026-07-15T12:00:00Z".to_string()),
+    }];
+
+    let error = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &MountId::new("linear-main"),
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &preconditions,
+            local_root: None,
+        })
+        .expect_err("context sidecar push should be rejected");
+
+    assert!(matches!(error, locality_core::LocalityError::Validation(_)));
+    assert!(api.updates.lock().unwrap().is_empty());
+}
+
 fn entry_paths(entries: &[locality_core::model::TreeEntry]) -> Vec<String> {
     entries
         .iter()
@@ -376,13 +545,19 @@ fn entry_paths(entries: &[locality_core::model::TreeEntry]) -> Vec<String> {
 #[derive(Debug, Default)]
 struct FakeLinearApi {
     issues: Mutex<Vec<LinearIssue>>,
+    contexts: Mutex<BTreeMap<String, LinearIssueContext>>,
     updates: Mutex<Vec<LinearIssueUpdateInput>>,
 }
 
 impl FakeLinearApi {
     fn with_issues(issues: Vec<LinearIssue>) -> Self {
+        let contexts = issues
+            .iter()
+            .map(|issue| (issue.id.clone(), issue_context(issue)))
+            .collect();
         Self {
             issues: Mutex::new(issues),
+            contexts: Mutex::new(contexts),
             updates: Mutex::new(Vec::new()),
         }
     }
@@ -418,6 +593,28 @@ impl LinearApi for FakeLinearApi {
             .find(|issue| issue.id == issue_id)
             .cloned()
             .ok_or_else(|| locality_core::LocalityError::RemoteNotFound(issue_id.to_string()))
+    }
+
+    fn get_issue_context(
+        &self,
+        issue_id: &str,
+    ) -> locality_core::LocalityResult<LinearIssueContext> {
+        self.contexts
+            .lock()
+            .unwrap()
+            .get(issue_id)
+            .cloned()
+            .ok_or_else(|| locality_core::LocalityError::RemoteNotFound(issue_id.to_string()))
+    }
+
+    fn download_attachment(
+        &self,
+        _url: &str,
+        _max_bytes: u64,
+    ) -> locality_core::LocalityResult<Vec<u8>> {
+        Err(locality_core::LocalityError::Unsupported(
+            "fake Linear attachment download",
+        ))
     }
 
     fn update_issue(
@@ -510,6 +707,92 @@ fn issue() -> LinearIssue {
         labels: vec![LinearLabel {
             id: "label-1".to_string(),
             name: "Bug".to_string(),
+        }],
+    }
+}
+
+fn issue_context(issue: &LinearIssue) -> LinearIssueContext {
+    LinearIssueContext {
+        issue_id: issue.id.clone(),
+        issue_identifier: issue.identifier.clone(),
+        issue_title: issue.title.clone(),
+        issue_updated_at: issue.updated_at.clone(),
+        branch_name: "eng-1-improve-sync".to_string(),
+        comments: vec![LinearComment {
+            id: "comment-1".to_string(),
+            body: "Looks good.".to_string(),
+            url: "https://linear.app/acme/issue/ENG-1/improve-sync#comment-comment-1".to_string(),
+            created_at: "2026-07-15T13:00:00Z".to_string(),
+            updated_at: "2026-07-15T13:05:00Z".to_string(),
+            edited_at: Some("2026-07-15T13:05:00Z".to_string()),
+            parent_id: None,
+            resolved_at: None,
+            user: issue.assignee.clone(),
+            external_user: None,
+            bot_actor: None,
+        }],
+        attachments: vec![LinearAttachment {
+            id: "attach-1".to_string(),
+            title: "GitHub PR #42".to_string(),
+            url: "https://github.com/acme/app/pull/42".to_string(),
+            created_at: "2026-07-15T14:00:00Z".to_string(),
+            updated_at: "2026-07-15T14:10:00Z".to_string(),
+            source_type: Some("github".to_string()),
+            subtitle: Some("Open pull request".to_string()),
+            creator: issue.assignee.clone(),
+            external_user_creator: None,
+            metadata: serde_json::json!({
+                "branch": "eng-1-improve-sync",
+                "number": 42,
+                "repository": "acme/app",
+                "status": "open"
+            }),
+            download: None,
+        }],
+        history: vec![LinearIssueHistoryEntry {
+            id: "history-1".to_string(),
+            created_at: "2026-07-15T15:00:00Z".to_string(),
+            updated_at: "2026-07-15T15:01:00Z".to_string(),
+            actor: issue.assignee.clone(),
+            bot_actor: None,
+            from_state: Some(issue.state.clone()),
+            to_state: Some(LinearIssueState {
+                id: "state-2".to_string(),
+                name: "Done".to_string(),
+                state_type: Some("completed".to_string()),
+            }),
+            from_title: Some("Improve sync".to_string()),
+            to_title: Some("Improve sync quickly".to_string()),
+            from_assignee: None,
+            to_assignee: issue.assignee.clone(),
+            from_project: None,
+            to_project: issue.project.clone(),
+            from_team: None,
+            to_team: None,
+            from_due_date: None,
+            to_due_date: Some("2026-07-31".to_string()),
+            from_estimate: None,
+            to_estimate: Some(3.0),
+            from_priority: None,
+            to_priority: Some(3.0),
+            updated_description: Some(true),
+            attachment_id: Some("attach-1".to_string()),
+            attachment: Some(LinearAttachment {
+                id: "attach-1".to_string(),
+                title: "GitHub PR #42".to_string(),
+                url: "https://github.com/acme/app/pull/42".to_string(),
+                created_at: "2026-07-15T14:00:00Z".to_string(),
+                updated_at: "2026-07-15T14:10:00Z".to_string(),
+                source_type: Some("github".to_string()),
+                subtitle: Some("Open pull request".to_string()),
+                creator: issue.assignee.clone(),
+                external_user_creator: None,
+                metadata: serde_json::json!({ "number": 42 }),
+                download: None,
+            }),
+            added_labels: issue.labels.clone(),
+            removed_labels: Vec::new(),
+            changes: Some(serde_json::json!({ "description": true })),
         }],
     }
 }

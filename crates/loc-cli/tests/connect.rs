@@ -121,6 +121,7 @@ fn connect_linear_stores_api_key_outside_connection_metadata() {
         .expect("linear capabilities");
     assert!(capabilities.supports_entity_body_updates);
     assert!(capabilities.supports_batch_observation);
+    assert!(capabilities.supports_media_download);
     assert!(!capabilities.supports_oauth);
 
     assert_eq!(
