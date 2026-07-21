@@ -2112,6 +2112,14 @@ fn remounting_same_mount_id_to_different_connection_clears_source_scoped_state()
         )
         .expect("save original mount");
     seed_source_scoped_state(&mut store, &fixture.mount_id);
+    assert_eq!(
+        search_index_row_count(&store, &fixture.mount_id, "entity_search_fts"),
+        1
+    );
+    assert_eq!(
+        search_index_row_count(&store, &fixture.mount_id, "search_documents_fts"),
+        1
+    );
 
     store
         .save_mount(
@@ -2189,6 +2197,14 @@ fn remounting_same_mount_id_to_different_connection_clears_source_scoped_state()
             .list_entity_search_candidates(&fixture.mount_id, "Roadmap", None)
             .expect("search candidates"),
         Some(Vec::new())
+    );
+    assert_eq!(
+        search_index_row_count(&reopened, &fixture.mount_id, "entity_search_fts"),
+        0
+    );
+    assert_eq!(
+        search_index_row_count(&reopened, &fixture.mount_id, "search_documents_fts"),
+        0
     );
 }
 
@@ -4529,6 +4545,21 @@ fn seed_source_scoped_state(store: &mut SqliteStateStore, mount_id: &MountId) {
     store
         .append_journal(journal_entry("push-1", JournalStatus::Prepared))
         .expect("append journal");
+}
+
+fn search_index_row_count(store: &SqliteStateStore, mount_id: &MountId, table: &str) -> i64 {
+    assert!(matches!(
+        table,
+        "entity_search_fts" | "search_documents_fts"
+    ));
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    connection
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE mount_id = ?1"),
+            params![mount_id.0.as_str()],
+            |row| row.get(0),
+        )
+        .expect("search index row count")
 }
 
 fn apply_effects(push_id: &str) -> Vec<JournalApplyEffect> {

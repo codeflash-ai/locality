@@ -2543,6 +2543,7 @@ fn clear_mount_source_state(connection: &Connection, mount_id: &MountId) -> Stor
         "freshness_states",
         "journals",
         "entity_search_fts",
+        "search_documents_fts",
     ] {
         connection.execute(
             &format!("DELETE FROM {table} WHERE mount_id = ?1"),
