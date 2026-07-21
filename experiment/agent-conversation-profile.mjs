@@ -986,7 +986,7 @@ function truncate(value, maxLength) {
 }
 
 function buildCombinedTrace(conversations) {
-  const baseMs = earliestStart(conversations);
+  const baseMs = earliestTraceStart(conversations);
   const traceEvents = [
     {
       ph: "M",
@@ -1005,7 +1005,7 @@ function buildCombinedTrace(conversations) {
       name: "thread_name",
       args: { name: conversation.label },
     });
-    for (const event of conversation.events) {
+    for (const event of traceableEvents(conversation)) {
       traceEvents.push(traceEventFor(event, 1, tid, baseMs));
     }
   });
@@ -1014,7 +1014,7 @@ function buildCombinedTrace(conversations) {
 }
 
 function buildSplitTrace(conversation) {
-  const baseMs = earliestStart([conversation]);
+  const baseMs = earliestTraceStart([conversation]);
   const tracks = [
     ["reasoning", 1],
     ["assistant", 2],
@@ -1037,7 +1037,7 @@ function buildSplitTrace(conversation) {
     })),
   ];
 
-  for (const event of conversation.events) {
+  for (const event of traceableEvents(conversation)) {
     traceEvents.push(traceEventFor(event, 1, splitTidForKind(event.kind), baseMs));
   }
 
@@ -1432,6 +1432,17 @@ function earliestStart(conversations) {
   return starts.length > 0 ? Math.min(...starts) : 0;
 }
 
+function earliestTraceStart(conversations) {
+  const starts = conversations.flatMap((conversation) =>
+    traceableEvents(conversation).map((event) => event.start_ms),
+  );
+  return starts.length > 0 ? Math.min(...starts) : earliestStart(conversations);
+}
+
+function traceableEvents(conversation) {
+  return conversation.events.filter((event) => !isMetadataEvent(event));
+}
+
 function buildSummary(conversations, outputFiles) {
   return {
     ok: true,
@@ -1594,8 +1605,18 @@ function wallTime(events) {
   if (events.length === 0) {
     return 0;
   }
-  return Math.max(...events.map((event) => event.end_ms)) -
-    Math.min(...events.map((event) => event.start_ms));
+  const nonMetadataEvents = events.filter((event) => !isMetadataEvent(event));
+  if (nonMetadataEvents.length === 0) {
+    return Math.max(...events.map((event) => event.end_ms)) -
+      Math.min(...events.map((event) => event.start_ms));
+  }
+
+  const startMs = Math.min(...nonMetadataEvents.map((event) => event.start_ms));
+  const endMs = Math.max(
+    ...nonMetadataEvents.map((event) => event.end_ms),
+    ...events.filter(isMetadataEvent).map((event) => event.start_ms),
+  );
+  return endMs - startMs;
 }
 
 function sortObject(value) {

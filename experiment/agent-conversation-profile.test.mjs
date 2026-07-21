@@ -694,6 +694,82 @@ test("excludes harness metadata from high-level activity profiles", () => {
   assert.match(summaryMarkdown, /system:turn_duration/);
 });
 
+test("does not let terminal result metadata extend wall time or traces", () => {
+  const temp = mkdtempSync(join(tmpdir(), "agent-profile-result-metadata-"));
+  const leftPath = join(temp, "left.jsonl");
+  const rightPath = join(temp, "right.jsonl");
+  const outDir = join(temp, "out");
+
+  const records = [
+    {
+      timestamp: "2026-07-20T10:00:00Z",
+      role: "user",
+      content: "Start.",
+    },
+    {
+      timestamp: "2026-07-20T10:00:09Z",
+      role: "assistant",
+      content: "Done.",
+      duration_ms: 1000,
+    },
+    {
+      timestamp: "2026-07-20T10:00:10Z",
+      type: "result",
+      subtype: "success",
+      duration_ms: 10000,
+      result: "Done.",
+    },
+  ];
+  const jsonl = records.map((record) => JSON.stringify(record)).join("\n");
+  writeFileSync(leftPath, jsonl);
+  writeFileSync(rightPath, jsonl);
+
+  const result = runProfiler([
+    "--left",
+    leftPath,
+    "--right",
+    rightPath,
+    "--out",
+    outDir,
+  ]);
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+
+  const summary = JSON.parse(readFileSync(join(outDir, "summary.json"), "utf8"));
+  const left = summary.conversations[0];
+  assert.equal(left.wall_time_ms, 10000);
+  assert.equal(left.metadata_duration_ms, 10000);
+  assert.deepEqual(left.metadata, [
+    {
+      category: "result:success",
+      count: 1,
+      duration_ms: 10000,
+      measured_duration_ms: 10000,
+      inferred_duration_ms: 0,
+    },
+  ]);
+  assert.equal(left.totals_by_activity.user_query, 9000);
+  assert.equal(left.totals_by_activity.agent_response, 1000);
+
+  const folded = readFileSync(join(outDir, "left.folded"), "utf8");
+  assert.doesNotMatch(folded, /result:success/);
+  assert.doesNotMatch(folded, /activity:metadata/);
+
+  const combinedTrace = JSON.parse(
+    readFileSync(join(outDir, "combined.perfetto.json"), "utf8"),
+  );
+  const slices = combinedTrace.traceEvents.filter((event) => event.ph === "X");
+  assert.ok(slices.length > 0, "trace should include profileable slices");
+  assert.ok(
+    slices.every((event) => event.args.raw_type !== "result"),
+    "terminal result metadata should not be emitted as a trace slice",
+  );
+  assert.ok(
+    slices.every((event) => event.args.source_index !== 2),
+    "terminal result metadata should not extend the trace timeline",
+  );
+});
+
 test("uses timestamps from nested item or message wrappers", () => {
   const temp = mkdtempSync(join(tmpdir(), "agent-profile-inner-ts-"));
   const leftPath = join(temp, "left.json");

@@ -87,12 +87,12 @@ Tool activity is additionally grouped in `tool_groups`. Bash calls whose shell
 segment invokes a `loc` executable are reported as `bash_loc`; other Bash calls
 are reported as `bash_other`; non-Bash tools keep their tool name.
 
-Harness metadata records, such as `system:turn_duration`, `system:local_command`,
-attachments, file-history deltas, and hook summaries, are excluded from viewer
-profiles and `totals_by_activity` because they can duplicate elapsed time that
-is already represented by user, assistant, reasoning, and tool spans. They are
-reported separately under `metadata` and in the Markdown `Excluded Metadata`
-section.
+Harness metadata records, such as Claude terminal `result:success` records,
+`system:turn_duration`, `system:local_command`, attachments, file-history
+deltas, and hook summaries, are excluded from Perfetto traces, viewer profiles,
+and `totals_by_activity` because they can duplicate elapsed time that is already
+represented by user, assistant, reasoning, and tool spans. They are reported
+separately under `metadata` and in the Markdown `Excluded Metadata` section.
 
 ## Timing Model
 
@@ -106,6 +106,12 @@ record has a start timestamp but no duration, the script infers the end from
 the next timestamp in the same conversation. If there is no next timestamp, it
 uses `--default-duration-ms` or `1000ms`.
 
+Top-level wall time is computed from non-metadata event spans when any are
+present. Metadata timestamps can still act as run-boundary markers, but metadata
+durations do not extend wall time; this keeps terminal aggregate records from
+doubling the apparent runtime.
+
 Every trace slice and summary bucket carries `timing_quality` as `measured` or
 `inferred`. Treat inferred reasoning time as a useful approximation, not ground
-truth.
+truth. Raw `Time By Kind` totals still include metadata durations for auditability
+and therefore may not sum to wall time.
