@@ -985,7 +985,14 @@ impl StagingDirectory {
         reader: &mut R,
         expected_size: u64,
     ) -> Result<(), ReplicaMaterializationError> {
-        write_file_at_path(&self.path.join(logical_path), reader, expected_size)
+        let path = self.path.join(logical_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| ReplicaMaterializationError::Write {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        write_file_at_path(&path, reader, expected_size)
     }
 
     #[cfg(unix)]
