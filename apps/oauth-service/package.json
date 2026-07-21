@@ -21,6 +21,9 @@
     "vitest": "^4.1.9",
     "wrangler": "^4.0.0"
   },
+  "overrides": {
+    "sharp": "0.35.3"
+  },
   "engines": {
     "node": ">=22"
   }
