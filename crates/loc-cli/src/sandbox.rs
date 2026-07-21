@@ -1164,6 +1164,11 @@ mod tests {
     }
 
     fn read_request(stream: &mut TcpStream) -> CapturedRequest {
+        // Accepted sockets may inherit the listener's nonblocking mode on some
+        // platforms. Normalize both test-server accept paths before reading.
+        stream
+            .set_nonblocking(false)
+            .expect("set request stream blocking");
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("set request timeout");
