@@ -359,6 +359,13 @@ where
             &final_destination_match.relative_path,
             source.kind,
         )?;
+        if source.kind == VirtualSourceKind::PageDirectory {
+            validate_virtual_page_directory_destination(
+                &source_match.relative_path,
+                &final_destination_match.relative_path,
+                &destination_absolute,
+            )?;
+        }
         if source.kind == VirtualSourceKind::File && !new_filename.ends_with(".md") {
             return Err(MvError::UnsupportedVirtualTarget {
                 path: destination_absolute,
@@ -754,6 +761,24 @@ where
             }
         }
     }
+    Ok(())
+}
+
+fn validate_virtual_page_directory_destination(
+    source_relative_path: &Path,
+    destination_relative_path: &Path,
+    destination_absolute: &Path,
+) -> Result<(), MvError> {
+    if destination_relative_path != source_relative_path
+        && destination_relative_path.starts_with(source_relative_path)
+    {
+        return Err(MvError::UnsupportedVirtualTarget {
+            path: destination_absolute.to_path_buf(),
+            message: "page directories cannot be moved into themselves or their descendants"
+                .to_string(),
+        });
+    }
+
     Ok(())
 }
 

@@ -421,6 +421,108 @@ fn mv_virtual_page_directory_move_records_new_parent_remote_id() {
 }
 
 #[test]
+fn mv_virtual_page_directory_rejects_self_and_descendant_moves_without_mutating() {
+    let fixture = MvFixture::new("loc-mv-virtual-cycle");
+    let state_root = fixture.temp.path("state");
+    let mut store = fixture.store(ProjectionMode::LinuxFuse, false);
+    seed_page(
+        &mut store,
+        "page-home",
+        "Home",
+        "Home/page.md",
+        HydrationState::Hydrated,
+    );
+    seed_page(
+        &mut store,
+        "page-child",
+        "Child",
+        "Home/Child/page.md",
+        HydrationState::Hydrated,
+    );
+    write_cache(
+        &state_root,
+        "Home/Child/page.md",
+        "---\ntitle: \"Child\"\n---\nBody",
+    );
+    let home_before = store
+        .get_entity(&fixture.mount_id, &RemoteId::new("page-home"))
+        .expect("home entity")
+        .expect("home entity");
+    let child_before = store
+        .get_entity(&fixture.mount_id, &RemoteId::new("page-child"))
+        .expect("child entity")
+        .expect("child entity");
+
+    let self_error = run_mv(
+        &mut store,
+        MvOptions {
+            source: fixture.root.join("Home/Child"),
+            destination: fixture.root.join("Home/Child"),
+            state_root: Some(state_root.clone()),
+        },
+    )
+    .expect_err("self move rejected");
+    assert!(
+        matches!(
+            self_error,
+            MvError::UnsupportedVirtualTarget {
+                ref path,
+                ref message
+            }
+                if path.ends_with("Home/Child/Child") && message.contains("descendants")
+        ),
+        "{self_error:?}"
+    );
+
+    let descendant_error = run_mv(
+        &mut store,
+        MvOptions {
+            source: fixture.root.join("Home"),
+            destination: fixture.root.join("Home/Child"),
+            state_root: Some(state_root.clone()),
+        },
+    )
+    .expect_err("descendant move rejected");
+    assert!(
+        matches!(
+            descendant_error,
+            MvError::UnsupportedVirtualTarget {
+                ref path,
+                ref message
+            }
+                if path.ends_with("Home/Child/Home") && message.contains("descendants")
+        ),
+        "{descendant_error:?}"
+    );
+
+    assert_eq!(
+        store
+            .get_entity(&fixture.mount_id, &RemoteId::new("page-home"))
+            .expect("home entity"),
+        Some(home_before)
+    );
+    assert_eq!(
+        store
+            .get_entity(&fixture.mount_id, &RemoteId::new("page-child"))
+            .expect("child entity"),
+        Some(child_before)
+    );
+    assert!(
+        store
+            .get_virtual_mutation(&fixture.mount_id, "move:page-home")
+            .expect("home mutation")
+            .is_none()
+    );
+    assert!(
+        store
+            .get_virtual_mutation(&fixture.mount_id, "move:page-child")
+            .expect("child mutation")
+            .is_none()
+    );
+    assert!(cache_path(&state_root, "Home/Child/page.md").exists());
+}
+
+#[test]
 fn mv_virtual_pending_created_page_directory_can_be_moved() {
     let fixture = MvFixture::new("loc-mv-virtual-pending");
     let state_root = fixture.temp.path("state");
