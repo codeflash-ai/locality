@@ -23,7 +23,7 @@ pub fn render_linear_issue(issue: &LinearIssue) -> LocalityResult<CanonicalDocum
     }
 
     let mut frontmatter = format!(
-        "loc:\n  id: {}\n  type: page\n  connector: {}\n  synced_at: {}\n  remote_edited_at: {}\ntitle: {}\nidentifier: {}\nurl: {}\nStatus: {}\nTeam: {}\n",
+        "loc:\n  id: {}\n  type: page\n  connector: {}\n  synced_at: {}\n  remote_edited_at: {}\ntitle: {}\nidentifier: {}\nurl: {}\ncreated_at: {}\nupdated_at: {}\narchived_at: {}\nstarted_at: {}\ncompleted_at: {}\ncanceled_at: {}\nauto_archived_at: {}\nauto_closed_at: {}\nstarted_triage_at: {}\ntriaged_at: {}\nsnoozed_until_at: {}\nadded_to_cycle_at: {}\nadded_to_project_at: {}\nadded_to_team_at: {}\ndue_date: {}\nStatus: {}\nTeam: {}\n",
         safe_plain_scalar(&issue.id),
         LINEAR_CONNECTOR_ID,
         yaml_string(&issue.updated_at),
@@ -31,6 +31,21 @@ pub fn render_linear_issue(issue: &LinearIssue) -> LocalityResult<CanonicalDocum
         yaml_string(&issue.title),
         safe_plain_scalar(&issue.identifier),
         yaml_string(&issue.url),
+        yaml_string(&issue.created_at),
+        yaml_string(&issue.updated_at),
+        optional_yaml_string(issue.archived_at.as_deref()),
+        optional_yaml_string(issue.started_at.as_deref()),
+        optional_yaml_string(issue.completed_at.as_deref()),
+        optional_yaml_string(issue.canceled_at.as_deref()),
+        optional_yaml_string(issue.auto_archived_at.as_deref()),
+        optional_yaml_string(issue.auto_closed_at.as_deref()),
+        optional_yaml_string(issue.started_triage_at.as_deref()),
+        optional_yaml_string(issue.triaged_at.as_deref()),
+        optional_yaml_string(issue.snoozed_until_at.as_deref()),
+        optional_yaml_string(issue.added_to_cycle_at.as_deref()),
+        optional_yaml_string(issue.added_to_project_at.as_deref()),
+        optional_yaml_string(issue.added_to_team_at.as_deref()),
+        optional_yaml_string(issue.due_date.as_deref()),
         yaml_string(&reference(&issue.state.name, &issue.state.id)),
         yaml_string(&reference(&issue.team.name, &issue.team.id)),
     );
@@ -113,6 +128,10 @@ fn safe_plain_scalar(value: &str) -> String {
 
 fn yaml_string(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+fn optional_yaml_string(value: Option<&str>) -> String {
+    value.map(yaml_string).unwrap_or_else(|| "null".to_string())
 }
 
 fn ensure_trailing_newline(mut value: String) -> String {
