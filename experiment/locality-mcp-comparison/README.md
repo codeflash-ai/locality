@@ -129,6 +129,18 @@ CODEX_EXEC_TIMEOUT_SECONDS=300 ./experiment/locality-mcp-comparison/run-agent-co
 
 Use `CODEX_EXEC_TIMEOUT_SECONDS=0` to disable the timeout.
 
+The runner enables Locality span tracing for setup commands and for any `loc`
+commands the Codex agents run. By default, if a running daemon serves a command,
+the trace captures the CLI boundary and daemon response. For the deepest
+hydration breakdown in a benchmark sandbox, force direct CLI execution:
+
+```bash
+LOCALITY_EXPERIMENT_TRACE_FORCE_DIRECT=1 ./experiment/locality-mcp-comparison/run-agent-comparison.sh
+```
+
+Use this only when the mounted target does not require daemon-only virtual
+projection behavior.
+
 To publish:
 
 ```bash
@@ -168,6 +180,11 @@ Important artifacts:
 - `locality-codex-summary.json` - event counts, usage, errors.
 - `notion-mcp-codex-summary.json` - event counts, usage, errors.
 - `locality-speedscope.json` and `notion-mcp-speedscope.json` - Speedscope-compatible flame graph files generated from the JSON events.
+- `locality-traces/*.jsonl` - raw Locality command and pull/hydration spans.
+- `locality-traces/*-summary.json` - top Locality spans by duration.
+- `locality-traces/*-spans.tsv` - tabular Locality span data.
+- `locality-traces/*-speedscope.json` - Speedscope-compatible Locality spans.
+- `locality-agent-locality-trace.jsonl` and `notion-mcp-agent-locality-trace.jsonl` - Locality spans emitted by any `loc` commands the agents run.
 - `locality-transcript.md` and `notion-mcp-transcript.md` - readable Codex event transcripts generated from the JSON events.
 - `locality-agent-trace.md` - agent-reported trace.
 - `notion-mcp-agent-trace.md` - agent-reported trace.
@@ -186,6 +203,18 @@ python3 experiment/locality-mcp-comparison/scripts/codex-events-to-trace.py \
 ```
 
 The generated Speedscope files use observed gaps between consecutive Codex JSON events. This makes the chart useful even when Codex flushes `item.started` and `item.completed` at the same timestamp. Treat these charts as agent-session timing, not exact internal shell, MCP, or model runtime profiling.
+
+Generate Locality span artifacts for a raw trace manually with:
+
+```bash
+python3 experiment/locality-mcp-comparison/scripts/locality-trace-to-speedscope.py \
+  experiment/runs/<run-id>/locality-traces/target-pull.jsonl \
+  experiment/runs/<run-id>/locality-traces/target-pull
+```
+
+Use the Locality trace files to answer questions the Codex event graph cannot:
+whether `loc locate` refreshed Notion metadata, which pull branch ran, how many
+pages were recursively hydrated, and which connector calls dominated the time.
 
 ## Model Notes
 

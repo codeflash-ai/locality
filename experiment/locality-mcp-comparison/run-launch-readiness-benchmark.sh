@@ -23,6 +23,8 @@ Important environment:
   CODEX_REASONING_EFFORT   Codex reasoning effort. Default: low
   CODEX_EXEC_TIMEOUT_SECONDS
                            Per-strategy codex exec timeout. Default: 900. Use 0 to disable.
+  LOCALITY_EXPERIMENT_TRACE_FORCE_DIRECT
+                           Set to 1 to force CLI direct pull during traced Locality setup.
   SINCE                    Git window. Default: 24 hours ago
   BASE_REF                 Git ref. Default: origin/main
   OUT_DIR                  Run artifact directory.
@@ -59,13 +61,16 @@ OUT_DIR="${OUT_DIR:-$REPO_DIR/experiment/runs/$RUN_ID}"
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-luna}"
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-low}"
 CODEX_EXEC_TIMEOUT_SECONDS="${CODEX_EXEC_TIMEOUT_SECONDS:-900}"
+LOCALITY_EXPERIMENT_TRACE_FORCE_DIRECT="${LOCALITY_EXPERIMENT_TRACE_FORCE_DIRECT:-0}"
 METRICS_TSV="$OUT_DIR/metrics.tsv"
 SUMMARY_JSON="$OUT_DIR/summary.json"
 CONTEXT_PATHS_FILE="$OUT_DIR/locality-context-paths.txt"
 CONTEXT_INVENTORY="$OUT_DIR/locality-context-inventory.txt"
 CONTEXT_SEARCH_RESULTS="$OUT_DIR/locality-context-search.txt"
+TRACE_DIR="$OUT_DIR/locality-traces"
 
-mkdir -p "$OUT_DIR"
+mkdir -p "$OUT_DIR" "$TRACE_DIR"
+export LOCALITY_TRACE_RUN_ID="$RUN_ID"
 
 now_ms() {
   python3 - <<'PY'
@@ -100,6 +105,32 @@ phase_end() {
   record_metric "$strategy" "$phase" "$PHASE_STARTED_AT" "$ended_at" "$status" "$detail"
 }
 
+trace_safe_name() {
+  printf '%s' "$1" | tr '/:[:space:]?&=%#' '__________' | tr -cd '[:alnum:]_.-'
+}
+
+run_loc_traced() {
+  local trace_name="$1"
+  shift
+  local trace_file="$TRACE_DIR/$trace_name.jsonl"
+  if [ "$LOCALITY_EXPERIMENT_TRACE_FORCE_DIRECT" = "1" ]; then
+    LOCALITY_DAEMON_DISABLE=1 LOCALITY_TRACE_FILE="$trace_file" LOCALITY_TRACE_RUN_ID="$RUN_ID" "$@"
+  else
+    LOCALITY_TRACE_FILE="$trace_file" LOCALITY_TRACE_RUN_ID="$RUN_ID" "$@"
+  fi
+}
+
+render_locality_traces() {
+  local trace_file
+  for trace_file in "$TRACE_DIR"/*.jsonl "$OUT_DIR"/*-agent-locality-trace.jsonl; do
+    if [ ! -s "$trace_file" ]; then
+      continue
+    fi
+    python3 "$SCRIPT_DIR/scripts/locality-trace-to-speedscope.py" \
+      "$trace_file" "${trace_file%.jsonl}" >/dev/null
+  done
+}
+
 run_codex_agent() {
   local strategy="$1"
   local prompt_file="$2"
@@ -114,6 +145,7 @@ run_codex_agent() {
   local events_tsv="$OUT_DIR/$strategy-codex-events.tsv"
   local prompt_snapshot="$OUT_DIR/$strategy-prompt.md"
   local command_snapshot="$OUT_DIR/$strategy-codex-command.txt"
+  local agent_loc_trace="$OUT_DIR/$strategy-agent-locality-trace.jsonl"
   local prompt
   local run_cmd
   prompt="$(cat "$prompt_file")"
@@ -152,7 +184,8 @@ run_codex_agent() {
 
   set +e
   set -o pipefail
-  "${run_cmd[@]}" < /dev/null 2> "$err_file" | python3 "$SCRIPT_DIR/scripts/timestamp-jsonl.py" > "$events_file"
+  LOCALITY_TRACE_FILE="$agent_loc_trace" LOCALITY_TRACE_RUN_ID="$RUN_ID" \
+    "${run_cmd[@]}" < /dev/null 2> "$err_file" | python3 "$SCRIPT_DIR/scripts/timestamp-jsonl.py" > "$events_file"
   local pipe_status=("${PIPESTATUS[@]}")
   local rc="${pipe_status[0]}"
   set +o pipefail
@@ -222,18 +255,21 @@ COMMIT_COUNT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[
 phase_end "locality" "git_collect" "ok" "commits=$COMMIT_COUNT"
 
 phase_start
-PAGE_PATH="$("$LOC_BIN" locate "$TARGET_URL")"
+PAGE_PATH="$(run_loc_traced "target-locate" "$LOC_BIN" locate "$TARGET_URL")"
+phase_end "locality" "notion_target_locate" "ok" "path=$PAGE_PATH; trace=$TRACE_DIR/target-locate.jsonl"
+
+phase_start
 set +e
-"$LOC_BIN" pull "$PAGE_PATH" > "$OUT_DIR/loc-pull.out" 2> "$OUT_DIR/loc-pull.err"
+run_loc_traced "target-pull" "$LOC_BIN" pull "$PAGE_PATH" > "$OUT_DIR/loc-pull.out" 2> "$OUT_DIR/loc-pull.err"
 PULL_RC=$?
 set -e
 PULL_DETAIL="$(tr '\n' ' ' < "$OUT_DIR/loc-pull.out" | sed 's/[[:space:]]*$//')"
 if [ "$PULL_RC" -eq 0 ]; then
-  phase_end "locality" "notion_locate_and_prehydrate" "ok" "path=$PAGE_PATH; $PULL_DETAIL"
+  phase_end "locality" "notion_target_prehydrate" "ok" "path=$PAGE_PATH; trace=$TRACE_DIR/target-pull.jsonl; $PULL_DETAIL"
 elif grep -qi "dirty" "$OUT_DIR/loc-pull.out" "$OUT_DIR/loc-pull.err"; then
-  phase_end "locality" "notion_locate_and_prehydrate" "ok" "path=$PAGE_PATH; pull skipped dirty target"
+  phase_end "locality" "notion_target_prehydrate" "ok" "path=$PAGE_PATH; trace=$TRACE_DIR/target-pull.jsonl; pull skipped dirty target"
 else
-  phase_end "locality" "notion_locate_and_prehydrate" "failed" "exit=$PULL_RC; path=$PAGE_PATH"
+  phase_end "locality" "notion_target_prehydrate" "failed" "exit=$PULL_RC; path=$PAGE_PATH; trace=$TRACE_DIR/target-pull.jsonl"
   cat "$OUT_DIR/loc-pull.out" >&2
   cat "$OUT_DIR/loc-pull.err" >&2
   exit "$PULL_RC"
@@ -241,13 +277,15 @@ fi
 
 phase_start
 : > "$CONTEXT_PATHS_FILE"
+context_url_index=0
 while IFS= read -r context_url; do
   context_url="${context_url#"${context_url%%[![:space:]]*}"}"
   context_url="${context_url%"${context_url##*[![:space:]]}"}"
   if [ -z "$context_url" ]; then
     continue
   fi
-  context_page="$("$LOC_BIN" locate "$context_url")"
+  context_url_index=$((context_url_index + 1))
+  context_page="$(run_loc_traced "context-locate-$context_url_index" "$LOC_BIN" locate "$context_url")"
   printf '%s\n' "$(dirname "$context_page")" >> "$CONTEXT_PATHS_FILE"
 done <<< "$CONTEXT_URLS"
 while IFS= read -r context_path; do
@@ -258,25 +296,29 @@ while IFS= read -r context_path; do
   fi
 done <<< "$CONTEXT_PULL_PATHS"
 sort -u "$CONTEXT_PATHS_FILE" -o "$CONTEXT_PATHS_FILE"
+context_path_count="$(grep -cve '^[[:space:]]*$' "$CONTEXT_PATHS_FILE" 2>/dev/null || true)"
+phase_end "locality" "notion_context_locate" "ok" "urls=$context_url_index; paths=$context_path_count; traces=$TRACE_DIR/context-locate-*.jsonl"
+
+phase_start
 hydrated_count=0
 while IFS= read -r context_path; do
   if [ -z "$context_path" ]; then
     continue
   fi
-  safe_name="$(printf '%s' "$context_path" | tr '/[:space:]' '__' | tr -cd '[:alnum:]_.-')"
+  safe_name="$(trace_safe_name "$context_path")"
   set +e
-  "$LOC_BIN" pull "$context_path" --json > "$OUT_DIR/loc-context-pull-$safe_name.json" 2> "$OUT_DIR/loc-context-pull-$safe_name.err"
+  run_loc_traced "context-pull-$safe_name" "$LOC_BIN" pull "$context_path" --json > "$OUT_DIR/loc-context-pull-$safe_name.json" 2> "$OUT_DIR/loc-context-pull-$safe_name.err"
   pull_rc=$?
   set -e
   if [ "$pull_rc" -ne 0 ] && ! grep -qi "dirty" "$OUT_DIR/loc-context-pull-$safe_name.json" "$OUT_DIR/loc-context-pull-$safe_name.err"; then
-    phase_end "locality" "notion_context_hydrate" "failed" "exit=$pull_rc; path=$context_path"
+    phase_end "locality" "notion_context_hydrate" "failed" "exit=$pull_rc; path=$context_path; trace=$TRACE_DIR/context-pull-$safe_name.jsonl"
     cat "$OUT_DIR/loc-context-pull-$safe_name.json" >&2
     cat "$OUT_DIR/loc-context-pull-$safe_name.err" >&2
     exit "$pull_rc"
   fi
   hydrated_count=$((hydrated_count + 1))
 done < "$CONTEXT_PATHS_FILE"
-phase_end "locality" "notion_context_hydrate" "ok" "paths=$hydrated_count; list=$CONTEXT_PATHS_FILE"
+phase_end "locality" "notion_context_hydrate" "ok" "paths=$hydrated_count; list=$CONTEXT_PATHS_FILE; traces=$TRACE_DIR/context-pull-*.jsonl"
 
 phase_start
 : > "$CONTEXT_INVENTORY"
@@ -373,6 +415,8 @@ if [ "$COMPARE_MCP" -eq 1 ]; then
   fi
 fi
 
+render_locality_traces
+
 python3 - "$METRICS_TSV" "$SUMMARY_JSON" "$REPORT_PAGE_PATH" "$OUT_DIR" "$PUSH" "$CODEX_MODEL" "$CODEX_REASONING_EFFORT" <<'PY'
 import csv
 import json
@@ -389,6 +433,12 @@ for name in ("locality", "notion-mcp"):
     p = out / f"{name}-codex-summary.json"
     if p.exists():
         agent_summaries[name] = json.loads(p.read_text())
+
+locality_trace_summaries = {}
+for p in sorted((out / "locality-traces").glob("*-summary.json")):
+    locality_trace_summaries[str(p.relative_to(out))] = json.loads(p.read_text())
+for p in sorted(out.glob("*-agent-locality-trace-summary.json")):
+    locality_trace_summaries[str(p.relative_to(out))] = json.loads(p.read_text())
 
 summary = {
     "ok": True,
@@ -408,6 +458,7 @@ summary = {
         for row in metrics
     ],
     "agent_event_summaries": agent_summaries,
+    "locality_trace_summaries": locality_trace_summaries,
 }
 Path(summary_path).write_text(json.dumps(summary, indent=2) + "\n")
 print(json.dumps(summary, indent=2))
