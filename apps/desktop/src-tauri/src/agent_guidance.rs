@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 
 const MANAGED_START: &str = "<!-- LOCALITY_AGENT_GUIDANCE_START -->";
 const MANAGED_END: &str = "<!-- LOCALITY_AGENT_GUIDANCE_END -->";
-const DEFAULT_NOTION_MOUNT: &str = "~/Library/CloudStorage/Locality/notion";
+const DEFAULT_LOCALITY_ROOT: &str = "~/Library/CloudStorage/Locality";
 const MCP_SERVER_NAME: &str = "loc";
 const SKILL_DIR_NAME: &str = "locality";
 
@@ -90,10 +90,10 @@ pub fn install_agent_guidance(mount_path: Option<&str>) -> AgentGuidanceInstallR
 
     if targets.is_empty() {
         targets.push(AgentGuidanceTarget {
-            agent: "Locality Notion folder".to_string(),
+            agent: "Locality source folder".to_string(),
             status: "available".to_string(),
             path: Some(format!("{mount_path}/AGENTS.md")),
-            detail: "No supported local agent install was detected. Locality guidance is still available inside the Notion folder.".to_string(),
+            detail: "No supported local agent install was detected. Locality guidance is still available inside the connected source folder.".to_string(),
         });
     }
 
@@ -404,40 +404,41 @@ fn skill_markdown(mount_path: &str) -> String {
     format!(
         r#"---
 name: locality
-description: Use Locality when the user wants to find, read, or edit Notion/company docs through local filesystem files.
+description: Use Locality when the user wants to find, read, or edit connected company sources through local filesystem files.
 ---
 
 # Locality
 
-Locality projects connected company sources, including Notion, into the local filesystem so agents can edit normal Markdown files and let the user review/push the changes back.
+Locality projects connected company sources into the local filesystem so agents can inspect, edit, review, and safely push supported changes back through the product path.
+Connected sources can include Notion, Google Docs, Google Calendar, Gmail, Linear, Slack, and Granola.
 
 ## Where to work
 
-- Notion files are under `{mount_path}`.
-- Connector-local guidance is available at `{mount_path}/AGENTS.md` and `{mount_path}/CLAUDE.md`.
+- Connected source files are under `{mount_path}`.
+- Read the nearest mount-local `AGENTS.md` before source-specific edits. `CLAUDE.md` is usually an alias for the same rules.
 - Online-only files hydrate automatically when opened by the filesystem.
 
-## Safe workflow
+## Locality CLI workflow
 
-1. If the user gives a Notion URL, run `loc locate <url>` and edit the printed local Markdown path.
-2. Edit the local Markdown file directly.
-3. Do not edit Locality identity frontmatter, block IDs, `::loc{{...}}` directives, `_schema.yaml`, `AGENTS.md`, or `CLAUDE.md` unless explicitly asked.
-4. Unless the user asked you to sync back to Notion, leave edits pending for Locality review and tell the user what changed.
-5. Use `loc status` only when you need to inspect pending changes; regular clean files hydrate automatically on open.
-6. If desktop Live Mode is on, safe local edits may sync automatically. Do not run routine `loc pull` or `loc push` after every edit.
-7. If the user asks you to sync back to Notion, update Notion, publish, or apply the edit remotely, do not stop after local edits. Run `loc diff <file>` first, then `loc push <file> -y` for safe plans.
-8. If push says the remote changed since last sync, run `loc pull <file>`, resolve any inline conflict markers in the Markdown, rerun `loc diff <file>`, then push again.
+- Use `loc info <path>` for mount and connector context.
+- Use `loc search <query>` to search local metadata and indexed content.
+- Use `loc locate <url-or-title>` when the user gives a remote URL, title, or page-like identifier.
+- Edit mounted Markdown directly for writable sources.
+- Use `loc status <path>` to inspect pending local changes.
+- Use `loc inspect <path>` when you need a read-only remote comparison for a hydrated file.
+- Use `loc diff <path>` before asking the user to review changes or before pushing.
+- Unless the user asked you to apply edits remotely, leave edits pending for Locality review and tell the user what changed.
+- If desktop Live Mode is on, safe local edits may sync automatically. Use `loc live-mode status <file>` to inspect state. Do not run routine `loc pull` or `loc push` after every edit.
+- If the user asks you to sync, publish, send, update the source, or apply the edit remotely, run `loc diff <path>` first, then `loc push <path> -y` for safe plans.
+- If push says the remote changed since last sync, run `loc pull <path>`, resolve any inline conflict markers in the Markdown, rerun `loc diff <path>`, then push again.
 
-## Creating Notion Content
+## Connector boundaries
 
-- Read `{mount_path}/AGENTS.md` for connector-specific creation rules.
-- Prefer `loc create page --title "New Page" --parent <parent-directory>` for new pages.
-- Create a Notion database with `loc create database --title "Tasks" --parent <page-dir>`, edit its draft `_schema.yaml`, inspect with `loc diff`, then push explicitly.
-- Pages are directories; edit or create the `page.md` inside the page directory.
-- To create a child page, create `parent-page/new-page/page.md`.
-- New `page.md` files need YAML frontmatter with `title: "..."` and no `loc:` identity block.
-- Existing files already have an `loc:` block; preserve it and edit only the body, `title`, and supported property frontmatter.
-- Database rows can be created as `database/new-row/page.md` or, where supported, direct `database/new-row.md` files.
+- Notion pages are directories with `page.md`; child pages live as child directories. Preserve Locality identity frontmatter, block IDs, directives starting with `::loc{{`, `_schema.yaml`, `AGENTS.md`, and `CLAUDE.md` unless explicitly asked.
+- Google Docs files are writable Markdown documents. Preserve Locality frontmatter and follow the mount-local `AGENTS.md` for supported formatting.
+- Calendar and Gmail mounts expose drafts for new or outbound objects. Create and edit drafts only through the filesystem shape described in the mount-local `AGENTS.md`, then use `loc diff <path>` and explicit push when the user asks to send or publish.
+- Linear issue edits and Linear status moves are supported through the mounted issue files when the mount-local `AGENTS.md` says so. Inspect with `loc diff <path>` before pushing.
+- Slack and Granola mounts are read-only. Do not edit, create, delete, rename, or push files there.
 
 ## MCP fallback
 
@@ -471,7 +472,7 @@ fn managed_instruction_block(mount_path: &str) -> String {
 
 fn suggested_agent_prompt(mount_path: &str) -> String {
     format!(
-        "Use Locality to edit my Notion workspace. Open the Notion files under {mount_path}, make the requested edits directly in Markdown, and leave the changes pending for Locality review unless I ask you to sync back to Notion. When I do, run `loc diff <file>` and then `loc push <file> -y` for safe plans."
+        "Use Locality to work with my connected sources under {mount_path}. Find the relevant mounted file with `loc locate <url-or-title>` for a URL or title, or `loc search <query>` for broader discovery. Edit mounted Markdown directly, use `loc status <path>` and `loc diff <path>` to inspect pending work, and leave changes pending for Locality review unless I ask you to apply them remotely. When I do, follow the nearest mount-local `AGENTS.md` and run `loc push <path> -y` for safe plans."
     )
 }
 
@@ -847,7 +848,7 @@ fn normalized_mount_path(mount_path: Option<&str>) -> String {
     let trimmed = mount_path
         .map(str::trim)
         .filter(|path| !path.is_empty())
-        .unwrap_or(DEFAULT_NOTION_MOUNT)
+        .unwrap_or(DEFAULT_LOCALITY_ROOT)
         .trim_end_matches('/');
     if trimmed.is_empty() {
         "/".to_string()
@@ -1028,28 +1029,52 @@ fn display_path(path: &Path) -> String {
 mod tests {
     use super::*;
 
-    #[cfg(windows)]
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn skill_mentions_mount_and_review_workflow() {
-        let skill = skill_markdown("~/Library/CloudStorage/Locality/notion");
+    fn skill_teaches_source_neutral_locality_cli_workflow() {
+        let skill = skill_markdown("~/Library/CloudStorage/Locality");
 
         assert!(skill.contains("name: locality"));
-        assert!(skill.contains("~/Library/CloudStorage/Locality/notion"));
+        assert!(skill.contains("description: Use Locality when the user wants to find, read, or edit connected company sources through local filesystem files."));
+        assert!(skill.contains("~/Library/CloudStorage/Locality"));
+        for source in [
+            "Notion",
+            "Google Docs",
+            "Google Calendar",
+            "Gmail",
+            "Linear",
+            "Slack",
+            "Granola",
+        ] {
+            assert!(skill.contains(source), "missing source {source}");
+        }
+        for command in [
+            "loc info <path>",
+            "loc search <query>",
+            "loc locate <url-or-title>",
+            "loc status <path>",
+            "loc inspect <path>",
+            "loc diff <path>",
+            "loc push <path> -y",
+            "loc pull <path>",
+            "loc live-mode status <file>",
+        ] {
+            assert!(skill.contains(command), "missing command {command}");
+        }
+        assert!(skill.contains("mount-local `AGENTS.md`"));
+        assert!(skill.contains("Calendar and Gmail mounts expose drafts"));
+        assert!(skill.contains("Linear issue edits"));
+        assert!(skill.contains("Linear status moves"));
+        assert!(skill.contains("Slack and Granola mounts are read-only"));
         assert!(skill.contains("pending for Locality review"));
-        assert!(skill.contains("sync back to Notion"));
         assert!(skill.contains("If desktop Live Mode is on"));
         assert!(skill.contains("Do not run routine `loc pull` or `loc push`"));
-        assert!(skill.contains("loc diff <file>"));
-        assert!(skill.contains("Creating Notion Content"));
-        assert!(skill.contains("loc create page --title"));
-        assert!(skill.contains("parent-page/new-page/page.md"));
-        assert!(skill.contains("no `loc:` identity block"));
         assert!(skill.contains("remote changed since last sync"));
         assert!(skill.contains("fall back to the Locality MCP tool named `loc`"));
-        assert!(skill.contains("Claude Cowork"));
+        assert!(skill.contains("JSON `argv`"));
         assert!(skill.contains("Locality configures this MCP fallback automatically"));
+        assert!(!skill.contains("Use Locality to edit my Notion workspace"));
     }
 
     #[test]
@@ -1072,8 +1097,11 @@ mod tests {
     }
 
     #[test]
-    fn normalized_blank_mount_path_uses_default_notion_mount() {
-        assert_eq!(normalized_mount_path(Some("  ")), DEFAULT_NOTION_MOUNT);
+    fn normalized_blank_mount_path_uses_default_locality_root() {
+        assert_eq!(
+            normalized_mount_path(Some("  ")),
+            "~/Library/CloudStorage/Locality"
+        );
         assert_eq!(
             normalized_mount_path(Some("~/Library/CloudStorage/Locality/notion/")),
             "~/Library/CloudStorage/Locality/notion"
@@ -1083,6 +1111,45 @@ mod tests {
     #[test]
     fn normalized_mount_preserves_root_path() {
         assert_eq!(normalized_mount_path(Some("/")), "/");
+    }
+
+    #[test]
+    fn suggested_prompt_is_source_neutral_and_cli_first() {
+        let prompt = suggested_agent_prompt("~/Library/CloudStorage/Locality");
+
+        assert!(prompt.contains("connected sources"));
+        assert!(prompt.contains("under ~/Library/CloudStorage/Locality"));
+        assert!(prompt.contains("loc locate <url-or-title>"));
+        assert!(prompt.contains("loc search <query>"));
+        assert!(prompt.contains("loc status <path>"));
+        assert!(prompt.contains("loc diff <path>"));
+        assert!(prompt.contains("loc push <path> -y"));
+        assert!(!prompt.contains("Notion workspace"));
+        assert!(!prompt.contains("sync back to Notion"));
+    }
+
+    #[test]
+    fn no_supported_agent_fallback_names_locality_source_folder() {
+        let temp = temp_root("loc-agent-guidance-empty-home");
+        let _env = EnvGuard::set(&[
+            ("HOME", Some(temp.as_os_str().to_os_string())),
+            ("USERPROFILE", Some(temp.as_os_str().to_os_string())),
+            ("PATH", Some(OsString::new())),
+        ]);
+
+        let report = install_agent_guidance(Some("/tmp/Locality"));
+
+        assert_eq!(report.targets.len(), 1);
+        assert_eq!(report.targets[0].agent, "Locality source folder");
+        assert_eq!(report.targets[0].status, "available");
+        assert_eq!(
+            report.targets[0].path.as_deref(),
+            Some("/tmp/Locality/AGENTS.md")
+        );
+        assert!(report.targets[0].detail.contains("connected source folder"));
+        assert!(!report.targets[0].detail.contains("Notion folder"));
+
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -1451,5 +1518,49 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("create temp root");
         root
+    }
+
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, Option<OsString>)]) -> Self {
+            let lock = ENV_LOCK.lock().expect("env lock");
+            let previous = vars
+                .iter()
+                .map(|(key, _)| (*key, env::var_os(key)))
+                .collect::<Vec<_>>();
+
+            unsafe {
+                for (key, value) in vars {
+                    if let Some(value) = value {
+                        env::set_var(key, value);
+                    } else {
+                        env::remove_var(key);
+                    }
+                }
+            }
+
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                for (key, value) in &self.previous {
+                    if let Some(value) = value {
+                        env::set_var(key, value);
+                    } else {
+                        env::remove_var(key);
+                    }
+                }
+            }
+        }
     }
 }
