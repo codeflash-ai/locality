@@ -7,35 +7,111 @@ on:
       - synchronize
       - reopened
       - ready_for_review
+  issue_comment:
+    types:
+      - created
 
 permissions:
   contents: read
 
 concurrency:
-  group: codex-review-${{ github.event.pull_request.number || github.ref }}
+  group: codex-review-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   review:
     name: Codex review
     if: >
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.draft == false &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      (
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.draft == false &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      ) ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        contains(github.event.comment.body, '@codex review')
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      pull-requests: read
+    outputs:
+      pr_number: ${{ steps.pr.outputs.number }}
     steps:
+      - name: Resolve pull request
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          COMMENT_BODY: ${{ github.event.comment.body || '' }}
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          EVENT_BASE_REF: ${{ github.event.pull_request.base.ref || '' }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha || '' }}
+        run: |
+          pr_number="$EVENT_PR_NUMBER"
+          should_review=true
+          skip_message=""
+
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
+            comment_lower="$(printf '%s' "$COMMENT_BODY" | tr '[:upper:]' '[:lower:]')"
+            if [[ "$comment_lower" != *"@codex review"* ]]; then
+              should_review=false
+              skip_message="Codex review skipped because the comment did not include @codex review."
+            fi
+          fi
+
+          if [ "$should_review" = true ]; then
+            pr_json="$RUNNER_TEMP/pr.json"
+            gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number" > "$pr_json"
+            draft="$(jq -r '.draft' "$pr_json")"
+            head_repo="$(jq -r '.head.repo.full_name' "$pr_json")"
+            base_ref="$(jq -r '.base.ref' "$pr_json")"
+            base_sha="$(jq -r '.base.sha' "$pr_json")"
+            head_sha="$(jq -r '.head.sha' "$pr_json")"
+
+            if [ "$draft" = "true" ]; then
+              should_review=false
+              skip_message="Codex review skipped because this pull request is still a draft."
+            elif [ "$head_repo" != "$GITHUB_REPOSITORY" ]; then
+              should_review=false
+              skip_message="Codex review skipped because this workflow only reviews same-repository pull requests."
+            fi
+          else
+            base_ref="$EVENT_BASE_REF"
+            base_sha="$EVENT_BASE_SHA"
+            head_sha="$EVENT_HEAD_SHA"
+          fi
+
+          {
+            echo "number=$pr_number"
+            echo "base_ref=$base_ref"
+            echo "base_sha=$base_sha"
+            echo "head_sha=$head_sha"
+            echo "should_review=$should_review"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$should_review" != true ]; then
+            {
+              printf '%s\n\n' "$skip_message"
+              printf 'No Codex review was run.\n'
+            } > codex-review.md
+          fi
+
       - uses: actions/checkout@v5
+        if: steps.pr.outputs.should_review == 'true'
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ steps.pr.outputs.head_sha }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Prepare review refs
+        if: steps.pr.outputs.should_review == 'true'
         env:
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
           git fetch --no-tags origin \
             "$BASE_REF:refs/remotes/origin/$BASE_REF" \
@@ -43,8 +119,9 @@ jobs:
 
       - name: Prepare review prompt
         id: prompt
+        if: steps.pr.outputs.should_review == 'true'
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ steps.pr.outputs.base_sha }}
           PROMPT_PATH: .github/codex/prompts/review.md
         run: |
           prompt_target="$RUNNER_TEMP/codex-review-prompt.md"
@@ -138,10 +215,10 @@ jobs:
         if: steps.prompt.outputs.available == 'true'
         uses: openai/codex-action@v1
         env:
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          BASE_SHA: ${{ steps.pr.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
         with:
           openai-api-key: ${{ secrets.AZURE_OPENAI_API_KEY }}
           responses-api-endpoint: ${{ steps.codex_config.outputs.endpoint }}
@@ -160,7 +237,7 @@ jobs:
         if: ${{ always() && hashFiles('codex-review.md') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: codex-review-${{ github.event.pull_request.number }}
+          name: codex-review-${{ steps.pr.outputs.number }}
           path: codex-review.md
           if-no-files-found: error
           retention-days: 7
@@ -170,8 +247,8 @@ jobs:
     needs: review
     if: >
       always() &&
-      github.event_name == 'pull_request' &&
-      needs.review.result == 'success'
+      needs.review.result == 'success' &&
+      needs.review.outputs.pr_number != ''
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -180,13 +257,14 @@ jobs:
       - name: Download review output
         uses: actions/download-artifact@v4
         with:
-          name: codex-review-${{ github.event.pull_request.number }}
+          name: codex-review-${{ needs.review.outputs.pr_number }}
           path: codex-review-output
 
       - name: Upsert review comment
         uses: actions/github-script@v7
         env:
           CODEX_REVIEW_FILE: codex-review-output/codex-review.md
+          PR_NUMBER: ${{ needs.review.outputs.pr_number }}
         with:
           script: |
             const fs = require("fs");
@@ -210,7 +288,7 @@ jobs:
             }
 
             const { owner, repo } = context.repo;
-            const issue_number = context.payload.pull_request.number;
+            const issue_number = Number(process.env.PR_NUMBER);
             const comments = await github.paginate(
               github.rest.issues.listComments,
               { owner, repo, issue_number, per_page: 100 },
