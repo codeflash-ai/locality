@@ -1,6 +1,10 @@
 use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
@@ -217,6 +221,90 @@ impl<R: Read> Read for ChunkedReader<R> {
         let allowed = buffer.len().min(self.chunk_size);
         self.inner.read(&mut buffer[..allowed])
     }
+}
+
+#[cfg(unix)]
+struct ComponentSwapReader {
+    inner: Cursor<Vec<u8>>,
+    staging_parent: PathBuf,
+    outside: PathBuf,
+    swapped: Arc<AtomicBool>,
+}
+
+#[cfg(unix)]
+impl Read for ComponentSwapReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        const FIRST_DIRECTORY_HEADER_END: u64 = 512;
+        if self.inner.position() == FIRST_DIRECTORY_HEADER_END
+            && !self.swapped.swap(true, Ordering::SeqCst)
+        {
+            let staging = fs::read_dir(&self.staging_parent)?
+                .filter_map(Result::ok)
+                .find(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".locality-stage-")
+                })
+                .expect("private staging directory exists before archive extraction");
+            let component = staging.path().join("legitimate");
+            assert!(component.is_dir(), "first tar entry created its directory");
+            fs::remove_dir(&component)?;
+            std::os::unix::fs::symlink(&self.outside, component)?;
+        }
+
+        let remaining_before_swap =
+            FIRST_DIRECTORY_HEADER_END.saturating_sub(self.inner.position());
+        let allowed = if remaining_before_swap == 0 {
+            buffer.len()
+        } else {
+            buffer.len().min(remaining_before_swap as usize)
+        };
+        self.inner.read(&mut buffer[..allowed])
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_component_replaced_by_symlink_without_writing_or_chmodding_outside() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestDirectory::new("component-swap");
+    let outside = TestDirectory::new("component-swap-outside");
+    fs::write(outside.0.join("sentinel.txt"), b"outside\n").expect("write outside sentinel");
+    fs::set_permissions(&outside.0, fs::Permissions::from_mode(0o711))
+        .expect("set distinctive outside mode");
+    let swapped = Arc::new(AtomicBool::new(false));
+    let archive = tar_archive(&[
+        TestMember::directory("legitimate/"),
+        TestMember::file("legitimate/escaped.txt", "must stay contained\n"),
+    ]);
+    let reader = ComponentSwapReader {
+        inner: Cursor::new(archive),
+        staging_parent: root.0.clone(),
+        outside: outside.0.clone(),
+        swapped: Arc::clone(&swapped),
+    };
+
+    let error = materialize_replica_archive(
+        ReplicaArchive::new(ReplicaArchiveEncoding::Identity, reader),
+        &root.destination(),
+        ReplicaMaterializationLimits::default(),
+    )
+    .expect_err("a symlink substituted for an opened component must be rejected");
+
+    assert!(swapped.load(Ordering::SeqCst), "test performed the swap");
+    assert!(
+        error.to_string().contains("legitimate/escaped.txt"),
+        "rejection identifies the affected logical path: {error}"
+    );
+    root.assert_no_staging_or_destination();
+    assert_eq!(
+        fs::read(outside.0.join("sentinel.txt")).expect("read untouched sentinel"),
+        b"outside\n"
+    );
+    assert!(!outside.0.join("escaped.txt").exists());
+    assert_modes(&outside.0, 0o711);
 }
 
 #[test]

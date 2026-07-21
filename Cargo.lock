@@ -2295,6 +2295,7 @@ dependencies = [
  "locality-protocol",
  "locality-store",
  "notify",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
