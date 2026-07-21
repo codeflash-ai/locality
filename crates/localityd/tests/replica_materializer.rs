@@ -265,6 +265,36 @@ impl Read for ComponentSwapReader {
 }
 
 #[cfg(unix)]
+struct RootSwapReader {
+    inner: Cursor<Vec<u8>>,
+    staging_parent: PathBuf,
+    outside: PathBuf,
+    swapped: Arc<AtomicBool>,
+}
+
+#[cfg(unix)]
+impl Read for RootSwapReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        if read == 0 && !self.swapped.swap(true, Ordering::SeqCst) {
+            let staging = fs::read_dir(&self.staging_parent)?
+                .filter_map(Result::ok)
+                .find(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".locality-stage-")
+                })
+                .expect("private staging directory exists before publication");
+            let detached = self.staging_parent.join("attacker-detached-staging");
+            fs::rename(staging.path(), &detached)?;
+            std::os::unix::fs::symlink(&self.outside, staging.path())?;
+        }
+        Ok(read)
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn rejects_component_replaced_by_symlink_without_writing_or_chmodding_outside() {
     use std::os::unix::fs::PermissionsExt;
@@ -304,6 +334,50 @@ fn rejects_component_replaced_by_symlink_without_writing_or_chmodding_outside() 
         b"outside\n"
     );
     assert!(!outside.0.join("escaped.txt").exists());
+    assert_modes(&outside.0, 0o711);
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_staging_root_replaced_by_symlink_before_publication() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestDirectory::new("root-swap");
+    let outside = TestDirectory::new("root-swap-outside");
+    fs::write(outside.0.join("sentinel.txt"), b"outside\n").expect("write outside sentinel");
+    fs::set_permissions(&outside.0, fs::Permissions::from_mode(0o711))
+        .expect("set distinctive outside mode");
+    let swapped = Arc::new(AtomicBool::new(false));
+    let reader = RootSwapReader {
+        inner: Cursor::new(tar_archive(&[TestMember::file(
+            "payload.txt",
+            "must stay in the held staging root\n",
+        )])),
+        staging_parent: root.0.clone(),
+        outside: outside.0.clone(),
+        swapped: Arc::clone(&swapped),
+    };
+
+    let error = materialize_replica_archive(
+        ReplicaArchive::new(ReplicaArchiveEncoding::Identity, reader),
+        &root.destination(),
+        ReplicaMaterializationLimits::default(),
+    )
+    .expect_err("a symlink substituted for the staging root must be rejected");
+
+    assert!(swapped.load(Ordering::SeqCst), "test performed the swap");
+    assert!(
+        error
+            .to_string()
+            .contains("staging root identity changed before publication"),
+        "rejection identifies the root publication race: {error}"
+    );
+    root.assert_no_staging_or_destination();
+    assert_eq!(
+        fs::read(outside.0.join("sentinel.txt")).expect("read untouched sentinel"),
+        b"outside\n"
+    );
+    assert!(!outside.0.join("payload.txt").exists());
     assert_modes(&outside.0, 0o711);
 }
 
