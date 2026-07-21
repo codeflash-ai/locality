@@ -65,6 +65,7 @@ use crate::autosave::{
 use crate::execution::{PushJob, PushJobError, PushJobReport};
 use crate::file_provider;
 use crate::hydration::{HydratedEntity, HydrationSource};
+use crate::linear::linear_shadow_matches_with_legacy_lifecycle_frontmatter;
 use crate::media::{render_document_with_absolute_media_hrefs, replace_hydrated_media_manifest};
 use crate::projection_state;
 use crate::shadow_match::shadows_match;
@@ -3548,7 +3549,8 @@ where
         &mut self,
         request: PushConcurrencyRequest<'_>,
     ) -> LocalityResult<()> {
-        self.store
+        let mount = self
+            .store
             .get_mount(request.mount_id)
             .map_err(LocalityError::from)?
             .ok_or_else(|| StoreError::MountMissing(request.mount_id.clone()))
@@ -3581,12 +3583,21 @@ where
                 &*self.store,
             )?;
 
-            if !remote_tree_matches_synced_tree(&synced_tree_shadow, &remote_tree_render.shadow) {
-                return Err(LocalityError::Guardrail(format!(
-                    "remote entity `{}` changed since the Synced Tree shadow; inspect or pull before pushing local edits",
-                    precondition.remote_id.0
-                )));
+            if remote_tree_matches_synced_tree(&synced_tree_shadow, &remote_tree_render.shadow) {
+                continue;
             }
+            if mount.connector == LINEAR_CONNECTOR_ID
+                && linear_shadow_matches_with_legacy_lifecycle_frontmatter(
+                    &synced_tree_shadow,
+                    &remote_tree_render.shadow,
+                )
+            {
+                continue;
+            }
+            return Err(LocalityError::Guardrail(format!(
+                "remote entity `{}` changed since the Synced Tree shadow; inspect or pull before pushing local edits",
+                precondition.remote_id.0
+            )));
         }
 
         Ok(())
