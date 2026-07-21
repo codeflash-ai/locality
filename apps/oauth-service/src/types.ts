@@ -13,6 +13,9 @@ export interface BrokerEnv {
   LOCALITY_GOOGLE_DOCS_REDIRECT_URIS?: string;
   LOCALITY_GOOGLE_DOCS_AUTH_BASE_URL?: string;
   LOCALITY_GOOGLE_DOCS_API_BASE_URL?: string;
+  LOCALITY_GOOGLE_CALENDAR_REDIRECT_URIS?: string;
+  LOCALITY_GOOGLE_CALENDAR_AUTH_BASE_URL?: string;
+  LOCALITY_GOOGLE_CALENDAR_API_BASE_URL?: string;
   LOCALITY_GMAIL_REDIRECT_URIS?: string;
   LOCALITY_GMAIL_AUTH_BASE_URL?: string;
   LOCALITY_GMAIL_API_BASE_URL?: string;
@@ -23,7 +26,7 @@ export interface BrokerEnv {
   LOCALITY_SLACK_API_BASE_URL?: string;
 }
 
-export type ConnectorId = "notion" | "google-docs" | "gmail" | "slack";
+export type ConnectorId = "notion" | "google-docs" | "google-calendar" | "gmail" | "slack";
 
 export interface ApiErrorBody {
   error: {

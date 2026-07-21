@@ -55,6 +55,7 @@ function isOAuthSessionPayload(value: unknown): value is OAuthSessionPayload {
     payload.v === 1 &&
     (payload.connector === "notion" ||
       payload.connector === "google-docs" ||
+      payload.connector === "google-calendar" ||
       payload.connector === "gmail" ||
       payload.connector === "slack") &&
     typeof payload.state === "string" &&

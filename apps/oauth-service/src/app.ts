@@ -6,6 +6,12 @@ import {
   refreshGoogleDocsToken,
   type GoogleDocsTokenResponse
 } from "./oauth/google-docs";
+import {
+  exchangeGoogleCalendarCode,
+  googleCalendarAuthorizeUrl,
+  refreshGoogleCalendarToken,
+  type GoogleCalendarTokenResponse
+} from "./oauth/google-calendar";
 import { exchangeGmailCode, gmailAuthorizeUrl, refreshGmailToken, type GmailTokenResponse } from "./oauth/gmail";
 import { googleClientId } from "./oauth/google";
 import { exchangeNotionCode, notionAuthorizeUrl, refreshNotionToken, type NotionTokenResponse } from "./oauth/notion";
@@ -13,6 +19,7 @@ import { exchangeSlackCode, refreshSlackToken, slackAuthorizeUrl, type SlackToke
 import { randomBase64Url, decryptJsonHandle, encryptJsonHandle } from "./security/crypto";
 import {
   validateGmailRedirectUri,
+  validateGoogleCalendarRedirectUri,
   validateGoogleDocsRedirectUri,
   validateNotionRedirectUri,
   validateSlackRedirectUri
@@ -61,6 +68,11 @@ app.get("/.well-known/loc-auth-broker", (c) =>
         refresh_token_modes: [tokenMode(c.env)]
       },
       "google-docs": {
+        oauth: "brokered_confidential",
+        session_ttl_seconds: SESSION_TTL_SECONDS,
+        refresh_token_modes: [tokenMode(c.env)]
+      },
+      "google-calendar": {
         oauth: "brokered_confidential",
         session_ttl_seconds: SESSION_TTL_SECONDS,
         refresh_token_modes: [tokenMode(c.env)]
@@ -187,6 +199,61 @@ app.post("/v1/oauth/google-docs/refresh", async (c) => {
   const refreshToken = await resolveRefreshToken(c.env, "google-docs", body);
   const token = await refreshGoogleDocsToken(c.env, refreshToken);
   return c.json(await shapeGoogleDocsTokenResponse(c.env, token));
+});
+
+app.post("/v1/oauth/google-calendar/start", async (c) => {
+  const body = await optionalJson<StartRequest>(c.req.raw);
+  const redirectUri = validateGoogleCalendarRedirectUri(
+    c.env,
+    body.redirect_uri ?? "http://localhost:8757/oauth/google-calendar/callback"
+  );
+  const now = nowSeconds();
+  const state = randomBase64Url();
+  const session = await signSession(
+    {
+      v: 1,
+      connector: "google-calendar",
+      state,
+      redirect_uri: redirectUri,
+      iat: now,
+      exp: now + SESSION_TTL_SECONDS,
+      nonce: randomBase64Url()
+    },
+    requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
+  );
+  return c.json({
+    connector: "google-calendar",
+    client_id: googleClientId(c.env),
+    authorization_url: googleCalendarAuthorizeUrl(c.env, redirectUri, state),
+    redirect_uri: redirectUri,
+    session,
+    state,
+    expires_in: SESSION_TTL_SECONDS
+  });
+});
+
+app.post("/v1/oauth/google-calendar/exchange", async (c) => {
+  const body = await requiredJson<ExchangeRequest>(c.req.raw);
+  const session = requireString(body.session, "session");
+  const state = requireString(body.state, "state");
+  const code = requireString(body.code, "code");
+  const redirectUri = validateGoogleCalendarRedirectUri(c.env, requireString(body.redirect_uri, "redirect_uri"));
+  const payload = await verifySession(
+    session,
+    requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
+  );
+  if (payload.connector !== "google-calendar" || payload.state !== state || payload.redirect_uri !== redirectUri) {
+    throw badRequest("oauth_session_mismatch", "OAuth callback did not match the broker session");
+  }
+  const token = await exchangeGoogleCalendarCode(c.env, code, redirectUri);
+  return c.json(await shapeGoogleCalendarTokenResponse(c.env, token));
+});
+
+app.post("/v1/oauth/google-calendar/refresh", async (c) => {
+  const body = await requiredJson<RefreshRequest>(c.req.raw);
+  const refreshToken = await resolveRefreshToken(c.env, "google-calendar", body);
+  const token = await refreshGoogleCalendarToken(c.env, refreshToken);
+  return c.json(await shapeGoogleCalendarTokenResponse(c.env, token));
 });
 
 app.post("/v1/oauth/gmail/start", async (c) => {
@@ -336,6 +403,21 @@ async function shapeGoogleDocsTokenResponse(env: BrokerEnv, token: GoogleDocsTok
     expires_in: token.expires_in,
     scope: token.scope,
     id_token: token.id_token,
+    ...refresh
+  };
+}
+
+async function shapeGoogleCalendarTokenResponse(env: BrokerEnv, token: GoogleCalendarTokenResponse) {
+  const refresh = await shapeRefreshToken(env, "google-calendar", token.refresh_token);
+  return {
+    connector: "google-calendar",
+    access_token: token.access_token,
+    token_type: token.token_type,
+    expires_in: token.expires_in,
+    scope: token.scope,
+    id_token: token.id_token,
+    workspace_id: "primary",
+    workspace_name: "Primary calendar",
     ...refresh
   };
 }

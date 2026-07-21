@@ -553,6 +553,7 @@ pub enum PropertyValueOutput {
     Number(String),
     String(String),
     List(Vec<String>),
+    Array(Vec<PropertyValueOutput>),
     Object(Vec<PropertyUpdateOutput>),
 }
 
@@ -564,6 +565,9 @@ impl From<PropertyValue> for PropertyValueOutput {
             PropertyValue::Number(value) => Self::Number(value),
             PropertyValue::String(value) => Self::String(value),
             PropertyValue::List(value) => Self::List(value),
+            PropertyValue::Array(value) => {
+                Self::Array(value.into_iter().map(PropertyValueOutput::from).collect())
+            }
             PropertyValue::Object(value) => Self::Object(
                 value
                     .into_iter()

@@ -4467,6 +4467,56 @@ mod tests {
     }
 
     #[test]
+    fn google_calendar_folder_read_only_metadata_reflects_direct_draft_create_policy() {
+        let mount_id = MountId::new("google-calendar-main");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount_with_connector(&mount_id, "google-calendar"))
+            .expect("save mount");
+        for (remote_id, title, path) in [
+            ("google-calendar-folder:draft", "draft", "draft"),
+            ("google-calendar-folder:events", "events", "events"),
+            (
+                "google-calendar-folder:draft/nested",
+                "nested",
+                "draft/nested",
+            ),
+        ] {
+            store
+                .save_entity(EntityRecord {
+                    mount_id: mount_id.clone(),
+                    remote_id: RemoteId::new(remote_id),
+                    kind: EntityKind::Directory,
+                    title: title.to_string(),
+                    path: path.into(),
+                    hydration: HydrationState::Stub,
+                    content_hash: None,
+                    remote_edited_at: Some(format!("folder:{path}")),
+                })
+                .expect("save folder");
+        }
+
+        assert!(
+            !virtual_fs_item(&store, &mount_id, "google-calendar-folder:draft")
+                .expect("draft item")
+                .item
+                .read_only
+        );
+        assert!(
+            virtual_fs_item(&store, &mount_id, "google-calendar-folder:events")
+                .expect("events item")
+                .item
+                .read_only
+        );
+        assert!(
+            virtual_fs_item(&store, &mount_id, "google-calendar-folder:draft/nested")
+                .expect("nested draft folder item")
+                .item
+                .read_only
+        );
+    }
+
+    #[test]
     fn source_folder_read_only_metadata_reflects_create_parent_kinds() {
         let notion_mount_id = MountId::new("notion-main");
         let mut notion_store = InMemoryStateStore::new();
@@ -7367,6 +7417,23 @@ mod tests {
         }
     }
 
+    fn save_linear_status_parents(store: &mut InMemoryStateStore, mount_id: &MountId) {
+        for (id, title, path) in [
+            ("team-state:team-a:todo", "Todo", "Teams/Team A/Issues/Todo"),
+            ("team-state:team-b:done", "Done", "Teams/Team B/Issues/Done"),
+        ] {
+            store
+                .save_entity(EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new(id),
+                    EntityKind::Directory,
+                    title,
+                    path,
+                ))
+                .expect("save Linear status parent");
+        }
+    }
+
     #[test]
     fn linear_pending_page_directory_move_preserves_canonical_title_and_cached_bytes() {
         let mount_id = MountId::new("linear-main");
@@ -7376,28 +7443,15 @@ mod tests {
         store
             .save_mount(virtual_mount_with_connector(&mount_id, "linear"))
             .expect("save mount");
-        for (id, title, path) in [
-            ("team-a", "Team A", "Team A/page.md"),
-            ("team-b", "Team B", "Team B/page.md"),
-        ] {
-            store
-                .save_entity(EntityRecord::new(
-                    mount_id.clone(),
-                    RemoteId::new(id),
-                    EntityKind::Page,
-                    title,
-                    path,
-                ))
-                .expect("save parent");
-        }
+        save_linear_status_parents(&mut store, &mount_id);
         let local_id = "local:linear-dir-move";
         let created_identifier = seed_pending_linear_issue(
             &mut store,
             &content_root,
             &mount_id,
             local_id,
-            "team-a",
-            "Team A/ENG-1-old-path/page.md",
+            "team-state:team-a:todo",
+            "Teams/Team A/Issues/Todo/ENG-1-old-path/page.md",
             "ENG-1-old-path",
         );
         let mut mutation = store
@@ -7409,21 +7463,24 @@ mod tests {
             .save_virtual_mutation(mutation)
             .expect("save mutation");
         let bytes = b"---\ntitle: \"Edited title in cache\"\nstatus: Started\n---\nEdited body\n";
-        std::fs::write(content_root.join("Team A/ENG-1-old-path/page.md"), bytes)
-            .expect("write cache");
+        std::fs::write(
+            content_root.join("Teams/Team A/Issues/Todo/ENG-1-old-path/page.md"),
+            bytes,
+        )
+        .expect("write cache");
 
         rename_virtual_fs_item(
             &mut store,
             &content_root,
             &mount_id,
             &created_identifier,
-            "children:team-b",
+            "team-state:team-b:done",
             "ENG-1-new-path",
         )
         .expect("move pending issue");
 
         assert_eq!(
-            std::fs::read(content_root.join("Team B/ENG-1-new-path/page.md"))
+            std::fs::read(content_root.join("Teams/Team B/Issues/Done/ENG-1-new-path/page.md"))
                 .expect("read moved cache"),
             bytes
         );
@@ -7432,75 +7489,76 @@ mod tests {
             .expect("get mutation")
             .expect("mutation");
         assert_eq!(mutation.title, "Explicit issue title");
-        assert_eq!(mutation.parent_remote_id, Some(RemoteId::new("team-b")));
+        assert_eq!(
+            mutation.parent_remote_id,
+            Some(RemoteId::new("team-state:team-b:done"))
+        );
         assert_eq!(
             mutation.projected_path,
-            PathBuf::from("Team B/ENG-1-new-path/page.md")
+            PathBuf::from("Teams/Team B/Issues/Done/ENG-1-new-path/page.md")
         );
         assert_eq!(mutation.mutation_kind, VirtualMutationKind::Create);
         let _ = std::fs::remove_dir_all(state_root);
     }
 
     #[test]
-    fn linear_pending_flat_rename_preserves_canonical_title_and_cached_bytes() {
+    fn linear_pending_page_directory_rename_preserves_canonical_title_and_cached_bytes() {
         let mount_id = MountId::new("linear-main");
-        let state_root = temp_root("loc-virtual-fs-linear-pending-flat-rename");
+        let state_root = temp_root("loc-virtual-fs-linear-pending-dir-rename");
         let content_root = state_root.join("content/linear-main/files");
         let mut store = InMemoryStateStore::new();
         store
             .save_mount(virtual_mount_with_connector(&mount_id, "linear"))
             .expect("save mount");
-        store
-            .save_entity(EntityRecord::new(
-                mount_id.clone(),
-                RemoteId::new("team-a"),
-                EntityKind::Page,
-                "Team A",
-                "Team A/page.md",
-            ))
-            .expect("save parent");
+        save_linear_status_parents(&mut store, &mount_id);
+        let local_id = "local:linear-dir-rename";
         let created_identifier = seed_pending_linear_issue(
             &mut store,
             &content_root,
             &mount_id,
-            "local:linear-flat-rename",
-            "team-a",
-            "Team A/ENG-2-old.md",
+            local_id,
+            "team-state:team-a:todo",
+            "Teams/Team A/Issues/Todo/ENG-2-old/page.md",
             "ENG-2-old",
         );
         let mut mutation = store
-            .get_virtual_mutation(&mount_id, &created_identifier)
+            .get_virtual_mutation(&mount_id, local_id)
             .expect("get mutation")
             .expect("mutation");
-        mutation.title = "Explicit flat title".to_string();
+        mutation.title = "Explicit directory title".to_string();
         store
             .save_virtual_mutation(mutation)
             .expect("save mutation");
         let bytes = b"---\ntitle: \"Cache title edit\"\n---\nBody edit\n";
-        std::fs::write(content_root.join("Team A/ENG-2-old.md"), bytes).expect("write cache");
+        std::fs::write(
+            content_root.join("Teams/Team A/Issues/Todo/ENG-2-old/page.md"),
+            bytes,
+        )
+        .expect("write cache");
 
         rename_virtual_fs_item(
             &mut store,
             &content_root,
             &mount_id,
             &created_identifier,
-            "children:team-a",
-            "ENG-2-new.md",
+            "team-state:team-a:todo",
+            "ENG-2-new",
         )
         .expect("rename pending issue");
 
         assert_eq!(
-            std::fs::read(content_root.join("Team A/ENG-2-new.md")).expect("read cache"),
+            std::fs::read(content_root.join("Teams/Team A/Issues/Todo/ENG-2-new/page.md"))
+                .expect("read cache"),
             bytes
         );
         let mutation = store
-            .get_virtual_mutation(&mount_id, &created_identifier)
+            .get_virtual_mutation(&mount_id, local_id)
             .expect("get mutation")
             .expect("mutation");
-        assert_eq!(mutation.title, "Explicit flat title");
+        assert_eq!(mutation.title, "Explicit directory title");
         assert_eq!(
             mutation.projected_path,
-            PathBuf::from("Team A/ENG-2-new.md")
+            PathBuf::from("Teams/Team A/Issues/Todo/ENG-2-new/page.md")
         );
         let _ = std::fs::remove_dir_all(state_root);
     }
@@ -7514,26 +7572,18 @@ mod tests {
         store
             .save_mount(virtual_mount_with_connector(&mount_id, "linear"))
             .expect("save mount");
-        store
-            .save_entity(EntityRecord::new(
-                mount_id.clone(),
-                RemoteId::new("team-a"),
-                EntityKind::Page,
-                "Team A",
-                "Team A/page.md",
-            ))
-            .expect("save parent");
+        save_linear_status_parents(&mut store, &mount_id);
         let local_id = "local:linear-dir-missing-cache";
         let created_identifier = seed_pending_linear_issue(
             &mut store,
             &content_root,
             &mount_id,
             local_id,
-            "team-a",
-            "Team A/ENG-7-old/page.md",
+            "team-state:team-a:todo",
+            "Teams/Team A/Issues/Todo/ENG-7-old/page.md",
             "ENG-7-old",
         );
-        let old_cache = content_root.join("Team A/ENG-7-old/page.md");
+        let old_cache = content_root.join("Teams/Team A/Issues/Todo/ENG-7-old/page.md");
         std::fs::remove_file(&old_cache).expect("remove pending cache");
         let before_entities = store.list_entities(&mount_id).expect("list entities");
         let before_mutation = store
@@ -7546,7 +7596,7 @@ mod tests {
             &content_root,
             &mount_id,
             &created_identifier,
-            "children:team-a",
+            "team-state:team-a:todo",
             "ENG-7-new",
         )
         .expect_err("missing pending page cache must fail");
@@ -7568,12 +7618,16 @@ mod tests {
             Some(before_mutation)
         );
         assert!(!old_cache.exists());
-        assert!(!content_root.join("Team A/ENG-7-new").exists());
+        assert!(
+            !content_root
+                .join("Teams/Team A/Issues/Todo/ENG-7-new")
+                .exists()
+        );
         let _ = std::fs::remove_dir_all(state_root);
     }
 
     #[test]
-    fn linear_pending_flat_rename_without_cache_fails_before_state_changes() {
+    fn linear_pending_flat_rename_is_blocked_before_state_changes() {
         let mount_id = MountId::new("linear-main");
         let state_root = temp_root("loc-virtual-fs-linear-pending-flat-missing-cache");
         let content_root = state_root.join("content/linear-main/files");
@@ -7615,14 +7669,11 @@ mod tests {
             "children:team-a",
             "ENG-8-new.md",
         )
-        .expect_err("missing pending flat cache must fail");
+        .expect_err("flat pending Linear rename must fail");
 
-        assert_eq!(
-            error,
-            LocalityError::InvalidState(format!(
-                "pending create `{}` must be materialized before it can be moved or renamed",
-                created_identifier
-            ))
+        assert!(
+            matches!(error, LocalityError::Unsupported(message) if message.contains("Linear writes are only supported")),
+            "{error:?}"
         );
         assert_eq!(
             store.list_entities(&mount_id).expect("list entities"),
@@ -7648,20 +7699,7 @@ mod tests {
         store
             .save_mount(virtual_mount_with_connector(&mount_id, "linear"))
             .expect("save mount");
-        for (id, title, path) in [
-            ("team-a", "Team A", "Team A/page.md"),
-            ("team-b", "Team B", "Team B/page.md"),
-        ] {
-            store
-                .save_entity(EntityRecord::new(
-                    mount_id.clone(),
-                    RemoteId::new(id),
-                    EntityKind::Page,
-                    title,
-                    path,
-                ))
-                .expect("save parent");
-        }
+        save_linear_status_parents(&mut store, &mount_id);
         store
             .save_entity(
                 EntityRecord::new(
@@ -7669,27 +7707,33 @@ mod tests {
                     RemoteId::new("issue-3"),
                     EntityKind::Page,
                     "Canonical remote title",
-                    "Team A/ENG-3-old/page.md",
+                    "Teams/Team A/Issues/Todo/ENG-3-old/page.md",
                 )
                 .with_hydration(HydrationState::Hydrated),
             )
             .expect("save issue");
-        std::fs::create_dir_all(content_root.join("Team A/ENG-3-old")).expect("cache dir");
+        std::fs::create_dir_all(content_root.join("Teams/Team A/Issues/Todo/ENG-3-old"))
+            .expect("cache dir");
         let bytes = b"---\nloc:\n  id: issue-3\ntitle: \"Explicit cache title\"\n---\nBody edit\n";
-        std::fs::write(content_root.join("Team A/ENG-3-old/page.md"), bytes).expect("cache");
+        std::fs::write(
+            content_root.join("Teams/Team A/Issues/Todo/ENG-3-old/page.md"),
+            bytes,
+        )
+        .expect("cache");
 
         rename_virtual_fs_item(
             &mut store,
             &content_root,
             &mount_id,
             "children:issue-3",
-            "children:team-b",
+            "team-state:team-b:done",
             "ENG-3-new",
         )
         .expect("move issue");
 
         assert_eq!(
-            std::fs::read(content_root.join("Team B/ENG-3-new/page.md")).expect("read cache"),
+            std::fs::read(content_root.join("Teams/Team B/Issues/Done/ENG-3-new/page.md"))
+                .expect("read cache"),
             bytes
         );
         let entity = store
@@ -7697,7 +7741,10 @@ mod tests {
             .expect("get entity")
             .expect("entity");
         assert_eq!(entity.title, "Canonical remote title");
-        assert_eq!(entity.path, PathBuf::from("Team B/ENG-3-new/page.md"));
+        assert_eq!(
+            entity.path,
+            PathBuf::from("Teams/Team B/Issues/Done/ENG-3-new/page.md")
+        );
         let mutation = store
             .get_virtual_mutation(&mount_id, "move:issue-3")
             .expect("get mutation")
@@ -7705,77 +7752,81 @@ mod tests {
         assert_eq!(mutation.title, "Canonical remote title");
         assert_eq!(
             mutation.original_path,
-            Some(PathBuf::from("Team A/ENG-3-old/page.md"))
+            Some(PathBuf::from("Teams/Team A/Issues/Todo/ENG-3-old/page.md"))
         );
-        assert_eq!(mutation.parent_remote_id, Some(RemoteId::new("team-b")));
+        assert_eq!(
+            mutation.parent_remote_id,
+            Some(RemoteId::new("team-state:team-b:done"))
+        );
         let _ = std::fs::remove_dir_all(state_root);
     }
 
     #[test]
-    fn linear_remote_flat_rename_preserves_entity_title_and_cached_bytes() {
+    fn linear_remote_page_directory_rename_preserves_entity_title_and_cached_bytes() {
         let mount_id = MountId::new("linear-main");
-        let state_root = temp_root("loc-virtual-fs-linear-remote-flat-rename");
+        let state_root = temp_root("loc-virtual-fs-linear-remote-dir-rename");
         let content_root = state_root.join("content/linear-main/files");
         let mut store = InMemoryStateStore::new();
         store
             .save_mount(virtual_mount_with_connector(&mount_id, "linear"))
             .expect("save mount");
-        store
-            .save_entity(EntityRecord::new(
-                mount_id.clone(),
-                RemoteId::new("team-a"),
-                EntityKind::Page,
-                "Team A",
-                "Team A/page.md",
-            ))
-            .expect("save parent");
+        save_linear_status_parents(&mut store, &mount_id);
         store
             .save_entity(
                 EntityRecord::new(
                     mount_id.clone(),
                     RemoteId::new("issue-4"),
                     EntityKind::Page,
-                    "Canonical flat title",
-                    "Team A/ENG-4-old.md",
+                    "Canonical directory title",
+                    "Teams/Team A/Issues/Todo/ENG-4-old/page.md",
                 )
                 .with_hydration(HydrationState::Hydrated),
             )
             .expect("save issue");
-        std::fs::create_dir_all(content_root.join("Team A")).expect("cache dir");
+        std::fs::create_dir_all(content_root.join("Teams/Team A/Issues/Todo/ENG-4-old"))
+            .expect("cache dir");
         let bytes = b"---\ntitle: \"Edited cache title\"\n---\nEdited body\n";
-        std::fs::write(content_root.join("Team A/ENG-4-old.md"), bytes).expect("cache");
+        std::fs::write(
+            content_root.join("Teams/Team A/Issues/Todo/ENG-4-old/page.md"),
+            bytes,
+        )
+        .expect("cache");
 
         rename_virtual_fs_item(
             &mut store,
             &content_root,
             &mount_id,
-            "issue-4",
-            "children:team-a",
-            "ENG-4-new.md",
+            "children:issue-4",
+            "team-state:team-a:todo",
+            "ENG-4-new",
         )
         .expect("rename issue");
 
         assert_eq!(
-            std::fs::read(content_root.join("Team A/ENG-4-new.md")).expect("read cache"),
+            std::fs::read(content_root.join("Teams/Team A/Issues/Todo/ENG-4-new/page.md"))
+                .expect("read cache"),
             bytes
         );
         let entity = store
             .get_entity(&mount_id, &RemoteId::new("issue-4"))
             .expect("get entity")
             .expect("entity");
-        assert_eq!(entity.title, "Canonical flat title");
-        assert_eq!(entity.path, PathBuf::from("Team A/ENG-4-new.md"));
+        assert_eq!(entity.title, "Canonical directory title");
+        assert_eq!(
+            entity.path,
+            PathBuf::from("Teams/Team A/Issues/Todo/ENG-4-new/page.md")
+        );
         let mutation = store
             .get_virtual_mutation(&mount_id, "move:issue-4")
             .expect("get mutation")
             .expect("mutation");
-        assert_eq!(mutation.title, "Canonical flat title");
+        assert_eq!(mutation.title, "Canonical directory title");
         let _ = std::fs::remove_dir_all(state_root);
     }
 
     #[test]
     fn linear_pending_moves_remain_retryable_when_cache_publication_fails() {
-        for page_directory in [false, true] {
+        for page_directory in [true] {
             let shape = if page_directory { "dir" } else { "flat" };
             let mount_id = MountId::new(format!("linear-pending-{shape}"));
             let state_root = temp_root(&format!("loc-linear-pending-move-failure-{shape}"));
@@ -7784,20 +7835,7 @@ mod tests {
             store
                 .save_mount(virtual_mount_with_connector(&mount_id, "linear"))
                 .expect("save mount");
-            for (id, title, path) in [
-                ("team-a", "Team A", "Team A/page.md"),
-                ("team-b", "Team B", "Team B/page.md"),
-            ] {
-                store
-                    .save_entity(EntityRecord::new(
-                        mount_id.clone(),
-                        RemoteId::new(id),
-                        EntityKind::Page,
-                        title,
-                        path,
-                    ))
-                    .expect("save parent");
-            }
+            save_linear_status_parents(&mut store, &mount_id);
 
             let created_identifier = if page_directory {
                 seed_pending_linear_issue(
@@ -7805,8 +7843,8 @@ mod tests {
                     &content_root,
                     &mount_id,
                     &format!("local:linear-pending-{shape}"),
-                    "team-a",
-                    "Team A/ENG-20-old/page.md",
+                    "team-state:team-a:todo",
+                    "Teams/Team A/Issues/Todo/ENG-20-old/page.md",
                     "ENG-20-old",
                 )
             } else {
@@ -7825,28 +7863,33 @@ mod tests {
                 .unwrap_or(&created_identifier)
                 .to_string();
             let source_relative = if page_directory {
-                "Team A/ENG-20-old/page.md"
+                "Teams/Team A/Issues/Todo/ENG-20-old/page.md"
             } else {
                 "Team A/ENG-20-old.md"
             };
             let target_relative = if page_directory {
-                "Team B/ENG-20-new/page.md"
+                "Teams/Team B/Issues/Done/ENG-20-new/page.md"
             } else {
                 "Team B/ENG-20-new.md"
             };
             let source_cache = content_root.join(source_relative);
             let target_cache = content_root.join(target_relative);
+            let blocker = target_cache
+                .parent()
+                .expect("target issue dir")
+                .to_path_buf();
             let bytes = format!("pending-{shape}-bytes").into_bytes();
             std::fs::write(&source_cache, &bytes).expect("write source cache");
-            std::fs::write(content_root.join("Team B"), b"blocks target directory")
-                .expect("write blocker");
+            std::fs::create_dir_all(blocker.parent().expect("blocker parent"))
+                .expect("create blocker parent");
+            std::fs::write(&blocker, b"blocks target directory").expect("write blocker");
 
             let error = rename_virtual_fs_item(
                 &mut store,
                 &content_root,
                 &mount_id,
                 &created_identifier,
-                "children:team-b",
+                "team-state:team-b:done",
                 if page_directory {
                     "ENG-20-new"
                 } else {
@@ -7870,13 +7913,13 @@ mod tests {
             );
             assert!(!target_cache.exists());
 
-            std::fs::remove_file(content_root.join("Team B")).expect("remove blocker");
+            std::fs::remove_file(&blocker).expect("remove blocker");
             rename_virtual_fs_item(
                 &mut store,
                 &content_root,
                 &mount_id,
                 &created_identifier,
-                "children:team-b",
+                "team-state:team-b:done",
                 if page_directory {
                     "ENG-20-new"
                 } else {
@@ -7901,7 +7944,7 @@ mod tests {
 
     #[test]
     fn linear_remote_moves_commit_consistent_state_before_cache_publication() {
-        for page_directory in [false, true] {
+        for page_directory in [true] {
             let shape = if page_directory { "dir" } else { "flat" };
             let mount_id = MountId::new(format!("linear-remote-{shape}"));
             let state_root = temp_root(&format!("loc-linear-remote-move-failure-{shape}"));
@@ -7910,33 +7953,24 @@ mod tests {
             store
                 .save_mount(virtual_mount_with_connector(&mount_id, "linear"))
                 .expect("save mount");
-            for (id, title, path) in [
-                ("team-a", "Team A", "Team A/page.md"),
-                ("team-b", "Team B", "Team B/page.md"),
-            ] {
-                store
-                    .save_entity(EntityRecord::new(
-                        mount_id.clone(),
-                        RemoteId::new(id),
-                        EntityKind::Page,
-                        title,
-                        path,
-                    ))
-                    .expect("save parent");
-            }
+            save_linear_status_parents(&mut store, &mount_id);
             let remote_id = RemoteId::new(format!("issue-{shape}"));
             let source_relative = if page_directory {
-                "Team A/ENG-21-old/page.md"
+                "Teams/Team A/Issues/Todo/ENG-21-old/page.md"
             } else {
                 "Team A/ENG-21-old.md"
             };
             let target_relative = if page_directory {
-                "Team B/ENG-21-new/page.md"
+                "Teams/Team B/Issues/Done/ENG-21-new/page.md"
             } else {
                 "Team B/ENG-21-new.md"
             };
             let source_cache = content_root.join(source_relative);
             let target_cache = content_root.join(target_relative);
+            let blocker = target_cache
+                .parent()
+                .expect("target issue dir")
+                .to_path_buf();
             store
                 .save_entity(
                     EntityRecord::new(
@@ -7965,7 +7999,7 @@ mod tests {
                     local_id: format!("rename:{}", remote_id.0),
                     mutation_kind: VirtualMutationKind::Rename,
                     target_remote_id: Some(remote_id.clone()),
-                    parent_remote_id: Some(RemoteId::new("team-a")),
+                    parent_remote_id: Some(RemoteId::new("team-state:team-a:todo")),
                     original_path: Some(PathBuf::from(source_relative)),
                     projected_path: PathBuf::from(source_relative),
                     title: "Canonical title".to_string(),
@@ -7978,8 +8012,9 @@ mod tests {
                 .expect("create source parent");
             let bytes = format!("remote-{shape}-bytes").into_bytes();
             std::fs::write(&source_cache, &bytes).expect("write source cache");
-            std::fs::write(content_root.join("Team B"), b"blocks target directory")
-                .expect("write blocker");
+            std::fs::create_dir_all(blocker.parent().expect("blocker parent"))
+                .expect("create blocker parent");
+            std::fs::write(&blocker, b"blocks target directory").expect("write blocker");
             let identifier = if page_directory {
                 format!("children:{}", remote_id.0)
             } else {
@@ -7991,7 +8026,7 @@ mod tests {
                 &content_root,
                 &mount_id,
                 &identifier,
-                "children:team-b",
+                "team-state:team-b:done",
                 if page_directory {
                     "ENG-21-new"
                 } else {
@@ -8034,13 +8069,13 @@ mod tests {
                 bytes
             );
 
-            std::fs::remove_file(content_root.join("Team B")).expect("remove blocker");
+            std::fs::remove_file(&blocker).expect("remove blocker");
             rename_virtual_fs_item(
                 &mut store,
                 &content_root,
                 &mount_id,
                 &identifier,
-                "children:team-b",
+                "team-state:team-b:done",
                 if page_directory {
                     "ENG-21-new"
                 } else {
@@ -8072,21 +8107,13 @@ mod tests {
         store
             .save_mount(virtual_mount_with_connector(&mount_id, "linear"))
             .expect("save mount");
-        store
-            .save_entity(EntityRecord::new(
-                mount_id.clone(),
-                RemoteId::new("team-a"),
-                EntityKind::Page,
-                "Team A",
-                "Team A/page.md",
-            ))
-            .expect("save parent");
+        save_linear_status_parents(&mut store, &mount_id);
         let before = EntityRecord::new(
             mount_id.clone(),
             RemoteId::new("issue-stub"),
             EntityKind::Page,
             "Canonical title",
-            "Team A/ENG-5.md",
+            "Teams/Team A/Issues/Todo/ENG-5/page.md",
         )
         .with_hydration(HydrationState::Stub);
         store.save_entity(before.clone()).expect("save issue");
@@ -8095,9 +8122,9 @@ mod tests {
             &mut store,
             &content_root,
             &mount_id,
-            "issue-stub",
-            "children:team-a",
-            "ENG-5-new.md",
+            "children:issue-stub",
+            "team-state:team-a:todo",
+            "ENG-5-new",
         )
         .expect_err("unmaterialized issue must be rejected");
 
@@ -8111,7 +8138,11 @@ mod tests {
             Some(before)
         );
         assert!(store.list_virtual_mutations(&mount_id).unwrap().is_empty());
-        assert!(!content_root.join("Team A/ENG-5-new.md").exists());
+        assert!(
+            !content_root
+                .join("Teams/Team A/Issues/Todo/ENG-5-new/page.md")
+                .exists()
+        );
         let _ = std::fs::remove_dir_all(state_root);
     }
 
@@ -8124,20 +8155,7 @@ mod tests {
         store
             .save_mount(virtual_mount_with_connector(&mount_id, "linear"))
             .expect("save mount");
-        for (id, title, path) in [
-            ("team-a", "Team A", "Team A/page.md"),
-            ("team-b", "Team B", "Team B/page.md"),
-        ] {
-            store
-                .save_entity(EntityRecord::new(
-                    mount_id.clone(),
-                    RemoteId::new(id),
-                    EntityKind::Page,
-                    title,
-                    path,
-                ))
-                .expect("save parent");
-        }
+        save_linear_status_parents(&mut store, &mount_id);
         store
             .save_entity(
                 EntityRecord::new(
@@ -8145,7 +8163,7 @@ mod tests {
                     RemoteId::new("issue-shadow"),
                     EntityKind::Page,
                     "Shadow-backed title",
-                    "Team A/ENG-6.md",
+                    "Teams/Team A/Issues/Todo/ENG-6/page.md",
                 )
                 .with_hydration(HydrationState::Stub),
             )
@@ -8168,9 +8186,9 @@ mod tests {
             &mut store,
             &content_root,
             &mount_id,
-            "issue-shadow",
-            "children:team-b",
-            "ENG-6-new.md",
+            "children:issue-shadow",
+            "team-state:team-b:done",
+            "ENG-6-new",
         )
         .expect("shadow-backed structural move");
 
@@ -8178,7 +8196,10 @@ mod tests {
             .get_entity(&mount_id, &RemoteId::new("issue-shadow"))
             .unwrap()
             .unwrap();
-        assert_eq!(entity.path, PathBuf::from("Team B/ENG-6-new.md"));
+        assert_eq!(
+            entity.path,
+            PathBuf::from("Teams/Team B/Issues/Done/ENG-6-new/page.md")
+        );
         assert_eq!(entity.title, "Shadow-backed title");
         assert!(
             store

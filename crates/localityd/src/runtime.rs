@@ -2597,11 +2597,51 @@ impl RuntimeState {
         mount_id: &str,
         container_identifier: &str,
     ) -> bool {
+        if !self.config.background_connector_sync {
+            return false;
+        }
         let key = ChildRefreshKey {
             mount_id: mount_id.to_string(),
             container_identifier: container_identifier.to_string(),
         };
-        self.child_refreshes.contains(&key) || self.active_child_refreshes.contains_key(&key)
+        if self
+            .completed_child_refreshes
+            .get(&key)
+            .is_some_and(|completed_priority| {
+                *completed_priority >= ChildRefreshPriority::Interactive
+            })
+        {
+            return false;
+        }
+        if self.child_refreshes.contains(&key) || self.active_child_refreshes.contains_key(&key) {
+            return true;
+        }
+        self.file_provider_children_needs_initial_discovery(mount_id, container_identifier)
+            .unwrap_or(false)
+    }
+
+    fn file_provider_children_needs_initial_discovery(
+        &self,
+        mount_id: &str,
+        container_identifier: &str,
+    ) -> locality_core::LocalityResult<bool> {
+        let store =
+            SqliteStateStore::open(self.config.state_root.clone()).map_err(LocalityError::from)?;
+        let mount_id = MountId::new(mount_id);
+        if !virtual_fs_children_refresh_needed(&store, &mount_id, container_identifier)? {
+            return Ok(false);
+        }
+        let content_root = virtual_fs_content_root(&self.config.state_root, &mount_id);
+        let report = virtual_fs_children_with_content_root(
+            &store,
+            &content_root,
+            &mount_id,
+            container_identifier,
+        )?;
+        Ok(!report
+            .children
+            .iter()
+            .any(|child| !is_virtual_guidance_child(&child.identifier)))
     }
 
     fn wait_for_file_provider_children_refresh(
@@ -4188,6 +4228,10 @@ fn run_job(
             JobCompletion::Freshness(runner.run_freshness_job(state_root, job))
         }
     }
+}
+
+fn is_virtual_guidance_child(identifier: &str) -> bool {
+    identifier.starts_with("guidance:")
 }
 
 fn file_provider_children_response_after_refresh(
@@ -5864,6 +5908,18 @@ mod tests {
     fn file_provider_children_returns_cached_listing_without_pending_discovery() {
         let state_root = temp_runtime_root("runtime-file-provider-children-interactive-discovery");
         seed_virtual_mount(&state_root);
+        {
+            let mut store = SqliteStateStore::open(state_root.clone()).expect("open store");
+            store
+                .save_entity(EntityRecord::new(
+                    MountId::new("notion-main"),
+                    RemoteId::new("page-1"),
+                    EntityKind::Page,
+                    "Roadmap",
+                    "Roadmap/page.md",
+                ))
+                .expect("save cached page");
+        }
         let mut runtime = runtime_state_for_root(state_root.clone());
         runtime.active_job = Some(test_active_job());
 

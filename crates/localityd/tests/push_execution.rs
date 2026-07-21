@@ -21,6 +21,11 @@ use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind, Pu
 use locality_core::push::PushExecutionAction;
 use locality_core::shadow::ShadowDocument;
 use locality_core::{LocalityError, LocalityResult};
+use locality_linear::{
+    LinearApi, LinearConfig, LinearConnector, LinearIssue, LinearIssuePage, LinearIssuePriority,
+    LinearIssueState, LinearIssueUpdateInput, LinearLabel, LinearProject, LinearTeam, LinearUser,
+    render_linear_issue,
+};
 use locality_notion::client::NotionApi;
 use locality_notion::dto::{
     BlockDto, BlockListDto, PageDto, PageListDto, PagePropertyDto, PaginatedListDto,
@@ -1047,6 +1052,418 @@ fn daemon_push_reconciles_sent_gmail_draft_create_to_sent_folder() {
             .expect("find mutation")
             .is_none()
     );
+}
+
+#[test]
+fn daemon_push_reconciles_google_calendar_draft_create_to_canonical_event_filename() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let source_path = Path::new("draft/design-review.md");
+    let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(
+        &cache_path,
+        "---\ntitle: Design review\nsummary: Design review\nstart:\n  dateTime: \"2026-07-20T10:00:00-07:00\"\nend:\n  dateTime: \"2026-07-20T10:30:00-07:00\"\n---\nAgenda\n",
+    )
+    .expect("cache file");
+
+    let draft_folder_id = RemoteId::new("google-calendar-folder:draft");
+    let events_folder_id = RemoteId::new("google-calendar-folder:events");
+    let created_remote_id = RemoteId::new("google-calendar-event:primary:created-event");
+    let expected_path = PathBuf::from("events/20260720-100000-design-review-created-event.md");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "google-calendar", &fixture.root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            draft_folder_id.clone(),
+            EntityKind::Directory,
+            "draft",
+            "draft",
+        ))
+        .expect("save draft folder");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            events_folder_id.clone(),
+            EntityKind::Directory,
+            "events",
+            "events",
+        ))
+        .expect("save events folder");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:calendar-draft",
+            VirtualMutationKind::Create,
+            None,
+            Some(draft_folder_id),
+            "draft/design-review.md",
+            Some(cache_path),
+        ))
+        .expect("save mutation");
+    let source = FakePushSource::default()
+        .with_created_entity(
+            created_remote_id.clone(),
+            rendered_google_calendar_entity(
+                "google-calendar-event:primary:created-event",
+                "Design review",
+                "2026-07-20T10:00:00-07:00",
+                "Agenda",
+            ),
+        )
+        .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
+            operation_id: PushOperationId("create-calendar-draft".to_string()),
+            operation_index: 0,
+            parent_id: events_folder_id,
+            entity_id: created_remote_id.clone(),
+        }]);
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join(source_path),
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &source,
+        Some(&state_root),
+    )
+    .expect("push google calendar draft");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    let event = store
+        .get_entity(&fixture.mount_id, &created_remote_id)
+        .expect("get created event")
+        .expect("created event entity");
+    assert_eq!(event.path, expected_path);
+    let requested_paths = source.requested_paths();
+    assert_eq!(
+        requested_paths,
+        vec![
+            PathBuf::from("events/design-review.md"),
+            expected_path.clone()
+        ]
+    );
+    assert_eq!(requested_paths.last(), Some(&expected_path));
+    assert!(content_root.join(&expected_path).exists());
+    assert!(!content_root.join(source_path).exists());
+    assert!(
+        store
+            .find_virtual_mutation_by_path(&fixture.mount_id, source_path)
+            .expect("find mutation")
+            .is_none()
+    );
+}
+
+#[test]
+fn daemon_push_accepts_google_calendar_summary_only_draft_create() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let source_path = Path::new("draft/summary-only.md");
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(
+        &cache_path,
+        "---\nsummary: Summary only review\nstart:\n  dateTime: \"2026-07-20T10:00:00-07:00\"\nend:\n  dateTime: \"2026-07-20T10:30:00-07:00\"\n---\nAgenda\n",
+    )
+    .expect("cache file");
+
+    let draft_folder_id = RemoteId::new("google-calendar-folder:draft");
+    let events_folder_id = RemoteId::new("google-calendar-folder:events");
+    let created_remote_id = RemoteId::new("google-calendar-event:primary:summary-only-event");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "google-calendar", &fixture.root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            draft_folder_id.clone(),
+            EntityKind::Directory,
+            "draft",
+            "draft",
+        ))
+        .expect("save draft folder");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            events_folder_id.clone(),
+            EntityKind::Directory,
+            "events",
+            "events",
+        ))
+        .expect("save events folder");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:calendar-summary-only-draft",
+            VirtualMutationKind::Create,
+            None,
+            Some(draft_folder_id),
+            "draft/summary-only.md",
+            Some(cache_path),
+        ))
+        .expect("save mutation");
+    let source = FakePushSource::default()
+        .with_created_entity(
+            created_remote_id.clone(),
+            rendered_google_calendar_entity(
+                "google-calendar-event:primary:summary-only-event",
+                "Summary only review",
+                "2026-07-20T10:00:00-07:00",
+                "Agenda",
+            ),
+        )
+        .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
+            operation_id: PushOperationId("create-calendar-summary-only-draft".to_string()),
+            operation_index: 0,
+            parent_id: events_folder_id,
+            entity_id: created_remote_id,
+        }]);
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join(source_path),
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &source,
+        Some(&state_root),
+    )
+    .expect("push summary-only google calendar draft");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    let journal = store.list_journal().expect("journal");
+    assert_eq!(journal.len(), 1);
+    let PushOperation::CreateEntity { title, .. } = &journal[0].plan.operations[0] else {
+        panic!("expected create entity operation");
+    };
+    assert_eq!(title, "Summary only review");
+}
+
+#[test]
+fn daemon_push_preserves_edited_google_calendar_draft_after_create_reconcile_retry() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let source_path = Path::new("draft/design-review.md");
+    let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    let edited_draft = "---\nsummary: Follow-up design review\nstart:\n  dateTime: \"2026-07-20T10:00:00-07:00\"\nend:\n  dateTime: \"2026-07-20T10:30:00-07:00\"\n---\nUpdated agenda\n";
+    fs::write(
+        &cache_path,
+        "---\nsummary: Design review\nstart:\n  dateTime: \"2026-07-20T10:00:00-07:00\"\nend:\n  dateTime: \"2026-07-20T10:30:00-07:00\"\n---\nAgenda\n",
+    )
+    .expect("cache file");
+
+    let draft_folder_id = RemoteId::new("google-calendar-folder:draft");
+    let events_folder_id = RemoteId::new("google-calendar-folder:events");
+    let created_remote_id = RemoteId::new("google-calendar-event:primary:created-event");
+    let expected_path = PathBuf::from("events/20260720-100000-design-review-created-event.md");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "google-calendar", &fixture.root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            draft_folder_id.clone(),
+            EntityKind::Directory,
+            "draft",
+            "draft",
+        ))
+        .expect("save draft folder");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            events_folder_id.clone(),
+            EntityKind::Directory,
+            "events",
+            "events",
+        ))
+        .expect("save events folder");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:calendar-draft",
+            VirtualMutationKind::Create,
+            None,
+            Some(draft_folder_id),
+            "draft/design-review.md",
+            Some(cache_path.clone()),
+        ))
+        .expect("save mutation");
+    let source = FakePushSource::default()
+        .with_created_entity(
+            created_remote_id.clone(),
+            rendered_google_calendar_entity(
+                "google-calendar-event:primary:created-event",
+                "Design review",
+                "2026-07-20T10:00:00-07:00",
+                "Agenda",
+            ),
+        )
+        .with_created_fetch_failures(created_remote_id.clone(), 1)
+        .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
+            operation_id: PushOperationId("create-calendar-draft".to_string()),
+            operation_index: 0,
+            parent_id: events_folder_id,
+            entity_id: created_remote_id.clone(),
+        }]);
+    let job = || PushJob {
+        target_path: fixture.root.join(source_path),
+        assume_yes: true,
+        confirm_dangerous: false,
+    };
+
+    let first = execute_push_job_with_content_root(&mut store, job(), &source, Some(&state_root))
+        .expect("first push");
+
+    assert_eq!(first.action, PushJobAction::Failed);
+    assert_eq!(source.applied_count(), 1);
+    let first_push_id = first.push_id.expect("first push id");
+    fs::write(&cache_path, edited_draft).expect("edit stale draft");
+
+    let second = execute_push_job_with_content_root(&mut store, job(), &source, Some(&state_root))
+        .expect("retry push");
+
+    assert_eq!(second.action, PushJobAction::Reconciled);
+    assert_eq!(
+        source.applied_count(),
+        1,
+        "retry must not recreate Calendar event"
+    );
+    assert_eq!(second.push_id.as_ref(), Some(&first_push_id));
+    let event = store
+        .get_entity(&fixture.mount_id, &created_remote_id)
+        .expect("get created event")
+        .expect("created event entity");
+    assert_eq!(event.path, expected_path);
+    assert!(content_root.join(&expected_path).exists());
+    assert_eq!(
+        fs::read_to_string(content_root.join(source_path)).expect("preserved edited draft"),
+        edited_draft
+    );
+    assert!(
+        store
+            .find_virtual_mutation_by_path(&fixture.mount_id, source_path)
+            .expect("find mutation")
+            .is_some()
+    );
+}
+
+#[test]
+fn auto_save_push_blocks_google_calendar_draft_create_without_applying() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let source_path = Path::new("draft/design-review.md");
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(
+        &cache_path,
+        "---\nsummary: Design review\nstart:\n  dateTime: \"2026-07-20T10:00:00-07:00\"\nend:\n  dateTime: \"2026-07-20T10:30:00-07:00\"\n---\nAgenda\n",
+    )
+    .expect("cache file");
+
+    let draft_folder_id = RemoteId::new("google-calendar-folder:draft");
+    let created_remote_id = RemoteId::new("google-calendar-event:primary:created-event");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "google-calendar", &fixture.root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            draft_folder_id.clone(),
+            EntityKind::Directory,
+            "draft",
+            "draft",
+        ))
+        .expect("save draft folder");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:calendar-draft",
+            VirtualMutationKind::Create,
+            None,
+            Some(draft_folder_id),
+            "draft/design-review.md",
+            Some(cache_path),
+        ))
+        .expect("save mutation");
+    store
+        .save_auto_save_enrollment(AutoSaveEnrollmentRecord::new(
+            fixture.mount_id.clone(),
+            source_path,
+            AutoSaveOrigin::LocalityCreated,
+            "now",
+        ))
+        .expect("save enrollment");
+    let source =
+        FakePushSource::default().with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
+            operation_id: PushOperationId("create-calendar-draft".to_string()),
+            operation_index: 0,
+            parent_id: RemoteId::new("google-calendar-folder:events"),
+            entity_id: created_remote_id,
+        }]);
+
+    let report = execute_auto_save_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join(source_path),
+            assume_yes: false,
+            confirm_dangerous: false,
+        },
+        &source,
+        Some(&state_root),
+    )
+    .expect("auto-save google calendar draft");
+
+    assert_eq!(report.action, PushJobAction::NotReady);
+    assert_eq!(
+        source.applied_count(),
+        0,
+        "auto-save must not create Calendar events"
+    );
+    assert_eq!(
+        report.error.as_ref().expect("error").code,
+        "auto_save_blocked"
+    );
+    assert_eq!(
+        report.error.as_ref().expect("error").message,
+        "Google Calendar event creates require review"
+    );
+    let enrollment = store
+        .get_auto_save_enrollment(&fixture.mount_id, source_path)
+        .expect("get enrollment")
+        .expect("enrollment");
+    assert_eq!(enrollment.state, AutoSaveState::Blocked);
+    assert_eq!(
+        enrollment.last_reason.as_deref(),
+        Some("Google Calendar event creates require review")
+    );
+    assert!(store.list_journal().expect("journal").is_empty());
 }
 
 #[test]
@@ -2141,7 +2558,7 @@ fn moved_entity_reconciliation_clears_intent_only_after_accepted_readback() {
     let report = execute_push_job_with_content_root(
         &mut store,
         PushJob {
-            target_path: fixture.root.join("Team B/Roadmap.md"),
+            target_path: fixture.root.join(linear_move_execution_path()),
             assume_yes: true,
             confirm_dangerous: false,
         },
@@ -2161,7 +2578,7 @@ fn moved_entity_reconciliation_clears_intent_only_after_accepted_readback() {
         .get_entity(&fixture.mount_id, &fixture.remote_id)
         .unwrap()
         .unwrap();
-    assert_eq!(entity.path, PathBuf::from("Team B/Roadmap.md"));
+    assert_eq!(entity.path, PathBuf::from(linear_move_execution_path()));
     assert_eq!(entity.title, "Roadmap");
     assert_eq!(entity.hydration, HydrationState::Hydrated);
     assert_eq!(
@@ -2176,7 +2593,7 @@ fn moved_entity_reconciliation_clears_intent_only_after_accepted_readback() {
             virtual_fs_content_path(
                 &state_root,
                 &fixture.mount_id,
-                Path::new("Team B/Roadmap.md"),
+                Path::new(linear_move_execution_path()),
             )
             .unwrap(),
         )
@@ -2210,7 +2627,7 @@ fn moved_entity_reconciliation_requires_effect_and_changed_id_and_retains_intent
         let report = execute_push_job_with_content_root(
             &mut store,
             PushJob {
-                target_path: fixture.root.join("Team B/Roadmap.md"),
+                target_path: fixture.root.join(linear_move_execution_path()),
                 assume_yes: true,
                 confirm_dangerous: false,
             },
@@ -2247,7 +2664,7 @@ fn moved_entity_fetch_failure_resumes_same_journal_without_reapplying() {
     let report = execute_push_job_with_content_root(
         &mut store,
         PushJob {
-            target_path: fixture.root.join("Team B/Roadmap.md"),
+            target_path: fixture.root.join(linear_move_execution_path()),
             assume_yes: true,
             confirm_dangerous: false,
         },
@@ -2269,7 +2686,7 @@ fn moved_entity_fetch_failure_resumes_same_journal_without_reapplying() {
     let retried = execute_push_job_with_content_root(
         &mut store,
         PushJob {
-            target_path: fixture.root.join("Team B/Roadmap.md"),
+            target_path: fixture.root.join(linear_move_execution_path()),
             assume_yes: true,
             confirm_dangerous: false,
         },
@@ -2292,6 +2709,142 @@ fn moved_entity_fetch_failure_resumes_same_journal_without_reapplying() {
     assert_eq!(journal.len(), 1);
     assert_eq!(journal[0].push_id, push_id);
     assert_eq!(journal[0].status, JournalStatus::Reconciled);
+}
+
+#[test]
+fn linear_move_reconciliation_uses_refreshed_canonical_path() {
+    let root =
+        std::env::temp_dir().join(format!("loc-linear-move-canonical-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("fixture root");
+    let state_root = root.join(".state");
+    let mount_id = MountId::new("linear-main");
+    let issue_id = RemoteId::new("issue-1");
+    let issue = linear_push_issue();
+    let api = Arc::new(FakeLinearMoveApi::new(issue.clone()));
+    let source = LinearConnector::with_api(LinearConfig::new("secret"), api.clone());
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(mount_id.clone(), "linear", root.clone())
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            mount_id.clone(),
+            RemoteId::new("team-state:team-2:state-2"),
+            EntityKind::Directory,
+            "Done",
+            "Teams/Platform/Issues/Done",
+        ))
+        .expect("save status");
+    let projected_path = PathBuf::from("Teams/Platform/Issues/Done/ENG-1 Improve sync/page.md");
+    store
+        .save_entity(
+            EntityRecord::new(
+                mount_id.clone(),
+                issue_id.clone(),
+                EntityKind::Page,
+                "Improve sync",
+                projected_path.clone(),
+            )
+            .with_hydration(HydrationState::Dirty)
+            .with_remote_edited_at("linear:issue-1:2026-07-15T12:00:00Z"),
+        )
+        .expect("save moved issue");
+    let rendered = render_linear_issue(&issue).expect("render issue");
+    store
+        .save_shadow(
+            &mount_id,
+            ShadowDocument::from_synced_body(
+                issue_id.clone(),
+                rendered.body.clone(),
+                1,
+                [RemoteId::new("body-1")],
+            )
+            .expect("shadow")
+            .with_frontmatter(rendered.frontmatter.clone()),
+        )
+        .expect("save shadow");
+    let cache =
+        virtual_fs_content_path(&state_root, &mount_id, &projected_path).expect("cache path");
+    fs::create_dir_all(cache.parent().expect("cache parent")).expect("cache parent");
+    let edited_frontmatter = rendered
+        .frontmatter
+        .replace("title: \"Improve sync\"", "title: \"Improve sync renamed\"");
+    fs::write(
+        &cache,
+        render_canonical_markdown(&CanonicalDocument::new(edited_frontmatter, rendered.body)),
+    )
+    .expect("write cache");
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: mount_id.clone(),
+            local_id: "move:issue-1".to_string(),
+            mutation_kind: VirtualMutationKind::Move,
+            target_remote_id: Some(issue_id.clone()),
+            parent_remote_id: Some(RemoteId::new("team-state:team-2:state-2")),
+            original_path: Some(PathBuf::from(
+                "Teams/Engineering/Issues/Todo/ENG-1 Improve sync/page.md",
+            )),
+            projected_path: projected_path.clone(),
+            title: "Improve sync".to_string(),
+            content_path: Some(cache),
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+        })
+        .expect("save move");
+    fs::create_dir_all(root.join(projected_path.parent().expect("projected parent")))
+        .expect("visible destination");
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: root.join(&projected_path),
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &source,
+        Some(&state_root),
+    )
+    .expect("execute Linear move");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    assert_eq!(
+        api.updates.lock().unwrap().as_slice(),
+        &[LinearIssueUpdateInput {
+            issue_id: "issue-1".to_string(),
+            title: Some("Improve sync renamed".to_string()),
+            description: None,
+            team_id: Some("team-2".to_string()),
+            state_id: Some("state-2".to_string()),
+            project_id: None,
+            assignee_id: None,
+        }]
+    );
+    let entity = store
+        .get_entity(&mount_id, &issue_id)
+        .expect("get issue")
+        .expect("issue");
+    assert_eq!(
+        entity.path,
+        PathBuf::from("Teams/Platform/Issues/Done/PLAT-9 Improve sync renamed/page.md")
+    );
+    assert!(
+        store
+            .get_virtual_mutation(&mount_id, "move:issue-1")
+            .expect("move mutation")
+            .is_none()
+    );
+    assert!(
+        fs::read_to_string(
+            virtual_fs_content_path(&state_root, &mount_id, &entity.path).expect("final cache")
+        )
+        .expect("read final cache")
+        .contains("Existing description.")
+    );
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2414,6 +2967,10 @@ fn pending_move_execution_store() -> (PushFixture, PathBuf, InMemoryStateStore) 
     pending_move_execution_store_for_connector("linear")
 }
 
+fn linear_move_execution_path() -> &'static str {
+    "Teams/Team B/Issues/Done/Roadmap/page.md"
+}
+
 fn pending_move_execution_store_for_connector(
     connector: &str,
 ) -> (PushFixture, PathBuf, InMemoryStateStore) {
@@ -2426,15 +2983,40 @@ fn pending_move_execution_store_for_connector(
                 .projection(ProjectionMode::LinuxFuse),
         )
         .expect("save mount");
-    store
-        .save_entity(EntityRecord::new(
-            fixture.mount_id.clone(),
-            RemoteId::new("team-b"),
-            EntityKind::Page,
-            "Team B",
-            "Team B/page.md",
-        ))
-        .expect("save team");
+    let linear = connector == "linear";
+    let parent_remote_id = if linear {
+        store
+            .save_entity(EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("team-state:team-b:done"),
+                EntityKind::Directory,
+                "Done",
+                "Teams/Team B/Issues/Done",
+            ))
+            .expect("save Linear status");
+        RemoteId::new("team-state:team-b:done")
+    } else {
+        store
+            .save_entity(EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("team-b"),
+                EntityKind::Page,
+                "Team B",
+                "Team B/page.md",
+            ))
+            .expect("save team");
+        RemoteId::new("team-b")
+    };
+    let moved_path = if linear {
+        PathBuf::from(linear_move_execution_path())
+    } else {
+        PathBuf::from("Team B/Roadmap.md")
+    };
+    let original_path = if linear {
+        PathBuf::from("Teams/Team A/Issues/Todo/Roadmap/page.md")
+    } else {
+        PathBuf::from("Team A/Roadmap.md")
+    };
     store
         .save_entity(
             EntityRecord::new(
@@ -2442,7 +3024,7 @@ fn pending_move_execution_store_for_connector(
                 fixture.remote_id.clone(),
                 EntityKind::Page,
                 "Roadmap",
-                "Team B/Roadmap.md",
+                moved_path.clone(),
             )
             .with_hydration(HydrationState::Dirty)
             .with_remote_edited_at("2026-06-10T00:00:00Z"),
@@ -2451,12 +3033,8 @@ fn pending_move_execution_store_for_connector(
     store
         .save_shadow(&fixture.mount_id, shadow("page-1", "Old body."))
         .expect("save shadow");
-    let cache = virtual_fs_content_path(
-        &state_root,
-        &fixture.mount_id,
-        Path::new("Team B/Roadmap.md"),
-    )
-    .expect("cache path");
+    let cache =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, &moved_path).expect("cache path");
     fs::create_dir_all(cache.parent().unwrap()).expect("cache parent");
     fixture.write_page_to(&cache, "Old body.");
     store
@@ -2465,16 +3043,21 @@ fn pending_move_execution_store_for_connector(
             local_id: "move:page-1".to_string(),
             mutation_kind: VirtualMutationKind::Move,
             target_remote_id: Some(fixture.remote_id.clone()),
-            parent_remote_id: Some(RemoteId::new("team-b")),
-            original_path: Some(PathBuf::from("Team A/Roadmap.md")),
-            projected_path: PathBuf::from("Team B/Roadmap.md"),
+            parent_remote_id: Some(parent_remote_id),
+            original_path: Some(original_path),
+            projected_path: moved_path.clone(),
             title: "Roadmap".to_string(),
             content_path: Some(cache),
             created_at: "2026-06-12T00:00:00Z".to_string(),
             updated_at: "2026-06-12T00:00:00Z".to_string(),
         })
         .expect("save move");
-    fs::create_dir_all(fixture.root.join("Team B")).expect("visible team");
+    fs::create_dir_all(
+        fixture
+            .root
+            .join(moved_path.parent().expect("moved parent")),
+    )
+    .expect("visible move parent");
     (fixture, state_root, store)
 }
 
@@ -2483,7 +3066,122 @@ fn moved_page_effect() -> JournalApplyEffect {
         operation_id: PushOperationId("move-page-1".to_string()),
         operation_index: 0,
         entity_id: RemoteId::new("page-1"),
-        parent_id: RemoteId::new("team-b"),
+        parent_id: RemoteId::new("team-state:team-b:done"),
+    }
+}
+
+#[derive(Debug)]
+struct FakeLinearMoveApi {
+    issue: Mutex<LinearIssue>,
+    updates: Mutex<Vec<LinearIssueUpdateInput>>,
+}
+
+impl FakeLinearMoveApi {
+    fn new(issue: LinearIssue) -> Self {
+        Self {
+            issue: Mutex::new(issue),
+            updates: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl LinearApi for FakeLinearMoveApi {
+    fn list_issues(
+        &self,
+        _cursor: Option<&str>,
+        _updated_after: Option<&str>,
+        team_id: Option<&str>,
+    ) -> LocalityResult<LinearIssuePage> {
+        let issue = self.issue.lock().unwrap().clone();
+        let issues = if team_id.is_none_or(|team_id| issue.team.id == team_id) {
+            vec![issue]
+        } else {
+            Vec::new()
+        };
+        Ok(LinearIssuePage {
+            issues,
+            has_next_page: false,
+            end_cursor: None,
+        })
+    }
+
+    fn get_issue(&self, issue_id: &str) -> LocalityResult<LinearIssue> {
+        let issue = self.issue.lock().unwrap().clone();
+        if issue.id == issue_id {
+            Ok(issue)
+        } else {
+            Err(LocalityError::RemoteNotFound(issue_id.to_string()))
+        }
+    }
+
+    fn update_issue(&self, input: LinearIssueUpdateInput) -> LocalityResult<LinearIssue> {
+        self.updates.lock().unwrap().push(input.clone());
+        let mut issue = self.issue.lock().unwrap();
+        if let Some(team_id) = &input.team_id {
+            issue.team = LinearTeam {
+                id: team_id.clone(),
+                key: "PLAT".to_string(),
+                name: "Platform".to_string(),
+            };
+            issue.identifier = "PLAT-9".to_string();
+            issue.url = "https://linear.app/acme/issue/PLAT-9/improve-sync".to_string();
+        }
+        if let Some(state_id) = &input.state_id {
+            issue.state = LinearIssueState {
+                id: state_id.clone(),
+                name: "Done".to_string(),
+                state_type: Some("completed".to_string()),
+            };
+        }
+        if let Some(title) = &input.title {
+            issue.title = title.clone();
+        }
+        if let Some(description) = &input.description {
+            issue.description = Some(description.clone());
+        }
+        issue.updated_at = "2026-07-16T12:00:00Z".to_string();
+        Ok(issue.clone())
+    }
+}
+
+fn linear_push_issue() -> LinearIssue {
+    LinearIssue {
+        id: "issue-1".to_string(),
+        identifier: "ENG-1".to_string(),
+        title: "Improve sync".to_string(),
+        description: Some("Existing description.".to_string()),
+        url: "https://linear.app/acme/issue/ENG-1/improve-sync".to_string(),
+        created_at: "2026-07-14T12:00:00Z".to_string(),
+        updated_at: "2026-07-15T12:00:00Z".to_string(),
+        archived_at: None,
+        priority: Some(LinearIssuePriority {
+            value: 3,
+            label: "High".to_string(),
+        }),
+        estimate: Some(3.0),
+        team: LinearTeam {
+            id: "team-1".to_string(),
+            key: "ENG".to_string(),
+            name: "Engineering".to_string(),
+        },
+        state: LinearIssueState {
+            id: "state-1".to_string(),
+            name: "Todo".to_string(),
+            state_type: Some("unstarted".to_string()),
+        },
+        project: Some(LinearProject {
+            id: "project-1".to_string(),
+            name: "Launch".to_string(),
+        }),
+        assignee: Some(LinearUser {
+            id: "user-1".to_string(),
+            name: "Ada".to_string(),
+            email: Some("ada@example.com".to_string()),
+        }),
+        labels: vec![LinearLabel {
+            id: "label-1".to_string(),
+            name: "Bug".to_string(),
+        }],
     }
 }
 
@@ -2814,6 +3512,31 @@ fn rendered_gmail_entity(
     let document = CanonicalDocument::new(
         format!(
             "loc:\n  id: {remote_id}\n  type: page\n  connector: gmail\n  synced_at: {remote_version}\n  remote_edited_at: {remote_version}\ntitle: {subject}\ngmail:\n  mailbox: sent\n  message_id: {remote_id}\n  thread_id: thread-{remote_id}\n  labels: [SENT]\nfrom: sender@example.com\nto: [user@example.com]\ncc: []\nbcc: []\nsubject: {subject}\ndate: Tue, 14 Jul 2026 10:00:00 +0000\n"
+        ),
+        body.clone(),
+    );
+    HydratedEntity {
+        document,
+        shadow: shadow(remote_id, plain_body),
+        remote_edited_at: Some(remote_version),
+        assets: Vec::new(),
+    }
+}
+
+fn rendered_google_calendar_entity(
+    remote_id: &str,
+    summary: &str,
+    start_date_time: &str,
+    plain_body: &str,
+) -> HydratedEntity {
+    let body = markdown_body(plain_body);
+    let event_id = remote_id
+        .strip_prefix("google-calendar-event:primary:")
+        .expect("primary event remote id");
+    let remote_version = format!("google-calendar:created-event:2026-07-20T17:30:00Z:\"etag\"");
+    let document = CanonicalDocument::new(
+        format!(
+            "loc:\n  id: {remote_id}\n  type: page\n  connector: google-calendar\n  synced_at: {remote_version}\n  remote_edited_at: {remote_version}\ntitle: {summary}\nsummary: {summary}\nstart:\n  dateTime: \"{start_date_time}\"\ngoogle_calendar:\n  calendar_id: primary\n  event_id: {event_id}\n"
         ),
         body.clone(),
     );

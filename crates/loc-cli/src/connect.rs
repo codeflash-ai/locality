@@ -6,6 +6,13 @@ use locality_gmail::{
     GMAIL_CONNECTOR_ID, GMAIL_OAUTH_SCOPES, HttpGmailOAuthBrokerClient, StoredGmailCredential,
     gmail_capabilities_json, validate_gmail_oauth_scopes,
 };
+use locality_google_calendar::oauth::{
+    google_calendar_capabilities_json, validate_google_calendar_oauth_scopes,
+};
+use locality_google_calendar::{
+    GOOGLE_CALENDAR_CONNECTOR_ID, GOOGLE_CALENDAR_OAUTH_SCOPES,
+    HttpGoogleCalendarOAuthBrokerClient, StoredGoogleCalendarCredential,
+};
 use locality_google_docs::{
     GOOGLE_DOCS_CONNECTOR_ID, GOOGLE_DOCS_OAUTH_SCOPES, HttpGoogleDocsOAuthBrokerClient,
     StoredGoogleDocsCredential, google_docs_capabilities_json,
@@ -32,6 +39,7 @@ use serde::Serialize;
 pub const DEFAULT_NOTION_PROFILE_ID: &str = "notion-token-default";
 pub const DEFAULT_NOTION_OAUTH_PROFILE_ID: &str = "notion-oauth-default";
 pub const DEFAULT_GOOGLE_DOCS_OAUTH_PROFILE_ID: &str = "google-docs-oauth-default";
+pub const DEFAULT_GOOGLE_CALENDAR_OAUTH_PROFILE_ID: &str = "google-calendar-oauth-default";
 pub const DEFAULT_GMAIL_OAUTH_PROFILE_ID: &str = "gmail-oauth-default";
 pub const DEFAULT_SLACK_OAUTH_PROFILE_ID: &str = "slack-oauth-default";
 pub const DEFAULT_GRANOLA_API_KEY_PROFILE_ID: &str = "granola-api-key-default";
@@ -76,6 +84,17 @@ pub struct GoogleDocsBrokerOAuthConnectOptions {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GmailBrokerOAuthConnectOptions {
+    pub connection_id: Option<ConnectionId>,
+    pub broker_url: String,
+    pub client_id: String,
+    pub session: String,
+    pub state: String,
+    pub code: String,
+    pub redirect_uri: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GoogleCalendarBrokerOAuthConnectOptions {
     pub connection_id: Option<ConnectionId>,
     pub broker_url: String,
     pub client_id: String,
@@ -245,6 +264,13 @@ pub trait GmailOAuthBrokerExchange {
     ) -> Result<OAuthBrokerToken, ConnectError>;
 }
 
+pub trait GoogleCalendarOAuthBrokerExchange {
+    fn exchange_code(
+        &self,
+        request: &OAuthBrokerCodeExchange,
+    ) -> Result<OAuthBrokerToken, ConnectError>;
+}
+
 pub trait SlackOAuthBrokerExchange {
     fn exchange_code(
         &self,
@@ -315,6 +341,19 @@ impl GmailOAuthBrokerExchange for HttpGmailOAuthBrokerClient {
     ) -> Result<OAuthBrokerToken, ConnectError> {
         HttpGmailOAuthBrokerClient::exchange_code(self, request).map_err(|error| {
             ConnectError::OAuthExchangeFailed(OAuthExchangeFailure::gmail(error.to_string()))
+        })
+    }
+}
+
+impl GoogleCalendarOAuthBrokerExchange for HttpGoogleCalendarOAuthBrokerClient {
+    fn exchange_code(
+        &self,
+        request: &OAuthBrokerCodeExchange,
+    ) -> Result<OAuthBrokerToken, ConnectError> {
+        HttpGoogleCalendarOAuthBrokerClient::exchange_code(self, request).map_err(|error| {
+            ConnectError::OAuthExchangeFailed(OAuthExchangeFailure::google_calendar(
+                error.to_string(),
+            ))
         })
     }
 }
@@ -873,6 +912,102 @@ where
     })
 }
 
+pub fn run_connect_google_calendar_broker_oauth<S, E>(
+    store: &mut S,
+    credentials: &dyn CredentialStore,
+    options: GoogleCalendarBrokerOAuthConnectOptions,
+    exchange: &E,
+) -> Result<ConnectReport, ConnectError>
+where
+    S: ConnectionRepository + ConnectorProfileRepository,
+    E: GoogleCalendarOAuthBrokerExchange,
+{
+    let connection_id = match options.connection_id {
+        Some(connection_id) => connection_id,
+        None => default_connection_id_for_connector(
+            store,
+            GOOGLE_CALENDAR_CONNECTOR_ID,
+            "google-calendar-default",
+            "Google Calendar",
+        )?,
+    };
+    let exchange_request = OAuthBrokerCodeExchange {
+        connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
+        session: options.session,
+        state: options.state,
+        code: options.code,
+        redirect_uri: options.redirect_uri,
+    };
+    let token = exchange.exchange_code(&exchange_request)?;
+    validate_google_calendar_oauth_scopes(&token.scopes).map_err(|error| {
+        ConnectError::OAuthExchangeFailed(OAuthExchangeFailure::google_calendar(error.to_string()))
+    })?;
+    let acquired_at = timestamp_secs();
+    let secret_ref = format!("connection:{}", connection_id.0);
+    let stored = StoredGoogleCalendarCredential::from_broker_token(
+        token.clone(),
+        options.client_id,
+        options.broker_url,
+        acquired_at,
+    );
+    let secret = serde_json::to_string(&stored).map_err(|error| {
+        ConnectError::CredentialEncode(CredentialEncodeFailure::google_calendar(error.to_string()))
+    })?;
+    credentials.put(&secret_ref, &secret).map_err(|error| {
+        ConnectError::Credential(CredentialStorageFailure::google_calendar(error))
+    })?;
+
+    let now = timestamp();
+    let profile_id = ConnectorProfileId::new(DEFAULT_GOOGLE_CALENDAR_OAUTH_PROFILE_ID);
+    store
+        .save_connector_profile(default_google_calendar_oauth_profile(now.clone()))
+        .map_err(ConnectError::Store)?;
+
+    let display_name = connection_id.0.clone();
+    let account_label = token
+        .account_label
+        .clone()
+        .or_else(|| token.account_id.clone())
+        .or_else(|| token.workspace_name.clone());
+    let connection = ConnectionRecord {
+        connection_id: connection_id.clone(),
+        profile_id: Some(profile_id.clone()),
+        connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
+        display_name: display_name.clone(),
+        account_label: account_label.clone(),
+        workspace_id: token.workspace_id.clone(),
+        workspace_name: token.workspace_name.clone(),
+        auth_kind: "oauth".to_string(),
+        secret_ref,
+        scopes: token.scopes.clone(),
+        capabilities_json: google_calendar_capabilities_json().map_err(|error| {
+            ConnectError::CredentialEncode(CredentialEncodeFailure::google_calendar(
+                error.to_string(),
+            ))
+        })?,
+        status: "active".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        expires_at: stored.expires_at.map(|expires_at| expires_at.to_string()),
+    };
+    store
+        .save_connection(connection)
+        .map_err(ConnectError::Store)?;
+
+    Ok(ConnectReport {
+        ok: true,
+        command: "connect",
+        connection_id: connection_id.0,
+        profile_id: profile_id.0,
+        connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
+        display_name,
+        account_label,
+        workspace_id: token.workspace_id,
+        workspace_name: token.workspace_name,
+        auth_kind: "oauth".to_string(),
+    })
+}
+
 pub fn run_connect_slack_broker_oauth<S, E>(
     store: &mut S,
     credentials: &dyn CredentialStore,
@@ -1067,6 +1202,7 @@ pub struct OAuthExchangeFailure {
 enum OAuthExchangeConnector {
     Notion,
     GoogleDocs,
+    GoogleCalendar,
     Gmail,
     Slack,
 }
@@ -1093,6 +1229,13 @@ impl OAuthExchangeFailure {
         }
     }
 
+    pub fn google_calendar(message: impl Into<String>) -> Self {
+        Self {
+            connector: OAuthExchangeConnector::GoogleCalendar,
+            message: message.into(),
+        }
+    }
+
     pub fn slack(message: impl Into<String>) -> Self {
         Self {
             connector: OAuthExchangeConnector::Slack,
@@ -1104,6 +1247,7 @@ impl OAuthExchangeFailure {
         match self.connector {
             OAuthExchangeConnector::Notion => "Notion",
             OAuthExchangeConnector::GoogleDocs => "Google Docs",
+            OAuthExchangeConnector::GoogleCalendar => "Google Calendar",
             OAuthExchangeConnector::Gmail => "Gmail",
             OAuthExchangeConnector::Slack => "Slack",
         }
@@ -1113,6 +1257,7 @@ impl OAuthExchangeFailure {
         match self.connector {
             OAuthExchangeConnector::Notion => "loc connect notion",
             OAuthExchangeConnector::GoogleDocs => "loc connect google-docs",
+            OAuthExchangeConnector::GoogleCalendar => "loc connect google-calendar",
             OAuthExchangeConnector::Gmail => "loc connect gmail",
             OAuthExchangeConnector::Slack => "loc connect slack",
         }
@@ -1135,6 +1280,7 @@ pub struct CredentialStorageFailure {
 enum CredentialFailureConnector {
     Notion,
     GoogleDocs,
+    GoogleCalendar,
     Gmail,
     Slack,
     Granola,
@@ -1152,6 +1298,10 @@ impl CredentialEncodeFailure {
 
     pub fn gmail(message: impl Into<String>) -> Self {
         Self::new(CredentialFailureConnector::Gmail, message)
+    }
+
+    pub fn google_calendar(message: impl Into<String>) -> Self {
+        Self::new(CredentialFailureConnector::GoogleCalendar, message)
     }
 
     pub fn slack(message: impl Into<String>) -> Self {
@@ -1197,6 +1347,10 @@ impl CredentialStorageFailure {
 
     pub fn gmail(error: CredentialError) -> Self {
         Self::new(CredentialFailureConnector::Gmail, error)
+    }
+
+    pub fn google_calendar(error: CredentialError) -> Self {
+        Self::new(CredentialFailureConnector::GoogleCalendar, error)
     }
 
     pub fn slack(error: CredentialError) -> Self {
@@ -1246,6 +1400,7 @@ impl CredentialFailureConnector {
     fn from_connector_id(connector: &str) -> Self {
         match connector {
             GOOGLE_DOCS_CONNECTOR_ID => Self::GoogleDocs,
+            GOOGLE_CALENDAR_CONNECTOR_ID => Self::GoogleCalendar,
             GMAIL_CONNECTOR_ID => Self::Gmail,
             SLACK_CONNECTOR_ID => Self::Slack,
             GRANOLA_CONNECTOR_ID => Self::Granola,
@@ -1258,6 +1413,7 @@ impl CredentialFailureConnector {
         match self {
             Self::Notion => "Notion",
             Self::GoogleDocs => "Google Docs",
+            Self::GoogleCalendar => "Google Calendar",
             Self::Gmail => "Gmail",
             Self::Slack => "Slack",
             Self::Granola => "Granola",
@@ -1269,6 +1425,7 @@ impl CredentialFailureConnector {
         match self {
             Self::Notion => "loc connect notion",
             Self::GoogleDocs => "loc connect google-docs",
+            Self::GoogleCalendar => "loc connect google-calendar",
             Self::Gmail => "loc connect gmail",
             Self::Slack => "loc connect slack",
             Self::Granola => "loc connect granola --api-key-stdin",
@@ -1451,6 +1608,25 @@ fn default_gmail_oauth_profile(now: String) -> ConnectorProfileRecord {
         capabilities_json: gmail_capabilities_json().unwrap_or_else(|_| "{}".to_string()),
         enabled_actions_json: "[\"read\",\"send\"]".to_string(),
         connector_version: "gmail.v1".to_string(),
+        status: "active".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
+fn default_google_calendar_oauth_profile(now: String) -> ConnectorProfileRecord {
+    ConnectorProfileRecord {
+        profile_id: ConnectorProfileId::new(DEFAULT_GOOGLE_CALENDAR_OAUTH_PROFILE_ID),
+        connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
+        display_name: "Google Calendar OAuth".to_string(),
+        auth_kind: "oauth".to_string(),
+        scopes: GOOGLE_CALENDAR_OAUTH_SCOPES
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect(),
+        capabilities_json: google_calendar_capabilities_json().unwrap_or_else(|_| "{}".to_string()),
+        enabled_actions_json: "[\"read\",\"create\"]".to_string(),
+        connector_version: "google-calendar.v1".to_string(),
         status: "active".to_string(),
         created_at: now.clone(),
         updated_at: now,

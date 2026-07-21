@@ -22,6 +22,10 @@ use locality_gmail::{
     DEFAULT_GMAIL_OAUTH_BROKER_URL, DEFAULT_GMAIL_OAUTH_REDIRECT_URI, GMAIL_CONNECTOR_ID,
     GmailMountSettings, GmailProjectionView, HttpGmailOAuthBrokerClient,
 };
+use locality_google_calendar::{
+    DEFAULT_GOOGLE_CALENDAR_OAUTH_BROKER_URL, DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI,
+    GOOGLE_CALENDAR_CONNECTOR_ID, GoogleCalendarMountSettings, HttpGoogleCalendarOAuthBrokerClient,
+};
 use locality_google_docs::{
     DEFAULT_GOOGLE_DOCS_OAUTH_BROKER_URL, DEFAULT_GOOGLE_DOCS_OAUTH_REDIRECT_URI,
     GOOGLE_DOCS_CONNECTOR_ID, HttpGoogleDocsOAuthBrokerClient,
@@ -65,12 +69,14 @@ use serde_json::Value;
 use crate::connect::{
     BrokerOAuthConnectOptions, ConnectError, ConnectOptions, ConnectReport, ConnectionShowReport,
     ConnectionsReport, DisconnectReport, GmailBrokerOAuthConnectOptions,
-    GoogleDocsBrokerOAuthConnectOptions, HttpGranolaConnectionProbe, HttpLinearConnectionProbe,
-    HttpNotionConnectionProbe, OAuthConnectOptions, ProfilesReport, SlackBrokerOAuthConnectOptions,
-    run_connect_gmail_broker_oauth, run_connect_google_docs_broker_oauth, run_connect_granola,
-    run_connect_linear, run_connect_notion, run_connect_notion_broker_oauth,
-    run_connect_notion_oauth, run_connect_slack_broker_oauth, run_connection_show, run_connections,
-    run_disconnect, run_profiles,
+    GoogleCalendarBrokerOAuthConnectOptions, GoogleDocsBrokerOAuthConnectOptions,
+    HttpGranolaConnectionProbe, HttpLinearConnectionProbe, HttpNotionConnectionProbe,
+    OAuthConnectOptions, ProfilesReport, SlackBrokerOAuthConnectOptions,
+    run_connect_gmail_broker_oauth, run_connect_google_calendar_broker_oauth,
+    run_connect_google_docs_broker_oauth, run_connect_granola, run_connect_linear,
+    run_connect_notion, run_connect_notion_broker_oauth, run_connect_notion_oauth,
+    run_connect_slack_broker_oauth, run_connection_show, run_connections, run_disconnect,
+    run_profiles,
 };
 use crate::connector::{
     ConnectorResolveError, SourceDescriptor, resolve_notion_connector_for_mount,
@@ -239,6 +245,8 @@ enum ConnectCommand {
     Notion(ConnectNotionArgs),
     #[command(name = "google-docs", about = "Connect Google Docs")]
     GoogleDocs(ConnectGoogleDocsArgs),
+    #[command(name = "google-calendar", about = "Connect Google Calendar")]
+    GoogleCalendar(ConnectGoogleCalendarArgs),
     #[command(about = "Connect Gmail")]
     Gmail(ConnectGmailArgs),
     #[command(about = "Connect Slack")]
@@ -326,6 +334,26 @@ struct ConnectGmailArgs {
         long,
         value_name = "ID",
         help = "Connection id to save. Defaults to gmail-default."
+    )]
+    name: Option<String>,
+    #[arg(long, help = "Print the OAuth URL instead of opening a browser.")]
+    no_browser: bool,
+    #[arg(long, value_name = "URL", help = "OAuth broker base URL.")]
+    broker_url: Option<String>,
+    #[arg(
+        long,
+        value_name = "URI",
+        help = "OAuth redirect URI for the local callback listener."
+    )]
+    redirect_uri: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ConnectGoogleCalendarArgs {
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Connection id to save. Defaults to google-calendar-default."
     )]
     name: Option<String>,
     #[arg(long, help = "Print the OAuth URL instead of opening a browser.")]
@@ -439,6 +467,8 @@ enum MountCommand {
     Notion(MountNotionArgs),
     #[command(name = "google-docs", about = "Mount Google Docs content")]
     GoogleDocs(MountGoogleDocsArgs),
+    #[command(name = "google-calendar", about = "Mount Google Calendar")]
+    GoogleCalendar(MountGoogleCalendarArgs),
     #[command(about = "Mount Gmail")]
     Gmail(MountGmailArgs),
     #[command(about = "Mount Slack read-only")]
@@ -609,6 +639,46 @@ struct MountGmailArgs {
         help = "Gmail projection view. Defaults to messages."
     )]
     view: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct MountGoogleCalendarArgs {
+    #[arg(
+        value_name = "path",
+        help = "Local directory where the Google Calendar mount should be registered."
+    )]
+    path: String,
+    #[arg(long, value_name = "id", help = "Connection id to use for this mount.")]
+    connection: Option<String>,
+    #[arg(
+        long,
+        value_name = "id",
+        help = "Mount id to save. Defaults to google-calendar-main."
+    )]
+    mount_id: Option<String>,
+    #[arg(
+        long,
+        value_name = "mode",
+        help = "Projection mode. Supported values depend on the host platform."
+    )]
+    projection: Option<String>,
+    #[arg(
+        long,
+        help = "Register the mount as read-only and block push operations."
+    )]
+    read_only: bool,
+    #[arg(
+        long,
+        value_name = "YYYY-MM-DD",
+        help = "Fetch Google Calendar events on or after this date. Must be paired with --before."
+    )]
+    after: Option<String>,
+    #[arg(
+        long,
+        value_name = "YYYY-MM-DD",
+        help = "Fetch Google Calendar events before this date. Must be paired with --after."
+    )]
+    before: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1077,6 +1147,21 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                         options.redirect_uri.as_deref(),
                     );
                 }
+                ConnectCommand::GoogleCalendar(options) => {
+                    args.push("google-calendar".to_string());
+                    push_optional_flag_value(&mut args, "--name", options.name.as_deref());
+                    push_flag(&mut args, "--no-browser", options.no_browser);
+                    push_optional_flag_value(
+                        &mut args,
+                        "--broker-url",
+                        options.broker_url.as_deref(),
+                    );
+                    push_optional_flag_value(
+                        &mut args,
+                        "--redirect-uri",
+                        options.redirect_uri.as_deref(),
+                    );
+                }
                 ConnectCommand::Gmail(options) => {
                     args.push("gmail".to_string());
                     push_optional_flag_value(&mut args, "--name", options.name.as_deref());
@@ -1200,6 +1285,24 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                         "--projection",
                         options.projection.as_deref(),
                     );
+                    push_flag(&mut args, "--read-only", options.read_only);
+                }
+                MountCommand::GoogleCalendar(options) => {
+                    args.push("google-calendar".to_string());
+                    args.push(options.path.clone());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--connection",
+                        options.connection.as_deref(),
+                    );
+                    push_optional_flag_value(&mut args, "--mount-id", options.mount_id.as_deref());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--projection",
+                        options.projection.as_deref(),
+                    );
+                    push_optional_flag_value(&mut args, "--after", options.after.as_deref());
+                    push_optional_flag_value(&mut args, "--before", options.before.as_deref());
                     push_flag(&mut args, "--read-only", options.read_only);
                 }
                 MountCommand::Gmail(options) => {
@@ -1606,6 +1709,9 @@ fn connect(args: &[String], json: bool) -> i32 {
     if connector == Some(GMAIL_CONNECTOR_ID) {
         return connect_gmail(args, json);
     }
+    if connector == Some(GOOGLE_CALENDAR_CONNECTOR_ID) {
+        return connect_google_calendar(args, json);
+    }
     if connector == Some(GOOGLE_DOCS_CONNECTOR_ID) {
         return connect_google_docs(args, json);
     }
@@ -1618,7 +1724,7 @@ fn connect(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "connect",
                 "usage",
-                "usage: loc connect <notion|google-docs|gmail|slack|granola|linear> [options] [--json]",
+                "usage: loc connect <notion|google-docs|google-calendar|gmail|slack|granola|linear> [options] [--json]",
             ),
             EXIT_USAGE,
         );
@@ -1916,6 +2022,86 @@ fn connect_google_docs(args: &[String], json: bool) -> i32 {
         redirect_uri: start.redirect_uri,
     };
     match run_connect_google_docs_broker_oauth(&mut store, credentials.as_ref(), options, &broker) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_connect_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => connect_command_error("connect", json, error),
+    }
+}
+
+fn connect_google_calendar(args: &[String], json: bool) -> i32 {
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("connect", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let credentials = open_credential_store(&state_root);
+    let broker_config = match google_calendar_oauth_broker_config(args) {
+        Ok(config) => config,
+        Err(error) => return command_error(json, error, EXIT_INTERNAL),
+    };
+    let broker = HttpGoogleCalendarOAuthBrokerClient::new(broker_config.broker_url.clone());
+    let start = match broker.start(&OAuthBrokerStart {
+        connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
+        redirect_uri: broker_config.redirect_uri,
+    }) {
+        Ok(start) => start,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new(
+                    "connect",
+                    "oauth_broker_start_failed",
+                    format!("Google Calendar OAuth broker start failed: {error}"),
+                )
+                .with_suggested_command("loc connect google-calendar"),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let authorization = match run_local_oauth_authorization(
+        "Google Calendar",
+        &start.authorization_url,
+        &start.redirect_uri,
+        &start.state,
+        has_flag(args, "--no-browser"),
+        json,
+    ) {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            return command_error(
+                json,
+                google_calendar_local_oauth_command_error(error),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let options = GoogleCalendarBrokerOAuthConnectOptions {
+        connection_id: flag_value(args, "--name").map(ConnectionId::new),
+        broker_url: broker_config.broker_url,
+        client_id: start.client_id,
+        session: start.session,
+        state: start.state,
+        code: authorization.code,
+        redirect_uri: start.redirect_uri,
+    };
+    match run_connect_google_calendar_broker_oauth(
+        &mut store,
+        credentials.as_ref(),
+        options,
+        &broker,
+    ) {
         Ok(report) if json => {
             print_json(&report);
             EXIT_SUCCESS
@@ -2887,13 +3073,16 @@ fn mount(args: &[String], json: bool) -> i32 {
             );
         }
     };
-    let settings_json = if descriptor.id() == GMAIL_CONNECTOR_ID {
-        match gmail_mount_settings_json(args) {
+    let settings_json = match descriptor.id() {
+        GMAIL_CONNECTOR_ID => match gmail_mount_settings_json(args) {
             Ok(settings_json) => settings_json,
             Err(error) => return command_error(json, error, EXIT_USAGE),
-        }
-    } else {
-        "{}".to_string()
+        },
+        GOOGLE_CALENDAR_CONNECTOR_ID => match google_calendar_mount_settings_json(args) {
+            Ok(settings_json) => settings_json,
+            Err(error) => return command_error(json, error, EXIT_USAGE),
+        },
+        _ => "{}".to_string(),
     };
 
     let state_root = default_state_root();
@@ -3266,6 +3455,41 @@ fn gmail_mount_settings_json(args: &[String]) -> Result<String, CommandError> {
     })
 }
 
+fn google_calendar_mount_settings_json(args: &[String]) -> Result<String, CommandError> {
+    let after = flag_value(args, "--after");
+    let before = flag_value(args, "--before");
+
+    if after.is_none() && before.is_none() {
+        return Ok("{}".to_string());
+    }
+
+    let settings = match (after, before) {
+        (Some(after), Some(before)) => GoogleCalendarMountSettings::with_date_window(after, before)
+            .map_err(|error| {
+                CommandError::new(
+                    "mount",
+                    "google_calendar_date_window_invalid",
+                    locality_error_message(error),
+                )
+            })?,
+        _ => {
+            return Err(CommandError::new(
+                "mount",
+                "google_calendar_date_window_requires_after_and_before",
+                "Google Calendar date windows require both --after and --before",
+            ));
+        }
+    };
+
+    settings.to_json().map_err(|error| {
+        CommandError::new(
+            "mount",
+            "google_calendar_settings_encode_failed",
+            error.to_string(),
+        )
+    })
+}
+
 fn locality_error_message(error: LocalityError) -> String {
     match error {
         LocalityError::Validation(issues) => issues
@@ -3374,6 +3598,19 @@ fn mount_remote_root_id(
                     "mount",
                     "usage",
                     "loc mount gmail does not accept Notion or Google Docs root flags",
+                ));
+            }
+            Ok(None)
+        }
+        GOOGLE_CALENDAR_CONNECTOR_ID => {
+            if has_flag(args, "--workspace")
+                || flag_value(args, "--root-page").is_some()
+                || flag_value(args, "--workspace-folder").is_some()
+            {
+                return Err(CommandError::new(
+                    "mount",
+                    "usage",
+                    "loc mount google-calendar does not accept Notion or Google Docs root flags",
                 ));
             }
             Ok(None)
@@ -7333,6 +7570,12 @@ struct GoogleDocsOAuthBrokerCliConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct GoogleCalendarOAuthBrokerCliConfig {
+    broker_url: String,
+    redirect_uri: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct GmailOAuthBrokerCliConfig {
     broker_url: String,
     redirect_uri: String,
@@ -7459,6 +7702,34 @@ fn gmail_oauth_broker_config(args: &[String]) -> Result<GmailOAuthBrokerCliConfi
     })
 }
 
+fn google_calendar_oauth_broker_config(
+    args: &[String],
+) -> Result<GoogleCalendarOAuthBrokerCliConfig, CommandError> {
+    let broker_url = flag_value(args, "--broker-url")
+        .map(str::to_string)
+        .or_else(|| {
+            env_first(&[
+                "LOCALITY_GOOGLE_CALENDAR_OAUTH_BROKER_URL",
+                "LOCALITY_AUTH_BROKER_URL",
+            ])
+        })
+        .unwrap_or_else(|| DEFAULT_GOOGLE_CALENDAR_OAUTH_BROKER_URL.to_string());
+    let redirect_uri = flag_value(args, "--redirect-uri")
+        .map(str::to_string)
+        .or_else(|| env_first(&["LOCALITY_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI"]))
+        .unwrap_or_else(|| DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI.to_string());
+
+    local_redirect(&redirect_uri).map_err(|error| {
+        CommandError::new("connect", error.code, error.message)
+            .with_suggested_command("loc connect google-calendar")
+    })?;
+
+    Ok(GoogleCalendarOAuthBrokerCliConfig {
+        broker_url,
+        redirect_uri,
+    })
+}
+
 fn slack_oauth_broker_config(args: &[String]) -> Result<SlackOAuthBrokerCliConfig, CommandError> {
     let broker_url = flag_value(args, "--broker-url")
         .map(str::to_string)
@@ -7564,6 +7835,15 @@ fn gmail_local_oauth_command_error(error: LocalOAuthError) -> CommandError {
     let command_error = CommandError::new("connect", error.code, error.message);
     if command_error.code == "invalid_redirect_uri" {
         command_error.with_suggested_command("loc connect gmail")
+    } else {
+        command_error
+    }
+}
+
+fn google_calendar_local_oauth_command_error(error: LocalOAuthError) -> CommandError {
+    let command_error = CommandError::new("connect", error.code, error.message);
+    if command_error.code == "invalid_redirect_uri" {
+        command_error.with_suggested_command("loc connect google-calendar")
     } else {
         command_error
     }
@@ -8373,7 +8653,7 @@ fn projection_mode_for_target(args: &[String], target_os: &str) -> Result<Projec
 
 fn mount_usage() -> String {
     format!(
-        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--read-only] [--json]\n       loc mount slack <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--history-limit 1-15] [--types public_channel,private_channel,im,mpim] [--json]\n       loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--json]\n       loc mount linear <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]",
+        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-calendar <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--read-only] [--json]\n       loc mount slack <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--history-limit 1-15] [--types public_channel,private_channel,im,mpim] [--json]\n       loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--json]\n       loc mount linear <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]",
         projection_usage_options_for_target(std::env::consts::OS)
     )
 }
@@ -8578,6 +8858,10 @@ fn takes_value(arg: &str) -> bool {
             | "--connection"
             | "--name"
             | "--projection"
+            | "--workspace-folder"
+            | "--after"
+            | "--before"
+            | "--view"
             | "--history-limit"
             | "--types"
             | "--helper"
@@ -8837,8 +9121,9 @@ mod tests {
         VirtualProjectionRegistration, absolute_command_path,
         auto_registration_for_mounted_projection, default_mount_id_for_source,
         diff_report_exit_code, exact_located_entity_record, file_provider_list_lines,
-        google_docs_oauth_broker_config, guard_linux_fuse_shared_root_unregister,
-        guard_unresolved_linux_fuse_unregister, guard_unresolved_windows_cloud_files_unregister,
+        google_calendar_oauth_broker_config, google_docs_oauth_broker_config,
+        guard_linux_fuse_shared_root_unregister, guard_unresolved_linux_fuse_unregister,
+        guard_unresolved_windows_cloud_files_unregister,
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
         locality_error_code, locate_result_from_report, mount_slack, mount_usage,
         mounted_projection_preflight_error, notion_authorize_url, notion_oauth_broker_config,
@@ -8884,6 +9169,7 @@ mod tests {
                     "Commands:",
                     "notion",
                     "google-docs",
+                    "google-calendar",
                     "gmail",
                     "slack",
                     "granola",
@@ -8905,6 +9191,15 @@ mod tests {
                 vec![
                     "Usage: loc connect google-docs",
                     "Connect Google Docs",
+                    "--broker-url",
+                    "--redirect-uri",
+                ],
+            ),
+            (
+                vec!["connect", "google-calendar", "--help"],
+                vec![
+                    "Usage: loc connect google-calendar",
+                    "Connect Google Calendar",
                     "--broker-url",
                     "--redirect-uri",
                 ],
@@ -9012,6 +9307,7 @@ mod tests {
                     "Commands:",
                     "notion",
                     "google-docs",
+                    "google-calendar",
                     "gmail",
                     "slack",
                     "granola",
@@ -9034,6 +9330,17 @@ mod tests {
                     "Usage: loc mount google-docs",
                     "Mount Google Docs content",
                     "--workspace-folder",
+                ],
+            ),
+            (
+                vec!["mount", "google-calendar", "--help"],
+                vec![
+                    "Usage: loc mount google-calendar",
+                    "Mount Google Calendar",
+                    "--connection",
+                    "--projection",
+                    "--after",
+                    "--before",
                 ],
             ),
             (
@@ -9338,6 +9645,7 @@ mod tests {
     fn mount_usage_mentions_connector_settings_flags() {
         let usage = mount_usage();
 
+        assert!(usage.contains("loc mount google-calendar"));
         assert!(usage.contains("--after YYYY-MM-DD --before YYYY-MM-DD"));
         assert!(usage.contains("--view messages|threads"));
         assert!(usage.contains("--history-limit 1-15"));
@@ -9454,6 +9762,58 @@ mod tests {
         );
 
         let cli = parse_cli([
+            "connect",
+            "google-calendar",
+            "--name",
+            "calendar-work",
+            "--no-browser",
+            "--broker-url",
+            "https://auth.example.test",
+            "--redirect-uri",
+            "http://localhost:8757/oauth/google-calendar/callback",
+        ]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec![
+                "connect",
+                "google-calendar",
+                "--name",
+                "calendar-work",
+                "--no-browser",
+                "--broker-url",
+                "https://auth.example.test",
+                "--redirect-uri",
+                "http://localhost:8757/oauth/google-calendar/callback"
+            ]
+        );
+
+        let cli = parse_cli([
+            "connect",
+            "slack",
+            "--name",
+            "slack-work",
+            "--no-browser",
+            "--broker-url",
+            "https://auth.example.test",
+            "--redirect-uri",
+            "http://localhost:8757/oauth/slack/callback",
+        ]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec![
+                "connect",
+                "slack",
+                "--name",
+                "slack-work",
+                "--no-browser",
+                "--broker-url",
+                "https://auth.example.test",
+                "--redirect-uri",
+                "http://localhost:8757/oauth/slack/callback"
+            ]
+        );
+
+        let cli = parse_cli([
             "mount",
             "gmail",
             "/tmp/Locality/gmail-main",
@@ -9477,6 +9837,42 @@ mod tests {
                 "gmail-main",
                 "--projection",
                 "plain-files",
+                "--read-only"
+            ]
+        );
+
+        let cli = parse_cli([
+            "mount",
+            "google-calendar",
+            "/tmp/Locality/calendar-main",
+            "--connection",
+            "calendar-work",
+            "--mount-id",
+            "calendar-main",
+            "--projection",
+            "plain-files",
+            "--after",
+            "2026-07-01",
+            "--before",
+            "2026-07-31",
+            "--read-only",
+        ]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec![
+                "mount",
+                "google-calendar",
+                "/tmp/Locality/calendar-main",
+                "--connection",
+                "calendar-work",
+                "--mount-id",
+                "calendar-main",
+                "--projection",
+                "plain-files",
+                "--after",
+                "2026-07-01",
+                "--before",
+                "2026-07-31",
                 "--read-only"
             ]
         );
@@ -9511,7 +9907,7 @@ mod tests {
                 "--history-limit",
                 "15",
                 "--types",
-                "public_channel,private_channel,im,mpim",
+                "public_channel,private_channel,im,mpim"
             ]
         );
 
@@ -10709,6 +11105,25 @@ mod tests {
         assert_eq!(
             config.redirect_uri,
             "http://localhost:8757/oauth/google-docs/callback"
+        );
+    }
+
+    #[test]
+    fn google_calendar_oauth_broker_config_accepts_explicit_broker_url() {
+        let args = vec![
+            "google-calendar".to_string(),
+            "--broker-url".to_string(),
+            "https://auth.example.test".to_string(),
+            "--redirect-uri".to_string(),
+            "http://localhost:8757/oauth/google-calendar/callback".to_string(),
+        ];
+
+        let config = google_calendar_oauth_broker_config(&args).expect("broker config");
+
+        assert_eq!(config.broker_url, "https://auth.example.test");
+        assert_eq!(
+            config.redirect_uri,
+            "http://localhost:8757/oauth/google-calendar/callback"
         );
     }
 
