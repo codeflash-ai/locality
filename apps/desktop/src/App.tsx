@@ -5004,7 +5004,6 @@ function MountDetailView({
             <AlertTriangle />
             Danger Zone
           </span>
-          <small>Closed by default</small>
         </summary>
         <div className="danger-body">
           <div>
