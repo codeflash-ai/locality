@@ -919,10 +919,14 @@ struct StagingDirectory {
 
 impl StagingDirectory {
     fn create(parent: &Path) -> Result<Self, ReplicaMaterializationError> {
+        // The pre-open metadata check alone is not enough: the path can be
+        // replaced with a symlink before `open`. Keep the descriptor anchored
+        // to the requested directory and let the identity checks below detect
+        // replacements after this point.
         #[cfg(unix)]
         let parent_descriptor = rustix::fs::open(
             parent,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
         .map_err(|error| ReplicaMaterializationError::Staging(error.into()))?;
