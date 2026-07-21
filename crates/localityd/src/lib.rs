@@ -27,6 +27,7 @@ pub use shadow_match::contents_match_shadow;
 pub mod slack;
 pub mod source;
 pub mod supervisor;
+pub mod trace;
 pub mod virtual_fs;
 pub mod virtual_projection;
 pub mod watcher;

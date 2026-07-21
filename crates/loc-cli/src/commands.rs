@@ -3827,32 +3827,70 @@ fn pull(args: &[String], json: bool) -> i32 {
         );
     };
 
+    let mut trace_span = localityd::trace::TraceSpan::start("cli.pull");
+    trace_span.attr("path", path);
+    trace_span.attr("json", json);
     let state_root = default_state_root();
+    trace_span.attr("state_root", state_root.display().to_string());
     let stderr_is_terminal = io::stderr().is_terminal();
     let spinner_config = spinner_config_for_command("pull", path, json, stderr_is_terminal);
     let daemon_report = with_terminal_spinner(spinner_config.clone(), || {
-        run_daemon_report::<PullReport>(
+        let mut daemon_span = localityd::trace::TraceSpan::start("cli.pull.daemon_request");
+        daemon_span.attr("path", path);
+        daemon_span.attr("state_root", state_root.display().to_string());
+        let report = run_daemon_report::<PullReport>(
             &state_root,
             &DaemonRequest::Pull {
                 path: PathBuf::from(path),
             },
-        )
+        );
+        match &report {
+            DaemonReport::Report(report) => {
+                daemon_span.attr("result", "report");
+                daemon_span.attr("via", report.via.as_str());
+                daemon_span.attr("enumerated", report.enumerated);
+                daemon_span.attr("hydrated", report.hydrated);
+                daemon_span.attr("skipped_dirty", report.skipped_dirty);
+                daemon_span.attr("conflicts", report.conflicts.len());
+            }
+            DaemonReport::Unavailable(reason) => {
+                daemon_span.attr("result", "unavailable");
+                daemon_span.attr("reason", format!("{:?}", reason));
+            }
+            DaemonReport::Error(error) => {
+                daemon_span.attr("result", "error");
+                daemon_span.attr("code", error.code.as_str());
+                daemon_span.status("error");
+            }
+        }
+        daemon_span.finish();
+        report
     });
     let fallback_reason = match daemon_report {
         DaemonReport::Report(report) if json => {
             signal_pull_virtual_projection_refresh(&state_root, &report);
             let exit_code = pull_report_exit_code(&report);
+            trace_span.attr("daemon_result", "report");
+            trace_span.attr("via", report.via.as_str());
+            trace_span.attr("exit_code", exit_code);
             print_json(&report);
             return exit_code;
         }
         DaemonReport::Report(report) => {
             signal_pull_virtual_projection_refresh(&state_root, &report);
             let exit_code = pull_report_exit_code(&report);
+            trace_span.attr("daemon_result", "report");
+            trace_span.attr("via", report.via.as_str());
+            trace_span.attr("exit_code", exit_code);
             print_pull_report(&report);
             return exit_code;
         }
         DaemonReport::Unavailable(reason) => reason,
         DaemonReport::Error(error) => {
+            trace_span.attr("daemon_result", "error");
+            trace_span.attr("code", error.code.as_str());
+            trace_span.attr("exit_code", error.exit_code);
+            trace_span.status("error");
             return command_error(
                 json,
                 CommandError::new("pull", error.code, error.message),
@@ -3861,12 +3899,18 @@ fn pull(args: &[String], json: bool) -> i32 {
         }
     };
     if let Some(error) = pull_direct_fallback_error(fallback_reason, None) {
+        trace_span.attr("fallback_reason", format!("{:?}", fallback_reason));
+        trace_span.attr("exit_code", EXIT_INTERNAL);
+        trace_span.status("error");
         return command_error(json, error, EXIT_INTERNAL);
     }
+    trace_span.attr("fallback_reason", format!("{:?}", fallback_reason));
 
     let mut store = match SqliteStateStore::open(state_root.clone()) {
         Ok(store) => store,
         Err(error) => {
+            trace_span.attr("exit_code", EXIT_INTERNAL);
+            trace_span.status("error");
             return command_error(
                 json,
                 CommandError::new("pull", "store_open_failed", error.to_string()),
@@ -3876,6 +3920,8 @@ fn pull(args: &[String], json: bool) -> i32 {
     };
     let fallback_mount = resolve_mount_target(&store, path).ok();
     if let Some(error) = pull_direct_fallback_error(fallback_reason, fallback_mount.as_ref()) {
+        trace_span.attr("exit_code", EXIT_INTERNAL);
+        trace_span.status("error");
         return command_error(json, error, EXIT_INTERNAL);
     }
     warn_daemon_fallback("pull", fallback_reason);
@@ -3883,30 +3929,46 @@ fn pull(args: &[String], json: bool) -> i32 {
     let credentials = open_credential_store(&state_root);
     let connector = match resolve_source_for_path(&store, credentials.as_ref(), path) {
         Ok(connector) => connector,
-        Err(error) => return connector_command_error("pull", json, error),
+        Err(error) => {
+            trace_span.attr("exit_code", EXIT_INTERNAL);
+            trace_span.status("error");
+            return connector_command_error("pull", json, error);
+        }
     };
 
     match with_terminal_spinner(spinner_config, || {
-        run_pull_with_state_root(
-            &mut store,
-            &connector,
-            PathBuf::from(path),
-            Some(&state_root),
-        )
+        localityd::trace::result("cli.pull.direct_fallback", |span| {
+            span.attr("path", path);
+            span.attr("fallback_reason", format!("{:?}", fallback_reason));
+            run_pull_with_state_root(
+                &mut store,
+                &connector,
+                PathBuf::from(path),
+                Some(&state_root),
+            )
+        })
     }) {
         Ok(report) if json => {
             signal_pull_virtual_projection_refresh_with_store(&store, &report);
             let exit_code = pull_report_exit_code(&report);
+            trace_span.attr("via", report.via.as_str());
+            trace_span.attr("exit_code", exit_code);
             print_json(&report);
             exit_code
         }
         Ok(report) => {
             signal_pull_virtual_projection_refresh_with_store(&store, &report);
             let exit_code = pull_report_exit_code(&report);
+            trace_span.attr("via", report.via.as_str());
+            trace_span.attr("exit_code", exit_code);
             print_pull_report(&report);
             exit_code
         }
-        Err(error) => pull_command_error(json, error),
+        Err(error) => {
+            trace_span.attr("exit_code", EXIT_INTERNAL);
+            trace_span.status("error");
+            pull_command_error(json, error)
+        }
     }
 }
 
@@ -4324,10 +4386,16 @@ fn live_mode_command_error(json: bool, error: LiveModeFileError) -> i32 {
 
 fn search(args: &[String], json: bool) -> i32 {
     let query = positional_args(args).join(" ");
+    let mut trace_span = localityd::trace::TraceSpan::start("cli.search");
+    trace_span.attr("query", query.as_str());
+    trace_span.attr("query_is_notion_url", notion_id_from_url(&query).is_some());
+    trace_span.attr("json", json);
     let limit = match flag_value(args, "--limit") {
         Some(value) => match value.parse::<usize>() {
             Ok(limit) => limit,
             Err(_) => {
+                trace_span.attr("exit_code", EXIT_USAGE);
+                trace_span.status("error");
                 return command_error(
                     json,
                     CommandError::new(
@@ -4341,10 +4409,14 @@ fn search(args: &[String], json: bool) -> i32 {
         },
         None => 10,
     };
+    trace_span.attr("limit", limit);
     let state_root = default_state_root();
+    trace_span.attr("state_root", state_root.display().to_string());
     let mut store = match SqliteStateStore::open(state_root.clone()) {
         Ok(store) => store,
         Err(error) => {
+            trace_span.attr("exit_code", EXIT_INTERNAL);
+            trace_span.status("error");
             return command_error(
                 json,
                 CommandError::new("search", "store_open_failed", error.to_string()),
@@ -4358,36 +4430,70 @@ fn search(args: &[String], json: bool) -> i32 {
         limit,
         include_stale_access: has_flag(args, "--all"),
     };
+    trace_span.attr(
+        "connector_filter",
+        options.connector.as_deref().unwrap_or(""),
+    );
+    trace_span.attr("include_stale_access", options.include_stale_access);
 
-    let report = match run_search(&store, options.clone()) {
+    let report = match localityd::trace::result("cli.search.run_search_initial", |span| {
+        span.attr("query", options.query.as_str());
+        span.attr("limit", options.limit);
+        span.attr(
+            "connector_filter",
+            options.connector.as_deref().unwrap_or(""),
+        );
+        run_search(&store, options.clone())
+    }) {
         Ok(report) => report,
-        Err(error) => return search_command_error(json, error),
+        Err(error) => {
+            trace_span.attr("exit_code", EXIT_INTERNAL);
+            trace_span.status("error");
+            return search_command_error(json, error);
+        }
     };
+    trace_span.attr("initial_results", report.results.len());
     let report = match refresh_notion_url_search_on_miss(&state_root, &mut store, &options, report)
     {
         Ok(report) => report,
-        Err(error) => return command_error(json, error, EXIT_INTERNAL),
+        Err(error) => {
+            trace_span.attr("exit_code", EXIT_INTERNAL);
+            trace_span.status("error");
+            return command_error(json, error, EXIT_INTERNAL);
+        }
     };
+    trace_span.attr("final_results", report.results.len());
     if let Err(error) = prefetch_notion_url_search_result_ancestors(&state_root, &options, &report)
     {
+        trace_span.attr("exit_code", EXIT_INTERNAL);
+        trace_span.status("error");
         return command_error(json, error, EXIT_INTERNAL);
     }
 
     if json {
         print_json(&report);
+        trace_span.attr("exit_code", EXIT_SUCCESS);
         EXIT_SUCCESS
     } else {
         print_search_report(&report);
+        trace_span.attr("exit_code", EXIT_SUCCESS);
         EXIT_SUCCESS
     }
 }
 
 fn locate(args: &[String], json: bool) -> i32 {
     let query = positional_args(args).join(" ");
+    let mut trace_span = localityd::trace::TraceSpan::start("cli.locate");
+    trace_span.attr("query", query.as_str());
+    trace_span.attr("query_is_notion_url", notion_id_from_url(&query).is_some());
+    trace_span.attr("json", json);
     let state_root = default_state_root();
+    trace_span.attr("state_root", state_root.display().to_string());
     let mut store = match SqliteStateStore::open(state_root.clone()) {
         Ok(store) => store,
         Err(error) => {
+            trace_span.attr("exit_code", EXIT_INTERNAL);
+            trace_span.status("error");
             return command_error(
                 json,
                 CommandError::new("locate", "store_open_failed", error.to_string()),
@@ -4398,10 +4504,16 @@ fn locate(args: &[String], json: bool) -> i32 {
 
     match locate_notion_query_path(&state_root, &mut store, &query) {
         Ok(path) => {
+            trace_span.attr("path", path.as_str());
+            trace_span.attr("exit_code", EXIT_SUCCESS);
             println!("{path}");
             EXIT_SUCCESS
         }
-        Err(error) => locate_command_error(json, error),
+        Err(error) => {
+            trace_span.attr("exit_code", EXIT_INTERNAL);
+            trace_span.status("error");
+            locate_command_error(json, error)
+        }
     }
 }
 
@@ -4411,7 +4523,11 @@ fn locate_notion_query_path(
     query: &str,
 ) -> Result<String, CommandError> {
     let query = query.trim();
+    let mut trace_span = localityd::trace::TraceSpan::start("cli.locate.resolve_path");
+    trace_span.attr("query", query);
+    trace_span.attr("query_is_notion_url", notion_id_from_url(query).is_some());
     if query.is_empty() {
+        trace_span.status("error");
         return Err(CommandError::new(
             "locate",
             "empty_query",
@@ -4419,11 +4535,20 @@ fn locate_notion_query_path(
         ));
     }
     if let Some(message) = unsupported_notion_locator_url_message(query) {
+        trace_span.status("error");
         return Err(CommandError::new("locate", "unsupported_url", message));
     }
 
     if notion_id_from_url(query).is_some() {
-        prepare_exact_notion_url_path(state_root, store, query)?;
+        if let Err(error) =
+            localityd::trace::result("cli.locate.prepare_exact_notion_url_path", |span| {
+                span.attr("query", query);
+                prepare_exact_notion_url_path(state_root, store, query)
+            })
+        {
+            trace_span.status("error");
+            return Err(error);
+        }
     }
 
     let options = SearchOptions {
@@ -4432,9 +4557,31 @@ fn locate_notion_query_path(
         limit: 1,
         include_stale_access: false,
     };
-    let report = run_search_with_access_roots(store, options, locate_mount_access_root)
-        .map_err(|error| CommandError::new("locate", error.code(), error.message()))?;
-    let result = locate_result_from_report(query, report, store)?;
+    let report = match localityd::trace::result("cli.locate.run_search_with_access_roots", |span| {
+        span.attr("query", query);
+        span.attr("limit", options.limit);
+        run_search_with_access_roots(store, options, locate_mount_access_root)
+    })
+    .map_err(|error| CommandError::new("locate", error.code(), error.message()))
+    {
+        Ok(report) => report,
+        Err(error) => {
+            trace_span.status("error");
+            return Err(error);
+        }
+    };
+    trace_span.attr("result_count", report.results.len());
+    let result = match locate_result_from_report(query, report, store) {
+        Ok(result) => result,
+        Err(error) => {
+            trace_span.status("error");
+            return Err(error);
+        }
+    };
+    trace_span.attr("selected_mount_id", result.mount_id.as_str());
+    trace_span.attr("selected_connector", result.connector.as_str());
+    trace_span.attr("selected_kind", result.kind.as_str());
+    trace_span.attr("selected_path", result.absolute_path.as_str());
     prioritize_located_notion_result(state_root, store, &result);
     Ok(result.absolute_path)
 }
@@ -4924,9 +5071,20 @@ fn refresh_notion_url_search_on_miss(
     options: &SearchOptions,
     report: SearchReport,
 ) -> Result<SearchReport, CommandError> {
+    let mut trace_span =
+        localityd::trace::TraceSpan::start("cli.search.refresh_notion_url_on_miss");
+    trace_span.attr("query", options.query.as_str());
+    trace_span.attr("initial_results", report.results.len());
+    trace_span.attr(
+        "query_is_notion_url",
+        notion_id_from_url(&options.query).is_some(),
+    );
     if !should_refresh_notion_url_search(options, &report) {
+        trace_span.attr("refreshed", false);
+        trace_span.attr("reason", "not_needed");
         return Ok(report);
     }
+    trace_span.attr("refreshed", true);
 
     let mounts = store
         .load_mounts()
@@ -4934,7 +5092,9 @@ fn refresh_notion_url_search_on_miss(
         .into_iter()
         .filter(|mount| mount.connector == "notion")
         .collect::<Vec<_>>();
+    trace_span.attr("notion_mount_count", mounts.len());
     if mounts.is_empty() {
+        trace_span.attr("reason", "no_notion_mounts");
         return Ok(report);
     }
 
@@ -4948,6 +5108,7 @@ fn refresh_notion_url_search_on_miss(
     }
 
     if !refreshed {
+        trace_span.status("error");
         let detail = errors
             .last()
             .cloned()
@@ -4961,8 +5122,19 @@ fn refresh_notion_url_search_on_miss(
 
     let store = SqliteStateStore::open(state_root.to_path_buf())
         .map_err(|error| CommandError::new("search", "store_open_failed", error.to_string()))?;
-    run_search(&store, options.clone())
-        .map_err(|error| CommandError::new("search", error.code(), error.message()))
+    let refreshed_report =
+        localityd::trace::result("cli.search.run_search_after_refresh", |span| {
+            span.attr("query", options.query.as_str());
+            span.attr("limit", options.limit);
+            span.attr(
+                "connector_filter",
+                options.connector.as_deref().unwrap_or(""),
+            );
+            run_search(&store, options.clone())
+        })
+        .map_err(|error| CommandError::new("search", error.code(), error.message()))?;
+    trace_span.attr("final_results", refreshed_report.results.len());
+    Ok(refreshed_report)
 }
 
 fn prefetch_notion_url_search_result_ancestors(
@@ -4970,7 +5142,12 @@ fn prefetch_notion_url_search_result_ancestors(
     options: &SearchOptions,
     report: &SearchReport,
 ) -> Result<(), CommandError> {
+    let mut trace_span = localityd::trace::TraceSpan::start("cli.search.prefetch_result_ancestors");
+    trace_span.attr("query", options.query.as_str());
+    trace_span.attr("result_count", report.results.len());
     let Some(notion_id) = notion_id_from_url(&options.query) else {
+        trace_span.attr("prefetch", false);
+        trace_span.attr("reason", "not_notion_url");
         return Ok(());
     };
     if options
@@ -4978,6 +5155,8 @@ fn prefetch_notion_url_search_result_ancestors(
         .as_deref()
         .is_some_and(|connector| connector != "notion")
     {
+        trace_span.attr("prefetch", false);
+        trace_span.attr("reason", "connector_filter_not_notion");
         return Ok(());
     }
 
@@ -4990,9 +5169,13 @@ fn prefetch_notion_url_search_result_ancestors(
                 && notion_id_from_url(&result.remote_id).as_deref() == Some(notion_id.as_str())
         })
         .collect::<Vec<_>>();
+    trace_span.attr("matching_results", matching_results.len());
     if matching_results.is_empty() {
+        trace_span.attr("prefetch", false);
+        trace_span.attr("reason", "no_matching_result");
         return Ok(());
     }
+    trace_span.attr("prefetch", true);
 
     let store = SqliteStateStore::open(state_root.to_path_buf())
         .map_err(|error| CommandError::new("search", "store_open_failed", error.to_string()))?;
@@ -5029,6 +5212,11 @@ fn prefetch_virtual_search_container(
     mount: &MountConfig,
     container_identifier: &str,
 ) -> Result<(), CommandError> {
+    let mut trace_span =
+        localityd::trace::TraceSpan::start("cli.search.prefetch_virtual_container");
+    trace_span.attr("mount_id", mount.mount_id.0.as_str());
+    trace_span.attr("projection", mount.projection.as_str());
+    trace_span.attr("container_identifier", container_identifier);
     match run_daemon_report::<VirtualFsChildrenReport>(
         state_root,
         &DaemonRequest::FileProviderChildren {
@@ -5036,20 +5224,36 @@ fn prefetch_virtual_search_container(
             container_identifier: container_identifier.to_string(),
         },
     ) {
-        DaemonReport::Report(_) => Ok(()),
-        DaemonReport::Error(error) => Err(CommandError::new("search", error.code, error.message)),
-        DaemonReport::Unavailable(DaemonUnavailableReason::TimedOut) => Err(CommandError::new(
-            "search",
-            "daemon_timeout",
-            format!(
-                "localityd did not respond within {}ms while enumerating ancestor metadata for search result `{container_identifier}`",
-                daemon_request_timeout().as_millis()
-            ),
-        )
-        .with_suggested_command("loc daemon restart")),
+        DaemonReport::Report(_) => {
+            trace_span.attr("result", "report");
+            Ok(())
+        }
+        DaemonReport::Error(error) => {
+            trace_span.attr("result", "error");
+            trace_span.attr("code", error.code.as_str());
+            trace_span.status("error");
+            Err(CommandError::new("search", error.code, error.message))
+        }
+        DaemonReport::Unavailable(DaemonUnavailableReason::TimedOut) => {
+            trace_span.attr("result", "unavailable");
+            trace_span.attr("reason", "TimedOut");
+            trace_span.status("error");
+            Err(CommandError::new(
+                "search",
+                "daemon_timeout",
+                format!(
+                    "localityd did not respond within {}ms while enumerating ancestor metadata for search result `{container_identifier}`",
+                    daemon_request_timeout().as_millis()
+                ),
+            )
+            .with_suggested_command("loc daemon restart"))
+        }
         DaemonReport::Unavailable(DaemonUnavailableReason::Disabled)
-        | DaemonReport::Unavailable(DaemonUnavailableReason::NotAvailable) => Err(
-            CommandError::new(
+        | DaemonReport::Unavailable(DaemonUnavailableReason::NotAvailable) => {
+            trace_span.attr("result", "unavailable");
+            trace_span.attr("reason", "daemon_required");
+            trace_span.status("error");
+            Err(CommandError::new(
                 "search",
                 "daemon_required",
                 format!(
@@ -5058,8 +5262,8 @@ fn prefetch_virtual_search_container(
                     mount.projection.as_str()
                 ),
             )
-            .with_suggested_command("loc daemon restart"),
-        ),
+            .with_suggested_command("loc daemon restart"))
+        }
     }
 }
 
@@ -5077,16 +5281,39 @@ fn refresh_search_mount_metadata(
     store: &mut SqliteStateStore,
     mount: &MountConfig,
 ) -> Result<(), CommandError> {
+    let mut trace_span = localityd::trace::TraceSpan::start("cli.search.refresh_mount_metadata");
+    trace_span.attr("mount_id", mount.mount_id.0.as_str());
+    trace_span.attr("connector", mount.connector.as_str());
+    trace_span.attr("projection", mount.projection.as_str());
+    trace_span.attr("root", mount.root.display().to_string());
     match run_daemon_report::<PullReport>(
         state_root,
         &DaemonRequest::Pull {
             path: mount.root.clone(),
         },
     ) {
-        DaemonReport::Report(_) => Ok(()),
-        DaemonReport::Error(error) => Err(CommandError::new("search", error.code, error.message)),
+        DaemonReport::Report(report) => {
+            trace_span.attr("path", report.target.as_str());
+            trace_span.attr("via", report.via.as_str());
+            trace_span.attr("enumerated", report.enumerated);
+            trace_span.attr("hydrated", report.hydrated);
+            trace_span.attr("result", "daemon_report");
+            Ok(())
+        }
+        DaemonReport::Error(error) => {
+            trace_span.attr("result", "daemon_error");
+            trace_span.attr("code", error.code.as_str());
+            trace_span.status("error");
+            Err(CommandError::new("search", error.code, error.message))
+        }
         DaemonReport::Unavailable(reason) => {
-            refresh_search_mount_metadata_direct(state_root, store, mount, reason)
+            trace_span.attr("result", "daemon_unavailable");
+            trace_span.attr("reason", format!("{:?}", reason));
+            let result = refresh_search_mount_metadata_direct(state_root, store, mount, reason);
+            if result.is_err() {
+                trace_span.status("error");
+            }
+            result
         }
     }
 }
@@ -5097,8 +5324,16 @@ fn refresh_search_mount_metadata_direct(
     mount: &MountConfig,
     reason: DaemonUnavailableReason,
 ) -> Result<(), CommandError> {
+    let mut trace_span =
+        localityd::trace::TraceSpan::start("cli.search.refresh_mount_metadata_direct");
+    trace_span.attr("mount_id", mount.mount_id.0.as_str());
+    trace_span.attr("connector", mount.connector.as_str());
+    trace_span.attr("projection", mount.projection.as_str());
+    trace_span.attr("root", mount.root.display().to_string());
+    trace_span.attr("reason", format!("{:?}", reason));
     match reason {
         DaemonUnavailableReason::TimedOut => {
+            trace_span.status("error");
             return Err(CommandError::new(
                 "search",
                 "daemon_timeout",
@@ -5110,6 +5345,7 @@ fn refresh_search_mount_metadata_direct(
             .with_suggested_command("loc daemon restart"));
         }
         DaemonUnavailableReason::NotAvailable if mount.projection.uses_virtual_filesystem() => {
+            trace_span.status("error");
             return Err(CommandError::new(
                 "search",
                 "daemon_required",
@@ -5127,9 +5363,15 @@ fn refresh_search_mount_metadata_direct(
     let credentials = open_credential_store(state_root);
     let connector = resolve_source_for_mount_id(store, credentials.as_ref(), &mount.mount_id)
         .map_err(|error| CommandError::new("search", error.code(), error.message()))?;
-    run_pull_with_state_root(store, &connector, mount.root.clone(), Some(state_root))
-        .map(|_| ())
-        .map_err(|error| CommandError::new("search", error.code(), error.message()))
+    let report = run_pull_with_state_root(store, &connector, mount.root.clone(), Some(state_root))
+        .map_err(|error| {
+            trace_span.status("error");
+            CommandError::new("search", error.code(), error.message())
+        })?;
+    trace_span.attr("enumerated", report.enumerated);
+    trace_span.attr("hydrated", report.hydrated);
+    trace_span.attr("conflicts", report.conflicts.len());
+    Ok(())
 }
 
 fn templates(args: &[String], json: bool) -> i32 {

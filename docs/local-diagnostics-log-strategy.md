@@ -64,6 +64,28 @@ The JSONL shape should stay stable enough for support tooling:
 }
 ```
 
+### Opt-In Trace Capture
+
+Locality also supports opt-in span tracing for short debugging sessions. Set
+`LOCALITY_TRACE_FILE` to an absolute JSONL path before running `loc` or
+`localityd`:
+
+```bash
+LOCALITY_TRACE_FILE=/tmp/locality-pull-trace.jsonl loc pull ~/Locality/notion/page.md
+```
+
+Each line records one bounded operation with `ts_start_ms`, `ts_end_ms`,
+`duration_ms`, `span`, `status`, and redacted attributes. Set
+`LOCALITY_TRACE_RUN_ID` when grouping several commands into one investigation.
+Trace writes are best effort: failure to create or append the trace file must not
+fail sync, pull, push, mount, search, or daemon work.
+
+Daemon-side spans are emitted only by the process doing the work. If `loc pull`
+is served by an already-running daemon, the daemon must have inherited
+`LOCALITY_TRACE_FILE` to emit internal pull, hydration, and connector spans. For
+one-off investigations, `LOCALITY_DAEMON_DISABLE=1` can force the CLI direct path
+when the target does not require daemon-only virtual projection behavior.
+
 ## Redaction Rules
 
 - No token, client secret, refresh token, OAuth code, or keychain secret ref.
