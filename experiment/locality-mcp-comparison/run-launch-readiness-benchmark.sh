@@ -109,8 +109,11 @@ run_codex_agent() {
   local out_file="$OUT_DIR/$strategy-codex.out"
   local summary_file="$OUT_DIR/$strategy-codex-summary.json"
   local events_tsv="$OUT_DIR/$strategy-codex-events.tsv"
+  local prompt_snapshot="$OUT_DIR/$strategy-prompt.md"
+  local command_snapshot="$OUT_DIR/$strategy-codex-command.txt"
   local prompt
   prompt="$(cat "$prompt_file")"
+  cp "$prompt_file" "$prompt_snapshot"
 
   local cmd=(
     codex exec
@@ -127,6 +130,8 @@ run_codex_agent() {
     cmd+=(--add-dir "$dir")
   done
   cmd+=("$prompt")
+  printf '%q ' "${cmd[@]}" > "$command_snapshot"
+  printf '\n' >> "$command_snapshot"
 
   set +e
   set -o pipefail
