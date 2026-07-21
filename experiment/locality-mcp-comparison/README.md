@@ -160,6 +160,8 @@ python3 experiment/locality-mcp-comparison/scripts/codex-events-to-trace.py \
   experiment/runs/<run-id>/notion-mcp
 ```
 
+The generated Speedscope files use observed gaps between consecutive Codex JSON events. This makes the chart useful even when Codex flushes `item.started` and `item.completed` at the same timestamp. Treat these charts as agent-session timing, not exact internal shell, MCP, or model runtime profiling.
+
 ## Model Notes
 
 The prior baseline used `gpt-5.5` with `xhigh` reasoning. This package defaults to `gpt-5.6-luna` with low reasoning for faster repeated benchmark runs.

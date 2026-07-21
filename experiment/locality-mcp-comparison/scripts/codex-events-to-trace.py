@@ -108,6 +108,63 @@ def item_label(record):
     return item_type or record["event_type"]
 
 
+def span_label(left, right):
+    left_type = left["event_type"]
+    left_item = left["item_type"]
+
+    if left_type == "turn.started":
+        return "model: first response"
+
+    if left_item in {"command_execution", "local_shell_call"}:
+        if left_type.endswith(".started"):
+            return item_label(left)
+        return "model: process shell result"
+
+    if left_item == "mcp_tool_call":
+        if left_type.endswith(".started"):
+            return item_label(left)
+        return "model: process MCP result"
+
+    if left_item in {"function_call", "tool_call"}:
+        if left_type.endswith(".started"):
+            return item_label(left)
+        return "model: process tool result"
+
+    if left_item == "agent_message":
+        return "model: plan after message"
+
+    if left_item == "file_change":
+        return "model: continue after file change"
+
+    if left_type == "turn.completed":
+        return "turn complete"
+
+    return "codex: " + item_label(left)
+
+
+def build_observed_spans(records, base_ms):
+    spans = []
+    for left, right in zip(records, records[1:]):
+        start_ms = left["observed_at_ms"]
+        end_ms = right["observed_at_ms"]
+        if end_ms <= start_ms:
+            continue
+        spans.append(
+            {
+                "name": span_label(left, right),
+                "start_ms": start_ms - base_ms,
+                "end_ms": end_ms - base_ms,
+                "duration_ms": end_ms - start_ms,
+                "start_line": left["line"],
+                "end_line": right["line"],
+                "event_type": left["event_type"],
+                "item_type": left["item_type"],
+                "span_kind": "observed_gap",
+            }
+        )
+    return spans
+
+
 def extract_transcript_text(record):
     event = record["event"]
     item = record["item"]
@@ -133,7 +190,7 @@ if not records:
 base_ms = min(r["observed_at_ms"] for r in records if r["observed_at_ms"])
 
 open_spans = {}
-spans = []
+paired_spans = []
 
 for record in records:
     ident = item_id(record)
@@ -144,7 +201,7 @@ for record in records:
         start = open_spans.pop(ident)
         start_ms = start["observed_at_ms"]
         end_ms = max(record["observed_at_ms"], start_ms)
-        spans.append(
+        paired_spans.append(
             {
                 "name": item_label(start),
                 "start_ms": start_ms - base_ms,
@@ -154,12 +211,13 @@ for record in records:
                 "end_line": record["line"],
                 "event_type": start["event_type"],
                 "item_type": start["item_type"],
+                "span_kind": "item_pair",
             }
         )
 
 for ident, start in open_spans.items():
     end_ms = records[-1]["observed_at_ms"]
-    spans.append(
+    paired_spans.append(
         {
             "name": item_label(start),
             "start_ms": start["observed_at_ms"] - base_ms,
@@ -169,25 +227,17 @@ for ident, start in open_spans.items():
             "end_line": records[-1]["line"],
             "event_type": start["event_type"],
             "item_type": start["item_type"],
+            "span_kind": "open_item",
         }
     )
 
-if not spans:
-    for left, right in zip(records, records[1:]):
-        start_ms = left["observed_at_ms"]
-        end_ms = max(right["observed_at_ms"], start_ms)
-        spans.append(
-            {
-                "name": item_label(left),
-                "start_ms": start_ms - base_ms,
-                "end_ms": end_ms - base_ms,
-                "duration_ms": end_ms - start_ms,
-                "start_line": left["line"],
-                "end_line": right["line"],
-                "event_type": left["event_type"],
-                "item_type": left["item_type"],
-            }
-        )
+observed_spans = build_observed_spans(records, base_ms)
+spans = observed_spans
+
+paired_positive_ms = sum(span["duration_ms"] for span in paired_spans if span["duration_ms"] > 0)
+observed_positive_ms = sum(span["duration_ms"] for span in observed_spans if span["duration_ms"] > 0)
+if not spans and paired_spans:
+    spans = paired_spans
 
 transcript_path = out_prefix.with_name(out_prefix.name + "-transcript.md")
 spans_path = out_prefix.with_name(out_prefix.name + "-spans.tsv")
@@ -195,6 +245,10 @@ speedscope_path = out_prefix.with_name(out_prefix.name + "-speedscope.json")
 
 with transcript_path.open("w") as f:
     f.write(f"# Codex Event Transcript\n\nSource: `{events_path}`\n\n")
+    f.write(
+        "Timing note: spans are inferred from observed gaps between consecutive Codex JSON events. "
+        "When Codex flushes `item.started` and `item.completed` together, exact internal tool runtime is not available in this event stream.\n\n"
+    )
     for record in records:
         rel = record["observed_at_ms"] - base_ms
         f.write(
@@ -217,6 +271,7 @@ with spans_path.open("w", newline="") as f:
             "end_line",
             "event_type",
             "item_type",
+            "span_kind",
         ],
         delimiter="\t",
     )
@@ -247,13 +302,19 @@ speedscope = {
     "profiles": [
         {
             "type": "evented",
-            "name": events_path.name,
+            "name": events_path.name + " observed gaps",
             "unit": "milliseconds",
             "startValue": 0,
             "endValue": max((s["end_ms"] for s in spans), default=0),
             "events": events,
         }
     ],
+    "metadata": {
+        "source": str(events_path),
+        "span_strategy": "observed gaps between consecutive Codex JSON events",
+        "paired_item_positive_ms": paired_positive_ms,
+        "observed_gap_positive_ms": observed_positive_ms,
+    },
     "activeProfileIndex": 0,
 }
 speedscope_path.write_text(json.dumps(speedscope, indent=2) + "\n")
