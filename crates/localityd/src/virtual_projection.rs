@@ -273,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_mount_point_item_reflects_source_root_create_policy() {
+    fn shared_mount_point_item_reflects_source_root_write_policy() {
         let mut store = InMemoryStateStore::new();
         store
             .save_mount(
@@ -314,7 +314,7 @@ mod tests {
             .iter()
             .find(|item| item.filename == "google-docs-main")
             .expect("google docs mount point");
-        assert!(notion.read_only);
+        assert!(!notion.read_only);
         assert!(!google_docs.read_only);
     }
 }

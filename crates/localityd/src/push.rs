@@ -2670,6 +2670,10 @@ fn pending_create_parent_entity<S>(
 where
     S: EntityRepository,
 {
+    if let Some(parent) = workspace_root_move_parent_entity(mount, parent_id) {
+        return Ok(parent);
+    }
+
     if let Some(parent) = store
         .get_entity(&mount.mount_id, parent_id)
         .map_err(PushPrepareError::Store)?
@@ -2694,6 +2698,21 @@ where
         mount_id: mount.mount_id.clone(),
         remote_id: parent_id.clone(),
     }))
+}
+
+fn workspace_root_move_parent_entity(
+    mount: &MountConfig,
+    parent_id: &RemoteId,
+) -> Option<EntityRecord> {
+    if mount.remote_root_id.is_none()
+        && parent_id == &workspace_parent_id(mount)
+        && source_descriptor(&mount.connector)
+            .workspace_root_move_parent_kind()
+            .is_some()
+    {
+        return Some(workspace_create_parent(mount));
+    }
+    None
 }
 
 fn move_parent_entity_for_mutation<S>(

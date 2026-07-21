@@ -172,6 +172,7 @@ pub struct SourceDescriptor {
     supports_oauth: bool,
     mount_guidance: Cow<'static, str>,
     source_root_create_parent_kind: Option<EntityKind>,
+    workspace_root_move_parent_kind: Option<EntityKind>,
     create_entity_parent_kinds: Vec<EntityKind>,
     move_entity_parent_kinds: Vec<EntityKind>,
     periodic_discovery_interval: Option<Duration>,
@@ -217,6 +218,10 @@ impl SourceDescriptor {
 
     pub fn source_root_create_parent_kind(&self) -> Option<EntityKind> {
         self.source_root_create_parent_kind.clone()
+    }
+
+    pub fn workspace_root_move_parent_kind(&self) -> Option<EntityKind> {
+        self.workspace_root_move_parent_kind.clone()
     }
 
     pub fn create_entity_parent_kinds(&self) -> &[EntityKind] {
@@ -409,6 +414,7 @@ fn notion_source_descriptor() -> SourceDescriptor {
         supports_oauth: true,
         mount_guidance: Cow::Borrowed(NOTION_AGENT_GUIDANCE),
         source_root_create_parent_kind: None,
+        workspace_root_move_parent_kind: Some(EntityKind::Directory),
         create_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
         move_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
         periodic_discovery_interval: None,
@@ -428,6 +434,7 @@ fn google_docs_source_descriptor() -> SourceDescriptor {
         supports_oauth: true,
         mount_guidance: Cow::Owned(google_docs_mount_guidance()),
         source_root_create_parent_kind: Some(EntityKind::Directory),
+        workspace_root_move_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Directory],
         move_entity_parent_kinds: vec![EntityKind::Directory],
         periodic_discovery_interval: None,
@@ -447,6 +454,7 @@ fn google_calendar_source_descriptor() -> SourceDescriptor {
         supports_oauth: true,
         mount_guidance: Cow::Owned(google_calendar_mount_guidance()),
         source_root_create_parent_kind: None,
+        workspace_root_move_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Directory],
         move_entity_parent_kinds: Vec::new(),
         periodic_discovery_interval: None,
@@ -466,6 +474,7 @@ fn gmail_source_descriptor() -> SourceDescriptor {
         supports_oauth: true,
         mount_guidance: Cow::Owned(gmail_mount_guidance()),
         source_root_create_parent_kind: None,
+        workspace_root_move_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Directory],
         move_entity_parent_kinds: vec![EntityKind::Directory],
         periodic_discovery_interval: None,
@@ -485,6 +494,7 @@ fn granola_source_descriptor() -> SourceDescriptor {
         supports_oauth: false,
         mount_guidance: Cow::Owned(granola_mount_guidance()),
         source_root_create_parent_kind: None,
+        workspace_root_move_parent_kind: None,
         create_entity_parent_kinds: Vec::new(),
         move_entity_parent_kinds: Vec::new(),
         periodic_discovery_interval: Some(Duration::from_secs(300)),
@@ -504,6 +514,7 @@ fn slack_source_descriptor() -> SourceDescriptor {
         supports_oauth: true,
         mount_guidance: Cow::Owned(slack_mount_guidance()),
         source_root_create_parent_kind: None,
+        workspace_root_move_parent_kind: None,
         create_entity_parent_kinds: Vec::new(),
         move_entity_parent_kinds: Vec::new(),
         periodic_discovery_interval: None,
@@ -581,6 +592,7 @@ fn generic_source_descriptor(connector: &str) -> SourceDescriptor {
         supports_oauth: false,
         mount_guidance: Cow::Owned(generic_mount_guidance(connector)),
         source_root_create_parent_kind: None,
+        workspace_root_move_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
         move_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
         periodic_discovery_interval: None,
@@ -600,6 +612,7 @@ fn linear_source_descriptor() -> SourceDescriptor {
         supports_oauth: false,
         mount_guidance: Cow::Owned(linear_mount_guidance()),
         source_root_create_parent_kind: None,
+        workspace_root_move_parent_kind: None,
         create_entity_parent_kinds: Vec::new(),
         move_entity_parent_kinds: vec![EntityKind::Directory],
         periodic_discovery_interval: Some(Duration::from_secs(300)),
