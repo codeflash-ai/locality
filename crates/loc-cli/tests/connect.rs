@@ -2,15 +2,16 @@ use loc_cli::connect::{
     BrokerOAuthConnectOptions, ConnectOptions, CredentialEncodeFailure, CredentialStorageFailure,
     DEFAULT_GMAIL_OAUTH_PROFILE_ID, DEFAULT_GOOGLE_CALENDAR_OAUTH_PROFILE_ID,
     DEFAULT_GOOGLE_DOCS_OAUTH_PROFILE_ID, DEFAULT_LINEAR_API_KEY_PROFILE_ID,
-    DEFAULT_NOTION_OAUTH_PROFILE_ID, DEFAULT_NOTION_PROFILE_ID, GmailBrokerOAuthConnectOptions,
-    GmailOAuthBrokerExchange, GoogleCalendarBrokerOAuthConnectOptions,
-    GoogleCalendarOAuthBrokerExchange, GoogleDocsBrokerOAuthConnectOptions,
-    GoogleDocsOAuthBrokerExchange, LinearConnectionProbe, NotionConnectionProbe,
-    NotionConnectionProbeResult, NotionOAuthBrokerExchange, NotionOAuthExchange,
-    OAuthConnectOptions, OAuthExchangeFailure, run_connect_gmail_broker_oauth,
+    DEFAULT_NOTION_OAUTH_PROFILE_ID, DEFAULT_NOTION_PROFILE_ID, DEFAULT_SLACK_OAUTH_PROFILE_ID,
+    GmailBrokerOAuthConnectOptions, GmailOAuthBrokerExchange,
+    GoogleCalendarBrokerOAuthConnectOptions, GoogleCalendarOAuthBrokerExchange,
+    GoogleDocsBrokerOAuthConnectOptions, GoogleDocsOAuthBrokerExchange, LinearConnectionProbe,
+    NotionConnectionProbe, NotionConnectionProbeResult, NotionOAuthBrokerExchange,
+    NotionOAuthExchange, OAuthConnectOptions, OAuthExchangeFailure, SlackBrokerOAuthConnectOptions,
+    SlackOAuthBrokerExchange, run_connect_gmail_broker_oauth,
     run_connect_google_calendar_broker_oauth, run_connect_google_docs_broker_oauth,
     run_connect_linear, run_connect_notion, run_connect_notion_broker_oauth,
-    run_connect_notion_oauth, run_disconnect, run_profiles,
+    run_connect_notion_oauth, run_connect_slack_broker_oauth, run_disconnect, run_profiles,
 };
 use locality_connector::ConnectorCapabilities;
 use locality_connector::oauth_broker::{OAuthBrokerCodeExchange, OAuthBrokerToken};
@@ -21,6 +22,9 @@ use locality_linear::LINEAR_CONNECTOR_ID;
 use locality_notion::oauth::{
     NotionOAuthBrokerCodeExchange, NotionOAuthCodeExchange, NotionOAuthToken,
     StoredNotionCredential,
+};
+use locality_slack::{
+    SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE, SLACK_OAUTH_SCOPES, StoredSlackCredential,
 };
 use locality_store::{
     ConnectionId, ConnectionRepository, ConnectorProfileId, ConnectorProfileRepository,
@@ -424,6 +428,92 @@ fn connect_google_calendar_broker_oauth_stores_refresh_handle_without_secrets() 
 }
 
 #[test]
+fn connect_slack_broker_oauth_stores_refresh_handle_without_secrets() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let exchange = FakeSlackBrokerOAuthExchange;
+
+    let report = run_connect_slack_broker_oauth(
+        &mut store,
+        &credentials,
+        SlackBrokerOAuthConnectOptions {
+            connection_id: Some(ConnectionId::new("slack-default")),
+            broker_url: "https://auth.example.test".to_string(),
+            client_id: "slack-client-id".to_string(),
+            session: "broker-session".to_string(),
+            state: "state-1".to_string(),
+            code: "oauth-code".to_string(),
+            redirect_uri: "http://localhost:8757/oauth/slack/callback".to_string(),
+        },
+        &exchange,
+    )
+    .expect("connect slack oauth");
+
+    assert_eq!(report.connection_id, "slack-default");
+    assert_eq!(report.profile_id, DEFAULT_SLACK_OAUTH_PROFILE_ID);
+    assert_eq!(report.connector, "slack");
+    assert_eq!(report.auth_kind, "oauth");
+    assert_eq!(report.workspace_name.as_deref(), Some("Locality Slack"));
+
+    let secret = credentials
+        .get("connection:slack-default")
+        .expect("credential saved");
+    let stored = serde_json::from_str::<StoredSlackCredential>(&secret).expect("stored oauth");
+    assert_eq!(stored.access_token, "xoxb-access-token");
+    assert_eq!(
+        stored.refresh_token_handle.as_deref(),
+        Some("opaque-refresh-handle")
+    );
+    assert_eq!(
+        stored.oauth_broker_url.as_deref(),
+        Some("https://auth.example.test")
+    );
+
+    let json = serde_json::to_string(&report).expect("json");
+    assert!(!json.contains("xoxb-access-token"));
+    assert!(!json.contains("opaque-refresh-handle"));
+    assert!(!json.contains("secret_ref"));
+}
+
+#[test]
+fn connect_slack_broker_oauth_rejects_missing_channels_join_scope() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let exchange = ScopedFakeSlackBrokerOAuthExchange {
+        scopes: slack_scopes_without_join(),
+    };
+
+    let error = run_connect_slack_broker_oauth(
+        &mut store,
+        &credentials,
+        SlackBrokerOAuthConnectOptions {
+            connection_id: Some(ConnectionId::new("slack-default")),
+            broker_url: "https://auth.example.test".to_string(),
+            client_id: "slack-client-id".to_string(),
+            session: "broker-session".to_string(),
+            state: "state-1".to_string(),
+            code: "oauth-code".to_string(),
+            redirect_uri: "http://localhost:8757/oauth/slack/callback".to_string(),
+        },
+        &exchange,
+    )
+    .expect_err("missing channels:join scope");
+
+    assert_eq!(error.code(), "oauth_exchange_failed");
+    assert!(
+        error
+            .message()
+            .contains(SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE),
+        "{}",
+        error.message()
+    );
+    assert!(matches!(
+        credentials.get("connection:slack-default"),
+        Err(CredentialError::NotFound(_))
+    ));
+}
+
+#[test]
 fn connect_gmail_broker_oauth_accepts_worker_scope_string() {
     let mut store = InMemoryStateStore::new();
     let credentials = InMemoryCredentialStore::new();
@@ -623,6 +713,17 @@ fn connect_oauth_exchange_errors_report_connector_guidance() {
     assert!(!gmail_message.contains("Notion OAuth"));
     assert_eq!(gmail.suggested_command(), Some("loc connect gmail"));
 
+    let slack = loc_cli::connect::ConnectError::OAuthExchangeFailed(OAuthExchangeFailure::slack(
+        "authorization code was rejected",
+    ));
+    let slack_message = slack.message();
+    assert_eq!(
+        slack_message,
+        "Slack OAuth exchange failed: authorization code was rejected"
+    );
+    assert!(!slack_message.contains("Notion OAuth"));
+    assert_eq!(slack.suggested_command(), Some("loc connect slack"));
+
     let google_calendar = loc_cli::connect::ConnectError::OAuthExchangeFailed(
         OAuthExchangeFailure::google_calendar("authorization code was rejected"),
     );
@@ -693,6 +794,18 @@ fn connect_credential_encode_errors_report_connector_guidance() {
         Some("loc connect google-docs")
     );
 
+    let google_calendar = loc_cli::connect::ConnectError::CredentialEncode(
+        CredentialEncodeFailure::google_calendar("serialization failed"),
+    );
+    assert_eq!(
+        google_calendar.message(),
+        "failed to encode Google Calendar credential: serialization failed"
+    );
+    assert_eq!(
+        google_calendar.suggested_command(),
+        Some("loc connect google-calendar")
+    );
+
     let gmail = loc_cli::connect::ConnectError::CredentialEncode(CredentialEncodeFailure::gmail(
         "serialization failed",
     ));
@@ -701,6 +814,15 @@ fn connect_credential_encode_errors_report_connector_guidance() {
         "failed to encode Gmail credential: serialization failed"
     );
     assert_eq!(gmail.suggested_command(), Some("loc connect gmail"));
+
+    let slack = loc_cli::connect::ConnectError::CredentialEncode(CredentialEncodeFailure::slack(
+        "serialization failed",
+    ));
+    assert_eq!(
+        slack.message(),
+        "failed to encode Slack credential: serialization failed"
+    );
+    assert_eq!(slack.suggested_command(), Some("loc connect slack"));
 }
 
 #[test]
@@ -727,6 +849,19 @@ fn connect_credential_store_errors_report_connector_guidance() {
         Some("loc connect google-docs")
     );
 
+    let google_calendar =
+        loc_cli::connect::ConnectError::Credential(CredentialStorageFailure::google_calendar(
+            CredentialError::Unavailable("keychain locked".to_string()),
+        ));
+    assert_eq!(
+        google_calendar.message(),
+        "failed to store Google Calendar credential: credential store unavailable: keychain locked"
+    );
+    assert_eq!(
+        google_calendar.suggested_command(),
+        Some("loc connect google-calendar")
+    );
+
     let gmail = loc_cli::connect::ConnectError::Credential(CredentialStorageFailure::gmail(
         CredentialError::Unavailable("keychain locked".to_string()),
     ));
@@ -735,6 +870,15 @@ fn connect_credential_store_errors_report_connector_guidance() {
         "failed to store Gmail credential: credential store unavailable: keychain locked"
     );
     assert_eq!(gmail.suggested_command(), Some("loc connect gmail"));
+
+    let slack = loc_cli::connect::ConnectError::Credential(CredentialStorageFailure::slack(
+        CredentialError::Unavailable("keychain locked".to_string()),
+    ));
+    assert_eq!(
+        slack.message(),
+        "failed to store Slack credential: credential store unavailable: keychain locked"
+    );
+    assert_eq!(slack.suggested_command(), Some("loc connect slack"));
 }
 
 #[test]
@@ -1134,6 +1278,71 @@ impl GoogleCalendarOAuthBrokerExchange for ScopedFakeGoogleCalendarBrokerOAuthEx
 }
 
 #[derive(Clone, Debug)]
+struct FakeSlackBrokerOAuthExchange;
+
+impl SlackOAuthBrokerExchange for FakeSlackBrokerOAuthExchange {
+    fn exchange_code(
+        &self,
+        request: &OAuthBrokerCodeExchange,
+    ) -> Result<OAuthBrokerToken, loc_cli::connect::ConnectError> {
+        assert_eq!(request.connector, "slack");
+        assert_eq!(request.session, "broker-session");
+        assert_eq!(request.state, "state-1");
+        assert_eq!(request.code, "oauth-code");
+        assert_eq!(
+            request.redirect_uri,
+            "http://localhost:8757/oauth/slack/callback"
+        );
+        Ok(slack_broker_token(slack_scopes_with_join()))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ScopedFakeSlackBrokerOAuthExchange {
+    scopes: Vec<String>,
+}
+
+impl SlackOAuthBrokerExchange for ScopedFakeSlackBrokerOAuthExchange {
+    fn exchange_code(
+        &self,
+        request: &OAuthBrokerCodeExchange,
+    ) -> Result<OAuthBrokerToken, loc_cli::connect::ConnectError> {
+        assert_eq!(request.connector, "slack");
+        assert_eq!(request.session, "broker-session");
+        assert_eq!(request.state, "state-1");
+        assert_eq!(request.code, "oauth-code");
+        assert_eq!(
+            request.redirect_uri,
+            "http://localhost:8757/oauth/slack/callback"
+        );
+        Ok(slack_broker_token(self.scopes.clone()))
+    }
+}
+
+fn slack_scopes_with_join() -> Vec<String> {
+    let mut scopes = SLACK_OAUTH_SCOPES
+        .iter()
+        .map(|scope| scope.to_string())
+        .collect::<Vec<_>>();
+    if !scopes
+        .iter()
+        .any(|scope| scope == SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE)
+    {
+        scopes.push(SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE.to_string());
+    }
+    scopes
+}
+
+fn slack_scopes_without_join() -> Vec<String> {
+    SLACK_OAUTH_SCOPES
+        .iter()
+        .copied()
+        .filter(|scope| *scope != SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE)
+        .map(str::to_string)
+        .collect()
+}
+
+#[derive(Clone, Debug)]
 struct ScopedFakeGmailBrokerOAuthExchange {
     scopes: Vec<String>,
 }
@@ -1244,6 +1453,20 @@ fn google_calendar_broker_token(scopes: Vec<String>) -> OAuthBrokerToken {
         account_label: Some("user@example.com".to_string()),
         workspace_id: Some("primary".to_string()),
         workspace_name: Some("Primary Calendar".to_string()),
+        scopes,
+    }
+}
+
+fn slack_broker_token(scopes: Vec<String>) -> OAuthBrokerToken {
+    OAuthBrokerToken {
+        access_token: "xoxb-access-token".to_string(),
+        token_type: Some("bot".to_string()),
+        expires_in: None,
+        refresh_token_handle: Some("opaque-refresh-handle".to_string()),
+        account_id: Some("T123".to_string()),
+        account_label: Some("Locality Slack".to_string()),
+        workspace_id: Some("T123".to_string()),
+        workspace_name: Some("Locality Slack".to_string()),
         scopes,
     }
 }

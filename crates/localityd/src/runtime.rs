@@ -4090,7 +4090,7 @@ fn run_job(
             respond_to,
         }) => {
             let response = runner.run_virtual_fs_materialize(state_root, mount_id, identifier);
-            let freshness_jobs = response_observe_jobs(&response, ChangeHintKind::FileOpened);
+            let freshness_jobs = response_file_opened_observe_jobs(&response);
             JobCompletion::Response {
                 response,
                 respond_to,
@@ -4104,7 +4104,7 @@ fn run_job(
             respond_to,
         }) => {
             let response = runner.run_file_provider_read(state_root, mount_id, identifier);
-            let freshness_jobs = response_observe_jobs(&response, ChangeHintKind::FileOpened);
+            let freshness_jobs = response_file_opened_observe_jobs(&response);
             JobCompletion::Response {
                 response,
                 respond_to,
@@ -4265,6 +4265,20 @@ fn response_local_edit_observe_jobs(response: &DaemonResponse) -> Vec<SyncJob> {
     }
 
     response_observe_jobs(response, ChangeHintKind::LocalEdited)
+}
+
+fn response_file_opened_observe_jobs(response: &DaemonResponse) -> Vec<SyncJob> {
+    if response
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("outcome"))
+        .and_then(Value::as_str)
+        == Some("hydrated")
+    {
+        return Vec::new();
+    }
+
+    response_observe_jobs(response, ChangeHintKind::FileOpened)
 }
 
 fn response_live_mode_signal_needed(response: &DaemonResponse) -> bool {
@@ -5533,6 +5547,7 @@ mod tests {
         RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
     };
 
+    use crate::ipc::DaemonResponse;
     use crate::virtual_fs::VirtualFsRefreshChildrenReport;
     use crate::watcher::{FileEvent, FileEventKind};
 
@@ -5542,7 +5557,7 @@ mod tests {
         RemoteDiscoveryHint, RuntimeJobRunner, RuntimeState, child_refresh_retry_delay,
         execute_file_event, execute_observe_entity_job, locality_error_code,
         observable_remote_identifier, remote_fast_forward_discovery_hints,
-        repair_clean_remote_deleted_projections,
+        repair_clean_remote_deleted_projections, response_file_opened_observe_jobs,
     };
 
     #[test]
@@ -5588,6 +5603,22 @@ mod tests {
         let second = queue.pop_ready(&active).expect("second refresh");
         assert_eq!(second.container_identifier, "children:page-2");
         assert_eq!(second.priority, ChildRefreshPriority::Background);
+    }
+
+    #[test]
+    fn hydrated_materialize_response_does_not_queue_file_opened_observe() {
+        let response = DaemonResponse::ok(serde_json::json!({
+            "mount_id": "slack-main",
+            "identifier": "slack-recent:C123",
+            "remote_id": "slack-recent:C123",
+            "path": "/tmp/slack-main/channels/general-C123/recent.md",
+            "outcome": "hydrated",
+            "hydration": "hydrated"
+        }));
+
+        let jobs = response_file_opened_observe_jobs(&response);
+
+        assert!(jobs.is_empty());
     }
 
     #[test]

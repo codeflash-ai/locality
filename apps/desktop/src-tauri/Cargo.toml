@@ -18,6 +18,7 @@ locality-google-calendar.workspace = true
 locality-google-docs.workspace = true
 locality-notion.workspace = true
 locality-platform.workspace = true
+locality-slack.workspace = true
 locality-store.workspace = true
 localityd = { path = "../../../crates/localityd" }
 notify = "8"

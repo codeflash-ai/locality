@@ -955,6 +955,66 @@ fn diff_surfaces_validation_issues_without_plan() {
 }
 
 #[test]
+fn diff_blocks_slack_recent_edit_before_planning() {
+    let fixture = DiffFixture::new();
+    let mount_id = MountId::new("slack-main");
+    let remote_id = RemoteId::new("slack-recent:C123");
+    let relative_path = "channels/general-C123/recent.md";
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(MountConfig::new(
+            mount_id.clone(),
+            "slack",
+            fixture.root.clone(),
+        ))
+        .expect("save Slack mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                mount_id.clone(),
+                remote_id.clone(),
+                EntityKind::Page,
+                "recent",
+                relative_path,
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save Slack recent entity");
+    store
+        .save_shadow(
+            &mount_id,
+            shadow_for(&remote_id.0, "# general\n\nOriginal Slack line."),
+        )
+        .expect("save Slack shadow");
+    let path = fixture.write_page_with_id(
+        relative_path,
+        &remote_id.0,
+        "# general\n\nEdited Slack line.",
+    );
+
+    let report = run_diff(&store, &path).expect("diff report");
+
+    assert!(!report.ok);
+    assert_eq!(report.action, "fix_validation");
+    assert_eq!(report.mount_id, "slack-main");
+    assert_eq!(report.entity_id, "slack-recent:C123");
+    assert!(report.plan.is_none());
+    assert_eq!(report.validation.len(), 1);
+    assert_eq!(report.validation[0].code, "slack_read_only");
+    assert_eq!(report.validation[0].file, relative_path);
+    assert_eq!(report.validation[0].line, Some(1));
+    assert_eq!(
+        report.validation[0].message,
+        "Slack conversations are read-only"
+    );
+    assert_eq!(
+        report.validation[0].suggested_fix.as_deref(),
+        Some("do not edit files under Slack mounts")
+    );
+    assert_eq!(report.completed_stages, vec!["parse_and_validate"]);
+}
+
+#[test]
 fn diff_rejects_frontmatter_id_mismatch_before_planning() {
     let fixture = DiffFixture::new();
     let store = fixture.store();

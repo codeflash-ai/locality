@@ -56,7 +56,8 @@ function isOAuthSessionPayload(value: unknown): value is OAuthSessionPayload {
     (payload.connector === "notion" ||
       payload.connector === "google-docs" ||
       payload.connector === "google-calendar" ||
-      payload.connector === "gmail") &&
+      payload.connector === "gmail" ||
+      payload.connector === "slack") &&
     typeof payload.state === "string" &&
     typeof payload.redirect_uri === "string" &&
     typeof payload.iat === "number" &&

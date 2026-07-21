@@ -23,9 +23,10 @@ use loc_cli::connect::DEFAULT_NOTION_PROFILE_ID;
 use loc_cli::connect::{
     BrokerOAuthConnectOptions, ConnectOptions, GmailBrokerOAuthConnectOptions,
     GoogleCalendarBrokerOAuthConnectOptions, GoogleDocsBrokerOAuthConnectOptions,
-    HttpGranolaConnectionProbe, HttpLinearConnectionProbe, run_connect_gmail_broker_oauth,
-    run_connect_google_calendar_broker_oauth, run_connect_google_docs_broker_oauth,
-    run_connect_granola, run_connect_linear, run_connect_notion_broker_oauth, run_disconnect,
+    HttpGranolaConnectionProbe, HttpLinearConnectionProbe, SlackBrokerOAuthConnectOptions,
+    run_connect_gmail_broker_oauth, run_connect_google_calendar_broker_oauth,
+    run_connect_google_docs_broker_oauth, run_connect_granola, run_connect_linear,
+    run_connect_notion_broker_oauth, run_connect_slack_broker_oauth, run_disconnect,
 };
 use loc_cli::daemon::{DaemonRunState, run_daemon_control};
 use loc_cli::diff::{DiffReport, run_diff};
@@ -92,6 +93,10 @@ use locality_platform::{
     DAEMON_PID_FILENAME, append_service_log, bundled_binary_next_to_current_exe,
     default_state_root as platform_default_state_root, logs_dir as platform_logs_dir,
     user_home as platform_user_home,
+};
+use locality_slack::{
+    DEFAULT_SLACK_OAUTH_BROKER_URL, DEFAULT_SLACK_OAUTH_REDIRECT_URI, HttpSlackOAuthBrokerClient,
+    SLACK_CONNECTOR_ID, SlackMountSettings,
 };
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
@@ -538,6 +543,7 @@ static CONNECT_NOTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static CONNECT_GOOGLE_DOCS_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static CONNECT_GOOGLE_CALENDAR_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static CONNECT_GMAIL_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static CONNECT_SLACK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static DAEMON_LIFECYCLE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static NOTION_LOGIN_LINK: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static DESKTOP_SNAPSHOT_CACHE: OnceLock<Mutex<DesktopSnapshotCache>> = OnceLock::new();
@@ -979,6 +985,11 @@ async fn connect_gmail(app: AppHandle) -> ActionReport {
     run_gmail_connection_flow(app, true).await
 }
 
+#[tauri::command]
+async fn connect_slack(app: AppHandle) -> ActionReport {
+    run_slack_connection_flow(app, true).await
+}
+
 #[derive(Clone, Copy)]
 enum NotionConnectionAction {
     Connect,
@@ -1199,6 +1210,54 @@ async fn run_gmail_connection_flow(app: AppHandle, open_browser: bool) -> Action
                 "warn",
                 "gmail_access.failed",
                 format!("connect gmail failed: {message}"),
+            );
+            ActionReport { ok: false, message }
+        }
+    };
+    if report.ok {
+        refresh_desktop_surfaces(&app);
+    }
+    report
+}
+
+async fn run_slack_connection_flow(app: AppHandle, open_browser: bool) -> ActionReport {
+    if CONNECT_SLACK_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        return ActionReport {
+            ok: false,
+            message: "A Slack connection flow is already waiting for browser approval.".to_string(),
+        };
+    }
+
+    let state_root = default_state_root();
+    let activity_state_root = state_root.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        connect_slack_with_broker(state_root, open_browser)
+    })
+    .await
+    .map_err(|error| format!("Slack OAuth worker failed: {error}"));
+    CONNECT_SLACK_IN_PROGRESS.store(false, Ordering::Release);
+
+    let report = match result {
+        Ok(Ok(message)) => {
+            if let Err(error) = record_desktop_activity(
+                &activity_state_root,
+                "Connected Slack",
+                &message,
+                "connect",
+            ) {
+                desktop_log(
+                    "warn",
+                    "activity.record_failed",
+                    format!("could not record Slack access activity: {error}"),
+                );
+            }
+            ActionReport { ok: true, message }
+        }
+        Ok(Err(message)) | Err(message) => {
+            desktop_log(
+                "warn",
+                "slack_access.failed",
+                format!("connect slack failed: {message}"),
             );
             ActionReport { ok: false, message }
         }
@@ -7509,6 +7568,7 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
         Some(connection_id) => Some(ConnectionId::new(connection_id.to_string())),
         None => preferred_connection_id_for_connector(&store, &connector)?,
     };
+    let read_only = request.read_only || connector == "granola" || connector == SLACK_CONNECTOR_ID;
     let remote_root_id = match connector.as_str() {
         "notion" => request
             .notion_root_page
@@ -7531,7 +7591,7 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
                 root: root.clone(),
                 remote_root_id: None,
                 connection_id: connection_id.clone(),
-                read_only: request.read_only,
+                read_only,
                 projection: projection.clone(),
                 settings_json: "{}".to_string(),
             };
@@ -7546,13 +7606,20 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
                 })?;
             Some(folder_id)
         }
-        GOOGLE_CALENDAR_CONNECTOR_ID | "gmail" | "granola" | "linear" => None,
+        GOOGLE_CALENDAR_CONNECTOR_ID | "gmail" | "granola" | "linear" | SLACK_CONNECTOR_ID => None,
         _ => unreachable!("unsupported desktop connector should be rejected before mount setup"),
     };
     let preserved = if can_remount_existing_workspace {
         prepare_existing_workspace_mount_for_remount(&mut store, &state_root, &mount_id)?
     } else {
         None
+    };
+    let settings_json = if connector == SLACK_CONNECTOR_ID {
+        SlackMountSettings::default()
+            .to_json()
+            .map_err(|error| format!("Could not encode Slack mount settings: {error}"))?
+    } else {
+        "{}".to_string()
     };
 
     let mount_report = run_mount(
@@ -7563,9 +7630,9 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
             root,
             remote_root_id,
             connection_id,
-            read_only: request.read_only,
+            read_only,
             projection: projection.clone(),
-            settings_json: "{}".to_string(),
+            settings_json,
         },
     )
     .map_err(|error| error.message())?;
@@ -7618,12 +7685,18 @@ fn append_macos_file_provider_activation_warning(message: &mut String, warning: 
 fn desktop_mount_creation_supports_connector(connector: &str) -> bool {
     matches!(
         connector,
-        "notion" | "google-docs" | GOOGLE_CALENDAR_CONNECTOR_ID | "gmail" | "granola" | "linear"
+        "notion"
+            | "google-docs"
+            | GOOGLE_CALENDAR_CONNECTOR_ID
+            | "gmail"
+            | "granola"
+            | "linear"
+            | SLACK_CONNECTOR_ID
     )
 }
 
 fn desktop_mount_is_editable_by_default(connector: &str) -> bool {
-    connector != "granola"
+    !matches!(connector, "granola" | "slack")
 }
 
 fn desktop_mount_by_id(store: &SqliteStateStore, mount_id: &str) -> Result<MountConfig, String> {
@@ -10236,6 +10309,57 @@ fn connect_gmail_with_broker(state_root: PathBuf, open_browser: bool) -> Result<
     ))
 }
 
+fn connect_slack_with_broker(state_root: PathBuf, open_browser: bool) -> Result<String, String> {
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let credentials = open_credential_store(&state_root);
+    let broker_url = env_first(&[
+        "LOCALITY_SLACK_OAUTH_BROKER_URL",
+        "LOCALITY_AUTH_BROKER_URL",
+    ])
+    .unwrap_or_else(|| DEFAULT_SLACK_OAUTH_BROKER_URL.to_string());
+    let redirect_uri = env_first(&[
+        "LOCALITY_SLACK_OAUTH_REDIRECT_URI",
+        "SLACK_OAUTH_REDIRECT_URI",
+    ])
+    .unwrap_or_else(|| DEFAULT_SLACK_OAUTH_REDIRECT_URI.to_string());
+    let broker = HttpSlackOAuthBrokerClient::new(broker_url.clone());
+    let start = broker
+        .start(&OAuthBrokerStart {
+            connector: SLACK_CONNECTOR_ID.to_string(),
+            redirect_uri,
+        })
+        .map_err(|error| format!("Could not start Slack OAuth broker flow: {error}"))?;
+    let authorization = run_local_oauth_authorization(
+        "Slack",
+        &start.authorization_url,
+        &start.redirect_uri,
+        &start.state,
+        !open_browser,
+        true,
+    )
+    .map_err(|error| error.message)?;
+    let options = SlackBrokerOAuthConnectOptions {
+        connection_id: None,
+        broker_url,
+        client_id: start.client_id,
+        session: start.session,
+        state: start.state,
+        code: authorization.code,
+        redirect_uri: start.redirect_uri,
+    };
+
+    let report = run_connect_slack_broker_oauth(&mut store, credentials.as_ref(), options, &broker)
+        .map_err(|error| error.message())?;
+    let connected_message = match report.workspace_name.or(report.account_label) {
+        Some(label) if !label.is_empty() => format!("Connected Slack workspace {label}."),
+        _ => "Connected Slack workspace.".to_string(),
+    };
+    Ok(format!(
+        "{connected_message} Create a Slack source folder to mount recent conversations."
+    ))
+}
+
 fn notion_login_link_slot() -> &'static Mutex<Option<String>> {
     NOTION_LOGIN_LINK.get_or_init(|| Mutex::new(None))
 }
@@ -11831,6 +11955,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use loc_cli::search::{SearchRemoteState, SearchResult, SearchSafety};
@@ -11842,6 +11967,7 @@ mod tests {
     };
     use locality_core::planner::PushPlan;
     use locality_core::shadow::ShadowDocument;
+    use locality_slack::{SLACK_CONNECTOR_ID, SlackMountSettings};
     use locality_store::{
         AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, ConnectionId,
         ConnectionRecord, ConnectionRepository, ConnectorProfileId, EntityRecord, EntityRepository,
@@ -12547,6 +12673,100 @@ mod tests {
 
         assert_eq!(selected.mount_id, google.mount_id);
         assert_eq!(selected.connector, "google-docs");
+    }
+
+    #[test]
+    fn slack_desktop_mount_persists_read_only_with_default_settings() {
+        let temp = TestTempDir::new("desktop-slack-mount-safety");
+        let state_root = temp.path().join(".loc");
+        let shared_root = temp.path().join("Locality");
+        let mount_root = shared_root.join("slack");
+        fs::create_dir_all(&shared_root).expect("create shared mount root");
+        let mount_id = MountId::new("slack-main");
+        let settings_json = SlackMountSettings::default()
+            .to_json()
+            .expect("serialize default Slack settings");
+        let mut store = SqliteStateStore::open(state_root.clone()).expect("open state store");
+
+        super::run_mount(
+            &mut store,
+            super::MountOptions {
+                mount_id: mount_id.clone(),
+                connector: SLACK_CONNECTOR_ID.to_string(),
+                root: mount_root.clone(),
+                remote_root_id: None,
+                connection_id: None,
+                read_only: true,
+                projection: super::desktop_projection_mode(),
+                settings_json: settings_json.clone(),
+            },
+        )
+        .expect("persist Slack mount");
+
+        let mount = store
+            .get_mount(&mount_id)
+            .expect("load persisted Slack mount")
+            .expect("Slack mount persisted");
+
+        assert_eq!(mount.mount_id, mount_id);
+        assert_eq!(mount.connector, SLACK_CONNECTOR_ID);
+        assert_eq!(mount.root, mount_root);
+        assert_eq!(mount.connection_id, None);
+        assert_eq!(mount.remote_root_id, None);
+        assert!(mount.read_only);
+        assert_eq!(mount.settings_json, settings_json);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn create_desktop_mount_blocking_for_slack_coerces_read_only_and_default_settings() {
+        let _lock = state_root_env_lock().lock().expect("state root env lock");
+        let temp = TestTempDir::new("desktop-slack-mount-request");
+        let state_root = temp.path().join(".loc");
+        let shared_root = temp.path().join("Locality");
+        let mount_root = shared_root.join("slack");
+        fs::create_dir_all(&shared_root).expect("create shared mount root");
+        let mount_id = MountId::new("slack-main");
+        let state_root_guard = LocalityStateDirGuard::set(&state_root);
+
+        let result = super::create_desktop_mount_blocking(super::CreateDesktopMountRequest {
+            connector: SLACK_CONNECTOR_ID.to_string(),
+            path: mount_root.display().to_string(),
+            mount_id: mount_id.0.clone(),
+            connection_id: None,
+            read_only: false,
+            notion_root_page: Some("should-not-be-used".to_string()),
+            google_docs_workspace_folder: Some("should-not-be-used".to_string()),
+        });
+
+        if let Err(error) = &result {
+            assert!(
+                error.contains("locality-fuse was not found")
+                    || error.contains("locality-cloud-files")
+                    || error.contains("Windows Cloud Files"),
+                "unexpected Slack desktop mount error: {error}"
+            );
+        }
+        drop(state_root_guard);
+
+        let store = SqliteStateStore::open(state_root.clone()).expect("open state store");
+        let mount = store
+            .get_mount(&mount_id)
+            .expect("load persisted Slack mount")
+            .expect("Slack mount persisted");
+
+        assert_eq!(mount.mount_id, mount_id);
+        assert_eq!(mount.connector, SLACK_CONNECTOR_ID);
+        assert_eq!(mount.root, mount_root);
+        assert_eq!(mount.connection_id, None);
+        assert_eq!(mount.remote_root_id, None);
+        assert!(mount.read_only);
+        assert_eq!(
+            mount.settings_json,
+            SlackMountSettings::default()
+                .to_json()
+                .expect("serialize default Slack settings")
+        );
     }
 
     #[test]
@@ -14777,7 +14997,8 @@ mod tests {
         ));
         assert!(super::desktop_mount_creation_supports_connector("linear"));
         assert!(super::desktop_mount_is_editable_by_default("linear"));
-        assert!(!super::desktop_mount_creation_supports_connector("slack"));
+        assert!(super::desktop_mount_creation_supports_connector("slack"));
+        assert!(!super::desktop_mount_is_editable_by_default("slack"));
     }
 
     #[test]
@@ -16860,6 +17081,46 @@ mod tests {
         }
     }
 
+    struct LocalityStateDirGuard {
+        previous: Option<std::ffi::OsString>,
+        state_root: PathBuf,
+    }
+
+    impl LocalityStateDirGuard {
+        fn set(state_root: &Path) -> Self {
+            let previous = std::env::var_os("LOCALITY_STATE_DIR");
+            unsafe {
+                std::env::set_var("LOCALITY_STATE_DIR", state_root);
+            }
+            Self {
+                previous,
+                state_root: state_root.to_path_buf(),
+            }
+        }
+    }
+
+    impl Drop for LocalityStateDirGuard {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => unsafe {
+                    std::env::set_var("LOCALITY_STATE_DIR", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("LOCALITY_STATE_DIR");
+                },
+            }
+            let _ = loc_cli::daemon::run_daemon_control(&super::daemon_control_args_any_manager(
+                "stop",
+                &self.state_root,
+            ));
+        }
+    }
+
+    fn state_root_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
     fn test_connection(workspace_id: &str, workspace_name: &str) -> ConnectionRecord {
         ConnectionRecord {
             connection_id: ConnectionId::new("notion-default"),
@@ -17722,6 +17983,7 @@ fn main() {
             connect_google_docs,
             connect_google_calendar,
             connect_gmail,
+            connect_slack,
             notion_login_link,
             install_state_review,
             acknowledge_install_state,

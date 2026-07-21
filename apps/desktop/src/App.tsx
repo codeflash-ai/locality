@@ -116,6 +116,7 @@ import googleDocsIconUrl from "./assets/connectors/google-docs.svg";
 import granolaIconUrl from "./assets/connectors/granola.svg";
 import linearIconUrl from "./assets/connectors/linear.svg";
 import notionIconUrl from "./assets/connectors/notion.svg";
+import slackIconUrl from "./assets/connectors/slack.svg";
 import localityShortDarkUrl from "./assets/brand/locality-short-dark.svg";
 import localityShortLightUrl from "./assets/brand/locality-short-light.svg";
 
@@ -152,6 +153,7 @@ const CONNECTOR_ICON_URLS: Record<SourceConnectorId, string> = {
   gmail: gmailIconUrl,
   granola: granolaIconUrl,
   linear: linearIconUrl,
+  slack: slackIconUrl,
 };
 
 const PRODUCT_TERMS = {
@@ -716,6 +718,8 @@ function suggestedAgentPrompt(mountPath: string, connector: OnboardingConnectorI
   switch (connector) {
     case "granola":
       return `Use Locality to read my Granola meetings. Open the files under ${mountPath}, search summaries and transcripts with normal file tools, and cite the meeting files you used. Granola is read-only in Locality, so do not try to push edits back.`;
+    case "slack":
+      return `Use Locality to read my Slack conversations. Open the files under ${mountPath}, search channels, private channels, DMs, group DMs, and users with normal file tools, and cite the conversation files you used. Slack is read-only in Locality, so do not try to push edits back.`;
     case "google-docs":
       return `Use Locality to edit my Google Docs workspace. Open the files under ${mountPath}, make the requested edits directly in Markdown, and leave changes pending for Locality review before pushing.`;
     case "google-calendar":
@@ -787,6 +791,8 @@ function onboardingConnectorDescription(
         return "Granola is ready. Locality mounted meeting summaries and transcripts as read-only files under CloudStorage.";
       case "linear":
         return "Linear is ready. Locality mounted issues by team as editable local files under CloudStorage.";
+      case "slack":
+        return "Slack is ready. Locality mounted recent accessible conversations as read-only files under CloudStorage.";
     }
   }
 
@@ -804,6 +810,8 @@ function onboardingConnectorDescription(
         return "Locality is validating the API key and creating a read-only Granola folder.";
       case "linear":
         return "Locality is validating the API key and creating an editable Linear folder.";
+      case "slack":
+        return "A browser window is open. Approve Slack access, then Locality will create the read-only conversation folder.";
     }
   }
 
@@ -820,6 +828,8 @@ function onboardingConnectorDescription(
       return "Paste a Granola API key to mount meeting summaries and transcripts as local read-only files. Keys are stored in your local credential store.";
     case "linear":
       return "Paste a Linear API key to mount issues by team as editable local files. Keys are stored in your local credential store.";
+    case "slack":
+      return "Connect Slack during setup so agents can search recent accessible conversations from local read-only Markdown files.";
   }
 }
 
@@ -837,6 +847,8 @@ function onboardingConnectorPills(connector: OnboardingConnectorId) {
       return ["Read-only", "Meeting summaries", "Transcripts"];
     case "linear":
       return ["API key", "Issues by team", "Review before push"];
+    case "slack":
+      return ["Slack OAuth", "Read-only", "Conversations"];
   }
 }
 
@@ -854,12 +866,14 @@ function onboardingReadyCopy(connector: OnboardingConnectorId) {
       return "Your Granola meetings are ready as local read-only files. Agents can search summaries and transcripts with normal file tools, while Locality keeps the remote notes protected from edits.";
     case "linear":
       return "Your Linear issues are ready as local files. Agents can edit issue descriptions and supported fields in Markdown, then leave changes for Review Center before anything is pushed back.";
+    case "slack":
+      return "Your Slack conversations are ready as local read-only files. Agents can search recent accessible channels, private channels, DMs, group DMs, and users with normal file tools.";
   }
 }
 
 function onboardingPromptHint(connector: OnboardingConnectorId) {
-  return connector === "granola"
-    ? "Ask an agent to use the mounted meeting files."
+  return connector === "granola" || connector === "slack"
+    ? "Ask an agent to use the mounted read-only files."
     : "Claude and Codex are now set up to use Locality.";
 }
 
@@ -2024,7 +2038,7 @@ function Onboarding({
           path: sourceDefaultPath(snapshot, connector),
           mountId: sourceMountId(connector),
           connectionId: null,
-          readOnly: connector === "granola",
+          readOnly: connector === "granola" || connector === "slack",
           notionRootPage: null,
           googleDocsWorkspaceFolder: connector === "google-docs"
             ? googleDocsWorkspaceFolder.trim() || "Locality"
@@ -2035,7 +2049,7 @@ function Onboarding({
     );
   }
 
-  async function connectGoogleOnboarding(connector: "google-docs" | "google-calendar" | "gmail") {
+  async function connectOAuthOnboarding(connector: "google-docs" | "google-calendar" | "gmail" | "slack") {
     if (selectedConnectorBusy) {
       return;
     }
@@ -2050,7 +2064,7 @@ function Onboarding({
     setOauthInFlight(true);
     setStep(3);
     try {
-      const command = googleOAuthConnectCommand(connector);
+      const command = oauthConnectCommand(connector);
       const connectReport = await callCommand<ActionReport>(
         command,
         undefined,
@@ -2101,7 +2115,8 @@ function Onboarding({
       case "google-docs":
       case "google-calendar":
       case "gmail":
-        await connectGoogleOnboarding(selectedOnboardingConnector);
+      case "slack":
+        await connectOAuthOnboarding(selectedOnboardingConnector);
         return;
       case "granola":
         await connectGranolaOnboarding();
@@ -3443,7 +3458,7 @@ function MountsView({
                 path: sourceDefaultPath(snapshot, connector),
                 mountId: sourceMountId(connector),
                 connectionId: null,
-                readOnly: false,
+                readOnly: connector === "granola" || connector === "slack",
                 notionRootPage: null,
                 googleDocsWorkspaceFolder: connector === "google-docs"
                   ? googleDocsWorkspaceFolder?.trim() || "Locality"
@@ -3519,7 +3534,7 @@ function MountsView({
       return { ok: false, message: `${sourceDisplayName(connector)} requires an API key.` };
     }
 
-    const command = googleOAuthConnectCommand(connector);
+    const command = oauthConnectCommand(connector);
     setActionError("");
     setActionMessage("");
     const report = await callCommand<ActionReport>(
@@ -3915,6 +3930,14 @@ function AddSourceDialog({
       keywords: ["linear", "issues", "tickets", "projects", "teams"],
       mounted: sourceMounted(snapshot, "linear"),
     },
+    {
+      id: "slack",
+      name: "Slack",
+      description: "Recent accessible conversations as read-only Markdown.",
+      status: sourceConnectorStatus(snapshot, "slack"),
+      keywords: ["slack", "channels", "private channels", "dms", "group dms", "users"],
+      mounted: sourceMounted(snapshot, "slack"),
+    },
   ];
   const normalizedQuery = query.trim().toLowerCase();
   const visibleConnectors = normalizedQuery
@@ -4068,6 +4091,11 @@ function AddSourceDialog({
                         <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
                         <SettingRow title="Access" value="Issue edits" />
                       </>
+                    ) : connector.id === "slack" ? (
+                      <>
+                        <SettingRow title="Content" value="Channels, DMs, group DMs, users" />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                      </>
                     ) : (
                       <>
                         <SettingRow title="Mailboxes" value="Inbox, Sent, Draft" />
@@ -4180,6 +4208,8 @@ function sourceDisplayName(connector: SourceConnectorId) {
       return "Granola";
     case "linear":
       return "Linear";
+    case "slack":
+      return "Slack";
   }
 }
 
@@ -4197,6 +4227,8 @@ function sourceMountId(connector: SourceConnectorId) {
       return "granola-main";
     case "linear":
       return "linear-main";
+    case "slack":
+      return "slack-main";
   }
 }
 
@@ -4260,6 +4292,8 @@ function sourceDefaultPath(snapshot: DesktopSnapshot, connector: SourceConnector
       return "~/Library/CloudStorage/Locality/granola";
     case "linear":
       return "~/Library/CloudStorage/Locality/linear";
+    case "slack":
+      return "~/Library/CloudStorage/Locality/slack";
   }
 }
 
@@ -4289,7 +4323,7 @@ function sourceActionIcon(connector: SourceConnectorId, needsConnection: boolean
   return <FolderOpen />;
 }
 
-function googleOAuthConnectCommand(connector: "google-docs" | "google-calendar" | "gmail") {
+function oauthConnectCommand(connector: "google-docs" | "google-calendar" | "gmail" | "slack") {
   switch (connector) {
     case "google-docs":
       return "connect_google_docs";
@@ -4297,6 +4331,8 @@ function googleOAuthConnectCommand(connector: "google-docs" | "google-calendar" 
       return "connect_google_calendar";
     case "gmail":
       return "connect_gmail";
+    case "slack":
+      return "connect_slack";
   }
 }
 
@@ -7667,6 +7703,19 @@ function ConnectorOptions({
           <small>Issues and teams as editable Markdown files.</small>
         </div>
         <span>{connectedConnector === "linear" ? "Connected" : "API key"}</span>
+      </button>
+      <button
+        type="button"
+        className={`connector-option available selectable ${selected === "slack" ? "selected" : ""}`}
+        disabled={busy}
+        onClick={() => onSelect("slack")}
+      >
+        <ConnectorIcon connector="slack" />
+        <div>
+          <strong>Slack</strong>
+          <small>Channels, DMs, group DMs, and users as read-only files.</small>
+        </div>
+        <span>{connectedConnector === "slack" ? "Connected" : "OAuth"}</span>
       </button>
     </div>
   );

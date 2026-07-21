@@ -211,9 +211,12 @@ where
         })?;
     let index = ProviderIndex::new(&entities);
     let target_container = match entity.kind {
-        EntityKind::Page => page_container_path(&entity.path),
+        EntityKind::Page if page_projects_as_directory(&entity.path) => {
+            page_container_path(&entity.path)
+        }
         EntityKind::Database | EntityKind::Directory => entity.path.clone(),
         EntityKind::Asset | EntityKind::Unknown(_) => parent_path(&entity.path).to_path_buf(),
+        EntityKind::Page => parent_path(&entity.path).to_path_buf(),
     };
 
     let mut identifiers = vec![
@@ -389,7 +392,7 @@ where
             continue;
         }
         if entity_listing_parent_path(entity) == container_path {
-            if entity.kind == EntityKind::Page {
+            if entity.kind == EntityKind::Page && page_projects_as_directory(&entity.path) {
                 children.push(page_child_dir_item(
                     &mount,
                     &page_container_path(&entity.path),
@@ -400,7 +403,10 @@ where
                 children.push(entity_item(&mount, entity, &index));
             }
         }
-        if entity.kind == EntityKind::Page && page_container_path(&entity.path) == container_path {
+        if entity.kind == EntityKind::Page
+            && page_projects_as_directory(&entity.path)
+            && page_container_path(&entity.path) == container_path
+        {
             children.push(entity_item(&mount, entity, &index));
         }
     }
@@ -569,7 +575,7 @@ fn stale_virtual_child_subtree<'a>(
     entities: &'a [EntityRecord],
     child: &EntityRecord,
 ) -> Vec<&'a EntityRecord> {
-    let subtree_root = entity_parent_container_path(child);
+    let subtree_root = entity_subtree_root_path(child);
     entities
         .iter()
         .filter(|entity| {
@@ -2853,7 +2859,11 @@ fn resolve_item(
         }
         let entity = entities
             .iter()
-            .find(|entity| entity.remote_id.0 == remote_id && entity.kind == EntityKind::Page)
+            .find(|entity| {
+                entity.remote_id.0 == remote_id
+                    && entity.kind == EntityKind::Page
+                    && page_projects_as_directory(&entity.path)
+            })
             .ok_or_else(|| missing_identifier(identifier))?;
         return Ok(page_child_dir_item(
             mount,
@@ -3661,7 +3671,11 @@ fn container_path(
         }
         let entity = entities
             .iter()
-            .find(|entity| entity.remote_id.0 == remote_id && entity.kind == EntityKind::Page)
+            .find(|entity| {
+                entity.remote_id.0 == remote_id
+                    && entity.kind == EntityKind::Page
+                    && page_projects_as_directory(&entity.path)
+            })
             .ok_or_else(|| missing_identifier(identifier))?;
         return Ok(page_container_path(&entity.path));
     }
@@ -3678,7 +3692,7 @@ fn container_path(
     if matches!(entity.kind, EntityKind::Database | EntityKind::Directory) {
         return Ok(entity.path.clone());
     }
-    if entity.kind == EntityKind::Page {
+    if entity.kind == EntityKind::Page && page_projects_as_directory(&entity.path) {
         return Ok(page_container_path(&entity.path));
     }
 
@@ -3720,10 +3734,12 @@ fn child_container_for_identifier(
     };
 
     Ok(match entity.kind {
-        EntityKind::Page => Some(ChildContainer::PageChildren(remote_id)),
+        EntityKind::Page if page_projects_as_directory(&entity.path) => {
+            Some(ChildContainer::PageChildren(remote_id))
+        }
         EntityKind::Database => Some(ChildContainer::DatabaseRows(remote_id)),
         EntityKind::Directory => Some(ChildContainer::DirectoryChildren(remote_id)),
-        EntityKind::Asset | EntityKind::Unknown(_) => None,
+        EntityKind::Page | EntityKind::Asset | EntityKind::Unknown(_) => None,
     })
 }
 
@@ -3864,22 +3880,45 @@ fn parent_path(path: &Path) -> &Path {
 
 fn entity_listing_parent_path(entity: &EntityRecord) -> PathBuf {
     match entity.kind {
-        EntityKind::Page => page_listing_parent_path(&entity.path),
+        EntityKind::Page if page_projects_as_directory(&entity.path) => {
+            page_listing_parent_path(&entity.path)
+        }
         EntityKind::Database
         | EntityKind::Directory
         | EntityKind::Asset
-        | EntityKind::Unknown(_) => parent_path(&entity.path).to_path_buf(),
+        | EntityKind::Unknown(_)
+        | EntityKind::Page => parent_path(&entity.path).to_path_buf(),
     }
 }
 
 fn entity_parent_container_path(entity: &EntityRecord) -> PathBuf {
     match entity.kind {
-        EntityKind::Page => page_container_path(&entity.path),
+        EntityKind::Page if page_projects_as_directory(&entity.path) => {
+            page_container_path(&entity.path)
+        }
         EntityKind::Database
         | EntityKind::Directory
         | EntityKind::Asset
-        | EntityKind::Unknown(_) => parent_path(&entity.path).to_path_buf(),
+        | EntityKind::Unknown(_)
+        | EntityKind::Page => parent_path(&entity.path).to_path_buf(),
     }
+}
+
+fn entity_subtree_root_path(entity: &EntityRecord) -> PathBuf {
+    match entity.kind {
+        EntityKind::Page if page_projects_as_directory(&entity.path) => {
+            page_container_path(&entity.path)
+        }
+        EntityKind::Database
+        | EntityKind::Directory
+        | EntityKind::Asset
+        | EntityKind::Unknown(_)
+        | EntityKind::Page => entity.path.clone(),
+    }
+}
+
+fn page_projects_as_directory(path: &Path) -> bool {
+    is_page_document_path(path)
 }
 
 fn filename(path: &Path) -> String {
@@ -3990,7 +4029,7 @@ impl ProviderIndex {
         let mut page_child_dirs = BTreeMap::new();
         for entity in entities {
             entities_by_path.insert(entity.path.clone(), entity.clone());
-            if entity.kind == EntityKind::Page {
+            if entity.kind == EntityKind::Page && page_projects_as_directory(&entity.path) {
                 page_child_dirs.insert(page_container_path(&entity.path), entity.remote_id.clone());
             }
         }
@@ -4420,9 +4459,11 @@ mod tests {
         let page_child = draft_children
             .children
             .iter()
-            .find(|child| child.identifier == "children:msg-draft-1")
-            .expect("draft page child folder");
-        assert!(page_child.read_only);
+            .find(|child| child.identifier == "msg-draft-1")
+            .expect("draft page file");
+        assert_eq!(page_child.filename, "reply.md");
+        assert_eq!(page_child.kind, VirtualFsItemKind::File);
+        assert!(!page_child.read_only);
     }
 
     #[test]
@@ -4710,7 +4751,7 @@ mod tests {
                 "draft/reply.md",
                 "children:target-parent",
                 EntityKind::Page,
-                "draft/parent.md",
+                "draft/parent/page.md",
             ),
             (
                 "google-docs",
@@ -5174,6 +5215,114 @@ mod tests {
         assert_eq!(
             report.children[1].parent_identifier.as_deref(),
             Some("children:page-root")
+        );
+    }
+
+    #[test]
+    fn flat_markdown_pages_list_as_files_in_virtual_fs() {
+        let mount_id = MountId::new("slack-main");
+        let content_root = temp_root("loc-virtual-fs-flat-pages").join("content/slack-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount_with_connector(&mount_id, "slack"))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("slack-folder:channels"),
+                EntityKind::Directory,
+                "channels",
+                "channels",
+            ))
+            .expect("save channels folder");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("slack-conversation:C123"),
+                EntityKind::Directory,
+                "general-C123",
+                "channels/general-C123",
+            ))
+            .expect("save conversation folder");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new("slack-recent:C123"),
+                    EntityKind::Page,
+                    "recent",
+                    "channels/general-C123/recent.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save recent page");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new("slack-users"),
+                    EntityKind::Page,
+                    "users",
+                    "users.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save users page");
+        std::fs::create_dir_all(content_root.join("channels/general-C123"))
+            .expect("content parent");
+        std::fs::write(
+            content_root.join("channels/general-C123/recent.md"),
+            b"recent messages",
+        )
+        .expect("recent cache");
+
+        let mount_children = virtual_fs_children(&store, &mount_id, "mount:slack-main")
+            .expect("mount point children");
+        let users = mount_children
+            .children
+            .iter()
+            .find(|child| child.identifier == "slack-users")
+            .expect("users file");
+        assert_eq!(users.filename, "users.md");
+        assert_eq!(users.kind, VirtualFsItemKind::File);
+        assert!(
+            !mount_children
+                .children
+                .iter()
+                .any(|child| child.identifier == "children:slack-users")
+        );
+
+        let conversation_children =
+            virtual_fs_children(&store, &mount_id, "slack-conversation:C123")
+                .expect("conversation children");
+        let recent = conversation_children
+            .children
+            .iter()
+            .find(|child| child.identifier == "slack-recent:C123")
+            .expect("recent file");
+        assert_eq!(recent.filename, "recent.md");
+        assert_eq!(recent.kind, VirtualFsItemKind::File);
+        assert!(
+            !conversation_children
+                .children
+                .iter()
+                .any(|child| child.identifier == "children:slack-recent:C123")
+        );
+
+        let recent_with_cache = virtual_fs_item_with_content_root(
+            &store,
+            &content_root,
+            &mount_id,
+            "slack-recent:C123",
+        )
+        .expect("recent item with cache");
+        let expected_cache_path = content_root
+            .join("channels/general-C123/recent.md")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(
+            recent_with_cache.item.materialized_path.as_deref(),
+            Some(expected_cache_path.as_str())
         );
     }
 

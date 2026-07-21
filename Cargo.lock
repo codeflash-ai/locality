@@ -2083,6 +2083,7 @@ dependencies = [
  "locality-linear",
  "locality-notion",
  "locality-platform",
+ "locality-slack",
  "locality-store",
  "localityd",
  "serde",
@@ -2138,6 +2139,7 @@ dependencies = [
  "locality-google-docs",
  "locality-notion",
  "locality-platform",
+ "locality-slack",
  "locality-store",
  "localityd",
  "notify",
@@ -2262,6 +2264,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "locality-slack"
+version = "0.3.2"
+dependencies = [
+ "chrono",
+ "locality-connector",
+ "locality-core",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "locality-store"
 version = "0.3.5"
 dependencies = [
@@ -2288,6 +2303,7 @@ dependencies = [
  "locality-linear",
  "locality-notion",
  "locality-platform",
+ "locality-slack",
  "locality-store",
  "notify",
  "rustix",

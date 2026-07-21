@@ -77,7 +77,8 @@
         "pages": [
           "connectors/notion",
           "connectors/google-docs",
-          "connectors/google-calendar"
+          "connectors/google-calendar",
+          "connectors/slack"
         ]
       },
       {

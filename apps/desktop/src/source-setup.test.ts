@@ -26,14 +26,18 @@ describe("source setup progress", () => {
     expect(sourceSetupProgressLabel("changing", true)).toBe("Updating access");
   });
 
-  it("includes Linear in the desktop source catalog as an API-key connector", () => {
+  it("includes connector catalog entries with their auth modes", () => {
     expect(sourceConnectorIds()).toContain("linear");
+    expect(sourceConnectorIds()).toContain("slack");
     expect(sourceConnectorIds()).toContain("google-calendar");
     expect(sourceRequiresApiKey("linear")).toBe(true);
     expect(sourceRequiresApiKey("granola")).toBe(true);
+    expect(sourceRequiresApiKey("slack")).toBe(false);
     expect(sourceRequiresApiKey("google-calendar")).toBe(false);
     expect(sourceRequiresApiKey("gmail")).toBe(false);
     expect(sourceSkipsManualMountStep("linear")).toBe(true);
+    expect(sourceSkipsManualMountStep("slack")).toBe(true);
+    expect(sourceSkipsManualMountStep("google-calendar")).toBe(true);
   });
 
   it("keeps connected but unmounted sources visible when another source is mounted", () => {
@@ -58,14 +62,18 @@ describe("source setup progress", () => {
     ).toEqual(["notion"]);
   });
 
-  it("recognizes Google Calendar as ready to mount when connected", () => {
+  it("includes connected unmounted sources in catalog order", () => {
     expect(isSourceConnectorId("google-calendar")).toBe(true);
     expect(
       connectedSourcesReadyToMount({
-        connections: [{ connector: "google-calendar", status: "active" }],
-        mounts: [],
+        connections: [
+          { connector: "google-calendar", status: "active" },
+          { connector: "slack", status: "active" },
+          { connector: "gmail", status: "active" },
+        ],
+        mounts: [{ connector: "gmail", status: "ready" }],
       }),
-    ).toEqual(["google-calendar"]);
+    ).toEqual(["google-calendar", "slack"]);
   });
 });
 
