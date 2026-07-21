@@ -12676,9 +12676,52 @@ mod tests {
     }
 
     #[test]
-    fn create_desktop_mount_blocking_persists_slack_as_read_only_with_default_settings() {
-        let _lock = state_root_env_lock().lock().expect("state root env lock");
+    fn slack_desktop_mount_persists_read_only_with_default_settings() {
         let temp = TestTempDir::new("desktop-slack-mount-safety");
+        let state_root = temp.path().join(".loc");
+        let shared_root = temp.path().join("Locality");
+        let mount_root = shared_root.join("slack");
+        fs::create_dir_all(&shared_root).expect("create shared mount root");
+        let mount_id = MountId::new("slack-main");
+        let settings_json = SlackMountSettings::default()
+            .to_json()
+            .expect("serialize default Slack settings");
+        let mut store = SqliteStateStore::open(state_root.clone()).expect("open state store");
+
+        super::run_mount(
+            &mut store,
+            super::MountOptions {
+                mount_id: mount_id.clone(),
+                connector: SLACK_CONNECTOR_ID.to_string(),
+                root: mount_root.clone(),
+                remote_root_id: None,
+                connection_id: None,
+                read_only: true,
+                projection: super::desktop_projection_mode(),
+                settings_json: settings_json.clone(),
+            },
+        )
+        .expect("persist Slack mount");
+
+        let mount = store
+            .get_mount(&mount_id)
+            .expect("load persisted Slack mount")
+            .expect("Slack mount persisted");
+
+        assert_eq!(mount.mount_id, mount_id);
+        assert_eq!(mount.connector, SLACK_CONNECTOR_ID);
+        assert_eq!(mount.root, mount_root);
+        assert_eq!(mount.connection_id, None);
+        assert_eq!(mount.remote_root_id, None);
+        assert!(mount.read_only);
+        assert_eq!(mount.settings_json, settings_json);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn create_desktop_mount_blocking_for_slack_coerces_read_only_and_default_settings() {
+        let _lock = state_root_env_lock().lock().expect("state root env lock");
+        let temp = TestTempDir::new("desktop-slack-mount-request");
         let state_root = temp.path().join(".loc");
         let shared_root = temp.path().join("Locality");
         let mount_root = shared_root.join("slack");
@@ -12686,7 +12729,7 @@ mod tests {
         let mount_id = MountId::new("slack-main");
         let state_root_guard = LocalityStateDirGuard::set(&state_root);
 
-        let _ = super::create_desktop_mount_blocking(super::CreateDesktopMountRequest {
+        let result = super::create_desktop_mount_blocking(super::CreateDesktopMountRequest {
             connector: SLACK_CONNECTOR_ID.to_string(),
             path: mount_root.display().to_string(),
             mount_id: mount_id.0.clone(),
@@ -12695,13 +12738,22 @@ mod tests {
             notion_root_page: Some("should-not-be-used".to_string()),
             google_docs_workspace_folder: Some("should-not-be-used".to_string()),
         });
+
+        if let Err(error) = &result {
+            assert!(
+                error.contains("locality-fuse was not found")
+                    || error.contains("locality-cloud-files")
+                    || error.contains("Windows Cloud Files"),
+                "unexpected Slack desktop mount error: {error}"
+            );
+        }
         drop(state_root_guard);
 
         let store = SqliteStateStore::open(state_root.clone()).expect("open state store");
         let mount = store
             .get_mount(&mount_id)
             .expect("load persisted Slack mount")
-            .expect("Slack mount persisted before provider activation");
+            .expect("Slack mount persisted");
 
         assert_eq!(mount.mount_id, mount_id);
         assert_eq!(mount.connector, SLACK_CONNECTOR_ID);

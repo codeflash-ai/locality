@@ -248,7 +248,11 @@ fn info_for_linux_fuse_reports_entity_absolute_path_under_mount_point_root() {
 fn targeted_info_uses_matched_access_root_for_entity_and_schema_paths() {
     let mut store = InMemoryStateStore::new();
     let mount_id = MountId::new("notion-main");
-    let mount = MountConfig::new(mount_id.clone(), "notion", PathBuf::from("/"))
+    #[cfg(windows)]
+    let mount_root = PathBuf::from(r"C:\");
+    #[cfg(not(windows))]
+    let mount_root = PathBuf::from("/");
+    let mount = MountConfig::new(mount_id.clone(), "notion", mount_root)
         .projection(ProjectionMode::LinuxFuse);
     store.save_mount(mount.clone()).expect("save mount");
     store
@@ -261,7 +265,10 @@ fn targeted_info_uses_matched_access_root_for_entity_and_schema_paths() {
         ))
         .expect("save database");
 
-    let access_root = PathBuf::from("/notion-main");
+    let access_root = localityd::file_provider::mount_access_roots(&mount)
+        .into_iter()
+        .find(|root| root != &mount.root)
+        .expect("virtual access root");
     let report = run_info(
         &store,
         InfoOptions {
