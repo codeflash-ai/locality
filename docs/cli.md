@@ -353,7 +353,10 @@ The flag is only valid for Notion mounts. Internal Notion integrations may still
 be rejected by Notion during push because workspace-private page creation
 requires a user-associated token.
 
-with only new-page frontmatter:
+Direct filesystem creates and page moves at the Notion mount root are rejected;
+use `loc create page --private` for new workspace-private root pages.
+
+New page drafts are initialized with only new-page frontmatter:
 
 ```md
 ---

@@ -4617,6 +4617,48 @@ fn apply_moves_page_then_updates_title() {
 }
 
 #[test]
+fn apply_rejects_move_page_to_workspace_root() {
+    let api = Arc::new(RecordingNotionApi::with_page_properties(
+        "2026-06-10T00:00:00.000Z",
+        BTreeMap::from([("Name".to_string(), page_property("title"))]),
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::MoveEntity {
+            entity_id: RemoteId::new("page-1"),
+            new_parent_id: RemoteId::new("workspace"),
+            new_parent_kind: EntityKind::Directory,
+            new_title: "Grocery SF Checklist".to_string(),
+            projected_path: PathBuf::from("Grocery SF Checklist/page.md"),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let error = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect_err("workspace root move is unsupported");
+
+    assert!(matches!(
+        error,
+        LocalityError::Unsupported(
+            "Notion pages cannot be moved to the workspace root through the Notion move API"
+        )
+    ));
+    let writes = api.writes.lock().expect("writes").clone();
+    assert!(writes.is_empty());
+}
+
+#[test]
 fn apply_rename_only_move_entity_skips_notions_same_parent_move() {
     let api = Arc::new(RecordingNotionApi::with_page_and_children(
         PageDto {

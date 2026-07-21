@@ -2294,11 +2294,8 @@ fn move_parent_remote(
     }
 
     if parent_identifier == mount_point_identifier(mount) {
-        if let (Some(_kind), Some(remote_id)) = (
-            source_descriptor(&mount.connector).source_root_create_parent_kind(),
-            mount.remote_root_id.clone(),
-        ) {
-            return Ok(MoveParent { remote_id });
+        if let Some(parent) = source_root_move_parent(mount) {
+            return Ok(parent);
         }
         return Err(LocalityError::Unsupported(
             "virtual filesystem pages must be moved inside a page, database, or folder directory",
@@ -2319,6 +2316,16 @@ fn move_parent_remote(
         .ok_or_else(|| missing_identifier(parent_identifier))?;
     let remote_id = move_parent_remote_id_for_entity(mount, remote_id, entity)?;
     Ok(MoveParent { remote_id })
+}
+
+fn source_root_move_parent(mount: &MountConfig) -> Option<MoveParent> {
+    let descriptor = source_descriptor(&mount.connector);
+    if descriptor.source_root_create_parent_kind().is_some()
+        && let Some(remote_id) = mount.remote_root_id.clone()
+    {
+        return Some(MoveParent { remote_id });
+    }
+    None
 }
 
 fn move_parent_remote_id_for_entity(
@@ -2996,11 +3003,7 @@ fn source_root_item(mount: &MountConfig) -> VirtualFsItem {
 }
 
 pub(crate) fn source_root_read_only(mount: &MountConfig) -> bool {
-    mount.read_only
-        || source_descriptor(&mount.connector)
-            .source_root_create_parent_kind()
-            .is_none()
-        || mount.remote_root_id.is_none()
+    mount.read_only || source_root_move_parent(mount).is_none()
 }
 
 fn item_file_read_only(mount: &MountConfig, path: &Path) -> bool {
@@ -4158,14 +4161,20 @@ mod tests {
     }
 
     #[test]
-    fn virtual_roots_report_read_only_when_source_root_creates_are_unsupported() {
+    fn virtual_roots_report_writable_only_when_source_root_creates_are_supported() {
         let mut store = InMemoryStateStore::new();
         let notion_mount_id = MountId::new("notion-main");
+        let notion_root_page_mount_id = MountId::new("notion-root-page");
         let google_mount_id = MountId::new("google-docs-main");
         let notion_mount = virtual_mount(&notion_mount_id);
+        let notion_root_page_mount = virtual_mount(&notion_root_page_mount_id)
+            .with_remote_root_id(RemoteId::new("page-root"));
         let google_mount = virtual_mount_with_connector(&google_mount_id, "google-docs")
             .with_remote_root_id(RemoteId::new("workspace-folder"));
         store.save_mount(notion_mount.clone()).expect("save notion");
+        store
+            .save_mount(notion_root_page_mount.clone())
+            .expect("save notion root-page mount");
         store
             .save_mount(google_mount.clone())
             .expect("save google docs");
@@ -4182,6 +4191,15 @@ mod tests {
         .item;
         assert!(notion_root.read_only);
         assert!(notion_mount_point.read_only);
+
+        let notion_root_page_mount_point = virtual_fs_item(
+            &store,
+            &notion_root_page_mount_id,
+            &mount_point_identifier(&notion_root_page_mount),
+        )
+        .expect("notion root-page mount point")
+        .item;
+        assert!(notion_root_page_mount_point.read_only);
 
         let google_root = virtual_fs_item(&store, &google_mount_id, ROOT_CONTAINER_IDENTIFIER)
             .expect("google docs root")
@@ -7377,6 +7395,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(state_root);
     }
 
+    #[test]
+    fn move_pending_page_directory_to_notion_workspace_root_is_rejected() {
+        let mount_id = MountId::new("notion-main");
+        let state_root = temp_root("loc-virtual-fs-rename-pending-dir-root");
+        let content_root = state_root.join("content/notion-main/files");
+        let mut store = InMemoryStateStore::new();
+        let mount = virtual_mount(&mount_id);
+        store.save_mount(mount.clone()).expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-root"),
+                EntityKind::Page,
+                "Home",
+                "Home/page.md",
+            ))
+            .expect("save parent page");
+        let created = create_virtual_fs_directory(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "children:page-root",
+            "Draft",
+        )
+        .expect("create virtual directory");
+        std::fs::write(
+            content_root.join("Home/Draft/page.md"),
+            b"---\ntitle: \"Draft\"\n---\nBody",
+        )
+        .expect("write pending page cache");
+
+        let error = rename_virtual_fs_item(
+            &mut store,
+            &content_root,
+            &mount_id,
+            &created.identifier,
+            &mount_point_identifier(&mount),
+            "Draft",
+        )
+        .expect_err("Notion workspace root pending create move is rejected");
+
+        assert!(matches!(error, LocalityError::Unsupported(_)));
+        assert!(content_root.join("Home/Draft/page.md").exists());
+        assert!(!content_root.join("Draft/page.md").exists());
+        let local_id = created
+            .identifier
+            .strip_prefix("children:")
+            .expect("pending page directory id");
+        let mutation = store
+            .get_virtual_mutation(&mount_id, local_id)
+            .expect("get mutation")
+            .expect("mutation");
+        assert_eq!(mutation.projected_path, PathBuf::from("Home/Draft/page.md"));
+        assert_eq!(
+            mutation.parent_remote_id.as_ref().map(RemoteId::as_str),
+            Some("page-root")
+        );
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
     fn seed_pending_linear_issue(
         store: &mut InMemoryStateStore,
         content_root: &Path,
@@ -8380,6 +8459,134 @@ mod tests {
             PathBuf::from("Archive/Moved Child/page.md")
         );
         assert_eq!(mutation.title, "Moved Child");
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn move_existing_page_directory_to_notion_workspace_root_is_rejected() {
+        let mount_id = MountId::new("notion-main");
+        let state_root = temp_root("loc-virtual-fs-move-existing-dir-root");
+        let content_root = state_root.join("content/notion-main/files");
+        let mut store = InMemoryStateStore::new();
+        let mount = virtual_mount(&mount_id);
+        store.save_mount(mount.clone()).expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-home"),
+                EntityKind::Page,
+                "Things to buy",
+                "Things to buy/page.md",
+            ))
+            .expect("save parent page");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new("page-grocery"),
+                    EntityKind::Page,
+                    "Grocery SF Checklist",
+                    "Things to buy/Grocery SF Checklist/page.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save child page");
+        std::fs::create_dir_all(content_root.join("Things to buy/Grocery SF Checklist"))
+            .expect("create cache dir");
+        std::fs::write(
+            content_root.join("Things to buy/Grocery SF Checklist/page.md"),
+            b"---\nloc:\n  id: page-grocery\n  type: page\ntitle: \"Grocery SF Checklist\"\n---\nBody",
+        )
+        .expect("write page cache");
+
+        let error = rename_virtual_fs_item(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "children:page-grocery",
+            &mount_point_identifier(&mount),
+            "Grocery SF Checklist",
+        )
+        .expect_err("Notion workspace root move is rejected");
+
+        assert!(matches!(error, LocalityError::Unsupported(_)));
+        assert!(
+            content_root
+                .join("Things to buy/Grocery SF Checklist/page.md")
+                .exists()
+        );
+        assert!(!content_root.join("Grocery SF Checklist/page.md").exists());
+        let entity = store
+            .get_entity(&mount_id, &RemoteId::new("page-grocery"))
+            .expect("get grocery page")
+            .expect("grocery page");
+        assert_eq!(
+            entity.path,
+            PathBuf::from("Things to buy/Grocery SF Checklist/page.md")
+        );
+        assert_eq!(entity.hydration, HydrationState::Hydrated);
+        assert!(
+            store
+                .list_virtual_mutations(&mount_id)
+                .expect("list mutations")
+                .is_empty()
+        );
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn root_level_page_entity_projects_in_mount_root_listing() {
+        let mount_id = MountId::new("notion-main");
+        let state_root = temp_root("loc-virtual-fs-root-page-listing");
+        let content_root = state_root.join("content/notion-main/files");
+        let mut store = InMemoryStateStore::new();
+        let mount = virtual_mount(&mount_id);
+        store.save_mount(mount.clone()).expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new("page-grocery"),
+                    EntityKind::Page,
+                    "Grocery SF Checklist",
+                    "Grocery SF Checklist/page.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save root page");
+        std::fs::create_dir_all(content_root.join("Grocery SF Checklist"))
+            .expect("create cache dir");
+        std::fs::write(
+            content_root.join("Grocery SF Checklist/page.md"),
+            b"---\nloc:\n  id: page-grocery\n  type: page\ntitle: \"Grocery SF Checklist\"\n---\nBody",
+        )
+        .expect("write page cache");
+
+        let root_children = virtual_fs_children_with_content_root(
+            &store,
+            &content_root,
+            &mount_id,
+            &mount_point_identifier(&mount),
+        )
+        .expect("list mount root");
+        let grocery = root_children
+            .children
+            .iter()
+            .find(|item| item.identifier == "children:page-grocery")
+            .expect("root page directory appears");
+        assert_eq!(grocery.filename, "Grocery SF Checklist");
+        assert_eq!(grocery.path, "Grocery SF Checklist");
+        let expected_materialized = mount
+            .root
+            .join("Grocery SF Checklist")
+            .display()
+            .to_string();
+        assert_eq!(
+            grocery.materialized_path.as_deref(),
+            Some(expected_materialized.as_str())
+        );
 
         let _ = std::fs::remove_dir_all(state_root);
     }
