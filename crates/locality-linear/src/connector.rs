@@ -15,6 +15,7 @@ use locality_core::model::{
     CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
 };
 use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind};
+use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::{LocalityError, LocalityResult};
 
 use crate::client::{HttpLinearApiClient, LinearApi};
@@ -562,7 +563,62 @@ fn observation_from_issue(mount_id: &MountId, issue: LinearIssue) -> RemoteObser
     )))
     .with_remote_version(RemoteVersion::new(remote_version(&issue)))
     .deleted(issue.archived_at.is_some())
-    .with_raw_metadata_json(serde_json::to_string(&issue).unwrap_or_else(|_| "{}".to_string()))
+    .with_raw_metadata_json(linear_issue_metadata_json(&issue))
+}
+
+fn linear_issue_metadata_json(issue: &LinearIssue) -> String {
+    let mut value = serde_json::to_value(issue).unwrap_or_else(|_| serde_json::json!({}));
+    if let serde_json::Value::Object(object) = &mut value {
+        let search_metadata = linear_issue_search_metadata(issue);
+        if !search_metadata.is_empty() {
+            if let Ok(search_value) = serde_json::to_value(search_metadata) {
+                object.insert(RAW_SEARCH_METADATA_KEY.to_string(), search_value);
+            }
+        }
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn linear_issue_search_metadata(issue: &LinearIssue) -> SearchMetadata {
+    let mut metadata_text = Vec::new();
+    push_search_value(&mut metadata_text, &issue.identifier);
+    push_search_value(&mut metadata_text, &issue.team.key);
+    push_search_value(&mut metadata_text, &issue.team.name);
+    push_search_value(&mut metadata_text, &issue.state.name);
+    if let Some(project) = &issue.project {
+        push_search_value(&mut metadata_text, &project.name);
+    }
+    if let Some(assignee) = &issue.assignee {
+        push_search_value(&mut metadata_text, &assignee.name);
+        if let Some(email) = &assignee.email {
+            push_search_value(&mut metadata_text, email);
+        }
+    }
+    for label in &issue.labels {
+        push_search_value(&mut metadata_text, &label.name);
+    }
+    if let Some(priority) = &issue.priority {
+        push_search_value(&mut metadata_text, &priority.label);
+    }
+    if let Some(due_date) = &issue.due_date {
+        push_search_value(&mut metadata_text, due_date);
+    }
+
+    let mut aliases = Vec::new();
+    push_search_value(&mut aliases, &issue.identifier);
+
+    SearchMetadata {
+        metadata_text,
+        aliases,
+        source_url: (!issue.url.trim().is_empty()).then(|| issue.url.clone()),
+    }
+}
+
+fn push_search_value(values: &mut Vec<String>, value: &str) {
+    let value = value.trim();
+    if !value.is_empty() {
+        values.push(value.to_string());
+    }
 }
 
 fn list_linear_directory_children(

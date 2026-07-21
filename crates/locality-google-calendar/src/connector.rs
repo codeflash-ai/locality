@@ -16,6 +16,7 @@ use locality_core::model::{
     CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
 };
 use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind};
+use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::validation::ValidationIssue;
 use locality_core::{LocalityError, LocalityResult};
 use serde::{Deserialize, Serialize};
@@ -196,7 +197,7 @@ impl Connector for GoogleCalendarConnector {
         .with_parent(RemoteId::new(EVENTS_FOLDER_ID))
         .with_remote_version(RemoteVersion::new(event.remote_version()))
         .deleted(deleted)
-        .with_raw_metadata_json(serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string())))
+        .with_raw_metadata_json(event_metadata_json(&event)))
     }
 
     fn fetch(&self, request: FetchRequest) -> LocalityResult<NativeEntity> {
@@ -408,10 +409,120 @@ fn folder_observation(
         PathBuf::from(folder.title),
     )
     .with_remote_version(RemoteVersion::new(format!("folder:{}", folder.title)))
-    .with_raw_metadata_json(format!(
-        r#"{{"kind":"google_calendar_folder","id":"{}","title":"{}"}}"#,
-        folder.id, folder.title
-    ))
+    .with_raw_metadata_json(folder_metadata_json(folder))
+}
+
+fn event_metadata_json(event: &CalendarEvent) -> String {
+    let mut value = serde_json::to_value(event).unwrap_or_else(|_| serde_json::json!({}));
+    if let Value::Object(object) = &mut value {
+        let search_metadata = event_search_metadata(event);
+        if !search_metadata.is_empty()
+            && let Ok(search_value) = serde_json::to_value(search_metadata)
+        {
+            object.insert(RAW_SEARCH_METADATA_KEY.to_string(), search_value);
+        }
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn folder_metadata_json(folder: FolderSpec) -> String {
+    let mut search_metadata = SearchMetadata::default();
+    search_metadata.push_metadata_text(folder.title);
+    search_metadata.push_metadata_text(folder.id);
+    search_metadata.push_alias(folder.id);
+    let mut value = serde_json::json!({
+        "kind": "google_calendar_folder",
+        "id": folder.id,
+        "title": folder.title,
+    });
+    if let Value::Object(object) = &mut value
+        && let Ok(search_value) = serde_json::to_value(search_metadata)
+    {
+        object.insert(RAW_SEARCH_METADATA_KEY.to_string(), search_value);
+    }
+    value.to_string()
+}
+
+fn event_search_metadata(event: &CalendarEvent) -> SearchMetadata {
+    let mut metadata = SearchMetadata::default();
+    if let Some(id) = &event.id {
+        metadata.push_metadata_text(id);
+        metadata.push_alias(id);
+    }
+    if let Some(summary) = &event.summary {
+        metadata.push_metadata_text(summary);
+    }
+    if let Some(location) = &event.location {
+        metadata.push_metadata_text(location);
+    }
+    if let Some(status) = &event.status {
+        metadata.push_metadata_text(status);
+    }
+    if let Some(event_type) = &event.event_type {
+        metadata.push_metadata_text(event_type);
+    }
+    if let Some(i_cal_uid) = &event.i_cal_uid {
+        metadata.push_metadata_text(i_cal_uid);
+        metadata.push_alias(i_cal_uid);
+    }
+    push_event_date_time_search_values(&mut metadata, event.start.as_ref());
+    push_event_date_time_search_values(&mut metadata, event.end.as_ref());
+    for recurrence in &event.recurrence {
+        metadata.push_metadata_text(recurrence);
+    }
+    if let Some(recurring_event_id) = &event.recurring_event_id {
+        metadata.push_metadata_text(recurring_event_id);
+    }
+    for attendee in &event.attendees {
+        if let Some(email) = &attendee.email {
+            metadata.push_metadata_text(email);
+        }
+        if let Some(display_name) = &attendee.display_name {
+            metadata.push_metadata_text(display_name);
+        }
+        if let Some(response_status) = &attendee.response_status {
+            metadata.push_metadata_text(response_status);
+        }
+    }
+    if let Some(creator) = &event.creator {
+        push_json_text_field(&mut metadata, creator, "email");
+        push_json_text_field(&mut metadata, creator, "displayName");
+    }
+    if let Some(organizer) = &event.organizer {
+        push_json_text_field(&mut metadata, organizer, "email");
+        push_json_text_field(&mut metadata, organizer, "displayName");
+    }
+    if let Some(hangout_link) = &event.hangout_link {
+        metadata.push_metadata_text(hangout_link);
+    }
+    if let Some(html_link) = &event.html_link {
+        metadata.set_source_url(html_link.clone());
+    }
+    metadata
+}
+
+fn push_event_date_time_search_values(
+    metadata: &mut SearchMetadata,
+    date_time: Option<&EventDateTime>,
+) {
+    let Some(date_time) = date_time else {
+        return;
+    };
+    if let Some(date) = &date_time.date {
+        metadata.push_metadata_text(date);
+    }
+    if let Some(value) = &date_time.date_time {
+        metadata.push_metadata_text(value);
+    }
+    if let Some(time_zone) = &date_time.time_zone {
+        metadata.push_metadata_text(time_zone);
+    }
+}
+
+fn push_json_text_field(metadata: &mut SearchMetadata, value: &Value, field: &str) {
+    if let Some(text) = value.get(field).and_then(Value::as_str) {
+        metadata.push_metadata_text(text);
+    }
 }
 
 fn list_primary_event_entries(
@@ -1026,6 +1137,7 @@ mod tests {
     use locality_core::model::{CanonicalDocument, EntityKind, MountId, RemoteId};
     use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind, PushPlan};
     use locality_core::push::RemotePrecondition;
+    use locality_core::search::RAW_SEARCH_METADATA_KEY;
     use serde_json::json;
 
     use super::{GoogleCalendarConfig, GoogleCalendarConnector};
@@ -1162,6 +1274,22 @@ mod tests {
             std::path::PathBuf::from("events/20260720-100000-design-review-event-1.md")
         );
         assert!(observation.raw_metadata_json.contains("\"event-1\""));
+        let raw_metadata: serde_json::Value =
+            serde_json::from_str(&observation.raw_metadata_json).expect("raw metadata json");
+        assert_eq!(
+            raw_metadata[RAW_SEARCH_METADATA_KEY]["source_url"],
+            json!("https://calendar.google.com/calendar/event?eid=event-1")
+        );
+        assert_eq!(
+            raw_metadata[RAW_SEARCH_METADATA_KEY]["aliases"],
+            json!(["event-1"])
+        );
+        assert!(
+            raw_metadata[RAW_SEARCH_METADATA_KEY]["metadata_text"]
+                .as_array()
+                .expect("metadata_text")
+                .contains(&json!("Room 12"))
+        );
 
         let calls = api.calls.lock().expect("calls");
         assert_eq!(

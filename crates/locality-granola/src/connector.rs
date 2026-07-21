@@ -15,6 +15,7 @@ use locality_core::model::{
     CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
 };
 use locality_core::planner::PushOperationKind;
+use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::{LocalityError, LocalityResult};
 
 use crate::client::{GranolaApi, HttpGranolaApiClient};
@@ -187,7 +188,12 @@ impl Connector for GranolaConnector {
             let parent_path =
                 PathBuf::from(meeting_directory_name(&GranolaNoteSummary::from(&note)));
             let entry = content_entry(&request.mount_id, &parent_path, &note, kind);
-            return Ok(observation_from_entry(entry, Some(RemoteId::new(note.id))));
+            let parent = RemoteId::new(note.id.clone());
+            return Ok(observation_from_entry(
+                entry,
+                Some(parent),
+                Some(granola_note_metadata_json(&note, Some(kind))),
+            ));
         }
         let note = self.api.get_note(request.remote_id.as_str(), false)?;
         let entry = meeting_entry(
@@ -195,7 +201,11 @@ impl Connector for GranolaConnector {
             Path::new(""),
             &GranolaNoteSummary::from(&note),
         );
-        Ok(observation_from_entry(entry, None))
+        Ok(observation_from_entry(
+            entry,
+            None,
+            Some(granola_note_metadata_json(&note, None)),
+        ))
     }
 
     fn fetch(&self, request: FetchRequest) -> LocalityResult<NativeEntity> {
@@ -303,7 +313,11 @@ fn content_entry(
     }
 }
 
-fn observation_from_entry(entry: TreeEntry, parent: Option<RemoteId>) -> RemoteObservation {
+fn observation_from_entry(
+    entry: TreeEntry,
+    parent: Option<RemoteId>,
+    raw_metadata_json: Option<String>,
+) -> RemoteObservation {
     let mut observation = RemoteObservation::new(
         entry.mount_id,
         entry.remote_id,
@@ -317,7 +331,79 @@ fn observation_from_entry(entry: TreeEntry, parent: Option<RemoteId>) -> RemoteO
     if let Some(version) = entry.remote_edited_at {
         observation = observation.with_remote_version(RemoteVersion::new(version));
     }
+    if let Some(raw_metadata_json) = raw_metadata_json {
+        observation = observation.with_raw_metadata_json(raw_metadata_json);
+    }
     observation
+}
+
+fn granola_note_metadata_json(
+    note: &GranolaNote,
+    content_kind: Option<GranolaContentKind>,
+) -> String {
+    let mut value = serde_json::to_value(note).unwrap_or_else(|_| serde_json::json!({}));
+    if let serde_json::Value::Object(object) = &mut value {
+        let search_metadata = granola_note_search_metadata(note, content_kind);
+        if !search_metadata.is_empty()
+            && let Ok(search_value) = serde_json::to_value(search_metadata)
+        {
+            object.insert(RAW_SEARCH_METADATA_KEY.to_string(), search_value);
+        }
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn granola_note_search_metadata(
+    note: &GranolaNote,
+    content_kind: Option<GranolaContentKind>,
+) -> SearchMetadata {
+    let mut metadata = SearchMetadata::default();
+    metadata.push_metadata_text(&note.id);
+    metadata.push_alias(&note.id);
+    metadata.push_metadata_text(note_title(note));
+    metadata.push_metadata_text(&note.object);
+    if let Some(kind) = content_kind {
+        metadata.push_metadata_text(kind.as_str());
+    }
+    metadata.push_metadata_text(&note.created_at);
+    metadata.push_metadata_text(&note.updated_at);
+    metadata.push_metadata_text(&note.owner.email);
+    if let Some(name) = &note.owner.name {
+        metadata.push_metadata_text(name);
+    }
+    for attendee in &note.attendees {
+        metadata.push_metadata_text(&attendee.email);
+        if let Some(name) = &attendee.name {
+            metadata.push_metadata_text(name);
+        }
+    }
+    for folder in &note.folder_membership {
+        metadata.push_metadata_text(&folder.id);
+        metadata.push_metadata_text(&folder.name);
+    }
+    if let Some(calendar_event) = &note.calendar_event {
+        if let Some(event_title) = &calendar_event.event_title {
+            metadata.push_metadata_text(event_title);
+        }
+        if let Some(organiser) = &calendar_event.organiser {
+            metadata.push_metadata_text(organiser);
+        }
+        if let Some(calendar_event_id) = &calendar_event.calendar_event_id {
+            metadata.push_metadata_text(calendar_event_id);
+            metadata.push_alias(calendar_event_id);
+        }
+        if let Some(start) = &calendar_event.scheduled_start_time {
+            metadata.push_metadata_text(start);
+        }
+        if let Some(end) = &calendar_event.scheduled_end_time {
+            metadata.push_metadata_text(end);
+        }
+        for invitee in &calendar_event.invitees {
+            metadata.push_metadata_text(&invitee.email);
+        }
+    }
+    metadata.set_source_url(note.web_url.clone());
+    metadata
 }
 
 pub fn meeting_directory_name(note: &GranolaNoteSummary) -> String {
@@ -401,11 +487,17 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
-    use locality_connector::{ChildContainer, Connector, EnumerateRequest, ListChildrenRequest};
-    use locality_core::model::{EntityKind, MountId};
+    use locality_connector::{
+        ChildContainer, Connector, EnumerateRequest, ListChildrenRequest, ObserveRequest,
+    };
+    use locality_core::model::{EntityKind, MountId, RemoteId};
+    use locality_core::search::RAW_SEARCH_METADATA_KEY;
 
     use crate::client::GranolaApi;
-    use crate::dto::{GranolaNote, GranolaNoteList, GranolaNoteSummary, GranolaUser};
+    use crate::dto::{
+        GranolaCalendarEvent, GranolaFolder, GranolaNote, GranolaNoteList, GranolaNoteSummary,
+        GranolaUser,
+    };
 
     use super::{GranolaConfig, GranolaConnector};
 
@@ -545,6 +637,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn observe_adds_search_metadata_from_note_fields() {
+        let api = Arc::new(FakeApi::default().with_note(note()));
+        let connector = GranolaConnector::with_api(GranolaConfig::new("secret"), api);
+
+        let observation = connector
+            .observe(ObserveRequest {
+                mount_id: MountId::new("granola-main"),
+                remote_id: RemoteId::new("not_1d3tmYTlCICgjy"),
+            })
+            .expect("observe note");
+
+        let raw_metadata: serde_json::Value =
+            serde_json::from_str(&observation.raw_metadata_json).expect("raw metadata json");
+        assert_eq!(
+            raw_metadata[RAW_SEARCH_METADATA_KEY]["source_url"],
+            serde_json::json!("https://app.granola.ai/notes/not_1d3tmYTlCICgjy")
+        );
+        assert_eq!(
+            raw_metadata[RAW_SEARCH_METADATA_KEY]["aliases"],
+            serde_json::json!(["not_1d3tmYTlCICgjy", "cal-1"])
+        );
+        let search_terms = raw_metadata[RAW_SEARCH_METADATA_KEY]["metadata_text"]
+            .as_array()
+            .expect("metadata_text");
+        assert!(search_terms.contains(&serde_json::json!("Customer call")));
+        assert!(search_terms.contains(&serde_json::json!("Ada Lovelace")));
+        assert!(search_terms.contains(&serde_json::json!("Deals")));
+    }
+
     #[derive(Debug, Default)]
     struct FakeApi {
         notes: Vec<GranolaNoteSummary>,
@@ -559,6 +681,11 @@ mod tests {
                 note: Mutex::new(None),
                 updated_after: Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_note(self, note: GranolaNote) -> Self {
+            *self.note.lock().unwrap() = Some(note);
+            self
         }
     }
 
@@ -607,6 +734,42 @@ mod tests {
             },
             created_at: created_at.to_string(),
             updated_at: created_at.to_string(),
+        }
+    }
+
+    fn note() -> GranolaNote {
+        GranolaNote {
+            id: "not_1d3tmYTlCICgjy".to_string(),
+            object: "note".to_string(),
+            title: Some("Customer call".to_string()),
+            owner: GranolaUser {
+                name: Some("Ada Lovelace".to_string()),
+                email: "ada@example.com".to_string(),
+            },
+            created_at: "2026-07-14T17:30:00Z".to_string(),
+            updated_at: "2026-07-14T18:00:00Z".to_string(),
+            web_url: "https://app.granola.ai/notes/not_1d3tmYTlCICgjy".to_string(),
+            calendar_event: Some(GranolaCalendarEvent {
+                event_title: Some("Customer discovery".to_string()),
+                invitees: Vec::new(),
+                organiser: Some("ada@example.com".to_string()),
+                calendar_event_id: Some("cal-1".to_string()),
+                scheduled_start_time: Some("2026-07-14T17:30:00Z".to_string()),
+                scheduled_end_time: Some("2026-07-14T18:00:00Z".to_string()),
+            }),
+            attendees: vec![GranolaUser {
+                name: Some("Grace Hopper".to_string()),
+                email: "grace@example.com".to_string(),
+            }],
+            folder_membership: vec![GranolaFolder {
+                id: "folder-1".to_string(),
+                object: "folder".to_string(),
+                name: "Deals".to_string(),
+                parent_folder_id: None,
+            }],
+            summary_text: "Summary".to_string(),
+            summary_markdown: Some("Summary".to_string()),
+            transcript: None,
         }
     }
 }

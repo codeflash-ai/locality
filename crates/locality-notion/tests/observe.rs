@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use locality_connector::{Connector, ObserveRequest};
 use locality_core::freshness::RemoteVersion;
 use locality_core::model::{EntityKind, MountId, RemoteId};
+use locality_core::search::RAW_SEARCH_METADATA_KEY;
 use locality_core::{LocalityError, LocalityResult};
 use locality_notion::client::{HttpNotionApi, NotionApi};
 use locality_notion::dto::{
@@ -52,6 +53,22 @@ fn notion_observe_page_reads_metadata_without_hydrating_blocks() {
         Some(RemoteVersion::new("2026-06-10T00:00:00.000Z"))
     );
     assert!(!observation.deleted);
+    let raw_metadata: Value =
+        serde_json::from_str(&observation.raw_metadata_json).expect("raw metadata json");
+    assert_eq!(
+        raw_metadata[RAW_SEARCH_METADATA_KEY]["source_url"],
+        json!("https://www.notion.so/ae1")
+    );
+    assert_eq!(
+        raw_metadata[RAW_SEARCH_METADATA_KEY]["aliases"],
+        json!(["page-1", "ae1"])
+    );
+    assert!(
+        raw_metadata[RAW_SEARCH_METADATA_KEY]["metadata_text"]
+            .as_array()
+            .expect("metadata_text")
+            .contains(&json!("Roadmap"))
+    );
     assert_eq!(api.block_children_calls.load(Ordering::SeqCst), 0);
 }
 
@@ -76,6 +93,16 @@ fn notion_observe_database_falls_back_to_database_metadata() {
     assert_eq!(
         observation.remote_version,
         Some(RemoteVersion::new("2026-06-10T00:00:00.000Z"))
+    );
+    let raw_metadata: Value =
+        serde_json::from_str(&observation.raw_metadata_json).expect("raw metadata json");
+    assert_eq!(
+        raw_metadata[RAW_SEARCH_METADATA_KEY]["source_url"],
+        json!("https://www.notion.so/daabae1")
+    );
+    assert_eq!(
+        raw_metadata[RAW_SEARCH_METADATA_KEY]["aliases"],
+        json!(["database-1", "daabae1"])
     );
 }
 

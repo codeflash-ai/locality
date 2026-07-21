@@ -14,6 +14,7 @@ use locality_core::model::{
     CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
 };
 use locality_core::planner::PushOperationKind;
+use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::{LocalityError, LocalityResult};
 
 use crate::client::{HttpSlackApiClient, SlackApi};
@@ -340,7 +341,8 @@ impl Connector for SlackConnector {
     fn observe(&self, request: ObserveRequest) -> LocalityResult<RemoteObservation> {
         let remote_id_value = request.remote_id.as_str().to_string();
         if remote_id_value == users_remote_id() {
-            let bundle = users_bundle(self.all_users()?);
+            let users = self.all_users()?;
+            let bundle = users_bundle(users.clone());
             let version = slack_remote_version(&bundle)?;
             return Ok(RemoteObservation::new(
                 request.mount_id,
@@ -350,7 +352,7 @@ impl Connector for SlackConnector {
                 "users.md",
             )
             .with_remote_version(RemoteVersion::new(version))
-            .with_raw_metadata_json(serde_json::json!({ "kind": "slack_users" }).to_string()));
+            .with_raw_metadata_json(slack_users_metadata_json(&users)));
         }
 
         if let Some(conversation_id) = parse_recent_remote_id(&remote_id_value) {
@@ -372,6 +374,8 @@ impl Connector for SlackConnector {
                 None,
                 self.config.settings.slack.history_limit,
             )?;
+            let raw_metadata_json =
+                slack_recent_metadata_json(&conversation, &users_by_id, conversation_id);
             let bundle = recent_bundle(conversation, users, history.messages, BTreeMap::new());
             let version = slack_remote_version(&bundle)?;
             return Ok(RemoteObservation::new(
@@ -383,13 +387,7 @@ impl Connector for SlackConnector {
             )
             .with_parent(conversation_entry.remote_id)
             .with_remote_version(RemoteVersion::new(version))
-            .with_raw_metadata_json(
-                serde_json::json!({
-                    "kind": "slack_recent",
-                    "conversation_id": conversation_id,
-                })
-                .to_string(),
-            ));
+            .with_raw_metadata_json(raw_metadata_json));
         }
 
         Err(LocalityError::Unsupported(
@@ -484,6 +482,93 @@ fn recent_bundle(
         users,
         messages,
         threads,
+    }
+}
+
+fn slack_users_metadata_json(users: &[SlackUser]) -> String {
+    let mut search_metadata = SearchMetadata::default();
+    search_metadata.push_metadata_text("users");
+    search_metadata.push_alias(users_remote_id());
+    for user in users {
+        push_slack_user_search_values(&mut search_metadata, user);
+    }
+    let mut value = serde_json::json!({
+        "kind": "slack_users",
+    });
+    if let serde_json::Value::Object(object) = &mut value
+        && let Ok(search_value) = serde_json::to_value(search_metadata)
+    {
+        object.insert(RAW_SEARCH_METADATA_KEY.to_string(), search_value);
+    }
+    value.to_string()
+}
+
+fn slack_recent_metadata_json(
+    conversation: &SlackConversation,
+    users: &BTreeMap<String, SlackUser>,
+    conversation_id: &str,
+) -> String {
+    let search_metadata = slack_conversation_search_metadata(conversation, users, conversation_id);
+    let mut value = serde_json::json!({
+        "kind": "slack_recent",
+        "conversation_id": conversation_id,
+    });
+    if let serde_json::Value::Object(object) = &mut value
+        && let Ok(search_value) = serde_json::to_value(search_metadata)
+    {
+        object.insert(RAW_SEARCH_METADATA_KEY.to_string(), search_value);
+    }
+    value.to_string()
+}
+
+fn slack_conversation_search_metadata(
+    conversation: &SlackConversation,
+    users: &BTreeMap<String, SlackUser>,
+    conversation_id: &str,
+) -> SearchMetadata {
+    let mut metadata = SearchMetadata::default();
+    metadata.push_metadata_text(conversation_id);
+    metadata.push_alias(conversation_id);
+    metadata.push_alias(recent_remote_id(conversation_id));
+    metadata.push_metadata_text(conversation_title(conversation, users));
+    metadata.push_metadata_text(conversation_type(conversation).root_folder());
+    if let Some(name) = &conversation.name {
+        metadata.push_metadata_text(name);
+    }
+    if let Some(user_id) = &conversation.user {
+        metadata.push_metadata_text(user_id);
+        if let Some(user) = users.get(user_id) {
+            push_slack_user_search_values(&mut metadata, user);
+        }
+    }
+    if let Some(topic) = &conversation.topic
+        && let Some(value) = &topic.value
+    {
+        metadata.push_metadata_text(value);
+    }
+    if let Some(purpose) = &conversation.purpose
+        && let Some(value) = &purpose.value
+    {
+        metadata.push_metadata_text(value);
+    }
+    metadata
+}
+
+fn push_slack_user_search_values(metadata: &mut SearchMetadata, user: &SlackUser) {
+    metadata.push_metadata_text(&user.id);
+    if let Some(name) = &user.name {
+        metadata.push_metadata_text(name);
+    }
+    if let Some(real_name) = &user.real_name {
+        metadata.push_metadata_text(real_name);
+    }
+    if let Some(profile) = &user.profile {
+        if let Some(real_name) = &profile.real_name {
+            metadata.push_metadata_text(real_name);
+        }
+        if let Some(display_name) = &profile.display_name {
+            metadata.push_metadata_text(display_name);
+        }
     }
 }
 
@@ -988,6 +1073,17 @@ mod tests {
             })
             .expect("observe recent");
         assert_content_remote_version(observation.remote_version.expect("version").as_str());
+        let raw_metadata: serde_json::Value =
+            serde_json::from_str(&observation.raw_metadata_json).expect("raw metadata json");
+        assert_eq!(
+            raw_metadata[RAW_SEARCH_METADATA_KEY]["aliases"],
+            serde_json::json!(["C123", "slack-recent:C123"])
+        );
+        let search_terms = raw_metadata[RAW_SEARCH_METADATA_KEY]["metadata_text"]
+            .as_array()
+            .expect("metadata_text");
+        assert!(search_terms.contains(&serde_json::json!("general")));
+        assert!(search_terms.contains(&serde_json::json!("channels")));
     }
 
     #[test]
