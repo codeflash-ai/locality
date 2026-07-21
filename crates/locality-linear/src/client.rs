@@ -259,6 +259,18 @@ struct GraphqlIssue {
     created_at: String,
     updated_at: String,
     archived_at: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    canceled_at: Option<String>,
+    auto_archived_at: Option<String>,
+    auto_closed_at: Option<String>,
+    started_triage_at: Option<String>,
+    triaged_at: Option<String>,
+    snoozed_until_at: Option<String>,
+    added_to_cycle_at: Option<String>,
+    added_to_project_at: Option<String>,
+    added_to_team_at: Option<String>,
+    due_date: Option<String>,
     priority: Option<i64>,
     priority_label: Option<String>,
     estimate: Option<f64>,
@@ -280,6 +292,18 @@ impl From<GraphqlIssue> for LinearIssue {
             created_at: value.created_at,
             updated_at: value.updated_at,
             archived_at: value.archived_at,
+            started_at: value.started_at,
+            completed_at: value.completed_at,
+            canceled_at: value.canceled_at,
+            auto_archived_at: value.auto_archived_at,
+            auto_closed_at: value.auto_closed_at,
+            started_triage_at: value.started_triage_at,
+            triaged_at: value.triaged_at,
+            snoozed_until_at: value.snoozed_until_at,
+            added_to_cycle_at: value.added_to_cycle_at,
+            added_to_project_at: value.added_to_project_at,
+            added_to_team_at: value.added_to_team_at,
+            due_date: value.due_date,
             priority: value.priority.map(|priority| LinearIssuePriority {
                 value: priority,
                 label: value.priority_label.unwrap_or_else(|| priority.to_string()),
@@ -504,6 +528,18 @@ query LocalityIssues($first: Int!, $after: String, $filter: IssueFilter) {
       createdAt
       updatedAt
       archivedAt
+      startedAt
+      completedAt
+      canceledAt
+      autoArchivedAt
+      autoClosedAt
+      startedTriageAt
+      triagedAt
+      snoozedUntilAt
+      addedToCycleAt
+      addedToProjectAt
+      addedToTeamAt
+      dueDate
       priority
       priorityLabel
       estimate
@@ -529,6 +565,18 @@ query LocalityIssue($id: String!) {
     createdAt
     updatedAt
     archivedAt
+    startedAt
+    completedAt
+    canceledAt
+    autoArchivedAt
+    autoClosedAt
+    startedTriageAt
+    triagedAt
+    snoozedUntilAt
+    addedToCycleAt
+    addedToProjectAt
+    addedToTeamAt
+    dueDate
     priority
     priorityLabel
     estimate
@@ -554,6 +602,18 @@ mutation LocalityIssueUpdate($id: String!, $input: IssueUpdateInput!) {
       createdAt
       updatedAt
       archivedAt
+      startedAt
+      completedAt
+      canceledAt
+      autoArchivedAt
+      autoClosedAt
+      startedTriageAt
+      triagedAt
+      snoozedUntilAt
+      addedToCycleAt
+      addedToProjectAt
+      addedToTeamAt
+      dueDate
       priority
       priorityLabel
       estimate

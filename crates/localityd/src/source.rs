@@ -788,10 +788,10 @@ fn linear_mount_guidance() -> String {
         "{}\n\
 Linear facts:\n\
 - This mount projects Linear issues as Teams/<team>/Issues/<status>/<identifier> <title>/page.md.\n\
-- Issue frontmatter contains stable Linear UUID references in the `Label <id>` shape. Preserve the id when editing status, project, or assignee fields.\n\
-- Supported writes are issue description body edits plus title, Status, Project, and Assignee frontmatter updates.\n\
+- Issue frontmatter contains stable Linear UUID references in the `Label <id>` shape plus read-only lifecycle/date metadata. Preserve the id when editing status, project, or assignee fields.\n\
+- Supported writes are only issue description body edits plus title, Status, Project, and Assignee frontmatter updates.\n\
 - Moving an issue folder into another Teams/<team>/Issues/<status>/ folder updates the Linear team and status. Linear may assign a new identifier after cross-team moves; refresh/reconciliation will follow the canonical path.\n\
-- Labels, priority, estimate, identifier, URL, create, delete, and undo are not supported by the Linear connector yet.\n",
+- Labels, priority, estimate, identifier, URL, lifecycle/date metadata, create, delete, and undo are not supported by the Linear connector yet.\n",
         generic_mount_guidance("Linear")
     )
 }

@@ -48,6 +48,15 @@ issue description as the body. Rendered references use the `Label <id>` shape so
 local diff can ignore label-only refreshes while preserving the stable Linear
 UUID.
 
+Rendered issue frontmatter also includes read-only lifecycle and date metadata:
+`created_at`, `updated_at`, `archived_at`, `started_at`, `completed_at`,
+`canceled_at`, `auto_archived_at`, `auto_closed_at`, `started_triage_at`,
+`triaged_at`, `snoozed_until_at`, `added_to_cycle_at`, `added_to_project_at`,
+`added_to_team_at`, and `due_date`. Missing optional values render as `null`;
+present timestamps and dates render as quoted strings. Only `title`, `Status`,
+`Project`, and `Assignee` are editable frontmatter fields. The lifecycle/date
+fields are generated metadata and are rejected as read-only if edited locally.
+
 The connector currently supports:
 
 - full issue enumeration;
@@ -59,8 +68,9 @@ The connector currently supports:
 - moving issue folders into another `Teams/<team>/Issues/<status>/` folder to
   update the Linear team and/or status.
 
-Unsupported properties fail closed before remote mutation. Undo, issue creates,
-and deletes remain future work for the native connector.
+Unsupported properties, including lifecycle/date metadata, fail closed before
+remote mutation. Undo, issue creates, and deletes remain future work for the
+native connector.
 
 ## Daemon Integration
 

@@ -1,8 +1,13 @@
+use std::collections::BTreeSet;
+
 use locality_connector::{Connector, FetchRequest};
-use locality_core::canonical::parse_canonical_markdown;
+use locality_core::canonical::{
+    Frontmatter, LocalityMetadata, ParsedCanonicalDocument, parse_canonical_markdown,
+    render_canonical_markdown,
+};
 use locality_core::hydration::HydrationRequest;
-use locality_core::model::RemoteId;
-use locality_core::shadow::{ShadowDocument, segment_markdown_body};
+use locality_core::model::{CanonicalDocument, RemoteId};
+use locality_core::shadow::{ShadowDocument, rendered_bodies_equivalent, segment_markdown_body};
 use locality_core::validation::{ValidationIssue, ValidationReport};
 use locality_core::{LocalityError, LocalityResult};
 use locality_linear::{
@@ -213,6 +218,104 @@ impl HydrationSource for LinearConnector {
     ) -> LocalityResult<Option<String>> {
         Ok(None)
     }
+}
+
+const LINEAR_LIFECYCLE_FRONTMATTER_KEYS: &[&str] = &[
+    "created_at",
+    "updated_at",
+    "archived_at",
+    "started_at",
+    "completed_at",
+    "canceled_at",
+    "auto_archived_at",
+    "auto_closed_at",
+    "started_triage_at",
+    "triaged_at",
+    "snoozed_until_at",
+    "added_to_cycle_at",
+    "added_to_project_at",
+    "added_to_team_at",
+    "due_date",
+];
+
+pub(crate) fn linear_shadow_matches_with_legacy_lifecycle_frontmatter(
+    synced_tree_shadow: &ShadowDocument,
+    remote_tree_shadow: &ShadowDocument,
+) -> bool {
+    if !rendered_bodies_equivalent(
+        &synced_tree_shadow.rendered_body,
+        &remote_tree_shadow.rendered_body,
+    ) {
+        return false;
+    }
+    let Some(synced) = parse_shadow_frontmatter(synced_tree_shadow) else {
+        return false;
+    };
+    let Some(remote) = parse_shadow_frontmatter(remote_tree_shadow) else {
+        return false;
+    };
+    if !loc_metadata_matches_ignoring_sync_metadata(&synced.frontmatter, &remote.frontmatter)
+        || synced.frontmatter.title != remote.frontmatter.title
+    {
+        return false;
+    }
+
+    let lifecycle_keys = LINEAR_LIFECYCLE_FRONTMATTER_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut repaired_missing_lifecycle_key = false;
+    for key in synced
+        .frontmatter
+        .properties
+        .keys()
+        .chain(remote.frontmatter.properties.keys())
+        .collect::<BTreeSet<_>>()
+    {
+        let synced_value = synced.frontmatter.properties.get(key);
+        let remote_value = remote.frontmatter.properties.get(key);
+        if lifecycle_keys.contains(key.as_str()) {
+            if synced_value.is_none() && remote_value.is_some() {
+                repaired_missing_lifecycle_key = true;
+                continue;
+            }
+            if synced_value == remote_value {
+                continue;
+            }
+            return false;
+        }
+        if synced_value != remote_value {
+            return false;
+        }
+    }
+
+    repaired_missing_lifecycle_key
+}
+
+fn parse_shadow_frontmatter(shadow: &ShadowDocument) -> Option<ParsedCanonicalDocument> {
+    parse_canonical_markdown(&render_canonical_markdown(&CanonicalDocument::new(
+        shadow.frontmatter.clone(),
+        shadow.rendered_body.clone(),
+    )))
+    .ok()
+}
+
+fn loc_metadata_matches_ignoring_sync_metadata(left: &Frontmatter, right: &Frontmatter) -> bool {
+    match (&left.loc, &right.loc) {
+        (None, None) => true,
+        (Some(left), Some(right)) => locality_metadata_matches_ignoring_sync_metadata(left, right),
+        _ => false,
+    }
+}
+
+fn locality_metadata_matches_ignoring_sync_metadata(
+    left: &LocalityMetadata,
+    right: &LocalityMetadata,
+) -> bool {
+    left.id == right.id
+        && left.entity_type == right.entity_type
+        && left.raw_entity_type == right.raw_entity_type
+        && left.parent == right.parent
 }
 
 pub(crate) fn validate_linear_frontmatter(

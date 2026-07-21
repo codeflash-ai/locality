@@ -144,6 +144,97 @@ fn explicit_push_uses_linear_whole_entity_body_policy() {
 }
 
 #[test]
+fn linear_push_repairs_legacy_shadow_missing_lifecycle_frontmatter() {
+    let root = std::env::temp_dir().join(format!(
+        "loc-linear-legacy-frontmatter-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("fixture root");
+    let mount_id = MountId::new("linear-main");
+    let issue_id = RemoteId::new("issue-1");
+    let issue = linear_push_issue();
+    let api = Arc::new(FakeLinearMoveApi::new(issue.clone()));
+    let source = LinearConnector::with_api(LinearConfig::new("secret"), api.clone());
+    let issue_path = PathBuf::from("Teams/Engineering/Issues/Todo/ENG-1 Improve sync/page.md");
+    let rendered = render_linear_issue(&issue).expect("render issue");
+    let legacy_frontmatter = legacy_linear_frontmatter_without_lifecycle(&rendered.frontmatter);
+
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(MountConfig::new(mount_id.clone(), "linear", root.clone()))
+        .expect("save mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                mount_id.clone(),
+                issue_id.clone(),
+                EntityKind::Page,
+                "Improve sync",
+                issue_path.clone(),
+            )
+            .with_hydration(HydrationState::Dirty)
+            .with_remote_edited_at("linear:issue-1:2026-07-15T12:00:00Z"),
+        )
+        .expect("save issue");
+    store
+        .save_shadow(
+            &mount_id,
+            ShadowDocument::from_synced_body(
+                issue_id.clone(),
+                rendered.body.clone(),
+                1,
+                [RemoteId::new("body-1")],
+            )
+            .expect("shadow")
+            .with_frontmatter(legacy_frontmatter.clone()),
+        )
+        .expect("save legacy shadow");
+    let local_path = root.join(&issue_path);
+    fs::create_dir_all(local_path.parent().expect("issue parent")).expect("issue parent");
+    fs::write(
+        &local_path,
+        render_canonical_markdown(&CanonicalDocument::new(
+            legacy_frontmatter.replace("title: \"Improve sync\"", "title: \"Improve sync v2\""),
+            rendered.body.clone(),
+        )),
+    )
+    .expect("write local edit");
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: local_path,
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &source,
+        None,
+    )
+    .expect("execute Linear push");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    assert_eq!(
+        api.updates.lock().unwrap().as_slice(),
+        &[LinearIssueUpdateInput {
+            issue_id: "issue-1".to_string(),
+            title: Some("Improve sync v2".to_string()),
+            description: None,
+            team_id: None,
+            state_id: None,
+            project_id: None,
+            assignee_id: None,
+        }]
+    );
+    let repaired_shadow = store
+        .load_shadow(&mount_id, &issue_id)
+        .expect("load repaired shadow");
+    assert!(repaired_shadow.frontmatter.contains("created_at:"));
+    assert!(repaired_shadow.frontmatter.contains("due_date:"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn auto_save_push_applies_safe_update_and_keeps_enrollment_active() {
     let fixture = PushFixture::new();
     let mut store = fixture.store("Old body.");
@@ -3154,6 +3245,18 @@ fn linear_push_issue() -> LinearIssue {
         created_at: "2026-07-14T12:00:00Z".to_string(),
         updated_at: "2026-07-15T12:00:00Z".to_string(),
         archived_at: None,
+        started_at: None,
+        completed_at: None,
+        canceled_at: None,
+        auto_archived_at: None,
+        auto_closed_at: None,
+        started_triage_at: None,
+        triaged_at: None,
+        snoozed_until_at: None,
+        added_to_cycle_at: None,
+        added_to_project_at: None,
+        added_to_team_at: None,
+        due_date: None,
         priority: Some(LinearIssuePriority {
             value: 3,
             label: "High".to_string(),
@@ -3183,6 +3286,33 @@ fn linear_push_issue() -> LinearIssue {
             name: "Bug".to_string(),
         }],
     }
+}
+
+fn legacy_linear_frontmatter_without_lifecycle(frontmatter: &str) -> String {
+    const LEGACY_REMOVED_KEYS: &[&str] = &[
+        "created_at:",
+        "updated_at:",
+        "archived_at:",
+        "started_at:",
+        "completed_at:",
+        "canceled_at:",
+        "auto_archived_at:",
+        "auto_closed_at:",
+        "started_triage_at:",
+        "triaged_at:",
+        "snoozed_until_at:",
+        "added_to_cycle_at:",
+        "added_to_project_at:",
+        "added_to_team_at:",
+        "due_date:",
+    ];
+    let mut legacy = frontmatter
+        .lines()
+        .filter(|line| !LEGACY_REMOVED_KEYS.iter().any(|key| line.starts_with(key)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    legacy.push('\n');
+    legacy
 }
 
 struct PushFixture {

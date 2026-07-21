@@ -208,9 +208,34 @@ fn rendering_uses_uuid_reference_frontmatter_and_description_body() {
 
     assert_eq!(
         document.frontmatter,
-        "loc:\n  id: issue-1\n  type: page\n  connector: linear\n  synced_at: \"2026-07-15T12:00:00Z\"\n  remote_edited_at: \"2026-07-15T12:00:00Z\"\ntitle: \"Improve sync\"\nidentifier: ENG-1\nurl: \"https://linear.app/acme/issue/ENG-1/improve-sync\"\nStatus: \"Todo <state-1>\"\nTeam: \"Engineering <team-1>\"\nProject: \"Launch <project-1>\"\nAssignee: \"Ada <user-1>\"\nPriority: High\nEstimate: 3\nLabels:\n  - \"Bug <label-1>\"\n"
+        "loc:\n  id: issue-1\n  type: page\n  connector: linear\n  synced_at: \"2026-07-15T12:00:00Z\"\n  remote_edited_at: \"2026-07-15T12:00:00Z\"\ntitle: \"Improve sync\"\nidentifier: ENG-1\nurl: \"https://linear.app/acme/issue/ENG-1/improve-sync\"\ncreated_at: \"2026-07-14T12:00:00Z\"\nupdated_at: \"2026-07-15T12:00:00Z\"\narchived_at: null\nstarted_at: null\ncompleted_at: null\ncanceled_at: null\nauto_archived_at: null\nauto_closed_at: null\nstarted_triage_at: null\ntriaged_at: null\nsnoozed_until_at: null\nadded_to_cycle_at: null\nadded_to_project_at: null\nadded_to_team_at: null\ndue_date: null\nStatus: \"Todo <state-1>\"\nTeam: \"Engineering <team-1>\"\nProject: \"Launch <project-1>\"\nAssignee: \"Ada <user-1>\"\nPriority: High\nEstimate: 3\nLabels:\n  - \"Bug <label-1>\"\n"
     );
     assert_eq!(document.body, "Existing description.\n");
+}
+
+#[test]
+fn rendering_quotes_populated_lifecycle_and_date_frontmatter() {
+    let mut issue = issue();
+    issue.archived_at = Some("2026-08-01T12:00:00Z".to_string());
+    issue.started_at = Some("2026-07-15T13:00:00Z".to_string());
+    issue.completed_at = Some("2026-07-20T10:00:00Z".to_string());
+    issue.canceled_at = Some("2026-07-21T10:00:00Z".to_string());
+    issue.auto_archived_at = Some("2026-08-15T00:00:00Z".to_string());
+    issue.auto_closed_at = Some("2026-07-25T00:00:00Z".to_string());
+    issue.started_triage_at = Some("2026-07-14T13:00:00Z".to_string());
+    issue.triaged_at = Some("2026-07-14T14:00:00Z".to_string());
+    issue.snoozed_until_at = Some("2026-07-22T09:00:00Z".to_string());
+    issue.added_to_cycle_at = Some("2026-07-14T15:00:00Z".to_string());
+    issue.added_to_project_at = Some("2026-07-14T16:00:00Z".to_string());
+    issue.added_to_team_at = Some("2026-07-14T17:00:00Z".to_string());
+    issue.due_date = Some("2026-07-31".to_string());
+
+    let document = render_linear_issue(&issue).expect("render issue");
+
+    assert_eq!(
+        document.frontmatter,
+        "loc:\n  id: issue-1\n  type: page\n  connector: linear\n  synced_at: \"2026-07-15T12:00:00Z\"\n  remote_edited_at: \"2026-07-15T12:00:00Z\"\ntitle: \"Improve sync\"\nidentifier: ENG-1\nurl: \"https://linear.app/acme/issue/ENG-1/improve-sync\"\ncreated_at: \"2026-07-14T12:00:00Z\"\nupdated_at: \"2026-07-15T12:00:00Z\"\narchived_at: \"2026-08-01T12:00:00Z\"\nstarted_at: \"2026-07-15T13:00:00Z\"\ncompleted_at: \"2026-07-20T10:00:00Z\"\ncanceled_at: \"2026-07-21T10:00:00Z\"\nauto_archived_at: \"2026-08-15T00:00:00Z\"\nauto_closed_at: \"2026-07-25T00:00:00Z\"\nstarted_triage_at: \"2026-07-14T13:00:00Z\"\ntriaged_at: \"2026-07-14T14:00:00Z\"\nsnoozed_until_at: \"2026-07-22T09:00:00Z\"\nadded_to_cycle_at: \"2026-07-14T15:00:00Z\"\nadded_to_project_at: \"2026-07-14T16:00:00Z\"\nadded_to_team_at: \"2026-07-14T17:00:00Z\"\ndue_date: \"2026-07-31\"\nStatus: \"Todo <state-1>\"\nTeam: \"Engineering <team-1>\"\nProject: \"Launch <project-1>\"\nAssignee: \"Ada <user-1>\"\nPriority: High\nEstimate: 3\nLabels:\n  - \"Bug <label-1>\"\n"
+    );
 }
 
 #[test]
@@ -446,6 +471,18 @@ fn issue() -> LinearIssue {
         created_at: "2026-07-14T12:00:00Z".to_string(),
         updated_at: "2026-07-15T12:00:00Z".to_string(),
         archived_at: None,
+        started_at: None,
+        completed_at: None,
+        canceled_at: None,
+        auto_archived_at: None,
+        auto_closed_at: None,
+        started_triage_at: None,
+        triaged_at: None,
+        snoozed_until_at: None,
+        added_to_cycle_at: None,
+        added_to_project_at: None,
+        added_to_team_at: None,
+        due_date: None,
         priority: Some(LinearIssuePriority {
             value: 3,
             label: "High".to_string(),
