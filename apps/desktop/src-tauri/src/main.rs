@@ -17225,6 +17225,7 @@ mod tests {
                 labels: vec![state.to_string()],
             },
             remote: SearchRemoteState::default(),
+            match_context: None,
             score: 0,
         }
     }

@@ -12,6 +12,7 @@ use locality_core::journal::JournalApplyEffect;
 use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, RemoteId, TreeEntry};
 use locality_core::path_projection::{page_container_path, page_document_path};
 use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind, PushPlan};
+use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::{LocalityError, LocalityResult};
 
 use crate::client::{GoogleDocsApi, GoogleDriveApi, HttpGoogleApiClient};
@@ -263,7 +264,7 @@ impl Connector for GoogleDocsConnector {
             projected_path,
         )
         .deleted(file.trashed)
-        .with_raw_metadata_json(serde_json::to_string(&file).unwrap_or_else(|_| "{}".to_string()));
+        .with_raw_metadata_json(drive_file_metadata_json(&file));
         if let Some(parent) = file.parents.first() {
             observation = observation.with_parent(RemoteId::new(parent.clone()));
         }
@@ -383,6 +384,52 @@ fn operation_targets_document(block_id: &RemoteId, remote_id: &RemoteId) -> bool
     GoogleBlockRange::parse(block_id)
         .map(|range| range.document_id == remote_id.0)
         .unwrap_or(false)
+}
+
+fn drive_file_metadata_json(file: &DriveFile) -> String {
+    let mut value = serde_json::to_value(file).unwrap_or_else(|_| serde_json::json!({}));
+    if let serde_json::Value::Object(object) = &mut value {
+        let search_metadata = drive_file_search_metadata(file);
+        if !search_metadata.is_empty()
+            && let Ok(search_value) = serde_json::to_value(search_metadata)
+        {
+            object.insert(RAW_SEARCH_METADATA_KEY.to_string(), search_value);
+        }
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn drive_file_search_metadata(file: &DriveFile) -> SearchMetadata {
+    let mut metadata = SearchMetadata::default();
+    metadata.push_metadata_text(&file.id);
+    metadata.push_metadata_text(&file.name);
+    metadata.push_metadata_text(&file.mime_type);
+    metadata.push_alias(&file.id);
+    if file.is_google_doc() {
+        metadata.push_metadata_text("Google Docs");
+        metadata.set_source_url(format!(
+            "https://docs.google.com/document/d/{}/edit",
+            file.id
+        ));
+    } else if file.is_folder() {
+        metadata.push_metadata_text("Google Drive folder");
+        metadata.set_source_url(format!(
+            "https://drive.google.com/drive/folders/{}",
+            file.id
+        ));
+    } else {
+        metadata.set_source_url(format!("https://drive.google.com/file/d/{}/view", file.id));
+    }
+    for parent in &file.parents {
+        metadata.push_metadata_text(parent);
+    }
+    if let Some(modified_time) = &file.modified_time {
+        metadata.push_metadata_text(modified_time);
+    }
+    if let Some(version) = &file.version {
+        metadata.push_metadata_text(version);
+    }
+    metadata
 }
 
 impl GoogleDocsConnector {
@@ -3064,6 +3111,7 @@ mod tests {
     use locality_core::model::{EntityKind, MountId, RemoteId};
     use locality_core::planner::{PushOperation, PushPlan};
     use locality_core::push::RemotePrecondition;
+    use locality_core::search::RAW_SEARCH_METADATA_KEY;
 
     use super::{
         GoogleDocsConfig, GoogleDocsConnector, docs_block_text, docs_document_text_requests,
@@ -3181,6 +3229,21 @@ mod tests {
             observation.remote_version.unwrap().as_str(),
             "drive:7:2026-06-25T10:00:00.000Z|docs:rev-1"
         );
+        let raw_metadata: serde_json::Value =
+            serde_json::from_str(&observation.raw_metadata_json).expect("raw metadata json");
+        assert_eq!(
+            raw_metadata[RAW_SEARCH_METADATA_KEY]["source_url"],
+            serde_json::json!("https://docs.google.com/document/d/doc-1/edit")
+        );
+        assert_eq!(
+            raw_metadata[RAW_SEARCH_METADATA_KEY]["aliases"],
+            serde_json::json!(["doc-1"])
+        );
+        let search_terms = raw_metadata[RAW_SEARCH_METADATA_KEY]["metadata_text"]
+            .as_array()
+            .expect("metadata_text");
+        assert!(search_terms.contains(&serde_json::json!("Launch Brief")));
+        assert!(search_terms.contains(&serde_json::json!("Google Docs")));
     }
 
     #[test]

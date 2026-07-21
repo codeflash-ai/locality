@@ -78,6 +78,21 @@ pub trait EntityRepository {
 pub struct EntitySearchCandidate {
     pub entity: EntityRecord,
     pub observation: Option<RemoteObservationRecord>,
+    pub search_document: Option<EntitySearchDocument>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EntitySearchDocument {
+    pub title: Option<String>,
+    pub path: Option<String>,
+    pub observed_title: Option<String>,
+    pub observed_path: Option<String>,
+    pub frontmatter: Option<String>,
+    pub body: Option<String>,
+    pub metadata_text: Option<String>,
+    pub breadcrumbs: Option<String>,
+    pub aliases: Option<String>,
+    pub source_url: Option<String>,
 }
 
 pub trait EntitySearchRepository {

@@ -9,6 +9,7 @@ use locality_core::journal::{JournalApplyEffect, PushId, PushOperationId};
 use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind, PushPlan};
 use locality_core::push::RemotePrecondition;
+use locality_core::search::RAW_SEARCH_METADATA_KEY;
 use locality_linear::{
     LinearApi, LinearAttachment, LinearAttachmentDownload, LinearComment, LinearConfig,
     LinearConnector, LinearIssue, LinearIssueContext, LinearIssueContextKind,
@@ -248,6 +249,34 @@ fn observe_and_observe_batch_use_hierarchical_issue_path() {
         observed.parent_remote_id,
         Some(RemoteId::new("team-state:team-1:state-1"))
     );
+    let raw_metadata = serde_json::from_str::<serde_json::Value>(&observed.raw_metadata_json)
+        .expect("raw metadata json");
+    assert_eq!(
+        raw_metadata[RAW_SEARCH_METADATA_KEY]["source_url"],
+        serde_json::json!("https://linear.app/acme/issue/ENG-1/improve-sync")
+    );
+    assert_eq!(
+        raw_metadata[RAW_SEARCH_METADATA_KEY]["aliases"],
+        serde_json::json!(["ENG-1"])
+    );
+    let search_terms = raw_metadata[RAW_SEARCH_METADATA_KEY]["metadata_text"]
+        .as_array()
+        .expect("metadata_text array");
+    for expected in [
+        "ENG",
+        "Engineering",
+        "Todo",
+        "Launch",
+        "Ada",
+        "ada@example.com",
+        "Bug",
+        "High",
+    ] {
+        assert!(
+            search_terms.contains(&serde_json::json!(expected)),
+            "missing search term {expected}"
+        );
+    }
 
     let batch = connector
         .observe_batch(BatchObserveRequest {

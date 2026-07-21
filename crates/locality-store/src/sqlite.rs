@@ -18,6 +18,7 @@ use locality_core::journal::{
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use locality_core::planner::{PlanSummary, PushOperation, PushPlan};
 use locality_core::readable_diff::ReadableDiffOutput;
+use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::shadow::ShadowDocument;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
@@ -46,15 +47,17 @@ use crate::records::{
 };
 use crate::repository::{
     AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, ConnectorStateRepository,
-    EntityRepository, EntitySearchCandidate, EntitySearchRepository, FreshnessStateRepository,
-    HydrationJobRepository, JournalRepository, MetadataDiscoveryJobRepository,
-    MountLiveModeRepository, MountRepository, RemoteObservationRepository, ShadowRepository,
-    VirtualMoveRepository, VirtualMoveTransition, VirtualMutationRepository,
-    validate_virtual_move_transition, virtual_move_content_changed, virtual_move_missing,
+    EntityRepository, EntitySearchCandidate, EntitySearchDocument, EntitySearchRepository,
+    FreshnessStateRepository, HydrationJobRepository, JournalRepository,
+    MetadataDiscoveryJobRepository, MountLiveModeRepository, MountRepository,
+    RemoteObservationRepository, ShadowRepository, VirtualMoveRepository, VirtualMoveTransition,
+    VirtualMutationRepository, validate_virtual_move_transition, virtual_move_content_changed,
+    virtual_move_missing,
 };
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
+const ENTITY_SEARCH_COMPONENT_VERSION: i64 = 2;
 const JOURNALS_COMPONENT_VERSION: i64 = 3;
 const LINUX_FUSE_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const WINDOWS_CLOUD_FILES_PROJECTION_LAYOUT_VERSION: i64 = 2;
@@ -196,11 +199,11 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
     StateComponentDefinition {
         component_id: "cache:entity_search",
         component_kind: "rebuildable_cache",
-        current_version: 1,
-        min_reader_version: 1,
+        current_version: ENTITY_SEARCH_COMPONENT_VERSION,
+        min_reader_version: ENTITY_SEARCH_COMPONENT_VERSION,
         required: false,
         rebuildable: true,
-        data_json: "{}",
+        data_json: "{\"index\":\"search_documents_fts\",\"legacy_index\":\"entity_search_fts\"}",
     },
 ];
 
@@ -1562,10 +1565,15 @@ impl EntitySearchRepository for SqliteStateStore {
             };
             let mut statement = connection.prepare(
                 "SELECT remote_id
-                 FROM entity_search_fts
-                 WHERE entity_search_fts MATCH ?1
+                 FROM search_documents_fts
+                 WHERE search_documents_fts MATCH ?1
                    AND mount_id = ?2
-                 ORDER BY bm25(entity_search_fts)
+                 ORDER BY bm25(
+                    search_documents_fts,
+                    0.0, 0.0, 0.0, 0.0,
+                    8.0, 6.0, 7.0, 5.0,
+                    2.0, 1.0, 4.0, 3.0, 9.0, 6.0
+                 )
                  LIMIT ?3",
             )?;
             let rows = statement.query_map(
@@ -1579,9 +1587,11 @@ impl EntitySearchRepository for SqliteStateStore {
         for remote_id in remote_ids {
             let remote_id = RemoteId(remote_id);
             if let Some(entity) = self.get_entity(mount_id, &remote_id)? {
+                let search_document = search_document(&connection, mount_id, &remote_id)?;
                 candidates.push(EntitySearchCandidate {
                     entity,
                     observation: self.get_remote_observation(mount_id, &remote_id)?,
+                    search_document,
                 });
             }
         }
@@ -1786,14 +1796,15 @@ impl ShadowRepository for SqliteStateStore {
                 rendered_body = excluded.rendered_body,
                 blocks_json = excluded.blocks_json",
             params![
-                record.mount_id.0,
-                record.entity_id.0,
-                record.frontmatter,
-                record.body_hash,
-                record.rendered_body,
+                record.mount_id.0.as_str(),
+                record.entity_id.0.as_str(),
+                record.frontmatter.as_str(),
+                record.body_hash.as_str(),
+                record.rendered_body.as_str(),
                 to_json(&record.blocks)?,
             ],
         )?;
+        upsert_entity_search_index(&connection, mount_id, &shadow.entity_id)?;
         Ok(())
     }
 
@@ -2532,6 +2543,7 @@ fn clear_mount_source_state(connection: &Connection, mount_id: &MountId) -> Stor
         "freshness_states",
         "journals",
         "entity_search_fts",
+        "search_documents_fts",
     ] {
         connection.execute(
             &format!("DELETE FROM {table} WHERE mount_id = ?1"),
@@ -2737,6 +2749,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         migrate_windows_cloud_files_projection_layout_to_v2(connection, false)?;
         migrate_journals_component_to_v3(connection)?;
         migrate_virtual_mutations_component_to_v3(connection)?;
+        migrate_entity_search_component_to_v2(connection)?;
         return Ok(());
     }
 
@@ -2972,6 +2985,23 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             path,
             observed_title,
             observed_path
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS search_documents_fts USING fts5(
+            mount_id UNINDEXED,
+            remote_id UNINDEXED,
+            connector UNINDEXED,
+            kind UNINDEXED,
+            title,
+            path,
+            observed_title,
+            observed_path,
+            frontmatter,
+            body,
+            metadata_text,
+            breadcrumbs,
+            aliases,
+            source_url
         );
 
         CREATE TABLE IF NOT EXISTS journals (
@@ -3244,6 +3274,14 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
     }
 
+    if user_version < 20 {
+        create_entity_search_index(connection)?;
+        rebuild_entity_search_index(connection)?;
+        if user_version >= 13 {
+            record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
+        }
+    }
+
     if user_version < SCHEMA_VERSION {
         seed_default_notion_profile(connection)?;
         migrate_linux_fuse_projection_layout_to_v2(connection, user_version < 13)?;
@@ -3339,6 +3377,13 @@ fn state_component_issue_allows_schema_migration(
             found,
             current: 3,
         } if component_id == "durable:virtual_mutations" && matches!(*found, 1 | 2)
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::OlderComponent {
+            component_id,
+            found: 1,
+            current: ENTITY_SEARCH_COMPONENT_VERSION,
+        } if component_id == "cache:entity_search"
     ) || matches!(
         issue,
         StateCompatibilityIssue::MissingComponent { component_id }
@@ -4096,6 +4141,29 @@ fn migrate_journals_component_to_v3(connection: &Connection) -> StoreResult<()> 
     migrate_state_component_to_current(connection, "durable:journals")
 }
 
+fn migrate_entity_search_component_to_v2(connection: &Connection) -> StoreResult<()> {
+    create_state_management_tables(connection)?;
+    let component = connection
+        .query_row(
+            "SELECT version, min_reader_version
+             FROM state_components
+             WHERE component_id = 'cache:entity_search'",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    if let Some((component_version, min_reader_version)) = component
+        && component_version >= ENTITY_SEARCH_COMPONENT_VERSION
+        && min_reader_version <= ENTITY_SEARCH_COMPONENT_VERSION
+    {
+        return Ok(());
+    }
+
+    create_entity_search_index(connection)?;
+    rebuild_entity_search_index(connection)?;
+    migrate_state_component_to_current(connection, "cache:entity_search")
+}
+
 fn migrate_state_component_to_current(
     connection: &Connection,
     component_id: &str,
@@ -4738,6 +4806,23 @@ fn create_entity_search_index(connection: &Connection) -> StoreResult<()> {
             path,
             observed_title,
             observed_path
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS search_documents_fts USING fts5(
+            mount_id UNINDEXED,
+            remote_id UNINDEXED,
+            connector UNINDEXED,
+            kind UNINDEXED,
+            title,
+            path,
+            observed_title,
+            observed_path,
+            frontmatter,
+            body,
+            metadata_text,
+            breadcrumbs,
+            aliases,
+            source_url
         );",
     )?;
     Ok(())
@@ -4746,6 +4831,7 @@ fn create_entity_search_index(connection: &Connection) -> StoreResult<()> {
 fn rebuild_entity_search_index(connection: &Connection) -> StoreResult<()> {
     create_entity_search_index(connection)?;
     connection.execute("DELETE FROM entity_search_fts", [])?;
+    connection.execute("DELETE FROM search_documents_fts", [])?;
 
     let entity_ids = {
         let mut statement = connection.prepare("SELECT mount_id, remote_id FROM entities")?;
@@ -4769,19 +4855,62 @@ fn upsert_entity_search_index(
 ) -> StoreResult<()> {
     delete_entity_search_index(connection, mount_id, remote_id)?;
 
-    let indexed: Option<(String, String, Option<String>, Option<String>)> = connection
+    let indexed: Option<(
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = connection
         .query_row(
-            "SELECT e.title, e.path, o.title, o.projected_path
+            "SELECT m.connector, e.kind_json, e.title, e.path,
+                    o.title, o.projected_path, s.frontmatter, s.rendered_body,
+                    o.raw_metadata_json
              FROM entities e
+             INNER JOIN mounts m
+               ON m.mount_id = e.mount_id
              LEFT JOIN remote_observations o
                ON o.mount_id = e.mount_id AND o.remote_id = e.remote_id
+             LEFT JOIN shadows s
+               ON s.mount_id = e.mount_id AND s.entity_id = e.remote_id
              WHERE e.mount_id = ?1 AND e.remote_id = ?2",
             params![mount_id.0, remote_id.0],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
         )
         .optional()?;
 
-    if let Some((title, path, observed_title, observed_path)) = indexed {
+    if let Some((
+        connector,
+        kind,
+        title,
+        path,
+        observed_title,
+        observed_path,
+        frontmatter,
+        body,
+        raw_metadata_json,
+    )) = indexed
+    {
+        let breadcrumbs = search_breadcrumb_text(Path::new(&path));
+        let search_metadata = search_metadata_from_raw_metadata_json(raw_metadata_json.as_deref());
+        let metadata_text = join_search_metadata_values(&search_metadata.metadata_text);
+        let aliases = join_search_metadata_values(&search_metadata.aliases);
         connection.execute(
             "INSERT INTO entity_search_fts (
                 mount_id,
@@ -4793,12 +4922,47 @@ fn upsert_entity_search_index(
              )
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
-                mount_id.0,
-                remote_id.0,
+                mount_id.0.as_str(),
+                remote_id.0.as_str(),
+                title.as_str(),
+                path.as_str(),
+                observed_title.as_deref(),
+                observed_path.as_deref(),
+            ],
+        )?;
+        connection.execute(
+            "INSERT INTO search_documents_fts (
+                mount_id,
+                remote_id,
+                connector,
+                kind,
                 title,
                 path,
                 observed_title,
                 observed_path,
+                frontmatter,
+                body,
+                metadata_text,
+                breadcrumbs,
+                aliases,
+                source_url
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                mount_id.0.as_str(),
+                remote_id.0.as_str(),
+                connector.as_str(),
+                kind.as_str(),
+                title.as_str(),
+                path.as_str(),
+                observed_title.as_deref(),
+                observed_path.as_deref(),
+                frontmatter.as_deref(),
+                body.as_deref(),
+                metadata_text.as_str(),
+                breadcrumbs.as_str(),
+                aliases.as_str(),
+                search_metadata.source_url.as_deref(),
             ],
         )?;
     }
@@ -4816,7 +4980,109 @@ fn delete_entity_search_index(
         "DELETE FROM entity_search_fts WHERE mount_id = ?1 AND remote_id = ?2",
         params![mount_id.0, remote_id.0],
     )?;
+    connection.execute(
+        "DELETE FROM search_documents_fts WHERE mount_id = ?1 AND remote_id = ?2",
+        params![mount_id.0, remote_id.0],
+    )?;
     Ok(())
+}
+
+fn search_breadcrumb_text(path: &Path) -> String {
+    let mut components = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .map(str::trim)
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    if components
+        .last()
+        .is_some_and(|component| component.eq_ignore_ascii_case("page.md"))
+    {
+        components.pop();
+    }
+    components.join(" ")
+}
+
+fn search_document(
+    connection: &Connection,
+    mount_id: &MountId,
+    remote_id: &RemoteId,
+) -> StoreResult<Option<EntitySearchDocument>> {
+    let row = connection
+        .query_row(
+            "SELECT title, path, observed_title, observed_path, frontmatter, body,
+                    metadata_text, breadcrumbs, aliases, source_url
+             FROM search_documents_fts
+             WHERE mount_id = ?1 AND remote_id = ?2
+             LIMIT 1",
+            params![mount_id.0, remote_id.0],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    Ok(row.map(
+        |(
+            title,
+            path,
+            observed_title,
+            observed_path,
+            frontmatter,
+            body,
+            metadata_text,
+            breadcrumbs,
+            aliases,
+            source_url,
+        )| {
+            EntitySearchDocument {
+                title,
+                path,
+                observed_title,
+                observed_path,
+                frontmatter,
+                body,
+                metadata_text,
+                breadcrumbs,
+                aliases,
+                source_url,
+            }
+        },
+    ))
+}
+
+fn search_metadata_from_raw_metadata_json(raw_metadata_json: Option<&str>) -> SearchMetadata {
+    let Some(raw_metadata_json) = raw_metadata_json else {
+        return SearchMetadata::default();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(raw_metadata_json) else {
+        return SearchMetadata::default();
+    };
+    value
+        .get(RAW_SEARCH_METADATA_KEY)
+        .and_then(|value| serde_json::from_value::<SearchMetadata>(value.clone()).ok())
+        .unwrap_or_default()
+}
+
+fn join_search_metadata_values(values: &[String]) -> String {
+    values
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn discovery_entities(

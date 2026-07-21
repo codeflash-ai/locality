@@ -292,12 +292,17 @@ The CLI locate command should perform the same locate operations as the desktop
 GUI and print only the resolved local filesystem path. Richer locate metadata
 can be exposed later through a separate JSON/reporting surface if needed.
 
-Initial desktop implementation can search metadata already stored in SQLite:
-remote ID, title, and projected path. The next step is a dedicated local search
-index that also covers Markdown body text, frontmatter properties, breadcrumbs,
-recently opened pages, and aliases from Notion mentions. That index should be
-updated by daemon reconciliation and virtual filesystem mutations, not by reading
-every file in the mounted folder.
+Initial desktop implementation searches metadata already stored in SQLite:
+remote ID, title, and projected path. The connector-neutral
+`search_documents_fts` cache extends that to hydrated Markdown body text,
+frontmatter, observed remote title/path metadata, and derived breadcrumb/path
+text plus connector-provided aliases and source URLs. Search callers receive
+structured indexed fields so desktop suggestions can rank titles, aliases, URLs,
+paths, metadata, and body text differently and show a compact match snippet. Later
+iterations can add recently opened pages and richer mention-derived names. The
+index should be updated by daemon
+reconciliation, hydration, shadow writes, and virtual filesystem mutations, not
+by reading every file in the mounted folder.
 
 Main app and tray search surfaces should show ranked suggestions while the user
 types, including the projected path and state label. A user should be able to
@@ -315,7 +320,7 @@ Required behavior:
 - Projection is metadata-first: directory listings come from SQLite and remain
   fast even when bodies are not hydrated.
 - Search is local-first: title/path results should appear instantly from the
-  entity index; body search can be eventually consistent.
+  local search index; hydrated body search can be eventually consistent.
 - Hydration is intent-driven: opening, searching, pinning, or agent-targeting a
   page should raise its priority above background sync.
 - Navigation preserves hierarchy: search results should show enough path context

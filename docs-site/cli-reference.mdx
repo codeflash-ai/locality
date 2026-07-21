@@ -239,16 +239,23 @@ loc pull ~/Locality/google-docs-main
 
 ### `loc search`
 
-Search local mount metadata without contacting remote sources.
+Search Locality's local SQLite search index.
 
 ```bash
 loc search <query...> [--connector <connector>] [--limit <n>] [--all]
 ```
 
 Use search for navigation, desktop typeahead, agent path lookup, and source URL
-resolution. It reads local SQLite metadata only, so it is fast and safe but may
-not know about the newest remote changes until a pull, daemon refresh, or
-freshness check has run.
+resolution. It reads local SQLite entity metadata, remote observations, derived
+breadcrumb/path text, connector-provided search metadata such as source URLs and
+aliases, and hydrated shadow frontmatter/body text. Ordinary search is
+local-first, so it is fast and safe but may not know about the newest remote
+changes until a pull, daemon refresh, or freshness check has run. Exact Notion URL
+misses may trigger a targeted metadata refresh before re-running the local search.
+Results are field-weighted so title, alias, source URL, and path hits outrank
+broader metadata and body hits. Human output can include a compact `match:` line,
+and JSON output can include stable optional `match_context` with the matched field
+and best-effort snippet. Tools should tolerate absence and future field names.
 
 Key arguments:
 

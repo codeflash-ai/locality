@@ -16,6 +16,7 @@ use locality_core::model::{
     CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
 };
 use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind};
+use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::validation::ValidationIssue;
 use locality_core::{LocalityError, LocalityResult};
 use serde::{Deserialize, Serialize};
@@ -291,9 +292,11 @@ impl Connector for GmailConnector {
             )
             .with_parent(thread_remote_id(&mailbox, &thread_id))
             .with_remote_version(RemoteVersion::new(remote_version(&message)))
-            .with_raw_metadata_json(
-                serde_json::to_string(&message).unwrap_or_else(|_| "{}".to_string()),
-            ));
+            .with_raw_metadata_json(gmail_message_metadata_json(
+                &message,
+                &mailbox,
+                Some(&thread_id),
+            )));
         }
 
         if let Some((mailbox, thread_id)) = parse_thread_remote_id(&request.remote_id) {
@@ -315,9 +318,7 @@ impl Connector for GmailConnector {
             )
             .with_parent(RemoteId::new(mailbox_folder_id(&mailbox)))
             .with_remote_version(RemoteVersion::new(thread_remote_version(&thread)))
-            .with_raw_metadata_json(
-                serde_json::to_string(&thread).unwrap_or_else(|_| "{}".to_string()),
-            ));
+            .with_raw_metadata_json(gmail_thread_metadata_json(&thread, &mailbox)));
         }
 
         let message = self.api.get_message_metadata(request.remote_id.as_str())?;
@@ -338,9 +339,7 @@ impl Connector for GmailConnector {
         )
         .with_parent(RemoteId::new(parent_id))
         .with_remote_version(RemoteVersion::new(remote_version(&message)))
-        .with_raw_metadata_json(
-            serde_json::to_string(&message).unwrap_or_else(|_| "{}".to_string()),
-        ))
+        .with_raw_metadata_json(gmail_message_metadata_json(&message, mailbox, None)))
     }
 
     fn fetch(&self, request: FetchRequest) -> LocalityResult<NativeEntity> {
@@ -605,10 +604,125 @@ fn folder_observation(
         folder.title,
     )
     .with_remote_version(RemoteVersion::new(format!("folder:{}", folder.title)))
-    .with_raw_metadata_json(format!(
-        r#"{{"kind":"gmail_folder","id":"{}","title":"{}"}}"#,
-        folder.id, folder.title
-    ))
+    .with_raw_metadata_json(gmail_folder_metadata_json(folder))
+}
+
+fn gmail_message_metadata_json(
+    message: &GmailMessage,
+    mailbox: &str,
+    thread_id: Option<&str>,
+) -> String {
+    metadata_json(
+        message,
+        gmail_message_search_metadata(message, mailbox, thread_id),
+    )
+}
+
+fn gmail_thread_metadata_json(thread: &GmailThread, mailbox: &str) -> String {
+    metadata_json(thread, gmail_thread_search_metadata(thread, mailbox))
+}
+
+fn metadata_json<T>(value: &T, search_metadata: SearchMetadata) -> String
+where
+    T: Serialize,
+{
+    let mut value = serde_json::to_value(value).unwrap_or_else(|_| serde_json::json!({}));
+    if let serde_json::Value::Object(object) = &mut value
+        && !search_metadata.is_empty()
+        && let Ok(search_value) = serde_json::to_value(search_metadata)
+    {
+        object.insert(RAW_SEARCH_METADATA_KEY.to_string(), search_value);
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn gmail_folder_metadata_json(folder: FolderSpec) -> String {
+    let mut search_metadata = SearchMetadata::default();
+    search_metadata.push_metadata_text(folder.title);
+    search_metadata.push_metadata_text(folder.id);
+    search_metadata.push_alias(folder.id);
+    let mut value = serde_json::json!({
+        "kind": "gmail_folder",
+        "id": folder.id,
+        "title": folder.title,
+    });
+    if let serde_json::Value::Object(object) = &mut value
+        && let Ok(search_value) = serde_json::to_value(search_metadata)
+    {
+        object.insert(RAW_SEARCH_METADATA_KEY.to_string(), search_value);
+    }
+    value.to_string()
+}
+
+fn gmail_message_search_metadata(
+    message: &GmailMessage,
+    mailbox: &str,
+    thread_id: Option<&str>,
+) -> SearchMetadata {
+    let mut metadata = SearchMetadata::default();
+    metadata.push_metadata_text(mailbox);
+    push_gmail_message_search_values(&mut metadata, message);
+    metadata.push_alias(&message.id);
+    let source_thread_id = thread_id
+        .map(str::to_string)
+        .or_else(|| message.thread_id.clone())
+        .unwrap_or_else(|| message.id.clone());
+    metadata.push_alias(&source_thread_id);
+    metadata.set_source_url(gmail_source_url(&source_thread_id));
+    metadata
+}
+
+fn gmail_thread_search_metadata(thread: &GmailThread, mailbox: &str) -> SearchMetadata {
+    let mut metadata = SearchMetadata::default();
+    metadata.push_metadata_text(mailbox);
+    metadata.push_metadata_text(&thread.id);
+    metadata.push_alias(&thread.id);
+    if let Some(history_id) = &thread.history_id {
+        metadata.push_metadata_text(history_id);
+    }
+    for message in &thread.messages {
+        push_gmail_message_search_values(&mut metadata, message);
+        metadata.push_alias(&message.id);
+    }
+    metadata.set_source_url(gmail_source_url(&thread.id));
+    metadata
+}
+
+fn push_gmail_message_search_values(metadata: &mut SearchMetadata, message: &GmailMessage) {
+    metadata.push_metadata_text(&message.id);
+    if let Some(thread_id) = &message.thread_id {
+        metadata.push_metadata_text(thread_id);
+    }
+    for label in &message.label_ids {
+        metadata.push_metadata_text(label);
+    }
+    if let Some(snippet) = &message.snippet {
+        metadata.push_metadata_text(snippet);
+    }
+    if let Some(internal_date) = &message.internal_date {
+        metadata.push_metadata_text(internal_date);
+    }
+    let headers = message.payload.as_ref().map(header_map).unwrap_or_default();
+    for header in [
+        "subject",
+        "from",
+        "to",
+        "cc",
+        "bcc",
+        "reply-to",
+        "sender",
+        "date",
+        "message-id",
+        "list-id",
+    ] {
+        if let Some(value) = headers.get(header) {
+            metadata.push_metadata_text(value);
+        }
+    }
+}
+
+fn gmail_source_url(id: &str) -> String {
+    format!("https://mail.google.com/mail/u/0/#all/{id}")
 }
 
 fn list_label_entries(
@@ -1104,6 +1218,7 @@ mod tests {
     use locality_core::model::{CanonicalDocument, EntityKind, MountId, RemoteId};
     use locality_core::planner::{PropertyValue, PushOperation, PushPlan};
     use locality_core::push::RemotePrecondition;
+    use locality_core::search::RAW_SEARCH_METADATA_KEY;
 
     use super::{GmailConfig, GmailConnector};
     use crate::client::GmailApi;
@@ -1475,6 +1590,21 @@ mod tests {
             std::path::PathBuf::from("inbox/1720900000000-hello-thread-inbox-1/page.md")
         );
         assert!(observation.raw_metadata_json.contains("thread-inbox-1"));
+        let raw_metadata: serde_json::Value =
+            serde_json::from_str(&observation.raw_metadata_json).expect("raw metadata json");
+        assert_eq!(
+            raw_metadata[RAW_SEARCH_METADATA_KEY]["source_url"],
+            serde_json::json!("https://mail.google.com/mail/u/0/#all/thread-inbox-1")
+        );
+        assert_eq!(
+            raw_metadata[RAW_SEARCH_METADATA_KEY]["aliases"],
+            serde_json::json!(["thread-inbox-1", "inbox-msg-1"])
+        );
+        let search_terms = raw_metadata[RAW_SEARCH_METADATA_KEY]["metadata_text"]
+            .as_array()
+            .expect("metadata_text");
+        assert!(search_terms.contains(&serde_json::json!("Ann <ann@example.com>")));
+        assert!(search_terms.contains(&serde_json::json!("Hello")));
     }
 
     #[test]

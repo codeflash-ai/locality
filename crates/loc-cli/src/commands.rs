@@ -6404,6 +6404,9 @@ fn print_search_report(report: &SearchReport) {
             result.mount_id, result.connector, result.remote_id
         );
         println!("  path: {}", result.absolute_path);
+        if let Some(context) = &result.match_context {
+            println!("  match: {}: {}", context.field, context.text);
+        }
         if !result.safety.agent_readable {
             println!("  safety: {}", result.safety.labels.join(", "));
         }
@@ -10388,6 +10391,7 @@ mod tests {
                     labels: vec!["ready".to_string()],
                 },
                 remote: SearchRemoteState::default(),
+                match_context: None,
                 score: 100,
             }],
         };
