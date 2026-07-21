@@ -147,6 +147,7 @@ export function mountStatusTone(mount: MountSummary): "ready" | "warn" | "danger
     status.includes("unregistered") ||
     status.includes("preparing") ||
     status.includes("pending") ||
+    status.includes("reconnect") ||
     status.includes("review") ||
     status.includes("not_mounted")
   ) {
@@ -244,7 +245,7 @@ function truncateLeading(value: string, maxLength: number): string {
 }
 
 function isRealMount(mount: MountSummary): boolean {
-  return mount.mountId.trim().length > 0 && mount.status !== "not_mounted";
+  return mount.mountId.trim().length > 0 && mount.status !== "not_mounted" && mount.status !== "reconnect_needed";
 }
 
 function mountSubtitle(mount: MountSummary): string {

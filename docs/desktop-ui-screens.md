@@ -146,8 +146,10 @@ Both actions require a phrase containing the selected mount id:
   remote connector. It does not change remote data or other mounts.
 - `Disconnect Source` deletes and revokes the selected mount's saved connection
   credential while retaining cached files and mount registration for a later
-  reconnect. If several mounts explicitly share that connection, the
-  confirmation explains that they will all require reconnection.
+  reconnect. The retained source is hidden from the connected Sources list and
+  the connector returns to the connect/reconnect path. If several mounts
+  explicitly share that connection, the confirmation explains that they will all
+  require reconnection.
 
 The backend validates the typed phrase as well as the UI; invoking the desktop
 command directly cannot bypass confirmation.

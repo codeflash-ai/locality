@@ -4398,9 +4398,8 @@ fn mount_summary_with_pending_change_count(
         };
     };
 
-    let mount_status = provider
-        .as_ref()
-        .and_then(mount_status_from_provider)
+    let mount_status = mount_connection_status(mount, connection)
+        .or_else(|| provider.as_ref().and_then(mount_status_from_provider))
         .unwrap_or("ready");
     let access_root = mount_access_root(mount);
     let root_exists = mount_root_exists_for_desktop_summary(mount, &access_root);
@@ -4574,6 +4573,24 @@ fn mount_status_from_provider(provider: &ProviderRuntimeSummary) -> Option<&'sta
         "error" => Some("provider_error"),
         _ => None,
     }
+}
+
+fn mount_connection_status(
+    mount: &MountConfig,
+    connection: Option<&ConnectionRecord>,
+) -> Option<&'static str> {
+    let Some(connection) = connection else {
+        return Some("reconnect_needed");
+    };
+    if connection.status != "active" || connection.connector != mount.connector {
+        return Some("reconnect_needed");
+    }
+    if let Some(connection_id) = mount.connection_id.as_ref()
+        && connection.connection_id != *connection_id
+    {
+        return Some("reconnect_needed");
+    }
+    None
 }
 
 fn provider_runtime_summary(
@@ -12493,6 +12510,38 @@ mod tests {
 
         assert!(snapshot.needs_onboarding);
         assert!(snapshot.recent_files.is_empty());
+    }
+
+    #[test]
+    fn desktop_snapshot_marks_mount_with_revoked_connection_as_reconnect_needed() {
+        let temp = TestTempDir::new("desktop-revoked-mount-status");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let mut connection = test_connection("workspace-1", "CodeFlash");
+        connection.status = "revoked".to_string();
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            temp.path().join("codeflash-wiki"),
+        )
+        .with_connection_id(connection.connection_id.clone())
+        .projection(ProjectionMode::LinuxFuse);
+        store.save_connection(connection).expect("save connection");
+        store.save_mount(mount).expect("save mount");
+
+        let snapshot = super::load_desktop_snapshot_from_store(&store, temp.path())
+            .expect("load snapshot from test store");
+
+        assert_eq!(snapshot.health.state, "reconnect_needed");
+        assert_eq!(snapshot.mount.status, "reconnect_needed");
+        assert_eq!(
+            snapshot
+                .mounts
+                .iter()
+                .find(|mount| mount.mount_id == "notion-main")
+                .expect("notion mount")
+                .status,
+            "reconnect_needed"
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ import {
   sourceConnectorIds,
   sourceRequiresApiKey,
   sourceSkipsManualMountStep,
+  sourceMounted,
   sourceMountRetryOutcome,
   sourceSetupIsActiveConnector,
   sourceSetupIsBusy,
@@ -74,6 +75,17 @@ describe("source setup progress", () => {
         mounts: [{ connector: "gmail", status: "ready" }],
       }),
     ).toEqual(["google-calendar", "slack"]);
+  });
+
+  it("does not treat a retained disconnected source mount as mounted", () => {
+    expect(
+      sourceMounted(
+        {
+          mounts: [{ connector: "notion", status: "reconnect_needed" }],
+        },
+        "notion",
+      ),
+    ).toBe(false);
   });
 });
 

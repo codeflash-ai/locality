@@ -92,6 +92,12 @@ describe("mount display helpers", () => {
     });
   });
 
+  it("does not show retained disconnected mounts as connected source rows", () => {
+    const rows = mountRows([mount({ status: "reconnect_needed" })], mount({}), "notion-main");
+
+    expect(rows).toEqual([]);
+  });
+
   it("builds Google Calendar mount rows with calendar workspace context", () => {
     const notion = mount({});
     const calendar = mount({
@@ -281,6 +287,8 @@ describe("mount display helpers", () => {
     ).toBe("warn");
     expect(mountStatusTone(mount({ status: "provider_stopped" }))).toBe("danger");
     expect(mountStatusTone(mount({ status: "provider_error" }))).toBe("danger");
+    expect(mountStatusLabel(mount({ status: "reconnect_needed" }))).toBe("Reconnect needed");
+    expect(mountStatusTone(mount({ status: "reconnect_needed" }))).toBe("warn");
   });
 });
 

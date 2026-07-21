@@ -95,7 +95,7 @@ export function sourceMounted(
   connector: SourceConnectorId,
 ): boolean {
   return sourceMounts(snapshot).some(
-    (mount) => mount.connector === connector && mount.status !== "not_mounted",
+    (mount) => mount.connector === connector && sourceMountStatusMounted(mount.status),
   );
 }
 
@@ -129,4 +129,9 @@ function sourceMounts(snapshot: SourceSnapshotLike): SourceMountLike[] {
 function sourceConnectionStatusReady(status: string): boolean {
   const normalized = status.trim().toLowerCase();
   return normalized === "active" || normalized === "ready";
+}
+
+function sourceMountStatusMounted(status?: string | null): boolean {
+  const normalized = status?.trim().toLowerCase() ?? "";
+  return normalized !== "not_mounted" && normalized !== "reconnect_needed";
 }
