@@ -13,6 +13,17 @@ pub struct NotionPageBundle {
     pub blocks: Vec<BlockTreeDto>,
 }
 
+/// Native database container plus the authoritative schemas for its data sources.
+///
+/// The data sources retain the order declared by the database response after
+/// equivalent duplicate references have been removed. This makes the bundle a
+/// stable input for both `_schema.yaml` rendering and portable synchronization.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotionDatabaseBundle {
+    pub database: DatabaseDto,
+    pub data_sources: Vec<DataSourceDto>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockTreeDto {
     pub block: BlockDto,
