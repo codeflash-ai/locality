@@ -420,8 +420,8 @@ Connected sources can include Notion, Google Docs, Google Calendar, Gmail, Linea
 ## Locality CLI workflow
 
 - Use `loc info <path>` for mount and connector context.
-- Use `loc search <query>` to search local metadata and indexed content.
-- Use `loc locate <url-or-title>` when the user gives a remote URL, title, or page-like identifier.
+- Use `loc search <query>` for broader source discovery, including Google Docs, Gmail, Linear, Slack, and Granola.
+- Use `loc locate <url-or-title>` for mounted Notion page or database URLs/titles.
 - Edit mounted Markdown directly for writable sources.
 - Use `loc status <path>` to inspect pending local changes.
 - Use `loc inspect <path>` when you need a read-only remote comparison for a hydrated file.
@@ -483,7 +483,7 @@ fn managed_instruction_block(mount_path: &str) -> String {
 
 fn suggested_agent_prompt(mount_path: &str) -> String {
     format!(
-        "Use Locality to work with my connected sources under {mount_path}. Find the relevant mounted file with `loc locate <url-or-title>` for a URL or title, or `loc search <query>` for broader discovery. Edit mounted Markdown directly, use `loc status <path>` and `loc diff <path>` to inspect pending work, and leave changes pending for Locality review unless I ask you to apply them remotely. When I do, follow the nearest mount-local `AGENTS.md` and run `loc push <path> -y` for safe plans."
+        "Use Locality to work with my connected sources under {mount_path}. Use `loc search <query>` for broad discovery across connected sources. Use `loc locate <url-or-title>` only for Notion page or database URLs/titles. Edit mounted Markdown directly, use `loc status <path>` and `loc diff <path>` to inspect pending work, and leave changes pending for Locality review unless I ask you to apply them remotely. When I do, follow the nearest mount-local `AGENTS.md` and run `loc push <path> -y` for safe plans."
     )
 }
 
@@ -1062,7 +1062,7 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn skill_teaches_source_neutral_locality_cli_workflow() {
+    fn skill_teaches_connector_aware_locality_cli_workflow() {
         let skill = skill_markdown("~/Library/CloudStorage/Locality");
 
         assert!(skill.contains("name: locality"));
@@ -1098,6 +1098,11 @@ mod tests {
         assert!(skill.contains("Linear status moves"));
         assert!(skill.contains("Slack and Granola mounts are read-only"));
         assert!(skill.contains("pending for Locality review"));
+        assert!(skill.contains(
+            "Use `loc locate <url-or-title>` for mounted Notion page or database URLs/titles."
+        ));
+        assert!(skill.contains("Use `loc search <query>` for broader source discovery, including Google Docs, Gmail, Linear, Slack, and Granola."));
+        assert!(!skill.contains("Use `loc locate <url-or-title>` when the user gives a remote URL, title, or page-like identifier."));
         assert!(skill.contains("If desktop Live Mode is on"));
         assert!(skill.contains("Do not run routine `loc pull` or `loc push`"));
         assert!(skill.contains("loc mv <source> <dest>"));
@@ -1134,6 +1139,7 @@ mod tests {
 
     #[test]
     fn normalized_blank_mount_path_uses_default_locality_root() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
         assert_eq!(normalized_mount_path(Some("  ")), default_locality_root());
         #[cfg(not(target_os = "macos"))]
         assert_eq!(normalized_mount_path(Some("  ")), "~/Locality");
@@ -1159,11 +1165,14 @@ mod tests {
 
         assert!(prompt.contains("connected sources"));
         assert!(prompt.contains("under ~/Library/CloudStorage/Locality"));
-        assert!(prompt.contains("loc locate <url-or-title>"));
+        assert!(prompt.contains(
+            "Use `loc locate <url-or-title>` only for Notion page or database URLs/titles"
+        ));
         assert!(prompt.contains("loc search <query>"));
         assert!(prompt.contains("loc status <path>"));
         assert!(prompt.contains("loc diff <path>"));
         assert!(prompt.contains("loc push <path> -y"));
+        assert!(!prompt.contains("with `loc locate <url-or-title>` for a URL or title"));
         assert!(!prompt.contains("Notion workspace"));
         assert!(!prompt.contains("sync back to Notion"));
     }

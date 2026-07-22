@@ -29,7 +29,7 @@ The skill tells agents:
 - Connected source files live under `~/Library/CloudStorage/Locality` on macOS by default, with connector-specific rules in the nearest mount-local `AGENTS.md`.
 - Supported sources can include Notion, Google Docs, Google Calendar, Gmail, Linear, Slack, and Granola; writable and read-only behavior depends on the connector.
 - Online-only files hydrate automatically when opened.
-- Agents should use `loc info <path>` for mount context, `loc search <query>` for broad discovery, and `loc locate <url-or-title>` when the user gives a remote URL or title.
+- Agents should use `loc info <path>` for mount context, `loc search <query>` for broad discovery across connected sources, and `loc locate <url-or-title>` only for mounted Notion page or database URLs/titles.
 - Agents should edit mounted Markdown directly for writable sources and leave changes pending for Locality review unless the user asks them to apply changes remotely.
 - Agents should use `loc status <path>`, `loc inspect <path>`, and `loc diff <path>` to inspect local state, remote comparison, and planned operations.
 - Agents should use `loc mv <source> <dest>` for intentional page/file moves or renames in mounted Locality content, then inspect with `loc status <path>` or `loc diff <path>`.
@@ -69,7 +69,7 @@ install uses: the package-local Roaming path for MSIX installs, or
 After the first source mount is created, the desktop app runs the installer and shows which local agents were updated. The final onboarding screen also offers this suggested prompt:
 
 ```text
-Use Locality to work with my connected sources under ~/Library/CloudStorage/Locality. Find the relevant mounted file with `loc locate <url-or-title>` for a URL or title, or `loc search <query>` for broader discovery. Edit mounted Markdown directly, use `loc status <path>` and `loc diff <path>` to inspect pending work, and leave changes pending for Locality review unless I ask you to apply them remotely. When I do, follow the nearest mount-local `AGENTS.md` and run `loc push <path> -y` for safe plans.
+Use Locality to work with my connected sources under ~/Library/CloudStorage/Locality. Use `loc search <query>` for broad discovery across connected sources. Use `loc locate <url-or-title>` only for Notion page or database URLs/titles. Edit mounted Markdown directly, use `loc status <path>` and `loc diff <path>` to inspect pending work, and leave changes pending for Locality review unless I ask you to apply them remotely. When I do, follow the nearest mount-local `AGENTS.md` and run `loc push <path> -y` for safe plans.
 ```
 
 Users can rerun the installer from Settings > Agent Instructions after installing
