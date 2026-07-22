@@ -48,6 +48,12 @@ The output directory contains:
   SnakeViz.
 - `<left-label>.snakeviz.prof`: SnakeViz profile for the left conversation.
 - `<right-label>.snakeviz.prof`: SnakeViz profile for the right conversation.
+- `combined.snakeviz.stats.md`: SnakeViz-style stats table for the combined
+  synthetic profile.
+- `<left-label>.snakeviz.stats.md`: SnakeViz-style stats table for the left
+  conversation.
+- `<right-label>.snakeviz.stats.md`: SnakeViz-style stats table for the right
+  conversation.
 - `combined.speedscope.json`: combined duration-weighted Speedscope profile.
 - `<left-label>.speedscope.json`: Speedscope profile for the left conversation.
 - `<right-label>.speedscope.json`: Speedscope profile for the right
@@ -57,7 +63,7 @@ The output directory contains:
 - `<right-label>.folded`: folded-stack file for the right conversation.
 - `summary.json`: machine-readable totals by kind, tool, timing quality, and
   longest events. It also includes high-level `totals_by_activity`,
-  `tool_groups`, and excluded `metadata`.
+  `tool_groups`, `tool_commands`, and excluded `metadata`.
 - `summary.md`: human-readable comparison tables.
 
 Open any `*.perfetto.json` file in Perfetto or another Chrome trace viewer.
@@ -73,6 +79,12 @@ Open SnakeViz profiles with:
 snakeviz <file>.snakeviz.prof
 ```
 
+Open the adjacent `*.snakeviz.stats.md` file for a sortable-source text view of
+the same synthetic pstats frames using cProfile-style columns: `ncalls`,
+`tottime`, `percall`, `cumtime`, `percall`, frame, and callers. The table also
+includes a `Tool Command Breakdown` section so loc commands appear as
+`tool_group=loc` with subcommands such as `push`, `status`, and `create-page`.
+
 Render folded stacks with Brendan Gregg's FlameGraph tooling:
 
 ```bash
@@ -82,26 +94,34 @@ flamegraph.pl --countname=us <file>.folded > <file>.svg
 If two labels sanitize to the same filename, the split trace, SnakeViz,
 Speedscope, and folded-stack filenames are deconflicted with their input side.
 The exact paths are listed in `summary.json` under `outputs.split`,
-`outputs.snakeviz`, `outputs.speedscope`, and `outputs.flamegraph`.
+`outputs.snakeviz`, `outputs.snakeviz_stats`, `outputs.speedscope`, and
+`outputs.flamegraph`.
 
 ## Activity Model
 
 Viewer profiles and the `Time By Activity` summary use derived activity buckets
 that are meant for high-level agent timing:
 
-- `tool`: time spent calling and waiting for a tool call to finish. This is
-  derived from tool-call records and, when a matching result exists, spans from
-  the call timestamp to the result timestamp. Tool-result records remain in the
-  raw kind summary but are not counted as separate tool activity.
+- `tool`: time spent running an agent action until it completes. This is
+  derived from tool-call and file-change records and, when a matching result
+  exists, spans from the start timestamp to the result timestamp. Tool-result
+  and file-change-result records remain in the raw kind summary but are not
+  counted as separate activity because their time is represented by the parent
+  tool span.
 - `reasoning`: reasoning or thinking records.
 - `user_query`: user-message records.
 - `agent_response`: assistant text response records.
 - `system`: system-message records.
 - `other`: non-metadata records that do not fit the activity model.
 
-Tool activity is additionally grouped in `tool_groups`. Bash calls whose shell
-segment invokes a `loc` executable are reported as `bash_loc`; other Bash calls
-are reported as `bash_other`; non-Bash tools keep their tool name.
+Tool activity uses a two-level stack hierarchy. The first frame is the broad
+tool group: `loc` for shell calls that invoke the Locality CLI, or `non_loc` for
+everything else. The second frame is the command detail. For `loc`, that detail
+is the loc subcommand, for example `status`, `diff`, `push`, or `create-page`.
+Shell commands that run more than one loc subcommand join the subcommands with
+`+`, for example `diff+status`. For non-loc shell calls, the detail is the
+executable name such as `git`, `gh`, `sed`, or `find`; for non-shell tools, it is
+the tool name such as `list_issues` or `API-post-search`.
 
 Harness metadata records, such as Claude terminal `result:success` records,
 `system:turn_duration`, `system:local_command`, attachments, file-history
@@ -127,7 +147,8 @@ present. Metadata timestamps can still act as run-boundary markers, but metadata
 durations do not extend wall time; this keeps terminal aggregate records from
 doubling the apparent runtime.
 
-Every trace slice and summary bucket carries `timing_quality` as `measured` or
-`inferred`. Treat inferred reasoning time as a useful approximation, not ground
-truth. Raw `Time By Kind` totals still include metadata durations for auditability
-and therefore may not sum to wall time.
+Every trace slice and summary entry carries `timing_quality` as `measured` or
+`inferred`, but timing quality is not included as a Speedscope, SnakeViz, or
+folded-stack frame. Treat inferred reasoning time as a useful approximation, not
+ground truth. Raw `Time By Kind` totals still include metadata durations for
+auditability and therefore may not sum to wall time.

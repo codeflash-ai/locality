@@ -61,6 +61,10 @@ function main(argv) {
       combined: join(outDir, "combined.snakeviz.prof"),
       split: splitOutputFiles(outDir, splitOutputBases, ".snakeviz.prof"),
     },
+    snakevizStats: {
+      combined: join(outDir, "combined.snakeviz.stats.md"),
+      split: splitOutputFiles(outDir, splitOutputBases, ".snakeviz.stats.md"),
+    },
     flamegraph: {
       combined: join(outDir, "combined.folded"),
       split: splitOutputFiles(outDir, splitOutputBases, ".folded"),
@@ -82,6 +86,9 @@ function main(argv) {
   writeSnakevizProfile(outputFiles.snakeviz.combined, conversations);
   writeSnakevizProfile(outputFiles.snakeviz.split[0].path, [left]);
   writeSnakevizProfile(outputFiles.snakeviz.split[1].path, [right]);
+  writeSnakevizStatsTable(outputFiles.snakevizStats.combined, conversations);
+  writeSnakevizStatsTable(outputFiles.snakevizStats.split[0].path, [left]);
+  writeSnakevizStatsTable(outputFiles.snakevizStats.split[1].path, [right]);
   writeJson(outputFiles.speedscope.combined, buildCombinedSpeedscope(conversations));
   writeJson(outputFiles.speedscope.split[0].path, buildSplitSpeedscope(left));
   writeJson(outputFiles.speedscope.split[1].path, buildSplitSpeedscope(right));
@@ -765,7 +772,9 @@ function enrichToolEvents(events) {
     if (event.kind !== "tool_call") {
       continue;
     }
-    event.tool_group = toolGroupFor(event);
+    const toolProfile = toolProfileFor(event);
+    event.tool_group = toolProfile.toolGroup;
+    event.tool_command_group = toolProfile.toolCommandGroup;
     if (event.tool_call_id) {
       callsById.set(event.tool_call_id, event);
     } else {
@@ -784,33 +793,77 @@ function enrichToolEvents(events) {
       event.tool_name = matched.tool_name;
       event.tool_command = matched.tool_command;
       event.tool_group = matched.tool_group;
+      event.tool_command_group = matched.tool_command_group;
     } else {
-      event.tool_group = toolGroupFor(event);
+      const toolProfile = toolProfileFor(event);
+      event.tool_group = toolProfile.toolGroup;
+      event.tool_command_group = toolProfile.toolCommandGroup;
     }
   }
 }
 
+function toolProfileFor(event) {
+  return {
+    toolGroup: toolGroupFor(event),
+    toolCommandGroup: toolCommandGroupFor(event),
+  };
+}
+
 function toolGroupFor(event) {
+  if (event.kind === "file_change") {
+    return "non_loc";
+  }
+  if (locCommandGroupFor(event.tool_command)) {
+    return "loc";
+  }
+  return "non_loc";
+}
+
+function toolCommandGroupFor(event) {
   const toolName = event.tool_name ?? "unknown_tool";
+  if (event.kind === "file_change") {
+    return "file_change";
+  }
   if (toolName.toLowerCase() === "bash") {
-    return commandCallsLoc(event.tool_command) ? "bash_loc" : "bash_other";
+    return locCommandGroupFor(event.tool_command) ??
+      shellCommandGroupFor(event.tool_command) ??
+      "bash";
   }
   if (
     ["command_execution", "local_shell"].includes(toolName.toLowerCase())
   ) {
-    return commandCallsLoc(event.tool_command)
-      ? "command_loc"
-      : "command_execution";
+    return locCommandGroupFor(event.tool_command) ??
+      shellCommandGroupFor(event.tool_command) ??
+      "unknown_command";
   }
-  return toolName;
+  return sanitizeCommandGroupPart(toolName);
 }
 
-function commandCallsLoc(command) {
-  if (bashCommandCallsLoc(command)) {
-    return true;
+function locCommandGroupFor(command) {
+  const subcommands = locSubcommandsFor(command);
+  if (subcommands.length === 0) {
+    return null;
   }
-  const nested = nestedShellCommand(command);
-  return nested ? bashCommandCallsLoc(nested) : false;
+  if (subcommands.length > 1) {
+    return subcommands.join("+");
+  }
+  return subcommands[0];
+}
+
+function locSubcommandsFor(command) {
+  if (typeof command !== "string" || command.trim() === "") {
+    return [];
+  }
+
+  const commandText = nestedShellCommand(command) ?? command;
+  const subcommands = new Set();
+  for (const segment of shellCommandSegments(commandText)) {
+    const subcommand = locSubcommandForSegment(segment);
+    if (subcommand) {
+      subcommands.add(subcommand);
+    }
+  }
+  return [...subcommands].sort();
 }
 
 function nestedShellCommand(command) {
@@ -831,34 +884,209 @@ function nestedShellCommand(command) {
   return stripShellTokenQuotes(loginCommand[1].trim());
 }
 
-function bashCommandCallsLoc(command) {
-  if (typeof command !== "string" || command.trim() === "") {
-    return false;
+function shellCommandSegments(command) {
+  const segments = [];
+  let current = "";
+  let quote = null;
+  let escaped = false;
+
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index];
+    const next = command[index + 1];
+
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      current += char;
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      current += char;
+      if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      current += char;
+      quote = char;
+      continue;
+    }
+    if (
+      char === "\n" ||
+      char === ";" ||
+      char === "|" ||
+      (char === "&" && next === "&")
+    ) {
+      segments.push(current);
+      current = "";
+      if ((char === "|" && next === "|") || (char === "&" && next === "&")) {
+        index += 1;
+      }
+      continue;
+    }
+    current += char;
   }
-  return command
-    .split(/(?:&&|\|\||[;|\n])/)
-    .some((segment) => shellSegmentExecutable(segment) === "loc");
+
+  segments.push(current);
+  return segments;
 }
 
-function shellSegmentExecutable(segment) {
-  let remaining = segment.trim();
+function shellCommandGroupFor(command) {
+  const executables = shellExecutablesFor(command).filter(
+    (executable) => executable !== "loc",
+  );
+  if (executables.length === 0) {
+    return null;
+  }
+  if (executables.length > 1) {
+    return executables.join("+");
+  }
+  return executables[0];
+}
+
+function shellExecutablesFor(command) {
+  if (typeof command !== "string" || command.trim() === "") {
+    return [];
+  }
+
+  const commandText = nestedShellCommand(command) ?? command;
+  const executables = new Set();
+  for (const segment of shellCommandSegments(commandText)) {
+    const executable = shellExecutableForSegment(segment);
+    if (executable) {
+      executables.add(executable);
+    }
+  }
+  for (const executable of knownShellExecutablesFor(commandText)) {
+    executables.add(executable);
+  }
+  return [...executables].sort();
+}
+
+function shellExecutableForSegment(segment) {
+  const tokens = shellTokens(segment);
+  const executableIndex = shellExecutableTokenIndex(tokens);
+  if (executableIndex === null) {
+    return null;
+  }
+  const executable = executableNameForToken(tokens[executableIndex]);
+  if (!executable || SHELL_CONTROL_KEYWORDS.has(executable)) {
+    return null;
+  }
+  return executable;
+}
+
+function executableNameForToken(value) {
+  const executable = basename(value);
+  if (!/^[A-Za-z_][A-Za-z0-9_.+-]*$/.test(executable)) {
+    return null;
+  }
+  return executable;
+}
+
+function knownShellExecutablesFor(command) {
+  const known = new Set();
+  const pattern =
+    /(?:^|[^A-Za-z0-9_.+-])(cat|curl|date|find|gh|git|grep|head|jq|loc|ls|mkdir|node|printf|pwd|python3|rg|sed|sort|true|uniq|xargs)(?=$|[^A-Za-z0-9_.+-])/g;
+  for (const match of command.matchAll(pattern)) {
+    known.add(match[1]);
+  }
+  return [...known];
+}
+
+function locSubcommandForSegment(segment) {
+  const tokens = shellTokens(segment);
+  const executableIndex = shellExecutableTokenIndex(tokens);
+  if (executableIndex === null) {
+    return null;
+  }
+  if (basename(tokens[executableIndex]) !== "loc") {
+    return null;
+  }
+
+  const subcommandParts = [];
+  for (let index = executableIndex + 1; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === "--help" || token === "-h") {
+      return "help";
+    }
+    if (token.startsWith("-")) {
+      continue;
+    }
+
+    subcommandParts.push(sanitizeLocSubcommandPart(token));
+    if (token !== "create" || subcommandParts.length === 2) {
+      break;
+    }
+  }
+
+  return subcommandParts.length > 0 ? subcommandParts.join("-") : "unknown";
+}
+
+function shellTokens(value) {
+  const tokens = [];
+  let remaining = value.trim();
   while (remaining !== "") {
     const token = firstShellToken(remaining);
     if (!token) {
-      return null;
+      break;
     }
-    const value = stripShellTokenQuotes(token.value);
+    tokens.push(stripShellTokenQuotes(token.value));
     remaining = remaining.slice(token.end).trimStart();
+  }
+  return tokens;
+}
 
+function shellExecutableTokenIndex(tokens) {
+  for (let index = 0; index < tokens.length; index += 1) {
+    const value = tokens[index];
     if (/^[A-Za-z_][A-Za-z0-9_]*=.*/.test(value)) {
       continue;
     }
     if (["command", "env", "nice", "nohup", "sudo", "time"].includes(value)) {
       continue;
     }
-    return basename(value);
+    return index;
   }
   return null;
+}
+
+const SHELL_CONTROL_KEYWORDS = new Set([
+  "!",
+  "[",
+  "[[",
+  "]",
+  "]]",
+  "case",
+  "do",
+  "done",
+  "elif",
+  "else",
+  "esac",
+  "fi",
+  "for",
+  "function",
+  "if",
+  "in",
+  "select",
+  "then",
+  "until",
+  "while",
+  "{",
+  "}",
+]);
+
+function sanitizeLocSubcommandPart(value) {
+  return sanitizeCommandGroupPart(value);
+}
+
+function sanitizeCommandGroupPart(value) {
+  return basename(value).replace(/[^A-Za-z0-9_.+-]+/g, "-") || "unknown";
 }
 
 function firstShellToken(value) {
@@ -904,6 +1132,7 @@ function profileEntryForEvent(conversation, event, index) {
     kind: event.kind,
     tool_name: event.tool_name,
     tool_group: profileToolGroupFor(event),
+    tool_command_group: profileToolCommandGroupFor(event),
     tool_command: event.tool_command,
     start_ms: event.start_ms,
     end_ms: event.start_ms + durationMs,
@@ -924,11 +1153,15 @@ function profileDurationMs(event, events, index) {
 }
 
 function profileToolGroupFor(event) {
-  if (event.kind === "tool_call") {
+  if (event.kind === "tool_call" || event.kind === "file_change") {
     return toolGroupFor(event);
   }
-  if (event.kind === "file_change") {
-    return "file_change";
+  return null;
+}
+
+function profileToolCommandGroupFor(event) {
+  if (event.kind === "tool_call" || event.kind === "file_change") {
+    return toolCommandGroupFor(event);
   }
   return null;
 }
@@ -941,7 +1174,7 @@ function activityForEvent(event) {
     return "tool";
   }
   if (event.kind === "file_change") {
-    return "file_edit";
+    return "tool";
   }
   if (event.kind === "reasoning") {
     return "reasoning";
@@ -1239,8 +1472,13 @@ function speedscopeStackFor(conversation, entry, includeRoot) {
   );
   if (entry.activity === "tool") {
     frames.push(speedscopeFrameName("tool", entry.tool_group ?? "unknown_tool"));
+    frames.push(
+      speedscopeFrameName(
+        "command",
+        entry.tool_command_group ?? "unknown_command",
+      ),
+    );
   }
-  frames.push(speedscopeFrameName("timing", entry.timing_quality));
   return frames;
 }
 
@@ -1286,8 +1524,8 @@ function buildFoldedStacks(conversations, { includeRoot }) {
       );
       if (entry.activity === "tool") {
         frames.push(`tool:${entry.tool_group ?? "unknown_tool"}`);
+        frames.push(`command:${entry.tool_command_group ?? "unknown_command"}`);
       }
-      frames.push(`timing:${entry.timing_quality}`);
 
       const stack = frames.map(sanitizeFoldedFrame).join(";");
       stacks.set(stack, (stacks.get(stack) ?? 0) + durationUs(entry));
@@ -1337,6 +1575,130 @@ function writeSnakevizProfile(path, conversations) {
       `failed to generate SnakeViz profile ${path}: ${detail}. SnakeViz output requires python3.`,
     );
   }
+}
+
+function writeSnakevizStatsTable(path, conversations) {
+  const rows = buildSnakevizStatsRows(conversations);
+  const lines = [
+    "# SnakeViz Stats",
+    "",
+    "| Rank | ncalls | tottime | percall | cumtime | percall | Frame | Callers |",
+    "| ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+  ];
+
+  rows.forEach((row, index) => {
+    lines.push(
+      `| ${index + 1} | ${row.ncalls} | ${formatSeconds(
+        row.total_time,
+      )} | ${formatSeconds(row.total_percall)} | ${formatSeconds(
+        row.cumulative_time,
+      )} | ${formatSeconds(row.cumulative_percall)} | ${markdownTableCell(
+        row.frame,
+      )} | ${markdownTableCell(
+        row.callers.length > 0 ? row.callers.join(", ") : "",
+      )} |`,
+    );
+  });
+
+  const toolRows = buildSnakevizToolCommandRows(conversations);
+  lines.push("", "## Tool Command Breakdown", "");
+  if (toolRows.length === 0) {
+    lines.push("No tool calls.", "");
+  } else {
+    lines.push(
+      "| Conversation | Tool group | Command | ncalls | tottime | percall | cumtime | percall |",
+    );
+    lines.push("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |");
+    for (const row of toolRows) {
+      lines.push(
+        `| ${markdownTableCell(row.conversation)} | ${markdownTableCell(
+          row.tool_group,
+        )} | ${markdownTableCell(row.command)} | ${row.ncalls} | ${formatSeconds(
+          row.total_time,
+        )} | ${formatSeconds(row.total_percall)} | ${formatSeconds(
+          row.cumulative_time,
+        )} | ${formatSeconds(row.cumulative_percall)} |`,
+      );
+    }
+    lines.push("");
+  }
+
+  writeFileSync(path, `${lines.join("\n")}\n`);
+}
+
+function buildSnakevizStatsRows(conversations) {
+  return buildSnakevizProfileFrames(conversations)
+    .filter(
+      (frame) =>
+        frame.name !== "agent-conversation-profile" ||
+        frame.total_time > 0 ||
+        frame.cumulative_time > 0,
+    )
+    .map((frame) => {
+      const ncalls = snakevizCallCount(frame);
+      return {
+        ncalls,
+        total_time: frame.total_time,
+        total_percall: ncalls === 0 ? 0 : frame.total_time / ncalls,
+        cumulative_time: frame.cumulative_time,
+        cumulative_percall: ncalls === 0 ? 0 : frame.cumulative_time / ncalls,
+        frame: `${frame.filename}:${frame.line}(${frame.name})`,
+        callers: frame.callers.map((caller) => caller.name).sort(),
+      };
+    })
+    .sort(
+      (left, right) =>
+        right.cumulative_time - left.cumulative_time ||
+        right.total_time - left.total_time ||
+        left.frame.localeCompare(right.frame),
+    );
+}
+
+function buildSnakevizToolCommandRows(conversations) {
+  const totals = new Map();
+  for (const conversation of conversations) {
+    for (const entry of buildProfileEntries(conversation)) {
+      if (entry.activity !== "tool") {
+        continue;
+      }
+
+      const conversationLabel = conversation.label;
+      const toolGroup = entry.tool_group ?? "unknown_tool";
+      const command = entry.tool_command_group ?? "unknown_command";
+      const key = `${conversationLabel}\0${toolGroup}\0${command}`;
+      const previous = totals.get(key) ?? {
+        conversation: conversationLabel,
+        tool_group: toolGroup,
+        command,
+        ncalls: 0,
+        total_time: 0,
+        cumulative_time: 0,
+      };
+      previous.ncalls += 1;
+      previous.total_time += entry.duration_ms / 1000;
+      previous.cumulative_time += entry.duration_ms / 1000;
+      totals.set(key, previous);
+    }
+  }
+
+  return [...totals.values()]
+    .map((row) => ({
+      ...row,
+      total_percall: row.ncalls === 0 ? 0 : row.total_time / row.ncalls,
+      cumulative_percall:
+        row.ncalls === 0 ? 0 : row.cumulative_time / row.ncalls,
+    }))
+    .sort(
+      (left, right) =>
+        left.conversation.localeCompare(right.conversation) ||
+        left.tool_group.localeCompare(right.tool_group) ||
+        right.cumulative_time - left.cumulative_time ||
+        left.command.localeCompare(right.command),
+    );
+}
+
+function snakevizCallCount(frame) {
+  return frame.total_calls > 0 ? frame.total_calls : frame.primitive_calls;
 }
 
 const PYTHON_PSTATS_WRITER = `
@@ -1389,8 +1751,12 @@ function buildSnakevizProfileFrames(conversations) {
 
       if (entry.activity === "tool") {
         stack.push(builder.frame(`tool:${entry.tool_group ?? "unknown_tool"}`));
+        stack.push(
+          builder.frame(
+            `command:${entry.tool_command_group ?? "unknown_command"}`,
+          ),
+        );
       }
-      stack.push(builder.frame(`timing:${entry.timing_quality}`));
 
       builder.addStack(stack, durationSeconds);
     }
@@ -1499,6 +1865,7 @@ function traceEventFor(event, pid, tid, baseMs) {
       activity: activityForEvent(event),
       tool_name: event.tool_name,
       tool_group: event.tool_group,
+      tool_command_group: event.tool_command_group,
       tool_command: event.tool_command,
       timing_quality: event.timing_quality,
       raw_type: event.raw_type,
@@ -1569,6 +1936,7 @@ function buildSummary(conversations, outputFiles) {
       combined: outputFiles.combined,
       split: outputFiles.split,
       snakeviz: outputFiles.snakeviz,
+      snakeviz_stats: outputFiles.snakevizStats,
       flamegraph: outputFiles.flamegraph,
       speedscope: outputFiles.speedscope,
       summary_json: outputFiles.summaryJson,
@@ -1591,6 +1959,7 @@ function summarizeConversation(conversation) {
   const percentByActivity = {};
   const toolTotals = new Map();
   const toolGroupTotals = new Map();
+  const toolCommandTotals = new Map();
   const metadataTotals = new Map();
   let measuredDurationMs = 0;
   let inferredDurationMs = 0;
@@ -1602,18 +1971,6 @@ function summarizeConversation(conversation) {
       measuredDurationMs += event.duration_ms;
     } else {
       inferredDurationMs += event.duration_ms;
-    }
-
-    if (event.kind === "tool_call") {
-      const name = event.tool_name ?? "unknown_tool";
-      const previous = toolTotals.get(name) ?? {
-        tool_name: name,
-        count: 0,
-        duration_ms: 0,
-      };
-      previous.count += 1;
-      previous.duration_ms += event.duration_ms;
-      toolTotals.set(name, previous);
     }
 
     if (isMetadataEvent(event)) {
@@ -1641,6 +1998,16 @@ function summarizeConversation(conversation) {
     totalsByActivity[entry.activity] =
       (totalsByActivity[entry.activity] ?? 0) + entry.duration_ms;
     if (entry.activity === "tool") {
+      const name = entry.tool_name ?? "unknown_tool";
+      const previousTool = toolTotals.get(name) ?? {
+        tool_name: name,
+        count: 0,
+        duration_ms: 0,
+      };
+      previousTool.count += 1;
+      previousTool.duration_ms += entry.duration_ms;
+      toolTotals.set(name, previousTool);
+
       const group = entry.tool_group ?? "unknown_tool";
       const previous = toolGroupTotals.get(group) ?? {
         tool_group: group,
@@ -1650,6 +2017,18 @@ function summarizeConversation(conversation) {
       previous.count += 1;
       previous.duration_ms += entry.duration_ms;
       toolGroupTotals.set(group, previous);
+
+      const command = entry.tool_command_group ?? "unknown_command";
+      const commandKey = `${group}\0${command}`;
+      const previousCommand = toolCommandTotals.get(commandKey) ?? {
+        tool_group: group,
+        command,
+        count: 0,
+        duration_ms: 0,
+      };
+      previousCommand.count += 1;
+      previousCommand.duration_ms += entry.duration_ms;
+      toolCommandTotals.set(commandKey, previousCommand);
     }
   }
 
@@ -1688,6 +2067,12 @@ function summarizeConversation(conversation) {
         right.duration_ms - left.duration_ms ||
         left.tool_group.localeCompare(right.tool_group),
     ),
+    tool_commands: [...toolCommandTotals.values()].sort(
+      (left, right) =>
+        right.duration_ms - left.duration_ms ||
+        left.tool_group.localeCompare(right.tool_group) ||
+        left.command.localeCompare(right.command),
+    ),
     metadata: [...metadataTotals.values()].sort(
       (left, right) =>
         right.duration_ms - left.duration_ms ||
@@ -1711,6 +2096,7 @@ function summarizeConversation(conversation) {
         activity: entry.activity,
         kind: entry.kind,
         tool_group: entry.tool_group,
+        tool_command_group: entry.tool_command_group,
         duration_ms: entry.duration_ms,
         timing_quality: entry.timing_quality,
         source_index: entry.source_index,
@@ -1779,6 +2165,9 @@ function renderSummaryMarkdown(summary) {
   for (const file of viewerFiles(summary.outputs.snakeviz)) {
     lines.push(`| SnakeViz | ${markdownTableCell(file)} |`);
   }
+  for (const file of viewerFiles(summary.outputs.snakeviz_stats)) {
+    lines.push(`| SnakeViz stats table | ${markdownTableCell(file)} |`);
+  }
   for (const file of viewerFiles(summary.outputs.flamegraph)) {
     lines.push(`| FlameGraph folded stack | ${markdownTableCell(file)} |`);
   }
@@ -1800,7 +2189,7 @@ function renderSummaryMarkdown(summary) {
     lines.push("");
   }
 
-  lines.push("## Tool Wait By Group", "");
+  lines.push("## Tool Time By Group", "");
   for (const conversation of summary.conversations) {
     lines.push(`### ${markdownHeadingText(conversation.label)}`, "");
     if (conversation.tool_groups.length === 0) {
@@ -1814,6 +2203,25 @@ function renderSummaryMarkdown(summary) {
         `| ${markdownTableCell(tool.tool_group)} | ${tool.count} | ${formatMs(
           tool.duration_ms,
         )} |`,
+      );
+    }
+    lines.push("");
+  }
+
+  lines.push("## Tool Time By Command", "");
+  for (const conversation of summary.conversations) {
+    lines.push(`### ${markdownHeadingText(conversation.label)}`, "");
+    if (conversation.tool_commands.length === 0) {
+      lines.push("No tool calls.", "");
+      continue;
+    }
+    lines.push("| Tool group | Command | Count | Duration |");
+    lines.push("| --- | --- | ---: | ---: |");
+    for (const command of conversation.tool_commands) {
+      lines.push(
+        `| ${markdownTableCell(command.tool_group)} | ${markdownTableCell(
+          command.command,
+        )} | ${command.count} | ${formatMs(command.duration_ms)} |`,
       );
     }
     lines.push("");
@@ -1888,13 +2296,15 @@ function renderSummaryMarkdown(summary) {
       continue;
     }
 
-    lines.push("| Activity | Kind | Tool group | Duration | Timing | Source index | Excerpt |");
-    lines.push("| --- | --- | --- | ---: | --- | ---: | --- |");
+    lines.push("| Activity | Kind | Tool group | Command | Duration | Timing | Source index | Excerpt |");
+    lines.push("| --- | --- | --- | --- | ---: | --- | ---: | --- |");
     for (const entry of conversation.longest_profile_entries) {
       lines.push(
         `| ${markdownTableCell(entry.activity)} | ${markdownTableCell(
           entry.kind,
-        )} | ${markdownTableCell(entry.tool_group ?? "")} | ${formatMs(
+        )} | ${markdownTableCell(entry.tool_group ?? "")} | ${markdownTableCell(
+          entry.tool_command_group ?? "",
+        )} | ${formatMs(
           entry.duration_ms,
         )} | ${markdownTableCell(entry.timing_quality)} | ${
           entry.source_index
@@ -1951,6 +2361,13 @@ function formatMs(value) {
     return `${value}ms`;
   }
   return `${(value / 1000).toFixed(2)}s`;
+}
+
+function formatSeconds(value) {
+  if (value === 0) {
+    return "0.000";
+  }
+  return value.toFixed(6);
 }
 
 function markdownTableCell(value) {
