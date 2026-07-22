@@ -16,6 +16,8 @@ The output parent page is:
 ## Files
 
 - `run-agent-comparison.sh` - wrapper used inside Amika.
+- `run-claude-locality-comparison.sh` - local wrapper that compares Claude Code
+  on the hosted MCP path against Claude Code on the Locality path.
 - `run-launch-readiness-benchmark.sh` - core benchmark runner.
 - `run-repeated.sh` - runs the benchmark multiple times.
 - `setup-codex-azure.sh` - writes Codex Azure config.
@@ -83,6 +85,29 @@ ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
   target/debug/loc locate "https://app.notion.com/p/codeflash/Locality-Launch-Amika-Environment-3a33ac0ebb888001ac26d52f57f1deba"
 '
 ```
+
+## Run Claude Comparison
+
+From the local machine, set token-backed MCP credentials for the
+`test-with-notion-connector` sandbox, then run:
+
+```bash
+export LINEAR_API_KEY=<linear-api-key>
+export NOTION_API_TOKEN=<notion-api-token>
+./experiment/locality-mcp-comparison/run-claude-locality-comparison.sh
+```
+
+The `test-with-notion-connector` sandbox is prepared with token-backed MCP
+servers before Claude starts:
+
+- `LINEAR_API_KEY` configures Linear's remote MCP server through an
+  authorization-header helper.
+- `NOTION_API_TOKEN` configures the official `@notionhq/notion-mcp-server`
+  stdio server through `OPENAPI_MCP_HEADERS`.
+
+The script writes these credentials only into sandbox-local files under
+`~/.config/locality-claude-comparison` and stores helper references in
+`~/.claude.json`.
 
 ## Run Once
 

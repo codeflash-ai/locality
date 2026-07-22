@@ -19,6 +19,11 @@ Defaults:
 Environment:
   CLAUDE_BIN           Claude executable in the sandbox. Default: claude
   CLAUDE_MODEL         Optional model passed as --model
+  LINEAR_API_KEY       Linear personal API key for test-with-notion-connector.
+  NOTION_API_TOKEN     Notion internal/PAT token for test-with-notion-connector.
+                       NOTION_TOKEN or NOTION_ACCESS_TOKEN are accepted aliases.
+  LOCALITY_DEB_URL     Locality Linux .deb used for onyx-falcon setup.
+                       Default: latest codeflash-ai/locality release asset
   AMIKA_SANDBOX_FLAGS  Optional flags passed to amika sandbox commands,
                        for example: --remote
   --remote-run-root is accepted for compatibility and is not used by the
@@ -33,6 +38,9 @@ OUT_DIR="${OUT_DIR:-$REPO_ROOT/target/claude-locality-comparison/$RUN_ID}"
 REMOTE_RUN_ROOT="${REMOTE_RUN_ROOT:-~/locality-claude-runs}"
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 CLAUDE_MODEL="${CLAUDE_MODEL:-}"
+LINEAR_API_KEY="${LINEAR_API_KEY:-}"
+NOTION_API_TOKEN="${NOTION_API_TOKEN:-${NOTION_TOKEN:-${NOTION_ACCESS_TOKEN:-}}}"
+LOCALITY_DEB_URL="${LOCALITY_DEB_URL:-https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.deb}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -128,6 +136,178 @@ amika_sandbox_ssh() {
   fi
 }
 
+prepare_test_with_connector_mcp() {
+  local machine="$1"
+  local local_dir="$2"
+  local setup_out="$local_dir/$machine.mcp-setup.out"
+  local setup_err="$local_dir/$machine.mcp-setup.err"
+  local remote_script
+  local remote_script_b64
+  local remote_command
+  local remote_shell_command
+  local linear_key_b64
+  local notion_token_b64
+
+  if [ -z "$LINEAR_API_KEY" ]; then
+    echo "LINEAR_API_KEY is required to configure Linear MCP auth for $machine" >&2
+    return 2
+  fi
+  if [ -z "$NOTION_API_TOKEN" ]; then
+    echo "NOTION_API_TOKEN is required to configure token-backed Notion MCP auth for $machine" >&2
+    return 2
+  fi
+
+  echo "Preparing MCP auth on $machine..."
+  remote_script="$(cat <<'REMOTE_MCP_SETUP'
+set -euo pipefail
+
+secret_dir="$HOME/.config/locality-claude-comparison"
+bin_dir="$HOME/.local/bin"
+mkdir -p "$secret_dir" "$bin_dir" "$HOME/.claude"
+chmod 700 "$secret_dir"
+
+umask 077
+printf '%s' "$LINEAR_API_KEY" > "$secret_dir/linear-api-key"
+printf '%s' "$NOTION_API_TOKEN" > "$secret_dir/notion-token"
+
+cat > "$bin_dir/linear-mcp-headers" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+token_file="${LINEAR_API_KEY_FILE:-$HOME/.config/locality-claude-comparison/linear-api-key}"
+python3 - "$token_file" <<'PY'
+import json
+import pathlib
+import sys
+
+token = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+print(json.dumps({"Authorization": "Bearer " + token}, separators=(",", ":")))
+PY
+SH
+
+cat > "$bin_dir/notion-mcp-token" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+token_file="${NOTION_API_TOKEN_FILE:-$HOME/.config/locality-claude-comparison/notion-token}"
+export OPENAPI_MCP_HEADERS="$(
+python3 - "$token_file" <<'PY'
+import json
+import pathlib
+import sys
+
+token = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+print(json.dumps({"Authorization": "Bearer " + token}, separators=(",", ":")))
+PY
+)"
+exec npx -y @notionhq/notion-mcp-server
+SH
+
+chmod 700 "$bin_dir/linear-mcp-headers" "$bin_dir/notion-mcp-token"
+
+linear_json="$(
+python3 - "$bin_dir/linear-mcp-headers" <<'PY'
+import json
+import sys
+
+print(json.dumps({
+    "type": "http",
+    "url": "https://mcp.linear.app/mcp",
+    "headersHelper": sys.argv[1],
+}, separators=(",", ":")))
+PY
+)"
+notion_json="$(
+python3 - "$bin_dir/notion-mcp-token" <<'PY'
+import json
+import sys
+
+print(json.dumps({
+    "type": "stdio",
+    "command": sys.argv[1],
+    "args": [],
+}, separators=(",", ":")))
+PY
+)"
+
+claude mcp remove linear-server >/dev/null 2>&1 || true
+claude mcp remove notion >/dev/null 2>&1 || true
+claude mcp add-json --scope user linear-server "$linear_json"
+claude mcp add-json --scope user notion "$notion_json"
+
+rm -f "$HOME/.claude/mcp-needs-auth-cache.json" 2>/dev/null || true
+echo "Configured token-backed MCP servers: linear-server, notion"
+REMOTE_MCP_SETUP
+)"
+  remote_script_b64="$(printf '%s' "$remote_script" | base64_one_line)"
+  linear_key_b64="$(printf '%s' "$LINEAR_API_KEY" | base64_one_line)"
+  notion_token_b64="$(printf '%s' "$NOTION_API_TOKEN" | base64_one_line)"
+  remote_command="export LINEAR_API_KEY=\"\$(printf %s $(shell_quote "$linear_key_b64") | base64 -d)\"; export NOTION_API_TOKEN=\"\$(printf %s $(shell_quote "$notion_token_b64") | base64 -d)\"; printf %s $(shell_quote "$remote_script_b64") | base64 -d | bash"
+  remote_shell_command="bash -lc $(shell_quote "$remote_command")"
+  amika_sandbox_ssh -t "$machine" -- "$remote_shell_command" > "$setup_out" 2> "$setup_err"
+}
+
+prepare_onyx_falcon_locality() {
+  local machine="$1"
+  local local_dir="$2"
+  local setup_out="$local_dir/onyx-falcon.locality-setup.out"
+  local setup_err="$local_dir/onyx-falcon.locality-setup.err"
+  local remote_script
+  local remote_script_b64
+  local remote_command
+  local remote_shell_command
+
+  echo "Preparing Locality on onyx-falcon..."
+  remote_script="$(cat <<'REMOTE_LOCALITY_SETUP'
+set -euo pipefail
+
+deb_url="$1"
+tmp_deb="$(mktemp "${TMPDIR:-/tmp}/locality.XXXXXX.deb")"
+trap 'rm -f "$tmp_deb"' EXIT
+
+if command -v curl >/dev/null 2>&1; then
+  curl -fsSL -o "$tmp_deb" "$deb_url"
+elif command -v wget >/dev/null 2>&1; then
+  wget -qO "$tmp_deb" "$deb_url"
+else
+  echo "curl or wget is required to download Locality_Linux.deb" >&2
+  exit 127
+fi
+
+if ! command -v apt-get >/dev/null 2>&1; then
+  echo "apt-get is required to install Locality_Linux.deb" >&2
+  exit 127
+fi
+
+if command -v sudo >/dev/null 2>&1; then
+  sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y "$tmp_deb"
+else
+  env DEBIAN_FRONTEND=noninteractive apt-get install -y "$tmp_deb"
+fi
+
+mkdir -p "$HOME/Locality/notion" "$HOME/Locality/linear"
+
+if ! loc status "$HOME/Locality/notion" --json >/dev/null 2>&1; then
+  loc mount notion --workspace "$HOME/Locality/notion" --connection notion-default ||
+    echo "warning: could not register Notion mount before pull" >&2
+fi
+if ! loc status "$HOME/Locality/linear" --json >/dev/null 2>&1; then
+  loc mount linear "$HOME/Locality/linear" --connection linear-default ||
+    echo "warning: could not register Linear mount before pull" >&2
+fi
+
+loc pull "$HOME/Locality/notion" ||
+  echo "warning: loc pull failed for $HOME/Locality/notion" >&2
+loc pull "$HOME/Locality/linear" ||
+  echo "warning: loc pull failed for $HOME/Locality/linear" >&2
+REMOTE_LOCALITY_SETUP
+)"
+  remote_script_b64="$(printf '%s' "$remote_script" | base64_one_line)"
+  remote_command="printf %s $(shell_quote "$remote_script_b64") | base64 -d | bash -s -- $(shell_quote "$LOCALITY_DEB_URL")"
+  remote_shell_command="bash -lc $(shell_quote "$remote_command")"
+  amika_sandbox_ssh -t "$machine" -- "$remote_shell_command" > "$setup_out" 2> "$setup_err"
+}
+
 run_remote_claude() {
   local machine="$1"
   local remote_cwd="$2"
@@ -141,11 +321,12 @@ run_remote_claude() {
   local transcript_file="$local_dir/$machine.claude.jsonl"
   local normalizer_file="$local_dir/timestamp-jsonl.py"
   local prompt_file="$local_dir/$machine.prompt.txt"
-  local ssh_target
   local remote_home
+  local remote_home_output
   local remote_cwd_resolved
   local remote_prompt
   local remote_command
+  local remote_shell_command
   local started_at
   local ended_at
   local connect_rc
@@ -185,23 +366,38 @@ PY
   started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   # Keep the requested "connect first" step lightweight; the actual
-  # non-interactive Claude run is streamed through raw ssh because Amika's
-  # command wrapper does not preserve Claude's stream-json invocation reliably.
+  # non-interactive Claude run is streamed through the Amika SSH command path.
   set +e
-  amika_sandbox_connect "$machine" --shell bash > "$connect_out" 2> "$connect_err" <<'REMOTE_CONNECT_CHECK'
-exit 0
-REMOTE_CONNECT_CHECK
+  amika_sandbox_ssh -t "$machine" -- true > "$connect_out" 2> "$connect_err"
   connect_rc=$?
   set -e
 
-  ssh_target="$(amika_sandbox_ssh --print "$machine")"
-  remote_home="$(ssh -o StrictHostKeyChecking=accept-new "$ssh_target" /usr/bin/printenv HOME)"
+  if ! remote_home_output="$(amika_sandbox_ssh -t "$machine" -- /usr/bin/printenv HOME)"; then
+    return 1
+  fi
+  remote_home="$(printf '%s\n' "$remote_home_output" | tr -d '\r' | sed -n '/^\//{p;q;}')"
+  if [ -z "$remote_home" ]; then
+    echo "could not resolve HOME for $machine" >&2
+    return 1
+  fi
   case "$remote_cwd" in
     "~") remote_cwd_resolved="$remote_home" ;;
     "~/"*) remote_cwd_resolved="$remote_home/${remote_cwd#\~/}" ;;
     "") remote_cwd_resolved="$remote_home" ;;
     *) remote_cwd_resolved="$remote_cwd" ;;
   esac
+
+  if [ "$machine" = "test-with-notion-connector" ]; then
+    if ! prepare_test_with_connector_mcp "$machine" "$local_dir"; then
+      return 1
+    fi
+  fi
+
+  if [ "$machine" = "onyx-falcon" ]; then
+    if ! prepare_onyx_falcon_locality "$machine" "$local_dir"; then
+      return 1
+    fi
+  fi
 
   remote_command="cd $(shell_quote "$remote_cwd_resolved") && $(shell_quote "$CLAUDE_BIN") -p --output-format stream-json --verbose --dangerously-skip-permissions"
   if [ -n "$CLAUDE_MODEL" ]; then
@@ -212,7 +408,8 @@ REMOTE_CONNECT_CHECK
 
   set +e
   set -o pipefail
-  ssh -tt -o StrictHostKeyChecking=accept-new "$ssh_target" "$remote_command" 2> "$stderr_file" | python3 "$normalizer_file" > "$transcript_file"
+  remote_shell_command="bash -lc $(shell_quote "$remote_command")"
+  amika_sandbox_ssh -t "$machine" -- "$remote_shell_command" 2> "$stderr_file" | python3 "$normalizer_file" > "$transcript_file"
   local pipe_status=("${PIPESTATUS[@]}")
   claude_rc="${pipe_status[0]}"
   normalizer_rc="${pipe_status[1]}"
