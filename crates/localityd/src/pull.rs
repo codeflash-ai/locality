@@ -18,7 +18,7 @@ use locality_core::hydration::{HydrationReason, HydrationRequest};
 use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, RemoteId, TreeEntry};
 use locality_core::path_projection::{
     is_page_document_path, named_markdown_page_workspace_entity_path, page_container_path,
-    page_listing_parent_path,
+    page_listing_parent_path, projection_namespace_root,
 };
 use locality_core::shadow::ShadowDocument;
 use locality_store::{
@@ -98,70 +98,216 @@ where
         + locality_store::RemoteObservationRepository,
     Source: SourceAdapter + Clone,
 {
-    let target_path = absolute_path(target_path.as_ref())?;
-    let mounts = store.load_mounts().map_err(PullError::Store)?;
-    let (mount, matched) = find_mount_for_path(&mounts, &target_path)
-        .ok_or_else(|| PullError::MountNotFound(target_path.clone()))?;
-    let mount = mount.clone();
-    let relative_path =
-        resolve_virtual_named_markdown_page_workspace_path(store, &mount, &matched.relative_path)?;
-    let source = source.scoped_to_mount(&mount);
-    let page_directory = page_directory_target(store, &mount, &relative_path)?;
-    let refresh_bases = prepare_visible_projection_pull(
-        store,
-        state_root,
-        &mount,
-        &relative_path,
-        &target_path,
-        page_directory.is_some(),
-    )?;
+    let requested_path = target_path.as_ref().to_path_buf();
+    crate::trace::result("pull.run", |trace| {
+        trace.attr("requested_path", requested_path.display().to_string());
+        trace.attr("has_state_root", state_root.is_some());
 
-    let report = if should_pull_workspace_virtual_mount_root(&mount, &relative_path) {
-        pull_workspace_virtual_mount_root(store, &source, &mount, target_path.clone())
-    } else if should_pull_mount_root(
-        &mount,
-        &relative_path,
-        &target_path,
-        page_directory.is_some(),
-    ) {
-        pull_mount_root(store, &source, &mount, target_path.clone(), state_root)
-    } else if let Some(page_directory) = page_directory {
-        pull_page_directory_path(
+        let target_path = absolute_path(&requested_path)?;
+        trace.attr("target_path", target_path.display().to_string());
+
+        let mounts = store.load_mounts().map_err(PullError::Store)?;
+        trace.attr("mount_count", mounts.len());
+        let (mount, matched) = find_mount_for_path(&mounts, &target_path)
+            .ok_or_else(|| PullError::MountNotFound(target_path.clone()))?;
+        let mount = mount.clone();
+        trace.attr("mount_id", mount.mount_id.0.as_str());
+        trace.attr("connector", mount.connector.as_str());
+        trace.attr("projection", mount.projection.as_str());
+        trace.attr(
+            "matched_relative_path",
+            matched.relative_path.display().to_string(),
+        );
+
+        let relative_path = resolve_virtual_named_markdown_page_workspace_path(
             store,
-            &source,
             &mount,
-            page_directory,
-            target_path.clone(),
-            state_root,
-        )
-    } else if let Some(report) = pull_virtual_directory_path(
-        store,
-        &source,
-        &mount,
-        &relative_path,
-        target_path.clone(),
-        state_root,
-    )? {
-        Ok(report)
-    } else {
-        pull_entity_path(
-            store,
-            &source,
+            &matched.relative_path,
+        )?;
+        trace.attr("relative_path", relative_path.display().to_string());
+        let source = source.scoped_to_mount(&mount);
+        let page_directory = page_directory_target(store, &mount, &relative_path)?;
+        trace.attr("page_directory_target", page_directory.is_some());
+
+        let refresh_bases = crate::trace::result("pull.prepare_visible_projection", |span| {
+            span.attr("mount_id", mount.mount_id.0.as_str());
+            span.attr("target_path", target_path.display().to_string());
+            span.attr("relative_path", relative_path.display().to_string());
+            prepare_visible_projection_pull(
+                store,
+                state_root,
+                &mount,
+                &relative_path,
+                &target_path,
+                page_directory.is_some(),
+            )
+        })?;
+
+        let report = if should_pull_workspace_virtual_mount_root(&mount, &relative_path) {
+            trace.attr("branch", "workspace_virtual_mount_root");
+            let mut branch = start_pull_branch_span(
+                "pull.branch.workspace_virtual_mount_root",
+                &mount,
+                &target_path,
+                &relative_path,
+            );
+            let result =
+                pull_workspace_virtual_mount_root(store, &source, &mount, target_path.clone());
+            finish_pull_branch_span(&mut branch, &result);
+            result
+        } else if should_pull_mount_root(
             &mount,
             &relative_path,
-            target_path.clone(),
-            state_root,
-        )
-    }?;
+            &target_path,
+            page_directory.is_some(),
+        ) {
+            trace.attr("branch", "mount_root");
+            let mut branch = start_pull_branch_span(
+                "pull.branch.mount_root",
+                &mount,
+                &target_path,
+                &relative_path,
+            );
+            let result = pull_mount_root(store, &source, &mount, target_path.clone(), state_root);
+            finish_pull_branch_span(&mut branch, &result);
+            result
+        } else if let Some(page_directory) = page_directory {
+            trace.attr("branch", "page_directory");
+            let mut branch = start_pull_branch_span(
+                "pull.branch.page_directory",
+                &mount,
+                &target_path,
+                &relative_path,
+            );
+            branch.attr("page_remote_id", page_directory.page.remote_id.0.as_str());
+            branch.attr("page_path", page_directory.page.path.display().to_string());
+            let result = pull_page_directory_path(
+                store,
+                &source,
+                &mount,
+                page_directory,
+                target_path.clone(),
+                state_root,
+            );
+            finish_pull_branch_span(&mut branch, &result);
+            result
+        } else {
+            let mut branch = start_pull_branch_span(
+                "pull.branch.virtual_directory_probe",
+                &mount,
+                &target_path,
+                &relative_path,
+            );
+            let virtual_result = pull_virtual_directory_path(
+                store,
+                &source,
+                &mount,
+                &relative_path,
+                target_path.clone(),
+                state_root,
+            );
+            match virtual_result {
+                Ok(Some(report)) => {
+                    trace.attr("branch", "virtual_directory");
+                    branch.attr("matched", true);
+                    let result = Ok(report);
+                    finish_pull_branch_span(&mut branch, &result);
+                    result
+                }
+                Ok(None) => {
+                    branch.attr("matched", false);
+                    let probe_result: Result<PullReport, PullError> = Ok(PullReport {
+                        ok: true,
+                        command: "pull".to_string(),
+                        via: "trace-probe".to_string(),
+                        mount_id: mount.mount_id.0.clone(),
+                        root: mount.root.display().to_string(),
+                        target: target_path.display().to_string(),
+                        enumerated: 0,
+                        stubbed: 0,
+                        hydrated: 0,
+                        skipped_dirty: 0,
+                        conflicts: Vec::new(),
+                    });
+                    finish_pull_branch_span(&mut branch, &probe_result);
 
-    refresh_visible_projection_after_pull(
-        store,
-        state_root,
-        &target_path,
-        &report,
-        &refresh_bases,
-    )?;
-    Ok(report)
+                    trace.attr("branch", "entity");
+                    let mut entity_branch = start_pull_branch_span(
+                        "pull.branch.entity",
+                        &mount,
+                        &target_path,
+                        &relative_path,
+                    );
+                    let result = pull_entity_path(
+                        store,
+                        &source,
+                        &mount,
+                        &relative_path,
+                        target_path.clone(),
+                        state_root,
+                    );
+                    finish_pull_branch_span(&mut entity_branch, &result);
+                    result
+                }
+                Err(error) => {
+                    let result = Err(error);
+                    finish_pull_branch_span(&mut branch, &result);
+                    result
+                }
+            }
+        }?;
+
+        crate::trace::result("pull.refresh_visible_projection", |span| {
+            span.attr("mount_id", report.mount_id.as_str());
+            span.attr("target_path", target_path.display().to_string());
+            span.attr("hydrated", report.hydrated);
+            span.attr("conflicts", report.conflicts.len());
+            refresh_visible_projection_after_pull(
+                store,
+                state_root,
+                &target_path,
+                &report,
+                &refresh_bases,
+            )
+        })?;
+        trace.attr("enumerated", report.enumerated);
+        trace.attr("stubbed", report.stubbed);
+        trace.attr("hydrated", report.hydrated);
+        trace.attr("skipped_dirty", report.skipped_dirty);
+        trace.attr("conflicts", report.conflicts.len());
+        Ok(report)
+    })
+}
+
+fn start_pull_branch_span(
+    name: &'static str,
+    mount: &MountConfig,
+    target_path: &Path,
+    relative_path: &Path,
+) -> crate::trace::TraceSpan {
+    let mut span = crate::trace::TraceSpan::start(name);
+    span.attr("mount_id", mount.mount_id.0.as_str());
+    span.attr("connector", mount.connector.as_str());
+    span.attr("projection", mount.projection.as_str());
+    span.attr("target_path", target_path.display().to_string());
+    span.attr("relative_path", relative_path.display().to_string());
+    span
+}
+
+fn finish_pull_branch_span(
+    span: &mut crate::trace::TraceSpan,
+    result: &Result<PullReport, PullError>,
+) {
+    match result {
+        Ok(report) => {
+            span.attr("enumerated", report.enumerated);
+            span.attr("stubbed", report.stubbed);
+            span.attr("hydrated", report.hydrated);
+            span.attr("skipped_dirty", report.skipped_dirty);
+            span.attr("conflicts", report.conflicts.len());
+        }
+        Err(_) => span.status("error"),
+    }
 }
 
 fn pull_workspace_virtual_mount_root<S, Source>(
@@ -286,12 +432,17 @@ where
         + locality_store::RemoteObservationRepository,
     Source: SourceAdapter,
 {
-    let entries = source
-        .enumerate(EnumerateRequest {
-            mount_id: mount.mount_id.clone(),
-            cursor: None,
-        })
-        .map_err(PullError::Connector)?;
+    let entries = crate::trace::result("connector.enumerate", |span| {
+        span.attr("mount_id", mount.mount_id.0.as_str());
+        span.attr("connector", mount.connector.as_str());
+        span.attr("reason", "pull_mount_root");
+        source
+            .enumerate(EnumerateRequest {
+                mount_id: mount.mount_id.clone(),
+                cursor: None,
+            })
+            .map_err(PullError::Connector)
+    })?;
     let remote_move_plan = remote_move_plan(store, mount, &entries, state_root)?;
     let mut stubbed = 0;
 
@@ -572,13 +723,24 @@ where
         }
     }
 
-    let result = source
-        .list_children(ListChildrenRequest {
-            mount_id: mount.mount_id.clone(),
-            container: ChildContainer::PageChildren(page.remote_id.clone()),
-            parent_path: page_container_path(&page.path).to_path_buf(),
-        })
-        .map_err(PullError::Connector)?;
+    let result = crate::trace::result("connector.list_children", |span| {
+        span.attr("mount_id", mount.mount_id.0.as_str());
+        span.attr("connector", mount.connector.as_str());
+        span.attr("reason", "pull_page_directory");
+        span.attr("container", "page_children");
+        span.attr("remote_id", page.remote_id.0.as_str());
+        span.attr(
+            "parent_path",
+            page_container_path(&page.path).display().to_string(),
+        );
+        source
+            .list_children(ListChildrenRequest {
+                mount_id: mount.mount_id.clone(),
+                container: ChildContainer::PageChildren(page.remote_id.clone()),
+                parent_path: page_container_path(&page.path).to_path_buf(),
+            })
+            .map_err(PullError::Connector)
+    })?;
     let mut enumerated = result.entries.len();
     let mut child_page_ids = Vec::new();
     for entry in result.entries {
@@ -653,13 +815,20 @@ where
     let recursive_page_hydration =
         matches!(target.container, Some(ChildContainer::PageChildren(_)));
     if let Some(container) = target.container {
-        let result = source
-            .list_children(ListChildrenRequest {
-                mount_id: mount.mount_id.clone(),
-                container,
-                parent_path: target.parent_path.clone(),
-            })
-            .map_err(PullError::Connector)?;
+        let result = crate::trace::result("connector.list_children", |span| {
+            span.attr("mount_id", mount.mount_id.0.as_str());
+            span.attr("connector", mount.connector.as_str());
+            span.attr("reason", "pull_virtual_directory");
+            span.attr("container", format!("{:?}", container));
+            span.attr("parent_path", target.parent_path.display().to_string());
+            source
+                .list_children(ListChildrenRequest {
+                    mount_id: mount.mount_id.clone(),
+                    container,
+                    parent_path: target.parent_path.clone(),
+                })
+                .map_err(PullError::Connector)
+        })?;
         if result.is_complete() {
             let returned_remote_ids = result
                 .entries
@@ -703,9 +872,14 @@ where
     let mut conflicts = Vec::new();
     if let Some(database_id) = target.schema_database_id
         && let Some(state_root) = state_root
-        && let Some(schema) = source
-            .database_schema_yaml(&database_id)
-            .map_err(PullError::Connector)?
+        && let Some(schema) = crate::trace::result("connector.database_schema_yaml", |span| {
+            span.attr("mount_id", mount.mount_id.0.as_str());
+            span.attr("connector", mount.connector.as_str());
+            span.attr("database_id", database_id.0.as_str());
+            source
+                .database_schema_yaml(&database_id)
+                .map_err(PullError::Connector)
+        })?
     {
         let directory = projection_output_root(Some(state_root), mount)?.join(&target.parent_path);
         write_atomic(&directory.join("_schema.yaml"), schema)?;
@@ -787,6 +961,11 @@ where
         + locality_store::RemoteObservationRepository,
     Source: SourceAdapter,
 {
+    let mut trace_span = crate::trace::TraceSpan::start("pull.hydrate_page_descendants");
+    trace_span.attr("mount_id", mount.mount_id.0.as_str());
+    trace_span.attr("connector", mount.connector.as_str());
+    trace_span.attr("seed_count", page_ids.len());
+    trace_span.attr("has_state_root", state_root.is_some());
     let mut report = RecursivePageHydrationReport::default();
 
     for page_id in page_ids {
@@ -817,13 +996,24 @@ where
             }
         }
 
-        let result = source
-            .list_children(ListChildrenRequest {
-                mount_id: mount.mount_id.clone(),
-                container: ChildContainer::PageChildren(page.remote_id.clone()),
-                parent_path: page_container_path(&page.path).to_path_buf(),
-            })
-            .map_err(PullError::Connector)?;
+        let result = crate::trace::result("connector.list_children", |span| {
+            span.attr("mount_id", mount.mount_id.0.as_str());
+            span.attr("connector", mount.connector.as_str());
+            span.attr("reason", "hydrate_page_descendants");
+            span.attr("container", "page_children");
+            span.attr("remote_id", page.remote_id.0.as_str());
+            span.attr(
+                "parent_path",
+                page_container_path(&page.path).display().to_string(),
+            );
+            source
+                .list_children(ListChildrenRequest {
+                    mount_id: mount.mount_id.clone(),
+                    container: ChildContainer::PageChildren(page.remote_id.clone()),
+                    parent_path: page_container_path(&page.path).to_path_buf(),
+                })
+                .map_err(PullError::Connector)
+        })?;
         report.enumerated += result.entries.len();
 
         let mut child_page_ids = Vec::new();
@@ -848,6 +1038,11 @@ where
         report.conflicts.extend(child_report.conflicts);
     }
 
+    trace_span.attr("visited_count", visited.len());
+    trace_span.attr("enumerated", report.enumerated);
+    trace_span.attr("hydrated", report.hydrated);
+    trace_span.attr("skipped_dirty", report.skipped_dirty);
+    trace_span.attr("conflicts", report.conflicts.len());
     Ok(report)
 }
 
@@ -1054,8 +1249,8 @@ where
             continue;
         }
 
-        let source_root = projection_subtree_path(&existing.kind, &existing.path);
-        let destination_root = projection_subtree_path(&entry.kind, &entry.path);
+        let source_root = projection_namespace_root(&existing.kind, &existing.path);
+        let destination_root = projection_namespace_root(&entry.kind, &entry.path);
         let blockers =
             remote_move_blockers(store, mount, state_root, &existing_entities, &source_root)?;
         if blockers.is_empty() {
@@ -1101,7 +1296,7 @@ where
 {
     let mut blockers = Vec::new();
     for entity in existing_entities {
-        let candidate_root = projection_subtree_path(&entity.kind, &entity.path);
+        let candidate_root = projection_namespace_root(&entity.kind, &entity.path);
         if !path_in_projection_subtree(&candidate_root, source_root) {
             continue;
         }
@@ -1144,22 +1339,12 @@ fn should_preserve_for_blocked_move(
         return false;
     }
 
-    let existing_root = projection_subtree_path(&existing.kind, &existing.path);
-    let entry_root = projection_subtree_path(&entry.kind, &entry.path);
+    let existing_root = projection_namespace_root(&existing.kind, &existing.path);
+    let entry_root = projection_namespace_root(&entry.kind, &entry.path);
     blocked_moves.iter().any(|blocked| {
         path_in_projection_subtree(&existing_root, &blocked.source_root)
             && path_in_projection_subtree(&entry_root, &blocked.destination_root)
     })
-}
-
-fn projection_subtree_path(kind: &EntityKind, path: &Path) -> PathBuf {
-    match kind {
-        EntityKind::Page => page_container_path(path),
-        EntityKind::Database
-        | EntityKind::Directory
-        | EntityKind::Asset
-        | EntityKind::Unknown(_) => path.to_path_buf(),
-    }
 }
 
 fn path_in_projection_subtree(path: &Path, subtree: &Path) -> bool {
@@ -1317,76 +1502,160 @@ where
         + locality_store::RemoteObservationRepository,
     Source: SourceAdapter,
 {
-    let path = projection_content_path(state_root, mount, &entity.path)?;
-    let can_replace = can_replace_file(store, mount, &entity, &path)?;
-    let rendered = match source.fetch_render(&HydrationRequest::new(
-        mount.mount_id.clone(),
-        entity.remote_id.clone(),
-        entity.path.clone(),
-        HydrationState::Hydrated,
-        HydrationReason::ExplicitPull,
-    )) {
-        Ok(rendered) => rendered,
-        Err(error) if is_remote_not_found(&error) => {
-            return reconcile_remote_not_found(store, mount, entity, &path, can_replace);
-        }
-        Err(error) => return Err(PullError::Connector(error)),
-    };
-    let media_root = projection_output_root(state_root, mount)?;
-    write_parent_database_schema_cache(store, source, mount, &entity, &media_root)?;
-    write_assets(&media_root, &rendered.assets)?;
+    crate::trace::result("pull.hydrate_entity", |trace| {
+        trace.attr("mount_id", mount.mount_id.0.as_str());
+        trace.attr("connector", mount.connector.as_str());
+        trace.attr("remote_id", entity.remote_id.0.as_str());
+        trace.attr("entity_path", entity.path.display().to_string());
+        trace.attr("entity_kind", format!("{:?}", entity.kind));
+        trace.attr("hydration_before", format!("{:?}", entity.hydration));
+        trace.attr("has_state_root", state_root.is_some());
 
-    if can_replace {
-        accept_remote_projection(store, mount, entity, &path, &media_root, rendered)?;
-        return Ok(HydrationOutcome::Hydrated);
-    }
+        let path = crate::trace::result("pull.hydrate.projection_content_path", |span| {
+            span.attr("mount_id", mount.mount_id.0.as_str());
+            span.attr("entity_path", entity.path.display().to_string());
+            projection_content_path(state_root, mount, &entity.path)
+        })?;
+        trace.attr("content_path", path.display().to_string());
 
-    if file_has_unresolved_conflict_markers(&path)? {
-        let conflict = pull_conflict(mount, &entity);
-        if same_version_shadow_drifted(store, mount, &entity, &rendered)? {
-            return match refresh_existing_conflict(
-                store,
-                mount,
-                entity,
-                &path,
-                &media_root,
-                rendered,
-                true,
-            )? {
-                DirtyRemoteDriftOutcome::Merged => Ok(HydrationOutcome::MergedDirty),
-                DirtyRemoteDriftOutcome::Conflicted => Ok(HydrationOutcome::Conflicted(conflict)),
-            };
-        } else if same_remote_version(&entity, &rendered) {
-            return match refresh_existing_conflict(
-                store,
-                mount,
-                entity,
-                &path,
-                &media_root,
-                rendered,
-                false,
-            )? {
-                DirtyRemoteDriftOutcome::Merged => Ok(HydrationOutcome::MergedDirty),
-                DirtyRemoteDriftOutcome::Conflicted => Ok(HydrationOutcome::Conflicted(conflict)),
-            };
-        }
-        store
-            .save_entity(mark_conflicted_if_allowed(entity))
-            .map_err(PullError::Store)?;
-        return Ok(HydrationOutcome::Conflicted(conflict));
-    } else if !remote_matches_shadow(store, mount, &entity, &rendered.shadow)? {
-        let conflict = pull_conflict(mount, &entity);
-        return match materialize_conflict(store, mount, entity, &path, &media_root, rendered)? {
-            DirtyRemoteDriftOutcome::Merged => Ok(HydrationOutcome::MergedDirty),
-            DirtyRemoteDriftOutcome::Conflicted => Ok(HydrationOutcome::Conflicted(conflict)),
+        let can_replace = crate::trace::result("pull.hydrate.can_replace_file", |span| {
+            span.attr("mount_id", mount.mount_id.0.as_str());
+            span.attr("remote_id", entity.remote_id.0.as_str());
+            span.attr("content_path", path.display().to_string());
+            can_replace_file(store, mount, &entity, &path)
+        })?;
+        trace.attr("can_replace", can_replace);
+
+        let rendered = match crate::trace::result("connector.fetch_render", |span| {
+            span.attr("mount_id", mount.mount_id.0.as_str());
+            span.attr("connector", mount.connector.as_str());
+            span.attr("reason", "explicit_pull");
+            span.attr("remote_id", entity.remote_id.0.as_str());
+            span.attr("entity_path", entity.path.display().to_string());
+            source
+                .fetch_render_with_repository(
+                    &HydrationRequest::new(
+                        mount.mount_id.clone(),
+                        entity.remote_id.clone(),
+                        entity.path.clone(),
+                        HydrationState::Hydrated,
+                        HydrationReason::ExplicitPull,
+                    ),
+                    &*store,
+                )
+                .map_err(PullError::Connector)
+        }) {
+            Ok(rendered) => rendered,
+            Err(PullError::Connector(error)) if is_remote_not_found(&error) => {
+                trace.attr("outcome", "remote_not_found");
+                return reconcile_remote_not_found(store, mount, entity, &path, can_replace);
+            }
+            Err(error) => return Err(error),
         };
-    } else {
-        store
-            .save_entity(mark_dirty_if_allowed(entity))
-            .map_err(PullError::Store)?;
-    }
+        trace.attr("asset_count", rendered.assets.len());
 
-    Ok(HydrationOutcome::SkippedDirty)
+        let media_root = crate::trace::result("pull.hydrate.projection_output_root", |span| {
+            span.attr("mount_id", mount.mount_id.0.as_str());
+            projection_output_root(state_root, mount)
+        })?;
+        trace.attr("media_root", media_root.display().to_string());
+
+        crate::trace::result("pull.hydrate.write_parent_database_schema_cache", |span| {
+            span.attr("mount_id", mount.mount_id.0.as_str());
+            span.attr("remote_id", entity.remote_id.0.as_str());
+            write_parent_database_schema_cache(store, source, mount, &entity, &media_root)
+        })?;
+        crate::trace::result("pull.hydrate.write_assets", |span| {
+            span.attr("mount_id", mount.mount_id.0.as_str());
+            span.attr("remote_id", entity.remote_id.0.as_str());
+            span.attr("asset_count", rendered.assets.len());
+            write_assets(&media_root, &rendered.assets)
+        })?;
+
+        if can_replace {
+            crate::trace::result("pull.hydrate.accept_remote_projection", |span| {
+                span.attr("mount_id", mount.mount_id.0.as_str());
+                span.attr("remote_id", entity.remote_id.0.as_str());
+                span.attr("content_path", path.display().to_string());
+                accept_remote_projection(store, mount, entity, &path, &media_root, rendered)
+            })?;
+            trace.attr("outcome", "hydrated");
+            return Ok(HydrationOutcome::Hydrated);
+        }
+
+        if crate::trace::result("pull.hydrate.check_conflict_markers", |span| {
+            span.attr("content_path", path.display().to_string());
+            file_has_unresolved_conflict_markers(&path)
+        })? {
+            let conflict = pull_conflict(mount, &entity);
+            if same_version_shadow_drifted(store, mount, &entity, &rendered)? {
+                let outcome = refresh_existing_conflict(
+                    store,
+                    mount,
+                    entity,
+                    &path,
+                    &media_root,
+                    rendered,
+                    true,
+                )?;
+                return match outcome {
+                    DirtyRemoteDriftOutcome::Merged => {
+                        trace.attr("outcome", "merged_existing_conflict");
+                        Ok(HydrationOutcome::MergedDirty)
+                    }
+                    DirtyRemoteDriftOutcome::Conflicted => {
+                        trace.attr("outcome", "conflicted_existing_conflict");
+                        Ok(HydrationOutcome::Conflicted(conflict))
+                    }
+                };
+            } else if same_remote_version(&entity, &rendered) {
+                let outcome = refresh_existing_conflict(
+                    store,
+                    mount,
+                    entity,
+                    &path,
+                    &media_root,
+                    rendered,
+                    false,
+                )?;
+                return match outcome {
+                    DirtyRemoteDriftOutcome::Merged => {
+                        trace.attr("outcome", "merged_same_remote_conflict");
+                        Ok(HydrationOutcome::MergedDirty)
+                    }
+                    DirtyRemoteDriftOutcome::Conflicted => {
+                        trace.attr("outcome", "conflicted_same_remote_conflict");
+                        Ok(HydrationOutcome::Conflicted(conflict))
+                    }
+                };
+            }
+            store
+                .save_entity(mark_conflicted_if_allowed(entity))
+                .map_err(PullError::Store)?;
+            trace.attr("outcome", "conflicted_unresolved_markers");
+            return Ok(HydrationOutcome::Conflicted(conflict));
+        } else if !remote_matches_shadow(store, mount, &entity, &rendered.shadow)? {
+            let conflict = pull_conflict(mount, &entity);
+            let outcome = materialize_conflict(store, mount, entity, &path, &media_root, rendered)?;
+            return match outcome {
+                DirtyRemoteDriftOutcome::Merged => {
+                    trace.attr("outcome", "merged_remote_drift");
+                    Ok(HydrationOutcome::MergedDirty)
+                }
+                DirtyRemoteDriftOutcome::Conflicted => {
+                    trace.attr("outcome", "conflicted_remote_drift");
+                    Ok(HydrationOutcome::Conflicted(conflict))
+                }
+            };
+        } else {
+            store
+                .save_entity(mark_dirty_if_allowed(entity))
+                .map_err(PullError::Store)?;
+        }
+
+        trace.attr("outcome", "skipped_dirty");
+        Ok(HydrationOutcome::SkippedDirty)
+    })
 }
 
 fn reconcile_remote_not_found<S>(
@@ -1532,9 +1801,16 @@ where
     let Some(database) = parent_database_entity(store, mount, entity)? else {
         return Ok(());
     };
-    let Some(schema) = source
-        .database_schema_yaml(&database.remote_id)
-        .map_err(PullError::Connector)?
+    let Some(schema) = crate::trace::result("connector.database_schema_yaml", |span| {
+        span.attr("mount_id", mount.mount_id.0.as_str());
+        span.attr("connector", mount.connector.as_str());
+        span.attr("reason", "parent_database_schema_cache");
+        span.attr("database_id", database.remote_id.0.as_str());
+        span.attr("entity_remote_id", entity.remote_id.0.as_str());
+        source
+            .database_schema_yaml(&database.remote_id)
+            .map_err(PullError::Connector)
+    })?
     else {
         return Ok(());
     };
@@ -2127,10 +2403,16 @@ impl PullError {
         match self {
             Self::Connector(locality_core::LocalityError::NotImplemented(_)) => "not_implemented",
             Self::Connector(locality_core::LocalityError::RemoteNotFound(_)) => "remote_not_found",
+            Self::Connector(locality_core::LocalityError::UpdateRequired { .. }) => {
+                "update_required"
+            }
             Self::Connector(locality_core::LocalityError::RateLimited { .. }) => "rate_limited",
             Self::Connector(_) => "connector_error",
             Self::CurrentDir(_) => "current_dir_failed",
             Self::MountNotFound(_) => "mount_not_found",
+            Self::Projection(locality_core::LocalityError::UpdateRequired { .. }) => {
+                "update_required"
+            }
             Self::Projection(_) => "projection_refresh_failed",
             Self::ReadFile { .. } => "read_file_failed",
             Self::Store(StoreError::EntityPathMissing { .. }) => "entity_path_missing",
@@ -2155,6 +2437,24 @@ impl PullError {
                 format!("failed to write `{}`: {message}", path.display())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod update_required_error_code_tests {
+    use locality_core::LocalityError;
+
+    use super::PullError;
+
+    #[test]
+    fn update_required_has_stable_pull_error_code() {
+        let error = PullError::Connector(LocalityError::UpdateRequired {
+            component: "linear:discovery".to_string(),
+            found: 2,
+            supported: 1,
+        });
+
+        assert_eq!(error.code(), "update_required");
     }
 }
 

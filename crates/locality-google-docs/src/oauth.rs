@@ -170,6 +170,7 @@ impl HttpGoogleDocsOAuthBrokerClient {
 pub fn google_docs_capabilities_json() -> Result<String, serde_json::Error> {
     let capabilities = ConnectorCapabilities {
         supports_block_updates: true,
+        supports_entity_body_updates: false,
         supports_databases: false,
         supports_oauth: true,
         supports_remote_observation: true,

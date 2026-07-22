@@ -25,7 +25,7 @@
 | `push` | Explicit push pipeline request/output types, validation/diff/guardrail orchestration, journaled execution hooks, and guardrail evaluation. |
 | `pull` | Polling/relay pull scheduler configuration. |
 | `shadow` | Shadow document snapshots, Markdown block segmentation, stable block hashes, and source spans. |
-| `diff` | Initial block-aware push planner over shadow snapshots and edited canonical documents. |
+| `diff` | Initial block-aware push planner over shadow snapshots and edited canonical documents, including semantic comparison for rendered UUID references such as `Label <uuid>`. |
 | `journal` | Push journal entry and status contracts. |
 | `undo` | Connector-neutral reverse-plan derivation from journaled preimage snapshots. |
 | `error` | Core error categories. |
@@ -80,6 +80,14 @@ The first planner is deliberately conservative:
   natively or, where the remote API lacks a safe reposition primitive, by
   creating a copy at the new position and archiving the old block.
 
+`PushPipelineRequest` selects a body diff mode. `Block` remains the default for
+block-native connectors. `WholeEntity` keeps the same frontmatter property diff
+but emits one `UpdateEntityBody` operation when the rendered body changes,
+which supports sources that expose one opaque Markdown body rather than remote
+blocks. Daemon source policy selects this mode during production push
+preparation. Clearing a whole-entity body is destructive: it requires explicit
+confirmation and is not eligible for Live Mode auto-save.
+
 This is not the final Notion-grade diff engine from `plan.md`; it is the first correct contract surface. Later exact/structural/residual passes can improve the internals while preserving the same `ShadowDocument -> PushPlan` boundary.
 
 ## Push Pipeline And Execution Contract
@@ -106,6 +114,10 @@ Execution prepares the journal before any remote mutation, moves status through 
 
 Each approved operation also receives a deterministic `PushOperationId` derived from the push ID, operation index, operation kind, and target remote ID. Connectors return operation-level `JournalApplyEffect` values after apply. Those effects record durable facts such as updated blocks, archived blocks, and created remote block/entity IDs so resume, reconcile, and undo do not have to infer what happened from the remote alone.
 
+`UpdateEntityBody` has the stable operation name `update_entity_body` and the
+matching `UpdatedEntityBody` journal effect. Connectors must advertise entity
+body update support explicitly; existing connectors default to unsupported.
+
 `ReplaceBlock` is the connector-neutral shape for Markdown edits that change the
 remote block type, such as paragraph to bullet item or heading level changes.
 Connectors should apply it as an in-place semantic replacement: create the new
@@ -127,7 +139,29 @@ Journal entries now include shadow preimages for affected entities. The undo pla
   and native block kind when the preimage carries it, so connectors can avoid
   restoring Markdown lookalikes as the wrong native block type;
 - appends reverse to archiving the created block when apply journaled the created block ID;
-- created entities reverse to archiving the created entity when apply journaled the created entity ID;
-- property updates and archived entities are reported as unsupported until apply journals property/entity preimages.
+- whole-entity body updates carry the pushed body as expected-current state and
+  restore `shadow.rendered_body`;
+- property updates carry expected-current values and restore values parsed from
+  shadow frontmatter, using `Null` only when an updated key was previously absent;
+- entity moves carry expected and previous parent/title values, and block when
+  either previous value is missing;
+- entity archives carry the archived postimage expected after the push
+  (`archived: true` plus the preimage parent, title, properties, and body) and
+  restore the implicit transition from archived to active; they require an
+  entity preimage so the removed local record and projection can be
+  reconstructed and connectors can drift-check before unarchive;
+- created entities reverse to archiving the created entity when apply journaled
+  the created ID, with an optional expected entity state for drift checks.
 
-Undo plans are marked `Complete`, `Partial`, or `Blocked`. A complete plan can now be handed to a connector reverse-apply hook; the Notion connector still returns `NotImplemented` until its API implementation exists.
+Undo plans are marked `Complete`, `Partial`, or `Blocked`. A complete plan can be
+handed to a connector reverse-apply hook. Apply results may include post-undo
+remote observations and must include them for move and entity archive/create
+reversals; move reconciliation uses those observations to relocate the local
+projection before restoring the journaled preimage.
+
+Before remote undo, the host verifies that every local projection it may replace
+or remove is hydrated, has no pending filesystem mutation, and still matches its
+current synced shadow (including any materialized virtual-provider replica).
+Entity move/archive/create reconciliation additionally requires connector
+observations and fails closed on missing, deleted-state, parent, path, or indexed
+path-owner mismatches.

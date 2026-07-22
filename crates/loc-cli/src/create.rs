@@ -17,6 +17,7 @@ use locality_store::{
     VirtualMutationRecord, VirtualMutationRepository,
 };
 use localityd::file_provider;
+use localityd::source::{source_create_decision_for_parent_path, source_display_name};
 use localityd::virtual_fs::virtual_fs_content_path;
 use serde::Serialize;
 
@@ -84,6 +85,15 @@ where
     if mount.read_only {
         return Err(CreateError::ReadOnlyMount {
             mount_id: mount.mount_id.0.clone(),
+        });
+    }
+    let relative_parent = relative_path(mount, &parent)?;
+    let create_decision = source_create_decision_for_parent_path(mount, &relative_parent);
+    if let Some(reason) = create_decision.reason() {
+        return Err(CreateError::ReadOnlySource {
+            mount_id: mount.mount_id.0.clone(),
+            connector: mount.connector.clone(),
+            reason: reason.to_string(),
         });
     }
     if options.private && mount.connector != "notion" {
@@ -258,17 +268,36 @@ where
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CreateError {
-    CurrentDir { message: String },
+    CurrentDir {
+        message: String,
+    },
     InvalidTitle(String),
     MountNotFound(PathBuf),
-    PrivateUnsupported { connector: String },
-    DatabaseUnsupported { connector: String },
-    InvalidParent { path: PathBuf, message: String },
-    ReadOnlyMount { mount_id: String },
+    PrivateUnsupported {
+        connector: String,
+    },
+    DatabaseUnsupported {
+        connector: String,
+    },
+    InvalidParent {
+        path: PathBuf,
+        message: String,
+    },
+    ReadOnlyMount {
+        mount_id: String,
+    },
+    ReadOnlySource {
+        mount_id: String,
+        connector: String,
+        reason: String,
+    },
     VirtualStateRootRequired,
     Store(StoreError),
     TargetExists(PathBuf),
-    WriteFile { path: PathBuf, message: String },
+    WriteFile {
+        path: PathBuf,
+        message: String,
+    },
 }
 
 impl CreateError {
@@ -281,6 +310,7 @@ impl CreateError {
             Self::DatabaseUnsupported { .. } => "database_unsupported",
             Self::InvalidParent { .. } => "invalid_parent",
             Self::ReadOnlyMount { .. } => "read_only_mount",
+            Self::ReadOnlySource { .. } => "read_only_source",
             Self::VirtualStateRootRequired => "virtual_state_root_required",
             Self::Store(_) => "store_error",
             Self::TargetExists(_) => "target_exists",
@@ -308,6 +338,14 @@ impl CreateError {
             }
             Self::ReadOnlyMount { mount_id } => {
                 format!("mount `{mount_id}` is read-only and cannot accept new items")
+            }
+            Self::ReadOnlySource {
+                mount_id,
+                connector,
+                reason,
+            } => {
+                let source = source_display_name(connector);
+                format!("{source} mount `{mount_id}` cannot accept new pages: {reason}")
             }
             Self::VirtualStateRootRequired => {
                 "creating items in virtual mounts requires a Locality state directory".to_string()

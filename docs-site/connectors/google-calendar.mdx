@@ -1,0 +1,93 @@
+---
+title: "Google Calendar connector"
+description: "How primary-calendar events map into Locality."
+---
+
+The Google Calendar connector mounts primary-calendar events as local files and
+uses reviewed draft files to create new events.
+
+## Connect
+
+```bash
+loc connect google-calendar --name google-calendar-default
+```
+
+## Mount
+
+```bash
+loc mount google-calendar ~/Locality/google-calendar-main --projection plain-files
+loc pull ~/Locality/google-calendar-main
+```
+
+Optional explicit date window:
+
+```bash
+loc mount google-calendar ~/Locality/google-calendar-main \
+  --projection plain-files \
+  --after 2026-07-01 \
+  --before 2026-07-31
+```
+
+## Projection
+
+```text
+google-calendar-main/
+  events/
+    2026-07-20-design-review-event-1.md
+  draft/
+```
+
+- `events/` contains read-only primary-calendar event files;
+- `draft/` accepts new Markdown files that create events after review and push;
+- the full Google Calendar event resource is stored under `google_calendar.event`;
+- the Markdown body is the event description.
+
+By default, pull uses a rolling window from 30 days back through 180 days
+forward. Recurring events are expanded in the projection.
+
+## Creating events
+
+Create a Markdown file directly under `draft/`:
+
+```markdown
+---
+summary: Design review
+location: Room 12
+start:
+  dateTime: "2026-07-20T10:00:00-07:00"
+  timeZone: America/Los_Angeles
+end:
+  dateTime: "2026-07-20T10:30:00-07:00"
+  timeZone: America/Los_Angeles
+attendees:
+  - email: ann@example.com
+google_calendar:
+  conference: google_meet
+---
+
+Agenda:
+
+- Review launch scope
+- Confirm owners
+```
+
+Review and push the draft:
+
+```bash
+loc status ~/Locality/google-calendar-main/draft/design-review.md
+loc diff ~/Locality/google-calendar-main/draft/design-review.md
+loc push ~/Locality/google-calendar-main/draft/design-review.md -y
+```
+
+Pushing sends attendee updates. When `google_calendar.conference` is
+`google_meet`, Locality requests a Google Meet link during event creation.
+
+## Current limits
+
+- Only the primary calendar is projected.
+- Existing event files under `events/` are read-only.
+- Remote Google Calendar drafts are not projected.
+- Attachments are rendered as metadata but are not uploaded from Locality
+  drafts in V1.
+- Incremental sync tokens are not persisted; pull uses bounded date-window
+  enumeration.

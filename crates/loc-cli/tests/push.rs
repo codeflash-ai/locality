@@ -102,6 +102,80 @@ fn push_read_only_mount_blocks_write() {
 }
 
 #[test]
+fn push_slack_recent_edit_blocks_before_daemon_apply() {
+    let fixture = PushFixture::new();
+    let mount_id = MountId::new("slack-main");
+    let remote_id = RemoteId::new("slack-recent:C123");
+    let relative_path = "channels/general-C123/recent.md";
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(MountConfig::new(
+            mount_id.clone(),
+            "slack",
+            fixture.root.clone(),
+        ))
+        .expect("save Slack mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                mount_id.clone(),
+                remote_id.clone(),
+                EntityKind::Page,
+                "recent",
+                relative_path,
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save Slack recent entity");
+    store
+        .save_shadow(
+            &mount_id,
+            shadow_for(&remote_id.0, "# general\n\nOriginal Slack line."),
+        )
+        .expect("save Slack shadow");
+    let path = fixture.write_raw(
+        relative_path,
+        &canonical_markdown(&remote_id.0, "# general\n\nEdited Slack line."),
+    );
+    let source = FakePushSource::default();
+
+    let report = run_push_with_daemon(
+        &mut store,
+        &source,
+        &path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: true,
+        },
+    )
+    .expect("push report");
+
+    assert!(!report.ok);
+    assert_eq!(report.action, "fix_validation");
+    assert_eq!(report.pipeline_action, "fix_validation");
+    assert_eq!(report.mount_id, "slack-main");
+    assert_eq!(report.entity_id, "slack-recent:C123");
+    assert!(report.plan.is_none());
+    assert_eq!(report.validation.len(), 1);
+    assert_eq!(report.validation[0].code, "slack_read_only");
+    assert_eq!(report.validation[0].file, relative_path);
+    assert_eq!(report.push_id, None);
+    assert_eq!(report.journal_status, None);
+    assert!(store.list_journal().expect("journal").is_empty());
+    assert_eq!(
+        source.checks.get(),
+        0,
+        "Slack push must not check remote concurrency"
+    );
+    assert_eq!(
+        source.applies.get(),
+        0,
+        "Slack push must not call connector apply"
+    );
+    assert_eq!(push_report_exit_code(&report), 3);
+}
+
+#[test]
 fn push_file_with_conflict_markers_requires_manual_resolution_first() {
     let fixture = PushFixture::new();
     let mut store = fixture.store();

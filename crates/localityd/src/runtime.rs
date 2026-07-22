@@ -21,14 +21,16 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use locality_connector::ConnectorExecutionPolicy;
 use locality_connector::{Connector, ObserveRequest};
 use locality_core::LocalityError;
-use locality_core::canonical::parse_canonical_markdown;
-use locality_core::diff::{BlockDiffEngine, DiffEngine};
+use locality_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
+use locality_core::diff::{BlockDiffEngine, DiffEngine, uuid_reference_ids_from_frontmatter};
 use locality_core::freshness::{
     ChangeHintKind, FreshnessOptimizationPolicy, FreshnessTier, RemoteObservation, SyncJob,
     SyncJobKind,
 };
 use locality_core::hydration::{HydrationPolicy, HydrationReason, HydrationRequest};
-use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
+use locality_core::model::{
+    CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
+};
 use locality_core::planner::PushOperation;
 use locality_core::pull::PullMode;
 use locality_core::shadow::{ShadowDocument, rendered_bodies_equivalent};
@@ -2595,11 +2597,51 @@ impl RuntimeState {
         mount_id: &str,
         container_identifier: &str,
     ) -> bool {
+        if !self.config.background_connector_sync {
+            return false;
+        }
         let key = ChildRefreshKey {
             mount_id: mount_id.to_string(),
             container_identifier: container_identifier.to_string(),
         };
-        self.child_refreshes.contains(&key) || self.active_child_refreshes.contains_key(&key)
+        if self
+            .completed_child_refreshes
+            .get(&key)
+            .is_some_and(|completed_priority| {
+                *completed_priority >= ChildRefreshPriority::Interactive
+            })
+        {
+            return false;
+        }
+        if self.child_refreshes.contains(&key) || self.active_child_refreshes.contains_key(&key) {
+            return true;
+        }
+        self.file_provider_children_needs_initial_discovery(mount_id, container_identifier)
+            .unwrap_or(false)
+    }
+
+    fn file_provider_children_needs_initial_discovery(
+        &self,
+        mount_id: &str,
+        container_identifier: &str,
+    ) -> locality_core::LocalityResult<bool> {
+        let store =
+            SqliteStateStore::open(self.config.state_root.clone()).map_err(LocalityError::from)?;
+        let mount_id = MountId::new(mount_id);
+        if !virtual_fs_children_refresh_needed(&store, &mount_id, container_identifier)? {
+            return Ok(false);
+        }
+        let content_root = virtual_fs_content_root(&self.config.state_root, &mount_id);
+        let report = virtual_fs_children_with_content_root(
+            &store,
+            &content_root,
+            &mount_id,
+            container_identifier,
+        )?;
+        Ok(!report
+            .children
+            .iter()
+            .any(|child| !is_virtual_guidance_child(&child.identifier)))
     }
 
     fn wait_for_file_provider_children_refresh(
@@ -2733,6 +2775,9 @@ impl RuntimeState {
         container_identifier: &str,
         parent_depth: u32,
     ) {
+        if container_identifier.starts_with("batch:") {
+            return;
+        }
         let child_containers = match self
             .child_container_identifiers(mount_id, container_identifier)
         {
@@ -2895,7 +2940,7 @@ impl RuntimeState {
             }
         };
 
-        for hint in remote_fast_forward_discovery_hints(previous_shadow, &current_shadow) {
+        for hint in remote_fast_forward_discovery_hints(&mount, previous_shadow, &current_shadow) {
             match hint {
                 RemoteDiscoveryHint::RefreshChildren {
                     container_identifier,
@@ -3405,16 +3450,28 @@ enum RemoteDiscoveryHint {
 }
 
 fn remote_fast_forward_discovery_hints(
+    mount: &MountConfig,
     previous_shadow: &ShadowDocument,
     current_shadow: &ShadowDocument,
 ) -> Vec<RemoteDiscoveryHint> {
-    if child_page_link_ids(previous_shadow) == child_page_link_ids(current_shadow) {
-        return Vec::new();
+    let mut hints = Vec::new();
+
+    if child_page_link_ids(previous_shadow) != child_page_link_ids(current_shadow) {
+        hints.push(RemoteDiscoveryHint::RefreshChildren {
+            container_identifier: format!("children:{}", current_shadow.entity_id.0),
+        });
     }
 
-    vec![RemoteDiscoveryHint::RefreshChildren {
-        container_identifier: format!("children:{}", current_shadow.entity_id.0),
-    }]
+    if mount.connector == "linear"
+        && frontmatter_uuid_reference_ids(previous_shadow)
+            != frontmatter_uuid_reference_ids(current_shadow)
+    {
+        hints.push(RemoteDiscoveryHint::RefreshChildren {
+            container_identifier: format!("batch:{}", mount.mount_id.0),
+        });
+    }
+
+    hints
 }
 
 fn child_page_link_ids(shadow: &ShadowDocument) -> BTreeSet<RemoteId> {
@@ -3424,6 +3481,13 @@ fn child_page_link_ids(shadow: &ShadowDocument) -> BTreeSet<RemoteId> {
         .filter(|block| block.native_kind.as_deref() == Some("child_page"))
         .map(|block| block.remote_id.clone())
         .collect()
+}
+
+fn frontmatter_uuid_reference_ids(shadow: &ShadowDocument) -> BTreeSet<String> {
+    let document = CanonicalDocument::new(shadow.frontmatter.clone(), shadow.rendered_body.clone());
+    parse_canonical_markdown(&render_canonical_markdown(&document))
+        .map(|parsed| uuid_reference_ids_from_frontmatter(&parsed.frontmatter.properties))
+        .unwrap_or_default()
 }
 
 fn load_persisted_hydrations(state_root: &Path) -> HydrationQueue {
@@ -4026,7 +4090,7 @@ fn run_job(
             respond_to,
         }) => {
             let response = runner.run_virtual_fs_materialize(state_root, mount_id, identifier);
-            let freshness_jobs = response_observe_jobs(&response, ChangeHintKind::FileOpened);
+            let freshness_jobs = response_file_opened_observe_jobs(&response);
             JobCompletion::Response {
                 response,
                 respond_to,
@@ -4040,7 +4104,7 @@ fn run_job(
             respond_to,
         }) => {
             let response = runner.run_file_provider_read(state_root, mount_id, identifier);
-            let freshness_jobs = response_observe_jobs(&response, ChangeHintKind::FileOpened);
+            let freshness_jobs = response_file_opened_observe_jobs(&response);
             JobCompletion::Response {
                 response,
                 respond_to,
@@ -4166,6 +4230,10 @@ fn run_job(
     }
 }
 
+fn is_virtual_guidance_child(identifier: &str) -> bool {
+    identifier.starts_with("guidance:")
+}
+
 fn file_provider_children_response_after_refresh(
     runner: Arc<dyn RuntimeJobRunner>,
     state_root: PathBuf,
@@ -4197,6 +4265,20 @@ fn response_local_edit_observe_jobs(response: &DaemonResponse) -> Vec<SyncJob> {
     }
 
     response_observe_jobs(response, ChangeHintKind::LocalEdited)
+}
+
+fn response_file_opened_observe_jobs(response: &DaemonResponse) -> Vec<SyncJob> {
+    if response
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("outcome"))
+        .and_then(Value::as_str)
+        == Some("hydrated")
+    {
+        return Vec::new();
+    }
+
+    response_observe_jobs(response, ChangeHintKind::FileOpened)
 }
 
 fn response_live_mode_signal_needed(response: &DaemonResponse) -> bool {
@@ -5432,6 +5514,7 @@ fn locality_error_code(error: &LocalityError) -> &'static str {
         LocalityError::RemoteNotFound(_) => "remote_not_found",
         LocalityError::RateLimited { .. } => "rate_limited",
         LocalityError::InvalidState(_) => "invalid_state",
+        LocalityError::UpdateRequired { .. } => "update_required",
         LocalityError::Unsupported(_) => "unsupported",
         LocalityError::NotImplemented(_) => "not_implemented",
         LocalityError::Io(_) => "io_error",
@@ -5464,6 +5547,7 @@ mod tests {
         RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
     };
 
+    use crate::ipc::DaemonResponse;
     use crate::virtual_fs::VirtualFsRefreshChildrenReport;
     use crate::watcher::{FileEvent, FileEventKind};
 
@@ -5471,9 +5555,22 @@ mod tests {
         ActiveChildRefresh, ActiveRuntimeJob, ChildRefreshPriority, ChildRefreshQueue,
         ChildRefreshRequest, DaemonRequest, DefaultRuntimeJobRunner, JobCompletion,
         RemoteDiscoveryHint, RuntimeJobRunner, RuntimeState, child_refresh_retry_delay,
-        execute_file_event, execute_observe_entity_job, observable_remote_identifier,
-        remote_fast_forward_discovery_hints, repair_clean_remote_deleted_projections,
+        execute_file_event, execute_observe_entity_job, locality_error_code,
+        observable_remote_identifier, remote_fast_forward_discovery_hints,
+        repair_clean_remote_deleted_projections, response_file_opened_observe_jobs,
     };
+
+    #[test]
+    fn update_required_has_stable_runtime_error_code() {
+        assert_eq!(
+            locality_error_code(&LocalityError::UpdateRequired {
+                component: "linear:discovery".to_string(),
+                found: 2,
+                supported: 1,
+            }),
+            "update_required"
+        );
+    }
 
     #[test]
     fn child_refresh_queue_promotes_existing_requests() {
@@ -5506,6 +5603,22 @@ mod tests {
         let second = queue.pop_ready(&active).expect("second refresh");
         assert_eq!(second.container_identifier, "children:page-2");
         assert_eq!(second.priority, ChildRefreshPriority::Background);
+    }
+
+    #[test]
+    fn hydrated_materialize_response_does_not_queue_file_opened_observe() {
+        let response = DaemonResponse::ok(serde_json::json!({
+            "mount_id": "slack-main",
+            "identifier": "slack-recent:C123",
+            "remote_id": "slack-recent:C123",
+            "path": "/tmp/slack-main/channels/general-C123/recent.md",
+            "outcome": "hydrated",
+            "hydration": "hydrated"
+        }));
+
+        let jobs = response_file_opened_observe_jobs(&response);
+
+        assert!(jobs.is_empty());
     }
 
     #[test]
@@ -5795,6 +5908,18 @@ mod tests {
     fn file_provider_children_returns_cached_listing_without_pending_discovery() {
         let state_root = temp_runtime_root("runtime-file-provider-children-interactive-discovery");
         seed_virtual_mount(&state_root);
+        {
+            let mut store = SqliteStateStore::open(state_root.clone()).expect("open store");
+            store
+                .save_entity(EntityRecord::new(
+                    MountId::new("notion-main"),
+                    RemoteId::new("page-1"),
+                    EntityKind::Page,
+                    "Roadmap",
+                    "Roadmap/page.md",
+                ))
+                .expect("save cached page");
+        }
         let mut runtime = runtime_state_for_root(state_root.clone());
         runtime.active_job = Some(test_active_job());
 
@@ -6355,11 +6480,12 @@ mod tests {
 
     #[test]
     fn remote_fast_forward_hints_refresh_parent_children_when_child_links_change() {
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/notion-main");
         let previous = shadow_with_child_page_links("page-1", ["child-a"]);
         let current = shadow_with_child_page_links("page-1", ["child-a", "child-b"]);
 
         assert_eq!(
-            remote_fast_forward_discovery_hints(&previous, &current),
+            remote_fast_forward_discovery_hints(&mount, &previous, &current),
             vec![RemoteDiscoveryHint::RefreshChildren {
                 container_identifier: "children:page-1".to_string(),
             }]
@@ -6368,10 +6494,11 @@ mod tests {
 
     #[test]
     fn remote_fast_forward_hints_ignore_unchanged_child_links() {
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/notion-main");
         let previous = shadow_with_child_page_links("page-1", ["child-a"]);
         let current = shadow_with_child_page_links("page-1", ["child-a"]);
 
-        assert!(remote_fast_forward_discovery_hints(&previous, &current).is_empty());
+        assert!(remote_fast_forward_discovery_hints(&mount, &previous, &current).is_empty());
     }
 
     #[test]

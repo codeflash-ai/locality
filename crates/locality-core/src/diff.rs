@@ -9,7 +9,9 @@ use std::path::PathBuf;
 
 use yaml_serde::Value;
 
-use crate::canonical::{parse_canonical_markdown, render_canonical_markdown};
+use crate::canonical::{
+    FrontmatterProperties, parse_canonical_markdown, render_canonical_markdown,
+};
 use crate::model::{CanonicalDocument, RemoteId};
 use crate::planner::{
     PlanDegradation, PlanDegradationKind, PropertyValue, PushOperation, PushPlan,
@@ -178,6 +180,21 @@ pub fn plan_block_diff(
     Ok(PushPlan::new(vec![shadow.entity_id.clone()], operations).with_degradations(degradations))
 }
 
+pub fn plan_whole_entity_diff(
+    shadow: &ShadowDocument,
+    edited: &CanonicalDocument,
+) -> LocalityResult<PushPlan> {
+    let mut operations = property_diff_operations(shadow, edited)?;
+    if !rendered_bodies_equivalent(&shadow.rendered_body, &edited.body) {
+        operations.push(PushOperation::UpdateEntityBody {
+            entity_id: shadow.entity_id.clone(),
+            body: edited.body.clone(),
+        });
+    }
+
+    Ok(PushPlan::new(vec![shadow.entity_id.clone()], operations))
+}
+
 fn property_diff_operations(
     shadow: &ShadowDocument,
     edited: &CanonicalDocument,
@@ -223,7 +240,7 @@ fn property_diff_operations(
     for key in keys {
         let synced_value = synced.frontmatter.properties.get(&key);
         let edited_value = edited.frontmatter.properties.get(&key);
-        if synced_value != edited_value {
+        if !frontmatter_values_semantically_equal(synced_value, edited_value) {
             updates.insert(
                 key.clone(),
                 edited_value
@@ -249,12 +266,14 @@ pub fn property_value_from_frontmatter(value: &Value) -> PropertyValue {
         Value::Bool(value) => PropertyValue::Bool(*value),
         Value::Number(value) => PropertyValue::Number(value.to_string()),
         Value::String(value) => PropertyValue::String(value.clone()),
-        Value::Sequence(values) => PropertyValue::List(
-            values
-                .iter()
-                .filter_map(simple_frontmatter_string)
-                .collect::<Vec<_>>(),
-        ),
+        Value::Sequence(values) => values
+            .iter()
+            .map(simple_frontmatter_string)
+            .collect::<Option<Vec<_>>>()
+            .map(PropertyValue::List)
+            .unwrap_or_else(|| {
+                PropertyValue::Array(values.iter().map(property_value_from_frontmatter).collect())
+            }),
         Value::Mapping(mapping) => PropertyValue::Object(
             mapping
                 .iter()
@@ -275,6 +294,98 @@ fn simple_frontmatter_string(value: &Value) -> Option<String> {
         Value::Bool(value) => Some(value.to_string()),
         _ => None,
     }
+}
+
+fn frontmatter_values_semantically_equal(left: Option<&Value>, right: Option<&Value>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            if left == right {
+                return true;
+            }
+            match (uuid_reference_value(left), uuid_reference_value(right)) {
+                (Some(left), Some(right)) => left == right,
+                _ => false,
+            }
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SemanticUuidReferenceValue {
+    Scalar(String),
+    Sequence(Vec<String>),
+}
+
+pub fn uuid_reference_ids_from_frontmatter(properties: &FrontmatterProperties) -> BTreeSet<String> {
+    properties
+        .values()
+        .flat_map(uuid_reference_ids_from_value)
+        .collect()
+}
+
+fn uuid_reference_ids_from_value(value: &Value) -> BTreeSet<String> {
+    match value {
+        Value::String(value) => canonical_uuid_reference(value).into_iter().collect(),
+        Value::Sequence(values) => values
+            .iter()
+            .flat_map(uuid_reference_ids_from_value)
+            .collect(),
+        Value::Tagged(tagged) => uuid_reference_ids_from_value(&tagged.value),
+        _ => BTreeSet::new(),
+    }
+}
+
+fn uuid_reference_value(value: &Value) -> Option<SemanticUuidReferenceValue> {
+    match value {
+        Value::String(value) => {
+            canonical_uuid_reference(value).map(SemanticUuidReferenceValue::Scalar)
+        }
+        Value::Sequence(values) => values
+            .iter()
+            .map(uuid_reference_scalar)
+            .collect::<Option<Vec<_>>>()
+            .map(SemanticUuidReferenceValue::Sequence),
+        Value::Tagged(tagged) => uuid_reference_value(&tagged.value),
+        _ => None,
+    }
+}
+
+fn uuid_reference_scalar(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => canonical_uuid_reference(value),
+        Value::Tagged(tagged) => uuid_reference_scalar(&tagged.value),
+        _ => None,
+    }
+}
+
+fn canonical_uuid_reference(value: &str) -> Option<String> {
+    let value = value.trim();
+    if is_hyphenated_uuid(value) {
+        return Some(value.to_ascii_lowercase());
+    }
+    let uuid = value.strip_suffix('>')?.rsplit_once('<')?.1.trim();
+    is_hyphenated_uuid(uuid).then(|| uuid.to_ascii_lowercase())
+}
+
+fn is_hyphenated_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (index, byte) in bytes.iter().enumerate() {
+        match index {
+            8 | 13 | 18 | 23 => {
+                if *byte != b'-' {
+                    return false;
+                }
+            }
+            _ if !byte.is_ascii_hexdigit() => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 fn validate_edited_directives(
@@ -1032,4 +1143,62 @@ fn issue(code: impl Into<String>, line: usize, message: impl Into<String>) -> Va
         message,
         Some("restore the directive line exactly or delete it to delete the block".to_string()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::property_value_from_frontmatter;
+    use crate::planner::PropertyValue;
+    use yaml_serde::Value;
+
+    #[test]
+    fn property_value_from_frontmatter_preserves_nested_sequences_for_connector_drafts() {
+        let value: Value = yaml_serde::from_str(
+            r#"
+attendees:
+  - email: ann@example.com
+    optional: true
+reminders:
+  overrides:
+    - method: popup
+      minutes: 10
+"#,
+        )
+        .expect("yaml");
+
+        let converted = property_value_from_frontmatter(&value);
+        let PropertyValue::Object(root) = converted else {
+            panic!("expected root object");
+        };
+        let PropertyValue::Array(attendees) = root.get("attendees").expect("attendees") else {
+            panic!("expected attendees array");
+        };
+        let PropertyValue::Object(attendee) = attendees.first().expect("first attendee") else {
+            panic!("expected attendee object");
+        };
+        assert_eq!(
+            attendee.get("email"),
+            Some(&PropertyValue::String("ann@example.com".to_string()))
+        );
+        assert_eq!(attendee.get("optional"), Some(&PropertyValue::Bool(true)));
+
+        let PropertyValue::Object(reminders) = root.get("reminders").expect("reminders") else {
+            panic!("expected reminders object");
+        };
+        let PropertyValue::Array(overrides) = reminders.get("overrides").expect("overrides") else {
+            panic!("expected reminders overrides array");
+        };
+        let PropertyValue::Object(override_value) = overrides.first().expect("first override")
+        else {
+            panic!("expected override object");
+        };
+        assert_eq!(
+            override_value.get("method"),
+            Some(&PropertyValue::String("popup".to_string()))
+        );
+        assert_eq!(
+            override_value.get("minutes"),
+            Some(&PropertyValue::Number("10".to_string()))
+        );
+    }
 }

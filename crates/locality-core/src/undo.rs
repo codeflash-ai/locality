@@ -5,10 +5,17 @@
 //! not contain enough information to reverse an operation without guessing, the
 //! unsupported reason is part of the plan instead of being hidden.
 
+use std::collections::BTreeMap;
+
 use crate::LocalityResult;
+use crate::canonical::{
+    ParsedCanonicalDocument, parse_canonical_markdown, render_canonical_markdown,
+};
+use crate::diff::property_value_from_frontmatter;
+use crate::freshness::RemoteObservation;
 use crate::journal::{JournalApplyEffect, JournalEntry, PushId};
-use crate::model::{MountId, RemoteId};
-use crate::planner::PushOperation;
+use crate::model::{CanonicalDocument, MountId, RemoteId};
+use crate::planner::{PropertyValue, PushOperation};
 use crate::shadow::{ShadowBlock, ShadowDocument};
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +35,15 @@ pub enum UndoPlanStatus {
     Complete,
     Partial,
     Blocked,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityUndoState {
+    pub parent_id: RemoteId,
+    pub title: String,
+    pub properties: BTreeMap<String, PropertyValue>,
+    pub body: String,
+    pub archived: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +70,30 @@ pub enum UndoOperation {
     },
     ArchiveCreatedEntity {
         entity_id: RemoteId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected: Option<EntityUndoState>,
+    },
+    RestoreEntityBody {
+        entity_id: RemoteId,
+        expected_current: String,
+        previous: String,
+    },
+    RestoreProperties {
+        entity_id: RemoteId,
+        expected_current: BTreeMap<String, PropertyValue>,
+        previous: BTreeMap<String, PropertyValue>,
+    },
+    RestoreEntityLocation {
+        entity_id: RemoteId,
+        expected_parent_id: RemoteId,
+        expected_title: String,
+        previous_parent_id: RemoteId,
+        previous_title: String,
+    },
+    /// Restores the implicit guarded transition from archived=true to false.
+    RestoreArchivedEntity {
+        entity_id: RemoteId,
+        expected: EntityUndoState,
     },
 }
 
@@ -202,39 +242,130 @@ pub fn plan_journal_undo(entry: &JournalEntry) -> UndoPlan {
                 }
             }
             PushOperation::ArchiveEntity { entity_id } => {
-                unsupported.push(UnsupportedUndoOperation::new(
-                    operation_index,
-                    "archive_entity_missing_entity_preimage",
-                    format!(
-                        "cannot restore archived entity `{}` until entity metadata preimages are journaled",
-                        entity_id.0
-                    ),
-                ));
+                match entity_archive_expected_state(entry, entity_id) {
+                    Some(expected) => {
+                        operations.push(UndoOperation::RestoreArchivedEntity {
+                            entity_id: entity_id.clone(),
+                            expected,
+                        });
+                    }
+                    None => unsupported.push(missing_entity_preimage(
+                        operation_index,
+                        entity_id,
+                        "archived entity",
+                    )),
+                }
             }
-            PushOperation::UpdateProperties { entity_id, .. } => {
-                unsupported.push(UnsupportedUndoOperation::new(
-                    operation_index,
-                    "update_properties_missing_property_preimage",
-                    format!(
-                        "cannot restore properties for entity `{}` until property preimages are journaled",
-                        entity_id.0
-                    ),
-                ));
+            PushOperation::UpdateEntityBody { entity_id, body } => {
+                match find_entity_preimage(entry, entity_id) {
+                    Some(shadow) => operations.push(UndoOperation::RestoreEntityBody {
+                        entity_id: entity_id.clone(),
+                        expected_current: body.clone(),
+                        previous: shadow.rendered_body.clone(),
+                    }),
+                    None => unsupported.push(missing_entity_preimage(
+                        operation_index,
+                        entity_id,
+                        "body",
+                    )),
+                }
             }
-            PushOperation::MoveEntity { entity_id, .. } => {
-                unsupported.push(UnsupportedUndoOperation::new(
-                    operation_index,
-                    "move_entity_missing_entity_preimage",
-                    format!(
-                        "cannot restore moved entity `{}` until entity metadata preimages are journaled",
-                        entity_id.0
-                    ),
-                ));
+            PushOperation::UpdateProperties {
+                entity_id,
+                properties,
+            } => {
+                if properties.is_empty() {
+                    unsupported.push(UnsupportedUndoOperation::new(
+                        operation_index,
+                        "update_properties_missing_current_values",
+                        format!(
+                            "cannot restore properties for entity `{}` because the journal does not record the applied values",
+                            entity_id.0
+                        ),
+                    ));
+                    continue;
+                }
+                match previous_property_values(entry, entity_id, properties) {
+                    Some(previous) => operations.push(UndoOperation::RestoreProperties {
+                        entity_id: entity_id.clone(),
+                        expected_current: properties.clone(),
+                        previous,
+                    }),
+                    None => unsupported.push(missing_entity_preimage(
+                        operation_index,
+                        entity_id,
+                        "property",
+                    )),
+                }
             }
-            PushOperation::CreateEntity { .. } | PushOperation::CreateDatabase { .. } => {
+            PushOperation::MoveEntity {
+                entity_id,
+                new_parent_id,
+                new_title,
+                ..
+            } => {
+                match previous_entity_location(entry, entity_id) {
+                    Some((previous_parent_id, previous_title)) => {
+                        operations.push(UndoOperation::RestoreEntityLocation {
+                            entity_id: entity_id.clone(),
+                            expected_parent_id: new_parent_id.clone(),
+                            expected_title: new_title.clone(),
+                            previous_parent_id,
+                            previous_title,
+                        });
+                    }
+                    None => unsupported.push(missing_entity_preimage(
+                        operation_index,
+                        entity_id,
+                        "location",
+                    )),
+                }
+            }
+            PushOperation::CreateEntity {
+                parent_id,
+                title,
+                properties,
+                body,
+                ..
+            } => {
                 match find_created_entity_effect(entry, operation_index) {
                     Some(entity_id) => {
-                        operations.push(UndoOperation::ArchiveCreatedEntity { entity_id });
+                        operations.push(UndoOperation::ArchiveCreatedEntity {
+                            entity_id,
+                            expected: Some(EntityUndoState {
+                                parent_id: parent_id.clone(),
+                                title: title.clone(),
+                                properties: properties.clone(),
+                                body: body.clone(),
+                                archived: false,
+                            }),
+                        });
+                    }
+                    None => unsupported.push(UnsupportedUndoOperation::new(
+                        operation_index,
+                        "create_entity_missing_created_id",
+                        "cannot remove a created entity until apply journals the created remote entity id",
+                    )),
+                }
+            }
+            PushOperation::CreateDatabase {
+                parent_id,
+                title,
+                schema,
+                ..
+            } => {
+                match find_created_entity_effect(entry, operation_index) {
+                    Some(entity_id) => {
+                        operations.push(UndoOperation::ArchiveCreatedEntity {
+                            entity_id,
+                            expected: Some(EntityUndoState {
+                                parent_id: parent_id.clone(),
+                                title: title.clone(),
+                                properties: BTreeMap::new(),
+                                body: schema.clone(),
+                                archived: false,
+                            }),
+                        });
                     }
                     None => unsupported.push(UnsupportedUndoOperation::new(
                         operation_index,
@@ -272,6 +403,7 @@ pub struct UndoApplyRequest<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UndoApplyResult {
     pub changed_remote_ids: Vec<RemoteId>,
+    pub observations: Vec<RemoteObservation>,
 }
 
 /// Hook that applies a complete connector-neutral undo plan remotely.
@@ -291,6 +423,123 @@ fn find_preimage_block<'a>(
             .find(|block| &block.remote_id == block_id)
             .map(|block| (&preimage.shadow, block))
     })
+}
+
+fn find_entity_preimage<'a>(
+    entry: &'a JournalEntry,
+    entity_id: &RemoteId,
+) -> Option<&'a ShadowDocument> {
+    entry
+        .preimages
+        .iter()
+        .find(|preimage| &preimage.entity_id == entity_id)
+        .map(|preimage| &preimage.shadow)
+}
+
+fn parsed_entity_preimage(
+    entry: &JournalEntry,
+    entity_id: &RemoteId,
+) -> Option<ParsedCanonicalDocument> {
+    let shadow = find_entity_preimage(entry, entity_id)?;
+    if shadow.frontmatter.trim().is_empty() {
+        return None;
+    }
+    parse_canonical_markdown(&render_canonical_markdown(&CanonicalDocument::new(
+        shadow.frontmatter.clone(),
+        shadow.rendered_body.clone(),
+    )))
+    .ok()
+}
+
+fn entity_archive_expected_state(
+    entry: &JournalEntry,
+    entity_id: &RemoteId,
+) -> Option<EntityUndoState> {
+    let shadow = find_entity_preimage(entry, entity_id)?;
+    let parsed = parsed_entity_preimage(entry, entity_id)?;
+    let loc = parsed.frontmatter.loc?;
+
+    if loc.id.as_ref() != Some(entity_id)
+        || loc
+            .entity_type
+            .as_ref()
+            .is_none_or(|kind| matches!(kind, crate::model::EntityKind::Unknown(_)))
+    {
+        return None;
+    }
+    let parent_id = loc.parent?;
+    let title = parsed.frontmatter.title?;
+    if title.trim().is_empty() {
+        return None;
+    }
+    let properties = parsed
+        .frontmatter
+        .properties
+        .into_iter()
+        .map(|(key, value)| (key, property_value_from_frontmatter(&value)))
+        .collect();
+    Some(EntityUndoState {
+        parent_id,
+        title,
+        properties,
+        body: shadow.rendered_body.clone(),
+        archived: true,
+    })
+}
+
+fn previous_property_values(
+    entry: &JournalEntry,
+    entity_id: &RemoteId,
+    expected_current: &BTreeMap<String, PropertyValue>,
+) -> Option<BTreeMap<String, PropertyValue>> {
+    let parsed = parsed_entity_preimage(entry, entity_id)?;
+    Some(
+        expected_current
+            .keys()
+            .map(|key| {
+                let previous = if key == "title" {
+                    parsed
+                        .frontmatter
+                        .title
+                        .as_ref()
+                        .map(|title| PropertyValue::String(title.clone()))
+                } else {
+                    parsed
+                        .frontmatter
+                        .properties
+                        .get(key)
+                        .map(property_value_from_frontmatter)
+                }
+                .unwrap_or(PropertyValue::Null);
+                (key.clone(), previous)
+            })
+            .collect(),
+    )
+}
+
+fn previous_entity_location(
+    entry: &JournalEntry,
+    entity_id: &RemoteId,
+) -> Option<(RemoteId, String)> {
+    let parsed = parsed_entity_preimage(entry, entity_id)?;
+    let parent_id = parsed.frontmatter.loc?.parent?;
+    let title = parsed.frontmatter.title?;
+    Some((parent_id, title))
+}
+
+fn missing_entity_preimage(
+    operation_index: usize,
+    entity_id: &RemoteId,
+    preimage_kind: &str,
+) -> UnsupportedUndoOperation {
+    UnsupportedUndoOperation::new(
+        operation_index,
+        "missing_entity_preimage",
+        format!(
+            "cannot restore {preimage_kind} for entity `{}` because the required journaled preimage is missing or incomplete",
+            entity_id.0
+        ),
+    )
 }
 
 fn find_preimage_block_position<'a>(

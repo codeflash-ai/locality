@@ -10,7 +10,13 @@ use loc_cli::mount::{GuidanceFileAction, MountOptions, run_mount};
 use locality_connector::ConnectorCapabilities;
 use locality_core::model::{MountId, RemoteId};
 use locality_gmail::{GMAIL_OAUTH_SCOPES, gmail_capabilities_json};
+use locality_google_calendar::oauth::google_calendar_capabilities_json;
+use locality_google_calendar::{GOOGLE_CALENDAR_OAUTH_SCOPES, StoredGoogleCalendarCredential};
 use locality_platform::{capabilities::projection_cli_value, mount_cli_capabilities};
+use locality_slack::{
+    SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE, SLACK_CONNECTOR_ID, SLACK_OAUTH_SCOPES,
+    slack_capabilities_json,
+};
 use locality_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorProfileRepository, CredentialStore, FileCredentialStore,
@@ -42,14 +48,21 @@ fn mount_writes_agent_guidance_and_claude_alias() {
     assert_eq!(claude, agents);
     assert!(agents.contains("including nested directories"));
     assert!(agents.contains("Browse directories normally"));
-    assert!(agents.contains("push approved changes to Notion"));
-    assert!(agents.contains("loc search <query-or-notion-url>"));
+    assert!(agents.contains("Common Locality CLI workflow:"));
+    assert!(agents.contains("loc search <query>"));
     assert!(agents.contains("Locality hydrates online-only files on open"));
     assert!(agents.contains("loc status <path>"));
+    assert!(agents.contains("loc inspect <path>"));
     assert!(agents.contains("loc diff <path>"));
-    assert!(agents.contains("Use `loc push <path>` to make Notion match local edits"));
+    assert!(agents.contains("loc push <path> -y"));
+    assert!(agents.contains("loc connect <provider> --no-browser"));
+    assert!(agents.contains("ask the user to open it while you wait"));
+    assert!(agents.contains("loc live-mode status <file>"));
+    assert!(agents.contains("loc mv <source> <dest>"));
+    assert!(agents.contains("Push intentional changes with `loc push <path>`"));
     assert!(agents.contains("If desktop Live Mode is on"));
     assert!(agents.contains("Do not run routine `loc pull` or `loc push`"));
+    assert!(agents.contains("remote changed since last sync"));
     assert!(agents.contains("Notion facts:"));
     assert!(agents.contains("Pages are directories"));
     assert!(agents.contains("Edit `page.md` for the page body"));
@@ -62,8 +75,8 @@ fn mount_writes_agent_guidance_and_claude_alias() {
     assert!(agents.contains("database/new-row.md"));
     assert!(agents.contains("`_schema.yaml` files are read-only references"));
     assert!(agents.contains("untrusted remote data"));
-    assert!(agents.lines().count() <= 40);
-    assert!(agents.split_whitespace().count() <= 450);
+    assert!(agents.lines().count() <= 70);
+    assert!(agents.split_whitespace().count() <= 850);
 
     let mounts = store.load_mounts().expect("load mounts");
     assert_eq!(mounts.len(), 1);
@@ -71,16 +84,18 @@ fn mount_writes_agent_guidance_and_claude_alias() {
 }
 
 #[test]
-fn mount_writes_connector_specific_fallback_guidance() {
+fn mount_writes_linear_source_guidance() {
     let fixture = MountFixture::new("loc-cli-mount-generic-guidance");
     let mut store = InMemoryStateStore::new();
 
     fixture.mount_with_connector(&mut store, "linear");
 
     let agents = read_to_string(fixture.agents_file());
-    assert!(agents.contains("# Locality linear Mount"));
-    assert!(agents.contains("projects linear as local Markdown"));
-    assert!(agents.contains("push approved changes to linear"));
+    assert!(agents.contains("# Locality Linear Mount"));
+    assert!(agents.contains("projects Linear as local Markdown"));
+    assert!(agents.contains("Linear facts:"));
+    assert!(agents.contains("read-only lifecycle/date metadata"));
+    assert!(agents.contains("Supported writes are only issue description body edits"));
     assert!(agents.contains("including nested directories"));
 }
 
@@ -325,6 +340,39 @@ fn mount_can_persist_google_docs_workspace_folder() {
 }
 
 #[test]
+fn slack_mount_is_read_only_by_default() {
+    let fixture = MountFixture::new("loc-cli-mount-slack-read-only");
+    let mut store = InMemoryStateStore::new();
+    let settings_json = r#"{"slack":{"history_limit":15,"types":["public_channel","private_channel","im","mpim"],"auto_join_public_channels":true}}"#;
+
+    let report = run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: MountId::new("slack-main"),
+            connector: SLACK_CONNECTOR_ID.to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: None,
+            connection_id: Some(ConnectionId::new("slack-default")),
+            read_only: true,
+            projection: ProjectionMode::PlainFiles,
+            settings_json: settings_json.to_string(),
+        },
+    )
+    .expect("mount slack");
+
+    assert_eq!(report.connector, SLACK_CONNECTOR_ID);
+    assert!(report.read_only);
+    assert_eq!(report.settings_json, settings_json);
+
+    let mount = store
+        .get_mount(&MountId::new("slack-main"))
+        .expect("get mount")
+        .expect("mount");
+    assert!(mount.read_only);
+    assert_eq!(mount.settings_json, settings_json);
+}
+
+#[test]
 fn mount_options_preserve_google_docs_workspace_folder_id_from_resolver() {
     let fixture = MountFixture::new("loc-cli-mount-google-docs-reusable");
     let mut store = InMemoryStateStore::new();
@@ -507,6 +555,340 @@ fn cli_mount_gmail_persists_requested_registration() {
 }
 
 #[test]
+fn cli_mount_slack_persists_requested_read_only_registration() {
+    let fixture = MountFixture::new("loc-cli-slack-mount-registration");
+    fs::create_dir_all(&fixture.root).expect("create fixture root");
+    let state_root = fixture.root.join("state");
+    seed_cli_slack_connection(&state_root, "slack-work");
+
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let mount_root = fixture.root.join("slack");
+    let mount_root_arg = mount_root.display().to_string();
+    let settings_json = r#"{"slack":{"history_limit":15,"types":["public_channel","private_channel","im","mpim"],"auto_join_public_channels":true}}"#;
+
+    let report = loc_json_ok(loc_command(loc, &state_root).args([
+        "mount",
+        "slack",
+        mount_root_arg.as_str(),
+        "--connection",
+        "slack-work",
+        "--mount-id",
+        "slack-main",
+        "--projection",
+        "plain-files",
+        "--history-limit",
+        "15",
+        "--types",
+        "public_channel,private_channel,im,mpim",
+        "--json",
+    ]));
+
+    assert_eq!(report["connector"], SLACK_CONNECTOR_ID, "{report:#?}");
+    assert_eq!(report["remote_root_id"], Value::Null, "{report:#?}");
+    assert_eq!(report["connection_id"], "slack-work", "{report:#?}");
+    assert_eq!(report["mount_id"], "slack-main", "{report:#?}");
+    assert_eq!(report["projection"], "plain_files", "{report:#?}");
+    assert_eq!(report["read_only"], true, "{report:#?}");
+    assert_eq!(report["settings_json"], settings_json, "{report:#?}");
+
+    let store = SqliteStateStore::open(state_root).expect("open state");
+    let mount = store
+        .get_mount(&MountId::new("slack-main"))
+        .expect("load mount")
+        .expect("mount exists");
+    assert_eq!(mount.connector, SLACK_CONNECTOR_ID);
+    assert_eq!(mount.remote_root_id, None);
+    assert_eq!(mount.connection_id, Some(ConnectionId::new("slack-work")));
+    assert_eq!(mount.mount_id, MountId::new("slack-main"));
+    assert_eq!(mount.projection, ProjectionMode::PlainFiles);
+    assert!(mount.read_only);
+    assert_eq!(mount.settings_json, settings_json);
+}
+
+#[test]
+fn cli_mount_slack_rejects_public_channel_mount_without_channels_join_scope() {
+    let fixture = MountFixture::new("loc-cli-slack-auto-join-missing-scope");
+    fs::create_dir_all(&fixture.root).expect("create fixture root");
+    let state_root = fixture.root.join("state");
+    seed_cli_slack_connection_with_scopes(
+        &state_root,
+        "slack-work",
+        slack_scopes_without_auto_join(),
+    );
+
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let mount_root = fixture.root.join("slack");
+    let mount_root_arg = mount_root.display().to_string();
+    let body = loc_json_with_exit(
+        loc_command(loc, &state_root).args([
+            "mount",
+            "slack",
+            mount_root_arg.as_str(),
+            "--connection",
+            "slack-work",
+            "--projection",
+            "plain-files",
+            "--json",
+        ]),
+        2,
+    );
+
+    assert_eq!(body["code"], "slack_auto_join_scope_missing", "{body:#?}");
+    assert!(
+        body["message"]
+            .as_str()
+            .expect("message")
+            .contains("channels:join"),
+        "{body:#?}"
+    );
+}
+
+#[test]
+fn cli_mount_slack_persists_auto_join_public_channels_setting() {
+    let fixture = MountFixture::new("loc-cli-slack-auto-join-setting");
+    fs::create_dir_all(&fixture.root).expect("create fixture root");
+    let state_root = fixture.root.join("state");
+    seed_cli_slack_connection_with_scopes(&state_root, "slack-work", slack_scopes_with_auto_join());
+
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let mount_root = fixture.root.join("slack");
+    let mount_root_arg = mount_root.display().to_string();
+    let report = loc_json_ok(loc_command(loc, &state_root).args([
+        "mount",
+        "slack",
+        mount_root_arg.as_str(),
+        "--connection",
+        "slack-work",
+        "--mount-id",
+        "slack-main",
+        "--projection",
+        "plain-files",
+        "--json",
+    ]));
+
+    assert_eq!(
+        report["settings_json"],
+        r#"{"slack":{"history_limit":15,"types":["public_channel","private_channel","im","mpim"],"auto_join_public_channels":true}}"#
+    );
+
+    let store = SqliteStateStore::open(state_root).expect("open state");
+    let mount = store
+        .get_mount(&MountId::new("slack-main"))
+        .expect("get mount")
+        .expect("mount");
+    assert_eq!(
+        mount.settings_json,
+        r#"{"slack":{"history_limit":15,"types":["public_channel","private_channel","im","mpim"],"auto_join_public_channels":true}}"#
+    );
+}
+
+#[test]
+fn cli_mount_slack_omits_auto_join_when_public_channel_type_is_excluded() {
+    let fixture = MountFixture::new("loc-cli-slack-auto-join-public-excluded");
+    fs::create_dir_all(&fixture.root).expect("create fixture root");
+    let state_root = fixture.root.join("state");
+    seed_cli_slack_connection_with_scopes(&state_root, "slack-work", slack_scopes_with_auto_join());
+
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let mount_root = fixture.root.join("slack");
+    let mount_root_arg = mount_root.display().to_string();
+    let report = loc_json_ok(loc_command(loc, &state_root).args([
+        "mount",
+        "slack",
+        mount_root_arg.as_str(),
+        "--connection",
+        "slack-work",
+        "--mount-id",
+        "slack-main",
+        "--projection",
+        "plain-files",
+        "--types",
+        "im,mpim",
+        "--json",
+    ]));
+
+    assert_eq!(
+        report["settings_json"],
+        r#"{"slack":{"history_limit":15,"types":["im","mpim"]}}"#
+    );
+}
+
+#[test]
+fn cli_mount_slack_rejects_out_of_range_history_limit_before_state_open() {
+    for history_limit in ["0", "999"] {
+        let fixture = MountFixture::new("loc-cli-slack-invalid-history-limit");
+        let state_root = fixture.root.join("state");
+
+        let loc = env!("CARGO_BIN_EXE_loc");
+        let mount_root = fixture.root.join("slack");
+        let mount_root_arg = mount_root.display().to_string();
+
+        let body = loc_json_with_exit(
+            loc_command(loc, &state_root).args([
+                "mount",
+                "slack",
+                mount_root_arg.as_str(),
+                "--connection",
+                "slack-work",
+                "--projection",
+                "plain-files",
+                "--history-limit",
+                history_limit,
+                "--json",
+            ]),
+            2,
+        );
+
+        assert_eq!(body["code"], "slack_history_limit_invalid", "{body:#?}");
+        assert!(
+            !state_root.exists(),
+            "invalid Slack history limit {history_limit} should fail before opening state"
+        );
+    }
+}
+
+#[test]
+fn cli_mount_slack_rejects_non_integer_history_limit_before_state_open() {
+    let fixture = MountFixture::new("loc-cli-slack-non-integer-history-limit");
+    let state_root = fixture.root.join("state");
+
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let mount_root = fixture.root.join("slack");
+    let mount_root_arg = mount_root.display().to_string();
+
+    let body = loc_json_with_exit(
+        loc_command(loc, &state_root).args([
+            "mount",
+            "slack",
+            mount_root_arg.as_str(),
+            "--connection",
+            "slack-work",
+            "--projection",
+            "plain-files",
+            "--history-limit",
+            "abc",
+            "--json",
+        ]),
+        2,
+    );
+
+    assert_eq!(body["code"], "slack_history_limit_invalid", "{body:#?}");
+    assert!(
+        body["message"]
+            .as_str()
+            .expect("message")
+            .contains("integer from 1 to 15"),
+        "{body:#?}"
+    );
+    assert!(
+        !state_root.exists(),
+        "non-integer Slack history limit should fail before opening state"
+    );
+}
+
+#[test]
+fn cli_mount_slack_rejects_invalid_types_before_state_open() {
+    for (types, expected_message) in [
+        (
+            "bogus",
+            "unsupported Slack conversation type `bogus`; supported values:",
+        ),
+        ("", "Slack conversation types must be non-empty"),
+    ] {
+        let fixture = MountFixture::new("loc-cli-slack-invalid-types");
+        let state_root = fixture.root.join("state");
+
+        let loc = env!("CARGO_BIN_EXE_loc");
+        let mount_root = fixture.root.join("slack");
+        let mount_root_arg = mount_root.display().to_string();
+
+        let body = loc_json_with_exit(
+            loc_command(loc, &state_root).args([
+                "mount",
+                "slack",
+                mount_root_arg.as_str(),
+                "--connection",
+                "slack-work",
+                "--projection",
+                "plain-files",
+                "--types",
+                types,
+                "--json",
+            ]),
+            2,
+        );
+
+        assert_eq!(body["code"], "slack_types_invalid", "{body:#?}");
+        assert!(
+            body["message"]
+                .as_str()
+                .expect("message")
+                .contains(expected_message),
+            "{body:#?}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .expect("message")
+                .contains("public_channel,private_channel,im,mpim"),
+            "{body:#?}"
+        );
+        assert!(
+            !state_root.exists(),
+            "invalid Slack types `{types}` should fail before opening state"
+        );
+    }
+}
+
+#[test]
+fn cli_mount_slack_rejects_remote_root_selectors() {
+    let cases: &[&[&str]] = &[
+        &["--workspace"],
+        &["--root-page", "root-page"],
+        &["--workspace-folder", "workspace-folder"],
+    ];
+
+    for forbidden_args in cases {
+        let fixture = MountFixture::new("loc-cli-slack-mount-root-rejection");
+        fs::create_dir_all(&fixture.root).expect("create fixture root");
+        let state_root = fixture.root.join("state");
+        seed_cli_slack_connection(&state_root, "slack-work");
+
+        let loc = env!("CARGO_BIN_EXE_loc");
+        let mount_root = fixture.root.join("slack");
+        let mount_root_arg = mount_root.display().to_string();
+        let mut command = loc_command(loc, &state_root);
+        command.args([
+            "mount",
+            "slack",
+            mount_root_arg.as_str(),
+            "--connection",
+            "slack-work",
+            "--mount-id",
+            "slack-main",
+            "--projection",
+            "plain-files",
+            "--json",
+        ]);
+        command.args(*forbidden_args);
+
+        let output = command.output().expect("run loc mount slack");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            !output.status.success(),
+            "Slack mount accepted forbidden args {forbidden_args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+
+        let store = SqliteStateStore::open(state_root).expect("open state");
+        assert!(
+            store.load_mounts().expect("load mounts").is_empty(),
+            "Slack mount with forbidden args {forbidden_args:?} must not be persisted"
+        );
+    }
+}
+
+#[test]
 fn cli_mount_gmail_persists_date_window_and_thread_view() {
     let fixture = MountFixture::new("loc-cli-gmail-mount-settings");
     fs::create_dir_all(&fixture.root).expect("create fixture root");
@@ -552,6 +934,95 @@ fn cli_mount_gmail_persists_date_window_and_thread_view() {
         mount.settings_json,
         r#"{"gmail":{"date_window":{"after":"2026-07-01","before":"2026-07-15"},"view":"threads"}}"#
     );
+}
+
+#[test]
+fn cli_mount_google_calendar_persists_explicit_date_window_settings() {
+    let fixture = MountFixture::new("loc-cli-google-calendar-mount-settings");
+    fs::create_dir_all(&fixture.root).expect("create fixture root");
+    let state_root = fixture.root.join("state");
+    seed_cli_google_calendar_connection(&state_root, "calendar-work");
+
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let mount_root = fixture.root.join("calendar");
+    let mount_root_arg = mount_root.display().to_string();
+
+    let report = loc_json_ok(loc_command(loc, &state_root).args([
+        "mount",
+        "google-calendar",
+        mount_root_arg.as_str(),
+        "--connection",
+        "calendar-work",
+        "--mount-id",
+        "calendar-main",
+        "--projection",
+        "plain-files",
+        "--after",
+        "2026-07-01",
+        "--before",
+        "2026-07-31",
+        "--json",
+    ]));
+
+    assert_eq!(report["connector"], "google-calendar", "{report:#?}");
+    assert_eq!(
+        report["settings_json"],
+        r#"{"google_calendar":{"date_window":{"after":"2026-07-01","before":"2026-07-31"}}}"#,
+        "{report:#?}"
+    );
+
+    let store = SqliteStateStore::open(state_root).expect("open state");
+    let mount = store
+        .get_mount(&MountId::new("calendar-main"))
+        .expect("load mount")
+        .expect("mount exists");
+    assert_eq!(mount.connector, "google-calendar");
+    assert_eq!(mount.remote_root_id, None);
+    assert_eq!(
+        mount.connection_id,
+        Some(ConnectionId::new("calendar-work"))
+    );
+    assert_eq!(
+        mount.settings_json,
+        r#"{"google_calendar":{"date_window":{"after":"2026-07-01","before":"2026-07-31"}}}"#
+    );
+}
+
+#[test]
+fn cli_mount_google_calendar_rejects_partial_date_window() {
+    for args in [
+        vec!["--after", "2026-07-01"],
+        vec!["--before", "2026-07-31"],
+    ] {
+        let fixture = MountFixture::new("loc-cli-google-calendar-partial-date-window");
+        fs::create_dir_all(&fixture.root).expect("create fixture root");
+        let state_root = fixture.root.join("state");
+        seed_cli_google_calendar_connection(&state_root, "calendar-work");
+        let loc = env!("CARGO_BIN_EXE_loc");
+        let mount_root = fixture.root.join("calendar");
+        let mount_root_arg = mount_root.display().to_string();
+        let mut command = loc_command(loc, &state_root);
+        command.args([
+            "mount",
+            "google-calendar",
+            mount_root_arg.as_str(),
+            "--connection",
+            "calendar-work",
+            "--projection",
+            "plain-files",
+            "--json",
+        ]);
+        command.args(args);
+
+        let output = command.output().expect("run loc mount google-calendar");
+        assert!(!output.status.success());
+        let body: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("json error response");
+        assert_eq!(
+            body["code"],
+            "google_calendar_date_window_requires_after_and_before"
+        );
+    }
 }
 
 #[test]
@@ -821,6 +1292,54 @@ fn cli_mount_gmail_rejects_remote_root_selectors() {
 }
 
 #[test]
+fn cli_mount_google_calendar_rejects_remote_root_selectors() {
+    let cases: &[&[&str]] = &[
+        &["--workspace"],
+        &["--root-page", "root-page"],
+        &["--workspace-folder", "workspace-folder"],
+    ];
+
+    for forbidden_args in cases {
+        let fixture = MountFixture::new("loc-cli-google-calendar-mount-root-rejection");
+        fs::create_dir_all(&fixture.root).expect("create fixture root");
+        let state_root = fixture.root.join("state");
+        seed_cli_google_calendar_connection(&state_root, "calendar-work");
+
+        let loc = env!("CARGO_BIN_EXE_loc");
+        let mount_root = fixture.root.join("calendar");
+        let mount_root_arg = mount_root.display().to_string();
+        let mut command = loc_command(loc, &state_root);
+        command.args([
+            "mount",
+            "google-calendar",
+            mount_root_arg.as_str(),
+            "--connection",
+            "calendar-work",
+            "--mount-id",
+            "calendar-main",
+            "--projection",
+            "plain-files",
+            "--json",
+        ]);
+        command.args(*forbidden_args);
+
+        let output = command.output().expect("run loc mount google-calendar");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            !output.status.success(),
+            "Google Calendar mount accepted forbidden args {forbidden_args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+
+        let store = SqliteStateStore::open(state_root).expect("open state");
+        assert!(
+            store.load_mounts().expect("load mounts").is_empty(),
+            "Google Calendar mount with forbidden args {forbidden_args:?} must not be persisted"
+        );
+    }
+}
+
+#[test]
 fn virtual_mount_rejects_duplicate_mount_point_under_same_root() {
     let fixture = MountFixture::new("loc-cli-duplicate-mount-point");
     let mut store = InMemoryStateStore::new();
@@ -977,6 +1496,7 @@ fn seed_cli_notion_connection(state_root: &Path, connection_id: &str, workspace_
 fn notion_capabilities_json() -> String {
     serde_json::to_string(&ConnectorCapabilities {
         supports_block_updates: true,
+        supports_entity_body_updates: false,
         supports_databases: true,
         supports_oauth: true,
         supports_remote_observation: true,
@@ -1043,6 +1563,170 @@ fn seed_cli_gmail_connection(state_root: &Path, connection_id: &str) {
             expires_at: None,
         })
         .expect("seed Gmail connection");
+}
+
+fn seed_cli_google_calendar_connection(state_root: &Path, connection_id: &str) {
+    fs::create_dir_all(state_root).expect("create state root");
+    let profile_id = ConnectorProfileId::new("google-calendar-oauth-default");
+    let secret_ref = format!("connection:{connection_id}");
+    let credentials = FileCredentialStore::new(state_root);
+    let credential = StoredGoogleCalendarCredential {
+        kind: "oauth".to_string(),
+        connector: "google-calendar".to_string(),
+        access_token: "access-token".to_string(),
+        token_type: Some("Bearer".to_string()),
+        oauth_client_id: Some("google-client-id".to_string()),
+        oauth_broker_url: Some("https://auth.example.test".to_string()),
+        account_id: Some("acct-1".to_string()),
+        account_label: Some(format!("{connection_id}@example.com")),
+        workspace_id: Some("primary".to_string()),
+        workspace_name: Some("Primary Calendar".to_string()),
+        scopes: GOOGLE_CALENDAR_OAUTH_SCOPES
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect(),
+        refresh_token_handle: Some("refresh-handle".to_string()),
+        acquired_at: 1_783_036_800,
+        expires_at: None,
+    };
+    credentials
+        .put(
+            &secret_ref,
+            &serde_json::to_string(&credential).expect("credential json"),
+        )
+        .expect("seed credential");
+
+    let now = "2026-07-03T00:00:00Z".to_string();
+    let capabilities_json =
+        google_calendar_capabilities_json().expect("google calendar capabilities");
+    let scopes = GOOGLE_CALENDAR_OAUTH_SCOPES
+        .iter()
+        .map(|scope| scope.to_string())
+        .collect::<Vec<_>>();
+    let mut store = SqliteStateStore::open(state_root.to_path_buf()).expect("open state");
+    store
+        .save_connector_profile(ConnectorProfileRecord {
+            profile_id: profile_id.clone(),
+            connector: "google-calendar".to_string(),
+            display_name: "Google Calendar OAuth".to_string(),
+            auth_kind: "oauth".to_string(),
+            scopes: scopes.clone(),
+            capabilities_json: capabilities_json.clone(),
+            enabled_actions_json: "[\"read\",\"create\"]".to_string(),
+            connector_version: "google-calendar.v1".to_string(),
+            status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        })
+        .expect("seed Google Calendar profile");
+    store
+        .save_connection(ConnectionRecord {
+            connection_id: ConnectionId::new(connection_id),
+            profile_id: Some(profile_id),
+            connector: "google-calendar".to_string(),
+            display_name: "Google Calendar".to_string(),
+            account_label: Some(format!("{connection_id}@example.com")),
+            workspace_id: Some("primary".to_string()),
+            workspace_name: Some("Primary Calendar".to_string()),
+            auth_kind: "oauth".to_string(),
+            secret_ref,
+            scopes,
+            capabilities_json,
+            status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            expires_at: None,
+        })
+        .expect("seed Google Calendar connection");
+}
+
+fn seed_cli_slack_connection(state_root: &Path, connection_id: &str) {
+    seed_cli_slack_connection_with_scopes(
+        state_root,
+        connection_id,
+        SLACK_OAUTH_SCOPES
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect(),
+    );
+}
+
+fn seed_cli_slack_connection_with_scopes(
+    state_root: &Path,
+    connection_id: &str,
+    scopes: Vec<String>,
+) {
+    fs::create_dir_all(state_root).expect("create state root");
+    let profile_id = ConnectorProfileId::new("slack-oauth-default");
+    let secret_ref = format!("connection:{connection_id}");
+    let credentials = FileCredentialStore::new(state_root);
+    credentials
+        .put(
+            &secret_ref,
+            "{\"connector\":\"slack\",\"access_token\":\"xoxb-test\"}",
+        )
+        .expect("seed credential");
+
+    let now = "2026-07-03T00:00:00Z".to_string();
+    let capabilities_json = slack_capabilities_json().expect("slack capabilities");
+    let mut store = SqliteStateStore::open(state_root.to_path_buf()).expect("open state");
+    store
+        .save_connector_profile(ConnectorProfileRecord {
+            profile_id: profile_id.clone(),
+            connector: SLACK_CONNECTOR_ID.to_string(),
+            display_name: "Slack OAuth".to_string(),
+            auth_kind: "oauth".to_string(),
+            scopes: scopes.clone(),
+            capabilities_json: capabilities_json.clone(),
+            enabled_actions_json: "[\"read\"]".to_string(),
+            connector_version: "slack.v1".to_string(),
+            status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        })
+        .expect("seed Slack profile");
+    store
+        .save_connection(ConnectionRecord {
+            connection_id: ConnectionId::new(connection_id),
+            profile_id: Some(profile_id),
+            connector: SLACK_CONNECTOR_ID.to_string(),
+            display_name: "Slack".to_string(),
+            account_label: Some(format!("{connection_id}@example.com")),
+            workspace_id: Some("slack-workspace".to_string()),
+            workspace_name: Some("Slack".to_string()),
+            auth_kind: "oauth".to_string(),
+            secret_ref,
+            scopes,
+            capabilities_json,
+            status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            expires_at: None,
+        })
+        .expect("seed Slack connection");
+}
+
+fn slack_scopes_with_auto_join() -> Vec<String> {
+    let mut scopes = SLACK_OAUTH_SCOPES
+        .iter()
+        .map(|scope| scope.to_string())
+        .collect::<Vec<_>>();
+    if !scopes
+        .iter()
+        .any(|scope| scope == SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE)
+    {
+        scopes.push(SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE.to_string());
+    }
+    scopes
+}
+
+fn slack_scopes_without_auto_join() -> Vec<String> {
+    SLACK_OAUTH_SCOPES
+        .iter()
+        .copied()
+        .filter(|scope| *scope != SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE)
+        .map(str::to_string)
+        .collect()
 }
 
 fn loc_command(loc: &str, state_root: &Path) -> Command {

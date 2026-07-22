@@ -105,6 +105,37 @@ pub enum DaemonRequest {
     },
 }
 
+impl DaemonRequest {
+    pub fn command_name(&self) -> &'static str {
+        match self {
+            Self::Ping => "ping",
+            Self::Status => "status",
+            Self::DebugQueueStatus => "debug_queue_status",
+            Self::ReloadMounts => "reload_mounts",
+            Self::Shutdown => "shutdown",
+            Self::Pull { .. } => "pull",
+            Self::Push { .. } => "push",
+            Self::Hydrate { .. } => "hydrate",
+            Self::ObserveEntity { .. } => "observe_entity",
+            Self::RemoteFastForward { .. } => "remote_fast_forward",
+            Self::VirtualFsItem { .. } => "virtual_fs_item",
+            Self::VirtualFsChildren { .. } => "virtual_fs_children",
+            Self::VirtualProjectionRootChildren { .. } => "virtual_projection_root_children",
+            Self::VirtualFsMaterialize { .. } => "virtual_fs_materialize",
+            Self::VirtualFsCommitWrite { .. } => "virtual_fs_commit_write",
+            Self::VirtualFsCreateFile { .. } => "virtual_fs_create_file",
+            Self::VirtualFsCreateDirectory { .. } => "virtual_fs_create_directory",
+            Self::VirtualFsRename { .. } => "virtual_fs_rename",
+            Self::VirtualFsTrash { .. } => "virtual_fs_trash",
+            Self::FileProviderItem { .. } => "file_provider_item",
+            Self::FileProviderChildren { .. } => "file_provider_children",
+            Self::FileProviderMaterialize { .. } => "file_provider_materialize",
+            Self::FileProviderRead { .. } => "file_provider_read",
+            Self::FileProviderDomainChildren { .. } => "file_provider_domain_children",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonStatusReport {
     pub status: String,

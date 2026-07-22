@@ -1,6 +1,6 @@
 [package]
 name = "locality-desktop"
-version = "0.3.3"
+version = "0.3.6"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -14,9 +14,11 @@ loc-cli = { path = "../../../crates/loc-cli" }
 locality-connector.workspace = true
 locality-core.workspace = true
 locality-gmail.workspace = true
+locality-google-calendar.workspace = true
 locality-google-docs.workspace = true
 locality-notion.workspace = true
 locality-platform.workspace = true
+locality-slack.workspace = true
 locality-store.workspace = true
 localityd = { path = "../../../crates/localityd" }
 notify = "8"

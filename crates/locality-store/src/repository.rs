@@ -10,7 +10,7 @@ use locality_core::journal::{JournalApplyEffect, JournalEntry, JournalStatus, Pu
 use locality_core::model::{MountId, RemoteId};
 use locality_core::shadow::ShadowDocument;
 
-use crate::error::StoreResult;
+use crate::error::{StoreError, StoreResult};
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorStateRecord, EntityRecord, FreshnessStateRecord,
@@ -78,6 +78,21 @@ pub trait EntityRepository {
 pub struct EntitySearchCandidate {
     pub entity: EntityRecord,
     pub observation: Option<RemoteObservationRecord>,
+    pub search_document: Option<EntitySearchDocument>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EntitySearchDocument {
+    pub title: Option<String>,
+    pub path: Option<String>,
+    pub observed_title: Option<String>,
+    pub observed_path: Option<String>,
+    pub frontmatter: Option<String>,
+    pub body: Option<String>,
+    pub metadata_text: Option<String>,
+    pub breadcrumbs: Option<String>,
+    pub aliases: Option<String>,
+    pub source_url: Option<String>,
 }
 
 pub trait EntitySearchRepository {
@@ -104,6 +119,77 @@ pub trait VirtualMutationRepository {
     fn list_virtual_mutations(&self, mount_id: &MountId)
     -> StoreResult<Vec<VirtualMutationRecord>>;
     fn delete_virtual_mutation(&mut self, mount_id: &MountId, local_id: &str) -> StoreResult<()>;
+}
+
+/// One durable state transition for a virtual filesystem move.
+///
+/// `mutation.content_path` points at the source cache until the filesystem
+/// publishes the destination cache. This makes an interrupted move readable
+/// through either its durable source pointer or its projected destination.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VirtualMoveTransition {
+    pub mutation: VirtualMutationRecord,
+    pub entity: Option<EntityRecord>,
+    pub freshness: Option<FreshnessStateRecord>,
+    pub superseded_local_ids: Vec<String>,
+}
+
+pub trait VirtualMoveRepository {
+    fn begin_virtual_move(&mut self, transition: VirtualMoveTransition) -> StoreResult<()>;
+
+    fn finalize_virtual_move_content(
+        &mut self,
+        mount_id: &MountId,
+        local_id: &str,
+        expected_content_path: Option<&Path>,
+        content_path: std::path::PathBuf,
+        updated_at: &str,
+    ) -> StoreResult<VirtualMutationRecord>;
+}
+
+pub(crate) fn validate_virtual_move_transition(
+    transition: &VirtualMoveTransition,
+) -> StoreResult<()> {
+    let mount_id = &transition.mutation.mount_id;
+    let target_id = transition.mutation.target_remote_id.as_ref();
+    if let Some(entity) = &transition.entity
+        && (&entity.mount_id != mount_id || target_id != Some(&entity.remote_id))
+    {
+        return Err(StoreError::InvalidState(
+            "virtual move entity does not match its mutation target".to_string(),
+        ));
+    }
+    if let Some(freshness) = &transition.freshness
+        && (&freshness.mount_id != mount_id
+            || target_id != Some(&freshness.remote_id)
+            || transition.entity.is_none())
+    {
+        return Err(StoreError::InvalidState(
+            "virtual move freshness does not match its entity".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn virtual_move_missing(mount_id: &MountId, local_id: &str) -> StoreError {
+    StoreError::InvalidState(format!(
+        "virtual move `{local_id}` is missing from mount `{}`",
+        mount_id.0
+    ))
+}
+
+pub(crate) fn virtual_move_content_changed(
+    mount_id: &MountId,
+    local_id: &str,
+    expected: Option<&Path>,
+    actual: Option<&Path>,
+) -> StoreError {
+    StoreError::InvalidState(format!(
+        "virtual move `{local_id}` in mount `{}` changed content path from `{}` to `{}`",
+        mount_id.0,
+        expected.map_or_else(|| "<none>".to_string(), |path| path.display().to_string()),
+        actual.map_or_else(|| "<none>".to_string(), |path| path.display().to_string()),
+    ))
 }
 
 pub trait AutoSaveRepository {
@@ -226,7 +312,7 @@ pub trait JournalRepository {
             if matches!(journal.status, JournalStatus::Reverted) {
                 continue;
             }
-            if !journal_touches_any_entity(&journal, remote_ids) {
+            if !journal.touches_any_entity(remote_ids) {
                 continue;
             }
             if latest
@@ -249,13 +335,7 @@ pub trait JournalRepository {
             if journal.mount_id != *mount_id {
                 continue;
             }
-            if !journal.remote_ids.iter().any(|id| id == remote_id)
-                && !journal
-                    .plan
-                    .affected_entities
-                    .iter()
-                    .any(|id| id == remote_id)
-            {
+            if !journal.touches_any_entity(std::slice::from_ref(remote_id)) {
                 continue;
             }
             if let JournalStatus::Failed(message) = journal.status {
@@ -264,37 +344,6 @@ pub trait JournalRepository {
         }
 
         Ok(latest.map(|(_, message)| message))
-    }
-}
-
-fn journal_touches_any_entity(journal: &JournalEntry, remote_ids: &[RemoteId]) -> bool {
-    journal
-        .remote_ids
-        .iter()
-        .any(|id| remote_ids.iter().any(|target| target == id))
-        || journal
-            .plan
-            .affected_entities
-            .iter()
-            .any(|id| remote_ids.iter().any(|target| target == id))
-        || journal
-            .apply_effects
-            .iter()
-            .any(|effect| apply_effect_touches_any_entity(effect, remote_ids))
-}
-
-fn apply_effect_touches_any_entity(effect: &JournalApplyEffect, remote_ids: &[RemoteId]) -> bool {
-    match effect {
-        JournalApplyEffect::ArchivedEntity { entity_id, .. }
-        | JournalApplyEffect::UpdatedProperties { entity_id, .. }
-        | JournalApplyEffect::MovedEntity { entity_id, .. }
-        | JournalApplyEffect::CreatedEntity { entity_id, .. } => {
-            remote_ids.iter().any(|target| target == entity_id)
-        }
-        JournalApplyEffect::UpdatedBlock { .. }
-        | JournalApplyEffect::CreatedBlock { .. }
-        | JournalApplyEffect::MovedBlock { .. }
-        | JournalApplyEffect::ArchivedBlock { .. } => false,
     }
 }
 

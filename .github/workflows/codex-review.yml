@@ -1,0 +1,318 @@
+name: codex-review
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  issue_comment:
+    types:
+      - created
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-review-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Codex review
+    if: >
+      (
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.draft == false &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      ) ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+        contains(github.event.comment.body, '@codex review')
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      pr_number: ${{ steps.pr.outputs.number }}
+    steps:
+      - name: Resolve pull request
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          COMMENT_BODY: ${{ github.event.comment.body || '' }}
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          EVENT_BASE_REF: ${{ github.event.pull_request.base.ref || '' }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha || '' }}
+        run: |
+          pr_number="$EVENT_PR_NUMBER"
+          should_review=true
+          skip_message=""
+
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
+            comment_lower="$(printf '%s' "$COMMENT_BODY" | tr '[:upper:]' '[:lower:]')"
+            if [[ "$comment_lower" != *"@codex review"* ]]; then
+              should_review=false
+              skip_message="Codex review skipped because the comment did not include @codex review."
+            fi
+          fi
+
+          if [ "$should_review" = true ]; then
+            pr_json="$RUNNER_TEMP/pr.json"
+            gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number" > "$pr_json"
+            draft="$(jq -r '.draft' "$pr_json")"
+            head_repo="$(jq -r '.head.repo.full_name' "$pr_json")"
+            base_ref="$(jq -r '.base.ref' "$pr_json")"
+            base_sha="$(jq -r '.base.sha' "$pr_json")"
+            head_sha="$(jq -r '.head.sha' "$pr_json")"
+
+            if [ "$draft" = "true" ]; then
+              should_review=false
+              skip_message="Codex review skipped because this pull request is still a draft."
+            elif [ "$head_repo" != "$GITHUB_REPOSITORY" ]; then
+              should_review=false
+              skip_message="Codex review skipped because this workflow only reviews same-repository pull requests."
+            fi
+          else
+            base_ref="$EVENT_BASE_REF"
+            base_sha="$EVENT_BASE_SHA"
+            head_sha="$EVENT_HEAD_SHA"
+          fi
+
+          {
+            echo "number=$pr_number"
+            echo "base_ref=$base_ref"
+            echo "base_sha=$base_sha"
+            echo "head_sha=$head_sha"
+            echo "should_review=$should_review"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$should_review" != true ]; then
+            {
+              printf '%s\n\n' "$skip_message"
+              printf 'No Codex review was run.\n'
+            } > codex-review.md
+          fi
+
+      - uses: actions/checkout@v5
+        if: steps.pr.outputs.should_review == 'true'
+        with:
+          ref: ${{ steps.pr.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare review refs
+        if: steps.pr.outputs.should_review == 'true'
+        env:
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          git fetch --no-tags origin \
+            "$BASE_REF:refs/remotes/origin/$BASE_REF" \
+            "+refs/pull/$PR_NUMBER/head:refs/remotes/pull/$PR_NUMBER/head"
+
+      - name: Prepare review prompt
+        id: prompt
+        if: steps.pr.outputs.should_review == 'true'
+        env:
+          BASE_SHA: ${{ steps.pr.outputs.base_sha }}
+          PROMPT_PATH: .github/codex/prompts/review.md
+        run: |
+          prompt_target="$RUNNER_TEMP/codex-review-prompt.md"
+          if git cat-file -e "$BASE_SHA:$PROMPT_PATH" 2>/dev/null; then
+            git show "$BASE_SHA:$PROMPT_PATH" > "$prompt_target"
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "CODEX_REVIEW_PROMPT=$prompt_target" >> "$GITHUB_ENV"
+          else
+            cat > codex-review.md <<'MSG'
+          Codex review skipped for this bootstrap PR because the trusted review prompt does not exist on the base branch yet.
+
+          After this workflow lands on `main`, future non-draft same-repository pull requests will be reviewed automatically.
+          MSG
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve Codex Azure config
+        id: codex_config
+        if: steps.prompt.outputs.available == 'true'
+        env:
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          CODEX_CONFIG_TOML: ${{ secrets.CODEX_CONFIG_TOML }}
+        run: |
+          if [ -z "$AZURE_OPENAI_API_KEY" ]; then
+            echo "::error::Set the AZURE_OPENAI_API_KEY repository or organization secret to enable Codex PR review."
+            exit 1
+          fi
+          if [ -z "$CODEX_CONFIG_TOML" ]; then
+            echo "::error::Set the CODEX_CONFIG_TOML repository or organization secret to enable Codex PR review."
+            exit 1
+          fi
+          python3 - <<'PY'
+          import os
+          import sys
+          import tomllib
+          from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+          config = tomllib.loads(os.environ["CODEX_CONFIG_TOML"])
+          providers = config.get("model_providers", {})
+          provider_name = config.get("model_provider")
+          provider = providers.get(provider_name) if provider_name else None
+
+          if not provider or provider.get("env_key") != "AZURE_OPENAI_API_KEY":
+              provider = next(
+                  (
+                      candidate
+                      for candidate in providers.values()
+                      if candidate.get("env_key") == "AZURE_OPENAI_API_KEY"
+                  ),
+                  None,
+              )
+
+          if not provider:
+              print(
+                  "::error::CODEX_CONFIG_TOML must include an Azure model provider "
+                  "with env_key = \"AZURE_OPENAI_API_KEY\".",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          base_url = str(provider.get("base_url", "")).strip()
+          if not base_url:
+              print("::error::Azure model provider must define base_url.", file=sys.stderr)
+              sys.exit(1)
+
+          parts = urlsplit(base_url)
+          path = parts.path.rstrip("/")
+          if path.endswith("/responses"):
+              endpoint_path = path
+          elif path.endswith("/v1"):
+              endpoint_path = f"{path}/responses"
+          else:
+              endpoint_path = f"{path}/v1/responses"
+
+          query = dict(parse_qsl(parts.query, keep_blank_values=True))
+          query.update({str(k): str(v) for k, v in provider.get("query_params", {}).items()})
+          endpoint = urlunsplit(
+              (parts.scheme, parts.netloc, endpoint_path, urlencode(query), "")
+          )
+          model = str(config.get("model", "")).strip()
+
+          print(f"::add-mask::{endpoint}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"endpoint={endpoint}", file=output)
+              if model:
+                  print(f"model={model}", file=output)
+          PY
+
+      - name: Run Codex review
+        id: codex
+        if: steps.prompt.outputs.available == 'true'
+        uses: openai/codex-action@v1
+        env:
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          BASE_SHA: ${{ steps.pr.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        with:
+          openai-api-key: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          responses-api-endpoint: ${{ steps.codex_config.outputs.endpoint }}
+          model: ${{ steps.codex_config.outputs.model }}
+          prompt-file: ${{ env.CODEX_REVIEW_PROMPT }}
+          output-file: codex-review.md
+          permission-profile: ":read-only"
+          safety-strategy: drop-sudo
+
+      - name: Ensure review output exists
+        if: ${{ always() && steps.prompt.outputs.available == 'true' && hashFiles('codex-review.md') == '' }}
+        run: |
+          echo "Codex review produced no output. Check the workflow logs for details." > codex-review.md
+
+      - name: Upload review output
+        if: ${{ always() && hashFiles('codex-review.md') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-review-${{ steps.pr.outputs.number }}
+          path: codex-review.md
+          if-no-files-found: error
+          retention-days: 7
+
+  comment:
+    name: Codex review comment
+    needs: review
+    if: >
+      always() &&
+      needs.review.result == 'success' &&
+      needs.review.outputs.pr_number != ''
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Download review output
+        uses: actions/download-artifact@v4
+        with:
+          name: codex-review-${{ needs.review.outputs.pr_number }}
+          path: codex-review-output
+
+      - name: Upsert review comment
+        uses: actions/github-script@v7
+        env:
+          CODEX_REVIEW_FILE: codex-review-output/codex-review.md
+          PR_NUMBER: ${{ needs.review.outputs.pr_number }}
+        with:
+          script: |
+            const fs = require("fs");
+
+            const marker = "<!-- codex-review -->";
+            const reviewPath = process.env.CODEX_REVIEW_FILE;
+            const review = fs.readFileSync(reviewPath, "utf8").trim();
+
+            if (!review) {
+              core.info("Codex review output was empty; skipping comment.");
+              return;
+            }
+
+            const maxBodyLength = 65000;
+            let body = `${marker}\n## Codex review\n\n${review}`;
+
+            if (body.length > maxBodyLength) {
+              body =
+                `${body.slice(0, maxBodyLength - 96)}\n\n` +
+                "_Output truncated. See the workflow logs for the full review._";
+            }
+
+            const { owner, repo } = context.repo;
+            const issue_number = Number(process.env.PR_NUMBER);
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number, per_page: 100 },
+            );
+            const previous = comments.find(
+              (comment) =>
+                comment.user.type === "Bot" &&
+                comment.body &&
+                comment.body.includes(marker),
+            );
+
+            if (previous) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: previous.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body,
+              });
+            }
