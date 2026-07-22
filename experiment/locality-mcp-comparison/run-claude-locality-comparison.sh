@@ -101,8 +101,8 @@ REMOTE_CWDS=(
 )
 
 PROMPTS=(
-  "i want you to analyze the progress made by different team members from July 15 to July 21 in the year 2025 on the repo codeflash-ai/codeflash , read the linear issues for that time range and read the notion doc named 'Company' and create a notion doc in the page title \`Locality Launch\` which summarizes your findings."
-  "i want you to analyze the progress made by different team members from July 15 to July 21 in the year 2025 on the repo codeflash-ai/codeflash , read the linear issues for that time range and read the notion doc named 'Company' and create a notion doc in the page title \`Locality Launch\` which summarizes your findings. use \`loc\` exclusively to fulfil the tasks, do not rely on notion or linear mcp or api calls."
+  "i want you to analyze the progress made by different team members from July 15 to July 21 in the year 2025 on the repo codeflash-ai/codeflash , read the linear issues for that time range and read the notion doc named 'Company' and create a notion doc in the page title \`Locality Launch\` followed by the current date and time in the title to distinguish it which summarizes your findings."
+  "i want you to analyze the progress made by different team members from July 15 to July 21 in the year 2025 on the repo codeflash-ai/codeflash , read the linear issues for that time range and read the notion doc named 'Company' and create a notion doc in the page title \`Locality Launch\` followed by the current date and time in the title to distinguish it which summarizes your findings. use \`loc\` , \`git\` and \`gh\` to fulfil the tasks, do not rely on notion or linear mcp or api calls."
 )
 
 shell_quote() {
