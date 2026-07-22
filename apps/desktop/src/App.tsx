@@ -4266,6 +4266,29 @@ function sourceConnectionStatusReady(status: string) {
   return normalized === "active" || normalized === "ready";
 }
 
+function sourceDefaultPathPrefix() {
+  return isMacRuntime() ? "~/Library/CloudStorage/Locality" : "~/Locality";
+}
+
+function sourceDefaultMountDirectory(connector: SourceConnectorId) {
+  switch (connector) {
+    case "notion":
+      return "notion";
+    case "google-docs":
+      return "google-docs-main";
+    case "google-calendar":
+      return "google-calendar-main";
+    case "gmail":
+      return "gmail-main";
+    case "granola":
+      return "granola";
+    case "linear":
+      return "linear";
+    case "slack":
+      return "slack";
+  }
+}
+
 function sourceDefaultPath(snapshot: DesktopSnapshot, connector: SourceConnectorId) {
   const existing = snapshot.mounts.find((mount) => mount.connector === connector)?.localPath;
   if (existing?.trim()) {
@@ -4277,24 +4300,9 @@ function sourceDefaultPath(snapshot: DesktopSnapshot, connector: SourceConnector
     snapshot.mount.status !== "not_mounted" &&
     snapshot.mount.localPath.trim()
   ) {
-    return snapshot.mount.localPath;
+      return snapshot.mount.localPath;
   }
-  switch (connector) {
-    case "notion":
-      return "~/Library/CloudStorage/Locality/notion";
-    case "google-docs":
-      return "~/Library/CloudStorage/Locality/google-docs-main";
-    case "google-calendar":
-      return "~/Library/CloudStorage/Locality/google-calendar-main";
-    case "gmail":
-      return "~/Library/CloudStorage/Locality/gmail-main";
-    case "granola":
-      return "~/Library/CloudStorage/Locality/granola";
-    case "linear":
-      return "~/Library/CloudStorage/Locality/linear";
-    case "slack":
-      return "~/Library/CloudStorage/Locality/slack";
-  }
+  return `${sourceDefaultPathPrefix()}/${sourceDefaultMountDirectory(connector)}`;
 }
 
 function sourceActionLabel(
@@ -6184,7 +6192,7 @@ function SettingsView({
                 busy={busySetting === "show_menu_bar"}
                 onToggle={(enabled) => void updateDesktopSetting("show_menu_bar", enabled)}
               />
-              <SettingRow title="Default Notion folder" value="~/Library/CloudStorage/Locality/notion" />
+              <SettingRow title="Default Notion folder" value={`${sourceDefaultPathPrefix()}/notion`} />
               {settingsMessage && <p className="quiet-note inline-note">{settingsMessage}</p>}
             </section>
           )}
@@ -7807,6 +7815,10 @@ function handleChromeMouseDown(event: React.MouseEvent<HTMLDivElement>) {
 
 function isWindowsRuntime() {
   return typeof navigator !== "undefined" && /^Win/i.test(navigator.platform);
+}
+
+function isMacRuntime() {
+  return typeof navigator !== "undefined" && /^Mac/i.test(navigator.platform);
 }
 
 function SetupContent({

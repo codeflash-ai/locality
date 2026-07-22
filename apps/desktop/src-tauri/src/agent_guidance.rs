@@ -9,7 +9,6 @@ use serde_json::{Map, Value, json};
 
 const MANAGED_START: &str = "<!-- LOCALITY_AGENT_GUIDANCE_START -->";
 const MANAGED_END: &str = "<!-- LOCALITY_AGENT_GUIDANCE_END -->";
-const DEFAULT_LOCALITY_ROOT: &str = "~/Library/CloudStorage/Locality";
 const MCP_SERVER_NAME: &str = "loc";
 const SKILL_DIR_NAME: &str = "locality";
 
@@ -845,16 +844,35 @@ fn remove_managed_section(existing: &str) -> String {
 }
 
 fn normalized_mount_path(mount_path: Option<&str>) -> String {
-    let trimmed = mount_path
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .unwrap_or(DEFAULT_LOCALITY_ROOT)
-        .trim_end_matches('/');
+    let default_root;
+    let trimmed = match mount_path.map(str::trim).filter(|path| !path.is_empty()) {
+        Some(path) => path,
+        None => {
+            default_root = default_locality_root();
+            &default_root
+        }
+    }
+    .trim_end_matches('/');
     if trimmed.is_empty() {
         "/".to_string()
     } else {
         trimmed.to_string()
     }
+}
+
+#[cfg(target_os = "macos")]
+fn default_locality_root() -> String {
+    let root = home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Library")
+        .join("CloudStorage")
+        .join("Locality");
+    display_path(&root)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_locality_root() -> String {
+    display_path(&locality_platform::default_mount_root())
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -1098,6 +1116,10 @@ mod tests {
 
     #[test]
     fn normalized_blank_mount_path_uses_default_locality_root() {
+        assert_eq!(normalized_mount_path(Some("  ")), default_locality_root());
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(normalized_mount_path(Some("  ")), "~/Locality");
+        #[cfg(target_os = "macos")]
         assert_eq!(
             normalized_mount_path(Some("  ")),
             "~/Library/CloudStorage/Locality"
