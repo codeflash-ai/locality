@@ -36,11 +36,60 @@ pub trait HydrationEngine {
 pub trait HydrationSource {
     fn fetch_render(&self, request: &HydrationRequest) -> LocalityResult<HydratedEntity>;
 
+    fn fetch_render_with_repository(
+        &self,
+        request: &HydrationRequest,
+        _repository: &dyn HydrationRepository,
+    ) -> LocalityResult<HydratedEntity> {
+        self.fetch_render(request)
+    }
+
     fn fetch_database_schema_yaml(
         &self,
         _database_id: &RemoteId,
     ) -> LocalityResult<Option<String>> {
         Ok(None)
+    }
+}
+
+pub trait HydrationRepository {
+    fn entity_record(
+        &self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> LocalityResult<Option<EntityRecord>>;
+
+    fn entity_record_by_path(
+        &self,
+        mount_id: &MountId,
+        path: &Path,
+    ) -> LocalityResult<Option<EntityRecord>>;
+
+    fn entity_records(&self, mount_id: &MountId) -> LocalityResult<Vec<EntityRecord>>;
+}
+
+impl<T> HydrationRepository for T
+where
+    T: EntityRepository,
+{
+    fn entity_record(
+        &self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> LocalityResult<Option<EntityRecord>> {
+        EntityRepository::get_entity(self, mount_id, remote_id).map_err(LocalityError::from)
+    }
+
+    fn entity_record_by_path(
+        &self,
+        mount_id: &MountId,
+        path: &Path,
+    ) -> LocalityResult<Option<EntityRecord>> {
+        EntityRepository::find_entity_by_path(self, mount_id, path).map_err(LocalityError::from)
+    }
+
+    fn entity_records(&self, mount_id: &MountId) -> LocalityResult<Vec<EntityRecord>> {
+        EntityRepository::list_entities(self, mount_id).map_err(LocalityError::from)
     }
 }
 
@@ -147,7 +196,10 @@ where
 
         let mut render_request = request.clone();
         render_request.path = entity.path.clone();
-        let rendered = match self.source.fetch_render(&render_request) {
+        let rendered = match self
+            .source
+            .fetch_render_with_repository(&render_request, &*self.store)
+        {
             Ok(rendered) => rendered,
             Err(error) if is_remote_not_found(&error) => {
                 return self.reconcile_remote_not_found(&mount, entity, &path, can_replace);
@@ -801,16 +853,20 @@ pub(crate) fn write_hydrated_asset_files(
         let path = mount_relative_path(output_root, &asset.path)?;
         write_binary_atomic(&path, &asset.bytes)?;
     }
-    prune_stale_gmail_attachment_assets(output_root, assets)
+    prune_stale_attachment_assets(output_root, assets, ".loc/gmail/attachments", "Gmail")?;
+    prune_stale_attachment_assets(output_root, assets, ".loc/linear/attachments", "Linear")
 }
 
-fn prune_stale_gmail_attachment_assets(
+fn prune_stale_attachment_assets(
     output_root: &Path,
     assets: &[HydratedAsset],
+    root: &str,
+    label: &str,
 ) -> LocalityResult<()> {
     let mut keep_by_parent: BTreeMap<PathBuf, BTreeSet<OsString>> = BTreeMap::new();
     for asset in assets {
-        let Some((parent, filename)) = gmail_attachment_asset_parent_and_filename(&asset.path)
+        let Some((parent, filename)) =
+            attachment_asset_parent_and_filename(&asset.path, Path::new(root))
         else {
             continue;
         };
@@ -824,7 +880,7 @@ fn prune_stale_gmail_attachment_assets(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 return Err(LocalityError::Io(format!(
-                    "failed to read Gmail attachment cache directory `{}`: {error}",
+                    "failed to read {label} attachment cache directory `{}`: {error}",
                     absolute_parent.display()
                 )));
             }
@@ -833,7 +889,7 @@ fn prune_stale_gmail_attachment_assets(
         for entry in entries {
             let entry = entry.map_err(|error| {
                 LocalityError::Io(format!(
-                    "failed to read Gmail attachment cache entry in `{}`: {error}",
+                    "failed to read {label} attachment cache entry in `{}`: {error}",
                     absolute_parent.display()
                 ))
             })?;
@@ -843,14 +899,14 @@ fn prune_stale_gmail_attachment_assets(
             }
             let file_type = entry.file_type().map_err(|error| {
                 LocalityError::Io(format!(
-                    "failed to inspect Gmail attachment cache entry `{}`: {error}",
+                    "failed to inspect {label} attachment cache entry `{}`: {error}",
                     entry.path().display()
                 ))
             })?;
             if file_type.is_file() {
                 std::fs::remove_file(entry.path()).map_err(|error| {
                     LocalityError::Io(format!(
-                        "failed to remove stale Gmail attachment cache file `{}`: {error}",
+                        "failed to remove stale {label} attachment cache file `{}`: {error}",
                         entry.path().display()
                     ))
                 })?;
@@ -861,12 +917,12 @@ fn prune_stale_gmail_attachment_assets(
     Ok(())
 }
 
-fn gmail_attachment_asset_parent_and_filename(path: &Path) -> Option<(PathBuf, OsString)> {
-    if !path.starts_with(Path::new(".loc/gmail/attachments")) {
+fn attachment_asset_parent_and_filename(path: &Path, root: &Path) -> Option<(PathBuf, OsString)> {
+    if !path.starts_with(root) {
         return None;
     }
     let parent = path.parent()?.to_path_buf();
-    if parent == Path::new(".loc/gmail/attachments") {
+    if parent == root {
         return None;
     }
     let filename = path.file_name()?.to_os_string();

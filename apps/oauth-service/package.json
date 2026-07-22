@@ -24,6 +24,9 @@
   "overrides": {
     "sharp": "^0.35.3"
   },
+  "overrides": {
+    "sharp": "0.35.3"
+  },
   "engines": {
     "node": ">=22"
   }

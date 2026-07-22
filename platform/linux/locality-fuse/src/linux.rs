@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -304,6 +304,22 @@ fn read_virtual_bytes(identifier: &str, offset: u64, size: u32) -> Option<Bytes>
     let start = offset.min(bytes.len() as u64) as usize;
     let end = (start + size as usize).min(bytes.len());
     Some(Bytes::copy_from_slice(&bytes[start..end]))
+}
+
+fn read_file_range(path: &Path, offset: u64, size: u32) -> Result<Bytes, FuseError> {
+    if size == 0 {
+        return Ok(Bytes::new());
+    }
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| FuseError::Io(format!("failed to open `{}`: {error}", path.display())))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|error| FuseError::Io(format!("failed to seek `{}`: {error}", path.display())))?;
+    let mut buffer = vec![0; size as usize];
+    let bytes_read = file
+        .read(&mut buffer)
+        .map_err(|error| FuseError::Io(format!("failed to read `{}`: {error}", path.display())))?;
+    buffer.truncate(bytes_read);
+    Ok(Bytes::from(buffer))
 }
 
 #[derive(Clone, Debug)]
@@ -844,6 +860,19 @@ where
         Ok(PathBuf::from(report.path))
     }
 
+    fn materialized_path_for_read(&self, item: &VirtualFsItem) -> Result<PathBuf, FuseError> {
+        if item.kind != VirtualFsItemKind::File {
+            return Err(FuseError::NotFile);
+        }
+        if item.read_only
+            && let Some(path) = item.materialized_path.as_ref().map(PathBuf::from)
+            && path.exists()
+        {
+            return Ok(path);
+        }
+        self.materialized_path(item)
+    }
+
     fn trash_path(&self, path: &Path, expected_kind: VirtualFsItemKind) -> Result<(), FuseError> {
         let path = normalize_path(path);
         let cached_pending_folder = expected_kind == VirtualFsItemKind::Folder
@@ -1077,8 +1106,10 @@ where
         let truncating = flags & libc::O_TRUNC as u32 != 0;
         let materialized = if truncating && writable {
             PathBuf::new()
-        } else {
+        } else if writable {
             self.materialized_path(&item)?
+        } else {
+            self.materialized_path_for_read(&item)?
         };
         let fh = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let mut handle = OpenHandle {
@@ -1136,15 +1167,10 @@ where
             if let Some(data) = read_virtual_bytes(&item.identifier, offset, size) {
                 return Ok(ReplyData { data });
             }
-            self.materialized_path(&item)?
+            self.materialized_path_for_read(&item)?
         };
-        let bytes = std::fs::read(&file_path).map_err(|error| {
-            FuseError::Io(format!("failed to read `{}`: {error}", file_path.display()))
-        })?;
-        let start = offset.min(bytes.len() as u64) as usize;
-        let end = (start + size as usize).min(bytes.len());
         Ok(ReplyData {
-            data: Bytes::copy_from_slice(&bytes[start..end]),
+            data: read_file_range(&file_path, offset, size)?,
         })
     }
 
@@ -1764,6 +1790,61 @@ mod tests {
             ensure_writable_item(&folder),
             Err(FuseError::ReadOnly)
         ));
+    }
+
+    #[tokio::test]
+    async fn read_only_cached_materialized_file_opens_without_daemon_materialize() {
+        let path = std::env::temp_dir().join(format!(
+            "locality-fuse-cached-open-{}-{}",
+            std::process::id(),
+            unique_test_suffix()
+        ));
+        std::fs::write(&path, b"cached recent markdown").expect("write cached file");
+        let root = test_root_item();
+        let mut item = test_named_item("slack-recent:C123", "recent.md", VirtualFsItemKind::File);
+        item.read_only = true;
+        item.materialized_path = Some(path.display().to_string());
+        item.byte_size = Some(22);
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "slack-main".to_string(),
+                root: root.clone(),
+                children: BTreeMap::new(),
+                created_files: Mutex::new(Vec::new()),
+                created_item: None,
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([
+                (PathBuf::from(ROOT_PATH), root),
+                (PathBuf::from("/recent.md"), item),
+            ])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        let opened = fs
+            .open(
+                Request::default(),
+                OsStr::new("/recent.md"),
+                libc::O_RDONLY as u32,
+            )
+            .await
+            .expect("cached read-only file opens");
+        let read = fs
+            .read(
+                Request::default(),
+                Some(OsStr::new("/recent.md")),
+                opened.fh,
+                7,
+                6,
+            )
+            .await
+            .expect("read cached file");
+
+        let _ = std::fs::remove_file(path);
+        assert_eq!(&read.data[..], b"recent");
     }
 
     #[test]

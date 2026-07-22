@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::model::EntityKind;
+
 pub const PAGE_DOCUMENT_FILENAME: &str = "page.md";
 
 pub fn page_document_path(page_directory: &Path) -> PathBuf {
@@ -23,6 +25,16 @@ pub fn page_container_path(page_path: &Path) -> PathBuf {
     }
 
     page_path.with_extension("")
+}
+
+pub fn projection_namespace_root(kind: &EntityKind, path: &Path) -> PathBuf {
+    match kind {
+        EntityKind::Page => page_container_path(path),
+        EntityKind::Database
+        | EntityKind::Directory
+        | EntityKind::Asset
+        | EntityKind::Unknown(_) => path.to_path_buf(),
+    }
 }
 
 pub fn page_listing_parent_path(page_path: &Path) -> PathBuf {
@@ -57,6 +69,23 @@ pub fn parent_path(path: &Path) -> &Path {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::EntityKind;
+
+    #[test]
+    fn projection_namespace_uses_page_container_semantics_only_for_pages() {
+        assert_eq!(
+            projection_namespace_root(&EntityKind::Page, Path::new("Roadmap/page.md")),
+            PathBuf::from("Roadmap")
+        );
+        assert_eq!(
+            projection_namespace_root(&EntityKind::Page, Path::new("Roadmap.md")),
+            PathBuf::from("Roadmap")
+        );
+        assert_eq!(
+            projection_namespace_root(&EntityKind::Asset, Path::new("assets/page.md")),
+            PathBuf::from("assets/page.md")
+        );
+    }
 
     #[test]
     fn named_markdown_page_workspace_document_maps_back_to_entity_path() {

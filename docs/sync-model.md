@@ -344,11 +344,16 @@ Add connector methods cheaper than hydration:
 
 ```text
 observe_entity(...)
+observe_batch(...)
 enumerate_children(...)
 hydrate_entity(...)
 ```
 
-Core daemon code must treat `RemoteVersion` as opaque.
+Core daemon code must treat `RemoteVersion` and connector checkpoint JSON as
+opaque. A batch checkpoint advances only after every change in its result has
+been reconciled successfully. Complete-batch omission is authoritative only
+inside the configured mount scope; incremental-batch omission never deletes an
+entity, while explicit tombstones can.
 
 ### Stage 4: Bounded Scheduler / Work Queue
 
@@ -510,7 +515,7 @@ activity scoring, media pruning, deep refresh, batching, and metrics.
 Current local-only implementation:
 
 - Connector capabilities now include explicit flags for remote observation,
-  lazy child enumeration, media download, undo, and future batch observation.
+  lazy child enumeration, media download, undo, and batch observation.
 - `locality-core::freshness` defines activity scoring and tier decay policy so
   recently opened/edited or hinted entities stay hot, hydrated files stay warm,
   and deep inactive virtual subtrees can cool to dormant.

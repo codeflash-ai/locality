@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use locality_core::model::RemoteId;
 use locality_core::planner::{GuardrailPolicy, PushOperationKind};
 use locality_core::portable::{LogicalPath, SourceOperation};
-use locality_core::push::PushPipelineAction;
+use locality_core::push::{BodyDiffMode, PushPipelineAction};
 use locality_core::shadow::ShadowDocument;
 use locality_engine::prepare_changeset::{PrepareChangesetRequest, prepare_changeset};
 
@@ -54,6 +54,31 @@ fn read_only_entries_never_produce_a_changeset_plan() {
     );
     assert_eq!(prepared.source_operation_plan, None);
     assert_eq!(prepared.readable_diff, None);
+}
+
+#[test]
+fn whole_entity_body_mode_is_preserved_across_the_engine_boundary() {
+    let path = LogicalPath::new("Issues/ENG-1/page.md").expect("path");
+    let shadow = shadow("Old issue body.\n");
+    let supported = PushOperationKind::all().into_iter().collect();
+    let edited = canonical("Changed issue body.\n");
+
+    let prepared = prepare_changeset(
+        PrepareChangesetRequest::new(&path, &edited, &shadow, &supported)
+            .with_body_diff_mode(BodyDiffMode::WholeEntity),
+    )
+    .expect("prepare whole-entity update");
+
+    assert_eq!(
+        prepared
+            .source_operation_plan
+            .expect("portable plan")
+            .operations,
+        vec![SourceOperation::UpdateEntityBody {
+            entity_id: RemoteId::new("page-1"),
+            body: "Changed issue body.\n".to_string(),
+        }]
+    );
 }
 
 #[test]

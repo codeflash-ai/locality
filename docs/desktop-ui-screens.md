@@ -146,8 +146,10 @@ Both actions require a phrase containing the selected mount id:
   remote connector. It does not change remote data or other mounts.
 - `Disconnect Source` deletes and revokes the selected mount's saved connection
   credential while retaining cached files and mount registration for a later
-  reconnect. If several mounts explicitly share that connection, the
-  confirmation explains that they will all require reconnection.
+  reconnect. The retained source is hidden from the connected Sources list and
+  the connector returns to the connect/reconnect path. If several mounts
+  explicitly share that connection, the confirmation explains that they will all
+  require reconnection.
 
 The backend validates the typed phrase as well as the UI; invoking the desktop
 command directly cannot bypass confirmation.
@@ -837,6 +839,7 @@ Diagnostics
 
 Locality process        Running
 State folder       ~/.loc
+Logs folder        ~/.loc/logs
 Mounts watched     1
 Projection         macOS File Provider
 
@@ -890,7 +893,7 @@ The UI needs desktop-facing data shaped around product concepts:
 
 ```text
 app_health
-  state: ready | preparing | needs_review | reconnect_needed | stopped
+  state: ready | preparing | needs_review | reconnect_needed | stopped | runtime_stopped
   attention_count
 
 connection

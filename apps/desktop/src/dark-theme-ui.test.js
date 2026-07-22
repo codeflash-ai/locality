@@ -36,6 +36,13 @@ describe("dark theme UI contrast", () => {
     expect(styles).not.toMatch(/:root\[data-theme="dark"\] \.tray-live-mode-control,[\s\S]*?\.file-row\.expanded/s);
   });
 
+  it("uses a dark safety wrapper on the source detail review prompt", () => {
+    expect(appSource).toMatch(/className="safety-strip"[\s\S]*?Review catches work that needs approval/);
+    expect(styles).toMatch(
+      /:root\[data-theme="dark"\] \.safety-strip\s*\{[\s\S]*?border-color:\s*rgba\(42,\s*161,\s*152,\s*0\.28\);[\s\S]*?background:\s*rgba\(42,\s*161,\s*152,\s*0\.12\);/s,
+    );
+  });
+
   it("keeps disabled mount detail buttons from taking hover colors", () => {
     expect(styles).toMatch(/\.mount-details-button:hover:not\(:disabled\)\s*\{/);
     expect(styles).toMatch(

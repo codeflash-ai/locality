@@ -1,7 +1,9 @@
 import { classifyMountSetupError } from "./onboarding-errors";
 
 export type SourceSetupState = "idle" | "connecting" | "creating" | "changing" | "success" | "error";
-export type SourceConnectorId = "notion" | "google-docs" | "gmail" | "granola";
+const SOURCE_CONNECTORS = ["notion", "google-docs", "google-calendar", "gmail", "granola", "linear", "slack"] as const;
+export type SourceConnectorId = (typeof SOURCE_CONNECTORS)[number];
+export type ApiKeySourceConnectorId = Extract<SourceConnectorId, "granola" | "linear">;
 export type SourceMountRetryOutcome =
   | { kind: "retry" }
   | { kind: "success" | "error"; message: string };
@@ -23,7 +25,17 @@ type SourceSnapshotLike = {
   mounts?: SourceMountLike[] | null;
 };
 
-const SOURCE_CONNECTORS: SourceConnectorId[] = ["notion", "google-docs", "gmail", "granola"];
+export function sourceConnectorIds(): SourceConnectorId[] {
+  return [...SOURCE_CONNECTORS];
+}
+
+export function sourceRequiresApiKey(connector: SourceConnectorId): connector is ApiKeySourceConnectorId {
+  return connector === "granola" || connector === "linear";
+}
+
+export function sourceSkipsManualMountStep(connector: SourceConnectorId): boolean {
+  return connector !== "notion";
+}
 
 export function sourceMountRetryOutcome(
   report: { ok: boolean; message: string },
@@ -83,7 +95,7 @@ export function sourceMounted(
   connector: SourceConnectorId,
 ): boolean {
   return sourceMounts(snapshot).some(
-    (mount) => mount.connector === connector && mount.status !== "not_mounted",
+    (mount) => mount.connector === connector && sourceMountStatusMounted(mount.status),
   );
 }
 
@@ -117,4 +129,9 @@ function sourceMounts(snapshot: SourceSnapshotLike): SourceMountLike[] {
 function sourceConnectionStatusReady(status: string): boolean {
   const normalized = status.trim().toLowerCase();
   return normalized === "active" || normalized === "ready";
+}
+
+function sourceMountStatusMounted(status?: string | null): boolean {
+  const normalized = status?.trim().toLowerCase() ?? "";
+  return normalized !== "not_mounted" && normalized !== "reconnect_needed";
 }

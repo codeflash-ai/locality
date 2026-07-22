@@ -32,6 +32,8 @@
 
 - [Notion connector](connectors/notion.mdx): Notion projection, databases, supported writes, and common errors.
 - [Google Docs connector](connectors/google-docs.mdx): Google Docs projection, supported content, and limits.
+- [Google Calendar connector](connectors/google-calendar.mdx): Primary-calendar events, event drafts, and limits.
+- [Slack connector](connectors/slack.mdx): Slack read-only conversation projection, mount shape, and limits.
 
 ## Reference
 

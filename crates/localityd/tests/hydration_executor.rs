@@ -19,7 +19,7 @@ use locality_store::{
 };
 use localityd::hydration::{
     HydratedAsset, HydratedEntity, HydrationExecutor, HydrationOutcome, HydrationQueue,
-    HydrationSource,
+    HydrationRepository, HydrationSource,
 };
 
 #[test]
@@ -71,6 +71,33 @@ fn executor_fetches_render_using_projected_entity_path() {
         vec![PathBuf::from("Roadmap/page.md")]
     );
     assert!(fixture.page_path().exists());
+}
+
+#[test]
+fn executor_passes_entity_repository_to_hydration_source() {
+    let fixture = HydrationFixture::new();
+    let mut store = fixture.store(HydrationState::Stub);
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("project-1"),
+            EntityKind::Page,
+            "Launch",
+            "projects/Launch/page.md",
+        ))
+        .expect("save related entity");
+    fixture.write_stub();
+    let source = RepositoryAwareHydrationSource::default();
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    executor
+        .hydrate_request(fixture.request())
+        .expect("hydrate request");
+
+    assert_eq!(
+        source.related_paths.borrow().as_slice(),
+        &[PathBuf::from("projects/Launch/page.md")]
+    );
 }
 
 #[test]
@@ -445,6 +472,46 @@ fn executor_prunes_stale_gmail_attachment_assets_in_same_message_cache() {
     assert!(
         !stale_path.exists(),
         "stale Gmail attachment cache remained"
+    );
+}
+
+#[test]
+fn executor_prunes_stale_linear_attachment_assets_in_same_issue_cache() {
+    let fixture = HydrationFixture::new();
+    let mut store = fixture.store(HydrationState::Stub);
+    fixture.write_stub();
+    let stale_path = fixture
+        .root
+        .join(".loc/linear/attachments/issue-1/stale-name.png");
+    fs::create_dir_all(stale_path.parent().expect("stale asset parent"))
+        .expect("create stale asset parent");
+    fs::write(&stale_path, b"stale-image").expect("write stale asset");
+
+    let mut rendered = rendered_entity("Remote body.");
+    rendered.assets.push(HydratedAsset {
+        path: PathBuf::from(".loc/linear/attachments/issue-1/current-name.png"),
+        bytes: b"current-image".to_vec(),
+        media: None,
+    });
+    let source = FakeHydrationSource::with_entity("page-1", rendered);
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    executor
+        .hydrate_request(fixture.request())
+        .expect("hydrate request");
+
+    assert_eq!(
+        fs::read(
+            fixture
+                .root
+                .join(".loc/linear/attachments/issue-1/current-name.png")
+        )
+        .expect("current asset"),
+        b"current-image"
+    );
+    assert!(
+        !stale_path.exists(),
+        "stale Linear attachment cache remained"
     );
 }
 
@@ -1176,6 +1243,31 @@ impl HydrationSource for FakeHydrationSource {
             .get(&request.remote_id)
             .cloned()
             .ok_or_else(|| LocalityError::InvalidState("missing fake entity".to_string()))
+    }
+}
+
+#[derive(Debug, Default)]
+struct RepositoryAwareHydrationSource {
+    related_paths: RefCell<Vec<PathBuf>>,
+}
+
+impl HydrationSource for RepositoryAwareHydrationSource {
+    fn fetch_render(&self, _request: &HydrationRequest) -> LocalityResult<HydratedEntity> {
+        Err(LocalityError::InvalidState(
+            "repository-aware fetch path was not used".to_string(),
+        ))
+    }
+
+    fn fetch_render_with_repository(
+        &self,
+        request: &HydrationRequest,
+        repository: &dyn HydrationRepository,
+    ) -> LocalityResult<HydratedEntity> {
+        let related = repository
+            .entity_record(&request.mount_id, &RemoteId::new("project-1"))?
+            .expect("related entity");
+        self.related_paths.borrow_mut().push(related.path);
+        Ok(rendered_entity("Remote body."))
     }
 }
 

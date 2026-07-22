@@ -134,6 +134,63 @@ Request:
 }
 ```
 
+### `POST /v1/oauth/google-calendar/start`
+
+Request:
+
+```json
+{
+  "redirect_uri": "http://localhost:8757/oauth/google-calendar/callback"
+}
+```
+
+If omitted, the default callback is
+`http://localhost:8757/oauth/google-calendar/callback`. The broker requests
+`openid`, `email`, `profile`, and
+`https://www.googleapis.com/auth/calendar.events`.
+
+Response:
+
+```json
+{
+  "connector": "google-calendar",
+  "client_id": "public-client-id",
+  "authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?...",
+  "redirect_uri": "http://localhost:8757/oauth/google-calendar/callback",
+  "session": "signed-session",
+  "state": "opaque-state",
+  "expires_in": 600
+}
+```
+
+### `POST /v1/oauth/google-calendar/exchange`
+
+Request:
+
+```json
+{
+  "session": "signed-session",
+  "state": "opaque-state",
+  "code": "provider-authorization-code",
+  "redirect_uri": "http://localhost:8757/oauth/google-calendar/callback"
+}
+```
+
+Response includes the Google OAuth access token for Calendar event scopes,
+granted scopes, optional ID token, `workspace_id: "primary"`,
+`workspace_name: "Primary calendar"`, and either `refresh_token_handle` or
+`refresh_token`, depending on `LOCALITY_TOKEN_MODE`.
+
+### `POST /v1/oauth/google-calendar/refresh`
+
+Request:
+
+```json
+{
+  "refresh_token_handle": "locrh_v1..."
+}
+```
+
 ### `POST /v1/oauth/gmail/start`
 
 Request:
@@ -185,6 +242,57 @@ Request:
 }
 ```
 
+### `POST /v1/oauth/slack/start`
+
+Request:
+
+```json
+{
+  "redirect_uri": "http://localhost:8757/oauth/slack/callback"
+}
+```
+
+Response:
+
+```json
+{
+  "connector": "slack",
+  "client_id": "public-client-id",
+  "authorization_url": "https://slack.com/oauth/v2/authorize?...",
+  "redirect_uri": "http://localhost:8757/oauth/slack/callback",
+  "session": "signed-session",
+  "state": "opaque-state",
+  "expires_in": 600
+}
+```
+
+### `POST /v1/oauth/slack/exchange`
+
+Request:
+
+```json
+{
+  "session": "signed-session",
+  "state": "opaque-state",
+  "code": "provider-authorization-code",
+  "redirect_uri": "http://localhost:8757/oauth/slack/callback"
+}
+```
+
+Response includes the Slack OAuth access token, granted read-only scopes,
+workspace identifiers, bot user ID, and either `refresh_token_handle` or
+`refresh_token`, depending on `LOCALITY_TOKEN_MODE`.
+
+### `POST /v1/oauth/slack/refresh`
+
+Request:
+
+```json
+{
+  "refresh_token_handle": "locrh_v1..."
+}
+```
+
 ## Local Development
 
 ```sh
@@ -205,14 +313,16 @@ npm run check
 - `LOCALITY_REFRESH_HANDLE_KEY`: encrypts opaque refresh handles in `handle` mode.
 - `LOCALITY_NOTION_CLIENT_ID`: Notion OAuth client ID.
 - `LOCALITY_NOTION_CLIENT_SECRET`: Notion OAuth client secret.
-- `LOCALITY_GOOGLE_CLIENT_ID`: Google OAuth client ID shared by Google Docs and Gmail.
-- `LOCALITY_GOOGLE_CLIENT_SECRET`: Google OAuth client secret shared by Google Docs and Gmail.
+- `LOCALITY_GOOGLE_CLIENT_ID`: Google OAuth client ID shared by Google Docs, Google Calendar, and Gmail.
+- `LOCALITY_GOOGLE_CLIENT_SECRET`: Google OAuth client secret shared by Google Docs, Google Calendar, and Gmail.
+- `LOCALITY_SLACK_CLIENT_ID`: Slack OAuth client ID.
+- `LOCALITY_SLACK_CLIENT_SECRET`: Slack OAuth client secret.
 
 Optional connector overrides:
 
-- `LOCALITY_NOTION_REDIRECT_URIS`, `LOCALITY_GOOGLE_DOCS_REDIRECT_URIS`, `LOCALITY_GMAIL_REDIRECT_URIS`: comma-separated allowed loopback redirect URIs.
-- `LOCALITY_NOTION_AUTH_BASE_URL`, `LOCALITY_GOOGLE_DOCS_AUTH_BASE_URL`, `LOCALITY_GMAIL_AUTH_BASE_URL`: provider authorization base URL.
-- `LOCALITY_NOTION_API_BASE_URL`, `LOCALITY_GOOGLE_DOCS_API_BASE_URL`, `LOCALITY_GMAIL_API_BASE_URL`: provider token API base URL.
+- `LOCALITY_NOTION_REDIRECT_URIS`, `LOCALITY_GOOGLE_DOCS_REDIRECT_URIS`, `LOCALITY_GOOGLE_CALENDAR_REDIRECT_URIS`, `LOCALITY_GMAIL_REDIRECT_URIS`, `LOCALITY_SLACK_REDIRECT_URIS`: comma-separated allowed loopback redirect URIs.
+- `LOCALITY_NOTION_AUTH_BASE_URL`, `LOCALITY_GOOGLE_DOCS_AUTH_BASE_URL`, `LOCALITY_GOOGLE_CALENDAR_AUTH_BASE_URL`, `LOCALITY_GMAIL_AUTH_BASE_URL`, `LOCALITY_SLACK_AUTH_BASE_URL`: provider authorization base URL.
+- `LOCALITY_NOTION_API_BASE_URL`, `LOCALITY_GOOGLE_DOCS_API_BASE_URL`, `LOCALITY_GOOGLE_CALENDAR_API_BASE_URL`, `LOCALITY_GMAIL_API_BASE_URL`, `LOCALITY_SLACK_API_BASE_URL`: provider token API base URL.
 
 ## Deployment
 

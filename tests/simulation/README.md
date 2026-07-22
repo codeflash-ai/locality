@@ -8,6 +8,6 @@ The randomized sync simulation should eventually drive the deterministic `locali
 - validation failures
 - crashes before, during, and after push apply
 - connector retries and rate limits
+- Slack read-only fixture projection for `users.md` and bucketed conversation `recent.md` files
 
 The harness should assert that content is not lost, journals replay cleanly, and convergent states are reached after failures are removed.
-

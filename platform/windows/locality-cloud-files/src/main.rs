@@ -6,6 +6,8 @@ use locality_platform::{
     cloud_files_mount_id_component, decode_cloud_files_mount_id_component,
     windows_cloud_files_registration_marker_dir,
 };
+#[cfg(target_os = "windows")]
+use locality_store::EntityRepository;
 #[cfg(any(target_os = "windows", test))]
 use locality_store::MountConfig;
 use locality_store::{MountRepository, ProjectionMode, SqliteStateStore};
@@ -42,6 +44,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Register(RegisterArgs),
+    Preflight(RunArgs),
     Run(RunArgs),
     Open(OpenArgs),
     Unregister(UnregisterArgs),
@@ -186,6 +189,7 @@ fn main() {
 fn run(command: Command) -> Result<CommandReport, HelperError> {
     match command {
         Command::Register(args) => register(args),
+        Command::Preflight(args) => preflight_provider(args),
         Command::Run(args) => run_provider(args),
         Command::Open(args) => open(args),
         Command::Unregister(args) => unregister(args),
@@ -198,6 +202,7 @@ impl Command {
     fn action(&self) -> &'static str {
         match self {
             Self::Register(_) => "register",
+            Self::Preflight(_) => "preflight",
             Self::Run(_) => "run",
             Self::Open(_) => "open",
             Self::Unregister(_) => "unregister",
@@ -253,6 +258,35 @@ fn register(args: RegisterArgs) -> Result<CommandReport, HelperError> {
         cloud_filter_registered: Some(true),
         shell_registered,
         shell_registration_error,
+    })
+}
+
+fn preflight_provider(args: RunArgs) -> Result<CommandReport, HelperError> {
+    ensure_supported_platform()?;
+    if let Some(mount_id) = args.mount_id.as_deref() {
+        validate_mount_id(mount_id)?;
+    }
+    validate_absolute_directory_candidate(&args.sync_root, "sync root")?;
+    validate_absolute_directory_candidate(&args.state_dir, "state dir")?;
+
+    let sync_root = canonical_or_original(&args.sync_root);
+    let projection_root = provider_daemon_projection_root(&args.sync_root, &sync_root);
+    let sync_root_id = sync_root_id_for_optional_mount(args.mount_id.as_deref(), &projection_root);
+    preflight_cloud_filter_provider(args.mount_id.as_deref(), &projection_root, &args.state_dir)?;
+
+    Ok(CommandReport {
+        ok: true,
+        command: COMMAND_NAME,
+        action: "preflight",
+        mount_id: args.mount_id,
+        display_name: None,
+        sync_root: Some(path_for_report(&sync_root)),
+        sync_root_id: Some(sync_root_id),
+        provider_id: Some(PROVIDER_ID.to_string()),
+        roots: None,
+        cloud_filter_registered: None,
+        shell_registered: None,
+        shell_registration_error: None,
     })
 }
 
@@ -1618,6 +1652,81 @@ impl ProviderContext {
         self.local_file_index.forget_subtree(&source);
     }
 
+    fn consume_projection_acknowledgement(
+        &self,
+        identifier: &str,
+        path: &Path,
+        event: localityd::file_provider::WindowsCloudFilesProjectionEvent,
+    ) -> bool {
+        self.consume_projection_acknowledgement_inner(identifier, path, event, None, false)
+    }
+
+    fn consume_quarantine_acknowledgement(
+        &self,
+        identifier: &str,
+        path: &Path,
+        event: localityd::file_provider::WindowsCloudFilesProjectionEvent,
+        observed_quarantine_path: Option<&Path>,
+    ) -> bool {
+        self.consume_projection_acknowledgement_inner(
+            identifier,
+            path,
+            event,
+            observed_quarantine_path,
+            true,
+        )
+    }
+
+    fn consume_projection_acknowledgement_inner(
+        &self,
+        identifier: &str,
+        path: &Path,
+        event: localityd::file_provider::WindowsCloudFilesProjectionEvent,
+        observed_quarantine_path: Option<&Path>,
+        quarantine: bool,
+    ) -> bool {
+        let Ok(resolved) = self.resolve_identifier(identifier) else {
+            return false;
+        };
+        let Some(remote_id) = provider_identity_remote_id(&resolved.daemon_identifier) else {
+            return false;
+        };
+        let Some(path_match) = localityd::file_provider::match_mount_path(&resolved.mount, path)
+        else {
+            return false;
+        };
+        let Ok(store) = SqliteStateStore::open(self.state_dir.clone()) else {
+            return false;
+        };
+        let Ok(entity) = store.get_entity(&resolved.mount.mount_id, &remote_id) else {
+            return false;
+        };
+        if quarantine {
+            localityd::file_provider::consume_windows_cloud_files_quarantine_acknowledgement(
+                &self.state_dir,
+                &path_match.access_root,
+                &resolved.mount.mount_id,
+                &remote_id,
+                &resolved.daemon_identifier,
+                &path_match.relative_path,
+                event,
+                entity.as_ref(),
+                observed_quarantine_path,
+            )
+        } else {
+            localityd::file_provider::consume_windows_cloud_files_projection_acknowledgement(
+                &self.state_dir,
+                &path_match.access_root,
+                &resolved.mount.mount_id,
+                &remote_id,
+                &resolved.daemon_identifier,
+                &path_match.relative_path,
+                event,
+                entity.as_ref(),
+            )
+        }
+    }
+
     fn request<T>(
         &self,
         request: &localityd::ipc::DaemonRequest,
@@ -1977,6 +2086,32 @@ fn handle_local_remove_like_path(
         ));
         return Ok(());
     };
+    if context.consume_quarantine_acknowledgement(
+        &identifier,
+        &path,
+        localityd::file_provider::WindowsCloudFilesProjectionEvent::WatcherQuarantineMoveSource,
+        None,
+    ) || context.consume_quarantine_acknowledgement(
+        &identifier,
+        &path,
+        localityd::file_provider::WindowsCloudFilesProjectionEvent::WatcherQuarantineArchiveSource,
+        None,
+    ) || context.consume_projection_acknowledgement(
+        &identifier,
+        &path,
+        localityd::file_provider::WindowsCloudFilesProjectionEvent::WatcherRemoveMoveSource,
+    ) || context.consume_projection_acknowledgement(
+        &identifier,
+        &path,
+        localityd::file_provider::WindowsCloudFilesProjectionEvent::WatcherRemoveArchivedEntity,
+    ) {
+        trace_cloud_files(format!(
+            "local remove acknowledged path=`{}` identity=`{identifier}` reason=already_durable",
+            path.display()
+        ));
+        context.forget_path_identities(&path);
+        return Ok(());
+    }
     trace_cloud_files(format!(
         "local remove trash path=`{}` identity=`{identifier}`",
         path.display()
@@ -2071,6 +2206,29 @@ fn cached_identity_refresh_unavailable(error: &HelperError) -> bool {
 fn is_local_identity(identifier: &str) -> bool {
     let identifier = daemon_identifier_for_identity_check(identifier);
     identifier.starts_with("local:") || identifier.starts_with("children:local:")
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn provider_identity_remote_id(identifier: &str) -> Option<locality_core::model::RemoteId> {
+    let identifier = daemon_identifier_for_identity_check(identifier);
+    let identifier = identifier.strip_prefix("children:").unwrap_or(&identifier);
+    if identifier.is_empty()
+        || identifier == localityd::file_provider::ROOT_CONTAINER_IDENTIFIER
+        || [
+            "local:",
+            "mount:",
+            "source:",
+            "path:",
+            "schema:",
+            "asset-cache:",
+            "guidance:",
+        ]
+        .iter()
+        .any(|prefix| identifier.starts_with(prefix))
+    {
+        return None;
+    }
+    Some(locality_core::model::RemoteId::new(identifier))
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -2206,12 +2364,20 @@ fn run_cloud_filter_provider(
     state_dir: &Path,
 ) -> Result<(), HelperError> {
     wait_for_daemon(state_dir)?;
-    let mut connected =
-        connect_cloud_filter_sync_root(mount_id, sync_root, projection_root, state_dir)?;
-    let seeded = seed_root_placeholders(&connected.context)?;
-    connected.local_change_watcher = Some(start_local_change_watcher(
-        connected.context.as_ref().clone(),
-    )?);
+    let access_roots =
+        windows_cloud_files_active_access_roots(state_dir, mount_id, projection_root)?;
+    let (connected, seeded) = start_cloud_filter_provider_after_recovery(
+        &access_roots,
+        |access_root| repair_windows_cloud_files_access_root_before_startup(state_dir, access_root),
+        || connect_cloud_filter_sync_root(mount_id, sync_root, projection_root, state_dir),
+        |connected| seed_root_placeholders(&connected.context),
+        |connected| {
+            connected.local_change_watcher = Some(start_local_change_watcher(
+                connected.context.as_ref().clone(),
+            )?);
+            Ok(())
+        },
+    )?;
     let display_id = mount_id.unwrap_or(SHARED_SYNC_ROOT_COMPONENT);
     eprintln!(
         "{COMMAND_NAME}: connected `{display_id}` at `{}` and seeded {seeded} root placeholder{}",
@@ -2219,6 +2385,220 @@ fn run_cloud_filter_provider(
         plural(seeded)
     );
     wait_for_shutdown()?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn preflight_cloud_filter_provider(
+    mount_id: Option<&str>,
+    projection_root: &Path,
+    state_dir: &Path,
+) -> Result<(), HelperError> {
+    wait_for_daemon(state_dir)?;
+    let access_roots =
+        windows_cloud_files_active_access_roots(state_dir, mount_id, projection_root)?;
+    repair_cloud_filter_access_roots(&access_roots, |access_root| {
+        repair_windows_cloud_files_access_root_before_startup(state_dir, access_root)
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn preflight_cloud_filter_provider(
+    _mount_id: Option<&str>,
+    _projection_root: &Path,
+    _state_dir: &Path,
+) -> Result<(), HelperError> {
+    Err(HelperError::new(
+        "unsupported_platform",
+        "Windows Cloud Files provider preflight is only supported on Windows",
+    ))
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_cloud_files_active_access_roots(
+    state_dir: &Path,
+    legacy_mount_id: Option<&str>,
+    projection_root: &Path,
+) -> Result<Vec<PathBuf>, HelperError> {
+    let store = SqliteStateStore::open(state_dir.to_path_buf())
+        .map_err(|error| HelperError::new("state_open_failed", error.to_string()))?;
+    let mounts = if let Some(mount_id) = legacy_mount_id {
+        let mount_id = locality_core::model::MountId::new(mount_id);
+        vec![
+            store
+                .get_mount(&mount_id)
+                .map_err(|error| HelperError::new("state_read_failed", error.to_string()))?
+                .ok_or_else(|| {
+                    HelperError::new(
+                        "mount_not_found",
+                        format!("mount `{}` was not found in Locality state", mount_id.0),
+                    )
+                })?,
+        ]
+    } else {
+        store
+            .load_mounts()
+            .map_err(|error| HelperError::new("state_read_failed", error.to_string()))?
+            .into_iter()
+            .filter(|mount| shared_provider_mount_matches_projection_root(mount, projection_root))
+            .collect()
+    };
+
+    let mut access_roots = Vec::new();
+    for mount in mounts {
+        if mount.projection != ProjectionMode::WindowsCloudFiles {
+            if legacy_mount_id.is_some() {
+                return Err(HelperError::new(
+                    "invalid_mount",
+                    format!(
+                        "mount `{}` is not a Windows Cloud Files mount",
+                        mount.mount_id.0
+                    ),
+                ));
+            }
+            continue;
+        }
+        access_roots.extend(localityd::file_provider::mount_access_roots(&mount));
+    }
+    access_roots.sort_by_key(|path| normalized_cloud_path_string(path));
+    access_roots.dedup_by(|left, right| same_cloud_path(left, right));
+    Ok(access_roots)
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn repair_windows_cloud_files_access_root_before_startup(
+    state_dir: &Path,
+    access_root: &Path,
+) -> Result<(), HelperError> {
+    let recoveries = localityd::file_provider::repair_windows_cloud_files_projection_recoveries(
+        state_dir,
+        access_root,
+    )
+    .map_err(|error| {
+        HelperError::new(
+            "projection_recovery_failed",
+            format!(
+                "repair Windows Cloud Files recovery state for `{}`: {error}",
+                access_root.display()
+            ),
+        )
+    })?;
+    let review_required = recoveries
+        .into_iter()
+        .filter(|recovery| {
+            windows_cloud_files_recovery_applies_to_access_root(recovery, access_root)
+        })
+        .filter(|recovery| windows_cloud_files_recovery_requires_review(recovery.status))
+        .map(|recovery| {
+            format!(
+                "{} at `{}` ({})",
+                recovery.recovery_id,
+                recovery.quarantine_path.display(),
+                recovery
+                    .review_reason
+                    .as_deref()
+                    .unwrap_or("manual review required")
+            )
+        })
+        .collect::<Vec<_>>();
+    if review_required.is_empty() {
+        return Ok(());
+    }
+
+    Err(HelperError::new(
+        "projection_recovery_review_required",
+        format!(
+            "Windows Cloud Files recovery requires review before provider startup for `{}`: {}",
+            access_root.display(),
+            review_required.join("; ")
+        ),
+    ))
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_cloud_files_recovery_applies_to_access_root(
+    recovery: &localityd::file_provider::WindowsCloudFilesProjectionRecovery,
+    access_root: &Path,
+) -> bool {
+    if let Some(provider_root) = recovery.provider_root.as_deref() {
+        return access_root
+            .parent()
+            .is_some_and(|root| same_cloud_path(provider_root, root));
+    }
+    if recovery.operation
+        == localityd::file_provider::WindowsCloudFilesProjectionRecoveryOperation::Orphan
+        && let Some(legacy_provider_root) = recovery
+            .source_access_root
+            .as_deref()
+            .and_then(Path::parent)
+    {
+        return access_root
+            .parent()
+            .is_some_and(|root| same_cloud_path(legacy_provider_root, root));
+    }
+    recovery
+        .source_access_root
+        .as_deref()
+        .is_none_or(|root| same_cloud_path(root, access_root))
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_cloud_files_recovery_requires_review(
+    status: localityd::file_provider::WindowsCloudFilesProjectionRecoveryStatus,
+) -> bool {
+    use localityd::file_provider::WindowsCloudFilesProjectionRecoveryStatus;
+
+    matches!(
+        status,
+        WindowsCloudFilesProjectionRecoveryStatus::Prepared
+            | WindowsCloudFilesProjectionRecoveryStatus::NeedsReview
+            | WindowsCloudFilesProjectionRecoveryStatus::Missing
+            | WindowsCloudFilesProjectionRecoveryStatus::Orphaned
+    )
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn start_cloud_filter_provider_after_recovery<Connected>(
+    access_roots: &[PathBuf],
+    repair: impl FnMut(&Path) -> Result<(), HelperError>,
+    connect: impl FnOnce() -> Result<Connected, HelperError>,
+    seed_placeholders: impl FnOnce(&Connected) -> Result<usize, HelperError>,
+    admit_watcher: impl FnOnce(&mut Connected) -> Result<(), HelperError>,
+) -> Result<(Connected, usize), HelperError> {
+    repair_cloud_filter_access_roots(access_roots, repair)?;
+    let mut connected = connect()?;
+    let seeded = seed_placeholders(&connected)?;
+    admit_watcher(&mut connected)?;
+    Ok((connected, seeded))
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn repair_cloud_filter_access_roots(
+    access_roots: &[PathBuf],
+    mut repair: impl FnMut(&Path) -> Result<(), HelperError>,
+) -> Result<(), HelperError> {
+    let mut recovery_errors = Vec::new();
+    for access_root in access_roots {
+        if let Err(error) = repair(access_root) {
+            recovery_errors.push(error);
+        }
+    }
+    if !recovery_errors.is_empty() {
+        let code = if recovery_errors
+            .iter()
+            .all(|error| error.code == "projection_recovery_review_required")
+        {
+            "projection_recovery_review_required"
+        } else {
+            "projection_recovery_failed"
+        };
+        let message = recovery_errors
+            .into_iter()
+            .map(|error| error.message)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(HelperError::new(code, message));
+    }
     Ok(())
 }
 
@@ -2764,7 +3144,31 @@ unsafe fn handle_rename(
     {
         identifier = refreshed;
     }
+    let target_path = pcwstr_to_path(rename.TargetPath)
+        .ok_or_else(|| HelperError::new("invalid_callback", "rename missing target path"))?;
+    let target_path = absolute_cloud_path(context, &target_path);
     if !target_in_scope {
+        if let Some(source_path) = source_path.as_deref()
+            && (context.consume_quarantine_acknowledgement(
+                &identifier,
+                source_path,
+                localityd::file_provider::WindowsCloudFilesProjectionEvent::CloudFilesQuarantineMoveSource,
+                Some(&target_path),
+            ) || context.consume_quarantine_acknowledgement(
+                &identifier,
+                source_path,
+                localityd::file_provider::WindowsCloudFilesProjectionEvent::CloudFilesQuarantineArchiveSource,
+                Some(&target_path),
+            ))
+        {
+            trace_cloud_files(format!(
+                "rename-out acknowledged source=`{}` target=`{}` identity=`{identifier}` reason=quarantined",
+                source_path.display(),
+                target_path.display()
+            ));
+            context.forget_path_identities(source_path);
+            return Ok(());
+        }
         if let Some(source_path) = source_path.as_deref()
             && cloud_path_still_exists_after_remove_settle(source_path)
         {
@@ -2782,9 +3186,24 @@ unsafe fn handle_rename(
         return Ok(());
     }
 
-    let target_path = pcwstr_to_path(rename.TargetPath)
-        .ok_or_else(|| HelperError::new("invalid_callback", "rename missing target path"))?;
-    let target_path = absolute_cloud_path(context, &target_path);
+    if context.consume_projection_acknowledgement(
+        &identifier,
+        &target_path,
+        localityd::file_provider::WindowsCloudFilesProjectionEvent::CloudFilesRenameTarget,
+    ) {
+        trace_cloud_files(format!(
+            "rename acknowledged path=`{}` identity=`{identifier}` reason=already_durable",
+            target_path.display()
+        ));
+        if let Some(source_path) = source_path.as_deref() {
+            context.move_path_identities(source_path, &target_path);
+        }
+        context.remember_path_identity(&target_path, &identifier);
+        if std::fs::metadata(&target_path).is_ok_and(|metadata| metadata.is_file()) {
+            context.remember_local_file(&target_path, &identifier);
+        }
+        return Ok(());
+    }
     let new_filename = target_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -2833,6 +3252,24 @@ unsafe fn handle_delete(
         && let Some(refreshed) = daemon_identity_for_path(context, path)?
     {
         identifier = refreshed;
+    }
+    if let Some(path) = path.as_deref()
+        && (context.consume_projection_acknowledgement(
+            &identifier,
+            path,
+            localityd::file_provider::WindowsCloudFilesProjectionEvent::CloudFilesDeleteArchivedEntity,
+        ) || context.consume_projection_acknowledgement(
+            &identifier,
+            path,
+            localityd::file_provider::WindowsCloudFilesProjectionEvent::CloudFilesDeleteMoveSource,
+        ))
+    {
+        trace_cloud_files(format!(
+            "delete acknowledged path=`{}` identity=`{identifier}` reason=already_durable",
+            path.display()
+        ));
+        context.forget_path_identities(path);
+        return Ok(());
     }
     if let Some(path) = path.as_deref()
         && cloud_path_still_exists_after_remove_settle(path)
@@ -4041,6 +4478,285 @@ mod tests {
         );
     }
 
+    #[test]
+    fn provider_preflight_is_a_synchronous_run_contract() {
+        let cli = Cli::try_parse_from([
+            COMMAND_NAME,
+            "preflight",
+            "--sync-root",
+            "/tmp/Locality",
+            "--state-dir",
+            "/tmp/state",
+        ])
+        .expect("parse preflight command");
+
+        assert_eq!(cli.command.action(), "preflight");
+        let Command::Preflight(args) = cli.command else {
+            panic!("expected preflight command");
+        };
+        assert_eq!(args.sync_root, PathBuf::from("/tmp/Locality"));
+        assert_eq!(args.state_dir, PathBuf::from("/tmp/state"));
+    }
+
+    #[test]
+    fn provider_startup_repairs_every_active_access_root_before_admitting_callbacks() {
+        let state_dir = unique_test_state_dir("startup-active-access-roots");
+        let projection_root = state_dir.join("Locality");
+        let other_projection_root = state_dir.join("Other Locality");
+        let mut store = SqliteStateStore::open(state_dir.clone()).expect("open state store");
+        for (mount_id, root, projection) in [
+            (
+                "notion-main",
+                projection_root.join("notion-main"),
+                ProjectionMode::WindowsCloudFiles,
+            ),
+            (
+                "gmail-main",
+                projection_root.join("gmail-main"),
+                ProjectionMode::WindowsCloudFiles,
+            ),
+            (
+                "other-root",
+                other_projection_root.join("other-root"),
+                ProjectionMode::WindowsCloudFiles,
+            ),
+            (
+                "plain-files",
+                projection_root.join("plain-files"),
+                ProjectionMode::PlainFiles,
+            ),
+        ] {
+            store
+                .save_mount(
+                    MountConfig::new(locality_core::model::MountId::new(mount_id), "notion", root)
+                        .projection(projection),
+                )
+                .expect("save mount");
+        }
+        drop(store);
+
+        let access_roots =
+            windows_cloud_files_active_access_roots(&state_dir, None, &projection_root)
+                .expect("discover active access roots");
+        assert_eq!(
+            access_roots,
+            vec![
+                projection_root.join("gmail-main"),
+                projection_root.join("notion-main"),
+            ]
+        );
+
+        let events = std::cell::RefCell::new(Vec::new());
+        let (_, seeded) = start_cloud_filter_provider_after_recovery(
+            &access_roots,
+            |access_root| {
+                events
+                    .borrow_mut()
+                    .push(format!("repair:{}", access_root.display()));
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("connect".to_string());
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("seed".to_string());
+                Ok(2)
+            },
+            |_| {
+                events.borrow_mut().push("watcher".to_string());
+                Ok(())
+            },
+        )
+        .expect("start provider after repairs");
+
+        assert_eq!(seeded, 2);
+        assert_eq!(
+            events.into_inner(),
+            vec![
+                format!("repair:{}", access_roots[0].display()),
+                format!("repair:{}", access_roots[1].display()),
+                "connect".to_string(),
+                "seed".to_string(),
+                "watcher".to_string(),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn provider_startup_repair_failure_prevents_callback_admission() {
+        let access_roots = vec![PathBuf::from("first"), PathBuf::from("second")];
+        let events = std::cell::RefCell::new(Vec::new());
+
+        let error = start_cloud_filter_provider_after_recovery(
+            &access_roots,
+            |access_root| {
+                events
+                    .borrow_mut()
+                    .push(format!("repair:{}", access_root.display()));
+                if access_root == Path::new("first") {
+                    return Err(HelperError::new(
+                        "projection_recovery_failed",
+                        "injected repair failure",
+                    ));
+                }
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("connect".to_string());
+                Ok(())
+            },
+            |_| {
+                events.borrow_mut().push("seed".to_string());
+                Ok(0)
+            },
+            |_| {
+                events.borrow_mut().push("watcher".to_string());
+                Ok(())
+            },
+        )
+        .expect_err("repair failure must stop startup");
+
+        assert_eq!(error.code, "projection_recovery_failed");
+        assert_eq!(
+            events.into_inner(),
+            vec!["repair:first".to_string(), "repair:second".to_string()]
+        );
+    }
+
+    #[test]
+    fn provider_startup_surfaces_review_required_recovery() {
+        let root = unique_test_state_dir("startup-review-required");
+        let state_dir = root.join("state");
+        let access_root = root.join("Locality/notion-main");
+        let quarantine_path = root.join("recovery/page-1.file");
+        let manifest_dir = state_dir.join("provider-recovery/windows-cloud-files");
+        std::fs::create_dir_all(&manifest_dir).expect("create manifest directory");
+        let manifest = serde_json::json!({
+            "state_version": 1,
+            "min_reader_version": 1,
+            "recovery_id": "review-1",
+            "record_revision": 1,
+            "mount_id": "notion-main",
+            "entity_id": "page-1",
+            "operation": "move",
+            "payload_kind": "file",
+            "status": "needs_review",
+            "source_access_root": access_root,
+            "source_relative_path": "page.md",
+            "source_path": access_root.join("page.md"),
+            "intended_entity_path": "restored/page.md",
+            "quarantine_path": quarantine_path,
+            "payload_document_relative_path": null,
+            "payload_byte_size": 4,
+            "payload_hash": null,
+            "unexpected_entries": [],
+            "review_reason": "injected review state",
+            "created_at_unix_ms": 1,
+            "updated_at_unix_ms": 1
+        });
+        std::fs::write(
+            manifest_dir.join("review-1-r00000001.json"),
+            serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let error = repair_windows_cloud_files_access_root_before_startup(&state_dir, &access_root)
+            .expect_err("review-required recovery must stop startup");
+
+        assert_eq!(error.code, "projection_recovery_review_required");
+        assert!(error.message.contains("review-1"));
+        assert!(
+            error
+                .message
+                .contains(&quarantine_path.display().to_string())
+        );
+        assert!(error.message.contains("injected review state"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn provider_startup_orphan_scope_does_not_block_unrelated_projection_root() {
+        let root = unique_test_state_dir("startup-orphan-provider-scope");
+        let state_dir = root.join("state");
+        let provider_root_a = root.join("provider-a/Locality");
+        let provider_root_b = root.join("provider-b/Locality");
+        let removed_access_root_a = provider_root_a.join("removed-mount");
+        let sibling_access_root_a = provider_root_a.join("notion-main");
+        let access_root_b = provider_root_b.join("notion-main");
+        let quarantine_path = root.join("recovery-a/orphan.file");
+        let manifest_dir = state_dir.join("provider-recovery/windows-cloud-files");
+        std::fs::create_dir_all(&manifest_dir).expect("create manifest directory");
+        let manifest = serde_json::json!({
+            "state_version": 1,
+            "min_reader_version": 1,
+            "recovery_id": "orphan-a",
+            "record_revision": 1,
+            "mount_id": null,
+            "entity_id": null,
+            "operation": "orphan",
+            "payload_kind": "unknown",
+            "status": "orphaned",
+            "source_access_root": removed_access_root_a,
+            "source_relative_path": null,
+            "source_path": null,
+            "intended_entity_path": null,
+            "quarantine_path": quarantine_path,
+            "payload_document_relative_path": null,
+            "payload_byte_size": 4,
+            "payload_hash": null,
+            "unexpected_entries": [],
+            "review_reason": "provider A orphan",
+            "created_at_unix_ms": 1,
+            "updated_at_unix_ms": 1
+        });
+        std::fs::write(
+            manifest_dir.join("orphan-a-r00000001.json"),
+            serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        repair_windows_cloud_files_access_root_before_startup(&state_dir, &access_root_b)
+            .expect("provider A orphan must not block provider B");
+        let error = repair_windows_cloud_files_access_root_before_startup(
+            &state_dir,
+            &sibling_access_root_a,
+        )
+        .expect_err("legacy provider A orphan must block a provider A sibling mount");
+
+        assert_eq!(error.code, "projection_recovery_review_required");
+        assert!(error.message.contains("orphan-a"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn provider_startup_recovery_status_policy_is_explicit() {
+        use localityd::file_provider::WindowsCloudFilesProjectionRecoveryStatus as Status;
+
+        assert!(!windows_cloud_files_recovery_requires_review(
+            Status::QuarantinedClean
+        ));
+        assert!(!windows_cloud_files_recovery_requires_review(
+            Status::SourcePresent
+        ));
+        assert!(windows_cloud_files_recovery_requires_review(
+            Status::Prepared
+        ));
+        assert!(windows_cloud_files_recovery_requires_review(
+            Status::NeedsReview
+        ));
+        assert!(windows_cloud_files_recovery_requires_review(
+            Status::Missing
+        ));
+        assert!(windows_cloud_files_recovery_requires_review(
+            Status::Orphaned
+        ));
+    }
+
     fn write_marker_at(marker_dir: &Path, marker: &RegistrationMarker) -> Result<(), HelperError> {
         std::fs::create_dir_all(marker_dir)
             .map_err(|error| HelperError::io("create test marker dir", error))?;
@@ -4161,6 +4877,25 @@ mod tests {
             &child_local,
             &missing_directory
         ));
+    }
+
+    #[test]
+    fn provider_reconciliation_identity_parser_accepts_wrapped_remote_items_only() {
+        let mount_id = locality_core::model::MountId::new("notion-main");
+        let wrapped_file = localityd::virtual_projection::wrap_identifier(&mount_id, "page-1");
+        let wrapped_directory =
+            localityd::virtual_projection::wrap_identifier(&mount_id, "children:page-1");
+        let wrapped_local = localityd::virtual_projection::wrap_identifier(&mount_id, "local:123");
+
+        assert_eq!(
+            provider_identity_remote_id(&wrapped_file),
+            Some(locality_core::model::RemoteId::new("page-1"))
+        );
+        assert_eq!(
+            provider_identity_remote_id(&wrapped_directory),
+            Some(locality_core::model::RemoteId::new("page-1"))
+        );
+        assert_eq!(provider_identity_remote_id(&wrapped_local), None);
     }
 
     #[test]

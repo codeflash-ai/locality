@@ -25,7 +25,7 @@ describe("desktop dev script helpers", () => {
     });
   });
 
-  it("stops the daemon before rebuilding Windows sidecars", () => {
+  it("rebuilds Windows sidecars before stopping the daemon", () => {
     const commands = devSidecarPreparationCommands({
       cargo: "cargo",
       platform: "win32",
@@ -35,10 +35,16 @@ describe("desktop dev script helpers", () => {
     });
 
     expect(commands.map((command) => command.name)).toEqual([
-      "stop-daemon",
       "build-sidecars",
+      "stop-daemon",
     ]);
-    expect(commands[0]).toMatchObject({
+    expect(commands[0]).toEqual({
+      name: "build-sidecars",
+      program: "cargo",
+      args: ["build", "-p", "loc-cli", "-p", "localityd"],
+      cwd: "C:\\repo",
+    });
+    expect(commands[1]).toMatchObject({
       program: "node",
       args: [
         "C:\\repo\\apps\\desktop\\scripts\\stop-daemon-for-build.mjs",
@@ -46,6 +52,36 @@ describe("desktop dev script helpers", () => {
         "C:\\repo\\target\\debug\\loc.exe",
       ],
       cwd: "C:\\repo",
+    });
+  });
+
+  it("rebuilds POSIX sidecars before stopping the daemon", () => {
+    const commands = devSidecarPreparationCommands({
+      cargo: "cargo",
+      platform: "darwin",
+      processExecPath: "node",
+      scriptDir: "/repo/apps/desktop/scripts",
+      workspaceRoot: "/repo",
+    });
+
+    expect(commands.map((command) => command.name)).toEqual([
+      "build-sidecars",
+      "stop-daemon",
+    ]);
+    expect(commands[0]).toMatchObject({
+      name: "build-sidecars",
+      program: "cargo",
+      args: ["build", "-p", "loc-cli", "-p", "localityd"],
+      cwd: "/repo",
+    });
+    expect(commands[1]).toMatchObject({
+      program: "node",
+      args: [
+        "/repo/apps/desktop/scripts/stop-daemon-for-build.mjs",
+        "--loc",
+        "/repo/target/debug/loc",
+      ],
+      cwd: "/repo",
     });
   });
 });

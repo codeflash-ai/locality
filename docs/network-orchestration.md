@@ -35,10 +35,23 @@ Current defaults are:
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Notion | 3 | 3 | 32 | 4 | 30 s |
 | Granola | 5 | 3 | 8 | 4 | 30 s |
+| Slack metadata | 1 | 2 | 2 | 4 | 30 s |
+| Slack history | 1/min | 1 | 1 | 4 | 30 s |
+| Slack replies | 1/min | 15 | 1 | 4 | 30 s |
 
 Notion's rate, burst, retry classification, exponential delay, and cooldown
 refill behavior match the previous Notion-specific limiter. This is a refactor
 of its admission mechanics, not a new Notion scheduling policy.
+
+Slack uses separate connector-owned quota scopes for metadata, conversation
+history, and thread replies. Metadata calls cover conversation and user
+listings. History calls cover `conversations.history` and default to a 1
+request/minute gate with a 15-message request limit to satisfy Slack's strictest
+documented history policy for new non-Marketplace commercial apps. Thread reply
+hydration covers bounded `conversations.replies` expansion with a separate
+one-at-a-time scope so reply expansion does not consume the conversation history
+token bucket. Internal customer-built and Marketplace apps may have higher
+provider limits, but Locality keeps this default conservative.
 
 ## Global layer
 
