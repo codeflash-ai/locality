@@ -16,8 +16,9 @@ pub struct NotionPageBundle {
 /// Versioned native page payload used only by opt-in portable hosted-media capture.
 ///
 /// `page` contains a sanitized Notion bundle: hosted URLs have no query or
-/// fragment, expiries are removed, and uncaptured media URLs are empty. Captured
-/// bytes are keyed by stable block identity rather than by signed provider URL.
+/// fragment, expiries are removed, uncaptured hosted URLs are empty, and safe
+/// external HTTPS references retain their exact spelling. Captured bytes are
+/// keyed by stable block identity rather than by signed provider URL.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotionPortablePageBundleV1 {
     pub format_version: u16,

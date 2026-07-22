@@ -36,6 +36,7 @@ use crate::media::{
     PORTABLE_MEDIA_MAX_AGGREGATE_BYTES, PORTABLE_MEDIA_MAX_ASSET_BYTES, PORTABLE_MEDIA_MAX_ASSETS,
     PortableMediaCaptureFetcher, PortableMediaCapturePolicy, default_portable_media_fetcher,
     portable_media_expired, sanitize_portable_hosted_media_url, sanitize_portable_media_type,
+    validate_portable_external_media_url,
 };
 use crate::projection::enumerate_explicit_root_trees;
 use crate::render::{RenderOptions, render_native_entity, render_native_entity_with_options};
@@ -348,8 +349,34 @@ impl<'a> PortableMediaCaptureState<'a> {
         payload: &mut FileBlockDto,
     ) -> LocalityResult<()> {
         let external_present = payload.external.is_some();
+        let hosted_present = payload.file.is_some();
+        if external_present && hosted_present {
+            if let Some(external) = payload.external.as_mut() {
+                external.url.clear();
+            }
+            if let Some(hosted) = payload.file.as_mut() {
+                hosted.url.clear();
+                hosted.expiry_time = None;
+            }
+            if !self.limit_exceeded {
+                self.record_incomplete(block_id, kind, "ambiguous_file_source");
+            }
+            return Ok(());
+        }
         if let Some(external) = payload.external.as_mut() {
+            if payload.kind != "external" {
+                return Err(LocalityError::InvalidState(
+                    "Notion portable media payload type does not match its source".to_string(),
+                ));
+            }
+            if validate_portable_external_media_url(&external.url).is_ok() {
+                return Ok(());
+            }
             external.url.clear();
+            if !self.limit_exceeded {
+                self.record_incomplete(block_id, kind, "invalid_external_media");
+            }
+            return Ok(());
         }
         if self.limit_exceeded {
             if let Some(hosted) = payload.file.as_mut() {
@@ -359,24 +386,22 @@ impl<'a> PortableMediaCaptureState<'a> {
             return Ok(());
         }
         let Some(hosted) = payload.file.as_mut() else {
-            self.record_incomplete(
-                block_id,
-                kind,
-                if external_present {
-                    "external_media"
-                } else {
-                    "missing_file"
-                },
-            );
+            if !matches!(payload.kind.as_str(), "external" | "file") {
+                return Err(LocalityError::InvalidState(
+                    "Notion portable media payload type does not match its source".to_string(),
+                ));
+            }
+            self.record_incomplete(block_id, kind, "missing_file");
             return Ok(());
         };
+        if payload.kind != "file" {
+            return Err(LocalityError::InvalidState(
+                "Notion portable media payload type does not match its source".to_string(),
+            ));
+        }
         let original_url = hosted.url.clone();
         let expiry_time = hosted.expiry_time.take();
         hosted.url.clear();
-        if external_present {
-            self.record_incomplete(block_id, kind, "ambiguous_file_source");
-            return Ok(());
-        }
         if original_url.is_empty() {
             self.record_incomplete(block_id, kind, "unavailable_hosted_media");
             return Ok(());
@@ -513,6 +538,21 @@ fn is_media_kind(kind: &str) -> bool {
     matches!(kind, "image" | "video" | "file" | "pdf" | "audio")
 }
 
+fn validate_portable_media_payload_source(payload: &FileBlockDto) -> LocalityResult<()> {
+    let source_matches = match (payload.external.is_some(), payload.file.is_some()) {
+        (true, true) => true,
+        (true, false) => payload.kind == "external",
+        (false, true) => payload.kind == "file",
+        (false, false) => matches!(payload.kind.as_str(), "external" | "file"),
+    };
+    if !source_matches {
+        return Err(LocalityError::InvalidState(
+            "Notion portable media payload type does not match its source".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn portable_media_asset_count(bundle: &NotionPageBundle) -> LocalityResult<usize> {
     fn count_blocks(
         trees: &[BlockTreeDto],
@@ -527,11 +567,24 @@ fn portable_media_asset_count(bundle: &NotionPageBundle) -> LocalityResult<usize
                         "Notion portable media contains a duplicate block identity".to_string(),
                     ));
                 }
-                count = count.checked_add(1).ok_or_else(|| {
+                let payload = media_payload(&tree.block).ok_or_else(|| {
                     LocalityError::InvalidState(
-                        "Notion portable media asset count overflowed".to_string(),
+                        "Notion portable media block is missing its payload".to_string(),
                     )
                 })?;
+                validate_portable_media_payload_source(payload)?;
+                let valid_external = payload.file.is_none()
+                    && payload.external.as_ref().is_some_and(|external| {
+                        payload.kind == "external"
+                            && validate_portable_external_media_url(&external.url).is_ok()
+                    });
+                if !valid_external {
+                    count = count.checked_add(1).ok_or_else(|| {
+                        LocalityError::InvalidState(
+                            "Notion portable media asset count overflowed".to_string(),
+                        )
+                    })?;
+                }
             }
             count = count
                 .checked_add(count_blocks(&tree.children, seen_media_ids)?)
@@ -928,6 +981,7 @@ fn render_portable_media_page(
         .iter()
         .map(|media| media.block_id.clone())
         .collect::<BTreeSet<_>>();
+    let mut external_block_ids = portable_external_media_block_ids(&bundle.page.blocks);
     let page_native = NativeEntity {
         remote_id: request.native.remote_id.clone(),
         kind: "notion_page".to_string(),
@@ -976,6 +1030,9 @@ fn render_portable_media_page(
     let mut projected_paths = BTreeSet::new();
     for rendered_asset in rendered.media_assets {
         let Some(captured) = captured_by_block.remove(&rendered_asset.block_id) else {
+            if external_block_ids.remove(&rendered_asset.block_id) {
+                continue;
+            }
             return Err(LocalityError::InvalidState(
                 "Notion portable media render produced an uncaptured asset".to_string(),
             ));
@@ -1024,6 +1081,11 @@ fn render_portable_media_page(
     if !captured_by_block.is_empty() {
         return Err(LocalityError::InvalidState(
             "Notion portable media native payload contains an unrendered asset".to_string(),
+        ));
+    }
+    if !external_block_ids.is_empty() {
+        return Err(LocalityError::InvalidState(
+            "Notion portable external media did not render as a reference".to_string(),
         ));
     }
 
@@ -1082,19 +1144,21 @@ fn validate_portable_media_bundle(bundle: &NotionPortablePageBundleV1) -> Locali
         ));
     }
     for (block_id, (kind, payload)) in &media_blocks {
+        validate_portable_media_payload_source(payload)?;
         if payload
-            .external
+            .file
             .as_ref()
-            .is_some_and(|file| !file.url.is_empty())
-            || payload
-                .file
-                .as_ref()
-                .is_some_and(|file| file.expiry_time.is_some())
+            .is_some_and(|file| file.expiry_time.is_some())
         {
             return Err(LocalityError::InvalidState(
                 "Notion portable media native payload is not sanitized".to_string(),
             ));
         }
+        let external_url = payload
+            .external
+            .as_ref()
+            .map(|file| file.url.as_str())
+            .unwrap_or("");
         let hosted_url = payload
             .file
             .as_ref()
@@ -1122,6 +1186,19 @@ fn validate_portable_media_bundle(bundle: &NotionPortablePageBundleV1) -> Locali
                 ));
             }
         } else {
+            if !external_url.is_empty() {
+                if payload.file.is_some() || payload.kind != "external" {
+                    return Err(LocalityError::InvalidState(
+                        "Notion portable external media source is ambiguous".to_string(),
+                    ));
+                }
+                validate_portable_external_media_url(external_url).map_err(|_| {
+                    LocalityError::InvalidState(
+                        "Notion portable external media URL is not allowed".to_string(),
+                    )
+                })?;
+                continue;
+            }
             if !hosted_url.is_empty() {
                 return Err(LocalityError::InvalidState(
                     "Notion portable incomplete media retained a remote URL".to_string(),
@@ -1130,7 +1207,7 @@ fn validate_portable_media_bundle(bundle: &NotionPortablePageBundleV1) -> Locali
             if !limit_exceeded {
                 let code = match (payload.external.is_some(), payload.file.is_some()) {
                     (true, true) => "ambiguous_file_source",
-                    (true, false) => "external_media",
+                    (true, false) => "invalid_external_media",
                     (false, true) => "unavailable_hosted_media",
                     (false, false) => "missing_file",
                 };
@@ -1227,6 +1304,29 @@ fn validate_portable_media_bundle(bundle: &NotionPortablePageBundleV1) -> Locali
         ));
     }
     Ok(())
+}
+
+fn portable_external_media_block_ids(trees: &[BlockTreeDto]) -> BTreeSet<String> {
+    fn collect(trees: &[BlockTreeDto], block_ids: &mut BTreeSet<String>) {
+        for tree in trees {
+            if is_media_kind(&tree.block.kind)
+                && media_payload(&tree.block).is_some_and(|payload| {
+                    payload.file.is_none()
+                        && payload.kind == "external"
+                        && payload.external.as_ref().is_some_and(|external| {
+                            validate_portable_external_media_url(&external.url).is_ok()
+                        })
+                })
+            {
+                block_ids.insert(tree.block.id.clone());
+            }
+            collect(&tree.children, block_ids);
+        }
+    }
+
+    let mut block_ids = BTreeSet::new();
+    collect(trees, &mut block_ids);
+    block_ids
 }
 
 fn insert_expected_incomplete(
