@@ -7,13 +7,17 @@
 //! Notion page/database names.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use locality_core::path_projection::page_container_path;
 use locality_core::{LocalityError, LocalityResult};
+use reqwest::StatusCode;
 use reqwest::blocking::Client;
+use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -24,6 +28,382 @@ const MEDIA_DIR: &str = "media";
 const MEDIA_MANIFEST: &str = "manifest.json";
 const MEDIA_FETCH_ATTEMPTS: usize = 3;
 const MEDIA_FETCH_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+pub const PORTABLE_MEDIA_MAX_ASSETS: usize = 128;
+pub const PORTABLE_MEDIA_MAX_ASSET_BYTES: usize = 20 * 1024 * 1024;
+pub const PORTABLE_MEDIA_MAX_AGGREGATE_BYTES: usize = 100 * 1024 * 1024;
+const PORTABLE_MEDIA_READ_BUFFER_BYTES: usize = 64 * 1024;
+const PORTABLE_MEDIA_MAX_REDIRECTS: usize = 3;
+const PORTABLE_MEDIA_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const PORTABLE_MEDIA_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Opt-in hosted-media behavior for portable Notion fetches.
+///
+/// The default preserves the existing direct connector behavior. `HostedPilot`
+/// captures only Notion-hosted file payloads under the fixed pilot limits above.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PortableMediaCapturePolicy {
+    #[default]
+    Disabled,
+    HostedPilot,
+}
+
+impl PortableMediaCapturePolicy {
+    pub(crate) fn captures_hosted_media(self) -> bool {
+        self == Self::HostedPilot
+    }
+}
+
+/// A bounded hosted-media response returned to portable capture.
+///
+/// Custom implementations are intended for deterministic tests. The connector
+/// validates the initial provider URL before invoking the fetcher and enforces
+/// the same byte limits on every returned body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortableMediaCapture {
+    pub bytes: Vec<u8>,
+    pub media_type: String,
+}
+
+pub trait PortableMediaCaptureFetcher: Send + Sync {
+    fn fetch(&self, hosted_url: &str, max_bytes: usize) -> LocalityResult<PortableMediaCapture>;
+}
+
+#[derive(Default)]
+struct SecurePortableMediaCaptureFetcher {
+    transport: Mutex<Option<ReqwestPortableMediaTransport>>,
+}
+
+impl PortableMediaCaptureFetcher for SecurePortableMediaCaptureFetcher {
+    fn fetch(&self, hosted_url: &str, max_bytes: usize) -> LocalityResult<PortableMediaCapture> {
+        let mut transport = self.transport.lock().map_err(|_| {
+            LocalityError::InvalidState("portable media HTTP client lock is poisoned".to_string())
+        })?;
+        if transport.is_none() {
+            *transport = Some(ReqwestPortableMediaTransport::new()?);
+        }
+        fetch_portable_media_with_transport(
+            transport
+                .as_ref()
+                .expect("portable media HTTP client was initialized above"),
+            hosted_url,
+            max_bytes,
+        )
+    }
+}
+
+pub(crate) fn default_portable_media_fetcher() -> Arc<dyn PortableMediaCaptureFetcher> {
+    Arc::new(SecurePortableMediaCaptureFetcher::default())
+}
+
+struct PortableMediaHttpResponse {
+    status: StatusCode,
+    location: Option<String>,
+    content_encoding: Option<String>,
+    content_length: Option<u64>,
+    content_type: Option<String>,
+    body: Box<dyn Read + Send>,
+}
+
+trait PortableMediaHttpTransport {
+    fn get(&self, url: &str, timeout: Duration) -> LocalityResult<PortableMediaHttpResponse>;
+}
+
+struct ReqwestPortableMediaTransport {
+    client: Client,
+}
+
+impl ReqwestPortableMediaTransport {
+    fn new() -> LocalityResult<Self> {
+        // Install the crate's selected rustls provider before building a
+        // separately hardened client.
+        drop(notion_http_client());
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(PORTABLE_MEDIA_CONNECT_TIMEOUT)
+            .timeout(PORTABLE_MEDIA_REQUEST_TIMEOUT)
+            .build()
+            .map_err(|_| {
+                LocalityError::Io("portable media HTTP client initialization failed".to_string())
+            })?;
+        Ok(Self { client })
+    }
+}
+
+impl PortableMediaHttpTransport for ReqwestPortableMediaTransport {
+    fn get(&self, url: &str, timeout: Duration) -> LocalityResult<PortableMediaHttpResponse> {
+        let response = self
+            .client
+            .get(url)
+            .header(ACCEPT_ENCODING, "identity")
+            .timeout(timeout)
+            .send()
+            .map_err(|_| LocalityError::Io("portable media request failed".to_string()))?;
+        let headers = response.headers();
+        let location = headers
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let content_encoding = headers
+            .get(CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let content_length = headers
+            .get(CONTENT_LENGTH)
+            .map(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        LocalityError::InvalidState(
+                            "portable media content length is invalid".to_string(),
+                        )
+                    })
+            })
+            .transpose()?;
+        let content_type = headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let status = response.status();
+        Ok(PortableMediaHttpResponse {
+            status,
+            location,
+            content_encoding,
+            content_length,
+            content_type,
+            body: Box::new(response),
+        })
+    }
+}
+
+fn fetch_portable_media_with_transport(
+    transport: &dyn PortableMediaHttpTransport,
+    hosted_url: &str,
+    max_bytes: usize,
+) -> LocalityResult<PortableMediaCapture> {
+    let mut current = validate_portable_hosted_media_url(hosted_url)?;
+    let mut visited = std::collections::BTreeSet::new();
+    let started = Instant::now();
+
+    for redirects in 0..=PORTABLE_MEDIA_MAX_REDIRECTS {
+        if !visited.insert(current.as_str().to_string()) {
+            return Err(LocalityError::InvalidState(
+                "portable media redirect loop rejected".to_string(),
+            ));
+        }
+        let timeout = PORTABLE_MEDIA_REQUEST_TIMEOUT
+            .checked_sub(started.elapsed())
+            .ok_or_else(|| LocalityError::Io("portable media request timed out".to_string()))?;
+        let mut response = transport.get(current.as_str(), timeout)?;
+
+        if response.status.is_redirection() {
+            if redirects == PORTABLE_MEDIA_MAX_REDIRECTS {
+                return Err(LocalityError::InvalidState(
+                    "portable media redirect limit exceeded".to_string(),
+                ));
+            }
+            let location = response.location.as_deref().ok_or_else(|| {
+                LocalityError::InvalidState(
+                    "portable media redirect omitted its destination".to_string(),
+                )
+            })?;
+            let destination = current.join(location).map_err(|_| {
+                LocalityError::InvalidState(
+                    "portable media redirect destination is invalid".to_string(),
+                )
+            })?;
+            current = validate_portable_hosted_media_url(destination.as_str())?;
+            continue;
+        }
+        if !response.status.is_success() {
+            return Err(LocalityError::Io(format!(
+                "portable media request returned HTTP {}",
+                response.status.as_u16()
+            )));
+        }
+        if let Some(encoding) = response.content_encoding.as_deref()
+            && !encoding.eq_ignore_ascii_case("identity")
+        {
+            return Err(LocalityError::InvalidState(
+                "portable media content encoding is unsupported".to_string(),
+            ));
+        }
+        if response
+            .content_length
+            .is_some_and(|length| length > max_bytes as u64)
+        {
+            return Err(LocalityError::InvalidState(
+                "portable media content length exceeds the asset limit".to_string(),
+            ));
+        }
+
+        let mut bytes = Vec::with_capacity(
+            response
+                .content_length
+                .and_then(|length| usize::try_from(length).ok())
+                .unwrap_or(0)
+                .min(max_bytes),
+        );
+        let mut buffer = [0_u8; PORTABLE_MEDIA_READ_BUFFER_BYTES];
+        loop {
+            let read = response.body.read(&mut buffer).map_err(|_| {
+                LocalityError::Io("portable media response body failed".to_string())
+            })?;
+            if read == 0 {
+                break;
+            }
+            if bytes.len().saturating_add(read) > max_bytes {
+                return Err(LocalityError::InvalidState(
+                    "portable media response exceeded the asset limit".to_string(),
+                ));
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+        if response
+            .content_length
+            .is_some_and(|length| length != bytes.len() as u64)
+        {
+            return Err(LocalityError::InvalidState(
+                "portable media content length did not match the response body".to_string(),
+            ));
+        }
+        return Ok(PortableMediaCapture {
+            bytes,
+            media_type: sanitize_portable_media_type(response.content_type.as_deref()),
+        });
+    }
+
+    unreachable!("redirect loop always returns or continues within its fixed bound")
+}
+
+pub(crate) fn validate_portable_hosted_media_url(url: &str) -> LocalityResult<reqwest::Url> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|_| LocalityError::InvalidState("portable media URL is invalid".to_string()))?;
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some_and(|port| port != 443)
+    {
+        return Err(LocalityError::InvalidState(
+            "portable media URL violates the HTTPS origin policy".to_string(),
+        ));
+    }
+    let host = parsed.host_str().ok_or_else(|| {
+        LocalityError::InvalidState("portable media URL has no allowed host".to_string())
+    })?;
+    let allowed = matches!(
+        host,
+        "secure.notion-static.com" | "prod-files-secure.s3.us-west-2.amazonaws.com"
+    ) || (host == "s3.us-west-2.amazonaws.com"
+        && parsed.path().starts_with("/secure.notion-static.com/"));
+    if !allowed {
+        return Err(LocalityError::InvalidState(
+            "portable media URL host is not allowed".to_string(),
+        ));
+    }
+    Ok(parsed)
+}
+
+pub(crate) fn sanitize_portable_hosted_media_url(url: &str) -> LocalityResult<String> {
+    let mut parsed = validate_portable_hosted_media_url(url)?;
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Ok(parsed.to_string())
+}
+
+pub(crate) fn portable_media_expired(expiry_time: &str) -> LocalityResult<bool> {
+    let expiry = parse_rfc3339_utc_seconds(expiry_time).ok_or_else(|| {
+        LocalityError::InvalidState("portable media expiry is invalid".to_string())
+    })?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| LocalityError::InvalidState("system clock is before Unix time".to_string()))?
+        .as_secs();
+    Ok(expiry <= now)
+}
+
+fn parse_rfc3339_utc_seconds(value: &str) -> Option<u64> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || *bytes.last()? != b'Z'
+    {
+        return None;
+    }
+    if bytes.len() > 20 {
+        let fraction = &bytes[20..bytes.len() - 1];
+        if bytes[19] != b'.' || fraction.is_empty() || !fraction.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+    }
+    let number = |start: usize, end: usize| -> Option<i64> {
+        std::str::from_utf8(&bytes[start..end]).ok()?.parse().ok()
+    };
+    let year = number(0, 4)?;
+    let month = number(5, 7)?;
+    let day = number(8, 10)?;
+    let hour = number(11, 13)?;
+    let minute = number(14, 16)?;
+    let second = number(17, 19)?;
+    if !(1..=12).contains(&month)
+        || day < 1
+        || day > days_in_month(year, month)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=59).contains(&second)
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    if days < 0 {
+        return None;
+    }
+    u64::try_from(days * 86_400 + hour * 3_600 + minute * 60 + second).ok()
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let adjusted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * adjusted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+pub(crate) fn sanitize_portable_media_type(value: Option<&str>) -> String {
+    let essence = value
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .filter(|value| {
+            let mut parts = value.split('/');
+            let valid_part = |part: &str| {
+                !part.is_empty()
+                    && part.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'!' | b'#' | b'$' | b'&' | b'^' | b'_' | b'.' | b'+' | b'-')
+                    })
+            };
+            matches!((parts.next(), parts.next(), parts.next()), (Some(kind), Some(subtype), None) if valid_part(kind) && valid_part(subtype))
+        });
+    essence
+        .unwrap_or("application/octet-stream")
+        .to_ascii_lowercase()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaAsset {
@@ -631,11 +1011,18 @@ mod tests {
     #[cfg(windows)]
     use super::resolve_media_href_with_content_root;
     use super::{
-        MediaAsset, local_media_href, media_local_path, replace_media_manifest, resolve_media_href,
+        MediaAsset, PORTABLE_MEDIA_READ_BUFFER_BYTES, PortableMediaHttpResponse,
+        PortableMediaHttpTransport, fetch_portable_media_with_transport, local_media_href,
+        media_local_path, portable_media_expired, replace_media_manifest, resolve_media_href,
+        sanitize_portable_hosted_media_url, validate_portable_hosted_media_url,
     };
+    use reqwest::StatusCode;
+    use std::collections::VecDeque;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     #[test]
@@ -783,6 +1170,337 @@ mod tests {
         };
 
         assert!(!super::should_download(&relative));
+    }
+
+    #[test]
+    fn portable_hosted_media_url_policy_is_exact_and_sanitizes_signatures() {
+        for url in [
+            "https://secure.notion-static.com/image.png",
+            "https://prod-files-secure.s3.us-west-2.amazonaws.com/image.png",
+            "https://s3.us-west-2.amazonaws.com/secure.notion-static.com/image.png",
+            "https://secure.notion-static.com:443/image.png",
+        ] {
+            validate_portable_hosted_media_url(url)
+                .unwrap_or_else(|error| panic!("allowed URL {url}: {error}"));
+        }
+        for url in [
+            "http://secure.notion-static.com/image.png",
+            "https://127.0.0.1/image.png",
+            "https://[::1]/image.png",
+            "https://user@secure.notion-static.com/image.png",
+            "https://user:pass@secure.notion-static.com/image.png",
+            "https://secure.notion-static.com:444/image.png",
+            "https://notion-static.com/image.png",
+            "https://sub.secure.notion-static.com/image.png",
+            "https://s3.amazonaws.com/secure.notion-static.com/image.png",
+            "https://s3.us-west-2.amazonaws.com/other/image.png",
+        ] {
+            assert!(
+                validate_portable_hosted_media_url(url).is_err(),
+                "denied URL {url}"
+            );
+        }
+        assert_eq!(
+            sanitize_portable_hosted_media_url(concat!(
+                "https://secure.notion-static.com/image.png?",
+                "X-Amz-Signature=secret&token=secret#fragment"
+            ))
+            .expect("sanitize"),
+            "https://secure.notion-static.com/image.png"
+        );
+    }
+
+    #[test]
+    fn portable_media_follows_only_three_revalidated_redirects() {
+        let transport = ScriptedPortableMediaTransport::new([
+            scripted_response(
+                StatusCode::FOUND,
+                Some("https://prod-files-secure.s3.us-west-2.amazonaws.com/second.png"),
+                None,
+                None,
+                None,
+                Vec::new(),
+            ),
+            scripted_response(
+                StatusCode::OK,
+                None,
+                None,
+                Some(4),
+                Some("image/png"),
+                b"data".to_vec(),
+            ),
+        ]);
+        let captured = fetch_portable_media_with_transport(
+            &transport,
+            "https://secure.notion-static.com/first.png?X-Amz-Signature=secret",
+            1024,
+        )
+        .expect("allowed redirect");
+        assert_eq!(captured.bytes, b"data");
+        assert_eq!(captured.media_type, "image/png");
+        assert_eq!(transport.requests().len(), 2);
+
+        let disallowed = ScriptedPortableMediaTransport::new([scripted_response(
+            StatusCode::FOUND,
+            Some("https://example.com/stolen.png?token=secret"),
+            None,
+            None,
+            None,
+            Vec::new(),
+        )]);
+        let error = fetch_portable_media_with_transport(
+            &disallowed,
+            "https://secure.notion-static.com/first.png",
+            1024,
+        )
+        .expect_err("disallowed redirect");
+        assert_eq!(
+            error.to_string(),
+            "invalid state: portable media URL host is not allowed"
+        );
+        assert!(!error.to_string().contains("token=secret"));
+
+        let redirect_loop = ScriptedPortableMediaTransport::new([scripted_response(
+            StatusCode::FOUND,
+            Some("/first.png"),
+            None,
+            None,
+            None,
+            Vec::new(),
+        )]);
+        assert_eq!(
+            fetch_portable_media_with_transport(
+                &redirect_loop,
+                "https://secure.notion-static.com/first.png",
+                1024,
+            )
+            .expect_err("redirect loop")
+            .to_string(),
+            "invalid state: portable media redirect loop rejected"
+        );
+
+        let too_many = ScriptedPortableMediaTransport::new((0..=3).map(|index| {
+            scripted_response(
+                StatusCode::FOUND,
+                Some(&format!(
+                    "https://secure.notion-static.com/redirect-{}.png",
+                    index + 1
+                )),
+                None,
+                None,
+                None,
+                Vec::new(),
+            )
+        }));
+        assert_eq!(
+            fetch_portable_media_with_transport(
+                &too_many,
+                "https://secure.notion-static.com/start.png",
+                1024,
+            )
+            .expect_err("redirect bound")
+            .to_string(),
+            "invalid state: portable media redirect limit exceeded"
+        );
+    }
+
+    #[test]
+    fn portable_media_rejects_encoding_length_and_stream_overflow() {
+        let encoded = ScriptedPortableMediaTransport::new([scripted_response(
+            StatusCode::OK,
+            None,
+            Some("gzip"),
+            Some(4),
+            Some("image/png"),
+            b"data".to_vec(),
+        )]);
+        assert_eq!(
+            portable_transport_error(&encoded, 4),
+            "invalid state: portable media content encoding is unsupported"
+        );
+
+        let declared_oversize = ScriptedPortableMediaTransport::new([scripted_response(
+            StatusCode::OK,
+            None,
+            None,
+            Some(5),
+            Some("image/png"),
+            b"data".to_vec(),
+        )]);
+        assert_eq!(
+            portable_transport_error(&declared_oversize, 4),
+            "invalid state: portable media content length exceeds the asset limit"
+        );
+
+        let mismatched = ScriptedPortableMediaTransport::new([scripted_response(
+            StatusCode::OK,
+            None,
+            Some("identity"),
+            Some(3),
+            Some("image/png"),
+            b"data".to_vec(),
+        )]);
+        assert_eq!(
+            portable_transport_error(&mismatched, 4),
+            "invalid state: portable media content length did not match the response body"
+        );
+
+        let streamed_oversize = ScriptedPortableMediaTransport::new([scripted_response(
+            StatusCode::OK,
+            None,
+            None,
+            None,
+            Some("image/png"),
+            b"12345".to_vec(),
+        )]);
+        assert_eq!(
+            portable_transport_error(&streamed_oversize, 4),
+            "invalid state: portable media response exceeded the asset limit"
+        );
+    }
+
+    #[test]
+    fn portable_media_stream_reads_are_bounded_to_64_kib() {
+        let body = vec![7_u8; PORTABLE_MEDIA_READ_BUFFER_BYTES * 2 + 1];
+        let transport = ScriptedPortableMediaTransport::new([scripted_response(
+            StatusCode::OK,
+            None,
+            None,
+            Some(body.len() as u64),
+            Some("APPLICATION/OCTET-STREAM; charset=binary"),
+            body.clone(),
+        )]);
+        let capture = fetch_portable_media_with_transport(
+            &transport,
+            "https://secure.notion-static.com/data.bin",
+            body.len(),
+        )
+        .expect("bounded stream");
+        assert_eq!(capture.bytes, body);
+        assert_eq!(capture.media_type, "application/octet-stream");
+        assert!(transport.max_read_size() <= 64 * 1024);
+    }
+
+    #[test]
+    fn portable_media_expiry_is_strict_and_utc() {
+        assert!(portable_media_expired("2000-01-01T00:00:00.000Z").expect("past"));
+        assert!(!portable_media_expired("2099-01-01T00:00:00Z").expect("future"));
+        assert!(portable_media_expired("2099-13-01T00:00:00Z").is_err());
+        assert!(portable_media_expired("2099-01-01T00:00:00.Z").is_err());
+        assert!(portable_media_expired("2099-01-01T00:00:00+01:00").is_err());
+    }
+
+    struct ScriptedPortableMediaTransport {
+        responses: Mutex<VecDeque<PortableMediaHttpResponse>>,
+        requests: Mutex<Vec<String>>,
+        max_read_size: Arc<AtomicUsize>,
+    }
+
+    impl ScriptedPortableMediaTransport {
+        fn new(responses: impl IntoIterator<Item = ScriptedResponse>) -> Self {
+            let max_read_size = Arc::new(AtomicUsize::new(0));
+            let responses = responses
+                .into_iter()
+                .map(|response| PortableMediaHttpResponse {
+                    status: response.status,
+                    location: response.location,
+                    content_encoding: response.content_encoding,
+                    content_length: response.content_length,
+                    content_type: response.content_type,
+                    body: Box::new(TrackingReader {
+                        bytes: std::io::Cursor::new(response.body),
+                        max_read_size: Arc::clone(&max_read_size),
+                    }),
+                })
+                .collect();
+            Self {
+                responses: Mutex::new(responses),
+                requests: Mutex::new(Vec::new()),
+                max_read_size,
+            }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().expect("requests").clone()
+        }
+
+        fn max_read_size(&self) -> usize {
+            self.max_read_size.load(Ordering::SeqCst)
+        }
+    }
+
+    impl PortableMediaHttpTransport for ScriptedPortableMediaTransport {
+        fn get(
+            &self,
+            url: &str,
+            _timeout: std::time::Duration,
+        ) -> locality_core::LocalityResult<PortableMediaHttpResponse> {
+            self.requests
+                .lock()
+                .expect("requests")
+                .push(url.to_string());
+            self.responses
+                .lock()
+                .expect("responses")
+                .pop_front()
+                .ok_or_else(|| {
+                    locality_core::LocalityError::InvalidState(
+                        "scripted transport exhausted".to_string(),
+                    )
+                })
+        }
+    }
+
+    struct ScriptedResponse {
+        status: StatusCode,
+        location: Option<String>,
+        content_encoding: Option<String>,
+        content_length: Option<u64>,
+        content_type: Option<String>,
+        body: Vec<u8>,
+    }
+
+    fn scripted_response(
+        status: StatusCode,
+        location: Option<&str>,
+        content_encoding: Option<&str>,
+        content_length: Option<u64>,
+        content_type: Option<&str>,
+        body: Vec<u8>,
+    ) -> ScriptedResponse {
+        ScriptedResponse {
+            status,
+            location: location.map(str::to_string),
+            content_encoding: content_encoding.map(str::to_string),
+            content_length,
+            content_type: content_type.map(str::to_string),
+            body,
+        }
+    }
+
+    struct TrackingReader {
+        bytes: std::io::Cursor<Vec<u8>>,
+        max_read_size: Arc<AtomicUsize>,
+    }
+
+    impl Read for TrackingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.max_read_size.fetch_max(buffer.len(), Ordering::SeqCst);
+            self.bytes.read(buffer)
+        }
+    }
+
+    fn portable_transport_error(
+        transport: &ScriptedPortableMediaTransport,
+        max_bytes: usize,
+    ) -> String {
+        fetch_portable_media_with_transport(
+            transport,
+            "https://secure.notion-static.com/image.png",
+            max_bytes,
+        )
+        .expect_err("transport must reject")
+        .to_string()
     }
 
     #[test]
