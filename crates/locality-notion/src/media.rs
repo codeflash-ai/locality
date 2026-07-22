@@ -33,6 +33,7 @@ pub const PORTABLE_MEDIA_MAX_ASSETS: usize = 128;
 pub const PORTABLE_MEDIA_MAX_ASSET_BYTES: usize = 20 * 1024 * 1024;
 pub const PORTABLE_MEDIA_MAX_AGGREGATE_BYTES: usize = 100 * 1024 * 1024;
 const PORTABLE_MEDIA_READ_BUFFER_BYTES: usize = 64 * 1024;
+const PORTABLE_EXTERNAL_MEDIA_MAX_URL_BYTES: usize = 8 * 1024;
 const PORTABLE_MEDIA_MAX_REDIRECTS: usize = 3;
 const PORTABLE_MEDIA_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PORTABLE_MEDIA_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -311,6 +312,37 @@ pub(crate) fn sanitize_portable_hosted_media_url(url: &str) -> LocalityResult<St
     parsed.set_query(None);
     parsed.set_fragment(None);
     Ok(parsed.to_string())
+}
+
+/// Validates a public external media reference without rewriting it.
+///
+/// Portable rendering never requests these URLs. Keeping validation separate
+/// from hosted-media capture makes that no-fetch boundary explicit and lets the
+/// renderer preserve the provider's exact safe spelling.
+pub(crate) fn validate_portable_external_media_url(url: &str) -> LocalityResult<()> {
+    if url.is_empty()
+        || url.len() > PORTABLE_EXTERNAL_MEDIA_MAX_URL_BYTES
+        || url
+            .chars()
+            .any(|character| character.is_ascii_control() || character.is_whitespace())
+    {
+        return Err(LocalityError::InvalidState(
+            "portable external media URL is not raw-safe".to_string(),
+        ));
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|_| {
+        LocalityError::InvalidState("portable external media URL is invalid".to_string())
+    })?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(LocalityError::InvalidState(
+            "portable external media URL violates the HTTPS reference policy".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn portable_media_expired(expiry_time: &str) -> LocalityResult<bool> {

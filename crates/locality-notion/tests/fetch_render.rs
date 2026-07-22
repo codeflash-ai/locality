@@ -3157,6 +3157,191 @@ fn portable_media_default_preserves_native_and_remains_incomplete() {
 }
 
 #[test]
+fn portable_external_media_is_an_exact_byte_free_reference_and_never_fetched() {
+    let page_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let block_id = "cccccccccccccccccccccccccccccccc";
+    let external_url = "https://CDN.Example.com:8443/assets/My%20Image.PNG?download=One#Section";
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = Arc::new(FixturePortableMediaFetcher {
+        outcomes: BTreeMap::new(),
+        calls: Arc::clone(&calls),
+    });
+    let block = file_block(block_id, "image", external_url, "Image caption");
+    let direct_bundle = locality_notion::dto::NotionPageBundle {
+        page: page(page_id, "Coverage"),
+        blocks: vec![BlockTreeDto {
+            block: block.clone(),
+            children: Vec::new(),
+        }],
+    };
+    let direct = locality_notion::render::render_page_bundle_with_options(
+        &direct_bundle,
+        &locality_notion::render::RenderOptions::with_page_path("Docs/Coverage/page.md")
+            .with_local_media_block_ids(Vec::<String>::new()),
+    )
+    .expect("direct external reference render");
+    let connector = portable_media_connector(page_id, vec![block])
+        .with_portable_media_capture_fetcher(PortableMediaCapturePolicy::HostedPilot, fetcher);
+
+    let fetched = connector
+        .fetch_portable(portable_fetch_request(page_id))
+        .expect("portable external reference fetch");
+    assert!(calls.lock().expect("calls").is_empty());
+    assert!(fetched.completeness.is_complete());
+    let native: NotionPortablePageBundleV1 =
+        serde_json::from_slice(&fetched.native.raw).expect("portable media native");
+    assert!(native.captured_media.is_empty());
+    assert!(native.incomplete_media.is_empty());
+    assert_eq!(
+        native.page.blocks[0]
+            .block
+            .image
+            .as_ref()
+            .and_then(|payload| payload.external.as_ref())
+            .map(|external| external.url.as_str()),
+        Some(external_url)
+    );
+
+    let rendered = connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            logical_path: LogicalPath::new("Docs/Coverage/page.md").expect("path"),
+            native: fetched.native,
+            format_version: 1,
+        })
+        .expect("portable external reference render");
+    let exact_markdown = concat!(
+        "---\n",
+        "loc:\n",
+        "  id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        "  type: page\n",
+        "  synced_at: \"2026-06-10T00:00:00.000Z\"\n",
+        "  remote_edited_at: \"2026-06-10T00:00:00.000Z\"\n",
+        "title: \"Coverage\"\n",
+        "---\n",
+        "![Image caption](https://CDN.Example.com:8443/assets/My%20Image.PNG?download=One#Section)\n",
+    );
+    assert_eq!(rendered.canonical.body, exact_markdown.as_bytes());
+    assert_eq!(
+        rendered.canonical.body,
+        render_canonical_markdown(&direct.document).as_bytes()
+    );
+    assert_eq!(rendered.projections.len(), 1);
+    assert_eq!(
+        rendered.projections[0].artifact.body,
+        exact_markdown.as_bytes()
+    );
+    assert!(rendered.completeness.is_complete());
+
+    let mut invalid_url = native.clone();
+    invalid_url.page.blocks[0]
+        .block
+        .image
+        .as_mut()
+        .expect("image payload")
+        .external
+        .as_mut()
+        .expect("external source")
+        .url = "http://example.com/not-https.png".to_string();
+    let mut mismatched_source = native;
+    mismatched_source.page.blocks[0]
+        .block
+        .image
+        .as_mut()
+        .expect("image payload")
+        .kind = "file".to_string();
+    for (case, bundle, expected) in [
+        (
+            "invalid URL",
+            invalid_url,
+            "invalid state: Notion portable external media URL is not allowed",
+        ),
+        (
+            "mismatched source",
+            mismatched_source,
+            "invalid state: Notion portable media payload type does not match its source",
+        ),
+    ] {
+        let error = connector
+            .render_portable(&portable_render_request(
+                page_id,
+                NativeEntity {
+                    remote_id: RemoteId::new(page_id),
+                    kind: "notion_page_portable_media_v1".to_string(),
+                    raw: serde_json::to_vec(&bundle).expect("tampered native"),
+                },
+            ))
+            .unwrap_err();
+        assert_eq!(error.to_string(), expected, "{case}");
+    }
+}
+
+#[test]
+fn portable_external_media_supports_every_file_like_block_without_capture() {
+    let page_id = "all-external-page";
+    let blocks = ["image", "video", "file", "pdf", "audio"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| {
+            file_block(
+                &format!("external-{kind}"),
+                kind,
+                &format!("https://example.com/{kind}?source=external&index={index}"),
+                &format!("External {kind}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let connector = portable_media_connector(page_id, blocks).with_portable_media_capture_fetcher(
+        PortableMediaCapturePolicy::HostedPilot,
+        Arc::new(FixturePortableMediaFetcher {
+            outcomes: BTreeMap::new(),
+            calls: Arc::clone(&calls),
+        }),
+    );
+
+    let fetched = connector
+        .fetch_portable(portable_fetch_request(page_id))
+        .expect("all external media fetch");
+    assert!(calls.lock().expect("calls").is_empty());
+    assert!(fetched.completeness.is_complete());
+    let native: NotionPortablePageBundleV1 =
+        serde_json::from_slice(&fetched.native.raw).expect("portable native");
+    assert!(native.captured_media.is_empty());
+    assert!(native.incomplete_media.is_empty());
+
+    let rendered = connector
+        .render_portable(&portable_render_request(page_id, fetched.native))
+        .expect("all external media render");
+    let expected_body = concat!(
+        "![External image](https://example.com/image?source=external&index=0)\n\n",
+        "[External video](https://example.com/video?source=external&index=1)\n\n",
+        "[External file](https://example.com/file?source=external&index=2)\n\n",
+        "[External pdf](https://example.com/pdf?source=external&index=3)\n\n",
+        "[External audio](https://example.com/audio?source=external&index=4)\n",
+    );
+    assert_eq!(
+        String::from_utf8(rendered.canonical.body).expect("UTF-8 Markdown"),
+        format!(
+            concat!(
+                "---\n",
+                "loc:\n",
+                "  id: all-external-page\n",
+                "  type: page\n",
+                "  synced_at: \"2026-06-10T00:00:00.000Z\"\n",
+                "  remote_edited_at: \"2026-06-10T00:00:00.000Z\"\n",
+                "title: \"Coverage\"\n",
+                "---\n",
+                "{}"
+            ),
+            expected_body
+        )
+    );
+    assert_eq!(rendered.projections.len(), 1);
+    assert!(rendered.completeness.is_complete());
+}
+
+#[test]
 fn portable_capture_keeps_pages_without_media_byte_exact() {
     let page_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let blocks = vec![paragraph_block(
@@ -3196,7 +3381,6 @@ fn portable_capture_keeps_pages_without_media_byte_exact() {
 #[test]
 fn portable_media_denials_are_incomplete_and_never_publish_remote_urls() {
     let denied = [
-        ("external", "https://example.com/external.png"),
         ("http", "http://secure.notion-static.com/image.png"),
         ("ip", "https://127.0.0.1/image.png"),
         (
@@ -3213,11 +3397,7 @@ fn portable_media_denials_are_incomplete_and_never_publish_remote_urls() {
     for (index, (case, url)) in denied.into_iter().enumerate() {
         let page_id = format!("page-denied-{index}");
         let block_id = format!("block-denied-{index}");
-        let block = if case == "external" {
-            file_block(&block_id, "image", url, "Image")
-        } else {
-            hosted_file_block(&block_id, "image", url, None)
-        };
+        let block = hosted_file_block(&block_id, "image", url, None);
         let connector = portable_media_connector(&page_id, vec![block])
             .with_portable_media_capture(PortableMediaCapturePolicy::HostedPilot);
         let fetched = connector
@@ -3237,6 +3417,176 @@ fn portable_media_denials_are_incomplete_and_never_publish_remote_urls() {
         assert!(!rendered.completeness.is_complete(), "{case}");
         assert_eq!(rendered.projections.len(), 1, "{case}");
         assert!(!String::from_utf8_lossy(&rendered.canonical.body).contains(url));
+    }
+}
+
+#[test]
+fn portable_external_media_fails_closed_without_fetching_bad_or_ambiguous_sources() {
+    let invalid = [
+        ("empty", ""),
+        ("malformed", "not a URL"),
+        ("http", "http://example.com/image.png"),
+        ("userinfo", "https://user:pass@example.com/image.png"),
+    ];
+    for (index, (case, url)) in invalid.into_iter().enumerate() {
+        let page_id = format!("external-invalid-{index}");
+        let block_id = format!("external-block-{index}");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let connector =
+            portable_media_connector(&page_id, vec![file_block(&block_id, "image", url, "Image")])
+                .with_portable_media_capture_fetcher(
+                    PortableMediaCapturePolicy::HostedPilot,
+                    Arc::new(FixturePortableMediaFetcher {
+                        outcomes: BTreeMap::new(),
+                        calls: Arc::clone(&calls),
+                    }),
+                );
+        let fetched = connector
+            .fetch_portable(portable_fetch_request(&page_id))
+            .unwrap_or_else(|error| panic!("{case} external fetch: {error}"));
+        assert!(calls.lock().expect("calls").is_empty(), "{case}");
+        assert!(!fetched.completeness.is_complete(), "{case}");
+        let native: NotionPortablePageBundleV1 =
+            serde_json::from_slice(&fetched.native.raw).expect("portable native");
+        assert!(native.captured_media.is_empty(), "{case}");
+        assert_eq!(
+            native.incomplete_media,
+            vec![NotionPortableIncompleteMediaV1 {
+                block_id: block_id.clone(),
+                kind: "image".to_string(),
+                code: "invalid_external_media".to_string(),
+            }],
+            "{case}"
+        );
+        assert_eq!(
+            native.page.blocks[0]
+                .block
+                .image
+                .as_ref()
+                .and_then(|payload| payload.external.as_ref())
+                .map(|external| external.url.as_str()),
+            Some(""),
+            "{case}"
+        );
+        let rendered = connector
+            .render_portable(&portable_render_request(
+                &page_id,
+                NativeEntity {
+                    remote_id: RemoteId::new(&page_id),
+                    kind: "notion_page_portable_media_v1".to_string(),
+                    raw: serde_json::to_vec(&native).expect("portable native"),
+                },
+            ))
+            .unwrap_or_else(|error| panic!("{case} external render: {error}"));
+        assert_eq!(rendered.projections.len(), 1, "{case}");
+        assert!(!rendered.completeness.is_complete(), "{case}");
+        if !url.is_empty() {
+            assert!(
+                !String::from_utf8_lossy(&rendered.canonical.body).contains(url),
+                "{case}"
+            );
+        }
+    }
+
+    for (case, url) in [
+        (
+            "control",
+            "https://example.com/image.png\u{7f}hidden".to_string(),
+        ),
+        (
+            "oversized",
+            format!("https://example.com/{}", "a".repeat(8 * 1024)),
+        ),
+    ] {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let connector = portable_media_connector(
+            case,
+            vec![file_block("invalid-raw", "image", &url, "Image")],
+        )
+        .with_portable_media_capture_fetcher(
+            PortableMediaCapturePolicy::HostedPilot,
+            Arc::new(FixturePortableMediaFetcher {
+                outcomes: BTreeMap::new(),
+                calls: Arc::clone(&calls),
+            }),
+        );
+        let fetched = connector
+            .fetch_portable(portable_fetch_request(case))
+            .expect("raw-unsafe external URL becomes explicitly incomplete");
+        assert!(calls.lock().expect("calls").is_empty(), "{case}");
+        assert!(!fetched.completeness.is_complete(), "{case}");
+        assert!(!String::from_utf8_lossy(&fetched.native.raw).contains(&url));
+    }
+
+    let external_url = "https://example.com/public.png";
+    let hosted_url = "https://secure.notion-static.com/private.png?X-Amz-Signature=must-not-escape";
+    let mut ambiguous = file_block("ambiguous", "image", external_url, "Image");
+    ambiguous.image.as_mut().expect("image payload").file = Some(HostedFileDto {
+        url: hosted_url.to_string(),
+        expiry_time: Some("2099-01-01T00:00:00.000Z".to_string()),
+    });
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let connector = portable_media_connector("ambiguous-page", vec![ambiguous])
+        .with_portable_media_capture_fetcher(
+            PortableMediaCapturePolicy::HostedPilot,
+            Arc::new(FixturePortableMediaFetcher {
+                outcomes: BTreeMap::new(),
+                calls: Arc::clone(&calls),
+            }),
+        );
+    let fetched = connector
+        .fetch_portable(portable_fetch_request("ambiguous-page"))
+        .expect("ambiguous source becomes explicit incomplete");
+    assert!(calls.lock().expect("calls").is_empty());
+    assert!(!fetched.completeness.is_complete());
+    let native: NotionPortablePageBundleV1 =
+        serde_json::from_slice(&fetched.native.raw).expect("ambiguous native");
+    assert!(native.captured_media.is_empty());
+    assert_eq!(
+        native.incomplete_media,
+        vec![NotionPortableIncompleteMediaV1 {
+            block_id: "ambiguous".to_string(),
+            kind: "image".to_string(),
+            code: "ambiguous_file_source".to_string(),
+        }]
+    );
+    let raw = String::from_utf8_lossy(&fetched.native.raw);
+    assert!(!raw.contains(external_url));
+    assert!(!raw.contains(hosted_url));
+
+    for (case, mut block) in [
+        (
+            "external-as-file",
+            file_block("mismatch-external", "image", external_url, "Image"),
+        ),
+        (
+            "hosted-as-external",
+            hosted_file_block("mismatch-hosted", "image", hosted_url, None),
+        ),
+    ] {
+        let payload = block.image.as_mut().expect("image payload");
+        payload.kind = if payload.kind == "external" {
+            "file".to_string()
+        } else {
+            "external".to_string()
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let connector = portable_media_connector(case, vec![block])
+            .with_portable_media_capture_fetcher(
+                PortableMediaCapturePolicy::HostedPilot,
+                Arc::new(FixturePortableMediaFetcher {
+                    outcomes: BTreeMap::new(),
+                    calls: Arc::clone(&calls),
+                }),
+            );
+        assert_eq!(
+            connector
+                .fetch_portable(portable_fetch_request(case))
+                .expect_err("payload mismatch must fail")
+                .to_string(),
+            "invalid state: Notion portable media payload type does not match its source"
+        );
+        assert!(calls.lock().expect("calls").is_empty(), "{case}");
     }
 }
 
