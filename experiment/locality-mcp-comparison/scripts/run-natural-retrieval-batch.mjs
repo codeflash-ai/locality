@@ -298,26 +298,26 @@ while IFS= read -r add_dir; do
 done < "$ADD_DIRS_FILE"
 cmd+=("$prompt")
 if [ "$CODEX_EXEC_TIMEOUT_SECONDS" = "0" ]; then
-  run_cmd=("\${cmd[@]}")
+  run_cmd=("${"$"}{cmd[@]}")
 elif command -v timeout >/dev/null 2>&1; then
-  run_cmd=(timeout --kill-after=30s "\${CODEX_EXEC_TIMEOUT_SECONDS}s" "\${cmd[@]}")
+  run_cmd=(timeout --kill-after=30s "${"$"}{CODEX_EXEC_TIMEOUT_SECONDS}s" "${"$"}{cmd[@]}")
 else
-  run_cmd=(python3 "$EXPERIMENT_DIR/scripts/run-with-timeout.py" "$CODEX_EXEC_TIMEOUT_SECONDS" -- "\${cmd[@]}")
+  run_cmd=(python3 "$EXPERIMENT_DIR/scripts/run-with-timeout.py" "$CODEX_EXEC_TIMEOUT_SECONDS" -- "${"$"}{cmd[@]}")
 fi
 {
   printf 'timeout_seconds=%s\n' "$CODEX_EXEC_TIMEOUT_SECONDS"
   printf 'codex_command='
-  printf '%q ' "\${cmd[@]}"
+  printf '%q ' "${"$"}{cmd[@]}"
   printf '\nwrapped_command='
-  printf '%q ' "\${run_cmd[@]}"
+  printf '%q ' "${"$"}{run_cmd[@]}"
   printf '\n'
 } > "$COMMAND_PATH"
 set +e
 set -o pipefail
 LOCALITY_TRACE_FILE="$LOCALITY_TRACE_FILE" LOCALITY_TRACE_RUN_ID="$NATURAL_BATCH_ID" \
-  "\${run_cmd[@]}" < /dev/null 2> "$ERR_PATH" | python3 "$EXPERIMENT_DIR/scripts/timestamp-jsonl.py" > "$EVENTS_PATH"
-pipe_status=("\${PIPESTATUS[@]}")
-rc="\${pipe_status[0]}"
+  "${"$"}{run_cmd[@]}" < /dev/null 2> "$ERR_PATH" | python3 "$EXPERIMENT_DIR/scripts/timestamp-jsonl.py" > "$EVENTS_PATH"
+pipe_status=("${"$"}{PIPESTATUS[@]}")
+rc="${"$"}{pipe_status[0]}"
 set +o pipefail
 set -e
 exit "$rc"
