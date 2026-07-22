@@ -198,6 +198,21 @@ to the same filesystem-equivalent path, all colliding siblings use a short
 remote ID suffix such as `Exact Page Title aaaaaa/page.md`. The suffix lengthens
 only when needed to keep sibling names unique.
 
+Portable and direct enumeration can also use an explicit set of up to 16 page
+or full-page database roots. Those roots are retrieved by ID without search and
+are projected together by the same root allocator and recursive traversal as
+the desktop workspace view, including title collision suffixes. The configured
+and requested root sets must match exactly; empty, duplicate, overlapping, or
+ambiguous roots fail closed. Every set-mode source change carries exactly one
+`SourceObject.edges` entry with relationship `locality_scope_root` and the
+canonical owning root as its target, including a self-edge for each root.
+Consumers decode it with `portable_scope_root_remote_id`; mixed or multiple
+owning-root edges fail closed.
+Notion does not expose reliable teamspace/private membership here, so Locality
+does not infer it. Database and media coverage remains explicitly incomplete.
+Legacy `with_root_page_id` synchronization keeps its v1 checkpoint format;
+`with_root_ids` uses component-versioned v2 root-set checkpoints.
+
 Each Notion page is a directory. The page body lives in `page.md`; sibling entries in the same directory are child Notion content:
 
 ```text

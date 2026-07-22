@@ -17,33 +17,72 @@ use crate::client::NotionApi;
 use crate::dto::{BlockDto, DatabaseDto, PageDto, ParentDto};
 use crate::render::{page_frontmatter, page_title};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExplicitRootTreeEntry {
+    pub entry: TreeEntry,
+    pub scope_root_remote_id: RemoteId,
+}
+
 pub fn enumerate_root_page_tree(
     api: &dyn NotionApi,
     mount_id: MountId,
     root_page_id: &RemoteId,
 ) -> LocalityResult<Vec<TreeEntry>> {
-    let root_page = api.retrieve_page(root_page_id.as_str())?;
+    Ok(
+        enumerate_explicit_root_trees(api, mount_id, std::slice::from_ref(root_page_id))?
+            .into_iter()
+            .map(|projected| projected.entry)
+            .collect(),
+    )
+}
+
+pub(crate) fn enumerate_explicit_root_trees(
+    api: &dyn NotionApi,
+    mount_id: MountId,
+    root_page_ids: &[RemoteId],
+) -> LocalityResult<Vec<ExplicitRootTreeEntry>> {
     let mut used_paths = BTreeSet::new();
     let mut entries = Vec::new();
-    let root_title = page_title(&root_page);
-    let root_path = allocate_page_path(Path::new(""), &root_title, &root_page.id, &mut used_paths);
+    let mut owners = BTreeMap::new();
+    let mut root_children = root_page_ids
+        .iter()
+        .map(|root_id| retrieve_explicit_root(api, root_id))
+        .collect::<LocalityResult<Vec<_>>>()?;
+    root_children.sort_by(|left, right| {
+        explicit_root_identity_key(left.remote_id())
+            .cmp(&explicit_root_identity_key(right.remote_id()))
+    });
 
-    entries.push(page_entry(
-        mount_id.clone(),
-        &root_page,
-        root_title,
-        root_path.clone(),
-    ));
-    enumerate_page_children(
-        api,
-        &mount_id,
-        root_page.id.as_str(),
-        page_child_dir(&root_path),
-        &mut used_paths,
-        &mut entries,
-    )?;
+    for projected in allocate_child_paths(Path::new(""), root_children, &mut used_paths) {
+        let scope_root_remote_id = RemoteId::new(projected.child.remote_id().to_string());
+        let mut sink = ExplicitRootSink {
+            scope_root_remote_id: &scope_root_remote_id,
+            entries: &mut entries,
+            owners: &mut owners,
+        };
+        push_projected_tree_entry(api, &mount_id, projected, &mut used_paths, &mut sink)?;
+    }
 
     Ok(entries)
+}
+
+fn retrieve_explicit_root(
+    api: &dyn NotionApi,
+    root_id: &RemoteId,
+) -> LocalityResult<ProjectedChild> {
+    match api.retrieve_page(root_id.as_str()) {
+        Ok(page) => {
+            let title = page_title(&page);
+            Ok(ProjectedChild::Page { page, title })
+        }
+        Err(LocalityError::RemoteNotFound(_)) => {
+            let database = api.retrieve_database(root_id.as_str())?;
+            let title =
+                database_title(&database).unwrap_or_else(|| "Untitled database".to_string());
+            Ok(ProjectedChild::Database { database, title })
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub fn enumerate_shared_pages(
@@ -407,21 +446,65 @@ fn push_projected_listing_entry(
     }
 }
 
-fn push_projected_tree_entry(
+trait TreeEntrySink {
+    fn push_entry(&mut self, entry: TreeEntry) -> LocalityResult<()>;
+}
+
+impl TreeEntrySink for Vec<TreeEntry> {
+    fn push_entry(&mut self, entry: TreeEntry) -> LocalityResult<()> {
+        self.push(entry);
+        Ok(())
+    }
+}
+
+struct ExplicitRootSink<'a> {
+    scope_root_remote_id: &'a RemoteId,
+    entries: &'a mut Vec<ExplicitRootTreeEntry>,
+    owners: &'a mut BTreeMap<String, RemoteId>,
+}
+
+impl TreeEntrySink for ExplicitRootSink<'_> {
+    fn push_entry(&mut self, entry: TreeEntry) -> LocalityResult<()> {
+        let key = explicit_root_identity_key(entry.remote_id.as_str());
+        if let Some(existing_owner) = self.owners.insert(key, self.scope_root_remote_id.clone()) {
+            return Err(LocalityError::InvalidState(format!(
+                "Notion explicit roots overlap or project object `{}` ambiguously between `{}` and `{}`",
+                entry.remote_id.as_str(),
+                existing_owner.as_str(),
+                self.scope_root_remote_id.as_str()
+            )));
+        }
+        self.entries.push(ExplicitRootTreeEntry {
+            entry,
+            scope_root_remote_id: self.scope_root_remote_id.clone(),
+        });
+        Ok(())
+    }
+}
+
+fn explicit_root_identity_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| *character != '-')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn push_projected_tree_entry<S: TreeEntrySink>(
     api: &dyn NotionApi,
     mount_id: &MountId,
     projected: ProjectedChildWithPath,
     used_paths: &mut BTreeSet<PathBuf>,
-    entries: &mut Vec<TreeEntry>,
+    entries: &mut S,
 ) -> LocalityResult<()> {
     match projected.child {
         ProjectedChild::Page { page, title } => {
-            entries.push(page_entry(
+            entries.push_entry(page_entry(
                 mount_id.clone(),
                 &page,
                 title,
                 projected.path.clone(),
-            ));
+            ))?;
             enumerate_page_children(
                 api,
                 mount_id,
@@ -432,12 +515,12 @@ fn push_projected_tree_entry(
             )?;
         }
         ProjectedChild::Database { database, title } => {
-            entries.push(database_entry(
+            entries.push_entry(database_entry(
                 mount_id.clone(),
                 &database,
                 title,
                 projected.path.clone(),
-            ));
+            ))?;
             enumerate_database_rows(
                 api,
                 mount_id,
@@ -714,13 +797,13 @@ fn list_database_rows(
     Ok(entries)
 }
 
-fn enumerate_page_children(
+fn enumerate_page_children<S: TreeEntrySink>(
     api: &dyn NotionApi,
     mount_id: &MountId,
     block_id: &str,
     parent_dir: PathBuf,
     used_paths: &mut BTreeSet<PathBuf>,
-    entries: &mut Vec<TreeEntry>,
+    entries: &mut S,
 ) -> LocalityResult<()> {
     let children = collect_page_child_projections(api, block_id)?;
     for projected in allocate_child_paths(&parent_dir, children, used_paths) {
@@ -730,23 +813,23 @@ fn enumerate_page_children(
     Ok(())
 }
 
-fn enumerate_database_rows(
+fn enumerate_database_rows<S: TreeEntrySink>(
     api: &dyn NotionApi,
     mount_id: &MountId,
     database: &DatabaseDto,
     database_dir: &Path,
     used_paths: &mut BTreeSet<PathBuf>,
-    entries: &mut Vec<TreeEntry>,
+    entries: &mut S,
 ) -> LocalityResult<()> {
     let rows = collect_database_row_projections(api, database)?;
     for projected in allocate_child_paths(database_dir, rows, used_paths) {
         if let ProjectedChild::Page { page, title } = projected.child {
-            entries.push(page_entry(
+            entries.push_entry(page_entry(
                 mount_id.clone(),
                 &page,
                 title,
                 projected.path.clone(),
-            ));
+            ))?;
             enumerate_page_children(
                 api,
                 mount_id,

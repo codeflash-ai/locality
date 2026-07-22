@@ -4,12 +4,13 @@ use std::sync::Arc;
 
 use locality_connector::{
     ChildContainer, Connector, EnumerateRequest, FetchRequest, ListChildrenRequest, NativeEntity,
-    PortableBootstrapRequest, PortableFetchReason, PortableFetchRequest, PortableIncompleteReason,
-    PortableRenderRequest, PortableSourceScope, PortableSyncRequest,
+    PORTABLE_SCOPE_ROOT_RELATIONSHIP, PortableBootstrapRequest, PortableFetchReason,
+    PortableFetchRequest, PortableIncompleteReason, PortableRenderRequest, PortableSourceScope,
+    PortableSyncRequest,
 };
 use locality_core::canonical::render_canonical_markdown;
 use locality_core::model::{EntityKind, MountId, RemoteId};
-use locality_core::portable::{LogicalPath, SourceConnectionId};
+use locality_core::portable::{LogicalPath, SourceConnectionId, SourceEdge};
 use locality_core::shadow::MarkdownBlockKind;
 use locality_notion::client::NotionApi;
 use locality_notion::dto::{
@@ -2136,6 +2137,355 @@ fn portable_bootstrap_requires_the_configured_explicit_root_without_search_fallb
 }
 
 #[test]
+fn explicit_multi_root_paths_match_workspace_projection_and_are_order_invariant() {
+    let first_root = RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let second_root = RemoteId::new("ffffffffffffffffffffffffffffffff");
+    let workspace = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(FixtureNotionApi::multi_root_workspace()),
+    );
+    let workspace_entries = workspace
+        .enumerate(EnumerateRequest {
+            mount_id: MountId::new("notion-main"),
+            cursor: None,
+        })
+        .expect("workspace enumerate");
+
+    let explicit = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::multi_root_workspace())),
+    )
+    .with_root_ids([second_root.clone(), first_root.clone()]);
+    let explicit_entries = explicit
+        .enumerate(EnumerateRequest {
+            mount_id: MountId::new("notion-main"),
+            cursor: None,
+        })
+        .expect("explicit enumerate");
+    let paths = |entries: Vec<locality_core::model::TreeEntry>| {
+        entries
+            .into_iter()
+            .map(|entry| (entry.remote_id, entry.path))
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(paths(explicit_entries), paths(workspace_entries));
+
+    let request = |roots| PortableBootstrapRequest {
+        source_connection_id: SourceConnectionId::new("source-notion"),
+        scope: PortableSourceScope::explicit_roots(roots),
+        checkpoint: None,
+        max_changes: 2,
+    };
+    let first = explicit
+        .bootstrap_portable(request([first_root.clone(), second_root.clone()]))
+        .expect("multi-root bootstrap");
+    let reversed = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::multi_root_workspace())),
+    )
+    .with_root_ids([first_root.clone(), second_root.clone()])
+    .bootstrap_portable(request([second_root, first_root]))
+    .expect("reversed multi-root bootstrap");
+
+    assert_eq!(first, reversed);
+    assert_eq!(first.next_checkpoint.format_version, 2);
+    assert_eq!(first.changes.len(), 2, "max_changes is aggregate");
+    assert!(first.changes.iter().all(|change| {
+        change.source_object.edges.len() == 1
+            && change.source_object.edges[0].relationship == PORTABLE_SCOPE_ROOT_RELATIONSHIP
+    }));
+    assert_eq!(
+        first
+            .changes
+            .iter()
+            .map(|change| (
+                change.source_object.remote_id.as_str(),
+                change
+                    .source_object
+                    .edges
+                    .first()
+                    .expect("owning-root edge")
+                    .target_remote_id
+                    .as_str(),
+                change.logical_path.as_ref().expect("logical path").as_str(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "Roadmap aaaaaa/page.md",
+            ),
+            (
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "Roadmap aaaaaa/Notes/page.md",
+            ),
+        ]
+    );
+    let checkpoint: serde_json::Value =
+        serde_json::from_str(&first.next_checkpoint.opaque).expect("v2 checkpoint json");
+    assert_eq!(checkpoint["component_version"], 2);
+    assert_eq!(
+        checkpoint["root_remote_ids"],
+        json!([
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ffffffffffffffffffffffffffffffff"
+        ])
+    );
+
+    let one_root = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::multi_root_workspace())),
+    )
+    .with_root_ids([RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")]);
+    let mismatch = one_root
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            scope: PortableSourceScope::explicit_roots([RemoteId::new(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )]),
+            checkpoint: Some(first.next_checkpoint.clone()),
+            max_changes: 2,
+        })
+        .expect_err("checkpoint root set must match exactly");
+    assert!(mismatch.to_string().contains("does not match"));
+
+    let mut newer_checkpoint = first.next_checkpoint;
+    let mut newer_opaque: serde_json::Value =
+        serde_json::from_str(&newer_checkpoint.opaque).expect("v2 checkpoint json");
+    newer_opaque["component_version"] = json!(3);
+    newer_checkpoint.opaque = serde_json::to_string(&newer_opaque).expect("checkpoint json");
+    let newer_error = explicit
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            scope: PortableSourceScope::explicit_roots([
+                RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                RemoteId::new("ffffffffffffffffffffffffffffffff"),
+            ]),
+            checkpoint: Some(newer_checkpoint),
+            max_changes: 2,
+        })
+        .expect_err("newer component version must fail cleanly");
+    assert!(newer_error.to_string().contains("requires an update"));
+}
+
+#[test]
+fn explicit_multi_root_rejects_overlap_duplicates_empty_and_scope_mismatch() {
+    let first_root = RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let nested_root = RemoteId::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    let overlapping = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::multi_root_workspace())),
+    )
+    .with_root_ids([first_root.clone(), nested_root]);
+    let overlap_error = overlapping
+        .enumerate(EnumerateRequest {
+            mount_id: MountId::new("notion-main"),
+            cursor: None,
+        })
+        .expect_err("nested roots must be rejected");
+    assert!(overlap_error.to_string().contains("overlap"));
+
+    let duplicate = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::new())),
+    )
+    .with_root_ids([RemoteId::new("page-1"), RemoteId::new("PAGE1")]);
+    assert!(
+        duplicate
+            .enumerate(EnumerateRequest {
+                mount_id: MountId::new("notion-main"),
+                cursor: None,
+            })
+            .expect_err("duplicates must fail")
+            .to_string()
+            .contains("duplicate")
+    );
+
+    let empty = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::new())),
+    )
+    .with_root_ids([]);
+    assert!(
+        empty
+            .enumerate(EnumerateRequest {
+                mount_id: MountId::new("notion-main"),
+                cursor: None,
+            })
+            .expect_err("empty set must fail")
+            .to_string()
+            .contains("must not be empty")
+    );
+
+    let mismatch = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::multi_root_workspace())),
+    )
+    .with_root_ids([first_root]);
+    assert!(
+        mismatch
+            .bootstrap_portable(PortableBootstrapRequest {
+                source_connection_id: SourceConnectionId::new("source-notion"),
+                scope: PortableSourceScope::explicit_roots([RemoteId::new(
+                    "ffffffffffffffffffffffffffffffff",
+                )]),
+                checkpoint: None,
+                max_changes: 10,
+            })
+            .expect_err("scope mismatch must fail")
+            .to_string()
+            .contains("exactly match")
+    );
+
+    let sixteen_ids = (0..16)
+        .map(|index| RemoteId::new(format!("root-{index:02}")))
+        .collect::<Vec<_>>();
+    let sixteen = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::many_roots(16))),
+    )
+    .with_root_ids(sixteen_ids.clone());
+    assert_eq!(
+        sixteen
+            .enumerate(EnumerateRequest {
+                mount_id: MountId::new("notion-main"),
+                cursor: None,
+            })
+            .expect("sixteen roots are supported")
+            .len(),
+        16
+    );
+    let seventeen =
+        sixteen.with_root_ids(sixteen_ids.into_iter().chain([RemoteId::new("root-16")]));
+    assert_eq!(
+        seventeen
+            .enumerate(EnumerateRequest {
+                mount_id: MountId::new("notion-main"),
+                cursor: None,
+            })
+            .expect_err("seventeen roots exceed the bound")
+            .to_string(),
+        "invalid state: Notion explicit root set exceeds the limit of 16"
+    );
+}
+
+#[test]
+fn explicit_database_root_matches_workspace_projection_without_search() {
+    let database_id = RemoteId::new("root-db");
+    let workspace = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(FixtureNotionApi::workspace()),
+    );
+    let workspace_database = workspace
+        .enumerate(EnumerateRequest {
+            mount_id: MountId::new("notion-main"),
+            cursor: None,
+        })
+        .expect("workspace enumerate")
+        .into_iter()
+        .find(|entry| entry.remote_id == database_id)
+        .expect("workspace database root");
+
+    let explicit = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::workspace())),
+    )
+    .with_root_ids([database_id.clone()]);
+    let entries = explicit
+        .enumerate(EnumerateRequest {
+            mount_id: MountId::new("notion-main"),
+            cursor: None,
+        })
+        .expect("explicit database enumerate");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].kind, EntityKind::Database);
+    assert_eq!(entries[0].path, workspace_database.path);
+    assert_eq!(entries[0].path, Path::new("Tasks"));
+
+    let batch = explicit
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            scope: PortableSourceScope::explicit_roots([database_id.clone()]),
+            checkpoint: None,
+            max_changes: 10,
+        })
+        .expect("explicit database bootstrap");
+    assert_eq!(batch.changes.len(), 1);
+    assert_eq!(batch.changes[0].source_object.remote_id, database_id);
+    assert_eq!(
+        batch.changes[0].source_object.edges,
+        vec![SourceEdge {
+            relationship: PORTABLE_SCOPE_ROOT_RELATIONSHIP.to_string(),
+            target_remote_id: RemoteId::new("rootdb"),
+        }]
+    );
+    assert!(!batch.changes[0].requires_fetch);
+    assert!(batch.completeness.incomplete_reasons().iter().any(
+        |reason| matches!(reason, PortableIncompleteReason::UnsupportedSourceKind {
+            source_kind,
+            ..
+        } if source_kind == "database")
+    ));
+}
+
+#[test]
+fn explicit_root_page_non_not_found_error_does_not_fall_back_to_database() {
+    let connector =
+        NotionConnector::with_api(NotionConfig::default(), Arc::new(NonNotFoundPageErrorApi))
+            .with_root_ids([RemoteId::new("database-id")]);
+    let error = connector
+        .enumerate(EnumerateRequest {
+            mount_id: MountId::new("notion-main"),
+            cursor: None,
+        })
+        .expect_err("non-not-found page failure must be preserved");
+    assert_eq!(
+        error.to_string(),
+        "invalid state: injected page retrieval failure"
+    );
+}
+
+#[test]
+fn legacy_single_root_keeps_v1_checkpoint_and_v2_set_mode_rejects_it() {
+    let root = RemoteId::new("page-1");
+    let legacy = NotionConnector::with_api(
+        NotionConfig::default().with_root_page_id(root.clone()),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::new())),
+    );
+    let legacy_batch = legacy
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            scope: PortableSourceScope::explicit_roots([root.clone()]),
+            checkpoint: None,
+            max_changes: 10,
+        })
+        .expect("legacy bootstrap");
+    assert_eq!(legacy_batch.next_checkpoint.format_version, 1);
+    assert_eq!(
+        legacy_batch.next_checkpoint.opaque,
+        "{\"operation\":\"bootstrap\",\"root_remote_id\":\"page-1\",\"inventory_sha256\":\"sha256:a870998d440a30dccfac26d79f3b2345e1bbec1aa1bcdb26e3682ac92680b3dc\",\"offset\":1,\"complete\":true}"
+    );
+    assert!(legacy_batch.changes[0].source_object.edges.is_empty());
+
+    let set_mode = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::new())),
+    )
+    .with_root_page_ids([root.clone()]);
+    let error = set_mode
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            scope: PortableSourceScope::explicit_roots([root]),
+            checkpoint: Some(legacy_batch.next_checkpoint),
+            max_changes: 10,
+        })
+        .expect_err("set mode must not accept legacy checkpoints");
+    assert!(error.to_string().contains("does not match"));
+}
+
+#[test]
 fn portable_render_matches_direct_canonical_bytes_and_keys_survive_rename() {
     let root_page_id = RemoteId::new("page-1");
     let connector = NotionConnector::with_api(
@@ -2498,6 +2848,26 @@ impl FixtureNotionApi {
         }
     }
 
+    fn many_roots(count: usize) -> Self {
+        let pages = (0..count)
+            .map(|index| {
+                let id = format!("root-{index:02}");
+                (id.clone(), page(&id, &format!("Root {index:02}")))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let children = pages
+            .keys()
+            .map(|id| ((id.clone(), None), PaginatedListDto::default()))
+            .collect();
+        Self {
+            pages,
+            children,
+            databases: BTreeMap::new(),
+            data_sources: BTreeMap::new(),
+            data_source_pages: BTreeMap::new(),
+        }
+    }
+
     fn tree(root_page_id: &str) -> Self {
         let child_page_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let database_id = "cccccccccccccccccccccccccccccccc";
@@ -2690,6 +3060,65 @@ impl FixtureNotionApi {
             ]),
             children: BTreeMap::new(),
             databases: BTreeMap::from([(root_database.id.clone(), root_database)]),
+            data_sources: BTreeMap::new(),
+            data_source_pages: BTreeMap::new(),
+        }
+    }
+
+    fn multi_root_workspace() -> Self {
+        let first_root_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let nested_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let second_root_id = "ffffffffffffffffffffffffffffffff";
+        let first_root = page_with_parent(
+            first_root_id,
+            "Roadmap",
+            Some(ParentDto {
+                kind: "workspace".to_string(),
+                workspace: Some(true),
+                ..Default::default()
+            }),
+        );
+        let nested = page_with_parent(
+            nested_id,
+            "Notes",
+            Some(ParentDto {
+                kind: "page_id".to_string(),
+                page_id: Some(first_root_id.to_string()),
+                ..Default::default()
+            }),
+        );
+        let second_root = page_with_parent(
+            second_root_id,
+            "Roadmap",
+            Some(ParentDto {
+                kind: "workspace".to_string(),
+                workspace: Some(true),
+                ..Default::default()
+            }),
+        );
+        let children = BTreeMap::from([
+            (
+                (first_root_id.to_string(), None),
+                PaginatedListDto {
+                    results: vec![child_page_block(nested_id, "Notes")],
+                    next_cursor: None,
+                    has_more: false,
+                },
+            ),
+            ((nested_id.to_string(), None), PaginatedListDto::default()),
+            (
+                (second_root_id.to_string(), None),
+                PaginatedListDto::default(),
+            ),
+        ]);
+        Self {
+            pages: BTreeMap::from([
+                (first_root.id.clone(), first_root),
+                (nested.id.clone(), nested),
+                (second_root.id.clone(), second_root),
+            ]),
+            children,
+            databases: BTreeMap::new(),
             data_sources: BTreeMap::new(),
             data_source_pages: BTreeMap::new(),
         }
@@ -2968,7 +3397,7 @@ impl FixtureNotionApi {
 impl NotionApi for FixtureNotionApi {
     fn retrieve_page(&self, page_id: &str) -> locality_core::LocalityResult<PageDto> {
         self.pages.get(page_id).cloned().ok_or_else(|| {
-            locality_core::LocalityError::InvalidState(format!("missing fixture page {page_id}"))
+            locality_core::LocalityError::RemoteNotFound(format!("missing fixture page {page_id}"))
         })
     }
 
@@ -3064,6 +3493,56 @@ impl NotionApi for FixtureNotionApi {
         Err(locality_core::LocalityError::NotImplemented(
             "fixture delete block",
         ))
+    }
+}
+
+#[derive(Debug)]
+struct NonNotFoundPageErrorApi;
+
+impl NotionApi for NonNotFoundPageErrorApi {
+    fn retrieve_page(&self, _page_id: &str) -> locality_core::LocalityResult<PageDto> {
+        Err(locality_core::LocalityError::InvalidState(
+            "injected page retrieval failure".to_string(),
+        ))
+    }
+
+    fn retrieve_database(&self, _database_id: &str) -> locality_core::LocalityResult<DatabaseDto> {
+        panic!("database fallback must only follow RemoteNotFound")
+    }
+
+    fn retrieve_block_children(
+        &self,
+        _block_id: &str,
+        _start_cursor: Option<&str>,
+    ) -> locality_core::LocalityResult<BlockListDto> {
+        unreachable!("page failure must stop traversal")
+    }
+
+    fn search_pages(
+        &self,
+        _start_cursor: Option<&str>,
+    ) -> locality_core::LocalityResult<PageListDto> {
+        panic!("explicit-root traversal must not call search")
+    }
+
+    fn update_block(
+        &self,
+        _block_id: &str,
+        _body: serde_json::Value,
+    ) -> locality_core::LocalityResult<BlockDto> {
+        unreachable!("page failure must stop traversal")
+    }
+
+    fn append_block_children(
+        &self,
+        _block_id: &str,
+        _body: serde_json::Value,
+    ) -> locality_core::LocalityResult<BlockListDto> {
+        unreachable!("page failure must stop traversal")
+    }
+
+    fn delete_block(&self, _block_id: &str) -> locality_core::LocalityResult<BlockDto> {
+        unreachable!("page failure must stop traversal")
     }
 }
 

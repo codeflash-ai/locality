@@ -39,7 +39,7 @@ use crate::client::{DEFAULT_NOTION_TOKEN_ENV, HttpNotionApi, NotionApi};
 use crate::fetch::fetch_page_bundle;
 use crate::media::{MediaDownloadReport, download_media_assets};
 use crate::projection::{
-    enumerate_root_page_tree, enumerate_shared_pages, list_container_children, observe_entity,
+    enumerate_explicit_root_trees, enumerate_shared_pages, list_container_children, observe_entity,
     resolve_notion_object_path_entries, resolve_page_path_entries,
 };
 use crate::render::{
@@ -102,6 +102,8 @@ impl NotionConfig {
 pub struct NotionConnector {
     config: NotionConfig,
     api: Arc<dyn NotionApi>,
+    explicit_root_page_ids: Vec<RemoteId>,
+    explicit_root_set: bool,
 }
 
 impl std::fmt::Debug for NotionConnector {
@@ -118,7 +120,13 @@ impl NotionConnector {
     }
 
     pub fn with_api(config: NotionConfig, api: Arc<dyn NotionApi>) -> Self {
-        Self { config, api }
+        let explicit_root_page_ids = config.root_page_id.iter().cloned().collect();
+        Self {
+            config,
+            api,
+            explicit_root_page_ids,
+            explicit_root_set: false,
+        }
     }
 
     pub fn config(&self) -> &NotionConfig {
@@ -127,11 +135,38 @@ impl NotionConnector {
 
     pub fn with_root_page_id(&self, root_page_id: locality_core::model::RemoteId) -> Self {
         let mut config = self.config.clone();
-        config.root_page_id = Some(root_page_id);
+        config.root_page_id = Some(root_page_id.clone());
         Self {
             config,
             api: Arc::clone(&self.api),
+            explicit_root_page_ids: vec![root_page_id],
+            explicit_root_set: false,
         }
+    }
+
+    /// Select up to 16 explicit page or full-page database roots without using
+    /// provider search. Validation is deferred to enumeration/bootstrap so
+    /// malformed scopes fail through the normal connector result channel.
+    pub fn with_root_ids(&self, root_ids: impl IntoIterator<Item = RemoteId>) -> Self {
+        let explicit_root_page_ids = root_ids.into_iter().collect::<Vec<_>>();
+        let mut config = self.config.clone();
+        config.root_page_id =
+            (explicit_root_page_ids.len() == 1).then(|| explicit_root_page_ids[0].clone());
+        Self {
+            config,
+            api: Arc::clone(&self.api),
+            explicit_root_page_ids,
+            explicit_root_set: true,
+        }
+    }
+
+    /// Compatibility alias for [`Self::with_root_ids`].
+    pub fn with_root_page_ids(&self, root_page_ids: impl IntoIterator<Item = RemoteId>) -> Self {
+        self.with_root_ids(root_page_ids)
+    }
+
+    pub fn explicit_root_page_ids(&self) -> &[RemoteId] {
+        &self.explicit_root_page_ids
     }
 
     pub fn render_native_entity(
@@ -206,7 +241,12 @@ impl NotionConnector {
 
 impl Connector for NotionConnector {
     fn with_execution_policy(&self, policy: ConnectorExecutionPolicy) -> Self {
-        Self::new(self.config.clone().with_execution_policy(policy))
+        let connector = Self::new(self.config.clone().with_execution_policy(policy));
+        if self.explicit_root_set {
+            connector.with_root_ids(self.explicit_root_page_ids.clone())
+        } else {
+            connector
+        }
     }
 
     fn kind(&self) -> ConnectorKind {
@@ -245,8 +285,16 @@ impl Connector for NotionConnector {
     }
 
     fn enumerate(&self, request: EnumerateRequest) -> LocalityResult<Vec<TreeEntry>> {
-        if let Some(root_page_id) = &self.config.root_page_id {
-            enumerate_root_page_tree(self.api.as_ref(), request.mount_id, root_page_id)
+        if self.explicit_root_set || !self.explicit_root_page_ids.is_empty() {
+            portable::validate_configured_roots(&self.explicit_root_page_ids)?;
+            Ok(enumerate_explicit_root_trees(
+                self.api.as_ref(),
+                request.mount_id,
+                &self.explicit_root_page_ids,
+            )?
+            .into_iter()
+            .map(|projected| projected.entry)
+            .collect())
         } else {
             enumerate_shared_pages(self.api.as_ref(), request.mount_id)
         }
@@ -258,7 +306,8 @@ impl Connector for NotionConnector {
     ) -> LocalityResult<PortableChangeBatch> {
         portable::bootstrap(
             self.api.as_ref(),
-            self.config.root_page_id.as_ref(),
+            &self.explicit_root_page_ids,
+            self.explicit_root_set,
             request,
         )
     }
@@ -266,7 +315,8 @@ impl Connector for NotionConnector {
     fn sync_portable(&self, request: PortableSyncRequest) -> LocalityResult<PortableChangeBatch> {
         portable::synchronize(
             self.api.as_ref(),
-            self.config.root_page_id.as_ref(),
+            &self.explicit_root_page_ids,
+            self.explicit_root_set,
             request,
         )
     }

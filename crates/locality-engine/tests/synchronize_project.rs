@@ -3,15 +3,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
     ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, NativeEntity,
-    ParsedEntity, PortableArtifactKey, PortableBootstrapRequest, PortableChangeBatch,
-    PortableCheckpoint, PortableCompleteness, PortableContentArtifact, PortableFetchRequest,
-    PortableFetchResult, PortableIncompleteReason, PortableProjectionArtifact,
-    PortableRenderRequest, PortableRenderResult, PortableSourceChange, PortableSyncRequest,
+    PORTABLE_SCOPE_ROOT_RELATIONSHIP, ParsedEntity, PortableArtifactKey, PortableBootstrapRequest,
+    PortableChangeBatch, PortableCheckpoint, PortableCompleteness, PortableContentArtifact,
+    PortableFetchRequest, PortableFetchResult, PortableIncompleteReason,
+    PortableProjectionArtifact, PortableRenderRequest, PortableRenderResult, PortableSourceChange,
+    PortableSyncRequest,
 };
 use locality_core::LocalityResult;
 use locality_core::model::{CanonicalDocument, EntityKind, RemoteId, TreeEntry};
 use locality_core::portable::{
-    LogicalPath, ProjectionFileKind, SourceAction, SourceConnectionId, SourceObject,
+    LogicalPath, ProjectionFileKind, SourceAction, SourceConnectionId, SourceEdge, SourceObject,
 };
 use locality_engine::synchronize_project::{
     bootstrap_and_project, synchronize_and_project_portable,
@@ -21,6 +22,8 @@ use locality_engine::synchronize_project::{
 struct FixtureConnector {
     incomplete: bool,
     duplicate_projection_key: bool,
+    duplicate_owning_root_edge: bool,
+    omit_owning_root_edge: bool,
 }
 
 impl FixtureConnector {
@@ -28,6 +31,8 @@ impl FixtureConnector {
         Self {
             incomplete: false,
             duplicate_projection_key: false,
+            duplicate_owning_root_edge: false,
+            omit_owning_root_edge: false,
         }
     }
 }
@@ -53,11 +58,21 @@ impl Connector for FixtureConnector {
         &self,
         request: PortableBootstrapRequest,
     ) -> LocalityResult<PortableChangeBatch> {
+        let mut changes = vec![
+            change(&request.source_connection_id, "page-b", "B/page.md"),
+            change(&request.source_connection_id, "page-a", "A/page.md"),
+        ];
+        if self.duplicate_owning_root_edge {
+            changes[0].source_object.edges.push(SourceEdge {
+                relationship: PORTABLE_SCOPE_ROOT_RELATIONSHIP.to_string(),
+                target_remote_id: RemoteId::new("other-root"),
+            });
+        }
+        if self.omit_owning_root_edge {
+            changes[1].source_object.edges.clear();
+        }
         Ok(PortableChangeBatch {
-            changes: vec![
-                change(&request.source_connection_id, "page-b", "B/page.md"),
-                change(&request.source_connection_id, "page-a", "A/page.md"),
-            ],
+            changes,
             next_checkpoint: PortableCheckpoint {
                 format_version: 1,
                 opaque: "ready".to_string(),
@@ -176,6 +191,13 @@ fn deterministic_retry_returns_identical_unpersisted_candidates_and_hashes() {
         first.source_versions[0].canonical_sha256,
         "sha256:5ebbb50be5c7e33f3fa9ea6c8ae904fa32f8827011e15bbf4947897bdc53e333"
     );
+    assert!(first.observed_changes.iter().all(|change| {
+        change.source_object.edges
+            == vec![SourceEdge {
+                relationship: PORTABLE_SCOPE_ROOT_RELATIONSHIP.to_string(),
+                target_remote_id: RemoteId::new("root"),
+            }]
+    }));
 }
 
 #[test]
@@ -183,6 +205,8 @@ fn incomplete_connector_batch_cannot_be_published() {
     let connector = FixtureConnector {
         incomplete: true,
         duplicate_projection_key: false,
+        duplicate_owning_root_edge: false,
+        omit_owning_root_edge: false,
     };
     let batch = bootstrap_and_project(&connector, request(), 1).expect("incomplete batch");
 
@@ -220,6 +244,8 @@ fn conflicting_artifact_keys_fail_the_whole_batch() {
     let connector = FixtureConnector {
         incomplete: false,
         duplicate_projection_key: true,
+        duplicate_owning_root_edge: false,
+        omit_owning_root_edge: false,
     };
     let error = bootstrap_and_project(&connector, request(), 1)
         .expect_err("duplicate artifact identity must fail closed");
@@ -229,6 +255,32 @@ fn conflicting_artifact_keys_fail_the_whole_batch() {
             .to_string()
             .contains("identified different immutable bytes")
     );
+}
+
+#[test]
+fn multiple_owning_root_edges_fail_closed() {
+    let connector = FixtureConnector {
+        incomplete: false,
+        duplicate_projection_key: false,
+        duplicate_owning_root_edge: true,
+        omit_owning_root_edge: false,
+    };
+    let error = bootstrap_and_project(&connector, request(), 1)
+        .expect_err("multiple owning roots must fail closed");
+    assert!(error.to_string().contains("multiple owning-root edges"));
+}
+
+#[test]
+fn mixed_owning_root_provenance_fails_closed() {
+    let connector = FixtureConnector {
+        incomplete: false,
+        duplicate_projection_key: false,
+        duplicate_owning_root_edge: false,
+        omit_owning_root_edge: true,
+    };
+    let error = bootstrap_and_project(&connector, request(), 1)
+        .expect_err("mixed owning-root provenance must fail closed");
+    assert!(error.to_string().contains("ambiguous owning-root"));
 }
 
 fn request() -> PortableBootstrapRequest {
@@ -250,7 +302,10 @@ fn change(
             source_connection_id: source_connection_id.clone(),
             remote_id: RemoteId::new(remote_id),
             kind: EntityKind::Page,
-            edges: Vec::new(),
+            edges: vec![SourceEdge {
+                relationship: PORTABLE_SCOPE_ROOT_RELATIONSHIP.to_string(),
+                target_remote_id: RemoteId::new("root"),
+            }],
             opaque_version: Some("v1".to_string()),
             deleted: false,
             connector_metadata: BTreeMap::new(),
