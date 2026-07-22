@@ -2611,6 +2611,12 @@ fn portable_database_root_fetches_and_renders_exact_shared_schema_projection() {
             change.source_object.remote_id == RemoteId::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
         })
         .expect("portable row change");
+    let portable_path = |path: &Path| {
+        path.iter()
+            .map(|component| component.to_str().expect("UTF-8 direct path component"))
+            .collect::<Vec<_>>()
+            .join("/")
+    };
     assert!(database_change.requires_fetch);
     assert_eq!(
         database_change
@@ -2618,11 +2624,11 @@ fn portable_database_root_fetches_and_renders_exact_shared_schema_projection() {
             .as_ref()
             .expect("database schema path")
             .as_str(),
-        format!("{}/_schema.yaml", direct_database.path.display())
+        format!("{}/_schema.yaml", portable_path(&direct_database.path))
     );
     assert_eq!(
         row_change.logical_path.as_ref().expect("row path").as_str(),
-        direct_row.path.to_str().expect("UTF-8 direct row path")
+        portable_path(&direct_row.path)
     );
 
     let fetched = connector
