@@ -129,6 +129,30 @@ copies `AZURE_OPENAI_API_KEY` into sandbox-local secret storage when that
 environment variable is set locally; otherwise it uses the sandbox's existing
 Codex auth/config or `~/.config/locality-experiment/env`.
 
+## Launch Runner MCP Auth
+
+When `run-launch-readiness-benchmark.sh` is run with `--compare-mcp`, it
+configures Codex MCP auth before running the MCP scenarios:
+
+```bash
+export LINEAR_API_KEY=<linear-api-key>
+export NOTION_API_TOKEN=<notion-api-token>
+
+# Optional Slack MCP support:
+export SLACK_BOT_TOKEN=<slack-bot-token>
+export SLACK_TEAM_ID=<slack-team-id>
+export SLACK_CHANNEL_IDS=<comma-delimited-channel-ids>
+```
+
+`NOTION_TOKEN` and `NOTION_ACCESS_TOKEN` are accepted aliases for
+`NOTION_API_TOKEN`. Slack is configured only when `SLACK_BOT_TOKEN` is set; if
+any Slack MCP variable is set, both `SLACK_BOT_TOKEN` and `SLACK_TEAM_ID` are
+required.
+
+The runner stores token-backed helper scripts and secret files under
+`~/.local/bin` and `~/.config/locality-launch-readiness/mcp` by default, then
+updates Codex MCP entries for `linear-server`, `notion`, and optionally `slack`.
+
 ## Add Scenarios
 
 The core runner discovers scenarios from `prompts/Locality/*.md`. To add a new
@@ -208,6 +232,7 @@ Important artifacts:
 - `metrics.tsv` - phase wall-clock metrics with a `scenario` column.
 - `summary.json` - machine-readable run summary.
 - `scenarios.tsv` - scenario manifest with prompt paths, output directories, and mounted report pages.
+- `mcp-auth-setup.out` and `mcp-auth-setup.err` - Codex MCP setup logs when `--compare-mcp` is enabled.
 - `scenarios/<scenario>/report-body.md` - Locality report for that scenario.
 - `scenarios/<scenario>/notion-mcp-report-body.md` - MCP report for that scenario.
 - `scenarios/<scenario>/locality-codex-events.jsonl` - timestamped Locality Codex JSON events.

@@ -27,6 +27,12 @@ Important environment:
   CODEX_REASONING_EFFORT   Codex reasoning effort. Default: low
   CODEX_EXEC_TIMEOUT_SECONDS
                            Per-strategy codex exec timeout. Default: 900. Use 0 to disable.
+  LINEAR_API_KEY           Required with --compare-mcp. Linear MCP bearer token.
+  NOTION_API_TOKEN         Required with --compare-mcp. NOTION_TOKEN and
+                           NOTION_ACCESS_TOKEN are accepted aliases.
+  SLACK_BOT_TOKEN          Optional with --compare-mcp. Slack bot token for Slack MCP.
+  SLACK_TEAM_ID            Required when SLACK_BOT_TOKEN is set.
+  SLACK_CHANNEL_IDS        Optional comma-delimited Slack channel allowlist.
   LOCALITY_EXPERIMENT_TRACE_FORCE_DIRECT
                            Set to 1 to force CLI direct pull during traced Locality setup.
   SINCE                    Git window. Default: 24 hours ago
@@ -65,10 +71,17 @@ OUT_DIR="${OUT_DIR:-$REPO_DIR/experiment/runs/$RUN_ID}"
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-luna}"
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-low}"
 CODEX_EXEC_TIMEOUT_SECONDS="${CODEX_EXEC_TIMEOUT_SECONDS:-900}"
+LINEAR_API_KEY="${LINEAR_API_KEY:-}"
+NOTION_API_TOKEN="${NOTION_API_TOKEN:-${NOTION_TOKEN:-${NOTION_ACCESS_TOKEN:-}}}"
+SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}"
+SLACK_TEAM_ID="${SLACK_TEAM_ID:-}"
+SLACK_CHANNEL_IDS="${SLACK_CHANNEL_IDS:-}"
 LOCALITY_EXPERIMENT_TRACE_FORCE_DIRECT="${LOCALITY_EXPERIMENT_TRACE_FORCE_DIRECT:-0}"
 PROMPT_ROOT="${PROMPT_ROOT:-$SCRIPT_DIR/prompts}"
 LOCALITY_PROMPT_DIR="${LOCALITY_PROMPT_DIR:-$PROMPT_ROOT/Locality}"
 MCP_PROMPT_DIR="${MCP_PROMPT_DIR:-$PROMPT_ROOT/MCP}"
+MCP_SECRET_DIR="${MCP_SECRET_DIR:-$HOME/.config/locality-launch-readiness/mcp}"
+MCP_BIN_DIR="${MCP_BIN_DIR:-$HOME/.local/bin}"
 METRICS_TSV="$OUT_DIR/metrics.tsv"
 SUMMARY_JSON="$OUT_DIR/summary.json"
 CONTEXT_PATHS_FILE="$OUT_DIR/locality-context-paths.txt"
@@ -139,6 +152,99 @@ render_locality_traces() {
     python3 "$SCRIPT_DIR/scripts/locality-trace-to-speedscope.py" \
       "$trace_file" "${trace_file%.jsonl}" >/dev/null
   done
+}
+
+configure_codex_mcp_auth() {
+  MCP_AUTH_DETAIL="linear=skipped; notion=skipped; slack=skipped"
+
+  command -v codex >/dev/null || return
+
+  if [ -z "$LINEAR_API_KEY" ]; then
+    echo "LINEAR_API_KEY is required when --compare-mcp is enabled" >&2
+    return 2
+  fi
+  if [ -z "$NOTION_API_TOKEN" ]; then
+    echo "NOTION_API_TOKEN is required when --compare-mcp is enabled; NOTION_TOKEN and NOTION_ACCESS_TOKEN are accepted aliases" >&2
+    return 2
+  fi
+  if { [ -n "$SLACK_BOT_TOKEN" ] || [ -n "$SLACK_TEAM_ID" ] || [ -n "$SLACK_CHANNEL_IDS" ]; } &&
+    { [ -z "$SLACK_BOT_TOKEN" ] || [ -z "$SLACK_TEAM_ID" ]; }; then
+    echo "SLACK_BOT_TOKEN and SLACK_TEAM_ID are both required to configure Slack MCP" >&2
+    return 2
+  fi
+
+  mkdir -p "$MCP_SECRET_DIR" "$MCP_BIN_DIR" "$HOME/.codex" || return
+  chmod 700 "$MCP_SECRET_DIR" "$HOME/.codex" || return
+
+  local notion_helper="$MCP_BIN_DIR/locality-launch-notion-mcp"
+  (
+    set -e
+    umask 077
+    printf '%s' "$LINEAR_API_KEY" > "$MCP_SECRET_DIR/linear-api-key"
+    printf '%s' "$NOTION_API_TOKEN" > "$MCP_SECRET_DIR/notion-token"
+    cat > "$notion_helper" <<SH
+#!/usr/bin/env bash
+set -euo pipefail
+
+token_file="\${NOTION_API_TOKEN_FILE:-$MCP_SECRET_DIR/notion-token}"
+export OPENAPI_MCP_HEADERS="\$(
+python3 - "\$token_file" <<'PY'
+import json
+import pathlib
+import sys
+
+token = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+print(json.dumps({"Authorization": "Bearer " + token}, separators=(",", ":")))
+PY
+)"
+exec npx -y @notionhq/notion-mcp-server
+SH
+    chmod 700 "$notion_helper"
+  ) || return
+
+  export LINEAR_API_KEY
+  codex mcp remove linear-server >/dev/null 2>&1 || true
+  codex mcp remove notion >/dev/null 2>&1 || true
+  codex mcp remove slack >/dev/null 2>&1 || true
+  codex mcp remove slack-server >/dev/null 2>&1 || true
+  codex mcp add linear-server --url https://mcp.linear.app/mcp --bearer-token-env-var LINEAR_API_KEY || return
+  codex mcp add notion -- "$notion_helper" || return
+
+  local slack_status="skipped"
+  if [ -n "$SLACK_BOT_TOKEN" ]; then
+    local slack_helper="$MCP_BIN_DIR/locality-launch-slack-mcp"
+    (
+      set -e
+      umask 077
+      printf '%s' "$SLACK_BOT_TOKEN" > "$MCP_SECRET_DIR/slack-bot-token"
+      printf '%s' "$SLACK_TEAM_ID" > "$MCP_SECRET_DIR/slack-team-id"
+      if [ -n "$SLACK_CHANNEL_IDS" ]; then
+        printf '%s' "$SLACK_CHANNEL_IDS" > "$MCP_SECRET_DIR/slack-channel-ids"
+      else
+        rm -f "$MCP_SECRET_DIR/slack-channel-ids"
+      fi
+      cat > "$slack_helper" <<SH
+#!/usr/bin/env bash
+set -euo pipefail
+
+secret_dir="$MCP_SECRET_DIR"
+export SLACK_BOT_TOKEN="\$(cat "\$secret_dir/slack-bot-token")"
+export SLACK_TEAM_ID="\$(cat "\$secret_dir/slack-team-id")"
+if [ -f "\$secret_dir/slack-channel-ids" ]; then
+  export SLACK_CHANNEL_IDS="\$(cat "\$secret_dir/slack-channel-ids")"
+fi
+exec npx -y @modelcontextprotocol/server-slack
+SH
+      chmod 700 "$slack_helper"
+    ) || return
+    codex mcp add slack -- "$slack_helper" || return
+    slack_status="configured"
+  else
+    rm -f "$MCP_SECRET_DIR/slack-bot-token" "$MCP_SECRET_DIR/slack-team-id" "$MCP_SECRET_DIR/slack-channel-ids"
+  fi
+
+  MCP_AUTH_DETAIL="linear=configured; notion=configured; slack=$slack_status"
+  echo "Configured Codex MCP auth: $MCP_AUTH_DETAIL"
 }
 
 run_codex_agent() {
@@ -316,6 +422,24 @@ test -d "$REPO_DIR"
 test -x "$LOC_BIN"
 git -C "$REPO_DIR" rev-parse --git-dir >/dev/null
 phase_end "locality" "validate_environment" "ok" "repo=$REPO_DIR; model=$CODEX_MODEL; effort=$CODEX_REASONING_EFFORT; scenarios=${#SCENARIO_FILES[@]}; prompts=$LOCALITY_PROMPT_DIR"
+
+phase_start
+if [ "$COMPARE_MCP" -eq 1 ]; then
+  set +e
+  configure_codex_mcp_auth > "$OUT_DIR/mcp-auth-setup.out" 2> "$OUT_DIR/mcp-auth-setup.err"
+  MCP_AUTH_RC=$?
+  set -e
+  if [ "$MCP_AUTH_RC" -eq 0 ]; then
+    phase_end "notion_mcp" "mcp_auth_setup" "ok" "$MCP_AUTH_DETAIL; out=$OUT_DIR/mcp-auth-setup.out"
+  else
+    phase_end "notion_mcp" "mcp_auth_setup" "failed" "exit=$MCP_AUTH_RC; out=$OUT_DIR/mcp-auth-setup.out; err=$OUT_DIR/mcp-auth-setup.err"
+    cat "$OUT_DIR/mcp-auth-setup.out" >&2 || true
+    cat "$OUT_DIR/mcp-auth-setup.err" >&2 || true
+    exit "$MCP_AUTH_RC"
+  fi
+else
+  phase_end "notion_mcp" "mcp_auth_setup" "skipped" "pass --compare-mcp to configure Codex MCP auth"
+fi
 
 phase_start
 git -C "$REPO_DIR" fetch --quiet origin || true
