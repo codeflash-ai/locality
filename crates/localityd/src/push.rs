@@ -27,13 +27,15 @@ use locality_core::path_projection::{
     is_page_document_path, page_container_path, page_document_path,
 };
 use locality_core::planner::GuardrailDecision;
-use locality_core::planner::{GuardrailPolicy, PropertyValue, PushOperation, PushPlan};
+use locality_core::planner::{
+    GuardrailPolicy, PropertyValue, PushOperation, PushOperationKind, PushPlan,
+};
+use locality_core::portable::LogicalPath;
 use locality_core::push::{
     PushApplier, PushApplyRequest, PushApplyResult, PushApproval, PushConcurrencyCheck,
     PushConcurrencyRequest, PushExecutionRequest, PushExecutionResult, PushPipelineAction,
-    PushPipelineRequest, PushPipelineResult, PushReconcileRequest, PushReconcileResult,
-    PushReconciler, PushStage, RemotePrecondition, execute_journaled_push_with_host,
-    plan_push_pipeline,
+    PushPipelineResult, PushReconcileRequest, PushReconcileResult, PushReconciler, PushStage,
+    RemotePrecondition, execute_journaled_push_with_host,
 };
 use locality_core::shadow::{
     MarkdownBlockKind, ShadowBlock, ShadowDocument, rendered_bodies_equivalent,
@@ -41,6 +43,7 @@ use locality_core::shadow::{
 };
 use locality_core::validation::{ValidationIssue, ValidationReport};
 use locality_core::{LocalityError, LocalityResult};
+use locality_engine::prepare_changeset::{PrepareChangesetRequest, prepare_changeset};
 use locality_google_docs::render::{
     GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND, GOOGLE_DOCS_TABLE_NATIVE_KIND,
 };
@@ -68,6 +71,7 @@ use crate::hydration::{HydratedEntity, HydrationSource};
 use crate::linear::linear_shadow_matches_with_legacy_lifecycle_frontmatter;
 use crate::media::{render_document_with_absolute_media_hrefs, replace_hydrated_media_manifest};
 use crate::projection_state;
+use crate::remote_truth::DirectSourceReplica;
 use crate::shadow_match::shadows_match;
 use crate::source::{
     LocalSourceValidator, SourcePushValidator, SourceValidationContext,
@@ -116,6 +120,8 @@ where
         + VirtualMutationRepository,
     Source: Connector + HydrationSource + ?Sized,
 {
+    let remote_truth = DirectSourceReplica::new(source);
+    let source = remote_truth.source();
     let validator = LocalSourceValidator;
     if let Some(state_root) = state_root {
         file_provider::reconcile_visible_projection(store, state_root, Some(&job.target_path))?;
@@ -151,6 +157,8 @@ where
         + AutoSaveRepository,
     Source: Connector + HydrationSource + ?Sized,
 {
+    let remote_truth = DirectSourceReplica::new(source);
+    let source = remote_truth.source();
     job.assume_yes = true;
     job.confirm_dangerous = false;
 
@@ -1798,27 +1806,6 @@ pub struct PreparedPush {
     pub readable_diff: Option<locality_core::readable_diff::ReadableDiffOutput>,
 }
 
-fn readable_diff_for_existing_entity(
-    relative_path: &Path,
-    shadow: &ShadowDocument,
-    local_text: &str,
-    pipeline: &PushPipelineResult,
-) -> Option<locality_core::readable_diff::ReadableDiffOutput> {
-    let plan = pipeline.plan.as_ref()?;
-    if plan.operations.is_empty() {
-        return None;
-    }
-    let old = render_canonical_markdown(&CanonicalDocument::new(
-        shadow.frontmatter.clone(),
-        shadow.rendered_body.clone(),
-    ));
-    locality_core::readable_diff::readable_diff_for_file(
-        locality_platform::logical_path_display(relative_path),
-        Some(&old),
-        Some(local_text),
-    )
-}
-
 fn readable_diff_for_created_entity(
     source_path: &Path,
     local_text: &str,
@@ -2126,18 +2113,30 @@ where
         parsed: &parsed,
         shadow: Some(&shadow),
     })?;
-    let mut pipeline = if schema_validation.is_clean() {
-        plan_push_pipeline(
-            PushPipelineRequest::new(&relative_path, &parsed, &shadow)
+    let (mut pipeline, engine_readable_diff) = if schema_validation.is_clean() {
+        let logical_path = LogicalPath::new(locality_platform::logical_path_display(
+            &relative_path,
+        ))
+        .map_err(|error| {
+            PushPrepareError::Core(LocalityError::InvalidState(format!(
+                "existing entity path is not portable: {error}"
+            )))
+        })?;
+        let supported_operations = PushOperationKind::all()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let prepared = prepare_changeset(
+            PrepareChangesetRequest::new(&logical_path, &contents, &shadow, &supported_operations)
                 .with_body_diff_mode(source_descriptor(&mount.connector).body_diff_mode())
                 .with_approval(PushApproval {
                     assume_yes: job.assume_yes,
                     confirm_dangerous: job.confirm_dangerous,
                 })
                 .read_only(mount.read_only),
-        )
+        )?;
+        (prepared.pipeline, prepared.readable_diff)
     } else {
-        validation_report_pipeline(schema_validation)
+        (validation_report_pipeline(schema_validation), None)
     };
     augment_notion_media_plan(
         &mount,
@@ -2153,8 +2152,12 @@ where
     );
     validate_notion_pre_apply_semantics(&mount, &relative_path, &shadow, &mut pipeline);
     validate_google_docs_pre_apply_semantics(&mount, &relative_path, &shadow, &mut pipeline);
-    let readable_diff =
-        readable_diff_for_existing_entity(&relative_path, &shadow, &contents, &pipeline);
+    let readable_diff = pipeline
+        .plan
+        .as_ref()
+        .is_some_and(|plan| !plan.operations.is_empty())
+        .then_some(engine_readable_diff)
+        .flatten();
 
     Ok(ExistingDocumentPreparation {
         shadow: Some(shadow),

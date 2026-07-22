@@ -1,0 +1,10 @@
+{
+  "media_type": "application/x-tar",
+  "supported_content_encodings": [
+    "identity",
+    "zstd"
+  ],
+  "selected_entries": 2,
+  "decoded_bytes": 3072,
+  "decoded_tar_sha256": "sha256:decoded-tar"
+}

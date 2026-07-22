@@ -1,0 +1,36 @@
+{
+  "tenant_id": "tenant-acme",
+  "access_set_id": "access-set-engineering",
+  "revision": 42,
+  "source_connection_id": "source-notion",
+  "subjects": [
+    {
+      "kind": "principal",
+      "id": "principal-agent"
+    },
+    {
+      "kind": "group",
+      "id": "group-engineering"
+    },
+    {
+      "kind": "workload",
+      "id": "workload-sandbox"
+    }
+  ],
+  "source_remote_ids": [
+    "page-public",
+    "page-roadmap"
+  ],
+  "actions": [
+    "read",
+    "search",
+    "download_attachment",
+    "create",
+    "update",
+    "move",
+    "delete",
+    "comment",
+    "update_properties",
+    "manage_schema"
+  ]
+}

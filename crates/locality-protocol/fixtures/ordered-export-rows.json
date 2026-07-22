@@ -1,0 +1,50 @@
+[
+  {
+    "tenant_id": "tenant-acme",
+    "source_connection_id": "source-notion",
+    "projection_id": "projection-roadmap",
+    "logical_path": "Projects/Roadmap/page.md",
+    "file_kind": "markdown",
+    "effective_actions": [
+      "read",
+      "update"
+    ],
+    "provider_version": "opaque-v4",
+    "content_sha256": "sha256:roadmap",
+    "byte_length": 10,
+    "body": [
+      35,
+      32,
+      82,
+      111,
+      97,
+      100,
+      109,
+      97,
+      112,
+      10
+    ]
+  },
+  {
+    "tenant_id": "tenant-acme",
+    "source_connection_id": "source-notion",
+    "projection_id": "projection-public",
+    "logical_path": "Projects/Public/page.md",
+    "file_kind": "markdown",
+    "effective_actions": [
+      "read"
+    ],
+    "provider_version": "opaque-v2",
+    "content_sha256": "sha256:public",
+    "byte_length": 7,
+    "body": [
+      80,
+      117,
+      98,
+      108,
+      105,
+      99,
+      10
+    ]
+  }
+]

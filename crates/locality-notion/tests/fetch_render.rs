@@ -3,9 +3,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use locality_connector::{
-    ChildContainer, Connector, EnumerateRequest, FetchRequest, ListChildrenRequest,
+    ChildContainer, Connector, EnumerateRequest, FetchRequest, ListChildrenRequest, NativeEntity,
+    PortableBootstrapRequest, PortableFetchReason, PortableFetchRequest, PortableIncompleteReason,
+    PortableRenderRequest, PortableSourceScope, PortableSyncRequest,
 };
+use locality_core::canonical::render_canonical_markdown;
 use locality_core::model::{EntityKind, MountId, RemoteId};
+use locality_core::portable::{LogicalPath, SourceConnectionId};
 use locality_core::shadow::MarkdownBlockKind;
 use locality_notion::client::NotionApi;
 use locality_notion::dto::{
@@ -2013,6 +2017,212 @@ fn enumerate_projects_root_page_tree_to_stable_paths() {
 }
 
 #[test]
+fn portable_bootstrap_resumes_and_never_claims_unsupported_database_coverage() {
+    let root_page_id = RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let connector = NotionConnector::with_api(
+        NotionConfig::default().with_root_page_id(root_page_id.clone()),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::tree(
+            root_page_id.as_str(),
+        ))),
+    );
+
+    let first = connector
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            scope: PortableSourceScope::explicit_roots([root_page_id.clone()]),
+            checkpoint: None,
+            max_changes: 2,
+        })
+        .expect("first checkpoint");
+    assert_eq!(first.changes.len(), 2);
+    assert!(!first.completeness.is_complete());
+    assert!(
+        first
+            .completeness
+            .incomplete_reasons()
+            .contains(&PortableIncompleteReason::CheckpointContinuation)
+    );
+
+    let second = connector
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            scope: PortableSourceScope::explicit_roots([root_page_id]),
+            checkpoint: Some(first.next_checkpoint),
+            max_changes: 2,
+        })
+        .expect("resumed checkpoint");
+    assert_eq!(second.changes.len(), 2);
+    assert!(!second.completeness.is_complete());
+    assert!(
+        !second
+            .completeness
+            .incomplete_reasons()
+            .contains(&PortableIncompleteReason::CheckpointContinuation)
+    );
+    assert!(second.completeness.incomplete_reasons().iter().any(
+        |reason| matches!(reason, PortableIncompleteReason::UnsupportedSourceKind {
+            source_kind,
+            ..
+        } if source_kind == "database")
+    ));
+
+    let synchronized = connector
+        .sync_portable(PortableSyncRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            scope: PortableSourceScope::explicit_roots([RemoteId::new(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )]),
+            checkpoint: second.next_checkpoint,
+            hints: Vec::new(),
+            max_changes: 10,
+        })
+        .expect("scheduled explicit-root synchronization");
+    assert_eq!(synchronized.changes.len(), 4);
+    assert!(!synchronized.completeness.is_complete());
+}
+
+#[test]
+fn portable_bootstrap_requires_the_configured_explicit_root_without_search_fallback() {
+    let root_page_id = RemoteId::new("page-1");
+    let connector = NotionConnector::with_api(
+        NotionConfig::default().with_root_page_id(root_page_id.clone()),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::new())),
+    );
+
+    let batch = connector
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            scope: PortableSourceScope::explicit_roots([root_page_id]),
+            checkpoint: None,
+            max_changes: 100,
+        })
+        .expect("explicit-root bootstrap");
+    let direct = connector
+        .enumerate(EnumerateRequest {
+            mount_id: MountId::new("notion-main"),
+            cursor: None,
+        })
+        .expect("direct explicit-root enumeration");
+    assert!(batch.completeness.is_complete());
+    assert_eq!(batch.changes.len(), 1);
+    let direct_logical_path = direct[0]
+        .path
+        .iter()
+        .map(|component| component.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    assert_eq!(
+        batch.changes[0]
+            .logical_path
+            .as_ref()
+            .expect("portable path")
+            .as_str(),
+        direct_logical_path
+    );
+
+    let workspace_connector = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::new())),
+    );
+    let error = workspace_connector
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            scope: PortableSourceScope::explicit_roots([RemoteId::new("page-1")]),
+            checkpoint: None,
+            max_changes: 100,
+        })
+        .expect_err("workspace search must not be a portable fallback");
+    assert!(error.to_string().contains("configured root page"));
+}
+
+#[test]
+fn portable_render_matches_direct_canonical_bytes_and_keys_survive_rename() {
+    let root_page_id = RemoteId::new("page-1");
+    let connector = NotionConnector::with_api(
+        NotionConfig::default().with_root_page_id(root_page_id.clone()),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::new())),
+    );
+    let fetched = connector
+        .fetch_portable(PortableFetchRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            remote_id: root_page_id,
+            reason: PortableFetchReason::Bootstrap,
+        })
+        .expect("portable fetch");
+    let direct = connector.render(&fetched.native).expect("direct render");
+
+    let before = connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            logical_path: LogicalPath::new("Roadmap/page.md").expect("path"),
+            native: fetched.native.clone(),
+            format_version: 1,
+        })
+        .expect("portable render");
+    let after = connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            logical_path: LogicalPath::new("Renamed Roadmap/page.md").expect("path"),
+            native: fetched.native,
+            format_version: 1,
+        })
+        .expect("portable renamed render");
+
+    assert_eq!(
+        before.canonical.body,
+        render_canonical_markdown(&direct).into_bytes()
+    );
+    assert_eq!(before.canonical.artifact_key, after.canonical.artifact_key);
+    assert_eq!(
+        before.projections[0].artifact.artifact_key,
+        after.projections[0].artifact.artifact_key
+    );
+    assert_eq!(
+        before.projections[0].artifact.body,
+        after.projections[0].artifact.body
+    );
+    assert_ne!(
+        before.projections[0].logical_path,
+        after.projections[0].logical_path
+    );
+}
+
+#[test]
+fn portable_render_marks_media_incomplete_instead_of_silently_omitting_it() {
+    let bundle = locality_notion::dto::NotionPageBundle {
+        page: page("page-media", "Media"),
+        blocks: vec![BlockTreeDto {
+            block: file_block("image-1", "image", "https://example.com/image.png", "Image"),
+            children: Vec::new(),
+        }],
+    };
+    let connector = NotionConnector::with_api(
+        NotionConfig::default().with_root_page_id(RemoteId::new("page-media")),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::new())),
+    );
+    let rendered = connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            logical_path: LogicalPath::new("Media/page.md").expect("path"),
+            native: NativeEntity {
+                remote_id: RemoteId::new("page-media"),
+                kind: "notion_page".to_string(),
+                raw: serde_json::to_vec(&bundle).expect("native fixture"),
+            },
+            format_version: 1,
+        })
+        .expect("render media page");
+
+    assert!(!rendered.completeness.is_complete());
+    assert!(rendered.completeness.incomplete_reasons().iter().any(
+        |reason| matches!(reason, PortableIncompleteReason::UnsupportedArtifact {
+            artifact_kind,
+            ..
+        } if artifact_kind == "notion_media")
+    ));
+}
+
+#[test]
 fn enumerate_suffixes_every_colliding_sibling_name() {
     let root_page_id = RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     let api = FixtureNotionApi::colliding_tree(root_page_id.as_str());
@@ -2854,6 +3064,76 @@ impl NotionApi for FixtureNotionApi {
         Err(locality_core::LocalityError::NotImplemented(
             "fixture delete block",
         ))
+    }
+}
+
+#[derive(Debug)]
+struct NoSearchNotionApi(FixtureNotionApi);
+
+impl NotionApi for NoSearchNotionApi {
+    fn retrieve_page(&self, page_id: &str) -> locality_core::LocalityResult<PageDto> {
+        self.0.retrieve_page(page_id)
+    }
+
+    fn retrieve_database(&self, database_id: &str) -> locality_core::LocalityResult<DatabaseDto> {
+        self.0.retrieve_database(database_id)
+    }
+
+    fn retrieve_data_source(
+        &self,
+        data_source_id: &str,
+    ) -> locality_core::LocalityResult<DataSourceDto> {
+        self.0.retrieve_data_source(data_source_id)
+    }
+
+    fn query_data_source(
+        &self,
+        data_source_id: &str,
+        start_cursor: Option<&str>,
+    ) -> locality_core::LocalityResult<PageListDto> {
+        self.0.query_data_source(data_source_id, start_cursor)
+    }
+
+    fn retrieve_block_children(
+        &self,
+        block_id: &str,
+        start_cursor: Option<&str>,
+    ) -> locality_core::LocalityResult<BlockListDto> {
+        self.0.retrieve_block_children(block_id, start_cursor)
+    }
+
+    fn search_pages(
+        &self,
+        _start_cursor: Option<&str>,
+    ) -> locality_core::LocalityResult<PageListDto> {
+        panic!("portable explicit-root traversal must not call Notion search")
+    }
+
+    fn search_databases(
+        &self,
+        _start_cursor: Option<&str>,
+    ) -> locality_core::LocalityResult<DatabaseListDto> {
+        panic!("portable explicit-root traversal must not call Notion search")
+    }
+
+    fn update_block(
+        &self,
+        _block_id: &str,
+        _body: serde_json::Value,
+    ) -> locality_core::LocalityResult<BlockDto> {
+        unreachable!("not used by portable read tests")
+    }
+
+    fn append_block_children(
+        &self,
+        _block_id: &str,
+        _body: serde_json::Value,
+    ) -> locality_core::LocalityResult<BlockListDto> {
+        unreachable!("not used by portable read tests")
+    }
+
+    fn delete_block(&self, _block_id: &str) -> locality_core::LocalityResult<BlockDto> {
+        unreachable!("not used by portable read tests")
     }
 }
 

@@ -1,0 +1,8 @@
+{
+  "tenant_id": "tenant-acme",
+  "source_connection_id": "source-notion",
+  "content_version_id": "content-roadmap-v4",
+  "sha256": "sha256:roadmap",
+  "byte_length": 10,
+  "media_type": "text/markdown; charset=utf-8"
+}

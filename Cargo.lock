@@ -359,6 +359,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "556e016178bb5662a08681bbe0f00f8e17631781a4dfc8c45e466e4b185ec27f"
 dependencies = [
  "find-msvc-tools",
+ "jobserver",
+ "libc",
  "shlex",
 ]
 
@@ -1913,6 +1915,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jobserver"
+version = "0.1.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
+dependencies = [
+ "getrandom 0.4.2",
+ "libc",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2083,12 +2095,18 @@ dependencies = [
  "locality-linear",
  "locality-notion",
  "locality-platform",
+ "locality-protocol",
  "locality-slack",
  "locality-store",
  "localityd",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
+ "sha2",
+ "tar",
  "yaml_serde",
+ "zstd",
 ]
 
 [[package]]
@@ -2151,6 +2169,15 @@ dependencies = [
  "tauri-plugin-process",
  "tauri-plugin-updater",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "locality-engine"
+version = "0.3.3"
+dependencies = [
+ "locality-connector",
+ "locality-core",
+ "sha2",
 ]
 
 [[package]]
@@ -2264,6 +2291,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "locality-protocol"
+version = "0.3.3"
+dependencies = [
+ "locality-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "locality-slack"
 version = "0.3.6"
 dependencies = [
@@ -2296,6 +2332,7 @@ dependencies = [
  "getrandom 0.3.4",
  "locality-connector",
  "locality-core",
+ "locality-engine",
  "locality-gmail",
  "locality-google-calendar",
  "locality-google-docs",
@@ -2303,6 +2340,7 @@ dependencies = [
  "locality-linear",
  "locality-notion",
  "locality-platform",
+ "locality-protocol",
  "locality-slack",
  "locality-store",
  "notify",
@@ -2310,6 +2348,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tar",
+ "unicode-normalization",
+ "zstd",
  "windows-sys 0.61.2",
 ]
 
@@ -4771,6 +4812,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
 name = "unicode-segmentation"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5922,3 +5972,31 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+
+[[package]]
+name = "zstd"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "7.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.0.16+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
+dependencies = [
+ "cc",
+ "pkg-config",
+]

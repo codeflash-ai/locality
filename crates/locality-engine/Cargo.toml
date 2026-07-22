@@ -1,0 +1,16 @@
+[package]
+name = "locality-engine"
+version = "0.3.3"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "locality_engine"
+path = "src/lib.rs"
+
+[dependencies]
+locality-core.workspace = true
+locality-connector.workspace = true
+sha2 = "0.10"
