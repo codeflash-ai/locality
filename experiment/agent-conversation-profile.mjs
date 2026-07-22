@@ -9,7 +9,7 @@ import { spawnSync } from "node:child_process";
 import { basename, extname, join, resolve } from "node:path";
 
 const DEFAULT_DURATION_MS = 1000;
-const TIMESTAMP_KEYS = ["timestamp", "created_at", "time", "ts"];
+const TIMESTAMP_KEYS = ["observed_at_ms", "timestamp", "created_at", "time", "ts"];
 const CONTAINER_KEYS = [
   "events",
   "messages",
@@ -384,6 +384,19 @@ function partialEventsForRecord(record, target = eventTargetForRecord(record)) {
 }
 
 function eventTargetForRecord(record) {
+  if (isPlainObject(record.event)) {
+    const event = record.event;
+    const item = isPlainObject(event.item) ? event.item : {};
+    return mergeEventContext(
+      {
+        ...event,
+        ...item,
+        event_type: event.type,
+        type: item.type ?? event.type,
+      },
+      record,
+    );
+  }
   if (isPlainObject(record.item)) {
     return mergeEventContext(record.item, record);
   }
@@ -402,6 +415,8 @@ function mergeEventContext(target, parent, options = {}) {
     created_at: target.created_at ?? parent.created_at,
     time: target.time ?? parent.time,
     ts: target.ts ?? parent.ts,
+    observed_at_ms: target.observed_at_ms ?? parent.observed_at_ms,
+    event_type: target.event_type ?? parent.event_type,
     duration_ms: inheritDuration
       ? target.duration_ms ?? parent.duration_ms
       : target.duration_ms,
@@ -516,6 +531,10 @@ function classifyKind(object, parent) {
   const rawType = String(object.type ?? object.kind ?? parent?.type ?? "")
     .toLowerCase()
     .replace(/\s+/g, "_");
+  const eventType = String(
+    object.event_type ?? object.eventType ?? parent?.event_type ?? parent?.eventType ?? "",
+  ).toLowerCase();
+  const status = String(object.status ?? parent?.status ?? "").toLowerCase();
   const role = roleFor(object, parent);
 
   if (
@@ -527,17 +546,25 @@ function classifyKind(object, parent) {
     return "reasoning";
   }
 
+  if (rawType === "agent_message") {
+    return "assistant_message";
+  }
+
   if (
     rawType.includes("tool_use") ||
     rawType.includes("tool_call") ||
     rawType.includes("function_call") ||
     rawType.includes("local_shell_call") ||
+    rawType.includes("command_execution") ||
     rawType === "mcp_call"
   ) {
     if (
       rawType.includes("output") ||
       rawType.includes("result") ||
-      rawType.includes("response")
+      rawType.includes("response") ||
+      eventType.endsWith(".completed") ||
+      eventType.endsWith(".done") ||
+      status === "completed"
     ) {
       return "tool_result";
     }
@@ -575,6 +602,12 @@ function roleFor(object, parent) {
 }
 
 function toolNameFor(object, parent) {
+  const rawType = String(object.type ?? object.kind ?? parent?.type ?? "")
+    .toLowerCase()
+    .replace(/\s+/g, "_");
+  if (rawType.includes("command_execution")) {
+    return "bash";
+  }
   const candidate =
     object.name ??
     object.tool_name ??
@@ -755,31 +788,99 @@ function enrichToolEvents(events) {
 function toolGroupFor(event) {
   const toolName = event.tool_name ?? "unknown_tool";
   if (toolName.toLowerCase() === "bash") {
-    return bashCommandCallsLoc(event.tool_command) ? "bash_loc" : "bash_other";
+    return shellToolGroupFor(event.tool_command);
+  }
+  if (toolName.toLowerCase() === "local_shell") {
+    return shellToolGroupFor(event.tool_command);
   }
   return toolName;
+}
+
+function shellToolGroupFor(command) {
+  const payload = shellCommandPayload(command);
+  const segments = payload.split(/(?:&&|\|\||[;|\n])/);
+  for (const segment of segments) {
+    const locSubcommand = locSubcommandForSegment(segment);
+    if (locSubcommand) {
+      return `loc_${locSubcommand}`;
+    }
+  }
+
+  for (const segment of segments) {
+    const executable = shellSegmentExecutable(segment);
+    if (!executable) {
+      continue;
+    }
+    if (executable === "git") {
+      return "git";
+    }
+    if (["rg", "grep", "find", "fd"].includes(executable)) {
+      return "rg_grep_find";
+    }
+    if (
+      ["cat", "sed", "head", "tail", "less", "awk", "nl", "wc", "jq"].includes(
+        executable,
+      )
+    ) {
+      return "file_read";
+    }
+  }
+
+  return "bash_other";
+}
+
+function shellCommandPayload(command) {
+  if (typeof command !== "string" || command.trim() === "") {
+    return "";
+  }
+  const trimmed = command.trim();
+  const match = trimmed.match(
+    /(?:^|\s)(?:\S*\/)?(?:zsh|bash|sh)\s+-lc\s+((?:"(?:\\"|[^"])*")|'[^']*')/,
+  );
+  if (!match) {
+    return trimmed;
+  }
+  return stripShellTokenQuotes(match[1])
+    .replace(/\\"/g, '"')
+    .replace(/\\'/g, "'")
+    .replace(/\\n/g, "\n");
+}
+
+function locSubcommandForSegment(segment) {
+  const tokens = shellSegmentTokens(segment);
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (isAssignmentToken(token) || ["command", "env", "nice", "nohup", "sudo", "time"].includes(token)) {
+      continue;
+    }
+    if (basename(token) !== "loc") {
+      return null;
+    }
+    for (let subIndex = index + 1; subIndex < tokens.length; subIndex += 1) {
+      const candidate = tokens[subIndex];
+      if (!candidate || candidate.startsWith("-") || isAssignmentToken(candidate)) {
+        continue;
+      }
+      return candidate.replace(/[^A-Za-z0-9_-].*$/, "") || "unknown";
+    }
+    return "unknown";
+  }
+  return null;
 }
 
 function bashCommandCallsLoc(command) {
   if (typeof command !== "string" || command.trim() === "") {
     return false;
   }
-  return command
+  return shellCommandPayload(command)
     .split(/(?:&&|\|\||[;|\n])/)
     .some((segment) => shellSegmentExecutable(segment) === "loc");
 }
 
 function shellSegmentExecutable(segment) {
-  let remaining = segment.trim();
-  while (remaining !== "") {
-    const token = firstShellToken(remaining);
-    if (!token) {
-      return null;
-    }
-    const value = stripShellTokenQuotes(token.value);
-    remaining = remaining.slice(token.end).trimStart();
-
-    if (/^[A-Za-z_][A-Za-z0-9_]*=.*/.test(value)) {
+  const tokens = shellSegmentTokens(segment);
+  for (const value of tokens) {
+    if (isAssignmentToken(value)) {
       continue;
     }
     if (["command", "env", "nice", "nohup", "sudo", "time"].includes(value)) {
@@ -788,6 +889,24 @@ function shellSegmentExecutable(segment) {
     return basename(value);
   }
   return null;
+}
+
+function shellSegmentTokens(segment) {
+  let remaining = segment.trim();
+  const tokens = [];
+  while (remaining !== "") {
+    const token = firstShellToken(remaining);
+    if (!token) {
+      break;
+    }
+    tokens.push(stripShellTokenQuotes(token.value));
+    remaining = remaining.slice(token.end).trimStart();
+  }
+  return tokens;
+}
+
+function isAssignmentToken(value) {
+  return /^[A-Za-z_][A-Za-z0-9_]*=.*/.test(value);
 }
 
 function firstShellToken(value) {
@@ -907,7 +1026,8 @@ function toolWaitDurationMs(event, events, index) {
   if (!result) {
     return event.duration_ms;
   }
-  return Math.max(1, result.start_ms - event.start_ms);
+  const observedWaitMs = result.start_ms - event.start_ms;
+  return observedWaitMs > 0 ? observedWaitMs : event.duration_ms;
 }
 
 function matchingToolResult(event, events, index) {
@@ -1681,7 +1801,7 @@ function renderSummaryMarkdown(summary) {
     lines.push("");
   }
 
-  lines.push("## Tool Wait By Group", "");
+  lines.push("## Tool Time By Group", "");
   for (const conversation of summary.conversations) {
     lines.push(`### ${markdownHeadingText(conversation.label)}`, "");
     if (conversation.tool_groups.length === 0) {
