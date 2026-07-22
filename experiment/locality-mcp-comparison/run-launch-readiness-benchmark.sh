@@ -3,17 +3,18 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: run-launch-readiness-benchmark.sh [--push] [--compare-mcp]
+Usage: run-launch-readiness-benchmark.sh [--push] [--compare-mcp] [--write-mounted-page]
 
 Runs the Locality vs Notion MCP launch-readiness benchmark:
-  1. collect git metadata for the selected window
+  1. discover prompt scenarios from prompts/Locality/*.md
   2. hydrate target and context through Locality
   3. inventory/search hydrated Locality context
-  4. discover prompt scenarios from prompts/Locality/*.md
+  4. collect git metadata for scenario1 only
   5. run each Locality-backed Codex scenario with timed JSON events
-  6. write each mounted page.md and run loc diff
-  7. optionally run each matching Notion-MCP-only Codex scenario
-  8. write run summary artifacts
+  6. write local report artifacts under OUT_DIR
+  7. optionally write each mounted page.md and run loc diff
+  8. optionally run each matching Notion-MCP-only Codex scenario
+  9. write run summary artifacts
 
 Important environment:
   REPO_DIR                 Repository path. Default: /home/amika/workspace/locality
@@ -33,26 +34,38 @@ Important environment:
   SLACK_BOT_TOKEN          Optional with --compare-mcp. Slack bot token for Slack MCP.
   SLACK_TEAM_ID            Required when SLACK_BOT_TOKEN is set.
   SLACK_CHANNEL_IDS        Optional comma-delimited Slack channel allowlist.
+  WRITE_MOUNTED_PAGE       Set to 1 to create/write mounted report pages and
+                           run loc diff. Default: 0.
   LOCALITY_EXPERIMENT_TRACE_FORCE_DIRECT
                            Set to 1 to force CLI direct pull during traced Locality setup.
   SINCE                    Git window. Default: 24 hours ago
   BASE_REF                 Git ref. Default: origin/main
   OUT_DIR                  Run artifact directory.
 
-By default this is a dry run. Pass --push to publish the mounted report page.
+By default this is artifact-only and does not create report pages. Pass
+--write-mounted-page to create/write mounted report pages and run loc diff.
+Pass --push to publish the mounted report page; --push implies
+--write-mounted-page.
 EOF
 }
 
 PUSH=0
+WRITE_MOUNTED_PAGE="${WRITE_MOUNTED_PAGE:-0}"
 COMPARE_MCP=0
 for arg in "$@"; do
   case "$arg" in
-    --push) PUSH=1 ;;
+    --push) PUSH=1; WRITE_MOUNTED_PAGE=1 ;;
     --compare-mcp) COMPARE_MCP=1 ;;
+    --write-mounted-page) WRITE_MOUNTED_PAGE=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $arg" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+case "$WRITE_MOUNTED_PAGE" in
+  0|1) ;;
+  *) echo "WRITE_MOUNTED_PAGE must be 0 or 1" >&2; exit 2 ;;
+esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="${REPO_DIR:-/home/amika/workspace/locality}"
@@ -405,48 +418,26 @@ scenario_report_title() {
 
 prepare_scenario_inputs() {
   local scenario_out_dir="$1"
-  cp "$OUT_DIR/git-data.json" "$scenario_out_dir/git-data.json"
   cp "$CONTEXT_PATHS_FILE" "$scenario_out_dir/locality-context-paths.txt"
   cp "$CONTEXT_INVENTORY" "$scenario_out_dir/locality-context-inventory.txt"
   cp "$CONTEXT_SEARCH_RESULTS" "$scenario_out_dir/locality-context-search.txt"
 }
 
-discover_prompt_scenarios
-validate_prompt_scenarios
+scenario_needs_git_metadata() {
+  local scenario_file="$1"
+  [ "$(scenario_name_for_file "$scenario_file")" = "scenario1" ]
+}
 
-echo -e "scenario\tstrategy\tphase\tstart_ms\tend_ms\tduration_ms\tstatus\tdetail" > "$METRICS_TSV"
-printf 'scenario\tlocality_prompt\tmcp_prompt\tout_dir\treport_title\treport_page_path\n' > "$SCENARIO_MANIFEST"
+collect_git_metadata() {
+  local out_path="$1"
+  local commit_count
 
-phase_start
-test -d "$REPO_DIR"
-test -x "$LOC_BIN"
-git -C "$REPO_DIR" rev-parse --git-dir >/dev/null
-phase_end "locality" "validate_environment" "ok" "repo=$REPO_DIR; model=$CODEX_MODEL; effort=$CODEX_REASONING_EFFORT; scenarios=${#SCENARIO_FILES[@]}; prompts=$LOCALITY_PROMPT_DIR"
+  phase_start
+  git -C "$REPO_DIR" fetch --quiet origin || true
+  phase_end "locality" "git_fetch" "ok" "ref=$BASE_REF"
 
-phase_start
-if [ "$COMPARE_MCP" -eq 1 ]; then
-  set +e
-  configure_codex_mcp_auth > "$OUT_DIR/mcp-auth-setup.out" 2> "$OUT_DIR/mcp-auth-setup.err"
-  MCP_AUTH_RC=$?
-  set -e
-  if [ "$MCP_AUTH_RC" -eq 0 ]; then
-    phase_end "notion_mcp" "mcp_auth_setup" "ok" "$MCP_AUTH_DETAIL; out=$OUT_DIR/mcp-auth-setup.out"
-  else
-    phase_end "notion_mcp" "mcp_auth_setup" "failed" "exit=$MCP_AUTH_RC; out=$OUT_DIR/mcp-auth-setup.out; err=$OUT_DIR/mcp-auth-setup.err"
-    cat "$OUT_DIR/mcp-auth-setup.out" >&2 || true
-    cat "$OUT_DIR/mcp-auth-setup.err" >&2 || true
-    exit "$MCP_AUTH_RC"
-  fi
-else
-  phase_end "notion_mcp" "mcp_auth_setup" "skipped" "pass --compare-mcp to configure Codex MCP auth"
-fi
-
-phase_start
-git -C "$REPO_DIR" fetch --quiet origin || true
-phase_end "locality" "git_fetch" "ok" "ref=$BASE_REF"
-
-phase_start
-python3 - "$REPO_DIR" "$BASE_REF" "$SINCE" "$OUT_DIR/git-data.json" <<'PY'
+  phase_start
+  python3 - "$REPO_DIR" "$BASE_REF" "$SINCE" "$out_path" <<'PY'
 import json
 import subprocess
 import sys
@@ -485,8 +476,39 @@ for email, items in sorted(by_email.items(), key=lambda kv: (-len(kv[1]), kv[0])
 
 Path(out_path).write_text(json.dumps({"repo": repo, "ref": ref, "since": since, "commit_count": len(commits), "people": people}, indent=2) + "\n")
 PY
-COMMIT_COUNT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["commit_count"])' "$OUT_DIR/git-data.json")"
-phase_end "locality" "git_collect" "ok" "commits=$COMMIT_COUNT"
+  commit_count="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["commit_count"])' "$out_path")"
+  phase_end "locality" "git_collect" "ok" "commits=$commit_count; file=$out_path"
+}
+
+discover_prompt_scenarios
+validate_prompt_scenarios
+
+echo -e "scenario\tstrategy\tphase\tstart_ms\tend_ms\tduration_ms\tstatus\tdetail" > "$METRICS_TSV"
+printf 'scenario\tlocality_prompt\tmcp_prompt\tout_dir\treport_title\treport_page_path\n' > "$SCENARIO_MANIFEST"
+
+phase_start
+test -d "$REPO_DIR"
+test -x "$LOC_BIN"
+git -C "$REPO_DIR" rev-parse --git-dir >/dev/null
+phase_end "locality" "validate_environment" "ok" "repo=$REPO_DIR; model=$CODEX_MODEL; effort=$CODEX_REASONING_EFFORT; scenarios=${#SCENARIO_FILES[@]}; prompts=$LOCALITY_PROMPT_DIR; write_mounted_page=$WRITE_MOUNTED_PAGE"
+
+phase_start
+if [ "$COMPARE_MCP" -eq 1 ]; then
+  set +e
+  configure_codex_mcp_auth > "$OUT_DIR/mcp-auth-setup.out" 2> "$OUT_DIR/mcp-auth-setup.err"
+  MCP_AUTH_RC=$?
+  set -e
+  if [ "$MCP_AUTH_RC" -eq 0 ]; then
+    phase_end "notion_mcp" "mcp_auth_setup" "ok" "$MCP_AUTH_DETAIL; out=$OUT_DIR/mcp-auth-setup.out"
+  else
+    phase_end "notion_mcp" "mcp_auth_setup" "failed" "exit=$MCP_AUTH_RC; out=$OUT_DIR/mcp-auth-setup.out; err=$OUT_DIR/mcp-auth-setup.err"
+    cat "$OUT_DIR/mcp-auth-setup.out" >&2 || true
+    cat "$OUT_DIR/mcp-auth-setup.err" >&2 || true
+    exit "$MCP_AUTH_RC"
+  fi
+else
+  phase_end "notion_mcp" "mcp_auth_setup" "skipped" "pass --compare-mcp to configure Codex MCP auth"
+fi
 
 phase_start
 PAGE_PATH="$(run_loc_traced "target-locate" "$LOC_BIN" locate "$TARGET_URL")"
@@ -593,14 +615,22 @@ for scenario_file in "${SCENARIO_FILES[@]}"; do
   SCENARIO_REPORT_TITLE="$(scenario_report_title "$SCENARIO_NAME")"
 
   phase_start
-  REPORT_PAGE_PATH="$PARENT_DIR/$SCENARIO_REPORT_TITLE/page.md"
-  if [ ! -f "$REPORT_PAGE_PATH" ]; then
-    "$LOC_BIN" create page --title "$SCENARIO_REPORT_TITLE" --parent "$PARENT_DIR" --json > "$SCENARIO_OUT_DIR/loc-create-page.json"
-    REPORT_PAGE_PATH="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["path"])' "$SCENARIO_OUT_DIR/loc-create-page.json")"
+  REPORT_PAGE_PATH=""
+  if [ "$WRITE_MOUNTED_PAGE" = "1" ]; then
+    REPORT_PAGE_PATH="$PARENT_DIR/$SCENARIO_REPORT_TITLE/page.md"
+    if [ ! -f "$REPORT_PAGE_PATH" ]; then
+      "$LOC_BIN" create page --title "$SCENARIO_REPORT_TITLE" --parent "$PARENT_DIR" --json > "$SCENARIO_OUT_DIR/loc-create-page.json"
+      REPORT_PAGE_PATH="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["path"])' "$SCENARIO_OUT_DIR/loc-create-page.json")"
+    fi
+    phase_end "locality" "prepare_report_target" "ok" "path=$REPORT_PAGE_PATH"
+  else
+    phase_end "locality" "prepare_report_target" "skipped" "artifact-only; report=$SCENARIO_OUT_DIR/report-body.md"
   fi
-  phase_end "locality" "prepare_report_target" "ok" "path=$REPORT_PAGE_PATH"
 
   prepare_scenario_inputs "$SCENARIO_OUT_DIR"
+  if scenario_needs_git_metadata "$scenario_file"; then
+    collect_git_metadata "$SCENARIO_OUT_DIR/git-data.json"
+  fi
   SCENARIO_CONTEXT_PATHS_FILE="$SCENARIO_OUT_DIR/locality-context-paths.txt"
   SCENARIO_CONTEXT_INVENTORY="$SCENARIO_OUT_DIR/locality-context-inventory.txt"
   SCENARIO_CONTEXT_SEARCH_RESULTS="$SCENARIO_OUT_DIR/locality-context-search.txt"
@@ -636,8 +666,9 @@ for scenario_file in "${SCENARIO_FILES[@]}"; do
     exit "$agent_rc"
   fi
 
-  phase_start
-  python3 - "$REPORT_PAGE_PATH" "$OUT_DIR/report-body.md" "$SCENARIO_REPORT_TITLE" <<'PY'
+  if [ "$WRITE_MOUNTED_PAGE" = "1" ]; then
+    phase_start
+    python3 - "$REPORT_PAGE_PATH" "$OUT_DIR/report-body.md" "$SCENARIO_REPORT_TITLE" <<'PY'
 import sys
 from pathlib import Path
 
@@ -652,21 +683,29 @@ if current.startswith("---\n"):
         frontmatter = current[: end + len("\n---\n")]
 page.write_text(frontmatter.rstrip() + "\n\n" + body)
 PY
-  phase_end "locality" "write_mounted_page" "ok" "path=$REPORT_PAGE_PATH"
+    phase_end "locality" "write_mounted_page" "ok" "path=$REPORT_PAGE_PATH"
 
-  phase_start
-  "$LOC_BIN" diff "$REPORT_PAGE_PATH" > "$OUT_DIR/loc-diff.out"
-  DIFF_SUMMARY="$(sed -n '1p' "$OUT_DIR/loc-diff.out")"
-  phase_end "locality" "loc_diff" "ok" "$DIFF_SUMMARY"
-
-  if [ "$PUSH" -eq 1 ]; then
     phase_start
-    "$LOC_BIN" push "$REPORT_PAGE_PATH" -y > "$OUT_DIR/loc-push.out"
-    PUSH_SUMMARY="$(tr '\n' ' ' < "$OUT_DIR/loc-push.out" | sed 's/[[:space:]]*$//')"
-    phase_end "locality" "loc_push" "ok" "$PUSH_SUMMARY"
+    "$LOC_BIN" diff "$REPORT_PAGE_PATH" > "$OUT_DIR/loc-diff.out"
+    DIFF_SUMMARY="$(sed -n '1p' "$OUT_DIR/loc-diff.out")"
+    phase_end "locality" "loc_diff" "ok" "$DIFF_SUMMARY"
+
+    if [ "$PUSH" -eq 1 ]; then
+      phase_start
+      "$LOC_BIN" push "$REPORT_PAGE_PATH" -y > "$OUT_DIR/loc-push.out"
+      PUSH_SUMMARY="$(tr '\n' ' ' < "$OUT_DIR/loc-push.out" | sed 's/[[:space:]]*$//')"
+      phase_end "locality" "loc_push" "ok" "$PUSH_SUMMARY"
+    else
+      phase_start
+      phase_end "locality" "loc_push" "skipped" "dry-run; pass --push to publish"
+    fi
   else
     phase_start
-    phase_end "locality" "loc_push" "skipped" "dry-run; pass --push to publish"
+    phase_end "locality" "write_mounted_page" "skipped" "artifact-only; report=$OUT_DIR/report-body.md"
+    phase_start
+    phase_end "locality" "loc_diff" "skipped" "artifact-only; pass --write-mounted-page to diff mounted page"
+    phase_start
+    phase_end "locality" "loc_push" "skipped" "artifact-only; pass --push to publish"
   fi
 
   if [ "$COMPARE_MCP" -eq 1 ]; then
@@ -693,13 +732,13 @@ CURRENT_SCENARIO="setup"
 
 render_locality_traces
 
-python3 - "$METRICS_TSV" "$SUMMARY_JSON" "$SCENARIO_MANIFEST" "$OUT_DIR" "$PUSH" "$CODEX_MODEL" "$CODEX_REASONING_EFFORT" <<'PY'
+python3 - "$METRICS_TSV" "$SUMMARY_JSON" "$SCENARIO_MANIFEST" "$OUT_DIR" "$PUSH" "$WRITE_MOUNTED_PAGE" "$CODEX_MODEL" "$CODEX_REASONING_EFFORT" <<'PY'
 import csv
 import json
 import sys
 from pathlib import Path
 
-metrics_path, summary_path, manifest_path, out_dir, push, model, effort = sys.argv[1:8]
+metrics_path, summary_path, manifest_path, out_dir, push, write_mounted_page, model, effort = sys.argv[1:9]
 with open(metrics_path) as f:
     metrics = list(csv.DictReader(f, delimiter="\t"))
 
@@ -741,6 +780,7 @@ summary = {
     "page_paths": {name: data["page_path"] for name, data in scenario_summaries.items()},
     "out_dir": out_dir,
     "pushed": push == "1",
+    "write_mounted_page": write_mounted_page == "1",
     "metrics": [
         {
             "scenario": row.get("scenario", ""),

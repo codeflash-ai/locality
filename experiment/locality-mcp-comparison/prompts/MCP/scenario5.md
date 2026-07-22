@@ -5,20 +5,18 @@ I need a short standup-style update for Locality based on what changed recently.
 
 Use these context sources:
 - local git commands in `REPO_DIR`
-- `OUT_DIR/git-data.json`
 - Notion MCP tools for Notion search/read context
 
 Do not read mounted Locality Notion files under `/home/amika/notion`.
 Do not use `loc` commands.
-Do not push or update Notion or any remote source in this run.
+Do not create Notion pages/docs, push or update Notion, or update any remote source.
 
 Required work:
-1. Read `OUT_DIR/git-data.json`.
-2. Inspect recent code changes with local git commands as needed.
-3. Use Notion MCP to search/read relevant product, launch, engineering, risk, blocker, and team context.
-4. Produce a short standup-style update with grounded evidence.
-5. Write the final Markdown draft to `OUT_DIR/notion-mcp-report-body.md`.
-6. Write a compact trace to `OUT_DIR/notion-mcp-agent-trace.md` listing:
+1. Inspect recent code changes with local git commands as needed.
+2. Use Notion MCP to search/read relevant product, launch, engineering, risk, blocker, and team context.
+3. Produce a short standup-style update with grounded evidence.
+4. Write the final Markdown draft to `OUT_DIR/notion-mcp-report-body.md`.
+5. Write a compact trace to `OUT_DIR/notion-mcp-agent-trace.md` listing:
    - git commands used
    - Notion MCP searches/calls attempted
    - Notion pages or excerpts used

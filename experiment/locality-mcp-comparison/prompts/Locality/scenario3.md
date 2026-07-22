@@ -11,19 +11,17 @@ Use only these context sources:
 - mounted Locality files under the paths listed in `CONTEXT_PATHS_FILE`
 - `CONTEXT_INVENTORY`
 - `CONTEXT_SEARCH_RESULTS`
-- `OUT_DIR/git-data.json`
 
 Do not use Notion MCP or direct Notion API tools in this run.
-Do not push to Notion or update any remote source.
+Do not create Notion pages/docs, push to Notion, or update any remote source.
 
 Required work:
-1. Read `OUT_DIR/git-data.json`.
-2. Inspect relevant recent engineering work with git, and use `gh` only for repository or issue context that materially affects the assessment.
-3. Read the hydrated Notion context inventory and search hits.
-4. Open the most relevant mounted `page.md` files to connect engineering work to internal launch context.
-5. Identify evidence, risks, blockers, and next validation steps.
-6. Write the final Markdown assessment to `OUT_DIR/report-body.md`.
-7. Write a compact trace to `OUT_DIR/locality-agent-trace.md` listing:
+1. Inspect relevant recent engineering work with git, and use `gh` only for repository or issue context that materially affects the assessment.
+2. Read the hydrated Notion context inventory and search hits.
+3. Open the most relevant mounted `page.md` files to connect engineering work to internal launch context.
+4. Identify evidence, risks, blockers, and next validation steps.
+5. Write the final Markdown assessment to `OUT_DIR/report-body.md`.
+6. Write a compact trace to `OUT_DIR/locality-agent-trace.md` listing:
    - git and gh commands used
    - mounted Notion files read
    - key facts used from Locality context

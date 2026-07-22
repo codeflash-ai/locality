@@ -9,7 +9,7 @@ Use these context sources:
 
 Do not read mounted Locality Notion files under `/home/amika/notion`.
 Do not use `loc` commands.
-Do not push or update Notion in this run.
+Do not create Notion pages/docs, push or update Notion, or update any remote source.
 
 Required work:
 1. Read `OUT_DIR/git-data.json`.

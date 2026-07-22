@@ -10,7 +10,7 @@ Use only these context sources:
 - `OUT_DIR/git-data.json`
 
 Do not use Notion MCP or direct Notion API tools in this run.
-Do not push to Notion.
+Do not create Notion pages/docs, push to Notion, or update any remote source.
 
 Required work:
 1. Read `OUT_DIR/git-data.json`.

@@ -2,7 +2,7 @@
 
 This experiment compares two agent paths for a launch-readiness workflow:
 
-- **Locality path:** hydrate Notion through Locality, let the agent read mounted Markdown files, write a mounted `page.md`, and run `loc diff`.
+- **Locality path:** hydrate Notion through Locality, let the agent read mounted Markdown files, and write local Markdown artifacts under `OUT_DIR`.
 - **Notion MCP path:** let the agent use Notion MCP search/fetch for context, without reading mounted Locality files or using `loc`.
 
 The benchmark case lives in Notion at:
@@ -169,6 +169,10 @@ and trace to the standard paths under `OUT_DIR`, such as `OUT_DIR/report-body.md
 for Locality and `OUT_DIR/notion-mcp-report-body.md` for MCP. The runner sets
 `OUT_DIR` separately for each scenario.
 
+Only `scenario1.md` receives precomputed git metadata at
+`OUT_DIR/git-data.json`. Other scenarios should not require that file; if they
+need repository context, they should inspect the repository directly with git.
+
 ## Run Once
 
 ```bash
@@ -179,7 +183,20 @@ ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
 '
 ```
 
-By default this is a dry run. It writes a mounted page and runs `loc diff`, but does not push.
+By default this is artifact-only. It writes local Markdown reports under
+`OUT_DIR` and does not create Notion pages, write mounted report pages, run
+`loc diff`, or push.
+
+To exercise mounted report page creation and push-plan generation without
+publishing:
+
+```bash
+ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
+  export PATH="$HOME/.cargo/bin:$PATH"
+  cd /home/amika/workspace/locality
+  CODEX_MODEL=gpt-5.6-luna CODEX_REASONING_EFFORT=low ./experiment/locality-mcp-comparison/run-agent-comparison.sh --write-mounted-page
+'
+```
 
 Each Codex strategy has a hard timeout so a stalled `codex exec` records a failed phase instead of hanging the benchmark indefinitely. The default is 900 seconds per strategy. Override it with:
 
@@ -201,7 +218,7 @@ LOCALITY_EXPERIMENT_TRACE_FORCE_DIRECT=1 ./experiment/locality-mcp-comparison/ru
 Use this only when the mounted target does not require daemon-only virtual
 projection behavior.
 
-To publish:
+To publish, which implies mounted report page creation:
 
 ```bash
 ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
@@ -231,13 +248,14 @@ Important artifacts:
 
 - `metrics.tsv` - phase wall-clock metrics with a `scenario` column.
 - `summary.json` - machine-readable run summary.
-- `scenarios.tsv` - scenario manifest with prompt paths, output directories, and mounted report pages.
+- `scenarios.tsv` - scenario manifest with prompt paths, output directories, and mounted report pages when `--write-mounted-page` or `--push` is used.
 - `mcp-auth-setup.out` and `mcp-auth-setup.err` - Codex MCP setup logs when `--compare-mcp` is enabled.
 - `scenarios/<scenario>/report-body.md` - Locality report for that scenario.
 - `scenarios/<scenario>/notion-mcp-report-body.md` - MCP report for that scenario.
 - `scenarios/<scenario>/locality-codex-events.jsonl` - timestamped Locality Codex JSON events.
 - `scenarios/<scenario>/notion-mcp-codex-events.jsonl` - timestamped MCP Codex JSON events.
 - `scenarios/<scenario>/locality-prompt.md` and `scenarios/<scenario>/notion-mcp-prompt.md` - exact prompts used for the scenario.
+- `scenarios/scenario1/git-data.json` - precomputed git metadata for the scenario1 prompts.
 - `scenarios/<scenario>/locality-codex-command.txt` and `scenarios/<scenario>/notion-mcp-codex-command.txt` - exact `codex exec` commands and timeout wrappers.
 - `scenarios/<scenario>/locality-codex-summary.json` - event counts, usage, errors.
 - `scenarios/<scenario>/notion-mcp-codex-summary.json` - event counts, usage, errors.
@@ -250,7 +268,7 @@ Important artifacts:
 - `scenarios/<scenario>/locality-transcript.md` and `scenarios/<scenario>/notion-mcp-transcript.md` - readable Codex event transcripts generated from the JSON events.
 - `scenarios/<scenario>/locality-agent-trace.md` - agent-reported Locality trace.
 - `scenarios/<scenario>/notion-mcp-agent-trace.md` - agent-reported MCP trace.
-- `scenarios/<scenario>/loc-diff.out` - Locality push plan.
+- `scenarios/<scenario>/loc-diff.out` - Locality push plan when mounted report page writing is enabled.
 
 Generate flame graph artifacts for a completed run with:
 
