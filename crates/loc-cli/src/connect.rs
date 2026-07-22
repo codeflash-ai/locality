@@ -1697,6 +1697,7 @@ fn linear_capabilities_json() -> Result<String, ConnectError> {
         supports_remote_observation: true,
         supports_lazy_child_enumeration: true,
         supports_batch_observation: true,
+        supports_media_download: true,
         ..ConnectorCapabilities::default()
     };
     serde_json::to_string(&capabilities).map_err(|error| {

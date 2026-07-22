@@ -15,11 +15,18 @@ use locality_core::model::{
     CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
 };
 use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind};
+use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::{LocalityError, LocalityResult};
 
 use crate::client::{HttpLinearApiClient, LinearApi};
-use crate::dto::{LinearIssue, LinearIssueState, LinearIssueUpdateInput, LinearTeam};
-use crate::render::{LinearNativeBundle, remote_version, render_linear_issue};
+use crate::dto::{
+    LinearIssue, LinearIssueContext, LinearIssueContextKind, LinearIssueState,
+    LinearIssueUpdateInput, LinearTeam,
+};
+use crate::render::{
+    LinearNativeBundle, LinearNativeContextBundle, linear_context_remote_id, remote_version,
+    render_linear_issue, render_linear_issue_context,
+};
 
 pub const LINEAR_CONNECTOR_ID: &str = "linear";
 const TEAMS_DIRECTORY_NAME: &str = "Teams";
@@ -28,6 +35,13 @@ const TEAMS_ROOT_REMOTE_ID: &str = "linear:teams";
 const TEAM_REMOTE_ID_PREFIX: &str = "team:";
 const TEAM_ISSUES_REMOTE_ID_PREFIX: &str = "team-issues:";
 const TEAM_STATE_REMOTE_ID_PREFIX: &str = "team-state:";
+const LINEAR_CONTEXT_REMOTE_ID_PREFIX: &str = "linear-context:";
+const LINEAR_CONTEXT_KINDS: &[LinearIssueContextKind] = &[
+    LinearIssueContextKind::Comments,
+    LinearIssueContextKind::Attachments,
+    LinearIssueContextKind::PullRequests,
+    LinearIssueContextKind::History,
+];
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct LinearConfig {
@@ -78,6 +92,14 @@ impl LinearConnector {
         &self.config
     }
 
+    pub fn get_issue_context(&self, issue_id: &str) -> LocalityResult<LinearIssueContext> {
+        self.api.get_issue_context(issue_id)
+    }
+
+    pub fn download_attachment(&self, url: &str, max_bytes: u64) -> LocalityResult<Vec<u8>> {
+        self.api.download_attachment(url, max_bytes)
+    }
+
     fn all_issues(
         &self,
         updated_after: Option<&str>,
@@ -116,6 +138,7 @@ impl Connector for LinearConnector {
             supports_remote_observation: true,
             supports_lazy_child_enumeration: true,
             supports_batch_observation: true,
+            supports_media_download: true,
             ..ConnectorCapabilities::default()
         }
     }
@@ -139,6 +162,13 @@ impl Connector for LinearConnector {
     }
 
     fn observe(&self, request: ObserveRequest) -> LocalityResult<RemoteObservation> {
+        if let Some((issue_id, kind)) = parse_context_remote_id(&request.remote_id) {
+            let issue = self.api.get_issue(issue_id)?;
+            return Ok(observation_from_context_entry(
+                context_entry(&request.mount_id, Path::new(""), &issue, kind),
+                RemoteId::new(issue.id),
+            ));
+        }
         let issue = self.api.get_issue(request.remote_id.as_str())?;
         Ok(observation_from_issue(&request.mount_id, issue))
     }
@@ -158,12 +188,10 @@ impl Connector for LinearConnector {
             .unwrap_or_default();
         let changes = issues
             .into_iter()
-            .map(|issue| {
-                BatchObservationChange::Upsert(issue_entry(
-                    &request.mount_id,
-                    Path::new(""),
-                    &issue,
-                ))
+            .flat_map(|issue| {
+                let mut entries = vec![issue_entry(&request.mount_id, Path::new(""), &issue)];
+                entries.extend(context_entries(&request.mount_id, Path::new(""), &issue));
+                entries.into_iter().map(BatchObservationChange::Upsert)
             })
             .collect();
         Ok(BatchObserveResult::incremental(
@@ -194,14 +222,30 @@ impl Connector for LinearConnector {
                 &request.parent_path,
                 &remote_id,
             )?,
+            ChildContainer::PageChildren(remote_id) => {
+                let issue = self.api.get_issue(remote_id.as_str())?;
+                context_child_entries(&request.mount_id, &request.parent_path, &issue)
+            }
             _ => Vec::new(),
         };
         Ok(ListChildrenResult::complete(entries))
     }
 
     fn fetch(&self, request: FetchRequest) -> LocalityResult<NativeEntity> {
-        let issue = self.api.get_issue(request.remote_id.as_str())?;
-        let raw = serde_json::to_vec(&LinearNativeBundle { issue })
+        let bundle = if let Some((issue_id, kind)) = parse_context_remote_id(&request.remote_id) {
+            let issue = self.api.get_issue(issue_id)?;
+            let context = self.api.get_issue_context(issue_id)?;
+            LinearNativeBundle {
+                issue,
+                context: Some(LinearNativeContextBundle { kind, context }),
+            }
+        } else {
+            LinearNativeBundle {
+                issue: self.api.get_issue(request.remote_id.as_str())?,
+                context: None,
+            }
+        };
+        let raw = serde_json::to_vec(&bundle)
             .map_err(|error| LocalityError::Io(format!("Linear native encode failed: {error}")))?;
         Ok(NativeEntity {
             remote_id: request.remote_id,
@@ -213,6 +257,9 @@ impl Connector for LinearConnector {
     fn render(&self, entity: &NativeEntity) -> LocalityResult<CanonicalDocument> {
         let bundle = serde_json::from_slice::<LinearNativeBundle>(&entity.raw)
             .map_err(|error| LocalityError::Io(format!("Linear native decode failed: {error}")))?;
+        if let Some(context) = &bundle.context {
+            return render_linear_issue_context(&context.context, context.kind);
+        }
         render_linear_issue(&bundle.issue)
     }
 
@@ -222,6 +269,7 @@ impl Connector for LinearConnector {
 
     fn check_concurrency(&self, request: ApplyPlanRequest<'_>) -> LocalityResult<()> {
         for precondition in request.remote_preconditions {
+            reject_context_remote_id(&precondition.remote_id)?;
             let Some(expected) = &precondition.remote_edited_at else {
                 continue;
             };
@@ -248,6 +296,7 @@ impl Connector for LinearConnector {
                 })?;
             match operation {
                 PushOperation::UpdateEntityBody { entity_id, body } => {
+                    reject_context_remote_id(entity_id)?;
                     update_for(&mut updates, entity_id).description = Some(body.clone());
                     effects.push(JournalApplyEffect::UpdatedEntityBody {
                         operation_id,
@@ -259,6 +308,7 @@ impl Connector for LinearConnector {
                     entity_id,
                     properties,
                 } => {
+                    reject_context_remote_id(entity_id)?;
                     let update = update_for(&mut updates, entity_id);
                     apply_property_updates(update, properties)?;
                     effects.push(JournalApplyEffect::UpdatedProperties {
@@ -274,6 +324,7 @@ impl Connector for LinearConnector {
                     new_title,
                     ..
                 } => {
+                    reject_context_remote_id(entity_id)?;
                     let (team_id, state_id) =
                         team_state_from_remote_id(new_parent_id).ok_or_else(|| {
                             validation_error(
@@ -425,11 +476,11 @@ fn entries_for_issues(
             .join(ISSUES_DIRECTORY_NAME);
         entries.push(status_entry(mount_id, &issues_path, &team_id, &state));
     }
-    entries.extend(
-        issues
-            .iter()
-            .map(|issue| issue_entry(mount_id, parent, issue)),
-    );
+    entries.extend(issues.iter().flat_map(|issue| {
+        let mut entries = vec![issue_entry(mount_id, parent, issue)];
+        entries.extend(context_entries(mount_id, parent, issue));
+        entries
+    }));
     entries.sort_by(|left, right| {
         left.path
             .cmp(&right.path)
@@ -527,18 +578,76 @@ fn issue_entry(mount_id: &MountId, parent: &Path, issue: &LinearIssue) -> TreeEn
         remote_id: RemoteId::new(issue.id.clone()),
         kind: EntityKind::Page,
         title: issue.title.clone(),
-        path: parent
-            .join(TEAMS_DIRECTORY_NAME)
-            .join(team_directory_name(&issue.team))
-            .join(ISSUES_DIRECTORY_NAME)
-            .join(status_directory_name(&issue.state))
-            .join(issue_directory_name(issue))
-            .join("page.md"),
+        path: issue_container_path(parent, issue).join("page.md"),
         hydration: HydrationState::Stub,
         content_hash: None,
         remote_edited_at: Some(remote_version(issue)),
         stub_frontmatter: frontmatter,
     }
+}
+
+fn context_entries(mount_id: &MountId, parent: &Path, issue: &LinearIssue) -> Vec<TreeEntry> {
+    LINEAR_CONTEXT_KINDS
+        .iter()
+        .copied()
+        .map(|kind| context_entry(mount_id, parent, issue, kind))
+        .collect()
+}
+
+fn context_child_entries(
+    mount_id: &MountId,
+    issue_parent: &Path,
+    issue: &LinearIssue,
+) -> Vec<TreeEntry> {
+    LINEAR_CONTEXT_KINDS
+        .iter()
+        .copied()
+        .map(|kind| context_child_entry(mount_id, issue_parent, issue, kind))
+        .collect()
+}
+
+fn context_entry(
+    mount_id: &MountId,
+    parent: &Path,
+    issue: &LinearIssue,
+    kind: LinearIssueContextKind,
+) -> TreeEntry {
+    TreeEntry {
+        mount_id: mount_id.clone(),
+        remote_id: RemoteId::new(linear_context_remote_id(&issue.id, kind)),
+        kind: EntityKind::Asset,
+        title: kind.title().to_string(),
+        path: issue_container_path(parent, issue).join(kind.filename()),
+        hydration: HydrationState::Stub,
+        content_hash: None,
+        remote_edited_at: Some(format!(
+            "linear-context:{}:{}:{}",
+            issue.id,
+            kind.as_str(),
+            issue.updated_at
+        )),
+        stub_frontmatter: None,
+    }
+}
+
+fn context_child_entry(
+    mount_id: &MountId,
+    issue_parent: &Path,
+    issue: &LinearIssue,
+    kind: LinearIssueContextKind,
+) -> TreeEntry {
+    let mut entry = context_entry(mount_id, Path::new(""), issue, kind);
+    entry.path = issue_parent.join(kind.filename());
+    entry
+}
+
+fn issue_container_path(parent: &Path, issue: &LinearIssue) -> std::path::PathBuf {
+    parent
+        .join(TEAMS_DIRECTORY_NAME)
+        .join(team_directory_name(&issue.team))
+        .join(ISSUES_DIRECTORY_NAME)
+        .join(status_directory_name(&issue.state))
+        .join(issue_directory_name(issue))
 }
 
 fn status_child_issue_entry(mount_id: &MountId, parent: &Path, issue: &LinearIssue) -> TreeEntry {
@@ -562,7 +671,77 @@ fn observation_from_issue(mount_id: &MountId, issue: LinearIssue) -> RemoteObser
     )))
     .with_remote_version(RemoteVersion::new(remote_version(&issue)))
     .deleted(issue.archived_at.is_some())
-    .with_raw_metadata_json(serde_json::to_string(&issue).unwrap_or_else(|_| "{}".to_string()))
+    .with_raw_metadata_json(linear_issue_metadata_json(&issue))
+}
+
+fn linear_issue_metadata_json(issue: &LinearIssue) -> String {
+    let mut value = serde_json::to_value(issue).unwrap_or_else(|_| serde_json::json!({}));
+    if let serde_json::Value::Object(object) = &mut value {
+        let search_metadata = linear_issue_search_metadata(issue);
+        if !search_metadata.is_empty() {
+            if let Ok(search_value) = serde_json::to_value(search_metadata) {
+                object.insert(RAW_SEARCH_METADATA_KEY.to_string(), search_value);
+            }
+        }
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn linear_issue_search_metadata(issue: &LinearIssue) -> SearchMetadata {
+    let mut metadata_text = Vec::new();
+    push_search_value(&mut metadata_text, &issue.identifier);
+    push_search_value(&mut metadata_text, &issue.team.key);
+    push_search_value(&mut metadata_text, &issue.team.name);
+    push_search_value(&mut metadata_text, &issue.state.name);
+    if let Some(project) = &issue.project {
+        push_search_value(&mut metadata_text, &project.name);
+    }
+    if let Some(assignee) = &issue.assignee {
+        push_search_value(&mut metadata_text, &assignee.name);
+        if let Some(email) = &assignee.email {
+            push_search_value(&mut metadata_text, email);
+        }
+    }
+    for label in &issue.labels {
+        push_search_value(&mut metadata_text, &label.name);
+    }
+    if let Some(priority) = &issue.priority {
+        push_search_value(&mut metadata_text, &priority.label);
+    }
+    if let Some(due_date) = &issue.due_date {
+        push_search_value(&mut metadata_text, due_date);
+    }
+
+    let mut aliases = Vec::new();
+    push_search_value(&mut aliases, &issue.identifier);
+
+    SearchMetadata {
+        metadata_text,
+        aliases,
+        source_url: (!issue.url.trim().is_empty()).then(|| issue.url.clone()),
+    }
+}
+
+fn push_search_value(values: &mut Vec<String>, value: &str) {
+    let value = value.trim();
+    if !value.is_empty() {
+        values.push(value.to_string());
+    }
+}
+
+fn observation_from_context_entry(entry: TreeEntry, issue_id: RemoteId) -> RemoteObservation {
+    let mut observation = RemoteObservation::new(
+        entry.mount_id,
+        entry.remote_id,
+        entry.kind,
+        entry.title,
+        entry.path,
+    )
+    .with_parent(issue_id);
+    if let Some(version) = entry.remote_edited_at {
+        observation = observation.with_remote_version(RemoteVersion::new(version));
+    }
+    observation
 }
 
 fn list_linear_directory_children(
@@ -601,6 +780,28 @@ fn team_state_from_remote_id(remote_id: &RemoteId) -> Option<(&str, &str)> {
     let value = remote_id.0.strip_prefix(TEAM_STATE_REMOTE_ID_PREFIX)?;
     let (team_id, state_id) = value.split_once(':')?;
     (!team_id.is_empty() && !state_id.is_empty()).then_some((team_id, state_id))
+}
+
+fn parse_context_remote_id(remote_id: &RemoteId) -> Option<(&str, LinearIssueContextKind)> {
+    let value = remote_id.0.strip_prefix(LINEAR_CONTEXT_REMOTE_ID_PREFIX)?;
+    let (issue_id, kind) = value.rsplit_once(':')?;
+    let kind = match kind {
+        "comments" => LinearIssueContextKind::Comments,
+        "attachments" => LinearIssueContextKind::Attachments,
+        "pull-requests" => LinearIssueContextKind::PullRequests,
+        "history" => LinearIssueContextKind::History,
+        _ => return None,
+    };
+    (!issue_id.is_empty()).then_some((issue_id, kind))
+}
+
+fn reject_context_remote_id(remote_id: &RemoteId) -> LocalityResult<()> {
+    if parse_context_remote_id(remote_id).is_some() {
+        return Err(validation_error(
+            "Linear generated context files are read-only".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn team_remote_id(team_id: &str) -> String {

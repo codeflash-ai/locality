@@ -49,6 +49,9 @@
   mount-scoped JSON settings field used by connector-specific mount options.
 - SQLite migrates v18 rows to v19 by adding durable discovery-projection
   transactions without rewriting or discarding existing mount work.
+- SQLite migrates v19 rows to v20 by creating and rebuilding
+  `search_documents_fts`, a connector-neutral search cache over entity metadata
+  plus connector search metadata and hydrated shadow frontmatter/body.
 - SQLite records component versions for durable subsystems so compatibility is
   decided from persisted state contracts instead of desktop build IDs.
 - SQLite enables WAL mode, a busy timeout, foreign keys, and `PRAGMA user_version` schema versioning.
@@ -147,8 +150,18 @@ The first schema keeps high-value lookup fields relational and stores complex co
   `windows_cloud_files`), optional connection id, and connector-specific
   `settings_json`;
 - `entities`: mount id, remote id, kind, title, projected path, hydration, content hash, remote edit time;
-- `entity_search_fts`: derived full-text index over entity titles/paths and
-  observed remote titles/paths. It is rebuildable and stores no secrets;
+- `entity_search_fts`: legacy derived full-text index over entity titles/paths
+  and observed remote titles/paths. It is rebuildable and stores no credential
+  material;
+- `search_documents_fts`: derived connector-neutral full-text index over entity
+  titles, projected paths, observed remote titles/paths, derived breadcrumbs, and
+  hydrated shadow frontmatter/body. It also indexes connector-provided
+  `loc_search.metadata_text`, `loc_search.aliases`, and `loc_search.source_url`
+  from remote observation raw metadata. It is rebuildable and stores no
+  credential material, but it can contain indexed user document content from
+  hydrated shadows and connector metadata. SQLite returns structured indexed
+  fields to callers so UI and CLI search can rank title, alias, URL, metadata,
+  and body matches differently;
 - `shadows`: mount id, entity id, body hash, rendered body, JSON shadow blocks;
 - `journals`: push id, mount id, JSON remote ids, JSON push plan, JSON preimage snapshots, JSON apply effects, JSON status;
 - `state_components`: current durable/rebuildable component versions, minimum
@@ -182,7 +195,7 @@ Shadow blocks, journal plans, journal preimages, and journal apply effects are J
 - Unknown required components block older binaries. Unknown non-required
   rebuildable components are ignored by older binaries.
 
-The SQLite test suite includes a v19 schema snapshot, old-DB migration fixtures,
+The SQLite test suite includes a v20 schema snapshot, old-DB migration fixtures,
 newer-schema detection, newer-component detection, and unknown-component
 compatibility checks. A PR that changes durable state should update these tests
 as part of the same change.

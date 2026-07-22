@@ -1540,6 +1540,90 @@ fn prepare_push_plans_pending_page_directory_move_as_move_entity() {
 }
 
 #[test]
+fn prepare_push_rejects_notion_workspace_root_move_mutation() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.virtual_store("notion");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("page-home"),
+            EntityKind::Page,
+            "Things to buy",
+            "Things to buy/page.md",
+        ))
+        .expect("save parent page");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-grocery"),
+                EntityKind::Page,
+                "Grocery SF Checklist",
+                "Grocery SF Checklist/page.md",
+            )
+            .with_hydration(HydrationState::Dirty),
+        )
+        .expect("save moved page");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("page-grocery"),
+                "Checklist body.",
+                8,
+                [RemoteId::new("block-grocery")],
+            )
+            .expect("shadow")
+            .with_frontmatter(
+                "loc:\n  id: page-grocery\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: \"Grocery SF Checklist\"\n",
+            ),
+        )
+        .expect("save shadow");
+    fixture.write_virtual_page(
+        "Grocery SF Checklist/page.md",
+        "---\nloc:\n  id: page-grocery\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: \"Grocery SF Checklist\"\n---\nChecklist body.",
+    );
+    fs::create_dir_all(fixture.root.join("Grocery SF Checklist")).expect("visible root page dir");
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "move:page-grocery".to_string(),
+            mutation_kind: VirtualMutationKind::Move,
+            target_remote_id: Some(RemoteId::new("page-grocery")),
+            parent_remote_id: Some(RemoteId::new("workspace")),
+            original_path: Some(PathBuf::from("Things to buy/Grocery SF Checklist/page.md")),
+            projected_path: PathBuf::from("Grocery SF Checklist/page.md"),
+            title: "Grocery SF Checklist".to_string(),
+            content_path: Some(
+                virtual_fs_content_path(
+                    &fixture.state_root,
+                    &fixture.mount_id,
+                    Path::new("Grocery SF Checklist/page.md"),
+                )
+                .expect("content path"),
+            ),
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+        })
+        .expect("save root move mutation");
+
+    let error = prepare_push(
+        &store,
+        &job(fixture.root.join("Grocery SF Checklist")),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect_err("prepare root move is rejected");
+
+    assert!(matches!(
+        error,
+        PushPrepareError::Core(LocalityError::Unsupported(
+            "Notion pages cannot be moved to the workspace root through the Notion move API"
+        ))
+    ));
+}
+
+#[test]
 fn prepare_push_uses_shared_validator_for_direct_and_virtual_creates() {
     let fixture = PrepareFixture::new();
     let validator = RecordingValidator::default();

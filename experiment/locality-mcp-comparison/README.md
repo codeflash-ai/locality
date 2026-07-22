@@ -16,6 +16,8 @@ The output parent page is:
 ## Files
 
 - `run-agent-comparison.sh` - wrapper used inside Amika.
+- `run-claude-locality-comparison.sh` - local wrapper that compares Claude Code
+  on the hosted MCP path against Claude Code on the Locality path.
 - `run-launch-readiness-benchmark.sh` - core benchmark runner.
 - `run-repeated.sh` - runs the benchmark multiple times.
 - `setup-codex-azure.sh` - writes Codex Azure config.
@@ -84,6 +86,29 @@ ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
 '
 ```
 
+## Run Claude Comparison
+
+From the local machine, set token-backed MCP credentials for the
+`test-with-notion-connector` sandbox, then run:
+
+```bash
+export LINEAR_API_KEY=<linear-api-key>
+export NOTION_API_TOKEN=<notion-api-token>
+./experiment/locality-mcp-comparison/run-claude-locality-comparison.sh
+```
+
+The `test-with-notion-connector` sandbox is prepared with token-backed MCP
+servers before Claude starts:
+
+- `LINEAR_API_KEY` configures Linear's remote MCP server through an
+  authorization-header helper.
+- `NOTION_API_TOKEN` configures the official `@notionhq/notion-mcp-server`
+  stdio server through `OPENAPI_MCP_HEADERS`.
+
+The script writes these credentials only into sandbox-local files under
+`~/.config/locality-claude-comparison` and stores helper references in
+`~/.claude.json`.
+
 ## Run Once
 
 ```bash
@@ -95,6 +120,14 @@ ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
 ```
 
 By default this is a dry run. It writes a mounted page and runs `loc diff`, but does not push.
+
+Each Codex strategy has a hard timeout so a stalled `codex exec` records a failed phase instead of hanging the benchmark indefinitely. The default is 900 seconds per strategy. Override it with:
+
+```bash
+CODEX_EXEC_TIMEOUT_SECONDS=300 ./experiment/locality-mcp-comparison/run-agent-comparison.sh
+```
+
+Use `CODEX_EXEC_TIMEOUT_SECONDS=0` to disable the timeout.
 
 To publish:
 
@@ -130,11 +163,29 @@ Important artifacts:
 - `notion-mcp-report-body.md` - MCP report.
 - `locality-codex-events.jsonl` - timestamped Codex JSON events.
 - `notion-mcp-codex-events.jsonl` - timestamped Codex JSON events.
+- `locality-prompt.md` and `notion-mcp-prompt.md` - exact prompts used for the run.
+- `locality-codex-command.txt` and `notion-mcp-codex-command.txt` - exact `codex exec` command and timeout wrapper.
 - `locality-codex-summary.json` - event counts, usage, errors.
 - `notion-mcp-codex-summary.json` - event counts, usage, errors.
+- `locality-speedscope.json` and `notion-mcp-speedscope.json` - Speedscope-compatible flame graph files generated from the JSON events.
+- `locality-transcript.md` and `notion-mcp-transcript.md` - readable Codex event transcripts generated from the JSON events.
 - `locality-agent-trace.md` - agent-reported trace.
 - `notion-mcp-agent-trace.md` - agent-reported trace.
 - `loc-diff.out` - Locality push plan.
+
+Generate flame graph artifacts for a completed run with:
+
+```bash
+python3 experiment/locality-mcp-comparison/scripts/codex-events-to-trace.py \
+  experiment/runs/<run-id>/locality-codex-events.jsonl \
+  experiment/runs/<run-id>/locality
+
+python3 experiment/locality-mcp-comparison/scripts/codex-events-to-trace.py \
+  experiment/runs/<run-id>/notion-mcp-codex-events.jsonl \
+  experiment/runs/<run-id>/notion-mcp
+```
+
+The generated Speedscope files use observed gaps between consecutive Codex JSON events. This makes the chart useful even when Codex flushes `item.started` and `item.completed` at the same timestamp. Treat these charts as agent-session timing, not exact internal shell, MCP, or model runtime profiling.
 
 ## Model Notes
 

@@ -34,6 +34,7 @@ use crate::media::{resolve_media_href_with_content_root, unescape_markdown_href}
 use crate::projection::observe_entity;
 
 const NOTION_RICH_TEXT_CONTENT_LIMIT: usize = 2000;
+const WORKSPACE_ROOT_PARENT_ID: &str = "workspace";
 const NOTION_RICH_TEXT_SENTENCE_SPLIT_LOOKBACK: usize = 400;
 const NOTION_APPEND_CHILDREN_BATCH_LIMIT: usize = 100;
 
@@ -1514,6 +1515,10 @@ fn move_page_parent_body(
     parent_id: &RemoteId,
     parent_kind: &locality_core::model::EntityKind,
 ) -> LocalityResult<Value> {
+    if is_workspace_root_parent(parent_id, parent_kind) {
+        return Err(unsupported_workspace_root_move());
+    }
+
     if matches!(parent_kind, locality_core::model::EntityKind::Page) {
         return Ok(json!({
             "type": "page_id",
@@ -1540,6 +1545,10 @@ fn move_page_parent_body(
 }
 
 fn undo_move_page_parent_body(api: &dyn NotionApi, parent_id: &RemoteId) -> LocalityResult<Value> {
+    if parent_id.as_str() == WORKSPACE_ROOT_PARENT_ID {
+        return Err(unsupported_workspace_root_move());
+    }
+
     match api.retrieve_database(parent_id.as_str()) {
         Ok(database) => {
             let [data_source] = database.data_sources.as_slice() else {
@@ -1579,6 +1588,10 @@ fn page_parent_matches_requested(
         return Ok(false);
     };
 
+    if is_workspace_root_parent(parent_id, parent_kind) {
+        return Err(unsupported_workspace_root_move());
+    }
+
     if matches!(parent_kind, locality_core::model::EntityKind::Page) {
         return Ok(parent.page_id.as_deref() == Some(parent_id.as_str()));
     }
@@ -1597,6 +1610,20 @@ fn page_parent_matches_requested(
     }
 
     Ok(false)
+}
+
+fn is_workspace_root_parent(
+    parent_id: &RemoteId,
+    parent_kind: &locality_core::model::EntityKind,
+) -> bool {
+    matches!(parent_kind, locality_core::model::EntityKind::Directory)
+        && parent_id.as_str() == WORKSPACE_ROOT_PARENT_ID
+}
+
+fn unsupported_workspace_root_move() -> LocalityError {
+    LocalityError::Unsupported(
+        "Notion pages cannot be moved to the workspace root through the Notion move API",
+    )
 }
 
 fn create_properties_body(

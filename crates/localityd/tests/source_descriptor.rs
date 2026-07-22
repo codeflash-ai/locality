@@ -42,6 +42,7 @@ fn notion_descriptor_exposes_cli_and_mount_metadata() {
     assert_eq!(descriptor.auth_env_var(), Some(DEFAULT_NOTION_TOKEN_ENV));
     assert!(descriptor.supports_oauth());
     assert!(descriptor.mount_guidance().contains("Notion facts:"));
+    assert_eq!(descriptor.source_root_create_parent_kind(), None);
     assert_eq!(descriptor.periodic_discovery_interval(), None);
     assert_eq!(descriptor.max_background_discovery_workers(), 3);
 }
@@ -69,6 +70,10 @@ fn google_docs_descriptor_comes_from_registry() {
         descriptor
             .mount_guidance()
             .contains("Docs manually added inside the workspace folder")
+    );
+    assert_eq!(
+        descriptor.source_root_create_parent_kind(),
+        Some(EntityKind::Directory)
     );
 }
 
@@ -930,6 +935,21 @@ fn validate_linear_create(markdown: &str) -> Vec<ValidationIssue> {
         .issues
 }
 
+fn linear_shadow_frontmatter() -> String {
+    linear_frontmatter(
+        "\"Improve sync\"",
+        "\"Todo <state-1>\"",
+        "\"Launch <project-1>\"",
+        "\"Ada <user-1>\"",
+    )
+}
+
+fn linear_frontmatter(title: &str, status: &str, project: &str, assignee: &str) -> String {
+    format!(
+        "loc:\n  id: issue-1\n  type: page\n  connector: linear\n  synced_at: \"2026-07-15T12:00:00Z\"\n  remote_edited_at: \"2026-07-15T12:00:00Z\"\ntitle: {title}\nidentifier: ENG-1\nurl: \"https://linear.app/acme/issue/ENG-1/improve-sync\"\ncreated_at: \"2026-07-14T12:00:00Z\"\nupdated_at: \"2026-07-15T12:00:00Z\"\narchived_at: null\nstarted_at: \"2026-07-15T13:00:00Z\"\ncompleted_at: null\ncanceled_at: null\nauto_archived_at: null\nauto_closed_at: null\nstarted_triage_at: \"2026-07-14T13:00:00Z\"\ntriaged_at: \"2026-07-14T14:00:00Z\"\nsnoozed_until_at: null\nadded_to_cycle_at: \"2026-07-14T15:00:00Z\"\nadded_to_project_at: \"2026-07-14T16:00:00Z\"\nadded_to_team_at: \"2026-07-14T17:00:00Z\"\ndue_date: \"2026-07-31\"\nStatus: {status}\nTeam: \"Engineering <team-1>\"\nProject: {project}\nAssignee: {assignee}\nPriority: High\nEstimate: 3\nLabels:\n  - \"Bug <label-1>\"\n"
+    )
+}
+
 #[test]
 fn supported_source_connectors_include_first_party_connectors() {
     assert_eq!(
@@ -1041,23 +1061,104 @@ fn resolving_linear_mount_uses_active_api_key_connection_credentials() {
 
 #[test]
 fn local_linear_validator_allows_supported_frontmatter_updates() {
-    let shadow_frontmatter = "loc:\n  id: issue-1\n  type: page\n  connector: linear\n  synced_at: \"2026-07-15T12:00:00Z\"\n  remote_edited_at: \"2026-07-15T12:00:00Z\"\ntitle: \"Improve sync\"\nidentifier: ENG-1\nurl: \"https://linear.app/acme/issue/ENG-1/improve-sync\"\nStatus: \"Todo <state-1>\"\nTeam: \"Engineering <team-1>\"\nProject: \"Launch <project-1>\"\nAssignee: \"Ada <user-1>\"\nPriority: High\nEstimate: 3\nLabels:\n  - \"Bug <label-1>\"\n";
-    let edited = "---\nloc:\n  id: issue-1\n  type: page\n  connector: linear\n  synced_at: \"2026-07-15T12:00:00Z\"\n  remote_edited_at: \"2026-07-15T12:00:00Z\"\ntitle: \"New title\"\nidentifier: ENG-1\nurl: \"https://linear.app/acme/issue/ENG-1/improve-sync\"\nStatus: \"Done <state-2>\"\nTeam: \"Engineering <team-1>\"\nProject: null\nAssignee: \"Grace <user-2>\"\nPriority: High\nEstimate: 3\nLabels:\n  - \"Bug <label-1>\"\n---\nBody\n";
+    let shadow_frontmatter = linear_shadow_frontmatter();
+    let edited_frontmatter = linear_frontmatter(
+        "\"New title\"",
+        "\"Done <state-2>\"",
+        "null",
+        "\"Grace <user-2>\"",
+    );
+    let edited = format!("---\n{edited_frontmatter}---\nBody\n");
 
-    let issues = validate_linear_changed(edited, shadow_frontmatter);
+    let issues = validate_linear_changed(&edited, &shadow_frontmatter);
 
     assert!(issues.is_empty());
 }
 
 #[test]
 fn local_linear_validator_blocks_read_only_frontmatter_changes() {
-    let shadow_frontmatter = "loc:\n  id: issue-1\n  type: page\n  connector: linear\n  synced_at: \"2026-07-15T12:00:00Z\"\n  remote_edited_at: \"2026-07-15T12:00:00Z\"\ntitle: \"Improve sync\"\nidentifier: ENG-1\nurl: \"https://linear.app/acme/issue/ENG-1/improve-sync\"\nStatus: \"Todo <state-1>\"\nTeam: \"Engineering <team-1>\"\nProject: \"Launch <project-1>\"\nAssignee: \"Ada <user-1>\"\nPriority: High\nEstimate: 3\nLabels:\n  - \"Bug <label-1>\"\n";
+    let shadow_frontmatter = linear_shadow_frontmatter();
     for (field, old, new) in [
         ("identifier", "identifier: ENG-1", "identifier: ENG-2"),
         (
             "url",
             "url: \"https://linear.app/acme/issue/ENG-1/improve-sync\"",
             "url: \"https://linear.app/acme/issue/ENG-2/new\"",
+        ),
+        (
+            "created_at",
+            "created_at: \"2026-07-14T12:00:00Z\"",
+            "created_at: \"2026-07-13T12:00:00Z\"",
+        ),
+        (
+            "updated_at",
+            "updated_at: \"2026-07-15T12:00:00Z\"",
+            "updated_at: \"2026-07-16T12:00:00Z\"",
+        ),
+        (
+            "archived_at",
+            "archived_at: null",
+            "archived_at: \"2026-08-01T12:00:00Z\"",
+        ),
+        (
+            "started_at",
+            "started_at: \"2026-07-15T13:00:00Z\"",
+            "started_at: \"2026-07-15T14:00:00Z\"",
+        ),
+        (
+            "completed_at",
+            "completed_at: null",
+            "completed_at: \"2026-07-20T10:00:00Z\"",
+        ),
+        (
+            "canceled_at",
+            "canceled_at: null",
+            "canceled_at: \"2026-07-21T10:00:00Z\"",
+        ),
+        (
+            "auto_archived_at",
+            "auto_archived_at: null",
+            "auto_archived_at: \"2026-08-15T00:00:00Z\"",
+        ),
+        (
+            "auto_closed_at",
+            "auto_closed_at: null",
+            "auto_closed_at: \"2026-07-25T00:00:00Z\"",
+        ),
+        (
+            "started_triage_at",
+            "started_triage_at: \"2026-07-14T13:00:00Z\"",
+            "started_triage_at: \"2026-07-14T13:30:00Z\"",
+        ),
+        (
+            "triaged_at",
+            "triaged_at: \"2026-07-14T14:00:00Z\"",
+            "triaged_at: \"2026-07-14T14:30:00Z\"",
+        ),
+        (
+            "snoozed_until_at",
+            "snoozed_until_at: null",
+            "snoozed_until_at: \"2026-07-22T09:00:00Z\"",
+        ),
+        (
+            "added_to_cycle_at",
+            "added_to_cycle_at: \"2026-07-14T15:00:00Z\"",
+            "added_to_cycle_at: \"2026-07-14T15:30:00Z\"",
+        ),
+        (
+            "added_to_project_at",
+            "added_to_project_at: \"2026-07-14T16:00:00Z\"",
+            "added_to_project_at: \"2026-07-14T16:30:00Z\"",
+        ),
+        (
+            "added_to_team_at",
+            "added_to_team_at: \"2026-07-14T17:00:00Z\"",
+            "added_to_team_at: \"2026-07-14T17:30:00Z\"",
+        ),
+        (
+            "due_date",
+            "due_date: \"2026-07-31\"",
+            "due_date: \"2026-08-01\"",
         ),
         (
             "Team",
@@ -1072,10 +1173,10 @@ fn local_linear_validator_blocks_read_only_frontmatter_changes() {
             "Labels:\n  - \"Feature <label-2>\"",
         ),
     ] {
-        let edited_frontmatter = shadow_frontmatter.replace(old, new);
+        let edited_frontmatter = shadow_frontmatter.replacen(old, new, 1);
         let markdown = format!("---\n{edited_frontmatter}---\nBody\n");
 
-        let issues = validate_linear_changed(&markdown, shadow_frontmatter);
+        let issues = validate_linear_changed(&markdown, &shadow_frontmatter);
 
         assert_eq!(issues.len(), 1, "{field}");
         assert_eq!(issues[0].code, "linear_read_only_frontmatter", "{field}");

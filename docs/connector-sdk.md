@@ -109,6 +109,31 @@ created by the target push must return an observation that reports that created
 entity as deleted. The host validates mount, entity, parent, path, deletion state,
 and path ownership before reconciling local files.
 
+## Search Metadata
+
+Connectors may add connector-neutral search hints under the reserved
+`loc_search` object inside `RemoteObservation.raw_metadata_json`. The host treats
+this payload as rebuildable index input only. It does not infer identity,
+parentage, projection paths, or push behavior from it.
+
+The supported shape is:
+
+```json
+{
+  "loc_search": {
+    "metadata_text": ["customer escalation", "Engineering", "Todo"],
+    "aliases": ["ENG-1"],
+    "source_url": "https://linear.app/acme/issue/ENG-1/improve-sync"
+  }
+}
+```
+
+Use `metadata_text` for concise provider-specific fields users naturally search
+for, such as issue identifiers, team/project/status names, labels, assignee
+names, and due dates. Use `aliases` for stable short handles or alternate IDs.
+Use `source_url` for the canonical provider URL. Do not include secrets,
+credentials, opaque auth state, or large raw provider payloads solely for search.
+
 ## v1 connector
 
 `locality-notion` is the first connector. It owns Notion-specific block mapping, database schema translation, OAuth/API behavior, and conversion between Notion payloads and the canonical Locality document model.

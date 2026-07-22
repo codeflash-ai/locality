@@ -426,10 +426,22 @@ Connected sources can include Notion, Google Docs, Google Calendar, Gmail, Linea
 - Use `loc status <path>` to inspect pending local changes.
 - Use `loc inspect <path>` when you need a read-only remote comparison for a hydrated file.
 - Use `loc diff <path>` before asking the user to review changes or before pushing.
+- Use `loc mv <source> <dest>` for intentional page/file moves or renames, then inspect with `loc status <path>` or `loc diff <path>`.
 - Unless the user asked you to apply edits remotely, leave edits pending for Locality review and tell the user what changed.
 - If desktop Live Mode is on, safe local edits may sync automatically. Use `loc live-mode status <file>` to inspect state. Do not run routine `loc pull` or `loc push` after every edit.
 - If the user asks you to sync, publish, send, update the source, or apply the edit remotely, run `loc diff <path>` first, then `loc push <path> -y` for safe plans.
 - If push says the remote changed since last sync, run `loc pull <path>`, resolve any inline conflict markers in the Markdown, rerun `loc diff <path>`, then push again.
+
+## Creating Notion Content
+
+- Read `{mount_path}/AGENTS.md` for connector-specific creation rules.
+- Prefer `loc create page --title "New Page" --parent <parent-directory>` for new pages.
+- Create a Notion database with `loc create database --title "Tasks" --parent <page-dir>`, edit its draft `_schema.yaml`, inspect with `loc diff <path>`, then push explicitly.
+- Pages are directories; edit or create the `page.md` inside the page directory.
+- To create a child page, create `parent-page/new-page/page.md`.
+- New `page.md` files need YAML frontmatter with `title: "..."` and no `loc:` identity block.
+- Existing files already have an `loc:` block; preserve it and edit only the body, `title`, and supported property frontmatter.
+- Database rows can be created as `database/new-row/page.md` or, where supported, direct `database/new-row.md` files.
 
 ## Connector boundaries
 
@@ -1088,6 +1100,12 @@ mod tests {
         assert!(skill.contains("pending for Locality review"));
         assert!(skill.contains("If desktop Live Mode is on"));
         assert!(skill.contains("Do not run routine `loc pull` or `loc push`"));
+        assert!(skill.contains("loc mv <source> <dest>"));
+        assert!(skill.contains("loc diff <path>"));
+        assert!(skill.contains("Creating Notion Content"));
+        assert!(skill.contains("loc create page --title"));
+        assert!(skill.contains("parent-page/new-page/page.md"));
+        assert!(skill.contains("no `loc:` identity block"));
         assert!(skill.contains("remote changed since last sync"));
         assert!(skill.contains("fall back to the Locality MCP tool named `loc`"));
         assert!(skill.contains("JSON `argv`"));

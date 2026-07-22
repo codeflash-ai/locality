@@ -1,4 +1,5 @@
 use std::fmt;
+use std::io::Read;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -7,12 +8,13 @@ use locality_core::{LocalityError, LocalityResult};
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
 use serde::Deserialize;
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, Deserializer};
 use serde_json::{Value, json};
 
 use crate::dto::{
-    LinearIssue, LinearIssuePage, LinearIssuePriority, LinearIssueState, LinearIssueUpdateInput,
-    LinearLabel, LinearProject, LinearTeam, LinearUser,
+    LinearAttachment, LinearBotActor, LinearComment, LinearExternalUser, LinearIssue,
+    LinearIssueContext, LinearIssueHistoryEntry, LinearIssuePage, LinearIssuePriority,
+    LinearIssueState, LinearIssueUpdateInput, LinearLabel, LinearProject, LinearTeam, LinearUser,
 };
 
 pub const DEFAULT_LINEAR_GRAPHQL_URL: &str = "https://api.linear.app/graphql";
@@ -34,6 +36,12 @@ pub trait LinearApi: fmt::Debug + Send + Sync {
         team_id: Option<&str>,
     ) -> LocalityResult<LinearIssuePage>;
     fn get_issue(&self, issue_id: &str) -> LocalityResult<LinearIssue>;
+    fn get_issue_context(&self, _issue_id: &str) -> LocalityResult<LinearIssueContext> {
+        Err(LocalityError::Unsupported("Linear issue context"))
+    }
+    fn download_attachment(&self, _url: &str, _max_bytes: u64) -> LocalityResult<Vec<u8>> {
+        Err(LocalityError::Unsupported("Linear attachment download"))
+    }
     fn update_issue(&self, input: LinearIssueUpdateInput) -> LocalityResult<LinearIssue>;
 }
 
@@ -116,6 +124,120 @@ impl HttpLinearApiClient {
             "Linear API request exhausted retries".to_string(),
         ))
     }
+
+    fn issue_comments(&self, issue_id: &str) -> LocalityResult<Vec<LinearComment>> {
+        let mut comments: Vec<LinearComment> = Vec::new();
+        let mut cursor = None;
+        loop {
+            let data: IssueCommentsData = self.graphql(
+                ISSUE_COMMENTS_QUERY,
+                json!({
+                    "id": issue_id,
+                    "first": PAGE_SIZE,
+                    "after": cursor,
+                }),
+            )?;
+            let issue = data
+                .issue
+                .ok_or_else(|| LocalityError::RemoteNotFound(issue_id.to_string()))?;
+            comments.extend(issue.comments.nodes.into_iter().map(Into::into));
+            if !issue.comments.page_info.has_next_page {
+                break;
+            }
+            cursor = issue
+                .comments
+                .page_info
+                .end_cursor
+                .filter(|value| !value.is_empty());
+            if cursor.is_none() {
+                return Err(LocalityError::InvalidState(
+                    "Linear API reported another comments page without a cursor".to_string(),
+                ));
+            }
+        }
+        comments.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(comments)
+    }
+
+    fn issue_attachments(&self, issue_id: &str) -> LocalityResult<Vec<LinearAttachment>> {
+        let mut attachments: Vec<LinearAttachment> = Vec::new();
+        let mut cursor = None;
+        loop {
+            let data: IssueAttachmentsData = self.graphql(
+                ISSUE_ATTACHMENTS_QUERY,
+                json!({
+                    "id": issue_id,
+                    "first": PAGE_SIZE,
+                    "after": cursor,
+                }),
+            )?;
+            let issue = data
+                .issue
+                .ok_or_else(|| LocalityError::RemoteNotFound(issue_id.to_string()))?;
+            attachments.extend(issue.attachments.nodes.into_iter().map(Into::into));
+            if !issue.attachments.page_info.has_next_page {
+                break;
+            }
+            cursor = issue
+                .attachments
+                .page_info
+                .end_cursor
+                .filter(|value| !value.is_empty());
+            if cursor.is_none() {
+                return Err(LocalityError::InvalidState(
+                    "Linear API reported another attachments page without a cursor".to_string(),
+                ));
+            }
+        }
+        attachments.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(attachments)
+    }
+
+    fn issue_history(&self, issue_id: &str) -> LocalityResult<Vec<LinearIssueHistoryEntry>> {
+        let mut history: Vec<LinearIssueHistoryEntry> = Vec::new();
+        let mut cursor = None;
+        loop {
+            let data: IssueHistoryData = self.graphql(
+                ISSUE_HISTORY_QUERY,
+                json!({
+                    "id": issue_id,
+                    "first": PAGE_SIZE,
+                    "after": cursor,
+                }),
+            )?;
+            let issue = data
+                .issue
+                .ok_or_else(|| LocalityError::RemoteNotFound(issue_id.to_string()))?;
+            history.extend(issue.history.nodes.into_iter().map(Into::into));
+            if !issue.history.page_info.has_next_page {
+                break;
+            }
+            cursor = issue
+                .history
+                .page_info
+                .end_cursor
+                .filter(|value| !value.is_empty());
+            if cursor.is_none() {
+                return Err(LocalityError::InvalidState(
+                    "Linear API reported another history page without a cursor".to_string(),
+                ));
+            }
+        }
+        history.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(history)
+    }
 }
 
 impl LinearApi for HttpLinearApiClient {
@@ -162,6 +284,76 @@ impl LinearApi for HttpLinearApiClient {
             ));
         }
         Ok(LinearIssue::from(data.issue_update.issue))
+    }
+
+    fn get_issue_context(&self, issue_id: &str) -> LocalityResult<LinearIssueContext> {
+        let data: IssueContextHeaderData = self.graphql(
+            ISSUE_CONTEXT_HEADER_QUERY,
+            json!({
+                "id": issue_id,
+            }),
+        )?;
+        let issue = data
+            .issue
+            .ok_or_else(|| LocalityError::RemoteNotFound(issue_id.to_string()))?;
+        Ok(LinearIssueContext {
+            issue_id: issue.id,
+            issue_identifier: issue.identifier,
+            issue_title: issue.title,
+            issue_updated_at: issue.updated_at,
+            branch_name: issue.branch_name,
+            comments: self.issue_comments(issue_id)?,
+            attachments: self.issue_attachments(issue_id)?,
+            history: self.issue_history(issue_id)?,
+        })
+    }
+
+    fn download_attachment(&self, url: &str, max_bytes: u64) -> LocalityResult<Vec<u8>> {
+        let parsed = reqwest::Url::parse(url).map_err(|error| {
+            LocalityError::Io(format!("Linear attachment URL is invalid: {error}"))
+        })?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(LocalityError::Unsupported(
+                "Linear attachment URL is not HTTP(S)",
+            ));
+        }
+
+        let send = || {
+            let mut request = self.client.get(parsed.clone());
+            if should_send_linear_authorization(&parsed, &self.graphql_url) {
+                request = request.header(reqwest::header::AUTHORIZATION, self.token.as_str());
+            }
+            request.send()
+        };
+
+        for attempt in 0..=DEFAULT_LINEAR_RATE_LIMIT_RETRIES {
+            let _network_permit = linear_network_gate().acquire();
+            let response = match send() {
+                Ok(response) => response,
+                Err(error)
+                    if is_retryable_transport_error(&error)
+                        && attempt < DEFAULT_LINEAR_RATE_LIMIT_RETRIES =>
+                {
+                    linear_network_gate().record_cooldown(linear_backoff(attempt));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(LocalityError::Io(format!(
+                        "Linear attachment download failed: {error}"
+                    )));
+                }
+            };
+            let status = response.status();
+            if is_retryable_status(status) && attempt < DEFAULT_LINEAR_RATE_LIMIT_RETRIES {
+                let delay = retry_after(&response).unwrap_or_else(|| linear_backoff(attempt));
+                linear_network_gate().record_cooldown(delay);
+                continue;
+            }
+            return decode_attachment_response(response, max_bytes);
+        }
+        Err(LocalityError::Io(
+            "Linear attachment download exhausted retries".to_string(),
+        ))
     }
 }
 
@@ -226,6 +418,58 @@ struct IssueUpdatePayload {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct IssueContextHeaderData {
+    issue: Option<GraphqlIssueContextHeader>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlIssueContextHeader {
+    id: String,
+    identifier: String,
+    title: String,
+    updated_at: String,
+    branch_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueCommentsData {
+    issue: Option<GraphqlIssueComments>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlIssueComments {
+    comments: CommentConnection,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueAttachmentsData {
+    issue: Option<GraphqlIssueAttachments>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlIssueAttachments {
+    attachments: AttachmentConnection,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueHistoryData {
+    issue: Option<GraphqlIssueHistoryList>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlIssueHistoryList {
+    history: IssueHistoryConnection,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct IssueConnection {
     nodes: Vec<GraphqlIssue>,
     page_info: PageInfo,
@@ -237,6 +481,163 @@ impl From<IssueConnection> for LinearIssuePage {
             issues: value.nodes.into_iter().map(LinearIssue::from).collect(),
             has_next_page: value.page_info.has_next_page,
             end_cursor: value.page_info.end_cursor,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommentConnection {
+    nodes: Vec<GraphqlComment>,
+    page_info: PageInfo,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlComment {
+    id: String,
+    body: String,
+    url: String,
+    created_at: String,
+    updated_at: String,
+    edited_at: Option<String>,
+    parent_id: Option<String>,
+    resolved_at: Option<String>,
+    user: Option<GraphqlUser>,
+    external_user: Option<GraphqlExternalUser>,
+    bot_actor: Option<GraphqlBotActor>,
+}
+
+impl From<GraphqlComment> for LinearComment {
+    fn from(value: GraphqlComment) -> Self {
+        Self {
+            id: value.id,
+            body: value.body,
+            url: value.url,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            edited_at: value.edited_at,
+            parent_id: value.parent_id,
+            resolved_at: value.resolved_at,
+            user: value.user.map(Into::into),
+            external_user: value.external_user.map(Into::into),
+            bot_actor: value.bot_actor.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AttachmentConnection {
+    nodes: Vec<GraphqlAttachment>,
+    page_info: PageInfo,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlAttachment {
+    id: String,
+    title: String,
+    url: String,
+    created_at: String,
+    updated_at: String,
+    source_type: Option<String>,
+    subtitle: Option<String>,
+    creator: Option<GraphqlUser>,
+    external_user_creator: Option<GraphqlExternalUser>,
+    #[serde(default)]
+    metadata: Value,
+}
+
+impl From<GraphqlAttachment> for LinearAttachment {
+    fn from(value: GraphqlAttachment) -> Self {
+        Self {
+            id: value.id,
+            title: value.title,
+            url: value.url,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            source_type: value.source_type,
+            subtitle: value.subtitle,
+            creator: value.creator.map(Into::into),
+            external_user_creator: value.external_user_creator.map(Into::into),
+            metadata: value.metadata,
+            download: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueHistoryConnection {
+    nodes: Vec<GraphqlIssueHistory>,
+    page_info: PageInfo,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlIssueHistory {
+    id: String,
+    created_at: String,
+    updated_at: String,
+    actor: Option<GraphqlUser>,
+    bot_actor: Option<GraphqlBotActor>,
+    from_state: Option<GraphqlState>,
+    to_state: Option<GraphqlState>,
+    from_title: Option<String>,
+    to_title: Option<String>,
+    from_assignee: Option<GraphqlUser>,
+    to_assignee: Option<GraphqlUser>,
+    from_project: Option<GraphqlProject>,
+    to_project: Option<GraphqlProject>,
+    from_team: Option<GraphqlTeam>,
+    to_team: Option<GraphqlTeam>,
+    from_due_date: Option<String>,
+    to_due_date: Option<String>,
+    from_estimate: Option<f64>,
+    to_estimate: Option<f64>,
+    from_priority: Option<f64>,
+    to_priority: Option<f64>,
+    updated_description: Option<bool>,
+    attachment_id: Option<String>,
+    attachment: Option<GraphqlAttachment>,
+    #[serde(default, deserialize_with = "null_to_empty_vec")]
+    added_labels: Vec<GraphqlLabel>,
+    #[serde(default, deserialize_with = "null_to_empty_vec")]
+    removed_labels: Vec<GraphqlLabel>,
+    changes: Option<Value>,
+}
+
+impl From<GraphqlIssueHistory> for LinearIssueHistoryEntry {
+    fn from(value: GraphqlIssueHistory) -> Self {
+        Self {
+            id: value.id,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            actor: value.actor.map(Into::into),
+            bot_actor: value.bot_actor.map(Into::into),
+            from_state: value.from_state.map(Into::into),
+            to_state: value.to_state.map(Into::into),
+            from_title: value.from_title,
+            to_title: value.to_title,
+            from_assignee: value.from_assignee.map(Into::into),
+            to_assignee: value.to_assignee.map(Into::into),
+            from_project: value.from_project.map(Into::into),
+            to_project: value.to_project.map(Into::into),
+            from_team: value.from_team.map(Into::into),
+            to_team: value.to_team.map(Into::into),
+            from_due_date: value.from_due_date,
+            to_due_date: value.to_due_date,
+            from_estimate: value.from_estimate,
+            to_estimate: value.to_estimate,
+            from_priority: value.from_priority,
+            to_priority: value.to_priority,
+            updated_description: value.updated_description,
+            attachment_id: value.attachment_id,
+            attachment: value.attachment.map(Into::into),
+            added_labels: value.added_labels.into_iter().map(Into::into).collect(),
+            removed_labels: value.removed_labels.into_iter().map(Into::into).collect(),
+            changes: value.changes,
         }
     }
 }
@@ -259,6 +660,18 @@ struct GraphqlIssue {
     created_at: String,
     updated_at: String,
     archived_at: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    canceled_at: Option<String>,
+    auto_archived_at: Option<String>,
+    auto_closed_at: Option<String>,
+    started_triage_at: Option<String>,
+    triaged_at: Option<String>,
+    snoozed_until_at: Option<String>,
+    added_to_cycle_at: Option<String>,
+    added_to_project_at: Option<String>,
+    added_to_team_at: Option<String>,
+    due_date: Option<String>,
     priority: Option<i64>,
     priority_label: Option<String>,
     estimate: Option<f64>,
@@ -280,6 +693,18 @@ impl From<GraphqlIssue> for LinearIssue {
             created_at: value.created_at,
             updated_at: value.updated_at,
             archived_at: value.archived_at,
+            started_at: value.started_at,
+            completed_at: value.completed_at,
+            canceled_at: value.canceled_at,
+            auto_archived_at: value.auto_archived_at,
+            auto_closed_at: value.auto_closed_at,
+            started_triage_at: value.started_triage_at,
+            triaged_at: value.triaged_at,
+            snoozed_until_at: value.snoozed_until_at,
+            added_to_cycle_at: value.added_to_cycle_at,
+            added_to_project_at: value.added_to_project_at,
+            added_to_team_at: value.added_to_team_at,
+            due_date: value.due_date,
             priority: value.priority.map(|priority| LinearIssuePriority {
                 value: priority,
                 label: value.priority_label.unwrap_or_else(|| priority.to_string()),
@@ -363,6 +788,47 @@ impl From<GraphqlUser> for LinearUser {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlExternalUser {
+    id: Option<String>,
+    name: Option<String>,
+    email: Option<String>,
+}
+
+impl From<GraphqlExternalUser> for LinearExternalUser {
+    fn from(value: GraphqlExternalUser) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            email: value.email,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlBotActor {
+    id: Option<String>,
+    name: Option<String>,
+    #[serde(rename = "type")]
+    actor_type: String,
+    sub_type: Option<String>,
+    user_display_name: Option<String>,
+}
+
+impl From<GraphqlBotActor> for LinearBotActor {
+    fn from(value: GraphqlBotActor) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            actor_type: value.actor_type,
+            sub_type: value.sub_type,
+            user_display_name: value.user_display_name,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct GraphqlLabelConnection {
     nodes: Vec<GraphqlLabel>,
 }
@@ -436,6 +902,51 @@ where
         .ok_or_else(|| LocalityError::Io("Linear GraphQL response missing data".to_string()))
 }
 
+fn null_to_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn decode_attachment_response(mut response: Response, max_bytes: u64) -> LocalityResult<Vec<u8>> {
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
+        return Err(LocalityError::Io(format!(
+            "Linear attachment download returned HTTP {status}: {body}"
+        )));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes)
+    {
+        return Err(LocalityError::Guardrail(format!(
+            "Linear attachment exceeds {} MB download limit",
+            max_bytes / 1024 / 1024
+        )));
+    }
+
+    let mut bytes = Vec::new();
+    response
+        .by_ref()
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            LocalityError::Io(format!("Linear attachment download body failed: {error}"))
+        })?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(LocalityError::Guardrail(format!(
+            "Linear attachment exceeds {} MB download limit",
+            max_bytes / 1024 / 1024
+        )));
+    }
+    Ok(bytes)
+}
+
 fn retry_after(response: &Response) -> Option<Duration> {
     let seconds = response
         .headers()
@@ -486,10 +997,194 @@ fn is_retryable_status(status: StatusCode) -> bool {
     )
 }
 
+fn should_send_linear_authorization(url: &reqwest::Url, graphql_url: &str) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host == "linear.app" || host.ends_with(".linear.app") {
+        return true;
+    }
+    reqwest::Url::parse(graphql_url)
+        .ok()
+        .and_then(|url| url.host_str().map(ToOwned::to_owned))
+        .is_some_and(|graphql_host| graphql_host == host)
+}
+
 fn ensure_reqwest_crypto_provider() {
     REQWEST_CRYPTO_PROVIDER.get_or_init(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn decodes_issue_context_header_comments_and_attachments() {
+        let header: IssueContextHeaderData = serde_json::from_value(json!({
+            "issue": {
+                "id": "issue-1",
+                "identifier": "ENG-1",
+                "title": "Improve sync",
+                "updatedAt": "2026-07-15T12:00:00Z",
+                "branchName": "eng-1-improve-sync"
+            }
+        }))
+        .expect("header");
+        let issue = header.issue.expect("issue");
+        assert_eq!(issue.branch_name, "eng-1-improve-sync");
+
+        let comments: IssueCommentsData = serde_json::from_value(json!({
+            "issue": {
+                "comments": {
+                    "nodes": [{
+                        "id": "comment-1",
+                        "body": "Looks good.",
+                        "url": "https://linear.app/acme/issue/ENG-1#comment-comment-1",
+                        "createdAt": "2026-07-15T13:00:00Z",
+                        "updatedAt": "2026-07-15T13:05:00Z",
+                        "editedAt": "2026-07-15T13:05:00Z",
+                        "parentId": null,
+                        "resolvedAt": null,
+                        "user": { "id": "user-1", "name": "Ada", "email": "ada@example.com" },
+                        "externalUser": null,
+                        "botActor": null
+                    }],
+                    "pageInfo": { "hasNextPage": false, "endCursor": null }
+                }
+            }
+        }))
+        .expect("comments");
+        let comment = LinearComment::from(
+            comments
+                .issue
+                .expect("issue")
+                .comments
+                .nodes
+                .into_iter()
+                .next()
+                .expect("comment"),
+        );
+        assert_eq!(comment.user.expect("user").name, "Ada");
+        assert_eq!(comment.edited_at.as_deref(), Some("2026-07-15T13:05:00Z"));
+
+        let attachments: IssueAttachmentsData = serde_json::from_value(json!({
+            "issue": {
+                "attachments": {
+                    "nodes": [{
+                        "id": "attach-1",
+                        "title": "GitHub PR #42",
+                        "url": "https://github.com/acme/app/pull/42",
+                        "createdAt": "2026-07-15T14:00:00Z",
+                        "updatedAt": "2026-07-15T14:10:00Z",
+                        "sourceType": "github",
+                        "subtitle": "Open pull request",
+                        "creator": { "id": "user-1", "name": "Ada", "email": "ada@example.com" },
+                        "externalUserCreator": null,
+                        "metadata": {
+                            "repository": "acme/app",
+                            "number": 42,
+                            "branch": "eng-1-improve-sync",
+                            "status": "open"
+                        }
+                    }],
+                    "pageInfo": { "hasNextPage": false, "endCursor": null }
+                }
+            }
+        }))
+        .expect("attachments");
+        let attachment = LinearAttachment::from(
+            attachments
+                .issue
+                .expect("issue")
+                .attachments
+                .nodes
+                .into_iter()
+                .next()
+                .expect("attachment"),
+        );
+        assert_eq!(attachment.source_type.as_deref(), Some("github"));
+        assert_eq!(attachment.metadata["number"], 42);
+    }
+
+    #[test]
+    fn decodes_issue_history_change_fields_and_raw_changes() {
+        let data: IssueHistoryData = serde_json::from_value(json!({
+            "issue": {
+                "history": {
+                    "nodes": [{
+                        "id": "history-1",
+                        "createdAt": "2026-07-15T15:00:00Z",
+                        "updatedAt": "2026-07-15T15:01:00Z",
+                        "actor": { "id": "user-1", "name": "Ada", "email": "ada@example.com" },
+                        "botActor": null,
+                        "fromState": { "id": "state-1", "name": "Todo", "type": "unstarted" },
+                        "toState": { "id": "state-2", "name": "Done", "type": "completed" },
+                        "fromTitle": "Improve sync",
+                        "toTitle": "Improve sync quickly",
+                        "fromAssignee": null,
+                        "toAssignee": { "id": "user-1", "name": "Ada", "email": "ada@example.com" },
+                        "fromProject": null,
+                        "toProject": { "id": "project-1", "name": "Launch" },
+                        "fromTeam": null,
+                        "toTeam": { "id": "team-1", "key": "ENG", "name": "Engineering" },
+                        "fromDueDate": null,
+                        "toDueDate": "2026-07-31",
+                        "fromEstimate": null,
+                        "toEstimate": 3,
+                        "fromPriority": null,
+                        "toPriority": 3,
+                        "updatedDescription": true,
+                        "attachmentId": "attach-1",
+                        "attachment": null,
+                        "addedLabels": [{ "id": "label-1", "name": "Bug" }],
+                        "removedLabels": [],
+                        "changes": { "description": true }
+                    }],
+                    "pageInfo": { "hasNextPage": false, "endCursor": null }
+                }
+            }
+        }))
+        .expect("history");
+
+        let entry = LinearIssueHistoryEntry::from(
+            data.issue
+                .expect("issue")
+                .history
+                .nodes
+                .into_iter()
+                .next()
+                .expect("history entry"),
+        );
+
+        assert_eq!(entry.actor.expect("actor").name, "Ada");
+        assert_eq!(entry.to_state.expect("state").name, "Done");
+        assert_eq!(entry.to_project.expect("project").name, "Launch");
+        assert_eq!(entry.to_due_date.as_deref(), Some("2026-07-31"));
+        assert_eq!(entry.to_estimate, Some(3.0));
+        assert_eq!(entry.to_priority, Some(3.0));
+        assert_eq!(entry.added_labels[0].name, "Bug");
+        assert_eq!(entry.changes.expect("changes")["description"], true);
+    }
+
+    #[test]
+    fn attachment_download_authorization_is_limited_to_linear_hosts() {
+        assert!(should_send_linear_authorization(
+            &reqwest::Url::parse("https://uploads.linear.app/spec.pdf").expect("url"),
+            DEFAULT_LINEAR_GRAPHQL_URL,
+        ));
+        assert!(should_send_linear_authorization(
+            &reqwest::Url::parse("https://linear.internal/download/spec.pdf").expect("url"),
+            "https://linear.internal/graphql",
+        ));
+        assert!(!should_send_linear_authorization(
+            &reqwest::Url::parse("https://github.com/acme/app/pull/42").expect("url"),
+            DEFAULT_LINEAR_GRAPHQL_URL,
+        ));
+    }
 }
 
 const ISSUE_LIST_QUERY: &str = r#"
@@ -504,6 +1199,18 @@ query LocalityIssues($first: Int!, $after: String, $filter: IssueFilter) {
       createdAt
       updatedAt
       archivedAt
+      startedAt
+      completedAt
+      canceledAt
+      autoArchivedAt
+      autoClosedAt
+      startedTriageAt
+      triagedAt
+      snoozedUntilAt
+      addedToCycleAt
+      addedToProjectAt
+      addedToTeamAt
+      dueDate
       priority
       priorityLabel
       estimate
@@ -529,6 +1236,18 @@ query LocalityIssue($id: String!) {
     createdAt
     updatedAt
     archivedAt
+    startedAt
+    completedAt
+    canceledAt
+    autoArchivedAt
+    autoClosedAt
+    startedTriageAt
+    triagedAt
+    snoozedUntilAt
+    addedToCycleAt
+    addedToProjectAt
+    addedToTeamAt
+    dueDate
     priority
     priorityLabel
     estimate
@@ -537,6 +1256,113 @@ query LocalityIssue($id: String!) {
     project { id name }
     assignee { id name email }
     labels { nodes { id name } }
+  }
+}
+"#;
+
+const ISSUE_CONTEXT_HEADER_QUERY: &str = r#"
+query LocalityIssueContextHeader($id: String!) {
+  issue(id: $id) {
+    id
+    identifier
+    title
+    updatedAt
+    branchName
+  }
+}
+"#;
+
+const ISSUE_COMMENTS_QUERY: &str = r#"
+query LocalityIssueComments($id: String!, $first: Int!, $after: String) {
+  issue(id: $id) {
+    comments(first: $first, after: $after, includeArchived: true) {
+      nodes {
+        id
+        body
+        url
+        createdAt
+        updatedAt
+        editedAt
+        parentId
+        resolvedAt
+        user { id name email }
+        externalUser { id name email }
+        botActor { id name type subType userDisplayName }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+"#;
+
+const ISSUE_ATTACHMENTS_QUERY: &str = r#"
+query LocalityIssueAttachments($id: String!, $first: Int!, $after: String) {
+  issue(id: $id) {
+    attachments(first: $first, after: $after, includeArchived: true) {
+      nodes {
+        id
+        title
+        url
+        createdAt
+        updatedAt
+        sourceType
+        subtitle
+        creator { id name email }
+        externalUserCreator { id name email }
+        metadata
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+"#;
+
+const ISSUE_HISTORY_QUERY: &str = r#"
+query LocalityIssueHistory($id: String!, $first: Int!, $after: String) {
+  issue(id: $id) {
+    history(first: $first, after: $after, includeArchived: true) {
+      nodes {
+        id
+        createdAt
+        updatedAt
+        actor { id name email }
+        botActor { id name type subType userDisplayName }
+        fromState { id name type }
+        toState { id name type }
+        fromTitle
+        toTitle
+        fromAssignee { id name email }
+        toAssignee { id name email }
+        fromProject { id name }
+        toProject { id name }
+        fromTeam { id key name }
+        toTeam { id key name }
+        fromDueDate
+        toDueDate
+        fromEstimate
+        toEstimate
+        fromPriority
+        toPriority
+        updatedDescription
+        attachmentId
+        attachment {
+          id
+          title
+          url
+          createdAt
+          updatedAt
+          sourceType
+          subtitle
+          creator { id name email }
+          externalUserCreator { id name email }
+          metadata
+        }
+        addedLabels { id name }
+        removedLabels { id name }
+        changes
+      }
+      pageInfo { hasNextPage endCursor }
+    }
   }
 }
 "#;
@@ -554,6 +1380,18 @@ mutation LocalityIssueUpdate($id: String!, $input: IssueUpdateInput!) {
       createdAt
       updatedAt
       archivedAt
+      startedAt
+      completedAt
+      canceledAt
+      autoArchivedAt
+      autoClosedAt
+      startedTriageAt
+      triagedAt
+      snoozedUntilAt
+      addedToCycleAt
+      addedToProjectAt
+      addedToTeamAt
+      dueDate
       priority
       priorityLabel
       estimate

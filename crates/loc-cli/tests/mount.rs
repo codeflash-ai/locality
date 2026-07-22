@@ -56,6 +56,8 @@ fn mount_writes_agent_guidance_and_claude_alias() {
     assert!(agents.contains("loc diff <path>"));
     assert!(agents.contains("loc push <path> -y"));
     assert!(agents.contains("loc live-mode status <file>"));
+    assert!(agents.contains("loc mv <source> <dest>"));
+    assert!(agents.contains("Push intentional changes with `loc push <path>`"));
     assert!(agents.contains("If desktop Live Mode is on"));
     assert!(agents.contains("Do not run routine `loc pull` or `loc push`"));
     assert!(agents.contains("remote changed since last sync"));
@@ -90,7 +92,8 @@ fn mount_writes_linear_source_guidance() {
     assert!(agents.contains("# Locality Linear Mount"));
     assert!(agents.contains("projects Linear as local Markdown"));
     assert!(agents.contains("Linear facts:"));
-    assert!(agents.contains("Supported writes are issue description body edits"));
+    assert!(agents.contains("read-only lifecycle/date metadata"));
+    assert!(agents.contains("Supported writes are only issue description body edits"));
     assert!(agents.contains("including nested directories"));
 }
 

@@ -23,6 +23,7 @@ pub mod planner;
 pub mod pull;
 pub mod push;
 pub mod readable_diff;
+pub mod search;
 pub mod shadow;
 pub mod sync;
 pub mod undo;

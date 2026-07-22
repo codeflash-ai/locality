@@ -6,10 +6,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use loc_cli::search::{SearchError, SearchOptions, notion_id_from_url, run_search};
 use locality_core::freshness::RemoteVersion;
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
+use locality_core::shadow::ShadowDocument;
 use locality_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository,
     InMemoryStateStore, MountConfig, MountRepository, ProjectionMode, RemoteObservationRecord,
-    RemoteObservationRepository, SqliteStateStore,
+    RemoteObservationRepository, ShadowRepository, SqliteStateStore,
 };
 
 #[test]
@@ -206,6 +207,156 @@ fn search_uses_sqlite_candidate_index_without_changing_report() {
     assert_eq!(
         report.results[0].remote.observed_title.as_deref(),
         Some("Launch Plan")
+    );
+}
+
+#[test]
+fn search_uses_hydrated_body_text_from_sqlite_index() {
+    let fixture = SearchFixture::new();
+    let mut store = fixture.sqlite_store();
+    fixture.seed_entities(&mut store);
+    let remote_id = RemoteId::new("37b3ac0ebb88802cbcf4d53c9cfc4972");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                remote_id,
+                "# Initial Idea\n\nRetry budget planning for OAuth broker handoff.",
+                1,
+                [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
+            )
+            .expect("shadow"),
+        )
+        .expect("save shadow");
+
+    let report = run_search(&store, SearchOptions::new("broker handoff")).expect("body search");
+
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].title, "Initial Idea");
+    assert_eq!(report.results[0].path, "Product/Initial Idea/page.md");
+    assert_eq!(report.results[0].state, "ready");
+    assert_eq!(
+        report.results[0]
+            .match_context
+            .as_ref()
+            .map(|context| context.field.as_str()),
+        Some("body")
+    );
+    assert!(
+        report.results[0]
+            .match_context
+            .as_ref()
+            .is_some_and(|context| context.text.contains("broker handoff"))
+    );
+}
+
+#[test]
+fn search_uses_connector_metadata_from_sqlite_index() {
+    let fixture = SearchFixture::new();
+    let mut store = fixture.sqlite_store();
+    fixture.seed_entities(&mut store);
+    store
+        .save_remote_observation(
+            RemoteObservationRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                EntityKind::Page,
+                "Launch Plan",
+                "Engineering/Launch Plan/page.md",
+                "2026-06-16T00:00:00Z",
+            )
+            .with_remote_version(RemoteVersion("remote-v2".to_string()))
+            .with_raw_metadata_json(
+                r#"{"loc_search":{"metadata_text":["customer escalation"],"aliases":["ENG-1"],"source_url":"https://linear.app/acme/issue/ENG-1/improve-sync"}}"#,
+            ),
+        )
+        .expect("save observation");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("37b3ac0ebb88802cbcf4d53c9cfc4972"),
+                "# Initial Idea\n\nENG-1 appears here only as body text.",
+                1,
+                [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
+            )
+            .expect("shadow"),
+        )
+        .expect("save body shadow");
+
+    let report =
+        run_search(&store, SearchOptions::new("customer escalation")).expect("metadata search");
+
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].title, "Roadmap 2026");
+    assert_eq!(report.results[0].state, "remote_update_available");
+    assert_eq!(
+        report.results[0].remote.observed_title.as_deref(),
+        Some("Launch Plan")
+    );
+    assert_eq!(
+        report.results[0]
+            .match_context
+            .as_ref()
+            .map(|context| context.field.as_str()),
+        Some("metadata")
+    );
+    assert!(
+        report.results[0]
+            .match_context
+            .as_ref()
+            .is_some_and(|context| context.text.contains("customer escalation"))
+    );
+
+    let alias_report = run_search(&store, SearchOptions::new("ENG-1")).expect("alias search");
+
+    assert_eq!(alias_report.results.len(), 2);
+    assert_eq!(alias_report.results[0].title, "Roadmap 2026");
+    assert_eq!(
+        alias_report.results[0]
+            .match_context
+            .as_ref()
+            .map(|context| context.field.as_str()),
+        Some("alias")
+    );
+    assert_eq!(alias_report.results[1].title, "Initial Idea");
+    assert_eq!(
+        alias_report.results[1]
+            .match_context
+            .as_ref()
+            .map(|context| context.field.as_str()),
+        Some("body")
+    );
+}
+
+#[test]
+fn search_uses_generic_remote_ids_from_sqlite_index() {
+    let fixture = SearchFixture::new();
+    let mut store = fixture.sqlite_store();
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("slack-C1234567"),
+                EntityKind::Page,
+                "Team Channel Recent",
+                "Slack/Team Channel/recent.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save generic remote id entity");
+
+    let report =
+        run_search(&store, SearchOptions::new("SLACK-C1234567")).expect("generic remote id search");
+
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].title, "Team Channel Recent");
+    assert_eq!(
+        report.results[0]
+            .match_context
+            .as_ref()
+            .map(|context| context.field.as_str()),
+        Some("remote_id")
     );
 }
 

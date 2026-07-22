@@ -32,6 +32,7 @@ The `loc` command is the single supported control surface for users and coding a
 - `loc daemon start|stop|status|reload|restart [--session|--launchd] [--localityd-bin <path>] [--state-dir <path>] [--tcp-addr <host:port|off>] [--include-env <KEY>] [--json]`
 - `loc doctor [--json]`
 - `loc diff [path] [--json]`
+- `loc mv <source> <dest> [--json]`
 - `loc restore <path> [--force] [--json]`
 - `loc reset --yes [--json]`
 - `loc undo [push-id] [--json]`
@@ -184,10 +185,19 @@ references.
 
 ## Local Search
 
-`loc search <query>` searches local mount metadata only. It reads SQLite mount,
-entity, and remote-observation records; it does not call Notion or any other
-remote connector. This makes search safe for desktop typeahead, large-workspace
-navigation, and future agent/MCP surfaces.
+`loc search <query>` searches Locality's local SQLite search index. It covers
+mount/entity metadata, remote-observation metadata, derived breadcrumb/path
+text, connector-provided search metadata such as source URLs and aliases, and
+hydrated shadow frontmatter/body text. The shared search engine does not call
+Notion or any other remote connector, which keeps ordinary title/body search safe
+for desktop typeahead, large-workspace navigation, and future agent/MCP surfaces.
+Results are field-weighted: exact title, alias, source URL, and path matches rank
+ahead of broader metadata, frontmatter, and body matches. When an indexed field
+explains the match, human output includes a compact `match:` line and JSON output
+includes `match_context`.
+The CLI has one targeted recovery path: an exact Notion URL or bare Notion ID
+that misses locally may refresh Notion metadata through the daemon or connector,
+then re-run the local search.
 
 Examples:
 
@@ -199,8 +209,9 @@ loc search roadmap --connector notion --limit 5 --json
 ```
 
 Human output lists title, entity kind, local state, projected path, mount,
-connector, and remote id. Results that are not safe for direct agent reads also
-print compact safety labels. JSON output is stable enough for tools:
+connector, remote id, and match context when available. Results that are not safe
+for direct agent reads also print compact safety labels. JSON output is stable
+enough for tools:
 
 ```json
 {
@@ -219,6 +230,10 @@ print compact safety labels. JSON output is stable enough for tools:
       "path": "Engineering/Roadmap 2026/page.md",
       "absolute_path": "/Users/alice/Locality/notion-main/Engineering/Roadmap 2026/page.md",
       "state": "ready",
+      "match_context": {
+        "field": "title",
+        "text": "Roadmap 2026"
+      },
       "safety": {
         "agent_readable": true,
         "labels": ["ready"]
@@ -235,16 +250,52 @@ print compact safety labels. JSON output is stable enough for tools:
 }
 ```
 
+`match_context` is a stable optional JSON object. `field` and `text` are stable
+keys; tools must tolerate the object being absent and should allow new `field`
+values as connectors add richer indexed metadata. The snippet text is
+best-effort display context, not a durable document excerpt contract.
+
 `state` is derived from local hydration plus the latest cheap remote observation:
 `online_only`, `ready`, `pending_changes`, `conflict`,
-`remote_update_available`, `remote_deleted`, or `review_needed`. Because search
-is local-only, run `loc pull`, `loc inspect`, or use the daemon freshness queue
-when you need the newest remote facts.
+`remote_update_available`, `remote_deleted`, or `review_needed`. Body matches
+come only from content already stored locally in shadows. Run `loc pull`,
+`loc inspect`, or use the daemon freshness queue when you need the newest remote
+facts.
 
 `safety.agent_readable` is true only for clean hydrated results. Online-only,
 dirty, conflicted, stale, or remotely deleted results are still returned for
 navigation, but future agent/MCP readers should treat their `safety.labels` as
 review or hydration requirements before reading file content.
+
+## Local Moves
+
+`loc mv <source> <dest> [--json]` stages an intentional move or rename inside a
+mounted Locality workspace. It never writes to the remote source. Review the
+result with `loc diff <dest>` and push only with an explicit later
+`loc push <dest> -y` or approved Live Mode review.
+
+Plain-files mounts use a guarded local filesystem rename. Virtual projections
+such as macOS File Provider, Linux FUSE, and Windows Cloud Files use the same
+virtual filesystem rename path as Finder/provider moves, so pending virtual
+moves show up in `loc status`, `loc diff`, and `loc push`.
+
+If `<dest>` is an existing directory, Locality appends the source filename:
+
+```bash
+loc mv "Product/Launch Plan" "Archive/"
+loc diff "Archive/Launch Plan"
+loc push "Archive/Launch Plan" -y
+```
+
+Validation happens before mutation. `loc mv` rejects missing sources, missing
+destination parents, mount-root moves, cross-mount moves, destination
+collisions, invalid filenames, read-only mounts, and unsupported virtual
+targets. Successful moves exit `0`; missing arguments exit `2`; validation
+failures exit `3`; read-only mounts exit `4`; unsupported connector boundaries
+exit `5`; I/O, store, or daemon protocol failures exit `1`.
+
+JSON output includes `source`, `destination`, `mount_id`, `connector`,
+`projection`, `mode`, `pushed: false`, and `next` review commands.
 
 ## Locate Notion Content
 
@@ -333,7 +384,10 @@ The flag is only valid for Notion mounts. Internal Notion integrations may still
 be rejected by Notion during push because workspace-private page creation
 requires a user-associated token.
 
-with only new-page frontmatter:
+Direct filesystem creates and page moves at the Notion mount root are rejected;
+use `loc create page --private` for new workspace-private root pages.
+
+New page drafts are initialized with only new-page frontmatter:
 
 ```md
 ---

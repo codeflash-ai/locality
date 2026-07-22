@@ -49,7 +49,7 @@ fn sqlite_store_initializes_idempotently() {
 
     assert!(first.db_path.exists());
     assert_eq!(first.db_path, second.db_path);
-    assert_eq!(user_version, 19);
+    assert_eq!(user_version, 20);
     assert_eq!(journal_mode, "wal");
 }
 
@@ -75,8 +75,8 @@ fn sqlite_store_seeds_state_compatibility_components() {
             (
                 "cache:entity_search".to_string(),
                 "rebuildable_cache".to_string(),
-                1,
-                1,
+                2,
+                2,
                 0,
                 1
             ),
@@ -96,7 +96,7 @@ fn sqlite_store_seeds_state_compatibility_components() {
                 1,
                 0
             ),
-            ("core:schema".to_string(), "schema".to_string(), 19, 1, 1, 0),
+            ("core:schema".to_string(), "schema".to_string(), 20, 1, 1, 0),
             (
                 "durable:auto_save".to_string(),
                 "durable_json".to_string(),
@@ -398,12 +398,12 @@ fn sqlite_store_retires_removed_notion_workspace_roots_component() {
 }
 
 #[test]
-fn sqlite_schema_snapshot_matches_v19_contract() {
+fn sqlite_schema_snapshot_matches_v20_contract() {
     let fixture = SqliteFixture::new();
     let store = fixture.open();
     let connection = Connection::open(&store.db_path).expect("raw connection");
 
-    assert_eq!(SqliteStateStore::current_schema_version(), 19);
+    assert_eq!(SqliteStateStore::current_schema_version(), 20);
     assert_eq!(
         schema_column_snapshot(&connection),
         "\
@@ -422,6 +422,7 @@ mount_live_modes: mount_id, enabled, state_json, last_reason, last_run_at, creat
 mounts: mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, settings_json
 projection_state: mount_id, projection, layout_version, min_reader_version, os_domain_id, root_item_id, repair_generation, state_json, updated_at
 remote_observations: mount_id, remote_id, kind_json, title, parent_remote_id, projected_path, remote_version_json, observed_at, deleted, raw_metadata_json
+search_documents_fts: mount_id, remote_id, connector, kind, title, path, observed_title, observed_path, frontmatter, body, metadata_text, breadcrumbs, aliases, source_url
 shadows: mount_id, entity_id, frontmatter, body_hash, rendered_body, blocks_json
 state_components: component_id, component_kind, version, min_reader_version, required, rebuildable, data_json, updated_at
 state_migrations: migration_id, from_schema_version, to_schema_version, app_version, app_build_id, daemon_build_id, started_at, finished_at, status, error_json
@@ -430,7 +431,7 @@ virtual_mutations: mount_id, local_id, mutation_kind_json, target_remote_id, par
 }
 
 #[test]
-fn sqlite_store_migrates_v18_to_v19_without_discarding_pending_work() {
+fn sqlite_store_migrates_v18_to_v20_without_discarding_pending_work() {
     let fixture = SqliteFixture::new();
     let mut store = fixture.open();
     store
@@ -457,7 +458,7 @@ fn sqlite_store_migrates_v18_to_v19_without_discarding_pending_work() {
     let db_path = store.db_path.clone();
     drop(store);
 
-    let connection = Connection::open(&db_path).expect("raw v19 connection");
+    let connection = Connection::open(&db_path).expect("raw downgraded connection");
     connection
         .execute_batch(
             "DROP TRIGGER discovery_projection_block_active_mount_delete;
@@ -496,13 +497,13 @@ fn sqlite_store_migrates_v18_to_v19_without_discarding_pending_work() {
     let migration_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM state_migrations
-             WHERE migration_id = 'schema-18-to-19'",
+             WHERE migration_id = 'schema-18-to-20'",
             [],
             |row| row.get(0),
         )
         .expect("migration history");
 
-    assert_eq!(user_version, 19);
+    assert_eq!(user_version, 20);
     assert_eq!(component, ("durable_transaction".to_string(), 1, 1, 1, 0));
     assert_eq!(migration_count, 1);
     assert!(sqlite_table_exists(
@@ -547,7 +548,7 @@ fn sqlite_store_reports_v12_state_as_migratable_then_migrates() {
         before.issues,
         vec![StateCompatibilityIssue::OlderSchema {
             found: 12,
-            current: 19,
+            current: 20,
         }]
     );
 
@@ -558,13 +559,13 @@ fn sqlite_store_reports_v12_state_as_migratable_then_migrates() {
         .expect("user version");
     let migration_count: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM state_migrations WHERE migration_id = 'schema-12-to-19'",
+            "SELECT COUNT(*) FROM state_migrations WHERE migration_id = 'schema-12-to-20'",
             [],
             |row| row.get(0),
         )
         .expect("migration row count");
 
-    assert_eq!(user_version, 19);
+    assert_eq!(user_version, 20);
     assert_eq!(migration_count, 1);
     assert_eq!(
         store.get_mount(&fixture.mount_id).expect("get mount"),
@@ -579,7 +580,7 @@ fn sqlite_store_reports_v12_state_as_migratable_then_migrates() {
     );
 
     let after =
-        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect v19");
+        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect v20");
     assert_eq!(after.status, StateCompatibilityStatus::Ready);
 }
 
@@ -599,7 +600,7 @@ fn sqlite_store_rejects_newer_schema_version() {
         error,
         StoreError::SchemaVersion {
             found: 999,
-            supported: 19,
+            supported: 20,
         }
     );
 }
@@ -622,7 +623,7 @@ fn sqlite_store_reports_newer_schema_as_needing_update() {
         report.issues,
         vec![StateCompatibilityIssue::NewerSchema {
             found: 999,
-            supported: 19,
+            supported: 20,
         }]
     );
 }
@@ -864,7 +865,7 @@ fn sqlite_store_migrates_journals_component_v2_to_v3_without_rewriting_rows() {
         .expect("journal");
 
     assert_eq!((version, min_reader_version), (3, 3));
-    assert_eq!(before_user_version, 19);
+    assert_eq!(before_user_version, 20);
     assert_eq!(after_user_version, before_user_version);
     assert_eq!(after_row, before_row);
     assert_eq!(
@@ -921,7 +922,7 @@ fn sqlite_store_migrates_journals_component_v1_to_v3_at_current_schema() {
         .expect("user version");
 
     assert_eq!(component, (3, 3));
-    assert_eq!(before_user_version, 19);
+    assert_eq!(before_user_version, 20);
     assert_eq!(after_user_version, before_user_version);
 }
 
@@ -1259,7 +1260,7 @@ fn sqlite_store_v13_valid_linux_fuse_v1_component_migrates_to_v2() {
 }
 
 #[test]
-fn sqlite_store_v14_missing_live_mode_component_migrates_to_v19() {
+fn sqlite_store_v14_missing_live_mode_component_migrates_to_v20() {
     let fixture = SqliteFixture::new();
     let mount_point_root = fixture
         .state_root
@@ -1306,7 +1307,7 @@ fn sqlite_store_v14_missing_live_mode_component_migrates_to_v19() {
         )
         .expect("live mode component version");
 
-    assert_eq!(user_version, 19);
+    assert_eq!(user_version, 20);
     assert!(sqlite_table_exists(&connection, "mount_live_modes"));
     assert_eq!(component_version, 1);
     assert_eq!(query_state_migration_count(&connection), 1);
@@ -1992,14 +1993,19 @@ fn entity_search_candidates_use_sqlite_index() {
     assert_eq!(numeric_matches[0].entity.remote_id, RemoteId::new("page-2"));
 
     store
-        .save_remote_observation(RemoteObservationRecord::new(
-            fixture.mount_id.clone(),
-            RemoteId::new("page-1"),
-            EntityKind::Page,
-            "Launch Plan",
-            "Planning/Launch Plan.md",
-            "2026-06-16T00:00:00Z",
-        ))
+        .save_remote_observation(
+            RemoteObservationRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Launch Plan",
+                "Planning/Launch Plan.md",
+                "2026-06-16T00:00:00Z",
+            )
+            .with_raw_metadata_json(
+                r#"{"loc_search":{"metadata_text":["customer escalation"],"aliases":["ENG-1"],"source_url":"https://linear.app/acme/issue/ENG-1/improve-sync"}}"#,
+            ),
+        )
         .expect("save observation");
     let observed_matches = store
         .list_entity_search_candidates(&fixture.mount_id, "launch", None)
@@ -2013,6 +2019,37 @@ fn entity_search_candidates_use_sqlite_index() {
             .map(|observation| observation.title.as_str()),
         Some("Launch Plan")
     );
+    let metadata_matches = store
+        .list_entity_search_candidates(&fixture.mount_id, "customer escalation", None)
+        .expect("search connector metadata")
+        .expect("sqlite search");
+    assert_eq!(metadata_matches.len(), 1);
+    assert_eq!(
+        metadata_matches[0].entity.remote_id,
+        RemoteId::new("page-1")
+    );
+    assert!(
+        metadata_matches[0]
+            .search_document
+            .as_ref()
+            .and_then(|document| document.metadata_text.as_deref())
+            .is_some_and(|text| text.contains("customer escalation"))
+    );
+    let alias_matches = store
+        .list_entity_search_candidates(&fixture.mount_id, "ENG-1", None)
+        .expect("search connector alias")
+        .expect("sqlite search");
+    assert_eq!(alias_matches.len(), 1);
+    assert_eq!(alias_matches[0].entity.remote_id, RemoteId::new("page-1"));
+    let source_url_matches = store
+        .list_entity_search_candidates(&fixture.mount_id, "improve sync", None)
+        .expect("search connector source url")
+        .expect("sqlite search");
+    assert_eq!(source_url_matches.len(), 1);
+    assert_eq!(
+        source_url_matches[0].entity.remote_id,
+        RemoteId::new("page-1")
+    );
 
     store
         .delete_remote_observation(&fixture.mount_id, &RemoteId::new("page-1"))
@@ -2023,6 +2060,26 @@ fn entity_search_candidates_use_sqlite_index() {
             .expect("search stale observed title")
             .expect("sqlite search")
             .is_empty()
+    );
+
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            shadow_document("# Roadmap\n\nOAuth broker handoff checklist."),
+        )
+        .expect("save searchable shadow");
+    let body_matches = store
+        .list_entity_search_candidates(&fixture.mount_id, "broker handoff", None)
+        .expect("search body text")
+        .expect("sqlite search");
+    assert_eq!(body_matches.len(), 1);
+    assert_eq!(body_matches[0].entity.remote_id, RemoteId::new("page-1"));
+    assert!(
+        body_matches[0]
+            .search_document
+            .as_ref()
+            .and_then(|document| document.body.as_deref())
+            .is_some_and(|text| text.contains("OAuth broker handoff checklist."))
     );
 
     let id_matches = store
@@ -2055,6 +2112,14 @@ fn remounting_same_mount_id_to_different_connection_clears_source_scoped_state()
         )
         .expect("save original mount");
     seed_source_scoped_state(&mut store, &fixture.mount_id);
+    assert_eq!(
+        search_index_row_count(&store, &fixture.mount_id, "entity_search_fts"),
+        1
+    );
+    assert_eq!(
+        search_index_row_count(&store, &fixture.mount_id, "search_documents_fts"),
+        1
+    );
 
     store
         .save_mount(
@@ -2132,6 +2197,14 @@ fn remounting_same_mount_id_to_different_connection_clears_source_scoped_state()
             .list_entity_search_candidates(&fixture.mount_id, "Roadmap", None)
             .expect("search candidates"),
         Some(Vec::new())
+    );
+    assert_eq!(
+        search_index_row_count(&reopened, &fixture.mount_id, "entity_search_fts"),
+        0
+    );
+    assert_eq!(
+        search_index_row_count(&reopened, &fixture.mount_id, "search_documents_fts"),
+        0
     );
 }
 
@@ -2673,7 +2746,7 @@ fn sqlite_store_migrates_v5_projection_and_connections_schema() {
         )
         .expect("connections table");
 
-    assert_eq!(user_version, 19);
+    assert_eq!(user_version, 20);
     assert_eq!(connection_column_count, 1);
     assert_eq!(projection_column_count, 1);
     assert_eq!(connection_table_count, 1);
@@ -2748,7 +2821,7 @@ fn sqlite_store_migrates_v6_projection_schema_to_connections() {
         )
         .expect("connections table");
 
-    assert_eq!(user_version, 19);
+    assert_eq!(user_version, 20);
     assert_eq!(connection_column_count, 1);
     assert_eq!(connection_table_count, 1);
     assert_eq!(
@@ -2833,7 +2906,7 @@ fn sqlite_store_migrates_v7_hydration_jobs_schema() {
         )
         .expect("hydration_jobs table");
 
-    assert_eq!(user_version, 19);
+    assert_eq!(user_version, 20);
     assert_eq!(hydration_jobs_table_count, 1);
     assert!(
         store
@@ -2920,7 +2993,7 @@ fn sqlite_store_migrates_v8_connections_to_default_connector_profile() {
         )
         .expect("profile_id column");
 
-    assert_eq!(user_version, 19);
+    assert_eq!(user_version, 20);
     assert_eq!(profile_column_count, 1);
     let migrated_connection = store
         .get_connection(&ConnectionId::new("notion-work"))
@@ -3033,14 +3106,16 @@ fn sqlite_store_migrates_v11_entity_search_index() {
         .expect("user version");
     let search_table_count: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'entity_search_fts'",
+            "SELECT COUNT(*)
+             FROM sqlite_master
+             WHERE name IN ('entity_search_fts', 'search_documents_fts')",
             [],
             |row| row.get(0),
         )
-        .expect("entity search table");
+        .expect("search tables");
 
-    assert_eq!(user_version, 19);
-    assert_eq!(search_table_count, 1);
+    assert_eq!(user_version, 20);
+    assert_eq!(search_table_count, 2);
     let matches = store
         .list_entity_search_candidates(&fixture.mount_id, "launch", None)
         .expect("search migrated index")
@@ -3514,7 +3589,7 @@ fn sqlite_store_migrates_v1_journals_with_empty_preimages() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 19);
+    assert_eq!(user_version, 20);
     assert!(entry.preimages.is_empty());
     assert!(entry.apply_effects.is_empty());
 }
@@ -3585,7 +3660,7 @@ fn sqlite_store_migrates_v2_journals_with_empty_apply_effects() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 19);
+    assert_eq!(user_version, 20);
     assert!(entry.apply_effects.is_empty());
 }
 
@@ -3648,7 +3723,7 @@ fn sqlite_store_migrates_v16_journals_with_empty_edit_metadata() {
         .query_row(
             "SELECT COUNT(*)
              FROM state_migrations
-             WHERE migration_id = 'schema-16-to-19'",
+             WHERE migration_id = 'schema-16-to-20'",
             [],
             |row| row.get(0),
         )
@@ -3658,7 +3733,7 @@ fn sqlite_store_migrates_v16_journals_with_empty_edit_metadata() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 19);
+    assert_eq!(user_version, 20);
     assert_eq!(journals_component_version, 3);
     assert_eq!(
         metadata_json,
@@ -3726,7 +3801,7 @@ fn sqlite_store_migrates_v17_mounts_with_default_settings_json() {
         .query_row(
             "SELECT COUNT(*)
              FROM state_migrations
-             WHERE migration_id = 'schema-17-to-19'",
+             WHERE migration_id = 'schema-17-to-20'",
             [],
             |row| row.get(0),
         )
@@ -3741,7 +3816,7 @@ fn sqlite_store_migrates_v17_mounts_with_default_settings_json() {
         )
         .expect("journal component metadata");
 
-    assert_eq!(user_version, 19);
+    assert_eq!(user_version, 20);
     assert_eq!(settings_json, "{}");
     assert_eq!(migration_count, 1);
     assert_eq!(journal_component, (3, 3));
@@ -3780,6 +3855,7 @@ fn schema_column_snapshot(connection: &Connection) -> String {
              WHERE type = 'table'
                AND name NOT LIKE 'sqlite_%'
                AND name NOT GLOB 'entity_search_fts_*'
+               AND name NOT GLOB 'search_documents_fts_*'
              ORDER BY name",
         )
         .expect("prepare table snapshot query");
@@ -4469,6 +4545,21 @@ fn seed_source_scoped_state(store: &mut SqliteStateStore, mount_id: &MountId) {
     store
         .append_journal(journal_entry("push-1", JournalStatus::Prepared))
         .expect("append journal");
+}
+
+fn search_index_row_count(store: &SqliteStateStore, mount_id: &MountId, table: &str) -> i64 {
+    assert!(matches!(
+        table,
+        "entity_search_fts" | "search_documents_fts"
+    ));
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    connection
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE mount_id = ?1"),
+            params![mount_id.0.as_str()],
+            |row| row.get(0),
+        )
+        .expect("search index row count")
 }
 
 fn apply_effects(push_id: &str) -> Vec<JournalApplyEffect> {

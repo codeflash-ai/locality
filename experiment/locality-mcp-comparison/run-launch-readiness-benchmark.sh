@@ -21,6 +21,8 @@ Important environment:
   CONTEXT_URLS             Newline-delimited Notion URLs to hydrate as directories.
   CODEX_MODEL              Model passed to codex exec. Default: gpt-5.6-luna
   CODEX_REASONING_EFFORT   Codex reasoning effort. Default: low
+  CODEX_EXEC_TIMEOUT_SECONDS
+                           Per-strategy codex exec timeout. Default: 900. Use 0 to disable.
   SINCE                    Git window. Default: 24 hours ago
   BASE_REF                 Git ref. Default: origin/main
   OUT_DIR                  Run artifact directory.
@@ -56,6 +58,7 @@ REPORT_TITLE="${REPORT_TITLE:-Launch Readiness Benchmark $RUN_ID}"
 OUT_DIR="${OUT_DIR:-$REPO_DIR/experiment/runs/$RUN_ID}"
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-luna}"
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-low}"
+CODEX_EXEC_TIMEOUT_SECONDS="${CODEX_EXEC_TIMEOUT_SECONDS:-900}"
 METRICS_TSV="$OUT_DIR/metrics.tsv"
 SUMMARY_JSON="$OUT_DIR/summary.json"
 CONTEXT_PATHS_FILE="$OUT_DIR/locality-context-paths.txt"
@@ -109,8 +112,12 @@ run_codex_agent() {
   local out_file="$OUT_DIR/$strategy-codex.out"
   local summary_file="$OUT_DIR/$strategy-codex-summary.json"
   local events_tsv="$OUT_DIR/$strategy-codex-events.tsv"
+  local prompt_snapshot="$OUT_DIR/$strategy-prompt.md"
+  local command_snapshot="$OUT_DIR/$strategy-codex-command.txt"
   local prompt
+  local run_cmd
   prompt="$(cat "$prompt_file")"
+  cp "$prompt_file" "$prompt_snapshot"
 
   local cmd=(
     codex exec
@@ -127,10 +134,25 @@ run_codex_agent() {
     cmd+=(--add-dir "$dir")
   done
   cmd+=("$prompt")
+  if [ "$CODEX_EXEC_TIMEOUT_SECONDS" = "0" ]; then
+    run_cmd=("${cmd[@]}")
+  elif command -v timeout >/dev/null 2>&1; then
+    run_cmd=(timeout --kill-after=30s "${CODEX_EXEC_TIMEOUT_SECONDS}s" "${cmd[@]}")
+  else
+    run_cmd=(python3 "$SCRIPT_DIR/scripts/run-with-timeout.py" "$CODEX_EXEC_TIMEOUT_SECONDS" -- "${cmd[@]}")
+  fi
+  {
+    printf 'timeout_seconds=%s\n' "$CODEX_EXEC_TIMEOUT_SECONDS"
+    printf 'codex_command='
+    printf '%q ' "${cmd[@]}"
+    printf '\nwrapped_command='
+    printf '%q ' "${run_cmd[@]}"
+    printf '\n'
+  } > "$command_snapshot"
 
   set +e
   set -o pipefail
-  "${cmd[@]}" < /dev/null 2> "$err_file" | python3 "$SCRIPT_DIR/scripts/timestamp-jsonl.py" > "$events_file"
+  "${run_cmd[@]}" < /dev/null 2> "$err_file" | python3 "$SCRIPT_DIR/scripts/timestamp-jsonl.py" > "$events_file"
   local pipe_status=("${PIPESTATUS[@]}")
   local rc="${pipe_status[0]}"
   set +o pipefail
