@@ -10,8 +10,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use loc_cli::sandbox::{
-    SandboxBootstrapToken, SandboxInitError, SandboxInitOptions, resolve_bootstrap_token,
-    run_sandbox_init,
+    SandboxBootstrapToken, SandboxContentEncodingPreference, SandboxInitError, SandboxInitOptions,
+    resolve_bootstrap_token, run_sandbox_init, run_sandbox_init_with_encoding,
 };
 use locality_core::portable::SessionId;
 use locality_protocol::{
@@ -279,6 +279,161 @@ fn zstd_bootstrap_streams_into_the_shared_materializer() {
         export.headers.get("accept-encoding").unwrap(),
         "zstd, identity"
     );
+}
+
+#[test]
+fn forced_content_encodings_send_exact_headers_and_match_reports() {
+    let tar = tar_file(b"forced.txt", b"forced\n");
+    let zstd = zstd::stream::encode_all(tar.as_slice(), 1).expect("compress tar");
+    let cases = [
+        (
+            "forced-identity",
+            SandboxContentEncodingPreference::Identity,
+            "identity",
+            tar.clone(),
+        ),
+        (
+            "forced-zstd",
+            SandboxContentEncodingPreference::Zstd,
+            "zstd",
+            zstd,
+        ),
+    ];
+
+    for (label, preference, expected_encoding, body) in cases {
+        let directory = TestDirectory::new(label);
+        let capability = capability();
+        let status = ready_status(
+            capability.session_id.clone(),
+            COMPONENT_VERSIONS,
+            &tar,
+            BTreeSet::from([TarContentEncoding::Identity, TarContentEncoding::Zstd]),
+        );
+        let server = MockServer::start(vec![
+            ResponseFixture::json(&capability),
+            ResponseFixture::json(&status),
+            ResponseFixture::export(expected_encoding, body),
+        ]);
+
+        let report = run_sandbox_init_with_encoding(
+            SandboxInitOptions {
+                api_url: server.api_url.clone(),
+                root: directory.root(),
+            },
+            SandboxBootstrapToken::new("bootstrap-secret").expect("token"),
+            preference,
+        )
+        .expect("bootstrap forced export encoding");
+
+        assert_eq!(report.content_encoding, expected_encoding, "case {label}");
+        assert_eq!(
+            fs::read(directory.root().join("forced.txt")).expect("read replica"),
+            b"forced\n",
+            "case {label}"
+        );
+        let _ = server.request();
+        let _ = server.request();
+        let export = server.request();
+        assert_eq!(
+            export.headers.get("accept-encoding").unwrap(),
+            expected_encoding,
+            "case {label}"
+        );
+    }
+}
+
+#[test]
+fn forced_content_encoding_fails_closed_on_offer_or_response_mismatch() {
+    let tar = tar_file(b"never-published.txt", b"body");
+    let offer_capability = capability();
+    let identity_only = ready_status(
+        offer_capability.session_id.clone(),
+        COMPONENT_VERSIONS,
+        &tar,
+        BTreeSet::from([TarContentEncoding::Identity]),
+    );
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&offer_capability),
+        ResponseFixture::json(&identity_only),
+    ]);
+    let directory = TestDirectory::new("forced-zstd-not-offered");
+
+    let error = run_sandbox_init_with_encoding(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: directory.root(),
+        },
+        SandboxBootstrapToken::new("bootstrap-secret").expect("token"),
+        SandboxContentEncodingPreference::Zstd,
+    )
+    .expect_err("unoffered forced encoding must fail before export");
+
+    assert_eq!(error.code(), "backend_protocol_invalid");
+    assert_eq!(
+        error.to_string(),
+        "unsupported sandbox export encoding `zstd`"
+    );
+    assert!(!directory.root().exists());
+    let _ = server.request();
+    let _ = server.request();
+    server.assert_no_request();
+
+    for (label, preference, response_encoding, requested) in [
+        (
+            "forced-identity-got-zstd",
+            SandboxContentEncodingPreference::Identity,
+            "zstd",
+            "identity",
+        ),
+        (
+            "forced-zstd-got-identity",
+            SandboxContentEncodingPreference::Zstd,
+            "identity",
+            "zstd",
+        ),
+    ] {
+        let directory = TestDirectory::new(label);
+        let capability = capability();
+        let status = ready_status(
+            capability.session_id.clone(),
+            COMPONENT_VERSIONS,
+            &tar,
+            BTreeSet::from([TarContentEncoding::Identity, TarContentEncoding::Zstd]),
+        );
+        let server = MockServer::start(vec![
+            ResponseFixture::json(&capability),
+            ResponseFixture::json(&status),
+            ResponseFixture::export(response_encoding, tar.clone()),
+        ]);
+
+        let error = run_sandbox_init_with_encoding(
+            SandboxInitOptions {
+                api_url: server.api_url.clone(),
+                root: directory.root(),
+            },
+            SandboxBootstrapToken::new("bootstrap-secret").expect("token"),
+            preference,
+        )
+        .expect_err("forced response mismatch must fail before materialization");
+
+        assert_eq!(error.code(), "backend_protocol_invalid", "case {label}");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "unsupported sandbox export encoding `{response_encoding} (requested {requested})`"
+            ),
+            "case {label}"
+        );
+        assert!(!directory.root().exists(), "case {label}");
+        let _ = server.request();
+        let _ = server.request();
+        let export = server.request();
+        assert_eq!(
+            export.headers.get("accept-encoding").unwrap(),
+            requested,
+            "case {label}"
+        );
+    }
 }
 
 #[test]
@@ -694,7 +849,7 @@ fn token_sources_are_exclusive_trim_only_line_endings_and_redact_debug() {
 }
 
 #[test]
-fn cli_environment_token_never_appears_in_output() {
+fn cli_forced_identity_reports_encoding_without_leaking_environment_token() {
     let directory = TestDirectory::new("cli-redaction");
     let tar = tar_file(b"visible.txt", b"visible\n");
     let capability = capability();
@@ -719,6 +874,8 @@ fn cli_environment_token_never_appears_in_output() {
             &server.api_url,
             "--root",
             &root,
+            "--encoding",
+            "identity",
             "--json",
         ])
         .env("LOCALITY_BOOTSTRAP_TOKEN", "cli-bootstrap-secret")
@@ -750,7 +907,8 @@ fn cli_environment_token_never_appears_in_output() {
         r#"{"bootstrap_token":"cli-bootstrap-secret"}"#
     );
     let _ = server.request();
-    let _ = server.request();
+    let export = server.request();
+    assert_eq!(export.headers.get("accept-encoding").unwrap(), "identity");
 }
 
 trait StatusFixtureExt {

@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use locality_connector::ConnectorUndoApplier;
 use locality_connector::oauth_broker::OAuthBrokerStart;
 use locality_core::LocalityError;
@@ -94,7 +94,8 @@ use crate::push::{
 };
 use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
 use crate::sandbox::{
-    SandboxInitOptions, SandboxInitReport, resolve_bootstrap_token, run_sandbox_init,
+    SandboxContentEncodingPreference, SandboxInitOptions, SandboxInitReport,
+    resolve_bootstrap_token, run_sandbox_init_with_encoding,
 };
 use crate::search::{
     SearchError, SearchOptions, SearchReport, SearchResult, is_notion_url_host, notion_id_from_url,
@@ -245,8 +246,39 @@ struct SandboxInitArgs {
         help = "Absent destination path for the read-only replica"
     )]
     root: String,
+    #[arg(
+        long,
+        value_enum,
+        value_name = "ENCODING",
+        help = "Require zstd or identity export encoding"
+    )]
+    encoding: Option<SandboxEncodingArg>,
     #[arg(long, help = "Read the one-time bootstrap token from standard input")]
     bootstrap_token_stdin: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SandboxEncodingArg {
+    Zstd,
+    Identity,
+}
+
+impl SandboxEncodingArg {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Zstd => "zstd",
+            Self::Identity => "identity",
+        }
+    }
+}
+
+impl From<SandboxEncodingArg> for SandboxContentEncodingPreference {
+    fn from(value: SandboxEncodingArg) -> Self {
+        match value {
+            SandboxEncodingArg::Zstd => Self::Zstd,
+            SandboxEncodingArg::Identity => Self::Identity,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -1186,6 +1218,9 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                     args.push("init".to_string());
                     push_flag_value(&mut args, "--api-url", &options.api_url);
                     push_flag_value(&mut args, "--root", &options.root);
+                    if let Some(encoding) = options.encoding {
+                        push_flag_value(&mut args, "--encoding", encoding.as_str());
+                    }
                     push_flag(
                         &mut args,
                         "--bootstrap-token-stdin",
@@ -1342,6 +1377,9 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
 }
 
 fn sandbox_init(options: SandboxInitArgs, json: bool) -> i32 {
+    let content_encoding = options
+        .encoding
+        .map_or(SandboxContentEncodingPreference::Automatic, Into::into);
     let token = {
         let mut stdin = io::stdin().lock();
         match resolve_bootstrap_token(
@@ -1353,12 +1391,13 @@ fn sandbox_init(options: SandboxInitArgs, json: bool) -> i32 {
             Err(error) => return sandbox_init_command_error(json, error),
         }
     };
-    match run_sandbox_init(
+    match run_sandbox_init_with_encoding(
         SandboxInitOptions {
             api_url: options.api_url,
             root: PathBuf::from(options.root),
         },
         token,
+        content_encoding,
     ) {
         Ok(report) => {
             if json {
@@ -8310,12 +8349,12 @@ mod tests {
     use super::resolve_mount_target;
     use super::{
         Cli, ConnectReport, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION,
-        FileProviderCommandReport, PushConfirmationPromptError, VirtualProjectionRegistration,
-        absolute_command_path, auto_registration_for_mounted_projection,
-        default_mount_id_for_source, diff_report_exit_code, exact_located_entity_record,
-        file_provider_list_lines, google_docs_oauth_broker_config,
-        guard_linux_fuse_shared_root_unregister, guard_unresolved_linux_fuse_unregister,
-        guard_unresolved_windows_cloud_files_unregister,
+        FileProviderCommandReport, LocalityCommand, PushConfirmationPromptError, SandboxCommand,
+        SandboxEncodingArg, VirtualProjectionRegistration, absolute_command_path,
+        auto_registration_for_mounted_projection, default_mount_id_for_source,
+        diff_report_exit_code, exact_located_entity_record, file_provider_list_lines,
+        google_docs_oauth_broker_config, guard_linux_fuse_shared_root_unregister,
+        guard_unresolved_linux_fuse_unregister, guard_unresolved_windows_cloud_files_unregister,
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
         locate_result_from_report, mount_usage, mounted_projection_preflight_error,
         notion_authorize_url, notion_oauth_broker_config, print_push_confirmation_preview,
@@ -8519,6 +8558,7 @@ mod tests {
                     "Usage: loc sandbox init",
                     "--api-url <URL>",
                     "--root <PATH>",
+                    "--encoding <ENCODING>",
                     "--bootstrap-token-stdin",
                     "--json",
                 ],
@@ -8804,6 +8844,8 @@ mod tests {
             "https://api.locality.test",
             "--root",
             "/mnt/locality",
+            "--encoding",
+            "zstd",
             "--bootstrap-token-stdin",
         ]);
         assert_eq!(
@@ -8815,6 +8857,8 @@ mod tests {
                 "https://api.locality.test",
                 "--root",
                 "/mnt/locality",
+                "--encoding",
+                "zstd",
                 "--bootstrap-token-stdin"
             ]
         );
@@ -9032,6 +9076,64 @@ mod tests {
                 assert_eq!(error.kind(), ErrorKind::UnknownArgument);
             }
         }
+    }
+
+    #[test]
+    fn sandbox_encoding_parser_is_typed_optional_and_exact() {
+        for (value, expected) in [
+            ("zstd", SandboxEncodingArg::Zstd),
+            ("identity", SandboxEncodingArg::Identity),
+        ] {
+            let cli = parse_cli([
+                "sandbox",
+                "init",
+                "--api-url",
+                "https://api.locality.test",
+                "--root",
+                "/mnt/locality",
+                "--encoding",
+                value,
+            ]);
+            let Some(LocalityCommand::Sandbox {
+                command: SandboxCommand::Init(options),
+            }) = cli.command
+            else {
+                panic!("sandbox init command expected");
+            };
+            assert_eq!(options.encoding, Some(expected));
+        }
+
+        let automatic = parse_cli([
+            "sandbox",
+            "init",
+            "--api-url",
+            "https://api.locality.test",
+            "--root",
+            "/mnt/locality",
+        ]);
+        let Some(LocalityCommand::Sandbox {
+            command: SandboxCommand::Init(options),
+        }) = automatic.command
+        else {
+            panic!("sandbox init command expected");
+        };
+        assert_eq!(options.encoding, None);
+
+        let error = Cli::try_parse_from(argv([
+            "sandbox",
+            "init",
+            "--api-url",
+            "https://api.locality.test",
+            "--root",
+            "/mnt/locality",
+            "--encoding",
+            "gzip",
+        ]))
+        .expect_err("unsupported encoding rejected by parser");
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
+        let message = error.to_string();
+        assert!(message.contains("invalid value 'gzip'"));
+        assert!(message.contains("[possible values: zstd, identity]"));
     }
 
     #[test]

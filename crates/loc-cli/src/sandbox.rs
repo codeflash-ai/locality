@@ -68,6 +68,38 @@ pub struct SandboxInitOptions {
     pub root: PathBuf,
 }
 
+/// Controls HTTP content negotiation for a sandbox export.
+///
+/// [`Self::Automatic`] preserves the original preference for Zstd with an
+/// identity fallback. The forced variants are intended for acceptance and
+/// interoperability testing and fail closed if the server selects a different
+/// encoding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SandboxContentEncodingPreference {
+    #[default]
+    Automatic,
+    Identity,
+    Zstd,
+}
+
+impl SandboxContentEncodingPreference {
+    fn accept_encoding(self) -> &'static str {
+        match self {
+            Self::Automatic => "zstd, identity",
+            Self::Identity => "identity",
+            Self::Zstd => "zstd",
+        }
+    }
+
+    fn required_encoding(self) -> Option<ReplicaArchiveEncoding> {
+        match self {
+            Self::Automatic => None,
+            Self::Identity => Some(ReplicaArchiveEncoding::Identity),
+            Self::Zstd => Some(ReplicaArchiveEncoding::Zstd),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct SandboxInitReport {
     pub ok: bool,
@@ -303,6 +335,29 @@ pub fn run_sandbox_init(
     options: SandboxInitOptions,
     bootstrap_token: SandboxBootstrapToken,
 ) -> Result<SandboxInitReport, SandboxInitError> {
+    run_sandbox_init_with_encoding(
+        options,
+        bootstrap_token,
+        SandboxContentEncodingPreference::Automatic,
+    )
+}
+
+/// Initializes a sandbox with an explicit export content-negotiation policy.
+///
+/// The existing [`run_sandbox_init`] entry point remains automatic for source
+/// compatibility. A forced preference is checked against the sealed offer
+/// before the export request and against the response before any body bytes are
+/// materialized.
+///
+/// # Errors
+///
+/// Returns [`SandboxInitError`] when validation, protocol exchange, content
+/// negotiation, or atomic materialization fails.
+pub fn run_sandbox_init_with_encoding(
+    options: SandboxInitOptions,
+    bootstrap_token: SandboxBootstrapToken,
+    content_encoding: SandboxContentEncodingPreference,
+) -> Result<SandboxInitReport, SandboxInitError> {
     let root = absolute_destination(&options.root)?;
     validate_destination(&root)?;
     let client = SandboxHttpClient::new(&options.api_url)?;
@@ -311,8 +366,9 @@ pub fn run_sandbox_init(
     validate_capability(&capability)?;
     let status = client.session_status(&capability)?;
     let (offer, expected_receipt) = validate_status(&capability, &status)?;
+    validate_encoding_preference(offer, content_encoding)?;
     let limits = limits_for_offer(offer)?;
-    let (encoding, response) = client.open_export(&capability, offer)?;
+    let (encoding, response) = client.open_export(&capability, offer, content_encoding)?;
     let archive = ReplicaArchive::new(encoding, response);
     let summary =
         materialize_replica_archive_with_expected_receipt(archive, &root, limits, expected_receipt)
@@ -495,6 +551,25 @@ fn limits_for_offer(
     })
 }
 
+fn validate_encoding_preference(
+    offer: &TarExportOffer,
+    preference: SandboxContentEncodingPreference,
+) -> Result<(), SandboxInitError> {
+    let Some(required) = preference.required_encoding() else {
+        return Ok(());
+    };
+    if offer
+        .supported_content_encodings
+        .contains(&protocol_encoding(required))
+    {
+        Ok(())
+    } else {
+        Err(SandboxInitError::UnsupportedExportEncoding(
+            encoding_name(required).to_string(),
+        ))
+    }
+}
+
 fn report(
     root: &Path,
     capability: &SessionCapability,
@@ -632,12 +707,13 @@ impl SandboxHttpClient {
         &self,
         capability: &SessionCapability,
         offer: &TarExportOffer,
+        preference: SandboxContentEncodingPreference,
     ) -> Result<(ReplicaArchiveEncoding, Response), SandboxInitError> {
         let response = self
             .client
             .get(self.export_url(capability.session_id.as_str()))
             .header(ACCEPT, TAR_MEDIA_TYPE)
-            .header(ACCEPT_ENCODING, "zstd, identity")
+            .header(ACCEPT_ENCODING, preference.accept_encoding())
             .bearer_auth(&capability.opaque_capability)
             .send()
             .map_err(|error| SandboxInitError::Http {
@@ -647,14 +723,20 @@ impl SandboxHttpClient {
         ensure_success(&response, "session export")?;
         require_media_type(response.headers(), "session export", TAR_MEDIA_TYPE)?;
         let encoding = response_encoding(response.headers())?;
-        let offered = match encoding {
-            ReplicaArchiveEncoding::Identity => TarContentEncoding::Identity,
-            ReplicaArchiveEncoding::Zstd => TarContentEncoding::Zstd,
-        };
+        let offered = protocol_encoding(encoding);
         if !offer.supported_content_encodings.contains(&offered) {
             return Err(SandboxInitError::UnsupportedExportEncoding(
                 encoding_name(encoding).to_string(),
             ));
+        }
+        if let Some(required) = preference.required_encoding()
+            && encoding != required
+        {
+            return Err(SandboxInitError::UnsupportedExportEncoding(format!(
+                "{} (requested {})",
+                encoding_name(encoding),
+                encoding_name(required)
+            )));
         }
         Ok((encoding, response))
     }
@@ -794,6 +876,13 @@ fn encoding_name(encoding: ReplicaArchiveEncoding) -> &'static str {
     match encoding {
         ReplicaArchiveEncoding::Identity => "identity",
         ReplicaArchiveEncoding::Zstd => "zstd",
+    }
+}
+
+fn protocol_encoding(encoding: ReplicaArchiveEncoding) -> TarContentEncoding {
+    match encoding {
+        ReplicaArchiveEncoding::Identity => TarContentEncoding::Identity,
+        ReplicaArchiveEncoding::Zstd => TarContentEncoding::Zstd,
     }
 }
 
