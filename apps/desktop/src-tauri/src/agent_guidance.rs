@@ -421,12 +421,13 @@ Locality projects connected company sources, including Notion, into the local fi
 
 1. If the user gives a Notion URL, run `loc locate <url>` and edit the printed local Markdown path.
 2. Edit the local Markdown file directly.
-3. Do not edit Locality identity frontmatter, block IDs, `::loc{{...}}` directives, `_schema.yaml`, `AGENTS.md`, or `CLAUDE.md` unless explicitly asked.
-4. Unless the user asked you to sync back to Notion, leave edits pending for Locality review and tell the user what changed.
-5. Use `loc status` only when you need to inspect pending changes; regular clean files hydrate automatically on open.
-6. If desktop Live Mode is on, safe local edits may sync automatically. Do not run routine `loc pull` or `loc push` after every edit.
-7. If the user asks you to sync back to Notion, update Notion, publish, or apply the edit remotely, do not stop after local edits. Run `loc diff <file>` first, then `loc push <file> -y` for safe plans.
-8. If push says the remote changed since last sync, run `loc pull <file>`, resolve any inline conflict markers in the Markdown, rerun `loc diff <file>`, then push again.
+3. Use `loc mv <source> <dest>` for intentional page/file moves or renames, then inspect with `loc status` or `loc diff`.
+4. Do not edit Locality identity frontmatter, block IDs, `::loc{{...}}` directives, `_schema.yaml`, `AGENTS.md`, or `CLAUDE.md` unless explicitly asked.
+5. Unless the user asked you to sync back to Notion, leave edits pending for Locality review and tell the user what changed.
+6. Use `loc status` only when you need to inspect pending changes; regular clean files hydrate automatically on open.
+7. If desktop Live Mode is on, safe local edits may sync automatically. Do not run routine `loc pull` or `loc push` after every edit.
+8. If the user asks you to sync back to Notion, update Notion, publish, or apply the edit remotely, do not stop after local edits. Run `loc diff <file>` first, then `loc push <file> -y` for safe plans.
+9. If push says the remote changed since last sync, run `loc pull <file>`, resolve any inline conflict markers in the Markdown, rerun `loc diff <file>`, then push again.
 
 ## Creating Notion Content
 
@@ -1041,6 +1042,7 @@ mod tests {
         assert!(skill.contains("sync back to Notion"));
         assert!(skill.contains("If desktop Live Mode is on"));
         assert!(skill.contains("Do not run routine `loc pull` or `loc push`"));
+        assert!(skill.contains("loc mv <source> <dest>"));
         assert!(skill.contains("loc diff <file>"));
         assert!(skill.contains("Creating Notion Content"));
         assert!(skill.contains("loc create page --title"));

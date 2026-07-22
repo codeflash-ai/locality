@@ -32,6 +32,7 @@ The `loc` command is the single supported control surface for users and coding a
 - `loc daemon start|stop|status|reload|restart [--session|--launchd] [--localityd-bin <path>] [--state-dir <path>] [--tcp-addr <host:port|off>] [--include-env <KEY>] [--json]`
 - `loc doctor [--json]`
 - `loc diff [path] [--json]`
+- `loc mv <source> <dest> [--json]`
 - `loc restore <path> [--force] [--json]`
 - `loc reset --yes [--json]`
 - `loc undo [push-id] [--json]`
@@ -265,6 +266,36 @@ facts.
 dirty, conflicted, stale, or remotely deleted results are still returned for
 navigation, but future agent/MCP readers should treat their `safety.labels` as
 review or hydration requirements before reading file content.
+
+## Local Moves
+
+`loc mv <source> <dest> [--json]` stages an intentional move or rename inside a
+mounted Locality workspace. It never writes to the remote source. Review the
+result with `loc diff <dest>` and push only with an explicit later
+`loc push <dest> -y` or approved Live Mode review.
+
+Plain-files mounts use a guarded local filesystem rename. Virtual projections
+such as macOS File Provider, Linux FUSE, and Windows Cloud Files use the same
+virtual filesystem rename path as Finder/provider moves, so pending virtual
+moves show up in `loc status`, `loc diff`, and `loc push`.
+
+If `<dest>` is an existing directory, Locality appends the source filename:
+
+```bash
+loc mv "Product/Launch Plan" "Archive/"
+loc diff "Archive/Launch Plan"
+loc push "Archive/Launch Plan" -y
+```
+
+Validation happens before mutation. `loc mv` rejects missing sources, missing
+destination parents, mount-root moves, cross-mount moves, destination
+collisions, invalid filenames, read-only mounts, and unsupported virtual
+targets. Successful moves exit `0`; missing arguments exit `2`; validation
+failures exit `3`; read-only mounts exit `4`; unsupported connector boundaries
+exit `5`; I/O, store, or daemon protocol failures exit `1`.
+
+JSON output includes `source`, `destination`, `mount_id`, `connector`,
+`projection`, `mode`, `pushed: false`, and `next` review commands.
 
 ## Locate Notion Content
 

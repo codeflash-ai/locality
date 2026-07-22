@@ -143,6 +143,7 @@ Common commands:
 | `loc locate <query>` | Find a Notion page/database and print its local path. |
 | `loc status [path]` | Show local state, pending edits, conflicts, and known remote drift. |
 | `loc diff <path>` | Review the planned connector operations and readable Markdown diff. |
+| `loc mv <source> <dest>` | Move or rename mounted pages/files locally without pushing. |
 | `loc push <path> -y` | Apply a safe plan to the remote source and reconcile local state. |
 | `loc pull <path>` | Refresh a mount, folder, page directory, or `page.md`. |
 | `loc inspect <path>` | Fetch the current remote page and explain local-vs-remote drift. |
@@ -154,9 +155,10 @@ For agents, the preferred path is usually:
 
 1. Use `loc locate` or normal filesystem search to find the page.
 2. Edit mounted Markdown directly.
-3. Stop unless the user asked for review or push.
-4. Use `loc status` and `loc diff` for inspection.
-5. Use `loc push` only when explicitly requested or when recovering a known
+3. Use `loc mv` for intentional mounted page/file moves or renames.
+4. Stop unless the user asked for review or push.
+5. Use `loc status` and `loc diff` for inspection.
+6. Use `loc push` only when explicitly requested or when recovering a known
    pending local change.
 
 ## Sync Engine

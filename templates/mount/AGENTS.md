@@ -9,6 +9,7 @@ Working rules:
 - Use `loc info .` for mount context and `loc search <query-or-notion-url>` to locate pages.
 - Open files directly. Locality hydrates online-only files on open and refreshes clean files in the background.
 - Use `loc status <path>` for pending local changes and `loc diff <path>` for planned Notion operations before pushing.
+- Use `loc mv <source> <dest>` for intentional page/file moves or renames, then review with `loc diff <dest>`.
 - Push intentional changes with `loc push <path>`; use `loc push <path> -y` only after review or explicit approval.
 - Use `loc pull <path>` only to refresh clean files now. Use `loc push <path>` to make Notion match local edits.
 - If desktop Live Mode is on, safe edits may sync automatically. Do not run routine `loc pull` or `loc push` after every edit.
@@ -19,7 +20,7 @@ Working rules:
 Notion facts:
 - Pages are directories. Edit `page.md` for the page body; siblings are child Notion content.
 - Prefer `loc create page --title "New Page" --parent <parent-directory>` for new pages.
-- To create a child page, make a directory under the parent page and write its `page.md`. Example: `parent-page/new-page/page.md`.
+- Child page path: `parent-page/new-page/page.md`.
 - New page files must start with YAML frontmatter containing `title: "..."` and must not include an `loc:` identity block. Locality adds `loc.id` after the first push.
 - Existing `page.md` files have an `loc:` block. Preserve it; edit only the body, `title`, and supported property frontmatter.
 - Databases are directories. Create one with `loc create database --title "Tasks" --parent <page-dir>`, then edit its draft `_schema.yaml`.

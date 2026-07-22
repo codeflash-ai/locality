@@ -11,6 +11,7 @@ pub mod info;
 pub mod inspect;
 pub mod local_oauth;
 pub mod mount;
+pub mod mv;
 pub mod okf;
 pub mod pull;
 pub mod push;
