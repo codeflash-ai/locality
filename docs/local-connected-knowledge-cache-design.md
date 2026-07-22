@@ -871,6 +871,195 @@ Metrics:
 - sync conflicts;
 - push success rate.
 
+## Experiment Evidence
+
+This design direction is partly motivated by the Amika comparison experiment we
+ran against a Locality-mounted Notion workspace and a Notion MCP workflow.
+
+Run shape:
+
+- run id: `traced-20260721T213706Z`;
+- model: `gpt-5.6-luna` with low reasoning;
+- task: generate a launch-readiness style report from local git state plus
+  Notion launch context;
+- Locality path: locate target page, pull target page, locate context page,
+  recursively hydrate context directory, let the agent read local files, write a
+  mounted `page.md`, and inspect `loc diff`;
+- MCP path: let the agent use Notion MCP calls for Notion context and local shell
+  commands for git context;
+- Locality trace mode: direct CLI tracing was forced so pull and hydration spans
+  were visible.
+
+Topline from this single traced run:
+
+| Phase | Time |
+| --- | ---: |
+| Locality setup before agent | 141.2s |
+| Locality agent wall time | 49.4s |
+| Notion MCP agent wall time | 47.8s |
+| Full run through both strategies | 239.5s |
+
+Agent usage shape:
+
+| Strategy | Input Tokens | Cached Input | Output Tokens | Tool Shape |
+| --- | ---: | ---: | ---: | --- |
+| Locality | 196,033 | 152,832 | 4,020 | 12 shell commands, 0 MCP calls |
+| Notion MCP | 341,129 | 252,672 | 4,187 | 8 shell commands, 20 MCP calls |
+
+Important interpretation:
+
+- The Locality agent phase used fewer input tokens and no MCP calls, which
+  supports the agent-native file interface thesis.
+- The current Locality setup path was expensive. The agent got useful local
+  files, but the synchronous locate and hydration work before the agent started
+  dominated the Locality side of the run.
+- This is one profile, not a statistical benchmark. It is useful for finding
+  critical paths, not for claiming a universal win.
+
+### What Prehydration Showed
+
+Prehydration is valuable only when it is already done, cheap, or relevance
+guided.
+
+In this run, the Locality path spent `141.2s` preparing context before the agent
+started. That setup included URL locate, target pull, context locate, recursive
+context hydration, local search, and report target preparation. Once the files
+were available, the Locality agent could work through normal shell reads and
+file writes. The problem is that current prehydration is still too synchronous
+and too broad.
+
+This points to a product requirement:
+
+```text
+Locality should not make every agent workflow pay the full cost of locating,
+repairing, pulling, and recursively hydrating at task time.
+```
+
+The local connected knowledge cache should move useful work earlier and make
+task-time work bounded:
+
+- metadata should already be indexed;
+- known URLs should resolve through `loc locate --offline`;
+- body chunks for hot files should already be searchable;
+- stale or metadata-only candidates should be ranked before hydration;
+- context hydration should use top-k or neighbor expansion, not recursive folder
+  traversal by default.
+
+### Critical Path Findings
+
+The traced run showed these bottlenecks:
+
+| Area | Finding | Design Implication |
+| --- | --- | --- |
+| URL locate | Target locate took `44.4s`; context locate took `32.0s`. Final local search was only `1-2ms`; most time was remote parent/path preparation. | Split `loc locate --offline` from `loc resolve`. Offline locate must stay local and fast. Remote path repair should be explicit and measured. |
+| Target pull | Pulling the target page took `4.0s`, dominated by one `connector.fetch_render`. | Single-file hydration is acceptable as an explicit operation, but should avoid re-fetching if remote version is unchanged. |
+| Context hydration | Context pull took `60.7s`, hydrated `19` pages, and enumerated `18` child entries. | Directory hydration must be policy-driven. Context building should hydrate ranked items, not recursively hydrate a page tree by default. |
+| Fetch/render | Context fetch/render spans summed to `34.3s` across `19` calls. | Add skip-on-freshness checks and consider bounded concurrent remote reads once local commit/projection writes remain serial and deterministic. |
+| Child listing | Context `list_children` spans summed to `26.1s` across `19` calls. | Avoid listing children unless the context plan needs neighbors. Add deeper connector spans so slow list calls can be separated into pagination, block-child listing, page/database metadata fetch, and rate-limit waits. |
+| Agent phase | Locality agent wall time was similar to MCP agent wall time, but used fewer input tokens and no MCP calls. | The opportunity is not only faster agent execution. The bigger opportunity is fewer repeated tool calls, cheaper context, more local cache hits, and safer sync back. |
+
+### Critical Paths To Improve
+
+#### 1. Locate And Resolve Split
+
+Current exact URL locate can do remote parent/path preparation. The product path
+should split this:
+
+```bash
+loc locate --offline <url>
+loc resolve <url>
+loc pull <file>
+```
+
+This makes the common cached case instant and makes remote repair visible in
+traces, benchmarks, and UI.
+
+#### 2. Local Body Indexing
+
+Search should not stop at metadata. Hydrated shadows and safe visible content
+should produce chunks with snippets, headings, and freshness. This is the first
+step toward agents discovering useful context without URLs.
+
+#### 3. Relevance-Guided Context Hydration
+
+`loc context build` should use a hydration policy:
+
+```text
+none -> metadata and already-indexed body only
+top-k -> hydrate the highest ranked missing body candidates
+neighbors -> hydrate graph neighbors around confident matches
+bounded-recursive -> explicit depth and item cap
+```
+
+Recursive directory pull should remain a deliberate operation, not the default
+way to prepare agent context.
+
+#### 4. Freshness-Based Fetch Skips
+
+If Locality has a hydrated page and remote metadata says the body version has
+not changed, context build should not fetch/render that page again. The cache
+must make "already good enough" cheap.
+
+#### 5. Bounded Parallel Remote Reads
+
+Fetch/render and child listing are currently strong candidates for bounded
+parallelism, but only after the operation is split into:
+
+- parallel remote read/list phase;
+- serial deterministic local commit/projection phase.
+
+This preserves Locality's state and sync safety while reducing wall time.
+
+#### 6. Deeper Connector Spans
+
+The current trace tells us `list_children` is expensive, but not always why. Add
+spans for:
+
+- Notion block children pagination;
+- retrieve page metadata;
+- retrieve database metadata;
+- retrieve database rows;
+- render canonical Markdown;
+- rate-limit waits and retries;
+- local SQLite writes;
+- visible projection writes.
+
+This turns "Notion is slow" into actionable work items.
+
+#### 7. Cache Coverage UI
+
+Desktop should show whether a source is:
+
+- metadata indexed;
+- body indexed;
+- stale;
+- hydration queued;
+- failed;
+- disconnected.
+
+That gives users a reason to trust or refresh context before asking agents to
+work.
+
+### Experiment Follow-Up
+
+Before using this comparison in external material, run a repeatable benchmark:
+
+- `RUNS=5` minimum for each strategy;
+- same model and reasoning effort;
+- same output format;
+- same Notion target and context corpus;
+- separate timings for offline locate, resolve, target hydrate, context hydrate,
+  agent run, diff, and optional push;
+- record remote call counts, hydrated item counts, token usage, wall time,
+  freshness failures, and output quality review.
+
+The design target is clear even before repeated runs:
+
+```text
+Make the common path local, cache-backed, relevance-ranked, and explicit about
+remote work.
+```
+
 ## Moat
 
 The defensible product advantage is not just a connector list. Connectors are
