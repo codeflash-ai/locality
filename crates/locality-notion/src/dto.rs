@@ -86,7 +86,10 @@ mod portable_media_base64 {
 
 #[cfg(test)]
 mod portable_media_tests {
-    use super::NotionPortableCapturedMediaV1;
+    use super::{
+        NotionPageBundle, NotionPortableCapturedMediaV1, NotionPortableIncompleteMediaV1,
+        NotionPortablePageBundleV1, PageDto,
+    };
     use crate::media::PORTABLE_MEDIA_MAX_ASSET_BYTES;
 
     #[test]
@@ -131,6 +134,41 @@ mod portable_media_tests {
 
         let error = serde_json::to_vec(&asset).expect_err("oversized media encode");
         assert!(error.to_string().contains("decoded asset limit"));
+    }
+
+    #[test]
+    fn portable_media_native_json_is_byte_exact() {
+        let bundle = NotionPortablePageBundleV1 {
+            format_version: 1,
+            page: NotionPageBundle {
+                page: PageDto {
+                    id: "page-1".to_string(),
+                    parent: None,
+                    created_time: None,
+                    last_edited_time: Some("2026-07-22T01:00:00.000Z".to_string()),
+                    archived: false,
+                    in_trash: false,
+                    properties: Default::default(),
+                },
+                blocks: Vec::new(),
+            },
+            captured_media: vec![NotionPortableCapturedMediaV1 {
+                block_id: "block-1".to_string(),
+                kind: "image".to_string(),
+                media_type: "image/png".to_string(),
+                bytes: vec![1, 2, 3],
+            }],
+            incomplete_media: vec![NotionPortableIncompleteMediaV1 {
+                block_id: "page-property-file-1".to_string(),
+                kind: "file_property".to_string(),
+                code: "unsupported_page_property_media".to_string(),
+            }],
+        };
+
+        assert_eq!(
+            serde_json::to_vec(&bundle).expect("portable media native JSON"),
+            br#"{"format_version":1,"page":{"page":{"id":"page-1","parent":null,"created_time":null,"last_edited_time":"2026-07-22T01:00:00.000Z","archived":false,"in_trash":false,"properties":{}},"blocks":[]},"captured_media":[{"block_id":"block-1","kind":"image","media_type":"image/png","bytes":"AQID"}],"incomplete_media":[{"block_id":"page-property-file-1","kind":"file_property","code":"unsupported_page_property_media"}]}"#
+        );
     }
 }
 
