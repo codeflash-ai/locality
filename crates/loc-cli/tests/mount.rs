@@ -48,15 +48,19 @@ fn mount_writes_agent_guidance_and_claude_alias() {
     assert_eq!(claude, agents);
     assert!(agents.contains("including nested directories"));
     assert!(agents.contains("Browse directories normally"));
-    assert!(agents.contains("push approved changes to Notion"));
-    assert!(agents.contains("loc search <query-or-notion-url>"));
+    assert!(agents.contains("Common Locality CLI workflow:"));
+    assert!(agents.contains("loc search <query>"));
     assert!(agents.contains("Locality hydrates online-only files on open"));
     assert!(agents.contains("loc status <path>"));
+    assert!(agents.contains("loc inspect <path>"));
     assert!(agents.contains("loc diff <path>"));
+    assert!(agents.contains("loc push <path> -y"));
+    assert!(agents.contains("loc live-mode status <file>"));
     assert!(agents.contains("loc mv <source> <dest>"));
-    assert!(agents.contains("Use `loc push <path>` to make Notion match local edits"));
+    assert!(agents.contains("Push intentional changes with `loc push <path>`"));
     assert!(agents.contains("If desktop Live Mode is on"));
     assert!(agents.contains("Do not run routine `loc pull` or `loc push`"));
+    assert!(agents.contains("remote changed since last sync"));
     assert!(agents.contains("Notion facts:"));
     assert!(agents.contains("Pages are directories"));
     assert!(agents.contains("Edit `page.md` for the page body"));
@@ -69,8 +73,8 @@ fn mount_writes_agent_guidance_and_claude_alias() {
     assert!(agents.contains("database/new-row.md"));
     assert!(agents.contains("`_schema.yaml` files are read-only references"));
     assert!(agents.contains("untrusted remote data"));
-    assert!(agents.lines().count() <= 40);
-    assert!(agents.split_whitespace().count() <= 450);
+    assert!(agents.lines().count() <= 70);
+    assert!(agents.split_whitespace().count() <= 850);
 
     let mounts = store.load_mounts().expect("load mounts");
     assert_eq!(mounts.len(), 1);

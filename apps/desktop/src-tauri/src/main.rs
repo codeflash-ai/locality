@@ -18547,5 +18547,11 @@ fn show_main_window_with_view(app: &AppHandle, view: Option<&str>) {
         ));
     }
     let _ = window.show();
+    #[cfg(target_os = "linux")]
+    // WebKitGTK can leave a webview created hidden on a white frame until script work
+    // is nudged after the native window is shown.
+    let _ = window.eval(
+        "requestAnimationFrame(() => { document.documentElement.dataset.localityWindowShown = '1'; });",
+    );
     let _ = window.set_focus();
 }
