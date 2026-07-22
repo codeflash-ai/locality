@@ -23,8 +23,10 @@ The output parent page is:
 - `run-launch-readiness-benchmark.sh` - core benchmark runner.
 - `run-repeated.sh` - runs the benchmark multiple times.
 - `setup-codex-azure.sh` - writes Codex Azure config.
-- `prompts/locality-agent-prompt.md` - Locality-only agent prompt.
-- `prompts/notion-mcp-agent-prompt.md` - Notion-MCP-only agent prompt.
+- `prompts/Locality/*.md` - Locality-only scenario prompts.
+- `prompts/MCP/*.md` - Notion-MCP-only scenario prompts, paired by filename with `prompts/Locality/*.md`.
+- `prompts/locality-agent-prompt.md` - legacy Locality-only agent prompt used only when `prompts/Locality/` has no scenarios.
+- `prompts/notion-mcp-agent-prompt.md` - legacy Notion-MCP-only agent prompt used only when `prompts/Locality/` has no scenarios.
 - `scripts/timestamp-jsonl.py` - timestamps Codex JSON events.
 - `scripts/summarize-codex-events.py` - summarizes one Codex JSON trace.
 - `scripts/summarize-runs.py` - summarizes multiple run folders.
@@ -127,6 +129,22 @@ copies `AZURE_OPENAI_API_KEY` into sandbox-local secret storage when that
 environment variable is set locally; otherwise it uses the sandbox's existing
 Codex auth/config or `~/.config/locality-experiment/env`.
 
+## Add Scenarios
+
+The core runner discovers scenarios from `prompts/Locality/*.md`. To add a new
+benchmark scenario, add the same filename to both prompt directories:
+
+```text
+prompts/Locality/scenario2.md
+prompts/MCP/scenario2.md
+```
+
+When `--compare-mcp` is enabled, every Locality scenario must have a matching
+MCP prompt with the same basename. Each prompt should keep writing its report
+and trace to the standard paths under `OUT_DIR`, such as `OUT_DIR/report-body.md`
+for Locality and `OUT_DIR/notion-mcp-report-body.md` for MCP. The runner sets
+`OUT_DIR` separately for each scenario.
+
 ## Run Once
 
 ```bash
@@ -181,43 +199,44 @@ ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
 
 ## Artifacts
 
-Each run writes to:
+Each run writes shared setup artifacts to:
 
 `experiment/runs/<run-id>/`
 
 Important artifacts:
 
-- `metrics.tsv` - phase wall-clock metrics.
+- `metrics.tsv` - phase wall-clock metrics with a `scenario` column.
 - `summary.json` - machine-readable run summary.
-- `report-body.md` - Locality report.
-- `notion-mcp-report-body.md` - MCP report.
-- `locality-codex-events.jsonl` - timestamped Codex JSON events.
-- `notion-mcp-codex-events.jsonl` - timestamped Codex JSON events.
-- `locality-prompt.md` and `notion-mcp-prompt.md` - exact prompts used for the run.
-- `locality-codex-command.txt` and `notion-mcp-codex-command.txt` - exact `codex exec` command and timeout wrapper.
-- `locality-codex-summary.json` - event counts, usage, errors.
-- `notion-mcp-codex-summary.json` - event counts, usage, errors.
-- `locality-speedscope.json` and `notion-mcp-speedscope.json` - Speedscope-compatible flame graph files generated from the JSON events.
+- `scenarios.tsv` - scenario manifest with prompt paths, output directories, and mounted report pages.
+- `scenarios/<scenario>/report-body.md` - Locality report for that scenario.
+- `scenarios/<scenario>/notion-mcp-report-body.md` - MCP report for that scenario.
+- `scenarios/<scenario>/locality-codex-events.jsonl` - timestamped Locality Codex JSON events.
+- `scenarios/<scenario>/notion-mcp-codex-events.jsonl` - timestamped MCP Codex JSON events.
+- `scenarios/<scenario>/locality-prompt.md` and `scenarios/<scenario>/notion-mcp-prompt.md` - exact prompts used for the scenario.
+- `scenarios/<scenario>/locality-codex-command.txt` and `scenarios/<scenario>/notion-mcp-codex-command.txt` - exact `codex exec` commands and timeout wrappers.
+- `scenarios/<scenario>/locality-codex-summary.json` - event counts, usage, errors.
+- `scenarios/<scenario>/notion-mcp-codex-summary.json` - event counts, usage, errors.
+- `scenarios/<scenario>/locality-speedscope.json` and `scenarios/<scenario>/notion-mcp-speedscope.json` - Speedscope-compatible flame graph files generated from the JSON events.
 - `locality-traces/*.jsonl` - raw Locality command and pull/hydration spans.
 - `locality-traces/*-summary.json` - top Locality spans by duration.
 - `locality-traces/*-spans.tsv` - tabular Locality span data.
 - `locality-traces/*-speedscope.json` - Speedscope-compatible Locality spans.
-- `locality-agent-locality-trace.jsonl` and `notion-mcp-agent-locality-trace.jsonl` - Locality spans emitted by any `loc` commands the agents run.
-- `locality-transcript.md` and `notion-mcp-transcript.md` - readable Codex event transcripts generated from the JSON events.
-- `locality-agent-trace.md` - agent-reported trace.
-- `notion-mcp-agent-trace.md` - agent-reported trace.
-- `loc-diff.out` - Locality push plan.
+- `scenarios/<scenario>/locality-agent-locality-trace.jsonl` and `scenarios/<scenario>/notion-mcp-agent-locality-trace.jsonl` - Locality spans emitted by any `loc` commands the agents run.
+- `scenarios/<scenario>/locality-transcript.md` and `scenarios/<scenario>/notion-mcp-transcript.md` - readable Codex event transcripts generated from the JSON events.
+- `scenarios/<scenario>/locality-agent-trace.md` - agent-reported Locality trace.
+- `scenarios/<scenario>/notion-mcp-agent-trace.md` - agent-reported MCP trace.
+- `scenarios/<scenario>/loc-diff.out` - Locality push plan.
 
 Generate flame graph artifacts for a completed run with:
 
 ```bash
 python3 experiment/locality-mcp-comparison/scripts/codex-events-to-trace.py \
-  experiment/runs/<run-id>/locality-codex-events.jsonl \
-  experiment/runs/<run-id>/locality
+  experiment/runs/<run-id>/scenarios/<scenario>/locality-codex-events.jsonl \
+  experiment/runs/<run-id>/scenarios/<scenario>/locality
 
 python3 experiment/locality-mcp-comparison/scripts/codex-events-to-trace.py \
-  experiment/runs/<run-id>/notion-mcp-codex-events.jsonl \
-  experiment/runs/<run-id>/notion-mcp
+  experiment/runs/<run-id>/scenarios/<scenario>/notion-mcp-codex-events.jsonl \
+  experiment/runs/<run-id>/scenarios/<scenario>/notion-mcp
 ```
 
 The generated Speedscope files use observed gaps between consecutive Codex JSON events. This makes the chart useful even when Codex flushes `item.started` and `item.completed` at the same timestamp. Treat these charts as agent-session timing, not exact internal shell, MCP, or model runtime profiling.

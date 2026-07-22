@@ -9,14 +9,18 @@ Runs the Locality vs Notion MCP launch-readiness benchmark:
   1. collect git metadata for the selected window
   2. hydrate target and context through Locality
   3. inventory/search hydrated Locality context
-  4. run a Locality-backed Codex agent with timed JSON events
-  5. write mounted page.md and run loc diff
-  6. optionally run a Notion-MCP-only Codex agent with timed JSON events
-  7. write run summary artifacts
+  4. discover prompt scenarios from prompts/Locality/*.md
+  5. run each Locality-backed Codex scenario with timed JSON events
+  6. write each mounted page.md and run loc diff
+  7. optionally run each matching Notion-MCP-only Codex scenario
+  8. write run summary artifacts
 
 Important environment:
   REPO_DIR                 Repository path. Default: /home/amika/workspace/locality
   LOC_BIN                  loc binary. Default: $REPO_DIR/target/debug/loc
+  PROMPT_ROOT              Prompt root. Default: <script-dir>/prompts
+  LOCALITY_PROMPT_DIR      Locality prompt directory. Default: $PROMPT_ROOT/Locality
+  MCP_PROMPT_DIR           MCP prompt directory. Default: $PROMPT_ROOT/MCP
   TARGET_URL               Notion page URL for benchmark output parent.
   CONTEXT_URLS             Newline-delimited Notion URLs to hydrate as directories.
   CODEX_MODEL              Model passed to codex exec. Default: gpt-5.6-luna
@@ -62,14 +66,20 @@ CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-luna}"
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-low}"
 CODEX_EXEC_TIMEOUT_SECONDS="${CODEX_EXEC_TIMEOUT_SECONDS:-900}"
 LOCALITY_EXPERIMENT_TRACE_FORCE_DIRECT="${LOCALITY_EXPERIMENT_TRACE_FORCE_DIRECT:-0}"
+PROMPT_ROOT="${PROMPT_ROOT:-$SCRIPT_DIR/prompts}"
+LOCALITY_PROMPT_DIR="${LOCALITY_PROMPT_DIR:-$PROMPT_ROOT/Locality}"
+MCP_PROMPT_DIR="${MCP_PROMPT_DIR:-$PROMPT_ROOT/MCP}"
 METRICS_TSV="$OUT_DIR/metrics.tsv"
 SUMMARY_JSON="$OUT_DIR/summary.json"
 CONTEXT_PATHS_FILE="$OUT_DIR/locality-context-paths.txt"
 CONTEXT_INVENTORY="$OUT_DIR/locality-context-inventory.txt"
 CONTEXT_SEARCH_RESULTS="$OUT_DIR/locality-context-search.txt"
 TRACE_DIR="$OUT_DIR/locality-traces"
+SCENARIO_ROOT="$OUT_DIR/scenarios"
+SCENARIO_MANIFEST="$OUT_DIR/scenarios.tsv"
+CURRENT_SCENARIO="setup"
 
-mkdir -p "$OUT_DIR" "$TRACE_DIR"
+mkdir -p "$OUT_DIR" "$TRACE_DIR" "$SCENARIO_ROOT"
 export LOCALITY_TRACE_RUN_ID="$RUN_ID"
 
 now_ms() {
@@ -87,8 +97,8 @@ record_metric() {
   local status="$5"
   local detail="${6:-}"
   local duration_ms=$((end_ms - start_ms))
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$strategy" "$phase" "$start_ms" "$end_ms" "$duration_ms" "$status" "$detail" >> "$METRICS_TSV"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$CURRENT_SCENARIO" "$strategy" "$phase" "$start_ms" "$end_ms" "$duration_ms" "$status" "$detail" >> "$METRICS_TSV"
 }
 
 phase_start() {
@@ -122,7 +132,7 @@ run_loc_traced() {
 
 render_locality_traces() {
   local trace_file
-  for trace_file in "$TRACE_DIR"/*.jsonl "$OUT_DIR"/*-agent-locality-trace.jsonl; do
+  for trace_file in "$TRACE_DIR"/*.jsonl "$SCENARIO_ROOT"/*/*-agent-locality-trace.jsonl; do
     if [ ! -s "$trace_file" ]; then
       continue
     fi
@@ -199,13 +209,113 @@ run_codex_agent() {
   test -s "$report_file"
 }
 
-echo -e "strategy\tphase\tstart_ms\tend_ms\tduration_ms\tstatus\tdetail" > "$METRICS_TSV"
+discover_prompt_scenarios() {
+  SCENARIO_FILES=()
+  if [ -d "$LOCALITY_PROMPT_DIR" ]; then
+    local prompt_file
+    while IFS= read -r -d '' prompt_file; do
+      SCENARIO_FILES+=("$(basename "$prompt_file")")
+    done < <(find "$LOCALITY_PROMPT_DIR" -maxdepth 1 -type f -name '*.md' -print0 | sort -z)
+  fi
+
+  if [ "${#SCENARIO_FILES[@]}" -eq 0 ]; then
+    if [ -f "$PROMPT_ROOT/locality-agent-prompt.md" ]; then
+      SCENARIO_FILES=("default.md")
+      USE_LEGACY_PROMPTS=1
+    else
+      echo "no Locality prompt scenarios found in $LOCALITY_PROMPT_DIR" >&2
+      exit 2
+    fi
+  else
+    USE_LEGACY_PROMPTS=0
+  fi
+}
+
+locality_prompt_for() {
+  local scenario_file="$1"
+  if [ "$USE_LEGACY_PROMPTS" -eq 1 ]; then
+    printf '%s\n' "$PROMPT_ROOT/locality-agent-prompt.md"
+  else
+    printf '%s\n' "$LOCALITY_PROMPT_DIR/$scenario_file"
+  fi
+}
+
+mcp_prompt_for() {
+  local scenario_file="$1"
+  if [ "$USE_LEGACY_PROMPTS" -eq 1 ]; then
+    printf '%s\n' "$PROMPT_ROOT/notion-mcp-agent-prompt.md"
+  else
+    printf '%s\n' "$MCP_PROMPT_DIR/$scenario_file"
+  fi
+}
+
+validate_prompt_scenarios() {
+  local scenario_file
+  local missing=0
+  for scenario_file in "${SCENARIO_FILES[@]}"; do
+    if [ ! -s "$(locality_prompt_for "$scenario_file")" ]; then
+      echo "missing or empty Locality prompt for scenario: $scenario_file" >&2
+      missing=1
+    fi
+    if [ "$COMPARE_MCP" -eq 1 ] && [ ! -s "$(mcp_prompt_for "$scenario_file")" ]; then
+      echo "missing or empty MCP prompt for scenario: $scenario_file" >&2
+      missing=1
+    fi
+  done
+
+  if [ "$COMPARE_MCP" -eq 1 ] && [ "$USE_LEGACY_PROMPTS" -eq 0 ] && [ -d "$MCP_PROMPT_DIR" ]; then
+    local mcp_prompt
+    local mcp_scenario_file
+    for mcp_prompt in "$MCP_PROMPT_DIR"/*.md; do
+      if [ ! -e "$mcp_prompt" ]; then
+        continue
+      fi
+      mcp_scenario_file="$(basename "$mcp_prompt")"
+      if [ ! -f "$LOCALITY_PROMPT_DIR/$mcp_scenario_file" ]; then
+        echo "MCP prompt has no matching Locality prompt: $mcp_scenario_file" >&2
+        missing=1
+      fi
+    done
+  fi
+
+  if [ "$missing" -ne 0 ]; then
+    exit 2
+  fi
+}
+
+scenario_name_for_file() {
+  local scenario_file="$1"
+  printf '%s\n' "${scenario_file%.md}"
+}
+
+scenario_report_title() {
+  local scenario_name="$1"
+  if [ "${#SCENARIO_FILES[@]}" -eq 1 ]; then
+    printf '%s\n' "$REPORT_TITLE"
+  else
+    printf '%s - %s\n' "$REPORT_TITLE" "$scenario_name"
+  fi
+}
+
+prepare_scenario_inputs() {
+  local scenario_out_dir="$1"
+  cp "$OUT_DIR/git-data.json" "$scenario_out_dir/git-data.json"
+  cp "$CONTEXT_PATHS_FILE" "$scenario_out_dir/locality-context-paths.txt"
+  cp "$CONTEXT_INVENTORY" "$scenario_out_dir/locality-context-inventory.txt"
+  cp "$CONTEXT_SEARCH_RESULTS" "$scenario_out_dir/locality-context-search.txt"
+}
+
+discover_prompt_scenarios
+validate_prompt_scenarios
+
+echo -e "scenario\tstrategy\tphase\tstart_ms\tend_ms\tduration_ms\tstatus\tdetail" > "$METRICS_TSV"
+printf 'scenario\tlocality_prompt\tmcp_prompt\tout_dir\treport_title\treport_page_path\n' > "$SCENARIO_MANIFEST"
 
 phase_start
 test -d "$REPO_DIR"
 test -x "$LOC_BIN"
 git -C "$REPO_DIR" rev-parse --git-dir >/dev/null
-phase_end "locality" "validate_environment" "ok" "repo=$REPO_DIR; model=$CODEX_MODEL; effort=$CODEX_REASONING_EFFORT"
+phase_end "locality" "validate_environment" "ok" "repo=$REPO_DIR; model=$CODEX_MODEL; effort=$CODEX_REASONING_EFFORT; scenarios=${#SCENARIO_FILES[@]}; prompts=$LOCALITY_PROMPT_DIR"
 
 phase_start
 git -C "$REPO_DIR" fetch --quiet origin || true
@@ -340,16 +450,6 @@ phase_end "locality" "notion_context_search" "ok" "pages=$inventory_count; hits=
 
 phase_start
 PARENT_DIR="$(dirname "$PAGE_PATH")"
-REPORT_PAGE_PATH="$PARENT_DIR/$REPORT_TITLE/page.md"
-if [ ! -f "$REPORT_PAGE_PATH" ]; then
-  "$LOC_BIN" create page --title "$REPORT_TITLE" --parent "$PARENT_DIR" --json > "$OUT_DIR/loc-create-page.json"
-  REPORT_PAGE_PATH="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["path"])' "$OUT_DIR/loc-create-page.json")"
-fi
-phase_end "locality" "prepare_report_target" "ok" "path=$REPORT_PAGE_PATH"
-
-phase_start
-export REPO_DIR LOC_BIN TARGET_URL PAGE_PATH REPORT_PAGE_PATH OUT_DIR METRICS_TSV SUMMARY_JSON
-export CONTEXT_PATHS_FILE CONTEXT_INVENTORY CONTEXT_SEARCH_RESULTS CONTEXT_SEARCH_QUERY
 locality_add_dirs=()
 while IFS= read -r context_path; do
   if [ -n "$context_path" ]; then
@@ -357,20 +457,63 @@ while IFS= read -r context_path; do
   fi
 done < "$CONTEXT_PATHS_FILE"
 locality_add_dirs+=("$(dirname "$PAGE_PATH")")
-set +e
-run_codex_agent "locality" "$SCRIPT_DIR/prompts/locality-agent-prompt.md" "$OUT_DIR/report-body.md" "$OUT_DIR/locality-agent-final.md" "${locality_add_dirs[@]}"
-agent_rc=$?
-set -e
-if [ "$agent_rc" -eq 0 ] && [ -s "$OUT_DIR/report-body.md" ]; then
-  phase_end "locality" "codex_exec_wall_time" "ok" "report=$OUT_DIR/report-body.md"
-else
-  phase_end "locality" "codex_exec_wall_time" "failed" "exit=$agent_rc"
-  cat "$OUT_DIR/locality-codex.err" >&2 || true
-  exit "$agent_rc"
-fi
+phase_end "locality" "prepare_context_add_dirs" "ok" "dirs=${#locality_add_dirs[@]}"
 
-phase_start
-python3 - "$REPORT_PAGE_PATH" "$OUT_DIR/report-body.md" "$REPORT_TITLE" <<'PY'
+for scenario_file in "${SCENARIO_FILES[@]}"; do
+  SCENARIO_NAME="$(scenario_name_for_file "$scenario_file")"
+  CURRENT_SCENARIO="$SCENARIO_NAME"
+  SCENARIO_OUT_DIR="$SCENARIO_ROOT/$SCENARIO_NAME"
+  mkdir -p "$SCENARIO_OUT_DIR"
+  LOCALITY_PROMPT_FILE="$(locality_prompt_for "$scenario_file")"
+  MCP_PROMPT_FILE="$(mcp_prompt_for "$scenario_file")"
+  SCENARIO_REPORT_TITLE="$(scenario_report_title "$SCENARIO_NAME")"
+
+  phase_start
+  REPORT_PAGE_PATH="$PARENT_DIR/$SCENARIO_REPORT_TITLE/page.md"
+  if [ ! -f "$REPORT_PAGE_PATH" ]; then
+    "$LOC_BIN" create page --title "$SCENARIO_REPORT_TITLE" --parent "$PARENT_DIR" --json > "$SCENARIO_OUT_DIR/loc-create-page.json"
+    REPORT_PAGE_PATH="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["path"])' "$SCENARIO_OUT_DIR/loc-create-page.json")"
+  fi
+  phase_end "locality" "prepare_report_target" "ok" "path=$REPORT_PAGE_PATH"
+
+  prepare_scenario_inputs "$SCENARIO_OUT_DIR"
+  SCENARIO_CONTEXT_PATHS_FILE="$SCENARIO_OUT_DIR/locality-context-paths.txt"
+  SCENARIO_CONTEXT_INVENTORY="$SCENARIO_OUT_DIR/locality-context-inventory.txt"
+  SCENARIO_CONTEXT_SEARCH_RESULTS="$SCENARIO_OUT_DIR/locality-context-search.txt"
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$SCENARIO_NAME" "$LOCALITY_PROMPT_FILE" "$MCP_PROMPT_FILE" "$SCENARIO_OUT_DIR" "$SCENARIO_REPORT_TITLE" "$REPORT_PAGE_PATH" >> "$SCENARIO_MANIFEST"
+
+  phase_start
+  RUN_OUT_DIR="$OUT_DIR"
+  RUN_CONTEXT_PATHS_FILE="$CONTEXT_PATHS_FILE"
+  RUN_CONTEXT_INVENTORY="$CONTEXT_INVENTORY"
+  RUN_CONTEXT_SEARCH_RESULTS="$CONTEXT_SEARCH_RESULTS"
+  OUT_DIR="$SCENARIO_OUT_DIR"
+  CONTEXT_PATHS_FILE="$SCENARIO_CONTEXT_PATHS_FILE"
+  CONTEXT_INVENTORY="$SCENARIO_CONTEXT_INVENTORY"
+  CONTEXT_SEARCH_RESULTS="$SCENARIO_CONTEXT_SEARCH_RESULTS"
+  export REPO_DIR LOC_BIN TARGET_URL PAGE_PATH REPORT_PAGE_PATH OUT_DIR METRICS_TSV SUMMARY_JSON
+  export CONTEXT_PATHS_FILE CONTEXT_INVENTORY CONTEXT_SEARCH_RESULTS CONTEXT_SEARCH_QUERY
+  set +e
+  run_codex_agent "locality" "$LOCALITY_PROMPT_FILE" "$OUT_DIR/report-body.md" "$OUT_DIR/locality-agent-final.md" "${locality_add_dirs[@]}"
+  agent_rc=$?
+  set -e
+  if [ "$agent_rc" -eq 0 ] && [ -s "$OUT_DIR/report-body.md" ]; then
+    phase_end "locality" "codex_exec_wall_time" "ok" "report=$OUT_DIR/report-body.md"
+  else
+    phase_end "locality" "codex_exec_wall_time" "failed" "exit=$agent_rc"
+    cat "$OUT_DIR/locality-codex.err" >&2 || true
+    OUT_DIR="$RUN_OUT_DIR"
+    CONTEXT_PATHS_FILE="$RUN_CONTEXT_PATHS_FILE"
+    CONTEXT_INVENTORY="$RUN_CONTEXT_INVENTORY"
+    CONTEXT_SEARCH_RESULTS="$RUN_CONTEXT_SEARCH_RESULTS"
+    export OUT_DIR CONTEXT_PATHS_FILE CONTEXT_INVENTORY CONTEXT_SEARCH_RESULTS
+    exit "$agent_rc"
+  fi
+
+  phase_start
+  python3 - "$REPORT_PAGE_PATH" "$OUT_DIR/report-body.md" "$SCENARIO_REPORT_TITLE" <<'PY'
 import sys
 from pathlib import Path
 
@@ -385,70 +528,98 @@ if current.startswith("---\n"):
         frontmatter = current[: end + len("\n---\n")]
 page.write_text(frontmatter.rstrip() + "\n\n" + body)
 PY
-phase_end "locality" "write_mounted_page" "ok" "path=$REPORT_PAGE_PATH"
+  phase_end "locality" "write_mounted_page" "ok" "path=$REPORT_PAGE_PATH"
 
-phase_start
-"$LOC_BIN" diff "$REPORT_PAGE_PATH" > "$OUT_DIR/loc-diff.out"
-DIFF_SUMMARY="$(sed -n '1p' "$OUT_DIR/loc-diff.out")"
-phase_end "locality" "loc_diff" "ok" "$DIFF_SUMMARY"
+  phase_start
+  "$LOC_BIN" diff "$REPORT_PAGE_PATH" > "$OUT_DIR/loc-diff.out"
+  DIFF_SUMMARY="$(sed -n '1p' "$OUT_DIR/loc-diff.out")"
+  phase_end "locality" "loc_diff" "ok" "$DIFF_SUMMARY"
 
-if [ "$PUSH" -eq 1 ]; then
-  phase_start
-  "$LOC_BIN" push "$REPORT_PAGE_PATH" -y > "$OUT_DIR/loc-push.out"
-  PUSH_SUMMARY="$(tr '\n' ' ' < "$OUT_DIR/loc-push.out" | sed 's/[[:space:]]*$//')"
-  phase_end "locality" "loc_push" "ok" "$PUSH_SUMMARY"
-else
-  phase_start
-  phase_end "locality" "loc_push" "skipped" "dry-run; pass --push to publish"
-fi
-
-if [ "$COMPARE_MCP" -eq 1 ]; then
-  phase_start
-  set +e
-  run_codex_agent "notion-mcp" "$SCRIPT_DIR/prompts/notion-mcp-agent-prompt.md" "$OUT_DIR/notion-mcp-report-body.md" "$OUT_DIR/notion-mcp-agent-final.md"
-  mcp_rc=$?
-  set -e
-  if [ "$mcp_rc" -eq 0 ] && [ -s "$OUT_DIR/notion-mcp-report-body.md" ]; then
-    phase_end "notion_mcp" "codex_exec_wall_time" "ok" "report=$OUT_DIR/notion-mcp-report-body.md"
+  if [ "$PUSH" -eq 1 ]; then
+    phase_start
+    "$LOC_BIN" push "$REPORT_PAGE_PATH" -y > "$OUT_DIR/loc-push.out"
+    PUSH_SUMMARY="$(tr '\n' ' ' < "$OUT_DIR/loc-push.out" | sed 's/[[:space:]]*$//')"
+    phase_end "locality" "loc_push" "ok" "$PUSH_SUMMARY"
   else
-    phase_end "notion_mcp" "codex_exec_wall_time" "failed" "exit=$mcp_rc"
+    phase_start
+    phase_end "locality" "loc_push" "skipped" "dry-run; pass --push to publish"
   fi
-fi
+
+  if [ "$COMPARE_MCP" -eq 1 ]; then
+    phase_start
+    set +e
+    run_codex_agent "notion-mcp" "$MCP_PROMPT_FILE" "$OUT_DIR/notion-mcp-report-body.md" "$OUT_DIR/notion-mcp-agent-final.md"
+    mcp_rc=$?
+    set -e
+    if [ "$mcp_rc" -eq 0 ] && [ -s "$OUT_DIR/notion-mcp-report-body.md" ]; then
+      phase_end "notion_mcp" "codex_exec_wall_time" "ok" "report=$OUT_DIR/notion-mcp-report-body.md"
+    else
+      phase_end "notion_mcp" "codex_exec_wall_time" "failed" "exit=$mcp_rc"
+    fi
+  fi
+
+  OUT_DIR="$RUN_OUT_DIR"
+  CONTEXT_PATHS_FILE="$RUN_CONTEXT_PATHS_FILE"
+  CONTEXT_INVENTORY="$RUN_CONTEXT_INVENTORY"
+  CONTEXT_SEARCH_RESULTS="$RUN_CONTEXT_SEARCH_RESULTS"
+  export OUT_DIR CONTEXT_PATHS_FILE CONTEXT_INVENTORY CONTEXT_SEARCH_RESULTS
+done
+
+CURRENT_SCENARIO="setup"
 
 render_locality_traces
 
-python3 - "$METRICS_TSV" "$SUMMARY_JSON" "$REPORT_PAGE_PATH" "$OUT_DIR" "$PUSH" "$CODEX_MODEL" "$CODEX_REASONING_EFFORT" <<'PY'
+python3 - "$METRICS_TSV" "$SUMMARY_JSON" "$SCENARIO_MANIFEST" "$OUT_DIR" "$PUSH" "$CODEX_MODEL" "$CODEX_REASONING_EFFORT" <<'PY'
 import csv
 import json
 import sys
 from pathlib import Path
 
-metrics_path, summary_path, page_path, out_dir, push, model, effort = sys.argv[1:8]
+metrics_path, summary_path, manifest_path, out_dir, push, model, effort = sys.argv[1:8]
 with open(metrics_path) as f:
     metrics = list(csv.DictReader(f, delimiter="\t"))
 
 out = Path(out_dir)
-agent_summaries = {}
-for name in ("locality", "notion-mcp"):
-    p = out / f"{name}-codex-summary.json"
-    if p.exists():
-        agent_summaries[name] = json.loads(p.read_text())
+with open(manifest_path) as f:
+    scenarios = list(csv.DictReader(f, delimiter="\t"))
+
+scenario_summaries = {}
+for scenario in scenarios:
+    scenario_out = Path(scenario["out_dir"])
+    agent_summaries = {}
+    for name in ("locality", "notion-mcp"):
+        p = scenario_out / f"{name}-codex-summary.json"
+        if p.exists():
+            agent_summaries[name] = json.loads(p.read_text())
+    scenario_summaries[scenario["scenario"]] = {
+        "out_dir": str(scenario_out),
+        "report_title": scenario["report_title"],
+        "page_path": scenario["report_page_path"],
+        "locality_prompt": scenario["locality_prompt"],
+        "mcp_prompt": scenario["mcp_prompt"],
+        "agent_event_summaries": agent_summaries,
+    }
 
 locality_trace_summaries = {}
 for p in sorted((out / "locality-traces").glob("*-summary.json")):
     locality_trace_summaries[str(p.relative_to(out))] = json.loads(p.read_text())
-for p in sorted(out.glob("*-agent-locality-trace-summary.json")):
+for p in sorted((out / "scenarios").glob("*/*-agent-locality-trace-summary.json")):
     locality_trace_summaries[str(p.relative_to(out))] = json.loads(p.read_text())
 
+first_scenario = scenarios[0] if scenarios else {}
+first_scenario_summary = scenario_summaries.get(first_scenario.get("scenario", ""), {})
 summary = {
     "ok": True,
     "model": model,
     "reasoning_effort": effort,
-    "page_path": page_path,
+    "scenario_count": len(scenarios),
+    "page_path": first_scenario_summary.get("page_path"),
+    "page_paths": {name: data["page_path"] for name, data in scenario_summaries.items()},
     "out_dir": out_dir,
     "pushed": push == "1",
     "metrics": [
         {
+            "scenario": row.get("scenario", ""),
             "strategy": row["strategy"],
             "phase": row["phase"],
             "duration_ms": int(row["duration_ms"]),
@@ -457,7 +628,8 @@ summary = {
         }
         for row in metrics
     ],
-    "agent_event_summaries": agent_summaries,
+    "agent_event_summaries": first_scenario_summary.get("agent_event_summaries", {}),
+    "scenarios": scenario_summaries,
     "locality_trace_summaries": locality_trace_summaries,
 }
 Path(summary_path).write_text(json.dumps(summary, indent=2) + "\n")
