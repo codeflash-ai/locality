@@ -23,8 +23,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::client::NotionApi;
-use crate::dto::{BlockTreeDto, NotionPageBundle};
-use crate::fetch::fetch_page_bundle;
+use crate::database::{
+    database_bundle_provider_version, fetch_database_bundle, render_database_bundle_schema,
+};
+use crate::dto::{BlockTreeDto, NotionDatabaseBundle, NotionPageBundle};
+use crate::fetch::fetch_known_page_bundle;
 use crate::projection::enumerate_explicit_root_trees;
 use crate::render::render_native_entity;
 
@@ -176,10 +179,40 @@ pub(crate) fn fetch(
     api: &dyn NotionApi,
     request: PortableFetchRequest,
 ) -> LocalityResult<PortableFetchResult> {
-    let bundle = fetch_page_bundle(api, request.remote_id.as_str())?;
+    match api.retrieve_page(request.remote_id.as_str()) {
+        Ok(page) => {
+            let bundle = fetch_known_page_bundle(api, request.remote_id.as_str(), page)?;
+            fetch_page_result(bundle, &request.remote_id)
+        }
+        Err(LocalityError::RemoteNotFound(_)) => {
+            let bundle = fetch_database_bundle(api, request.remote_id.as_str())?;
+            let provider_version = Some(database_bundle_provider_version(&bundle)?);
+            let remote_id = RemoteId::new(bundle.database.id.clone());
+            let raw = serde_json::to_vec(&bundle).map_err(|error| {
+                LocalityError::Io(format!("notion database native encode failed: {error}"))
+            })?;
+
+            Ok(PortableFetchResult {
+                native: NativeEntity {
+                    remote_id,
+                    kind: "notion_database".to_string(),
+                    raw,
+                },
+                provider_version,
+                completeness: PortableCompleteness::complete(),
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn fetch_page_result(
+    bundle: NotionPageBundle,
+    requested_remote_id: &RemoteId,
+) -> LocalityResult<PortableFetchResult> {
     let provider_version = bundle.page.last_edited_time.clone();
     let remote_id = RemoteId::new(bundle.page.id.clone());
-    if !notion_ids_equal(remote_id.as_str(), request.remote_id.as_str()) {
+    if !notion_ids_equal(remote_id.as_str(), requested_remote_id.as_str()) {
         return Err(LocalityError::InvalidState(
             "Notion portable fetch returned a different remote object".to_string(),
         ));
@@ -204,8 +237,23 @@ pub(crate) fn render(request: &PortableRenderRequest) -> LocalityResult<Portable
             "Notion portable render format version",
         ));
     }
+    match request.native.kind.as_str() {
+        "notion_page" => render_page(request),
+        "notion_database" => render_database(request),
+        kind => Err(LocalityError::InvalidState(format!(
+            "Notion portable render received unsupported native kind `{kind}`"
+        ))),
+    }
+}
+
+fn render_page(request: &PortableRenderRequest) -> LocalityResult<PortableRenderResult> {
     let native_bundle = serde_json::from_slice::<NotionPageBundle>(&request.native.raw)
         .map_err(|error| LocalityError::Io(format!("notion native decode failed: {error}")))?;
+    if !notion_ids_equal(&native_bundle.page.id, request.native.remote_id.as_str()) {
+        return Err(LocalityError::InvalidState(
+            "Notion portable page native payload does not match its remote ID".to_string(),
+        ));
+    }
     let contains_media = native_bundle.blocks.iter().any(contains_media_block);
     let rendered = render_native_entity(&request.native)?;
     let canonical_bytes = render_canonical_markdown(&rendered.document).into_bytes();
@@ -251,6 +299,124 @@ pub(crate) fn render(request: &PortableRenderRequest) -> LocalityResult<Portable
         projections: vec![projection],
         completeness,
     })
+}
+
+fn render_database(request: &PortableRenderRequest) -> LocalityResult<PortableRenderResult> {
+    let bundle =
+        serde_json::from_slice::<NotionDatabaseBundle>(&request.native.raw).map_err(|error| {
+            LocalityError::Io(format!("notion database native decode failed: {error}"))
+        })?;
+    validate_database_bundle(&bundle, &request.native.remote_id)?;
+    let body = render_database_bundle_schema(&bundle).into_bytes();
+    let canonical = PortableContentArtifact {
+        artifact_key: database_artifact_key(
+            &request.native.remote_id,
+            "canonical_schema",
+            request.format_version,
+        )?,
+        media_type: "application/yaml; charset=utf-8".to_string(),
+        body: body.clone(),
+    };
+    let projection = PortableProjectionArtifact {
+        artifact: PortableContentArtifact {
+            artifact_key: database_artifact_key(
+                &request.native.remote_id,
+                "database_schema",
+                request.format_version,
+            )?,
+            media_type: "application/yaml; charset=utf-8".to_string(),
+            body,
+        },
+        logical_path: request.logical_path.clone(),
+        file_kind: ProjectionFileKind::Yaml,
+        format_version: request.format_version,
+        supported_actions: [SourceAction::Read, SourceAction::Search]
+            .into_iter()
+            .collect(),
+    };
+
+    Ok(PortableRenderResult {
+        canonical,
+        projections: vec![projection],
+        completeness: PortableCompleteness::complete(),
+    })
+}
+
+fn validate_database_bundle(
+    bundle: &NotionDatabaseBundle,
+    remote_id: &RemoteId,
+) -> LocalityResult<()> {
+    let database_id = canonical_notion_uuid(&bundle.database.id).ok_or_else(|| {
+        LocalityError::InvalidState(format!(
+            "Notion portable database payload contains non-canonical database ID `{}`",
+            bundle.database.id
+        ))
+    })?;
+    let native_remote_id = canonical_notion_uuid(remote_id.as_str()).ok_or_else(|| {
+        LocalityError::InvalidState(format!(
+            "Notion portable database native entity contains non-canonical remote ID `{}`",
+            remote_id.as_str()
+        ))
+    })?;
+    if database_id != native_remote_id {
+        return Err(LocalityError::InvalidState(
+            "Notion portable database native payload does not match its remote ID".to_string(),
+        ));
+    }
+
+    let mut declared_data_source_ids = Vec::new();
+    for summary in &bundle.database.data_sources {
+        let data_source_id = canonical_notion_uuid(&summary.id).ok_or_else(|| {
+            LocalityError::InvalidState(format!(
+                "Notion portable database payload contains non-canonical data source ID `{}`",
+                summary.id
+            ))
+        })?;
+        if !declared_data_source_ids.contains(&data_source_id) {
+            declared_data_source_ids.push(data_source_id);
+        }
+    }
+
+    let mut fetched_data_source_ids = Vec::with_capacity(bundle.data_sources.len());
+    for data_source in &bundle.data_sources {
+        let data_source_id = canonical_notion_uuid(&data_source.id).ok_or_else(|| {
+            LocalityError::InvalidState(format!(
+                "Notion portable database payload contains non-canonical data source ID `{}`",
+                data_source.id
+            ))
+        })?;
+        if fetched_data_source_ids.contains(&data_source_id) {
+            return Err(LocalityError::InvalidState(format!(
+                "Notion portable database payload contains duplicate data source `{}`",
+                data_source.id
+            )));
+        }
+        let parent_database_id = data_source
+            .parent
+            .as_ref()
+            .and_then(|parent| parent.database_id.as_deref())
+            .and_then(canonical_notion_uuid)
+            .ok_or_else(|| {
+                LocalityError::InvalidState(format!(
+                    "Notion portable data source `{}` does not expose a canonical parent database",
+                    data_source.id
+                ))
+            })?;
+        if parent_database_id != database_id {
+            return Err(LocalityError::InvalidState(format!(
+                "Notion portable data source `{}` belongs to a different database",
+                data_source.id
+            )));
+        }
+        fetched_data_source_ids.push(data_source_id);
+    }
+
+    if declared_data_source_ids != fetched_data_source_ids {
+        return Err(LocalityError::InvalidState(
+            "Notion portable database payload data sources do not match its summaries".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn contains_media_block(tree: &BlockTreeDto) -> bool {
@@ -348,12 +514,17 @@ fn inventory(
                 })
                 .collect::<LocalityResult<Vec<_>>>()?
                 .join("/");
+            let logical_path = if entry.kind == EntityKind::Database {
+                format!("{logical_path}/_schema.yaml")
+            } else {
+                logical_path
+            };
             let logical_path = LogicalPath::new(logical_path).map_err(|error| {
                 LocalityError::InvalidState(format!(
                     "Notion portable projection produced an invalid logical path: {error}"
                 ))
             })?;
-            let requires_fetch = entry.kind == EntityKind::Page;
+            let requires_fetch = matches!(entry.kind, EntityKind::Page | EntityKind::Database);
             let mut connector_metadata = BTreeMap::new();
             connector_metadata.insert("title".to_string(), entry.title);
             Ok(PortableSourceChange {
@@ -483,6 +654,22 @@ fn artifact_key(remote_id: &RemoteId, role: &str, format_version: u32) -> Portab
         "notion:page:{}:{role}:v{format_version}",
         normalize_notion_id(remote_id.as_str())
     ))
+}
+
+fn database_artifact_key(
+    remote_id: &RemoteId,
+    role: &str,
+    format_version: u32,
+) -> LocalityResult<PortableArtifactKey> {
+    let canonical_id = canonical_notion_uuid(remote_id.as_str()).ok_or_else(|| {
+        LocalityError::InvalidState(format!(
+            "Notion database artifact key requires a canonical remote ID, got `{}`",
+            remote_id.as_str()
+        ))
+    })?;
+    Ok(PortableArtifactKey::new(format!(
+        "notion:database:{canonical_id}:{role}:v{format_version}"
+    )))
 }
 
 fn inventory_sha256(inventory: &[PortableSourceChange], include_root_provenance: bool) -> String {
@@ -640,6 +827,22 @@ fn normalize_notion_id(value: &str) -> String {
         .filter(|character| *character != '-')
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+fn canonical_notion_uuid(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let valid = match bytes.len() {
+        32 => bytes.iter().all(u8::is_ascii_hexdigit),
+        36 => bytes.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        }),
+        _ => false,
+    };
+    valid.then(|| normalize_notion_id(value))
 }
 
 fn notion_ids_equal(left: &str, right: &str) -> bool {
