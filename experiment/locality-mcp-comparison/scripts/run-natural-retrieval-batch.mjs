@@ -174,6 +174,10 @@ function main() {
   }
 
   writeBatchSummary(batchDir, pairSummaries);
+  runIfExists("node", [
+    join(EXPERIMENT_DIR, "scripts/summarize-natural-batch.mjs"),
+    batchDir,
+  ]);
   console.log(`Natural retrieval batch written to ${batchDir}`);
 }
 

@@ -191,6 +191,13 @@ Optional files-only ablation for the daily-engineering scenario:
 NATURAL_INCLUDE_FILES_ONLY=1 ./experiment/locality-mcp-comparison/run-natural-retrieval-batch.sh
 ```
 
+Natural retrieval batches also write:
+
+- `batch-summary.md` - raw per-run status, wall time, token, and MCP-call rows.
+- `normalized-summary.md` - mean, median, min, max, and pairwise MCP-over-Locality ratios.
+- `normalized-summary.json` - machine-readable normalized stats for notebooks or dashboards.
+- `profile-locality-vs-mcp/summary.md` under each matched pair - per-pair tool grouping and viewer file links.
+
 ## Artifacts
 
 Each run writes to:
