@@ -2292,6 +2292,14 @@ POST /v1/changesets/{id}/cancel
 POST /v1/search                            # current policy, bounded results
 ```
 
+`POST /v1/sessions` uses an `Idempotency-Key` derived once from the opaque
+bootstrap token and reused only for bounded ambiguous-response retries. An
+exact replay during the short recovery window returns the original session,
+capability, and expiry; it cannot create a second session or extend authority.
+The backend derives the recoverable capability with a domain-separated keyed
+hash and PostgreSQL stores only token, idempotency-key, and capability hashes,
+never the plaintext values or an encrypted response blob.
+
 An SSE/revision-delta endpoint is a later desktop/long-session extension, not a
 sandbox v1 endpoint. Human-review and advisory-claim endpoints are later
 extensions to the changeset/session state machines, not v1 placeholders.

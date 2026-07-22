@@ -11,6 +11,7 @@ use locality_connector::{
     PortableCompleteness, PortableContentArtifact, PortableEnumerateRequest,
     PortableEnumerateResult, PortableFetchReason, PortableFetchRequest, PortableProjectionArtifact,
     PortableRenderRequest, PortableSourceChange, PortableSyncRequest,
+    portable_scope_root_remote_id,
 };
 use locality_core::model::RemoteId;
 use locality_core::portable::{
@@ -265,6 +266,7 @@ fn validate_changes(
     changes: &[PortableSourceChange],
 ) -> LocalityResult<()> {
     let mut remote_ids = BTreeSet::new();
+    let mut provenance_mode = None;
     for change in changes {
         if &change.source_object.source_connection_id != source_connection_id {
             return Err(LocalityError::InvalidState(
@@ -277,6 +279,14 @@ fn validate_changes(
                 change.source_object.remote_id.as_str()
             )));
         }
+        let has_root_provenance = portable_scope_root_remote_id(&change.source_object)?.is_some();
+        if provenance_mode.is_some_and(|expected| expected != has_root_provenance) {
+            return Err(LocalityError::InvalidState(
+                "portable connector returned a batch with ambiguous owning-root provenance"
+                    .to_string(),
+            ));
+        }
+        provenance_mode.get_or_insert(has_root_provenance);
     }
     Ok(())
 }

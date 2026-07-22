@@ -208,6 +208,29 @@ impl PortableCompleteness {
     }
 }
 
+/// Reserved [`SourceObject::edges`] relationship for the canonical explicit
+/// scope root that owns a portable source object.
+pub const PORTABLE_SCOPE_ROOT_RELATIONSHIP: &str = "locality_scope_root";
+
+/// Decode the optional owning-root edge, rejecting ambiguous source objects.
+pub fn portable_scope_root_remote_id(
+    source_object: &SourceObject,
+) -> LocalityResult<Option<&RemoteId>> {
+    let mut roots = source_object
+        .edges
+        .iter()
+        .filter(|edge| edge.relationship == PORTABLE_SCOPE_ROOT_RELATIONSHIP)
+        .map(|edge| &edge.target_remote_id);
+    let root = roots.next();
+    if roots.next().is_some() {
+        return Err(locality_core::LocalityError::InvalidState(format!(
+            "portable source `{}` returned multiple owning-root edges",
+            source_object.remote_id.as_str()
+        )));
+    }
+    Ok(root)
+}
+
 /// One provider object discovered by bootstrap or synchronization.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortableSourceChange {

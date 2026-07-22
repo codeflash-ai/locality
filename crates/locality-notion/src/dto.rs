@@ -13,6 +13,176 @@ pub struct NotionPageBundle {
     pub blocks: Vec<BlockTreeDto>,
 }
 
+/// Versioned native page payload used only by opt-in portable hosted-media capture.
+///
+/// `page` contains a sanitized Notion bundle: hosted URLs have no query or
+/// fragment, expiries are removed, and uncaptured media URLs are empty. Captured
+/// bytes are keyed by stable block identity rather than by signed provider URL.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotionPortablePageBundleV1 {
+    pub format_version: u16,
+    pub page: NotionPageBundle,
+    pub captured_media: Vec<NotionPortableCapturedMediaV1>,
+    pub incomplete_media: Vec<NotionPortableIncompleteMediaV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotionPortableCapturedMediaV1 {
+    pub block_id: String,
+    pub kind: String,
+    pub media_type: String,
+    #[serde(with = "portable_media_base64")]
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotionPortableIncompleteMediaV1 {
+    pub block_id: String,
+    pub kind: String,
+    pub code: String,
+}
+
+mod portable_media_base64 {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use crate::media::PORTABLE_MEDIA_MAX_ASSET_BYTES;
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if bytes.len() > PORTABLE_MEDIA_MAX_ASSET_BYTES {
+            return Err(serde::ser::Error::custom(
+                "portable media bytes exceed the decoded asset limit",
+            ));
+        }
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        let maximum_encoded_len = PORTABLE_MEDIA_MAX_ASSET_BYTES.div_ceil(3) * 4;
+        if encoded.len() > maximum_encoded_len {
+            return Err(serde::de::Error::custom(
+                "portable media base64 exceeds the encoded asset limit",
+            ));
+        }
+        let bytes = STANDARD.decode(&encoded).map_err(|_| {
+            serde::de::Error::custom("portable media base64 is invalid or non-canonical")
+        })?;
+        if bytes.len() > PORTABLE_MEDIA_MAX_ASSET_BYTES || STANDARD.encode(&bytes) != encoded {
+            return Err(serde::de::Error::custom(
+                "portable media base64 exceeds the decoded limit or is non-canonical",
+            ));
+        }
+        Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod portable_media_tests {
+    use super::{
+        NotionPageBundle, NotionPortableCapturedMediaV1, NotionPortableIncompleteMediaV1,
+        NotionPortablePageBundleV1, PageDto,
+    };
+    use crate::media::PORTABLE_MEDIA_MAX_ASSET_BYTES;
+
+    #[test]
+    fn portable_media_base64_roundtrips_near_cap_with_bounded_overhead() {
+        let decoded_len = PORTABLE_MEDIA_MAX_ASSET_BYTES - 17;
+        let bytes = vec![0xa5; decoded_len];
+        let asset = NotionPortableCapturedMediaV1 {
+            block_id: "block-1".to_string(),
+            kind: "file".to_string(),
+            media_type: "application/octet-stream".to_string(),
+            bytes: bytes.clone(),
+        };
+
+        let encoded = serde_json::to_vec(&asset).expect("near-cap media encode");
+        let base64_len = decoded_len.div_ceil(3) * 4;
+        assert!(encoded.len() <= base64_len + 160);
+        assert!(encoded.len() < decoded_len * 2);
+
+        let decoded: NotionPortableCapturedMediaV1 =
+            serde_json::from_slice(&encoded).expect("near-cap media decode");
+        assert_eq!(decoded.bytes.len(), decoded_len);
+        assert!(decoded.bytes == bytes);
+    }
+
+    #[test]
+    fn portable_media_base64_rejects_noncanonical_input() {
+        let error = serde_json::from_str::<NotionPortableCapturedMediaV1>(
+            r#"{"block_id":"block-1","kind":"file","media_type":"application/octet-stream","bytes":"Zh=="}"#,
+        )
+        .expect_err("non-canonical trailing bits");
+        assert!(error.to_string().contains("non-canonical"));
+    }
+
+    #[test]
+    fn portable_media_base64_refuses_to_serialize_oversized_bytes() {
+        let asset = NotionPortableCapturedMediaV1 {
+            block_id: "block-1".to_string(),
+            kind: "file".to_string(),
+            media_type: "application/octet-stream".to_string(),
+            bytes: vec![0; PORTABLE_MEDIA_MAX_ASSET_BYTES + 1],
+        };
+
+        let error = serde_json::to_vec(&asset).expect_err("oversized media encode");
+        assert!(error.to_string().contains("decoded asset limit"));
+    }
+
+    #[test]
+    fn portable_media_native_json_is_byte_exact() {
+        let bundle = NotionPortablePageBundleV1 {
+            format_version: 1,
+            page: NotionPageBundle {
+                page: PageDto {
+                    id: "page-1".to_string(),
+                    parent: None,
+                    created_time: None,
+                    last_edited_time: Some("2026-07-22T01:00:00.000Z".to_string()),
+                    archived: false,
+                    in_trash: false,
+                    properties: Default::default(),
+                },
+                blocks: Vec::new(),
+            },
+            captured_media: vec![NotionPortableCapturedMediaV1 {
+                block_id: "block-1".to_string(),
+                kind: "image".to_string(),
+                media_type: "image/png".to_string(),
+                bytes: vec![1, 2, 3],
+            }],
+            incomplete_media: vec![NotionPortableIncompleteMediaV1 {
+                block_id: "page-property-file-1".to_string(),
+                kind: "file_property".to_string(),
+                code: "unsupported_page_property_media".to_string(),
+            }],
+        };
+
+        assert_eq!(
+            serde_json::to_vec(&bundle).expect("portable media native JSON"),
+            br#"{"format_version":1,"page":{"page":{"id":"page-1","parent":null,"created_time":null,"last_edited_time":"2026-07-22T01:00:00.000Z","archived":false,"in_trash":false,"properties":{}},"blocks":[]},"captured_media":[{"block_id":"block-1","kind":"image","media_type":"image/png","bytes":"AQID"}],"incomplete_media":[{"block_id":"page-property-file-1","kind":"file_property","code":"unsupported_page_property_media"}]}"#
+        );
+    }
+}
+
+/// Native database container plus the authoritative schemas for its data sources.
+///
+/// The data sources retain the order declared by the database response after
+/// equivalent duplicate references have been removed. This makes the bundle a
+/// stable input for both `_schema.yaml` rendering and portable synchronization.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotionDatabaseBundle {
+    pub database: DatabaseDto,
+    pub data_sources: Vec<DataSourceDto>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockTreeDto {
     pub block: BlockDto,

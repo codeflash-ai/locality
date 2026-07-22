@@ -2268,6 +2268,7 @@ dependencies = [
 name = "locality-notion"
 version = "0.3.6"
 dependencies = [
+ "base64 0.22.1",
  "locality-connector",
  "locality-core",
  "mime_guess",

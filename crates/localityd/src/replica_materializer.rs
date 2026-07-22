@@ -5,10 +5,26 @@
 //! or per-file SQLite state.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
+use std::ffi::{OsStr, OsString};
 use std::fmt::{Display, Formatter};
-use std::fs::{self, OpenOptions};
+use std::fs;
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use rustix::fd::{AsFd, OwnedFd};
+#[cfg(all(
+    unix,
+    any(target_vendor = "apple", target_os = "linux", target_os = "android")
+))]
+use rustix::fs::RenameFlags;
+#[cfg(unix)]
+use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat};
 
 use locality_core::portable::LogicalPath;
 use sha2::{Digest, Sha256};
@@ -321,7 +337,7 @@ fn materialize_replica_archive_inner<Body: Read>(
     let (summary, decoded_tar_sha256) = match archive.encoding {
         ReplicaArchiveEncoding::Identity => {
             let mut decoded = DecodedLimitReader::new(archive.body, limits.max_decoded_bytes);
-            let result = extract_tar(&mut decoded, staging.path(), limits);
+            let result = extract_tar(&mut decoded, &staging, limits);
             let exceeded = decoded.exceeded();
             let decoded_bytes = decoded.consumed();
             let decoded_tar_sha256 = decoded.finish_sha256();
@@ -343,7 +359,7 @@ fn materialize_replica_archive_inner<Body: Read>(
             let mut decoder = decoder.single_frame();
             let (result, exceeded, decoded_bytes, decoded_tar_sha256) = {
                 let mut decoded = DecodedLimitReader::new(&mut decoder, limits.max_decoded_bytes);
-                let result = extract_tar(&mut decoded, staging.path(), limits);
+                let result = extract_tar(&mut decoded, &staging, limits);
                 let exceeded = decoded.exceeded();
                 let decoded_bytes = decoded.consumed();
                 let decoded_tar_sha256 = decoded.finish_sha256();
@@ -371,7 +387,7 @@ fn materialize_replica_archive_inner<Body: Read>(
         validate_receipt(expected, summary, decoded_tar_sha256)?;
     }
 
-    make_tree_read_only(staging.path()).map_err(|source| ReplicaMaterializationError::Write {
+    make_tree_read_only(&staging).map_err(|source| ReplicaMaterializationError::Write {
         path: staging.path().to_path_buf(),
         source,
     })?;
@@ -419,7 +435,7 @@ fn write_sha256(formatter: &mut Formatter<'_>, digest: &[u8; 32]) -> std::fmt::R
 
 fn extract_tar<R: Read>(
     reader: &mut R,
-    staging: &Path,
+    staging: &StagingDirectory,
     limits: ReplicaMaterializationLimits,
 ) -> Result<ReplicaMaterializationSummary, ReplicaMaterializationError> {
     let mut state = ExtractionState::default();
@@ -455,8 +471,6 @@ fn extract_tar<R: Read>(
                 .header()
                 .mode()
                 .map_err(|error| ReplicaMaterializationError::MalformedTar(error.to_string()))?;
-            let target = staging.join(Path::new(&path));
-
             if is_directory {
                 if mode != READ_ONLY_DIRECTORY_MODE {
                     return Err(ReplicaMaterializationError::InvalidDirectoryMode { path, mode });
@@ -464,7 +478,7 @@ fn extract_tar<R: Read>(
                 if entry.size() != 0 {
                     return Err(ReplicaMaterializationError::NonEmptyDirectory { path });
                 }
-                create_directory(&target)?;
+                staging.create_directory(&path)?;
             } else {
                 if mode != READ_ONLY_FILE_MODE {
                     return Err(ReplicaMaterializationError::InvalidFileMode { path, mode });
@@ -484,10 +498,7 @@ fn extract_tar<R: Read>(
                         limit: limits.max_disk_bytes,
                     });
                 }
-                if let Some(parent) = target.parent() {
-                    create_directory(parent)?;
-                }
-                write_file(&target, &mut entry, size)?;
+                staging.write_file(&path, &mut entry, size)?;
                 state.summary.files += 1;
                 state.summary.materialized_bytes = disk_size;
             }
@@ -620,14 +631,8 @@ impl ExtractionState {
     }
 }
 
-fn create_directory(path: &Path) -> Result<(), ReplicaMaterializationError> {
-    fs::create_dir_all(path).map_err(|source| ReplicaMaterializationError::Write {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-fn write_file<R: Read>(
+#[cfg(not(unix))]
+fn write_file_at_path<R: Read>(
     path: &Path,
     reader: &mut R,
     expected_size: u64,
@@ -662,7 +667,44 @@ fn write_file<R: Read>(
     })
 }
 
-fn make_tree_read_only(root: &Path) -> io::Result<()> {
+#[cfg(unix)]
+fn make_tree_read_only(staging: &StagingDirectory) -> io::Result<()> {
+    // macOS refuses to rename a directory whose own mode is 0555. Finalize
+    // only children here; `publish` chmods the still-open root after rename.
+    make_child_directories_read_only(&staging.root)
+}
+
+#[cfg(unix)]
+fn make_child_directories_read_only(directory: &OwnedFd) -> io::Result<()> {
+    let entries = Dir::read_from(directory)?;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let metadata = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        match FileType::from_raw_mode(metadata.st_mode) {
+            FileType::Directory => {
+                let child = open_directory_at(directory, name)?;
+                make_child_directories_read_only(&child)?;
+                rustix::fs::fchmod(&child, Mode::from_raw_mode(0o555))?;
+            }
+            FileType::RegularFile => {}
+            _ => {
+                return Err(io::Error::other(format!(
+                    "staging tree contains a non-file, non-directory entry: {}",
+                    name.to_string_lossy()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_tree_read_only(staging: &StagingDirectory) -> io::Result<()> {
+    let root = staging.path();
     let mut directories = Vec::new();
     collect_directories(root, &mut directories)?;
     directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
@@ -677,6 +719,7 @@ fn make_tree_read_only(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
 fn collect_directories(root: &Path, directories: &mut Vec<PathBuf>) -> io::Result<()> {
     directories.push(root.to_path_buf());
     for entry in fs::read_dir(root)? {
@@ -688,23 +731,11 @@ fn collect_directories(root: &Path, directories: &mut Vec<PathBuf>) -> io::Resul
     Ok(())
 }
 
-#[cfg(unix)]
-fn set_file_read_only(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(READ_ONLY_FILE_MODE))
-}
-
 #[cfg(not(unix))]
 fn set_file_read_only(path: &Path) -> io::Result<()> {
     let mut permissions = fs::metadata(path)?.permissions();
     permissions.set_readonly(true);
     fs::set_permissions(path, permissions)
-}
-
-#[cfg(unix)]
-fn set_directory_read_only(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(READ_ONLY_DIRECTORY_MODE))
 }
 
 #[cfg(not(unix))]
@@ -714,6 +745,7 @@ fn set_directory_read_only(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, permissions)
 }
 
+#[cfg(not(unix))]
 fn make_tree_removable(root: &Path) {
     let Ok(metadata) = fs::symlink_metadata(root) else {
         return;
@@ -730,12 +762,6 @@ fn make_tree_removable(root: &Path) {
     }
 }
 
-#[cfg(unix)]
-fn make_directory_writable(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-}
-
 #[cfg(not(unix))]
 fn make_directory_writable(path: &Path) -> io::Result<()> {
     let mut permissions = fs::metadata(path)?.permissions();
@@ -743,26 +769,179 @@ fn make_directory_writable(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, permissions)
 }
 
-#[cfg(unix)]
-fn make_file_writable(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
 #[cfg(not(unix))]
 fn make_file_writable(path: &Path) -> io::Result<()> {
     let mut permissions = fs::metadata(path)?.permissions();
     permissions.set_readonly(false);
     fs::set_permissions(path, permissions)
+}
+
+#[cfg(unix)]
+fn open_directory_at<Fd: AsFd, P: rustix::path::Arg>(
+    directory: Fd,
+    path: P,
+) -> io::Result<OwnedFd> {
+    rustix::fs::openat(
+        directory,
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(Into::into)
+}
+
+#[cfg(unix)]
+fn remove_directory_contents(directory: &OwnedFd) {
+    let _ = rustix::fs::fchmod(directory, Mode::from_raw_mode(0o700));
+    let Ok(entries) = Dir::read_from(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let Ok(metadata) = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) else {
+            continue;
+        };
+        if FileType::from_raw_mode(metadata.st_mode) == FileType::Directory
+            && let Ok(child) = open_directory_at(directory, name)
+        {
+            remove_directory_contents(&child);
+            if rustix::fs::unlinkat(directory, name, AtFlags::REMOVEDIR).is_ok() {
+                continue;
+            }
+        }
+        // unlinkat without REMOVEDIR never follows symlinks and safely
+        // removes regular files, links, devices, fifos, and sockets.
+        let _ = rustix::fs::unlinkat(directory, name, AtFlags::empty());
+    }
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &Stat, right: &Stat) -> bool {
+    left.st_dev == right.st_dev && left.st_ino == right.st_ino
+}
+
+#[cfg(unix)]
+fn named_entry_matches(directory: &OwnedFd, name: &OsStr, expected: &Stat) -> io::Result<bool> {
+    let observed = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    Ok(same_file_identity(&observed, expected))
+}
+
+#[cfg(all(
+    unix,
+    any(target_vendor = "apple", target_os = "linux", target_os = "android")
+))]
+fn rename_directory_noreplace(
+    directory: &OwnedFd,
+    source: &OsStr,
+    destination: &OsStr,
+) -> io::Result<()> {
+    rustix::fs::renameat_with(
+        directory,
+        source,
+        directory,
+        destination,
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(Into::into)
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_vendor = "apple", target_os = "linux", target_os = "android"))
+))]
+fn rename_directory_noreplace(
+    _directory: &OwnedFd,
+    _source: &OsStr,
+    _destination: &OsStr,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "this Unix platform lacks atomic no-replace directory publication",
+    ))
+}
+
+#[cfg(unix)]
+fn unlink_named_entry(directory: &OwnedFd, name: &OsStr) {
+    let Ok(metadata) = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) else {
+        return;
+    };
+    let flags = if FileType::from_raw_mode(metadata.st_mode) == FileType::Directory {
+        AtFlags::REMOVEDIR
+    } else {
+        AtFlags::empty()
+    };
+    let _ = rustix::fs::unlinkat(directory, name, flags);
+}
+
+#[cfg(unix)]
+fn remove_open_staging_directory(parent: &OwnedFd, root: &OwnedFd, hinted_name: &OsStr) {
+    remove_directory_contents(root);
+    let Ok(root_identity) = rustix::fs::fstat(root) else {
+        return;
+    };
+
+    let matching_name = Dir::read_from(parent).ok().and_then(|entries| {
+        entries.filter_map(Result::ok).find_map(|entry| {
+            let name = entry.file_name();
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                return None;
+            }
+            let name = OsString::from_vec(name.to_bytes().to_vec());
+            named_entry_matches(parent, &name, &root_identity)
+                .ok()
+                .filter(|matches| *matches)
+                .map(|_| name)
+        })
+    });
+    if let Some(name) = matching_name {
+        let _ = rustix::fs::unlinkat(parent, &name, AtFlags::REMOVEDIR);
+    }
+
+    // A same-user substitution may leave a symlink or regular file at the
+    // expected name. Remove that entry without following it. A non-empty
+    // replacement directory is deliberately left untouched.
+    unlink_named_entry(parent, hinted_name);
 }
 
 struct StagingDirectory {
     path: PathBuf,
+    #[cfg(unix)]
+    parent: OwnedFd,
+    #[cfg(unix)]
+    root: OwnedFd,
+    #[cfg(unix)]
+    name: OsString,
     published: bool,
 }
 
 impl StagingDirectory {
     fn create(parent: &Path) -> Result<Self, ReplicaMaterializationError> {
+        // The pre-open metadata check alone is not enough: the path can be
+        // replaced with a symlink before `open`. Keep the descriptor anchored
+        // to the requested directory and let the identity checks below detect
+        // replacements after this point.
+        #[cfg(unix)]
+        let parent_descriptor = rustix::fs::open(
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| ReplicaMaterializationError::Staging(error.into()))?;
+        #[cfg(unix)]
+        {
+            let opened = rustix::fs::fstat(&parent_descriptor)
+                .map_err(|error| ReplicaMaterializationError::Staging(error.into()))?;
+            let named = rustix::fs::stat(parent)
+                .map_err(|error| ReplicaMaterializationError::Staging(error.into()))?;
+            if !same_file_identity(&opened, &named) {
+                return Err(ReplicaMaterializationError::Staging(io::Error::other(
+                    "replica destination parent changed while staging was created",
+                )));
+            }
+        }
         for _ in 0..16 {
             let mut random = [0_u8; 16];
             getrandom::fill(&mut random).map_err(|error| {
@@ -772,12 +951,49 @@ impl StagingDirectory {
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
+            #[cfg(unix)]
+            let name = OsString::from(format!(".locality-stage-{suffix}"));
+            #[cfg(unix)]
+            let path = parent.join(&name);
+            #[cfg(not(unix))]
             let path = parent.join(format!(".locality-stage-{suffix}"));
-            match fs::create_dir(&path) {
+            #[cfg(unix)]
+            let create_result =
+                rustix::fs::mkdirat(&parent_descriptor, &name, Mode::from_raw_mode(0o700))
+                    .map_err(io::Error::from);
+            #[cfg(not(unix))]
+            let create_result = fs::create_dir(&path);
+            match create_result {
                 Ok(()) => {
+                    #[cfg(unix)]
+                    let root = match rustix::fs::openat(
+                        &parent_descriptor,
+                        &name,
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    ) {
+                        Ok(root) => root,
+                        Err(error) => {
+                            let _ =
+                                rustix::fs::unlinkat(&parent_descriptor, &name, AtFlags::REMOVEDIR);
+                            return Err(ReplicaMaterializationError::Staging(error.into()));
+                        }
+                    };
+                    #[cfg(unix)]
+                    if let Err(error) = rustix::fs::fchmod(&root, Mode::from_raw_mode(0o700)) {
+                        let _ = rustix::fs::unlinkat(&parent_descriptor, &name, AtFlags::REMOVEDIR);
+                        return Err(ReplicaMaterializationError::Staging(error.into()));
+                    }
+                    #[cfg(not(unix))]
                     make_directory_writable(&path).map_err(ReplicaMaterializationError::Staging)?;
                     return Ok(Self {
                         path,
+                        #[cfg(unix)]
+                        parent: parent_descriptor,
+                        #[cfg(unix)]
+                        root,
+                        #[cfg(unix)]
+                        name,
                         published: false,
                     });
                 }
@@ -795,6 +1011,185 @@ impl StagingDirectory {
         &self.path
     }
 
+    #[cfg(unix)]
+    fn open_or_create_directory(&self, logical_path: &str) -> io::Result<OwnedFd> {
+        let mut current = None;
+        for component in logical_path.split('/') {
+            let parent = current
+                .as_ref()
+                .map(AsFd::as_fd)
+                .unwrap_or_else(|| self.root.as_fd());
+            let child = match rustix::fs::openat(
+                parent,
+                component,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(child) => child,
+                Err(rustix::io::Errno::NOENT) => {
+                    match rustix::fs::mkdirat(parent, component, Mode::from_raw_mode(0o700)) {
+                        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    open_directory_at(parent, component)?
+                }
+                Err(error) => return Err(error.into()),
+            };
+            current = Some(child);
+        }
+        current.ok_or_else(|| io::Error::other("empty logical directory path"))
+    }
+
+    #[cfg(unix)]
+    fn create_directory(&self, logical_path: &str) -> Result<(), ReplicaMaterializationError> {
+        self.open_or_create_directory(logical_path)
+            .map(|_| ())
+            .map_err(|source| ReplicaMaterializationError::Write {
+                path: self.path.join(logical_path),
+                source,
+            })
+    }
+
+    #[cfg(not(unix))]
+    fn create_directory(&self, logical_path: &str) -> Result<(), ReplicaMaterializationError> {
+        let path = self.path.join(logical_path);
+        fs::create_dir_all(&path)
+            .map_err(|source| ReplicaMaterializationError::Write { path, source })
+    }
+
+    #[cfg(unix)]
+    fn write_file<R: Read>(
+        &self,
+        logical_path: &str,
+        reader: &mut R,
+        expected_size: u64,
+    ) -> Result<(), ReplicaMaterializationError> {
+        let target = self.path.join(logical_path);
+        let (parent_path, name) = logical_path
+            .rsplit_once('/')
+            .map_or((None, logical_path), |(parent, name)| (Some(parent), name));
+        let parent = parent_path
+            .map(|parent| self.open_or_create_directory(parent))
+            .transpose()
+            .map_err(|source| ReplicaMaterializationError::Write {
+                path: target.clone(),
+                source,
+            })?;
+        let directory = parent
+            .as_ref()
+            .map(AsFd::as_fd)
+            .unwrap_or_else(|| self.root.as_fd());
+        let descriptor = rustix::fs::openat(
+            directory,
+            name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(|source| ReplicaMaterializationError::Write {
+            path: target.clone(),
+            source: source.into(),
+        })?;
+        let mut file = fs::File::from(descriptor);
+        let written =
+            io::copy(reader, &mut file).map_err(|source| ReplicaMaterializationError::Write {
+                path: target.clone(),
+                source,
+            })?;
+        if written != expected_size {
+            return Err(ReplicaMaterializationError::MalformedTar(format!(
+                "entry `{}` ended after {written} of {expected_size} bytes",
+                target.display()
+            )));
+        }
+        file.flush()
+            .map_err(|source| ReplicaMaterializationError::Write {
+                path: target.clone(),
+                source,
+            })?;
+        rustix::fs::fchmod(&file, Mode::from_raw_mode(0o444)).map_err(|source| {
+            ReplicaMaterializationError::Write {
+                path: target,
+                source: source.into(),
+            }
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn write_file<R: Read>(
+        &self,
+        logical_path: &str,
+        reader: &mut R,
+        expected_size: u64,
+    ) -> Result<(), ReplicaMaterializationError> {
+        let path = self.path.join(logical_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| ReplicaMaterializationError::Write {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        write_file_at_path(&path, reader, expected_size)
+    }
+
+    #[cfg(unix)]
+    fn publish(&mut self, destination: &Path) -> Result<(), ReplicaMaterializationError> {
+        let parent_path = self
+            .path
+            .parent()
+            .ok_or(ReplicaMaterializationError::InvalidDestination)?
+            .to_path_buf();
+        if destination.parent() != Some(parent_path.as_path()) {
+            return Err(ReplicaMaterializationError::InvalidDestination);
+        }
+        let destination_name = destination
+            .file_name()
+            .ok_or(ReplicaMaterializationError::InvalidDestination)?;
+        let root_identity = rustix::fs::fstat(&self.root)
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        let parent_identity = rustix::fs::fstat(&self.parent)
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        let named_parent = rustix::fs::stat(&parent_path)
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        if !same_file_identity(&parent_identity, &named_parent)
+            || !named_entry_matches(&self.parent, &self.name, &root_identity).unwrap_or(false)
+        {
+            return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                "replica staging root identity changed before publication",
+            )));
+        }
+
+        if let Err(error) = rename_directory_noreplace(&self.parent, &self.name, destination_name) {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                return Err(ReplicaMaterializationError::DestinationExists(
+                    destination.to_path_buf(),
+                ));
+            }
+            return Err(ReplicaMaterializationError::Publish(error));
+        }
+        self.name = destination_name.to_os_string();
+        self.path = destination.to_path_buf();
+
+        if !named_entry_matches(&self.parent, &self.name, &root_identity).unwrap_or(false) {
+            return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                "replica staging root identity changed during publication",
+            )));
+        }
+        rustix::fs::fchmod(&self.root, Mode::from_raw_mode(0o555))
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        let named_parent = rustix::fs::stat(&parent_path)
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        if !same_file_identity(&parent_identity, &named_parent)
+            || !named_entry_matches(&self.parent, &self.name, &root_identity).unwrap_or(false)
+        {
+            return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                "replica staging root identity changed while publication was finalized",
+            )));
+        }
+        self.published = true;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
     fn publish(&mut self, destination: &Path) -> Result<(), ReplicaMaterializationError> {
         match fs::rename(&self.path, destination) {
             Ok(()) => {
@@ -813,8 +1208,15 @@ impl StagingDirectory {
 impl Drop for StagingDirectory {
     fn drop(&mut self) {
         if !self.published {
-            make_tree_removable(&self.path);
-            let _ = fs::remove_dir_all(&self.path);
+            #[cfg(unix)]
+            {
+                remove_open_staging_directory(&self.parent, &self.root, &self.name);
+            }
+            #[cfg(not(unix))]
+            {
+                make_tree_removable(&self.path);
+                let _ = fs::remove_dir_all(&self.path);
+            }
         }
     }
 }

@@ -188,6 +188,49 @@ When Locality writes a Notion page into a local projection, media blocks with `e
 
 The media tree mirrors the Notion page directory under the reserved `.loc/` namespace in the projection output root. This keeps binary files out of content directories while giving agents a stable local file they can open, and avoids collision with a projected Notion page or database named `media`. Locality records downloaded media metadata and checksums in `.loc/media/manifest.json` using mount-relative paths. `loc status`, `loc inspect`, `loc diff`, and `loc push` treat equivalent relative and projection-output-root absolute media hrefs as the same asset. If the resolved local media path, bytes, or caption changes, `loc diff` plans an `update_media` operation and `loc push` uploads the local file to the existing Notion media block. Appending a new Markdown image or link whose href resolves under the projection output root's `.loc/media/` tree uploads that file and creates a Notion image, video, audio, PDF, or generic file block based on the file MIME type. Single-part uploads are capped at 20 MB until multipart upload support exists.
 
+Portable hosted-media capture is a separate, opt-in read policy. The default
+portable path and every direct desktop/headless path keep the behavior above:
+portable pages containing media remain explicitly incomplete, while direct
+projection continues to download through the existing media manifest workflow.
+Enabling the hosted-media pilot on `NotionConnector` does not create or consume
+that manifest. Instead, portable fetch captures Notion-hosted `file` payloads
+into a versioned sanitized native page bundle using canonical padded base64 for
+bounded byte overhead, and portable render emits one binary projection per
+successful asset at the exact same
+`.loc/media/<page path>/...` path used by desktop rendering. The page Markdown
+uses that local path, and each binary supports only `read` and
+`download_attachment`.
+
+Signed query parameters, URL fragments, and Notion expiry timestamps are
+removed before native serialization. Failed or uncaptured payloads have no
+remote URL in native or rendered Markdown and make the result incomplete.
+The same recursive sanitization covers opaque Notion JSON fields, including
+formula and rollup results and raw AI/custom block payloads. A non-secret marker
+binds each such redaction to an exact incomplete outcome; portable render
+recomputes that outcome ledger and rejects missing, duplicate, spurious, or
+mismatched entries before producing an artifact. Durable v1 native JSON is
+canonical: render streams a byte-for-byte reserialization comparison and
+rejects unknown fields, alternate field order, or noncanonical whitespace.
+External media stays unsupported and incomplete in this policy. Production
+capture accepts HTTPS on the default port only, rejects user information and IP
+literals, and permits exactly these origins:
+
+- `secure.notion-static.com`;
+- `prod-files-secure.s3.us-west-2.amazonaws.com`;
+- `s3.us-west-2.amazonaws.com` only below `/secure.notion-static.com/`.
+
+Redirects are disabled in the HTTP client and followed manually at most three
+times, with every destination revalidated. Responses must use absent or
+`identity` content encoding. The pilot uses a five-second connection timeout, a
+30-second overall request deadline, reads at most 64 KiB per streaming read,
+and enforces 128 assets per page, 20 MiB per asset, and 100 MiB total captured
+bytes. Asset shape, identity, and count are preflighted before downloading. An
+over-limit page is fully sanitized and explicitly incomplete without issuing a
+media request or publishing binary projections. Its asset bookkeeping stays
+bounded at one page-level `asset_limit_exceeded` outcome, plus any independent
+opaque-JSON redaction outcomes. Missing, expired, duplicate, oversized, denied,
+or failed media cannot silently fall back to a provider URL.
+
 ## Path Projection
 
 Root-page mounts use a stable directory shape based on the remote title:
@@ -197,6 +240,21 @@ safely live in a path segment are minimally replaced. When two siblings project
 to the same filesystem-equivalent path, all colliding siblings use a short
 remote ID suffix such as `Exact Page Title aaaaaa/page.md`. The suffix lengthens
 only when needed to keep sibling names unique.
+
+Portable and direct enumeration can also use an explicit set of up to 16 page
+or full-page database roots. Those roots are retrieved by ID without search and
+are projected together by the same root allocator and recursive traversal as
+the desktop workspace view, including title collision suffixes. The configured
+and requested root sets must match exactly; empty, duplicate, overlapping, or
+ambiguous roots fail closed. Every set-mode source change carries exactly one
+`SourceObject.edges` entry with relationship `locality_scope_root` and the
+canonical owning root as its target, including a self-edge for each root.
+Consumers decode it with `portable_scope_root_remote_id`; mixed or multiple
+owning-root edges fail closed.
+Notion does not expose reliable teamspace/private membership here, so Locality
+does not infer it. Database and media coverage remains explicitly incomplete.
+Legacy `with_root_page_id` synchronization keeps its v1 checkpoint format;
+`with_root_ids` uses component-versioned v2 root-set checkpoints.
 
 Each Notion page is a directory. The page body lives in `page.md`; sibling entries in the same directory are child Notion content:
 
