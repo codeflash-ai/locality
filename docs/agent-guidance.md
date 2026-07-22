@@ -30,6 +30,7 @@ The skill tells agents:
 - Supported sources can include Notion, Google Docs, Google Calendar, Gmail, Linear, Slack, and Granola; writable and read-only behavior depends on the connector.
 - Online-only files hydrate automatically when opened.
 - Agents should use `loc info <path>` for mount context, `loc search <query>` for broad discovery across connected sources, and `loc locate <url-or-title>` only for mounted Notion page or database URLs/titles.
+- If the user asks an agent to connect a provider before mounting, the agent should run `loc connect <provider> --no-browser`, share the printed authorization URL, ask the user to open it, and wait for verification before continuing to `loc mount`.
 - Agents should edit mounted Markdown directly for writable sources and leave changes pending for Locality review unless the user asks them to apply changes remotely.
 - Agents should use `loc status <path>`, `loc inspect <path>`, and `loc diff <path>` to inspect local state, remote comparison, and planned operations.
 - Agents should use `loc mv <source> <dest>` for intentional page/file moves or renames in mounted Locality content, then inspect with `loc status <path>` or `loc diff <path>`.

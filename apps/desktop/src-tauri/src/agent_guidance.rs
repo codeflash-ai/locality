@@ -420,6 +420,7 @@ Connected sources can include Notion, Google Docs, Google Calendar, Gmail, Linea
 ## Locality CLI workflow
 
 - Use `loc info <path>` for mount and connector context.
+- If the user asks you to connect a provider before mounting, run `loc connect <provider> --no-browser`, share the authorization URL, and ask the user to open it while you wait for verification.
 - Use `loc search <query>` for broader source discovery, including Google Docs, Gmail, Linear, Slack, and Granola.
 - Use `loc locate <url-or-title>` for mounted Notion page or database URLs/titles.
 - Edit mounted Markdown directly for writable sources.
@@ -1089,9 +1090,11 @@ mod tests {
             "loc push <path> -y",
             "loc pull <path>",
             "loc live-mode status <file>",
+            "loc connect <provider> --no-browser",
         ] {
             assert!(skill.contains(command), "missing command {command}");
         }
+        assert!(skill.contains("ask the user to open it while you wait"));
         assert!(skill.contains("mount-local `AGENTS.md`"));
         assert!(skill.contains("Calendar and Gmail mounts expose drafts"));
         assert!(skill.contains("Linear issue edits"));

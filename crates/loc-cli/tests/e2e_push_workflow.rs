@@ -318,6 +318,8 @@ fn mount_agent_guidance_matches_filesystem_workflow_and_does_not_dirty_status() 
         "loc status <path>",
         "loc diff <path>",
         "loc mv <source> <dest>",
+        "loc connect <provider> --no-browser",
+        "ask the user to open it while you wait",
         "Use `loc push <path>` to make Notion match local edits",
         "If desktop Live Mode is on",
         "Do not run routine `loc pull` or `loc push` after every edit",

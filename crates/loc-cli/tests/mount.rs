@@ -55,6 +55,8 @@ fn mount_writes_agent_guidance_and_claude_alias() {
     assert!(agents.contains("loc inspect <path>"));
     assert!(agents.contains("loc diff <path>"));
     assert!(agents.contains("loc push <path> -y"));
+    assert!(agents.contains("loc connect <provider> --no-browser"));
+    assert!(agents.contains("ask the user to open it while you wait"));
     assert!(agents.contains("loc live-mode status <file>"));
     assert!(agents.contains("loc mv <source> <dest>"));
     assert!(agents.contains("Push intentional changes with `loc push <path>`"));
