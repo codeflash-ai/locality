@@ -33,6 +33,12 @@ export function devSidecarPreparationCommands({
 
   return [
     {
+      name: "build-sidecars",
+      program: cargo,
+      args: ["build", "-p", "loc-cli", "-p", "localityd"],
+      cwd: workspaceRoot,
+    },
+    {
       name: "stop-daemon",
       program: processExecPath,
       args: [
@@ -40,12 +46,6 @@ export function devSidecarPreparationCommands({
         "--loc",
         platformPath.join(workspaceRoot, "target", "debug", locBinary),
       ],
-      cwd: workspaceRoot,
-    },
-    {
-      name: "build-sidecars",
-      program: cargo,
-      args: ["build", "-p", "loc-cli", "-p", "localityd"],
       cwd: workspaceRoot,
     },
   ];

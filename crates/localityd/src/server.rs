@@ -221,7 +221,9 @@ fn handle_connection(mut stream: impl Read + Write, server: DaemonServerHandle) 
 }
 
 fn handle_request(request: DaemonRequest, server: &DaemonServerHandle) -> DaemonResponse {
-    match request {
+    let mut trace_span = crate::trace::TraceSpan::start("daemon.request");
+    trace_daemon_request_attrs(&mut trace_span, &request);
+    let response = match request {
         DaemonRequest::Status => match daemon_status(server) {
             Ok(report) => DaemonResponse::ok(report),
             Err(error) => DaemonResponse::error("status_failed", error.to_string()),
@@ -248,6 +250,140 @@ fn handle_request(request: DaemonRequest, server: &DaemonServerHandle) -> Daemon
             DaemonResponse::ok(json!({ "status": "shutting_down" }))
         }
         request => server.runtime.request(request),
+    };
+    trace_span.attr("ok", response.ok);
+    if let Some(error) = response.error.as_ref() {
+        trace_span.attr("error_code", error.code.as_str());
+        trace_span.status("error");
+    }
+    response
+}
+
+fn trace_daemon_request_attrs(span: &mut crate::trace::TraceSpan, request: &DaemonRequest) {
+    span.attr("command", request.command_name());
+    match request {
+        DaemonRequest::Pull { path } => span.attr("path", path.display().to_string()),
+        DaemonRequest::Push {
+            path,
+            assume_yes,
+            confirm_dangerous,
+        } => {
+            span.attr("path", path.display().to_string());
+            span.attr("assume_yes", *assume_yes);
+            span.attr("confirm_dangerous", *confirm_dangerous);
+        }
+        DaemonRequest::Hydrate {
+            mount_id,
+            remote_id,
+            path,
+        }
+        | DaemonRequest::RemoteFastForward {
+            mount_id,
+            remote_id,
+            path,
+        } => {
+            span.attr("mount_id", mount_id.as_str());
+            span.attr("remote_id", remote_id.as_str());
+            span.attr("path", path.display().to_string());
+        }
+        DaemonRequest::ObserveEntity {
+            mount_id,
+            remote_id,
+        } => {
+            span.attr("mount_id", mount_id.as_str());
+            span.attr("remote_id", remote_id.as_str());
+        }
+        DaemonRequest::VirtualFsItem {
+            mount_id,
+            identifier,
+        }
+        | DaemonRequest::VirtualFsChildren {
+            mount_id,
+            container_identifier: identifier,
+        }
+        | DaemonRequest::VirtualFsMaterialize {
+            mount_id,
+            identifier,
+        }
+        | DaemonRequest::FileProviderItem {
+            mount_id,
+            identifier,
+        }
+        | DaemonRequest::FileProviderChildren {
+            mount_id,
+            container_identifier: identifier,
+        }
+        | DaemonRequest::FileProviderMaterialize {
+            mount_id,
+            identifier,
+        }
+        | DaemonRequest::FileProviderRead {
+            mount_id,
+            identifier,
+        } => {
+            span.attr("mount_id", mount_id.as_str());
+            span.attr("identifier", identifier.as_str());
+        }
+        DaemonRequest::VirtualFsCommitWrite {
+            mount_id,
+            identifier,
+            contents_base64,
+        } => {
+            span.attr("mount_id", mount_id.as_str());
+            span.attr("identifier", identifier.as_str());
+            span.attr("contents_base64_len", contents_base64.len());
+        }
+        DaemonRequest::VirtualFsCreateFile {
+            mount_id,
+            parent_identifier,
+            filename,
+        } => {
+            span.attr("mount_id", mount_id.as_str());
+            span.attr("parent_identifier", parent_identifier.as_str());
+            span.attr("filename", filename.as_str());
+        }
+        DaemonRequest::VirtualFsCreateDirectory {
+            mount_id,
+            parent_identifier,
+            dirname,
+        } => {
+            span.attr("mount_id", mount_id.as_str());
+            span.attr("parent_identifier", parent_identifier.as_str());
+            span.attr("dirname", dirname.as_str());
+        }
+        DaemonRequest::VirtualFsRename {
+            mount_id,
+            identifier,
+            new_parent_identifier,
+            new_filename,
+        } => {
+            span.attr("mount_id", mount_id.as_str());
+            span.attr("identifier", identifier.as_str());
+            span.attr("new_parent_identifier", new_parent_identifier.as_str());
+            span.attr("new_filename", new_filename.as_str());
+        }
+        DaemonRequest::VirtualFsTrash {
+            mount_id,
+            identifier,
+        } => {
+            span.attr("mount_id", mount_id.as_str());
+            span.attr("identifier", identifier.as_str());
+        }
+        DaemonRequest::VirtualProjectionRootChildren {
+            projection_root,
+            projection,
+        } => {
+            span.attr("projection_root", projection_root.display().to_string());
+            span.attr("projection", projection.as_str());
+        }
+        DaemonRequest::FileProviderDomainChildren { domain_id } => {
+            span.attr("domain_id", domain_id.as_str());
+        }
+        DaemonRequest::Ping
+        | DaemonRequest::Status
+        | DaemonRequest::DebugQueueStatus
+        | DaemonRequest::ReloadMounts
+        | DaemonRequest::Shutdown => {}
     }
 }
 

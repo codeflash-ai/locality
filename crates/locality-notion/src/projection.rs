@@ -11,11 +11,14 @@ use locality_connector::ChildContainer;
 use locality_core::freshness::{RemoteObservation, RemoteVersion};
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
 use locality_core::path_projection::{page_container_path, page_document_path};
+use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::{LocalityError, LocalityResult};
 
 use crate::client::NotionApi;
-use crate::dto::{BlockDto, DatabaseDto, PageDto, ParentDto};
-use crate::render::{page_frontmatter, page_title};
+use crate::dto::{
+    BlockDto, DatabaseDto, DateMentionDto, PageDto, PagePropertyDto, ParentDto, UserMentionDto,
+};
+use crate::render::{page_frontmatter, page_title, rich_text_plain_text};
 
 pub fn enumerate_root_page_tree(
     api: &dyn NotionApi,
@@ -135,7 +138,27 @@ pub fn observe_entity(
     remote_id: &RemoteId,
 ) -> LocalityResult<RemoteObservation> {
     match api.retrieve_page(remote_id.as_str()) {
-        Ok(page) => Ok(page_observation(mount_id, &page)),
+        Ok(page) => {
+            let mut observation = page_observation(mount_id, &page);
+            if let Some(data_source_id) = page
+                .parent
+                .as_ref()
+                .and_then(|parent| parent.data_source_id.as_deref())
+            {
+                let data_source = api.retrieve_data_source(data_source_id)?;
+                let database_id = data_source
+                    .parent
+                    .as_ref()
+                    .and_then(|parent| parent.database_id.as_deref())
+                    .ok_or_else(|| {
+                        LocalityError::InvalidState(format!(
+                            "notion data source `{data_source_id}` did not expose a parent database"
+                        ))
+                    })?;
+                observation.parent_remote_id = Some(RemoteId::new(database_id));
+            }
+            Ok(observation)
+        }
         Err(page_error) => match api.retrieve_database(remote_id.as_str()) {
             Ok(database) => Ok(database_observation(mount_id, &database)),
             Err(database_error) => Err(LocalityError::InvalidState(format!(
@@ -856,7 +879,7 @@ fn page_observation(mount_id: MountId, page: &PageDto) -> RemoteObservation {
         path,
     )
     .deleted(page.archived || page.in_trash)
-    .with_raw_metadata_json(metadata_json(page));
+    .with_raw_metadata_json(metadata_json(page, page_search_metadata(page)));
 
     if let Some(parent_id) = parent_remote_id(page.parent.as_ref()) {
         observation = observation.with_parent(parent_id);
@@ -899,7 +922,7 @@ fn database_observation(mount_id: MountId, database: &DatabaseDto) -> RemoteObse
         path,
     )
     .deleted(database.archived || database.in_trash)
-    .with_raw_metadata_json(metadata_json(database));
+    .with_raw_metadata_json(metadata_json(database, database_search_metadata(database)));
 
     if let Some(parent_id) = parent_remote_id(database.parent.as_ref()) {
         observation = observation.with_parent(parent_id);
@@ -922,15 +945,156 @@ fn parent_remote_id(parent: Option<&ParentDto>) -> Option<RemoteId> {
         .map(|id| RemoteId::new(id.clone()))
 }
 
-fn metadata_json<T>(value: &T) -> String
+fn metadata_json<T>(value: &T, search_metadata: SearchMetadata) -> String
 where
     T: serde::Serialize,
 {
-    serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
+    let mut value = serde_json::to_value(value).unwrap_or_else(|_| serde_json::json!({}));
+    if let serde_json::Value::Object(object) = &mut value
+        && !search_metadata.is_empty()
+        && let Ok(search_value) = serde_json::to_value(search_metadata)
+    {
+        object.insert(RAW_SEARCH_METADATA_KEY.to_string(), search_value);
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn page_search_metadata(page: &PageDto) -> SearchMetadata {
+    let mut metadata = SearchMetadata::default();
+    metadata.push_metadata_text(page_title(page));
+    metadata.push_metadata_text(&page.id);
+    metadata.push_alias(&page.id);
+    let compact_id = compact_notion_id(&page.id);
+    if compact_id != page.id {
+        metadata.push_alias(&compact_id);
+    }
+    metadata.set_source_url(notion_source_url(&page.id));
+    for (name, property) in &page.properties {
+        metadata.push_metadata_text(name);
+        push_page_property_search_values(&mut metadata, property);
+    }
+    metadata
+}
+
+fn database_search_metadata(database: &DatabaseDto) -> SearchMetadata {
+    let mut metadata = SearchMetadata::default();
+    if let Some(title) = database_title(database) {
+        metadata.push_metadata_text(title);
+    }
+    metadata.push_metadata_text(&database.id);
+    metadata.push_alias(&database.id);
+    let compact_id = compact_notion_id(&database.id);
+    if compact_id != database.id {
+        metadata.push_alias(&compact_id);
+    }
+    metadata.set_source_url(notion_source_url(&database.id));
+    for data_source in &database.data_sources {
+        metadata.push_metadata_text(&data_source.id);
+        if let Some(name) = &data_source.name {
+            metadata.push_metadata_text(name);
+        }
+    }
+    metadata
+}
+
+fn push_page_property_search_values(metadata: &mut SearchMetadata, property: &PagePropertyDto) {
+    metadata.push_metadata_text(rich_text_plain_text(&property.title));
+    metadata.push_metadata_text(rich_text_plain_text(&property.rich_text));
+    if let Some(number) = &property.number {
+        metadata.push_metadata_text(number.to_string());
+    }
+    if let Some(select) = &property.select {
+        metadata.push_metadata_text(&select.name);
+    }
+    for option in &property.multi_select {
+        metadata.push_metadata_text(&option.name);
+    }
+    if let Some(status) = &property.status {
+        metadata.push_metadata_text(&status.name);
+    }
+    if let Some(checked) = property.checkbox {
+        metadata.push_metadata_text(if checked { "checked" } else { "unchecked" });
+    }
+    if let Some(date) = &property.date {
+        push_date_search_values(metadata, date);
+    }
+    if let Some(url) = &property.url {
+        metadata.push_metadata_text(url);
+    }
+    if let Some(email) = &property.email {
+        metadata.push_metadata_text(email);
+    }
+    if let Some(phone_number) = &property.phone_number {
+        metadata.push_metadata_text(phone_number);
+    }
+    for file in &property.files {
+        if let Some(name) = &file.name {
+            metadata.push_metadata_text(name);
+        }
+    }
+    for person in &property.people {
+        push_user_search_values(metadata, person);
+    }
+    for relation in &property.relation {
+        metadata.push_metadata_text(&relation.id);
+    }
+    if let Some(created_time) = &property.created_time {
+        metadata.push_metadata_text(created_time);
+    }
+    if let Some(last_edited_time) = &property.last_edited_time {
+        metadata.push_metadata_text(last_edited_time);
+    }
+    if let Some(created_by) = &property.created_by {
+        push_user_search_values(metadata, created_by);
+    }
+    if let Some(last_edited_by) = &property.last_edited_by {
+        push_user_search_values(metadata, last_edited_by);
+    }
+    if let Some(unique_id) = &property.unique_id {
+        match (&unique_id.prefix, unique_id.number) {
+            (Some(prefix), Some(number)) => {
+                metadata.push_metadata_text(format!("{prefix}{number}"))
+            }
+            (None, Some(number)) => metadata.push_metadata_text(number.to_string()),
+            _ => {}
+        }
+    }
+    if let Some(verification) = &property.verification {
+        if let Some(state) = &verification.state {
+            metadata.push_metadata_text(state);
+        }
+        if let Some(verified_by) = &verification.verified_by {
+            push_user_search_values(metadata, verified_by);
+        }
+        if let Some(date) = &verification.date {
+            push_date_search_values(metadata, date);
+        }
+    }
+}
+
+fn push_user_search_values(metadata: &mut SearchMetadata, user: &UserMentionDto) {
+    metadata.push_metadata_text(&user.id);
+    if let Some(name) = &user.name {
+        metadata.push_metadata_text(name);
+    }
+}
+
+fn push_date_search_values(metadata: &mut SearchMetadata, date: &DateMentionDto) {
+    metadata.push_metadata_text(&date.start);
+    if let Some(end) = &date.end {
+        metadata.push_metadata_text(end);
+    }
+    if let Some(time_zone) = &date.time_zone {
+        metadata.push_metadata_text(time_zone);
+    }
+}
+
+fn notion_source_url(id: &str) -> String {
+    format!("https://www.notion.so/{}", compact_notion_id(id))
 }
 
 fn database_title(database: &DatabaseDto) -> Option<String> {
-    let title = crate::render::rich_text_plain_text(&database.title);
+    let title = rich_text_plain_text(&database.title);
     if title.trim().is_empty() {
         None
     } else {

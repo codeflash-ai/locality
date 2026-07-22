@@ -419,6 +419,10 @@ pub enum SourceOperation {
     ArchiveEntity {
         entity_id: RemoteId,
     },
+    UpdateEntityBody {
+        entity_id: RemoteId,
+        body: String,
+    },
     UpdateProperties {
         entity_id: RemoteId,
         #[serde(default)]
@@ -462,6 +466,7 @@ impl SourceOperation {
             Self::UpdateMedia { .. } => PushOperationKind::UpdateMedia,
             Self::ArchiveBlock { .. } => PushOperationKind::ArchiveBlock,
             Self::ArchiveEntity { .. } => PushOperationKind::ArchiveEntity,
+            Self::UpdateEntityBody { .. } => PushOperationKind::UpdateEntityBody,
             Self::UpdateProperties { .. } => PushOperationKind::UpdateProperties,
             Self::MoveEntity { .. } => PushOperationKind::MoveEntity,
             Self::CreateEntity { .. } => PushOperationKind::CreateEntity,
@@ -510,6 +515,10 @@ impl TryFrom<&PushOperation> for SourceOperation {
             },
             PushOperation::ArchiveEntity { entity_id } => Self::ArchiveEntity {
                 entity_id: entity_id.clone(),
+            },
+            PushOperation::UpdateEntityBody { entity_id, body } => Self::UpdateEntityBody {
+                entity_id: entity_id.clone(),
+                body: body.clone(),
             },
             PushOperation::UpdateProperties {
                 entity_id,
@@ -689,5 +698,20 @@ mod tests {
         })
         .expect_err("absolute host paths cannot enter a portable plan");
         assert_eq!(error, LogicalPathError::Absolute);
+    }
+
+    #[test]
+    fn source_operation_preserves_entity_body_updates_exactly() {
+        let portable = SourceOperation::try_from(&PushOperation::UpdateEntityBody {
+            entity_id: RemoteId::new("page-1"),
+            body: "# Current main body\n".to_string(),
+        })
+        .expect("entity body updates are portable");
+
+        assert_eq!(portable.kind(), PushOperationKind::UpdateEntityBody);
+        assert_eq!(
+            serde_json::to_string(&portable).expect("serialize portable operation"),
+            r##"{"type":"update_entity_body","entity_id":"page-1","body":"# Current main body\n"}"##
+        );
     }
 }

@@ -99,8 +99,11 @@ import {
   connectedSourcesReadyToMount,
   isSourceConnectorId,
   sourceConnectionReady,
+  sourceConnectorIds,
   sourceMountRetryOutcome,
   sourceMounted,
+  sourceRequiresApiKey,
+  sourceSkipsManualMountStep,
   sourceSetupIsActiveConnector,
   sourceSetupIsBusy,
   sourceSetupProgressLabel,
@@ -108,9 +111,12 @@ import {
   type SourceSetupState,
 } from "./source-setup";
 import gmailIconUrl from "./assets/connectors/gmail.svg";
+import googleCalendarIconUrl from "./assets/connectors/google-calendar.svg";
 import googleDocsIconUrl from "./assets/connectors/google-docs.svg";
 import granolaIconUrl from "./assets/connectors/granola.svg";
+import linearIconUrl from "./assets/connectors/linear.svg";
 import notionIconUrl from "./assets/connectors/notion.svg";
+import slackIconUrl from "./assets/connectors/slack.svg";
 import localityShortDarkUrl from "./assets/brand/locality-short-dark.svg";
 import localityShortLightUrl from "./assets/brand/locality-short-light.svg";
 
@@ -143,8 +149,11 @@ type ConnectorOption = {
 const CONNECTOR_ICON_URLS: Record<SourceConnectorId, string> = {
   notion: notionIconUrl,
   "google-docs": googleDocsIconUrl,
+  "google-calendar": googleCalendarIconUrl,
   gmail: gmailIconUrl,
   granola: granolaIconUrl,
+  linear: linearIconUrl,
+  slack: slackIconUrl,
 };
 
 const PRODUCT_TERMS = {
@@ -529,7 +538,7 @@ const sampleSnapshot: DesktopSnapshot = {
     {
       connector: "Linear",
       description: "Mount issues and projects as local files.",
-      state: "planned",
+      state: "available",
     },
   ],
 };
@@ -709,17 +718,23 @@ function suggestedAgentPrompt(mountPath: string, connector: OnboardingConnectorI
   switch (connector) {
     case "granola":
       return `Use Locality to read my Granola meetings. Open the files under ${mountPath}, search summaries and transcripts with normal file tools, and cite the meeting files you used. Granola is read-only in Locality, so do not try to push edits back.`;
+    case "slack":
+      return `Use Locality to read my Slack conversations. Open the files under ${mountPath}, search channels, private channels, DMs, group DMs, and users with normal file tools, and cite the conversation files you used. Slack is read-only in Locality, so do not try to push edits back.`;
     case "google-docs":
       return `Use Locality to edit my Google Docs workspace. Open the files under ${mountPath}, make the requested edits directly in Markdown, and leave changes pending for Locality review before pushing.`;
+    case "google-calendar":
+      return `Use Locality to inspect my Google Calendar source. Open the files under ${mountPath}, review calendar events with normal file tools, and prepare new event drafts for Locality review before creating them.`;
     case "gmail":
       return `Use Locality to inspect my Gmail source. Open the files under ${mountPath}, search mail with normal file tools, and prepare draft updates only when the mounted draft files support it. Leave outbound changes for Locality review.`;
+    case "linear":
+      return `Use Locality to edit my Linear issues. Open the files under ${mountPath}, update issue Markdown and editable frontmatter, and leave changes pending for Locality review before pushing.`;
     case "notion":
       return `Use Locality to edit my Notion workspace. Open the files under ${mountPath}, make the requested edits directly in Markdown, and leave changes pending for Locality review.`;
   }
 }
 
 function isOnboardingConnector(value?: string | null): value is OnboardingConnectorId {
-  return value === "notion" || value === "google-docs" || value === "gmail" || value === "granola";
+  return sourceConnectorIds().includes(value as SourceConnectorId);
 }
 
 function onboardingConnectorFromSnapshot(snapshot: DesktopSnapshot): OnboardingConnectorId {
@@ -733,11 +748,11 @@ function onboardingConnectorFromSnapshot(snapshot: DesktopSnapshot): OnboardingC
 }
 
 function connectorUsesOAuth(connector: OnboardingConnectorId) {
-  return connector === "notion" || connector === "google-docs" || connector === "gmail";
+  return !sourceRequiresApiKey(connector);
 }
 
 function connectorSkipsMountStep(connector: OnboardingConnectorId) {
-  return connector !== "notion";
+  return sourceSkipsManualMountStep(connector);
 }
 
 function onboardingConnectorTitle(
@@ -749,8 +764,8 @@ function onboardingConnectorTitle(
     return `Your ${sourceDisplayName(connector)} source is connected`;
   }
   if (busy) {
-    return connector === "granola"
-      ? "Checking Granola access."
+    return sourceRequiresApiKey(connector)
+      ? `Checking ${sourceDisplayName(connector)} access.`
       : `Finish connecting in ${sourceDisplayName(connector)}.`;
   }
   return `Start with ${sourceDisplayName(connector)}.`;
@@ -768,10 +783,16 @@ function onboardingConnectorDescription(
         return `${workspaceLabel} is ready. Locality will now create the Notion folder under CloudStorage and prepare the local workspace.`;
       case "google-docs":
         return "Google Docs is ready. Locality mounted the selected Drive folder as local files under CloudStorage.";
+      case "google-calendar":
+        return "Google Calendar is ready. Locality mounted primary calendar events as local files under CloudStorage.";
       case "gmail":
         return "Gmail is ready. Locality mounted mailboxes as local files under CloudStorage.";
       case "granola":
         return "Granola is ready. Locality mounted meeting summaries and transcripts as read-only files under CloudStorage.";
+      case "linear":
+        return "Linear is ready. Locality mounted issues by team as editable local files under CloudStorage.";
+      case "slack":
+        return "Slack is ready. Locality mounted recent accessible conversations as read-only files under CloudStorage.";
     }
   }
 
@@ -781,10 +802,16 @@ function onboardingConnectorDescription(
         return "A browser window is open. Choose the workspace and pages Locality can access, then approve.";
       case "google-docs":
         return "A browser window is open. Approve Google Docs access, then Locality will create the local folder.";
+      case "google-calendar":
+        return "A browser window is open. Approve Google Calendar access, then Locality will create the local calendar folder.";
       case "gmail":
         return "A browser window is open. Approve Gmail access, then Locality will create the local mailbox folder.";
       case "granola":
         return "Locality is validating the API key and creating a read-only Granola folder.";
+      case "linear":
+        return "Locality is validating the API key and creating an editable Linear folder.";
+      case "slack":
+        return "A browser window is open. Approve Slack access, then Locality will create the read-only conversation folder.";
     }
   }
 
@@ -793,10 +820,16 @@ function onboardingConnectorDescription(
       return "Connect the source you want agents to help with. Your machine talks directly to Notion, and app credentials are protected by macOS Keychain.";
     case "google-docs":
       return "Connect Google Docs during setup so agents can work with docs through the same local file workflow.";
+    case "google-calendar":
+      return "Connect Google Calendar during setup so agents can review events and prepare new event drafts through local files.";
     case "gmail":
       return "Connect Gmail during setup so agents can search mailboxes and prepare reviewed draft work from local files.";
     case "granola":
       return "Paste a Granola API key to mount meeting summaries and transcripts as local read-only files. Keys are stored in your local credential store.";
+    case "linear":
+      return "Paste a Linear API key to mount issues by team as editable local files. Keys are stored in your local credential store.";
+    case "slack":
+      return "Connect Slack during setup so agents can search recent accessible conversations from local read-only Markdown files.";
   }
 }
 
@@ -806,10 +839,16 @@ function onboardingConnectorPills(connector: OnboardingConnectorId) {
       return ["Scoped access", "Credentials in Keychain", "Direct app connection"];
     case "google-docs":
       return ["Google OAuth", "Drive folder", "Markdown edits"];
+    case "google-calendar":
+      return ["Google OAuth", "Primary calendar", "Event drafts"];
     case "gmail":
       return ["Google OAuth", "Mailbox files", "Draft review"];
     case "granola":
       return ["Read-only", "Meeting summaries", "Transcripts"];
+    case "linear":
+      return ["API key", "Issues by team", "Review before push"];
+    case "slack":
+      return ["Slack OAuth", "Read-only", "Conversations"];
   }
 }
 
@@ -819,16 +858,22 @@ function onboardingReadyCopy(connector: OnboardingConnectorId) {
       return "Your local workspace is ready. Agents can open this folder, edit Markdown, and leave changes for Review Center. Open the app to review changes, manage sync, and turn on Live Mode when you want file saves to update Notion and new Notion changes to appear locally.";
     case "google-docs":
       return "Your Google Docs workspace is ready as local files. Agents can edit docs in Markdown and leave changes for Review Center before anything is pushed back.";
+    case "google-calendar":
+      return "Your Google Calendar source is ready as local files. Agents can review events and prepare new event drafts before anything is created remotely.";
     case "gmail":
       return "Your Gmail source is ready as local files. Agents can search mailbox content and prepare reviewed draft work without leaving the filesystem.";
     case "granola":
       return "Your Granola meetings are ready as local read-only files. Agents can search summaries and transcripts with normal file tools, while Locality keeps the remote notes protected from edits.";
+    case "linear":
+      return "Your Linear issues are ready as local files. Agents can edit issue descriptions and supported fields in Markdown, then leave changes for Review Center before anything is pushed back.";
+    case "slack":
+      return "Your Slack conversations are ready as local read-only files. Agents can search recent accessible channels, private channels, DMs, group DMs, and users with normal file tools.";
   }
 }
 
 function onboardingPromptHint(connector: OnboardingConnectorId) {
-  return connector === "granola"
-    ? "Ask an agent to use the mounted meeting files."
+  return connector === "granola" || connector === "slack"
+    ? "Ask an agent to use the mounted read-only files."
     : "Claude and Codex are now set up to use Locality.";
 }
 
@@ -1658,6 +1703,7 @@ function Onboarding({
     return connectionReady(snapshot) && !mountMissing(snapshot) ? connector : null;
   });
   const [granolaApiKey, setGranolaApiKey] = useState("");
+  const [linearApiKey, setLinearApiKey] = useState("");
   const [googleDocsWorkspaceFolder, setGoogleDocsWorkspaceFolder] = useState("Locality");
   const [connectorConnecting, setConnectorConnecting] = useState(false);
   const [connectedWorkspace, setConnectedWorkspace] = useState(snapshot.connection.workspaceName);
@@ -1694,6 +1740,7 @@ function Onboarding({
       );
   const selectedSourceName = sourceDisplayName(selectedOnboardingConnector);
   const selectedConnectorBusy = oauthInFlight || connectorConnecting;
+  const selectedApiKey = selectedOnboardingConnector === "linear" ? linearApiKey : granolaApiKey;
 
   async function installAgentGuidance(path: string) {
     setAgentGuidanceState("installing");
@@ -1991,7 +2038,7 @@ function Onboarding({
           path: sourceDefaultPath(snapshot, connector),
           mountId: sourceMountId(connector),
           connectionId: null,
-          readOnly: connector === "granola",
+          readOnly: connector === "granola" || connector === "slack",
           notionRootPage: null,
           googleDocsWorkspaceFolder: connector === "google-docs"
             ? googleDocsWorkspaceFolder.trim() || "Locality"
@@ -2002,7 +2049,7 @@ function Onboarding({
     );
   }
 
-  async function connectGoogleOnboarding(connector: "google-docs" | "gmail") {
+  async function connectOAuthOnboarding(connector: "google-docs" | "google-calendar" | "gmail" | "slack") {
     if (selectedConnectorBusy) {
       return;
     }
@@ -2017,7 +2064,7 @@ function Onboarding({
     setOauthInFlight(true);
     setStep(3);
     try {
-      const command = connector === "google-docs" ? "connect_google_docs" : "connect_gmail";
+      const command = oauthConnectCommand(connector);
       const connectReport = await callCommand<ActionReport>(
         command,
         undefined,
@@ -2066,11 +2113,16 @@ function Onboarding({
         await startConnect();
         return;
       case "google-docs":
+      case "google-calendar":
       case "gmail":
-        await connectGoogleOnboarding(selectedOnboardingConnector);
+      case "slack":
+        await connectOAuthOnboarding(selectedOnboardingConnector);
         return;
       case "granola":
         await connectGranolaOnboarding();
+        return;
+      case "linear":
+        await connectLinearOnboarding();
     }
   }
 
@@ -2085,9 +2137,18 @@ function Onboarding({
   }
 
   async function connectGranolaOnboarding() {
-    if (connectorConnecting || !granolaApiKey.trim()) {
-      if (!granolaApiKey.trim()) {
-        setOauthError("Enter a Granola API key.");
+    await connectApiKeyOnboarding("granola", granolaApiKey);
+  }
+
+  async function connectLinearOnboarding() {
+    await connectApiKeyOnboarding("linear", linearApiKey);
+  }
+
+  async function connectApiKeyOnboarding(connector: "granola" | "linear", apiKey: string) {
+    const sourceName = sourceDisplayName(connector);
+    if (connectorConnecting || !apiKey.trim()) {
+      if (!apiKey.trim()) {
+        setOauthError(`Enter a ${sourceName} API key.`);
       }
       return;
     }
@@ -2099,9 +2160,9 @@ function Onboarding({
     setStep(3);
     try {
       const report = await callCommand<ActionReport>(
-        "connect_granola",
-        { apiKey: granolaApiKey },
-        { ok: true, message: "Connected demo Granola source." },
+        connector === "linear" ? "connect_linear" : "connect_granola",
+        { apiKey },
+        { ok: true, message: `Connected demo ${sourceName} source.` },
       );
       if (!report.ok) {
         setOauthError(report.message);
@@ -2113,17 +2174,17 @@ function Onboarding({
         undefined,
         sampleSnapshot,
       );
-      const granolaMount = nextSnapshot.mounts.find((mount) => mount.connector === "granola")
-        ?? (nextSnapshot.mount.connector === "granola" ? nextSnapshot.mount : null);
-      const nextMountPath = granolaMount?.localPath || sourceDefaultPath(nextSnapshot, "granola");
+      const sourceMount = nextSnapshot.mounts.find((mount) => mount.connector === connector)
+        ?? (nextSnapshot.mount.connector === connector ? nextSnapshot.mount : null);
+      const nextMountPath = sourceMount?.localPath || sourceDefaultPath(nextSnapshot, connector);
       setMountPathDirty(false);
       setMountPath(nextMountPath);
-      setConnectedWorkspace("Granola");
-      setConnectedOnboardingConnector("granola");
+      setConnectedWorkspace(sourceName);
+      setConnectedOnboardingConnector(connector);
       const cliReady = await ensureCliAvailable();
       if (!cliReady) {
         setOauthError(
-          "Granola is connected, but Locality could not prepare the terminal command. Open Settings to repair Locality, then open the app.",
+          `${sourceName} is connected, but Locality could not prepare the terminal command. Open Settings to repair Locality, then open the app.`,
         );
         return;
       }
@@ -2450,16 +2511,22 @@ function Onboarding({
                     ]}
               />
             )}
-            {selectedOnboardingConnector === "granola" && !connectionReadyNow && (
+            {sourceRequiresApiKey(selectedOnboardingConnector) && !connectionReadyNow && (
               <label className="source-inline-field onboarding-source-field">
-                <span>Granola API key</span>
+                <span>{selectedSourceName} API key</span>
                 <input
                   type="password"
                   autoComplete="off"
-                  value={granolaApiKey}
+                  value={selectedApiKey}
                   placeholder="Paste API key"
                   disabled={connectorConnecting}
-                  onChange={(event) => setGranolaApiKey(event.target.value)}
+                  onChange={(event) => {
+                    if (selectedOnboardingConnector === "linear") {
+                      setLinearApiKey(event.target.value);
+                    } else {
+                      setGranolaApiKey(event.target.value);
+                    }
+                  }}
                 />
               </label>
             )}
@@ -2480,7 +2547,7 @@ function Onboarding({
                 disabled={
                   !connectionReadyNow &&
                   (
-                    (selectedOnboardingConnector === "granola" && !granolaApiKey.trim()) ||
+                    (sourceRequiresApiKey(selectedOnboardingConnector) && !selectedApiKey.trim()) ||
                     (selectedOnboardingConnector === "google-docs" && !googleDocsWorkspaceFolder.trim())
                   )
                 }
@@ -3391,7 +3458,7 @@ function MountsView({
                 path: sourceDefaultPath(snapshot, connector),
                 mountId: sourceMountId(connector),
                 connectionId: null,
-                readOnly: false,
+                readOnly: connector === "granola" || connector === "slack",
                 notionRootPage: null,
                 googleDocsWorkspaceFolder: connector === "google-docs"
                   ? googleDocsWorkspaceFolder?.trim() || "Locality"
@@ -3463,11 +3530,11 @@ function MountsView({
     if (connector === "notion") {
       return connectNotionSource();
     }
-    if (connector === "granola") {
-      return { ok: false, message: "Granola requires an API key." };
+    if (sourceRequiresApiKey(connector)) {
+      return { ok: false, message: `${sourceDisplayName(connector)} requires an API key.` };
     }
 
-    const command = connector === "google-docs" ? "connect_google_docs" : "connect_gmail";
+    const command = oauthConnectCommand(connector);
     setActionError("");
     setActionMessage("");
     const report = await callCommand<ActionReport>(
@@ -3544,19 +3611,20 @@ function MountsView({
     }
   }
 
-  async function connectGranolaSource(apiKey: string) {
+  async function connectApiKeySource(connector: "granola" | "linear", apiKey: string) {
     if (sourceSetupBusy) {
       return;
     }
+    const sourceName = sourceDisplayName(connector);
     setSourceDialogMessage("");
     setActionMessage("");
-    setSourceDialogConnector("granola");
+    setSourceDialogConnector(connector);
     setSourceDialogState("connecting");
     try {
       const report = await callCommand<ActionReport>(
-        "connect_granola",
+        connector === "linear" ? "connect_linear" : "connect_granola",
         { apiKey },
-        { ok: true, message: "Connected demo Granola source." },
+        { ok: true, message: `Connected demo ${sourceName} source.` },
       );
       setSourceDialogMessage(report.message);
       setSourceDialogState(report.ok ? "success" : "error");
@@ -3775,7 +3843,7 @@ function MountsView({
           message={sourceDialogMessage}
           fileProviderEnablement={sourceFileProviderEnablement}
           onAction={(connector, options) => void runSourceDialogAction(connector, options)}
-          onGranolaAction={(apiKey) => void connectGranolaSource(apiKey)}
+          onApiKeyAction={(connector, apiKey) => void connectApiKeySource(connector, apiKey)}
           onReopenFinder={() => void revealSourceFileProviderEnablement()}
           onClose={() => {
             setSourceDialogOpen(false);
@@ -3793,7 +3861,7 @@ function AddSourceDialog({
   message,
   fileProviderEnablement,
   onAction,
-  onGranolaAction,
+  onApiKeyAction,
   onReopenFinder,
   onClose,
 }: {
@@ -3803,7 +3871,7 @@ function AddSourceDialog({
   message: string;
   fileProviderEnablement: FileProviderEnablementReport | null;
   onAction: (connector: SourceConnectorId, options?: { googleDocsWorkspaceFolder?: string }) => void;
-  onGranolaAction: (apiKey: string) => void;
+  onApiKeyAction: (connector: "granola" | "linear", apiKey: string) => void;
   onReopenFinder: () => void;
   onClose: () => void;
 }) {
@@ -3811,6 +3879,7 @@ function AddSourceDialog({
   const [viewMode, setViewMode] = useState<SourceListViewMode>("list");
   const [googleDocsWorkspaceFolder, setGoogleDocsWorkspaceFolder] = useState("Locality");
   const [granolaApiKey, setGranolaApiKey] = useState("");
+  const [linearApiKey, setLinearApiKey] = useState("");
   const busy = sourceSetupIsBusy(state);
   const connectors: ConnectorOption[] = [
     {
@@ -3830,6 +3899,14 @@ function AddSourceDialog({
       mounted: sourceMounted(snapshot, "google-docs"),
     },
     {
+      id: "google-calendar",
+      name: "Google Calendar",
+      description: "Primary calendar events as files, new events from reviewed drafts.",
+      status: sourceConnectorStatus(snapshot, "google-calendar"),
+      keywords: ["google", "calendar", "gcal", "events", "meet"],
+      mounted: sourceMounted(snapshot, "google-calendar"),
+    },
+    {
       id: "gmail",
       name: "Gmail",
       description: "Inbox and sent as readable files, drafts as reviewed outbound mail.",
@@ -3844,6 +3921,22 @@ function AddSourceDialog({
       status: sourceConnectorStatus(snapshot, "granola"),
       keywords: ["granola", "meetings", "notes", "transcripts", "summaries"],
       mounted: sourceMounted(snapshot, "granola"),
+    },
+    {
+      id: "linear",
+      name: "Linear",
+      description: "Issues and teams as editable Markdown files.",
+      status: sourceConnectorStatus(snapshot, "linear"),
+      keywords: ["linear", "issues", "tickets", "projects", "teams"],
+      mounted: sourceMounted(snapshot, "linear"),
+    },
+    {
+      id: "slack",
+      name: "Slack",
+      description: "Recent accessible conversations as read-only Markdown.",
+      status: sourceConnectorStatus(snapshot, "slack"),
+      keywords: ["slack", "channels", "private channels", "dms", "group dms", "users"],
+      mounted: sourceMounted(snapshot, "slack"),
     },
   ];
   const normalizedQuery = query.trim().toLowerCase();
@@ -3930,6 +4023,7 @@ function AddSourceDialog({
           <div className={`connector-choice-grid ${viewMode}`}>
             {visibleConnectors.map((connector) => {
               const connectorBusy = sourceSetupIsActiveConnector(state, activeConnector, connector.id);
+              const apiKeyConnector = sourceRequiresApiKey(connector.id) ? connector.id : null;
               const connected = sourceConnectionReady(snapshot, connector.id);
               const needsConnection = !connected;
               const needsFolder = connected && !connector.mounted;
@@ -3981,9 +4075,25 @@ function AddSourceDialog({
                         <SettingRow title="Workspace folder" value={googleDocsWorkspaceFolder || "Locality"} />
                         <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
                       </>
+                    ) : connector.id === "google-calendar" ? (
+                      <>
+                        <SettingRow title="Calendar" value="Primary calendar" />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                      </>
                     ) : connector.id === "granola" ? (
                       <>
                         <SettingRow title="Content" value="Summaries and transcripts" />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                      </>
+                    ) : connector.id === "linear" ? (
+                      <>
+                        <SettingRow title="Content" value="Issues by team" />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                        <SettingRow title="Access" value="Issue edits" />
+                      </>
+                    ) : connector.id === "slack" ? (
+                      <>
+                        <SettingRow title="Content" value="Channels, DMs, group DMs, users" />
                         <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
                       </>
                     ) : (
@@ -4003,21 +4113,29 @@ function AddSourceDialog({
                       />
                     </label>
                   )}
-                  {connector.id === "granola" && !connector.mounted && needsConnection && (
+                  {apiKeyConnector && !connector.mounted && needsConnection && (
                     <>
                       <label className="source-inline-field">
-                        <span>Granola API key</span>
+                        <span>{connector.name} API key</span>
                         <input
                           type="password"
                           autoComplete="off"
-                          value={granolaApiKey}
+                          value={apiKeyConnector === "linear" ? linearApiKey : granolaApiKey}
                           placeholder="Paste API key"
                           disabled={busy}
-                          onChange={(event) => setGranolaApiKey(event.target.value)}
+                          onChange={(event) => {
+                            if (apiKeyConnector === "linear") {
+                              setLinearApiKey(event.target.value);
+                            } else {
+                              setGranolaApiKey(event.target.value);
+                            }
+                          }}
                         />
                       </label>
                       <p className="quiet-note">
-                        Create a key in Granola Settings → Connectors → API keys. Business or Enterprise is required.
+                        {apiKeyConnector === "linear"
+                          ? "Create a key in Linear Settings > API > Personal API keys."
+                          : "Create a key in Granola Settings > Connectors > API keys. Business or Enterprise is required."}
                       </p>
                     </>
                   )}
@@ -4025,15 +4143,21 @@ function AddSourceDialog({
                     <SecondaryButton compact disabled icon={<Check />}>
                       Mounted
                     </SecondaryButton>
-                  ) : connector.id === "granola" ? (
+                  ) : apiKeyConnector ? (
                     <PrimaryButton
                       compact
                       busy={connectorBusy}
-                      disabled={disabled || (needsConnection && !granolaApiKey.trim())}
+                      disabled={
+                        disabled ||
+                        (needsConnection && !(apiKeyConnector === "linear" ? linearApiKey : granolaApiKey).trim())
+                      }
                       icon={needsConnection ? <ShieldCheck /> : <FolderOpen />}
                       onClick={() => {
                         if (needsConnection) {
-                          onGranolaAction(granolaApiKey);
+                          onApiKeyAction(
+                            apiKeyConnector,
+                            apiKeyConnector === "linear" ? linearApiKey : granolaApiKey,
+                          );
                         } else {
                           onAction(connector.id);
                         }
@@ -4076,10 +4200,16 @@ function sourceDisplayName(connector: SourceConnectorId) {
       return "Notion";
     case "google-docs":
       return "Google Docs";
+    case "google-calendar":
+      return "Google Calendar";
     case "gmail":
       return "Gmail";
     case "granola":
       return "Granola";
+    case "linear":
+      return "Linear";
+    case "slack":
+      return "Slack";
   }
 }
 
@@ -4089,10 +4219,16 @@ function sourceMountId(connector: SourceConnectorId) {
       return "notion-main";
     case "google-docs":
       return "google-docs-main";
+    case "google-calendar":
+      return "google-calendar-main";
     case "gmail":
       return "gmail-main";
     case "granola":
       return "granola-main";
+    case "linear":
+      return "linear-main";
+    case "slack":
+      return "slack-main";
   }
 }
 
@@ -4119,7 +4255,7 @@ function sourceConnectorStatus(snapshot: DesktopSnapshot, connector: SourceConne
   if (sourceConnectionReady(snapshot, connector)) {
     return "Folder needed";
   }
-  if (connector === "granola") {
+  if (sourceRequiresApiKey(connector)) {
     return "API key required";
   }
   return "Ready to connect";
@@ -4128,6 +4264,29 @@ function sourceConnectorStatus(snapshot: DesktopSnapshot, connector: SourceConne
 function sourceConnectionStatusReady(status: string) {
   const normalized = status.trim().toLowerCase();
   return normalized === "active" || normalized === "ready";
+}
+
+function sourceDefaultPathPrefix() {
+  return isMacRuntime() ? "~/Library/CloudStorage/Locality" : "~/Locality";
+}
+
+function sourceDefaultMountDirectory(connector: SourceConnectorId) {
+  switch (connector) {
+    case "notion":
+      return "notion";
+    case "google-docs":
+      return "google-docs-main";
+    case "google-calendar":
+      return "google-calendar-main";
+    case "gmail":
+      return "gmail-main";
+    case "granola":
+      return "granola";
+    case "linear":
+      return "linear";
+    case "slack":
+      return "slack";
+  }
 }
 
 function sourceDefaultPath(snapshot: DesktopSnapshot, connector: SourceConnectorId) {
@@ -4141,18 +4300,9 @@ function sourceDefaultPath(snapshot: DesktopSnapshot, connector: SourceConnector
     snapshot.mount.status !== "not_mounted" &&
     snapshot.mount.localPath.trim()
   ) {
-    return snapshot.mount.localPath;
+      return snapshot.mount.localPath;
   }
-  switch (connector) {
-    case "notion":
-      return "~/Library/CloudStorage/Locality/notion";
-    case "google-docs":
-      return "~/Library/CloudStorage/Locality/google-docs-main";
-    case "gmail":
-      return "~/Library/CloudStorage/Locality/gmail-main";
-    case "granola":
-      return "~/Library/CloudStorage/Locality/granola";
-  }
+  return `${sourceDefaultPathPrefix()}/${sourceDefaultMountDirectory(connector)}`;
 }
 
 function sourceActionLabel(
@@ -4179,6 +4329,19 @@ function sourceActionIcon(connector: SourceConnectorId, needsConnection: boolean
     return <ShieldCheck />;
   }
   return <FolderOpen />;
+}
+
+function oauthConnectCommand(connector: "google-docs" | "google-calendar" | "gmail" | "slack") {
+  switch (connector) {
+    case "google-docs":
+      return "connect_google_docs";
+    case "google-calendar":
+      return "connect_google_calendar";
+    case "gmail":
+      return "connect_gmail";
+    case "slack":
+      return "connect_slack";
+  }
 }
 
 function ConnectorIcon({ connector }: { connector: SourceConnectorId }) {
@@ -4849,7 +5012,6 @@ function MountDetailView({
             <AlertTriangle />
             Danger Zone
           </span>
-          <small>Closed by default</small>
         </summary>
         <div className="danger-body">
           <div>
@@ -5821,9 +5983,11 @@ function SettingsView({
 
   function copyDiagnostics() {
     const summary = [
+      `Health: ${healthLabel(snapshot.health.state)}`,
       `Locality process: ${daemonStopped ? "Stopped" : "Running"}`,
       snapshot.mount.provider ? `Provider: ${providerStatusLabel(snapshot.mount.provider)}` : null,
       "State folder: ~/.loc",
+      "Logs folder: ~/.loc/logs",
       `Projection: ${snapshot.mount.projection}`,
       `Connection: ${snapshot.connection.status}`,
       `Mount: ${snapshot.mount.status}`,
@@ -6028,7 +6192,7 @@ function SettingsView({
                 busy={busySetting === "show_menu_bar"}
                 onToggle={(enabled) => void updateDesktopSetting("show_menu_bar", enabled)}
               />
-              <SettingRow title="Default Notion folder" value="~/Library/CloudStorage/Locality/notion" />
+              <SettingRow title="Default Notion folder" value={`${sourceDefaultPathPrefix()}/notion`} />
               {settingsMessage && <p className="quiet-note inline-note">{settingsMessage}</p>}
             </section>
           )}
@@ -6124,6 +6288,7 @@ function SettingsView({
                   <SettingRow title="Provider" value={providerStatusLabel(snapshot.mount.provider)} />
                 )}
                 <SettingRow title="State folder" value="~/.loc" />
+                <SettingRow title="Logs folder" value="~/.loc/logs" />
                 <SettingRow title="Projection" value={snapshot.mount.projection} />
                 <div className="button-row">
                   <SecondaryButton compact onClick={copyDiagnostics}>
@@ -7496,6 +7661,19 @@ function ConnectorOptions({
       </button>
       <button
         type="button"
+        className={`connector-option available selectable ${selected === "google-calendar" ? "selected" : ""}`}
+        disabled={busy}
+        onClick={() => onSelect("google-calendar")}
+      >
+        <ConnectorIcon connector="google-calendar" />
+        <div>
+          <strong>Google Calendar</strong>
+          <small>Primary calendar events and reviewed event drafts.</small>
+        </div>
+        <span>{connectedConnector === "google-calendar" ? "Connected" : "OAuth"}</span>
+      </button>
+      <button
+        type="button"
         className={`connector-option available selectable ${selected === "gmail" ? "selected" : ""}`}
         disabled={busy}
         onClick={() => onSelect("gmail")}
@@ -7519,6 +7697,32 @@ function ConnectorOptions({
           <small>Meeting summaries and transcripts as read-only files.</small>
         </div>
         <span>{connectedConnector === "granola" ? "Connected" : "API key"}</span>
+      </button>
+      <button
+        type="button"
+        className={`connector-option available selectable ${selected === "linear" ? "selected" : ""}`}
+        disabled={busy}
+        onClick={() => onSelect("linear")}
+      >
+        <ConnectorIcon connector="linear" />
+        <div>
+          <strong>Linear</strong>
+          <small>Issues and teams as editable Markdown files.</small>
+        </div>
+        <span>{connectedConnector === "linear" ? "Connected" : "API key"}</span>
+      </button>
+      <button
+        type="button"
+        className={`connector-option available selectable ${selected === "slack" ? "selected" : ""}`}
+        disabled={busy}
+        onClick={() => onSelect("slack")}
+      >
+        <ConnectorIcon connector="slack" />
+        <div>
+          <strong>Slack</strong>
+          <small>Channels, DMs, group DMs, and users as read-only files.</small>
+        </div>
+        <span>{connectedConnector === "slack" ? "Connected" : "OAuth"}</span>
       </button>
     </div>
   );
@@ -7611,6 +7815,10 @@ function handleChromeMouseDown(event: React.MouseEvent<HTMLDivElement>) {
 
 function isWindowsRuntime() {
   return typeof navigator !== "undefined" && /^Win/i.test(navigator.platform);
+}
+
+function isMacRuntime() {
+  return typeof navigator !== "undefined" && /^Mac/i.test(navigator.platform);
 }
 
 function SetupContent({

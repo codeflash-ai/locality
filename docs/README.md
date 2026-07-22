@@ -15,3 +15,5 @@ Use this directory for repo-facing documentation that helps contributors underst
 ## Static collaboration artifacts
 
 - `wireframes/index.html`: Locality desktop wireframe deck. If GitHub Pages is configured to serve the repository's `docs/` directory, this is available at `/wireframes/`. Sibling screen URLs such as `/wireframes/home.html` are generated from the root deck with `node scripts/generate-wireframe-pages.mjs`.
+- `agent-conversation-profile.md`: usage notes for the local experiment that turns
+  Claude/Codex conversation exports into Perfetto-readable traces.

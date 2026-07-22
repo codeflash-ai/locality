@@ -10,11 +10,11 @@ This file approach simplifies external apps for your agents, and collaborating w
 
 https://github.com/user-attachments/assets/b2486a4a-e957-4c4f-8e4d-12163c920b16
 
-The first supported platform is Notion: pages become directories, page bodies live
+Locality began with Notion support: pages become directories, page bodies live
 in `page.md`, child pages become child directories, and database rows become
 page-like folders with frontmatter. Humans, editors, scripts, and coding agents
-can search, read, and edit those files with ordinary filesystem tools while keeping
-Notion as the source of truth.
+can search, read, and edit mounted files with ordinary filesystem tools while
+keeping the remote app as the source of truth.
 
 ```text
 ~/Library/CloudStorage/Locality/notion
@@ -143,6 +143,7 @@ Common commands:
 | `loc locate <query>` | Find a Notion page/database and print its local path. |
 | `loc status [path]` | Show local state, pending edits, conflicts, and known remote drift. |
 | `loc diff <path>` | Review the planned connector operations and readable Markdown diff. |
+| `loc mv <source> <dest>` | Move or rename mounted pages/files locally without pushing. |
 | `loc push <path> -y` | Apply a safe plan to the remote source and reconcile local state. |
 | `loc pull <path>` | Refresh a mount, folder, page directory, or `page.md`. |
 | `loc inspect <path>` | Fetch the current remote page and explain local-vs-remote drift. |
@@ -154,9 +155,10 @@ For agents, the preferred path is usually:
 
 1. Use `loc locate` or normal filesystem search to find the page.
 2. Edit mounted Markdown directly.
-3. Stop unless the user asked for review or push.
-4. Use `loc status` and `loc diff` for inspection.
-5. Use `loc push` only when explicitly requested or when recovering a known
+3. Use `loc mv` for intentional mounted page/file moves or renames.
+4. Stop unless the user asked for review or push.
+5. Use `loc status` and `loc diff` for inspection.
+6. Use `loc push` only when explicitly requested or when recovering a known
    pending local change.
 
 ## Sync Engine
@@ -239,6 +241,7 @@ Core crates and directories:
 | `crates/locality-core` | Connector-neutral sync model, canonical Markdown, diff planning, validation, guardrails, conflicts, and journals. |
 | `crates/locality-connector` | Connector trait and data types for enumerate, fetch, render, parse, apply, and reverse apply. |
 | `crates/locality-notion` | Notion API client, DTOs, renderer, parser/apply support, database schema handling, media, and OAuth integration. |
+| `crates/locality-slack` | Slack Web API client, OAuth credential handling, read-only conversation projection, and Markdown rendering. |
 | `crates/locality-store` | SQLite state store, migrations, mounts, entities, shadows, journals, credentials metadata, and freshness state. |
 | `platform/linux/locality-fuse` | Linux FUSE helper for online-only virtual mounts. |
 | `platform/windows/locality-cloud-files` | Windows Cloud Files provider runtime. |

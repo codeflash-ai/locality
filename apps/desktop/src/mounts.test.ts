@@ -92,6 +92,37 @@ describe("mount display helpers", () => {
     });
   });
 
+  it("does not show retained disconnected mounts as connected source rows", () => {
+    const rows = mountRows([mount({ status: "reconnect_needed" })], mount({}), "notion-main");
+
+    expect(rows).toEqual([]);
+  });
+
+  it("builds Google Calendar mount rows with calendar workspace context", () => {
+    const notion = mount({});
+    const calendar = mount({
+      mountId: "google-calendar-main",
+      connector: "google-calendar",
+      connectorName: "Google Calendar",
+      connectionId: "google-calendar-default",
+      workspaceName: "Primary calendar",
+      localPath: "/home/ada/Locality/google-calendar-main",
+      notionUrl: null,
+      accessScope: "Primary calendar",
+      remoteRootId: null,
+      entityCount: 8,
+      pendingChangeCount: 0,
+    });
+
+    const rows = mountRows([notion, calendar], notion, "google-calendar-main");
+    const selected = selectedMountRow(rows, "google-calendar-main");
+
+    expect(selected).toMatchObject({
+      title: "Google Calendar",
+      subtitle: "Primary calendar / google-calendar-main",
+    });
+  });
+
   it("labels indexed mount entities as items, not physical files", () => {
     expect(mountEntityCountLabel(mount({ entityCount: 1 }))).toBe("1 item");
     expect(mountEntityCountLabel(mount({ entityCount: 260 }))).toBe("260 items");
@@ -256,6 +287,8 @@ describe("mount display helpers", () => {
     ).toBe("warn");
     expect(mountStatusTone(mount({ status: "provider_stopped" }))).toBe("danger");
     expect(mountStatusTone(mount({ status: "provider_error" }))).toBe("danger");
+    expect(mountStatusLabel(mount({ status: "reconnect_needed" }))).toBe("Reconnect needed");
+    expect(mountStatusTone(mount({ status: "reconnect_needed" }))).toBe("warn");
   });
 });
 

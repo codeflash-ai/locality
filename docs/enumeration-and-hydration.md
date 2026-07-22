@@ -20,6 +20,9 @@ In this document:
   children with `Connector::list_children`.
 - **Observation** means asking a connector for metadata or freshness for a
   known entity. Observation is not enumeration and is not hydration by itself.
+- **Batch observation** means asking a connector for mount-wide metadata
+  changes relative to an opaque connector checkpoint. It is discovery, but it
+  is neither full-tree enumeration nor body hydration.
 - **Hydration** means fetching/rendering a remote entity body through
   `fetch_render` and then using the result for a local file, shadow, assets, or
   comparison.
@@ -32,15 +35,105 @@ The connector boundary is in `crates/locality-connector/src/lib.rs`.
   metadata for a mount. It is the full-tree path.
 - `Connector::observe(ObserveRequest)` returns metadata/freshness for a known
   remote entity. It does not fetch body content.
+- `Connector::observe_batch(BatchObserveRequest)` returns metadata upserts and
+  explicit tombstones plus a connector-owned next checkpoint. A `Complete`
+  result authorizes omission-based removal only inside the configured mount
+  scope. An `Incremental` result never treats omission as deletion.
 - `Connector::list_children(ListChildrenRequest)` returns immediate child
   metadata for a `ChildContainer`. The trait comments explicitly keep it to
   metadata and require implementations not to fetch page bodies.
 - `Connector::fetch(FetchRequest)` returns the connector-native entity body.
 
+Unlike `enumerate`, batch observation returns changes rather than requiring a
+full remote tree on every call. Unlike `observe`, it can discover entities that
+are not already known locally. All three paths remain metadata-only unless a
+separate fetch/render path hydrates an entity. The daemon must persist the
+opaque checkpoint JSON only after the complete batch has been validated and
+reconciled successfully.
+
+### Daemon Batch Reconciliation Planning
+
+`crates/localityd/src/discovery.rs` provides the read-only planning boundary for
+checkpointed batch observation. `plan_batch_discovery` validates the complete
+connector batch, reads the current durable state, and returns one deterministic
+`DiscoveryPlan`. The plan separates filesystem projection actions that must
+happen before commit, held changes that require review, post-commit hydration
+requests, and the single `DiscoveryCommit` that publishes all accepted or held
+state together with the next connector checkpoint. Planning itself does not
+mutate the filesystem or store.
+
+The planner preserves incremental omissions and treats complete omissions as
+deletes. Unknown tombstones are no-ops. Held upserts and tombstones are retained
+in a tagged, versioned replay envelope in remote-observation state, so a later
+empty incremental batch can reconsider them. A newer replay format fails with
+an update-required result; an incoming connector change for the same remote id
+takes precedence over an older held replay.
+
+Structural creates, moves, and deletes are grouped into deterministic projection
+components before admission. Each action contributes connector-neutral
+namespace roots: pages use their containing directory, while databases,
+directories, assets, and unknown kinds use their projected path unchanged.
+Actions belong to one component when any roots are equal or have an
+ancestor/descendant relationship, including transitive bridge relationships.
+The returned component roots and actions are sorted deterministically. A
+descendant delete is omitted when an ancestor delete already realizes it, and a
+descendant move is omitted only when an acyclic ancestor move maps the exact
+same relative suffix for both its namespace and raw projected path. Divergent
+moves, layout-changing moves, and move cycles remain explicit.
+
+Every structural action in a component is held when any member has an
+incompatible kind change, a blocked or missing projection assessment, or an
+intersecting pending virtual mutation. The planner also expands the component
+over all existing entities in overlapping namespace subtrees. A dirty or
+conflicted entity, an unsettled push journal (`Prepared`, `Applying`, `Applied`,
+or `Failed`), a local edit whose 30-second lease is still active, or an
+explicitly reported active child-refresh namespace anywhere in that expanded
+component holds every action in it. Malformed or future local-edit timestamps
+hold conservatively. Reconciled and reverted journals are settled. Blocker
+selection is deterministic, with pending mutations taking priority over
+journals, recent edits, active refreshes, entity state, kind changes, and
+projection assessments.
+
+Same-path remote drift is not a structural component action. It retains the
+individual mutation, dirty/conflicted, and kind-change checks. New entries must
+be metadata-only `Virtual` or `Stub` entries. Accepted remote metadata for
+existing `Virtual` and `Stub` entities updates the durable entity record, while
+remote drift for a `Hydrated` entity preserves synced fields, leaves a remote
+hint pending, queues post-commit hydration, and pauses enabled auto-save. Held
+changes retain replay observations and freshness state, and the planner never
+deletes virtual-mutation state.
+
+Pending virtual mutations are durable write intent, not a projection cache.
+Their semantic component is versioned independently of SQLite's physical
+schema. Version 3 requires move/rename planning to preserve coexisting cached
+document edits and to clear structural intent only after successful remote
+readback. It also permits an in-flight move/rename mutation's `content_path` to
+point at the source cache after the projected path has already moved; the daemon
+uses that source pointer while copying the cache to the destination, then
+finalizes `content_path` to the destination in a compare-and-set store update.
+Push planning and repair must therefore read `content_path` before falling back
+to the projected destination. The v1/v2 to v3 migration changes component
+metadata only and leaves every pending row byte-for-byte intact; a newer
+component version is update-required and must not mutate state.
+
+Before returning filesystem actions, the planner runs the store's read-only
+`DiscoveryCommit` preflight against the state it read, so final entity paths,
+mutation guards, and auto-save ownership use the same admission rules as the
+atomic memory and SQLite commit paths. This module still implements planning
+only. A future filesystem projection executor must serialize component
+execution per mount and publish the accompanying commit only after projection
+succeeds. Runtime connector scheduling, projection execution, and mutation
+cleanup remain separate integration work.
+
 Daemon hydration uses `fetch_render`, not the raw connector `fetch` method
 directly. The common daemon-side abstraction is `HydrationSource::fetch_render`
 in `crates/localityd/src/hydration.rs`; concrete adapters live in
 `crates/localityd/src/notion.rs` and `crates/localityd/src/google_docs.rs`.
+Stateful hydration, explicit pull, and push reconciliation call
+`fetch_render_with_repository`, which defaults to `fetch_render` but also passes
+a read-only `HydrationRepository` view of mounted entities. Connectors can use
+that view to render connector-native references as local links when the target
+entity is already mounted, without mutating daemon state during render.
 
 The persisted model lives in `crates/locality-core/src/model.rs`.
 
@@ -177,10 +270,12 @@ Local metadata response:
 - `virtual_fs_children`
 - `virtual_fs_item`
 
-The daemon answers `VirtualFsChildren` and `FileProviderChildren` from the local
-store first. If that local response succeeds, runtime queues an interactive
-child refresh for the same container. The queued refresh is the part that may
-call the remote connector.
+The daemon answers `VirtualFsChildren` from the local store first. If that local
+response succeeds, runtime queues an interactive child refresh for the same
+container. `FileProviderChildren` returns cached listings immediately when they
+already contain content, but waits for an interactive refresh when discovery is
+already queued/active or when a discoverable virtual container only has guidance
+files. The queued refresh is the part that may call the remote connector.
 
 The local response does not hydrate bodies. It only projects the current store
 state, local mutations, and virtual entries into a children report.
@@ -236,8 +331,12 @@ Implementation:
 - child-refresh queuing after hydration/observation results
 
 When remote fast-forward handling detects that child links may have changed, it
-can queue background child refreshes. The actual body update remains a hydration
-decision; the child discovery part uses `list_children`.
+can queue background child refreshes. For Linear mounts, a remote fast-forward
+that changes UUID reference targets in frontmatter queues the existing
+`batch:<mount-id>` metadata refresh so dependent projected containers can be
+rediscovered. Label-only changes around the same UUID do not queue this refresh.
+The actual body update remains a hydration decision; the discovery part uses
+connector metadata refresh paths.
 
 ### `loc pull` At A Virtual Directory
 
@@ -385,9 +484,9 @@ Implementation:
 - `hydrate_entity`
 
 When `loc pull` targets an entity path, `pull_entity_path` calls
-`hydrate_entity`. `hydrate_entity` calls `source.fetch_render` with
-`HydrationReason::ExplicitPull`, writes rendered files/assets/schema data, and
-updates the entity and shadow if the local state allows the result to be
+`hydrate_entity`. `hydrate_entity` calls `source.fetch_render_with_repository`
+with `HydrationReason::ExplicitPull`, writes rendered files/assets/schema data,
+and updates the entity and shadow if the local state allows the result to be
 accepted.
 
 Mount-root pull may also hydrate the root entity or repair missing media, as
@@ -541,7 +640,8 @@ Before applying a push, the remote guard can call `fetch_render` with
 `HydrationReason::ExplicitPull` to compare remote content against expected state.
 After applying creates or updates, push reconciliation can fetch/render the
 resulting remote entity, write assets/Markdown, save entity and shadow state,
-record observation, and clear remote hints.
+record observation, and clear remote hints. These stateful push fetch/render
+paths pass the same read-only `HydrationRepository` view as hydration.
 
 This is body fetch and local materialization, but it is owned by push execution
 rather than the runtime hydration queue.
@@ -587,9 +687,10 @@ The runtime schedules work in this order:
 
 The executor only hydrates to a `Hydrated` target state. It loads mount and
 entity records, maps virtual projections to the content root when needed, checks
-whether the target file can be replaced, calls `fetch_render`, validates shadow
-identity, writes assets/media/schema/Markdown, saves the shadow/entity, and
-clears remote hints when the rendered remote version is current.
+whether the target file can be replaced, calls `fetch_render_with_repository`,
+validates shadow identity, writes assets/media/schema/Markdown, saves the
+shadow/entity, and clears remote hints when the rendered remote version is
+current.
 
 `can_replace_file` allows replacement when:
 
@@ -617,6 +718,42 @@ they call one of the trigger paths above.
   local mount configuration. It does not call a connector.
 - `observe` paths are metadata/freshness checks. They can lead to later
   fast-forward hydration, but the observation call itself does not fetch bodies.
+- `observe_batch` is mount-wide metadata discovery. Its upserts remain stubs or
+  metadata until a separate hydration trigger fetches their bodies.
+- An accepted batch is not published directly. The transactional discovery
+  APIs reserve from the exact store snapshot used by planning, perform
+  projection work, and only then atomically publish the stored commit,
+  checkpoint, and committed marker. Reservation drift leaves the old checkpoint
+  authoritative and requires rollback or review.
+- Plain-file projection work uses a versioned execution plan under a hashed
+  `.locality-recovery/discovery` path beside the mount. Preparation requires the
+  mount and recovery parent to be on the same volume, binds public projection
+  actions and normalized components to the structural commit changes, and
+  rejects missing destination ancestors unless directory operations provide
+  them. Each filesystem change returns before its matching effect is recorded,
+  so repair can distinguish the two crash orderings from path fingerprints.
+- Unix execution flushes created files and syncs affected parent directories
+  around no-replace renames and removals. Windows flushes created files and
+  requests write-through for same-volume no-replace renames, but cannot portably
+  fsync parent directories; namespace creation and removal are therefore not
+  claimed to survive every power loss on Windows.
+- Directory ownership fingerprints stream each file into a SHA-256 content
+  digest and hash sorted path/kind/size/digest records. They do not retain an
+  entire moved subtree in memory. Create materializations use the same record
+  format as files read back from disk.
+- `run_plain_files_discovery_transaction` drives a newly reserved transaction
+  through projection, atomic store commit, hydration-job publication, recovery
+  cleanup, and finalization. `repair_plain_files_discovery_transaction` aborts
+  untouched `reserved` work without re-fingerprinting source paths, resumes or
+  rolls back later work, and preserves ambiguous or mismatched temporary create
+  payloads for review. `repair_active_plain_files_discovery_transactions`
+  filters active records to this executor. These APIs do not imply a daemon
+  startup integration. A newer execution version fails with an update-required
+  result before state or files change.
+- This executor is intentionally limited to `plain_files`. File Provider,
+  FUSE, and Cloud Files transactions keep their provider-owned projection
+  paths; active repair filters those records without decoding or mutating
+  their opaque plans.
 - `list_children` paths must not fetch page bodies according to the connector
   contract.
 - `loc status` and `loc diff` may inspect local projection and shadow state, but

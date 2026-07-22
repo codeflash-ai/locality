@@ -1,6 +1,6 @@
 [package]
 name = "locality-granola"
-version = "0.3.3"
+version = "0.3.6"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

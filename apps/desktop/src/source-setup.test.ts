@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   connectedSourcesReadyToMount,
+  isSourceConnectorId,
+  sourceConnectorIds,
+  sourceRequiresApiKey,
+  sourceSkipsManualMountStep,
+  sourceMounted,
+  sourceMountRetryOutcome,
   sourceSetupIsActiveConnector,
   sourceSetupIsBusy,
-  sourceMountRetryOutcome,
   sourceSetupProgressLabel,
 } from "./source-setup";
 
@@ -20,6 +25,20 @@ describe("source setup progress", () => {
     expect(sourceSetupProgressLabel("creating", false)).toBe("Mounting");
     expect(sourceSetupProgressLabel("connecting", true)).toBe("Finishing setup");
     expect(sourceSetupProgressLabel("changing", true)).toBe("Updating access");
+  });
+
+  it("includes connector catalog entries with their auth modes", () => {
+    expect(sourceConnectorIds()).toContain("linear");
+    expect(sourceConnectorIds()).toContain("slack");
+    expect(sourceConnectorIds()).toContain("google-calendar");
+    expect(sourceRequiresApiKey("linear")).toBe(true);
+    expect(sourceRequiresApiKey("granola")).toBe(true);
+    expect(sourceRequiresApiKey("slack")).toBe(false);
+    expect(sourceRequiresApiKey("google-calendar")).toBe(false);
+    expect(sourceRequiresApiKey("gmail")).toBe(false);
+    expect(sourceSkipsManualMountStep("linear")).toBe(true);
+    expect(sourceSkipsManualMountStep("slack")).toBe(true);
+    expect(sourceSkipsManualMountStep("google-calendar")).toBe(true);
   });
 
   it("keeps connected but unmounted sources visible when another source is mounted", () => {
@@ -42,6 +61,31 @@ describe("source setup progress", () => {
         mounts: [],
       }),
     ).toEqual(["notion"]);
+  });
+
+  it("includes connected unmounted sources in catalog order", () => {
+    expect(isSourceConnectorId("google-calendar")).toBe(true);
+    expect(
+      connectedSourcesReadyToMount({
+        connections: [
+          { connector: "google-calendar", status: "active" },
+          { connector: "slack", status: "active" },
+          { connector: "gmail", status: "active" },
+        ],
+        mounts: [{ connector: "gmail", status: "ready" }],
+      }),
+    ).toEqual(["google-calendar", "slack"]);
+  });
+
+  it("does not treat a retained disconnected source mount as mounted", () => {
+    expect(
+      sourceMounted(
+        {
+          mounts: [{ connector: "notion", status: "reconnect_needed" }],
+        },
+        "notion",
+      ),
+    ).toBe(false);
   });
 });
 

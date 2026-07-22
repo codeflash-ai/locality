@@ -70,6 +70,16 @@ mount-point children before starting the Cloud Files runtime, so the helper seed
 root placeholders from discovered workspace metadata instead of from an empty
 initial projection.
 
+Before the helper registers Cloud Filter callbacks, it loads every active mount
+access root in the shared projection and repairs interrupted recovery manifests
+and orphan quarantine payloads. Repair errors and records requiring review stop
+provider startup before placeholder seeding or local watcher admission; the
+helper reports a `projection_recovery_failed` or
+`projection_recovery_review_required` error instead of accepting filesystem
+events against unresolved recovery state. Detached lifecycle start invokes this
+check synchronously with `locality-cloud-files.exe preflight` before spawning;
+the provider repeats it in `run` immediately before callback registration.
+
 Installed files:
 
 ```text

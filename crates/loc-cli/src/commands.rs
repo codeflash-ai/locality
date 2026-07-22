@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
@@ -21,14 +22,24 @@ use locality_gmail::{
     DEFAULT_GMAIL_OAUTH_BROKER_URL, DEFAULT_GMAIL_OAUTH_REDIRECT_URI, GMAIL_CONNECTOR_ID,
     GmailMountSettings, GmailProjectionView, HttpGmailOAuthBrokerClient,
 };
+use locality_google_calendar::{
+    DEFAULT_GOOGLE_CALENDAR_OAUTH_BROKER_URL, DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI,
+    GOOGLE_CALENDAR_CONNECTOR_ID, GoogleCalendarMountSettings, HttpGoogleCalendarOAuthBrokerClient,
+};
 use locality_google_docs::{
     DEFAULT_GOOGLE_DOCS_OAUTH_BROKER_URL, DEFAULT_GOOGLE_DOCS_OAUTH_REDIRECT_URI,
     GOOGLE_DOCS_CONNECTOR_ID, HttpGoogleDocsOAuthBrokerClient,
 };
 use locality_granola::GRANOLA_CONNECTOR_ID;
+use locality_linear::LINEAR_CONNECTOR_ID;
 use locality_notion::oauth::{
     DEFAULT_LOCALITY_NOTION_OAUTH_BROKER_URL, DEFAULT_NOTION_OAUTH_AUTHORIZE_URL,
     HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NotionOAuthBrokerStart,
+};
+use locality_slack::{
+    DEFAULT_SLACK_OAUTH_BROKER_URL, DEFAULT_SLACK_OAUTH_REDIRECT_URI, HttpSlackOAuthBrokerClient,
+    SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE, SLACK_CONNECTOR_ID, SlackConversationType,
+    SlackMountSettings,
 };
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
@@ -45,6 +56,7 @@ use localityd::google_docs::resolve_google_docs_connector_for_mount;
 use localityd::granola::resolve_granola_connector_for_mount;
 use localityd::hydration::write_parent_database_schema_cache;
 use localityd::ipc::{DaemonClientError, DaemonRequest, send_request_with_timeout};
+use localityd::linear::resolve_linear_connector_for_mount;
 use localityd::runtime::repair_clean_remote_deleted_projections;
 use localityd::virtual_fs::{
     VirtualFsChildrenReport, mount_point_identifier, virtual_fs_ancestor_container_identifiers,
@@ -57,11 +69,14 @@ use serde_json::Value;
 use crate::connect::{
     BrokerOAuthConnectOptions, ConnectError, ConnectOptions, ConnectReport, ConnectionShowReport,
     ConnectionsReport, DisconnectReport, GmailBrokerOAuthConnectOptions,
-    GoogleDocsBrokerOAuthConnectOptions, HttpGranolaConnectionProbe, HttpNotionConnectionProbe,
-    OAuthConnectOptions, ProfilesReport, run_connect_gmail_broker_oauth,
-    run_connect_google_docs_broker_oauth, run_connect_granola, run_connect_notion,
-    run_connect_notion_broker_oauth, run_connect_notion_oauth, run_connection_show,
-    run_connections, run_disconnect, run_profiles,
+    GoogleCalendarBrokerOAuthConnectOptions, GoogleDocsBrokerOAuthConnectOptions,
+    HttpGranolaConnectionProbe, HttpLinearConnectionProbe, HttpNotionConnectionProbe,
+    OAuthConnectOptions, ProfilesReport, SlackBrokerOAuthConnectOptions,
+    run_connect_gmail_broker_oauth, run_connect_google_calendar_broker_oauth,
+    run_connect_google_docs_broker_oauth, run_connect_granola, run_connect_linear,
+    run_connect_notion, run_connect_notion_broker_oauth, run_connect_notion_oauth,
+    run_connect_slack_broker_oauth, run_connection_show, run_connections, run_disconnect,
+    run_profiles,
 };
 use crate::connector::{
     ConnectorResolveError, SourceDescriptor, resolve_notion_connector_for_mount,
@@ -86,6 +101,7 @@ use crate::local_oauth::{
     run_local_oauth_authorization,
 };
 use crate::mount::{MountError, MountOptions, MountReport, run_mount};
+use crate::mv::{MvError, MvOptions, MvReport, run_mv_with_daemon_at_state_root};
 use crate::okf::{OkfExportError, OkfExportOptions, OkfExportReport, run_okf_export};
 use crate::pull::{PullError, PullReport, run_pull_with_state_root};
 use crate::push::{
@@ -116,6 +132,9 @@ const EXIT_USAGE: i32 = 2;
 const EXIT_VALIDATION: i32 = 3;
 const DEFAULT_DAEMON_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_DAEMON_MUTATING_TIMEOUT: Duration = Duration::from_secs(60);
+const MIN_SLACK_HISTORY_LIMIT: u32 = 1;
+const MAX_SLACK_HISTORY_LIMIT: u32 = 15;
+const SLACK_CONVERSATION_TYPE_VALUES: &str = "public_channel,private_channel,im,mpim";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -207,6 +226,8 @@ enum LocalityCommand {
     Push(PushArgs),
     #[command(about = "Preview the push plan for local changes")]
     Diff(RequiredPathArg),
+    #[command(about = "Move or rename mounted content locally without pushing")]
+    Mv(MvArgs),
     #[command(about = "Undo a reconciled push using its journal entry")]
     Undo(UndoArgs),
     #[command(about = "List push journal entries")]
@@ -255,10 +276,16 @@ enum ConnectCommand {
     Notion(ConnectNotionArgs),
     #[command(name = "google-docs", about = "Connect Google Docs")]
     GoogleDocs(ConnectGoogleDocsArgs),
+    #[command(name = "google-calendar", about = "Connect Google Calendar")]
+    GoogleCalendar(ConnectGoogleCalendarArgs),
     #[command(about = "Connect Gmail")]
     Gmail(ConnectGmailArgs),
+    #[command(about = "Connect Slack")]
+    Slack(ConnectSlackArgs),
     #[command(about = "Connect Granola with an API key")]
     Granola(ConnectGranolaArgs),
+    #[command(about = "Connect Linear with an API key")]
+    Linear(ConnectLinearArgs),
 }
 
 #[derive(Debug, Args)]
@@ -270,6 +297,18 @@ struct ConnectGranolaArgs {
     )]
     name: Option<String>,
     #[arg(long, help = "Read a Granola API key from standard input.")]
+    api_key_stdin: bool,
+}
+
+#[derive(Debug, Args)]
+struct ConnectLinearArgs {
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Connection id to save. Defaults to linear-default."
+    )]
+    name: Option<String>,
+    #[arg(long, help = "Read a Linear API key from standard input.")]
     api_key_stdin: bool,
 }
 
@@ -326,6 +365,46 @@ struct ConnectGmailArgs {
         long,
         value_name = "ID",
         help = "Connection id to save. Defaults to gmail-default."
+    )]
+    name: Option<String>,
+    #[arg(long, help = "Print the OAuth URL instead of opening a browser.")]
+    no_browser: bool,
+    #[arg(long, value_name = "URL", help = "OAuth broker base URL.")]
+    broker_url: Option<String>,
+    #[arg(
+        long,
+        value_name = "URI",
+        help = "OAuth redirect URI for the local callback listener."
+    )]
+    redirect_uri: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ConnectGoogleCalendarArgs {
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Connection id to save. Defaults to google-calendar-default."
+    )]
+    name: Option<String>,
+    #[arg(long, help = "Print the OAuth URL instead of opening a browser.")]
+    no_browser: bool,
+    #[arg(long, value_name = "URL", help = "OAuth broker base URL.")]
+    broker_url: Option<String>,
+    #[arg(
+        long,
+        value_name = "URI",
+        help = "OAuth redirect URI for the local callback listener."
+    )]
+    redirect_uri: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ConnectSlackArgs {
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Connection id to save. Defaults to slack-default."
     )]
     name: Option<String>,
     #[arg(long, help = "Print the OAuth URL instead of opening a browser.")]
@@ -419,10 +498,16 @@ enum MountCommand {
     Notion(MountNotionArgs),
     #[command(name = "google-docs", about = "Mount Google Docs content")]
     GoogleDocs(MountGoogleDocsArgs),
+    #[command(name = "google-calendar", about = "Mount Google Calendar")]
+    GoogleCalendar(MountGoogleCalendarArgs),
     #[command(about = "Mount Gmail")]
     Gmail(MountGmailArgs),
+    #[command(about = "Mount Slack read-only")]
+    Slack(MountSlackArgs),
     #[command(about = "Mount Granola meeting notes read-only")]
     Granola(MountGranolaArgs),
+    #[command(about = "Mount Linear issues")]
+    Linear(MountLinearArgs),
 }
 
 #[derive(Debug, Args)]
@@ -439,6 +524,31 @@ struct MountGranolaArgs {
     mount_id: Option<String>,
     #[arg(long, value_name = "mode", help = "Projection mode.")]
     projection: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct MountLinearArgs {
+    #[arg(value_name = "path", help = "Local directory for the Linear mount.")]
+    path: String,
+    #[arg(long, value_name = "id", help = "Connection id to use for this mount.")]
+    connection: Option<String>,
+    #[arg(
+        long,
+        value_name = "id",
+        help = "Mount id to save. Defaults to linear-main."
+    )]
+    mount_id: Option<String>,
+    #[arg(
+        long,
+        value_name = "mode",
+        help = "Projection mode. Supported values depend on the host platform."
+    )]
+    projection: Option<String>,
+    #[arg(
+        long,
+        help = "Register the mount as read-only and block push operations."
+    )]
+    read_only: bool,
 }
 
 #[derive(Debug, Args)]
@@ -563,6 +673,81 @@ struct MountGmailArgs {
 }
 
 #[derive(Debug, Args)]
+struct MountGoogleCalendarArgs {
+    #[arg(
+        value_name = "path",
+        help = "Local directory where the Google Calendar mount should be registered."
+    )]
+    path: String,
+    #[arg(long, value_name = "id", help = "Connection id to use for this mount.")]
+    connection: Option<String>,
+    #[arg(
+        long,
+        value_name = "id",
+        help = "Mount id to save. Defaults to google-calendar-main."
+    )]
+    mount_id: Option<String>,
+    #[arg(
+        long,
+        value_name = "mode",
+        help = "Projection mode. Supported values depend on the host platform."
+    )]
+    projection: Option<String>,
+    #[arg(
+        long,
+        help = "Register the mount as read-only and block push operations."
+    )]
+    read_only: bool,
+    #[arg(
+        long,
+        value_name = "YYYY-MM-DD",
+        help = "Fetch Google Calendar events on or after this date. Must be paired with --before."
+    )]
+    after: Option<String>,
+    #[arg(
+        long,
+        value_name = "YYYY-MM-DD",
+        help = "Fetch Google Calendar events before this date. Must be paired with --after."
+    )]
+    before: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct MountSlackArgs {
+    #[arg(
+        value_name = "path",
+        help = "Local directory where the Slack mount should be registered."
+    )]
+    path: String,
+    #[arg(long, value_name = "id", help = "Connection id to use for this mount.")]
+    connection: Option<String>,
+    #[arg(
+        long,
+        value_name = "id",
+        help = "Mount id to save. Defaults to slack-main."
+    )]
+    mount_id: Option<String>,
+    #[arg(
+        long,
+        value_name = "mode",
+        help = "Projection mode. Supported values depend on the host platform."
+    )]
+    projection: Option<String>,
+    #[arg(
+        long,
+        value_name = "1-15",
+        help = "Slack history limit from 1 to 15. Defaults to 15."
+    )]
+    history_limit: Option<String>,
+    #[arg(
+        long,
+        value_name = "types",
+        help = "Comma-separated Slack conversation types. Defaults to public_channel,private_channel,im,mpim."
+    )]
+    types: Option<String>,
+}
+
+#[derive(Debug, Args)]
 struct PathArg {
     #[arg(
         value_name = "path",
@@ -575,6 +760,17 @@ struct PathArg {
 struct RequiredPathArg {
     #[arg(value_name = "path", help = "Path inside an Locality mount.")]
     path: String,
+}
+
+#[derive(Debug, Args)]
+struct MvArgs {
+    #[arg(value_name = "source", help = "Source path inside a Locality mount.")]
+    source: String,
+    #[arg(
+        value_name = "dest",
+        help = "Destination path inside the same Locality mount."
+    )]
+    destination: String,
 }
 
 #[derive(Debug, Args)]
@@ -951,6 +1147,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         LocalityCommand::Pull(_) => pull(&legacy_args[1..], json),
         LocalityCommand::Push(_) => push(&legacy_args[1..], json),
         LocalityCommand::Diff(_) => diff(&legacy_args[1..], json),
+        LocalityCommand::Mv(_) => mv(&legacy_args[1..], json),
         LocalityCommand::Restore(_) => restore(&legacy_args[1..], json),
         LocalityCommand::Reset(_) => reset(&legacy_args[1..], json),
         LocalityCommand::Undo(_) => undo(&legacy_args[1..], json),
@@ -1012,6 +1209,21 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                         options.redirect_uri.as_deref(),
                     );
                 }
+                ConnectCommand::GoogleCalendar(options) => {
+                    args.push("google-calendar".to_string());
+                    push_optional_flag_value(&mut args, "--name", options.name.as_deref());
+                    push_flag(&mut args, "--no-browser", options.no_browser);
+                    push_optional_flag_value(
+                        &mut args,
+                        "--broker-url",
+                        options.broker_url.as_deref(),
+                    );
+                    push_optional_flag_value(
+                        &mut args,
+                        "--redirect-uri",
+                        options.redirect_uri.as_deref(),
+                    );
+                }
                 ConnectCommand::Gmail(options) => {
                     args.push("gmail".to_string());
                     push_optional_flag_value(&mut args, "--name", options.name.as_deref());
@@ -1027,8 +1239,28 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                         options.redirect_uri.as_deref(),
                     );
                 }
+                ConnectCommand::Slack(options) => {
+                    args.push("slack".to_string());
+                    push_optional_flag_value(&mut args, "--name", options.name.as_deref());
+                    push_flag(&mut args, "--no-browser", options.no_browser);
+                    push_optional_flag_value(
+                        &mut args,
+                        "--broker-url",
+                        options.broker_url.as_deref(),
+                    );
+                    push_optional_flag_value(
+                        &mut args,
+                        "--redirect-uri",
+                        options.redirect_uri.as_deref(),
+                    );
+                }
                 ConnectCommand::Granola(options) => {
                     args.push("granola".to_string());
+                    push_optional_flag_value(&mut args, "--name", options.name.as_deref());
+                    push_flag(&mut args, "--api-key-stdin", options.api_key_stdin);
+                }
+                ConnectCommand::Linear(options) => {
+                    args.push("linear".to_string());
                     push_optional_flag_value(&mut args, "--name", options.name.as_deref());
                     push_flag(&mut args, "--api-key-stdin", options.api_key_stdin);
                 }
@@ -1117,6 +1349,24 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                     );
                     push_flag(&mut args, "--read-only", options.read_only);
                 }
+                MountCommand::GoogleCalendar(options) => {
+                    args.push("google-calendar".to_string());
+                    args.push(options.path.clone());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--connection",
+                        options.connection.as_deref(),
+                    );
+                    push_optional_flag_value(&mut args, "--mount-id", options.mount_id.as_deref());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--projection",
+                        options.projection.as_deref(),
+                    );
+                    push_optional_flag_value(&mut args, "--after", options.after.as_deref());
+                    push_optional_flag_value(&mut args, "--before", options.before.as_deref());
+                    push_flag(&mut args, "--read-only", options.read_only);
+                }
                 MountCommand::Gmail(options) => {
                     args.push("gmail".to_string());
                     args.push(options.path.clone());
@@ -1136,6 +1386,27 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                     push_optional_flag_value(&mut args, "--view", options.view.as_deref());
                     push_flag(&mut args, "--read-only", options.read_only);
                 }
+                MountCommand::Slack(options) => {
+                    args.push("slack".to_string());
+                    args.push(options.path.clone());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--connection",
+                        options.connection.as_deref(),
+                    );
+                    push_optional_flag_value(&mut args, "--mount-id", options.mount_id.as_deref());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--projection",
+                        options.projection.as_deref(),
+                    );
+                    push_optional_flag_value(
+                        &mut args,
+                        "--history-limit",
+                        options.history_limit.as_deref(),
+                    );
+                    push_optional_flag_value(&mut args, "--types", options.types.as_deref());
+                }
                 MountCommand::Granola(options) => {
                     args.push("granola".to_string());
                     args.push(options.path.clone());
@@ -1150,6 +1421,22 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                         "--projection",
                         options.projection.as_deref(),
                     );
+                }
+                MountCommand::Linear(options) => {
+                    args.push("linear".to_string());
+                    args.push(options.path.clone());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--connection",
+                        options.connection.as_deref(),
+                    );
+                    push_optional_flag_value(&mut args, "--mount-id", options.mount_id.as_deref());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--projection",
+                        options.projection.as_deref(),
+                    );
+                    push_flag(&mut args, "--read-only", options.read_only);
                 }
             }
         }
@@ -1276,6 +1563,11 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
         LocalityCommand::Diff(options) => {
             args.push("diff".to_string());
             args.push(options.path.clone());
+        }
+        LocalityCommand::Mv(options) => {
+            args.push("mv".to_string());
+            args.push(options.source.clone());
+            args.push(options.destination.clone());
         }
         LocalityCommand::Undo(options) => {
             args.push("undo".to_string());
@@ -1546,14 +1838,23 @@ fn reset(args: &[String], json: bool) -> i32 {
 
 fn connect(args: &[String], json: bool) -> i32 {
     let connector = first_positional(args);
+    if connector == Some(LINEAR_CONNECTOR_ID) {
+        return connect_linear(args, json);
+    }
     if connector == Some(GRANOLA_CONNECTOR_ID) {
         return connect_granola(args, json);
     }
     if connector == Some(GMAIL_CONNECTOR_ID) {
         return connect_gmail(args, json);
     }
+    if connector == Some(GOOGLE_CALENDAR_CONNECTOR_ID) {
+        return connect_google_calendar(args, json);
+    }
     if connector == Some(GOOGLE_DOCS_CONNECTOR_ID) {
         return connect_google_docs(args, json);
+    }
+    if connector == Some(SLACK_CONNECTOR_ID) {
+        return connect_slack(args, json);
     }
     if connector != Some("notion") {
         return command_error(
@@ -1561,7 +1862,7 @@ fn connect(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "connect",
                 "usage",
-                "usage: loc connect <notion|google-docs|gmail|granola> [options] [--json]",
+                "usage: loc connect <notion|google-docs|google-calendar|gmail|slack|granola|linear> [options] [--json]",
             ),
             EXIT_USAGE,
         );
@@ -1871,6 +2172,86 @@ fn connect_google_docs(args: &[String], json: bool) -> i32 {
     }
 }
 
+fn connect_google_calendar(args: &[String], json: bool) -> i32 {
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("connect", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let credentials = open_credential_store(&state_root);
+    let broker_config = match google_calendar_oauth_broker_config(args) {
+        Ok(config) => config,
+        Err(error) => return command_error(json, error, EXIT_INTERNAL),
+    };
+    let broker = HttpGoogleCalendarOAuthBrokerClient::new(broker_config.broker_url.clone());
+    let start = match broker.start(&OAuthBrokerStart {
+        connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
+        redirect_uri: broker_config.redirect_uri,
+    }) {
+        Ok(start) => start,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new(
+                    "connect",
+                    "oauth_broker_start_failed",
+                    format!("Google Calendar OAuth broker start failed: {error}"),
+                )
+                .with_suggested_command("loc connect google-calendar"),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let authorization = match run_local_oauth_authorization(
+        "Google Calendar",
+        &start.authorization_url,
+        &start.redirect_uri,
+        &start.state,
+        has_flag(args, "--no-browser"),
+        json,
+    ) {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            return command_error(
+                json,
+                google_calendar_local_oauth_command_error(error),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let options = GoogleCalendarBrokerOAuthConnectOptions {
+        connection_id: flag_value(args, "--name").map(ConnectionId::new),
+        broker_url: broker_config.broker_url,
+        client_id: start.client_id,
+        session: start.session,
+        state: start.state,
+        code: authorization.code,
+        redirect_uri: start.redirect_uri,
+    };
+    match run_connect_google_calendar_broker_oauth(
+        &mut store,
+        credentials.as_ref(),
+        options,
+        &broker,
+    ) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_connect_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => connect_command_error("connect", json, error),
+    }
+}
+
 fn connect_gmail(args: &[String], json: bool) -> i32 {
     let state_root = default_state_root();
     let mut store = match SqliteStateStore::open(state_root.clone()) {
@@ -1942,6 +2323,77 @@ fn connect_gmail(args: &[String], json: bool) -> i32 {
     }
 }
 
+fn connect_slack(args: &[String], json: bool) -> i32 {
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("connect", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let credentials = open_credential_store(&state_root);
+    let broker_config = match slack_oauth_broker_config(args) {
+        Ok(config) => config,
+        Err(error) => return command_error(json, error, EXIT_INTERNAL),
+    };
+    let broker = HttpSlackOAuthBrokerClient::new(broker_config.broker_url.clone());
+    let start = match broker.start(&OAuthBrokerStart {
+        connector: SLACK_CONNECTOR_ID.to_string(),
+        redirect_uri: broker_config.redirect_uri,
+    }) {
+        Ok(start) => start,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new(
+                    "connect",
+                    "oauth_broker_start_failed",
+                    format!("Slack OAuth broker start failed: {error}"),
+                )
+                .with_suggested_command("loc connect slack"),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let authorization = match run_local_oauth_authorization(
+        "Slack",
+        &start.authorization_url,
+        &start.redirect_uri,
+        &start.state,
+        has_flag(args, "--no-browser"),
+        json,
+    ) {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            return command_error(json, slack_local_oauth_command_error(error), EXIT_INTERNAL);
+        }
+    };
+    let options = SlackBrokerOAuthConnectOptions {
+        connection_id: flag_value(args, "--name").map(ConnectionId::new),
+        broker_url: broker_config.broker_url,
+        client_id: start.client_id,
+        session: start.session,
+        state: start.state,
+        code: authorization.code,
+        redirect_uri: start.redirect_uri,
+    };
+    match run_connect_slack_broker_oauth(&mut store, credentials.as_ref(), options, &broker) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_connect_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => connect_command_error("connect", json, error),
+    }
+}
+
 fn connect_granola(args: &[String], json: bool) -> i32 {
     if !has_flag(args, "--api-key-stdin") {
         return command_error(
@@ -1994,6 +2446,71 @@ fn connect_granola(args: &[String], json: bool) -> i32 {
         credentials.as_ref(),
         options,
         &HttpGranolaConnectionProbe,
+    ) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_connect_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => connect_command_error("connect", json, error),
+    }
+}
+
+fn connect_linear(args: &[String], json: bool) -> i32 {
+    if !has_flag(args, "--api-key-stdin") {
+        return command_error(
+            json,
+            CommandError::new(
+                "connect",
+                "auth_required",
+                "Linear API keys must be provided with --api-key-stdin",
+            )
+            .with_suggested_command("loc connect linear --api-key-stdin"),
+            EXIT_USAGE,
+        );
+    }
+    let mut api_key = String::new();
+    if let Err(error) = io::stdin().read_to_string(&mut api_key) {
+        return command_error(
+            json,
+            CommandError::new("connect", "stdin_read_failed", error.to_string()),
+            EXIT_INTERNAL,
+        );
+    }
+    let api_key = api_key.trim().to_string();
+    if api_key.is_empty() {
+        return command_error(
+            json,
+            CommandError::new("connect", "auth_required", "empty Linear API key")
+                .with_suggested_command("loc connect linear --api-key-stdin"),
+            EXIT_USAGE,
+        );
+    }
+
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("connect", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let credentials = open_credential_store(&state_root);
+    let options = ConnectOptions {
+        connection_id: flag_value(args, "--name").map(ConnectionId::new),
+        token: api_key,
+    };
+    match run_connect_linear(
+        &mut store,
+        credentials.as_ref(),
+        options,
+        &HttpLinearConnectionProbe,
     ) {
         Ok(report) if json => {
             print_json(&report);
@@ -2672,6 +3189,9 @@ fn mount(args: &[String], json: bool) -> i32 {
             EXIT_USAGE,
         );
     };
+    if connector == SLACK_CONNECTOR_ID {
+        return mount_slack(args, json);
+    }
     let descriptor = source_descriptor(connector);
 
     let Some(root) = nth_positional(args, 1) else {
@@ -2691,13 +3211,16 @@ fn mount(args: &[String], json: bool) -> i32 {
             );
         }
     };
-    let settings_json = if descriptor.id() == GMAIL_CONNECTOR_ID {
-        match gmail_mount_settings_json(args) {
+    let settings_json = match descriptor.id() {
+        GMAIL_CONNECTOR_ID => match gmail_mount_settings_json(args) {
             Ok(settings_json) => settings_json,
             Err(error) => return command_error(json, error, EXIT_USAGE),
-        }
-    } else {
-        "{}".to_string()
+        },
+        GOOGLE_CALENDAR_CONNECTOR_ID => match google_calendar_mount_settings_json(args) {
+            Ok(settings_json) => settings_json,
+            Err(error) => return command_error(json, error, EXIT_USAGE),
+        },
+        _ => "{}".to_string(),
     };
 
     let state_root = default_state_root();
@@ -2788,6 +3311,248 @@ fn mount(args: &[String], json: bool) -> i32 {
     }
 }
 
+fn mount_slack(args: &[String], json: bool) -> i32 {
+    if has_flag(args, "--workspace")
+        || flag_value(args, "--root-page").is_some()
+        || flag_value(args, "--workspace-folder").is_some()
+    {
+        return command_error(
+            json,
+            CommandError::new(
+                "mount",
+                "usage",
+                "loc mount slack does not accept Notion or Google Docs root flags",
+            ),
+            EXIT_USAGE,
+        );
+    }
+
+    let Some(root) = nth_positional(args, 1) else {
+        return command_error(json, slack_mount_missing_path_error(), EXIT_USAGE);
+    };
+    let projection = match projection_mode(args) {
+        Ok(projection) => projection,
+        Err(message) => {
+            return command_error(
+                json,
+                CommandError::new("mount", "usage", message),
+                EXIT_USAGE,
+            );
+        }
+    };
+    let settings_json = match slack_settings_from_mount_args(args) {
+        Ok(settings_json) => settings_json,
+        Err(error) => return command_error(json, error, EXIT_USAGE),
+    };
+
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("mount", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let descriptor = source_descriptor(SLACK_CONNECTOR_ID);
+    let connection_id = match resolve_mount_connection(&store, args, &descriptor) {
+        Ok(connection_id) => connection_id,
+        Err(error) => return command_error(json, error, EXIT_INTERNAL),
+    };
+    if slack_mount_requires_auto_join(&settings_json) {
+        if let Err(error) = require_slack_auto_join_scope(&store, connection_id.as_ref()) {
+            return command_error(json, error, EXIT_USAGE);
+        }
+    }
+    let explicit_mount_id = flag_value(args, "--mount-id").map(str::to_string);
+    let mut mount_id = MountId::new(
+        explicit_mount_id
+            .clone()
+            .unwrap_or_else(|| descriptor.default_mount_id().to_string()),
+    );
+    if let Some(error) = mounted_projection_preflight_error(
+        projection.clone(),
+        std::env::consts::OS,
+        std::env::var_os("LOCALITY_DAEMON_DISABLE").is_some(),
+        || virtual_projection_daemon_is_running(&state_root),
+    ) {
+        return command_error(json, error, EXIT_INTERNAL);
+    }
+    if explicit_mount_id.is_none() {
+        mount_id =
+            match default_mount_id_for_source(&store, &descriptor, connection_id.as_ref(), None) {
+                Ok(mount_id) => mount_id,
+                Err(error) => return command_error(json, error, EXIT_INTERNAL),
+            };
+    }
+
+    let options = MountOptions {
+        mount_id,
+        connector: SLACK_CONNECTOR_ID.to_string(),
+        root: PathBuf::from(root),
+        remote_root_id: None,
+        connection_id,
+        read_only: true,
+        projection,
+        settings_json,
+    };
+    let mount_id = options.mount_id.clone();
+
+    match run_mount(&mut store, options) {
+        Ok(report) => {
+            notify_daemon_mounts_changed(&state_root);
+            if let Err(error) = auto_register_mounted_projection(&state_root, &store, &mount_id) {
+                return command_error(json, error, EXIT_INTERNAL);
+            }
+            if json {
+                print_json(&report);
+            } else {
+                print_mount_report(&report);
+            }
+            EXIT_SUCCESS
+        }
+        Err(error) => mount_command_error(json, error),
+    }
+}
+
+fn slack_mount_missing_path_error() -> CommandError {
+    CommandError::new(
+        "mount",
+        "usage",
+        "usage: loc mount slack <path> [--connection <id>] [--mount-id <id>] [--projection <mode>] [--history-limit 1-15] [--types public_channel,private_channel,im,mpim]",
+    )
+}
+
+fn slack_settings_from_mount_args(args: &[String]) -> Result<String, CommandError> {
+    let mut settings = SlackMountSettings::default();
+    if let Some(value) = flag_value(args, "--history-limit") {
+        let history_limit = value.parse::<u32>().map_err(|_| {
+            CommandError::new(
+                "mount",
+                "slack_history_limit_invalid",
+                "`--history-limit` must be an integer from 1 to 15",
+            )
+        })?;
+        if !(MIN_SLACK_HISTORY_LIMIT..=MAX_SLACK_HISTORY_LIMIT).contains(&history_limit) {
+            return Err(CommandError::new(
+                "mount",
+                "slack_history_limit_invalid",
+                "`--history-limit` must be an integer from 1 to 15",
+            ));
+        }
+        settings.slack.history_limit = history_limit;
+    }
+    if let Some(value) = flag_value(args, "--types") {
+        settings.slack.types = slack_conversation_types_from_mount_arg(value)?;
+    }
+    let settings_json = settings.to_json().map_err(|error| {
+        CommandError::new("mount", "slack_settings_encode_failed", error.to_string())
+    })?;
+    let settings = SlackMountSettings::from_json(&settings_json).map_err(|error| {
+        CommandError::new(
+            "mount",
+            "slack_settings_invalid",
+            locality_error_message(error),
+        )
+    })?;
+    settings.to_json().map_err(|error| {
+        CommandError::new("mount", "slack_settings_encode_failed", error.to_string())
+    })
+}
+
+fn slack_mount_requires_auto_join(settings_json: &str) -> bool {
+    SlackMountSettings::from_json(settings_json)
+        .map(|settings| settings.slack.auto_join_public_channels)
+        .unwrap_or(false)
+}
+
+fn require_slack_auto_join_scope(
+    store: &SqliteStateStore,
+    connection_id: Option<&ConnectionId>,
+) -> Result<(), CommandError> {
+    let Some(connection_id) = connection_id else {
+        return Err(CommandError::new(
+            "mount",
+            "slack_auto_join_scope_missing",
+            "Slack public-channel mounts require an explicit Slack connection with OAuth scope `channels:join`; reconnect with `loc connect slack` and pass it with --connection",
+        )
+        .with_suggested_command("loc connect slack"));
+    };
+    let connection = store
+        .get_connection(connection_id)
+        .map_err(|error| CommandError::new("mount", "store_error", error.to_string()))?
+        .ok_or_else(|| {
+            CommandError::new(
+                "mount",
+                "missing_connection",
+                format!(
+                    "Slack connection `{}` was not found",
+                    connection_id.as_str()
+                ),
+            )
+        })?;
+    if connection
+        .scopes
+        .iter()
+        .any(|scope| scope == SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE)
+    {
+        Ok(())
+    } else {
+        Err(CommandError::new(
+            "mount",
+            "slack_auto_join_scope_missing",
+            "Slack public-channel mounts require OAuth scope `channels:join`; reconnect with `loc connect slack` after adding or approving the Slack app scope",
+        )
+        .with_suggested_command("loc connect slack"))
+    }
+}
+
+fn slack_conversation_types_from_mount_arg(
+    value: &str,
+) -> Result<BTreeSet<SlackConversationType>, CommandError> {
+    let mut types = BTreeSet::new();
+    for raw_type in value.split(',') {
+        let raw_type = raw_type.trim();
+        if raw_type.is_empty() {
+            return Err(CommandError::new(
+                "mount",
+                "slack_types_invalid",
+                format!(
+                    "Slack conversation types must be non-empty; supported values: {SLACK_CONVERSATION_TYPE_VALUES}"
+                ),
+            ));
+        }
+        let conversation_type = match raw_type {
+            "public_channel" => SlackConversationType::PublicChannel,
+            "private_channel" => SlackConversationType::PrivateChannel,
+            "im" => SlackConversationType::Im,
+            "mpim" => SlackConversationType::Mpim,
+            unsupported => {
+                return Err(CommandError::new(
+                    "mount",
+                    "slack_types_invalid",
+                    format!(
+                        "unsupported Slack conversation type `{unsupported}`; supported values: {SLACK_CONVERSATION_TYPE_VALUES}"
+                    ),
+                ));
+            }
+        };
+        types.insert(conversation_type);
+    }
+    if types.is_empty() {
+        return Err(CommandError::new(
+            "mount",
+            "slack_types_invalid",
+            format!(
+                "Slack settings must include at least one Slack conversation type; supported values: {SLACK_CONVERSATION_TYPE_VALUES}"
+            ),
+        ));
+    }
+    Ok(types)
+}
+
 fn gmail_mount_settings_json(args: &[String]) -> Result<String, CommandError> {
     let after = flag_value(args, "--after");
     let before = flag_value(args, "--before");
@@ -2825,6 +3590,41 @@ fn gmail_mount_settings_json(args: &[String]) -> Result<String, CommandError> {
 
     settings.to_json().map_err(|error| {
         CommandError::new("mount", "gmail_settings_encode_failed", error.to_string())
+    })
+}
+
+fn google_calendar_mount_settings_json(args: &[String]) -> Result<String, CommandError> {
+    let after = flag_value(args, "--after");
+    let before = flag_value(args, "--before");
+
+    if after.is_none() && before.is_none() {
+        return Ok("{}".to_string());
+    }
+
+    let settings = match (after, before) {
+        (Some(after), Some(before)) => GoogleCalendarMountSettings::with_date_window(after, before)
+            .map_err(|error| {
+                CommandError::new(
+                    "mount",
+                    "google_calendar_date_window_invalid",
+                    locality_error_message(error),
+                )
+            })?,
+        _ => {
+            return Err(CommandError::new(
+                "mount",
+                "google_calendar_date_window_requires_after_and_before",
+                "Google Calendar date windows require both --after and --before",
+            ));
+        }
+    };
+
+    settings.to_json().map_err(|error| {
+        CommandError::new(
+            "mount",
+            "google_calendar_settings_encode_failed",
+            error.to_string(),
+        )
     })
 }
 
@@ -2940,6 +3740,19 @@ fn mount_remote_root_id(
             }
             Ok(None)
         }
+        GOOGLE_CALENDAR_CONNECTOR_ID => {
+            if has_flag(args, "--workspace")
+                || flag_value(args, "--root-page").is_some()
+                || flag_value(args, "--workspace-folder").is_some()
+            {
+                return Err(CommandError::new(
+                    "mount",
+                    "usage",
+                    "loc mount google-calendar does not accept Notion or Google Docs root flags",
+                ));
+            }
+            Ok(None)
+        }
         GRANOLA_CONNECTOR_ID => {
             if has_flag(args, "--workspace")
                 || flag_value(args, "--root-page").is_some()
@@ -2963,6 +3776,32 @@ fn mount_remote_root_id(
             };
             let credentials = open_credential_store(state_root);
             resolve_granola_connector_for_mount(store, credentials.as_ref(), &temp_mount)
+                .map_err(|error| connector_resolve_command_error("mount", error))?;
+            Ok(None)
+        }
+        LINEAR_CONNECTOR_ID => {
+            if has_flag(args, "--workspace")
+                || flag_value(args, "--root-page").is_some()
+                || flag_value(args, "--workspace-folder").is_some()
+            {
+                return Err(CommandError::new(
+                    "mount",
+                    "usage",
+                    "loc mount linear does not accept source root flags",
+                ));
+            }
+            let temp_mount = MountConfig {
+                mount_id: mount_id.clone(),
+                connector: descriptor.id().to_string(),
+                root: PathBuf::from(root),
+                remote_root_id: None,
+                connection_id: connection_id.clone(),
+                read_only,
+                projection: projection.clone(),
+                settings_json: "{}".to_string(),
+            };
+            let credentials = open_credential_store(state_root);
+            resolve_linear_connector_for_mount(store, credentials.as_ref(), &temp_mount)
                 .map_err(|error| connector_resolve_command_error("mount", error))?;
             Ok(None)
         }
@@ -3106,32 +3945,70 @@ fn pull(args: &[String], json: bool) -> i32 {
         );
     };
 
+    let mut trace_span = localityd::trace::TraceSpan::start("cli.pull");
+    trace_span.attr("path", path);
+    trace_span.attr("json", json);
     let state_root = default_state_root();
+    trace_span.attr("state_root", state_root.display().to_string());
     let stderr_is_terminal = io::stderr().is_terminal();
     let spinner_config = spinner_config_for_command("pull", path, json, stderr_is_terminal);
     let daemon_report = with_terminal_spinner(spinner_config.clone(), || {
-        run_daemon_report::<PullReport>(
+        let mut daemon_span = localityd::trace::TraceSpan::start("cli.pull.daemon_request");
+        daemon_span.attr("path", path);
+        daemon_span.attr("state_root", state_root.display().to_string());
+        let report = run_daemon_report::<PullReport>(
             &state_root,
             &DaemonRequest::Pull {
                 path: PathBuf::from(path),
             },
-        )
+        );
+        match &report {
+            DaemonReport::Report(report) => {
+                daemon_span.attr("result", "report");
+                daemon_span.attr("via", report.via.as_str());
+                daemon_span.attr("enumerated", report.enumerated);
+                daemon_span.attr("hydrated", report.hydrated);
+                daemon_span.attr("skipped_dirty", report.skipped_dirty);
+                daemon_span.attr("conflicts", report.conflicts.len());
+            }
+            DaemonReport::Unavailable(reason) => {
+                daemon_span.attr("result", "unavailable");
+                daemon_span.attr("reason", format!("{:?}", reason));
+            }
+            DaemonReport::Error(error) => {
+                daemon_span.attr("result", "error");
+                daemon_span.attr("code", error.code.as_str());
+                daemon_span.status("error");
+            }
+        }
+        daemon_span.finish();
+        report
     });
     let fallback_reason = match daemon_report {
         DaemonReport::Report(report) if json => {
             signal_pull_virtual_projection_refresh(&state_root, &report);
             let exit_code = pull_report_exit_code(&report);
+            trace_span.attr("daemon_result", "report");
+            trace_span.attr("via", report.via.as_str());
+            trace_span.attr("exit_code", exit_code);
             print_json(&report);
             return exit_code;
         }
         DaemonReport::Report(report) => {
             signal_pull_virtual_projection_refresh(&state_root, &report);
             let exit_code = pull_report_exit_code(&report);
+            trace_span.attr("daemon_result", "report");
+            trace_span.attr("via", report.via.as_str());
+            trace_span.attr("exit_code", exit_code);
             print_pull_report(&report);
             return exit_code;
         }
         DaemonReport::Unavailable(reason) => reason,
         DaemonReport::Error(error) => {
+            trace_span.attr("daemon_result", "error");
+            trace_span.attr("code", error.code.as_str());
+            trace_span.attr("exit_code", error.exit_code);
+            trace_span.status("error");
             return command_error(
                 json,
                 CommandError::new("pull", error.code, error.message),
@@ -3140,12 +4017,18 @@ fn pull(args: &[String], json: bool) -> i32 {
         }
     };
     if let Some(error) = pull_direct_fallback_error(fallback_reason, None) {
+        trace_span.attr("fallback_reason", format!("{:?}", fallback_reason));
+        trace_span.attr("exit_code", EXIT_INTERNAL);
+        trace_span.status("error");
         return command_error(json, error, EXIT_INTERNAL);
     }
+    trace_span.attr("fallback_reason", format!("{:?}", fallback_reason));
 
     let mut store = match SqliteStateStore::open(state_root.clone()) {
         Ok(store) => store,
         Err(error) => {
+            trace_span.attr("exit_code", EXIT_INTERNAL);
+            trace_span.status("error");
             return command_error(
                 json,
                 CommandError::new("pull", "store_open_failed", error.to_string()),
@@ -3155,6 +4038,8 @@ fn pull(args: &[String], json: bool) -> i32 {
     };
     let fallback_mount = resolve_mount_target(&store, path).ok();
     if let Some(error) = pull_direct_fallback_error(fallback_reason, fallback_mount.as_ref()) {
+        trace_span.attr("exit_code", EXIT_INTERNAL);
+        trace_span.status("error");
         return command_error(json, error, EXIT_INTERNAL);
     }
     warn_daemon_fallback("pull", fallback_reason);
@@ -3162,30 +4047,46 @@ fn pull(args: &[String], json: bool) -> i32 {
     let credentials = open_credential_store(&state_root);
     let connector = match resolve_source_for_path(&store, credentials.as_ref(), path) {
         Ok(connector) => connector,
-        Err(error) => return connector_command_error("pull", json, error),
+        Err(error) => {
+            trace_span.attr("exit_code", EXIT_INTERNAL);
+            trace_span.status("error");
+            return connector_command_error("pull", json, error);
+        }
     };
 
     match with_terminal_spinner(spinner_config, || {
-        run_pull_with_state_root(
-            &mut store,
-            &connector,
-            PathBuf::from(path),
-            Some(&state_root),
-        )
+        localityd::trace::result("cli.pull.direct_fallback", |span| {
+            span.attr("path", path);
+            span.attr("fallback_reason", format!("{:?}", fallback_reason));
+            run_pull_with_state_root(
+                &mut store,
+                &connector,
+                PathBuf::from(path),
+                Some(&state_root),
+            )
+        })
     }) {
         Ok(report) if json => {
             signal_pull_virtual_projection_refresh_with_store(&store, &report);
             let exit_code = pull_report_exit_code(&report);
+            trace_span.attr("via", report.via.as_str());
+            trace_span.attr("exit_code", exit_code);
             print_json(&report);
             exit_code
         }
         Ok(report) => {
             signal_pull_virtual_projection_refresh_with_store(&store, &report);
             let exit_code = pull_report_exit_code(&report);
+            trace_span.attr("via", report.via.as_str());
+            trace_span.attr("exit_code", exit_code);
             print_pull_report(&report);
             exit_code
         }
-        Err(error) => pull_command_error(json, error),
+        Err(error) => {
+            trace_span.attr("exit_code", EXIT_INTERNAL);
+            trace_span.status("error");
+            pull_command_error(json, error)
+        }
     }
 }
 
@@ -3603,10 +4504,16 @@ fn live_mode_command_error(json: bool, error: LiveModeFileError) -> i32 {
 
 fn search(args: &[String], json: bool) -> i32 {
     let query = positional_args(args).join(" ");
+    let mut trace_span = localityd::trace::TraceSpan::start("cli.search");
+    trace_span.attr("query", query.as_str());
+    trace_span.attr("query_is_notion_url", notion_id_from_url(&query).is_some());
+    trace_span.attr("json", json);
     let limit = match flag_value(args, "--limit") {
         Some(value) => match value.parse::<usize>() {
             Ok(limit) => limit,
             Err(_) => {
+                trace_span.attr("exit_code", EXIT_USAGE);
+                trace_span.status("error");
                 return command_error(
                     json,
                     CommandError::new(
@@ -3620,10 +4527,14 @@ fn search(args: &[String], json: bool) -> i32 {
         },
         None => 10,
     };
+    trace_span.attr("limit", limit);
     let state_root = default_state_root();
+    trace_span.attr("state_root", state_root.display().to_string());
     let mut store = match SqliteStateStore::open(state_root.clone()) {
         Ok(store) => store,
         Err(error) => {
+            trace_span.attr("exit_code", EXIT_INTERNAL);
+            trace_span.status("error");
             return command_error(
                 json,
                 CommandError::new("search", "store_open_failed", error.to_string()),
@@ -3637,36 +4548,70 @@ fn search(args: &[String], json: bool) -> i32 {
         limit,
         include_stale_access: has_flag(args, "--all"),
     };
+    trace_span.attr(
+        "connector_filter",
+        options.connector.as_deref().unwrap_or(""),
+    );
+    trace_span.attr("include_stale_access", options.include_stale_access);
 
-    let report = match run_search(&store, options.clone()) {
+    let report = match localityd::trace::result("cli.search.run_search_initial", |span| {
+        span.attr("query", options.query.as_str());
+        span.attr("limit", options.limit);
+        span.attr(
+            "connector_filter",
+            options.connector.as_deref().unwrap_or(""),
+        );
+        run_search(&store, options.clone())
+    }) {
         Ok(report) => report,
-        Err(error) => return search_command_error(json, error),
+        Err(error) => {
+            trace_span.attr("exit_code", EXIT_INTERNAL);
+            trace_span.status("error");
+            return search_command_error(json, error);
+        }
     };
+    trace_span.attr("initial_results", report.results.len());
     let report = match refresh_notion_url_search_on_miss(&state_root, &mut store, &options, report)
     {
         Ok(report) => report,
-        Err(error) => return command_error(json, error, EXIT_INTERNAL),
+        Err(error) => {
+            trace_span.attr("exit_code", EXIT_INTERNAL);
+            trace_span.status("error");
+            return command_error(json, error, EXIT_INTERNAL);
+        }
     };
+    trace_span.attr("final_results", report.results.len());
     if let Err(error) = prefetch_notion_url_search_result_ancestors(&state_root, &options, &report)
     {
+        trace_span.attr("exit_code", EXIT_INTERNAL);
+        trace_span.status("error");
         return command_error(json, error, EXIT_INTERNAL);
     }
 
     if json {
         print_json(&report);
+        trace_span.attr("exit_code", EXIT_SUCCESS);
         EXIT_SUCCESS
     } else {
         print_search_report(&report);
+        trace_span.attr("exit_code", EXIT_SUCCESS);
         EXIT_SUCCESS
     }
 }
 
 fn locate(args: &[String], json: bool) -> i32 {
     let query = positional_args(args).join(" ");
+    let mut trace_span = localityd::trace::TraceSpan::start("cli.locate");
+    trace_span.attr("query", query.as_str());
+    trace_span.attr("query_is_notion_url", notion_id_from_url(&query).is_some());
+    trace_span.attr("json", json);
     let state_root = default_state_root();
+    trace_span.attr("state_root", state_root.display().to_string());
     let mut store = match SqliteStateStore::open(state_root.clone()) {
         Ok(store) => store,
         Err(error) => {
+            trace_span.attr("exit_code", EXIT_INTERNAL);
+            trace_span.status("error");
             return command_error(
                 json,
                 CommandError::new("locate", "store_open_failed", error.to_string()),
@@ -3677,10 +4622,16 @@ fn locate(args: &[String], json: bool) -> i32 {
 
     match locate_notion_query_path(&state_root, &mut store, &query) {
         Ok(path) => {
+            trace_span.attr("path", path.as_str());
+            trace_span.attr("exit_code", EXIT_SUCCESS);
             println!("{path}");
             EXIT_SUCCESS
         }
-        Err(error) => locate_command_error(json, error),
+        Err(error) => {
+            trace_span.attr("exit_code", EXIT_INTERNAL);
+            trace_span.status("error");
+            locate_command_error(json, error)
+        }
     }
 }
 
@@ -3690,7 +4641,11 @@ fn locate_notion_query_path(
     query: &str,
 ) -> Result<String, CommandError> {
     let query = query.trim();
+    let mut trace_span = localityd::trace::TraceSpan::start("cli.locate.resolve_path");
+    trace_span.attr("query", query);
+    trace_span.attr("query_is_notion_url", notion_id_from_url(query).is_some());
     if query.is_empty() {
+        trace_span.status("error");
         return Err(CommandError::new(
             "locate",
             "empty_query",
@@ -3698,11 +4653,20 @@ fn locate_notion_query_path(
         ));
     }
     if let Some(message) = unsupported_notion_locator_url_message(query) {
+        trace_span.status("error");
         return Err(CommandError::new("locate", "unsupported_url", message));
     }
 
     if notion_id_from_url(query).is_some() {
-        prepare_exact_notion_url_path(state_root, store, query)?;
+        if let Err(error) =
+            localityd::trace::result("cli.locate.prepare_exact_notion_url_path", |span| {
+                span.attr("query", query);
+                prepare_exact_notion_url_path(state_root, store, query)
+            })
+        {
+            trace_span.status("error");
+            return Err(error);
+        }
     }
 
     let options = SearchOptions {
@@ -3711,9 +4675,31 @@ fn locate_notion_query_path(
         limit: 1,
         include_stale_access: false,
     };
-    let report = run_search_with_access_roots(store, options, locate_mount_access_root)
-        .map_err(|error| CommandError::new("locate", error.code(), error.message()))?;
-    let result = locate_result_from_report(query, report, store)?;
+    let report = match localityd::trace::result("cli.locate.run_search_with_access_roots", |span| {
+        span.attr("query", query);
+        span.attr("limit", options.limit);
+        run_search_with_access_roots(store, options, locate_mount_access_root)
+    })
+    .map_err(|error| CommandError::new("locate", error.code(), error.message()))
+    {
+        Ok(report) => report,
+        Err(error) => {
+            trace_span.status("error");
+            return Err(error);
+        }
+    };
+    trace_span.attr("result_count", report.results.len());
+    let result = match locate_result_from_report(query, report, store) {
+        Ok(result) => result,
+        Err(error) => {
+            trace_span.status("error");
+            return Err(error);
+        }
+    };
+    trace_span.attr("selected_mount_id", result.mount_id.as_str());
+    trace_span.attr("selected_connector", result.connector.as_str());
+    trace_span.attr("selected_kind", result.kind.as_str());
+    trace_span.attr("selected_path", result.absolute_path.as_str());
     prioritize_located_notion_result(state_root, store, &result);
     Ok(result.absolute_path)
 }
@@ -4203,9 +5189,20 @@ fn refresh_notion_url_search_on_miss(
     options: &SearchOptions,
     report: SearchReport,
 ) -> Result<SearchReport, CommandError> {
+    let mut trace_span =
+        localityd::trace::TraceSpan::start("cli.search.refresh_notion_url_on_miss");
+    trace_span.attr("query", options.query.as_str());
+    trace_span.attr("initial_results", report.results.len());
+    trace_span.attr(
+        "query_is_notion_url",
+        notion_id_from_url(&options.query).is_some(),
+    );
     if !should_refresh_notion_url_search(options, &report) {
+        trace_span.attr("refreshed", false);
+        trace_span.attr("reason", "not_needed");
         return Ok(report);
     }
+    trace_span.attr("refreshed", true);
 
     let mounts = store
         .load_mounts()
@@ -4213,7 +5210,9 @@ fn refresh_notion_url_search_on_miss(
         .into_iter()
         .filter(|mount| mount.connector == "notion")
         .collect::<Vec<_>>();
+    trace_span.attr("notion_mount_count", mounts.len());
     if mounts.is_empty() {
+        trace_span.attr("reason", "no_notion_mounts");
         return Ok(report);
     }
 
@@ -4227,6 +5226,7 @@ fn refresh_notion_url_search_on_miss(
     }
 
     if !refreshed {
+        trace_span.status("error");
         let detail = errors
             .last()
             .cloned()
@@ -4240,8 +5240,19 @@ fn refresh_notion_url_search_on_miss(
 
     let store = SqliteStateStore::open(state_root.to_path_buf())
         .map_err(|error| CommandError::new("search", "store_open_failed", error.to_string()))?;
-    run_search(&store, options.clone())
-        .map_err(|error| CommandError::new("search", error.code(), error.message()))
+    let refreshed_report =
+        localityd::trace::result("cli.search.run_search_after_refresh", |span| {
+            span.attr("query", options.query.as_str());
+            span.attr("limit", options.limit);
+            span.attr(
+                "connector_filter",
+                options.connector.as_deref().unwrap_or(""),
+            );
+            run_search(&store, options.clone())
+        })
+        .map_err(|error| CommandError::new("search", error.code(), error.message()))?;
+    trace_span.attr("final_results", refreshed_report.results.len());
+    Ok(refreshed_report)
 }
 
 fn prefetch_notion_url_search_result_ancestors(
@@ -4249,7 +5260,12 @@ fn prefetch_notion_url_search_result_ancestors(
     options: &SearchOptions,
     report: &SearchReport,
 ) -> Result<(), CommandError> {
+    let mut trace_span = localityd::trace::TraceSpan::start("cli.search.prefetch_result_ancestors");
+    trace_span.attr("query", options.query.as_str());
+    trace_span.attr("result_count", report.results.len());
     let Some(notion_id) = notion_id_from_url(&options.query) else {
+        trace_span.attr("prefetch", false);
+        trace_span.attr("reason", "not_notion_url");
         return Ok(());
     };
     if options
@@ -4257,6 +5273,8 @@ fn prefetch_notion_url_search_result_ancestors(
         .as_deref()
         .is_some_and(|connector| connector != "notion")
     {
+        trace_span.attr("prefetch", false);
+        trace_span.attr("reason", "connector_filter_not_notion");
         return Ok(());
     }
 
@@ -4269,9 +5287,13 @@ fn prefetch_notion_url_search_result_ancestors(
                 && notion_id_from_url(&result.remote_id).as_deref() == Some(notion_id.as_str())
         })
         .collect::<Vec<_>>();
+    trace_span.attr("matching_results", matching_results.len());
     if matching_results.is_empty() {
+        trace_span.attr("prefetch", false);
+        trace_span.attr("reason", "no_matching_result");
         return Ok(());
     }
+    trace_span.attr("prefetch", true);
 
     let store = SqliteStateStore::open(state_root.to_path_buf())
         .map_err(|error| CommandError::new("search", "store_open_failed", error.to_string()))?;
@@ -4308,6 +5330,11 @@ fn prefetch_virtual_search_container(
     mount: &MountConfig,
     container_identifier: &str,
 ) -> Result<(), CommandError> {
+    let mut trace_span =
+        localityd::trace::TraceSpan::start("cli.search.prefetch_virtual_container");
+    trace_span.attr("mount_id", mount.mount_id.0.as_str());
+    trace_span.attr("projection", mount.projection.as_str());
+    trace_span.attr("container_identifier", container_identifier);
     match run_daemon_report::<VirtualFsChildrenReport>(
         state_root,
         &DaemonRequest::FileProviderChildren {
@@ -4315,20 +5342,36 @@ fn prefetch_virtual_search_container(
             container_identifier: container_identifier.to_string(),
         },
     ) {
-        DaemonReport::Report(_) => Ok(()),
-        DaemonReport::Error(error) => Err(CommandError::new("search", error.code, error.message)),
-        DaemonReport::Unavailable(DaemonUnavailableReason::TimedOut) => Err(CommandError::new(
-            "search",
-            "daemon_timeout",
-            format!(
-                "localityd did not respond within {}ms while enumerating ancestor metadata for search result `{container_identifier}`",
-                daemon_request_timeout().as_millis()
-            ),
-        )
-        .with_suggested_command("loc daemon restart")),
+        DaemonReport::Report(_) => {
+            trace_span.attr("result", "report");
+            Ok(())
+        }
+        DaemonReport::Error(error) => {
+            trace_span.attr("result", "error");
+            trace_span.attr("code", error.code.as_str());
+            trace_span.status("error");
+            Err(CommandError::new("search", error.code, error.message))
+        }
+        DaemonReport::Unavailable(DaemonUnavailableReason::TimedOut) => {
+            trace_span.attr("result", "unavailable");
+            trace_span.attr("reason", "TimedOut");
+            trace_span.status("error");
+            Err(CommandError::new(
+                "search",
+                "daemon_timeout",
+                format!(
+                    "localityd did not respond within {}ms while enumerating ancestor metadata for search result `{container_identifier}`",
+                    daemon_request_timeout().as_millis()
+                ),
+            )
+            .with_suggested_command("loc daemon restart"))
+        }
         DaemonReport::Unavailable(DaemonUnavailableReason::Disabled)
-        | DaemonReport::Unavailable(DaemonUnavailableReason::NotAvailable) => Err(
-            CommandError::new(
+        | DaemonReport::Unavailable(DaemonUnavailableReason::NotAvailable) => {
+            trace_span.attr("result", "unavailable");
+            trace_span.attr("reason", "daemon_required");
+            trace_span.status("error");
+            Err(CommandError::new(
                 "search",
                 "daemon_required",
                 format!(
@@ -4337,8 +5380,8 @@ fn prefetch_virtual_search_container(
                     mount.projection.as_str()
                 ),
             )
-            .with_suggested_command("loc daemon restart"),
-        ),
+            .with_suggested_command("loc daemon restart"))
+        }
     }
 }
 
@@ -4356,16 +5399,39 @@ fn refresh_search_mount_metadata(
     store: &mut SqliteStateStore,
     mount: &MountConfig,
 ) -> Result<(), CommandError> {
+    let mut trace_span = localityd::trace::TraceSpan::start("cli.search.refresh_mount_metadata");
+    trace_span.attr("mount_id", mount.mount_id.0.as_str());
+    trace_span.attr("connector", mount.connector.as_str());
+    trace_span.attr("projection", mount.projection.as_str());
+    trace_span.attr("root", mount.root.display().to_string());
     match run_daemon_report::<PullReport>(
         state_root,
         &DaemonRequest::Pull {
             path: mount.root.clone(),
         },
     ) {
-        DaemonReport::Report(_) => Ok(()),
-        DaemonReport::Error(error) => Err(CommandError::new("search", error.code, error.message)),
+        DaemonReport::Report(report) => {
+            trace_span.attr("path", report.target.as_str());
+            trace_span.attr("via", report.via.as_str());
+            trace_span.attr("enumerated", report.enumerated);
+            trace_span.attr("hydrated", report.hydrated);
+            trace_span.attr("result", "daemon_report");
+            Ok(())
+        }
+        DaemonReport::Error(error) => {
+            trace_span.attr("result", "daemon_error");
+            trace_span.attr("code", error.code.as_str());
+            trace_span.status("error");
+            Err(CommandError::new("search", error.code, error.message))
+        }
         DaemonReport::Unavailable(reason) => {
-            refresh_search_mount_metadata_direct(state_root, store, mount, reason)
+            trace_span.attr("result", "daemon_unavailable");
+            trace_span.attr("reason", format!("{:?}", reason));
+            let result = refresh_search_mount_metadata_direct(state_root, store, mount, reason);
+            if result.is_err() {
+                trace_span.status("error");
+            }
+            result
         }
     }
 }
@@ -4376,8 +5442,16 @@ fn refresh_search_mount_metadata_direct(
     mount: &MountConfig,
     reason: DaemonUnavailableReason,
 ) -> Result<(), CommandError> {
+    let mut trace_span =
+        localityd::trace::TraceSpan::start("cli.search.refresh_mount_metadata_direct");
+    trace_span.attr("mount_id", mount.mount_id.0.as_str());
+    trace_span.attr("connector", mount.connector.as_str());
+    trace_span.attr("projection", mount.projection.as_str());
+    trace_span.attr("root", mount.root.display().to_string());
+    trace_span.attr("reason", format!("{:?}", reason));
     match reason {
         DaemonUnavailableReason::TimedOut => {
+            trace_span.status("error");
             return Err(CommandError::new(
                 "search",
                 "daemon_timeout",
@@ -4389,6 +5463,7 @@ fn refresh_search_mount_metadata_direct(
             .with_suggested_command("loc daemon restart"));
         }
         DaemonUnavailableReason::NotAvailable if mount.projection.uses_virtual_filesystem() => {
+            trace_span.status("error");
             return Err(CommandError::new(
                 "search",
                 "daemon_required",
@@ -4406,9 +5481,15 @@ fn refresh_search_mount_metadata_direct(
     let credentials = open_credential_store(state_root);
     let connector = resolve_source_for_mount_id(store, credentials.as_ref(), &mount.mount_id)
         .map_err(|error| CommandError::new("search", error.code(), error.message()))?;
-    run_pull_with_state_root(store, &connector, mount.root.clone(), Some(state_root))
-        .map(|_| ())
-        .map_err(|error| CommandError::new("search", error.code(), error.message()))
+    let report = run_pull_with_state_root(store, &connector, mount.root.clone(), Some(state_root))
+        .map_err(|error| {
+            trace_span.status("error");
+            CommandError::new("search", error.code(), error.message())
+        })?;
+    trace_span.attr("enumerated", report.enumerated);
+    trace_span.attr("hydrated", report.hydrated);
+    trace_span.attr("conflicts", report.conflicts.len());
+    Ok(())
 }
 
 fn templates(args: &[String], json: bool) -> i32 {
@@ -5309,6 +6390,54 @@ fn diff(args: &[String], json: bool) -> i32 {
     }
 }
 
+fn mv(args: &[String], json: bool) -> i32 {
+    let positionals = positional_args(args);
+    if positionals.len() != 2 {
+        return command_error(
+            json,
+            CommandError::new("mv", "usage", "usage: loc mv <source> <dest> [--json]"),
+            EXIT_USAGE,
+        );
+    }
+
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("mv", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let options = MvOptions {
+        source: PathBuf::from(&positionals[0]),
+        destination: PathBuf::from(&positionals[1]),
+        state_root: Some(state_root),
+    };
+
+    match run_mv_with_daemon_at_state_root(&mut store, options) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_mv_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => mv_command_error(json, error),
+    }
+}
+
+fn print_mv_report(report: &MvReport) {
+    println!("{}", report.message);
+    println!("next:");
+    for next in &report.next {
+        println!("  {next}");
+    }
+}
+
 fn print_log_report(report: &LogReport) {
     let mut output = io::stdout();
     let _ = write_log_report(report, &mut output);
@@ -5341,8 +6470,9 @@ fn write_log_report<W: Write>(report: &LogReport, output: &mut W) -> io::Result<
         }
         writeln!(
             output,
-            "  summary: {} updated, {} replaced, {} media updated, {} created, {} moved, {} archived",
+            "  summary: {} blocks updated, {} entity bodies updated, {} replaced, {} media updated, {} created, {} moved, {} archived",
             entry.plan_summary.blocks_updated,
+            entry.plan_summary.entity_bodies_updated,
             entry.plan_summary.blocks_replaced,
             entry.plan_summary.media_updated,
             entry.plan_summary.blocks_created,
@@ -5702,6 +6832,9 @@ fn print_search_report(report: &SearchReport) {
             result.mount_id, result.connector, result.remote_id
         );
         println!("  path: {}", result.absolute_path);
+        if let Some(context) = &result.match_context {
+            println!("  match: {}: {}", context.field, context.text);
+        }
         if !result.safety.agent_readable {
             println!("  safety: {}", result.safety.labels.join(", "));
         }
@@ -6781,9 +7914,15 @@ fn write_diff_report_fields<W: Write>(
 
     writeln!(
         output,
-        "{} block{} updated, {} replaced, {} media updated, {} block{} created, {} entit{} created, {} moved, {} block{} archived, {} entit{} archived",
+        "{} block{} updated, {} entity bod{} updated, {} replaced, {} media updated, {} block{} created, {} entit{} created, {} moved, {} block{} archived, {} entit{} archived",
         plan.summary.blocks_updated,
         plural(plan.summary.blocks_updated),
+        plan.summary.entity_bodies_updated,
+        if plan.summary.entity_bodies_updated == 1 {
+            "y"
+        } else {
+            "ies"
+        },
         plan.summary.blocks_replaced,
         plan.summary.media_updated,
         plan.summary.blocks_created,
@@ -6862,7 +8001,19 @@ struct GoogleDocsOAuthBrokerCliConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct GoogleCalendarOAuthBrokerCliConfig {
+    broker_url: String,
+    redirect_uri: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct GmailOAuthBrokerCliConfig {
+    broker_url: String,
+    redirect_uri: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SlackOAuthBrokerCliConfig {
     broker_url: String,
     redirect_uri: String,
 }
@@ -6982,6 +8133,60 @@ fn gmail_oauth_broker_config(args: &[String]) -> Result<GmailOAuthBrokerCliConfi
     })
 }
 
+fn google_calendar_oauth_broker_config(
+    args: &[String],
+) -> Result<GoogleCalendarOAuthBrokerCliConfig, CommandError> {
+    let broker_url = flag_value(args, "--broker-url")
+        .map(str::to_string)
+        .or_else(|| {
+            env_first(&[
+                "LOCALITY_GOOGLE_CALENDAR_OAUTH_BROKER_URL",
+                "LOCALITY_AUTH_BROKER_URL",
+            ])
+        })
+        .unwrap_or_else(|| DEFAULT_GOOGLE_CALENDAR_OAUTH_BROKER_URL.to_string());
+    let redirect_uri = flag_value(args, "--redirect-uri")
+        .map(str::to_string)
+        .or_else(|| env_first(&["LOCALITY_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI"]))
+        .unwrap_or_else(|| DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI.to_string());
+
+    local_redirect(&redirect_uri).map_err(|error| {
+        CommandError::new("connect", error.code, error.message)
+            .with_suggested_command("loc connect google-calendar")
+    })?;
+
+    Ok(GoogleCalendarOAuthBrokerCliConfig {
+        broker_url,
+        redirect_uri,
+    })
+}
+
+fn slack_oauth_broker_config(args: &[String]) -> Result<SlackOAuthBrokerCliConfig, CommandError> {
+    let broker_url = flag_value(args, "--broker-url")
+        .map(str::to_string)
+        .or_else(|| {
+            env_first(&[
+                "LOCALITY_SLACK_OAUTH_BROKER_URL",
+                "LOCALITY_AUTH_BROKER_URL",
+            ])
+        })
+        .unwrap_or_else(|| DEFAULT_SLACK_OAUTH_BROKER_URL.to_string());
+    let redirect_uri = flag_value(args, "--redirect-uri")
+        .map(str::to_string)
+        .or_else(|| env_first(&["LOCALITY_SLACK_OAUTH_REDIRECT_URI"]))
+        .unwrap_or_else(|| DEFAULT_SLACK_OAUTH_REDIRECT_URI.to_string());
+
+    local_redirect(&redirect_uri).map_err(|error| {
+        CommandError::new("connect", error.code, error.message)
+            .with_suggested_command("loc connect slack")
+    })?;
+
+    Ok(SlackOAuthBrokerCliConfig {
+        broker_url,
+        redirect_uri,
+    })
+}
+
 fn missing_oauth_config(name: &str) -> CommandError {
     CommandError::new(
         "connect",
@@ -7061,6 +8266,24 @@ fn gmail_local_oauth_command_error(error: LocalOAuthError) -> CommandError {
     let command_error = CommandError::new("connect", error.code, error.message);
     if command_error.code == "invalid_redirect_uri" {
         command_error.with_suggested_command("loc connect gmail")
+    } else {
+        command_error
+    }
+}
+
+fn google_calendar_local_oauth_command_error(error: LocalOAuthError) -> CommandError {
+    let command_error = CommandError::new("connect", error.code, error.message);
+    if command_error.code == "invalid_redirect_uri" {
+        command_error.with_suggested_command("loc connect google-calendar")
+    } else {
+        command_error
+    }
+}
+
+fn slack_local_oauth_command_error(error: LocalOAuthError) -> CommandError {
+    let command_error = CommandError::new("connect", error.code, error.message);
+    if command_error.code == "invalid_redirect_uri" {
+        command_error.with_suggested_command("loc connect slack")
     } else {
         command_error
     }
@@ -7460,7 +8683,7 @@ fn command_error(json: bool, error: CommandError, exit_code: i32) -> i32 {
 fn connect_command_error(command: &'static str, json: bool, error: ConnectError) -> i32 {
     let exit_code = match &error {
         ConnectError::ConnectionNameRequired(_) => EXIT_USAGE,
-        ConnectError::ConnectionProbeFailed(_)
+        ConnectError::ConnectionProbeFailed { .. }
         | ConnectError::OAuthExchangeFailed(_)
         | ConnectError::CredentialEncode(_)
         | ConnectError::Credential(_)
@@ -7520,6 +8743,7 @@ fn create_command_error(json: bool, command: &'static str, error: CreateError) -
         | CreateError::PrivateUnsupported { .. }
         | CreateError::DatabaseUnsupported { .. }
         | CreateError::ReadOnlyMount { .. }
+        | CreateError::ReadOnlySource { .. }
         | CreateError::TargetExists(_) => EXIT_USAGE,
         CreateError::Store(_)
         | CreateError::VirtualStateRootRequired
@@ -7573,6 +8797,34 @@ fn mount_command_error(json: bool, error: MountError) -> i32 {
     command_error(
         json,
         CommandError::new("mount", error.code(), error.message()),
+        exit_code,
+    )
+}
+
+fn mv_command_error(json: bool, error: MvError) -> i32 {
+    let exit_code = match &error {
+        MvError::CurrentDir { .. }
+        | MvError::Store(_)
+        | MvError::Io { .. }
+        | MvError::DaemonError { .. }
+        | MvError::DaemonTimeout { .. }
+        | MvError::VirtualStateRootRequired => EXIT_INTERNAL,
+        MvError::ReadOnlyMount { .. } => 4,
+        MvError::MountNotFound { .. }
+        | MvError::CrossMount { .. }
+        | MvError::MountRootMove { .. }
+        | MvError::MissingSource(_)
+        | MvError::MissingDestinationParent(_)
+        | MvError::InvalidFilename { .. }
+        | MvError::DestinationExists(_)
+        | MvError::UnsupportedVirtualTarget { .. } => EXIT_VALIDATION,
+        MvError::Locality(LocalityError::NotImplemented(_))
+        | MvError::Locality(LocalityError::Unsupported(_)) => 5,
+        MvError::Locality(error) => locality_error_exit_code(error),
+    };
+    command_error(
+        json,
+        CommandError::new("mv", error.code(), error.message()),
         exit_code,
     )
 }
@@ -7735,6 +8987,12 @@ fn history_error_exit_code(error: &HistoryError) -> i32 {
         HistoryError::MountNotFound(_)
         | HistoryError::JournalNotFound(_)
         | HistoryError::Store(locality_store::StoreError::EntityPathMissing { .. }) => EXIT_USAGE,
+        HistoryError::UnsafeUndoLocalState { .. } | HistoryError::UndoNotLatest { .. } => {
+            EXIT_VALIDATION
+        }
+        HistoryError::InvalidUndoObservation { .. }
+        | HistoryError::IncompleteUndoApplyResult { .. }
+        | HistoryError::UndoProjectionRefreshFailed { .. } => EXIT_INTERNAL,
         HistoryError::Store(_) => EXIT_INTERNAL,
     }
 }
@@ -7756,6 +9014,7 @@ fn locality_error_code(error: &LocalityError) -> &'static str {
         LocalityError::RemoteNotFound(_) => "remote_not_found",
         LocalityError::RateLimited { .. } => "rate_limited",
         LocalityError::InvalidState(_) => "invalid_state",
+        LocalityError::UpdateRequired { .. } => "update_required",
         LocalityError::Unsupported(_) => "unsupported",
         LocalityError::NotImplemented(_) => "not_implemented",
         LocalityError::Io(_) => "io_error",
@@ -7853,7 +9112,7 @@ fn projection_mode_for_target(args: &[String], target_os: &str) -> Result<Projec
 
 fn mount_usage() -> String {
     format!(
-        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--read-only] [--json]\n       loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--json]",
+        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-calendar <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--read-only] [--json]\n       loc mount slack <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--history-limit 1-15] [--types public_channel,private_channel,im,mpim] [--json]\n       loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--json]\n       loc mount linear <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]",
         projection_usage_options_for_target(std::env::consts::OS)
     )
 }
@@ -8058,6 +9317,12 @@ fn takes_value(arg: &str) -> bool {
             | "--connection"
             | "--name"
             | "--projection"
+            | "--workspace-folder"
+            | "--after"
+            | "--before"
+            | "--view"
+            | "--history-limit"
+            | "--types"
             | "--helper"
             | "--display-name"
             | "--redirect-uri"
@@ -8289,6 +9554,7 @@ mod tests {
     use clap::Parser;
     use clap::error::ErrorKind;
 
+    use locality_core::LocalityError;
     use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
     use locality_core::shadow::ShadowDocument;
     use locality_google_docs::GOOGLE_DOCS_CONNECTOR_ID;
@@ -8309,23 +9575,38 @@ mod tests {
     #[cfg(target_os = "windows")]
     use super::resolve_mount_target;
     use super::{
-        Cli, ConnectReport, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION,
-        FileProviderCommandReport, PushConfirmationPromptError, VirtualProjectionRegistration,
-        absolute_command_path, auto_registration_for_mounted_projection,
-        default_mount_id_for_source, diff_report_exit_code, exact_located_entity_record,
-        file_provider_list_lines, google_docs_oauth_broker_config,
+        Cli, ConnectReport, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_USAGE, EXIT_VALIDATION,
+        FileProviderCommandReport, PushConfirmationPromptError, SLACK_CONNECTOR_ID,
+        VirtualProjectionRegistration, absolute_command_path,
+        auto_registration_for_mounted_projection, default_mount_id_for_source,
+        diff_report_exit_code, exact_located_entity_record, file_provider_list_lines,
+        google_calendar_oauth_broker_config, google_docs_oauth_broker_config,
         guard_linux_fuse_shared_root_unregister, guard_unresolved_linux_fuse_unregister,
         guard_unresolved_windows_cloud_files_unregister,
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
-        locate_result_from_report, mount_usage, mounted_projection_preflight_error,
-        notion_authorize_url, notion_oauth_broker_config, print_push_confirmation_preview,
-        projection_mode_for_target, projection_usage_options_for_target,
-        prompt_for_push_confirmation, pull_direct_fallback_error,
-        push_confirmation_preview_matches_displayed, push_preview_plan_matches,
-        should_prompt_for_push_confirmation, should_refresh_notion_url_search,
-        spinner_config_for_command, spinner_enabled, status as run_status_command,
-        validate_virtual_projection_registration, write_connect_report, write_log_report,
+        locality_error_code, locate_result_from_report, mount_slack, mount_usage,
+        mounted_projection_preflight_error, notion_authorize_url, notion_oauth_broker_config,
+        print_push_confirmation_preview, projection_mode_for_target,
+        projection_usage_options_for_target, prompt_for_push_confirmation,
+        pull_direct_fallback_error, push_confirmation_preview_matches_displayed,
+        push_preview_plan_matches, should_prompt_for_push_confirmation,
+        should_refresh_notion_url_search, slack_mount_missing_path_error,
+        slack_oauth_broker_config, spinner_config_for_command, spinner_enabled,
+        status as run_status_command, validate_virtual_projection_registration,
+        write_connect_report, write_log_report,
     };
+
+    #[test]
+    fn update_required_has_stable_command_error_code() {
+        assert_eq!(
+            locality_error_code(&LocalityError::UpdateRequired {
+                component: "linear:discovery".to_string(),
+                found: 2,
+                supported: 1,
+            }),
+            "update_required"
+        );
+    }
 
     #[test]
     fn clap_help_is_available_for_commands_and_nested_subcommands() {
@@ -8347,8 +9628,11 @@ mod tests {
                     "Commands:",
                     "notion",
                     "google-docs",
+                    "google-calendar",
                     "gmail",
+                    "slack",
                     "granola",
+                    "linear",
                     "--json",
                 ],
             ),
@@ -8371,6 +9655,15 @@ mod tests {
                 ],
             ),
             (
+                vec!["connect", "google-calendar", "--help"],
+                vec![
+                    "Usage: loc connect google-calendar",
+                    "Connect Google Calendar",
+                    "--broker-url",
+                    "--redirect-uri",
+                ],
+            ),
+            (
                 vec!["connect", "gmail", "--help"],
                 vec![
                     "Usage: loc connect gmail",
@@ -8380,10 +9673,27 @@ mod tests {
                 ],
             ),
             (
+                vec!["connect", "slack", "--help"],
+                vec![
+                    "Usage: loc connect slack",
+                    "Connect Slack",
+                    "--broker-url",
+                    "--redirect-uri",
+                ],
+            ),
+            (
                 vec!["connect", "granola", "--help"],
                 vec![
                     "Usage: loc connect granola",
                     "Connect Granola with an API key",
+                    "--api-key-stdin",
+                ],
+            ),
+            (
+                vec!["connect", "linear", "--help"],
+                vec![
+                    "Usage: loc connect linear",
+                    "Connect Linear with an API key",
                     "--api-key-stdin",
                 ],
             ),
@@ -8456,8 +9766,11 @@ mod tests {
                     "Commands:",
                     "notion",
                     "google-docs",
+                    "google-calendar",
                     "gmail",
+                    "slack",
                     "granola",
+                    "linear",
                     "--json",
                 ],
             ),
@@ -8479,6 +9792,17 @@ mod tests {
                 ],
             ),
             (
+                vec!["mount", "google-calendar", "--help"],
+                vec![
+                    "Usage: loc mount google-calendar",
+                    "Mount Google Calendar",
+                    "--connection",
+                    "--projection",
+                    "--after",
+                    "--before",
+                ],
+            ),
+            (
                 vec!["mount", "gmail", "--help"],
                 vec![
                     "Usage: loc mount gmail",
@@ -8488,10 +9812,29 @@ mod tests {
                 ],
             ),
             (
+                vec!["mount", "slack", "--help"],
+                vec![
+                    "Usage: loc mount slack",
+                    "Mount Slack read-only",
+                    "--connection",
+                    "--history-limit",
+                    "--types",
+                ],
+            ),
+            (
                 vec!["mount", "granola", "--help"],
                 vec![
                     "Usage: loc mount granola",
                     "Mount Granola meeting notes read-only",
+                    "--connection",
+                    "--projection",
+                ],
+            ),
+            (
+                vec!["mount", "linear", "--help"],
+                vec![
+                    "Usage: loc mount linear",
+                    "Mount Linear issues",
                     "--connection",
                     "--projection",
                 ],
@@ -8768,11 +10111,31 @@ mod tests {
     }
 
     #[test]
-    fn mount_usage_mentions_gmail_settings_flags() {
+    fn mount_usage_mentions_connector_settings_flags() {
         let usage = mount_usage();
 
+        assert!(usage.contains("loc mount google-calendar"));
         assert!(usage.contains("--after YYYY-MM-DD --before YYYY-MM-DD"));
         assert!(usage.contains("--view messages|threads"));
+        assert!(usage.contains("--history-limit 1-15"));
+        assert!(usage.contains("--types public_channel,private_channel,im,mpim"));
+        assert!(!usage.contains("--auto-join-public-channels"));
+        assert!(usage.contains("loc mount linear <path>"));
+    }
+
+    #[test]
+    fn slack_mount_missing_path_runtime_error_uses_exact_usage() {
+        let error = slack_mount_missing_path_error();
+
+        assert_eq!(error.code, "usage");
+        assert_eq!(
+            error.message,
+            "usage: loc mount slack <path> [--connection <id>] [--mount-id <id>] [--projection <mode>] [--history-limit 1-15] [--types public_channel,private_channel,im,mpim]"
+        );
+        assert_eq!(
+            mount_slack(&[SLACK_CONNECTOR_ID.to_string()], true),
+            EXIT_USAGE
+        );
     }
 
     #[test]
@@ -8890,6 +10253,58 @@ mod tests {
         );
 
         let cli = parse_cli([
+            "connect",
+            "google-calendar",
+            "--name",
+            "calendar-work",
+            "--no-browser",
+            "--broker-url",
+            "https://auth.example.test",
+            "--redirect-uri",
+            "http://localhost:8757/oauth/google-calendar/callback",
+        ]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec![
+                "connect",
+                "google-calendar",
+                "--name",
+                "calendar-work",
+                "--no-browser",
+                "--broker-url",
+                "https://auth.example.test",
+                "--redirect-uri",
+                "http://localhost:8757/oauth/google-calendar/callback"
+            ]
+        );
+
+        let cli = parse_cli([
+            "connect",
+            "slack",
+            "--name",
+            "slack-work",
+            "--no-browser",
+            "--broker-url",
+            "https://auth.example.test",
+            "--redirect-uri",
+            "http://localhost:8757/oauth/slack/callback",
+        ]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec![
+                "connect",
+                "slack",
+                "--name",
+                "slack-work",
+                "--no-browser",
+                "--broker-url",
+                "https://auth.example.test",
+                "--redirect-uri",
+                "http://localhost:8757/oauth/slack/callback"
+            ]
+        );
+
+        let cli = parse_cli([
             "mount",
             "gmail",
             "/tmp/Locality/gmail-main",
@@ -8914,6 +10329,76 @@ mod tests {
                 "--projection",
                 "plain-files",
                 "--read-only"
+            ]
+        );
+
+        let cli = parse_cli([
+            "mount",
+            "google-calendar",
+            "/tmp/Locality/calendar-main",
+            "--connection",
+            "calendar-work",
+            "--mount-id",
+            "calendar-main",
+            "--projection",
+            "plain-files",
+            "--after",
+            "2026-07-01",
+            "--before",
+            "2026-07-31",
+            "--read-only",
+        ]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec![
+                "mount",
+                "google-calendar",
+                "/tmp/Locality/calendar-main",
+                "--connection",
+                "calendar-work",
+                "--mount-id",
+                "calendar-main",
+                "--projection",
+                "plain-files",
+                "--after",
+                "2026-07-01",
+                "--before",
+                "2026-07-31",
+                "--read-only"
+            ]
+        );
+
+        let cli = parse_cli([
+            "mount",
+            "slack",
+            "/tmp/Locality/slack-main",
+            "--connection",
+            "slack-work",
+            "--mount-id",
+            "slack-main",
+            "--projection",
+            "plain-files",
+            "--history-limit",
+            "15",
+            "--types",
+            "public_channel,private_channel,im,mpim",
+        ]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec![
+                "mount",
+                "slack",
+                "/tmp/Locality/slack-main",
+                "--connection",
+                "slack-work",
+                "--mount-id",
+                "slack-main",
+                "--projection",
+                "plain-files",
+                "--history-limit",
+                "15",
+                "--types",
+                "public_channel,private_channel,im,mpim"
             ]
         );
 
@@ -9063,6 +10548,7 @@ mod tests {
                     blocks_archived: 0,
                     entities_created: 0,
                     entities_archived: 0,
+                    entity_bodies_updated: 0,
                     entities_moved: 0,
                     properties_updated: 0,
                 },
@@ -9075,7 +10561,7 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(output).expect("utf8 output"),
-            "push push-1\n  status: reconciled\n  mount: notion-main\n  entities: page-1\n  author: anonymous\n  created_at_unix_ms: 1783612800000\n  previous: push-0\n  summary: 1 updated, 0 replaced, 0 media updated, 0 created, 0 moved, 0 archived\n  operations: 1\n\ndiff --locality a/Roadmap.md b/Roadmap.md\n"
+            "push push-1\n  status: reconciled\n  mount: notion-main\n  entities: page-1\n  author: anonymous\n  created_at_unix_ms: 1783612800000\n  previous: push-0\n  summary: 1 blocks updated, 0 entity bodies updated, 0 replaced, 0 media updated, 0 created, 0 moved, 0 archived\n  operations: 1\n\ndiff --locality a/Roadmap.md b/Roadmap.md\n"
         );
     }
 
@@ -9129,6 +10615,7 @@ mod tests {
                 blocks_archived: 0,
                 entities_created: 0,
                 entities_archived: 0,
+                entity_bodies_updated: 0,
                 entities_moved: 0,
                 properties_updated: 0,
             },
@@ -9412,6 +10899,7 @@ mod tests {
                     labels: vec!["ready".to_string()],
                 },
                 remote: SearchRemoteState::default(),
+                match_context: None,
                 score: 100,
             }],
         };
@@ -10132,6 +11620,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn google_calendar_oauth_broker_config_accepts_explicit_broker_url() {
+        let args = vec![
+            "google-calendar".to_string(),
+            "--broker-url".to_string(),
+            "https://auth.example.test".to_string(),
+            "--redirect-uri".to_string(),
+            "http://localhost:8757/oauth/google-calendar/callback".to_string(),
+        ];
+
+        let config = google_calendar_oauth_broker_config(&args).expect("broker config");
+
+        assert_eq!(config.broker_url, "https://auth.example.test");
+        assert_eq!(
+            config.redirect_uri,
+            "http://localhost:8757/oauth/google-calendar/callback"
+        );
+    }
+
+    #[test]
+    fn slack_oauth_broker_config_accepts_explicit_broker_url() {
+        let args = vec![
+            "slack".to_string(),
+            "--broker-url".to_string(),
+            "https://auth.example.test".to_string(),
+            "--redirect-uri".to_string(),
+            "http://localhost:8757/oauth/slack/callback".to_string(),
+        ];
+
+        let config = slack_oauth_broker_config(&args).expect("broker config");
+
+        assert_eq!(config.broker_url, "https://auth.example.test");
+        assert_eq!(
+            config.redirect_uri,
+            "http://localhost:8757/oauth/slack/callback"
+        );
+    }
+
     fn report(ok: bool) -> DiffReport {
         DiffReport {
             ok,
@@ -10194,6 +11720,7 @@ mod tests {
                 blocks_archived: 0,
                 entities_created: 0,
                 entities_archived: 0,
+                entity_bodies_updated: 0,
                 entities_moved: 0,
                 properties_updated: 0,
             },

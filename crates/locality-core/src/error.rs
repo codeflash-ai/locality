@@ -23,6 +23,11 @@ pub enum LocalityError {
         message: String,
     },
     InvalidState(String),
+    UpdateRequired {
+        component: String,
+        found: i64,
+        supported: i64,
+    },
     Unsupported(&'static str),
     NotImplemented(&'static str),
     Io(String),
@@ -45,6 +50,14 @@ impl Display for LocalityError {
                 retry_after.as_millis()
             ),
             Self::InvalidState(message) => write!(f, "invalid state: {message}"),
+            Self::UpdateRequired {
+                component,
+                found,
+                supported,
+            } => write!(
+                f,
+                "update required for {component}: found version {found}, supported version {supported}"
+            ),
             Self::Unsupported(feature) => write!(f, "unsupported feature: {feature}"),
             Self::NotImplemented(feature) => write!(f, "not implemented: {feature}"),
             Self::Io(message) => write!(f, "io error: {message}"),

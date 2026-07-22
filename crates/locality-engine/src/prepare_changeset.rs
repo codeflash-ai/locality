@@ -7,7 +7,8 @@ use locality_core::model::CanonicalDocument;
 use locality_core::planner::{GuardrailPolicy, PushOperationKind};
 use locality_core::portable::{LogicalPath, SourceOperationPlan};
 use locality_core::push::{
-    PushApproval, PushPipelineAction, PushPipelineRequest, PushPipelineResult, plan_push_pipeline,
+    BodyDiffMode, PushApproval, PushPipelineAction, PushPipelineRequest, PushPipelineResult,
+    plan_push_pipeline,
 };
 use locality_core::readable_diff::{ReadableDiffOutput, readable_diff_for_file};
 use locality_core::shadow::ShadowDocument;
@@ -24,6 +25,7 @@ pub struct PrepareChangesetRequest<'a> {
     pub total_scope_entities: Option<usize>,
     pub approval: PushApproval,
     pub read_only: bool,
+    pub body_diff_mode: BodyDiffMode,
 }
 
 impl<'a> PrepareChangesetRequest<'a> {
@@ -42,6 +44,7 @@ impl<'a> PrepareChangesetRequest<'a> {
             total_scope_entities: None,
             approval: PushApproval::default(),
             read_only: false,
+            body_diff_mode: BodyDiffMode::Block,
         }
     }
 
@@ -62,6 +65,11 @@ impl<'a> PrepareChangesetRequest<'a> {
 
     pub fn with_approval(mut self, approval: PushApproval) -> Self {
         self.approval = approval;
+        self
+    }
+
+    pub fn with_body_diff_mode(mut self, mode: BodyDiffMode) -> Self {
+        self.body_diff_mode = mode;
         self
     }
 }
@@ -92,6 +100,7 @@ pub fn prepare_changeset(
         request.delivered_shadow,
     )
     .with_guardrail_policy(request.guardrail_policy)
+    .with_body_diff_mode(request.body_diff_mode)
     .with_approval(request.approval)
     .read_only(request.read_only);
     if let Some(total) = request.total_scope_entities {

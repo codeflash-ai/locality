@@ -22,9 +22,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use loc_cli::connect::DEFAULT_NOTION_PROFILE_ID;
 use loc_cli::connect::{
     BrokerOAuthConnectOptions, ConnectOptions, GmailBrokerOAuthConnectOptions,
-    GoogleDocsBrokerOAuthConnectOptions, HttpGranolaConnectionProbe,
-    run_connect_gmail_broker_oauth, run_connect_google_docs_broker_oauth, run_connect_granola,
-    run_connect_notion_broker_oauth, run_disconnect,
+    GoogleCalendarBrokerOAuthConnectOptions, GoogleDocsBrokerOAuthConnectOptions,
+    HttpGranolaConnectionProbe, HttpLinearConnectionProbe, SlackBrokerOAuthConnectOptions,
+    run_connect_gmail_broker_oauth, run_connect_google_calendar_broker_oauth,
+    run_connect_google_docs_broker_oauth, run_connect_granola, run_connect_linear,
+    run_connect_notion_broker_oauth, run_connect_slack_broker_oauth, run_disconnect,
 };
 use loc_cli::daemon::{DaemonRunState, run_daemon_control};
 use loc_cli::diff::{DiffReport, run_diff};
@@ -65,6 +67,10 @@ use locality_gmail::{
     DEFAULT_GMAIL_OAUTH_BROKER_URL, DEFAULT_GMAIL_OAUTH_REDIRECT_URI, GMAIL_CONNECTOR_ID,
     HttpGmailOAuthBrokerClient,
 };
+use locality_google_calendar::{
+    DEFAULT_GOOGLE_CALENDAR_OAUTH_BROKER_URL, DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI,
+    GOOGLE_CALENDAR_CONNECTOR_ID, HttpGoogleCalendarOAuthBrokerClient,
+};
 use locality_google_docs::{
     DEFAULT_GOOGLE_DOCS_OAUTH_BROKER_URL, DEFAULT_GOOGLE_DOCS_OAUTH_REDIRECT_URI,
     GOOGLE_DOCS_CONNECTOR_ID, HttpGoogleDocsOAuthBrokerClient,
@@ -87,6 +93,10 @@ use locality_platform::{
     DAEMON_PID_FILENAME, append_service_log, bundled_binary_next_to_current_exe,
     default_state_root as platform_default_state_root, logs_dir as platform_logs_dir,
     user_home as platform_user_home,
+};
+use locality_slack::{
+    DEFAULT_SLACK_OAUTH_BROKER_URL, DEFAULT_SLACK_OAUTH_REDIRECT_URI, HttpSlackOAuthBrokerClient,
+    SLACK_CONNECTOR_ID, SlackMountSettings,
 };
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
@@ -531,7 +541,9 @@ struct MountLiveModeChange {
 
 static CONNECT_NOTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static CONNECT_GOOGLE_DOCS_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static CONNECT_GOOGLE_CALENDAR_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static CONNECT_GMAIL_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static CONNECT_SLACK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static DAEMON_LIFECYCLE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static NOTION_LOGIN_LINK: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static DESKTOP_SNAPSHOT_CACHE: OnceLock<Mutex<DesktopSnapshotCache>> = OnceLock::new();
@@ -964,8 +976,18 @@ async fn connect_google_docs(app: AppHandle) -> ActionReport {
 }
 
 #[tauri::command]
+async fn connect_google_calendar(app: AppHandle) -> ActionReport {
+    run_google_calendar_connection_flow(app, true).await
+}
+
+#[tauri::command]
 async fn connect_gmail(app: AppHandle) -> ActionReport {
     run_gmail_connection_flow(app, true).await
+}
+
+#[tauri::command]
+async fn connect_slack(app: AppHandle) -> ActionReport {
+    run_slack_connection_flow(app, true).await
 }
 
 #[derive(Clone, Copy)]
@@ -1101,6 +1123,55 @@ async fn run_google_docs_connection_flow(app: AppHandle, open_browser: bool) -> 
     report
 }
 
+async fn run_google_calendar_connection_flow(app: AppHandle, open_browser: bool) -> ActionReport {
+    if CONNECT_GOOGLE_CALENDAR_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        return ActionReport {
+            ok: false,
+            message: "A Google Calendar connection flow is already waiting for browser approval."
+                .to_string(),
+        };
+    }
+
+    let state_root = default_state_root();
+    let activity_state_root = state_root.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        connect_google_calendar_with_broker(state_root, open_browser)
+    })
+    .await
+    .map_err(|error| format!("Google Calendar OAuth worker failed: {error}"));
+    CONNECT_GOOGLE_CALENDAR_IN_PROGRESS.store(false, Ordering::Release);
+
+    let report = match result {
+        Ok(Ok(message)) => {
+            if let Err(error) = record_desktop_activity(
+                &activity_state_root,
+                "Connected Google Calendar",
+                &message,
+                "connect",
+            ) {
+                desktop_log(
+                    "warn",
+                    "activity.record_failed",
+                    format!("could not record Google Calendar access activity: {error}"),
+                );
+            }
+            ActionReport { ok: true, message }
+        }
+        Ok(Err(message)) | Err(message) => {
+            desktop_log(
+                "warn",
+                "google_calendar_access.failed",
+                format!("connect google calendar failed: {message}"),
+            );
+            ActionReport { ok: false, message }
+        }
+    };
+    if report.ok {
+        refresh_desktop_surfaces(&app);
+    }
+    report
+}
+
 async fn run_gmail_connection_flow(app: AppHandle, open_browser: bool) -> ActionReport {
     if CONNECT_GMAIL_IN_PROGRESS.swap(true, Ordering::AcqRel) {
         return ActionReport {
@@ -1139,6 +1210,54 @@ async fn run_gmail_connection_flow(app: AppHandle, open_browser: bool) -> Action
                 "warn",
                 "gmail_access.failed",
                 format!("connect gmail failed: {message}"),
+            );
+            ActionReport { ok: false, message }
+        }
+    };
+    if report.ok {
+        refresh_desktop_surfaces(&app);
+    }
+    report
+}
+
+async fn run_slack_connection_flow(app: AppHandle, open_browser: bool) -> ActionReport {
+    if CONNECT_SLACK_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        return ActionReport {
+            ok: false,
+            message: "A Slack connection flow is already waiting for browser approval.".to_string(),
+        };
+    }
+
+    let state_root = default_state_root();
+    let activity_state_root = state_root.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        connect_slack_with_broker(state_root, open_browser)
+    })
+    .await
+    .map_err(|error| format!("Slack OAuth worker failed: {error}"));
+    CONNECT_SLACK_IN_PROGRESS.store(false, Ordering::Release);
+
+    let report = match result {
+        Ok(Ok(message)) => {
+            if let Err(error) = record_desktop_activity(
+                &activity_state_root,
+                "Connected Slack",
+                &message,
+                "connect",
+            ) {
+                desktop_log(
+                    "warn",
+                    "activity.record_failed",
+                    format!("could not record Slack access activity: {error}"),
+                );
+            }
+            ActionReport { ok: true, message }
+        }
+        Ok(Err(message)) | Err(message) => {
+            desktop_log(
+                "warn",
+                "slack_access.failed",
+                format!("connect slack failed: {message}"),
             );
             ActionReport { ok: false, message }
         }
@@ -1329,6 +1448,20 @@ async fn connect_granola(app: AppHandle, api_key: String) -> ActionReport {
     report
 }
 
+#[tauri::command]
+async fn connect_linear(app: AppHandle, api_key: String) -> ActionReport {
+    let report = tauri::async_runtime::spawn_blocking(move || connect_linear_blocking(api_key))
+        .await
+        .map_err(|error| format!("Linear connection worker failed: {error}"))
+        .and_then(|result| result)
+        .map(|message| ActionReport { ok: true, message })
+        .unwrap_or_else(|message| ActionReport { ok: false, message });
+    if report.ok {
+        refresh_desktop_surfaces(&app);
+    }
+    report
+}
+
 fn connect_granola_blocking(api_key: String) -> Result<String, String> {
     let api_key = api_key.trim().to_string();
     if api_key.is_empty() {
@@ -1356,10 +1489,17 @@ fn connect_granola_blocking(api_key: String) -> Result<String, String> {
     if let Some(mount) = existing_mount {
         ensure_daemon_running(&state_root)?;
         reload_daemon_mounts(&state_root)?;
+        let mut message = "Reconnected the existing Granola source.".to_string();
         if mount.projection.uses_virtual_filesystem() {
-            activate_virtual_projection_mount(&state_root, &mount, true)?;
+            if let Err(error) = activate_virtual_projection_mount(&state_root, &mount, true) {
+                if recoverable_macos_file_provider_activation_error(&error) {
+                    append_macos_file_provider_activation_warning(&mut message, &error);
+                } else {
+                    return Err(error);
+                }
+            }
         }
-        return Ok("Reconnected the existing Granola source.".to_string());
+        return Ok(message);
     }
 
     create_desktop_mount_blocking(CreateDesktopMountRequest {
@@ -1367,7 +1507,58 @@ fn connect_granola_blocking(api_key: String) -> Result<String, String> {
         path: "granola".to_string(),
         mount_id: "granola-main".to_string(),
         connection_id: Some(report.connection_id),
-        read_only: true,
+        read_only: !desktop_mount_is_editable_by_default("granola"),
+        notion_root_page: None,
+        google_docs_workspace_folder: None,
+    })
+}
+
+fn connect_linear_blocking(api_key: String) -> Result<String, String> {
+    let api_key = api_key.trim().to_string();
+    if api_key.is_empty() {
+        return Err("Enter a Linear API key.".to_string());
+    }
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let credentials = open_credential_store(&state_root);
+    let report = run_connect_linear(
+        &mut store,
+        credentials.as_ref(),
+        ConnectOptions {
+            connection_id: Some(ConnectionId::new("linear-default")),
+            token: api_key,
+        },
+        &HttpLinearConnectionProbe,
+    )
+    .map_err(|error| error.message())?;
+    let existing_mount = store
+        .get_mount(&MountId::new("linear-main"))
+        .map_err(|error| format!("Could not inspect Linear mount: {error}"))?
+        .filter(|mount| mount.connector == "linear");
+    drop(store);
+    if let Some(mount) = existing_mount {
+        ensure_daemon_running(&state_root)?;
+        reload_daemon_mounts(&state_root)?;
+        let mut message = "Reconnected the existing Linear source.".to_string();
+        if mount.projection.uses_virtual_filesystem() {
+            if let Err(error) = activate_virtual_projection_mount(&state_root, &mount, true) {
+                if recoverable_macos_file_provider_activation_error(&error) {
+                    append_macos_file_provider_activation_warning(&mut message, &error);
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+        return Ok(message);
+    }
+
+    create_desktop_mount_blocking(CreateDesktopMountRequest {
+        connector: "linear".to_string(),
+        path: "linear".to_string(),
+        mount_id: "linear-main".to_string(),
+        connection_id: Some(report.connection_id),
+        read_only: !desktop_mount_is_editable_by_default("linear"),
         notion_root_page: None,
         google_docs_workspace_folder: None,
     })
@@ -3827,9 +4018,42 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
 }
 
 fn load_desktop_snapshot_at_state_root(state_root: &Path) -> Result<DesktopSnapshot, String> {
+    ensure_dev_sidecars_match_desktop_before_state_open(state_root)?;
     let store =
         SqliteStateStore::open(state_root.to_path_buf()).map_err(|error| error.to_string())?;
     load_desktop_snapshot_from_store(&store, &state_root)
+}
+
+fn ensure_dev_sidecars_match_desktop_before_state_open(state_root: &Path) -> Result<(), String> {
+    #[cfg(debug_assertions)]
+    {
+        if !state_root.join("state.sqlite3").exists() {
+            return Ok(());
+        }
+        let desktop_build_id = current_desktop_build_id();
+        let daemon_build_id = current_daemon_build_id();
+        if let Some(message) = dev_sidecar_build_skew_message(&desktop_build_id, &daemon_build_id) {
+            desktop_log("warn", "daemon.dev_sidecar_build_skew", message.clone());
+            return Err(message);
+        }
+    }
+    let _ = state_root;
+    Ok(())
+}
+
+fn dev_sidecar_build_skew_message(desktop_build_id: &str, daemon_build_id: &str) -> Option<String> {
+    if desktop_build_id.is_empty()
+        || daemon_build_id.is_empty()
+        || desktop_build_id == "unknown"
+        || daemon_build_id == "unknown"
+        || desktop_build_id == daemon_build_id
+    {
+        return None;
+    }
+
+    Some(format!(
+        "Locality debug sidecars are stale: desktop build {desktop_build_id} but bundled localityd build {daemon_build_id}. Run `make prepare-desktop-dev-sidecars` and relaunch Locality; do not delete ~/.loc/state.sqlite3."
+    ))
 }
 
 fn load_desktop_snapshot_for_surface() -> Result<DesktopSnapshot, String> {
@@ -3942,7 +4166,7 @@ fn load_desktop_snapshot_from_store(
         suggestions: vec![ConnectorSuggestion {
             connector: "Linear".to_string(),
             description: "Mount issues and projects as local files.".to_string(),
-            state: "planned".to_string(),
+            state: "available".to_string(),
         }],
     })
 }
@@ -4002,7 +4226,7 @@ fn degraded_snapshot(message: String) -> DesktopSnapshot {
         suggestions: vec![ConnectorSuggestion {
             connector: "Linear".to_string(),
             description: "Mount issues and projects as local files.".to_string(),
-            state: "planned".to_string(),
+            state: "available".to_string(),
         }],
     }
 }
@@ -4125,8 +4349,9 @@ fn connection_connector_rank(connector: &str) -> usize {
     match connector {
         "notion" => 0,
         "google-docs" => 1,
-        "gmail" => 2,
-        "granola" => 3,
+        GOOGLE_CALENDAR_CONNECTOR_ID => 2,
+        "gmail" => 3,
+        "granola" => 4,
         _ => 10,
     }
 }
@@ -4173,9 +4398,8 @@ fn mount_summary_with_pending_change_count(
         };
     };
 
-    let mount_status = provider
-        .as_ref()
-        .and_then(mount_status_from_provider)
+    let mount_status = mount_connection_status(mount, connection)
+        .or_else(|| provider.as_ref().and_then(mount_status_from_provider))
         .unwrap_or("ready");
     let access_root = mount_access_root(mount);
     let root_exists = mount_root_exists_for_desktop_summary(mount, &access_root);
@@ -4349,6 +4573,24 @@ fn mount_status_from_provider(provider: &ProviderRuntimeSummary) -> Option<&'sta
         "error" => Some("provider_error"),
         _ => None,
     }
+}
+
+fn mount_connection_status(
+    mount: &MountConfig,
+    connection: Option<&ConnectionRecord>,
+) -> Option<&'static str> {
+    let Some(connection) = connection else {
+        return Some("reconnect_needed");
+    };
+    if connection.status != "active" || connection.connector != mount.connector {
+        return Some("reconnect_needed");
+    }
+    if let Some(connection_id) = mount.connection_id.as_ref()
+        && connection.connection_id != *connection_id
+    {
+        return Some("reconnect_needed");
+    }
+    None
 }
 
 fn provider_runtime_summary(
@@ -5410,6 +5652,11 @@ fn mount_access_scope_label(store: Option<&SqliteStateStore>, mount: &MountConfi
             .as_ref()
             .map(|remote_id| format!("Drive folder {}", remote_id.0))
             .unwrap_or_else(|| "Google Docs workspace folder".to_string()),
+        GOOGLE_CALENDAR_CONNECTOR_ID => mount
+            .remote_root_id
+            .as_ref()
+            .map(|remote_id| format!("Calendar {}", remote_id.0))
+            .unwrap_or_else(|| "Primary calendar".to_string()),
         _ => mount
             .remote_root_id
             .as_ref()
@@ -7308,6 +7555,11 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
     if mount_id.is_empty() {
         return Err("Mount id is required.".to_string());
     }
+    if !desktop_mount_creation_supports_connector(&connector) {
+        return Err(format!(
+            "Desktop mount creation does not support connector `{connector}`."
+        ));
+    }
     ensure_virtual_projection_domain_available(&projection)?;
     let root = resolve_desktop_mount_root(&request.path)?;
     validate_desktop_mount_root(&root, &state_root, &projection)?;
@@ -7333,6 +7585,7 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
         Some(connection_id) => Some(ConnectionId::new(connection_id.to_string())),
         None => preferred_connection_id_for_connector(&store, &connector)?,
     };
+    let read_only = request.read_only || connector == "granola" || connector == SLACK_CONNECTOR_ID;
     let remote_root_id = match connector.as_str() {
         "notion" => request
             .notion_root_page
@@ -7355,7 +7608,7 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
                 root: root.clone(),
                 remote_root_id: None,
                 connection_id: connection_id.clone(),
-                read_only: request.read_only,
+                read_only,
                 projection: projection.clone(),
                 settings_json: "{}".to_string(),
             };
@@ -7370,17 +7623,20 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
                 })?;
             Some(folder_id)
         }
-        "gmail" | "granola" => None,
-        other => {
-            return Err(format!(
-                "Desktop mount creation does not support connector `{other}`."
-            ));
-        }
+        GOOGLE_CALENDAR_CONNECTOR_ID | "gmail" | "granola" | "linear" | SLACK_CONNECTOR_ID => None,
+        _ => unreachable!("unsupported desktop connector should be rejected before mount setup"),
     };
     let preserved = if can_remount_existing_workspace {
         prepare_existing_workspace_mount_for_remount(&mut store, &state_root, &mount_id)?
     } else {
         None
+    };
+    let settings_json = if connector == SLACK_CONNECTOR_ID {
+        SlackMountSettings::default()
+            .to_json()
+            .map_err(|error| format!("Could not encode Slack mount settings: {error}"))?
+    } else {
+        "{}".to_string()
     };
 
     let mount_report = run_mount(
@@ -7391,9 +7647,9 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
             root,
             remote_root_id,
             connection_id,
-            read_only: request.read_only,
+            read_only,
             projection: projection.clone(),
-            settings_json: "{}".to_string(),
+            settings_json,
         },
     )
     .map_err(|error| error.message())?;
@@ -7406,9 +7662,15 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
         .map_err(|error| format!("Could not reload created mount: {error}"))?
         .ok_or_else(|| "Created mount was not found in Locality state.".to_string())?;
 
-    if mount.projection.uses_virtual_filesystem() {
-        activate_virtual_projection_mount(&state_root, &mount, true)?;
-    }
+    let projection_warning = if mount.projection.uses_virtual_filesystem() {
+        match activate_virtual_projection_mount(&state_root, &mount, true) {
+            Ok(()) => None,
+            Err(error) if recoverable_macos_file_provider_activation_error(&error) => Some(error),
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
 
     let mut message = format!(
         "Mounted {} at {} with {}.",
@@ -7424,8 +7686,34 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
             preserved.directory.display()
         ));
     }
+    if let Some(warning) = projection_warning {
+        append_macos_file_provider_activation_warning(&mut message, &warning);
+    }
 
     Ok(message)
+}
+
+fn append_macos_file_provider_activation_warning(message: &mut String, warning: &str) {
+    message.push_str(&format!(
+        " macOS File Provider is still preparing the visible folder; it may appear in Finder shortly. {warning}"
+    ));
+}
+
+fn desktop_mount_creation_supports_connector(connector: &str) -> bool {
+    matches!(
+        connector,
+        "notion"
+            | "google-docs"
+            | GOOGLE_CALENDAR_CONNECTOR_ID
+            | "gmail"
+            | "granola"
+            | "linear"
+            | SLACK_CONNECTOR_ID
+    )
+}
+
+fn desktop_mount_is_editable_by_default(connector: &str) -> bool {
+    !matches!(connector, "granola" | "slack")
 }
 
 fn desktop_mount_by_id(store: &SqliteStateStore, mount_id: &str) -> Result<MountConfig, String> {
@@ -9929,6 +10217,64 @@ fn connect_google_docs_with_broker(
     ))
 }
 
+fn connect_google_calendar_with_broker(
+    state_root: PathBuf,
+    open_browser: bool,
+) -> Result<String, String> {
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let credentials = open_credential_store(&state_root);
+    let broker_url = env_first(&[
+        "LOCALITY_GOOGLE_CALENDAR_OAUTH_BROKER_URL",
+        "LOCALITY_AUTH_BROKER_URL",
+    ])
+    .unwrap_or_else(|| DEFAULT_GOOGLE_CALENDAR_OAUTH_BROKER_URL.to_string());
+    let redirect_uri = env_first(&["LOCALITY_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI"])
+        .unwrap_or_else(|| DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI.to_string());
+    let broker = HttpGoogleCalendarOAuthBrokerClient::new(broker_url.clone());
+    let start = broker
+        .start(&OAuthBrokerStart {
+            connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
+            redirect_uri,
+        })
+        .map_err(|error| format!("Could not start Google Calendar OAuth broker flow: {error}"))?;
+    let authorization = run_local_oauth_authorization(
+        "Google Calendar",
+        &start.authorization_url,
+        &start.redirect_uri,
+        &start.state,
+        !open_browser,
+        true,
+    )
+    .map_err(|error| error.message)?;
+    let options = GoogleCalendarBrokerOAuthConnectOptions {
+        connection_id: Some(ConnectionId::new("google-calendar-default")),
+        broker_url,
+        client_id: start.client_id,
+        session: start.session,
+        state: start.state,
+        code: authorization.code,
+        redirect_uri: start.redirect_uri,
+    };
+
+    let report = run_connect_google_calendar_broker_oauth(
+        &mut store,
+        credentials.as_ref(),
+        options,
+        &broker,
+    )
+    .map_err(|error| error.message())?;
+    let connected_message = match report.workspace_name.or(report.account_label) {
+        Some(label) if !label.is_empty() => {
+            format!("Connected Google Calendar account {label}.")
+        }
+        _ => "Connected Google Calendar.".to_string(),
+    };
+    Ok(format!(
+        "{connected_message} Create a Google Calendar source folder to mount primary calendar events."
+    ))
+}
+
 fn connect_gmail_with_broker(state_root: PathBuf, open_browser: bool) -> Result<String, String> {
     let mut store = SqliteStateStore::open(state_root.clone())
         .map_err(|error| format!("Could not open Locality state: {error}"))?;
@@ -9977,6 +10323,57 @@ fn connect_gmail_with_broker(state_root: PathBuf, open_browser: bool) -> Result<
     };
     Ok(format!(
         "{connected_message} Create a Gmail source folder to mount inbox, sent, and draft mailboxes."
+    ))
+}
+
+fn connect_slack_with_broker(state_root: PathBuf, open_browser: bool) -> Result<String, String> {
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let credentials = open_credential_store(&state_root);
+    let broker_url = env_first(&[
+        "LOCALITY_SLACK_OAUTH_BROKER_URL",
+        "LOCALITY_AUTH_BROKER_URL",
+    ])
+    .unwrap_or_else(|| DEFAULT_SLACK_OAUTH_BROKER_URL.to_string());
+    let redirect_uri = env_first(&[
+        "LOCALITY_SLACK_OAUTH_REDIRECT_URI",
+        "SLACK_OAUTH_REDIRECT_URI",
+    ])
+    .unwrap_or_else(|| DEFAULT_SLACK_OAUTH_REDIRECT_URI.to_string());
+    let broker = HttpSlackOAuthBrokerClient::new(broker_url.clone());
+    let start = broker
+        .start(&OAuthBrokerStart {
+            connector: SLACK_CONNECTOR_ID.to_string(),
+            redirect_uri,
+        })
+        .map_err(|error| format!("Could not start Slack OAuth broker flow: {error}"))?;
+    let authorization = run_local_oauth_authorization(
+        "Slack",
+        &start.authorization_url,
+        &start.redirect_uri,
+        &start.state,
+        !open_browser,
+        true,
+    )
+    .map_err(|error| error.message)?;
+    let options = SlackBrokerOAuthConnectOptions {
+        connection_id: None,
+        broker_url,
+        client_id: start.client_id,
+        session: start.session,
+        state: start.state,
+        code: authorization.code,
+        redirect_uri: start.redirect_uri,
+    };
+
+    let report = run_connect_slack_broker_oauth(&mut store, credentials.as_ref(), options, &broker)
+        .map_err(|error| error.message())?;
+    let connected_message = match report.workspace_name.or(report.account_label) {
+        Some(label) if !label.is_empty() => format!("Connected Slack workspace {label}."),
+        _ => "Connected Slack workspace.".to_string(),
+    };
+    Ok(format!(
+        "{connected_message} Create a Slack source folder to mount recent conversations."
     ))
 }
 
@@ -10115,6 +10512,8 @@ fn recoverable_macos_file_provider_activation_error(message: &str) -> bool {
         || message.contains("registered but not enabled")
         || message.contains("did not return a CloudStorage URL")
         || message.contains("macOS has not created")
+        || (message.contains("did not produce a healthy mount root")
+            && macos_file_provider_mount_root_is_missing(message))
 }
 
 fn workspace_mount_onboarding_report(
@@ -11573,6 +11972,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use loc_cli::search::{SearchRemoteState, SearchResult, SearchSafety};
@@ -11584,6 +11984,7 @@ mod tests {
     };
     use locality_core::planner::PushPlan;
     use locality_core::shadow::ShadowDocument;
+    use locality_slack::{SLACK_CONNECTOR_ID, SlackMountSettings};
     use locality_store::{
         AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, ConnectionId,
         ConnectionRecord, ConnectionRepository, ConnectorProfileId, EntityRecord, EntityRepository,
@@ -11768,6 +12169,29 @@ mod tests {
     }
 
     #[test]
+    fn dev_sidecar_build_skew_message_reports_known_mismatch_only() {
+        let message = super::dev_sidecar_build_skew_message("desktop-build", "daemon-build")
+            .expect("known mismatch should report");
+
+        assert!(message.contains("desktop build desktop-build"));
+        assert!(message.contains("bundled localityd build daemon-build"));
+        assert!(message.contains("make prepare-desktop-dev-sidecars"));
+        assert!(message.contains("do not delete ~/.loc/state.sqlite3"));
+        assert_eq!(
+            super::dev_sidecar_build_skew_message("same-build", "same-build"),
+            None
+        );
+        assert_eq!(
+            super::dev_sidecar_build_skew_message("unknown", "daemon-build"),
+            None
+        );
+        assert_eq!(
+            super::dev_sidecar_build_skew_message("desktop-build", "unknown"),
+            None
+        );
+    }
+
+    #[test]
     fn daemon_process_started_before_bundled_binary_compares_modified_times() {
         let pid_modified = UNIX_EPOCH + Duration::from_secs(10);
         let binary_modified = UNIX_EPOCH + Duration::from_secs(20);
@@ -11817,6 +12241,87 @@ mod tests {
 
         assert!(Path::new(&summary.local_path).is_absolute());
         assert!(summary.hydration_progress.is_none());
+    }
+
+    #[test]
+    fn source_connection_order_places_google_calendar_before_gmail() {
+        let mut connections = vec![
+            connection_for_connector("gmail", "Gmail"),
+            connection_for_connector("google-calendar", "Primary calendar"),
+            connection_for_connector("granola", "Granola"),
+            connection_for_connector("notion", "CodeFlash"),
+            connection_for_connector("google-docs", "Drive"),
+        ];
+
+        let summaries = super::connection_summaries(&connections);
+
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|connection| connection.connector.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "notion",
+                "google-docs",
+                "google-calendar",
+                "gmail",
+                "granola"
+            ]
+        );
+
+        connections.reverse();
+        let summaries = super::connection_summaries(&connections);
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|connection| connection.connector.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "notion",
+                "google-docs",
+                "google-calendar",
+                "gmail",
+                "granola"
+            ]
+        );
+    }
+
+    #[test]
+    fn desktop_snapshot_lists_google_calendar_mount_without_remote_root() {
+        let temp = TestTempDir::new("desktop-google-calendar-mount");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let calendar_connection = connection_for_connector("google-calendar", "Primary calendar");
+        let calendar_mount = MountConfig::new(
+            MountId::new("google-calendar-main"),
+            "google-calendar",
+            temp.path().join("google-calendar"),
+        )
+        .with_connection_id(calendar_connection.connection_id.clone())
+        .projection(ProjectionMode::LinuxFuse);
+
+        store
+            .save_connection(calendar_connection)
+            .expect("save calendar connection");
+        store
+            .save_mount(calendar_mount)
+            .expect("save calendar mount");
+
+        let snapshot = super::load_desktop_snapshot_from_store(&store, temp.path())
+            .expect("load snapshot from test store");
+        let calendar = snapshot
+            .mounts
+            .iter()
+            .find(|mount| mount.mount_id == "google-calendar-main")
+            .expect("calendar mount");
+
+        assert_eq!(
+            snapshot.active_mount_id.as_deref(),
+            Some("google-calendar-main")
+        );
+        assert_eq!(snapshot.connection.connector, "google-calendar");
+        assert_eq!(calendar.connector_name, "Google Calendar");
+        assert_eq!(calendar.access_scope, "Primary calendar");
+        assert_eq!(calendar.remote_root_id, None);
     }
 
     #[test]
@@ -12008,6 +12513,38 @@ mod tests {
     }
 
     #[test]
+    fn desktop_snapshot_marks_mount_with_revoked_connection_as_reconnect_needed() {
+        let temp = TestTempDir::new("desktop-revoked-mount-status");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let mut connection = test_connection("workspace-1", "CodeFlash");
+        connection.status = "revoked".to_string();
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            temp.path().join("codeflash-wiki"),
+        )
+        .with_connection_id(connection.connection_id.clone())
+        .projection(ProjectionMode::LinuxFuse);
+        store.save_connection(connection).expect("save connection");
+        store.save_mount(mount).expect("save mount");
+
+        let snapshot = super::load_desktop_snapshot_from_store(&store, temp.path())
+            .expect("load snapshot from test store");
+
+        assert_eq!(snapshot.health.state, "reconnect_needed");
+        assert_eq!(snapshot.mount.status, "reconnect_needed");
+        assert_eq!(
+            snapshot
+                .mounts
+                .iter()
+                .find(|mount| mount.mount_id == "notion-main")
+                .expect("notion mount")
+                .status,
+            "reconnect_needed"
+        );
+    }
+
+    #[test]
     fn desktop_snapshot_reports_hydratable_file_progress() {
         let temp = TestTempDir::new("desktop-file-progress");
         let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
@@ -12185,6 +12722,100 @@ mod tests {
 
         assert_eq!(selected.mount_id, google.mount_id);
         assert_eq!(selected.connector, "google-docs");
+    }
+
+    #[test]
+    fn slack_desktop_mount_persists_read_only_with_default_settings() {
+        let temp = TestTempDir::new("desktop-slack-mount-safety");
+        let state_root = temp.path().join(".loc");
+        let shared_root = temp.path().join("Locality");
+        let mount_root = shared_root.join("slack");
+        fs::create_dir_all(&shared_root).expect("create shared mount root");
+        let mount_id = MountId::new("slack-main");
+        let settings_json = SlackMountSettings::default()
+            .to_json()
+            .expect("serialize default Slack settings");
+        let mut store = SqliteStateStore::open(state_root.clone()).expect("open state store");
+
+        super::run_mount(
+            &mut store,
+            super::MountOptions {
+                mount_id: mount_id.clone(),
+                connector: SLACK_CONNECTOR_ID.to_string(),
+                root: mount_root.clone(),
+                remote_root_id: None,
+                connection_id: None,
+                read_only: true,
+                projection: super::desktop_projection_mode(),
+                settings_json: settings_json.clone(),
+            },
+        )
+        .expect("persist Slack mount");
+
+        let mount = store
+            .get_mount(&mount_id)
+            .expect("load persisted Slack mount")
+            .expect("Slack mount persisted");
+
+        assert_eq!(mount.mount_id, mount_id);
+        assert_eq!(mount.connector, SLACK_CONNECTOR_ID);
+        assert_eq!(mount.root, mount_root);
+        assert_eq!(mount.connection_id, None);
+        assert_eq!(mount.remote_root_id, None);
+        assert!(mount.read_only);
+        assert_eq!(mount.settings_json, settings_json);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn create_desktop_mount_blocking_for_slack_coerces_read_only_and_default_settings() {
+        let _lock = state_root_env_lock().lock().expect("state root env lock");
+        let temp = TestTempDir::new("desktop-slack-mount-request");
+        let state_root = temp.path().join(".loc");
+        let shared_root = temp.path().join("Locality");
+        let mount_root = shared_root.join("slack");
+        fs::create_dir_all(&shared_root).expect("create shared mount root");
+        let mount_id = MountId::new("slack-main");
+        let state_root_guard = LocalityStateDirGuard::set(&state_root);
+
+        let result = super::create_desktop_mount_blocking(super::CreateDesktopMountRequest {
+            connector: SLACK_CONNECTOR_ID.to_string(),
+            path: mount_root.display().to_string(),
+            mount_id: mount_id.0.clone(),
+            connection_id: None,
+            read_only: false,
+            notion_root_page: Some("should-not-be-used".to_string()),
+            google_docs_workspace_folder: Some("should-not-be-used".to_string()),
+        });
+
+        if let Err(error) = &result {
+            assert!(
+                error.contains("locality-fuse was not found")
+                    || error.contains("locality-cloud-files")
+                    || error.contains("Windows Cloud Files"),
+                "unexpected Slack desktop mount error: {error}"
+            );
+        }
+        drop(state_root_guard);
+
+        let store = SqliteStateStore::open(state_root.clone()).expect("open state store");
+        let mount = store
+            .get_mount(&mount_id)
+            .expect("load persisted Slack mount")
+            .expect("Slack mount persisted");
+
+        assert_eq!(mount.mount_id, mount_id);
+        assert_eq!(mount.connector, SLACK_CONNECTOR_ID);
+        assert_eq!(mount.root, mount_root);
+        assert_eq!(mount.connection_id, None);
+        assert_eq!(mount.remote_root_id, None);
+        assert!(mount.read_only);
+        assert_eq!(
+            mount.settings_json,
+            SlackMountSettings::default()
+                .to_json()
+                .expect("serialize default Slack settings")
+        );
     }
 
     #[test]
@@ -13814,6 +14445,13 @@ mod tests {
     }
 
     #[test]
+    fn file_provider_missing_child_mount_after_recovery_is_recoverable() {
+        assert!(super::recoverable_macos_file_provider_activation_error(
+            "macOS File Provider recovery did not produce a healthy mount root `/Users/codeflash/Library/CloudStorage/Locality/linear`: Could not inspect macOS File Provider mount root `/Users/codeflash/Library/CloudStorage/Locality/linear`: Error: Error Domain=NSPOSIXErrorDomain Code=2 \"Couldn't find a file for /Users/codeflash/Library/CloudStorage/Locality/linear\" UserInfo={NSDescription=Couldn't find a file for /Users/codeflash/Library/CloudStorage/Locality/linear}"
+        ));
+    }
+
+    #[test]
     fn file_provider_enablement_report_distinguishes_registration_and_approval() {
         let missing = super::classify_macos_file_provider_enablement(None, None, Ok(None));
         assert_eq!(missing.state, "not_registered");
@@ -14399,6 +15037,17 @@ mod tests {
             virtual_projection_source_ready_timeout_message("notion", "last error")
                 .contains("at least one page is selected")
         );
+    }
+
+    #[test]
+    fn desktop_mount_creation_supports_linear_as_editable_source() {
+        assert!(super::desktop_mount_creation_supports_connector(
+            "google-calendar"
+        ));
+        assert!(super::desktop_mount_creation_supports_connector("linear"));
+        assert!(super::desktop_mount_is_editable_by_default("linear"));
+        assert!(super::desktop_mount_creation_supports_connector("slack"));
+        assert!(!super::desktop_mount_is_editable_by_default("slack"));
     }
 
     #[test]
@@ -16481,6 +17130,46 @@ mod tests {
         }
     }
 
+    struct LocalityStateDirGuard {
+        previous: Option<std::ffi::OsString>,
+        state_root: PathBuf,
+    }
+
+    impl LocalityStateDirGuard {
+        fn set(state_root: &Path) -> Self {
+            let previous = std::env::var_os("LOCALITY_STATE_DIR");
+            unsafe {
+                std::env::set_var("LOCALITY_STATE_DIR", state_root);
+            }
+            Self {
+                previous,
+                state_root: state_root.to_path_buf(),
+            }
+        }
+    }
+
+    impl Drop for LocalityStateDirGuard {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => unsafe {
+                    std::env::set_var("LOCALITY_STATE_DIR", value);
+                },
+                None => unsafe {
+                    std::env::remove_var("LOCALITY_STATE_DIR");
+                },
+            }
+            let _ = loc_cli::daemon::run_daemon_control(&super::daemon_control_args_any_manager(
+                "stop",
+                &self.state_root,
+            ));
+        }
+    }
+
+    fn state_root_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
     fn test_connection(workspace_id: &str, workspace_name: &str) -> ConnectionRecord {
         ConnectionRecord {
             connection_id: ConnectionId::new("notion-default"),
@@ -16492,6 +17181,26 @@ mod tests {
             workspace_name: Some(workspace_name.to_string()),
             auth_kind: "oauth".to_string(),
             secret_ref: "connection:notion-default".to_string(),
+            scopes: Vec::new(),
+            capabilities_json: "{}".to_string(),
+            status: "active".to_string(),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+            expires_at: None,
+        }
+    }
+
+    fn connection_for_connector(connector: &str, workspace_name: &str) -> ConnectionRecord {
+        ConnectionRecord {
+            connection_id: ConnectionId::new(format!("{connector}-default")),
+            profile_id: None,
+            connector: connector.to_string(),
+            display_name: format!("{connector}-default"),
+            account_label: Some(workspace_name.to_string()),
+            workspace_id: None,
+            workspace_name: Some(workspace_name.to_string()),
+            auth_kind: "oauth".to_string(),
+            secret_ref: format!("connection:{connector}-default"),
             scopes: Vec::new(),
             capabilities_json: "{}".to_string(),
             status: "active".to_string(),
@@ -16516,6 +17225,7 @@ mod tests {
                 labels: vec![state.to_string()],
             },
             remote: SearchRemoteState::default(),
+            match_context: None,
             score: 0,
         }
     }
@@ -16621,7 +17331,7 @@ fn sample_snapshot() -> DesktopSnapshot {
         suggestions: vec![ConnectorSuggestion {
             connector: "Linear".to_string(),
             description: "Mount issues and projects as local files.".to_string(),
-            state: "planned".to_string(),
+            state: "available".to_string(),
         }],
     }
 }
@@ -16878,6 +17588,7 @@ fn live_mode_e2e_seed_notion_connection(state_root: &Path, token: &str) {
 fn live_mode_e2e_notion_capabilities_json() -> String {
     serde_json::to_string(&ConnectorCapabilities {
         supports_block_updates: true,
+        supports_entity_body_updates: false,
         supports_databases: true,
         supports_oauth: true,
         supports_remote_observation: true,
@@ -17320,7 +18031,9 @@ fn main() {
             connect_notion_without_browser,
             change_notion_access,
             connect_google_docs,
+            connect_google_calendar,
             connect_gmail,
+            connect_slack,
             notion_login_link,
             install_state_review,
             acknowledge_install_state,
@@ -17332,6 +18045,7 @@ fn main() {
             create_workspace_mount,
             create_desktop_mount,
             connect_granola,
+            connect_linear,
             reset_source_state,
             disconnect_source,
             export_source_backup,
@@ -17833,5 +18547,11 @@ fn show_main_window_with_view(app: &AppHandle, view: Option<&str>) {
         ));
     }
     let _ = window.show();
+    #[cfg(target_os = "linux")]
+    // WebKitGTK can leave a webview created hidden on a white frame until script work
+    // is nudged after the native window is shown.
+    let _ = window.eval(
+        "requestAnimationFrame(() => { document.documentElement.dataset.localityWindowShown = '1'; });",
+    );
     let _ = window.set_focus();
 }
