@@ -47,6 +47,8 @@ const MAX_EXPLICIT_ROOTS: usize = 16;
 const PORTABLE_FORMAT_VERSION: u32 = 1;
 const PORTABLE_MEDIA_NATIVE_FORMAT_VERSION: u16 = 1;
 const PORTABLE_MEDIA_NATIVE_KIND: &str = "notion_page_portable_media_v1";
+const PORTABLE_MEDIA_LIMIT_OUTCOME_ID: &str = "__locality_portable_media_limit_v1";
+const PORTABLE_MEDIA_SANITIZED_MARKER: &str = "_locality_portable_media_sanitized_v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -236,13 +238,22 @@ fn fetch_portable_media_page_result(
         ));
     }
 
+    let asset_count = portable_media_asset_count(&bundle)?;
+    let limit_exceeded = asset_count > PORTABLE_MEDIA_MAX_ASSETS;
     let default_fetcher = default_portable_media_fetcher();
     let fetcher = media_fetcher.unwrap_or(default_fetcher.as_ref());
-    let mut capture = PortableMediaCaptureState::new(fetcher);
+    let mut capture = PortableMediaCaptureState::new(fetcher, limit_exceeded);
     for tree in &mut bundle.blocks {
         capture.capture_tree(tree)?;
     }
     capture.sanitize_page_file_properties(&mut bundle)?;
+    if limit_exceeded {
+        capture.record_incomplete(
+            PORTABLE_MEDIA_LIMIT_OUTCOME_ID,
+            "page",
+            "asset_limit_exceeded",
+        );
+    }
 
     let completeness = portable_media_completeness(&capture.incomplete);
     let portable_bundle = NotionPortablePageBundleV1 {
@@ -270,40 +281,36 @@ struct PortableMediaCaptureState<'a> {
     captured: Vec<NotionPortableCapturedMediaV1>,
     incomplete: Vec<NotionPortableIncompleteMediaV1>,
     seen_block_ids: BTreeSet<String>,
-    asset_count: usize,
     aggregate_bytes: usize,
+    limit_exceeded: bool,
 }
 
 impl<'a> PortableMediaCaptureState<'a> {
-    fn new(fetcher: &'a dyn PortableMediaCaptureFetcher) -> Self {
+    fn new(fetcher: &'a dyn PortableMediaCaptureFetcher, limit_exceeded: bool) -> Self {
         Self {
             fetcher,
             captured: Vec::new(),
             incomplete: Vec::new(),
             seen_block_ids: BTreeSet::new(),
-            asset_count: 0,
             aggregate_bytes: 0,
+            limit_exceeded,
         }
     }
 
     fn capture_tree(&mut self, tree: &mut BlockTreeDto) -> LocalityResult<()> {
         let block_id = tree.block.id.clone();
         let kind = tree.block.kind.clone();
+        validate_exclusive_typed_media_payload(&tree.block)?;
+        self.sanitize_block_arbitrary_json(&mut tree.block);
         if is_media_kind(&kind) {
             if !self.seen_block_ids.insert(block_id.clone()) {
                 return Err(LocalityError::InvalidState(
                     "Notion portable media contains a duplicate block identity".to_string(),
                 ));
             }
-            self.asset_count += 1;
-            if self.asset_count > PORTABLE_MEDIA_MAX_ASSETS {
-                return Err(LocalityError::InvalidState(format!(
-                    "Notion portable media exceeds the {PORTABLE_MEDIA_MAX_ASSETS}-asset pilot limit"
-                )));
-            }
-            let payload = ensure_media_payload_mut(&mut tree.block).ok_or_else(|| {
+            let payload = selected_media_payload_mut(&mut tree.block).ok_or_else(|| {
                 LocalityError::InvalidState(
-                    "Notion portable media kind cannot select its payload".to_string(),
+                    "Notion portable media block is missing its selected payload".to_string(),
                 )
             })?;
             self.capture_payload(&block_id, &kind, payload)?;
@@ -312,6 +319,26 @@ impl<'a> PortableMediaCaptureState<'a> {
             self.capture_tree(child)?;
         }
         Ok(())
+    }
+
+    fn sanitize_block_arbitrary_json(&mut self, block: &mut BlockDto) {
+        for (field, value) in [
+            ("tab", block.tab.as_mut()),
+            ("ai_block", block.ai_block.as_mut()),
+            ("custom_block", block.custom_block.as_mut()),
+            ("button", block.button.as_mut()),
+        ] {
+            if let Some(value) = value
+                && sanitize_arbitrary_json_media_secrets(value)
+            {
+                mark_sanitized_arbitrary_json(value);
+                self.record_incomplete(
+                    &format!("{}:json:{field}", block.id),
+                    "arbitrary_json",
+                    "sanitized_embedded_media_secret",
+                );
+            }
+        }
     }
 
     fn capture_payload(
@@ -344,13 +371,17 @@ impl<'a> PortableMediaCaptureState<'a> {
             return Ok(());
         }
         if original_url.is_empty() {
-            self.record_incomplete(block_id, kind, "missing_url");
+            self.record_incomplete(block_id, kind, "unavailable_hosted_media");
+            return Ok(());
+        }
+        if self.limit_exceeded {
+            self.record_incomplete(block_id, kind, "unavailable_hosted_media");
             return Ok(());
         }
         let sanitized_url = match sanitize_portable_hosted_media_url(&original_url) {
             Ok(url) => url,
             Err(_) => {
-                self.record_incomplete(block_id, kind, "url_denied");
+                self.record_incomplete(block_id, kind, "unavailable_hosted_media");
                 return Ok(());
             }
         };
@@ -358,11 +389,11 @@ impl<'a> PortableMediaCaptureState<'a> {
             match portable_media_expired(expiry_time) {
                 Ok(false) => {}
                 Ok(true) => {
-                    self.record_incomplete(block_id, kind, "expired");
+                    self.record_incomplete(block_id, kind, "unavailable_hosted_media");
                     return Ok(());
                 }
                 Err(_) => {
-                    self.record_incomplete(block_id, kind, "invalid_expiry");
+                    self.record_incomplete(block_id, kind, "unavailable_hosted_media");
                     return Ok(());
                 }
             }
@@ -373,18 +404,18 @@ impl<'a> PortableMediaCaptureState<'a> {
         {
             Ok(captured) => captured,
             Err(_) => {
-                self.record_incomplete(block_id, kind, "fetch_failed");
+                self.record_incomplete(block_id, kind, "unavailable_hosted_media");
                 return Ok(());
             }
         };
         if captured.bytes.len() > PORTABLE_MEDIA_MAX_ASSET_BYTES {
-            self.record_incomplete(block_id, kind, "asset_too_large");
+            self.record_incomplete(block_id, kind, "unavailable_hosted_media");
             return Ok(());
         }
         let Some(aggregate_bytes) =
             checked_portable_media_aggregate(self.aggregate_bytes, captured.bytes.len())
         else {
-            self.record_incomplete(block_id, kind, "aggregate_too_large");
+            self.record_incomplete(block_id, kind, "unavailable_hosted_media");
             return Ok(());
         };
         self.aggregate_bytes = aggregate_bytes;
@@ -403,15 +434,9 @@ impl<'a> PortableMediaCaptureState<'a> {
         bundle: &mut NotionPageBundle,
     ) -> LocalityResult<()> {
         let mut property_asset_index = 0_usize;
-        for property in bundle.page.properties.values_mut() {
+        for (property_index, property) in bundle.page.properties.values_mut().enumerate() {
             for file in &mut property.files {
                 property_asset_index += 1;
-                self.asset_count += 1;
-                if self.asset_count > PORTABLE_MEDIA_MAX_ASSETS {
-                    return Err(LocalityError::InvalidState(format!(
-                        "Notion portable media exceeds the {PORTABLE_MEDIA_MAX_ASSETS}-asset pilot limit"
-                    )));
-                }
                 if let Some(external) = file.external.as_mut() {
                     external.url.clear();
                 }
@@ -424,6 +449,21 @@ impl<'a> PortableMediaCaptureState<'a> {
                     "file_property",
                     "unsupported_page_property_media",
                 );
+            }
+            for (field, value) in [
+                ("formula", property.formula.as_mut()),
+                ("rollup", property.rollup.as_mut()),
+            ] {
+                if let Some(value) = value
+                    && sanitize_arbitrary_json_media_secrets(value)
+                {
+                    mark_sanitized_arbitrary_json(value);
+                    self.record_incomplete(
+                        &format!("page-property-json-{property_index}:{field}"),
+                        "arbitrary_json",
+                        "sanitized_embedded_media_secret",
+                    );
+                }
             }
         }
         Ok(())
@@ -453,19 +493,295 @@ fn portable_media_completeness(
     completeness
 }
 
-fn ensure_media_payload_mut(block: &mut BlockDto) -> Option<&mut FileBlockDto> {
+fn selected_media_payload_mut(block: &mut BlockDto) -> Option<&mut FileBlockDto> {
     match block.kind.as_str() {
-        "image" => Some(block.image.get_or_insert_with(FileBlockDto::default)),
-        "video" => Some(block.video.get_or_insert_with(FileBlockDto::default)),
-        "file" => Some(block.file.get_or_insert_with(FileBlockDto::default)),
-        "pdf" => Some(block.pdf.get_or_insert_with(FileBlockDto::default)),
-        "audio" => Some(block.audio.get_or_insert_with(FileBlockDto::default)),
+        "image" => block.image.as_mut(),
+        "video" => block.video.as_mut(),
+        "file" => block.file.as_mut(),
+        "pdf" => block.pdf.as_mut(),
+        "audio" => block.audio.as_mut(),
         _ => None,
     }
 }
 
 fn is_media_kind(kind: &str) -> bool {
     matches!(kind, "image" | "video" | "file" | "pdf" | "audio")
+}
+
+fn portable_media_asset_count(bundle: &NotionPageBundle) -> LocalityResult<usize> {
+    fn count_blocks(
+        trees: &[BlockTreeDto],
+        seen_media_ids: &mut BTreeSet<String>,
+    ) -> LocalityResult<usize> {
+        let mut count = 0_usize;
+        for tree in trees {
+            validate_exclusive_typed_media_payload(&tree.block)?;
+            if is_media_kind(&tree.block.kind) {
+                if !seen_media_ids.insert(tree.block.id.clone()) {
+                    return Err(LocalityError::InvalidState(
+                        "Notion portable media contains a duplicate block identity".to_string(),
+                    ));
+                }
+                count = count.checked_add(1).ok_or_else(|| {
+                    LocalityError::InvalidState(
+                        "Notion portable media asset count overflowed".to_string(),
+                    )
+                })?;
+            }
+            count = count
+                .checked_add(count_blocks(&tree.children, seen_media_ids)?)
+                .ok_or_else(|| {
+                    LocalityError::InvalidState(
+                        "Notion portable media asset count overflowed".to_string(),
+                    )
+                })?;
+        }
+        Ok(count)
+    }
+
+    let mut seen_media_ids = BTreeSet::new();
+    bundle.page.properties.values().try_fold(
+        count_blocks(&bundle.blocks, &mut seen_media_ids)?,
+        |count, property| {
+            count.checked_add(property.files.len()).ok_or_else(|| {
+                LocalityError::InvalidState(
+                    "Notion portable media asset count overflowed".to_string(),
+                )
+            })
+        },
+    )
+}
+
+fn validate_exclusive_typed_media_payload(block: &BlockDto) -> LocalityResult<()> {
+    let present = [
+        ("image", block.image.is_some()),
+        ("video", block.video.is_some()),
+        ("file", block.file.is_some()),
+        ("pdf", block.pdf.is_some()),
+        ("audio", block.audio.is_some()),
+    ];
+    let present_count = present.iter().filter(|(_, present)| *present).count();
+    if is_media_kind(&block.kind) {
+        let selected_present = present
+            .iter()
+            .any(|(kind, present)| *kind == block.kind && *present);
+        if !selected_present || present_count != 1 {
+            return Err(LocalityError::InvalidState(
+                "Notion portable media block must contain exactly its selected typed payload"
+                    .to_string(),
+            ));
+        }
+    } else if present_count != 0 {
+        return Err(LocalityError::InvalidState(
+            "Notion portable non-media block contains a typed media payload".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn sanitize_arbitrary_json_media_secrets(value: &mut serde_json::Value) -> bool {
+    sanitize_arbitrary_json_media_secrets_in_context(value, false)
+}
+
+fn sanitize_arbitrary_json_media_secrets_in_context(
+    value: &mut serde_json::Value,
+    inherited_media_context: bool,
+) -> bool {
+    match value {
+        serde_json::Value::String(string) => {
+            if sanitize_portable_hosted_media_url(string).is_ok()
+                || looks_like_media_secret_value(string)
+                || (inherited_media_context && media_url_has_query_or_fragment(string))
+            {
+                string.clear();
+                true
+            } else {
+                false
+            }
+        }
+        serde_json::Value::Array(values) => {
+            let mut changed = false;
+            for value in values {
+                changed |= sanitize_arbitrary_json_media_secrets_in_context(
+                    value,
+                    inherited_media_context,
+                );
+            }
+            changed
+        }
+        serde_json::Value::Object(object) => {
+            let media_context = inherited_media_context
+                || arbitrary_json_object_looks_like_media(object)
+                || object.values().any(arbitrary_json_contains_provider_url);
+            let sensitive_keys = object
+                .keys()
+                .filter(|key| {
+                    key.as_str() == PORTABLE_MEDIA_SANITIZED_MARKER
+                        || is_unconditional_secret_key(key)
+                        || (media_context && is_media_metadata_key(key))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut changed = !sensitive_keys.is_empty();
+            for key in sensitive_keys {
+                object.remove(&key);
+            }
+            for child in object.values_mut() {
+                changed |= sanitize_arbitrary_json_media_secrets_in_context(child, media_context);
+            }
+            changed
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            false
+        }
+    }
+}
+
+fn arbitrary_json_contains_provider_url(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(value) => sanitize_portable_hosted_media_url(value).is_ok(),
+        serde_json::Value::Array(values) => values.iter().any(arbitrary_json_contains_provider_url),
+        serde_json::Value::Object(object) => {
+            object.values().any(arbitrary_json_contains_provider_url)
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            false
+        }
+    }
+}
+
+fn arbitrary_json_object_looks_like_media(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    object.get("file").is_some_and(serde_json::Value::is_object)
+        || object
+            .get("external")
+            .is_some_and(serde_json::Value::is_object)
+        || object.contains_key("expiry_time")
+        || matches!(
+            object.get("type").and_then(serde_json::Value::as_str),
+            Some("file" | "files")
+        )
+}
+
+fn normalized_json_key(key: &str) -> String {
+    key.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>()
+}
+
+fn is_unconditional_secret_key(key: &str) -> bool {
+    let normalized = normalized_json_key(key);
+    normalized.contains("xamz")
+        || normalized.contains("signature")
+        || normalized.contains("credential")
+        || normalized.contains("authorization")
+        || normalized.contains("secret")
+        || normalized == "token"
+        || normalized.ends_with("token")
+}
+
+fn is_media_metadata_key(key: &str) -> bool {
+    let normalized = normalized_json_key(key);
+    normalized == "expirytime" || normalized == "query" || normalized == "fragment"
+}
+
+fn looks_like_media_secret_value(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("x-amz-")
+        || lower.contains("signature=")
+        || lower.contains("token=")
+        || lower.contains("secret=")
+        || lower.contains("authorization")
+        || lower.contains("bearer ")
+}
+
+fn media_url_has_query_or_fragment(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    (lower.starts_with("https://") || lower.starts_with("http://"))
+        && (lower.contains('?') || lower.contains('#'))
+}
+
+fn mark_sanitized_arbitrary_json(value: &mut serde_json::Value) {
+    let marker = || {
+        serde_json::Value::Object(serde_json::Map::from_iter([(
+            PORTABLE_MEDIA_SANITIZED_MARKER.to_string(),
+            serde_json::Value::Bool(true),
+        )]))
+    };
+    match value {
+        serde_json::Value::Object(object) => {
+            object.insert(
+                PORTABLE_MEDIA_SANITIZED_MARKER.to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        serde_json::Value::Array(values) => values.push(marker()),
+        _ => *value = marker(),
+    }
+}
+
+fn sanitized_marker_count(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(sanitized_marker_count)
+            .fold(0_usize, usize::saturating_add),
+        serde_json::Value::Object(object) => {
+            usize::from(object.contains_key(PORTABLE_MEDIA_SANITIZED_MARKER))
+                + object
+                    .values()
+                    .map(sanitized_marker_count)
+                    .fold(0_usize, usize::saturating_add)
+        }
+        _ => 0,
+    }
+}
+
+fn take_top_sanitized_marker(value: &mut serde_json::Value) -> LocalityResult<bool> {
+    let marker_count = sanitized_marker_count(value);
+    let has_valid_top_marker = match value {
+        serde_json::Value::Object(object) => object
+            .get(PORTABLE_MEDIA_SANITIZED_MARKER)
+            .is_some_and(|marker| marker == &serde_json::Value::Bool(true)),
+        serde_json::Value::Array(values) => values.last().is_some_and(|last| {
+            last.as_object().is_some_and(|object| {
+                object.len() == 1
+                    && object.get(PORTABLE_MEDIA_SANITIZED_MARKER)
+                        == Some(&serde_json::Value::Bool(true))
+            })
+        }),
+        _ => false,
+    };
+    if marker_count != usize::from(has_valid_top_marker) {
+        return Err(LocalityError::InvalidState(
+            "Notion portable arbitrary JSON has an invalid sanitization marker".to_string(),
+        ));
+    }
+    if has_valid_top_marker {
+        match value {
+            serde_json::Value::Object(object) => {
+                object.remove(PORTABLE_MEDIA_SANITIZED_MARKER);
+            }
+            serde_json::Value::Array(values) => {
+                values.pop();
+            }
+            _ => unreachable!("validated marker has a container"),
+        }
+    }
+    Ok(has_valid_top_marker)
+}
+
+fn validate_sanitized_arbitrary_json(value: &serde_json::Value) -> LocalityResult<bool> {
+    let mut sanitized = value.clone();
+    let has_marker = take_top_sanitized_marker(&mut sanitized)?;
+    if sanitize_arbitrary_json_media_secrets(&mut sanitized) {
+        return Err(LocalityError::InvalidState(
+            "Notion portable arbitrary JSON retained media credentials".to_string(),
+        ));
+    }
+    Ok(has_marker)
 }
 
 fn checked_portable_media_aggregate(current: usize, next: usize) -> Option<usize> {
@@ -644,30 +960,13 @@ fn render_portable_media_page(
 }
 
 fn validate_portable_media_bundle(bundle: &NotionPortablePageBundleV1) -> LocalityResult<()> {
-    let captured = bundle
-        .captured_media
-        .iter()
-        .map(|media| media.block_id.clone())
-        .collect::<BTreeSet<_>>();
-    if captured.len() != bundle.captured_media.len() {
-        return Err(LocalityError::InvalidState(
-            "Notion portable media native payload has duplicate captures".to_string(),
-        ));
-    }
-    let incomplete = bundle
-        .incomplete_media
-        .iter()
-        .map(|media| media.block_id.clone())
-        .collect::<BTreeSet<_>>();
-    if incomplete.len() != bundle.incomplete_media.len() || !captured.is_disjoint(&incomplete) {
-        return Err(LocalityError::InvalidState(
-            "Notion portable media native payload has ambiguous outcomes".to_string(),
-        ));
-    }
-    if bundle.captured_media.len() + bundle.incomplete_media.len() > PORTABLE_MEDIA_MAX_ASSETS {
-        return Err(LocalityError::InvalidState(
-            "Notion portable media native payload exceeds the asset limit".to_string(),
-        ));
+    let mut captured = BTreeMap::new();
+    for media in &bundle.captured_media {
+        if captured.insert(media.block_id.clone(), media).is_some() {
+            return Err(LocalityError::InvalidState(
+                "Notion portable media native payload has duplicate captures".to_string(),
+            ));
+        }
     }
     let aggregate_bytes = bundle
         .captured_media
@@ -694,15 +993,13 @@ fn validate_portable_media_bundle(bundle: &NotionPortablePageBundleV1) -> Locali
     }
 
     let mut media_blocks = BTreeMap::new();
-    collect_media_blocks(&bundle.page.blocks, &mut media_blocks)?;
+    let mut expected_incomplete = BTreeMap::new();
+    collect_media_blocks(
+        &bundle.page.blocks,
+        &mut media_blocks,
+        &mut expected_incomplete,
+    )?;
     for (block_id, (kind, payload)) in &media_blocks {
-        let is_captured = captured.contains(block_id);
-        let is_incomplete = incomplete.contains(block_id);
-        if !is_captured && !is_incomplete {
-            return Err(LocalityError::InvalidState(
-                "Notion portable media block has no capture outcome".to_string(),
-            ));
-        }
         if payload
             .external
             .as_ref()
@@ -721,7 +1018,12 @@ fn validate_portable_media_bundle(bundle: &NotionPortablePageBundleV1) -> Locali
             .as_ref()
             .map(|file| file.url.as_str())
             .unwrap_or("");
-        if is_captured {
+        if let Some(capture) = captured.get(block_id) {
+            if payload.external.is_some() || payload.file.is_none() || hosted_url.is_empty() {
+                return Err(LocalityError::InvalidState(
+                    "Notion portable captured media source is ambiguous".to_string(),
+                ));
+            }
             let sanitized = sanitize_portable_hosted_media_url(hosted_url).map_err(|_| {
                 LocalityError::InvalidState(
                     "Notion portable captured media URL is not allowed".to_string(),
@@ -732,20 +1034,24 @@ fn validate_portable_media_bundle(bundle: &NotionPortablePageBundleV1) -> Locali
                     "Notion portable captured media URL is not sanitized".to_string(),
                 ));
             }
-            let captured_kind = bundle
-                .captured_media
-                .iter()
-                .find(|media| media.block_id == *block_id)
-                .map(|media| media.kind.as_str());
-            if captured_kind != Some(kind.as_str()) {
+            if capture.kind != *kind {
                 return Err(LocalityError::InvalidState(
                     "Notion portable captured media kind does not match its block".to_string(),
                 ));
             }
-        } else if !hosted_url.is_empty() {
-            return Err(LocalityError::InvalidState(
-                "Notion portable incomplete media retained a remote URL".to_string(),
-            ));
+        } else {
+            if !hosted_url.is_empty() {
+                return Err(LocalityError::InvalidState(
+                    "Notion portable incomplete media retained a remote URL".to_string(),
+                ));
+            }
+            let code = match (payload.external.is_some(), payload.file.is_some()) {
+                (true, true) => "ambiguous_file_source",
+                (true, false) => "external_media",
+                (false, true) => "unavailable_hosted_media",
+                (false, false) => "missing_file",
+            };
+            insert_expected_incomplete(&mut expected_incomplete, block_id, kind, code)?;
         }
     }
     for media in &bundle.captured_media {
@@ -756,8 +1062,10 @@ fn validate_portable_media_bundle(bundle: &NotionPortablePageBundleV1) -> Locali
         }
     }
 
-    for property in bundle.page.page.properties.values() {
+    let mut property_asset_index = 0_usize;
+    for (property_index, property) in bundle.page.page.properties.values().enumerate() {
         for file in &property.files {
+            property_asset_index += 1;
             if file
                 .external
                 .as_ref()
@@ -771,7 +1079,89 @@ fn validate_portable_media_bundle(bundle: &NotionPortablePageBundleV1) -> Locali
                     "Notion portable page property media is not sanitized".to_string(),
                 ));
             }
+            insert_expected_incomplete(
+                &mut expected_incomplete,
+                &format!("page-property-file-{property_asset_index}"),
+                "file_property",
+                "unsupported_page_property_media",
+            )?;
         }
+        for (field, value) in [
+            ("formula", property.formula.as_ref()),
+            ("rollup", property.rollup.as_ref()),
+        ] {
+            if let Some(value) = value
+                && validate_sanitized_arbitrary_json(value)?
+            {
+                insert_expected_incomplete(
+                    &mut expected_incomplete,
+                    &format!("page-property-json-{property_index}:{field}"),
+                    "arbitrary_json",
+                    "sanitized_embedded_media_secret",
+                )?;
+            }
+        }
+    }
+
+    let asset_count = portable_media_asset_count(&bundle.page)?;
+    if asset_count > PORTABLE_MEDIA_MAX_ASSETS {
+        if !bundle.captured_media.is_empty() {
+            return Err(LocalityError::InvalidState(
+                "Notion portable over-limit native payload contains captured media".to_string(),
+            ));
+        }
+        insert_expected_incomplete(
+            &mut expected_incomplete,
+            PORTABLE_MEDIA_LIMIT_OUTCOME_ID,
+            "page",
+            "asset_limit_exceeded",
+        )?;
+    }
+
+    if captured
+        .keys()
+        .any(|block_id| expected_incomplete.contains_key(block_id))
+    {
+        return Err(LocalityError::InvalidState(
+            "Notion portable media native payload has ambiguous outcomes".to_string(),
+        ));
+    }
+    let mut actual_incomplete = BTreeMap::new();
+    for outcome in &bundle.incomplete_media {
+        if actual_incomplete
+            .insert(
+                outcome.block_id.clone(),
+                (outcome.kind.clone(), outcome.code.clone()),
+            )
+            .is_some()
+        {
+            return Err(LocalityError::InvalidState(
+                "Notion portable media native payload has duplicate incomplete outcomes"
+                    .to_string(),
+            ));
+        }
+    }
+    if actual_incomplete != expected_incomplete {
+        return Err(LocalityError::InvalidState(
+            "Notion portable media native payload has invalid incomplete outcomes".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn insert_expected_incomplete(
+    expected: &mut BTreeMap<String, (String, String)>,
+    block_id: &str,
+    kind: &str,
+    code: &str,
+) -> LocalityResult<()> {
+    if expected
+        .insert(block_id.to_string(), (kind.to_string(), code.to_string()))
+        .is_some()
+    {
+        return Err(LocalityError::InvalidState(
+            "Notion portable media native payload has colliding outcome identities".to_string(),
+        ));
     }
     Ok(())
 }
@@ -779,8 +1169,27 @@ fn validate_portable_media_bundle(bundle: &NotionPortablePageBundleV1) -> Locali
 fn collect_media_blocks<'a>(
     trees: &'a [BlockTreeDto],
     media: &mut BTreeMap<String, (String, &'a FileBlockDto)>,
+    expected_incomplete: &mut BTreeMap<String, (String, String)>,
 ) -> LocalityResult<()> {
     for tree in trees {
+        validate_exclusive_typed_media_payload(&tree.block)?;
+        for (field, value) in [
+            ("tab", tree.block.tab.as_ref()),
+            ("ai_block", tree.block.ai_block.as_ref()),
+            ("custom_block", tree.block.custom_block.as_ref()),
+            ("button", tree.block.button.as_ref()),
+        ] {
+            if let Some(value) = value
+                && validate_sanitized_arbitrary_json(value)?
+            {
+                insert_expected_incomplete(
+                    expected_incomplete,
+                    &format!("{}:json:{field}", tree.block.id),
+                    "arbitrary_json",
+                    "sanitized_embedded_media_secret",
+                )?;
+            }
+        }
         if is_media_kind(&tree.block.kind) {
             let payload = media_payload(&tree.block).ok_or_else(|| {
                 LocalityError::InvalidState(
@@ -796,7 +1205,7 @@ fn collect_media_blocks<'a>(
                 ));
             }
         }
-        collect_media_blocks(&tree.children, media)?;
+        collect_media_blocks(&tree.children, media, expected_incomplete)?;
     }
     Ok(())
 }
@@ -1467,7 +1876,7 @@ mod tests {
         }
 
         let fetcher = OneByteFetcher;
-        let mut state = PortableMediaCaptureState::new(&fetcher);
+        let mut state = PortableMediaCaptureState::new(&fetcher, false);
         state.aggregate_bytes = PORTABLE_MEDIA_MAX_AGGREGATE_BYTES;
         let mut payload = FileBlockDto {
             kind: "file".to_string(),
@@ -1485,7 +1894,7 @@ mod tests {
             .expect("aggregate capture");
 
         assert!(state.captured.is_empty());
-        assert_eq!(state.incomplete[0].code, "aggregate_too_large");
+        assert_eq!(state.incomplete[0].code, "unavailable_hosted_media");
         assert_eq!(payload.file.expect("hosted").url, "");
     }
 }

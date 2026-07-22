@@ -204,6 +204,11 @@ uses that local path, and each binary supports only `read` and
 Signed query parameters, URL fragments, and Notion expiry timestamps are
 removed before native serialization. Failed or uncaptured payloads have no
 remote URL in native or rendered Markdown and make the result incomplete.
+The same recursive sanitization covers opaque Notion JSON fields, including
+formula and rollup results and raw AI/custom block payloads. A non-secret marker
+binds each such redaction to an exact incomplete outcome; portable render
+recomputes that outcome ledger and rejects missing, duplicate, spurious, or
+mismatched entries before producing an artifact.
 External media stays unsupported and incomplete in this policy. Production
 capture accepts HTTPS on the default port only, rejects user information and IP
 literals, and permits exactly these origins:
@@ -217,8 +222,10 @@ times, with every destination revalidated. Responses must use absent or
 `identity` content encoding. The pilot uses a five-second connection timeout, a
 30-second overall request deadline, reads at most 64 KiB per streaming read,
 and enforces 128 assets per page, 20 MiB per asset, and 100 MiB total captured
-bytes. Missing, expired, duplicate, oversized, denied, or failed media cannot
-silently fall back to a provider URL.
+bytes. Asset shape, identity, and count are preflighted before downloading. An
+over-limit page is fully sanitized and explicitly incomplete without issuing a
+media request or publishing binary projections. Missing, expired, duplicate,
+oversized, denied, or failed media cannot silently fall back to a provider URL.
 
 ## Path Projection
 
