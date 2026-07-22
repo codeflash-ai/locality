@@ -7,6 +7,13 @@ It is intended for local investigation of where an agent run spent time:
 reasoning, assistant text, tool calls, tool results, and unsupported or unknown
 records.
 
+`experiment/agent-conversation-profile-modern-codex.mjs` is a compatibility
+variant for newer Codex JSONL streams. It keeps the same CLI and output shape,
+but additionally recognizes Codex `agent_message`, `command_execution`,
+`mcp_tool_call`, `file_change`, and turn/thread lifecycle records. Use it for
+recent `codex exec --json` captures when the original profiler reports most of
+the run as `unknown` or double-counts started/completed MCP calls.
+
 ## Usage
 
 ```bash
@@ -14,6 +21,15 @@ node experiment/agent-conversation-profile.mjs \
   --left claude.jsonl --left-label claude \
   --right codex.jsonl --right-label codex \
   --out target/agent-profiles/run-1
+```
+
+For newer Codex event streams:
+
+```bash
+node experiment/agent-conversation-profile-modern-codex.mjs \
+  --left locality-codex-events.jsonl --left-label locality \
+  --right notion-mcp-codex-events.jsonl --right-label notion-mcp \
+  --out target/agent-profiles/modern-codex-run-1
 ```
 
 The script accepts JSONL, JSON arrays, or JSON objects containing nested event

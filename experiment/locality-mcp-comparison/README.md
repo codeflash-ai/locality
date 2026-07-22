@@ -18,6 +18,8 @@ The output parent page is:
 - `run-agent-comparison.sh` - wrapper used inside Amika.
 - `run-claude-locality-comparison.sh` - local wrapper that compares Claude Code
   on the hosted MCP path against Claude Code on the Locality path.
+- `run-codex-locality-comparison.sh` - local wrapper that compares Codex on the
+  hosted MCP path against Codex on the Locality path.
 - `run-launch-readiness-benchmark.sh` - core benchmark runner.
 - `run-repeated.sh` - runs the benchmark multiple times.
 - `setup-codex-azure.sh` - writes Codex Azure config.
@@ -108,6 +110,22 @@ servers before Claude starts:
 The script writes these credentials only into sandbox-local files under
 `~/.config/locality-claude-comparison` and stores helper references in
 `~/.claude.json`.
+
+## Run Codex Comparison
+
+From the local machine, set token-backed MCP credentials for the
+`test-with-notion-connector` sandbox, then run:
+
+```bash
+export LINEAR_API_KEY=<linear-api-key>
+export NOTION_API_TOKEN=<notion-api-token>
+./experiment/locality-mcp-comparison/run-codex-locality-comparison.sh
+```
+
+The Codex comparison defaults to `gpt-5.6-luna` with low reasoning effort. It
+copies `AZURE_OPENAI_API_KEY` into sandbox-local secret storage when that
+environment variable is set locally; otherwise it uses the sandbox's existing
+Codex auth/config or `~/.config/locality-experiment/env`.
 
 ## Run Once
 
