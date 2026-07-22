@@ -2071,7 +2071,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "loc-cli"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "clap",
  "locality-connector",
@@ -2093,7 +2093,7 @@ dependencies = [
 
 [[package]]
 name = "locality-cloud-files"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -2110,7 +2110,7 @@ dependencies = [
 
 [[package]]
 name = "locality-connector"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "locality-core",
  "serde",
@@ -2119,7 +2119,7 @@ dependencies = [
 
 [[package]]
 name = "locality-core"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -2129,7 +2129,7 @@ dependencies = [
 
 [[package]]
 name = "locality-desktop"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "loc-cli",
  "locality-connector",
@@ -2155,7 +2155,7 @@ dependencies = [
 
 [[package]]
 name = "locality-fuse"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2172,7 +2172,7 @@ dependencies = [
 
 [[package]]
 name = "locality-gmail"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "base64 0.22.1",
  "locality-connector",
@@ -2186,7 +2186,7 @@ dependencies = [
 
 [[package]]
 name = "locality-google-calendar"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "locality-connector",
@@ -2200,7 +2200,7 @@ dependencies = [
 
 [[package]]
 name = "locality-google-docs"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "locality-connector",
  "locality-core",
@@ -2212,7 +2212,7 @@ dependencies = [
 
 [[package]]
 name = "locality-granola"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "locality-connector",
@@ -2225,7 +2225,7 @@ dependencies = [
 
 [[package]]
 name = "locality-linear"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "locality-connector",
@@ -2239,7 +2239,7 @@ dependencies = [
 
 [[package]]
 name = "locality-notion"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "locality-connector",
  "locality-core",
@@ -2255,7 +2255,7 @@ dependencies = [
 
 [[package]]
 name = "locality-platform"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "libc",
  "locality-store",
@@ -2265,7 +2265,7 @@ dependencies = [
 
 [[package]]
 name = "locality-slack"
-version = "0.3.2"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "locality-connector",
@@ -2278,7 +2278,7 @@ dependencies = [
 
 [[package]]
 name = "locality-store"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "locality-core",
  "rusqlite",
@@ -2289,7 +2289,7 @@ dependencies = [
 
 [[package]]
 name = "localityd"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "base64 0.22.1",
  "chrono",
