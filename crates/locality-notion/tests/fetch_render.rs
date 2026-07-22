@@ -3456,6 +3456,57 @@ fn portable_media_sanitizes_nested_arbitrary_json_and_preserves_ordinary_values(
 }
 
 #[test]
+fn portable_media_preserves_ordinary_authentication_words_exactly() {
+    let page_id = "ordinary-auth-words";
+    let formula = json!({
+        "type": "string",
+        "string": "Authorization approved",
+        "note": "unrelated token words remain ordinary prose"
+    });
+    let rollup = json!({
+        "type": "array",
+        "array": ["bearer bonds", "token budget approved"]
+    });
+    let mut fixture_page = page(page_id, "Ordinary Words");
+    fixture_page.properties.insert(
+        "formula".to_string(),
+        PagePropertyDto {
+            kind: "formula".to_string(),
+            formula: Some(formula.clone()),
+            ..Default::default()
+        },
+    );
+    fixture_page.properties.insert(
+        "rollup".to_string(),
+        PagePropertyDto {
+            kind: "rollup".to_string(),
+            rollup: Some(rollup.clone()),
+            ..Default::default()
+        },
+    );
+    let connector = portable_media_connector_with_page(fixture_page, Vec::new())
+        .with_portable_media_capture(PortableMediaCapturePolicy::HostedPilot);
+
+    let fetched = connector
+        .fetch_portable(portable_fetch_request(page_id))
+        .expect("ordinary prose fetch");
+    assert!(fetched.completeness.is_complete());
+    let native: NotionPortablePageBundleV1 =
+        serde_json::from_slice(&fetched.native.raw).expect("portable native");
+    assert_eq!(
+        native.page.page.properties["formula"].formula,
+        Some(formula)
+    );
+    assert_eq!(native.page.page.properties["rollup"].rollup, Some(rollup));
+    assert!(native.incomplete_media.is_empty());
+
+    let rendered = connector
+        .render_portable(&portable_render_request(page_id, fetched.native))
+        .expect("ordinary prose render");
+    assert!(rendered.completeness.is_complete());
+}
+
+#[test]
 fn portable_media_rejects_extra_typed_payloads_without_echoing_credentials() {
     let first_url = "https://secure.notion-static.com/image.png?X-Amz-Signature=first-secret";
     let second_url = "https://secure.notion-static.com/video.mp4?X-Amz-Signature=second-secret";
@@ -3601,6 +3652,66 @@ fn portable_media_render_binds_every_incomplete_outcome_exactly() {
 }
 
 #[test]
+fn portable_media_render_rejects_unknown_fields_without_echoing_secrets() {
+    let page_id = "unknown-fields-page";
+    let connector = portable_media_connector(
+        page_id,
+        vec![file_block(
+            "image-unknown",
+            "image",
+            "https://example.com/image.png",
+            "Image",
+        )],
+    )
+    .with_portable_media_capture(PortableMediaCapturePolicy::HostedPilot);
+    let fetched = connector
+        .fetch_portable(portable_fetch_request(page_id))
+        .expect("base portable native");
+    let raw = String::from_utf8(fetched.native.raw).expect("UTF-8 JSON");
+
+    let top_secret = concat!(
+        "https://secure.notion-static.com/top.png?",
+        "X-Amz-Signature=top-secret&token=top-token"
+    );
+    let top = format!(r#"{{"unknown_top":"{top_secret}",{}"#, &raw[1..]);
+    let deep_secret = concat!(
+        "https://secure.notion-static.com/deep.png?",
+        "X-Amz-Signature=deep-secret&token=deep-token"
+    );
+    let deep = raw.replacen(
+        r#"},"video":null"#,
+        &format!(
+            r#","unknown_nested":{{"url":"{deep_secret}","token":"deep-token"}}}},"video":null"#
+        ),
+        1,
+    );
+    assert_ne!(deep, raw);
+
+    for (tampered, secrets) in [
+        (top, ["top-secret", "top-token"]),
+        (deep, ["deep-secret", "deep-token"]),
+    ] {
+        let error = connector
+            .render_portable(&portable_render_request(
+                page_id,
+                NativeEntity {
+                    remote_id: RemoteId::new(page_id),
+                    kind: "notion_page_portable_media_v1".to_string(),
+                    raw: tampered.into_bytes(),
+                },
+            ))
+            .expect_err("unknown field must fail canonical validation");
+        assert_eq!(
+            error.to_string(),
+            "invalid state: Notion portable media native payload is not canonical"
+        );
+        for secret in secrets {
+            assert!(!format!("{error:?}").contains(secret));
+        }
+    }
+}
+
+#[test]
 fn portable_media_duplicate_and_count_limits_fail_closed() {
     let duplicate = hosted_file_block(
         "duplicate-block",
@@ -3658,12 +3769,66 @@ fn portable_media_duplicate_and_count_limits_fail_closed() {
     let native: NotionPortablePageBundleV1 =
         serde_json::from_slice(&fetched.native.raw).expect("over-limit native");
     assert!(native.captured_media.is_empty());
-    assert_eq!(native.incomplete_media.len(), 130);
-    assert!(native.incomplete_media.iter().any(|outcome| {
-        outcome.block_id == "__locality_portable_media_limit_v1"
-            && outcome.kind == "page"
-            && outcome.code == "asset_limit_exceeded"
-    }));
+    assert_eq!(
+        native.incomplete_media,
+        vec![NotionPortableIncompleteMediaV1 {
+            block_id: "__locality_portable_media_limit_v1".to_string(),
+            kind: "page".to_string(),
+            code: "asset_limit_exceeded".to_string(),
+        }]
+    );
+    for extra in [
+        NotionPortableIncompleteMediaV1 {
+            block_id: "media-0".to_string(),
+            kind: "image".to_string(),
+            code: "unavailable_hosted_media".to_string(),
+        },
+        NotionPortableIncompleteMediaV1 {
+            block_id: "spurious".to_string(),
+            kind: "page".to_string(),
+            code: "asset_limit_exceeded".to_string(),
+        },
+    ] {
+        let mut tampered = native.clone();
+        tampered.incomplete_media.push(extra);
+        let error = count_connector
+            .render_portable(&portable_render_request(
+                "count-page",
+                NativeEntity {
+                    remote_id: RemoteId::new("count-page"),
+                    kind: "notion_page_portable_media_v1".to_string(),
+                    raw: serde_json::to_vec(&tampered).expect("tampered outcome native"),
+                },
+            ))
+            .expect_err("over-limit per-asset or spurious outcome must fail");
+        assert_eq!(
+            error.to_string(),
+            "invalid state: Notion portable media native payload has invalid incomplete outcomes"
+        );
+    }
+    let mut captured = native.clone();
+    captured
+        .captured_media
+        .push(locality_notion::dto::NotionPortableCapturedMediaV1 {
+            block_id: "media-0".to_string(),
+            kind: "image".to_string(),
+            media_type: "image/png".to_string(),
+            bytes: vec![1],
+        });
+    assert_eq!(
+        count_connector
+            .render_portable(&portable_render_request(
+                "count-page",
+                NativeEntity {
+                    remote_id: RemoteId::new("count-page"),
+                    kind: "notion_page_portable_media_v1".to_string(),
+                    raw: serde_json::to_vec(&captured).expect("tampered capture native"),
+                },
+            ))
+            .expect_err("over-limit capture must fail")
+            .to_string(),
+        "invalid state: Notion portable over-limit native payload contains captured media"
+    );
     let rendered = count_connector
         .render_portable(&portable_render_request("count-page", fetched.native))
         .expect("render over-limit incomplete page");
@@ -3674,6 +3839,123 @@ fn portable_media_duplicate_and_count_limits_fail_closed() {
         ProjectionFileKind::Markdown
     );
     assert!(!format!("{rendered:?}").contains("X-Amz"));
+}
+
+#[test]
+fn portable_media_large_over_limit_page_has_bounded_outcomes() {
+    const PROPERTY_ASSETS: usize = 4_096;
+    let page_id = "large-over-limit-page";
+    let property_url = concat!(
+        "https://secure.notion-static.com/property.pdf?",
+        "X-Amz-Signature=property-secret"
+    );
+    let block_url = concat!(
+        "https://secure.notion-static.com/image.png?",
+        "X-Amz-Signature=block-secret"
+    );
+    let mut fixture_page = page(page_id, "Large Over Limit");
+    fixture_page.properties.insert(
+        "attachments".to_string(),
+        PagePropertyDto {
+            kind: "files".to_string(),
+            files: (0..PROPERTY_ASSETS)
+                .map(|index| FilePropertyDto {
+                    name: Some(format!("file-{index}.pdf")),
+                    kind: "file".to_string(),
+                    external: None,
+                    file: Some(HostedFileDto {
+                        url: property_url.to_string(),
+                        expiry_time: Some("2099-01-01T00:00:00.000Z".to_string()),
+                    }),
+                })
+                .collect(),
+            ..Default::default()
+        },
+    );
+    fixture_page.properties.insert(
+        "rollup".to_string(),
+        PagePropertyDto {
+            kind: "rollup".to_string(),
+            rollup: Some(json!({
+                "type": "files",
+                "file": {
+                    "url": property_url,
+                    "expiry_time": "2099-01-01T00:00:00.000Z"
+                }
+            })),
+            ..Default::default()
+        },
+    );
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let connector = portable_media_connector_with_page(
+        fixture_page,
+        vec![hosted_file_block(
+            "large-image",
+            "image",
+            block_url,
+            Some("2099-01-01T00:00:00.000Z"),
+        )],
+    )
+    .with_portable_media_capture_fetcher(
+        PortableMediaCapturePolicy::HostedPilot,
+        Arc::new(FixturePortableMediaFetcher {
+            outcomes: BTreeMap::new(),
+            calls: Arc::clone(&calls),
+        }),
+    );
+
+    let fetched = connector
+        .fetch_portable(portable_fetch_request(page_id))
+        .expect("large over-limit fetch");
+    assert!(calls.lock().expect("media calls").is_empty());
+    let native: NotionPortablePageBundleV1 =
+        serde_json::from_slice(&fetched.native.raw).expect("large native");
+    assert!(native.captured_media.is_empty());
+    assert_eq!(native.incomplete_media.len(), 2);
+    assert!(native.incomplete_media.iter().any(|outcome| {
+        outcome.block_id == "__locality_portable_media_limit_v1"
+            && outcome.kind == "page"
+            && outcome.code == "asset_limit_exceeded"
+    }));
+    assert!(native.incomplete_media.iter().any(|outcome| {
+        outcome.kind == "arbitrary_json" && outcome.code == "sanitized_embedded_media_secret"
+    }));
+    assert!(
+        native.page.page.properties["attachments"]
+            .files
+            .iter()
+            .all(|file| file
+                .file
+                .as_ref()
+                .is_some_and(|hosted| { hosted.url.is_empty() && hosted.expiry_time.is_none() }))
+    );
+    let hosted = native.page.blocks[0]
+        .block
+        .image
+        .as_ref()
+        .and_then(|payload| payload.file.as_ref())
+        .expect("hosted block");
+    assert!(hosted.url.is_empty());
+    assert!(hosted.expiry_time.is_none());
+    let raw = String::from_utf8_lossy(&fetched.native.raw);
+    for forbidden in [
+        "secure.notion-static.com",
+        "X-Amz",
+        "property-secret",
+        "block-secret",
+        "2099-01-01",
+    ] {
+        assert!(!raw.contains(forbidden));
+    }
+
+    let rendered = connector
+        .render_portable(&portable_render_request(page_id, fetched.native))
+        .expect("large over-limit render");
+    assert_eq!(rendered.projections.len(), 1);
+    assert_eq!(
+        rendered.projections[0].file_kind,
+        ProjectionFileKind::Markdown
+    );
 }
 
 #[test]

@@ -351,6 +351,13 @@ impl<'a> PortableMediaCaptureState<'a> {
         if let Some(external) = payload.external.as_mut() {
             external.url.clear();
         }
+        if self.limit_exceeded {
+            if let Some(hosted) = payload.file.as_mut() {
+                hosted.url.clear();
+                hosted.expiry_time = None;
+            }
+            return Ok(());
+        }
         let Some(hosted) = payload.file.as_mut() else {
             self.record_incomplete(
                 block_id,
@@ -371,10 +378,6 @@ impl<'a> PortableMediaCaptureState<'a> {
             return Ok(());
         }
         if original_url.is_empty() {
-            self.record_incomplete(block_id, kind, "unavailable_hosted_media");
-            return Ok(());
-        }
-        if self.limit_exceeded {
             self.record_incomplete(block_id, kind, "unavailable_hosted_media");
             return Ok(());
         }
@@ -444,11 +447,13 @@ impl<'a> PortableMediaCaptureState<'a> {
                     hosted.url.clear();
                     hosted.expiry_time = None;
                 }
-                self.record_incomplete(
-                    &format!("page-property-file-{property_asset_index}"),
-                    "file_property",
-                    "unsupported_page_property_media",
-                );
+                if !self.limit_exceeded {
+                    self.record_incomplete(
+                        &format!("page-property-file-{property_asset_index}"),
+                        "file_property",
+                        "unsupported_page_property_media",
+                    );
+                }
             }
             for (field, value) in [
                 ("formula", property.formula.as_mut()),
@@ -590,7 +595,7 @@ fn sanitize_arbitrary_json_media_secrets_in_context(
     match value {
         serde_json::Value::String(string) => {
             if sanitize_portable_hosted_media_url(string).is_ok()
-                || looks_like_media_secret_value(string)
+                || looks_like_exact_credential_value(string)
                 || (inherited_media_context && media_url_has_query_or_fragment(string))
             {
                 string.clear();
@@ -687,14 +692,28 @@ fn is_media_metadata_key(key: &str) -> bool {
     normalized == "expirytime" || normalized == "query" || normalized == "fragment"
 }
 
-fn looks_like_media_secret_value(value: &str) -> bool {
+fn looks_like_exact_credential_value(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    lower.contains("x-amz-")
+    lower.contains("x-amz-signature=")
+        || lower.contains("x-amz-credential=")
+        || lower.contains("x-amz-security-token=")
         || lower.contains("signature=")
         || lower.contains("token=")
         || lower.contains("secret=")
-        || lower.contains("authorization")
-        || lower.contains("bearer ")
+        || lower.contains("authorization=")
+        || lower.contains("authorization: bearer ")
+        || looks_like_bearer_credential(value)
+}
+
+fn looks_like_bearer_credential(value: &str) -> bool {
+    let Some((scheme, credential)) = value.trim().split_once(' ') else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("bearer")
+        && credential.len() >= 16
+        && credential.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '~')
+        })
 }
 
 fn media_url_has_query_or_fragment(value: &str) -> bool {
@@ -831,11 +850,67 @@ pub(crate) fn render(request: &PortableRenderRequest) -> LocalityResult<Portable
     }
 }
 
+struct ExactJsonWriter<'a> {
+    expected: &'a [u8],
+    offset: usize,
+    matches: bool,
+}
+
+impl<'a> ExactJsonWriter<'a> {
+    fn new(expected: &'a [u8]) -> Self {
+        Self {
+            expected,
+            offset: 0,
+            matches: true,
+        }
+    }
+
+    fn is_exact(&self) -> bool {
+        self.matches && self.offset == self.expected.len()
+    }
+}
+
+impl std::io::Write for ExactJsonWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let Some(end) = self.offset.checked_add(bytes.len()) else {
+            self.matches = false;
+            self.offset = usize::MAX;
+            return Ok(bytes.len());
+        };
+        if end > self.expected.len() || self.expected[self.offset..end] != *bytes {
+            self.matches = false;
+        }
+        self.offset = end;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn validate_exact_portable_media_native(
+    bundle: &NotionPortablePageBundleV1,
+    raw: &[u8],
+) -> LocalityResult<()> {
+    let mut writer = ExactJsonWriter::new(raw);
+    serde_json::to_writer(&mut writer, bundle).map_err(|_| {
+        LocalityError::Io("Notion portable media canonical validation failed".to_string())
+    })?;
+    if !writer.is_exact() {
+        return Err(LocalityError::InvalidState(
+            "Notion portable media native payload is not canonical".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn render_portable_media_page(
     request: &PortableRenderRequest,
 ) -> LocalityResult<PortableRenderResult> {
     let bundle = serde_json::from_slice::<NotionPortablePageBundleV1>(&request.native.raw)
         .map_err(|_| LocalityError::Io("Notion portable media native decode failed".to_string()))?;
+    validate_exact_portable_media_native(&bundle, &request.native.raw)?;
     if bundle.format_version != PORTABLE_MEDIA_NATIVE_FORMAT_VERSION {
         return Err(LocalityError::InvalidState(
             "Notion portable media native format version is unsupported".to_string(),
@@ -999,6 +1074,13 @@ fn validate_portable_media_bundle(bundle: &NotionPortablePageBundleV1) -> Locali
         &mut media_blocks,
         &mut expected_incomplete,
     )?;
+    let asset_count = portable_media_asset_count(&bundle.page)?;
+    let limit_exceeded = asset_count > PORTABLE_MEDIA_MAX_ASSETS;
+    if limit_exceeded && !bundle.captured_media.is_empty() {
+        return Err(LocalityError::InvalidState(
+            "Notion portable over-limit native payload contains captured media".to_string(),
+        ));
+    }
     for (block_id, (kind, payload)) in &media_blocks {
         if payload
             .external
@@ -1045,13 +1127,15 @@ fn validate_portable_media_bundle(bundle: &NotionPortablePageBundleV1) -> Locali
                     "Notion portable incomplete media retained a remote URL".to_string(),
                 ));
             }
-            let code = match (payload.external.is_some(), payload.file.is_some()) {
-                (true, true) => "ambiguous_file_source",
-                (true, false) => "external_media",
-                (false, true) => "unavailable_hosted_media",
-                (false, false) => "missing_file",
-            };
-            insert_expected_incomplete(&mut expected_incomplete, block_id, kind, code)?;
+            if !limit_exceeded {
+                let code = match (payload.external.is_some(), payload.file.is_some()) {
+                    (true, true) => "ambiguous_file_source",
+                    (true, false) => "external_media",
+                    (false, true) => "unavailable_hosted_media",
+                    (false, false) => "missing_file",
+                };
+                insert_expected_incomplete(&mut expected_incomplete, block_id, kind, code)?;
+            }
         }
     }
     for media in &bundle.captured_media {
@@ -1079,12 +1163,14 @@ fn validate_portable_media_bundle(bundle: &NotionPortablePageBundleV1) -> Locali
                     "Notion portable page property media is not sanitized".to_string(),
                 ));
             }
-            insert_expected_incomplete(
-                &mut expected_incomplete,
-                &format!("page-property-file-{property_asset_index}"),
-                "file_property",
-                "unsupported_page_property_media",
-            )?;
+            if !limit_exceeded {
+                insert_expected_incomplete(
+                    &mut expected_incomplete,
+                    &format!("page-property-file-{property_asset_index}"),
+                    "file_property",
+                    "unsupported_page_property_media",
+                )?;
+            }
         }
         for (field, value) in [
             ("formula", property.formula.as_ref()),
@@ -1103,13 +1189,7 @@ fn validate_portable_media_bundle(bundle: &NotionPortablePageBundleV1) -> Locali
         }
     }
 
-    let asset_count = portable_media_asset_count(&bundle.page)?;
-    if asset_count > PORTABLE_MEDIA_MAX_ASSETS {
-        if !bundle.captured_media.is_empty() {
-            return Err(LocalityError::InvalidState(
-                "Notion portable over-limit native payload contains captured media".to_string(),
-            ));
-        }
+    if limit_exceeded {
         insert_expected_incomplete(
             &mut expected_incomplete,
             PORTABLE_MEDIA_LIMIT_OUTCOME_ID,

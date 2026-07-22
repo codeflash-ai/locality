@@ -208,7 +208,9 @@ The same recursive sanitization covers opaque Notion JSON fields, including
 formula and rollup results and raw AI/custom block payloads. A non-secret marker
 binds each such redaction to an exact incomplete outcome; portable render
 recomputes that outcome ledger and rejects missing, duplicate, spurious, or
-mismatched entries before producing an artifact.
+mismatched entries before producing an artifact. Durable v1 native JSON is
+canonical: render streams a byte-for-byte reserialization comparison and
+rejects unknown fields, alternate field order, or noncanonical whitespace.
 External media stays unsupported and incomplete in this policy. Production
 capture accepts HTTPS on the default port only, rejects user information and IP
 literals, and permits exactly these origins:
@@ -224,8 +226,10 @@ times, with every destination revalidated. Responses must use absent or
 and enforces 128 assets per page, 20 MiB per asset, and 100 MiB total captured
 bytes. Asset shape, identity, and count are preflighted before downloading. An
 over-limit page is fully sanitized and explicitly incomplete without issuing a
-media request or publishing binary projections. Missing, expired, duplicate,
-oversized, denied, or failed media cannot silently fall back to a provider URL.
+media request or publishing binary projections. Its asset bookkeeping stays
+bounded at one page-level `asset_limit_exceeded` outcome, plus any independent
+opaque-JSON redaction outcomes. Missing, expired, duplicate, oversized, denied,
+or failed media cannot silently fall back to a provider URL.
 
 ## Path Projection
 
