@@ -72,17 +72,33 @@ fn retrieve_explicit_root(
 ) -> LocalityResult<ProjectedChild> {
     match api.retrieve_page(root_id.as_str()) {
         Ok(page) => {
+            validate_explicit_root_identity(root_id, &page.id, "page")?;
             let title = page_title(&page);
             Ok(ProjectedChild::Page { page, title })
         }
         Err(LocalityError::RemoteNotFound(_)) => {
             let database = api.retrieve_database(root_id.as_str())?;
+            validate_explicit_root_identity(root_id, &database.id, "database")?;
             let title =
                 database_title(&database).unwrap_or_else(|| "Untitled database".to_string());
             Ok(ProjectedChild::Database { database, title })
         }
         Err(error) => Err(error),
     }
+}
+
+fn validate_explicit_root_identity(
+    requested: &RemoteId,
+    returned: &str,
+    kind: &str,
+) -> LocalityResult<()> {
+    if explicit_root_identity_key(requested.as_str()) != explicit_root_identity_key(returned) {
+        return Err(LocalityError::InvalidState(format!(
+            "Notion explicit root request `{}` returned {kind} `{returned}`",
+            requested.as_str()
+        )));
+    }
+    Ok(())
 }
 
 pub fn enumerate_shared_pages(
@@ -1335,8 +1351,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        ProjectedChild, allocate_child_paths, allocate_page_path, projected_title_stem,
-        resolve_notion_object_path_entries, resolve_page_path_entries,
+        ProjectedChild, allocate_child_paths, allocate_page_path, enumerate_explicit_root_trees,
+        projected_title_stem, resolve_notion_object_path_entries, resolve_page_path_entries,
     };
     use locality_core::model::{EntityKind, MountId, RemoteId};
     use locality_core::path_projection::PAGE_DOCUMENT_FILENAME;
@@ -1710,6 +1726,54 @@ mod tests {
             "38e3ac0e-bb88-8140-94e2-d9ff17e60faa",
             "38e3ac0ebb88814094e2d9ff17e60faa"
         ));
+    }
+
+    #[test]
+    fn explicit_root_rejects_page_identity_mismatch() {
+        let mut api = FakeNotionApi::new();
+        api.pages.insert(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            page("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        );
+
+        let error = enumerate_explicit_root_trees(
+            &api,
+            MountId::new("notion-main"),
+            &[RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
+        )
+        .expect_err("mismatched page identity");
+
+        assert_eq!(
+            error,
+            LocalityError::InvalidState(
+                "Notion explicit root request `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` returned page `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn explicit_root_rejects_database_identity_mismatch() {
+        let mut api = FakeNotionApi::new();
+        api.databases.insert(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            database("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        );
+
+        let error = enumerate_explicit_root_trees(
+            &api,
+            MountId::new("notion-main"),
+            &[RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
+        )
+        .expect_err("mismatched database identity");
+
+        assert_eq!(
+            error,
+            LocalityError::InvalidState(
+                "Notion explicit root request `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` returned database `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`"
+                    .to_string()
+            )
+        );
     }
 
     fn page(id: &str) -> PageDto {
