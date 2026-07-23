@@ -3553,7 +3553,7 @@ fn portable_external_media_fails_closed_without_fetching_bad_or_ambiguous_source
         (
             "malformed",
             "not-a-url".to_string(),
-            "unsafe_external_media_malformed",
+            "external_media_malformed",
         ),
         (
             "non-https",
@@ -3756,7 +3756,11 @@ fn portable_external_media_legacy_generic_outcome_remains_readable() {
         "invalid state: Notion portable media native payload has invalid incomplete outcomes"
     );
 
-    for legacy_code in ["unsafe_external_media", "invalid_external_media"] {
+    for legacy_code in [
+        "unsafe_external_media",
+        "unsafe_external_media_malformed",
+        "invalid_external_media",
+    ] {
         let mut legacy = current.clone();
         legacy.incomplete_media[0].code = legacy_code.to_string();
         let legacy_raw = serde_json::to_vec(&legacy).expect("legacy native");

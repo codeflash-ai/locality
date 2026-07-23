@@ -503,7 +503,7 @@ impl PortableExternalMediaUrlFailure {
             Self::Unavailable => "unavailable_external_media",
             Self::TooLong => "unsafe_external_media_too_long",
             Self::WhitespaceOrControl => "unsafe_external_media_whitespace_or_control",
-            Self::Malformed => "unsafe_external_media_malformed",
+            Self::Malformed => "external_media_malformed",
             Self::NonHttps => "unsafe_external_media_non_https",
             Self::MissingHost => "unsafe_external_media_missing_host",
             Self::Userinfo => "unsafe_external_media_userinfo",

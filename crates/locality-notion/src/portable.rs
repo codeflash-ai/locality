@@ -1325,6 +1325,7 @@ fn actual_external_incomplete_code<'a>(
     };
     match outcome.code.as_str() {
         "unavailable_external_media"
+        | "external_media_malformed"
         | "unsafe_external_media_too_long"
         | "unsafe_external_media_whitespace_or_control"
         | "unsafe_external_media_malformed"
