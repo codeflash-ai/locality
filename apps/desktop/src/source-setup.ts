@@ -7,13 +7,13 @@ const SOURCE_CONNECTORS = [
   "google-calendar",
   "gmail",
   "granola",
+  "confluence",
   "github",
   "gitlab",
   "linear",
   "slack",
 ] as const;
 const PLANNED_SOURCE_CONNECTORS = [
-  "confluence",
   "jira",
   "sharepoint",
   "onedrive",
@@ -36,7 +36,7 @@ const PLANNED_SOURCE_CONNECTORS = [
 export type SourceConnectorId = (typeof SOURCE_CONNECTORS)[number];
 export type PlannedSourceConnectorId = (typeof PLANNED_SOURCE_CONNECTORS)[number];
 export type SourceCatalogConnectorId = SourceConnectorId | PlannedSourceConnectorId;
-export type ApiKeySourceConnectorId = Extract<SourceConnectorId, "github" | "gitlab" | "granola" | "linear">;
+export type ApiKeySourceConnectorId = Extract<SourceConnectorId, "confluence" | "github" | "gitlab" | "granola" | "linear">;
 export type SourceConnectorAvailability = "implemented" | "planned";
 export type SourceConnectorCategory = "knowledge" | "action" | "hybrid";
 export type SourceConnectorAuthMode = "oauth" | "api-key" | "api-token" | "personal-token" | "github-app" | "smart-oauth";
@@ -122,6 +122,19 @@ const SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<SourceCon
     defaultMountDirectory: "granola",
   },
   {
+    id: "confluence",
+    name: "Confluence",
+    description: "Spaces and pages as read-only local knowledge files.",
+    availability: "implemented",
+    category: "knowledge",
+    authModes: ["api-key", "api-token"],
+    keywords: ["atlassian", "confluence", "wiki", "spaces", "pages"],
+    projection: "Spaces and pages as folders with page.md bodies.",
+    writeModel: "Read-only.",
+    defaultMountId: "confluence-main",
+    defaultMountDirectory: "confluence",
+  },
+  {
     id: "github",
     name: "GitHub",
     description: "Repositories, README files, issues, and pull requests as read-only context.",
@@ -176,17 +189,6 @@ const SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<SourceCon
 ];
 
 const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<PlannedSourceConnectorId>[] = [
-  {
-    id: "confluence",
-    name: "Confluence",
-    description: "Spaces, pages, and knowledge-base articles as local documents.",
-    availability: "planned",
-    category: "knowledge",
-    authModes: ["oauth", "api-token"],
-    keywords: ["atlassian", "confluence", "wiki", "spaces", "pages"],
-    projection: "Spaces and pages as folders with page.md bodies.",
-    writeModel: "Start read-only, then reviewed page body updates.",
-  },
   {
     id: "jira",
     name: "Jira",

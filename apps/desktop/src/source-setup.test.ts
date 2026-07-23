@@ -44,6 +44,7 @@ describe("source setup progress", () => {
       "google-calendar",
       "gmail",
       "granola",
+      "confluence",
       "github",
       "gitlab",
       "linear",
@@ -51,6 +52,7 @@ describe("source setup progress", () => {
     ]);
     expect(sourceConnectorDefinitions().map((connector) => connector.id)).toEqual(sourceConnectorIds());
     expect(sourceRequiresApiKey("linear")).toBe(true);
+    expect(sourceRequiresApiKey("confluence")).toBe(true);
     expect(sourceRequiresApiKey("github")).toBe(true);
     expect(sourceRequiresApiKey("gitlab")).toBe(true);
     expect(sourceRequiresApiKey("granola")).toBe(true);
@@ -66,13 +68,13 @@ describe("source setup progress", () => {
     expect(sourceConnectorDefinition("notion").availability).toBe("implemented");
     expect(sourceConnectorDefinition("notion").projection).toContain("page.md");
     expect(sourceConnectorDefinition("slack").writeModel).toBe("Read-only.");
+    expect(sourceConnectorDefinition("confluence").projection).toContain("Spaces");
     expect(sourceConnectorDefinition("github").writeModel).toContain("repository edits stay in git");
     expect(sourceConnectorDefinition("gitlab").projection).toContain("merge requests");
   });
 
   it("keeps planned connector catalog entries separate from runtime setup", () => {
     expect(plannedSourceConnectorIds()).toEqual([
-      "confluence",
       "jira",
       "sharepoint",
       "onedrive",
@@ -92,16 +94,17 @@ describe("source setup progress", () => {
       "fhir",
     ]);
     expect(sourceConnectorCatalogDefinitions()).toHaveLength(27);
-    expect(plannedSourceConnectorDefinitions()).toHaveLength(18);
-    expect(isSourceConnectorId("confluence")).toBe(false);
+    expect(plannedSourceConnectorDefinitions()).toHaveLength(17);
+    expect(isSourceConnectorId("confluence")).toBe(true);
     expect(isSourceCatalogConnectorId("confluence")).toBe(true);
     expect(isSourceCatalogConnectorId("notion")).toBe(true);
     expect(sourceCatalogConnectorDefinition("github").availability).toBe("implemented");
     expect(sourceCatalogConnectorDefinition("github").authModes).toEqual(["api-key", "personal-token"]);
     expect(sourceCatalogConnectorDefinition("gitlab").availability).toBe("implemented");
     expect(sourceCatalogConnectorDefinition("gitlab").authModes).toEqual(["api-key", "personal-token"]);
+    expect(sourceCatalogConnectorDefinition("confluence").availability).toBe("implemented");
+    expect(sourceCatalogConnectorDefinition("confluence").authModes).toEqual(["api-key", "api-token"]);
     expect(sourceCatalogConnectorDefinition("fhir").authModes).toEqual(["smart-oauth"]);
-    expect(sourceCatalogConnectorDefinition("confluence").availability).toBe("planned");
     expect(sourceCatalogConnectorDefinition("confluence").projection).toContain("Spaces");
     expect(sourceCatalogConnectorDefinition("fhir").writeModel).toContain("Read-only");
   });

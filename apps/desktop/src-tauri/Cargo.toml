@@ -13,6 +13,7 @@ tauri-build = { version = "2", features = [] }
 loc-cli = { path = "../../../crates/loc-cli" }
 locality-connector.workspace = true
 locality-core.workspace = true
+locality-confluence.workspace = true
 locality-gmail.workspace = true
 locality-google-calendar.workspace = true
 locality-google-docs.workspace = true

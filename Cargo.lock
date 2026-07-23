@@ -2148,6 +2148,7 @@ name = "locality-desktop"
 version = "0.3.6"
 dependencies = [
  "loc-cli",
+ "locality-confluence",
  "locality-connector",
  "locality-core",
  "locality-gitlab",

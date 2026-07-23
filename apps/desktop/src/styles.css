@@ -3368,6 +3368,11 @@ button.home-stat:hover {
   font-weight: 850;
 }
 
+.source-inline-stack {
+  display: grid;
+  gap: 10px;
+}
+
 .source-inline-field input {
   min-height: 34px;
   padding: 0 10px;

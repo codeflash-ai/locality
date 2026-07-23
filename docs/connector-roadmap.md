@@ -22,6 +22,7 @@ credentials in the current build.
 | Google Docs | Knowledge | OAuth | Docs as Markdown, workspace-folder based mounting |
 | Google Calendar | Action | OAuth | Read events, create reviewed drafts |
 | Gmail | Action | OAuth | Read inbox/sent, create reviewed drafts |
+| Confluence | Knowledge | Atlassian email plus API token | Read-only spaces and pages |
 | GitHub | Hybrid | Personal access token | Read-only repositories, README files, issues, and pull requests |
 | GitLab | Hybrid | Personal access token | Read-only projects, README files, issues, and merge requests |
 | Granola | Knowledge | API key | Read-only summaries and transcripts |
@@ -39,7 +40,6 @@ same product contract.
 
 | Connector | Type | Auth options | First useful projection |
 | --- | --- | --- | --- |
-| Confluence | Knowledge | OAuth, API token | Spaces and pages as folders with `page.md` bodies |
 | Jira | Hybrid | OAuth, API token | Projects, issues, comments, sprints, and status context |
 | SharePoint | Knowledge | OAuth | Sites, libraries, pages, and documents |
 | OneDrive | Knowledge | OAuth | User and shared-drive files |
@@ -66,7 +66,7 @@ are built against the relevant official API contract.
 
 | Connector | Official docs to implement against |
 | --- | --- |
-| Confluence | Atlassian OAuth 2.0 and Confluence Cloud REST API v2 |
+| Confluence (runtime read-only v1) | Atlassian basic auth with account email/API token and Confluence Cloud REST API v2 spaces/pages |
 | Jira | Atlassian OAuth 2.0 and Jira Cloud REST API v3 issue/search resources |
 | SharePoint | Microsoft Graph auth, permissions, sites, lists, drives, and driveItem APIs |
 | OneDrive | Microsoft Graph auth, permissions, drives, and driveItem APIs |
@@ -116,13 +116,12 @@ added to `SOURCE_REGISTRY`, desktop runtime setup, or automatic mount creation.
 
 The highest leverage next connectors are:
 
-1. Confluence, because it is the closest enterprise wiki analogue to Notion.
-2. Jira, because it pairs naturally with engineering status workflows.
-3. SharePoint and OneDrive, because Microsoft 365 content is common in larger
+1. Jira, because it pairs naturally with engineering status workflows.
+2. SharePoint and OneDrive, because Microsoft 365 content is common in larger
    teams.
-4. Google Drive, because Drive folders and files complete the Google workspace
+3. Google Drive, because Drive folders and files complete the Google workspace
    story beyond Docs, Calendar, and Gmail.
-5. Zendesk or Intercom, because support workflows benefit from local search,
+4. Zendesk or Intercom, because support workflows benefit from local search,
    review, and safe response drafts.
 
 Healthcare-specific work should start with a FHIR read-only connector and a
