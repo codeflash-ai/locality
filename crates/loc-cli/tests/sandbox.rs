@@ -1082,10 +1082,11 @@ fn cli_profile_has_stable_monotonic_phases_and_no_request_details() {
     let stderr = String::from_utf8(output.stderr).expect("stderr UTF-8");
     let expected_phases = [
         "bootstrap_token_input",
+        "client_setup",
         "bootstrap_exchange",
         "session_status",
         "export_open_headers",
-        "first_body_byte",
+        "first_consumer_body_byte",
         "stream_decode_materialize",
         "total",
     ];
@@ -1182,6 +1183,7 @@ fn cli_profile_failure_prints_completed_phases_and_total() {
         phases,
         [
             "bootstrap_token_input",
+            "client_setup",
             "bootstrap_exchange",
             "session_status",
             "total"

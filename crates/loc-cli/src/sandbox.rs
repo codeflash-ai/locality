@@ -48,10 +48,11 @@ const EXPORT_READ_AHEAD_CHUNKS: usize = 8;
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 
 pub(crate) const PROFILE_BOOTSTRAP_TOKEN_INPUT: &str = "bootstrap_token_input";
+const PROFILE_CLIENT_SETUP: &str = "client_setup";
 const PROFILE_BOOTSTRAP_EXCHANGE: &str = "bootstrap_exchange";
 const PROFILE_SESSION_STATUS: &str = "session_status";
 const PROFILE_EXPORT_OPEN_HEADERS: &str = "export_open_headers";
-const PROFILE_FIRST_BODY_BYTE: &str = "first_body_byte";
+const PROFILE_FIRST_CONSUMER_BODY_BYTE: &str = "first_consumer_body_byte";
 const PROFILE_STREAM_DECODE_MATERIALIZE: &str = "stream_decode_materialize";
 pub(crate) const PROFILE_TOTAL: &str = "total";
 
@@ -432,6 +433,7 @@ fn run_sandbox_init_internal(
     let root = absolute_destination(&options.root)?;
     validate_destination(&root)?;
     let client = SandboxHttpClient::new(&options.api_url)?;
+    mark_profile(&mut profile, PROFILE_CLIENT_SETUP);
 
     let capability = client.exchange_bootstrap(&bootstrap_token)?;
     mark_profile(&mut profile, PROFILE_BOOTSTRAP_EXCHANGE);
@@ -510,7 +512,7 @@ impl<Body: Read> Read for ProfiledExportBody<'_, Body> {
         if read != 0 && !self.observed_first_byte {
             self.observed_first_byte = true;
             if let Some(profile) = self.profile.as_deref_mut() {
-                profile.mark(PROFILE_FIRST_BODY_BYTE);
+                profile.mark(PROFILE_FIRST_CONSUMER_BODY_BYTE);
             }
         }
         Ok(read)
