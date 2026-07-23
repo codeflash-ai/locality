@@ -1,13 +1,11 @@
 use std::collections::{BTreeMap, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use loc_cli::connect::{
@@ -64,7 +62,10 @@ use locality_notion::dto::{
     PagePropertyDto, PaginatedListDto, ParentDto, RichTextBlockDto, RichTextDto, SelectOptionDto,
     SyncedBlockDto, SyncedFromDto, TextRichTextDto, TitleBlockDto,
 };
-use locality_notion::media::resolve_media_href_with_content_root;
+use locality_notion::media::{
+    PortableMediaCapture, PortableMediaCaptureFetcher, PortableMediaCapturePolicy,
+    resolve_media_href_with_content_root,
+};
 use locality_notion::oauth::{
     NotionOAuthBrokerCodeExchange, NotionOAuthToken, StoredNotionCredential,
 };
@@ -630,17 +631,24 @@ fn pull_materializes_and_repairs_downloaded_media_cache() {
     let fixture = E2eFixture::new();
     let mut store = InMemoryStateStore::new();
     let image_bytes = b"locality-e2e-image-bytes".to_vec();
-    let media_server = LocalMediaServer::new(image_bytes.clone(), 2);
+    let hosted_url = concat!(
+        "https://secure.notion-static.com/locality-e2e-image.png?",
+        "X-Amz-Signature=test-only-signature"
+    );
+    let media_fetcher = Arc::new(CountingHostedMediaFetcher {
+        expected_url: hosted_url.to_string(),
+        bytes: image_bytes.clone(),
+        requests: AtomicUsize::new(0),
+    });
     let api = Arc::new(MutableNotionApi::with_blocks(vec![
         paragraph_block("block-1", "Media cache page."),
-        media_block(
-            "image-block",
-            "image",
-            media_server.url(),
-            "Local test image",
-        ),
+        hosted_media_block("image-block", "image", hosted_url, "Local test image"),
     ]));
-    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone())
+        .with_portable_media_capture_fetcher(
+            PortableMediaCapturePolicy::HostedPilot,
+            media_fetcher.clone(),
+        );
 
     run_mount(
         &mut store,
@@ -672,7 +680,7 @@ fn pull_materializes_and_repairs_downloaded_media_cache() {
     let manifest = fs::read_to_string(fixture.root.join(".loc/media/manifest.json"))
         .expect("read media manifest");
     assert!(manifest.contains("image-block"), "{manifest}");
-    assert!(manifest.contains(media_server.url()), "{manifest}");
+    assert!(manifest.contains(hosted_url), "{manifest}");
 
     fs::remove_file(&local_image).expect("remove materialized image");
     let repair = run_pull(&mut store, &connector, &fixture.root).expect("repair media cache page");
@@ -720,11 +728,8 @@ fn pull_materializes_and_repairs_downloaded_media_cache() {
         !pruned_manifest.contains("image-block"),
         "{pruned_manifest}"
     );
-    assert!(
-        !pruned_manifest.contains(&media_server.url()),
-        "{pruned_manifest}"
-    );
-    media_server.assert_served();
+    assert!(!pruned_manifest.contains(hosted_url), "{pruned_manifest}");
+    assert_eq!(media_fetcher.requests.load(Ordering::SeqCst), 2);
 }
 
 #[test]
@@ -16409,107 +16414,26 @@ fn collect_files_into(path: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-struct LocalMediaServer {
-    url: String,
-    expected_requests: usize,
-    stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<usize>>,
+struct CountingHostedMediaFetcher {
+    expected_url: String,
+    bytes: Vec<u8>,
+    requests: AtomicUsize,
 }
 
-const LOCAL_MEDIA_SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
-impl LocalMediaServer {
-    fn new(bytes: Vec<u8>, expected_requests: usize) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local media server");
-        let url = format!(
-            "http://{}/locality-e2e-image.png",
-            listener.local_addr().expect("local media server addr")
-        );
-        let stop = Arc::new(AtomicBool::new(false));
-        let server_stop = Arc::clone(&stop);
-        let handle = thread::spawn(move || {
-            listener
-                .set_nonblocking(true)
-                .expect("nonblocking media listener");
-            let mut deadline = Instant::now() + LOCAL_MEDIA_SERVER_IDLE_TIMEOUT;
-            let mut served = 0;
-            while !server_stop.load(Ordering::SeqCst) && Instant::now() < deadline {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        if serve_local_media_response(stream, &bytes) {
-                            served += 1;
-                            deadline = Instant::now() + LOCAL_MEDIA_SERVER_IDLE_TIMEOUT;
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("accept local media request: {error}"),
-                }
-            }
-            served
-        });
-
-        Self {
-            url,
-            expected_requests,
-            stop,
-            handle: Some(handle),
-        }
+impl PortableMediaCaptureFetcher for CountingHostedMediaFetcher {
+    fn fetch(
+        &self,
+        hosted_url: &str,
+        max_bytes: usize,
+    ) -> locality_core::LocalityResult<PortableMediaCapture> {
+        assert_eq!(hosted_url, self.expected_url);
+        assert!(self.bytes.len() <= max_bytes);
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        Ok(PortableMediaCapture {
+            bytes: self.bytes.clone(),
+            media_type: "image/png".to_string(),
+        })
     }
-
-    fn url(&self) -> &str {
-        &self.url
-    }
-
-    fn assert_served(mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        let served = self
-            .handle
-            .take()
-            .expect("local media server join handle")
-            .join()
-            .expect("join local media server");
-        assert!(
-            served >= self.expected_requests,
-            "local media server should receive at least every expected download request: served {served}, expected {}",
-            self.expected_requests
-        );
-    }
-}
-
-impl Drop for LocalMediaServer {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-fn serve_local_media_response(mut stream: TcpStream, bytes: &[u8]) -> bool {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-    let mut request = [0_u8; 1024];
-    let Ok(read) = stream.read(&mut request) else {
-        return false;
-    };
-    let request = String::from_utf8_lossy(&request[..read]);
-    if !request.starts_with("GET /locality-e2e-image.png ") {
-        return false;
-    }
-
-    let headers = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        bytes.len()
-    );
-    if stream.write_all(headers.as_bytes()).is_err() {
-        return false;
-    }
-    if stream.write_all(bytes).is_err() {
-        return false;
-    }
-    stream.flush().is_ok()
 }
 
 #[derive(Debug, Default)]
@@ -17592,10 +17516,21 @@ fn synced_block(id: &str, source_block_id: &str) -> BlockDto {
     block
 }
 
-fn media_block(id: &str, kind: &str, url: &str, caption: &str) -> BlockDto {
-    let mut block = media_child(kind, url, caption);
-    block["id"] = json!(id);
-    serde_json::from_value(block).expect("media block dto")
+fn hosted_media_block(id: &str, kind: &str, url: &str, caption: &str) -> BlockDto {
+    let mut block = json!({
+        "object": "block",
+        "id": id,
+        "type": kind
+    });
+    block[kind] = json!({
+        "type": "file",
+        "file": {
+            "url": url,
+            "expiry_time": "2099-01-01T00:00:00.000Z"
+        },
+        "caption": rich_text_json(caption)
+    });
+    serde_json::from_value(block).expect("hosted media block dto")
 }
 
 fn ambiguous_tasks_schema() -> &'static str {

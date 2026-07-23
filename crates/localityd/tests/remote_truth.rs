@@ -98,6 +98,7 @@ impl Connector for RecordingDirectConnector {
     fn apply_undo(&self, _request: ApplyUndoRequest<'_>) -> LocalityResult<ApplyUndoResult> {
         Ok(ApplyUndoResult {
             changed_remote_ids: Vec::new(),
+            observations: Vec::new(),
         })
     }
 }

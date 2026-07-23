@@ -279,19 +279,58 @@ fn fetch_hosted_media_outcome_with_policy(
     deadline: Duration,
     retry_delay: Duration,
 ) -> HostedMediaCaptureOutcome {
+    let clock = SystemHostedMediaRetryClock {
+        started: Instant::now(),
+    };
+    fetch_hosted_media_outcome_with_clock(
+        transport,
+        hosted_url,
+        max_bytes,
+        deadline,
+        retry_delay,
+        &clock,
+    )
+}
+
+trait HostedMediaRetryClock {
+    fn elapsed(&self) -> Duration;
+    fn sleep(&self, duration: Duration);
+}
+
+struct SystemHostedMediaRetryClock {
+    started: Instant,
+}
+
+impl HostedMediaRetryClock for SystemHostedMediaRetryClock {
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        thread::sleep(duration);
+    }
+}
+
+fn fetch_hosted_media_outcome_with_clock(
+    transport: &dyn PortableMediaHttpTransport,
+    hosted_url: &str,
+    max_bytes: usize,
+    deadline: Duration,
+    retry_delay: Duration,
+    clock: &dyn HostedMediaRetryClock,
+) -> HostedMediaCaptureOutcome {
     let initial = match validate_portable_hosted_media_url(hosted_url) {
         Ok(url) => url,
         Err(_) => return HostedMediaCaptureOutcome::Unsafe,
     };
-    let started = Instant::now();
     for attempt in 1..=MEDIA_FETCH_ATTEMPTS {
-        match fetch_hosted_media_once(transport, &initial, max_bytes, started, deadline) {
+        match fetch_hosted_media_once(transport, &initial, max_bytes, deadline, clock) {
             Ok(capture) => return HostedMediaCaptureOutcome::Captured(capture),
             Err(HostedMediaTransferFailure::RetryableUnavailable)
-                if attempt < MEDIA_FETCH_ATTEMPTS && started.elapsed() < deadline =>
+                if attempt < MEDIA_FETCH_ATTEMPTS && clock.elapsed() < deadline =>
             {
-                let remaining = deadline.saturating_sub(started.elapsed());
-                thread::sleep(retry_delay.min(remaining));
+                let remaining = deadline.saturating_sub(clock.elapsed());
+                clock.sleep(retry_delay.min(remaining));
             }
             Err(HostedMediaTransferFailure::RetryableUnavailable)
             | Err(HostedMediaTransferFailure::Unavailable) => {
@@ -312,8 +351,8 @@ fn fetch_hosted_media_once(
     transport: &dyn PortableMediaHttpTransport,
     initial: &reqwest::Url,
     max_bytes: usize,
-    started: Instant,
     deadline: Duration,
+    clock: &dyn HostedMediaRetryClock,
 ) -> Result<PortableMediaCapture, HostedMediaTransferFailure> {
     let mut current = initial.clone();
     let mut visited = std::collections::BTreeSet::new();
@@ -323,7 +362,7 @@ fn fetch_hosted_media_once(
             return Err(HostedMediaTransferFailure::Unsafe);
         }
         let timeout = deadline
-            .checked_sub(started.elapsed())
+            .checked_sub(clock.elapsed())
             .ok_or(HostedMediaTransferFailure::RetryableUnavailable)?;
         if timeout.is_zero() {
             return Err(HostedMediaTransferFailure::RetryableUnavailable);
@@ -1161,9 +1200,10 @@ mod tests {
     #[cfg(windows)]
     use super::resolve_media_href_with_content_root;
     use super::{
-        HostedMediaCaptureOutcome, MediaAsset, PORTABLE_MEDIA_READ_BUFFER_BYTES,
-        PortableMediaCapture, PortableMediaCaptureFetcher, PortableMediaHttpResponse,
-        PortableMediaHttpTransport, fetch_hosted_media_outcome_with_policy,
+        HostedMediaCaptureOutcome, HostedMediaRetryClock, MediaAsset,
+        PORTABLE_MEDIA_READ_BUFFER_BYTES, PortableMediaCapture, PortableMediaCaptureFetcher,
+        PortableMediaHttpResponse, PortableMediaHttpTransport,
+        fetch_hosted_media_outcome_with_clock, fetch_hosted_media_outcome_with_policy,
         fetch_hosted_media_outcome_with_transport, fetch_portable_media_with_transport,
         local_media_href, media_local_path, portable_media_expired, replace_media_manifest,
         resolve_media_href, sanitize_portable_hosted_media_url, validate_portable_hosted_media_url,
@@ -1599,6 +1639,7 @@ mod tests {
 
     struct ScriptedPortableMediaTransport {
         responses: Mutex<VecDeque<PortableMediaHttpResponse>>,
+        transport_failures: Mutex<usize>,
         requests: Mutex<Vec<String>>,
         timeouts: Mutex<Vec<std::time::Duration>>,
         max_read_size: Arc<AtomicUsize>,
@@ -1618,15 +1659,29 @@ mod tests {
                     body: Box::new(TrackingReader {
                         bytes: std::io::Cursor::new(response.body),
                         max_read_size: Arc::clone(&max_read_size),
+                        fail_next_read: response.read_error,
                     }),
                 })
                 .collect();
             Self {
                 responses: Mutex::new(responses),
+                transport_failures: Mutex::new(0),
                 requests: Mutex::new(Vec::new()),
                 timeouts: Mutex::new(Vec::new()),
                 max_read_size,
             }
+        }
+
+        fn with_transport_failures(
+            failures: usize,
+            responses: impl IntoIterator<Item = ScriptedResponse>,
+        ) -> Self {
+            let transport = Self::new(responses);
+            *transport
+                .transport_failures
+                .lock()
+                .expect("transport failures") = failures;
+            transport
         }
 
         fn requests(&self) -> Vec<String> {
@@ -1653,6 +1708,13 @@ mod tests {
                 .expect("requests")
                 .push(url.to_string());
             self.timeouts.lock().expect("timeouts").push(timeout);
+            let mut failures = self.transport_failures.lock().expect("transport failures");
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(locality_core::LocalityError::Io(
+                    "scripted transport failure".to_string(),
+                ));
+            }
             self.responses
                 .lock()
                 .expect("responses")
@@ -1672,6 +1734,7 @@ mod tests {
         content_length: Option<u64>,
         content_type: Option<String>,
         body: Vec<u8>,
+        read_error: bool,
     }
 
     fn scripted_response(
@@ -1689,17 +1752,31 @@ mod tests {
             content_length,
             content_type: content_type.map(str::to_string),
             body,
+            read_error: false,
         }
+    }
+
+    fn scripted_read_error_response(mut response: ScriptedResponse) -> ScriptedResponse {
+        response.read_error = true;
+        response
     }
 
     struct TrackingReader {
         bytes: std::io::Cursor<Vec<u8>>,
         max_read_size: Arc<AtomicUsize>,
+        fail_next_read: bool,
     }
 
     impl Read for TrackingReader {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
             self.max_read_size.fetch_max(buffer.len(), Ordering::SeqCst);
+            if self.fail_next_read {
+                self.fail_next_read = false;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "scripted response read failure",
+                ));
+            }
             self.bytes.read(buffer)
         }
     }
@@ -1831,5 +1908,134 @@ mod tests {
             HostedMediaCaptureOutcome::Unavailable
         );
         assert_eq!(transport.requests().len(), 1);
+    }
+
+    #[test]
+    fn hosted_media_retries_transport_and_read_io_failures() {
+        let success = || {
+            scripted_response(
+                StatusCode::OK,
+                None,
+                None,
+                Some(4),
+                Some("image/png"),
+                b"data".to_vec(),
+            )
+        };
+        let transport_failure =
+            ScriptedPortableMediaTransport::with_transport_failures(1, [success()]);
+        assert_eq!(
+            fetch_hosted_media_outcome_with_policy(
+                &transport_failure,
+                "https://secure.notion-static.com/image.png",
+                1024,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::ZERO,
+            ),
+            HostedMediaCaptureOutcome::Captured(PortableMediaCapture {
+                bytes: b"data".to_vec(),
+                media_type: "image/png".to_string(),
+            })
+        );
+        assert_eq!(transport_failure.requests().len(), 2);
+
+        let read_failure = ScriptedPortableMediaTransport::new([
+            scripted_read_error_response(success()),
+            success(),
+        ]);
+        assert_eq!(
+            fetch_hosted_media_outcome_with_policy(
+                &read_failure,
+                "https://secure.notion-static.com/image.png",
+                1024,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::ZERO,
+            ),
+            HostedMediaCaptureOutcome::Captured(PortableMediaCapture {
+                bytes: b"data".to_vec(),
+                media_type: "image/png".to_string(),
+            })
+        );
+        assert_eq!(read_failure.requests().len(), 2);
+    }
+
+    #[derive(Default)]
+    struct ManualHostedMediaRetryClock {
+        elapsed: Mutex<std::time::Duration>,
+    }
+
+    impl ManualHostedMediaRetryClock {
+        fn advance(&self, duration: std::time::Duration) {
+            let mut elapsed = self.elapsed.lock().expect("manual elapsed");
+            *elapsed += duration;
+        }
+    }
+
+    impl HostedMediaRetryClock for ManualHostedMediaRetryClock {
+        fn elapsed(&self) -> std::time::Duration {
+            *self.elapsed.lock().expect("manual elapsed")
+        }
+
+        fn sleep(&self, duration: std::time::Duration) {
+            self.advance(duration);
+        }
+    }
+
+    struct DeadlineConsumingTransport {
+        clock: Arc<ManualHostedMediaRetryClock>,
+        timeouts: Mutex<Vec<std::time::Duration>>,
+    }
+
+    impl PortableMediaHttpTransport for DeadlineConsumingTransport {
+        fn get(
+            &self,
+            _url: &str,
+            timeout: std::time::Duration,
+        ) -> locality_core::LocalityResult<PortableMediaHttpResponse> {
+            self.timeouts
+                .lock()
+                .expect("deadline timeouts")
+                .push(timeout);
+            self.clock.advance(std::time::Duration::from_millis(600));
+            Err(locality_core::LocalityError::Io(
+                "scripted transport timeout".to_string(),
+            ))
+        }
+    }
+
+    #[test]
+    fn hosted_media_retries_share_one_total_elapsed_deadline() {
+        let clock = Arc::new(ManualHostedMediaRetryClock::default());
+        let transport = DeadlineConsumingTransport {
+            clock: Arc::clone(&clock),
+            timeouts: Mutex::new(Vec::new()),
+        };
+
+        assert_eq!(
+            fetch_hosted_media_outcome_with_clock(
+                &transport,
+                "https://secure.notion-static.com/image.png",
+                1024,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_millis(100),
+                clock.as_ref(),
+            ),
+            HostedMediaCaptureOutcome::Unavailable
+        );
+        assert_eq!(
+            transport
+                .timeouts
+                .lock()
+                .expect("deadline timeouts")
+                .as_slice(),
+            [
+                std::time::Duration::from_millis(1000),
+                std::time::Duration::from_millis(300),
+            ]
+        );
+        assert_eq!(
+            HostedMediaRetryClock::elapsed(clock.as_ref()),
+            std::time::Duration::from_millis(1300)
+        );
     }
 }
