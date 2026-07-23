@@ -22,10 +22,7 @@ use locality_core::{LocalityError, LocalityResult};
 use serde::{Deserialize, Serialize};
 
 use crate::client::{GmailApi, HttpGmailApiClient};
-use crate::dto::{
-    GmailDraftCreateRequest, GmailDraftSendRequest, GmailMessage, GmailRawMessage, GmailThread,
-    header_map,
-};
+use crate::dto::{GmailDraftCreateRequest, GmailMessage, GmailRawMessage, GmailThread, header_map};
 use crate::oauth::GMAIL_CONNECTOR_ID;
 use crate::render::{
     GmailDraftDocument, GmailNativeBundle, GmailThreadMessageNativeBundle, GmailThreadNativeBundle,
@@ -485,30 +482,13 @@ impl Connector for GmailConnector {
                     raw: raw_message_base64url(&mime),
                 },
             })?;
-            let sent = match self
-                .api
-                .send_draft(GmailDraftSendRequest { id: created.id })
-            {
-                Ok(sent) => sent,
-                Err(error) => {
-                    match find_sent_message_by_message_id(self.api.as_ref(), &message_id) {
-                        Ok(Some(sent)) => sent,
-                        Ok(None) => return Err(error),
-                        Err(lookup_error) => {
-                            return Err(LocalityError::Io(format!(
-                                "gmail draft send ambiguous after send failure; sent lookup failed: {lookup_error}"
-                            )));
-                        }
-                    }
-                }
-            };
-            let sent_id = RemoteId::new(sent.id);
-            changed_remote_ids.push(sent_id.clone());
+            let draft_message_id = RemoteId::new(created.message.id);
+            changed_remote_ids.push(draft_message_id.clone());
             effects.push(JournalApplyEffect::CreatedEntity {
                 operation_id,
                 operation_index: index,
-                parent_id: RemoteId::new(SENT_FOLDER_ID),
-                entity_id: sent_id,
+                parent_id: RemoteId::new(DRAFT_FOLDER_ID),
+                entity_id: draft_message_id,
             });
         }
 
@@ -1815,7 +1795,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_create_entity_creates_and_sends_gmail_draft() {
+    fn apply_create_entity_creates_unsent_gmail_draft() {
         let api = Arc::new(FakeGmailApi::default());
         let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
         let plan = PushPlan::new(
@@ -1851,10 +1831,13 @@ mod tests {
             })
             .expect("apply");
 
-        assert_eq!(result.changed_remote_ids, vec![RemoteId::new("sent-msg-1")]);
+        assert_eq!(
+            result.changed_remote_ids,
+            vec![RemoteId::new("draft-message-1")]
+        );
         let calls = api.calls.lock().expect("calls");
         assert_eq!(calls.created_drafts, 1);
-        assert_eq!(calls.sent_drafts, vec!["draft-1"]);
+        assert!(calls.sent_drafts.is_empty());
         let raw = calls.created_draft_raw.last().expect("created draft raw");
         let mime = String::from_utf8(
             URL_SAFE_NO_PAD
@@ -1870,7 +1853,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_create_entity_recovers_existing_sent_message_by_message_id_without_resend() {
+    fn apply_create_entity_recovers_existing_sent_message_by_message_id_without_duplicate() {
         let api = Arc::new(FakeGmailApi::default());
         let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
         let push_id = PushId("push-1".to_string());
@@ -1927,7 +1910,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_create_entity_recovers_sent_message_after_send_response_failure() {
+    fn apply_create_entity_does_not_send_when_send_endpoint_would_fail() {
         let api = Arc::new(FakeGmailApi::default());
         let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
         let push_id = PushId("push-1".to_string());
@@ -1978,22 +1961,19 @@ mod tests {
 
         assert_eq!(
             result.changed_remote_ids,
-            vec![RemoteId::new("sent-msg-recovered")]
+            vec![RemoteId::new("draft-message-1")]
         );
         let calls = api.calls.lock().expect("calls");
         assert_eq!(calls.created_drafts, 1);
-        assert_eq!(calls.sent_drafts, vec!["draft-1"]);
+        assert!(calls.sent_drafts.is_empty());
         assert_eq!(
             calls.list_queries,
-            vec![
-                format!("rfc822msgid:<{message_id}>"),
-                format!("rfc822msgid:<{message_id}>"),
-            ]
+            vec![format!("rfc822msgid:<{message_id}>")]
         );
     }
 
     #[test]
-    fn apply_create_entity_preserves_send_ambiguity_when_recovery_lookup_fails() {
+    fn apply_create_entity_does_not_depend_on_sent_lookup() {
         let api = Arc::new(FakeGmailApi::default());
         let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
         {
@@ -2026,7 +2006,7 @@ mod tests {
             }],
         );
 
-        let error = connector
+        let result = connector
             .apply(locality_connector::ApplyPlanRequest {
                 push_id: &PushId("push-1".to_string()),
                 mount_id: &MountId::new("gmail-main"),
@@ -2035,14 +2015,15 @@ mod tests {
                 remote_preconditions: &[] as &[RemotePrecondition],
                 local_root: None,
             })
-            .expect_err("recovery lookup failure should preserve ambiguous send");
+            .expect("draft creation should not send or query sent mail");
 
-        let message = error.to_string();
-        assert!(message.contains("gmail draft send"));
-        assert!(message.contains("sent search timed out"));
+        assert_eq!(
+            result.changed_remote_ids,
+            vec![RemoteId::new("draft-message-1")]
+        );
         let calls = api.calls.lock().expect("calls");
         assert_eq!(calls.created_drafts, 1);
-        assert_eq!(calls.sent_drafts, vec!["draft-1"]);
+        assert!(calls.sent_drafts.is_empty());
     }
 
     #[test]
