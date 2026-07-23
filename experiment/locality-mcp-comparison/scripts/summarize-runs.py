@@ -5,12 +5,15 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("experiment/runs")
-summaries = sorted(root.glob("*/summary.json"))
+summaries = sorted(root.glob("**/summary.json"))
 rows = []
 for path in summaries:
     data = json.loads(path.read_text())
-    run_id = path.parent.name
-    for metric in data.get("metrics", []):
+    metrics = data.get("metrics", [])
+    if not metrics:
+        continue
+    run_id = str(path.parent.relative_to(root))
+    for metric in metrics:
         rows.append(
             {
                 "run_id": run_id,
@@ -30,7 +33,7 @@ for row in latest:
 lines = []
 lines.append("# Repeated Benchmark Summary")
 lines.append("")
-lines.append(f"Runs discovered: {len(summaries)}")
+lines.append(f"Runs discovered: {len(set(row['run_id'] for row in rows))}")
 lines.append("")
 lines.append("| Model | Effort | Scenario | Strategy | Phase | Runs | Mean | Median | Min | Max |")
 lines.append("| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |")

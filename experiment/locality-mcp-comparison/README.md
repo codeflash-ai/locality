@@ -15,13 +15,14 @@ The output parent page is:
 
 ## Files
 
-- `run-agent-comparison.sh` - wrapper used inside Amika.
+- `run-agent-comparison.sh` - local Amika wrapper that runs launch-readiness
+  Locality scenarios on `LOCALITY_SANDBOX` and MCP scenarios on `MCP_SANDBOX`.
 - `run-claude-locality-comparison.sh` - local wrapper that compares Claude Code
   on the hosted MCP path against Claude Code on the Locality path.
 - `run-codex-locality-comparison.sh` - local wrapper that compares Codex on the
   hosted MCP path against Codex on the Locality path.
 - `run-launch-readiness-benchmark.sh` - core benchmark runner.
-- `run-repeated.sh` - runs the benchmark multiple times.
+- `run-repeated.sh` - runs the split Amika benchmark multiple times.
 - `setup-codex-azure.sh` - writes Codex Azure config without MCP servers.
 - `prompts/Locality/*.md` - Locality-only scenario prompts.
 - `prompts/MCP/*.md` - Notion-MCP-only scenario prompts, paired by filename with `prompts/Locality/*.md`.
@@ -47,11 +48,11 @@ This is workflow separation, not a hard security boundary, because the benchmark
 From the local machine:
 
 ```bash
-export SANDBOX=locality-scrum-report
-export SSH_TARGET="$(amika sandbox ssh --print "$SANDBOX")"
+export LOCALITY_SANDBOX=aseem-locality
+export MCP_SANDBOX=aseem-mcp
 ```
 
-Seed the Azure key without printing it:
+Seed the Azure key into both sandboxes without printing it:
 
 ```bash
 line="$(python3 - <<'PY'
@@ -62,29 +63,34 @@ PY
 
 b64="$(printf '%s\n' "$line" | base64 | tr -d '\n')"
 
-ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" "
-  mkdir -p ~/.config/locality-experiment &&
-  chmod 700 ~/.config/locality-experiment &&
-  printf '%s' '$b64' | base64 -d > ~/.config/locality-experiment/env &&
-  chmod 600 ~/.config/locality-experiment/env
-"
+for sandbox in "$LOCALITY_SANDBOX" "$MCP_SANDBOX"; do
+  ssh_target="$(amika sandbox ssh --print "$sandbox")"
+  ssh -o StrictHostKeyChecking=accept-new "$ssh_target" "
+    mkdir -p ~/.config/locality-experiment &&
+    chmod 700 ~/.config/locality-experiment &&
+    printf '%s' '$b64' | base64 -d > ~/.config/locality-experiment/env &&
+    chmod 600 ~/.config/locality-experiment/env
+  "
+done
 ```
 
-Build sidecars and configure Codex:
+Build `loc` on the Locality sandbox; the split wrapper defaults
+`REMOTE_LOC_BIN` to this binary:
 
 ```bash
-ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
+ssh_target="$(amika sandbox ssh --print "$LOCALITY_SANDBOX")"
+ssh -o StrictHostKeyChecking=accept-new "$ssh_target" '
   export PATH="$HOME/.cargo/bin:$PATH"
   cd /home/amika/workspace/locality
   cargo build -p loc-cli -p localityd
-  CODEX_MODEL=gpt-5.6-luna CODEX_REASONING_EFFORT=low ./experiment/locality-mcp-comparison/setup-codex-azure.sh
 '
 ```
 
 Verify Locality:
 
 ```bash
-ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
+ssh_target="$(amika sandbox ssh --print "$LOCALITY_SANDBOX")"
+ssh -o StrictHostKeyChecking=accept-new "$ssh_target" '
   export PATH="$HOME/.cargo/bin:$PATH"
   cd /home/amika/workspace/locality
   target/debug/loc connections --json
@@ -94,8 +100,12 @@ ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
 
 ## Run Claude Comparison
 
-From the local machine, set token-backed MCP credentials for the
-`test-with-notion-connector` sandbox, then run:
+`run-claude-locality-comparison.sh` is a legacy comparison helper and is not the
+supported split launch-readiness path. Prefer the Codex launch wrapper below for
+the Amika split-sandbox benchmark.
+
+If you still need the Claude helper, set its MCP credentials explicitly before
+running it:
 
 ```bash
 export LINEAR_API_KEY=<linear-api-key>
@@ -103,22 +113,13 @@ export NOTION_API_TOKEN=<notion-api-token>
 ./experiment/locality-mcp-comparison/run-claude-locality-comparison.sh
 ```
 
-The `test-with-notion-connector` sandbox is prepared with token-backed MCP
-servers before Claude starts:
-
-- `LINEAR_API_KEY` configures Linear's remote MCP server through an
-  authorization-header helper.
-- `NOTION_API_TOKEN` configures the official `@notionhq/notion-mcp-server`
-  stdio server through `OPENAPI_MCP_HEADERS`.
-
-The script writes these credentials only into sandbox-local files under
-`~/.config/locality-claude-comparison` and stores helper references in
-`~/.claude.json`.
+The script owns its own credential files under
+`~/.config/locality-claude-comparison` and its own Claude configuration.
 
 ## Run Codex Comparison
 
-From the local machine, set token-backed MCP credentials for the
-`test-with-notion-connector` sandbox, then run:
+From the local machine, set token-backed MCP credentials for the MCP sandbox,
+then run:
 
 ```bash
 export LINEAR_API_KEY=<linear-api-key>
@@ -127,6 +128,8 @@ export NOTION_API_TOKEN=<notion-api-token>
 ```
 
 The Codex comparison defaults to `gpt-5.6-luna` with low reasoning effort. It
+uses `MCP_SANDBOX=aseem-mcp` and `LOCALITY_SANDBOX=aseem-locality` by default.
+Override those variables to point at different prepared Amika sandboxes. It
 copies `AZURE_OPENAI_API_KEY` into sandbox-local secret storage when that
 environment variable is set locally; otherwise it uses the sandbox's existing
 Codex auth/config or `~/.config/locality-experiment/env`.
@@ -184,26 +187,21 @@ repository context, they should inspect the repository directly with git.
 ## Run Once
 
 ```bash
-ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
-  export PATH="$HOME/.cargo/bin:$PATH"
-  cd /home/amika/workspace/locality
-  CODEX_MODEL=gpt-5.6-luna CODEX_REASONING_EFFORT=low ./experiment/locality-mcp-comparison/run-agent-comparison.sh
-'
+CODEX_MODEL=gpt-5.6-luna CODEX_REASONING_EFFORT=low \
+  ./experiment/locality-mcp-comparison/run-agent-comparison.sh
 ```
 
 By default this is artifact-only. It writes local Markdown reports under
-`OUT_DIR` and does not create Notion pages, write mounted report pages, run
-`loc diff`, or push.
+`target/launch-readiness-amika/<run-id>/artifacts/{locality,notion-mcp}` after
+syncing the remote sandbox `OUT_DIR`s back to the local machine. It does not
+create Notion pages, write mounted report pages, run `loc diff`, or push.
 
 To exercise mounted report page creation and push-plan generation without
 publishing:
 
 ```bash
-ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
-  export PATH="$HOME/.cargo/bin:$PATH"
-  cd /home/amika/workspace/locality
-  CODEX_MODEL=gpt-5.6-luna CODEX_REASONING_EFFORT=low ./experiment/locality-mcp-comparison/run-agent-comparison.sh --write-mounted-page
-'
+CODEX_MODEL=gpt-5.6-luna CODEX_REASONING_EFFORT=low \
+  ./experiment/locality-mcp-comparison/run-agent-comparison.sh --write-mounted-page
 ```
 
 Each Codex strategy has a hard timeout so a stalled `codex exec` records a failed phase instead of hanging the benchmark indefinitely. The default is 900 seconds per strategy. Override it with:
@@ -214,16 +212,18 @@ CODEX_EXEC_TIMEOUT_SECONDS=300 ./experiment/locality-mcp-comparison/run-agent-co
 
 Use `CODEX_EXEC_TIMEOUT_SECONDS=0` to disable the timeout.
 
-To split a launch-readiness run across two Amika sandboxes, run the Locality
-strategy on the Locality sandbox and the MCP strategy on the MCP sandbox:
+The launch wrapper always runs split Amika strategies. The default sandboxes are
+`aseem-locality` for Locality and `aseem-mcp` for MCP:
 
 ```bash
-./experiment/locality-mcp-comparison/run-launch-readiness-benchmark.sh --strategy locality
-./experiment/locality-mcp-comparison/run-launch-readiness-benchmark.sh --strategy notion-mcp
+LOCALITY_SANDBOX=my-locality MCP_SANDBOX=my-mcp \
+  ./experiment/locality-mcp-comparison/run-agent-comparison.sh
 ```
 
-`--strategy notion-mcp` configures MCP auth and skips Locality mount hydration,
-so the MCP sandbox does not need a Locality connection.
+The wrapper prepares a clean detached worktree in each sandbox from
+`BENCHMARK_REF` and then runs `run-launch-readiness-benchmark.sh --strategy
+locality` or `--strategy notion-mcp` inside the matching sandbox. Set
+`SYNC_ARTIFACTS=0` to leave outputs only on the remote sandboxes.
 
 Hooks are enabled by default. The runner installs a benchmark-owned `hooks.json`
 into each per-strategy `CODEX_HOME` and starts Codex with
@@ -268,28 +268,27 @@ projection behavior.
 To publish, which implies mounted report page creation:
 
 ```bash
-ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
-  export PATH="$HOME/.cargo/bin:$PATH"
-  cd /home/amika/workspace/locality
-  CODEX_MODEL=gpt-5.6-luna CODEX_REASONING_EFFORT=low ./experiment/locality-mcp-comparison/run-agent-comparison.sh --push
-'
+CODEX_MODEL=gpt-5.6-luna CODEX_REASONING_EFFORT=low \
+  ./experiment/locality-mcp-comparison/run-agent-comparison.sh --push
 ```
 
 ## Run Five Times
 
 ```bash
-ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
-  export PATH="$HOME/.cargo/bin:$PATH"
-  cd /home/amika/workspace/locality
-  RUNS=5 CODEX_MODEL=gpt-5.6-luna CODEX_REASONING_EFFORT=low ./experiment/locality-mcp-comparison/run-repeated.sh
-'
+RUNS=5 CODEX_MODEL=gpt-5.6-luna CODEX_REASONING_EFFORT=low \
+  ./experiment/locality-mcp-comparison/run-repeated.sh
 ```
 
 ## Artifacts
 
-Each run writes shared setup artifacts to:
+Each split wrapper run writes local metadata to:
 
-`experiment/runs/<run-id>/`
+`target/launch-readiness-amika/<run-id>/`
+
+The synced benchmark artifacts are under:
+
+`target/launch-readiness-amika/<run-id>/artifacts/locality/`
+`target/launch-readiness-amika/<run-id>/artifacts/notion-mcp/`
 
 Important artifacts:
 
@@ -344,12 +343,12 @@ a completed run with:
 
 ```bash
 python3 experiment/locality-mcp-comparison/scripts/codex-events-to-trace.py \
-  experiment/runs/<run-id>/scenarios/<scenario>/locality-codex-events.jsonl \
-  experiment/runs/<run-id>/scenarios/<scenario>/locality
+  target/launch-readiness-amika/<run-id>/artifacts/locality/scenarios/<scenario>/locality-codex-events.jsonl \
+  target/launch-readiness-amika/<run-id>/artifacts/locality/scenarios/<scenario>/locality
 
 python3 experiment/locality-mcp-comparison/scripts/codex-events-to-trace.py \
-  experiment/runs/<run-id>/scenarios/<scenario>/notion-mcp-codex-events.jsonl \
-  experiment/runs/<run-id>/scenarios/<scenario>/notion-mcp
+  target/launch-readiness-amika/<run-id>/artifacts/notion-mcp/scenarios/<scenario>/notion-mcp-codex-events.jsonl \
+  target/launch-readiness-amika/<run-id>/artifacts/notion-mcp/scenarios/<scenario>/notion-mcp
 ```
 
 When live hook `harness.phase` records are present, the generated Speedscope
@@ -361,8 +360,8 @@ Generate Locality span artifacts for a raw trace manually with:
 
 ```bash
 python3 experiment/locality-mcp-comparison/scripts/locality-trace-to-speedscope.py \
-  experiment/runs/<run-id>/locality-traces/target-pull.jsonl \
-  experiment/runs/<run-id>/locality-traces/target-pull
+  target/launch-readiness-amika/<run-id>/artifacts/locality/locality-traces/target-pull.jsonl \
+  target/launch-readiness-amika/<run-id>/artifacts/locality/locality-traces/target-pull
 ```
 
 Use the Locality trace files to answer questions the Codex event graph cannot:

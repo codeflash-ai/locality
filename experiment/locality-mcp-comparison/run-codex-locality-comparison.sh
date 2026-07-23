@@ -13,11 +13,17 @@ Defaults:
   transcript capture: streamed back over amika sandbox ssh
   Codex model: gpt-5.6-luna
   Codex reasoning effort: low
+  MCP sandbox: aseem-mcp
+  Locality sandbox: aseem-locality
   remote cwd:
-    test-with-notion-connector: ~
-    onyx-falcon: ~/Locality
+    aseem-mcp: /home/amika/workspace/locality
+    aseem-locality: /home/amika/workspace/locality
 
 Environment:
+  MCP_SANDBOX               Amika sandbox for MCP runs. Default: aseem-mcp.
+  LOCALITY_SANDBOX          Amika sandbox for Locality runs. Default: aseem-locality.
+  MCP_REMOTE_CWD            Remote cwd for MCP Codex. Default: /home/amika/workspace/locality.
+  LOCALITY_REMOTE_CWD       Remote cwd for Locality Codex. Default: /home/amika/workspace/locality.
   CODEX_BIN                 Codex executable in the sandbox. Default: codex
   CODEX_MODEL               Model passed to codex exec. Default: gpt-5.6-luna
   CODEX_REASONING_EFFORT    Codex reasoning effort. Default: low
@@ -28,11 +34,9 @@ Environment:
                             If absent, the sandbox's existing Codex auth/config
                             or ~/.config/locality-experiment/env is used.
   AZURE_OPENAI_BASE_URL     Azure OpenAI base URL used when configuring Codex.
-  LINEAR_API_KEY            Linear personal API key for test-with-notion-connector.
-  NOTION_API_TOKEN          Notion internal/PAT token for test-with-notion-connector.
+  LINEAR_API_KEY            Linear personal API key for the MCP sandbox.
+  NOTION_API_TOKEN          Notion internal/PAT token for the MCP sandbox.
                             NOTION_TOKEN or NOTION_ACCESS_TOKEN are accepted aliases.
-  LOCALITY_DEB_URL          Locality Linux .deb used for onyx-falcon setup.
-                            Default: latest codeflash-ai/locality release asset
   AMIKA_SANDBOX_FLAGS       Optional flags passed to amika sandbox commands,
                             for example: --remote
   --remote-run-root is accepted for compatibility and is not used by the
@@ -45,6 +49,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT_DIR="${OUT_DIR:-$REPO_ROOT/target/codex-locality-comparison/$RUN_ID}"
 REMOTE_RUN_ROOT="${REMOTE_RUN_ROOT:-~/locality-codex-runs}"
+MCP_SANDBOX="${MCP_SANDBOX:-aseem-mcp}"
+LOCALITY_SANDBOX="${LOCALITY_SANDBOX:-aseem-locality}"
+MCP_REMOTE_CWD="${MCP_REMOTE_CWD:-/home/amika/workspace/locality}"
+LOCALITY_REMOTE_CWD="${LOCALITY_REMOTE_CWD:-/home/amika/workspace/locality}"
 CODEX_BIN="${CODEX_BIN:-codex}"
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-luna}"
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-low}"
@@ -53,7 +61,6 @@ AZURE_OPENAI_API_KEY="${AZURE_OPENAI_API_KEY:-}"
 AZURE_OPENAI_BASE_URL="${AZURE_OPENAI_BASE_URL:-https://aseem-mp32maxp-eastus2.openai.azure.com/openai/v1}"
 LINEAR_API_KEY="${LINEAR_API_KEY:-}"
 NOTION_API_TOKEN="${NOTION_API_TOKEN:-${NOTION_TOKEN:-${NOTION_ACCESS_TOKEN:-}}}"
-LOCALITY_DEB_URL="${LOCALITY_DEB_URL:-https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.deb}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -95,6 +102,11 @@ if ! command -v node >/dev/null 2>&1; then
   exit 127
 fi
 
+if [ "$MCP_SANDBOX" = "$LOCALITY_SANDBOX" ]; then
+  echo "MCP_SANDBOX and LOCALITY_SANDBOX must be different Amika sandboxes" >&2
+  exit 2
+fi
+
 mkdir -p "$OUT_DIR"
 OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 
@@ -104,13 +116,13 @@ if [ -n "${AMIKA_SANDBOX_FLAGS:-}" ]; then
 fi
 
 MACHINES=(
-  "test-with-notion-connector"
-  "onyx-falcon"
+  "$MCP_SANDBOX"
+  "$LOCALITY_SANDBOX"
 )
 
 REMOTE_CWDS=(
-  "~"
-  "~/Locality"
+  "$MCP_REMOTE_CWD"
+  "$LOCALITY_REMOTE_CWD"
 )
 
 PROMPTS=(
@@ -213,7 +225,7 @@ REMOTE_CODEX_SETUP
   amika_sandbox_ssh "$machine" -- "$remote_shell_command" > "$setup_out" 2> "$setup_err"
 }
 
-prepare_test_with_connector_mcp() {
+prepare_mcp_sandbox() {
   local machine="$1"
   local local_dir="$2"
   local setup_out="$local_dir/$machine.mcp-setup.out"
@@ -286,63 +298,42 @@ REMOTE_MCP_SETUP
   amika_sandbox_ssh "$machine" -- "$remote_shell_command" > "$setup_out" 2> "$setup_err"
 }
 
-prepare_onyx_falcon_locality() {
+prepare_locality_sandbox() {
   local machine="$1"
   local local_dir="$2"
-  local setup_out="$local_dir/onyx-falcon.locality-setup.out"
-  local setup_err="$local_dir/onyx-falcon.locality-setup.err"
+  local setup_out="$local_dir/$machine.locality-setup.out"
+  local setup_err="$local_dir/$machine.locality-setup.err"
   local remote_script
   local remote_script_b64
   local remote_command
   local remote_shell_command
 
-  echo "Preparing Locality on onyx-falcon..."
+  echo "Verifying Locality on $machine..."
   remote_script="$(cat <<'REMOTE_LOCALITY_SETUP'
 set -euo pipefail
 
-deb_url="$1"
-tmp_deb="$(mktemp "${TMPDIR:-/tmp}/locality.XXXXXX.deb")"
-trap 'rm -f "$tmp_deb"' EXIT
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 
-if command -v curl >/dev/null 2>&1; then
-  curl -fsSL -o "$tmp_deb" "$deb_url"
-elif command -v wget >/dev/null 2>&1; then
-  wget -qO "$tmp_deb" "$deb_url"
-else
-  echo "curl or wget is required to download Locality_Linux.deb" >&2
+if ! command -v loc >/dev/null 2>&1; then
+  echo "loc is not available on PATH" >&2
   exit 127
 fi
 
-if ! command -v apt-get >/dev/null 2>&1; then
-  echo "apt-get is required to install Locality_Linux.deb" >&2
-  exit 127
-fi
-
-if command -v sudo >/dev/null 2>&1; then
-  sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y "$tmp_deb"
-else
-  env DEBIAN_FRONTEND=noninteractive apt-get install -y "$tmp_deb"
-fi
+loc --version || true
 
 mkdir -p "$HOME/Locality/notion" "$HOME/Locality/linear"
 
-if ! loc status "$HOME/Locality/notion" --json >/dev/null 2>&1; then
-  loc mount notion --workspace "$HOME/Locality/notion" --connection notion-default ||
-    echo "warning: could not register Notion mount before pull" >&2
-fi
-if ! loc status "$HOME/Locality/linear" --json >/dev/null 2>&1; then
-  loc mount linear "$HOME/Locality/linear" --connection linear-default ||
-    echo "warning: could not register Linear mount before pull" >&2
-fi
-
-loc pull "$HOME/Locality/notion" ||
+loc status "$HOME/Locality/notion" --json >/dev/null 2>&1 &&
+  loc pull "$HOME/Locality/notion" ||
   echo "warning: loc pull failed for $HOME/Locality/notion" >&2
-loc pull "$HOME/Locality/linear" ||
+
+loc status "$HOME/Locality/linear" --json >/dev/null 2>&1 &&
+  loc pull "$HOME/Locality/linear" ||
   echo "warning: loc pull failed for $HOME/Locality/linear" >&2
 REMOTE_LOCALITY_SETUP
 )"
   remote_script_b64="$(printf '%s' "$remote_script" | base64_one_line)"
-  remote_command="printf %s $(shell_quote "$remote_script_b64") | base64 -d | bash -s -- $(shell_quote "$LOCALITY_DEB_URL")"
+  remote_command="printf %s $(shell_quote "$remote_script_b64") | base64 -d | bash -s --"
   remote_shell_command="bash -lc $(shell_quote "$remote_command")"
   amika_sandbox_ssh "$machine" -- "$remote_shell_command" > "$setup_out" 2> "$setup_err"
 }
@@ -457,14 +448,14 @@ PY
     return 1
   fi
 
-  if [ "$machine" = "test-with-notion-connector" ]; then
-    if ! prepare_test_with_connector_mcp "$machine" "$local_dir"; then
+  if [ "$machine" = "$MCP_SANDBOX" ]; then
+    if ! prepare_mcp_sandbox "$machine" "$local_dir"; then
       return 1
     fi
   fi
 
-  if [ "$machine" = "onyx-falcon" ]; then
-    if ! prepare_onyx_falcon_locality "$machine" "$local_dir"; then
+  if [ "$machine" = "$LOCALITY_SANDBOX" ]; then
+    if ! prepare_locality_sandbox "$machine" "$local_dir"; then
       return 1
     fi
   fi
@@ -598,8 +589,8 @@ PY
 }
 
 run_profiler() {
-  local left="$OUT_DIR/test-with-notion-connector/test-with-notion-connector.codex.jsonl"
-  local right="$OUT_DIR/onyx-falcon/onyx-falcon.codex.jsonl"
+  local left="$OUT_DIR/$MCP_SANDBOX/$MCP_SANDBOX.codex.jsonl"
+  local right="$OUT_DIR/$LOCALITY_SANDBOX/$LOCALITY_SANDBOX.codex.jsonl"
 
   if [ ! -s "$left" ]; then
     echo "missing transcript: $left" >&2
@@ -612,9 +603,9 @@ run_profiler() {
 
   node "$REPO_ROOT/experiment/agent-conversation-profile-modern-codex.mjs" \
     --left "$left" \
-    --left-label "test-with-notion-connector" \
+    --left-label "$MCP_SANDBOX" \
     --right "$right" \
-    --right-label "onyx-falcon" \
+    --right-label "$LOCALITY_SANDBOX" \
     --out "$OUT_DIR/profile"
 }
 
