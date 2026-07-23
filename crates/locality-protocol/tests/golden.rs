@@ -304,6 +304,55 @@ fn capability_debug_output_is_redacted() {
 }
 
 #[test]
+fn export_v2_pax_wire_contract_is_exact_and_round_trips() {
+    assert_eq!(
+        locality_protocol::EXPORT_V2_FILE_PAX_KEYS,
+        [
+            "locality.source_connection_id",
+            "locality.projection_id",
+            "locality.winning_scope_ordinal",
+            "locality.file_kind",
+            "locality.effective_actions",
+            "locality.content_sha256",
+        ]
+    );
+
+    for kind in [
+        ProjectionFileKind::Markdown,
+        ProjectionFileKind::Text,
+        ProjectionFileKind::Json,
+        ProjectionFileKind::Yaml,
+        ProjectionFileKind::Binary,
+        ProjectionFileKind::Directory,
+    ] {
+        let label = locality_protocol::projection_file_kind_wire_label(&kind);
+        assert_eq!(
+            locality_protocol::projection_file_kind_from_wire_label(label),
+            Some(kind)
+        );
+    }
+
+    for action in [
+        SourceAction::Read,
+        SourceAction::Search,
+        SourceAction::DownloadAttachment,
+        SourceAction::Create,
+        SourceAction::Update,
+        SourceAction::Move,
+        SourceAction::Delete,
+        SourceAction::Comment,
+        SourceAction::UpdateProperties,
+        SourceAction::ManageSchema,
+    ] {
+        let label = locality_protocol::source_action_wire_label(&action);
+        assert_eq!(
+            locality_protocol::source_action_from_wire_label(label),
+            Some(action)
+        );
+    }
+}
+
+#[test]
 fn public_goldens_never_expose_physical_serving_identifiers() {
     for golden in [
         SOURCE_VERSION_GOLDEN_JSON,

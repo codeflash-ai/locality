@@ -21,6 +21,21 @@ use sha2::{Digest, Sha256};
 
 pub use locality_core::portable::RESERVED_EXPORT_METADATA_PATH;
 
+pub const PAX_SOURCE_CONNECTION_ID: &str = "locality.source_connection_id";
+pub const PAX_PROJECTION_ID: &str = "locality.projection_id";
+pub const PAX_WINNING_SCOPE_ORDINAL: &str = "locality.winning_scope_ordinal";
+pub const PAX_FILE_KIND: &str = "locality.file_kind";
+pub const PAX_EFFECTIVE_ACTIONS: &str = "locality.effective_actions";
+pub const PAX_CONTENT_SHA256: &str = "locality.content_sha256";
+pub const EXPORT_V2_FILE_PAX_KEYS: [&str; 6] = [
+    PAX_SOURCE_CONNECTION_ID,
+    PAX_PROJECTION_ID,
+    PAX_WINNING_SCOPE_ORDINAL,
+    PAX_FILE_KIND,
+    PAX_EFFECTIVE_ACTIONS,
+    PAX_CONTENT_SHA256,
+];
+
 pub const COMPONENT_VERSIONS: ComponentVersions = ComponentVersions {
     session: 1,
     replica: 1,
@@ -753,11 +768,11 @@ pub fn canonical_export_inventory_preimage(
                 append_text(&mut output, source_connection_id.as_str())?;
                 append_text(&mut output, order_key.projection_id.as_str())?;
                 append_text(&mut output, order_key.logical_path.as_str())?;
-                append_text(&mut output, projection_file_kind_label(file_kind))?;
+                append_text(&mut output, projection_file_kind_wire_label(file_kind))?;
                 append_count(&mut output, effective_actions.len())?;
                 let mut action_labels = effective_actions
                     .iter()
-                    .map(source_action_label)
+                    .map(source_action_wire_label)
                     .collect::<Vec<_>>();
                 action_labels.sort_unstable();
                 for action_label in action_labels {
@@ -1636,7 +1651,7 @@ fn append_u64(output: &mut Vec<u8>, value: u64) -> Result<(), ScopeContractError
     append_scalar(output, &value.to_be_bytes())
 }
 
-fn projection_file_kind_label(kind: &ProjectionFileKind) -> &'static str {
+pub fn projection_file_kind_wire_label(kind: &ProjectionFileKind) -> &'static str {
     match kind {
         ProjectionFileKind::Markdown => "markdown",
         ProjectionFileKind::Text => "text",
@@ -1647,7 +1662,19 @@ fn projection_file_kind_label(kind: &ProjectionFileKind) -> &'static str {
     }
 }
 
-fn source_action_label(action: &SourceAction) -> &'static str {
+pub fn projection_file_kind_from_wire_label(value: &str) -> Option<ProjectionFileKind> {
+    match value {
+        "markdown" => Some(ProjectionFileKind::Markdown),
+        "text" => Some(ProjectionFileKind::Text),
+        "json" => Some(ProjectionFileKind::Json),
+        "yaml" => Some(ProjectionFileKind::Yaml),
+        "binary" => Some(ProjectionFileKind::Binary),
+        "directory" => Some(ProjectionFileKind::Directory),
+        _ => None,
+    }
+}
+
+pub fn source_action_wire_label(action: &SourceAction) -> &'static str {
     match action {
         SourceAction::Read => "read",
         SourceAction::Search => "search",
@@ -1659,6 +1686,22 @@ fn source_action_label(action: &SourceAction) -> &'static str {
         SourceAction::Comment => "comment",
         SourceAction::UpdateProperties => "update_properties",
         SourceAction::ManageSchema => "manage_schema",
+    }
+}
+
+pub fn source_action_from_wire_label(value: &str) -> Option<SourceAction> {
+    match value {
+        "read" => Some(SourceAction::Read),
+        "search" => Some(SourceAction::Search),
+        "download_attachment" => Some(SourceAction::DownloadAttachment),
+        "create" => Some(SourceAction::Create),
+        "update" => Some(SourceAction::Update),
+        "move" => Some(SourceAction::Move),
+        "delete" => Some(SourceAction::Delete),
+        "comment" => Some(SourceAction::Comment),
+        "update_properties" => Some(SourceAction::UpdateProperties),
+        "manage_schema" => Some(SourceAction::ManageSchema),
+        _ => None,
     }
 }
 

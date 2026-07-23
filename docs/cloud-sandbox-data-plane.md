@@ -1322,6 +1322,12 @@ Content-Encoding: zstd
   path, size, and non-executable mode. File members follow
   `(winning_scope_ordinal, parent_path COLLATE "C", logical_path COLLATE "C",
   projection_id)` order;
+- each v2 file member carries bounded transient POSIX PAX fields for source
+  connection ID, projection ID, winning scope ordinal, file kind, sorted
+  effective actions, and content SHA-256. Public constants and parsers define
+  their exact names/encoding. They allow the client to recompute the inventory
+  and body digests but are never materialized or inserted into SQLite; directory
+  and control members carry no Locality PAX fields;
 - v1 retains its reserved first writable-metadata member unchanged. V2 instead
   requires exactly one final record-class-2 `.loc/session.json` member combining
   that writable metadata with the completion receipt. It is bounded, canonical
