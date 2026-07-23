@@ -350,6 +350,35 @@ fn export_v2_pax_wire_contract_is_exact_and_round_trips() {
             Some(action)
         );
     }
+
+    let actions = BTreeSet::from([
+        SourceAction::UpdateProperties,
+        SourceAction::Read,
+        SourceAction::DownloadAttachment,
+    ]);
+    let encoded = locality_protocol::canonical_effective_actions_pax_value(&actions).unwrap();
+    assert_eq!(
+        encoded,
+        r#"["download_attachment","read","update_properties"]"#
+    );
+    assert_eq!(
+        locality_protocol::source_actions_from_canonical_pax_value(&encoded),
+        Some(actions)
+    );
+    for invalid in [
+        "[]",
+        r#"["read","read"]"#,
+        r#"["read", "update"]"#,
+        r#"["update","read"]"#,
+        r#"["unknown"]"#,
+        r#"{"action":"read"}"#,
+    ] {
+        assert_eq!(
+            locality_protocol::source_actions_from_canonical_pax_value(invalid),
+            None,
+            "accepted non-canonical effective actions: {invalid}"
+        );
+    }
 }
 
 #[test]

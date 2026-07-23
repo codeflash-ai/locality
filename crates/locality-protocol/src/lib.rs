@@ -1705,6 +1705,36 @@ pub fn source_action_from_wire_label(value: &str) -> Option<SourceAction> {
     }
 }
 
+/// Encodes the effective actions carried by an export-v2 file PAX record.
+///
+/// The wire value is a compact JSON array whose labels are sorted by their
+/// UTF-8 bytes. An empty action set is invalid for an exported file.
+pub fn canonical_effective_actions_pax_value(actions: &BTreeSet<SourceAction>) -> Option<String> {
+    if actions.is_empty() {
+        return None;
+    }
+    let mut labels = actions
+        .iter()
+        .map(source_action_wire_label)
+        .collect::<Vec<_>>();
+    labels.sort_unstable();
+    Some(format!(r#"["{}"]"#, labels.join(r#"",""#)))
+}
+
+/// Decodes an export-v2 effective-actions PAX value only when it is already in
+/// the exact canonical encoding accepted by the inventory digest.
+pub fn source_actions_from_canonical_pax_value(value: &str) -> Option<BTreeSet<SourceAction>> {
+    let labels = value.strip_prefix(r#"[""#)?.strip_suffix(r#""]"#)?;
+    let mut actions = BTreeSet::new();
+    for label in labels.split(r#"",""#) {
+        let action = source_action_from_wire_label(label)?;
+        if !actions.insert(action) {
+            return None;
+        }
+    }
+    (canonical_effective_actions_pax_value(&actions)?.as_str() == value).then_some(actions)
+}
+
 fn validate_sha256(field: &'static str, value: &str) -> Result<(), ScopeContractError> {
     let Some(hex) = value.strip_prefix("sha256:") else {
         return Err(ScopeContractError::InvalidSha256(field));
