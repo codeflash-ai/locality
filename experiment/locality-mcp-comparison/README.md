@@ -22,7 +22,7 @@ The output parent page is:
   hosted MCP path against Codex on the Locality path.
 - `run-launch-readiness-benchmark.sh` - core benchmark runner.
 - `run-repeated.sh` - runs the benchmark multiple times.
-- `setup-codex-azure.sh` - writes Codex Azure config.
+- `setup-codex-azure.sh` - writes Codex Azure config without MCP servers.
 - `prompts/Locality/*.md` - Locality-only scenario prompts.
 - `prompts/MCP/*.md` - Notion-MCP-only scenario prompts, paired by filename with `prompts/Locality/*.md`.
 - `prompts/locality-agent-prompt.md` - legacy Locality-only agent prompt used only when `prompts/Locality/` has no scenarios.
@@ -78,13 +78,12 @@ ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
 '
 ```
 
-Verify Notion MCP and Locality:
+Verify Locality:
 
 ```bash
 ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
   export PATH="$HOME/.cargo/bin:$PATH"
   cd /home/amika/workspace/locality
-  codex mcp list
   target/debug/loc connections --json
   target/debug/loc locate "https://app.notion.com/p/codeflash/Locality-Launch-Amika-Environment-3a33ac0ebb888001ac26d52f57f1deba"
 '
@@ -132,7 +131,8 @@ Codex auth/config or `~/.config/locality-experiment/env`.
 ## Launch Runner MCP Auth
 
 When `run-launch-readiness-benchmark.sh` is run with `--compare-mcp`, it
-configures Codex MCP auth before running the MCP scenarios:
+validates MCP credentials during setup and configures Codex MCP auth only before
+running the MCP scenarios:
 
 ```bash
 export LINEAR_API_KEY=<linear-api-key>
@@ -149,9 +149,11 @@ export SLACK_CHANNEL_IDS=<comma-delimited-channel-ids>
 any Slack MCP variable is set, both `SLACK_BOT_TOKEN` and `SLACK_TEAM_ID` are
 required.
 
-The runner stores token-backed helper scripts and secret files under
-`~/.local/bin` and `~/.config/locality-launch-readiness/mcp` by default, then
-updates Codex MCP entries for `linear-server`, `notion`, and optionally `slack`.
+The runner uses separate per-run Codex homes under `OUT_DIR/codex` by default.
+The Locality strategy uses a config with all `mcp_servers.*` tables stripped.
+The MCP strategy stores token-backed helper scripts and secret files under
+`OUT_DIR/mcp` by default, then updates only the MCP strategy Codex home with
+entries for `linear-server`, `notion`, and optionally `slack`.
 
 ## Add Scenarios
 
@@ -249,6 +251,7 @@ Important artifacts:
 - `metrics.tsv` - phase wall-clock metrics with a `scenario` column.
 - `summary.json` - machine-readable run summary.
 - `scenarios.tsv` - scenario manifest with prompt paths, output directories, and mounted report pages when `--write-mounted-page` or `--push` is used.
+- `codex-strategy-setup.out` and `codex-strategy-setup.err` - per-strategy Codex config setup logs.
 - `mcp-auth-setup.out` and `mcp-auth-setup.err` - Codex MCP setup logs when `--compare-mcp` is enabled.
 - `scenarios/<scenario>/report-body.md` - Locality report for that scenario.
 - `scenarios/<scenario>/notion-mcp-report-body.md` - MCP report for that scenario.

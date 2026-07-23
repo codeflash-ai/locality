@@ -81,6 +81,7 @@ REPORT_DATE="${REPORT_DATE:-$(TZ="$REPORT_TZ" date +%F)}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 REPORT_TITLE="${REPORT_TITLE:-Launch Readiness Benchmark $RUN_ID}"
 OUT_DIR="${OUT_DIR:-$REPO_DIR/experiment/runs/$RUN_ID}"
+RUN_ROOT_OUT_DIR="$OUT_DIR"
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-luna}"
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-low}"
 CODEX_EXEC_TIMEOUT_SECONDS="${CODEX_EXEC_TIMEOUT_SECONDS:-900}"
@@ -93,8 +94,15 @@ LOCALITY_EXPERIMENT_TRACE_FORCE_DIRECT="${LOCALITY_EXPERIMENT_TRACE_FORCE_DIRECT
 PROMPT_ROOT="${PROMPT_ROOT:-$SCRIPT_DIR/prompts}"
 LOCALITY_PROMPT_DIR="${LOCALITY_PROMPT_DIR:-$PROMPT_ROOT/Locality}"
 MCP_PROMPT_DIR="${MCP_PROMPT_DIR:-$PROMPT_ROOT/MCP}"
-MCP_SECRET_DIR="${MCP_SECRET_DIR:-$HOME/.config/locality-launch-readiness/mcp}"
-MCP_BIN_DIR="${MCP_BIN_DIR:-$HOME/.local/bin}"
+BASE_CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+CODEX_STRATEGY_ROOT="${CODEX_STRATEGY_ROOT:-$RUN_ROOT_OUT_DIR/codex}"
+LOCALITY_CODEX_HOME="$CODEX_STRATEGY_ROOT/locality"
+MCP_CODEX_HOME="$CODEX_STRATEGY_ROOT/notion-mcp"
+MCP_SECRET_DIR="${MCP_SECRET_DIR:-$RUN_ROOT_OUT_DIR/mcp/secrets}"
+MCP_BIN_DIR="${MCP_BIN_DIR:-$RUN_ROOT_OUT_DIR/mcp/bin}"
+MCP_AUTH_SETUP_OUT="$RUN_ROOT_OUT_DIR/mcp-auth-setup.out"
+MCP_AUTH_SETUP_ERR="$RUN_ROOT_OUT_DIR/mcp-auth-setup.err"
+MCP_AUTH_CONFIGURED=0
 METRICS_TSV="$OUT_DIR/metrics.tsv"
 SUMMARY_JSON="$OUT_DIR/summary.json"
 CONTEXT_PATHS_FILE="$OUT_DIR/locality-context-paths.txt"
@@ -167,11 +175,52 @@ render_locality_traces() {
   done
 }
 
-configure_codex_mcp_auth() {
-  MCP_AUTH_DETAIL="linear=skipped; notion=skipped; slack=skipped"
+strip_codex_mcp_tables() {
+  local source="$1"
+  local destination="$2"
+  python3 - "$source" "$destination" <<'PY'
+import re
+import sys
+from pathlib import Path
 
-  command -v codex >/dev/null || return
+source = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+text = source.read_text(encoding="utf-8") if source.exists() else ""
 
+skip = False
+lines = []
+for line in text.splitlines(keepends=True):
+    stripped = line.strip()
+    header = stripped.split("#", 1)[0].strip()
+    if header.startswith("[") and header.endswith("]"):
+        table = header.strip("[]").strip()
+        skip = table == "mcp_servers" or table.startswith("mcp_servers.")
+    if skip:
+        continue
+    if re.match(r"^mcp_servers\s*=", stripped):
+        continue
+    lines.append(line)
+
+destination.parent.mkdir(parents=True, exist_ok=True)
+body = "".join(lines).rstrip()
+destination.write_text((body + "\n") if body else "", encoding="utf-8")
+PY
+}
+
+prepare_codex_home_without_mcp() {
+  local codex_home="$1"
+  mkdir -p "$codex_home"
+  chmod 700 "$codex_home"
+
+  if [ -d "$BASE_CODEX_HOME" ] && [ "$BASE_CODEX_HOME" != "$codex_home" ]; then
+    find "$BASE_CODEX_HOME" -maxdepth 1 -type f ! -name config.toml -exec cp -p {} "$codex_home/" \; 2>/dev/null || true
+  fi
+
+  strip_codex_mcp_tables "$BASE_CODEX_HOME/config.toml" "$codex_home/config.toml"
+  chmod 600 "$codex_home/config.toml"
+}
+
+validate_codex_mcp_auth_inputs() {
   if [ -z "$LINEAR_API_KEY" ]; then
     echo "LINEAR_API_KEY is required when --compare-mcp is enabled" >&2
     return 2
@@ -185,9 +234,32 @@ configure_codex_mcp_auth() {
     echo "SLACK_BOT_TOKEN and SLACK_TEAM_ID are both required to configure Slack MCP" >&2
     return 2
   fi
+}
 
-  mkdir -p "$MCP_SECRET_DIR" "$MCP_BIN_DIR" "$HOME/.codex" || return
-  chmod 700 "$MCP_SECRET_DIR" "$HOME/.codex" || return
+prepare_codex_strategy_homes() {
+  prepare_codex_home_without_mcp "$LOCALITY_CODEX_HOME"
+  if [ "$COMPARE_MCP" -eq 1 ]; then
+    validate_codex_mcp_auth_inputs || return
+    prepare_codex_home_without_mcp "$MCP_CODEX_HOME"
+  fi
+}
+
+codex_home_for_strategy() {
+  case "$1" in
+    locality) printf '%s\n' "$LOCALITY_CODEX_HOME" ;;
+    notion-mcp) printf '%s\n' "$MCP_CODEX_HOME" ;;
+    *) printf '%s\n' "$BASE_CODEX_HOME" ;;
+  esac
+}
+
+configure_codex_mcp_auth() {
+  MCP_AUTH_DETAIL="linear=skipped; notion=skipped; slack=skipped"
+
+  command -v codex >/dev/null || return
+  validate_codex_mcp_auth_inputs || return
+
+  mkdir -p "$MCP_SECRET_DIR" "$MCP_BIN_DIR" "$MCP_CODEX_HOME" || return
+  chmod 700 "$MCP_SECRET_DIR" "$MCP_BIN_DIR" "$MCP_CODEX_HOME" || return
 
   local notion_helper="$MCP_BIN_DIR/locality-launch-notion-mcp"
   (
@@ -216,12 +288,12 @@ SH
   ) || return
 
   export LINEAR_API_KEY
-  codex mcp remove linear-server >/dev/null 2>&1 || true
-  codex mcp remove notion >/dev/null 2>&1 || true
-  codex mcp remove slack >/dev/null 2>&1 || true
-  codex mcp remove slack-server >/dev/null 2>&1 || true
-  codex mcp add linear-server --url https://mcp.linear.app/mcp --bearer-token-env-var LINEAR_API_KEY || return
-  codex mcp add notion -- "$notion_helper" || return
+  CODEX_HOME="$MCP_CODEX_HOME" codex mcp remove linear-server >/dev/null 2>&1 || true
+  CODEX_HOME="$MCP_CODEX_HOME" codex mcp remove notion >/dev/null 2>&1 || true
+  CODEX_HOME="$MCP_CODEX_HOME" codex mcp remove slack >/dev/null 2>&1 || true
+  CODEX_HOME="$MCP_CODEX_HOME" codex mcp remove slack-server >/dev/null 2>&1 || true
+  CODEX_HOME="$MCP_CODEX_HOME" codex mcp add linear-server --url https://mcp.linear.app/mcp --bearer-token-env-var LINEAR_API_KEY || return
+  CODEX_HOME="$MCP_CODEX_HOME" codex mcp add notion -- "$notion_helper" || return
 
   local slack_status="skipped"
   if [ -n "$SLACK_BOT_TOKEN" ]; then
@@ -250,13 +322,14 @@ exec npx -y @modelcontextprotocol/server-slack
 SH
       chmod 700 "$slack_helper"
     ) || return
-    codex mcp add slack -- "$slack_helper" || return
+    CODEX_HOME="$MCP_CODEX_HOME" codex mcp add slack -- "$slack_helper" || return
     slack_status="configured"
   else
     rm -f "$MCP_SECRET_DIR/slack-bot-token" "$MCP_SECRET_DIR/slack-team-id" "$MCP_SECRET_DIR/slack-channel-ids"
   fi
 
-  MCP_AUTH_DETAIL="linear=configured; notion=configured; slack=$slack_status"
+  MCP_AUTH_DETAIL="linear=configured; notion=configured; slack=$slack_status; codex_home=$MCP_CODEX_HOME"
+  MCP_AUTH_CONFIGURED=1
   echo "Configured Codex MCP auth: $MCP_AUTH_DETAIL"
 }
 
@@ -277,6 +350,8 @@ run_codex_agent() {
   local agent_loc_trace="$OUT_DIR/$strategy-agent-locality-trace.jsonl"
   local prompt
   local run_cmd
+  local codex_home
+  codex_home="$(codex_home_for_strategy "$strategy")"
   prompt="$(cat "$prompt_file")"
   cp "$prompt_file" "$prompt_snapshot"
 
@@ -304,6 +379,7 @@ run_codex_agent() {
   fi
   {
     printf 'timeout_seconds=%s\n' "$CODEX_EXEC_TIMEOUT_SECONDS"
+    printf 'codex_home=%s\n' "$codex_home"
     printf 'codex_command='
     printf '%q ' "${cmd[@]}"
     printf '\nwrapped_command='
@@ -313,7 +389,7 @@ run_codex_agent() {
 
   set +e
   set -o pipefail
-  LOCALITY_TRACE_FILE="$agent_loc_trace" LOCALITY_TRACE_RUN_ID="$RUN_ID" \
+  CODEX_HOME="$codex_home" LOCALITY_TRACE_FILE="$agent_loc_trace" LOCALITY_TRACE_RUN_ID="$RUN_ID" \
     "${run_cmd[@]}" < /dev/null 2> "$err_file" | python3 "$SCRIPT_DIR/scripts/timestamp-jsonl.py" > "$events_file"
   local pipe_status=("${PIPESTATUS[@]}")
   local rc="${pipe_status[0]}"
@@ -493,21 +569,21 @@ git -C "$REPO_DIR" rev-parse --git-dir >/dev/null
 phase_end "locality" "validate_environment" "ok" "repo=$REPO_DIR; model=$CODEX_MODEL; effort=$CODEX_REASONING_EFFORT; scenarios=${#SCENARIO_FILES[@]}; prompts=$LOCALITY_PROMPT_DIR; write_mounted_page=$WRITE_MOUNTED_PAGE"
 
 phase_start
-if [ "$COMPARE_MCP" -eq 1 ]; then
-  set +e
-  configure_codex_mcp_auth > "$OUT_DIR/mcp-auth-setup.out" 2> "$OUT_DIR/mcp-auth-setup.err"
-  MCP_AUTH_RC=$?
-  set -e
-  if [ "$MCP_AUTH_RC" -eq 0 ]; then
-    phase_end "notion_mcp" "mcp_auth_setup" "ok" "$MCP_AUTH_DETAIL; out=$OUT_DIR/mcp-auth-setup.out"
+set +e
+prepare_codex_strategy_homes > "$OUT_DIR/codex-strategy-setup.out" 2> "$OUT_DIR/codex-strategy-setup.err"
+CODEX_STRATEGY_SETUP_RC=$?
+set -e
+if [ "$CODEX_STRATEGY_SETUP_RC" -eq 0 ]; then
+  if [ "$COMPARE_MCP" -eq 1 ]; then
+    phase_end "locality" "codex_strategy_config" "ok" "locality_home=$LOCALITY_CODEX_HOME; mcp_home=$MCP_CODEX_HOME; mcp_auth=validated"
   else
-    phase_end "notion_mcp" "mcp_auth_setup" "failed" "exit=$MCP_AUTH_RC; out=$OUT_DIR/mcp-auth-setup.out; err=$OUT_DIR/mcp-auth-setup.err"
-    cat "$OUT_DIR/mcp-auth-setup.out" >&2 || true
-    cat "$OUT_DIR/mcp-auth-setup.err" >&2 || true
-    exit "$MCP_AUTH_RC"
+    phase_end "locality" "codex_strategy_config" "ok" "locality_home=$LOCALITY_CODEX_HOME; mcp_auth=not requested"
   fi
 else
-  phase_end "notion_mcp" "mcp_auth_setup" "skipped" "pass --compare-mcp to configure Codex MCP auth"
+  phase_end "locality" "codex_strategy_config" "failed" "exit=$CODEX_STRATEGY_SETUP_RC; out=$OUT_DIR/codex-strategy-setup.out; err=$OUT_DIR/codex-strategy-setup.err"
+  cat "$OUT_DIR/codex-strategy-setup.out" >&2 || true
+  cat "$OUT_DIR/codex-strategy-setup.err" >&2 || true
+  exit "$CODEX_STRATEGY_SETUP_RC"
 fi
 
 phase_start
@@ -709,6 +785,29 @@ PY
   fi
 
   if [ "$COMPARE_MCP" -eq 1 ]; then
+    phase_start
+    if [ "$MCP_AUTH_CONFIGURED" -eq 0 ]; then
+      set +e
+      configure_codex_mcp_auth > "$MCP_AUTH_SETUP_OUT" 2> "$MCP_AUTH_SETUP_ERR"
+      MCP_AUTH_RC=$?
+      set -e
+      if [ "$MCP_AUTH_RC" -eq 0 ]; then
+        phase_end "notion_mcp" "mcp_auth_setup" "ok" "$MCP_AUTH_DETAIL; out=$MCP_AUTH_SETUP_OUT"
+      else
+        phase_end "notion_mcp" "mcp_auth_setup" "failed" "exit=$MCP_AUTH_RC; out=$MCP_AUTH_SETUP_OUT; err=$MCP_AUTH_SETUP_ERR"
+        cat "$MCP_AUTH_SETUP_OUT" >&2 || true
+        cat "$MCP_AUTH_SETUP_ERR" >&2 || true
+        OUT_DIR="$RUN_OUT_DIR"
+        CONTEXT_PATHS_FILE="$RUN_CONTEXT_PATHS_FILE"
+        CONTEXT_INVENTORY="$RUN_CONTEXT_INVENTORY"
+        CONTEXT_SEARCH_RESULTS="$RUN_CONTEXT_SEARCH_RESULTS"
+        export OUT_DIR CONTEXT_PATHS_FILE CONTEXT_INVENTORY CONTEXT_SEARCH_RESULTS
+        exit "$MCP_AUTH_RC"
+      fi
+    else
+      phase_end "notion_mcp" "mcp_auth_setup" "skipped" "already configured; codex_home=$MCP_CODEX_HOME"
+    fi
+
     phase_start
     set +e
     run_codex_agent "notion-mcp" "$MCP_PROMPT_FILE" "$OUT_DIR/notion-mcp-report-body.md" "$OUT_DIR/notion-mcp-agent-final.md"

@@ -229,6 +229,10 @@ test-release-asset-names: ## Validate GitHub Release asset naming configuration.
 test-release-notes: ## Validate LLM-generated GitHub Release notes plumbing.
 	tests/release_notes.sh
 
+.PHONY: test-launch-readiness-mcp-config
+test-launch-readiness-mcp-config: ## Validate launch-readiness Codex MCP isolation.
+	tests/launch_readiness_mcp_config.sh
+
 .PHONY: fmt
 fmt: ## Format Rust code.
 	$(CARGO) fmt --all
