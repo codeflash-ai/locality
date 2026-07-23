@@ -91,6 +91,11 @@ fn scope_authorized_export_contracts_are_exact_golden_bytes() {
         .validate_against(&offer)
         .expect("completion matches sealed metadata selection");
     assert_exact_round_trip(EXPORT_COMPLETION_RECEIPT_GOLDEN_JSON, &receipt);
+    assert_eq!(
+        locality_protocol::canonical_export_completion_receipt_sha256(&receipt)
+            .expect("completion receipt digest"),
+        "sha256:8e5e9d9e12fbb951e1127f97a2214d7462cb685973cdb6c3d8f4c540cec080ae"
+    );
 
     let control = export_terminal_control_v2();
     control

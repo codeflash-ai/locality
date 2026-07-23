@@ -1512,6 +1512,20 @@ impl ExportCompletionReceipt {
     }
 }
 
+/// Domain-separated digest of the exact compact JSON completion receipt
+/// persisted by the private delivery audit. The receipt contains no maps, so
+/// its derived field order is the canonical JSON order for this version.
+pub fn canonical_export_completion_receipt_sha256(
+    receipt: &ExportCompletionReceipt,
+) -> Result<String, ScopeContractError> {
+    receipt.validate()?;
+    let mut preimage = b"locality.export.completion-receipt.v2\0".to_vec();
+    preimage.extend_from_slice(
+        &serde_json::to_vec(receipt).map_err(|_| ScopeContractError::InvalidControlRecord)?,
+    );
+    Ok(format!("sha256:{:x}", Sha256::digest(preimage)))
+}
+
 /// Encodings and exact decoded bounds available for one immutable tar export.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TarExportOffer {
