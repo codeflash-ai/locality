@@ -2254,6 +2254,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "locality-planned-connectors"
+version = "0.3.6"
+dependencies = [
+ "locality-connector",
+ "locality-core",
+]
+
+[[package]]
 name = "locality-platform"
 version = "0.3.6"
 dependencies = [
@@ -2302,6 +2310,7 @@ dependencies = [
  "locality-granola",
  "locality-linear",
  "locality-notion",
+ "locality-planned-connectors",
  "locality-platform",
  "locality-slack",
  "locality-store",

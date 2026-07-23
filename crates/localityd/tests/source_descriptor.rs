@@ -13,6 +13,7 @@ use locality_google_docs::{GOOGLE_DOCS_CONNECTOR_ID, StoredGoogleDocsCredential}
 use locality_granola::GRANOLA_CONNECTOR_ID;
 use locality_linear::LINEAR_CONNECTOR_ID;
 use locality_notion::client::DEFAULT_NOTION_TOKEN_ENV;
+use locality_planned_connectors::planned_connector_ids;
 use locality_slack::{SLACK_CONNECTOR_ID, SLACK_OAUTH_SCOPES, StoredSlackCredential};
 use locality_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
@@ -994,6 +995,7 @@ fn planned_source_connectors_stay_out_of_runtime_registry() {
             "fhir"
         ]
     );
+    assert_eq!(planned_source_connectors(), planned_connector_ids());
 
     for connector in planned_source_connectors() {
         assert!(

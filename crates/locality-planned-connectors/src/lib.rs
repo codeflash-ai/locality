@@ -9,8 +9,8 @@ use std::collections::BTreeSet;
 
 use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
-    ConnectorCapabilities, ConnectorExecutionPolicy, ConnectorKind, EnumerateRequest,
-    FetchRequest, NativeEntity, ParsedEntity,
+    ConnectorCapabilities, ConnectorExecutionPolicy, ConnectorKind, EnumerateRequest, FetchRequest,
+    NativeEntity, ParsedEntity,
 };
 use locality_core::model::{CanonicalDocument, TreeEntry};
 use locality_core::planner::PushOperationKind;
@@ -338,9 +338,7 @@ impl PlannedConnector {
 }
 
 pub fn planned_connector_spec(id: &str) -> Option<&'static PlannedConnectorSpec> {
-    PLANNED_CONNECTOR_SPECS
-        .iter()
-        .find(|spec| spec.id() == id)
+    PLANNED_CONNECTOR_SPECS.iter().find(|spec| spec.id() == id)
 }
 
 pub fn planned_connector_ids() -> Vec<&'static str> {
@@ -467,4 +465,3 @@ mod tests {
         ));
     }
 }
-
