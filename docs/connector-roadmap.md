@@ -28,8 +28,11 @@ credentials in the current build.
 ## Planned Catalog
 
 The planned catalog is intentionally separate from the runtime registry. Desktop
-can show the direction in Add Source, and daemon/tests can reason about the
-catalog, without allowing unsupported providers to mount or push.
+can show the direction in onboarding and Add Source, and daemon/tests can reason
+about the catalog, without allowing unsupported providers to mount or push.
+Each planned connector has a scaffolded source type, auth model, first
+projection, and intended write model so implementation work starts from the
+same product contract.
 
 | Connector | Type | Auth options | First useful projection |
 | --- | --- | --- | --- |
@@ -73,6 +76,10 @@ the following:
 10. One end-to-end test that connects, mounts, hydrates, edits where supported,
     plans review, pushes where supported, and verifies local state reconciliation.
 
+Until every item above exists, the connector should stay visible as planned
+metadata only. It must not be added to `SOURCE_REGISTRY`, desktop runtime setup,
+or automatic mount creation.
+
 ## Implementation Order
 
 The highest leverage next connectors are:
@@ -89,4 +96,3 @@ The highest leverage next connectors are:
 Healthcare-specific work should start with a FHIR read-only connector and a
 strict scope model. Write support should remain out of scope until the audit,
 consent, and patient-safety model is designed.
-
