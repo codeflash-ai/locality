@@ -11,6 +11,8 @@ use std::io::{self, Read};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use locality_protocol::{
@@ -37,6 +39,8 @@ const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const BOOTSTRAP_EXCHANGE_ATTEMPTS: usize = 2;
 const BOOTSTRAP_IDEMPOTENCY_DOMAIN: &[u8] = b"locality.session-exchange-idempotency.v1\0";
 const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
+const EXPORT_READ_AHEAD_CHUNK_BYTES: usize = 64 * 1024;
+const EXPORT_READ_AHEAD_CHUNKS: usize = 8;
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 
 #[derive(Clone)]
@@ -369,12 +373,171 @@ pub fn run_sandbox_init_with_encoding(
     validate_encoding_preference(offer, content_encoding)?;
     let limits = limits_for_offer(offer)?;
     let (encoding, response) = client.open_export(&capability, offer, content_encoding)?;
-    let archive = ReplicaArchive::new(encoding, response);
-    let summary =
+    let (body, mut producer) =
+        spawn_export_read_ahead(response).map_err(|error| SandboxInitError::Http {
+            operation: "session export read-ahead setup",
+            detail: error.to_string(),
+        })?;
+    let archive = ReplicaArchive::new(encoding, body);
+    let materialization =
         materialize_replica_archive_with_expected_receipt(archive, &root, limits, expected_receipt)
-            .map_err(|error| SandboxInitError::Materialization(error.to_string()))?;
+            .map_err(|error| SandboxInitError::Materialization(error.to_string()));
+    let producer_outcome = producer.join();
+
+    let summary = match materialization {
+        Err(error) => return Err(error),
+        Ok(summary) => {
+            match producer_outcome {
+                Ok(ReadAheadProducerOutcome::CleanEof) => {}
+                Ok(
+                    ReadAheadProducerOutcome::ConsumerClosed
+                    | ReadAheadProducerOutcome::ErrorDelivered,
+                ) => {
+                    return Err(SandboxInitError::Materialization(
+                        "sandbox export transport ended without a clean EOF".to_string(),
+                    ));
+                }
+                Err(()) => {
+                    return Err(SandboxInitError::Materialization(
+                        "sandbox export read-ahead worker panicked".to_string(),
+                    ));
+                }
+            }
+            summary
+        }
+    };
 
     Ok(report(&root, &capability, encoding, summary))
+}
+
+enum ReadAheadMessage {
+    Data(Vec<u8>),
+    Error(io::Error),
+    CleanEof,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadAheadProducerOutcome {
+    CleanEof,
+    ConsumerClosed,
+    ErrorDelivered,
+}
+
+struct ExportReadAhead {
+    receiver: Receiver<ReadAheadMessage>,
+    current: Vec<u8>,
+    offset: usize,
+    clean_eof: bool,
+}
+
+impl Read for ExportReadAhead {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.clean_eof {
+            return Ok(0);
+        }
+
+        loop {
+            if self.offset < self.current.len() {
+                let available = &self.current[self.offset..];
+                let copied = available.len().min(output.len());
+                output[..copied].copy_from_slice(&available[..copied]);
+                self.offset += copied;
+                return Ok(copied);
+            }
+
+            match self.receiver.recv() {
+                Ok(ReadAheadMessage::Data(chunk)) => {
+                    self.current = chunk;
+                    self.offset = 0;
+                }
+                Ok(ReadAheadMessage::Error(error)) => return Err(error),
+                Ok(ReadAheadMessage::CleanEof) => {
+                    self.clean_eof = true;
+                    return Ok(0);
+                }
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "sandbox export read-ahead producer stopped before EOF",
+                    ));
+                }
+            }
+        }
+    }
+}
+
+struct ReadAheadProducer {
+    handle: Option<JoinHandle<ReadAheadProducerOutcome>>,
+}
+
+impl ReadAheadProducer {
+    fn join(&mut self) -> Result<ReadAheadProducerOutcome, ()> {
+        let handle = self.handle.take().ok_or(())?;
+        handle.join().map_err(|_| ())
+    }
+}
+
+impl Drop for ReadAheadProducer {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn spawn_export_read_ahead<Body>(body: Body) -> io::Result<(ExportReadAhead, ReadAheadProducer)>
+where
+    Body: Read + Send + 'static,
+{
+    let (sender, receiver) = sync_channel(EXPORT_READ_AHEAD_CHUNKS);
+    let handle = thread::Builder::new()
+        .name("locality-export-read-ahead".to_string())
+        .spawn(move || produce_export(body, &sender))?;
+    Ok((
+        ExportReadAhead {
+            receiver,
+            current: Vec::new(),
+            offset: 0,
+            clean_eof: false,
+        },
+        ReadAheadProducer {
+            handle: Some(handle),
+        },
+    ))
+}
+
+fn produce_export<Body: Read>(
+    mut body: Body,
+    sender: &SyncSender<ReadAheadMessage>,
+) -> ReadAheadProducerOutcome {
+    loop {
+        let mut chunk = vec![0_u8; EXPORT_READ_AHEAD_CHUNK_BYTES];
+        match body.read(&mut chunk) {
+            Ok(0) => {
+                return if sender.send(ReadAheadMessage::CleanEof).is_ok() {
+                    ReadAheadProducerOutcome::CleanEof
+                } else {
+                    ReadAheadProducerOutcome::ConsumerClosed
+                };
+            }
+            Ok(read) => {
+                chunk.truncate(read);
+                if sender.send(ReadAheadMessage::Data(chunk)).is_err() {
+                    return ReadAheadProducerOutcome::ConsumerClosed;
+                }
+            }
+            Err(error) => {
+                return if sender.send(ReadAheadMessage::Error(error)).is_ok() {
+                    ReadAheadProducerOutcome::ErrorDelivered
+                } else {
+                    ReadAheadProducerOutcome::ConsumerClosed
+                };
+            }
+        }
+    }
 }
 
 fn absolute_destination(path: &Path) -> Result<PathBuf, SandboxInitError> {
@@ -891,6 +1054,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::{self, Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{self, Receiver};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
@@ -898,6 +1063,37 @@ mod tests {
     use locality_core::portable::SessionId;
 
     use super::*;
+
+    struct FixedChunkBody {
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl Read for FixedChunkBody {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            output.fill(0x5a);
+            Ok(output.len())
+        }
+    }
+
+    struct FailingBody {
+        first_read: bool,
+    }
+
+    impl Read for FailingBody {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if self.first_read {
+                self.first_read = false;
+                output[..3].copy_from_slice(b"abc");
+                Ok(3)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "sentinel export transport failure",
+                ))
+            }
+        }
+    }
 
     #[derive(Debug)]
     struct CapturedRequest {
@@ -969,6 +1165,76 @@ mod tests {
             self.handle.join().expect("test server completed");
             self.requests.try_iter().collect()
         }
+    }
+
+    #[test]
+    fn export_read_ahead_is_byte_bounded_and_consumer_drop_unblocks_producer() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (reader, mut producer) = spawn_export_read_ahead(FixedChunkBody {
+            reads: Arc::clone(&reads),
+        })
+        .expect("start read-ahead producer");
+        let expected_reads = EXPORT_READ_AHEAD_CHUNKS + 1;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while reads.load(Ordering::SeqCst) < expected_reads {
+            assert!(
+                Instant::now() < deadline,
+                "producer did not fill bounded queue"
+            );
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(25));
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            expected_reads,
+            "the producer may hold only eight queued chunks and one in-flight chunk"
+        );
+
+        drop(reader);
+        assert_eq!(
+            producer.join(),
+            Ok(ReadAheadProducerOutcome::ConsumerClosed),
+            "dropping a rejecting consumer must promptly release a blocked producer"
+        );
+    }
+
+    #[test]
+    fn export_read_ahead_delivers_the_original_io_error() {
+        let (mut reader, mut producer) = spawn_export_read_ahead(FailingBody { first_read: true })
+            .expect("start read-ahead producer");
+        let mut prefix = [0_u8; 3];
+        reader.read_exact(&mut prefix).expect("read prefix");
+        assert_eq!(&prefix, b"abc");
+
+        let error = reader.read(&mut [0_u8; 1]).expect_err("transport fails");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        assert_eq!(error.to_string(), "sentinel export transport failure");
+        drop(reader);
+        assert_eq!(
+            producer.join(),
+            Ok(ReadAheadProducerOutcome::ErrorDelivered)
+        );
+    }
+
+    #[test]
+    fn export_read_ahead_disconnect_is_not_mistaken_for_clean_eof() {
+        let (sender, receiver) = sync_channel(1);
+        drop(sender);
+        let mut reader = ExportReadAhead {
+            receiver,
+            current: Vec::new(),
+            offset: 0,
+            clean_eof: false,
+        };
+
+        let error = reader
+            .read(&mut [0_u8; 1])
+            .expect_err("disconnect without an EOF marker must fail");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            error.to_string(),
+            "sandbox export read-ahead producer stopped before EOF"
+        );
     }
 
     #[test]

@@ -62,6 +62,9 @@ struct ResponseFixture {
     status: &'static str,
     headers: Vec<(&'static str, &'static str)>,
     body: Vec<u8>,
+    declared_content_length: Option<usize>,
+    split_after: Option<(usize, Duration)>,
+    staging_gate: Option<(PathBuf, PathBuf, PathBuf)>,
 }
 
 impl ResponseFixture {
@@ -70,6 +73,9 @@ impl ResponseFixture {
             status: "200 OK",
             headers: vec![("Content-Type", "application/json")],
             body: serde_json::to_vec(value).expect("serialize response"),
+            declared_content_length: None,
+            split_after: None,
+            staging_gate: None,
         }
     }
 
@@ -81,7 +87,39 @@ impl ResponseFixture {
                 ("Content-Encoding", encoding),
             ],
             body,
+            declared_content_length: None,
+            split_after: None,
+            staging_gate: None,
         }
+    }
+
+    fn streaming_export(
+        encoding: &'static str,
+        body: Vec<u8>,
+        split_after: usize,
+        pause: Duration,
+    ) -> Self {
+        Self::export(encoding, body).with_split_after(split_after, pause)
+    }
+
+    fn with_declared_content_length(mut self, length: usize) -> Self {
+        self.declared_content_length = Some(length);
+        self
+    }
+
+    fn with_split_after(mut self, bytes: usize, pause: Duration) -> Self {
+        self.split_after = Some((bytes, pause));
+        self
+    }
+
+    fn with_staging_gate(
+        mut self,
+        parent: PathBuf,
+        logical_path: PathBuf,
+        destination: PathBuf,
+    ) -> Self {
+        self.staging_gate = Some((parent, logical_path, destination));
+        self
     }
 }
 
@@ -279,6 +317,89 @@ fn zstd_bootstrap_streams_into_the_shared_materializer() {
         export.headers.get("accept-encoding").unwrap(),
         "zstd, identity"
     );
+}
+
+#[test]
+fn export_bytes_are_staged_while_the_http_response_is_still_streaming() {
+    let directory = TestDirectory::new("streaming-overlap");
+    let body = vec![0x5a; 256 * 1024];
+    let tar = tar_file(b"large.bin", &body);
+    let capability = capability();
+    let status = ready_status(
+        capability.session_id.clone(),
+        COMPONENT_VERSIONS,
+        &tar,
+        BTreeSet::from([TarContentEncoding::Identity]),
+    );
+    let destination = directory.root();
+    let response = ResponseFixture::streaming_export(
+        "identity",
+        tar,
+        512 + 64 * 1024,
+        Duration::from_millis(10),
+    )
+    .with_staging_gate(
+        destination
+            .parent()
+            .expect("destination parent")
+            .to_path_buf(),
+        PathBuf::from("large.bin"),
+        destination.clone(),
+    );
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&capability),
+        ResponseFixture::json(&status),
+        response,
+    ]);
+
+    let report = run_sandbox_init(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: destination.clone(),
+        },
+        SandboxBootstrapToken::new("bootstrap-secret").expect("token"),
+    )
+    .expect("stream and publish export");
+
+    assert_eq!(report.files, 1);
+    assert_eq!(report.materialized_bytes, body.len() as u64);
+    assert_eq!(
+        fs::read(destination.join("large.bin")).expect("read published file"),
+        body
+    );
+}
+
+#[test]
+fn truncated_http_body_producer_error_prevents_publication() {
+    let directory = TestDirectory::new("transport-truncation");
+    let tar = tar_file(b"complete-before-http-eof.txt", b"complete\n");
+    let capability = capability();
+    let status = ready_status(
+        capability.session_id.clone(),
+        COMPONENT_VERSIONS,
+        &tar,
+        BTreeSet::from([TarContentEncoding::Identity]),
+    );
+    let declared_length = tar.len() + 128;
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&capability),
+        ResponseFixture::json(&status),
+        ResponseFixture::export("identity", tar).with_declared_content_length(declared_length),
+    ]);
+
+    let error = run_sandbox_init(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: directory.root(),
+        },
+        SandboxBootstrapToken::new("bootstrap-secret").expect("token"),
+    )
+    .expect_err("an incomplete HTTP response must not publish a complete-looking tar");
+
+    assert_eq!(error.code(), "materialization_failed");
+    assert!(!directory.root().exists());
+    assert!(!error.to_string().contains("bootstrap-secret"));
+    assert!(!error.to_string().contains("capability-secret"));
 }
 
 #[test]
@@ -602,6 +723,9 @@ fn bearer_authenticated_redirect_is_not_followed() {
             status: "302 Found",
             headers: vec![("Location", "/redirected")],
             body: Vec::new(),
+            declared_content_length: None,
+            split_after: None,
+            staging_gate: None,
         },
     ]);
 
@@ -773,6 +897,9 @@ fn version_session_offer_media_and_response_encoding_are_validated() {
                 status: "200 OK",
                 headers: vec![("Content-Type", "application/octet-stream")],
                 body: tar.clone(),
+                declared_content_length: None,
+                split_after: None,
+                staging_gate: None,
             }),
             "backend_protocol_invalid",
         ),
@@ -1081,20 +1208,62 @@ fn read_request(stream: &mut TcpStream) -> CapturedRequest {
 }
 
 fn write_response(stream: &mut TcpStream, response: ResponseFixture) {
+    let content_length = response
+        .declared_content_length
+        .unwrap_or(response.body.len());
     write!(
         stream,
         "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        response.status,
-        response.body.len()
+        response.status, content_length
     )
     .expect("write response head");
     for (name, value) in response.headers {
         write!(stream, "{name}: {value}\r\n").expect("write response header");
     }
     write!(stream, "\r\n").expect("finish response headers");
-    stream
-        .write_all(&response.body)
-        .expect("write response body");
+    if let Some((split_after, pause)) = response.split_after {
+        let split_after = split_after.min(response.body.len());
+        stream
+            .write_all(&response.body[..split_after])
+            .expect("write first response body chunk");
+        stream.flush().expect("flush first response body chunk");
+        if let Some((parent, logical_path, destination)) = &response.staging_gate {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let staged = fs::read_dir(parent)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .any(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".locality-stage-")
+                            && entry.path().join(logical_path).is_file()
+                    });
+                if staged {
+                    assert!(
+                        !destination.exists(),
+                        "the destination must remain absent while the response is incomplete"
+                    );
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "materializer did not stage the first file while the response was paused"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        thread::sleep(pause);
+        stream
+            .write_all(&response.body[split_after..])
+            .expect("write remaining response body");
+    } else {
+        stream
+            .write_all(&response.body)
+            .expect("write response body");
+    }
     stream.flush().expect("flush response");
 }
 
