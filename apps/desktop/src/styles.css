@@ -3208,8 +3208,17 @@ button.home-stat:hover {
   background: var(--chip-bg);
 }
 
+.connector-choice-card.planned {
+  border-style: dashed;
+  background: var(--surface);
+}
+
 .connector-choice-card.disabled {
   opacity: 0.72;
+}
+
+.connector-choice-card.planned.disabled {
+  opacity: 1;
 }
 
 .connector-choice-heading {
@@ -3268,6 +3277,18 @@ button.home-stat:hover {
   height: 100%;
   object-fit: contain;
   user-select: none;
+}
+
+.connector-icon.generic {
+  border: 1px solid var(--line);
+  background: var(--control-bg);
+  color: var(--control-muted);
+}
+
+.connector-icon.generic svg {
+  width: 18px;
+  height: 18px;
+  stroke-width: 2;
 }
 
 .connector-choice-facts {

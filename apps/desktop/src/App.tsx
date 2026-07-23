@@ -23,6 +23,7 @@ import {
   Minus,
   Monitor,
   Moon,
+  Plug,
   Plus,
   Power,
   RefreshCw,
@@ -98,8 +99,12 @@ import {
 import {
   connectedSourcesReadyToMount,
   isSourceConnectorId,
+  sourceConnectorCatalogDefinitions,
+  sourceConnectorDefaultMountDirectory as sourceConnectorDefaultMountDirectoryForId,
+  sourceConnectorDefaultMountId,
   sourceConnectionReady,
   sourceConnectorIds,
+  sourceConnectorName,
   sourceMountRetryOutcome,
   sourceMounted,
   sourceRequiresApiKey,
@@ -107,7 +112,11 @@ import {
   sourceSetupIsActiveConnector,
   sourceSetupIsBusy,
   sourceSetupProgressLabel,
+  type SourceCatalogConnectorId,
   type SourceConnectorId,
+  type SourceConnectorAuthMode,
+  type SourceConnectorCategory,
+  type SourceConnectorAvailability,
   type SourceSetupState,
 } from "./source-setup";
 import gmailIconUrl from "./assets/connectors/gmail.svg";
@@ -138,11 +147,14 @@ type AppTheme = "system" | "light" | "dark";
 const APP_THEME_STORAGE_KEY = "locality.desktop.theme";
 
 type ConnectorOption = {
-  id: SourceConnectorId;
+  id: SourceCatalogConnectorId;
   name: string;
   description: string;
   status: string;
   keywords: string[];
+  availability: SourceConnectorAvailability;
+  category: SourceConnectorCategory;
+  authModes: readonly SourceConnectorAuthMode[];
   mounted: boolean;
 };
 
@@ -3881,64 +3893,20 @@ function AddSourceDialog({
   const [granolaApiKey, setGranolaApiKey] = useState("");
   const [linearApiKey, setLinearApiKey] = useState("");
   const busy = sourceSetupIsBusy(state);
-  const connectors: ConnectorOption[] = [
-    {
-      id: "notion",
-      name: "Notion",
-      description: "Pages and databases as folders with page.md files.",
-      status: sourceConnectorStatus(snapshot, "notion"),
-      keywords: ["notion", "wiki", "pages", "database", "docs"],
-      mounted: sourceMounted(snapshot, "notion"),
-    },
-    {
-      id: "google-docs",
-      name: "Google Docs",
-      description: "Docs and Drive folders through the same local file workflow.",
-      status: sourceConnectorStatus(snapshot, "google-docs"),
-      keywords: ["google", "docs", "gdocs", "drive", "documents"],
-      mounted: sourceMounted(snapshot, "google-docs"),
-    },
-    {
-      id: "google-calendar",
-      name: "Google Calendar",
-      description: "Primary calendar events as files, new events from reviewed drafts.",
-      status: sourceConnectorStatus(snapshot, "google-calendar"),
-      keywords: ["google", "calendar", "gcal", "events", "meet"],
-      mounted: sourceMounted(snapshot, "google-calendar"),
-    },
-    {
-      id: "gmail",
-      name: "Gmail",
-      description: "Inbox and sent as readable files, drafts as reviewed outbound mail.",
-      status: sourceConnectorStatus(snapshot, "gmail"),
-      keywords: ["gmail", "mail", "email", "inbox", "drafts"],
-      mounted: sourceMounted(snapshot, "gmail"),
-    },
-    {
-      id: "granola",
-      name: "Granola",
-      description: "Meeting summaries and raw transcripts as read-only files.",
-      status: sourceConnectorStatus(snapshot, "granola"),
-      keywords: ["granola", "meetings", "notes", "transcripts", "summaries"],
-      mounted: sourceMounted(snapshot, "granola"),
-    },
-    {
-      id: "linear",
-      name: "Linear",
-      description: "Issues and teams as editable Markdown files.",
-      status: sourceConnectorStatus(snapshot, "linear"),
-      keywords: ["linear", "issues", "tickets", "projects", "teams"],
-      mounted: sourceMounted(snapshot, "linear"),
-    },
-    {
-      id: "slack",
-      name: "Slack",
-      description: "Recent accessible conversations as read-only Markdown.",
-      status: sourceConnectorStatus(snapshot, "slack"),
-      keywords: ["slack", "channels", "private channels", "dms", "group dms", "users"],
-      mounted: sourceMounted(snapshot, "slack"),
-    },
-  ];
+  const connectors: ConnectorOption[] = sourceConnectorCatalogDefinitions().map((definition) => {
+    const runtimeConnector = isSourceConnectorId(definition.id) ? definition.id : null;
+    return {
+      id: definition.id,
+      name: definition.name,
+      description: definition.description,
+      status: runtimeConnector ? sourceConnectorStatus(snapshot, runtimeConnector) : "Planned",
+      keywords: [...definition.keywords],
+      availability: definition.availability,
+      category: definition.category,
+      authModes: definition.authModes,
+      mounted: runtimeConnector ? sourceMounted(snapshot, runtimeConnector) : false,
+    };
+  });
   const normalizedQuery = query.trim().toLowerCase();
   const visibleConnectors = normalizedQuery
     ? connectors.filter((connector) =>
@@ -4022,25 +3990,30 @@ function AddSourceDialog({
         <div className="source-list-scroll">
           <div className={`connector-choice-grid ${viewMode}`}>
             {visibleConnectors.map((connector) => {
-              const connectorBusy = sourceSetupIsActiveConnector(state, activeConnector, connector.id);
-              const apiKeyConnector = sourceRequiresApiKey(connector.id) ? connector.id : null;
-              const connected = sourceConnectionReady(snapshot, connector.id);
+              const runtimeConnector = isSourceConnectorId(connector.id) ? connector.id : null;
+              const connectorBusy = runtimeConnector
+                ? sourceSetupIsActiveConnector(state, activeConnector, runtimeConnector)
+                : false;
+              const apiKeyConnector = runtimeConnector && sourceRequiresApiKey(runtimeConnector) ? runtimeConnector : null;
+              const connected = runtimeConnector ? sourceConnectionReady(snapshot, runtimeConnector) : false;
               const needsConnection = !connected;
               const needsFolder = connected && !connector.mounted;
-              const connectionDetails = sourceConnectionDetails(snapshot, connector.id);
-              const mountDetails = sourceMountDetails(snapshot, connector.id);
-              const disabled = busy || (connector.id !== "notion" && connector.mounted);
+              const connectionDetails = runtimeConnector ? sourceConnectionDetails(snapshot, runtimeConnector) : null;
+              const mountDetails = runtimeConnector ? sourceMountDetails(snapshot, runtimeConnector) : null;
+              const disabled = !runtimeConnector || busy || (runtimeConnector !== "notion" && connector.mounted);
               const displayedStatus = connectorBusy
                 ? sourceSetupProgressLabel(state, connector.mounted)
                 : connector.status;
-              const actionLabel = sourceActionLabel(connector.id, {
-                needsConnection,
-                needsFolder,
-                mounted: connector.mounted,
-              });
+              const actionLabel = runtimeConnector
+                ? sourceActionLabel(runtimeConnector, {
+                    needsConnection,
+                    needsFolder,
+                    mounted: connector.mounted,
+                  })
+                : "Planned";
               return (
                 <article
-                  className={`connector-choice-card ${connector.mounted ? "mounted" : "active"}`}
+                  className={`connector-choice-card ${connector.mounted ? "mounted" : "active"} ${runtimeConnector ? "" : "planned disabled"}`}
                   aria-disabled={disabled}
                   key={connector.id}
                 >
@@ -4054,7 +4027,9 @@ function AddSourceDialog({
                       tone={
                         connectorBusy
                           ? "warn"
-                          : connector.mounted || (connector.id === "notion" && !needsConnection && !needsFolder)
+                          : !runtimeConnector
+                          ? "warn"
+                          : connector.mounted || (runtimeConnector === "notion" && !needsConnection && !needsFolder)
                           ? "ready"
                           : "warn"
                       }
@@ -4064,46 +4039,52 @@ function AddSourceDialog({
                     </StatusPill>
                   </div>
                   <div className="connector-choice-facts">
-                    {connector.id === "notion" ? (
+                    {!runtimeConnector ? (
+                      <>
+                        <SettingRow title="Availability" value="Planned connector" />
+                        <SettingRow title="Mode" value={sourceCategoryLabel(connector.category)} />
+                        <SettingRow title="Auth" value={sourceAuthModesLabel(connector.authModes)} />
+                      </>
+                    ) : runtimeConnector === "notion" ? (
                       <>
                         <SettingRow title="Workspace" value={connectionDetails?.workspaceName || "Not connected"} />
-                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
                         <SettingRow title="Access" value={mountDetails?.accessScope || (connected ? "Ready to mount" : "Not requested")} />
                       </>
-                    ) : connector.id === "google-docs" ? (
+                    ) : runtimeConnector === "google-docs" ? (
                       <>
                         <SettingRow title="Workspace folder" value={googleDocsWorkspaceFolder || "Locality"} />
-                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
                       </>
-                    ) : connector.id === "google-calendar" ? (
+                    ) : runtimeConnector === "google-calendar" ? (
                       <>
                         <SettingRow title="Calendar" value="Primary calendar" />
-                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
                       </>
-                    ) : connector.id === "granola" ? (
+                    ) : runtimeConnector === "granola" ? (
                       <>
                         <SettingRow title="Content" value="Summaries and transcripts" />
-                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
                       </>
-                    ) : connector.id === "linear" ? (
+                    ) : runtimeConnector === "linear" ? (
                       <>
                         <SettingRow title="Content" value="Issues by team" />
-                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
                         <SettingRow title="Access" value="Issue edits" />
                       </>
-                    ) : connector.id === "slack" ? (
+                    ) : runtimeConnector === "slack" ? (
                       <>
                         <SettingRow title="Content" value="Channels, DMs, group DMs, users" />
-                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
                       </>
                     ) : (
                       <>
                         <SettingRow title="Mailboxes" value="Inbox, Sent, Draft" />
-                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
                       </>
                     )}
                   </div>
-                  {connector.id === "google-docs" && !connector.mounted && (
+                  {runtimeConnector === "google-docs" && !connector.mounted && (
                     <label className="source-inline-field">
                       <span>Drive folder</span>
                       <input
@@ -4139,7 +4120,11 @@ function AddSourceDialog({
                       </p>
                     </>
                   )}
-                  {connector.mounted && connector.id !== "notion" && !connectorBusy ? (
+                  {!runtimeConnector ? (
+                    <SecondaryButton compact disabled icon={<Plug />}>
+                      Planned
+                    </SecondaryButton>
+                  ) : connector.mounted && runtimeConnector !== "notion" && !connectorBusy ? (
                     <SecondaryButton compact disabled icon={<Check />}>
                       Mounted
                     </SecondaryButton>
@@ -4159,7 +4144,7 @@ function AddSourceDialog({
                             apiKeyConnector === "linear" ? linearApiKey : granolaApiKey,
                           );
                         } else {
-                          onAction(connector.id);
+                          onAction(runtimeConnector);
                         }
                       }}
                     >
@@ -4169,9 +4154,9 @@ function AddSourceDialog({
                     <PrimaryButton
                       compact
                       busy={connectorBusy}
-                      disabled={disabled || (connector.id === "google-docs" && !googleDocsWorkspaceFolder.trim())}
-                      icon={sourceActionIcon(connector.id, needsConnection)}
-                      onClick={() => onAction(connector.id, { googleDocsWorkspaceFolder })}
+                      disabled={disabled || (runtimeConnector === "google-docs" && !googleDocsWorkspaceFolder.trim())}
+                      icon={sourceActionIcon(runtimeConnector, needsConnection)}
+                      onClick={() => onAction(runtimeConnector, { googleDocsWorkspaceFolder })}
                     >
                       {connectorBusy ? sourceSetupProgressLabel(state, connector.mounted) : actionLabel}
                     </PrimaryButton>
@@ -4195,41 +4180,11 @@ function AddSourceDialog({
 }
 
 function sourceDisplayName(connector: SourceConnectorId) {
-  switch (connector) {
-    case "notion":
-      return "Notion";
-    case "google-docs":
-      return "Google Docs";
-    case "google-calendar":
-      return "Google Calendar";
-    case "gmail":
-      return "Gmail";
-    case "granola":
-      return "Granola";
-    case "linear":
-      return "Linear";
-    case "slack":
-      return "Slack";
-  }
+  return sourceConnectorName(connector);
 }
 
 function sourceMountId(connector: SourceConnectorId) {
-  switch (connector) {
-    case "notion":
-      return "notion-main";
-    case "google-docs":
-      return "google-docs-main";
-    case "google-calendar":
-      return "google-calendar-main";
-    case "gmail":
-      return "gmail-main";
-    case "granola":
-      return "granola-main";
-    case "linear":
-      return "linear-main";
-    case "slack":
-      return "slack-main";
-  }
+  return sourceConnectorDefaultMountId(connector);
 }
 
 function sourceConnectionDetails(snapshot: DesktopSnapshot, connector: SourceConnectorId): ConnectionSummary | null {
@@ -4271,22 +4226,7 @@ function sourceDefaultPathPrefix() {
 }
 
 function sourceDefaultMountDirectory(connector: SourceConnectorId) {
-  switch (connector) {
-    case "notion":
-      return "notion";
-    case "google-docs":
-      return "google-docs-main";
-    case "google-calendar":
-      return "google-calendar-main";
-    case "gmail":
-      return "gmail-main";
-    case "granola":
-      return "granola";
-    case "linear":
-      return "linear";
-    case "slack":
-      return "slack";
-  }
+  return sourceConnectorDefaultMountDirectoryForId(connector);
 }
 
 function sourceDefaultPath(snapshot: DesktopSnapshot, connector: SourceConnectorId) {
@@ -4331,6 +4271,38 @@ function sourceActionIcon(connector: SourceConnectorId, needsConnection: boolean
   return <FolderOpen />;
 }
 
+function sourceCategoryLabel(category: SourceConnectorCategory) {
+  switch (category) {
+    case "knowledge":
+      return "Knowledge source";
+    case "action":
+      return "Action source";
+    case "hybrid":
+      return "Knowledge and actions";
+  }
+}
+
+function sourceAuthModesLabel(authModes: readonly SourceConnectorAuthMode[]) {
+  return authModes.map(sourceAuthModeLabel).join(", ");
+}
+
+function sourceAuthModeLabel(authMode: SourceConnectorAuthMode) {
+  switch (authMode) {
+    case "oauth":
+      return "OAuth";
+    case "api-key":
+      return "API key";
+    case "api-token":
+      return "API token";
+    case "personal-token":
+      return "Personal token";
+    case "github-app":
+      return "GitHub App";
+    case "smart-oauth":
+      return "SMART OAuth";
+  }
+}
+
 function oauthConnectCommand(connector: "google-docs" | "google-calendar" | "gmail" | "slack") {
   switch (connector) {
     case "google-docs":
@@ -4344,7 +4316,14 @@ function oauthConnectCommand(connector: "google-docs" | "google-calendar" | "gma
   }
 }
 
-function ConnectorIcon({ connector }: { connector: SourceConnectorId }) {
+function ConnectorIcon({ connector }: { connector: SourceCatalogConnectorId }) {
+  if (!isSourceConnectorId(connector)) {
+    return (
+      <span className={`connector-icon ${connector} generic`} aria-hidden="true">
+        <Plug />
+      </span>
+    );
+  }
   return (
     <span className={`connector-icon ${connector}`} aria-hidden="true">
       <img src={CONNECTOR_ICON_URLS[connector]} alt="" draggable="false" />
