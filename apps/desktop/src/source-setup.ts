@@ -1,7 +1,17 @@
 import { classifyMountSetupError } from "./onboarding-errors";
 
 export type SourceSetupState = "idle" | "connecting" | "creating" | "changing" | "success" | "error";
-const SOURCE_CONNECTORS = ["notion", "google-docs", "google-calendar", "gmail", "granola", "github", "linear", "slack"] as const;
+const SOURCE_CONNECTORS = [
+  "notion",
+  "google-docs",
+  "google-calendar",
+  "gmail",
+  "granola",
+  "github",
+  "gitlab",
+  "linear",
+  "slack",
+] as const;
 const PLANNED_SOURCE_CONNECTORS = [
   "confluence",
   "jira",
@@ -10,7 +20,6 @@ const PLANNED_SOURCE_CONNECTORS = [
   "outlook-mail",
   "outlook-calendar",
   "microsoft-teams",
-  "gitlab",
   "google-drive",
   "dropbox",
   "box",
@@ -27,7 +36,7 @@ const PLANNED_SOURCE_CONNECTORS = [
 export type SourceConnectorId = (typeof SOURCE_CONNECTORS)[number];
 export type PlannedSourceConnectorId = (typeof PLANNED_SOURCE_CONNECTORS)[number];
 export type SourceCatalogConnectorId = SourceConnectorId | PlannedSourceConnectorId;
-export type ApiKeySourceConnectorId = Extract<SourceConnectorId, "github" | "granola" | "linear">;
+export type ApiKeySourceConnectorId = Extract<SourceConnectorId, "github" | "gitlab" | "granola" | "linear">;
 export type SourceConnectorAvailability = "implemented" | "planned";
 export type SourceConnectorCategory = "knowledge" | "action" | "hybrid";
 export type SourceConnectorAuthMode = "oauth" | "api-key" | "api-token" | "personal-token" | "github-app" | "smart-oauth";
@@ -124,6 +133,19 @@ const SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<SourceCon
     writeModel: "Read-only; repository edits stay in git.",
     defaultMountId: "github-main",
     defaultMountDirectory: "github",
+  },
+  {
+    id: "gitlab",
+    name: "GitLab",
+    description: "Projects, README files, issues, and merge requests as read-only context.",
+    availability: "implemented",
+    category: "hybrid",
+    authModes: ["api-key", "personal-token"],
+    keywords: ["gitlab", "git", "repos", "repositories", "merge requests", "issues"],
+    projection: "Projects, README files, issues, and merge requests.",
+    writeModel: "Read-only; repository edits stay in git.",
+    defaultMountId: "gitlab-main",
+    defaultMountDirectory: "gitlab",
   },
   {
     id: "linear",
@@ -230,17 +252,6 @@ const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<P
     keywords: ["microsoft", "teams", "channels", "chats", "meetings"],
     projection: "Teams, channels, chats, meetings, and users as context.",
     writeModel: "Start read-only, then reviewed message drafts if approved.",
-  },
-  {
-    id: "gitlab",
-    name: "GitLab",
-    description: "Projects, merge requests, issues, pipelines, and release context.",
-    availability: "planned",
-    category: "hybrid",
-    authModes: ["oauth", "personal-token"],
-    keywords: ["gitlab", "git", "repos", "merge requests", "pipelines"],
-    projection: "Projects, MRs, issues, pipelines, releases, and reviews.",
-    writeModel: "Reviewed issue/comment/MR note drafts; repository edits stay in git.",
   },
   {
     id: "google-drive",

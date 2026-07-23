@@ -16,6 +16,7 @@ locality-core.workspace = true
 locality-gmail.workspace = true
 locality-google-calendar.workspace = true
 locality-google-docs.workspace = true
+locality-gitlab.workspace = true
 locality-notion.workspace = true
 locality-platform.workspace = true
 locality-slack.workspace = true

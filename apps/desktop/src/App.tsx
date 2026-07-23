@@ -745,6 +745,8 @@ function suggestedAgentPrompt(mountPath: string, connector: OnboardingConnectorI
       return `Use Locality to inspect my Gmail source. Open the files under ${mountPath}, search mail with normal file tools, and prepare draft updates only when the mounted draft files support it. Leave outbound changes for Locality review.`;
     case "github":
       return `Use Locality to inspect my GitHub repositories. Open the files under ${mountPath}, search README files, issues, and pull requests with normal file tools, and cite the GitHub files you used. GitHub is read-only in Locality, so make repository edits in a normal git checkout.`;
+    case "gitlab":
+      return `Use Locality to inspect my GitLab projects. Open the files under ${mountPath}, search README files, issues, and merge requests with normal file tools, and cite the GitLab files you used. GitLab is read-only in Locality, so make repository edits in a normal git checkout.`;
     case "linear":
       return `Use Locality to edit my Linear issues. Open the files under ${mountPath}, update issue Markdown and editable frontmatter, and leave changes pending for Locality review before pushing.`;
     case "notion":
@@ -808,6 +810,8 @@ function onboardingConnectorDescription(
         return "Gmail is ready. Locality mounted mailboxes as local files under CloudStorage.";
       case "github":
         return "GitHub is ready. Locality mounted repositories, README files, issues, and pull requests as read-only local context.";
+      case "gitlab":
+        return "GitLab is ready. Locality mounted projects, README files, issues, and merge requests as read-only local context.";
       case "granola":
         return "Granola is ready. Locality mounted meeting summaries and transcripts as read-only files under CloudStorage.";
       case "linear":
@@ -829,6 +833,8 @@ function onboardingConnectorDescription(
         return "A browser window is open. Approve Gmail access, then Locality will create the local mailbox folder.";
       case "github":
         return "Locality is validating the personal access token and creating a read-only GitHub folder.";
+      case "gitlab":
+        return "Locality is validating the personal access token and creating a read-only GitLab folder.";
       case "granola":
         return "Locality is validating the API key and creating a read-only Granola folder.";
       case "linear":
@@ -849,6 +855,8 @@ function onboardingConnectorDescription(
       return "Connect Gmail during setup so agents can search mailboxes and prepare reviewed draft work from local files.";
     case "github":
       return "Paste a GitHub personal access token to mount repositories, README files, issues, and pull requests as local read-only context.";
+    case "gitlab":
+      return "Paste a GitLab personal access token to mount projects, README files, issues, and merge requests as local read-only context.";
     case "granola":
       return "Paste a Granola API key to mount meeting summaries and transcripts as local read-only files. Keys are stored in your local credential store.";
     case "linear":
@@ -870,6 +878,8 @@ function onboardingConnectorPills(connector: OnboardingConnectorId) {
       return ["Google OAuth", "Mailbox files", "Draft review"];
     case "github":
       return ["Personal token", "Read-only", "Repos and PRs"];
+    case "gitlab":
+      return ["Personal token", "Read-only", "Projects and MRs"];
     case "granola":
       return ["Read-only", "Meeting summaries", "Transcripts"];
     case "linear":
@@ -891,6 +901,8 @@ function onboardingReadyCopy(connector: OnboardingConnectorId) {
       return "Your Gmail source is ready as local files. Agents can search mailbox content and prepare reviewed draft work without leaving the filesystem.";
     case "github":
       return "Your GitHub repositories are ready as local read-only context. Agents can search README files, issues, and pull requests with normal file tools, while repository edits stay in a normal git checkout.";
+    case "gitlab":
+      return "Your GitLab projects are ready as local read-only context. Agents can search README files, issues, and merge requests with normal file tools, while repository edits stay in a normal git checkout.";
     case "granola":
       return "Your Granola meetings are ready as local read-only files. Agents can search summaries and transcripts with normal file tools, while Locality keeps the remote notes protected from edits.";
     case "linear":
@@ -901,7 +913,7 @@ function onboardingReadyCopy(connector: OnboardingConnectorId) {
 }
 
 function onboardingPromptHint(connector: OnboardingConnectorId) {
-  return connector === "github" || connector === "granola" || connector === "slack"
+  return connector === "github" || connector === "gitlab" || connector === "granola" || connector === "slack"
     ? "Ask an agent to use the mounted read-only files."
     : "Claude and Codex are now set up to use Locality.";
 }
@@ -1732,6 +1744,7 @@ function Onboarding({
     return connectionReady(snapshot) && !mountMissing(snapshot) ? connector : null;
   });
   const [githubApiKey, setGithubApiKey] = useState("");
+  const [gitlabApiKey, setGitlabApiKey] = useState("");
   const [granolaApiKey, setGranolaApiKey] = useState("");
   const [linearApiKey, setLinearApiKey] = useState("");
   const [googleDocsWorkspaceFolder, setGoogleDocsWorkspaceFolder] = useState("Locality");
@@ -1772,6 +1785,8 @@ function Onboarding({
   const selectedConnectorBusy = oauthInFlight || connectorConnecting;
   const selectedApiKey = selectedOnboardingConnector === "github"
     ? githubApiKey
+    : selectedOnboardingConnector === "gitlab"
+    ? gitlabApiKey
     : selectedOnboardingConnector === "linear"
     ? linearApiKey
     : granolaApiKey;
@@ -2072,7 +2087,7 @@ function Onboarding({
           path: sourceDefaultPath(snapshot, connector),
           mountId: sourceMountId(connector),
           connectionId: null,
-          readOnly: connector === "granola" || connector === "slack",
+          readOnly: connector === "github" || connector === "gitlab" || connector === "granola" || connector === "slack",
           notionRootPage: null,
           googleDocsWorkspaceFolder: connector === "google-docs"
             ? googleDocsWorkspaceFolder.trim() || "Locality"
@@ -2158,6 +2173,9 @@ function Onboarding({
       case "github":
         await connectGitHubOnboarding();
         return;
+      case "gitlab":
+        await connectGitLabOnboarding();
+        return;
       case "linear":
         await connectLinearOnboarding();
     }
@@ -2179,6 +2197,10 @@ function Onboarding({
 
   async function connectGitHubOnboarding() {
     await connectApiKeyOnboarding("github", githubApiKey);
+  }
+
+  async function connectGitLabOnboarding() {
+    await connectApiKeyOnboarding("gitlab", gitlabApiKey);
   }
 
   async function connectLinearOnboarding() {
@@ -2554,7 +2576,7 @@ function Onboarding({
             )}
             {sourceRequiresApiKey(selectedOnboardingConnector) && !connectionReadyNow && (
               <label className="source-inline-field onboarding-source-field">
-                <span>{selectedOnboardingConnector === "github" ? "GitHub personal access token" : `${selectedSourceName} API key`}</span>
+                <span>{selectedOnboardingConnector === "github" || selectedOnboardingConnector === "gitlab" ? `${selectedSourceName} personal access token` : `${selectedSourceName} API key`}</span>
                 <input
                   type="password"
                   autoComplete="off"
@@ -2566,6 +2588,8 @@ function Onboarding({
                   onChange={(event) => {
                     if (selectedOnboardingConnector === "github") {
                       setGithubApiKey(event.target.value);
+                    } else if (selectedOnboardingConnector === "gitlab") {
+                      setGitlabApiKey(event.target.value);
                     } else if (selectedOnboardingConnector === "linear") {
                       setLinearApiKey(event.target.value);
                     } else {
@@ -3503,7 +3527,7 @@ function MountsView({
                 path: sourceDefaultPath(snapshot, connector),
                 mountId: sourceMountId(connector),
                 connectionId: null,
-                readOnly: connector === "granola" || connector === "slack",
+                readOnly: connector === "github" || connector === "gitlab" || connector === "granola" || connector === "slack",
                 notionRootPage: null,
                 googleDocsWorkspaceFolder: connector === "google-docs"
                   ? googleDocsWorkspaceFolder?.trim() || "Locality"
@@ -3924,6 +3948,7 @@ function AddSourceDialog({
   const [viewMode, setViewMode] = useState<SourceListViewMode>("list");
   const [googleDocsWorkspaceFolder, setGoogleDocsWorkspaceFolder] = useState("Locality");
   const [githubApiKey, setGithubApiKey] = useState("");
+  const [gitlabApiKey, setGitlabApiKey] = useState("");
   const [granolaApiKey, setGranolaApiKey] = useState("");
   const [linearApiKey, setLinearApiKey] = useState("");
   const busy = sourceSetupIsBusy(state);
@@ -4105,6 +4130,12 @@ function AddSourceDialog({
                         <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
                         <SettingRow title="Access" value="Read-only context" />
                       </>
+                    ) : runtimeConnector === "gitlab" ? (
+                      <>
+                        <SettingRow title="Content" value="Projects, README files, issues, merge requests" />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
+                        <SettingRow title="Access" value="Read-only context" />
+                      </>
                     ) : runtimeConnector === "granola" ? (
                       <>
                         <SettingRow title="Content" value="Summaries and transcripts" />
@@ -4147,6 +4178,7 @@ function AddSourceDialog({
                           autoComplete="off"
                           value={apiKeyInputValue(apiKeyConnector, {
                             github: githubApiKey,
+                            gitlab: gitlabApiKey,
                             granola: granolaApiKey,
                             linear: linearApiKey,
                           })}
@@ -4155,6 +4187,8 @@ function AddSourceDialog({
                           onChange={(event) => {
                             if (apiKeyConnector === "github") {
                               setGithubApiKey(event.target.value);
+                            } else if (apiKeyConnector === "gitlab") {
+                              setGitlabApiKey(event.target.value);
                             } else if (apiKeyConnector === "linear") {
                               setLinearApiKey(event.target.value);
                             } else {
@@ -4184,6 +4218,7 @@ function AddSourceDialog({
                         disabled ||
                         (needsConnection && !apiKeyInputValue(apiKeyConnector, {
                           github: githubApiKey,
+                          gitlab: gitlabApiKey,
                           granola: granolaApiKey,
                           linear: linearApiKey,
                         }).trim())
@@ -4195,6 +4230,7 @@ function AddSourceDialog({
                             apiKeyConnector,
                             apiKeyInputValue(apiKeyConnector, {
                               github: githubApiKey,
+                              gitlab: gitlabApiKey,
                               granola: granolaApiKey,
                               linear: linearApiKey,
                             }),
@@ -4376,6 +4412,8 @@ function apiKeyConnectCommand(connector: ApiKeySourceConnectorId) {
   switch (connector) {
     case "github":
       return "connect_github";
+    case "gitlab":
+      return "connect_gitlab";
     case "granola":
       return "connect_granola";
     case "linear":
@@ -4393,6 +4431,7 @@ function apiKeyInputValue(
 function apiKeyPlaceholder(connector: ApiKeySourceConnectorId) {
   switch (connector) {
     case "github":
+    case "gitlab":
       return "Paste personal access token";
     case "granola":
     case "linear":
@@ -4404,6 +4443,8 @@ function apiKeyHelpText(connector: ApiKeySourceConnectorId) {
   switch (connector) {
     case "github":
       return "Create a fine-grained GitHub personal access token with repository metadata, contents, issues, and pull request read access.";
+    case "gitlab":
+      return "Create a GitLab personal access token with read API and read repository access.";
     case "granola":
       return "Create a key in Granola Settings > Connectors > API keys. Business or Enterprise is required.";
     case "linear":
