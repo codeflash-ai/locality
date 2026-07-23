@@ -1311,6 +1311,28 @@ fn resolving_unregistered_connector_reports_unsupported_connector() {
 }
 
 #[test]
+fn planned_catalog_connector_mount_fails_before_remote_resolution() {
+    let store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let mount = MountConfig::new(
+        MountId::new("confluence-main"),
+        "confluence",
+        "/tmp/locality/confluence",
+    );
+
+    assert!(source_connector_catalog_ids().contains(&"confluence"));
+
+    let error =
+        resolve_source_for_mount(&store, &credentials, &mount).expect_err("planned connector");
+
+    assert_eq!(error.code(), "unsupported_connector");
+    assert_eq!(
+        error.message(),
+        "connector `confluence` is not supported by this build"
+    );
+}
+
+#[test]
 fn available_source_set_isolates_an_unavailable_mount() {
     let mut store = InMemoryStateStore::new();
     let credentials = InMemoryCredentialStore::new();
