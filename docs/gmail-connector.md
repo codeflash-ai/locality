@@ -164,10 +164,11 @@ Thanks for the notes. I will follow up here.
 Push is the send action. Attachments are not supported for Gmail draft sends in
 v1; `attachment` or `attachments` frontmatter is rejected.
 
-On macOS File Provider mounts, a reconciled send automatically signals both the
-`draft/` and `sent/` containers. Versioned File Provider sync anchors report the
-removed draft identifier as well as the canonical sent message, without
-requiring the user to run `loc pull`, refresh Finder, or reopen the mount.
+On macOS File Provider mounts, the push journal remembers the temporary local
+draft identifier before sending. Once Gmail apply and read-back both succeed,
+Locality removes that exact File Provider item and signals both the `draft/` and
+`sent/` containers. Remote or unconfirmed item deletion remains blocked. This
+does not require the user to run `loc pull` or refresh Finder.
 
 ## Useful Commands
 

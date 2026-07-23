@@ -3,35 +3,58 @@ import FileProvider
 import XCTest
 
 final class LocalityFileProviderItemTests: XCTestCase {
-  func testSyncAnchorRoundTripsItemIdentifiers() throws {
-    let identifiers = Set([
-      NSFileProviderItemIdentifier("draft-message"),
-      NSFileProviderItemIdentifier("sent-message"),
-    ])
+  func testCurrentSyncAnchorIsRecognized() throws {
+    let anchor = try LocalitySyncAnchor.next()
 
-    let anchor = try LocalitySyncAnchor.encode(identifiers: identifiers)
-
-    XCTAssertEqual(LocalitySyncAnchor.decode(anchor), identifiers)
+    XCTAssertTrue(LocalitySyncAnchor.isCurrent(anchor))
   }
 
-  func testSyncAnchorIdentifiesDeletedItems() throws {
-    let draft = NSFileProviderItemIdentifier("draft-message")
-    let retained = NSFileProviderItemIdentifier("retained-message")
-    let anchor = try LocalitySyncAnchor.encode(identifiers: Set([draft, retained]))
-    let current = Set([retained, NSFileProviderItemIdentifier("new-sent-message")])
+  func testSuccessiveSyncAnchorsAdvance() throws {
+    let first = try LocalitySyncAnchor.next()
+    let second = try LocalitySyncAnchor.next()
 
-    let previous = try XCTUnwrap(LocalitySyncAnchor.decode(anchor))
-
-    XCTAssertEqual(
-      LocalitySyncAnchor.deletedIdentifiers(previous: previous, current: current),
-      [draft]
-    )
+    XCTAssertNotEqual(first, second)
   }
 
   func testLegacyTimestampSyncAnchorExpires() {
     let legacyAnchor = NSFileProviderSyncAnchor(Data("1784775141.0".utf8))
 
-    XCTAssertNil(LocalitySyncAnchor.decode(legacyAnchor))
+    XCTAssertFalse(LocalitySyncAnchor.isCurrent(legacyAnchor))
+  }
+
+  func testMissingReconciledLocalItemCanBeDeleted() {
+    let error = LocalityDaemonClientError.daemonError(
+      code: "invalid_state",
+      message: "invalid state: virtual filesystem item `local:1` is not present in daemon state"
+    )
+
+    XCTAssertTrue(
+      shouldAcceptAlreadyReconciledLocalDeletion(
+        daemonIdentifier: "local:1",
+        error: error
+      )
+    )
+  }
+
+  func testRemoteOrUnconfirmedItemDeletionRemainsBlocked() {
+    let missing = LocalityDaemonClientError.daemonError(
+      code: "invalid_state",
+      message: "invalid state: virtual filesystem item `page-1` is not present in daemon state"
+    )
+    let unavailable = LocalityDaemonClientError.connectFailed("offline")
+
+    XCTAssertFalse(
+      shouldAcceptAlreadyReconciledLocalDeletion(
+        daemonIdentifier: "page-1",
+        error: missing
+      )
+    )
+    XCTAssertFalse(
+      shouldAcceptAlreadyReconciledLocalDeletion(
+        daemonIdentifier: "local:1",
+        error: unavailable
+      )
+    )
   }
 
   func testSharedDomainPageChildFolderAllowsAddingSubitems() {

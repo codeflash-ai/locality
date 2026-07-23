@@ -33,6 +33,7 @@ private enum Command {
   case open(mountId: String)
   case signal(mountId: String, identifier: String)
   case reimport(mountId: String, identifier: String)
+  case remove(mountId: String, identifier: String)
   case unregister(mountId: String)
   case list
   case reset
@@ -64,6 +65,11 @@ private enum Command {
       let identifier = value(args, "--identifier") ?? "root"
       try validateDomainIdentifier(mountId)
       return .reimport(mountId: mountId, identifier: identifier)
+    case "remove":
+      let mountId = try requiredValue(args, "--mount-id")
+      let identifier = try requiredValue(args, "--identifier")
+      try validateDomainIdentifier(mountId)
+      return .remove(mountId: mountId, identifier: identifier)
     case "unregister":
       let mountId = try requiredValue(args, "--mount-id")
       try validateDomainIdentifier(mountId)
@@ -195,6 +201,24 @@ private enum Command {
         domains: nil,
         url: nil,
         message: "reimported \(mountId):\(identifier)"
+      )
+    case .remove(let mountId, let identifier):
+      guard let domain = try getDomains().first(where: { $0.identifier.rawValue == mountId }) else {
+        throw UsageError("File Provider domain \(mountId) is not registered")
+      }
+      guard let manager = NSFileProviderManager(for: domain) else {
+        throw UsageError("No File Provider manager is available for domain \(mountId)")
+      }
+      let itemIdentifier = fileProviderItemIdentifier(identifier)
+      let url = try userVisibleItemURL(manager: manager, identifier: itemIdentifier)
+      try FileManager.default.removeItem(at: url)
+      return FileProviderCtlReport(
+        ok: true,
+        action: "remove",
+        domain: DomainReport(domain),
+        domains: nil,
+        url: url.path,
+        message: "removed \(mountId):\(identifier)"
       )
     case .unregister(let mountId):
       let domain = NSFileProviderDomain(
@@ -384,6 +408,29 @@ private func userVisibleDomainURLFromManager(for domain: NSFileProviderDomain) t
   }
   semaphore.wait()
   return try result.get() ?? nil
+}
+
+private func userVisibleItemURL(
+  manager: NSFileProviderManager,
+  identifier: NSFileProviderItemIdentifier
+) throws -> URL {
+  let result = AsyncResultBox<URL>()
+  let semaphore = DispatchSemaphore(value: 0)
+  manager.getUserVisibleURL(for: identifier) { url, error in
+    if let error {
+      result.complete(.failure(error))
+    } else if let url {
+      result.complete(.success(url))
+    } else {
+      result.complete(.failure(UsageError("File Provider item \(identifier.rawValue) has no user-visible URL")))
+    }
+    semaphore.signal()
+  }
+  semaphore.wait()
+  guard let url = try result.get() else {
+    throw UsageError("File Provider item \(identifier.rawValue) has no user-visible URL")
+  }
+  return url
 }
 
 private func waitForVoid(_ body: (@escaping @Sendable (Error?) -> Void) -> Void) throws {

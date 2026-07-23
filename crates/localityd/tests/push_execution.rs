@@ -1143,6 +1143,19 @@ fn daemon_push_reconciles_sent_gmail_draft_create_to_sent_folder() {
             .expect("find mutation")
             .is_none()
     );
+    let journal = store
+        .get_journal(report.push_id.as_ref().expect("push id"))
+        .expect("get journal")
+        .expect("journal");
+    assert_eq!(journal.metadata.local_projection_items.len(), 1);
+    assert_eq!(
+        journal.metadata.local_projection_items[0].local_id,
+        "local:gmail-draft"
+    );
+    assert_eq!(
+        journal.metadata.local_projection_items[0].operation_index,
+        0
+    );
 }
 
 #[test]

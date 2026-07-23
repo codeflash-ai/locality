@@ -66,19 +66,14 @@ final class LocalityEnumerator: NSObject, NSFileProviderEnumerator {
     func currentSyncAnchor(
         completionHandler: @escaping (NSFileProviderSyncAnchor?) -> Void
     ) {
-        do {
-            let items = try currentItems()
-            completionHandler(try LocalitySyncAnchor.encode(items: items))
-        } catch {
-            completionHandler(nil)
-        }
+        completionHandler(try? LocalitySyncAnchor.next())
     }
 
     func enumerateChanges(
         for observer: NSFileProviderChangeObserver,
         from syncAnchor: NSFileProviderSyncAnchor
     ) {
-        guard let previousIdentifiers = LocalitySyncAnchor.decode(syncAnchor) else {
+        guard LocalitySyncAnchor.isCurrent(syncAnchor) else {
             observer.finishEnumeratingWithError(
                 NSError(
                     domain: NSFileProviderErrorDomain,
@@ -90,17 +85,9 @@ final class LocalityEnumerator: NSObject, NSFileProviderEnumerator {
 
         do {
             let items = try currentItems()
-            let currentIdentifiers = Set(items.map(\.itemIdentifier))
-            let deletedIdentifiers = LocalitySyncAnchor.deletedIdentifiers(
-                previous: previousIdentifiers,
-                current: currentIdentifiers
-            )
-            if !deletedIdentifiers.isEmpty {
-                observer.didDeleteItems(withIdentifiers: deletedIdentifiers)
-            }
             observer.didUpdate(items)
             observer.finishEnumeratingChanges(
-                upTo: try LocalitySyncAnchor.encode(identifiers: currentIdentifiers),
+                upTo: try LocalitySyncAnchor.next(),
                 moreComing: false
             )
         } catch {
@@ -151,40 +138,25 @@ enum LocalitySyncAnchor {
 
     private struct Snapshot: Codable {
         let schemaVersion: Int
-        let itemIdentifiers: [String]
+        let nonce: UUID
     }
 
-    static func encode(items: [LocalityFileProviderItem]) throws -> NSFileProviderSyncAnchor {
-        try encode(identifiers: Set(items.map(\.itemIdentifier)))
-    }
-
-    static func encode(
-        identifiers: Set<NSFileProviderItemIdentifier>
-    ) throws -> NSFileProviderSyncAnchor {
+    static func next() throws -> NSFileProviderSyncAnchor {
         let snapshot = Snapshot(
             schemaVersion: schemaVersion,
-            itemIdentifiers: identifiers.map(\.rawValue).sorted()
+            nonce: UUID()
         )
         return NSFileProviderSyncAnchor(try JSONEncoder().encode(snapshot))
     }
 
-    static func decode(
-        _ syncAnchor: NSFileProviderSyncAnchor
-    ) -> Set<NSFileProviderItemIdentifier>? {
+    static func isCurrent(_ syncAnchor: NSFileProviderSyncAnchor) -> Bool {
         guard
             let snapshot = try? JSONDecoder().decode(Snapshot.self, from: syncAnchor.rawValue),
             snapshot.schemaVersion == schemaVersion
         else {
-            return nil
+            return false
         }
-        return Set(snapshot.itemIdentifiers.map { NSFileProviderItemIdentifier($0) })
-    }
-
-    static func deletedIdentifiers(
-        previous: Set<NSFileProviderItemIdentifier>,
-        current: Set<NSFileProviderItemIdentifier>
-    ) -> [NSFileProviderItemIdentifier] {
-        previous.subtracting(current).sorted { $0.rawValue < $1.rawValue }
+        return true
     }
 }
 

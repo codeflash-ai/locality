@@ -38,7 +38,7 @@ use locality_core::shadow::{ShadowDocument, rendered_bodies_equivalent};
 use locality_notion::client::{notion_request_debug_status, notion_requests_per_second_setting};
 use locality_store::{
     AutoSaveRepository, EntityRecord, EntityRepository, FreshnessStateRecord,
-    FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository,
+    FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository, JournalRepository,
     MetadataDiscoveryJobRecord, MetadataDiscoveryJobRepository, MetadataDiscoveryPriority,
     MountConfig, MountLiveModeRepository, MountRepository, ProjectionMode, RemoteObservationRecord,
     RemoteObservationRepository, ShadowRepository, SqliteStateStore, open_credential_store,
@@ -2068,18 +2068,24 @@ impl RuntimeState {
                 return;
             }
         };
+        let mut refresh_request = None;
         if let Err(error) = dispatch_gmail_push_projection_refresh(&store, response, |request| {
-            if let Err(error) = refresh_macos_file_provider_container(
-                &request.mount_id,
-                &request.container_identifier,
-            ) {
-                eprintln!(
-                    "localityd failed to refresh macOS File Provider for `{}:{}` after Gmail send: {error}",
-                    request.mount_id, request.container_identifier
-                );
-            }
+            refresh_request = Some(request)
         }) {
             eprintln!("localityd failed to plan Gmail File Provider refresh: {error}");
+            return;
+        }
+        if let Some(request) = refresh_request {
+            thread::spawn(move || {
+                if let Err(error) = refresh_macos_file_provider_after_gmail_push_with(
+                    &request,
+                    |action, identifier| run_macos_file_provider_refresh_action(action, identifier),
+                ) {
+                    eprintln!(
+                        "localityd failed to refresh macOS File Provider after Gmail send: {error}"
+                    );
+                }
+            });
         }
     }
 
@@ -3391,13 +3397,15 @@ fn child_refresh_priority_label(priority: ChildRefreshPriority) -> &'static str 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProjectionRefreshRequest {
     mount_id: String,
-    container_identifier: String,
+    container_identifiers: Vec<String>,
+    local_item_identifiers: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GmailPushProjectionRefresh {
     mount_id: MountId,
     container_identifiers: Vec<String>,
+    push_id: locality_core::journal::PushId,
 }
 
 fn gmail_push_projection_refresh(response: &DaemonResponse) -> Option<GmailPushProjectionRefresh> {
@@ -3409,6 +3417,7 @@ fn gmail_push_projection_refresh(response: &DaemonResponse) -> Option<GmailPushP
     if report.action != PushJobAction::Reconciled {
         return None;
     }
+    let push_id = report.push_id.clone()?;
 
     let mut container_identifiers = BTreeSet::new();
     if let Some(plan) = report.pipeline.plan.as_ref() {
@@ -3429,6 +3438,7 @@ fn gmail_push_projection_refresh(response: &DaemonResponse) -> Option<GmailPushP
     (!container_identifiers.is_empty()).then(|| GmailPushProjectionRefresh {
         mount_id: report.mount_id,
         container_identifiers: container_identifiers.into_iter().collect(),
+        push_id,
     })
 }
 
@@ -3438,7 +3448,7 @@ fn dispatch_gmail_push_projection_refresh<S, F>(
     mut refresh: F,
 ) -> locality_core::LocalityResult<()>
 where
-    S: MountRepository,
+    S: MountRepository + JournalRepository,
     F: FnMut(ProjectionRefreshRequest),
 {
     let Some(planned) = gmail_push_projection_refresh(response) else {
@@ -3454,56 +3464,69 @@ where
         return Ok(());
     }
 
-    for container_identifier in planned.container_identifiers {
-        refresh(ProjectionRefreshRequest {
-            mount_id: planned.mount_id.0.clone(),
-            container_identifier,
-        });
-    }
+    let local_item_identifiers = store
+        .get_journal(&planned.push_id)
+        .map_err(LocalityError::from)?
+        .filter(|journal| journal.status == locality_core::journal::JournalStatus::Reconciled)
+        .map(|journal| {
+            journal
+                .metadata
+                .local_projection_items
+                .into_iter()
+                .map(|item| item.local_id)
+                .collect()
+        })
+        .unwrap_or_default();
+    refresh(ProjectionRefreshRequest {
+        mount_id: planned.mount_id.0,
+        container_identifiers: planned.container_identifiers,
+        local_item_identifiers,
+    });
     Ok(())
 }
 
-fn refresh_macos_file_provider_container(
-    mount_id: &str,
-    container_identifier: &str,
-) -> Result<(), String> {
-    refresh_macos_file_provider_container_impl(mount_id, container_identifier)
-}
-
-#[cfg(target_os = "macos")]
-fn refresh_macos_file_provider_container_impl(
-    mount_id: &str,
-    container_identifier: &str,
-) -> Result<(), String> {
-    let Some(helper) = macos_file_provider_helper_path() else {
-        return Err("locality-file-providerctl was not found".to_string());
-    };
-    refresh_macos_file_provider_container_with(
-        mount_id,
-        container_identifier,
-        |action, identifier| run_macos_file_provider_helper_action(&helper, action, identifier),
-    )
-}
-
-#[cfg(not(target_os = "macos"))]
-fn refresh_macos_file_provider_container_impl(
-    _mount_id: &str,
-    _container_identifier: &str,
-) -> Result<(), String> {
-    Ok(())
-}
-
-fn refresh_macos_file_provider_container_with<F>(
-    mount_id: &str,
-    container_identifier: &str,
+fn refresh_macos_file_provider_after_gmail_push_with<F>(
+    request: &ProjectionRefreshRequest,
     mut run: F,
 ) -> Result<(), String>
 where
     F: FnMut(&str, &str) -> Result<(), String>,
 {
-    let identifier =
-        file_provider::macos_file_provider_item_identifier(mount_id, container_identifier);
-    run("signal", &identifier)
+    let mut failures = Vec::new();
+    for local_identifier in &request.local_item_identifiers {
+        let identifier =
+            file_provider::macos_file_provider_item_identifier(&request.mount_id, local_identifier);
+        if let Err(error) = run("remove", &identifier) {
+            failures.push(format!("remove `{identifier}`: {error}"));
+        }
+    }
+    for container_identifier in &request.container_identifiers {
+        let identifier = file_provider::macos_file_provider_item_identifier(
+            &request.mount_id,
+            container_identifier,
+        );
+        if let Err(error) = run("signal", &identifier) {
+            failures.push(format!("signal `{identifier}`: {error}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_file_provider_refresh_action(action: &str, identifier: &str) -> Result<(), String> {
+    let Some(helper) = macos_file_provider_helper_path() else {
+        return Err("locality-file-providerctl was not found".to_string());
+    };
+    run_macos_file_provider_helper_action(&helper, action, identifier)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_macos_file_provider_refresh_action(_action: &str, _identifier: &str) -> Result<(), String> {
+    Ok(())
 }
 
 fn signal_macos_file_provider_enumerator(
@@ -5682,7 +5705,10 @@ mod tests {
         ChangeHintKind, FreshnessTier, RemoteObservation, RemoteVersion, SyncJob, SyncJobKind,
     };
     use locality_core::hydration::{HydrationReason, HydrationRequest};
-    use locality_core::journal::{JournalApplyEffect, JournalStatus, PushId, PushOperationId};
+    use locality_core::journal::{
+        JournalApplyEffect, JournalEntry, JournalLocalProjectionItem, JournalMetadata,
+        JournalStatus, PushId, PushOperationId,
+    };
     use locality_core::model::{
         CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, SourceSpan,
     };
@@ -5695,7 +5721,7 @@ mod tests {
     use locality_store::{
         AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
         ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository,
-        FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore,
+        FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore, JournalRepository,
         MetadataDiscoveryJobRecord, MetadataDiscoveryJobRepository, MetadataDiscoveryPriority,
         MountConfig, MountLiveModeRecord, MountLiveModeRepository, MountRepository, ProjectionMode,
         RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
@@ -5713,7 +5739,7 @@ mod tests {
         ProjectionRefreshRequest, RemoteDiscoveryHint, RuntimeJobRunner, RuntimeState,
         child_refresh_retry_delay, dispatch_gmail_push_projection_refresh, execute_file_event,
         execute_observe_entity_job, locality_error_code, observable_remote_identifier,
-        refresh_macos_file_provider_container_with, remote_fast_forward_discovery_hints,
+        refresh_macos_file_provider_after_gmail_push_with, remote_fast_forward_discovery_hints,
         repair_clean_remote_deleted_projections, response_file_opened_observe_jobs,
     };
 
@@ -5770,6 +5796,28 @@ mod tests {
         })
     }
 
+    fn save_reconciled_gmail_send_journal(store: &mut InMemoryStateStore) {
+        store
+            .append_journal(
+                JournalEntry::new(
+                    PushId("push-gmail-draft".to_string()),
+                    MountId::new("gmail-main"),
+                    vec![RemoteId::new("gmail-folder:draft")],
+                    PushPlan::new(Vec::new(), Vec::new()),
+                    JournalStatus::Reconciled,
+                )
+                .with_metadata(
+                    JournalMetadata::default().with_local_projection_items(vec![
+                        JournalLocalProjectionItem {
+                            operation_index: 0,
+                            local_id: "local:gmail-draft".to_string(),
+                        },
+                    ]),
+                ),
+            )
+            .expect("save reconciled Gmail journal");
+    }
+
     #[test]
     fn reconciled_gmail_send_refreshes_draft_and_sent_file_provider_containers() {
         let mut store = InMemoryStateStore::new();
@@ -5779,6 +5827,7 @@ mod tests {
                     .projection(ProjectionMode::MacosFileProvider),
             )
             .expect("save Gmail mount");
+        save_reconciled_gmail_send_journal(&mut store);
         let mut refreshes = Vec::new();
 
         dispatch_gmail_push_projection_refresh(
@@ -5790,16 +5839,14 @@ mod tests {
 
         assert_eq!(
             refreshes,
-            vec![
-                ProjectionRefreshRequest {
-                    mount_id: "gmail-main".to_string(),
-                    container_identifier: "gmail-folder:draft".to_string(),
-                },
-                ProjectionRefreshRequest {
-                    mount_id: "gmail-main".to_string(),
-                    container_identifier: "gmail-folder:sent".to_string(),
-                },
-            ]
+            vec![ProjectionRefreshRequest {
+                mount_id: "gmail-main".to_string(),
+                container_identifiers: vec![
+                    "gmail-folder:draft".to_string(),
+                    "gmail-folder:sent".to_string(),
+                ],
+                local_item_identifiers: vec!["local:gmail-draft".to_string()],
+            }]
         );
     }
 
@@ -5825,22 +5872,34 @@ mod tests {
     }
 
     #[test]
-    fn gmail_file_provider_refresh_signals_reconciled_containers() {
+    fn gmail_file_provider_refresh_removes_local_draft_before_signaling_containers() {
         let mut actions = Vec::new();
 
-        refresh_macos_file_provider_container_with(
-            "gmail-main",
-            "gmail-folder:draft",
+        refresh_macos_file_provider_after_gmail_push_with(
+            &ProjectionRefreshRequest {
+                mount_id: "gmail-main".to_string(),
+                container_identifiers: vec![
+                    "gmail-folder:draft".to_string(),
+                    "gmail-folder:sent".to_string(),
+                ],
+                local_item_identifiers: vec!["local:gmail-draft".to_string()],
+            },
             |action, identifier| {
                 actions.push((action.to_string(), identifier.to_string()));
                 Ok(())
             },
         )
-        .expect("signal container");
+        .expect("remove draft and signal containers");
 
-        assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0].0, "signal");
-        assert_ne!(actions[0].1, "gmail-folder:draft");
+        assert_eq!(actions.len(), 3);
+        assert_eq!(actions[0].0, "remove");
+        assert_eq!(actions[1].0, "signal");
+        assert_eq!(actions[2].0, "signal");
+        assert!(
+            actions
+                .iter()
+                .all(|(_, identifier)| identifier.starts_with("m:"))
+        );
     }
 
     #[test]

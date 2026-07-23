@@ -8,7 +8,7 @@ enum LocalityDaemonClientError: Error, LocalizedError {
   case connectFailed(String)
   case writeFailed
   case readFailed
-  case daemonError(String)
+  case daemonError(code: String, message: String)
   case missingPayload
 
   var errorDescription: String? {
@@ -25,8 +25,8 @@ enum LocalityDaemonClientError: Error, LocalizedError {
       return "failed to write daemon request"
     case .readFailed:
       return "failed to read daemon response"
-    case .daemonError(let message):
-      return message
+    case .daemonError(let code, let message):
+      return "\(code): \(message)"
     case .missingPayload:
       return "daemon response did not include a payload"
     }
@@ -329,6 +329,14 @@ final class LocalityDaemonClient: @unchecked Sendable {
     ])
   }
 
+  func trash(mountId: String, identifier: String) throws -> LocalityMutationPayload {
+    try request([
+      "command": "virtual_fs_trash",
+      "mount_id": mountId,
+      "identifier": identifier,
+    ])
+  }
+
   private func request<Payload: Decodable>(_ object: [String: String]) throws -> Payload {
     var payload = try JSONSerialization.data(withJSONObject: object)
     payload.append(0x0a)
@@ -362,7 +370,8 @@ final class LocalityDaemonClient: @unchecked Sendable {
       return payload
     }
     throw LocalityDaemonClientError.daemonError(
-      response.error.map { "\($0.code): \($0.message)" } ?? "unknown daemon error"
+      code: response.error?.code ?? "unknown",
+      message: response.error?.message ?? "unknown daemon error"
     )
   }
 

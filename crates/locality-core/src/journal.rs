@@ -21,6 +21,8 @@ pub struct JournalMetadata {
     pub previous_push_id: Option<PushId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at_unix_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_projection_items: Vec<JournalLocalProjectionItem>,
 }
 
 impl Default for JournalMetadata {
@@ -32,6 +34,7 @@ impl Default for JournalMetadata {
             },
             previous_push_id: None,
             created_at_unix_ms: None,
+            local_projection_items: Vec::new(),
         }
     }
 }
@@ -44,6 +47,17 @@ impl JournalMetadata {
             ..Self::default()
         }
     }
+
+    pub fn with_local_projection_items(mut self, items: Vec<JournalLocalProjectionItem>) -> Self {
+        self.local_projection_items = items;
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalLocalProjectionItem {
+    pub operation_index: usize,
+    pub local_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

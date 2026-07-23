@@ -333,8 +333,43 @@ final class LocalityFileProviderExtension: NSObject, NSFileProviderReplicatedExt
     completionHandler: @escaping (Error?) -> Void
   ) -> Progress {
     let progress = Progress(totalUnitCount: 1)
-    completionHandler(unsupportedWriteError())
-    progress.completedUnitCount = 1
+    let completion = UncheckedSendable(completionHandler)
+    let progressHandle = UncheckedSendable(progress)
+    let client: LocalityDaemonClient
+    let resolved: LocalityResolvedIdentifier
+    do {
+      client = try daemonClient()
+      resolved = try resolveIdentifier(identifier)
+      guard resolved.daemonIdentifier.hasPrefix("local:") else {
+        completionHandler(unsupportedWriteError())
+        progress.completedUnitCount = 1
+        return progress
+      }
+    } catch {
+      completionHandler(error)
+      progress.completedUnitCount = 1
+      return progress
+    }
+
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        _ = try client.trash(
+          mountId: resolved.mountId,
+          identifier: resolved.daemonIdentifier
+        )
+        completion.value(nil)
+      } catch where shouldAcceptAlreadyReconciledLocalDeletion(
+        daemonIdentifier: resolved.daemonIdentifier,
+        error: error
+      ) {
+        // A successful create push removes its virtual mutation before the
+        // host asks File Provider to remove the now-stale local replica.
+        completion.value(nil)
+      } catch {
+        completion.value(agentFSFileProviderError(error))
+      }
+      progressHandle.value.completedUnitCount = 1
+    }
     return progress
   }
 
@@ -407,6 +442,21 @@ final class LocalityFileProviderExtension: NSObject, NSFileProviderReplicatedExt
   private func unsupportedWriteError(_ message: String) -> NSError {
     agentFSUnsupportedWriteError(message)
   }
+}
+
+func shouldAcceptAlreadyReconciledLocalDeletion(
+  daemonIdentifier: String,
+  error: Error
+) -> Bool {
+  guard daemonIdentifier.hasPrefix("local:") else {
+    return false
+  }
+  guard case LocalityDaemonClientError.daemonError(let code, let message) = error else {
+    return false
+  }
+  return code == "invalid_state"
+    && message.contains("virtual filesystem item")
+    && message.contains("is not present in daemon state")
 }
 
 private func agentFSUnsupportedWriteError(_ message: String) -> NSError {

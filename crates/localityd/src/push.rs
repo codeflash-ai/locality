@@ -19,8 +19,8 @@ use locality_core::conflict::unresolved_conflict_marker_line;
 use locality_core::diff::property_value_from_frontmatter;
 use locality_core::freshness::RemoteVersion;
 use locality_core::journal::{
-    JournalApplyEffect, JournalEntry, JournalMetadata, JournalPreimage, JournalStatus,
-    JournalStore, PushId,
+    JournalApplyEffect, JournalEntry, JournalLocalProjectionItem, JournalMetadata, JournalPreimage,
+    JournalStatus, JournalStore, PushId,
 };
 use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use locality_core::path_projection::{
@@ -341,16 +341,18 @@ where
         .ok()
         .map(|duration| duration.as_millis());
     let readable_diff = prepared.readable_diff.clone();
+    let local_projection_items =
+        local_projection_items_for_plan(store, &prepared.mount, prepared.pipeline.plan.as_ref())?;
     let mut execution_request = PushExecutionRequest::new(
         push_id.clone(),
         prepared.mount.mount_id.clone(),
         prepared.pipeline.clone(),
     )
     .with_remote_preconditions(remote_preconditions)
-    .with_metadata(JournalMetadata::anonymous(
-        previous_push_id,
-        created_at_unix_ms,
-    ))
+    .with_metadata(
+        JournalMetadata::anonymous(previous_push_id, created_at_unix_ms)
+            .with_local_projection_items(local_projection_items),
+    )
     .with_readable_diff(readable_diff.clone());
 
     if !prepared.shadows.is_empty() {
@@ -409,6 +411,41 @@ where
             error: Some(PushJobError::from(error)),
         }),
     }
+}
+
+fn local_projection_items_for_plan<S>(
+    store: &S,
+    mount: &MountConfig,
+    plan: Option<&PushPlan>,
+) -> LocalityResult<Vec<JournalLocalProjectionItem>>
+where
+    S: VirtualMutationRepository,
+{
+    if !mount.projection.uses_virtual_filesystem() {
+        return Ok(Vec::new());
+    }
+    let Some(plan) = plan else {
+        return Ok(Vec::new());
+    };
+
+    let mut items = Vec::new();
+    for (operation_index, operation) in plan.operations.iter().enumerate() {
+        let source_path = match operation {
+            PushOperation::CreateEntity { source_path, .. }
+            | PushOperation::CreateDatabase { source_path, .. } => source_path,
+            _ => continue,
+        };
+        if let Some(mutation) = store
+            .find_virtual_mutation_by_path(&mount.mount_id, source_path)
+            .map_err(LocalityError::from)?
+        {
+            items.push(JournalLocalProjectionItem {
+                operation_index,
+                local_id: mutation.local_id,
+            });
+        }
+    }
+    Ok(items)
 }
 
 fn block_ambiguous_gmail_send_replay<S>(
