@@ -5,7 +5,9 @@ use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_core::push::BodyDiffMode;
 use locality_core::shadow::ShadowDocument;
 use locality_core::validation::ValidationIssue;
-use locality_gmail::{GMAIL_CONNECTOR_ID, GMAIL_OAUTH_SCOPES, StoredGmailCredential};
+use locality_gmail::{
+    GMAIL_CONNECTOR_ID, GMAIL_OAUTH_SCOPES, GmailMountSettings, StoredGmailCredential,
+};
 use locality_google_calendar::{
     GOOGLE_CALENDAR_CONNECTOR_ID, GOOGLE_CALENDAR_OAUTH_SCOPES, StoredGoogleCalendarCredential,
 };
@@ -22,8 +24,8 @@ use locality_store::{
 use localityd::source::{
     LocalSourceValidator, ResolvedSource, ResolvedSourceSet, SourcePushValidator,
     SourceValidationContext, VirtualRenamePolicy, resolve_source_for_mount,
-    source_create_decision_for_parent_path, source_descriptor, source_display_name,
-    source_move_decision_for_parent_path, source_write_decision_for_path,
+    source_create_decision_for_parent_path, source_delete_decision_for_path, source_descriptor,
+    source_display_name, source_move_decision_for_parent_path, source_write_decision_for_path,
     supported_source_connectors,
 };
 use std::io::{Read, Write};
@@ -125,6 +127,28 @@ fn gmail_descriptor_comes_from_registry() {
     assert_eq!(
         descriptor.create_entity_parent_kinds(),
         &[EntityKind::Directory]
+    );
+    assert_eq!(descriptor.body_diff_mode(), BodyDiffMode::WholeEntity);
+}
+
+#[test]
+fn gmail_drafts_are_writable_and_creatable_but_not_deletable() {
+    let mut mount = gmail_mount();
+    mount.read_only = false;
+
+    assert!(
+        source_write_decision_for_path(&mount, std::path::Path::new("draft/existing.md"))
+            .is_writable()
+    );
+    assert!(
+        source_create_decision_for_parent_path(&mount, std::path::Path::new("draft")).is_writable()
+    );
+    let deletion =
+        source_delete_decision_for_path(&mount, std::path::Path::new("draft/existing.md"));
+    assert!(!deletion.is_writable());
+    assert_eq!(
+        deletion.reason(),
+        Some("Gmail draft deletion is not supported")
     );
 }
 
@@ -804,6 +828,11 @@ fn expired_gmail_credential(access_token: &str, broker_url: String) -> StoredGma
 
 fn gmail_mount() -> MountConfig {
     MountConfig::new(MountId::new("gmail-main"), GMAIL_CONNECTOR_ID, "/tmp/gmail")
+        .with_settings_json(
+            GmailMountSettings::default()
+                .to_json()
+                .expect("Gmail settings"),
+        )
 }
 
 fn google_calendar_mount() -> MountConfig {
@@ -839,8 +868,29 @@ fn validate_gmail_create(path: &str, markdown: &str) -> Vec<String> {
 }
 
 fn validate_gmail_changed(path: &str, markdown: &str) -> Vec<String> {
+    validate_gmail_changed_with_shadow(path, markdown, None)
+        .into_iter()
+        .map(|issue| issue.code)
+        .collect()
+}
+
+fn validate_gmail_changed_with_shadow(
+    path: &str,
+    markdown: &str,
+    shadow_frontmatter: Option<&str>,
+) -> Vec<ValidationIssue> {
     let mount = gmail_mount();
     let parsed = parse_canonical_markdown(markdown).expect("parse gmail markdown");
+    let shadow = shadow_frontmatter.map(|frontmatter| {
+        ShadowDocument::from_synced_body(
+            RemoteId::new("gmail-draft:draft-1"),
+            "Body\n",
+            1,
+            vec![RemoteId::new("gmail-draft:draft-1:body:0")],
+        )
+        .expect("gmail shadow")
+        .with_frontmatter(frontmatter)
+    });
 
     LocalSourceValidator
         .validate_changed_frontmatter(SourceValidationContext {
@@ -849,13 +899,10 @@ fn validate_gmail_changed(path: &str, markdown: &str) -> Vec<String> {
             parent: None,
             relative_path: std::path::Path::new(path),
             parsed: &parsed,
-            shadow: None,
+            shadow: shadow.as_ref(),
         })
         .expect("validate gmail changed")
         .issues
-        .into_iter()
-        .map(|issue| issue.code)
-        .collect()
 }
 
 fn validate_google_calendar_create(path: &str, markdown: &str) -> Vec<String> {
@@ -1589,10 +1636,72 @@ fn resolving_gmail_mount_with_invalid_settings_reports_validation_detail() {
     let error = resolve_source_for_mount(&store, &credentials, &mount)
         .expect_err("invalid Gmail settings should reject resolver");
 
-    assert_eq!(error.code(), "credential_store_unavailable");
+    assert_eq!(error.code(), "connector_settings_invalid");
     let message = error.message();
     assert!(message.contains("Gmail mount `gmail-main` settings are invalid"));
     assert!(message.contains("Gmail mount settings JSON is invalid"));
+}
+
+#[test]
+fn resolving_gmail_mount_with_legacy_implicit_layout_fails_before_enumeration() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (connection_id, secret_ref) =
+        save_gmail_connection(&mut store, "gmail-default", GMAIL_CONNECTOR_ID, "oauth");
+    credentials
+        .put(
+            &secret_ref,
+            &serde_json::to_string(&stored_gmail_credential("gmail-access-token"))
+                .expect("credential json"),
+        )
+        .expect("save credential");
+    let mount = gmail_mount()
+        .with_connection_id(connection_id)
+        .with_settings_json("{}");
+
+    let error = resolve_source_for_mount(&store, &credentials, &mount)
+        .expect_err("legacy implicit Gmail layout must not be reinterpreted");
+
+    assert_eq!(error.code(), "connector_settings_invalid");
+    assert_eq!(
+        error.message(),
+        "Gmail mount `gmail-main` settings are invalid: Gmail mount uses legacy implicit settings (`{}`), whose message layout cannot be safely changed in place to the thread-default layout"
+    );
+}
+
+#[test]
+fn resolving_gmail_mount_with_newer_projection_layout_requires_update() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (connection_id, secret_ref) =
+        save_gmail_connection(&mut store, "gmail-default", GMAIL_CONNECTOR_ID, "oauth");
+    credentials
+        .put(
+            &secret_ref,
+            &serde_json::to_string(&stored_gmail_credential("gmail-access-token"))
+                .expect("credential json"),
+        )
+        .expect("save credential");
+    let mount = gmail_mount()
+        .with_connection_id(connection_id)
+        .with_settings_json(r#"{"gmail":{"view":"threads"},"projection_layout_version":3}"#);
+
+    let error = resolve_source_for_mount(&store, &credentials, &mount)
+        .expect_err("newer Gmail projection layout must require an update");
+
+    assert_eq!(error.code(), "update_required");
+    assert_eq!(
+        error.message(),
+        "update required for gmail:projection_layout: found version 3, supported version 2"
+    );
+    assert_eq!(
+        locality_core::LocalityError::from(error),
+        locality_core::LocalityError::UpdateRequired {
+            component: "gmail:projection_layout".to_string(),
+            found: 3,
+            supported: 2,
+        }
+    );
 }
 
 #[test]
@@ -2023,6 +2132,52 @@ fn local_gmail_validator_blocks_changed_inbox_and_sent_items() {
 
         assert_eq!(issues, vec!["gmail_read_only_mailbox"]);
     }
+}
+
+#[test]
+fn local_gmail_validator_allows_remote_draft_content_and_editable_header_changes() {
+    let shadow = "loc:\n  id: gmail-draft:draft-1\n  type: page\n  connector: gmail\n  synced_at: old\n  remote_edited_at: old\ntitle: Original\ngmail:\n  mailbox: draft\n  draft_id: draft-1\n  message_id: message-1\n  thread_id: thread-1\n  rfc_message_id: <message-1@example.com>\n  in_reply_to: <parent@example.com>\n  references: [<root@example.com>]\n  labels: [DRAFT]\nfrom: sender@example.com\nto: [old@example.com]\ncc: []\nbcc: []\nsubject: Original\ndate: Tue, 14 Jul 2026 10:00:00 +0000\n";
+    let markdown = "---\nloc:\n  id: gmail-draft:draft-1\n  type: page\n  connector: gmail\n  synced_at: new\n  remote_edited_at: new\ntitle: Original\ngmail:\n  mailbox: draft\n  draft_id: draft-1\n  message_id: message-1\n  thread_id: thread-1\n  rfc_message_id: <message-1@example.com>\n  in_reply_to: <parent@example.com>\n  references: [<root@example.com>]\n  labels: [DRAFT]\nfrom: sender@example.com\nto: [new@example.com]\ncc: [copy@example.com]\nbcc: [blind@example.com]\nsubject: Updated\ndate: Tue, 14 Jul 2026 10:00:00 +0000\n---\nUpdated body\n";
+
+    let issues = validate_gmail_changed_with_shadow("draft/reply.md", markdown, Some(shadow));
+
+    assert!(issues.is_empty(), "{issues:#?}");
+}
+
+#[test]
+fn local_gmail_validator_rejects_remote_draft_identity_and_metadata_changes() {
+    let shadow = "loc:\n  id: gmail-draft:draft-1\n  type: page\n  connector: gmail\ntitle: Original\ngmail:\n  mailbox: draft\n  draft_id: draft-1\n  message_id: message-1\n  thread_id: thread-1\n  rfc_message_id: <message-1@example.com>\n  labels: [DRAFT]\nfrom: sender@example.com\nto: [old@example.com]\ncc: []\nbcc: []\nsubject: Original\ndate: Tue, 14 Jul 2026 10:00:00 +0000\n";
+    let markdown = "---\nloc:\n  id: gmail-draft:draft-2\n  type: page\n  connector: gmail\ntitle: Original\ngmail:\n  mailbox: inbox\n  draft_id: draft-2\n  message_id: message-2\n  thread_id: thread-1\n  rfc_message_id: <message-2@example.com>\n  labels: [INBOX]\nfrom: attacker@example.com\nto: [old@example.com]\ncc: []\nbcc: []\nsubject: Original\ndate: Wed, 15 Jul 2026 10:00:00 +0000\n---\nBody\n";
+
+    let issues = validate_gmail_changed_with_shadow("draft/reply.md", markdown, Some(shadow));
+    let codes = issues
+        .iter()
+        .map(|issue| issue.code.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(codes[0], "gmail_immutable_identity");
+    assert_eq!(
+        codes
+            .iter()
+            .filter(|code| **code == "gmail_immutable_frontmatter")
+            .count(),
+        3
+    );
+    assert!(issues.iter().any(|issue| {
+        issue
+            .message
+            .contains("Gmail frontmatter `gmail` is read-only")
+    }));
+}
+
+#[test]
+fn local_gmail_validator_blocks_changed_thread_projection() {
+    let issues = validate_gmail_changed(
+        "inbox/topic-thread/page.md",
+        "---\nloc:\n  id: gmail-thread:inbox:thread-1\n  type: page\n  connector: gmail\ntitle: Topic\n---\nEdited body\n",
+    );
+
+    assert_eq!(issues, vec!["gmail_read_only_mailbox"]);
 }
 
 #[test]

@@ -83,8 +83,9 @@ use crate::connector::{
     resolve_source_for_mount_id, resolve_source_for_path, source_descriptor, source_display_name,
 };
 use crate::create::{
-    CreateDatabaseOptions, CreateDatabaseReport, CreateError, CreatePageOptions, CreatePageReport,
-    run_create_database, run_create_page,
+    CreateDatabaseOptions, CreateDatabaseReport, CreateError, CreateGmailReplyOptions,
+    CreateGmailReplyReport, CreatePageOptions, CreatePageReport, run_create_database,
+    run_create_gmail_reply, run_create_page,
 };
 use crate::daemon::{DaemonControlError, DaemonControlReport, run_daemon_control};
 use crate::diff::{DiffError, run_diff_with_state_root};
@@ -703,7 +704,7 @@ struct MountGmailArgs {
     #[arg(
         long,
         value_name = "messages|threads",
-        help = "Gmail projection view. Defaults to messages."
+        help = "Gmail projection view. Defaults to threads."
     )]
     view: Option<String>,
 }
@@ -914,6 +915,23 @@ enum CreateCommand {
     Page(CreatePageArgs),
     #[command(about = "Create a Notion database directory with a draft _schema.yaml")]
     Database(CreateDatabaseArgs),
+    #[command(about = "Create a canonical Gmail draft that replies to a thread")]
+    GmailReply(CreateGmailReplyArgs),
+}
+
+#[derive(Debug, Args)]
+struct CreateGmailReplyArgs {
+    #[arg(
+        value_name = "thread-dir",
+        help = "Hydrated Gmail thread directory (or its page.md)."
+    )]
+    thread: String,
+    #[arg(
+        long,
+        value_name = "message",
+        help = "Reply to a specific child path, filename, or Gmail message id. Defaults to the latest message."
+    )]
+    message: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1549,6 +1567,11 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                     args.push("database".to_string());
                     push_flag_value(&mut args, "--title", &options.title);
                     push_optional_flag_value(&mut args, "--parent", options.parent.as_deref());
+                }
+                CreateCommand::GmailReply(options) => {
+                    args.push("gmail-reply".to_string());
+                    args.push(options.thread.clone());
+                    push_optional_flag_value(&mut args, "--message", options.message.as_deref());
                 }
             }
         }
@@ -3633,11 +3656,7 @@ fn gmail_mount_settings_json(args: &[String]) -> Result<String, CommandError> {
         .map_err(|error| {
             CommandError::new("mount", "gmail_view_invalid", locality_error_message(error))
         })?
-        .unwrap_or(GmailProjectionView::Messages);
-
-    if after.is_none() && before.is_none() && view == GmailProjectionView::Messages {
-        return Ok("{}".to_string());
-    }
+        .unwrap_or(GmailProjectionView::Threads);
 
     let settings = match (after, before) {
         (None, None) => GmailMountSettings::default().with_view(view),
@@ -5167,15 +5186,57 @@ fn create(args: &[String], json: bool) -> i32 {
     match first_positional(args) {
         Some("page") => create_page(args, json),
         Some("database") => create_database(args, json),
+        Some("gmail-reply") => create_gmail_reply(args, json),
         _ => command_error(
             json,
             CommandError::new(
                 "create",
                 "usage",
-                "usage: loc create <page|database> [options] [--json]",
+                "usage: loc create <page|database|gmail-reply> [options] [--json]",
             ),
             EXIT_USAGE,
         ),
+    }
+}
+
+fn create_gmail_reply(args: &[String], json: bool) -> i32 {
+    let Some(thread) = nth_positional(args, 1) else {
+        return command_error(
+            json,
+            CommandError::new(
+                "create_gmail_reply",
+                "missing_thread",
+                "a Gmail thread directory is required",
+            ),
+            EXIT_USAGE,
+        );
+    };
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("create_gmail_reply", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let options = CreateGmailReplyOptions {
+        thread: PathBuf::from(thread),
+        message: flag_value(args, "--message").map(str::to_string),
+        state_root: Some(state_root),
+    };
+    match run_create_gmail_reply(&mut store, options) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_create_gmail_reply_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => create_command_error(json, "create_gmail_reply", error),
     }
 }
 
@@ -6938,6 +6999,17 @@ fn print_create_database_report(report: &CreateDatabaseReport) {
     println!("  title: {}", report.title);
     println!("  mount: {}", report.mount_id);
     println!("  edit `_schema.yaml` to add properties before pushing");
+    println!("  next:");
+    for next in &report.next {
+        println!("    {next}");
+    }
+}
+
+fn print_create_gmail_reply_report(report: &CreateGmailReplyReport) {
+    println!("created Gmail reply draft {}", report.path);
+    println!("  thread: {}", report.thread_id);
+    println!("  replying to: {}", report.reply_to_message_id);
+    println!("  recipient: {}", report.recipient);
     println!("  next:");
     for next in &report.next {
         println!("    {next}");
@@ -8821,6 +8893,8 @@ fn create_command_error(json: bool, command: &'static str, error: CreateError) -
         | CreateError::MountNotFound(_)
         | CreateError::PrivateUnsupported { .. }
         | CreateError::DatabaseUnsupported { .. }
+        | CreateError::GmailReplyUnsupported { .. }
+        | CreateError::InvalidReply(_)
         | CreateError::ReadOnlyMount { .. }
         | CreateError::ReadOnlySource { .. }
         | CreateError::TargetExists(_) => EXIT_USAGE,
@@ -9410,6 +9484,7 @@ fn takes_value(arg: &str) -> bool {
             | "--limit"
             | "--title"
             | "--parent"
+            | "--message"
             | "--push-id"
     )
 }

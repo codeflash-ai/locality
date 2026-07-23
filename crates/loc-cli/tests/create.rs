@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use loc_cli::create::{
-    CreateDatabaseOptions, CreateError, CreatePageOptions, run_create_database, run_create_page,
+    CreateDatabaseOptions, CreateError, CreateGmailReplyOptions, CreatePageOptions,
+    run_create_database, run_create_gmail_reply, run_create_page,
 };
 use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_store::{
@@ -450,6 +451,187 @@ fn create_page_rejects_titles_that_are_paths() {
     assert!(matches!(error, CreateError::InvalidTitle(_)));
 }
 
+#[test]
+fn create_gmail_reply_writes_a_threaded_draft_from_the_selected_message() {
+    let fixture = CreateFixture::new("loc-create-gmail-reply");
+    let mut store = fixture.gmail_store(ProjectionMode::PlainFiles, false);
+    let thread = fixture.root.join("inbox/Quarterly update");
+    fs::create_dir_all(&thread).expect("thread directory");
+    fs::write(
+        thread.join("page.md"),
+        "---\ntitle: Quarterly update\n---\n",
+    )
+    .expect("thread page");
+    fs::write(
+        thread.join("2026-07-02-update.md"),
+        "---\nfrom: \"Earlier <earlier@example.com>\"\nsubject: \"Quarterly update\"\ngmail:\n  message_id: \"message-1\"\n  thread_id: \"thread-1\"\n  rfc_message_id: \"<message-1@example.com>\"\n  references:\n    - \"<root@example.com>\"\n---\nEarlier message\n",
+    )
+    .expect("first message");
+    fs::write(
+        thread.join("2026-07-03-reply.md"),
+        "---\nfrom: \"Latest <latest@example.com>\"\nsubject: \"Quarterly update\"\ngmail:\n  message_id: \"message-2\"\n  thread_id: \"thread-1\"\n  rfc_message_id: \"<message-2@example.com>\"\n  reply_to: \"reply@example.com\"\n  references:\n    - \"<root@example.com>\"\n---\nLatest message\n",
+    )
+    .expect("latest message");
+
+    let report = run_create_gmail_reply(
+        &mut store,
+        CreateGmailReplyOptions {
+            thread: thread.clone(),
+            message: Some("2026-07-02-update.md".to_string()),
+            state_root: None,
+        },
+    )
+    .expect("create Gmail reply");
+
+    assert_eq!(report.command, "create_gmail_reply");
+    assert_eq!(report.thread_id, "thread-1");
+    assert_eq!(report.reply_to_message_id, "message-1");
+    assert_eq!(report.recipient, "Earlier <earlier@example.com>");
+    assert_eq!(report.subject, "Quarterly update");
+    let draft = fs::read_to_string(&report.path).expect("reply draft");
+    assert_eq!(
+        draft,
+        "---\nto: \"Earlier <earlier@example.com>\"\nsubject: \"Quarterly update\"\ngmail:\n  thread_id: \"thread-1\"\n  reply_to_message_id: \"message-1\"\n  in_reply_to: \"<message-1@example.com>\"\n  references:\n    - \"<root@example.com>\"\n    - \"<message-1@example.com>\"\n---\n\n"
+    );
+    assert!(Path::new(&report.path).starts_with(fixture.root.join("draft")));
+}
+
+#[test]
+fn create_gmail_reply_selects_a_message_by_gmail_message_id() {
+    let fixture = CreateFixture::new("loc-create-gmail-reply-message-id");
+    let mut store = fixture.gmail_store(ProjectionMode::PlainFiles, false);
+    let thread = fixture.root.join("inbox/Quarterly update");
+    fs::create_dir_all(&thread).expect("thread directory");
+    fs::write(
+        thread.join("2026-07-02-update.md"),
+        "---\nfrom: \"Earlier <earlier@example.com>\"\nsubject: \"Quarterly update\"\ngmail:\n  message_id: \"gmail-message-1\"\n  thread_id: \"thread-1\"\n  rfc_message_id: \"<message-1@example.com>\"\n---\nEarlier message\n",
+    )
+    .expect("first message");
+    fs::write(
+        thread.join("2026-07-03-update.md"),
+        "---\nfrom: \"Later <later@example.com>\"\nsubject: \"Quarterly update\"\ngmail:\n  message_id: \"gmail-message-2\"\n  thread_id: \"thread-1\"\n  rfc_message_id: \"<message-2@example.com>\"\n---\nLater message\n",
+    )
+    .expect("second message");
+
+    let report = run_create_gmail_reply(
+        &mut store,
+        CreateGmailReplyOptions {
+            thread,
+            message: Some("gmail-message-1".to_string()),
+            state_root: None,
+        },
+    )
+    .expect("create reply from Gmail message ID");
+
+    assert_eq!(report.reply_to_message_id, "gmail-message-1");
+    assert_eq!(report.recipient, "Earlier <earlier@example.com>");
+}
+
+#[test]
+fn create_gmail_reply_uses_unique_bounded_draft_filenames() {
+    let fixture = CreateFixture::new("loc-create-gmail-reply-filenames");
+    let mut store = fixture.gmail_store(ProjectionMode::PlainFiles, false);
+    let thread = fixture.root.join("inbox/Long subject");
+    fs::create_dir_all(&thread).expect("thread directory");
+    let subject = "📬 A very long subject ".repeat(20);
+    fs::write(
+        thread.join("message.md"),
+        format!(
+            "---\nfrom: \"sender@example.com\"\nsubject: {subject:?}\ngmail:\n  message_id: \"message-1\"\n  thread_id: \"thread-1\"\n  rfc_message_id: \"<message-1@example.com>\"\n---\nMessage\n"
+        ),
+    )
+    .expect("message");
+
+    let first = run_create_gmail_reply(
+        &mut store,
+        CreateGmailReplyOptions {
+            thread: thread.clone(),
+            message: None,
+            state_root: None,
+        },
+    )
+    .expect("first reply");
+    let second = run_create_gmail_reply(
+        &mut store,
+        CreateGmailReplyOptions {
+            thread,
+            message: None,
+            state_root: None,
+        },
+    )
+    .expect("second reply");
+
+    assert_ne!(first.path, second.path);
+    for path in [&first.path, &second.path] {
+        let filename = Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("draft filename");
+        assert!(
+            filename.len() <= 128,
+            "filename was not bounded: {filename}"
+        );
+        assert!(
+            filename.starts_with("reply-"),
+            "unexpected filename: {filename}"
+        );
+    }
+}
+
+#[test]
+fn cli_create_gmail_reply_defaults_to_the_latest_thread_message() {
+    let fixture = CreateFixture::new("loc-create-gmail-reply-cli");
+    let state_root = fixture.temp.path("state");
+    let mut store = SqliteStateStore::open(state_root.clone()).expect("sqlite");
+    store
+        .save_mount(MountConfig {
+            mount_id: MountId::new("gmail-main"),
+            connector: "gmail".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: None,
+            connection_id: None,
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
+        })
+        .expect("save Gmail mount");
+    let thread = fixture.root.join("inbox/Quarterly update");
+    fs::create_dir_all(&thread).expect("thread directory");
+    fs::write(
+        thread.join("2026-07-03-latest.md"),
+        "---\nfrom: \"Latest <latest@example.com>\"\nsubject: \"Quarterly update\"\ngmail:\n  message_id: \"message-2\"\n  thread_id: \"thread-1\"\n  rfc_message_id: \"<message-2@example.com>\"\n---\nLatest message\n",
+    )
+    .expect("message");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_loc"))
+        .env("LOCALITY_STATE_DIR", &state_root)
+        .args([
+            "create",
+            "gmail-reply",
+            thread.to_str().expect("thread path"),
+            "--json",
+        ])
+        .output()
+        .expect("loc create gmail-reply");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+    assert_eq!(report["command"], "create_gmail_reply");
+    assert_eq!(report["thread_id"], "thread-1");
+    assert_eq!(report["reply_to_message_id"], "message-2");
+    assert_eq!(report["recipient"], "Latest <latest@example.com>");
+    let draft = fs::read_to_string(report["path"].as_str().expect("draft path")).expect("draft");
+    assert!(
+        draft.contains("in_reply_to: \"<message-2@example.com>\""),
+        "{draft}"
+    );
+}
+
 struct CreateFixture {
     temp: TestTempDir,
     root: PathBuf,
@@ -498,6 +680,23 @@ impl CreateFixture {
                 settings_json: "{}".to_string(),
             })
             .expect("save mount");
+        store
+    }
+
+    fn gmail_store(&self, projection: ProjectionMode, read_only: bool) -> InMemoryStateStore {
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(MountConfig {
+                mount_id: MountId::new("gmail-main"),
+                connector: "gmail".to_string(),
+                root: self.root.clone(),
+                remote_root_id: None,
+                connection_id: None,
+                read_only,
+                projection,
+                settings_json: "{}".to_string(),
+            })
+            .expect("save Gmail mount");
         store
     }
 }

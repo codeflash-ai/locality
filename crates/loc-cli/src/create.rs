@@ -3,8 +3,9 @@
 //! Creation stays filesystem-first: this module writes the draft shape that
 //! push and Live Mode already understand. It does not call remote connectors.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io;
+use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,7 +20,9 @@ use locality_store::{
 use localityd::file_provider;
 use localityd::source::{source_create_decision_for_parent_path, source_display_name};
 use localityd::virtual_fs::virtual_fs_content_path;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+const MAX_GMAIL_REPLY_FILENAME_BYTES: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreatePageOptions {
@@ -62,6 +65,27 @@ pub struct CreateDatabaseReport {
     pub path: String,
     pub mount_id: String,
     pub connector: String,
+    pub next: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateGmailReplyOptions {
+    pub thread: PathBuf,
+    pub message: Option<String>,
+    pub state_root: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CreateGmailReplyReport {
+    pub ok: bool,
+    pub command: &'static str,
+    pub kind: &'static str,
+    pub path: String,
+    pub mount_id: String,
+    pub thread_id: String,
+    pub reply_to_message_id: String,
+    pub recipient: String,
+    pub subject: String,
     pub next: Vec<String>,
 }
 
@@ -266,6 +290,291 @@ where
     })
 }
 
+pub fn run_create_gmail_reply<S>(
+    store: &mut S,
+    options: CreateGmailReplyOptions,
+) -> Result<CreateGmailReplyReport, CreateError>
+where
+    S: EntityRepository + MountRepository + VirtualMutationRepository,
+{
+    let mut thread = absolute_path(&options.thread)?;
+    if thread.file_name().and_then(|name| name.to_str()) == Some(PAGE_DOCUMENT_FILENAME) {
+        thread = thread.parent().map(Path::to_path_buf).ok_or_else(|| {
+            CreateError::InvalidReply("thread page has no parent directory".into())
+        })?;
+    }
+    let mounts = store.load_mounts().map_err(CreateError::Store)?;
+    let (mount, _) = file_provider::find_mount_for_path(&mounts, &thread)
+        .ok_or_else(|| CreateError::MountNotFound(thread.clone()))?;
+    if mount.read_only {
+        return Err(CreateError::ReadOnlyMount {
+            mount_id: mount.mount_id.0.clone(),
+        });
+    }
+    if mount.connector != "gmail" {
+        return Err(CreateError::GmailReplyUnsupported {
+            connector: mount.connector.clone(),
+        });
+    }
+    let relative_thread = relative_path(mount, &thread)?;
+    if !matches!(relative_thread.components().next(), Some(Component::Normal(folder)) if folder == "inbox" || folder == "sent")
+    {
+        return Err(CreateError::InvalidReply(
+            "Gmail replies must target an inbox/ or sent/ thread directory".to_string(),
+        ));
+    }
+
+    let mut messages = Vec::new();
+    for entry in fs::read_dir(&thread).map_err(|error| CreateError::WriteFile {
+        path: thread.clone(),
+        message: error.to_string(),
+    })? {
+        let entry = entry.map_err(|error| CreateError::WriteFile {
+            path: thread.clone(),
+            message: error.to_string(),
+        })?;
+        let path = entry.path();
+        if path.file_name().and_then(|name| name.to_str()) == Some(PAGE_DOCUMENT_FILENAME)
+            || path.extension().and_then(|extension| extension.to_str()) != Some("md")
+        {
+            continue;
+        }
+        let content = fs::read_to_string(&path).map_err(|error| CreateError::WriteFile {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+        if let Some(frontmatter) = markdown_frontmatter(&content) {
+            let parsed =
+                yaml_serde::from_str::<ReplyMessageFrontmatter>(frontmatter).map_err(|error| {
+                    CreateError::InvalidReply(format!(
+                        "cannot read Gmail metadata from `{}`: {error}",
+                        path.display()
+                    ))
+                })?;
+            if parsed.gmail.thread_id.trim().is_empty()
+                || parsed.gmail.message_id.trim().is_empty()
+                || parsed.gmail.rfc_message_id.trim().is_empty()
+            {
+                continue;
+            }
+            messages.push(ReplyMessage { path, parsed });
+        }
+    }
+    if messages.is_empty() {
+        return Err(CreateError::InvalidReply(
+            "thread has no hydrated message files with Gmail reply metadata; open or pull a message first"
+                .to_string(),
+        ));
+    }
+
+    let selected = if let Some(selector) = options.message.as_deref() {
+        let selector_path = Path::new(selector);
+        messages
+            .iter()
+            .find(|message| {
+                message.path == selector_path
+                    || message.path.file_name() == selector_path.file_name()
+                    || message.path.strip_prefix(&thread).ok() == Some(selector_path)
+                    || message.parsed.gmail.message_id == selector
+            })
+            .ok_or_else(|| {
+                CreateError::InvalidReply(format!(
+                    "no hydrated message in the thread matches `{selector}`"
+                ))
+            })?
+    } else {
+        messages
+            .iter()
+            .max_by(|left, right| reply_message_order(left).cmp(&reply_message_order(right)))
+            .expect("messages is not empty")
+    };
+
+    let thread_id = selected.parsed.gmail.thread_id.trim().to_string();
+    if messages
+        .iter()
+        .any(|message| message.parsed.gmail.thread_id.trim() != thread_id)
+    {
+        return Err(CreateError::InvalidReply(
+            "thread directory contains messages from different Gmail threads".to_string(),
+        ));
+    }
+    let recipient = selected
+        .parsed
+        .gmail
+        .reply_to
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&selected.parsed.from)
+        .trim()
+        .to_string();
+    if recipient.is_empty() {
+        return Err(CreateError::InvalidReply(
+            "selected message has neither Reply-To nor From metadata".to_string(),
+        ));
+    }
+    let subject = selected.parsed.subject.trim().to_string();
+    if subject.is_empty() {
+        return Err(CreateError::InvalidReply(
+            "selected message has no subject".to_string(),
+        ));
+    }
+    let rfc_message_id = selected.parsed.gmail.rfc_message_id.trim().to_string();
+    let mut references = selected.parsed.gmail.references.clone();
+    if !references
+        .iter()
+        .any(|reference| reference == &rfc_message_id)
+    {
+        references.push(rfc_message_id.clone());
+    }
+    let body = gmail_reply_markdown(
+        &recipient,
+        &subject,
+        &thread_id,
+        &selected.parsed.gmail.message_id,
+        &rfc_message_id,
+        &references,
+    );
+    let draft_dir = mount.root.join("draft");
+    let draft_path = unique_reply_draft_path(&draft_dir, &subject);
+    if mount.projection.uses_virtual_filesystem() {
+        let state_root = options
+            .state_root
+            .as_deref()
+            .ok_or(CreateError::VirtualStateRootRequired)?;
+        stage_virtual_file(
+            store,
+            mount,
+            state_root,
+            &draft_path,
+            &body,
+            Some(RemoteId::new("gmail-folder:draft")),
+        )?;
+    } else {
+        fs::create_dir_all(&draft_dir).map_err(|error| CreateError::WriteFile {
+            path: draft_dir.clone(),
+            message: error.to_string(),
+        })?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&draft_path)
+            .map_err(|error| CreateError::WriteFile {
+                path: draft_path.clone(),
+                message: error.to_string(),
+            })?;
+        file.write_all(body.as_bytes())
+            .map_err(|error| CreateError::WriteFile {
+                path: draft_path.clone(),
+                message: error.to_string(),
+            })?;
+    }
+
+    let path = draft_path.display().to_string();
+    Ok(CreateGmailReplyReport {
+        ok: true,
+        command: "create_gmail_reply",
+        kind: "gmail_reply_draft",
+        path: path.clone(),
+        mount_id: mount.mount_id.0.clone(),
+        thread_id,
+        reply_to_message_id: selected.parsed.gmail.message_id.clone(),
+        recipient,
+        subject,
+        next: vec![
+            format!("loc diff {}", shell_quote_path(&path)),
+            format!("loc push {} -y", shell_quote_path(&path)),
+        ],
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplyMessageFrontmatter {
+    #[serde(default)]
+    from: String,
+    #[serde(default)]
+    subject: String,
+    gmail: ReplyGmailFrontmatter,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplyGmailFrontmatter {
+    message_id: String,
+    thread_id: String,
+    rfc_message_id: String,
+    reply_to: Option<String>,
+    #[serde(default)]
+    references: Vec<String>,
+    internal_date: Option<String>,
+}
+
+struct ReplyMessage {
+    path: PathBuf,
+    parsed: ReplyMessageFrontmatter,
+}
+
+fn markdown_frontmatter(markdown: &str) -> Option<&str> {
+    let rest = markdown.strip_prefix("---\n")?;
+    let end = rest.find("\n---")?;
+    Some(&rest[..end])
+}
+
+fn reply_message_order(message: &ReplyMessage) -> (u64, String) {
+    let internal_date = message
+        .parsed
+        .gmail
+        .internal_date
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    (internal_date, message.path.display().to_string())
+}
+
+fn unique_reply_draft_path(draft_dir: &Path, subject: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let prefix = format!("reply-{stamp}-{counter}-");
+    let suffix = ".md";
+    let slug_budget = MAX_GMAIL_REPLY_FILENAME_BYTES
+        .saturating_sub(prefix.len())
+        .saturating_sub(suffix.len());
+    let mut slug = page_directory_name_for_title(subject);
+    if slug.len() > slug_budget {
+        let mut end = slug_budget;
+        while !slug.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        slug.truncate(end);
+    }
+    draft_dir.join(format!("{prefix}{slug}{suffix}"))
+}
+
+fn gmail_reply_markdown(
+    recipient: &str,
+    subject: &str,
+    thread_id: &str,
+    reply_to_message_id: &str,
+    in_reply_to: &str,
+    references: &[String],
+) -> String {
+    let mut output = format!(
+        "---\nto: {}\nsubject: {}\ngmail:\n  thread_id: {}\n  reply_to_message_id: {}\n  in_reply_to: {}\n  references:\n",
+        yaml_double_quoted(recipient),
+        yaml_double_quoted(subject),
+        yaml_double_quoted(thread_id),
+        yaml_double_quoted(reply_to_message_id),
+        yaml_double_quoted(in_reply_to),
+    );
+    for reference in references {
+        output.push_str(&format!("    - {}\n", yaml_double_quoted(reference)));
+    }
+    output.push_str("---\n\n");
+    output
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CreateError {
     CurrentDir {
@@ -279,6 +588,10 @@ pub enum CreateError {
     DatabaseUnsupported {
         connector: String,
     },
+    GmailReplyUnsupported {
+        connector: String,
+    },
+    InvalidReply(String),
     InvalidParent {
         path: PathBuf,
         message: String,
@@ -308,6 +621,8 @@ impl CreateError {
             Self::MountNotFound(_) => "mount_not_found",
             Self::PrivateUnsupported { .. } => "private_unsupported",
             Self::DatabaseUnsupported { .. } => "database_unsupported",
+            Self::GmailReplyUnsupported { .. } => "gmail_reply_unsupported",
+            Self::InvalidReply(_) => "invalid_gmail_reply",
             Self::InvalidParent { .. } => "invalid_parent",
             Self::ReadOnlyMount { .. } => "read_only_mount",
             Self::ReadOnlySource { .. } => "read_only_source",
@@ -333,6 +648,10 @@ impl CreateError {
             Self::DatabaseUnsupported { connector } => {
                 format!("database creation is only supported for Notion mounts, not `{connector}`")
             }
+            Self::GmailReplyUnsupported { connector } => {
+                format!("Gmail replies are only supported for Gmail mounts, not `{connector}`")
+            }
+            Self::InvalidReply(message) => message.clone(),
             Self::InvalidParent { path, message } => {
                 format!("cannot create inside `{}`: {message}", path.display())
             }

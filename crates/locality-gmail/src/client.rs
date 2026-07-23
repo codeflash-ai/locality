@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::dto::{
-    GmailDraft, GmailDraftCreateRequest, GmailDraftSendRequest, GmailMessage, GmailMessageList,
+    GmailDraft, GmailDraftCreateRequest, GmailDraftList, GmailMessage, GmailMessageList,
     GmailMessagePartBody, GmailThread, GmailThreadList,
 };
 
@@ -38,13 +38,24 @@ pub trait GmailApi: std::fmt::Debug + Send + Sync {
     fn get_message_full(&self, message_id: &str) -> LocalityResult<GmailMessage>;
     fn get_thread_metadata(&self, thread_id: &str) -> LocalityResult<GmailThread>;
     fn get_thread_full(&self, thread_id: &str) -> LocalityResult<GmailThread>;
+    fn list_drafts(
+        &self,
+        max_results: u32,
+        page_token: Option<&str>,
+    ) -> LocalityResult<GmailDraftList>;
+    fn get_draft_metadata(&self, draft_id: &str) -> LocalityResult<GmailDraft>;
+    fn get_draft_full(&self, draft_id: &str) -> LocalityResult<GmailDraft>;
     fn get_attachment(
         &self,
         message_id: &str,
         attachment_id: &str,
     ) -> LocalityResult<GmailMessagePartBody>;
     fn create_draft(&self, request: GmailDraftCreateRequest) -> LocalityResult<GmailDraft>;
-    fn send_draft(&self, request: GmailDraftSendRequest) -> LocalityResult<GmailMessage>;
+    fn update_draft(
+        &self,
+        draft_id: &str,
+        request: GmailDraftCreateRequest,
+    ) -> LocalityResult<GmailDraft>;
 }
 
 #[derive(Clone)]
@@ -110,6 +121,21 @@ impl HttpGmailApiClient {
             context,
         )
     }
+
+    fn put_json_with_context<T, B>(&self, path: &str, body: &B, context: &str) -> LocalityResult<T>
+    where
+        T: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
+        decode_response(
+            self.client
+                .put(format!("{}{}", self.base_url, path))
+                .bearer_auth(&self.access_token)
+                .json(body)
+                .send(),
+            context,
+        )
+    }
 }
 
 impl GmailApi for HttpGmailApiClient {
@@ -155,7 +181,18 @@ impl GmailApi for HttpGmailApiClient {
 
     fn get_message_metadata(&self, message_id: &str) -> LocalityResult<GmailMessage> {
         let mut query = vec![("format".to_string(), "metadata".to_string())];
-        for header in ["From", "To", "Cc", "Bcc", "Subject", "Date", "Message-ID"] {
+        for header in [
+            "From",
+            "Reply-To",
+            "To",
+            "Cc",
+            "Bcc",
+            "Subject",
+            "Date",
+            "Message-ID",
+            "References",
+            "In-Reply-To",
+        ] {
             query.push(("metadataHeaders".to_string(), header.to_string()));
         }
         self.get_json(&format!("/users/me/messages/{message_id}"), query)
@@ -171,7 +208,18 @@ impl GmailApi for HttpGmailApiClient {
     fn get_thread_metadata(&self, thread_id: &str) -> LocalityResult<GmailThread> {
         let thread_id = percent_encode_path_segment(thread_id);
         let mut query = vec![("format".to_string(), "metadata".to_string())];
-        for header in ["From", "To", "Cc", "Bcc", "Subject", "Date", "Message-ID"] {
+        for header in [
+            "From",
+            "Reply-To",
+            "To",
+            "Cc",
+            "Bcc",
+            "Subject",
+            "Date",
+            "Message-ID",
+            "References",
+            "In-Reply-To",
+        ] {
             query.push(("metadataHeaders".to_string(), header.to_string()));
         }
         self.get_json(&format!("/users/me/threads/{thread_id}"), query)
@@ -181,6 +229,46 @@ impl GmailApi for HttpGmailApiClient {
         let thread_id = percent_encode_path_segment(thread_id);
         self.get_json(
             &format!("/users/me/threads/{thread_id}"),
+            vec![("format".to_string(), "full".to_string())],
+        )
+    }
+
+    fn list_drafts(
+        &self,
+        max_results: u32,
+        page_token: Option<&str>,
+    ) -> LocalityResult<GmailDraftList> {
+        let mut params = vec![("maxResults".to_string(), max_results.to_string())];
+        if let Some(page_token) = page_token {
+            params.push(("pageToken".to_string(), page_token.to_string()));
+        }
+        self.get_json("/users/me/drafts", params)
+    }
+
+    fn get_draft_metadata(&self, draft_id: &str) -> LocalityResult<GmailDraft> {
+        let draft_id = percent_encode_path_segment(draft_id);
+        let mut query = vec![("format".to_string(), "metadata".to_string())];
+        for header in [
+            "From",
+            "Reply-To",
+            "To",
+            "Cc",
+            "Bcc",
+            "Subject",
+            "Date",
+            "Message-ID",
+            "References",
+            "In-Reply-To",
+        ] {
+            query.push(("metadataHeaders".to_string(), header.to_string()));
+        }
+        self.get_json(&format!("/users/me/drafts/{draft_id}"), query)
+    }
+
+    fn get_draft_full(&self, draft_id: &str) -> LocalityResult<GmailDraft> {
+        let draft_id = percent_encode_path_segment(draft_id);
+        self.get_json(
+            &format!("/users/me/drafts/{draft_id}"),
             vec![("format".to_string(), "full".to_string())],
         )
     }
@@ -202,8 +290,17 @@ impl GmailApi for HttpGmailApiClient {
         self.post_json_with_context("/users/me/drafts", &request, "gmail draft create")
     }
 
-    fn send_draft(&self, request: GmailDraftSendRequest) -> LocalityResult<GmailMessage> {
-        self.post_json_with_context("/users/me/drafts/send", &request, "gmail draft send")
+    fn update_draft(
+        &self,
+        draft_id: &str,
+        request: GmailDraftCreateRequest,
+    ) -> LocalityResult<GmailDraft> {
+        let draft_id = percent_encode_path_segment(draft_id);
+        self.put_json_with_context(
+            &format!("/users/me/drafts/{draft_id}"),
+            &request,
+            "gmail draft update",
+        )
     }
 }
 
@@ -268,6 +365,8 @@ mod tests {
 
     use locality_core::LocalityError;
 
+    use crate::dto::{GmailDraftCreateRequest, GmailRawMessage};
+
     use super::{GmailApi, HttpGmailApiClient};
 
     #[test]
@@ -308,12 +407,15 @@ mod tests {
             metadata_headers,
             vec![
                 "metadataHeaders=From",
+                "metadataHeaders=Reply-To",
                 "metadataHeaders=To",
                 "metadataHeaders=Cc",
                 "metadataHeaders=Bcc",
                 "metadataHeaders=Subject",
                 "metadataHeaders=Date",
                 "metadataHeaders=Message-ID",
+                "metadataHeaders=References",
+                "metadataHeaders=In-Reply-To",
             ]
         );
         assert!(!query.contains("From%2CTo"));
@@ -390,6 +492,111 @@ mod tests {
         assert_eq!(target, "/users/me/threads/thread%2F1%20space?format=full");
         assert!(!target.contains("thread/1"), "{target}");
         assert!(!target.contains(' '), "{target}");
+    }
+
+    #[test]
+    fn list_drafts_uses_gmail_drafts_endpoint_with_pagination() {
+        let (base_url, request_rx, server) = spawn_response_server(
+            "HTTP/1.1 200 OK",
+            r#"{"drafts":[{"id":"draft-1","message":{"id":"message-1"}}],"nextPageToken":"next"}"#,
+        );
+        let client = HttpGmailApiClient::with_base_url("access-token", base_url);
+
+        let drafts = client.list_drafts(100, Some("page-2")).expect("draft list");
+
+        assert_eq!(drafts.drafts[0].id, "draft-1");
+        assert_eq!(drafts.next_page_token.as_deref(), Some("next"));
+        let request = request_rx.recv().expect("request");
+        server.join().expect("server exits");
+        assert!(
+            request.starts_with("GET /users/me/drafts?maxResults=100&pageToken=page-2 "),
+            "{request}"
+        );
+    }
+
+    #[test]
+    fn get_draft_metadata_percent_encodes_id_and_requests_reply_headers() {
+        let (base_url, request_rx, server) = spawn_response_server(
+            "HTTP/1.1 200 OK",
+            r#"{"id":"draft/1","message":{"id":"message-1","threadId":"thread-1"}}"#,
+        );
+        let client = HttpGmailApiClient::with_base_url("access-token", base_url);
+
+        let draft = client
+            .get_draft_metadata("draft/1 space")
+            .expect("draft metadata");
+
+        assert_eq!(draft.id, "draft/1");
+        let request = request_rx.recv().expect("request");
+        server.join().expect("server exits");
+        let request_line = request.lines().next().expect("request line");
+        assert!(
+            request_line.starts_with("GET /users/me/drafts/draft%2F1%20space?format=metadata&"),
+            "{request_line}"
+        );
+        assert!(
+            request_line.contains("metadataHeaders=Reply-To"),
+            "{request_line}"
+        );
+        assert!(
+            request_line.contains("metadataHeaders=References"),
+            "{request_line}"
+        );
+        assert!(
+            request_line.contains("metadataHeaders=In-Reply-To"),
+            "{request_line}"
+        );
+    }
+
+    #[test]
+    fn get_draft_full_requests_full_format() {
+        let (base_url, request_rx, server) = spawn_response_server(
+            "HTTP/1.1 200 OK",
+            r#"{"id":"draft-1","message":{"id":"message-1"}}"#,
+        );
+        let client = HttpGmailApiClient::with_base_url("access-token", base_url);
+
+        client.get_draft_full("draft-1").expect("draft full");
+
+        let request = request_rx.recv().expect("request");
+        server.join().expect("server exits");
+        assert!(
+            request.starts_with("GET /users/me/drafts/draft-1?format=full "),
+            "{request}"
+        );
+    }
+
+    #[test]
+    fn update_draft_puts_threaded_raw_message_to_percent_encoded_draft_path() {
+        let (base_url, request_rx, server) = spawn_response_server(
+            "HTTP/1.1 200 OK",
+            r#"{"id":"draft/1","message":{"id":"message-2","threadId":"thread-1"}}"#,
+        );
+        let client = HttpGmailApiClient::with_base_url("access-token", base_url);
+
+        let draft = client
+            .update_draft(
+                "draft/1",
+                GmailDraftCreateRequest {
+                    message: GmailRawMessage {
+                        raw: "base64url-mime".to_string(),
+                        thread_id: Some("thread-1".to_string()),
+                    },
+                },
+            )
+            .expect("draft update");
+
+        assert_eq!(draft.message.id, "message-2");
+        let request = request_rx.recv().expect("request");
+        server.join().expect("server exits");
+        let (headers, body) = request.split_once("\r\n\r\n").expect("request body");
+        assert!(
+            headers.starts_with("PUT /users/me/drafts/draft%2F1 HTTP/1.1\r\n"),
+            "{headers}"
+        );
+        let body: serde_json::Value = serde_json::from_str(body).expect("JSON request body");
+        assert_eq!(body["message"]["raw"], "base64url-mime");
+        assert_eq!(body["message"]["threadId"], "thread-1");
     }
 
     #[test]
@@ -482,8 +689,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept request");
             let request = read_http_request(&mut stream);
-            let request_line = request.lines().next().unwrap_or_default().to_string();
-            request_tx.send(request_line).expect("send request line");
+            request_tx.send(request).expect("send request");
             let response = format!(
                 "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -504,8 +710,17 @@ mod tests {
                 break;
             }
             request.extend_from_slice(&buffer[..bytes_read]);
-            if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                break;
+            if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
             }
         }
         String::from_utf8(request).expect("utf8 request")

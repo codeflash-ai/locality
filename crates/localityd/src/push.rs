@@ -320,15 +320,17 @@ where
         + VirtualMutationRepository,
     Source: Connector + HydrationSource + ?Sized,
 {
-    if let Some(report) = block_ambiguous_gmail_send_replay(store, &prepared)? {
-        return Ok(report);
-    }
     if let Some(report) =
         resume_failed_applied_reconciliation(store, source, &prepared, state_root)?
     {
         return Ok(report);
     }
 
+    // Gmail derives a draft's RFC Message-ID from the push and operation IDs.
+    // Reusing an incomplete draft-create journal's idempotency key lets the
+    // connector find a draft created before a crash instead of creating a
+    // second one, while recording this retry in a distinct local journal.
+    let idempotency_push_id = retryable_gmail_draft_create_push_id(store, &prepared)?;
     let push_id = generate_push_id();
     let remote_preconditions = remote_preconditions_for_plan(
         store,
@@ -362,6 +364,10 @@ where
             .with_local_projection_items(local_projection_items),
     )
     .with_readable_diff(readable_diff.clone());
+
+    if let Some(idempotency_push_id) = idempotency_push_id {
+        execution_request = execution_request.with_idempotency_push_id(idempotency_push_id);
+    }
 
     if !prepared.shadows.is_empty() {
         execution_request = execution_request.with_preimages(
@@ -456,10 +462,10 @@ where
     Ok(items)
 }
 
-fn block_ambiguous_gmail_send_replay<S>(
+fn retryable_gmail_draft_create_push_id<S>(
     store: &S,
     prepared: &PreparedPush,
-) -> LocalityResult<Option<PushJobReport>>
+) -> LocalityResult<Option<PushId>>
 where
     S: JournalRepository,
 {
@@ -480,63 +486,27 @@ where
         return Ok(None);
     }
 
-    let Some(journal) = latest_ambiguous_gmail_send_journal(store, &prepared.mount.mount_id, plan)?
-    else {
-        return Ok(None);
-    };
-    let error = LocalityError::Guardrail(
-        "a previous Gmail send for this draft has an ambiguous result and may have already sent; inspect Gmail Sent Mail and the Locality journal before retrying"
-            .to_string(),
-    );
-
-    Ok(Some(PushJobReport {
-        target_path: prepared.absolute_path.clone(),
-        mount_id: prepared.mount.mount_id.clone(),
-        entity_id: prepared.entity.remote_id.clone(),
-        pipeline: prepared.pipeline.clone(),
-        readable_diff: prepared.readable_diff.clone(),
-        action: PushJobAction::Failed,
-        execution: None,
-        push_id: Some(journal.push_id),
-        journal_status: Some(journal.status),
-        error: Some(PushJobError::from(error)),
-    }))
-}
-
-fn latest_ambiguous_gmail_send_journal<S>(
-    store: &S,
-    mount_id: &MountId,
-    plan: &PushPlan,
-) -> LocalityResult<Option<JournalEntry>>
-where
-    S: JournalRepository,
-{
-    let mut latest = None;
+    let mut retryable = None;
     for journal in store.list_journal().map_err(LocalityError::from)? {
-        if journal.mount_id != *mount_id
-            || !journal_created_entity_source_paths_match(&journal.plan, plan)
+        if journal.mount_id != prepared.mount.mount_id
+            || journal.plan != *plan
+            || !journal.apply_effects.is_empty()
+            || !matches!(
+                journal.status,
+                JournalStatus::Applying | JournalStatus::Failed(_)
+            )
         {
             continue;
         }
-        if latest
+        if retryable
             .as_ref()
-            .is_none_or(|current| journal_is_newer(&journal, current))
+            .is_none_or(|current: &JournalEntry| journal_is_newer(&journal, current))
         {
-            latest = Some(journal);
+            retryable = Some(journal);
         }
     }
 
-    Ok(latest.filter(|journal: &JournalEntry| {
-        journal.apply_effects.is_empty() && ambiguous_gmail_send_status(&journal.status)
-    }))
-}
-
-fn ambiguous_gmail_send_status(status: &JournalStatus) -> bool {
-    match status {
-        JournalStatus::Applying => true,
-        JournalStatus::Failed(message) => message.contains("gmail draft send"),
-        _ => false,
-    }
+    Ok(retryable.map(|journal| journal.push_id))
 }
 
 fn resume_failed_applied_reconciliation<S, Source>(
@@ -834,14 +804,6 @@ fn journal_created_entity_sources_match(journal: &JournalEntry, plan: &PushPlan)
     }
 
     current_sources.is_empty()
-}
-
-fn journal_created_entity_source_paths_match(left: &PushPlan, right: &PushPlan) -> bool {
-    let mut left_sources = plan_create_entity_sources(left);
-    let mut right_sources = plan_create_entity_sources(right);
-    left_sources.sort();
-    right_sources.sort();
-    left_sources == right_sources
 }
 
 fn plan_create_entity_sources(plan: &PushPlan) -> Vec<(&RemoteId, &PathBuf)> {
