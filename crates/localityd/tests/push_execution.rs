@@ -1051,7 +1051,7 @@ fn daemon_push_reconciles_created_database_to_canonical_schema_directory() {
 }
 
 #[test]
-fn daemon_push_reconciles_sent_gmail_draft_create_to_sent_folder() {
+fn daemon_push_reconciles_gmail_draft_create_to_draft_folder() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join(".state");
     let source_path = Path::new("draft/reply.md");
@@ -1066,8 +1066,7 @@ fn daemon_push_reconciles_sent_gmail_draft_create_to_sent_folder() {
     .expect("cache file");
 
     let draft_folder_id = RemoteId::new("gmail-folder:draft");
-    let sent_folder_id = RemoteId::new("gmail-folder:sent");
-    let created_remote_id = RemoteId::new("gmail-message:sent-1");
+    let created_remote_id = RemoteId::new("gmail-message:draft-1");
     let mut store = InMemoryStateStore::new();
     store
         .save_mount(
@@ -1085,21 +1084,12 @@ fn daemon_push_reconciles_sent_gmail_draft_create_to_sent_folder() {
         ))
         .expect("save draft folder");
     store
-        .save_entity(EntityRecord::new(
-            fixture.mount_id.clone(),
-            sent_folder_id.clone(),
-            EntityKind::Directory,
-            "sent",
-            "sent",
-        ))
-        .expect("save sent folder");
-    store
         .save_virtual_mutation(virtual_mutation(
             &fixture.mount_id,
             "local:gmail-draft",
             VirtualMutationKind::Create,
             None,
-            Some(draft_folder_id),
+            Some(draft_folder_id.clone()),
             "draft/reply.md",
             Some(cache_path),
         ))
@@ -1107,12 +1097,12 @@ fn daemon_push_reconciles_sent_gmail_draft_create_to_sent_folder() {
     let source = FakePushSource::default()
         .with_created_entity(
             created_remote_id.clone(),
-            rendered_entity("gmail-message:sent-1", "Body."),
+            rendered_entity("gmail-message:draft-1", "Body."),
         )
         .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
             operation_id: PushOperationId("create-gmail-draft".to_string()),
             operation_index: 0,
-            parent_id: sent_folder_id,
+            parent_id: draft_folder_id,
             entity_id: created_remote_id.clone(),
         }]);
 
@@ -1131,12 +1121,11 @@ fn daemon_push_reconciles_sent_gmail_draft_create_to_sent_folder() {
     assert_eq!(report.action, PushJobAction::Reconciled);
     let message = store
         .get_entity(&fixture.mount_id, &created_remote_id)
-        .expect("get sent message")
+        .expect("get draft message")
         .expect("sent message entity");
-    assert_eq!(message.path, PathBuf::from("sent/reply.md"));
+    assert_eq!(message.path, PathBuf::from("draft/reply.md"));
     assert_eq!(source.requested_paths(), vec![message.path.clone()]);
-    assert!(content_root.join("sent/reply.md").exists());
-    assert!(!content_root.join(source_path).exists());
+    assert!(content_root.join(source_path).exists());
     assert!(
         store
             .find_virtual_mutation_by_path(&fixture.mount_id, source_path)
@@ -1637,7 +1626,7 @@ fn auto_save_push_blocks_gmail_draft_send_without_applying() {
     );
     assert_eq!(
         report.error.as_ref().expect("error").message,
-        "Gmail draft sends require review"
+        "Gmail draft creation requires review"
     );
     let enrollment = store
         .get_auto_save_enrollment(&fixture.mount_id, source_path)
@@ -1646,7 +1635,7 @@ fn auto_save_push_blocks_gmail_draft_send_without_applying() {
     assert_eq!(enrollment.state, AutoSaveState::Blocked);
     assert_eq!(
         enrollment.last_reason.as_deref(),
-        Some("Gmail draft sends require review")
+        Some("Gmail draft creation requires review")
     );
     assert!(store.list_journal().expect("journal").is_empty());
 }
