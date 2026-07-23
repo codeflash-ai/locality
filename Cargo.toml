@@ -14,6 +14,7 @@ members = [
   "crates/locality-granola",
   "crates/locality-linear",
   "crates/locality-slack",
+  "crates/locality-planned-connectors",
   "platform/linux/locality-fuse",
   "platform/windows/locality-cloud-files",
 ]
@@ -37,3 +38,4 @@ locality-gmail = { path = "crates/locality-gmail" }
 locality-granola = { path = "crates/locality-granola" }
 locality-linear = { path = "crates/locality-linear" }
 locality-slack = { path = "crates/locality-slack" }
+locality-planned-connectors = { path = "crates/locality-planned-connectors" }
