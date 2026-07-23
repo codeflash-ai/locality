@@ -44,11 +44,13 @@ describe("source setup progress", () => {
       "google-calendar",
       "gmail",
       "granola",
+      "github",
       "linear",
       "slack",
     ]);
     expect(sourceConnectorDefinitions().map((connector) => connector.id)).toEqual(sourceConnectorIds());
     expect(sourceRequiresApiKey("linear")).toBe(true);
+    expect(sourceRequiresApiKey("github")).toBe(true);
     expect(sourceRequiresApiKey("granola")).toBe(true);
     expect(sourceRequiresApiKey("slack")).toBe(false);
     expect(sourceRequiresApiKey("google-calendar")).toBe(false);
@@ -62,6 +64,7 @@ describe("source setup progress", () => {
     expect(sourceConnectorDefinition("notion").availability).toBe("implemented");
     expect(sourceConnectorDefinition("notion").projection).toContain("page.md");
     expect(sourceConnectorDefinition("slack").writeModel).toBe("Read-only.");
+    expect(sourceConnectorDefinition("github").writeModel).toContain("repository edits stay in git");
   });
 
   it("keeps planned connector catalog entries separate from runtime setup", () => {
@@ -73,7 +76,6 @@ describe("source setup progress", () => {
       "outlook-mail",
       "outlook-calendar",
       "microsoft-teams",
-      "github",
       "gitlab",
       "google-drive",
       "dropbox",
@@ -88,19 +90,15 @@ describe("source setup progress", () => {
       "fhir",
     ]);
     expect(sourceConnectorCatalogDefinitions()).toHaveLength(27);
-    expect(plannedSourceConnectorDefinitions()).toHaveLength(20);
+    expect(plannedSourceConnectorDefinitions()).toHaveLength(19);
     expect(isSourceConnectorId("confluence")).toBe(false);
     expect(isSourceCatalogConnectorId("confluence")).toBe(true);
     expect(isSourceCatalogConnectorId("notion")).toBe(true);
-    expect(sourceCatalogConnectorDefinition("github").authModes).toEqual([
-      "oauth",
-      "github-app",
-      "personal-token",
-    ]);
+    expect(sourceCatalogConnectorDefinition("github").availability).toBe("implemented");
+    expect(sourceCatalogConnectorDefinition("github").authModes).toEqual(["api-key", "personal-token"]);
     expect(sourceCatalogConnectorDefinition("fhir").authModes).toEqual(["smart-oauth"]);
     expect(sourceCatalogConnectorDefinition("confluence").availability).toBe("planned");
     expect(sourceCatalogConnectorDefinition("confluence").projection).toContain("Spaces");
-    expect(sourceCatalogConnectorDefinition("github").writeModel).toContain("repository edits stay in git");
     expect(sourceCatalogConnectorDefinition("fhir").writeModel).toContain("Read-only");
   });
 

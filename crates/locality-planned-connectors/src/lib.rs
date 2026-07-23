@@ -23,7 +23,6 @@ pub const ONEDRIVE_CONNECTOR_ID: &str = "onedrive";
 pub const OUTLOOK_MAIL_CONNECTOR_ID: &str = "outlook-mail";
 pub const OUTLOOK_CALENDAR_CONNECTOR_ID: &str = "outlook-calendar";
 pub const MICROSOFT_TEAMS_CONNECTOR_ID: &str = "microsoft-teams";
-pub const GITHUB_CONNECTOR_ID: &str = "github";
 pub const GITLAB_CONNECTOR_ID: &str = "gitlab";
 pub const GOOGLE_DRIVE_CONNECTOR_ID: &str = "google-drive";
 pub const DROPBOX_CONNECTOR_ID: &str = "dropbox";
@@ -170,15 +169,6 @@ pub const MICROSOFT_TEAMS_SPEC: PlannedConnectorSpec = PlannedConnectorSpec::new
     "Start read-only, then reviewed message drafts if approved.",
 );
 
-pub const GITHUB_SPEC: PlannedConnectorSpec = PlannedConnectorSpec::new(
-    GITHUB_CONNECTOR_ID,
-    "GitHub",
-    PlannedConnectorCategory::Hybrid,
-    &["oauth", "github-app", "personal-token"],
-    "Repositories, PRs, issues, discussions, reviews, and CI context.",
-    "Reviewed issue/comment/review drafts; repository edits stay in git.",
-);
-
 pub const GITLAB_SPEC: PlannedConnectorSpec = PlannedConnectorSpec::new(
     GITLAB_CONNECTOR_ID,
     "GitLab",
@@ -295,7 +285,6 @@ pub const PLANNED_CONNECTOR_SPECS: &[PlannedConnectorSpec] = &[
     OUTLOOK_MAIL_SPEC,
     OUTLOOK_CALENDAR_SPEC,
     MICROSOFT_TEAMS_SPEC,
-    GITHUB_SPEC,
     GITLAB_SPEC,
     GOOGLE_DRIVE_SPEC,
     DROPBOX_SPEC,
@@ -420,7 +409,6 @@ mod tests {
                 "outlook-mail",
                 "outlook-calendar",
                 "microsoft-teams",
-                "github",
                 "gitlab",
                 "google-drive",
                 "dropbox",
@@ -450,9 +438,9 @@ mod tests {
 
     #[test]
     fn planned_connector_implements_connector_but_blocks_remote_io() {
-        let connector = PlannedConnector::new(GITHUB_CONNECTOR_ID).expect("github connector");
+        let connector = PlannedConnector::new(GITLAB_CONNECTOR_ID).expect("gitlab connector");
 
-        assert_eq!(connector.kind().0, GITHUB_CONNECTOR_ID);
+        assert_eq!(connector.kind().0, GITLAB_CONNECTOR_ID);
         assert!(connector.capabilities().supports_oauth);
         assert!(connector.supported_push_operations().is_empty());
         assert!(matches!(

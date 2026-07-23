@@ -5,6 +5,7 @@ use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_core::push::BodyDiffMode;
 use locality_core::shadow::ShadowDocument;
 use locality_core::validation::ValidationIssue;
+use locality_github::GITHUB_CONNECTOR_ID;
 use locality_gmail::{GMAIL_CONNECTOR_ID, GMAIL_OAUTH_SCOPES, StoredGmailCredential};
 use locality_google_calendar::{
     GOOGLE_CALENDAR_CONNECTOR_ID, GOOGLE_CALENDAR_OAUTH_SCOPES, StoredGoogleCalendarCredential,
@@ -437,12 +438,70 @@ fn linear_descriptor_comes_from_registry_and_uses_api_key_setup() {
 }
 
 #[test]
+fn github_descriptor_comes_from_registry_and_is_read_only() {
+    let descriptor = source_descriptor(GITHUB_CONNECTOR_ID);
+
+    assert_eq!(descriptor.id(), GITHUB_CONNECTOR_ID);
+    assert_eq!(descriptor.display_name(), "GitHub");
+    assert_eq!(descriptor.default_mount_id(), "github-main");
+    assert_eq!(
+        descriptor.connect_command(),
+        Some("loc connect github --api-key-stdin")
+    );
+    assert_eq!(descriptor.auth_env_var(), None);
+    assert!(!descriptor.supports_oauth());
+    assert!(
+        descriptor
+            .mount_guidance()
+            .contains("# Locality GitHub Mount")
+    );
+    assert!(
+        descriptor
+            .mount_guidance()
+            .contains("Repository source-code edits should happen in a normal git checkout")
+    );
+    assert_eq!(descriptor.body_diff_mode(), BodyDiffMode::Block);
+    assert_eq!(
+        descriptor.periodic_discovery_interval(),
+        Some(Duration::from_secs(300))
+    );
+
+    let mount = MountConfig::new(
+        MountId::new("github-main"),
+        GITHUB_CONNECTOR_ID,
+        "/tmp/locality/github",
+    );
+    assert!(
+        !source_write_decision_for_path(
+            &mount,
+            std::path::Path::new("Repositories/codeflash-ai/locality/Issues/#1/page.md")
+        )
+        .is_writable()
+    );
+    assert!(
+        !source_create_decision_for_parent_path(
+            &mount,
+            std::path::Path::new("Repositories/codeflash-ai/locality/Issues")
+        )
+        .is_writable()
+    );
+    assert!(
+        !source_move_decision_for_parent_path(
+            &mount,
+            std::path::Path::new("Repositories/codeflash-ai/locality/Pull Requests")
+        )
+        .is_writable()
+    );
+}
+
+#[test]
 fn source_descriptors_declare_canonical_title_rename_policy() {
     for connector in [
         "notion",
         "google-docs",
         "google-calendar",
         "gmail",
+        "github",
         "granola",
         "slack",
         "custom",
@@ -961,6 +1020,7 @@ fn supported_source_connectors_include_first_party_connectors() {
             "google-docs",
             "google-calendar",
             "gmail",
+            "github",
             "granola",
             "linear",
             "slack"
@@ -980,7 +1040,6 @@ fn planned_source_connectors_stay_out_of_runtime_registry() {
             "outlook-mail",
             "outlook-calendar",
             "microsoft-teams",
-            "github",
             "gitlab",
             "google-drive",
             "dropbox",
@@ -1011,19 +1070,16 @@ fn planned_source_connectors_stay_out_of_runtime_registry() {
 #[test]
 fn planned_source_connector_descriptors_include_auth_and_category() {
     let planned = planned_source_connector_descriptors();
-    let github = planned
+    let gitlab = planned
         .iter()
-        .find(|descriptor| descriptor.id() == "github")
-        .expect("github descriptor");
-    assert_eq!(github.display_name(), "GitHub");
-    assert_eq!(github.category(), SourceConnectorCategory::Hybrid);
-    assert_eq!(
-        github.auth_modes(),
-        &["oauth", "github-app", "personal-token"]
-    );
-    assert!(github.projection().contains("PRs"));
+        .find(|descriptor| descriptor.id() == "gitlab")
+        .expect("gitlab descriptor");
+    assert_eq!(gitlab.display_name(), "GitLab");
+    assert_eq!(gitlab.category(), SourceConnectorCategory::Hybrid);
+    assert_eq!(gitlab.auth_modes(), &["oauth", "personal-token"]);
+    assert!(gitlab.projection().contains("MRs"));
     assert!(
-        github
+        gitlab
             .write_model()
             .contains("repository edits stay in git")
     );
@@ -1129,6 +1185,33 @@ fn resolving_linear_mount_uses_active_api_key_connection_credentials() {
     assert_eq!(connector.config().token, "lin_api_secret");
     assert_eq!(connector.kind().0, LINEAR_CONNECTOR_ID);
     assert!(connector.capabilities().supports_batch_observation);
+}
+
+#[test]
+fn resolving_github_mount_uses_active_personal_token_credentials() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (connection_id, secret_ref) =
+        save_gmail_connection(&mut store, "github-default", GITHUB_CONNECTOR_ID, "api_key");
+    credentials
+        .put(&secret_ref, "ghp_secret")
+        .expect("save credential");
+    let mount = MountConfig::new(
+        MountId::new("github-main"),
+        GITHUB_CONNECTOR_ID,
+        "/tmp/locality/github",
+    )
+    .with_connection_id(connection_id);
+
+    let source = resolve_source_for_mount(&store, &credentials, &mount).expect("resolve github");
+
+    let ResolvedSource::GitHub(connector) = source else {
+        panic!("expected github source");
+    };
+    assert_eq!(connector.config().token, "ghp_secret");
+    assert_eq!(connector.kind().0, GITHUB_CONNECTOR_ID);
+    assert!(connector.capabilities().supports_remote_observation);
+    assert!(connector.supported_push_operations().is_empty());
 }
 
 #[test]

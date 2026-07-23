@@ -114,6 +114,7 @@ import {
   sourceSetupIsActiveConnector,
   sourceSetupIsBusy,
   sourceSetupProgressLabel,
+  type ApiKeySourceConnectorId,
   type SourceCatalogConnectorId,
   type SourceConnectorId,
   type SourceConnectorAuthMode,
@@ -162,7 +163,7 @@ type ConnectorOption = {
   mounted: boolean;
 };
 
-const CONNECTOR_ICON_URLS: Record<SourceConnectorId, string> = {
+const CONNECTOR_ICON_URLS: Partial<Record<SourceConnectorId, string>> = {
   notion: notionIconUrl,
   "google-docs": googleDocsIconUrl,
   "google-calendar": googleCalendarIconUrl,
@@ -742,6 +743,8 @@ function suggestedAgentPrompt(mountPath: string, connector: OnboardingConnectorI
       return `Use Locality to inspect my Google Calendar source. Open the files under ${mountPath}, review calendar events with normal file tools, and prepare new event drafts for Locality review before creating them.`;
     case "gmail":
       return `Use Locality to inspect my Gmail source. Open the files under ${mountPath}, search mail with normal file tools, and prepare draft updates only when the mounted draft files support it. Leave outbound changes for Locality review.`;
+    case "github":
+      return `Use Locality to inspect my GitHub repositories. Open the files under ${mountPath}, search README files, issues, and pull requests with normal file tools, and cite the GitHub files you used. GitHub is read-only in Locality, so make repository edits in a normal git checkout.`;
     case "linear":
       return `Use Locality to edit my Linear issues. Open the files under ${mountPath}, update issue Markdown and editable frontmatter, and leave changes pending for Locality review before pushing.`;
     case "notion":
@@ -803,6 +806,8 @@ function onboardingConnectorDescription(
         return "Google Calendar is ready. Locality mounted primary calendar events as local files under CloudStorage.";
       case "gmail":
         return "Gmail is ready. Locality mounted mailboxes as local files under CloudStorage.";
+      case "github":
+        return "GitHub is ready. Locality mounted repositories, README files, issues, and pull requests as read-only local context.";
       case "granola":
         return "Granola is ready. Locality mounted meeting summaries and transcripts as read-only files under CloudStorage.";
       case "linear":
@@ -822,6 +827,8 @@ function onboardingConnectorDescription(
         return "A browser window is open. Approve Google Calendar access, then Locality will create the local calendar folder.";
       case "gmail":
         return "A browser window is open. Approve Gmail access, then Locality will create the local mailbox folder.";
+      case "github":
+        return "Locality is validating the personal access token and creating a read-only GitHub folder.";
       case "granola":
         return "Locality is validating the API key and creating a read-only Granola folder.";
       case "linear":
@@ -840,6 +847,8 @@ function onboardingConnectorDescription(
       return "Connect Google Calendar during setup so agents can review events and prepare new event drafts through local files.";
     case "gmail":
       return "Connect Gmail during setup so agents can search mailboxes and prepare reviewed draft work from local files.";
+    case "github":
+      return "Paste a GitHub personal access token to mount repositories, README files, issues, and pull requests as local read-only context.";
     case "granola":
       return "Paste a Granola API key to mount meeting summaries and transcripts as local read-only files. Keys are stored in your local credential store.";
     case "linear":
@@ -859,6 +868,8 @@ function onboardingConnectorPills(connector: OnboardingConnectorId) {
       return ["Google OAuth", "Primary calendar", "Event drafts"];
     case "gmail":
       return ["Google OAuth", "Mailbox files", "Draft review"];
+    case "github":
+      return ["Personal token", "Read-only", "Repos and PRs"];
     case "granola":
       return ["Read-only", "Meeting summaries", "Transcripts"];
     case "linear":
@@ -878,6 +889,8 @@ function onboardingReadyCopy(connector: OnboardingConnectorId) {
       return "Your Google Calendar source is ready as local files. Agents can review events and prepare new event drafts before anything is created remotely.";
     case "gmail":
       return "Your Gmail source is ready as local files. Agents can search mailbox content and prepare reviewed draft work without leaving the filesystem.";
+    case "github":
+      return "Your GitHub repositories are ready as local read-only context. Agents can search README files, issues, and pull requests with normal file tools, while repository edits stay in a normal git checkout.";
     case "granola":
       return "Your Granola meetings are ready as local read-only files. Agents can search summaries and transcripts with normal file tools, while Locality keeps the remote notes protected from edits.";
     case "linear":
@@ -888,7 +901,7 @@ function onboardingReadyCopy(connector: OnboardingConnectorId) {
 }
 
 function onboardingPromptHint(connector: OnboardingConnectorId) {
-  return connector === "granola" || connector === "slack"
+  return connector === "github" || connector === "granola" || connector === "slack"
     ? "Ask an agent to use the mounted read-only files."
     : "Claude and Codex are now set up to use Locality.";
 }
@@ -1718,6 +1731,7 @@ function Onboarding({
     const connector = onboardingConnectorFromSnapshot(snapshot);
     return connectionReady(snapshot) && !mountMissing(snapshot) ? connector : null;
   });
+  const [githubApiKey, setGithubApiKey] = useState("");
   const [granolaApiKey, setGranolaApiKey] = useState("");
   const [linearApiKey, setLinearApiKey] = useState("");
   const [googleDocsWorkspaceFolder, setGoogleDocsWorkspaceFolder] = useState("Locality");
@@ -1756,7 +1770,11 @@ function Onboarding({
       );
   const selectedSourceName = sourceDisplayName(selectedOnboardingConnector);
   const selectedConnectorBusy = oauthInFlight || connectorConnecting;
-  const selectedApiKey = selectedOnboardingConnector === "linear" ? linearApiKey : granolaApiKey;
+  const selectedApiKey = selectedOnboardingConnector === "github"
+    ? githubApiKey
+    : selectedOnboardingConnector === "linear"
+    ? linearApiKey
+    : granolaApiKey;
 
   async function installAgentGuidance(path: string) {
     setAgentGuidanceState("installing");
@@ -2137,6 +2155,9 @@ function Onboarding({
       case "granola":
         await connectGranolaOnboarding();
         return;
+      case "github":
+        await connectGitHubOnboarding();
+        return;
       case "linear":
         await connectLinearOnboarding();
     }
@@ -2156,11 +2177,15 @@ function Onboarding({
     await connectApiKeyOnboarding("granola", granolaApiKey);
   }
 
+  async function connectGitHubOnboarding() {
+    await connectApiKeyOnboarding("github", githubApiKey);
+  }
+
   async function connectLinearOnboarding() {
     await connectApiKeyOnboarding("linear", linearApiKey);
   }
 
-  async function connectApiKeyOnboarding(connector: "granola" | "linear", apiKey: string) {
+  async function connectApiKeyOnboarding(connector: ApiKeySourceConnectorId, apiKey: string) {
     const sourceName = sourceDisplayName(connector);
     if (connectorConnecting || !apiKey.trim()) {
       if (!apiKey.trim()) {
@@ -2176,7 +2201,7 @@ function Onboarding({
     setStep(3);
     try {
       const report = await callCommand<ActionReport>(
-        connector === "linear" ? "connect_linear" : "connect_granola",
+        apiKeyConnectCommand(connector),
         { apiKey },
         { ok: true, message: `Connected demo ${sourceName} source.` },
       );
@@ -2529,15 +2554,19 @@ function Onboarding({
             )}
             {sourceRequiresApiKey(selectedOnboardingConnector) && !connectionReadyNow && (
               <label className="source-inline-field onboarding-source-field">
-                <span>{selectedSourceName} API key</span>
+                <span>{selectedOnboardingConnector === "github" ? "GitHub personal access token" : `${selectedSourceName} API key`}</span>
                 <input
                   type="password"
                   autoComplete="off"
                   value={selectedApiKey}
-                  placeholder="Paste API key"
+                  placeholder={sourceRequiresApiKey(selectedOnboardingConnector)
+                    ? apiKeyPlaceholder(selectedOnboardingConnector)
+                    : "Paste API key"}
                   disabled={connectorConnecting}
                   onChange={(event) => {
-                    if (selectedOnboardingConnector === "linear") {
+                    if (selectedOnboardingConnector === "github") {
+                      setGithubApiKey(event.target.value);
+                    } else if (selectedOnboardingConnector === "linear") {
                       setLinearApiKey(event.target.value);
                     } else {
                       setGranolaApiKey(event.target.value);
@@ -3627,7 +3656,7 @@ function MountsView({
     }
   }
 
-  async function connectApiKeySource(connector: "granola" | "linear", apiKey: string) {
+  async function connectApiKeySource(connector: ApiKeySourceConnectorId, apiKey: string) {
     if (sourceSetupBusy) {
       return;
     }
@@ -3638,7 +3667,7 @@ function MountsView({
     setSourceDialogState("connecting");
     try {
       const report = await callCommand<ActionReport>(
-        connector === "linear" ? "connect_linear" : "connect_granola",
+        apiKeyConnectCommand(connector),
         { apiKey },
         { ok: true, message: `Connected demo ${sourceName} source.` },
       );
@@ -3887,13 +3916,14 @@ function AddSourceDialog({
   message: string;
   fileProviderEnablement: FileProviderEnablementReport | null;
   onAction: (connector: SourceConnectorId, options?: { googleDocsWorkspaceFolder?: string }) => void;
-  onApiKeyAction: (connector: "granola" | "linear", apiKey: string) => void;
+  onApiKeyAction: (connector: ApiKeySourceConnectorId, apiKey: string) => void;
   onReopenFinder: () => void;
   onClose: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [viewMode, setViewMode] = useState<SourceListViewMode>("list");
   const [googleDocsWorkspaceFolder, setGoogleDocsWorkspaceFolder] = useState("Locality");
+  const [githubApiKey, setGithubApiKey] = useState("");
   const [granolaApiKey, setGranolaApiKey] = useState("");
   const [linearApiKey, setLinearApiKey] = useState("");
   const busy = sourceSetupIsBusy(state);
@@ -4069,6 +4099,12 @@ function AddSourceDialog({
                         <SettingRow title="Calendar" value="Primary calendar" />
                         <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
                       </>
+                    ) : runtimeConnector === "github" ? (
+                      <>
+                        <SettingRow title="Content" value="Repositories, README files, issues, pull requests" />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
+                        <SettingRow title="Access" value="Read-only context" />
+                      </>
                     ) : runtimeConnector === "granola" ? (
                       <>
                         <SettingRow title="Content" value="Summaries and transcripts" />
@@ -4109,11 +4145,17 @@ function AddSourceDialog({
                         <input
                           type="password"
                           autoComplete="off"
-                          value={apiKeyConnector === "linear" ? linearApiKey : granolaApiKey}
-                          placeholder="Paste API key"
+                          value={apiKeyInputValue(apiKeyConnector, {
+                            github: githubApiKey,
+                            granola: granolaApiKey,
+                            linear: linearApiKey,
+                          })}
+                          placeholder={apiKeyPlaceholder(apiKeyConnector)}
                           disabled={busy}
                           onChange={(event) => {
-                            if (apiKeyConnector === "linear") {
+                            if (apiKeyConnector === "github") {
+                              setGithubApiKey(event.target.value);
+                            } else if (apiKeyConnector === "linear") {
                               setLinearApiKey(event.target.value);
                             } else {
                               setGranolaApiKey(event.target.value);
@@ -4122,9 +4164,7 @@ function AddSourceDialog({
                         />
                       </label>
                       <p className="quiet-note">
-                        {apiKeyConnector === "linear"
-                          ? "Create a key in Linear Settings > API > Personal API keys."
-                          : "Create a key in Granola Settings > Connectors > API keys. Business or Enterprise is required."}
+                        {apiKeyHelpText(apiKeyConnector)}
                       </p>
                     </>
                   )}
@@ -4142,14 +4182,22 @@ function AddSourceDialog({
                       busy={connectorBusy}
                       disabled={
                         disabled ||
-                        (needsConnection && !(apiKeyConnector === "linear" ? linearApiKey : granolaApiKey).trim())
+                        (needsConnection && !apiKeyInputValue(apiKeyConnector, {
+                          github: githubApiKey,
+                          granola: granolaApiKey,
+                          linear: linearApiKey,
+                        }).trim())
                       }
                       icon={needsConnection ? <ShieldCheck /> : <FolderOpen />}
                       onClick={() => {
                         if (needsConnection) {
                           onApiKeyAction(
                             apiKeyConnector,
-                            apiKeyConnector === "linear" ? linearApiKey : granolaApiKey,
+                            apiKeyInputValue(apiKeyConnector, {
+                              github: githubApiKey,
+                              granola: granolaApiKey,
+                              linear: linearApiKey,
+                            }),
                           );
                         } else {
                           onAction(runtimeConnector);
@@ -4324,8 +4372,48 @@ function oauthConnectCommand(connector: "google-docs" | "google-calendar" | "gma
   }
 }
 
+function apiKeyConnectCommand(connector: ApiKeySourceConnectorId) {
+  switch (connector) {
+    case "github":
+      return "connect_github";
+    case "granola":
+      return "connect_granola";
+    case "linear":
+      return "connect_linear";
+  }
+}
+
+function apiKeyInputValue(
+  connector: ApiKeySourceConnectorId,
+  values: Record<ApiKeySourceConnectorId, string>,
+) {
+  return values[connector];
+}
+
+function apiKeyPlaceholder(connector: ApiKeySourceConnectorId) {
+  switch (connector) {
+    case "github":
+      return "Paste personal access token";
+    case "granola":
+    case "linear":
+      return "Paste API key";
+  }
+}
+
+function apiKeyHelpText(connector: ApiKeySourceConnectorId) {
+  switch (connector) {
+    case "github":
+      return "Create a fine-grained GitHub personal access token with repository metadata, contents, issues, and pull request read access.";
+    case "granola":
+      return "Create a key in Granola Settings > Connectors > API keys. Business or Enterprise is required.";
+    case "linear":
+      return "Create a key in Linear Settings > API > Personal API keys.";
+  }
+}
+
 function ConnectorIcon({ connector }: { connector: SourceCatalogConnectorId }) {
-  if (!isSourceConnectorId(connector)) {
+  const iconUrl = isSourceConnectorId(connector) ? CONNECTOR_ICON_URLS[connector] : null;
+  if (!iconUrl) {
     return (
       <span className={`connector-icon ${connector} generic`} aria-hidden="true">
         <Plug />
@@ -4334,7 +4422,7 @@ function ConnectorIcon({ connector }: { connector: SourceCatalogConnectorId }) {
   }
   return (
     <span className={`connector-icon ${connector}`} aria-hidden="true">
-      <img src={CONNECTOR_ICON_URLS[connector]} alt="" draggable="false" />
+      <img src={iconUrl} alt="" draggable="false" />
     </span>
   );
 }

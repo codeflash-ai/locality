@@ -1,7 +1,7 @@
 import { classifyMountSetupError } from "./onboarding-errors";
 
 export type SourceSetupState = "idle" | "connecting" | "creating" | "changing" | "success" | "error";
-const SOURCE_CONNECTORS = ["notion", "google-docs", "google-calendar", "gmail", "granola", "linear", "slack"] as const;
+const SOURCE_CONNECTORS = ["notion", "google-docs", "google-calendar", "gmail", "granola", "github", "linear", "slack"] as const;
 const PLANNED_SOURCE_CONNECTORS = [
   "confluence",
   "jira",
@@ -10,7 +10,6 @@ const PLANNED_SOURCE_CONNECTORS = [
   "outlook-mail",
   "outlook-calendar",
   "microsoft-teams",
-  "github",
   "gitlab",
   "google-drive",
   "dropbox",
@@ -28,7 +27,7 @@ const PLANNED_SOURCE_CONNECTORS = [
 export type SourceConnectorId = (typeof SOURCE_CONNECTORS)[number];
 export type PlannedSourceConnectorId = (typeof PLANNED_SOURCE_CONNECTORS)[number];
 export type SourceCatalogConnectorId = SourceConnectorId | PlannedSourceConnectorId;
-export type ApiKeySourceConnectorId = Extract<SourceConnectorId, "granola" | "linear">;
+export type ApiKeySourceConnectorId = Extract<SourceConnectorId, "github" | "granola" | "linear">;
 export type SourceConnectorAvailability = "implemented" | "planned";
 export type SourceConnectorCategory = "knowledge" | "action" | "hybrid";
 export type SourceConnectorAuthMode = "oauth" | "api-key" | "api-token" | "personal-token" | "github-app" | "smart-oauth";
@@ -112,6 +111,19 @@ const SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<SourceCon
     writeModel: "Read-only.",
     defaultMountId: "granola-main",
     defaultMountDirectory: "granola",
+  },
+  {
+    id: "github",
+    name: "GitHub",
+    description: "Repositories, README files, issues, and pull requests as read-only context.",
+    availability: "implemented",
+    category: "hybrid",
+    authModes: ["api-key", "personal-token"],
+    keywords: ["github", "git", "repos", "repositories", "pull requests", "issues"],
+    projection: "Repositories, README files, issues, and pull requests.",
+    writeModel: "Read-only; repository edits stay in git.",
+    defaultMountId: "github-main",
+    defaultMountDirectory: "github",
   },
   {
     id: "linear",
@@ -218,17 +230,6 @@ const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<P
     keywords: ["microsoft", "teams", "channels", "chats", "meetings"],
     projection: "Teams, channels, chats, meetings, and users as context.",
     writeModel: "Start read-only, then reviewed message drafts if approved.",
-  },
-  {
-    id: "github",
-    name: "GitHub",
-    description: "Repositories, pull requests, issues, discussions, and review activity.",
-    availability: "planned",
-    category: "hybrid",
-    authModes: ["oauth", "github-app", "personal-token"],
-    keywords: ["github", "git", "repos", "pull requests", "issues"],
-    projection: "Repositories, PRs, issues, discussions, reviews, and CI context.",
-    writeModel: "Reviewed issue/comment/review drafts; repository edits stay in git.",
   },
   {
     id: "gitlab",

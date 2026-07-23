@@ -5,11 +5,11 @@ local files and folders, while the source of truth remains protected by review,
 conflict checks, and connector-owned concurrency guards.
 
 This document tracks the connector catalog added to the desktop, daemon metadata
-layer, and `locality-planned-connectors` scaffold crate. A connector in the
-planned catalog is visible as product direction and exists as a compile-time
-connector scaffold, but it is not mountable until it has a real provider client,
-credential resolver, rendering/parsing fixtures, sync tests, and provider API
-coverage.
+layer, runtime connector crates, and the `locality-planned-connectors` scaffold
+crate. A connector in the planned catalog is visible as product direction and
+exists as a compile-time connector scaffold, but it is not mountable until it
+has a real provider client, credential resolver, rendering fixtures, sync tests,
+and provider API coverage.
 
 ## Current Runtime Connectors
 
@@ -22,6 +22,7 @@ credentials in the current build.
 | Google Docs | Knowledge | OAuth | Docs as Markdown, workspace-folder based mounting |
 | Google Calendar | Action | OAuth | Read events, create reviewed drafts |
 | Gmail | Action | OAuth | Read inbox/sent, create reviewed drafts |
+| GitHub | Hybrid | Personal access token | Read-only repositories, README files, issues, and pull requests |
 | Granola | Knowledge | API key | Read-only summaries and transcripts |
 | Linear | Hybrid | API key | Editable issue pages and supported issue moves |
 | Slack | Knowledge | OAuth | Read-only accessible conversations |
@@ -44,7 +45,6 @@ same product contract.
 | Outlook Mail | Action | OAuth | Mail folders and reviewed draft creation |
 | Outlook Calendar | Action | OAuth | Calendar events and reviewed scheduling drafts |
 | Microsoft Teams | Knowledge | OAuth | Teams, channels, chats, meetings, and user context |
-| GitHub | Hybrid | OAuth, GitHub App, personal token | Repos, PRs, issues, discussions, and reviews |
 | GitLab | Hybrid | OAuth, personal token | Projects, MRs, issues, pipelines, and releases |
 | Google Drive | Knowledge | OAuth | Drive files, PDFs, sheets, slides, and shared drives |
 | Dropbox | Knowledge | OAuth | Shared files and folders |
@@ -73,7 +73,7 @@ are built against the relevant official API contract.
 | Outlook Mail | Microsoft Graph auth, permissions, mail folders, and message APIs |
 | Outlook Calendar | Microsoft Graph auth, permissions, calendars, and event APIs |
 | Microsoft Teams | Microsoft Graph auth, permissions, Teams, channel, chat, and message APIs |
-| GitHub | GitHub REST API, issues, pull requests, reviews, discussions, and app/PAT auth |
+| GitHub (runtime read-only v1) | GitHub REST API, repository contents, issues, pull requests, and PAT auth |
 | GitLab | GitLab REST API authentication, projects, issues, merge requests, and pipelines |
 | Google Drive | Google Drive API v3 files, drives, changes, comments, revisions, and permissions |
 | Dropbox | Dropbox API v2 HTTP docs, OAuth, files, folders, sharing, and revisions |
@@ -97,10 +97,12 @@ the following:
    credential-store backed secrets.
 3. A conservative network policy using the shared network gate.
 4. Canonical Markdown rendering fixtures and exact expected output tests.
-5. Parser and validation tests for every editable field.
+5. Parser and validation tests for every editable field, or an explicit
+   read-only policy that blocks parse/apply/push.
 6. Batch observation or explicit documented fallback behavior.
-7. Push-plan tests for every supported mutation.
-8. Conflict/concurrency tests using stale remote observations.
+7. Push-plan tests for every supported mutation, if writes are supported.
+8. Conflict/concurrency tests using stale remote observations, if writes are
+   supported.
 9. A source descriptor with mount guidance, write policy, body diff mode, and
    virtual rename policy.
 10. One end-to-end test that connects, mounts, hydrates, edits where supported,
@@ -118,8 +120,8 @@ The highest leverage next connectors are:
 2. Jira, because it pairs naturally with engineering status workflows.
 3. SharePoint and OneDrive, because Microsoft 365 content is common in larger
    teams.
-4. GitHub, because repository and PR context can become a first-class local
-   knowledge source instead of only shell/git context.
+4. GitLab, because repository and merge-request context should follow the same
+   read-only-first pattern as GitHub.
 5. Zendesk or Intercom, because support workflows benefit from local search,
    review, and safe response drafts.
 

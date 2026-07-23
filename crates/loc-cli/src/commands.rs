@@ -18,6 +18,7 @@ use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEn
 use locality_core::path_projection::{
     page_container_path, page_document_path, page_listing_parent_path,
 };
+use locality_github::GITHUB_CONNECTOR_ID;
 use locality_gmail::{
     DEFAULT_GMAIL_OAUTH_BROKER_URL, DEFAULT_GMAIL_OAUTH_REDIRECT_URI, GMAIL_CONNECTOR_ID,
     GmailMountSettings, GmailProjectionView, HttpGmailOAuthBrokerClient,
@@ -70,9 +71,9 @@ use crate::connect::{
     BrokerOAuthConnectOptions, ConnectError, ConnectOptions, ConnectReport, ConnectionShowReport,
     ConnectionsReport, DisconnectReport, GmailBrokerOAuthConnectOptions,
     GoogleCalendarBrokerOAuthConnectOptions, GoogleDocsBrokerOAuthConnectOptions,
-    HttpGranolaConnectionProbe, HttpLinearConnectionProbe, HttpNotionConnectionProbe,
-    OAuthConnectOptions, ProfilesReport, SlackBrokerOAuthConnectOptions,
-    run_connect_gmail_broker_oauth, run_connect_google_calendar_broker_oauth,
+    HttpGitHubConnectionProbe, HttpGranolaConnectionProbe, HttpLinearConnectionProbe,
+    HttpNotionConnectionProbe, OAuthConnectOptions, ProfilesReport, SlackBrokerOAuthConnectOptions,
+    run_connect_github, run_connect_gmail_broker_oauth, run_connect_google_calendar_broker_oauth,
     run_connect_google_docs_broker_oauth, run_connect_granola, run_connect_linear,
     run_connect_notion, run_connect_notion_broker_oauth, run_connect_notion_oauth,
     run_connect_slack_broker_oauth, run_connection_show, run_connections, run_disconnect,
@@ -1723,6 +1724,9 @@ fn connect(args: &[String], json: bool) -> i32 {
     if connector == Some(LINEAR_CONNECTOR_ID) {
         return connect_linear(args, json);
     }
+    if connector == Some(GITHUB_CONNECTOR_ID) {
+        return connect_github(args, json);
+    }
     if connector == Some(GRANOLA_CONNECTOR_ID) {
         return connect_granola(args, json);
     }
@@ -1744,7 +1748,7 @@ fn connect(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "connect",
                 "usage",
-                "usage: loc connect <notion|google-docs|google-calendar|gmail|slack|granola|linear> [options] [--json]",
+                "usage: loc connect <notion|google-docs|google-calendar|gmail|slack|granola|linear|github> [options] [--json]",
             ),
             EXIT_USAGE,
         );
@@ -2393,6 +2397,75 @@ fn connect_linear(args: &[String], json: bool) -> i32 {
         credentials.as_ref(),
         options,
         &HttpLinearConnectionProbe,
+    ) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_connect_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => connect_command_error("connect", json, error),
+    }
+}
+
+fn connect_github(args: &[String], json: bool) -> i32 {
+    if !has_flag(args, "--api-key-stdin") {
+        return command_error(
+            json,
+            CommandError::new(
+                "connect",
+                "auth_required",
+                "GitHub personal access tokens must be provided with --api-key-stdin",
+            )
+            .with_suggested_command("loc connect github --api-key-stdin"),
+            EXIT_USAGE,
+        );
+    }
+    let mut api_key = String::new();
+    if let Err(error) = io::stdin().read_to_string(&mut api_key) {
+        return command_error(
+            json,
+            CommandError::new("connect", "stdin_read_failed", error.to_string()),
+            EXIT_INTERNAL,
+        );
+    }
+    let api_key = api_key.trim().to_string();
+    if api_key.is_empty() {
+        return command_error(
+            json,
+            CommandError::new(
+                "connect",
+                "auth_required",
+                "empty GitHub personal access token",
+            )
+            .with_suggested_command("loc connect github --api-key-stdin"),
+            EXIT_USAGE,
+        );
+    }
+
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("connect", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let credentials = open_credential_store(&state_root);
+    let options = ConnectOptions {
+        connection_id: flag_value(args, "--name").map(ConnectionId::new),
+        token: api_key,
+    };
+    match run_connect_github(
+        &mut store,
+        credentials.as_ref(),
+        options,
+        &HttpGitHubConnectionProbe,
     ) {
         Ok(report) if json => {
             print_json(&report);
