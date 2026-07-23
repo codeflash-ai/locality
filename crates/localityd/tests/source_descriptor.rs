@@ -281,6 +281,17 @@ fn source_guidance_teaches_common_cli_workflow() {
             guidance.contains("Common Locality CLI workflow:"),
             "{connector}"
         );
+        for expected in [
+            "Read the nearest `AGENTS.md` before connector-specific work",
+            "For discovery or research tasks, triage by path and title first",
+            "If initial search gives no hits, refine the query and browse directory names before concluding context is unavailable",
+            "If useful results are outside a user-provided path or source scope, do not read them until the user permits it",
+        ] {
+            assert!(
+                guidance.contains(expected),
+                "{connector} missing {expected}"
+            );
+        }
         for command in [
             "loc info .",
             "loc search <query>",
