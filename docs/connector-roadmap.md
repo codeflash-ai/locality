@@ -58,6 +58,35 @@ same product contract.
 | Salesforce | Hybrid | OAuth | Accounts, opportunities, cases, notes, tasks, and CRM knowledge |
 | FHIR | Knowledge | SMART OAuth | Scoped clinical resources projected for healthcare workflows |
 
+## Official API References
+
+These are the provider docs that should drive implementation. A connector should
+not move out of the planned scaffold until its client, renderer, and E2E tests
+are built against the relevant official API contract.
+
+| Connector | Official docs to implement against |
+| --- | --- |
+| Confluence | Atlassian OAuth 2.0 and Confluence Cloud REST API v2 |
+| Jira | Atlassian OAuth 2.0 and Jira Cloud REST API v3 issue/search resources |
+| SharePoint | Microsoft Graph auth, permissions, sites, lists, drives, and driveItem APIs |
+| OneDrive | Microsoft Graph auth, permissions, drives, and driveItem APIs |
+| Outlook Mail | Microsoft Graph auth, permissions, mail folders, and message APIs |
+| Outlook Calendar | Microsoft Graph auth, permissions, calendars, and event APIs |
+| Microsoft Teams | Microsoft Graph auth, permissions, Teams, channel, chat, and message APIs |
+| GitHub | GitHub REST API, issues, pull requests, reviews, discussions, and app/PAT auth |
+| GitLab | GitLab REST API authentication, projects, issues, merge requests, and pipelines |
+| Google Drive | Google Drive API v3 files, drives, changes, comments, revisions, and permissions |
+| Dropbox | Dropbox API v2 HTTP docs, OAuth, files, folders, sharing, and revisions |
+| Box | Box API reference, OAuth 2.0, files, folders, versions, and collaborations |
+| Figma | Figma REST API OpenAPI spec, OAuth, files, comments, components, and projects |
+| Asana | Asana auth docs, OAuth/PAT, projects, tasks, comments, and sections |
+| ClickUp | ClickUp auth docs, OAuth/personal token, spaces, folders, lists, tasks, docs |
+| Zendesk | Zendesk OAuth/API-token docs, tickets, users, organizations, macros, help center |
+| Intercom | Intercom REST/OpenAPI docs, OAuth, conversations, contacts, companies, articles |
+| HubSpot | HubSpot OAuth and CRM object APIs for contacts, companies, deals, notes, tasks |
+| Salesforce | Salesforce REST API OAuth/connected apps and object/record APIs |
+| FHIR | HL7 SMART App Launch and SMART on FHIR scopes/launch context |
+
 ## Promotion Bar
 
 A planned connector can move into the runtime registry only when it has all of
