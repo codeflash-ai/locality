@@ -343,7 +343,10 @@ pub(crate) fn validate_gmail_changed_frontmatter(
             context.relative_path,
             Some(1),
             "Gmail inbox and sent items are read-only",
-            Some("create a new Markdown file directly under draft/ to send mail".to_string()),
+            Some(
+                "create a new Markdown file directly under draft/ to create an unsent Gmail draft"
+                    .to_string(),
+            ),
         ));
     }
     Ok(report)
@@ -398,7 +401,7 @@ pub(crate) fn validate_gmail_create_frontmatter(
             "gmail_attachments_unsupported",
             context.relative_path,
             Some(1),
-            "Gmail draft sends do not support attachments",
+            "Gmail draft creation does not support attachments",
             Some("remove attachment frontmatter".to_string()),
         ));
     }

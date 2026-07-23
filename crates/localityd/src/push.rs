@@ -926,7 +926,7 @@ fn draft_create_auto_save_block_reason(prepared: &PreparedPush) -> Option<String
         return None;
     }
     match prepared.mount.connector.as_str() {
-        "gmail" => Some("Gmail draft sends require review".to_string()),
+        "gmail" => Some("Gmail draft creation requires review".to_string()),
         "google-calendar" => Some("Google Calendar event creates require review".to_string()),
         _ => None,
     }
