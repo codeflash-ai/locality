@@ -3534,12 +3534,20 @@ fn portable_media_denials_are_incomplete_and_never_publish_remote_urls() {
 #[test]
 fn portable_external_media_fails_closed_without_fetching_bad_or_ambiguous_sources() {
     let invalid = [
-        ("empty", ""),
-        ("malformed", "not a URL"),
-        ("http", "http://example.com/image.png"),
-        ("userinfo", "https://user:pass@example.com/image.png"),
+        ("empty", "", "unavailable_external_media"),
+        ("malformed", "not a URL", "unsafe_external_media"),
+        (
+            "http",
+            "http://example.com/image.png",
+            "unsafe_external_media",
+        ),
+        (
+            "userinfo",
+            "https://user:pass@example.com/image.png",
+            "unsafe_external_media",
+        ),
     ];
-    for (index, (case, url)) in invalid.into_iter().enumerate() {
+    for (index, (case, url, expected_code)) in invalid.into_iter().enumerate() {
         let page_id = format!("external-invalid-{index}");
         let block_id = format!("external-block-{index}");
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -3565,7 +3573,15 @@ fn portable_external_media_fails_closed_without_fetching_bad_or_ambiguous_source
             vec![NotionPortableIncompleteMediaV1 {
                 block_id: block_id.clone(),
                 kind: "image".to_string(),
-                code: "invalid_external_media".to_string(),
+                code: expected_code.to_string(),
+            }],
+            "{case}"
+        );
+        assert_eq!(
+            fetched.completeness.incomplete_reasons(),
+            &[PortableIncompleteReason::ConnectorLimitation {
+                code: format!("notion_media_{expected_code}"),
+                remote_id: Some(RemoteId::new(block_id.clone())),
             }],
             "{case}"
         );
@@ -3626,6 +3642,17 @@ fn portable_external_media_fails_closed_without_fetching_bad_or_ambiguous_source
             .expect("raw-unsafe external URL becomes explicitly incomplete");
         assert!(calls.lock().expect("calls").is_empty(), "{case}");
         assert!(!fetched.completeness.is_complete(), "{case}");
+        let native: NotionPortablePageBundleV1 =
+            serde_json::from_slice(&fetched.native.raw).expect("unsafe external native");
+        assert_eq!(
+            native.incomplete_media,
+            vec![NotionPortableIncompleteMediaV1 {
+                block_id: "invalid-raw".to_string(),
+                kind: "image".to_string(),
+                code: "unsafe_external_media".to_string(),
+            }],
+            "{case}"
+        );
         assert!(!String::from_utf8_lossy(&fetched.native.raw).contains(&url));
     }
 
@@ -3699,6 +3726,71 @@ fn portable_external_media_fails_closed_without_fetching_bad_or_ambiguous_source
         );
         assert!(calls.lock().expect("calls").is_empty(), "{case}");
     }
+}
+
+#[test]
+fn portable_external_media_legacy_generic_outcome_remains_readable() {
+    let page_id = "legacy-invalid-external-page";
+    let block_id = "legacy-invalid-external-block";
+    let unsafe_url = "http://user:secret@example.com/private.png";
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let connector = portable_media_connector(
+        page_id,
+        vec![file_block(block_id, "image", unsafe_url, "Private image")],
+    )
+    .with_portable_media_capture_fetcher(
+        PortableMediaCapturePolicy::HostedPilot,
+        Arc::new(FixturePortableMediaFetcher {
+            outcomes: BTreeMap::new(),
+            calls: Arc::clone(&calls),
+        }),
+    );
+    let fetched = connector
+        .fetch_portable(portable_fetch_request(page_id))
+        .expect("unsafe external fetch");
+    assert!(calls.lock().expect("calls").is_empty());
+    let current: NotionPortablePageBundleV1 =
+        serde_json::from_slice(&fetched.native.raw).expect("portable native");
+    let mut unsupported = current.clone();
+    unsupported.incomplete_media[0].code = "external_media".to_string();
+    assert_eq!(
+        connector
+            .render_portable(&portable_render_request(
+                page_id,
+                NativeEntity {
+                    remote_id: RemoteId::new(page_id),
+                    kind: "notion_page_portable_media_v1".to_string(),
+                    raw: serde_json::to_vec(&unsupported).expect("unsupported native"),
+                },
+            ))
+            .expect_err("unsupported generic outcome must fail")
+            .to_string(),
+        "invalid state: Notion portable media native payload has invalid incomplete outcomes"
+    );
+
+    let mut legacy = current;
+    legacy.incomplete_media[0].code = "invalid_external_media".to_string();
+    let legacy_raw = serde_json::to_vec(&legacy).expect("legacy native");
+    assert!(!String::from_utf8_lossy(&legacy_raw).contains(unsafe_url));
+
+    let rendered = connector
+        .render_portable(&portable_render_request(
+            page_id,
+            NativeEntity {
+                remote_id: RemoteId::new(page_id),
+                kind: "notion_page_portable_media_v1".to_string(),
+                raw: legacy_raw,
+            },
+        ))
+        .expect("legacy generic outcome remains readable");
+    assert_eq!(
+        rendered.completeness.incomplete_reasons(),
+        &[PortableIncompleteReason::ConnectorLimitation {
+            code: "notion_media_invalid_external_media".to_string(),
+            remote_id: Some(RemoteId::new(block_id)),
+        }]
+    );
+    assert!(!String::from_utf8_lossy(&rendered.canonical.body).contains(unsafe_url));
 }
 
 #[test]

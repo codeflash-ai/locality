@@ -372,9 +372,14 @@ impl<'a> PortableMediaCaptureState<'a> {
             if validate_portable_external_media_url(&external.url).is_ok() {
                 return Ok(());
             }
+            let code = if external.url.is_empty() {
+                "unavailable_external_media"
+            } else {
+                "unsafe_external_media"
+            };
             external.url.clear();
             if !self.limit_exceeded {
-                self.record_incomplete(block_id, kind, "invalid_external_media");
+                self.record_incomplete(block_id, kind, code);
             }
             return Ok(());
         }
@@ -1205,7 +1210,9 @@ fn validate_portable_media_bundle(bundle: &NotionPortablePageBundleV1) -> Locali
             if !limit_exceeded {
                 let code = match (payload.external.is_some(), payload.file.is_some()) {
                     (true, true) => "ambiguous_file_source",
-                    (true, false) => "invalid_external_media",
+                    (true, false) => {
+                        actual_external_incomplete_code(&bundle.incomplete_media, block_id, kind)?
+                    }
                     (false, true) => {
                         actual_hosted_incomplete_code(&bundle.incomplete_media, block_id, kind)?
                     }
@@ -1304,6 +1311,29 @@ fn validate_portable_media_bundle(bundle: &NotionPortablePageBundleV1) -> Locali
         ));
     }
     Ok(())
+}
+
+fn actual_external_incomplete_code<'a>(
+    incomplete: &'a [NotionPortableIncompleteMediaV1],
+    block_id: &str,
+    kind: &str,
+) -> LocalityResult<&'a str> {
+    let Some(outcome) = incomplete
+        .iter()
+        .find(|outcome| outcome.block_id == block_id && outcome.kind == kind)
+    else {
+        return Err(LocalityError::InvalidState(
+            "Notion portable media native payload has invalid incomplete outcomes".to_string(),
+        ));
+    };
+    match outcome.code.as_str() {
+        "unavailable_external_media" | "unsafe_external_media" | "invalid_external_media" => {
+            Ok(&outcome.code)
+        }
+        _ => Err(LocalityError::InvalidState(
+            "Notion portable media native payload has invalid incomplete outcomes".to_string(),
+        )),
+    }
 }
 
 fn actual_hosted_incomplete_code<'a>(
