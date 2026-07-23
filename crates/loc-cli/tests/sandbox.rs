@@ -13,11 +13,21 @@ use loc_cli::sandbox::{
     SandboxBootstrapToken, SandboxContentEncodingPreference, SandboxInitError, SandboxInitOptions,
     resolve_bootstrap_token, run_sandbox_init, run_sandbox_init_with_encoding,
 };
-use locality_core::portable::SessionId;
+use locality_core::portable::{
+    ExportAttemptId, LogicalPath, ProjectionFileKind, ProjectionId, SessionId, SourceAction,
+    SourceConnectionId, SourceGenerationId,
+};
 use locality_protocol::{
-    COMPONENT_VERSIONS, ComponentVersions, FreshnessRequirement, OpaqueBootstrapExchangeRequest,
-    SandboxSessionState, SandboxSessionStatus, SessionCapability, SessionErrorCode,
-    SessionProtocolError, StaleSessionBehavior, TarContentEncoding, TarExportOffer,
+    COMPONENT_VERSIONS, CanonicalControlOrderKey, CanonicalExportRecord, CanonicalFileOrderKey,
+    ComponentVersions, DeliveredBodyDigestV2, ExportAttemptLimits, ExportAttemptRequest,
+    ExportCompletionReceipt, ExportTerminalControlV2, FreshnessRequirement,
+    OpaqueBootstrapExchangeRequest, OrderedSourceGeneration, PAX_CONTENT_SHA256,
+    PAX_EFFECTIVE_ACTIONS, PAX_FILE_KIND, PAX_PROJECTION_ID, PAX_SOURCE_CONNECTION_ID,
+    PAX_WINNING_SCOPE_ORDINAL, SCOPE_AUTHORIZED_COMPONENT_VERSIONS, SandboxSessionState,
+    SandboxSessionStatus, ScopeAuthorizedWritableExportMetadata, SealedExportOffer,
+    SessionCapability, SessionErrorCode, SessionProtocolError, StaleSessionBehavior,
+    TarContentEncoding, TarExportOffer, canonical_export_inventory_sha256,
+    canonical_writable_metadata_sha256,
 };
 use localityd::replica_materializer::ReplicaMaterializationLimits;
 use sha2::{Digest, Sha256};
@@ -317,6 +327,137 @@ fn zstd_bootstrap_streams_into_the_shared_materializer() {
         export.headers.get("accept-encoding").unwrap(),
         "zstd, identity"
     );
+}
+
+#[test]
+fn scope_authorized_export_attempts_materialize_identity_and_zstd() {
+    let mut idempotency_keys = Vec::new();
+    for (label, preference, protocol_encoding, header_encoding) in [
+        (
+            "scope-identity",
+            SandboxContentEncodingPreference::Identity,
+            TarContentEncoding::Identity,
+            "identity",
+        ),
+        (
+            "scope-zstd",
+            SandboxContentEncodingPreference::Zstd,
+            TarContentEncoding::Zstd,
+            "zstd",
+        ),
+    ] {
+        let directory = TestDirectory::new(label);
+        let capability = capability();
+        let status = scope_ready_status(capability.session_id.clone());
+        let (offer, tar) = scope_export_fixture(protocol_encoding);
+        let response_body = match protocol_encoding {
+            TarContentEncoding::Identity => tar,
+            TarContentEncoding::Zstd => {
+                zstd::stream::encode_all(tar.as_slice(), 1).expect("compress scope tar")
+            }
+        };
+        let server = MockServer::start(vec![
+            ResponseFixture::json(&capability),
+            ResponseFixture::json(&status),
+            ResponseFixture::json(&offer),
+            ResponseFixture::export(header_encoding, response_body),
+        ]);
+
+        let report = run_sandbox_init_with_encoding(
+            SandboxInitOptions {
+                api_url: server.api_url.clone(),
+                root: directory.root(),
+            },
+            SandboxBootstrapToken::new("scope-bootstrap-secret").expect("token"),
+            preference,
+        )
+        .expect("materialize scope-authorized export");
+
+        assert_eq!(report.content_encoding, header_encoding);
+        assert_eq!(report.entries, 2);
+        assert_eq!(report.files, 1);
+        assert_eq!(report.directories, 0);
+        assert_eq!(report.materialized_bytes, 9);
+        assert_eq!(
+            fs::read(directory.root().join("readme.md")).expect("read scope file"),
+            b"scope v2\n"
+        );
+        assert!(!directory.root().join(".loc").exists());
+
+        let _bootstrap = server.request();
+        let _status = server.request();
+        let attempt = server.request();
+        assert_eq!(attempt.method, "POST");
+        assert_eq!(attempt.path, "/v1/sessions/session-7/export-attempts");
+        assert_eq!(
+            attempt.headers.get("authorization").unwrap(),
+            "Bearer capability-secret"
+        );
+        let request: ExportAttemptRequest =
+            serde_json::from_slice(&attempt.body).expect("decode export-attempt request");
+        request.validate().expect("valid export-attempt request");
+        assert_eq!(request.content_encoding, protocol_encoding);
+        assert_eq!(request.opaque_session_capability, "capability-secret");
+        assert!(request.idempotency_key.starts_with("loc-export-v2-"));
+        assert_eq!(request.idempotency_key.len(), 78);
+        idempotency_keys.push(request.idempotency_key);
+
+        let export = server.request();
+        assert_eq!(export.method, "GET");
+        assert_eq!(
+            export.path,
+            "/v1/sessions/session-7/export-attempts/attempt-scope/export"
+        );
+        assert_eq!(
+            export.headers.get("accept-encoding").unwrap(),
+            header_encoding
+        );
+    }
+    assert_ne!(idempotency_keys[0], idempotency_keys[1]);
+}
+
+#[test]
+fn malformed_scope_offer_fails_before_stream_without_identifier_leaks() {
+    let directory = TestDirectory::new("scope-malformed-offer");
+    let capability = capability();
+    let status = scope_ready_status(capability.session_id.clone());
+    let (mut offer, _tar) = scope_export_fixture(TarContentEncoding::Zstd);
+    offer.archive_entry_count = 1;
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&capability),
+        ResponseFixture::json(&status),
+        ResponseFixture::json(&offer),
+    ]);
+
+    let error = run_sandbox_init(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: directory.root(),
+        },
+        SandboxBootstrapToken::new("scope-bootstrap-secret").expect("token"),
+    )
+    .expect_err("malformed scope offer must fail before export");
+
+    assert_eq!(error.code(), "backend_protocol_invalid");
+    let display = error.to_string();
+    for secret_or_id in [
+        "scope-bootstrap-secret",
+        "capability-secret",
+        "session-7",
+        "attempt-scope",
+        "source-notion",
+        "generation-scope",
+    ] {
+        assert!(
+            !display.contains(secret_or_id),
+            "error leaked {secret_or_id}"
+        );
+    }
+    assert!(!directory.root().exists());
+    let _ = server.request();
+    let _ = server.request();
+    let _ = server.request();
+    server.assert_no_request();
 }
 
 #[test]
@@ -1265,6 +1406,148 @@ fn ready_status(
         error: None,
         updated_at: "2026-07-20T11:00:00Z".to_string(),
     }
+}
+
+fn scope_ready_status(session_id: SessionId) -> SandboxSessionStatus {
+    SandboxSessionStatus {
+        versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+        session_id,
+        state: SandboxSessionState::Ready,
+        freshness_requirement: freshness_requirement(),
+        replicas: Vec::new(),
+        export_offer: None,
+        error: None,
+        updated_at: "2026-07-23T20:00:00Z".to_string(),
+    }
+}
+
+fn scope_export_fixture(encoding: TarContentEncoding) -> (SealedExportOffer, Vec<u8>) {
+    let body = b"scope v2\n";
+    let content_sha256 = sha256_label(body);
+    let source_connection_id = SourceConnectionId::new("source-notion");
+    let projection_id = ProjectionId::new("projection-readme");
+    let records = vec![
+        CanonicalExportRecord::File {
+            order_key: CanonicalFileOrderKey {
+                winning_scope_ordinal: 0,
+                parent_path: None,
+                logical_path: LogicalPath::new("readme.md").expect("logical path"),
+                projection_id: projection_id.clone(),
+            },
+            source_connection_id: source_connection_id.clone(),
+            file_kind: ProjectionFileKind::Markdown,
+            effective_actions: BTreeSet::from([SourceAction::Read]),
+            content_sha256: content_sha256.clone(),
+            byte_length: body.len() as u64,
+        },
+        CanonicalExportRecord::Control {
+            order_key: CanonicalControlOrderKey { ordinal: 0 },
+            member_path: locality_protocol::RESERVED_EXPORT_METADATA_PATH.to_string(),
+        },
+    ];
+    let source_generations = vec![OrderedSourceGeneration {
+        ordinal: 0,
+        source_connection_id: source_connection_id.clone(),
+        source_generation_id: SourceGenerationId::new("generation-scope").expect("generation ID"),
+    }];
+    let limits = ExportAttemptLimits {
+        max_files: ReplicaMaterializationLimits::default()
+            .max_entries
+            .saturating_sub(1),
+        max_directories: ReplicaMaterializationLimits::default()
+            .max_entries
+            .saturating_sub(1),
+        max_content_bytes: ReplicaMaterializationLimits::default().max_disk_bytes,
+    };
+    let inventory_sha256 = canonical_export_inventory_sha256(&records).expect("scope inventory");
+    let writable_metadata = ScopeAuthorizedWritableExportMetadata {
+        versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+        session_id: SessionId::new("session-7"),
+        export_attempt_id: ExportAttemptId::new("attempt-scope").expect("attempt ID"),
+        source_generations: source_generations.clone(),
+        writable_entries: Vec::new(),
+    };
+    let writable_metadata_sha256 =
+        canonical_writable_metadata_sha256(&writable_metadata).expect("writable metadata digest");
+    let offer = SealedExportOffer {
+        versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+        session_id: writable_metadata.session_id.clone(),
+        export_attempt_id: writable_metadata.export_attempt_id.clone(),
+        source_generations: source_generations.clone(),
+        media_type: "application/x-tar".to_string(),
+        content_encoding: encoding,
+        limits,
+        control_entry_count: 1,
+        file_count: 1,
+        directory_count: 0,
+        archive_entry_count: 2,
+        selected_content_bytes: body.len() as u64,
+        inventory_sha256: inventory_sha256.clone(),
+        writable_metadata_sha256: writable_metadata_sha256.clone(),
+        sealed_at: "2026-07-23T20:00:01Z".to_string(),
+        expires_at: "2026-07-23T20:10:01Z".to_string(),
+    };
+    let mut body_digest = DeliveredBodyDigestV2::new(1);
+    body_digest
+        .update_file(&projection_id, body)
+        .expect("update delivered-body digest");
+    let receipt = ExportCompletionReceipt {
+        versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+        session_id: offer.session_id.clone(),
+        export_attempt_id: offer.export_attempt_id.clone(),
+        source_generations,
+        inventory_sha256,
+        writable_metadata_sha256,
+        delivered_control_entry_count: 1,
+        delivered_file_count: 1,
+        delivered_directory_count: 0,
+        delivered_archive_entry_count: 2,
+        delivered_content_bytes: body.len() as u64,
+        delivered_body_sha256: body_digest.finish().expect("delivered-body digest"),
+        completed_at: "2026-07-23T20:00:03Z".to_string(),
+    };
+    let terminal_control = ExportTerminalControlV2 {
+        writable_metadata,
+        completion_receipt: receipt,
+    };
+    let mut builder = Builder::new(Vec::new());
+    let pax = [
+        (PAX_SOURCE_CONNECTION_ID, source_connection_id.as_str()),
+        (PAX_PROJECTION_ID, projection_id.as_str()),
+        (PAX_WINNING_SCOPE_ORDINAL, "0"),
+        (PAX_FILE_KIND, "markdown"),
+        (PAX_EFFECTIVE_ACTIONS, "[\"read\"]"),
+        (PAX_CONTENT_SHA256, content_sha256.as_str()),
+    ];
+    builder
+        .append_pax_extensions(pax.map(|(key, value)| (key, value.as_bytes())))
+        .expect("append scope PAX metadata");
+    append_tar_member(&mut builder, b"readme.md", body);
+    append_tar_member(
+        &mut builder,
+        locality_protocol::RESERVED_EXPORT_METADATA_PATH.as_bytes(),
+        &serde_json::to_vec(&terminal_control).expect("serialize scope terminal control"),
+    );
+    builder.finish().expect("finish scope tar");
+    (offer, builder.into_inner().expect("collect scope tar"))
+}
+
+fn append_tar_member(builder: &mut Builder<Vec<u8>>, path: &[u8], body: &[u8]) {
+    assert!(path.len() <= 100);
+    let mut header = Header::new_gnu();
+    header.set_entry_type(EntryType::file());
+    header.set_mode(0o444);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header.set_size(body.len() as u64);
+    {
+        let bytes = header.as_mut_bytes();
+        bytes[..100].fill(0);
+        bytes[..path.len()].copy_from_slice(path);
+    }
+    header.set_cksum();
+    builder.append(&header, body).expect("append tar member");
 }
 
 fn sha256_label(bytes: &[u8]) -> String {

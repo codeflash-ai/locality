@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
@@ -7,11 +8,24 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use locality_core::portable::{
+    ExportAttemptId, LogicalPath, ProjectionFileKind, ProjectionId, SessionId, SourceAction,
+    SourceConnectionId, SourceGenerationId,
+};
+use locality_protocol::{
+    CanonicalControlOrderKey, CanonicalDirectoryOrderKey, CanonicalExportRecord,
+    CanonicalFileOrderKey, DeliveredBodyDigestV2, ExportAttemptLimits, ExportCompletionReceipt,
+    ExportTerminalControlV2, OrderedSourceGeneration, PAX_CONTENT_SHA256, PAX_EFFECTIVE_ACTIONS,
+    PAX_FILE_KIND, PAX_PROJECTION_ID, PAX_SOURCE_CONNECTION_ID, PAX_WINNING_SCOPE_ORDINAL,
+    SCOPE_AUTHORIZED_COMPONENT_VERSIONS, ScopeAuthorizedWritableExportMetadata, SealedExportOffer,
+    TarContentEncoding, canonical_export_inventory_sha256, canonical_writable_metadata_sha256,
+};
 use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 use localityd::replica_materializer::{
     ExpectedReplicaMaterializationReceipt, ReplicaMaterializationLimits,
     ReplicaMaterializationSummary, materialize_replica_archive,
     materialize_replica_archive_with_expected_receipt,
+    materialize_scope_authorized_replica_archive,
 };
 use sha2::{Digest, Sha256};
 use tar::{Builder, EntryType, Header};
@@ -209,6 +223,352 @@ fn exact_receipt_identity_archive_publishes_after_decoded_tar_verification() {
         fs::read(root.destination().join("verified.txt")).expect("read verified file"),
         b"identity\n"
     );
+}
+
+#[derive(Clone, Copy)]
+enum V2ArchiveMutation {
+    None,
+    MissingPax,
+    DuplicatePax,
+    UnknownPax,
+    LocDirectoryHeader,
+    MissingReceipt,
+    MalformedReceipt,
+    NoncanonicalReceipt,
+    TrailingReceipt,
+    UnknownReceiptField,
+    DuplicateReceipt,
+    ReceiptNotFinal,
+    ReceiptBodyDigestMismatch,
+    ReceiptGenerationMismatch,
+    ReceiptCountMismatch,
+}
+
+fn v2_offer_and_archive(mutation: V2ArchiveMutation) -> (SealedExportOffer, Vec<u8>) {
+    let body = b"scope authorized\n";
+    let content_sha256 = sha256_label(Sha256::digest(body).into());
+    let source_connection_id = SourceConnectionId::new("source-notion");
+    let projection_id = ProjectionId::new("projection-readme");
+    let actions = BTreeSet::from([SourceAction::Read, SourceAction::Search]);
+    let records = vec![
+        CanonicalExportRecord::Directory {
+            order_key: CanonicalDirectoryOrderKey {
+                depth: 1,
+                logical_path: LogicalPath::new("docs").expect("directory path"),
+            },
+        },
+        CanonicalExportRecord::File {
+            order_key: CanonicalFileOrderKey {
+                winning_scope_ordinal: 0,
+                parent_path: Some(LogicalPath::new("docs").expect("parent path")),
+                logical_path: LogicalPath::new("docs/readme.md").expect("file path"),
+                projection_id: projection_id.clone(),
+            },
+            source_connection_id: source_connection_id.clone(),
+            file_kind: ProjectionFileKind::Markdown,
+            effective_actions: actions,
+            content_sha256: content_sha256.clone(),
+            byte_length: body.len() as u64,
+        },
+        CanonicalExportRecord::Control {
+            order_key: CanonicalControlOrderKey { ordinal: 0 },
+            member_path: locality_protocol::RESERVED_EXPORT_METADATA_PATH.to_string(),
+        },
+    ];
+    let source_generations = vec![OrderedSourceGeneration {
+        ordinal: 0,
+        source_connection_id: source_connection_id.clone(),
+        source_generation_id: SourceGenerationId::new("generation-9").expect("generation ID"),
+    }];
+    let inventory_sha256 =
+        canonical_export_inventory_sha256(&records).expect("canonical inventory");
+    let writable_metadata = ScopeAuthorizedWritableExportMetadata {
+        versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+        session_id: SessionId::new("session-scope"),
+        export_attempt_id: ExportAttemptId::new("attempt-9").expect("attempt ID"),
+        source_generations: source_generations.clone(),
+        writable_entries: Vec::new(),
+    };
+    let writable_metadata_sha256 =
+        canonical_writable_metadata_sha256(&writable_metadata).expect("writable metadata digest");
+    let offer = SealedExportOffer {
+        versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+        session_id: writable_metadata.session_id.clone(),
+        export_attempt_id: writable_metadata.export_attempt_id.clone(),
+        source_generations: source_generations.clone(),
+        media_type: "application/x-tar".to_string(),
+        content_encoding: TarContentEncoding::Identity,
+        limits: ExportAttemptLimits {
+            max_files: 10,
+            max_directories: 10,
+            max_content_bytes: 1024,
+        },
+        control_entry_count: 1,
+        file_count: 1,
+        directory_count: 1,
+        archive_entry_count: 3,
+        selected_content_bytes: body.len() as u64,
+        inventory_sha256: inventory_sha256.clone(),
+        writable_metadata_sha256: writable_metadata_sha256.clone(),
+        sealed_at: "2026-07-23T20:00:00Z".to_string(),
+        expires_at: "2026-07-23T20:10:00Z".to_string(),
+    };
+    offer.validate_inventory(&records).expect("valid offer");
+
+    let mut body_digest = DeliveredBodyDigestV2::new(1);
+    body_digest
+        .update_file(&projection_id, body)
+        .expect("body digest update");
+    let delivered_body_sha256 = body_digest.finish().expect("body digest");
+    let mut receipt = ExportCompletionReceipt {
+        versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+        session_id: offer.session_id.clone(),
+        export_attempt_id: offer.export_attempt_id.clone(),
+        source_generations,
+        inventory_sha256,
+        writable_metadata_sha256,
+        delivered_control_entry_count: 1,
+        delivered_file_count: 1,
+        delivered_directory_count: 1,
+        delivered_archive_entry_count: 3,
+        delivered_content_bytes: body.len() as u64,
+        delivered_body_sha256,
+        completed_at: "2026-07-23T20:00:03Z".to_string(),
+    };
+    if matches!(mutation, V2ArchiveMutation::ReceiptBodyDigestMismatch) {
+        receipt.delivered_body_sha256 = format!("sha256:{}", "0".repeat(64));
+    }
+    if matches!(mutation, V2ArchiveMutation::ReceiptGenerationMismatch) {
+        receipt.source_generations[0].source_generation_id =
+            SourceGenerationId::new("generation-other").expect("generation ID");
+    }
+    if matches!(mutation, V2ArchiveMutation::ReceiptCountMismatch) {
+        receipt.delivered_file_count = 2;
+        receipt.delivered_archive_entry_count = 4;
+    }
+
+    let mut builder = Builder::new(Vec::new());
+    append_test_member(&mut builder, &TestMember::directory("docs/"));
+    if matches!(mutation, V2ArchiveMutation::LocDirectoryHeader) {
+        append_test_member(&mut builder, &TestMember::directory(".loc/"));
+    }
+    let mut pax = vec![
+        (PAX_SOURCE_CONNECTION_ID, source_connection_id.as_str()),
+        (PAX_PROJECTION_ID, projection_id.as_str()),
+        (PAX_WINNING_SCOPE_ORDINAL, "0"),
+        (PAX_FILE_KIND, "markdown"),
+        (PAX_EFFECTIVE_ACTIONS, "[\"read\",\"search\"]"),
+        (PAX_CONTENT_SHA256, content_sha256.as_str()),
+    ];
+    match mutation {
+        V2ArchiveMutation::MissingPax => {
+            pax.retain(|(key, _)| *key != PAX_PROJECTION_ID);
+        }
+        V2ArchiveMutation::DuplicatePax => pax.push((PAX_PROJECTION_ID, "projection-other")),
+        V2ArchiveMutation::UnknownPax => pax.push(("locality.unknown", "forbidden")),
+        _ => {}
+    }
+    builder
+        .append_pax_extensions(pax.iter().map(|(key, value)| (*key, value.as_bytes())))
+        .expect("append file PAX metadata");
+    append_test_member(&mut builder, &TestMember::file("docs/readme.md", body));
+    let terminal_control = ExportTerminalControlV2 {
+        writable_metadata,
+        completion_receipt: receipt,
+    };
+    let mut receipt_body =
+        serde_json::to_vec(&terminal_control).expect("serialize terminal control");
+    match mutation {
+        V2ArchiveMutation::MalformedReceipt => receipt_body = b"not-json".to_vec(),
+        V2ArchiveMutation::NoncanonicalReceipt => receipt_body.insert(0, b' '),
+        V2ArchiveMutation::TrailingReceipt => receipt_body.push(b'\n'),
+        V2ArchiveMutation::UnknownReceiptField => {
+            receipt_body.splice(1..1, b"\"unknown\":true,".iter().copied());
+        }
+        _ => {}
+    }
+    let receipt_member = TestMember::file(
+        locality_protocol::RESERVED_EXPORT_METADATA_PATH,
+        receipt_body,
+    );
+    if matches!(mutation, V2ArchiveMutation::ReceiptNotFinal) {
+        append_test_member(&mut builder, &receipt_member);
+        append_test_member(&mut builder, &TestMember::file("after.txt", "after"));
+    } else if !matches!(mutation, V2ArchiveMutation::MissingReceipt) {
+        append_test_member(&mut builder, &receipt_member);
+        if matches!(mutation, V2ArchiveMutation::DuplicateReceipt) {
+            append_test_member(&mut builder, &receipt_member);
+        }
+    }
+    builder.finish().expect("finish v2 tar");
+    (offer, builder.into_inner().expect("collect v2 tar"))
+}
+
+fn append_test_member(builder: &mut Builder<Vec<u8>>, member: &TestMember) {
+    let mut header = Header::new_gnu();
+    header.set_entry_type(member.entry_type);
+    header.set_mode(member.mode);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header.set_size(member.data.len() as u64);
+    assert!(member.path.len() <= 100, "test path fits GNU name field");
+    {
+        let bytes = header.as_mut_bytes();
+        bytes[..100].fill(0);
+        bytes[..member.path.len()].copy_from_slice(&member.path);
+    }
+    header.set_cksum();
+    builder
+        .append(&header, member.data.as_slice())
+        .expect("append test member");
+}
+
+fn materialize_v2(
+    archive: Vec<u8>,
+    encoding: ReplicaArchiveEncoding,
+    offer: &SealedExportOffer,
+    destination: &Path,
+) -> Result<ReplicaMaterializationSummary, String> {
+    materialize_scope_authorized_replica_archive(
+        ReplicaArchive::new(encoding, Cursor::new(archive)),
+        destination,
+        ReplicaMaterializationLimits::default(),
+        offer,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[test]
+fn scope_authorized_identity_and_zstd_publish_without_exposing_receipt() {
+    for (label, encoding) in [
+        ("v2-identity", ReplicaArchiveEncoding::Identity),
+        ("v2-zstd", ReplicaArchiveEncoding::Zstd),
+    ] {
+        let root = TestDirectory::new(label);
+        let (mut offer, tar) = v2_offer_and_archive(V2ArchiveMutation::None);
+        let archive = match encoding {
+            ReplicaArchiveEncoding::Identity => tar,
+            ReplicaArchiveEncoding::Zstd => {
+                offer.content_encoding = TarContentEncoding::Zstd;
+                zstd::stream::encode_all(tar.as_slice(), 1).expect("compress v2 tar")
+            }
+        };
+        let summary = materialize_v2(archive, encoding, &offer, &root.destination())
+            .expect("materialize v2 archive");
+        assert_eq!(summary.entries, 3);
+        assert_eq!(summary.files, 1);
+        assert_eq!(summary.directories, 1);
+        assert_eq!(summary.materialized_bytes, 17);
+        assert_eq!(
+            fs::read(root.destination().join("docs/readme.md")).expect("read v2 file"),
+            b"scope authorized\n"
+        );
+        assert!(!root.destination().join(".loc").exists());
+    }
+}
+
+#[test]
+fn scope_authorized_malformed_metadata_receipts_and_order_roll_back() {
+    for (label, mutation, expected) in [
+        (
+            "v2-missing-pax",
+            V2ArchiveMutation::MissingPax,
+            "invalid locality PAX metadata",
+        ),
+        (
+            "v2-duplicate-pax",
+            V2ArchiveMutation::DuplicatePax,
+            "invalid locality PAX metadata",
+        ),
+        (
+            "v2-unknown-pax",
+            V2ArchiveMutation::UnknownPax,
+            "invalid locality PAX metadata",
+        ),
+        (
+            "v2-loc-directory-header",
+            V2ArchiveMutation::LocDirectoryHeader,
+            "reserved .loc directory header is forbidden",
+        ),
+        (
+            "v2-missing-receipt",
+            V2ArchiveMutation::MissingReceipt,
+            "completion receipt is missing",
+        ),
+        (
+            "v2-malformed-receipt",
+            V2ArchiveMutation::MalformedReceipt,
+            "completion receipt is malformed",
+        ),
+        (
+            "v2-noncanonical-receipt",
+            V2ArchiveMutation::NoncanonicalReceipt,
+            "completion receipt is not canonical JSON",
+        ),
+        (
+            "v2-trailing-receipt",
+            V2ArchiveMutation::TrailingReceipt,
+            "completion receipt is not canonical JSON",
+        ),
+        (
+            "v2-unknown-receipt-field",
+            V2ArchiveMutation::UnknownReceiptField,
+            "completion receipt is not canonical JSON",
+        ),
+        (
+            "v2-duplicate-receipt",
+            V2ArchiveMutation::DuplicateReceipt,
+            "completion receipt is not the final member",
+        ),
+        (
+            "v2-receipt-not-final",
+            V2ArchiveMutation::ReceiptNotFinal,
+            "completion receipt is not the final member",
+        ),
+        (
+            "v2-body-digest-mismatch",
+            V2ArchiveMutation::ReceiptBodyDigestMismatch,
+            "delivered-body digest does not match",
+        ),
+        (
+            "v2-generation-mismatch",
+            V2ArchiveMutation::ReceiptGenerationMismatch,
+            "completion receipt does not match sealed export offer",
+        ),
+        (
+            "v2-count-mismatch",
+            V2ArchiveMutation::ReceiptCountMismatch,
+            "completion receipt does not match sealed export offer",
+        ),
+    ] {
+        let root = TestDirectory::new(label);
+        let (offer, archive) = v2_offer_and_archive(mutation);
+        let error = materialize_v2(
+            archive,
+            ReplicaArchiveEncoding::Identity,
+            &offer,
+            &root.destination(),
+        )
+        .expect_err("malformed v2 archive must fail");
+        assert!(error.contains(expected), "{label}: {error}");
+        root.assert_no_staging_or_destination();
+    }
+}
+
+#[test]
+fn scope_authorized_truncation_rolls_back() {
+    let root = TestDirectory::new("v2-truncated");
+    let (offer, mut archive) = v2_offer_and_archive(V2ArchiveMutation::None);
+    archive.truncate(archive.len() - 700);
+    materialize_v2(
+        archive,
+        ReplicaArchiveEncoding::Identity,
+        &offer,
+        &root.destination(),
+    )
+    .expect_err("truncated v2 archive must fail");
+    root.assert_no_staging_or_destination();
 }
 
 struct ChunkedReader<R> {

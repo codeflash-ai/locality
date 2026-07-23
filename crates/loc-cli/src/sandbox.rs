@@ -16,13 +16,15 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use locality_protocol::{
-    OpaqueBootstrapExchangeRequest, SandboxSessionState, SandboxSessionStatus, SessionCapability,
-    SessionErrorCode, TarContentEncoding, TarExportOffer,
+    ExportAttemptLimits, ExportAttemptRequest, OpaqueBootstrapExchangeRequest,
+    SCOPE_AUTHORIZED_COMPONENT_VERSIONS, SandboxSessionState, SandboxSessionStatus,
+    SealedExportOffer, SessionCapability, SessionErrorCode, TarContentEncoding, TarExportOffer,
 };
 use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 use localityd::replica_materializer::{
     ExpectedReplicaMaterializationReceipt, ReplicaMaterializationLimits,
     ReplicaMaterializationSummary, materialize_replica_archive_with_expected_receipt,
+    materialize_scope_authorized_replica_archive,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
@@ -440,10 +442,36 @@ fn run_sandbox_init_internal(
     validate_capability(&capability)?;
     let status = client.session_status(&capability)?;
     mark_profile(&mut profile, PROFILE_SESSION_STATUS);
-    let (offer, expected_receipt) = validate_status(&capability, &status)?;
-    validate_encoding_preference(offer, content_encoding)?;
-    let limits = limits_for_offer(offer)?;
-    let (encoding, response) = client.open_export(&capability, offer, content_encoding)?;
+    let session = validate_status(&capability, &status)?;
+    let (encoding, response, limits, validation) = match session {
+        ValidatedSandboxSession::Legacy {
+            offer,
+            expected_receipt,
+        } => {
+            validate_encoding_preference(offer, content_encoding)?;
+            let limits = limits_for_offer(offer)?;
+            let (encoding, response) = client.open_export(&capability, offer, content_encoding)?;
+            (
+                encoding,
+                response,
+                limits,
+                ExportValidation::Legacy(expected_receipt),
+            )
+        }
+        ValidatedSandboxSession::ScopeAuthorized => {
+            let request = export_attempt_request(&capability, content_encoding)?;
+            let offer = client.create_export_attempt(&capability, &request)?;
+            validate_scope_offer(&capability, &request, &offer)?;
+            let limits = limits_for_scope_offer(&offer)?;
+            let (encoding, response) = client.open_export_attempt(&capability, &offer)?;
+            (
+                encoding,
+                response,
+                limits,
+                ExportValidation::ScopeAuthorized(offer),
+            )
+        }
+    };
     mark_profile(&mut profile, PROFILE_EXPORT_OPEN_HEADERS);
     let (body, mut producer) =
         spawn_export_read_ahead(response).map_err(|error| SandboxInitError::Http {
@@ -452,9 +480,20 @@ fn run_sandbox_init_internal(
         })?;
     let profiled_body = ProfiledExportBody::new(body, profile.as_deref_mut());
     let archive = ReplicaArchive::new(encoding, profiled_body);
-    let materialization =
-        materialize_replica_archive_with_expected_receipt(archive, &root, limits, expected_receipt)
-            .map_err(|error| SandboxInitError::Materialization(error.to_string()));
+    let materialization = match validation {
+        ExportValidation::Legacy(expected_receipt) => {
+            materialize_replica_archive_with_expected_receipt(
+                archive,
+                &root,
+                limits,
+                expected_receipt,
+            )
+        }
+        ExportValidation::ScopeAuthorized(offer) => {
+            materialize_scope_authorized_replica_archive(archive, &root, limits, &offer)
+        }
+    }
+    .map_err(|error| SandboxInitError::Materialization(error.to_string()));
     let producer_outcome = producer.join();
     mark_profile(&mut profile, PROFILE_STREAM_DECODE_MATERIALIZE);
 
@@ -717,10 +756,23 @@ fn validate_capability(capability: &SessionCapability) -> Result<(), SandboxInit
     Ok(())
 }
 
+enum ValidatedSandboxSession<'a> {
+    Legacy {
+        offer: &'a TarExportOffer,
+        expected_receipt: ExpectedReplicaMaterializationReceipt,
+    },
+    ScopeAuthorized,
+}
+
+enum ExportValidation {
+    Legacy(ExpectedReplicaMaterializationReceipt),
+    ScopeAuthorized(SealedExportOffer),
+}
+
 fn validate_status<'a>(
     capability: &SessionCapability,
     status: &'a SandboxSessionStatus,
-) -> Result<(&'a TarExportOffer, ExpectedReplicaMaterializationReceipt), SandboxInitError> {
+) -> Result<ValidatedSandboxSession<'a>, SandboxInitError> {
     status
         .versions
         .validate_required()
@@ -737,6 +789,20 @@ fn validate_status<'a>(
     if status.error.is_some() {
         return Err(SandboxInitError::InvalidReadySession("error is present"));
     }
+    if status.versions.session >= 2 {
+        if status.versions.replica < 2 || status.versions.export_metadata < 2 {
+            return Err(SandboxInitError::ComponentVersion(
+                "scope-authorized session requires replica and export-metadata version 2"
+                    .to_string(),
+            ));
+        }
+        if status.export_offer.is_some() {
+            return Err(SandboxInitError::InvalidReadySession(
+                "scope-authorized status contains a legacy export offer",
+            ));
+        }
+        return Ok(ValidatedSandboxSession::ScopeAuthorized);
+    }
     let offer = status
         .export_offer
         .as_ref()
@@ -744,7 +810,81 @@ fn validate_status<'a>(
             "export offer is missing",
         ))?;
     let expected_receipt = validate_offer(offer)?;
-    Ok((offer, expected_receipt))
+    Ok(ValidatedSandboxSession::Legacy {
+        offer,
+        expected_receipt,
+    })
+}
+
+fn export_attempt_request(
+    capability: &SessionCapability,
+    preference: SandboxContentEncodingPreference,
+) -> Result<ExportAttemptRequest, SandboxInitError> {
+    let defaults = ReplicaMaterializationLimits::default();
+    let request = ExportAttemptRequest {
+        versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+        opaque_session_capability: capability.opaque_capability.clone(),
+        idempotency_key: random_export_idempotency_key()?,
+        content_encoding: match preference {
+            SandboxContentEncodingPreference::Automatic
+            | SandboxContentEncodingPreference::Zstd => TarContentEncoding::Zstd,
+            SandboxContentEncodingPreference::Identity => TarContentEncoding::Identity,
+        },
+        limits: ExportAttemptLimits {
+            max_files: defaults.max_entries.saturating_sub(1),
+            max_directories: defaults.max_entries.saturating_sub(1),
+            max_content_bytes: defaults.max_disk_bytes,
+        },
+    };
+    request.validate().map_err(|_| {
+        SandboxInitError::InvalidExportOffer("client export-attempt request is invalid")
+    })?;
+    Ok(request)
+}
+
+fn random_export_idempotency_key() -> Result<String, SandboxInitError> {
+    let mut random = [0_u8; 32];
+    rustls::crypto::ring::default_provider()
+        .secure_random
+        .fill(&mut random)
+        .map_err(|_| SandboxInitError::Http {
+            operation: "export-attempt idempotency-key generation",
+            detail: "secure randomness is unavailable".to_string(),
+        })?;
+    Ok(format!("loc-export-v2-{}", lower_hex(&random)))
+}
+
+fn validate_scope_offer(
+    capability: &SessionCapability,
+    request: &ExportAttemptRequest,
+    offer: &SealedExportOffer,
+) -> Result<(), SandboxInitError> {
+    offer
+        .versions
+        .validate_required()
+        .map_err(|error| SandboxInitError::ComponentVersion(error.to_string()))?;
+    offer
+        .validate()
+        .map_err(|_| SandboxInitError::InvalidExportOffer("scope-authorized offer is invalid"))?;
+    if offer.session_id != capability.session_id {
+        return Err(SandboxInitError::SessionIdMismatch);
+    }
+    if offer.media_type != TAR_MEDIA_TYPE {
+        return Err(SandboxInitError::InvalidExportOffer(
+            "media type must be application/x-tar",
+        ));
+    }
+    if offer.content_encoding != request.content_encoding {
+        return Err(SandboxInitError::InvalidExportOffer(
+            "content encoding does not match the export-attempt request",
+        ));
+    }
+    if offer.limits != request.limits {
+        return Err(SandboxInitError::InvalidExportOffer(
+            "limits do not match the export-attempt request",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_offer(
@@ -840,6 +980,31 @@ fn limits_for_offer(
     Ok(ReplicaMaterializationLimits {
         max_entries: offer.selected_entries,
         max_decoded_bytes: offer.decoded_bytes,
+        ..defaults
+    })
+}
+
+fn limits_for_scope_offer(
+    offer: &SealedExportOffer,
+) -> Result<ReplicaMaterializationLimits, SandboxInitError> {
+    let defaults = ReplicaMaterializationLimits::default();
+    if offer.archive_entry_count > defaults.max_entries {
+        return Err(SandboxInitError::ExportLimit {
+            limit: "entry count",
+            offered: offer.archive_entry_count,
+            maximum: defaults.max_entries,
+        });
+    }
+    if offer.selected_content_bytes > defaults.max_disk_bytes {
+        return Err(SandboxInitError::ExportLimit {
+            limit: "content bytes",
+            offered: offer.selected_content_bytes,
+            maximum: defaults.max_disk_bytes,
+        });
+    }
+    Ok(ReplicaMaterializationLimits {
+        max_entries: offer.archive_entry_count,
+        max_disk_bytes: offer.selected_content_bytes,
         ..defaults
     })
 }
@@ -1055,6 +1220,66 @@ impl SandboxHttpClient {
         Ok((encoding, response))
     }
 
+    fn create_export_attempt(
+        &self,
+        capability: &SessionCapability,
+        request: &ExportAttemptRequest,
+    ) -> Result<SealedExportOffer, SandboxInitError> {
+        let response = self
+            .client
+            .post(self.export_attempts_url(capability.session_id.as_str()))
+            .header(ACCEPT, JSON_MEDIA_TYPE)
+            .bearer_auth(&capability.opaque_capability)
+            .json(request)
+            .send()
+            .map_err(|error| SandboxInitError::Http {
+                operation: "export-attempt creation",
+                detail: error.without_url().to_string(),
+            })?;
+        read_json_response(response, "export-attempt creation")
+    }
+
+    fn open_export_attempt(
+        &self,
+        capability: &SessionCapability,
+        offer: &SealedExportOffer,
+    ) -> Result<(ReplicaArchiveEncoding, Response), SandboxInitError> {
+        let response = self
+            .export_client
+            .get(self.export_attempt_url(
+                capability.session_id.as_str(),
+                offer.export_attempt_id.as_str(),
+            ))
+            .header(ACCEPT, TAR_MEDIA_TYPE)
+            .header(
+                ACCEPT_ENCODING,
+                match offer.content_encoding {
+                    TarContentEncoding::Identity => "identity",
+                    TarContentEncoding::Zstd => "zstd",
+                },
+            )
+            .bearer_auth(&capability.opaque_capability)
+            .send()
+            .map_err(|error| SandboxInitError::Http {
+                operation: "export-attempt stream",
+                detail: error.without_url().to_string(),
+            })?;
+        ensure_success(&response, "export-attempt stream")?;
+        require_media_type(response.headers(), "export-attempt stream", TAR_MEDIA_TYPE)?;
+        let encoding = response_encoding(response.headers())?;
+        if protocol_encoding(encoding) != offer.content_encoding {
+            return Err(SandboxInitError::UnsupportedExportEncoding(format!(
+                "{} (sealed {})",
+                encoding_name(encoding),
+                match offer.content_encoding {
+                    TarContentEncoding::Identity => "identity",
+                    TarContentEncoding::Zstd => "zstd",
+                }
+            )));
+        }
+        Ok((encoding, response))
+    }
+
     fn sessions_url(&self) -> reqwest::Url {
         endpoint_url(&self.api_url, &["v1", "sessions"])
     }
@@ -1066,6 +1291,27 @@ impl SandboxHttpClient {
     fn export_url(&self, session_id: &str) -> reqwest::Url {
         endpoint_url(&self.api_url, &["v1", "sessions", session_id, "export"])
     }
+
+    fn export_attempts_url(&self, session_id: &str) -> reqwest::Url {
+        endpoint_url(
+            &self.api_url,
+            &["v1", "sessions", session_id, "export-attempts"],
+        )
+    }
+
+    fn export_attempt_url(&self, session_id: &str, attempt_id: &str) -> reqwest::Url {
+        endpoint_url(
+            &self.api_url,
+            &[
+                "v1",
+                "sessions",
+                session_id,
+                "export-attempts",
+                attempt_id,
+                "export",
+            ],
+        )
+    }
 }
 
 fn derive_idempotency_key(token: &SandboxBootstrapToken) -> String {
@@ -1073,13 +1319,17 @@ fn derive_idempotency_key(token: &SandboxBootstrapToken) -> String {
     hasher.update(BOOTSTRAP_IDEMPOTENCY_DOMAIN);
     hasher.update(token.expose().as_bytes());
     let digest = hasher.finalize();
-    let mut encoded = [0_u8; 64];
+    lower_hex(&digest)
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    let mut encoded = vec![0_u8; bytes.len() * 2];
     const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
-    for (index, byte) in digest.into_iter().enumerate() {
+    for (index, byte) in bytes.iter().copied().enumerate() {
         encoded[index * 2] = LOWER_HEX[usize::from(byte >> 4)];
         encoded[index * 2 + 1] = LOWER_HEX[usize::from(byte & 0x0f)];
     }
-    String::from_utf8(encoded.to_vec()).expect("lowercase hexadecimal is valid UTF-8")
+    String::from_utf8(encoded).expect("lowercase hexadecimal is valid UTF-8")
 }
 
 fn has_retry_remaining(attempt: usize) -> bool {
