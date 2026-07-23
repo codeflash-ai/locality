@@ -23,6 +23,7 @@ credentials in the current build.
 | Google Calendar | Action | OAuth | Read events, create reviewed drafts |
 | Gmail | Action | OAuth | Read inbox/sent, create reviewed drafts |
 | GitHub | Hybrid | Personal access token | Read-only repositories, README files, issues, and pull requests |
+| GitLab | Hybrid | Personal access token | Read-only projects, README files, issues, and merge requests |
 | Granola | Knowledge | API key | Read-only summaries and transcripts |
 | Linear | Hybrid | API key | Editable issue pages and supported issue moves |
 | Slack | Knowledge | OAuth | Read-only accessible conversations |
@@ -45,7 +46,6 @@ same product contract.
 | Outlook Mail | Action | OAuth | Mail folders and reviewed draft creation |
 | Outlook Calendar | Action | OAuth | Calendar events and reviewed scheduling drafts |
 | Microsoft Teams | Knowledge | OAuth | Teams, channels, chats, meetings, and user context |
-| GitLab | Hybrid | OAuth, personal token | Projects, MRs, issues, pipelines, and releases |
 | Google Drive | Knowledge | OAuth | Drive files, PDFs, sheets, slides, and shared drives |
 | Dropbox | Knowledge | OAuth | Shared files and folders |
 | Box | Knowledge | OAuth | Enterprise files and folders |
@@ -74,7 +74,7 @@ are built against the relevant official API contract.
 | Outlook Calendar | Microsoft Graph auth, permissions, calendars, and event APIs |
 | Microsoft Teams | Microsoft Graph auth, permissions, Teams, channel, chat, and message APIs |
 | GitHub (runtime read-only v1) | GitHub REST API, repository contents, issues, pull requests, and PAT auth |
-| GitLab | GitLab REST API authentication, projects, issues, merge requests, and pipelines |
+| GitLab (runtime read-only v1) | GitLab REST API authentication, projects, repository files, issues, merge requests, and PAT auth |
 | Google Drive | Google Drive API v3 files, drives, changes, comments, revisions, and permissions |
 | Dropbox | Dropbox API v2 HTTP docs, OAuth, files, folders, sharing, and revisions |
 | Box | Box API reference, OAuth 2.0, files, folders, versions, and collaborations |
@@ -120,8 +120,8 @@ The highest leverage next connectors are:
 2. Jira, because it pairs naturally with engineering status workflows.
 3. SharePoint and OneDrive, because Microsoft 365 content is common in larger
    teams.
-4. GitLab, because repository and merge-request context should follow the same
-   read-only-first pattern as GitHub.
+4. Google Drive, because Drive folders and files complete the Google workspace
+   story beyond Docs, Calendar, and Gmail.
 5. Zendesk or Intercom, because support workflows benefit from local search,
    review, and safe response drafts.
 
