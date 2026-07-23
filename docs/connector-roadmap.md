@@ -4,9 +4,10 @@ Locality connectors must preserve the product contract: remote systems become
 local files and folders, while the source of truth remains protected by review,
 conflict checks, and connector-owned concurrency guards.
 
-This document tracks the connector catalog added to the desktop and daemon
-metadata layers. A connector in the planned catalog is visible as product
-direction, but it is not mountable until it has a real connector crate,
+This document tracks the connector catalog added to the desktop, daemon metadata
+layer, and `locality-planned-connectors` scaffold crate. A connector in the
+planned catalog is visible as product direction and exists as a compile-time
+connector scaffold, but it is not mountable until it has a real provider client,
 credential resolver, rendering/parsing fixtures, sync tests, and provider API
 coverage.
 
@@ -77,8 +78,8 @@ the following:
     plans review, pushes where supported, and verifies local state reconciliation.
 
 Until every item above exists, the connector should stay visible as planned
-metadata only. It must not be added to `SOURCE_REGISTRY`, desktop runtime setup,
-or automatic mount creation.
+metadata only. It can live in `locality-planned-connectors`, but it must not be
+added to `SOURCE_REGISTRY`, desktop runtime setup, or automatic mount creation.
 
 ## Implementation Order
 
