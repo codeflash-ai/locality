@@ -142,6 +142,14 @@ impl Connector for GmailConnector {
                 "sent",
                 Path::new("sent"),
             )?);
+            entries.extend(list_label_entries(
+                self.api.as_ref(),
+                &self.config.settings,
+                &request.mount_id,
+                "DRAFT",
+                "draft",
+                Path::new("draft"),
+            )?);
             return Ok(entries);
         }
 
@@ -161,6 +169,14 @@ impl Connector for GmailConnector {
             "SENT",
             "sent",
             Path::new("sent"),
+        )?);
+        entries.extend(list_label_entries(
+            self.api.as_ref(),
+            &self.config.settings,
+            &request.mount_id,
+            "DRAFT",
+            "draft",
+            Path::new("draft"),
         )?);
         Ok(entries)
     }
@@ -217,7 +233,14 @@ impl Connector for GmailConnector {
             ChildContainer::DirectoryChildren(remote_id)
                 if remote_id.as_str() == DRAFT_FOLDER_ID =>
             {
-                Vec::new()
+                list_label_entries(
+                    self.api.as_ref(),
+                    &self.config.settings,
+                    &request.mount_id,
+                    "DRAFT",
+                    "draft",
+                    &request.parent_path,
+                )?
             }
             ChildContainer::PageChildren(remote_id) => {
                 let Some((mailbox, thread_id)) = parse_thread_remote_id(&remote_id) else {
@@ -1209,7 +1232,7 @@ mod tests {
     use crate::settings::GmailMountSettings;
 
     #[test]
-    fn enumerate_projects_three_folders_and_recent_inbox_sent_messages() {
+    fn enumerate_projects_three_folders_and_recent_inbox_sent_draft_messages() {
         let api = Arc::new(FakeGmailApi::default());
         let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
 
@@ -1237,12 +1260,10 @@ mod tests {
         );
         assert!(entries.iter().any(|entry| entry.path.starts_with("inbox/")));
         assert!(entries.iter().any(|entry| entry.path.starts_with("sent/")));
-        assert!(!entries
-            .iter()
-            .any(|entry| entry.path.starts_with("draft") && entry.path.components().count() > 1));
+        assert!(entries.iter().any(|entry| entry.path.starts_with("draft/")));
         assert_eq!(
             api.calls.lock().expect("calls").list_max_results,
-            vec![100, 100]
+            vec![100, 100, 100]
         );
     }
 
@@ -1306,11 +1327,12 @@ mod tests {
                 "after:2026/07/01 before:2026/07/15".to_string(),
                 "after:2026/07/01 before:2026/07/15".to_string(),
                 "after:2026/07/01 before:2026/07/15".to_string(),
+                "after:2026/07/01 before:2026/07/15".to_string(),
             ]
         );
         assert_eq!(
             calls.list_page_tokens,
-            vec![None, Some("next-inbox".to_string()), None]
+            vec![None, Some("next-inbox".to_string()), None, None]
         );
     }
 
@@ -1327,8 +1349,8 @@ mod tests {
             .expect("enumerate");
 
         let calls = api.calls.lock().expect("calls");
-        assert_eq!(calls.list_max_results, vec![100, 100]);
-        assert_eq!(calls.list_page_tokens, vec![None, None]);
+        assert_eq!(calls.list_max_results, vec![100, 100, 100]);
+        assert_eq!(calls.list_page_tokens, vec![None, None, None]);
         assert!(calls.list_queries.is_empty());
     }
 
@@ -1412,7 +1434,7 @@ mod tests {
     }
 
     #[test]
-    fn list_children_for_draft_folder_returns_empty_remote_entries() {
+    fn list_children_for_draft_folder_returns_remote_drafts() {
         let api = Arc::new(FakeGmailApi::default());
         let connector = GmailConnector::with_api(GmailConfig::new("token"), api);
 
@@ -1424,7 +1446,8 @@ mod tests {
             })
             .expect("list draft");
 
-        assert!(result.entries.is_empty());
+        assert_eq!(result.entries.len(), 1);
+        assert!(result.entries[0].path.starts_with("draft/"));
     }
 
     #[test]
@@ -2252,6 +2275,7 @@ mod tests {
             let id = match label_id {
                 "INBOX" => "inbox-msg-1",
                 "SENT" => "sent-msg-1",
+                "DRAFT" => "draft-msg-1",
                 other => panic!("unexpected label {other}"),
             };
             Ok(GmailMessageList {
@@ -2385,6 +2409,8 @@ mod tests {
     fn message_fixture(id: &str) -> GmailMessage {
         let labels = if id.starts_with("sent") {
             Some(vec!["SENT".to_string()])
+        } else if id.starts_with("draft") {
+            Some(vec!["DRAFT".to_string()])
         } else {
             Some(vec!["INBOX".to_string()])
         };
