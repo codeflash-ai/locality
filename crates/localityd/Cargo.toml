@@ -23,6 +23,7 @@ locality-notion.workspace = true
 locality-google-docs.workspace = true
 locality-google-calendar.workspace = true
 locality-gmail.workspace = true
+locality-confluence.workspace = true
 locality-github.workspace = true
 locality-gitlab.workspace = true
 locality-granola.workspace = true

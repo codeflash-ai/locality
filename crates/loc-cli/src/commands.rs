@@ -8,6 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
+use locality_confluence::CONFLUENCE_CONNECTOR_ID;
 use locality_connector::ConnectorUndoApplier;
 use locality_connector::oauth_broker::OAuthBrokerStart;
 use locality_core::LocalityError;
@@ -69,17 +70,17 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::connect::{
-    BrokerOAuthConnectOptions, ConnectError, ConnectOptions, ConnectReport, ConnectionShowReport,
-    ConnectionsReport, DisconnectReport, GmailBrokerOAuthConnectOptions,
-    GoogleCalendarBrokerOAuthConnectOptions, GoogleDocsBrokerOAuthConnectOptions,
-    HttpGitHubConnectionProbe, HttpGitLabConnectionProbe, HttpGranolaConnectionProbe,
-    HttpLinearConnectionProbe, HttpNotionConnectionProbe, OAuthConnectOptions, ProfilesReport,
-    SlackBrokerOAuthConnectOptions, run_connect_github, run_connect_gitlab,
-    run_connect_gmail_broker_oauth, run_connect_google_calendar_broker_oauth,
-    run_connect_google_docs_broker_oauth, run_connect_granola, run_connect_linear,
-    run_connect_notion, run_connect_notion_broker_oauth, run_connect_notion_oauth,
-    run_connect_slack_broker_oauth, run_connection_show, run_connections, run_disconnect,
-    run_profiles,
+    BrokerOAuthConnectOptions, ConfluenceConnectOptions, ConnectError, ConnectOptions,
+    ConnectReport, ConnectionShowReport, ConnectionsReport, DisconnectReport,
+    GmailBrokerOAuthConnectOptions, GoogleCalendarBrokerOAuthConnectOptions,
+    GoogleDocsBrokerOAuthConnectOptions, HttpConfluenceConnectionProbe, HttpGitHubConnectionProbe,
+    HttpGitLabConnectionProbe, HttpGranolaConnectionProbe, HttpLinearConnectionProbe,
+    HttpNotionConnectionProbe, OAuthConnectOptions, ProfilesReport, SlackBrokerOAuthConnectOptions,
+    run_connect_confluence, run_connect_github, run_connect_gitlab, run_connect_gmail_broker_oauth,
+    run_connect_google_calendar_broker_oauth, run_connect_google_docs_broker_oauth,
+    run_connect_granola, run_connect_linear, run_connect_notion, run_connect_notion_broker_oauth,
+    run_connect_notion_oauth, run_connect_slack_broker_oauth, run_connection_show, run_connections,
+    run_disconnect, run_profiles,
 };
 use crate::connector::{
     ConnectorResolveError, SourceDescriptor, resolve_notion_connector_for_mount,
@@ -261,6 +262,11 @@ enum ConnectCommand {
     Granola(ConnectGranolaArgs),
     #[command(about = "Connect Linear with an API key")]
     Linear(ConnectLinearArgs),
+    #[command(
+        name = "confluence",
+        about = "Connect Confluence with an Atlassian API token"
+    )]
+    Confluence(ConnectConfluenceArgs),
     #[command(name = "github", about = "Connect GitHub with a personal access token")]
     GitHub(ConnectGitHubArgs),
     #[command(name = "gitlab", about = "Connect GitLab with a personal access token")]
@@ -289,6 +295,22 @@ struct ConnectLinearArgs {
     name: Option<String>,
     #[arg(long, help = "Read a Linear API key from standard input.")]
     api_key_stdin: bool,
+}
+
+#[derive(Debug, Args)]
+struct ConnectConfluenceArgs {
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Connection id to save. Defaults to confluence-default."
+    )]
+    name: Option<String>,
+    #[arg(long, value_name = "URL", help = "Confluence Cloud site URL.")]
+    site_url: String,
+    #[arg(long, value_name = "EMAIL", help = "Atlassian account email.")]
+    email: String,
+    #[arg(long, help = "Read a Confluence API token from standard input.")]
+    api_token_stdin: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1254,6 +1276,13 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                     push_optional_flag_value(&mut args, "--name", options.name.as_deref());
                     push_flag(&mut args, "--api-key-stdin", options.api_key_stdin);
                 }
+                ConnectCommand::Confluence(options) => {
+                    args.push("confluence".to_string());
+                    push_optional_flag_value(&mut args, "--name", options.name.as_deref());
+                    push_optional_flag_value(&mut args, "--site-url", Some(&options.site_url));
+                    push_optional_flag_value(&mut args, "--email", Some(&options.email));
+                    push_flag(&mut args, "--api-token-stdin", options.api_token_stdin);
+                }
                 ConnectCommand::GitHub(options) => {
                     args.push("github".to_string());
                     push_optional_flag_value(&mut args, "--name", options.name.as_deref());
@@ -1770,6 +1799,9 @@ fn connect(args: &[String], json: bool) -> i32 {
     if connector == Some(LINEAR_CONNECTOR_ID) {
         return connect_linear(args, json);
     }
+    if connector == Some(CONFLUENCE_CONNECTOR_ID) {
+        return connect_confluence(args, json);
+    }
     if connector == Some(GITHUB_CONNECTOR_ID) {
         return connect_github(args, json);
     }
@@ -1797,7 +1829,7 @@ fn connect(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "connect",
                 "usage",
-                "usage: loc connect <notion|google-docs|google-calendar|gmail|slack|granola|linear|github|gitlab> [options] [--json]",
+                "usage: loc connect <notion|google-docs|google-calendar|gmail|slack|granola|linear|confluence|github|gitlab> [options] [--json]",
             ),
             EXIT_USAGE,
         );
@@ -2515,6 +2547,111 @@ fn connect_github(args: &[String], json: bool) -> i32 {
         credentials.as_ref(),
         options,
         &HttpGitHubConnectionProbe,
+    ) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_connect_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => connect_command_error("connect", json, error),
+    }
+}
+
+fn connect_confluence(args: &[String], json: bool) -> i32 {
+    let suggested_command =
+        "loc connect confluence --site-url <url> --email <email> --api-token-stdin";
+    let Some(site_url) = flag_value(args, "--site-url").map(str::trim) else {
+        return command_error(
+            json,
+            CommandError::new(
+                "connect",
+                "auth_required",
+                "Confluence site URL must be provided with --site-url",
+            )
+            .with_suggested_command(suggested_command),
+            EXIT_USAGE,
+        );
+    };
+    let Some(email) = flag_value(args, "--email").map(str::trim) else {
+        return command_error(
+            json,
+            CommandError::new(
+                "connect",
+                "auth_required",
+                "Confluence Atlassian account email must be provided with --email",
+            )
+            .with_suggested_command(suggested_command),
+            EXIT_USAGE,
+        );
+    };
+    if site_url.is_empty() || email.is_empty() {
+        return command_error(
+            json,
+            CommandError::new(
+                "connect",
+                "auth_required",
+                "Confluence site URL and email cannot be empty",
+            )
+            .with_suggested_command(suggested_command),
+            EXIT_USAGE,
+        );
+    }
+    if !has_flag(args, "--api-token-stdin") {
+        return command_error(
+            json,
+            CommandError::new(
+                "connect",
+                "auth_required",
+                "Confluence API tokens must be provided with --api-token-stdin",
+            )
+            .with_suggested_command(suggested_command),
+            EXIT_USAGE,
+        );
+    }
+    let mut api_token = String::new();
+    if let Err(error) = io::stdin().read_to_string(&mut api_token) {
+        return command_error(
+            json,
+            CommandError::new("connect", "stdin_read_failed", error.to_string()),
+            EXIT_INTERNAL,
+        );
+    }
+    let api_token = api_token.trim().to_string();
+    if api_token.is_empty() {
+        return command_error(
+            json,
+            CommandError::new("connect", "auth_required", "empty Confluence API token")
+                .with_suggested_command(suggested_command),
+            EXIT_USAGE,
+        );
+    }
+
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("connect", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let credentials = open_credential_store(&state_root);
+    let options = ConfluenceConnectOptions {
+        connection_id: flag_value(args, "--name").map(ConnectionId::new),
+        site_url: site_url.to_string(),
+        email: email.to_string(),
+        api_token,
+    };
+    match run_connect_confluence(
+        &mut store,
+        credentials.as_ref(),
+        options,
+        &HttpConfluenceConnectionProbe,
     ) {
         Ok(report) if json => {
             print_json(&report);
@@ -3317,7 +3454,9 @@ fn mount(args: &[String], json: bool) -> i32 {
             .clone()
             .unwrap_or_else(|| descriptor.default_mount_id().to_string()),
     );
-    let read_only = has_flag(args, "--read-only") || descriptor.id() == GRANOLA_CONNECTOR_ID;
+    let read_only = has_flag(args, "--read-only")
+        || descriptor.id() == GRANOLA_CONNECTOR_ID
+        || descriptor.id() == CONFLUENCE_CONNECTOR_ID;
     if let Some(error) = mounted_projection_preflight_error(
         projection.clone(),
         std::env::consts::OS,
@@ -9398,6 +9537,8 @@ fn takes_value(arg: &str) -> bool {
             | "--types"
             | "--helper"
             | "--display-name"
+            | "--site-url"
+            | "--email"
             | "--redirect-uri"
             | "--broker-url"
             | "--connector"

@@ -16,7 +16,6 @@ use locality_core::model::{CanonicalDocument, TreeEntry};
 use locality_core::planner::PushOperationKind;
 use locality_core::{LocalityError, LocalityResult};
 
-pub const CONFLUENCE_CONNECTOR_ID: &str = "confluence";
 pub const JIRA_CONNECTOR_ID: &str = "jira";
 pub const SHAREPOINT_CONNECTOR_ID: &str = "sharepoint";
 pub const ONEDRIVE_CONNECTOR_ID: &str = "onedrive";
@@ -104,15 +103,6 @@ impl PlannedConnectorSpec {
             .any(|mode| matches!(*mode, "oauth" | "smart-oauth" | "github-app"))
     }
 }
-
-pub const CONFLUENCE_SPEC: PlannedConnectorSpec = PlannedConnectorSpec::new(
-    CONFLUENCE_CONNECTOR_ID,
-    "Confluence",
-    PlannedConnectorCategory::Knowledge,
-    &["oauth", "api-token"],
-    "Spaces and pages as folders with page.md bodies.",
-    "Start read-only, then reviewed page body updates.",
-);
 
 pub const JIRA_SPEC: PlannedConnectorSpec = PlannedConnectorSpec::new(
     JIRA_CONNECTOR_ID,
@@ -268,7 +258,6 @@ pub const FHIR_SPEC: PlannedConnectorSpec = PlannedConnectorSpec::new(
 );
 
 pub const PLANNED_CONNECTOR_SPECS: &[PlannedConnectorSpec] = &[
-    CONFLUENCE_SPEC,
     JIRA_SPEC,
     SHAREPOINT_SPEC,
     ONEDRIVE_SPEC,
@@ -391,7 +380,6 @@ mod tests {
         assert_eq!(
             planned_connector_ids(),
             vec![
-                "confluence",
                 "jira",
                 "sharepoint",
                 "onedrive",
@@ -426,10 +414,9 @@ mod tests {
 
     #[test]
     fn planned_connector_implements_connector_but_blocks_remote_io() {
-        let connector =
-            PlannedConnector::new(CONFLUENCE_CONNECTOR_ID).expect("confluence connector");
+        let connector = PlannedConnector::new(JIRA_CONNECTOR_ID).expect("jira connector");
 
-        assert_eq!(connector.kind().0, CONFLUENCE_CONNECTOR_ID);
+        assert_eq!(connector.kind().0, JIRA_CONNECTOR_ID);
         assert!(connector.capabilities().supports_oauth);
         assert!(connector.supported_push_operations().is_empty());
         assert!(matches!(

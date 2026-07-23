@@ -1,4 +1,5 @@
 pub mod autosave;
+pub mod confluence;
 pub mod discovery;
 pub mod discovery_execution;
 mod durable_fs;

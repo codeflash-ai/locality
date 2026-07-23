@@ -1,3 +1,4 @@
+use locality_confluence::{CONFLUENCE_CONNECTOR_ID, StoredConfluenceCredential};
 use locality_connector::Connector;
 use locality_connector::oauth_broker::OAuthBrokerToken;
 use locality_core::canonical::parse_canonical_markdown;
@@ -274,6 +275,7 @@ fn source_guidance_teaches_common_cli_workflow() {
         GOOGLE_DOCS_CONNECTOR_ID,
         GOOGLE_CALENDAR_CONNECTOR_ID,
         GMAIL_CONNECTOR_ID,
+        CONFLUENCE_CONNECTOR_ID,
         GRANOLA_CONNECTOR_ID,
         SLACK_CONNECTOR_ID,
         LINEAR_CONNECTOR_ID,
@@ -331,6 +333,7 @@ fn source_guidance_distinguishes_writable_and_read_only_sources() {
     for connector in [
         GITHUB_CONNECTOR_ID,
         GITLAB_CONNECTOR_ID,
+        CONFLUENCE_CONNECTOR_ID,
         GRANOLA_CONNECTOR_ID,
         SLACK_CONNECTOR_ID,
     ] {
@@ -361,6 +364,11 @@ fn source_guidance_distinguishes_writable_and_read_only_sources() {
         source_descriptor(GITLAB_CONNECTOR_ID)
             .mount_guidance()
             .contains("GitLab project context is read-only")
+    );
+    assert!(
+        source_descriptor(CONFLUENCE_CONNECTOR_ID)
+            .mount_guidance()
+            .contains("Confluence spaces and pages are read-only")
     );
     assert!(
         source_descriptor(GRANOLA_CONNECTOR_ID)
@@ -568,12 +576,70 @@ fn gitlab_descriptor_comes_from_registry_and_is_read_only() {
 }
 
 #[test]
+fn confluence_descriptor_comes_from_registry_and_is_read_only() {
+    let descriptor = source_descriptor(CONFLUENCE_CONNECTOR_ID);
+
+    assert_eq!(descriptor.id(), CONFLUENCE_CONNECTOR_ID);
+    assert_eq!(descriptor.display_name(), "Confluence");
+    assert_eq!(descriptor.default_mount_id(), "confluence-main");
+    assert_eq!(
+        descriptor.connect_command(),
+        Some("loc connect confluence --site-url <url> --email <email> --api-token-stdin")
+    );
+    assert_eq!(descriptor.auth_env_var(), None);
+    assert!(!descriptor.supports_oauth());
+    assert!(
+        descriptor
+            .mount_guidance()
+            .contains("# Locality Confluence Mount")
+    );
+    assert!(
+        descriptor
+            .mount_guidance()
+            .contains("Page bodies are rendered from Confluence storage markup")
+    );
+    assert_eq!(descriptor.body_diff_mode(), BodyDiffMode::Block);
+    assert_eq!(
+        descriptor.periodic_discovery_interval(),
+        Some(Duration::from_secs(300))
+    );
+
+    let mount = MountConfig::new(
+        MountId::new("confluence-main"),
+        CONFLUENCE_CONNECTOR_ID,
+        "/tmp/locality/confluence",
+    );
+    assert!(
+        !source_write_decision_for_path(
+            &mount,
+            std::path::Path::new("Spaces/ENG Engineering/Pages/Launch plan 1001/page.md")
+        )
+        .is_writable()
+    );
+    assert!(
+        !source_create_decision_for_parent_path(
+            &mount,
+            std::path::Path::new("Spaces/ENG Engineering/Pages")
+        )
+        .is_writable()
+    );
+    assert!(
+        !source_move_decision_for_parent_path(
+            &mount,
+            std::path::Path::new("Spaces/ENG Engineering/Pages")
+        )
+        .is_writable()
+    );
+}
+
+#[test]
 fn source_descriptors_declare_canonical_title_rename_policy() {
     for connector in [
         "notion",
         "google-docs",
         "google-calendar",
         "gmail",
+        "confluence",
         "github",
         "gitlab",
         "granola",
@@ -601,6 +667,7 @@ fn source_display_name_uses_descriptor_registry() {
     assert_eq!(source_display_name("notion"), "Notion");
     assert_eq!(source_display_name("google-docs"), "Google Docs");
     assert_eq!(source_display_name("google-calendar"), "Google Calendar");
+    assert_eq!(source_display_name("confluence"), "Confluence");
     assert_eq!(source_display_name("gitlab"), "GitLab");
     assert_eq!(source_display_name("linear"), "Linear");
     assert_eq!(source_display_name("slack"), "Slack");
@@ -1095,6 +1162,7 @@ fn supported_source_connectors_include_first_party_connectors() {
             "google-docs",
             "google-calendar",
             "gmail",
+            "confluence",
             "github",
             "gitlab",
             "granola",
@@ -1109,7 +1177,6 @@ fn planned_source_connectors_stay_out_of_runtime_registry() {
     assert_eq!(
         planned_source_connectors(),
         vec![
-            "confluence",
             "jira",
             "sharepoint",
             "onedrive",
@@ -1145,19 +1212,15 @@ fn planned_source_connectors_stay_out_of_runtime_registry() {
 #[test]
 fn planned_source_connector_descriptors_include_auth_and_category() {
     let planned = planned_source_connector_descriptors();
-    let confluence = planned
+    let jira = planned
         .iter()
-        .find(|descriptor| descriptor.id() == "confluence")
-        .expect("confluence descriptor");
-    assert_eq!(confluence.display_name(), "Confluence");
-    assert_eq!(confluence.category(), SourceConnectorCategory::Knowledge);
-    assert_eq!(confluence.auth_modes(), &["oauth", "api-token"]);
-    assert!(confluence.projection().contains("Spaces"));
-    assert!(
-        confluence
-            .write_model()
-            .contains("reviewed page body updates")
-    );
+        .find(|descriptor| descriptor.id() == "jira")
+        .expect("jira descriptor");
+    assert_eq!(jira.display_name(), "Jira");
+    assert_eq!(jira.category(), SourceConnectorCategory::Hybrid);
+    assert_eq!(jira.auth_modes(), &["oauth", "api-token"]);
+    assert!(jira.projection().contains("Projects"));
+    assert!(jira.write_model().contains("Reviewed issue body"));
 
     let fhir = planned
         .iter()
@@ -1312,6 +1375,51 @@ fn resolving_gitlab_mount_uses_active_personal_token_credentials() {
     };
     assert_eq!(connector.config().token, "glpat_secret");
     assert_eq!(connector.kind().0, GITLAB_CONNECTOR_ID);
+    assert!(connector.capabilities().supports_remote_observation);
+    assert!(connector.supported_push_operations().is_empty());
+}
+
+#[test]
+fn resolving_confluence_mount_uses_structured_api_token_credentials() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (connection_id, secret_ref) = save_gmail_connection(
+        &mut store,
+        "confluence-default",
+        CONFLUENCE_CONNECTOR_ID,
+        "api_key",
+    );
+    let stored = StoredConfluenceCredential {
+        site_url: "https://codeflash.atlassian.net".to_string(),
+        email: "saga4@example.com".to_string(),
+        api_token: "atl_secret".to_string(),
+    };
+    credentials
+        .put(
+            &secret_ref,
+            &serde_json::to_string(&stored).expect("encode confluence credential"),
+        )
+        .expect("save credential");
+    let mount = MountConfig::new(
+        MountId::new("confluence-main"),
+        CONFLUENCE_CONNECTOR_ID,
+        "/tmp/locality/confluence",
+    )
+    .with_connection_id(connection_id);
+
+    let source =
+        resolve_source_for_mount(&store, &credentials, &mount).expect("resolve confluence");
+
+    let ResolvedSource::Confluence(connector) = source else {
+        panic!("expected confluence source");
+    };
+    assert_eq!(
+        connector.config().site_url,
+        "https://codeflash.atlassian.net"
+    );
+    assert_eq!(connector.config().email, "saga4@example.com");
+    assert_eq!(connector.config().api_token, "atl_secret");
+    assert_eq!(connector.kind().0, CONFLUENCE_CONNECTOR_ID);
     assert!(connector.capabilities().supports_remote_observation);
     assert!(connector.supported_push_operations().is_empty());
 }
@@ -1509,13 +1617,9 @@ fn resolving_unregistered_connector_reports_unsupported_connector() {
 fn planned_catalog_connector_mount_fails_before_remote_resolution() {
     let store = InMemoryStateStore::new();
     let credentials = InMemoryCredentialStore::new();
-    let mount = MountConfig::new(
-        MountId::new("confluence-main"),
-        "confluence",
-        "/tmp/locality/confluence",
-    );
+    let mount = MountConfig::new(MountId::new("jira-main"), "jira", "/tmp/locality/jira");
 
-    assert!(source_connector_catalog_ids().contains(&"confluence"));
+    assert!(source_connector_catalog_ids().contains(&"jira"));
 
     let error =
         resolve_source_for_mount(&store, &credentials, &mount).expect_err("planned connector");
@@ -1523,7 +1627,7 @@ fn planned_catalog_connector_mount_fails_before_remote_resolution() {
     assert_eq!(error.code(), "unsupported_connector");
     assert_eq!(
         error.message(),
-        "connector `confluence` is not supported by this build"
+        "connector `jira` is not supported by this build"
     );
 }
 

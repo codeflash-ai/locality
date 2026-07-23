@@ -2074,6 +2074,7 @@ name = "loc-cli"
 version = "0.3.6"
 dependencies = [
  "clap",
+ "locality-confluence",
  "locality-connector",
  "locality-core",
  "locality-github",
@@ -2108,6 +2109,19 @@ dependencies = [
  "serde",
  "serde_json",
  "windows",
+]
+
+[[package]]
+name = "locality-confluence"
+version = "0.3.6"
+dependencies = [
+ "base64 0.22.1",
+ "locality-connector",
+ "locality-core",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2331,6 +2345,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "getrandom 0.3.4",
+ "locality-confluence",
  "locality-connector",
  "locality-core",
  "locality-github",
