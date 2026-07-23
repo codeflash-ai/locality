@@ -1099,11 +1099,11 @@ fn render_all_known_notion_block_objects_into_markdown_or_directives() {
         "[Embed](https://example.com/embed)",
         "[Bookmark](https://example.com/bookmark)",
         "[Preview](https://example.com/preview)",
-        "![Image](../.loc/media/Docs/Coverage/image-111111111111aaaa.png)",
-        "[Video](../.loc/media/Docs/Coverage/video-222222222222bbbb.mp4)",
-        "[File](../.loc/media/Docs/Coverage/file-333333333333cccc.txt)",
-        "[PDF](../.loc/media/Docs/Coverage/pdf-444444444444dddd.pdf)",
-        "[Audio](../.loc/media/Docs/Coverage/audio-555555555555eeee.mp3)",
+        "![Image](https://example.com/image.png)",
+        "[Video](https://example.com/video.mp4)",
+        "[File](https://example.com/file.txt)",
+        "[PDF](https://example.com/file.pdf)",
+        "[Audio](https://example.com/audio.mp3)",
         "::loc{id=synced-original-1 type=synced_block}",
         "::loc{id=synced-copy-1 type=synced_block source_block_id=\"source-block-1\"}",
         "[Linked page](https://www.notion.so/target-page-1)",
@@ -1130,14 +1130,7 @@ fn render_all_known_notion_block_objects_into_markdown_or_directives() {
         );
     }
 
-    assert_eq!(
-        rendered
-            .media_assets
-            .iter()
-            .map(|asset| asset.kind.as_str())
-            .collect::<Vec<_>>(),
-        vec!["image", "video", "file", "pdf", "audio"]
-    );
+    assert!(rendered.media_assets.is_empty());
     let link_preview_shadow = rendered
         .shadow
         .blocks
@@ -1294,10 +1287,10 @@ fn render_media_blocks_as_markdown_links_and_tracks_local_paths() {
     let bundle = locality_notion::dto::NotionPageBundle {
         page: page("page-1", "Coverage"),
         blocks: vec![BlockTreeDto {
-            block: file_block(
+            block: hosted_file_block_with_caption(
                 "0123456789abcdef",
                 "image",
-                "https://example.com/image.PNG?download=1",
+                "https://secure.notion-static.com/image.PNG?download=1",
                 "Image caption",
             ),
             children: Vec::new(),
@@ -1327,37 +1320,37 @@ fn render_file_like_media_blocks_as_local_links_when_downloaded() {
         page: page("page-1", "Coverage"),
         blocks: vec![
             BlockTreeDto {
-                block: file_block(
+                block: hosted_file_block_with_caption(
                     "1111111111111111",
                     "video",
-                    "https://example.com/cars.MP4?download=1",
+                    "https://secure.notion-static.com/cars.MP4?download=1",
                     "Cars",
                 ),
                 children: Vec::new(),
             },
             BlockTreeDto {
-                block: file_block(
+                block: hosted_file_block_with_caption(
                     "2222222222222222",
                     "pdf",
-                    "https://example.com/brief.PDF?download=1",
+                    "https://secure.notion-static.com/brief.PDF?download=1",
                     "Brief",
                 ),
                 children: Vec::new(),
             },
             BlockTreeDto {
-                block: file_block(
+                block: hosted_file_block_with_caption(
                     "3333333333333333",
                     "audio",
-                    "https://example.com/theme.MP3?download=1",
+                    "https://secure.notion-static.com/theme.MP3?download=1",
                     "Theme",
                 ),
                 children: Vec::new(),
             },
             BlockTreeDto {
-                block: file_block(
+                block: hosted_file_block_with_caption(
                     "4444444444444444",
                     "file",
-                    "https://example.com/index.HTML?download=1",
+                    "https://secure.notion-static.com/index.HTML?download=1",
                     "Index",
                 ),
                 children: Vec::new(),
@@ -1403,14 +1396,14 @@ fn render_file_like_media_blocks_as_local_links_when_downloaded() {
 }
 
 #[test]
-fn render_media_blocks_can_keep_failed_downloads_as_remote_urls() {
+fn render_failed_hosted_media_as_url_free_directive() {
     let bundle = locality_notion::dto::NotionPageBundle {
         page: page("page-1", "Coverage"),
         blocks: vec![BlockTreeDto {
-            block: file_block(
+            block: hosted_file_block_with_caption(
                 "0123456789abcdef",
                 "image",
-                "https://example.com/image.PNG?download=1",
+                "https://secure.notion-static.com/image.PNG?X-Amz-Signature=secret",
                 "Image caption",
             ),
             children: Vec::new(),
@@ -1424,15 +1417,12 @@ fn render_media_blocks_can_keep_failed_downloads_as_remote_urls() {
     )
     .expect("render");
 
-    assert_eq!(rendered.media_assets.len(), 1);
-    assert_eq!(
-        rendered.media_assets[0].local_path,
-        Path::new(".loc/media/Docs/Coverage/image-0123456789abcdef.png")
-    );
+    assert!(rendered.media_assets.is_empty());
     assert_eq!(
         rendered.document.body,
-        "![Image caption](https://example.com/image.PNG?download=1)\n"
+        "::loc{id=0123456789abcdef type=image title=\"Image caption\"}\n"
     );
+    assert!(!rendered.document.body.contains("X-Amz"));
     assert_eq!(rendered.shadow.rendered_body, rendered.document.body);
 }
 
@@ -1453,12 +1443,12 @@ fn render_relative_media_url_without_local_download_asset() {
     .expect("render");
 
     assert!(rendered.media_assets.is_empty());
-    assert_eq!(rendered.document.body, "![Image](img_2.png)\n");
+    assert_eq!(rendered.document.body, "::loc{id=image-1 type=image}\n");
     assert_eq!(rendered.shadow.blocks.len(), 1);
-    assert_eq!(
-        rendered.shadow.blocks[0].remote_id,
-        RemoteId::new("image-1")
-    );
+    assert!(matches!(
+        rendered.shadow.blocks[0].kind,
+        MarkdownBlockKind::Directive { .. }
+    ));
 }
 
 #[test]
@@ -3342,6 +3332,112 @@ fn portable_external_media_supports_every_file_like_block_without_capture() {
 }
 
 #[test]
+fn mixed_hosted_success_omission_and_external_match_desktop_renderer_exactly() {
+    let page_id = "mixed-media-page";
+    let captured_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let omitted_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let captured_url =
+        "https://secure.notion-static.com/captured.png?X-Amz-Signature=captured-secret";
+    let omitted_url = "https://secure.notion-static.com/omitted.png?X-Amz-Signature=omitted-secret";
+    let external_url = "https://cdn.example.com/public.png?spelling=Exact#fragment";
+    let fetcher = Arc::new(FixturePortableMediaFetcher {
+        outcomes: BTreeMap::from([
+            (
+                captured_url.to_string(),
+                FixturePortableMediaOutcome::Success(PortableMediaCapture {
+                    bytes: b"captured-bytes".to_vec(),
+                    media_type: "image/png".to_string(),
+                }),
+            ),
+            (
+                omitted_url.to_string(),
+                FixturePortableMediaOutcome::Failure("temporary transport failure".to_string()),
+            ),
+        ]),
+        calls: Arc::new(Mutex::new(Vec::new())),
+    });
+    let connector = portable_media_connector(
+        page_id,
+        vec![
+            hosted_file_block(captured_id, "image", captured_url, None),
+            hosted_file_block(omitted_id, "image", omitted_url, None),
+            file_block("external-media", "image", external_url, "Public image"),
+        ],
+    )
+    .with_portable_media_capture_fetcher(PortableMediaCapturePolicy::HostedPilot, fetcher);
+
+    let fetched = connector
+        .fetch_portable(portable_fetch_request(page_id))
+        .expect("mixed portable fetch");
+    assert!(
+        fetched
+            .completeness
+            .incomplete_reasons()
+            .iter()
+            .any(|reason| {
+                matches!(reason, PortableIncompleteReason::ConnectorLimitation { code, remote_id }
+            if code == "notion_media_unavailable_hosted_media"
+                && remote_id.as_ref() == Some(&RemoteId::new(omitted_id)))
+            })
+    );
+    let native: NotionPortablePageBundleV1 =
+        serde_json::from_slice(&fetched.native.raw).expect("mixed native");
+    assert_eq!(native.captured_media.len(), 1);
+    assert_eq!(
+        native.incomplete_media,
+        vec![NotionPortableIncompleteMediaV1 {
+            block_id: omitted_id.to_string(),
+            kind: "image".to_string(),
+            code: "unavailable_hosted_media".to_string(),
+        }]
+    );
+
+    let desktop = locality_notion::render::render_page_bundle_with_options(
+        &native.page,
+        &locality_notion::render::RenderOptions::with_page_path("Docs/Mixed/page.md")
+            .with_local_media_block_ids([captured_id.to_string()]),
+    )
+    .expect("desktop shared render");
+    assert_eq!(desktop.media_assets.len(), 1);
+    assert_eq!(
+        desktop.media_assets[0].local_path,
+        Path::new(".loc/media/Docs/Mixed/image-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png")
+    );
+    assert_eq!(desktop.media_assets[0].block_id, captured_id);
+
+    let rendered = connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            logical_path: LogicalPath::new("Docs/Mixed/page.md").expect("mixed logical path"),
+            native: fetched.native,
+            format_version: 1,
+        })
+        .expect("mixed portable render");
+    let desktop_bytes = render_canonical_markdown(&desktop.document).into_bytes();
+    assert_eq!(rendered.canonical.body, desktop_bytes);
+    assert_eq!(rendered.projections.len(), 2);
+    assert_eq!(
+        rendered.projections[1].logical_path.as_str(),
+        ".loc/media/Docs/Mixed/image-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png"
+    );
+    assert_eq!(rendered.projections[1].artifact.body, b"captured-bytes");
+    let markdown = String::from_utf8(desktop_bytes).expect("UTF-8 markdown");
+    assert!(markdown.contains(
+        "![Image](../../.loc/media/Docs/Mixed/image-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png)"
+    ));
+    assert!(markdown.contains("::loc{id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb type=image}"));
+    assert!(markdown.contains(&format!("![Public image]({external_url})")));
+    for forbidden in [
+        captured_url,
+        omitted_url,
+        "captured-secret",
+        "omitted-secret",
+    ] {
+        assert!(!markdown.contains(forbidden));
+    }
+}
+
+#[test]
 fn portable_capture_keeps_pages_without_media_byte_exact() {
     let page_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let blocks = vec![paragraph_block(
@@ -3404,6 +3500,21 @@ fn portable_media_denials_are_incomplete_and_never_publish_remote_urls() {
             .fetch_portable(portable_fetch_request(&page_id))
             .unwrap_or_else(|error| panic!("{case} fetch failed closed unexpectedly: {error}"));
         assert!(!fetched.completeness.is_complete(), "{case}");
+        assert!(fetched.completeness.incomplete_reasons().iter().any(|reason| {
+            matches!(reason, PortableIncompleteReason::ConnectorLimitation { code, remote_id }
+                if code == "notion_media_unsafe_hosted_media"
+                    && remote_id.as_ref() == Some(&RemoteId::new(block_id.clone())))
+        }));
+        let native: NotionPortablePageBundleV1 =
+            serde_json::from_slice(&fetched.native.raw).expect("denied native");
+        assert_eq!(
+            native.incomplete_media,
+            vec![NotionPortableIncompleteMediaV1 {
+                block_id: block_id.clone(),
+                kind: "image".to_string(),
+                code: "unsafe_hosted_media".to_string(),
+            }]
+        );
         let raw = String::from_utf8_lossy(&fetched.native.raw);
         assert!(!raw.contains(url), "{case}: {raw}");
         let rendered = connector
@@ -3595,6 +3706,7 @@ fn portable_media_expired_failed_and_oversized_captures_are_redacted() {
     let cases = [
         (
             "expired",
+            "unavailable_hosted_media",
             Some("2000-01-01T00:00:00.000Z"),
             FixturePortableMediaOutcome::Success(PortableMediaCapture {
                 bytes: b"unused".to_vec(),
@@ -3603,6 +3715,7 @@ fn portable_media_expired_failed_and_oversized_captures_are_redacted() {
         ),
         (
             "failed",
+            "unavailable_hosted_media",
             Some("2099-01-01T00:00:00.000Z"),
             FixturePortableMediaOutcome::Failure(
                 "X-Amz-Signature=must-not-escape token-secret".to_string(),
@@ -3610,14 +3723,24 @@ fn portable_media_expired_failed_and_oversized_captures_are_redacted() {
         ),
         (
             "oversized",
+            "hosted_media_too_large",
             Some("2099-01-01T00:00:00.000Z"),
             FixturePortableMediaOutcome::Success(PortableMediaCapture {
                 bytes: vec![0; PORTABLE_MEDIA_MAX_ASSET_BYTES + 1],
                 media_type: "image/png".to_string(),
             }),
         ),
+        (
+            "malformed-expiry",
+            "unsafe_hosted_media",
+            Some("2099-01-01T00:00:00+01:00"),
+            FixturePortableMediaOutcome::Success(PortableMediaCapture {
+                bytes: b"unused".to_vec(),
+                media_type: "image/png".to_string(),
+            }),
+        ),
     ];
-    for (case, expiry, outcome) in cases {
+    for (case, expected_code, expiry, outcome) in cases {
         let page_id = format!("page-{case}");
         let block_id = format!("block-{case}");
         let url =
@@ -3635,6 +3758,21 @@ fn portable_media_expired_failed_and_oversized_captures_are_redacted() {
             .fetch_portable(portable_fetch_request(&page_id))
             .unwrap_or_else(|error| panic!("{case}: {error}"));
         assert!(!fetched.completeness.is_complete(), "{case}");
+        assert!(fetched.completeness.incomplete_reasons().iter().any(|reason| {
+            matches!(reason, PortableIncompleteReason::ConnectorLimitation { code, remote_id }
+                if code == &format!("notion_media_{expected_code}")
+                    && remote_id.as_ref() == Some(&RemoteId::new(block_id.clone())))
+        }));
+        let native: NotionPortablePageBundleV1 =
+            serde_json::from_slice(&fetched.native.raw).expect("incomplete native");
+        assert_eq!(
+            native.incomplete_media,
+            vec![NotionPortableIncompleteMediaV1 {
+                block_id: block_id.clone(),
+                kind: "image".to_string(),
+                code: expected_code.to_string(),
+            }]
+        );
         let raw = String::from_utf8_lossy(&fetched.native.raw);
         assert!(!raw.contains("X-Amz-Signature"), "{case}");
         assert!(!raw.contains("signature-secret"), "{case}");
@@ -5701,6 +5839,21 @@ fn hosted_file_block(id: &str, kind: &str, url: &str, expiry_time: Option<&str>)
         "audio" => block.audio = payload,
         _ => panic!("unsupported hosted fixture file block kind: {kind}"),
     }
+    block
+}
+
+fn hosted_file_block_with_caption(id: &str, kind: &str, url: &str, caption: &str) -> BlockDto {
+    let mut block = hosted_file_block(id, kind, url, None);
+    let payload = match kind {
+        "image" => block.image.as_mut(),
+        "video" => block.video.as_mut(),
+        "file" => block.file.as_mut(),
+        "pdf" => block.pdf.as_mut(),
+        "audio" => block.audio.as_mut(),
+        _ => None,
+    }
+    .expect("hosted media payload");
+    payload.caption = vec![rich_text(caption)];
     block
 }
 
