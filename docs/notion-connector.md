@@ -214,13 +214,23 @@ rejects unknown fields, alternate field order, or noncanonical whitespace.
 External media is never fetched. A valid external HTTPS URL remains an exact
 remote reference, including its explicit port, path, query, and fragment. An
 empty external URL is redacted and reports `unavailable_external_media`;
-malformed, non-HTTPS, user-info-bearing, control-containing, oversized, or
-otherwise invalid external URLs are redacted and report
-`unsafe_external_media`. Older sanitized v1 payloads carrying the legacy
+unsafe URLs are redacted and report one exact, URL-free outcome:
+
+| Condition | Portable outcome |
+|---|---|
+| Above the 8 KiB bound | `unsafe_external_media_too_long` |
+| Contains whitespace or an ASCII control | `unsafe_external_media_whitespace_or_control` |
+| Cannot be parsed as a URL | `unsafe_external_media_malformed` |
+| Uses a scheme other than HTTPS | `unsafe_external_media_non_https` |
+| Has no host | `unsafe_external_media_missing_host` |
+| Contains user information | `unsafe_external_media_userinfo` |
+
+The outcome retains neither the URL nor parser details. Older sanitized v1
+payloads carrying the generic `unsafe_external_media` or
 `invalid_external_media` outcome remain readable, but new fetches never emit
-that generic code. Production hosted-media capture accepts HTTPS on the default
-port only, rejects user information and IP literals, and permits exactly these
-origins:
+either generic code. Production hosted-media capture accepts HTTPS on the
+default port only, rejects user information and IP literals, and permits exactly
+these origins:
 
 - `secure.notion-static.com`;
 - `prod-files-secure.s3.us-west-2.amazonaws.com`;

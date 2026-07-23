@@ -3533,33 +3533,64 @@ fn portable_media_denials_are_incomplete_and_never_publish_remote_urls() {
 
 #[test]
 fn portable_external_media_fails_closed_without_fetching_bad_or_ambiguous_sources() {
-    let invalid = [
-        ("empty", "", "unavailable_external_media"),
-        ("malformed", "not a URL", "unsafe_external_media"),
+    let invalid = vec![
+        ("empty", String::new(), "unavailable_external_media"),
         (
-            "http",
-            "http://example.com/image.png",
-            "unsafe_external_media",
+            "too-long",
+            format!("https://example.com/{}", "a".repeat(8 * 1024)),
+            "unsafe_external_media_too_long",
+        ),
+        (
+            "whitespace",
+            "https://example.com/image name.png".to_string(),
+            "unsafe_external_media_whitespace_or_control",
+        ),
+        (
+            "control",
+            "https://example.com/image.png\u{7f}hidden".to_string(),
+            "unsafe_external_media_whitespace_or_control",
+        ),
+        (
+            "malformed",
+            "not-a-url".to_string(),
+            "unsafe_external_media_malformed",
+        ),
+        (
+            "non-https",
+            "http://example.com/image.png".to_string(),
+            "unsafe_external_media_non_https",
+        ),
+        (
+            "missing-host",
+            "https://:443/image.png".to_string(),
+            "unsafe_external_media_missing_host",
         ),
         (
             "userinfo",
-            "https://user:pass@example.com/image.png",
-            "unsafe_external_media",
+            "https://user:pass@example.com/image.png".to_string(),
+            "unsafe_external_media_userinfo",
+        ),
+        (
+            "empty-userinfo",
+            "https://@example.com/image.png".to_string(),
+            "unsafe_external_media_userinfo",
         ),
     ];
     for (index, (case, url, expected_code)) in invalid.into_iter().enumerate() {
         let page_id = format!("external-invalid-{index}");
         let block_id = format!("external-block-{index}");
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let connector =
-            portable_media_connector(&page_id, vec![file_block(&block_id, "image", url, "Image")])
-                .with_portable_media_capture_fetcher(
-                    PortableMediaCapturePolicy::HostedPilot,
-                    Arc::new(FixturePortableMediaFetcher {
-                        outcomes: BTreeMap::new(),
-                        calls: Arc::clone(&calls),
-                    }),
-                );
+        let connector = portable_media_connector(
+            &page_id,
+            vec![file_block(&block_id, "image", &url, "Image")],
+        )
+        .with_portable_media_capture_fetcher(
+            PortableMediaCapturePolicy::HostedPilot,
+            Arc::new(FixturePortableMediaFetcher {
+                outcomes: BTreeMap::new(),
+                calls: Arc::clone(&calls),
+            }),
+        );
         let fetched = connector
             .fetch_portable(portable_fetch_request(&page_id))
             .unwrap_or_else(|error| panic!("{case} external fetch: {error}"));
@@ -3608,52 +3639,9 @@ fn portable_external_media_fails_closed_without_fetching_bad_or_ambiguous_source
         assert_eq!(rendered.projections.len(), 1, "{case}");
         assert!(!rendered.completeness.is_complete(), "{case}");
         if !url.is_empty() {
-            assert!(
-                !String::from_utf8_lossy(&rendered.canonical.body).contains(url),
-                "{case}"
-            );
+            assert!(!String::from_utf8_lossy(&fetched.native.raw).contains(&url));
+            assert!(!String::from_utf8_lossy(&rendered.canonical.body).contains(&url));
         }
-    }
-
-    for (case, url) in [
-        (
-            "control",
-            "https://example.com/image.png\u{7f}hidden".to_string(),
-        ),
-        (
-            "oversized",
-            format!("https://example.com/{}", "a".repeat(8 * 1024)),
-        ),
-    ] {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let connector = portable_media_connector(
-            case,
-            vec![file_block("invalid-raw", "image", &url, "Image")],
-        )
-        .with_portable_media_capture_fetcher(
-            PortableMediaCapturePolicy::HostedPilot,
-            Arc::new(FixturePortableMediaFetcher {
-                outcomes: BTreeMap::new(),
-                calls: Arc::clone(&calls),
-            }),
-        );
-        let fetched = connector
-            .fetch_portable(portable_fetch_request(case))
-            .expect("raw-unsafe external URL becomes explicitly incomplete");
-        assert!(calls.lock().expect("calls").is_empty(), "{case}");
-        assert!(!fetched.completeness.is_complete(), "{case}");
-        let native: NotionPortablePageBundleV1 =
-            serde_json::from_slice(&fetched.native.raw).expect("unsafe external native");
-        assert_eq!(
-            native.incomplete_media,
-            vec![NotionPortableIncompleteMediaV1 {
-                block_id: "invalid-raw".to_string(),
-                kind: "image".to_string(),
-                code: "unsafe_external_media".to_string(),
-            }],
-            "{case}"
-        );
-        assert!(!String::from_utf8_lossy(&fetched.native.raw).contains(&url));
     }
 
     let external_url = "https://example.com/public.png";
@@ -3768,29 +3756,32 @@ fn portable_external_media_legacy_generic_outcome_remains_readable() {
         "invalid state: Notion portable media native payload has invalid incomplete outcomes"
     );
 
-    let mut legacy = current;
-    legacy.incomplete_media[0].code = "invalid_external_media".to_string();
-    let legacy_raw = serde_json::to_vec(&legacy).expect("legacy native");
-    assert!(!String::from_utf8_lossy(&legacy_raw).contains(unsafe_url));
+    for legacy_code in ["unsafe_external_media", "invalid_external_media"] {
+        let mut legacy = current.clone();
+        legacy.incomplete_media[0].code = legacy_code.to_string();
+        let legacy_raw = serde_json::to_vec(&legacy).expect("legacy native");
+        assert!(!String::from_utf8_lossy(&legacy_raw).contains(unsafe_url));
 
-    let rendered = connector
-        .render_portable(&portable_render_request(
-            page_id,
-            NativeEntity {
-                remote_id: RemoteId::new(page_id),
-                kind: "notion_page_portable_media_v1".to_string(),
-                raw: legacy_raw,
-            },
-        ))
-        .expect("legacy generic outcome remains readable");
-    assert_eq!(
-        rendered.completeness.incomplete_reasons(),
-        &[PortableIncompleteReason::ConnectorLimitation {
-            code: "notion_media_invalid_external_media".to_string(),
-            remote_id: Some(RemoteId::new(block_id)),
-        }]
-    );
-    assert!(!String::from_utf8_lossy(&rendered.canonical.body).contains(unsafe_url));
+        let rendered = connector
+            .render_portable(&portable_render_request(
+                page_id,
+                NativeEntity {
+                    remote_id: RemoteId::new(page_id),
+                    kind: "notion_page_portable_media_v1".to_string(),
+                    raw: legacy_raw,
+                },
+            ))
+            .expect("legacy generic outcome remains readable");
+        assert_eq!(
+            rendered.completeness.incomplete_reasons(),
+            &[PortableIncompleteReason::ConnectorLimitation {
+                code: format!("notion_media_{legacy_code}"),
+                remote_id: Some(RemoteId::new(block_id)),
+            }],
+            "{legacy_code}"
+        );
+        assert!(!String::from_utf8_lossy(&rendered.canonical.body).contains(unsafe_url));
+    }
 }
 
 #[test]

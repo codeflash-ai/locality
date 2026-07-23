@@ -486,30 +486,99 @@ pub(crate) fn sanitize_portable_hosted_media_url(url: &str) -> LocalityResult<St
 /// Portable rendering never requests these URLs. Keeping validation separate
 /// from hosted-media capture makes that no-fetch boundary explicit and lets the
 /// renderer preserve the provider's exact safe spelling.
-pub(crate) fn validate_portable_external_media_url(url: &str) -> LocalityResult<()> {
-    if url.is_empty()
-        || url.len() > PORTABLE_EXTERNAL_MEDIA_MAX_URL_BYTES
-        || url
-            .chars()
-            .any(|character| character.is_ascii_control() || character.is_whitespace())
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PortableExternalMediaUrlFailure {
+    Unavailable,
+    TooLong,
+    WhitespaceOrControl,
+    Malformed,
+    NonHttps,
+    MissingHost,
+    Userinfo,
+}
+
+impl PortableExternalMediaUrlFailure {
+    pub(crate) const fn omission_code(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable_external_media",
+            Self::TooLong => "unsafe_external_media_too_long",
+            Self::WhitespaceOrControl => "unsafe_external_media_whitespace_or_control",
+            Self::Malformed => "unsafe_external_media_malformed",
+            Self::NonHttps => "unsafe_external_media_non_https",
+            Self::MissingHost => "unsafe_external_media_missing_host",
+            Self::Userinfo => "unsafe_external_media_userinfo",
+        }
+    }
+}
+
+pub(crate) fn classify_portable_external_media_url(
+    url: &str,
+) -> Result<(), PortableExternalMediaUrlFailure> {
+    if url.is_empty() {
+        return Err(PortableExternalMediaUrlFailure::Unavailable);
+    }
+    if url.len() > PORTABLE_EXTERNAL_MEDIA_MAX_URL_BYTES {
+        return Err(PortableExternalMediaUrlFailure::TooLong);
+    }
+    if url
+        .chars()
+        .any(|character| character.is_ascii_control() || character.is_whitespace())
     {
-        return Err(LocalityError::InvalidState(
-            "portable external media URL is not raw-safe".to_string(),
-        ));
+        return Err(PortableExternalMediaUrlFailure::WhitespaceOrControl);
     }
     let parsed = reqwest::Url::parse(url).map_err(|_| {
-        LocalityError::InvalidState("portable external media URL is invalid".to_string())
+        if https_url_has_empty_authority(url) {
+            PortableExternalMediaUrlFailure::MissingHost
+        } else {
+            PortableExternalMediaUrlFailure::Malformed
+        }
     })?;
-    if parsed.scheme() != "https"
-        || parsed.host_str().is_none()
-        || !parsed.username().is_empty()
+    if parsed.scheme() != "https" {
+        return Err(PortableExternalMediaUrlFailure::NonHttps);
+    }
+    if parsed.host_str().is_none() {
+        return Err(PortableExternalMediaUrlFailure::MissingHost);
+    }
+    if !parsed.username().is_empty()
         || parsed.password().is_some()
+        || url_authority_has_userinfo(url)
     {
-        return Err(LocalityError::InvalidState(
-            "portable external media URL violates the HTTPS reference policy".to_string(),
-        ));
+        return Err(PortableExternalMediaUrlFailure::Userinfo);
     }
     Ok(())
+}
+
+fn https_url_has_empty_authority(url: &str) -> bool {
+    let Some(prefix) = url.get(.."https://".len()) else {
+        return false;
+    };
+    if !prefix.eq_ignore_ascii_case("https://") {
+        return false;
+    }
+    let authority_and_path = &url["https://".len()..];
+    let authority = authority_and_path
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host_and_port = authority.rsplit('@').next().unwrap_or_default();
+    host_and_port.is_empty() || host_and_port.starts_with(':')
+}
+
+fn url_authority_has_userinfo(url: &str) -> bool {
+    url.split_once("://")
+        .map(|(_, authority_and_path)| {
+            authority_and_path
+                .split(['/', '?', '#'])
+                .next()
+                .is_some_and(|authority| authority.contains('@'))
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn validate_portable_external_media_url(url: &str) -> LocalityResult<()> {
+    classify_portable_external_media_url(url).map_err(|_| {
+        LocalityError::InvalidState("portable external media URL is not allowed".to_string())
+    })
 }
 
 pub(crate) fn portable_media_expired(expiry_time: &str) -> LocalityResult<bool> {

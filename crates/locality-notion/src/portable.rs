@@ -35,8 +35,9 @@ use crate::fetch::fetch_known_page_bundle;
 use crate::media::{
     HostedMediaCaptureOutcome, PORTABLE_MEDIA_MAX_AGGREGATE_BYTES, PORTABLE_MEDIA_MAX_ASSET_BYTES,
     PORTABLE_MEDIA_MAX_ASSETS, PortableMediaCaptureFetcher, PortableMediaCapturePolicy,
-    default_portable_media_fetcher, portable_media_expired, sanitize_portable_hosted_media_url,
-    sanitize_portable_media_type, validate_portable_external_media_url,
+    classify_portable_external_media_url, default_portable_media_fetcher, portable_media_expired,
+    sanitize_portable_hosted_media_url, sanitize_portable_media_type,
+    validate_portable_external_media_url,
 };
 use crate::projection::enumerate_explicit_root_trees;
 use crate::render::{RenderOptions, render_native_entity, render_native_entity_with_options};
@@ -369,13 +370,9 @@ impl<'a> PortableMediaCaptureState<'a> {
                     "Notion portable media payload type does not match its source".to_string(),
                 ));
             }
-            if validate_portable_external_media_url(&external.url).is_ok() {
-                return Ok(());
-            }
-            let code = if external.url.is_empty() {
-                "unavailable_external_media"
-            } else {
-                "unsafe_external_media"
+            let code = match classify_portable_external_media_url(&external.url) {
+                Ok(()) => return Ok(()),
+                Err(failure) => failure.omission_code(),
             };
             external.url.clear();
             if !self.limit_exceeded {
@@ -1327,9 +1324,15 @@ fn actual_external_incomplete_code<'a>(
         ));
     };
     match outcome.code.as_str() {
-        "unavailable_external_media" | "unsafe_external_media" | "invalid_external_media" => {
-            Ok(&outcome.code)
-        }
+        "unavailable_external_media"
+        | "unsafe_external_media_too_long"
+        | "unsafe_external_media_whitespace_or_control"
+        | "unsafe_external_media_malformed"
+        | "unsafe_external_media_non_https"
+        | "unsafe_external_media_missing_host"
+        | "unsafe_external_media_userinfo"
+        | "unsafe_external_media"
+        | "invalid_external_media" => Ok(&outcome.code),
         _ => Err(LocalityError::InvalidState(
             "Notion portable media native payload has invalid incomplete outcomes".to_string(),
         )),
