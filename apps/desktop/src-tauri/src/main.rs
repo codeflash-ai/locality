@@ -21,9 +21,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(test)]
 use loc_cli::connect::DEFAULT_NOTION_PROFILE_ID;
 use loc_cli::connect::{
-    BrokerOAuthConnectOptions, ConnectOptions, GmailBrokerOAuthConnectOptions,
-    GoogleCalendarBrokerOAuthConnectOptions, GoogleDocsBrokerOAuthConnectOptions,
-    HttpGranolaConnectionProbe, HttpLinearConnectionProbe, SlackBrokerOAuthConnectOptions,
+    BrokerOAuthConnectOptions, ConfluenceConnectOptions, ConnectOptions,
+    GmailBrokerOAuthConnectOptions, GoogleCalendarBrokerOAuthConnectOptions,
+    GoogleDocsBrokerOAuthConnectOptions, HttpConfluenceConnectionProbe, HttpGitHubConnectionProbe,
+    HttpGitLabConnectionProbe, HttpGranolaConnectionProbe, HttpLinearConnectionProbe,
+    SlackBrokerOAuthConnectOptions, run_connect_confluence, run_connect_github, run_connect_gitlab,
     run_connect_gmail_broker_oauth, run_connect_google_calendar_broker_oauth,
     run_connect_google_docs_broker_oauth, run_connect_granola, run_connect_linear,
     run_connect_notion_broker_oauth, run_connect_slack_broker_oauth, run_disconnect,
@@ -52,6 +54,7 @@ use loc_cli::search::{
     run_search_with_access_roots, source_url_host,
 };
 use loc_cli::status::{StatusOptions, StatusState, StatusSyncState, run_status};
+use locality_confluence::CONFLUENCE_CONNECTOR_ID;
 #[cfg(test)]
 use locality_connector::ConnectorCapabilities;
 use locality_connector::oauth_broker::OAuthBrokerStart;
@@ -63,6 +66,7 @@ use locality_core::freshness::RemoteVersion;
 use locality_core::hydration::{HydrationReason, HydrationRequest};
 use locality_core::journal::{JournalEntry, JournalStatus};
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
+use locality_gitlab::GITLAB_CONNECTOR_ID;
 use locality_gmail::{
     DEFAULT_GMAIL_OAUTH_BROKER_URL, DEFAULT_GMAIL_OAUTH_REDIRECT_URI, GMAIL_CONNECTOR_ID,
     HttpGmailOAuthBrokerClient,
@@ -1462,6 +1466,55 @@ async fn connect_linear(app: AppHandle, api_key: String) -> ActionReport {
     report
 }
 
+#[tauri::command]
+async fn connect_github(app: AppHandle, api_key: String) -> ActionReport {
+    let report = tauri::async_runtime::spawn_blocking(move || connect_github_blocking(api_key))
+        .await
+        .map_err(|error| format!("GitHub connection worker failed: {error}"))
+        .and_then(|result| result)
+        .map(|message| ActionReport { ok: true, message })
+        .unwrap_or_else(|message| ActionReport { ok: false, message });
+    if report.ok {
+        refresh_desktop_surfaces(&app);
+    }
+    report
+}
+
+#[tauri::command]
+async fn connect_gitlab(app: AppHandle, api_key: String) -> ActionReport {
+    let report = tauri::async_runtime::spawn_blocking(move || connect_gitlab_blocking(api_key))
+        .await
+        .map_err(|error| format!("GitLab connection worker failed: {error}"))
+        .and_then(|result| result)
+        .map(|message| ActionReport { ok: true, message })
+        .unwrap_or_else(|message| ActionReport { ok: false, message });
+    if report.ok {
+        refresh_desktop_surfaces(&app);
+    }
+    report
+}
+
+#[tauri::command]
+async fn connect_confluence(
+    app: AppHandle,
+    site_url: String,
+    email: String,
+    api_token: String,
+) -> ActionReport {
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        connect_confluence_blocking(site_url, email, api_token)
+    })
+    .await
+    .map_err(|error| format!("Confluence connection worker failed: {error}"))
+    .and_then(|result| result)
+    .map(|message| ActionReport { ok: true, message })
+    .unwrap_or_else(|message| ActionReport { ok: false, message });
+    if report.ok {
+        refresh_desktop_surfaces(&app);
+    }
+    report
+}
+
 fn connect_granola_blocking(api_key: String) -> Result<String, String> {
     let api_key = api_key.trim().to_string();
     if api_key.is_empty() {
@@ -1559,6 +1612,174 @@ fn connect_linear_blocking(api_key: String) -> Result<String, String> {
         mount_id: "linear-main".to_string(),
         connection_id: Some(report.connection_id),
         read_only: !desktop_mount_is_editable_by_default("linear"),
+        notion_root_page: None,
+        google_docs_workspace_folder: None,
+    })
+}
+
+fn connect_github_blocking(api_key: String) -> Result<String, String> {
+    let api_key = api_key.trim().to_string();
+    if api_key.is_empty() {
+        return Err("Enter a GitHub personal access token.".to_string());
+    }
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let credentials = open_credential_store(&state_root);
+    let report = run_connect_github(
+        &mut store,
+        credentials.as_ref(),
+        ConnectOptions {
+            connection_id: Some(ConnectionId::new("github-default")),
+            token: api_key,
+        },
+        &HttpGitHubConnectionProbe,
+    )
+    .map_err(|error| error.message())?;
+    let existing_mount = store
+        .get_mount(&MountId::new("github-main"))
+        .map_err(|error| format!("Could not inspect GitHub mount: {error}"))?
+        .filter(|mount| mount.connector == "github");
+    drop(store);
+    if let Some(mount) = existing_mount {
+        ensure_daemon_running(&state_root)?;
+        reload_daemon_mounts(&state_root)?;
+        let mut message = "Reconnected the existing GitHub source.".to_string();
+        if mount.projection.uses_virtual_filesystem() {
+            if let Err(error) = activate_virtual_projection_mount(&state_root, &mount, true) {
+                if recoverable_macos_file_provider_activation_error(&error) {
+                    append_macos_file_provider_activation_warning(&mut message, &error);
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+        return Ok(message);
+    }
+
+    create_desktop_mount_blocking(CreateDesktopMountRequest {
+        connector: "github".to_string(),
+        path: "github".to_string(),
+        mount_id: "github-main".to_string(),
+        connection_id: Some(report.connection_id),
+        read_only: !desktop_mount_is_editable_by_default("github"),
+        notion_root_page: None,
+        google_docs_workspace_folder: None,
+    })
+}
+
+fn connect_gitlab_blocking(api_key: String) -> Result<String, String> {
+    let api_key = api_key.trim().to_string();
+    if api_key.is_empty() {
+        return Err("Enter a GitLab personal access token.".to_string());
+    }
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let credentials = open_credential_store(&state_root);
+    let report = run_connect_gitlab(
+        &mut store,
+        credentials.as_ref(),
+        ConnectOptions {
+            connection_id: Some(ConnectionId::new("gitlab-default")),
+            token: api_key,
+        },
+        &HttpGitLabConnectionProbe,
+    )
+    .map_err(|error| error.message())?;
+    let existing_mount = store
+        .get_mount(&MountId::new("gitlab-main"))
+        .map_err(|error| format!("Could not inspect GitLab mount: {error}"))?
+        .filter(|mount| mount.connector == GITLAB_CONNECTOR_ID);
+    drop(store);
+    if let Some(mount) = existing_mount {
+        ensure_daemon_running(&state_root)?;
+        reload_daemon_mounts(&state_root)?;
+        let mut message = "Reconnected the existing GitLab source.".to_string();
+        if mount.projection.uses_virtual_filesystem() {
+            if let Err(error) = activate_virtual_projection_mount(&state_root, &mount, true) {
+                if recoverable_macos_file_provider_activation_error(&error) {
+                    append_macos_file_provider_activation_warning(&mut message, &error);
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+        return Ok(message);
+    }
+
+    create_desktop_mount_blocking(CreateDesktopMountRequest {
+        connector: GITLAB_CONNECTOR_ID.to_string(),
+        path: "gitlab".to_string(),
+        mount_id: "gitlab-main".to_string(),
+        connection_id: Some(report.connection_id),
+        read_only: !desktop_mount_is_editable_by_default(GITLAB_CONNECTOR_ID),
+        notion_root_page: None,
+        google_docs_workspace_folder: None,
+    })
+}
+
+fn connect_confluence_blocking(
+    site_url: String,
+    email: String,
+    api_token: String,
+) -> Result<String, String> {
+    let site_url = site_url.trim().trim_end_matches('/').to_string();
+    let email = email.trim().to_string();
+    let api_token = api_token.trim().to_string();
+    if site_url.is_empty() {
+        return Err("Enter a Confluence site URL.".to_string());
+    }
+    if email.is_empty() {
+        return Err("Enter your Atlassian account email.".to_string());
+    }
+    if api_token.is_empty() {
+        return Err("Enter a Confluence API token.".to_string());
+    }
+
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let credentials = open_credential_store(&state_root);
+    let report = run_connect_confluence(
+        &mut store,
+        credentials.as_ref(),
+        ConfluenceConnectOptions {
+            connection_id: Some(ConnectionId::new("confluence-default")),
+            site_url,
+            email,
+            api_token,
+        },
+        &HttpConfluenceConnectionProbe,
+    )
+    .map_err(|error| error.message())?;
+    let existing_mount = store
+        .get_mount(&MountId::new("confluence-main"))
+        .map_err(|error| format!("Could not inspect Confluence mount: {error}"))?
+        .filter(|mount| mount.connector == CONFLUENCE_CONNECTOR_ID);
+    drop(store);
+    if let Some(mount) = existing_mount {
+        ensure_daemon_running(&state_root)?;
+        reload_daemon_mounts(&state_root)?;
+        let mut message = "Reconnected the existing Confluence source.".to_string();
+        if mount.projection.uses_virtual_filesystem() {
+            if let Err(error) = activate_virtual_projection_mount(&state_root, &mount, true) {
+                if recoverable_macos_file_provider_activation_error(&error) {
+                    append_macos_file_provider_activation_warning(&mut message, &error);
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+        return Ok(message);
+    }
+
+    create_desktop_mount_blocking(CreateDesktopMountRequest {
+        connector: CONFLUENCE_CONNECTOR_ID.to_string(),
+        path: "confluence".to_string(),
+        mount_id: "confluence-main".to_string(),
+        connection_id: Some(report.connection_id),
+        read_only: !desktop_mount_is_editable_by_default(CONFLUENCE_CONNECTOR_ID),
         notion_root_page: None,
         google_docs_workspace_folder: None,
     })
@@ -7585,7 +7806,10 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
         Some(connection_id) => Some(ConnectionId::new(connection_id.to_string())),
         None => preferred_connection_id_for_connector(&store, &connector)?,
     };
-    let read_only = request.read_only || connector == "granola" || connector == SLACK_CONNECTOR_ID;
+    let read_only = request.read_only
+        || connector == GITLAB_CONNECTOR_ID
+        || connector == "granola"
+        || connector == SLACK_CONNECTOR_ID;
     let remote_root_id = match connector.as_str() {
         "notion" => request
             .notion_root_page
@@ -7623,7 +7847,12 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
                 })?;
             Some(folder_id)
         }
-        GOOGLE_CALENDAR_CONNECTOR_ID | "gmail" | "granola" | "linear" | SLACK_CONNECTOR_ID => None,
+        GOOGLE_CALENDAR_CONNECTOR_ID
+        | "gmail"
+        | GITLAB_CONNECTOR_ID
+        | "granola"
+        | "linear"
+        | SLACK_CONNECTOR_ID => None,
         _ => unreachable!("unsupported desktop connector should be rejected before mount setup"),
     };
     let preserved = if can_remount_existing_workspace {
@@ -7706,6 +7935,9 @@ fn desktop_mount_creation_supports_connector(connector: &str) -> bool {
             | "google-docs"
             | GOOGLE_CALENDAR_CONNECTOR_ID
             | "gmail"
+            | CONFLUENCE_CONNECTOR_ID
+            | "github"
+            | GITLAB_CONNECTOR_ID
             | "granola"
             | "linear"
             | SLACK_CONNECTOR_ID
@@ -7713,7 +7945,10 @@ fn desktop_mount_creation_supports_connector(connector: &str) -> bool {
 }
 
 fn desktop_mount_is_editable_by_default(connector: &str) -> bool {
-    !matches!(connector, "granola" | "slack")
+    !matches!(
+        connector,
+        CONFLUENCE_CONNECTOR_ID | "github" | GITLAB_CONNECTOR_ID | "granola" | "slack"
+    )
 }
 
 fn desktop_mount_by_id(store: &SqliteStateStore, mount_id: &str) -> Result<MountConfig, String> {
@@ -15046,6 +15281,14 @@ mod tests {
         ));
         assert!(super::desktop_mount_creation_supports_connector("linear"));
         assert!(super::desktop_mount_is_editable_by_default("linear"));
+        assert!(super::desktop_mount_creation_supports_connector("github"));
+        assert!(!super::desktop_mount_is_editable_by_default("github"));
+        assert!(super::desktop_mount_creation_supports_connector(
+            "confluence"
+        ));
+        assert!(!super::desktop_mount_is_editable_by_default("confluence"));
+        assert!(super::desktop_mount_creation_supports_connector("gitlab"));
+        assert!(!super::desktop_mount_is_editable_by_default("gitlab"));
         assert!(super::desktop_mount_creation_supports_connector("slack"));
         assert!(!super::desktop_mount_is_editable_by_default("slack"));
     }
@@ -18046,6 +18289,9 @@ fn main() {
             create_desktop_mount,
             connect_granola,
             connect_linear,
+            connect_github,
+            connect_gitlab,
+            connect_confluence,
             reset_source_state,
             disconnect_source,
             export_source_backup,

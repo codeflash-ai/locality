@@ -1,7 +1,17 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use locality_confluence::{
+    CONFLUENCE_CONNECTOR_ID, ConfluenceApi, HttpConfluenceApiClient, StoredConfluenceCredential,
+    confluence_capabilities_json,
+};
 use locality_connector::ConnectorCapabilities;
 use locality_connector::oauth_broker::{OAuthBrokerCodeExchange, OAuthBrokerToken};
+use locality_github::{
+    GITHUB_CONNECTOR_ID, GitHubApi, HttpGitHubApiClient, github_capabilities_json,
+};
+use locality_gitlab::{
+    GITLAB_CONNECTOR_ID, GitLabApi, HttpGitLabApiClient, gitlab_capabilities_json,
+};
 use locality_gmail::{
     GMAIL_CONNECTOR_ID, GMAIL_OAUTH_SCOPES, HttpGmailOAuthBrokerClient, StoredGmailCredential,
     gmail_capabilities_json, validate_gmail_oauth_scopes,
@@ -42,6 +52,9 @@ pub const DEFAULT_GOOGLE_DOCS_OAUTH_PROFILE_ID: &str = "google-docs-oauth-defaul
 pub const DEFAULT_GOOGLE_CALENDAR_OAUTH_PROFILE_ID: &str = "google-calendar-oauth-default";
 pub const DEFAULT_GMAIL_OAUTH_PROFILE_ID: &str = "gmail-oauth-default";
 pub const DEFAULT_SLACK_OAUTH_PROFILE_ID: &str = "slack-oauth-default";
+pub const DEFAULT_CONFLUENCE_API_KEY_PROFILE_ID: &str = "confluence-api-key-default";
+pub const DEFAULT_GITHUB_API_KEY_PROFILE_ID: &str = "github-api-key-default";
+pub const DEFAULT_GITLAB_API_KEY_PROFILE_ID: &str = "gitlab-api-key-default";
 pub const DEFAULT_GRANOLA_API_KEY_PROFILE_ID: &str = "granola-api-key-default";
 pub const DEFAULT_LINEAR_API_KEY_PROFILE_ID: &str = "linear-api-key-default";
 
@@ -49,6 +62,14 @@ pub const DEFAULT_LINEAR_API_KEY_PROFILE_ID: &str = "linear-api-key-default";
 pub struct ConnectOptions {
     pub connection_id: Option<ConnectionId>,
     pub token: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfluenceConnectOptions {
+    pub connection_id: Option<ConnectionId>,
+    pub site_url: String,
+    pub email: String,
+    pub api_token: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -208,6 +229,18 @@ pub trait LinearConnectionProbe {
     fn probe(&self, api_key: &str) -> Result<(), ConnectError>;
 }
 
+pub trait GitHubConnectionProbe {
+    fn probe(&self, api_key: &str) -> Result<String, ConnectError>;
+}
+
+pub trait GitLabConnectionProbe {
+    fn probe(&self, api_key: &str) -> Result<String, ConnectError>;
+}
+
+pub trait ConfluenceConnectionProbe {
+    fn probe(&self, site_url: &str, email: &str, api_token: &str) -> Result<(), ConnectError>;
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct HttpGranolaConnectionProbe;
 
@@ -232,6 +265,48 @@ impl LinearConnectionProbe for HttpLinearConnectionProbe {
             .map(|_| ())
             .map_err(|error| {
                 ConnectError::connection_probe_failed(LINEAR_CONNECTOR_ID, error.to_string())
+            })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct HttpGitHubConnectionProbe;
+
+impl GitHubConnectionProbe for HttpGitHubConnectionProbe {
+    fn probe(&self, api_key: &str) -> Result<String, ConnectError> {
+        HttpGitHubApiClient::new(api_key)
+            .current_user()
+            .map(|user| user.login)
+            .map_err(|error| {
+                ConnectError::connection_probe_failed(GITHUB_CONNECTOR_ID, error.to_string())
+            })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct HttpGitLabConnectionProbe;
+
+impl GitLabConnectionProbe for HttpGitLabConnectionProbe {
+    fn probe(&self, api_key: &str) -> Result<String, ConnectError> {
+        HttpGitLabApiClient::new(api_key)
+            .current_user()
+            .map(|user| user.username)
+            .map_err(|error| {
+                ConnectError::connection_probe_failed(GITLAB_CONNECTOR_ID, error.to_string())
+            })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct HttpConfluenceConnectionProbe;
+
+impl ConfluenceConnectionProbe for HttpConfluenceConnectionProbe {
+    fn probe(&self, site_url: &str, email: &str, api_token: &str) -> Result<(), ConnectError> {
+        HttpConfluenceApiClient::new(site_url, email, api_token)
+            .list_spaces()
+            .map(|_| ())
+            .map_err(|error| {
+                ConnectError::connection_probe_failed(CONFLUENCE_CONNECTOR_ID, error.to_string())
             })
     }
 }
@@ -557,6 +632,222 @@ where
         account_label: None,
         workspace_id: None,
         workspace_name: None,
+        auth_kind: "api_key".to_string(),
+    })
+}
+
+pub fn run_connect_github<S, P>(
+    store: &mut S,
+    credentials: &dyn CredentialStore,
+    options: ConnectOptions,
+    probe: &P,
+) -> Result<ConnectReport, ConnectError>
+where
+    S: ConnectionRepository + ConnectorProfileRepository,
+    P: GitHubConnectionProbe,
+{
+    let connection_id = match options.connection_id {
+        Some(connection_id) => connection_id,
+        None => default_connection_id_for_connector(
+            store,
+            GITHUB_CONNECTOR_ID,
+            "github-default",
+            "GitHub",
+        )?,
+    };
+    let account_label = Some(probe.probe(&options.token)?);
+    let secret_ref = format!("connection:{}", connection_id.0);
+    credentials
+        .put(&secret_ref, &options.token)
+        .map_err(|error| ConnectError::Credential(CredentialStorageFailure::github(error)))?;
+
+    let now = timestamp();
+    let profile_id = ConnectorProfileId::new(DEFAULT_GITHUB_API_KEY_PROFILE_ID);
+    store
+        .save_connector_profile(default_github_api_key_profile(now.clone()))
+        .map_err(ConnectError::Store)?;
+    let display_name = connection_id.0.clone();
+    store
+        .save_connection(ConnectionRecord {
+            connection_id: connection_id.clone(),
+            profile_id: Some(profile_id.clone()),
+            connector: GITHUB_CONNECTOR_ID.to_string(),
+            display_name: display_name.clone(),
+            account_label: account_label.clone(),
+            workspace_id: None,
+            workspace_name: None,
+            auth_kind: "api_key".to_string(),
+            secret_ref,
+            scopes: vec![
+                "metadata:read".to_string(),
+                "contents:read".to_string(),
+                "issues:read".to_string(),
+                "pull_requests:read".to_string(),
+            ],
+            capabilities_json: github_capabilities_json().map_err(|error| {
+                ConnectError::CredentialEncode(CredentialEncodeFailure::github(error.to_string()))
+            })?,
+            status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            expires_at: None,
+        })
+        .map_err(ConnectError::Store)?;
+
+    Ok(ConnectReport {
+        ok: true,
+        command: "connect",
+        connection_id: connection_id.0,
+        profile_id: profile_id.0,
+        connector: GITHUB_CONNECTOR_ID.to_string(),
+        display_name,
+        account_label,
+        workspace_id: None,
+        workspace_name: None,
+        auth_kind: "api_key".to_string(),
+    })
+}
+
+pub fn run_connect_gitlab<S, P>(
+    store: &mut S,
+    credentials: &dyn CredentialStore,
+    options: ConnectOptions,
+    probe: &P,
+) -> Result<ConnectReport, ConnectError>
+where
+    S: ConnectionRepository + ConnectorProfileRepository,
+    P: GitLabConnectionProbe,
+{
+    let connection_id = match options.connection_id {
+        Some(connection_id) => connection_id,
+        None => default_connection_id_for_connector(
+            store,
+            GITLAB_CONNECTOR_ID,
+            "gitlab-default",
+            "GitLab",
+        )?,
+    };
+    let account_label = Some(probe.probe(&options.token)?);
+    let secret_ref = format!("connection:{}", connection_id.0);
+    credentials
+        .put(&secret_ref, &options.token)
+        .map_err(|error| ConnectError::Credential(CredentialStorageFailure::gitlab(error)))?;
+
+    let now = timestamp();
+    let profile_id = ConnectorProfileId::new(DEFAULT_GITLAB_API_KEY_PROFILE_ID);
+    store
+        .save_connector_profile(default_gitlab_api_key_profile(now.clone()))
+        .map_err(ConnectError::Store)?;
+    let display_name = connection_id.0.clone();
+    store
+        .save_connection(ConnectionRecord {
+            connection_id: connection_id.clone(),
+            profile_id: Some(profile_id.clone()),
+            connector: GITLAB_CONNECTOR_ID.to_string(),
+            display_name: display_name.clone(),
+            account_label: account_label.clone(),
+            workspace_id: None,
+            workspace_name: None,
+            auth_kind: "api_key".to_string(),
+            secret_ref,
+            scopes: vec!["read_api".to_string(), "read_repository".to_string()],
+            capabilities_json: gitlab_capabilities_json().map_err(|error| {
+                ConnectError::CredentialEncode(CredentialEncodeFailure::gitlab(error.to_string()))
+            })?,
+            status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            expires_at: None,
+        })
+        .map_err(ConnectError::Store)?;
+
+    Ok(ConnectReport {
+        ok: true,
+        command: "connect",
+        connection_id: connection_id.0,
+        profile_id: profile_id.0,
+        connector: GITLAB_CONNECTOR_ID.to_string(),
+        display_name,
+        account_label,
+        workspace_id: None,
+        workspace_name: None,
+        auth_kind: "api_key".to_string(),
+    })
+}
+
+pub fn run_connect_confluence<S, P>(
+    store: &mut S,
+    credentials: &dyn CredentialStore,
+    options: ConfluenceConnectOptions,
+    probe: &P,
+) -> Result<ConnectReport, ConnectError>
+where
+    S: ConnectionRepository + ConnectorProfileRepository,
+    P: ConfluenceConnectionProbe,
+{
+    probe.probe(&options.site_url, &options.email, &options.api_token)?;
+    let connection_id = match options.connection_id {
+        Some(connection_id) => connection_id,
+        None => default_connection_id_for_connector(
+            store,
+            CONFLUENCE_CONNECTOR_ID,
+            "confluence-default",
+            "Confluence",
+        )?,
+    };
+    let secret_ref = format!("connection:{}", connection_id.0);
+    let stored = StoredConfluenceCredential {
+        site_url: options.site_url.trim().trim_end_matches('/').to_string(),
+        email: options.email.trim().to_string(),
+        api_token: options.api_token,
+    };
+    let secret = serde_json::to_string(&stored).map_err(|error| {
+        ConnectError::CredentialEncode(CredentialEncodeFailure::confluence(error.to_string()))
+    })?;
+    credentials
+        .put(&secret_ref, &secret)
+        .map_err(|error| ConnectError::Credential(CredentialStorageFailure::confluence(error)))?;
+
+    let now = timestamp();
+    let profile_id = ConnectorProfileId::new(DEFAULT_CONFLUENCE_API_KEY_PROFILE_ID);
+    store
+        .save_connector_profile(default_confluence_api_key_profile(now.clone()))
+        .map_err(ConnectError::Store)?;
+    let display_name = connection_id.0.clone();
+    store
+        .save_connection(ConnectionRecord {
+            connection_id: connection_id.clone(),
+            profile_id: Some(profile_id.clone()),
+            connector: CONFLUENCE_CONNECTOR_ID.to_string(),
+            display_name: display_name.clone(),
+            account_label: Some(stored.email.clone()),
+            workspace_id: None,
+            workspace_name: Some(stored.site_url.clone()),
+            auth_kind: "api_key".to_string(),
+            secret_ref,
+            scopes: vec!["read".to_string()],
+            capabilities_json: confluence_capabilities_json().map_err(|error| {
+                ConnectError::CredentialEncode(CredentialEncodeFailure::confluence(
+                    error.to_string(),
+                ))
+            })?,
+            status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            expires_at: None,
+        })
+        .map_err(ConnectError::Store)?;
+
+    Ok(ConnectReport {
+        ok: true,
+        command: "connect",
+        connection_id: connection_id.0,
+        profile_id: profile_id.0,
+        connector: CONFLUENCE_CONNECTOR_ID.to_string(),
+        display_name,
+        account_label: Some(stored.email),
+        workspace_id: None,
+        workspace_name: Some(stored.site_url),
         auth_kind: "api_key".to_string(),
     })
 }
@@ -1283,7 +1574,10 @@ enum CredentialFailureConnector {
     GoogleCalendar,
     Gmail,
     Slack,
+    Confluence,
     Granola,
+    GitHub,
+    GitLab,
     Linear,
 }
 
@@ -1308,8 +1602,20 @@ impl CredentialEncodeFailure {
         Self::new(CredentialFailureConnector::Slack, message)
     }
 
+    pub fn confluence(message: impl Into<String>) -> Self {
+        Self::new(CredentialFailureConnector::Confluence, message)
+    }
+
     pub fn granola(message: impl Into<String>) -> Self {
         Self::new(CredentialFailureConnector::Granola, message)
+    }
+
+    pub fn github(message: impl Into<String>) -> Self {
+        Self::new(CredentialFailureConnector::GitHub, message)
+    }
+
+    pub fn gitlab(message: impl Into<String>) -> Self {
+        Self::new(CredentialFailureConnector::GitLab, message)
     }
 
     pub fn linear(message: impl Into<String>) -> Self {
@@ -1357,8 +1663,20 @@ impl CredentialStorageFailure {
         Self::new(CredentialFailureConnector::Slack, error)
     }
 
+    pub fn confluence(error: CredentialError) -> Self {
+        Self::new(CredentialFailureConnector::Confluence, error)
+    }
+
     pub fn granola(error: CredentialError) -> Self {
         Self::new(CredentialFailureConnector::Granola, error)
+    }
+
+    pub fn github(error: CredentialError) -> Self {
+        Self::new(CredentialFailureConnector::GitHub, error)
+    }
+
+    pub fn gitlab(error: CredentialError) -> Self {
+        Self::new(CredentialFailureConnector::GitLab, error)
     }
 
     pub fn linear(error: CredentialError) -> Self {
@@ -1403,6 +1721,9 @@ impl CredentialFailureConnector {
             GOOGLE_CALENDAR_CONNECTOR_ID => Self::GoogleCalendar,
             GMAIL_CONNECTOR_ID => Self::Gmail,
             SLACK_CONNECTOR_ID => Self::Slack,
+            CONFLUENCE_CONNECTOR_ID => Self::Confluence,
+            GITHUB_CONNECTOR_ID => Self::GitHub,
+            GITLAB_CONNECTOR_ID => Self::GitLab,
             GRANOLA_CONNECTOR_ID => Self::Granola,
             LINEAR_CONNECTOR_ID => Self::Linear,
             _ => Self::Notion,
@@ -1416,6 +1737,9 @@ impl CredentialFailureConnector {
             Self::GoogleCalendar => "Google Calendar",
             Self::Gmail => "Gmail",
             Self::Slack => "Slack",
+            Self::Confluence => "Confluence",
+            Self::GitHub => "GitHub",
+            Self::GitLab => "GitLab",
             Self::Granola => "Granola",
             Self::Linear => "Linear",
         }
@@ -1428,6 +1752,11 @@ impl CredentialFailureConnector {
             Self::GoogleCalendar => "loc connect google-calendar",
             Self::Gmail => "loc connect gmail",
             Self::Slack => "loc connect slack",
+            Self::Confluence => {
+                "loc connect confluence --site-url <url> --email <email> --api-token-stdin"
+            }
+            Self::GitHub => "loc connect github --api-key-stdin",
+            Self::GitLab => "loc connect gitlab --api-key-stdin",
             Self::Granola => "loc connect granola --api-key-stdin",
             Self::Linear => "loc connect linear --api-key-stdin",
         }
@@ -1668,6 +1997,59 @@ fn default_granola_api_key_profile(now: String) -> ConnectorProfileRecord {
     }
 }
 
+fn default_confluence_api_key_profile(now: String) -> ConnectorProfileRecord {
+    ConnectorProfileRecord {
+        profile_id: ConnectorProfileId::new(DEFAULT_CONFLUENCE_API_KEY_PROFILE_ID),
+        connector: CONFLUENCE_CONNECTOR_ID.to_string(),
+        display_name: "Confluence API token".to_string(),
+        auth_kind: "api_key".to_string(),
+        scopes: vec!["read".to_string()],
+        capabilities_json: confluence_capabilities_json().unwrap_or_else(|_| "{}".to_string()),
+        enabled_actions_json: "[\"read\"]".to_string(),
+        connector_version: "confluence.v1".to_string(),
+        status: "active".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
+fn default_github_api_key_profile(now: String) -> ConnectorProfileRecord {
+    ConnectorProfileRecord {
+        profile_id: ConnectorProfileId::new(DEFAULT_GITHUB_API_KEY_PROFILE_ID),
+        connector: GITHUB_CONNECTOR_ID.to_string(),
+        display_name: "GitHub personal access token".to_string(),
+        auth_kind: "api_key".to_string(),
+        scopes: vec![
+            "metadata:read".to_string(),
+            "contents:read".to_string(),
+            "issues:read".to_string(),
+            "pull_requests:read".to_string(),
+        ],
+        capabilities_json: github_capabilities_json().unwrap_or_else(|_| "{}".to_string()),
+        enabled_actions_json: "[\"read\"]".to_string(),
+        connector_version: "github.v1".to_string(),
+        status: "active".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
+fn default_gitlab_api_key_profile(now: String) -> ConnectorProfileRecord {
+    ConnectorProfileRecord {
+        profile_id: ConnectorProfileId::new(DEFAULT_GITLAB_API_KEY_PROFILE_ID),
+        connector: GITLAB_CONNECTOR_ID.to_string(),
+        display_name: "GitLab personal access token".to_string(),
+        auth_kind: "api_key".to_string(),
+        scopes: vec!["read_api".to_string(), "read_repository".to_string()],
+        capabilities_json: gitlab_capabilities_json().unwrap_or_else(|_| "{}".to_string()),
+        enabled_actions_json: "[\"read\"]".to_string(),
+        connector_version: "gitlab.v1".to_string(),
+        status: "active".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
 fn default_linear_api_key_profile(now: String) -> ConnectorProfileRecord {
     ConnectorProfileRecord {
         profile_id: ConnectorProfileId::new(DEFAULT_LINEAR_API_KEY_PROFILE_ID),
@@ -1784,7 +2166,11 @@ mod tests {
         InMemoryStateStore,
     };
 
-    use super::{ConnectOptions, GranolaConnectionProbe, run_connect_granola};
+    use super::{
+        ConfluenceConnectOptions, ConfluenceConnectionProbe, ConnectOptions, GitHubConnectionProbe,
+        GitLabConnectionProbe, GranolaConnectionProbe, run_connect_confluence, run_connect_github,
+        run_connect_gitlab, run_connect_granola,
+    };
 
     #[derive(Debug)]
     struct SuccessfulGranolaProbe;
@@ -1792,6 +2178,43 @@ mod tests {
     impl GranolaConnectionProbe for SuccessfulGranolaProbe {
         fn probe(&self, api_key: &str) -> Result<(), super::ConnectError> {
             assert_eq!(api_key, "grn_test_secret");
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct SuccessfulGitHubProbe;
+
+    impl GitHubConnectionProbe for SuccessfulGitHubProbe {
+        fn probe(&self, api_key: &str) -> Result<String, super::ConnectError> {
+            assert_eq!(api_key, "ghp_test_secret");
+            Ok("saga4".to_string())
+        }
+    }
+
+    #[derive(Debug)]
+    struct SuccessfulGitLabProbe;
+
+    impl GitLabConnectionProbe for SuccessfulGitLabProbe {
+        fn probe(&self, api_key: &str) -> Result<String, super::ConnectError> {
+            assert_eq!(api_key, "glpat_test_secret");
+            Ok("saga4".to_string())
+        }
+    }
+
+    #[derive(Debug)]
+    struct SuccessfulConfluenceProbe;
+
+    impl ConfluenceConnectionProbe for SuccessfulConfluenceProbe {
+        fn probe(
+            &self,
+            site_url: &str,
+            email: &str,
+            api_token: &str,
+        ) -> Result<(), super::ConnectError> {
+            assert_eq!(site_url, "https://codeflash.atlassian.net");
+            assert_eq!(email, "saga4@example.com");
+            assert_eq!(api_token, "atl_test_secret");
             Ok(())
         }
     }
@@ -1825,5 +2248,117 @@ mod tests {
                 .expect("stored credential"),
             "grn_test_secret"
         );
+    }
+
+    #[test]
+    fn github_connect_stores_secret_and_account_label() {
+        let mut store = InMemoryStateStore::new();
+        let credentials = InMemoryCredentialStore::new();
+        let report = run_connect_github(
+            &mut store,
+            &credentials,
+            ConnectOptions {
+                connection_id: Some(ConnectionId::new("github-work")),
+                token: "ghp_test_secret".to_string(),
+            },
+            &SuccessfulGitHubProbe,
+        )
+        .expect("connect GitHub");
+
+        assert_eq!(report.connector, "github");
+        assert_eq!(report.auth_kind, "api_key");
+        assert_eq!(report.account_label.as_deref(), Some("saga4"));
+        let connection = store
+            .get_connection(&ConnectionId::new("github-work"))
+            .expect("read connection")
+            .expect("connection");
+        assert_eq!(connection.secret_ref, "connection:github-work");
+        assert_eq!(connection.account_label.as_deref(), Some("saga4"));
+        assert!(!format!("{connection:?}").contains("ghp_test_secret"));
+        assert_eq!(
+            credentials
+                .get("connection:github-work")
+                .expect("stored credential"),
+            "ghp_test_secret"
+        );
+    }
+
+    #[test]
+    fn gitlab_connect_stores_secret_and_account_label() {
+        let mut store = InMemoryStateStore::new();
+        let credentials = InMemoryCredentialStore::new();
+        let report = run_connect_gitlab(
+            &mut store,
+            &credentials,
+            ConnectOptions {
+                connection_id: Some(ConnectionId::new("gitlab-work")),
+                token: "glpat_test_secret".to_string(),
+            },
+            &SuccessfulGitLabProbe,
+        )
+        .expect("connect GitLab");
+
+        assert_eq!(report.connector, "gitlab");
+        assert_eq!(report.auth_kind, "api_key");
+        assert_eq!(report.account_label.as_deref(), Some("saga4"));
+        let connection = store
+            .get_connection(&ConnectionId::new("gitlab-work"))
+            .expect("read connection")
+            .expect("connection");
+        assert_eq!(connection.secret_ref, "connection:gitlab-work");
+        assert_eq!(connection.account_label.as_deref(), Some("saga4"));
+        assert!(!format!("{connection:?}").contains("glpat_test_secret"));
+        assert_eq!(
+            credentials
+                .get("connection:gitlab-work")
+                .expect("stored credential"),
+            "glpat_test_secret"
+        );
+    }
+
+    #[test]
+    fn confluence_connect_stores_structured_secret_without_leaking_token() {
+        let mut store = InMemoryStateStore::new();
+        let credentials = InMemoryCredentialStore::new();
+        let report = run_connect_confluence(
+            &mut store,
+            &credentials,
+            ConfluenceConnectOptions {
+                connection_id: Some(ConnectionId::new("confluence-work")),
+                site_url: "https://codeflash.atlassian.net".to_string(),
+                email: "saga4@example.com".to_string(),
+                api_token: "atl_test_secret".to_string(),
+            },
+            &SuccessfulConfluenceProbe,
+        )
+        .expect("connect Confluence");
+
+        assert_eq!(report.connector, "confluence");
+        assert_eq!(report.auth_kind, "api_key");
+        assert_eq!(report.account_label.as_deref(), Some("saga4@example.com"));
+        assert_eq!(
+            report.workspace_name.as_deref(),
+            Some("https://codeflash.atlassian.net")
+        );
+        let connection = store
+            .get_connection(&ConnectionId::new("confluence-work"))
+            .expect("read connection")
+            .expect("connection");
+        assert_eq!(connection.secret_ref, "connection:confluence-work");
+        assert_eq!(
+            connection.account_label.as_deref(),
+            Some("saga4@example.com")
+        );
+        assert_eq!(
+            connection.workspace_name.as_deref(),
+            Some("https://codeflash.atlassian.net")
+        );
+        assert!(!format!("{connection:?}").contains("atl_test_secret"));
+        let secret = credentials
+            .get("connection:confluence-work")
+            .expect("stored credential");
+        assert!(secret.contains("https://codeflash.atlassian.net"));
+        assert!(secret.contains("saga4@example.com"));
+        assert!(secret.contains("atl_test_secret"));
     }
 }

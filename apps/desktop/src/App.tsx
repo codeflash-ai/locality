@@ -23,6 +23,7 @@ import {
   Minus,
   Monitor,
   Moon,
+  Plug,
   Plus,
   Power,
   RefreshCw,
@@ -98,8 +99,14 @@ import {
 import {
   connectedSourcesReadyToMount,
   isSourceConnectorId,
+  plannedSourceConnectorDefinitions,
+  sourceConnectorCatalogDefinitions,
+  sourceConnectorDefaultMountDirectory as sourceConnectorDefaultMountDirectoryForId,
+  sourceConnectorDefaultMountId,
+  sourceConnectorDefinitions,
   sourceConnectionReady,
   sourceConnectorIds,
+  sourceConnectorName,
   sourceMountRetryOutcome,
   sourceMounted,
   sourceRequiresApiKey,
@@ -107,7 +114,12 @@ import {
   sourceSetupIsActiveConnector,
   sourceSetupIsBusy,
   sourceSetupProgressLabel,
+  type ApiKeySourceConnectorId,
+  type SourceCatalogConnectorId,
   type SourceConnectorId,
+  type SourceConnectorAuthMode,
+  type SourceConnectorCategory,
+  type SourceConnectorAvailability,
   type SourceSetupState,
 } from "./source-setup";
 import gmailIconUrl from "./assets/connectors/gmail.svg";
@@ -138,15 +150,20 @@ type AppTheme = "system" | "light" | "dark";
 const APP_THEME_STORAGE_KEY = "locality.desktop.theme";
 
 type ConnectorOption = {
-  id: SourceConnectorId;
+  id: SourceCatalogConnectorId;
   name: string;
   description: string;
   status: string;
   keywords: string[];
+  availability: SourceConnectorAvailability;
+  category: SourceConnectorCategory;
+  authModes: readonly SourceConnectorAuthMode[];
+  projection: string;
+  writeModel: string;
   mounted: boolean;
 };
 
-const CONNECTOR_ICON_URLS: Record<SourceConnectorId, string> = {
+const CONNECTOR_ICON_URLS: Partial<Record<SourceConnectorId, string>> = {
   notion: notionIconUrl,
   "google-docs": googleDocsIconUrl,
   "google-calendar": googleCalendarIconUrl,
@@ -726,6 +743,12 @@ function suggestedAgentPrompt(mountPath: string, connector: OnboardingConnectorI
       return `Use Locality to inspect my Google Calendar source. Open the files under ${mountPath}, review calendar events with normal file tools, and prepare new event drafts for Locality review before creating them.`;
     case "gmail":
       return `Use Locality to inspect my Gmail source. Open the files under ${mountPath}, search mail with normal file tools, and prepare draft updates only when the mounted draft files support it. Leave outbound changes for Locality review.`;
+    case "confluence":
+      return `Use Locality to inspect my Confluence spaces. Open the files under ${mountPath}, search spaces and pages with normal file tools, and cite the Confluence files you used. Confluence is read-only in Locality, so do not try to push edits back.`;
+    case "github":
+      return `Use Locality to inspect my GitHub repositories. Open the files under ${mountPath}, search README files, issues, and pull requests with normal file tools, and cite the GitHub files you used. GitHub is read-only in Locality, so make repository edits in a normal git checkout.`;
+    case "gitlab":
+      return `Use Locality to inspect my GitLab projects. Open the files under ${mountPath}, search README files, issues, and merge requests with normal file tools, and cite the GitLab files you used. GitLab is read-only in Locality, so make repository edits in a normal git checkout.`;
     case "linear":
       return `Use Locality to edit my Linear issues. Open the files under ${mountPath}, update issue Markdown and editable frontmatter, and leave changes pending for Locality review before pushing.`;
     case "notion":
@@ -787,6 +810,12 @@ function onboardingConnectorDescription(
         return "Google Calendar is ready. Locality mounted primary calendar events as local files under CloudStorage.";
       case "gmail":
         return "Gmail is ready. Locality mounted mailboxes as local files under CloudStorage.";
+      case "confluence":
+        return "Confluence is ready. Locality mounted spaces and pages as read-only local files under CloudStorage.";
+      case "github":
+        return "GitHub is ready. Locality mounted repositories, README files, issues, and pull requests as read-only local context.";
+      case "gitlab":
+        return "GitLab is ready. Locality mounted projects, README files, issues, and merge requests as read-only local context.";
       case "granola":
         return "Granola is ready. Locality mounted meeting summaries and transcripts as read-only files under CloudStorage.";
       case "linear":
@@ -806,6 +835,12 @@ function onboardingConnectorDescription(
         return "A browser window is open. Approve Google Calendar access, then Locality will create the local calendar folder.";
       case "gmail":
         return "A browser window is open. Approve Gmail access, then Locality will create the local mailbox folder.";
+      case "confluence":
+        return "Locality is validating the Confluence site, account email, and API token before creating a read-only folder.";
+      case "github":
+        return "Locality is validating the personal access token and creating a read-only GitHub folder.";
+      case "gitlab":
+        return "Locality is validating the personal access token and creating a read-only GitLab folder.";
       case "granola":
         return "Locality is validating the API key and creating a read-only Granola folder.";
       case "linear":
@@ -824,6 +859,12 @@ function onboardingConnectorDescription(
       return "Connect Google Calendar during setup so agents can review events and prepare new event drafts through local files.";
     case "gmail":
       return "Connect Gmail during setup so agents can search mailboxes and prepare reviewed draft work from local files.";
+    case "confluence":
+      return "Enter your Confluence Cloud site URL, Atlassian account email, and API token to mount spaces and pages as local read-only files.";
+    case "github":
+      return "Paste a GitHub personal access token to mount repositories, README files, issues, and pull requests as local read-only context.";
+    case "gitlab":
+      return "Paste a GitLab personal access token to mount projects, README files, issues, and merge requests as local read-only context.";
     case "granola":
       return "Paste a Granola API key to mount meeting summaries and transcripts as local read-only files. Keys are stored in your local credential store.";
     case "linear":
@@ -843,6 +884,12 @@ function onboardingConnectorPills(connector: OnboardingConnectorId) {
       return ["Google OAuth", "Primary calendar", "Event drafts"];
     case "gmail":
       return ["Google OAuth", "Mailbox files", "Draft review"];
+    case "confluence":
+      return ["API token", "Read-only", "Spaces and pages"];
+    case "github":
+      return ["Personal token", "Read-only", "Repos and PRs"];
+    case "gitlab":
+      return ["Personal token", "Read-only", "Projects and MRs"];
     case "granola":
       return ["Read-only", "Meeting summaries", "Transcripts"];
     case "linear":
@@ -862,6 +909,12 @@ function onboardingReadyCopy(connector: OnboardingConnectorId) {
       return "Your Google Calendar source is ready as local files. Agents can review events and prepare new event drafts before anything is created remotely.";
     case "gmail":
       return "Your Gmail source is ready as local files. Agents can search mailbox content and prepare reviewed draft work without leaving the filesystem.";
+    case "confluence":
+      return "Your Confluence spaces are ready as local read-only files. Agents can search pages and space summaries with normal file tools, while Locality keeps Confluence protected from edits.";
+    case "github":
+      return "Your GitHub repositories are ready as local read-only context. Agents can search README files, issues, and pull requests with normal file tools, while repository edits stay in a normal git checkout.";
+    case "gitlab":
+      return "Your GitLab projects are ready as local read-only context. Agents can search README files, issues, and merge requests with normal file tools, while repository edits stay in a normal git checkout.";
     case "granola":
       return "Your Granola meetings are ready as local read-only files. Agents can search summaries and transcripts with normal file tools, while Locality keeps the remote notes protected from edits.";
     case "linear":
@@ -872,7 +925,7 @@ function onboardingReadyCopy(connector: OnboardingConnectorId) {
 }
 
 function onboardingPromptHint(connector: OnboardingConnectorId) {
-  return connector === "granola" || connector === "slack"
+  return connector === "github" || connector === "gitlab" || connector === "granola" || connector === "confluence" || connector === "slack"
     ? "Ask an agent to use the mounted read-only files."
     : "Claude and Codex are now set up to use Locality.";
 }
@@ -1702,8 +1755,13 @@ function Onboarding({
     const connector = onboardingConnectorFromSnapshot(snapshot);
     return connectionReady(snapshot) && !mountMissing(snapshot) ? connector : null;
   });
+  const [githubApiKey, setGithubApiKey] = useState("");
+  const [gitlabApiKey, setGitlabApiKey] = useState("");
   const [granolaApiKey, setGranolaApiKey] = useState("");
   const [linearApiKey, setLinearApiKey] = useState("");
+  const [confluenceSiteUrl, setConfluenceSiteUrl] = useState("");
+  const [confluenceEmail, setConfluenceEmail] = useState("");
+  const [confluenceApiToken, setConfluenceApiToken] = useState("");
   const [googleDocsWorkspaceFolder, setGoogleDocsWorkspaceFolder] = useState("Locality");
   const [connectorConnecting, setConnectorConnecting] = useState(false);
   const [connectedWorkspace, setConnectedWorkspace] = useState(snapshot.connection.workspaceName);
@@ -1740,7 +1798,18 @@ function Onboarding({
       );
   const selectedSourceName = sourceDisplayName(selectedOnboardingConnector);
   const selectedConnectorBusy = oauthInFlight || connectorConnecting;
-  const selectedApiKey = selectedOnboardingConnector === "linear" ? linearApiKey : granolaApiKey;
+  const selectedApiKey = selectedOnboardingConnector === "github"
+    ? githubApiKey
+    : selectedOnboardingConnector === "gitlab"
+    ? gitlabApiKey
+    : selectedOnboardingConnector === "confluence"
+    ? confluenceApiToken
+    : selectedOnboardingConnector === "linear"
+    ? linearApiKey
+    : granolaApiKey;
+  const selectedConfluenceCredentialsReady = Boolean(
+    confluenceSiteUrl.trim() && confluenceEmail.trim() && confluenceApiToken.trim(),
+  );
 
   async function installAgentGuidance(path: string) {
     setAgentGuidanceState("installing");
@@ -2038,7 +2107,7 @@ function Onboarding({
           path: sourceDefaultPath(snapshot, connector),
           mountId: sourceMountId(connector),
           connectionId: null,
-          readOnly: connector === "granola" || connector === "slack",
+          readOnly: connector === "github" || connector === "gitlab" || connector === "granola" || connector === "confluence" || connector === "slack",
           notionRootPage: null,
           googleDocsWorkspaceFolder: connector === "google-docs"
             ? googleDocsWorkspaceFolder.trim() || "Locality"
@@ -2121,6 +2190,15 @@ function Onboarding({
       case "granola":
         await connectGranolaOnboarding();
         return;
+      case "confluence":
+        await connectConfluenceOnboarding();
+        return;
+      case "github":
+        await connectGitHubOnboarding();
+        return;
+      case "gitlab":
+        await connectGitLabOnboarding();
+        return;
       case "linear":
         await connectLinearOnboarding();
     }
@@ -2140,16 +2218,39 @@ function Onboarding({
     await connectApiKeyOnboarding("granola", granolaApiKey);
   }
 
+  async function connectConfluenceOnboarding() {
+    await connectApiKeyOnboarding("confluence", confluenceApiToken, {
+      siteUrl: confluenceSiteUrl,
+      email: confluenceEmail,
+    });
+  }
+
+  async function connectGitHubOnboarding() {
+    await connectApiKeyOnboarding("github", githubApiKey);
+  }
+
+  async function connectGitLabOnboarding() {
+    await connectApiKeyOnboarding("gitlab", gitlabApiKey);
+  }
+
   async function connectLinearOnboarding() {
     await connectApiKeyOnboarding("linear", linearApiKey);
   }
 
-  async function connectApiKeyOnboarding(connector: "granola" | "linear", apiKey: string) {
+  async function connectApiKeyOnboarding(
+    connector: ApiKeySourceConnectorId,
+    apiKey: string,
+    options?: { siteUrl?: string; email?: string },
+  ) {
     const sourceName = sourceDisplayName(connector);
     if (connectorConnecting || !apiKey.trim()) {
       if (!apiKey.trim()) {
-        setOauthError(`Enter a ${sourceName} API key.`);
+        setOauthError(connector === "confluence" ? "Enter a Confluence API token." : `Enter a ${sourceName} API key.`);
       }
+      return;
+    }
+    if (connector === "confluence" && (!options?.siteUrl?.trim() || !options.email?.trim())) {
+      setOauthError("Enter your Confluence site URL and Atlassian account email.");
       return;
     }
 
@@ -2160,8 +2261,10 @@ function Onboarding({
     setStep(3);
     try {
       const report = await callCommand<ActionReport>(
-        connector === "linear" ? "connect_linear" : "connect_granola",
-        { apiKey },
+        apiKeyConnectCommand(connector),
+        connector === "confluence"
+          ? { siteUrl: options?.siteUrl?.trim(), email: options?.email?.trim(), apiToken: apiKey }
+          : { apiKey },
         { ok: true, message: `Connected demo ${sourceName} source.` },
       );
       if (!report.ok) {
@@ -2511,19 +2614,60 @@ function Onboarding({
                     ]}
               />
             )}
-            {sourceRequiresApiKey(selectedOnboardingConnector) && !connectionReadyNow && (
+            {selectedOnboardingConnector === "confluence" && !connectionReadyNow && (
+              <div className="source-inline-stack onboarding-source-field">
+                <label className="source-inline-field">
+                  <span>Confluence site URL</span>
+                  <input
+                    value={confluenceSiteUrl}
+                    placeholder="https://your-team.atlassian.net"
+                    disabled={connectorConnecting}
+                    onChange={(event) => setConfluenceSiteUrl(event.target.value)}
+                  />
+                </label>
+                <label className="source-inline-field">
+                  <span>Atlassian email</span>
+                  <input
+                    type="email"
+                    autoComplete="email"
+                    value={confluenceEmail}
+                    placeholder="you@company.com"
+                    disabled={connectorConnecting}
+                    onChange={(event) => setConfluenceEmail(event.target.value)}
+                  />
+                </label>
+                <label className="source-inline-field">
+                  <span>Confluence API token</span>
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    value={confluenceApiToken}
+                    placeholder="Paste API token"
+                    disabled={connectorConnecting}
+                    onChange={(event) => setConfluenceApiToken(event.target.value)}
+                  />
+                </label>
+              </div>
+            )}
+            {sourceRequiresApiKey(selectedOnboardingConnector) && selectedOnboardingConnector !== "confluence" && !connectionReadyNow && (
               <label className="source-inline-field onboarding-source-field">
-                <span>{selectedSourceName} API key</span>
+                <span>{selectedOnboardingConnector === "github" || selectedOnboardingConnector === "gitlab" ? `${selectedSourceName} personal access token` : `${selectedSourceName} API key`}</span>
                 <input
                   type="password"
                   autoComplete="off"
                   value={selectedApiKey}
-                  placeholder="Paste API key"
+                  placeholder={sourceRequiresApiKey(selectedOnboardingConnector)
+                    ? apiKeyPlaceholder(selectedOnboardingConnector)
+                    : "Paste API key"}
                   disabled={connectorConnecting}
                   onChange={(event) => {
-                    if (selectedOnboardingConnector === "linear") {
+                    if (selectedOnboardingConnector === "github") {
+                      setGithubApiKey(event.target.value);
+                    } else if (selectedOnboardingConnector === "gitlab") {
+                      setGitlabApiKey(event.target.value);
+                    } else if (selectedOnboardingConnector === "linear") {
                       setLinearApiKey(event.target.value);
-                    } else {
+                    } else if (selectedOnboardingConnector === "granola") {
                       setGranolaApiKey(event.target.value);
                     }
                   }}
@@ -2548,6 +2692,7 @@ function Onboarding({
                   !connectionReadyNow &&
                   (
                     (sourceRequiresApiKey(selectedOnboardingConnector) && !selectedApiKey.trim()) ||
+                    (selectedOnboardingConnector === "confluence" && !selectedConfluenceCredentialsReady) ||
                     (selectedOnboardingConnector === "google-docs" && !googleDocsWorkspaceFolder.trim())
                   )
                 }
@@ -3458,7 +3603,7 @@ function MountsView({
                 path: sourceDefaultPath(snapshot, connector),
                 mountId: sourceMountId(connector),
                 connectionId: null,
-                readOnly: connector === "granola" || connector === "slack",
+                readOnly: connector === "github" || connector === "gitlab" || connector === "granola" || connector === "confluence" || connector === "slack",
                 notionRootPage: null,
                 googleDocsWorkspaceFolder: connector === "google-docs"
                   ? googleDocsWorkspaceFolder?.trim() || "Locality"
@@ -3611,19 +3756,29 @@ function MountsView({
     }
   }
 
-  async function connectApiKeySource(connector: "granola" | "linear", apiKey: string) {
+  async function connectApiKeySource(
+    connector: ApiKeySourceConnectorId,
+    apiKey: string,
+    options?: { siteUrl?: string; email?: string },
+  ) {
     if (sourceSetupBusy) {
       return;
     }
     const sourceName = sourceDisplayName(connector);
+    if (connector === "confluence" && (!options?.siteUrl?.trim() || !options.email?.trim())) {
+      setActionError("Enter your Confluence site URL and Atlassian account email.");
+      return;
+    }
     setSourceDialogMessage("");
     setActionMessage("");
     setSourceDialogConnector(connector);
     setSourceDialogState("connecting");
     try {
       const report = await callCommand<ActionReport>(
-        connector === "linear" ? "connect_linear" : "connect_granola",
-        { apiKey },
+        apiKeyConnectCommand(connector),
+        connector === "confluence"
+          ? { siteUrl: options?.siteUrl?.trim(), email: options?.email?.trim(), apiToken: apiKey }
+          : { apiKey },
         { ok: true, message: `Connected demo ${sourceName} source.` },
       );
       setSourceDialogMessage(report.message);
@@ -3843,7 +3998,7 @@ function MountsView({
           message={sourceDialogMessage}
           fileProviderEnablement={sourceFileProviderEnablement}
           onAction={(connector, options) => void runSourceDialogAction(connector, options)}
-          onApiKeyAction={(connector, apiKey) => void connectApiKeySource(connector, apiKey)}
+          onApiKeyAction={(connector, apiKey, options) => void connectApiKeySource(connector, apiKey, options)}
           onReopenFinder={() => void revealSourceFileProviderEnablement()}
           onClose={() => {
             setSourceDialogOpen(false);
@@ -3871,74 +4026,41 @@ function AddSourceDialog({
   message: string;
   fileProviderEnablement: FileProviderEnablementReport | null;
   onAction: (connector: SourceConnectorId, options?: { googleDocsWorkspaceFolder?: string }) => void;
-  onApiKeyAction: (connector: "granola" | "linear", apiKey: string) => void;
+  onApiKeyAction: (
+    connector: ApiKeySourceConnectorId,
+    apiKey: string,
+    options?: { siteUrl?: string; email?: string },
+  ) => void;
   onReopenFinder: () => void;
   onClose: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [viewMode, setViewMode] = useState<SourceListViewMode>("list");
   const [googleDocsWorkspaceFolder, setGoogleDocsWorkspaceFolder] = useState("Locality");
+  const [githubApiKey, setGithubApiKey] = useState("");
+  const [gitlabApiKey, setGitlabApiKey] = useState("");
   const [granolaApiKey, setGranolaApiKey] = useState("");
   const [linearApiKey, setLinearApiKey] = useState("");
+  const [confluenceSiteUrl, setConfluenceSiteUrl] = useState("");
+  const [confluenceEmail, setConfluenceEmail] = useState("");
+  const [confluenceApiToken, setConfluenceApiToken] = useState("");
   const busy = sourceSetupIsBusy(state);
-  const connectors: ConnectorOption[] = [
-    {
-      id: "notion",
-      name: "Notion",
-      description: "Pages and databases as folders with page.md files.",
-      status: sourceConnectorStatus(snapshot, "notion"),
-      keywords: ["notion", "wiki", "pages", "database", "docs"],
-      mounted: sourceMounted(snapshot, "notion"),
-    },
-    {
-      id: "google-docs",
-      name: "Google Docs",
-      description: "Docs and Drive folders through the same local file workflow.",
-      status: sourceConnectorStatus(snapshot, "google-docs"),
-      keywords: ["google", "docs", "gdocs", "drive", "documents"],
-      mounted: sourceMounted(snapshot, "google-docs"),
-    },
-    {
-      id: "google-calendar",
-      name: "Google Calendar",
-      description: "Primary calendar events as files, new events from reviewed drafts.",
-      status: sourceConnectorStatus(snapshot, "google-calendar"),
-      keywords: ["google", "calendar", "gcal", "events", "meet"],
-      mounted: sourceMounted(snapshot, "google-calendar"),
-    },
-    {
-      id: "gmail",
-      name: "Gmail",
-      description: "Inbox and sent as readable files, drafts as reviewed outbound mail.",
-      status: sourceConnectorStatus(snapshot, "gmail"),
-      keywords: ["gmail", "mail", "email", "inbox", "drafts"],
-      mounted: sourceMounted(snapshot, "gmail"),
-    },
-    {
-      id: "granola",
-      name: "Granola",
-      description: "Meeting summaries and raw transcripts as read-only files.",
-      status: sourceConnectorStatus(snapshot, "granola"),
-      keywords: ["granola", "meetings", "notes", "transcripts", "summaries"],
-      mounted: sourceMounted(snapshot, "granola"),
-    },
-    {
-      id: "linear",
-      name: "Linear",
-      description: "Issues and teams as editable Markdown files.",
-      status: sourceConnectorStatus(snapshot, "linear"),
-      keywords: ["linear", "issues", "tickets", "projects", "teams"],
-      mounted: sourceMounted(snapshot, "linear"),
-    },
-    {
-      id: "slack",
-      name: "Slack",
-      description: "Recent accessible conversations as read-only Markdown.",
-      status: sourceConnectorStatus(snapshot, "slack"),
-      keywords: ["slack", "channels", "private channels", "dms", "group dms", "users"],
-      mounted: sourceMounted(snapshot, "slack"),
-    },
-  ];
+  const connectors: ConnectorOption[] = sourceConnectorCatalogDefinitions().map((definition) => {
+    const runtimeConnector = isSourceConnectorId(definition.id) ? definition.id : null;
+    return {
+      id: definition.id,
+      name: definition.name,
+      description: definition.description,
+      status: runtimeConnector ? sourceConnectorStatus(snapshot, runtimeConnector) : "Planned",
+      keywords: [...definition.keywords],
+      availability: definition.availability,
+      category: definition.category,
+      authModes: definition.authModes,
+      projection: definition.projection,
+      writeModel: definition.writeModel,
+      mounted: runtimeConnector ? sourceMounted(snapshot, runtimeConnector) : false,
+    };
+  });
   const normalizedQuery = query.trim().toLowerCase();
   const visibleConnectors = normalizedQuery
     ? connectors.filter((connector) =>
@@ -4022,25 +4144,30 @@ function AddSourceDialog({
         <div className="source-list-scroll">
           <div className={`connector-choice-grid ${viewMode}`}>
             {visibleConnectors.map((connector) => {
-              const connectorBusy = sourceSetupIsActiveConnector(state, activeConnector, connector.id);
-              const apiKeyConnector = sourceRequiresApiKey(connector.id) ? connector.id : null;
-              const connected = sourceConnectionReady(snapshot, connector.id);
+              const runtimeConnector = isSourceConnectorId(connector.id) ? connector.id : null;
+              const connectorBusy = runtimeConnector
+                ? sourceSetupIsActiveConnector(state, activeConnector, runtimeConnector)
+                : false;
+              const apiKeyConnector = runtimeConnector && sourceRequiresApiKey(runtimeConnector) ? runtimeConnector : null;
+              const connected = runtimeConnector ? sourceConnectionReady(snapshot, runtimeConnector) : false;
               const needsConnection = !connected;
               const needsFolder = connected && !connector.mounted;
-              const connectionDetails = sourceConnectionDetails(snapshot, connector.id);
-              const mountDetails = sourceMountDetails(snapshot, connector.id);
-              const disabled = busy || (connector.id !== "notion" && connector.mounted);
+              const connectionDetails = runtimeConnector ? sourceConnectionDetails(snapshot, runtimeConnector) : null;
+              const mountDetails = runtimeConnector ? sourceMountDetails(snapshot, runtimeConnector) : null;
+              const disabled = !runtimeConnector || busy || (runtimeConnector !== "notion" && connector.mounted);
               const displayedStatus = connectorBusy
                 ? sourceSetupProgressLabel(state, connector.mounted)
                 : connector.status;
-              const actionLabel = sourceActionLabel(connector.id, {
-                needsConnection,
-                needsFolder,
-                mounted: connector.mounted,
-              });
+              const actionLabel = runtimeConnector
+                ? sourceActionLabel(runtimeConnector, {
+                    needsConnection,
+                    needsFolder,
+                    mounted: connector.mounted,
+                  })
+                : "Planned";
               return (
                 <article
-                  className={`connector-choice-card ${connector.mounted ? "mounted" : "active"}`}
+                  className={`connector-choice-card ${connector.mounted ? "mounted" : "active"} ${runtimeConnector ? "" : "planned disabled"}`}
                   aria-disabled={disabled}
                   key={connector.id}
                 >
@@ -4054,7 +4181,9 @@ function AddSourceDialog({
                       tone={
                         connectorBusy
                           ? "warn"
-                          : connector.mounted || (connector.id === "notion" && !needsConnection && !needsFolder)
+                          : !runtimeConnector
+                          ? "warn"
+                          : connector.mounted || (runtimeConnector === "notion" && !needsConnection && !needsFolder)
                           ? "ready"
                           : "warn"
                       }
@@ -4064,46 +4193,72 @@ function AddSourceDialog({
                     </StatusPill>
                   </div>
                   <div className="connector-choice-facts">
-                    {connector.id === "notion" ? (
+                    {!runtimeConnector ? (
+                      <>
+                        <SettingRow title="Availability" value="Planned connector" />
+                        <SettingRow title="Mode" value={sourceCategoryLabel(connector.category)} />
+                        <SettingRow title="Auth" value={sourceAuthModesLabel(connector.authModes)} />
+                        <SettingRow title="Projection" value={connector.projection} />
+                        <SettingRow title="Writes" value={connector.writeModel} />
+                      </>
+                    ) : runtimeConnector === "notion" ? (
                       <>
                         <SettingRow title="Workspace" value={connectionDetails?.workspaceName || "Not connected"} />
-                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
                         <SettingRow title="Access" value={mountDetails?.accessScope || (connected ? "Ready to mount" : "Not requested")} />
                       </>
-                    ) : connector.id === "google-docs" ? (
+                    ) : runtimeConnector === "google-docs" ? (
                       <>
                         <SettingRow title="Workspace folder" value={googleDocsWorkspaceFolder || "Locality"} />
-                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
                       </>
-                    ) : connector.id === "google-calendar" ? (
+                    ) : runtimeConnector === "google-calendar" ? (
                       <>
                         <SettingRow title="Calendar" value="Primary calendar" />
-                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
                       </>
-                    ) : connector.id === "granola" ? (
+                    ) : runtimeConnector === "confluence" ? (
+                      <>
+                        <SettingRow title="Content" value="Spaces, space summaries, pages" />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
+                        <SettingRow title="Access" value="Read-only context" />
+                      </>
+                    ) : runtimeConnector === "github" ? (
+                      <>
+                        <SettingRow title="Content" value="Repositories, README files, issues, pull requests" />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
+                        <SettingRow title="Access" value="Read-only context" />
+                      </>
+                    ) : runtimeConnector === "gitlab" ? (
+                      <>
+                        <SettingRow title="Content" value="Projects, README files, issues, merge requests" />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
+                        <SettingRow title="Access" value="Read-only context" />
+                      </>
+                    ) : runtimeConnector === "granola" ? (
                       <>
                         <SettingRow title="Content" value="Summaries and transcripts" />
-                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
                       </>
-                    ) : connector.id === "linear" ? (
+                    ) : runtimeConnector === "linear" ? (
                       <>
                         <SettingRow title="Content" value="Issues by team" />
-                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
                         <SettingRow title="Access" value="Issue edits" />
                       </>
-                    ) : connector.id === "slack" ? (
+                    ) : runtimeConnector === "slack" ? (
                       <>
                         <SettingRow title="Content" value="Channels, DMs, group DMs, users" />
-                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
                       </>
                     ) : (
                       <>
                         <SettingRow title="Mailboxes" value="Inbox, Sent, Draft" />
-                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
                       </>
                     )}
                   </div>
-                  {connector.id === "google-docs" && !connector.mounted && (
+                  {runtimeConnector === "google-docs" && !connector.mounted && (
                     <label className="source-inline-field">
                       <span>Drive folder</span>
                       <input
@@ -4115,16 +4270,52 @@ function AddSourceDialog({
                   )}
                   {apiKeyConnector && !connector.mounted && needsConnection && (
                     <>
+                      {apiKeyConnector === "confluence" && (
+                        <>
+                          <label className="source-inline-field">
+                            <span>Confluence site URL</span>
+                            <input
+                              value={confluenceSiteUrl}
+                              placeholder="https://your-team.atlassian.net"
+                              disabled={busy}
+                              onChange={(event) => setConfluenceSiteUrl(event.target.value)}
+                            />
+                          </label>
+                          <label className="source-inline-field">
+                            <span>Atlassian email</span>
+                            <input
+                              type="email"
+                              autoComplete="email"
+                              value={confluenceEmail}
+                              placeholder="you@company.com"
+                              disabled={busy}
+                              onChange={(event) => setConfluenceEmail(event.target.value)}
+                            />
+                          </label>
+                        </>
+                      )}
                       <label className="source-inline-field">
-                        <span>{connector.name} API key</span>
+                        <span>{apiKeyConnector === "confluence" ? "Confluence API token" : `${connector.name} API key`}</span>
                         <input
                           type="password"
                           autoComplete="off"
-                          value={apiKeyConnector === "linear" ? linearApiKey : granolaApiKey}
-                          placeholder="Paste API key"
+                          value={apiKeyInputValue(apiKeyConnector, {
+                            confluence: confluenceApiToken,
+                            github: githubApiKey,
+                            gitlab: gitlabApiKey,
+                            granola: granolaApiKey,
+                            linear: linearApiKey,
+                          })}
+                          placeholder={apiKeyPlaceholder(apiKeyConnector)}
                           disabled={busy}
                           onChange={(event) => {
-                            if (apiKeyConnector === "linear") {
+                            if (apiKeyConnector === "confluence") {
+                              setConfluenceApiToken(event.target.value);
+                            } else if (apiKeyConnector === "github") {
+                              setGithubApiKey(event.target.value);
+                            } else if (apiKeyConnector === "gitlab") {
+                              setGitlabApiKey(event.target.value);
+                            } else if (apiKeyConnector === "linear") {
                               setLinearApiKey(event.target.value);
                             } else {
                               setGranolaApiKey(event.target.value);
@@ -4133,13 +4324,15 @@ function AddSourceDialog({
                         />
                       </label>
                       <p className="quiet-note">
-                        {apiKeyConnector === "linear"
-                          ? "Create a key in Linear Settings > API > Personal API keys."
-                          : "Create a key in Granola Settings > Connectors > API keys. Business or Enterprise is required."}
+                        {apiKeyHelpText(apiKeyConnector)}
                       </p>
                     </>
                   )}
-                  {connector.mounted && connector.id !== "notion" && !connectorBusy ? (
+                  {!runtimeConnector ? (
+                    <SecondaryButton compact disabled icon={<Plug />}>
+                      Planned
+                    </SecondaryButton>
+                  ) : connector.mounted && runtimeConnector !== "notion" && !connectorBusy ? (
                     <SecondaryButton compact disabled icon={<Check />}>
                       Mounted
                     </SecondaryButton>
@@ -4147,19 +4340,35 @@ function AddSourceDialog({
                     <PrimaryButton
                       compact
                       busy={connectorBusy}
-                      disabled={
-                        disabled ||
-                        (needsConnection && !(apiKeyConnector === "linear" ? linearApiKey : granolaApiKey).trim())
-                      }
+	                      disabled={
+	                        disabled ||
+	                        (needsConnection && !apiKeyInputValue(apiKeyConnector, {
+	                          confluence: confluenceApiToken,
+	                          github: githubApiKey,
+	                          gitlab: gitlabApiKey,
+	                          granola: granolaApiKey,
+	                          linear: linearApiKey,
+	                        }).trim()) ||
+	                        (apiKeyConnector === "confluence" && (!confluenceSiteUrl.trim() || !confluenceEmail.trim()))
+	                      }
                       icon={needsConnection ? <ShieldCheck /> : <FolderOpen />}
                       onClick={() => {
                         if (needsConnection) {
-                          onApiKeyAction(
-                            apiKeyConnector,
-                            apiKeyConnector === "linear" ? linearApiKey : granolaApiKey,
-                          );
+	                          onApiKeyAction(
+	                            apiKeyConnector,
+	                            apiKeyInputValue(apiKeyConnector, {
+	                              confluence: confluenceApiToken,
+	                              github: githubApiKey,
+	                              gitlab: gitlabApiKey,
+	                              granola: granolaApiKey,
+	                              linear: linearApiKey,
+	                            }),
+	                            apiKeyConnector === "confluence"
+	                              ? { siteUrl: confluenceSiteUrl, email: confluenceEmail }
+	                              : undefined,
+	                          );
                         } else {
-                          onAction(connector.id);
+                          onAction(runtimeConnector);
                         }
                       }}
                     >
@@ -4169,9 +4378,9 @@ function AddSourceDialog({
                     <PrimaryButton
                       compact
                       busy={connectorBusy}
-                      disabled={disabled || (connector.id === "google-docs" && !googleDocsWorkspaceFolder.trim())}
-                      icon={sourceActionIcon(connector.id, needsConnection)}
-                      onClick={() => onAction(connector.id, { googleDocsWorkspaceFolder })}
+                      disabled={disabled || (runtimeConnector === "google-docs" && !googleDocsWorkspaceFolder.trim())}
+                      icon={sourceActionIcon(runtimeConnector, needsConnection)}
+                      onClick={() => onAction(runtimeConnector, { googleDocsWorkspaceFolder })}
                     >
                       {connectorBusy ? sourceSetupProgressLabel(state, connector.mounted) : actionLabel}
                     </PrimaryButton>
@@ -4195,41 +4404,11 @@ function AddSourceDialog({
 }
 
 function sourceDisplayName(connector: SourceConnectorId) {
-  switch (connector) {
-    case "notion":
-      return "Notion";
-    case "google-docs":
-      return "Google Docs";
-    case "google-calendar":
-      return "Google Calendar";
-    case "gmail":
-      return "Gmail";
-    case "granola":
-      return "Granola";
-    case "linear":
-      return "Linear";
-    case "slack":
-      return "Slack";
-  }
+  return sourceConnectorName(connector);
 }
 
 function sourceMountId(connector: SourceConnectorId) {
-  switch (connector) {
-    case "notion":
-      return "notion-main";
-    case "google-docs":
-      return "google-docs-main";
-    case "google-calendar":
-      return "google-calendar-main";
-    case "gmail":
-      return "gmail-main";
-    case "granola":
-      return "granola-main";
-    case "linear":
-      return "linear-main";
-    case "slack":
-      return "slack-main";
-  }
+  return sourceConnectorDefaultMountId(connector);
 }
 
 function sourceConnectionDetails(snapshot: DesktopSnapshot, connector: SourceConnectorId): ConnectionSummary | null {
@@ -4271,22 +4450,7 @@ function sourceDefaultPathPrefix() {
 }
 
 function sourceDefaultMountDirectory(connector: SourceConnectorId) {
-  switch (connector) {
-    case "notion":
-      return "notion";
-    case "google-docs":
-      return "google-docs-main";
-    case "google-calendar":
-      return "google-calendar-main";
-    case "gmail":
-      return "gmail-main";
-    case "granola":
-      return "granola";
-    case "linear":
-      return "linear";
-    case "slack":
-      return "slack";
-  }
+  return sourceConnectorDefaultMountDirectoryForId(connector);
 }
 
 function sourceDefaultPath(snapshot: DesktopSnapshot, connector: SourceConnectorId) {
@@ -4331,6 +4495,38 @@ function sourceActionIcon(connector: SourceConnectorId, needsConnection: boolean
   return <FolderOpen />;
 }
 
+function sourceCategoryLabel(category: SourceConnectorCategory) {
+  switch (category) {
+    case "knowledge":
+      return "Knowledge source";
+    case "action":
+      return "Action source";
+    case "hybrid":
+      return "Knowledge and actions";
+  }
+}
+
+function sourceAuthModesLabel(authModes: readonly SourceConnectorAuthMode[]) {
+  return authModes.map(sourceAuthModeLabel).join(", ");
+}
+
+function sourceAuthModeLabel(authMode: SourceConnectorAuthMode) {
+  switch (authMode) {
+    case "oauth":
+      return "OAuth";
+    case "api-key":
+      return "API key";
+    case "api-token":
+      return "API token";
+    case "personal-token":
+      return "Personal token";
+    case "github-app":
+      return "GitHub App";
+    case "smart-oauth":
+      return "SMART OAuth";
+  }
+}
+
 function oauthConnectCommand(connector: "google-docs" | "google-calendar" | "gmail" | "slack") {
   switch (connector) {
     case "google-docs":
@@ -4344,10 +4540,68 @@ function oauthConnectCommand(connector: "google-docs" | "google-calendar" | "gma
   }
 }
 
-function ConnectorIcon({ connector }: { connector: SourceConnectorId }) {
+function apiKeyConnectCommand(connector: ApiKeySourceConnectorId) {
+  switch (connector) {
+    case "confluence":
+      return "connect_confluence";
+    case "github":
+      return "connect_github";
+    case "gitlab":
+      return "connect_gitlab";
+    case "granola":
+      return "connect_granola";
+    case "linear":
+      return "connect_linear";
+  }
+}
+
+function apiKeyInputValue(
+  connector: ApiKeySourceConnectorId,
+  values: Record<ApiKeySourceConnectorId, string>,
+) {
+  return values[connector];
+}
+
+function apiKeyPlaceholder(connector: ApiKeySourceConnectorId) {
+  switch (connector) {
+    case "github":
+    case "gitlab":
+      return "Paste personal access token";
+    case "confluence":
+      return "Paste API token";
+    case "granola":
+    case "linear":
+      return "Paste API key";
+  }
+}
+
+function apiKeyHelpText(connector: ApiKeySourceConnectorId) {
+  switch (connector) {
+    case "github":
+      return "Create a fine-grained GitHub personal access token with repository metadata, contents, issues, and pull request read access.";
+    case "gitlab":
+      return "Create a GitLab personal access token with read API and read repository access.";
+    case "confluence":
+      return "Use an Atlassian API token for your Confluence Cloud site. Locality stores it in the local credential store and mounts Confluence read-only.";
+    case "granola":
+      return "Create a key in Granola Settings > Connectors > API keys. Business or Enterprise is required.";
+    case "linear":
+      return "Create a key in Linear Settings > API > Personal API keys.";
+  }
+}
+
+function ConnectorIcon({ connector }: { connector: SourceCatalogConnectorId }) {
+  const iconUrl = isSourceConnectorId(connector) ? CONNECTOR_ICON_URLS[connector] : null;
+  if (!iconUrl) {
+    return (
+      <span className={`connector-icon ${connector} generic`} aria-hidden="true">
+        <Plug />
+      </span>
+    );
+  }
   return (
     <span className={`connector-icon ${connector}`} aria-hidden="true">
-      <img src={CONNECTOR_ICON_URLS[connector]} alt="" draggable="false" />
+      <img src={iconUrl} alt="" draggable="false" />
     </span>
   );
 }
@@ -7631,99 +7885,48 @@ function ConnectorOptions({
   busy: boolean;
   onSelect: (connector: OnboardingConnectorId) => void;
 }) {
+  const runtimeConnectors = sourceConnectorDefinitions();
+  const plannedConnectors = plannedSourceConnectorDefinitions();
+
   return (
     <div className="connector-options">
-      <button
-        type="button"
-        className={`connector-option available selectable ${selected === "notion" ? "selected" : ""}`}
-        disabled={busy}
-        onClick={() => onSelect("notion")}
-      >
-        <ConnectorIcon connector="notion" />
-        <div>
-          <strong>Notion</strong>
-          <small>Pages, databases, properties, and Markdown edits.</small>
-        </div>
-        <span>{connectedConnector === "notion" ? "Connected" : "OAuth"}</span>
-      </button>
-      <button
-        type="button"
-        className={`connector-option available selectable ${selected === "google-docs" ? "selected" : ""}`}
-        disabled={busy}
-        onClick={() => onSelect("google-docs")}
-      >
-        <ConnectorIcon connector="google-docs" />
-        <div>
-          <strong>Google Docs</strong>
-          <small>Docs and Drive folders through the same local model.</small>
-        </div>
-        <span>{connectedConnector === "google-docs" ? "Connected" : "OAuth"}</span>
-      </button>
-      <button
-        type="button"
-        className={`connector-option available selectable ${selected === "google-calendar" ? "selected" : ""}`}
-        disabled={busy}
-        onClick={() => onSelect("google-calendar")}
-      >
-        <ConnectorIcon connector="google-calendar" />
-        <div>
-          <strong>Google Calendar</strong>
-          <small>Primary calendar events and reviewed event drafts.</small>
-        </div>
-        <span>{connectedConnector === "google-calendar" ? "Connected" : "OAuth"}</span>
-      </button>
-      <button
-        type="button"
-        className={`connector-option available selectable ${selected === "gmail" ? "selected" : ""}`}
-        disabled={busy}
-        onClick={() => onSelect("gmail")}
-      >
-        <ConnectorIcon connector="gmail" />
-        <div>
-          <strong>Gmail</strong>
-          <small>Inbox and sent as files, drafts as reviewed outbound mail.</small>
-        </div>
-        <span>{connectedConnector === "gmail" ? "Connected" : "OAuth"}</span>
-      </button>
-      <button
-        type="button"
-        className={`connector-option available selectable ${selected === "granola" ? "selected" : ""}`}
-        disabled={busy}
-        onClick={() => onSelect("granola")}
-      >
-        <ConnectorIcon connector="granola" />
-        <div>
-          <strong>Granola</strong>
-          <small>Meeting summaries and transcripts as read-only files.</small>
-        </div>
-        <span>{connectedConnector === "granola" ? "Connected" : "API key"}</span>
-      </button>
-      <button
-        type="button"
-        className={`connector-option available selectable ${selected === "linear" ? "selected" : ""}`}
-        disabled={busy}
-        onClick={() => onSelect("linear")}
-      >
-        <ConnectorIcon connector="linear" />
-        <div>
-          <strong>Linear</strong>
-          <small>Issues and teams as editable Markdown files.</small>
-        </div>
-        <span>{connectedConnector === "linear" ? "Connected" : "API key"}</span>
-      </button>
-      <button
-        type="button"
-        className={`connector-option available selectable ${selected === "slack" ? "selected" : ""}`}
-        disabled={busy}
-        onClick={() => onSelect("slack")}
-      >
-        <ConnectorIcon connector="slack" />
-        <div>
-          <strong>Slack</strong>
-          <small>Channels, DMs, group DMs, and users as read-only files.</small>
-        </div>
-        <span>{connectedConnector === "slack" ? "Connected" : "OAuth"}</span>
-      </button>
+      {runtimeConnectors.map((connector) => (
+        <button
+          type="button"
+          className={`connector-option available selectable ${selected === connector.id ? "selected" : ""}`}
+          disabled={busy}
+          key={connector.id}
+          onClick={() => onSelect(connector.id)}
+        >
+          <ConnectorIcon connector={connector.id} />
+          <div>
+            <strong>{connector.name}</strong>
+            <small>{connector.projection}</small>
+          </div>
+          <span>{connectedConnector === connector.id ? "Connected" : sourceAuthModesLabel(connector.authModes)}</span>
+        </button>
+      ))}
+
+      <div className="connector-options-section">
+        <span>Planned next</span>
+      </div>
+      <div className="connector-options-planned-grid">
+        {plannedConnectors.map((connector) => (
+          <button
+            type="button"
+            className="connector-option planned"
+            disabled
+            key={connector.id}
+          >
+            <ConnectorIcon connector={connector.id} />
+            <div>
+              <strong>{connector.name}</strong>
+              <small>{connector.projection}</small>
+            </div>
+            <span>{sourceAuthModesLabel(connector.authModes)}</span>
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

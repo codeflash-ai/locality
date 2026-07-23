@@ -1362,6 +1362,10 @@ p {
 .connector-options {
   display: grid;
   gap: 12px;
+  max-height: min(640px, calc(100vh - 220px));
+  overflow-y: auto;
+  padding-right: 4px;
+  overscroll-behavior: contain;
 }
 
 .connector-option {
@@ -1408,6 +1412,19 @@ p {
   background: rgba(255, 255, 255, 0.72);
 }
 
+.connector-option.planned {
+  grid-template-columns: 28px minmax(0, 1fr);
+  min-height: 64px;
+  padding: 10px;
+  border-style: dashed;
+  background: var(--surface);
+  opacity: 1;
+}
+
+.connector-option.planned > span {
+  display: none;
+}
+
 .connector-option strong,
 .connector-option small {
   display: block;
@@ -1422,6 +1439,36 @@ p {
 .connector-option .connector-icon {
   width: 32px;
   height: 32px;
+}
+
+.connector-option.planned .connector-icon {
+  width: 28px;
+  height: 28px;
+}
+
+.connector-options-section {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 2px 0;
+  color: var(--subtle);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.connector-options-section::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line-soft);
+}
+
+.connector-options-planned-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
 }
 
 .onboarding-source-field {
@@ -3208,8 +3255,17 @@ button.home-stat:hover {
   background: var(--chip-bg);
 }
 
+.connector-choice-card.planned {
+  border-style: dashed;
+  background: var(--surface);
+}
+
 .connector-choice-card.disabled {
   opacity: 0.72;
+}
+
+.connector-choice-card.planned.disabled {
+  opacity: 1;
 }
 
 .connector-choice-heading {
@@ -3270,6 +3326,18 @@ button.home-stat:hover {
   user-select: none;
 }
 
+.connector-icon.generic {
+  border: 1px solid var(--line);
+  background: var(--control-bg);
+  color: var(--control-muted);
+}
+
+.connector-icon.generic svg {
+  width: 18px;
+  height: 18px;
+  stroke-width: 2;
+}
+
 .connector-choice-facts {
   display: grid;
   border: 1px solid var(--line-soft);
@@ -3298,6 +3366,11 @@ button.home-stat:hover {
   color: var(--muted);
   font-size: 11px;
   font-weight: 850;
+}
+
+.source-inline-stack {
+  display: grid;
+  gap: 10px;
 }
 
 .source-inline-field input {
@@ -4525,6 +4598,7 @@ button.home-stat:hover {
 
 :root[data-theme="dark"] .connector-choice-card,
 :root[data-theme="dark"] .connector-choice-card.mounted,
+:root[data-theme="dark"] .connector-option.planned,
 :root[data-theme="dark"] .workspace-path-row,
 :root[data-theme="dark"] .workspace-facts span {
   border-color: var(--control-border);

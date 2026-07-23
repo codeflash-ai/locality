@@ -2074,8 +2074,11 @@ name = "loc-cli"
 version = "0.3.6"
 dependencies = [
  "clap",
+ "locality-confluence",
  "locality-connector",
  "locality-core",
+ "locality-github",
+ "locality-gitlab",
  "locality-gmail",
  "locality-google-calendar",
  "locality-google-docs",
@@ -2109,6 +2112,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "locality-confluence"
+version = "0.3.6"
+dependencies = [
+ "base64 0.22.1",
+ "locality-connector",
+ "locality-core",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "locality-connector"
 version = "0.3.6"
 dependencies = [
@@ -2132,8 +2148,10 @@ name = "locality-desktop"
 version = "0.3.6"
 dependencies = [
  "loc-cli",
+ "locality-confluence",
  "locality-connector",
  "locality-core",
+ "locality-gitlab",
  "locality-gmail",
  "locality-google-calendar",
  "locality-google-docs",
@@ -2168,6 +2186,32 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "locality-github"
+version = "0.3.6"
+dependencies = [
+ "base64 0.22.1",
+ "locality-connector",
+ "locality-core",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "locality-gitlab"
+version = "0.3.6"
+dependencies = [
+ "base64 0.22.1",
+ "locality-connector",
+ "locality-core",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2254,6 +2298,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "locality-planned-connectors"
+version = "0.3.6"
+dependencies = [
+ "locality-connector",
+ "locality-core",
+]
+
+[[package]]
 name = "locality-platform"
 version = "0.3.6"
 dependencies = [
@@ -2294,14 +2346,18 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "getrandom 0.3.4",
+ "locality-confluence",
  "locality-connector",
  "locality-core",
+ "locality-github",
+ "locality-gitlab",
  "locality-gmail",
  "locality-google-calendar",
  "locality-google-docs",
  "locality-granola",
  "locality-linear",
  "locality-notion",
+ "locality-planned-connectors",
  "locality-platform",
  "locality-slack",
  "locality-store",
