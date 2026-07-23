@@ -38,8 +38,8 @@ use crate::apply::{apply_plan, apply_undo, check_concurrency};
 use crate::client::{DEFAULT_NOTION_TOKEN_ENV, HttpNotionApi, NotionApi};
 use crate::fetch::fetch_page_bundle;
 use crate::media::{
-    MediaDownloadReport, PortableMediaCaptureFetcher, PortableMediaCapturePolicy,
-    download_media_assets,
+    MediaDownloadReport, MediaFetchReport, PortableMediaCaptureFetcher, PortableMediaCapturePolicy,
+    default_portable_media_fetcher, download_media_assets, fetch_media_asset_report_with_fetcher,
 };
 use crate::projection::{
     enumerate_explicit_root_trees, enumerate_shared_pages, list_container_children, observe_entity,
@@ -246,6 +246,19 @@ impl NotionConnector {
         mount_root: impl AsRef<Path>,
     ) -> LocalityResult<MediaDownloadReport> {
         download_media_assets(mount_root.as_ref(), &rendered.media_assets)
+    }
+
+    /// Fetch the hosted assets selected by the shared renderer.
+    ///
+    /// The optional injected fetcher is also used by daemon hydration tests;
+    /// production connectors use the hardened default transport.
+    pub fn fetch_rendered_media(&self, rendered: &NotionRenderedEntity) -> MediaFetchReport {
+        let default_fetcher = default_portable_media_fetcher();
+        let fetcher = self
+            .portable_media_fetcher
+            .as_deref()
+            .unwrap_or(default_fetcher.as_ref());
+        fetch_media_asset_report_with_fetcher(&rendered.media_assets, fetcher)
     }
 
     pub fn database_schema_yaml(&self, database_id: &RemoteId) -> LocalityResult<String> {

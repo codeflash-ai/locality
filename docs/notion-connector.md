@@ -211,9 +211,26 @@ recomputes that outcome ledger and rejects missing, duplicate, spurious, or
 mismatched entries before producing an artifact. Durable v1 native JSON is
 canonical: render streams a byte-for-byte reserialization comparison and
 rejects unknown fields, alternate field order, or noncanonical whitespace.
-External media stays unsupported and incomplete in this policy. Production
-capture accepts HTTPS on the default port only, rejects user information and IP
-literals, and permits exactly these origins:
+External media is never fetched. A valid external HTTPS URL remains an exact
+remote reference, including its explicit port, path, query, and fragment. An
+empty external URL is redacted and reports `unavailable_external_media`;
+unsafe URLs are redacted and report one exact, URL-free outcome:
+
+| Condition | Portable outcome |
+|---|---|
+| Above the 8 KiB bound | `unsafe_external_media_too_long` |
+| Contains whitespace or an ASCII control | `unsafe_external_media_whitespace_or_control` |
+| Cannot be parsed as a URL | `unsafe_external_media_malformed` |
+| Uses a scheme other than HTTPS | `unsafe_external_media_non_https` |
+| Has no host | `unsafe_external_media_missing_host` |
+| Contains user information | `unsafe_external_media_userinfo` |
+
+The outcome retains neither the URL nor parser details. Older sanitized v1
+payloads carrying the generic `unsafe_external_media` or
+`invalid_external_media` outcome remain readable, but new fetches never emit
+either generic code. Production hosted-media capture accepts HTTPS on the
+default port only, rejects user information and IP literals, and permits exactly
+these origins:
 
 - `secure.notion-static.com`;
 - `prod-files-secure.s3.us-west-2.amazonaws.com`;

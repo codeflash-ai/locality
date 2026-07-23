@@ -11,7 +11,9 @@ use std::io::{self, Read};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use locality_protocol::{
     OpaqueBootstrapExchangeRequest, SandboxSessionState, SandboxSessionStatus, SessionCapability,
@@ -34,10 +36,62 @@ const TAR_MEDIA_TYPE: &str = "application/x-tar";
 const MAX_JSON_RESPONSE_BYTES: u64 = 1024 * 1024;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Reqwest's blocking response reapplies the client's operation timeout to
+/// each `Read`. A dedicated export client therefore bounds idle body reads
+/// without imposing a 60-second total limit on a progressing export.
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const BOOTSTRAP_EXCHANGE_ATTEMPTS: usize = 2;
 const BOOTSTRAP_IDEMPOTENCY_DOMAIN: &[u8] = b"locality.session-exchange-idempotency.v1\0";
 const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
+const EXPORT_READ_AHEAD_CHUNK_BYTES: usize = 64 * 1024;
+const EXPORT_READ_AHEAD_CHUNKS: usize = 8;
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
+
+pub(crate) const PROFILE_BOOTSTRAP_TOKEN_INPUT: &str = "bootstrap_token_input";
+const PROFILE_CLIENT_SETUP: &str = "client_setup";
+const PROFILE_BOOTSTRAP_EXCHANGE: &str = "bootstrap_exchange";
+const PROFILE_SESSION_STATUS: &str = "session_status";
+const PROFILE_EXPORT_OPEN_HEADERS: &str = "export_open_headers";
+const PROFILE_FIRST_CONSUMER_BODY_BYTE: &str = "first_consumer_body_byte";
+const PROFILE_STREAM_DECODE_MATERIALIZE: &str = "stream_decode_materialize";
+pub(crate) const PROFILE_TOTAL: &str = "total";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SandboxProfileTiming {
+    pub phase: &'static str,
+    pub phase_ms: u128,
+    pub total_ms: u128,
+}
+
+pub(crate) struct SandboxInitProfile {
+    started: Instant,
+    last_total_ms: u128,
+    timings: Vec<SandboxProfileTiming>,
+}
+
+impl SandboxInitProfile {
+    pub(crate) fn start() -> Self {
+        Self {
+            started: Instant::now(),
+            last_total_ms: 0,
+            timings: Vec::new(),
+        }
+    }
+
+    pub(crate) fn mark(&mut self, phase: &'static str) {
+        let total_ms = self.started.elapsed().as_millis();
+        self.timings.push(SandboxProfileTiming {
+            phase,
+            phase_ms: total_ms.saturating_sub(self.last_total_ms),
+            total_ms,
+        });
+        self.last_total_ms = total_ms;
+    }
+
+    pub(crate) fn timings(&self) -> &[SandboxProfileTiming] {
+        &self.timings
+    }
+}
 
 #[derive(Clone)]
 pub struct SandboxBootstrapToken(String);
@@ -358,23 +412,262 @@ pub fn run_sandbox_init_with_encoding(
     bootstrap_token: SandboxBootstrapToken,
     content_encoding: SandboxContentEncodingPreference,
 ) -> Result<SandboxInitReport, SandboxInitError> {
+    run_sandbox_init_internal(options, bootstrap_token, content_encoding, None)
+}
+
+pub(crate) fn run_sandbox_init_with_encoding_and_profile(
+    options: SandboxInitOptions,
+    bootstrap_token: SandboxBootstrapToken,
+    content_encoding: SandboxContentEncodingPreference,
+    profile: &mut SandboxInitProfile,
+) -> Result<SandboxInitReport, SandboxInitError> {
+    run_sandbox_init_internal(options, bootstrap_token, content_encoding, Some(profile))
+}
+
+fn run_sandbox_init_internal(
+    options: SandboxInitOptions,
+    bootstrap_token: SandboxBootstrapToken,
+    content_encoding: SandboxContentEncodingPreference,
+    mut profile: Option<&mut SandboxInitProfile>,
+) -> Result<SandboxInitReport, SandboxInitError> {
     let root = absolute_destination(&options.root)?;
     validate_destination(&root)?;
     let client = SandboxHttpClient::new(&options.api_url)?;
+    mark_profile(&mut profile, PROFILE_CLIENT_SETUP);
 
     let capability = client.exchange_bootstrap(&bootstrap_token)?;
+    mark_profile(&mut profile, PROFILE_BOOTSTRAP_EXCHANGE);
     validate_capability(&capability)?;
     let status = client.session_status(&capability)?;
+    mark_profile(&mut profile, PROFILE_SESSION_STATUS);
     let (offer, expected_receipt) = validate_status(&capability, &status)?;
     validate_encoding_preference(offer, content_encoding)?;
     let limits = limits_for_offer(offer)?;
     let (encoding, response) = client.open_export(&capability, offer, content_encoding)?;
-    let archive = ReplicaArchive::new(encoding, response);
-    let summary =
+    mark_profile(&mut profile, PROFILE_EXPORT_OPEN_HEADERS);
+    let (body, mut producer) =
+        spawn_export_read_ahead(response).map_err(|error| SandboxInitError::Http {
+            operation: "session export read-ahead setup",
+            detail: error.to_string(),
+        })?;
+    let profiled_body = ProfiledExportBody::new(body, profile.as_deref_mut());
+    let archive = ReplicaArchive::new(encoding, profiled_body);
+    let materialization =
         materialize_replica_archive_with_expected_receipt(archive, &root, limits, expected_receipt)
-            .map_err(|error| SandboxInitError::Materialization(error.to_string()))?;
+            .map_err(|error| SandboxInitError::Materialization(error.to_string()));
+    let producer_outcome = producer.join();
+    mark_profile(&mut profile, PROFILE_STREAM_DECODE_MATERIALIZE);
+
+    let summary = match materialization {
+        Err(error) => return Err(error),
+        Ok(summary) => {
+            match producer_outcome {
+                Ok(ReadAheadProducerOutcome::CleanEof) => {}
+                Ok(
+                    ReadAheadProducerOutcome::ConsumerClosed
+                    | ReadAheadProducerOutcome::ErrorDelivered,
+                ) => {
+                    return Err(SandboxInitError::Materialization(
+                        "sandbox export transport ended without a clean EOF".to_string(),
+                    ));
+                }
+                Err(()) => {
+                    return Err(SandboxInitError::Materialization(
+                        "sandbox export read-ahead worker panicked".to_string(),
+                    ));
+                }
+            }
+            summary
+        }
+    };
 
     Ok(report(&root, &capability, encoding, summary))
+}
+
+fn mark_profile(profile: &mut Option<&mut SandboxInitProfile>, phase: &'static str) {
+    if let Some(profile) = profile.as_deref_mut() {
+        profile.mark(phase);
+    }
+}
+
+struct ProfiledExportBody<'a, Body> {
+    body: Body,
+    profile: Option<&'a mut SandboxInitProfile>,
+    observed_first_byte: bool,
+}
+
+impl<'a, Body> ProfiledExportBody<'a, Body> {
+    fn new(body: Body, profile: Option<&'a mut SandboxInitProfile>) -> Self {
+        Self {
+            body,
+            profile,
+            observed_first_byte: false,
+        }
+    }
+}
+
+impl<Body: Read> Read for ProfiledExportBody<'_, Body> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let read = self.body.read(output)?;
+        if read != 0 && !self.observed_first_byte {
+            self.observed_first_byte = true;
+            if let Some(profile) = self.profile.as_deref_mut() {
+                profile.mark(PROFILE_FIRST_CONSUMER_BODY_BYTE);
+            }
+        }
+        Ok(read)
+    }
+}
+
+enum ReadAheadMessage {
+    Data(Vec<u8>),
+    Error(io::Error),
+    CleanEof,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadAheadProducerOutcome {
+    CleanEof,
+    ConsumerClosed,
+    ErrorDelivered,
+}
+
+struct ExportReadAhead {
+    receiver: Receiver<ReadAheadMessage>,
+    recycle: SyncSender<Vec<u8>>,
+    current: Option<Vec<u8>>,
+    offset: usize,
+    clean_eof: bool,
+}
+
+impl Read for ExportReadAhead {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.clean_eof {
+            return Ok(0);
+        }
+
+        loop {
+            if self
+                .current
+                .as_ref()
+                .is_some_and(|current| self.offset < current.len())
+            {
+                let available = &self.current.as_ref().expect("current chunk")[self.offset..];
+                let copied = available.len().min(output.len());
+                output[..copied].copy_from_slice(&available[..copied]);
+                self.offset += copied;
+                return Ok(copied);
+            }
+            if let Some(mut exhausted) = self.current.take() {
+                exhausted.clear();
+                let _ = self.recycle.send(exhausted);
+            }
+
+            match self.receiver.recv() {
+                Ok(ReadAheadMessage::Data(chunk)) => {
+                    self.current = Some(chunk);
+                    self.offset = 0;
+                }
+                Ok(ReadAheadMessage::Error(error)) => return Err(error),
+                Ok(ReadAheadMessage::CleanEof) => {
+                    self.clean_eof = true;
+                    return Ok(0);
+                }
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "sandbox export read-ahead producer stopped before EOF",
+                    ));
+                }
+            }
+        }
+    }
+}
+
+struct ReadAheadProducer {
+    handle: Option<JoinHandle<ReadAheadProducerOutcome>>,
+}
+
+impl ReadAheadProducer {
+    fn join(&mut self) -> Result<ReadAheadProducerOutcome, ()> {
+        let handle = self.handle.take().ok_or(())?;
+        handle.join().map_err(|_| ())
+    }
+}
+
+impl Drop for ReadAheadProducer {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn spawn_export_read_ahead<Body>(body: Body) -> io::Result<(ExportReadAhead, ReadAheadProducer)>
+where
+    Body: Read + Send + 'static,
+{
+    let (sender, receiver) = sync_channel(EXPORT_READ_AHEAD_CHUNKS);
+    let (recycle, buffers) = sync_channel(EXPORT_READ_AHEAD_CHUNKS);
+    for _ in 0..EXPORT_READ_AHEAD_CHUNKS {
+        recycle
+            .send(Vec::with_capacity(EXPORT_READ_AHEAD_CHUNK_BYTES))
+            .expect("new buffer pool accepts its fixed capacity");
+    }
+    let handle = thread::Builder::new()
+        .name("locality-export-read-ahead".to_string())
+        .spawn(move || produce_export(body, &sender, &buffers))?;
+    Ok((
+        ExportReadAhead {
+            receiver,
+            recycle,
+            current: None,
+            offset: 0,
+            clean_eof: false,
+        },
+        ReadAheadProducer {
+            handle: Some(handle),
+        },
+    ))
+}
+
+fn produce_export<Body: Read>(
+    mut body: Body,
+    sender: &SyncSender<ReadAheadMessage>,
+    buffers: &Receiver<Vec<u8>>,
+) -> ReadAheadProducerOutcome {
+    loop {
+        let Ok(mut chunk) = buffers.recv() else {
+            return ReadAheadProducerOutcome::ConsumerClosed;
+        };
+        chunk.resize(EXPORT_READ_AHEAD_CHUNK_BYTES, 0);
+        match body.read(&mut chunk) {
+            Ok(0) => {
+                return if sender.send(ReadAheadMessage::CleanEof).is_ok() {
+                    ReadAheadProducerOutcome::CleanEof
+                } else {
+                    ReadAheadProducerOutcome::ConsumerClosed
+                };
+            }
+            Ok(read) => {
+                chunk.truncate(read);
+                if sender.send(ReadAheadMessage::Data(chunk)).is_err() {
+                    return ReadAheadProducerOutcome::ConsumerClosed;
+                }
+            }
+            Err(error) => {
+                let redacted = io::Error::new(error.kind(), "sandbox export transport read failed");
+                return if sender.send(ReadAheadMessage::Error(redacted)).is_ok() {
+                    ReadAheadProducerOutcome::ErrorDelivered
+                } else {
+                    ReadAheadProducerOutcome::ConsumerClosed
+                };
+            }
+        }
+    }
 }
 
 fn absolute_destination(path: &Path) -> Result<PathBuf, SandboxInitError> {
@@ -595,11 +888,19 @@ fn report(
 
 struct SandboxHttpClient {
     client: Client,
+    export_client: Client,
     api_url: reqwest::Url,
 }
 
 impl SandboxHttpClient {
     fn new(api_url: &str) -> Result<Self, SandboxInitError> {
+        Self::new_with_read_timeout(api_url, HTTP_READ_TIMEOUT)
+    }
+
+    fn new_with_read_timeout(
+        api_url: &str,
+        read_timeout: Duration,
+    ) -> Result<Self, SandboxInitError> {
         let api_url = reqwest::Url::parse(api_url)
             .map_err(|_| SandboxInitError::InvalidApiUrl("URL cannot be parsed"))?;
         if !matches!(api_url.scheme(), "http" | "https") {
@@ -635,7 +936,20 @@ impl SandboxHttpClient {
                 operation: "HTTP client setup",
                 detail: error.without_url().to_string(),
             })?;
-        Ok(Self { client, api_url })
+        let export_client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .timeout(read_timeout)
+            .build()
+            .map_err(|error| SandboxInitError::Http {
+                operation: "HTTP client setup",
+                detail: error.without_url().to_string(),
+            })?;
+        Ok(Self {
+            client,
+            export_client,
+            api_url,
+        })
     }
 
     fn exchange_bootstrap(
@@ -710,7 +1024,7 @@ impl SandboxHttpClient {
         preference: SandboxContentEncodingPreference,
     ) -> Result<(ReplicaArchiveEncoding, Response), SandboxInitError> {
         let response = self
-            .client
+            .export_client
             .get(self.export_url(capability.session_id.as_str()))
             .header(ACCEPT, TAR_MEDIA_TYPE)
             .header(ACCEPT_ENCODING, preference.accept_encoding())
@@ -891,6 +1205,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::{self, Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{self, Receiver};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
@@ -898,6 +1214,37 @@ mod tests {
     use locality_core::portable::SessionId;
 
     use super::*;
+
+    struct FixedChunkBody {
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl Read for FixedChunkBody {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            output.fill(0x5a);
+            Ok(output.len())
+        }
+    }
+
+    struct FailingBody {
+        first_read: bool,
+    }
+
+    impl Read for FailingBody {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if self.first_read {
+                self.first_read = false;
+                output[..3].copy_from_slice(b"abc");
+                Ok(3)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "sentinel export transport failure",
+                ))
+            }
+        }
+    }
 
     #[derive(Debug)]
     struct CapturedRequest {
@@ -909,7 +1256,18 @@ mod tests {
 
     enum TestResponse {
         DropConnection,
-        Json { status: &'static str, body: Vec<u8> },
+        Json {
+            status: &'static str,
+            body: Vec<u8>,
+        },
+        StalledExport {
+            prefix: Vec<u8>,
+            stall: Duration,
+        },
+        ProgressingExport {
+            chunks: Vec<Vec<u8>>,
+            pause: Duration,
+        },
     }
 
     struct TestServer {
@@ -936,6 +1294,36 @@ mod tests {
                         TestResponse::DropConnection => {}
                         TestResponse::Json { status, body } => {
                             write_json_response(&mut stream, status, &body);
+                        }
+                        TestResponse::StalledExport { prefix, stall } => {
+                            write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/x-tar\r\nContent-Encoding: identity\r\nConnection: close\r\n\r\n",
+                                prefix.len() + 512
+                            )
+                            .expect("write stalled response head");
+                            stream
+                                .write_all(&prefix)
+                                .expect("write stalled response prefix");
+                            stream.flush().expect("flush stalled response prefix");
+                            thread::sleep(stall);
+                        }
+                        TestResponse::ProgressingExport { chunks, pause } => {
+                            let content_length = chunks.iter().map(Vec::len).sum::<usize>();
+                            write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Length: {content_length}\r\nContent-Type: application/x-tar\r\nContent-Encoding: identity\r\nConnection: close\r\n\r\n"
+                            )
+                            .expect("write progressing response head");
+                            for (index, chunk) in chunks.into_iter().enumerate() {
+                                if index != 0 {
+                                    thread::sleep(pause);
+                                }
+                                stream
+                                    .write_all(&chunk)
+                                    .expect("write progressing response chunk");
+                                stream.flush().expect("flush progressing response chunk");
+                            }
                         }
                     }
                 }
@@ -969,6 +1357,165 @@ mod tests {
             self.handle.join().expect("test server completed");
             self.requests.try_iter().collect()
         }
+    }
+
+    #[test]
+    fn export_read_ahead_is_byte_bounded_and_consumer_drop_unblocks_producer() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (reader, mut producer) = spawn_export_read_ahead(FixedChunkBody {
+            reads: Arc::clone(&reads),
+        })
+        .expect("start read-ahead producer");
+        let expected_reads = EXPORT_READ_AHEAD_CHUNKS;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while reads.load(Ordering::SeqCst) < expected_reads {
+            assert!(
+                Instant::now() < deadline,
+                "producer did not fill bounded queue"
+            );
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(25));
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            expected_reads,
+            "the producer is bounded by exactly eight reusable 64 KiB buffers"
+        );
+
+        drop(reader);
+        assert_eq!(
+            producer.join(),
+            Ok(ReadAheadProducerOutcome::ConsumerClosed),
+            "dropping a rejecting consumer must promptly release a blocked producer"
+        );
+    }
+
+    #[test]
+    fn export_read_ahead_redacts_the_original_io_error() {
+        let (mut reader, mut producer) = spawn_export_read_ahead(FailingBody { first_read: true })
+            .expect("start read-ahead producer");
+        let mut prefix = [0_u8; 3];
+        reader.read_exact(&mut prefix).expect("read prefix");
+        assert_eq!(&prefix, b"abc");
+
+        let error = reader.read(&mut [0_u8; 1]).expect_err("transport fails");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        assert_eq!(error.to_string(), "sandbox export transport read failed");
+        assert!(!error.to_string().contains("sentinel"));
+        drop(reader);
+        assert_eq!(
+            producer.join(),
+            Ok(ReadAheadProducerOutcome::ErrorDelivered)
+        );
+    }
+
+    #[test]
+    fn export_read_ahead_disconnect_is_not_mistaken_for_clean_eof() {
+        let (sender, receiver) = sync_channel(1);
+        let (recycle, _) = sync_channel(1);
+        drop(sender);
+        let mut reader = ExportReadAhead {
+            receiver,
+            recycle,
+            current: None,
+            offset: 0,
+            clean_eof: false,
+        };
+
+        let error = reader
+            .read(&mut [0_u8; 1])
+            .expect_err("disconnect without an EOF marker must fail");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            error.to_string(),
+            "sandbox export read-ahead producer stopped before EOF"
+        );
+    }
+
+    #[test]
+    fn early_materializer_rejection_joins_a_producer_blocked_on_http_read() {
+        static DIRECTORY_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+        let server = TestServer::start(
+            vec![TestResponse::StalledExport {
+                prefix: vec![0xff; 512],
+                stall: Duration::from_millis(500),
+            }],
+            false,
+        );
+        let client =
+            SandboxHttpClient::new_with_read_timeout(&server.api_url, Duration::from_millis(100))
+                .expect("HTTP client");
+        let response = client
+            .export_client
+            .get(endpoint_url(&client.api_url, &["stalled-export"]))
+            .send()
+            .expect("open stalled response");
+        let (body, mut producer) = spawn_export_read_ahead(response).expect("start producer");
+        let parent = std::env::temp_dir().join(format!(
+            "locality-stalled-export-{}-{}",
+            std::process::id(),
+            DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&parent).expect("create test parent");
+        let destination = parent.join("tree");
+
+        let archive = ReplicaArchive::new(ReplicaArchiveEncoding::Identity, body);
+        localityd::replica_materializer::materialize_replica_archive(
+            archive,
+            &destination,
+            ReplicaMaterializationLimits::default(),
+        )
+        .expect_err("invalid first header rejects before HTTP EOF");
+        let join_started = Instant::now();
+        assert_eq!(
+            producer.join(),
+            Ok(ReadAheadProducerOutcome::ConsumerClosed)
+        );
+        assert!(
+            join_started.elapsed() >= Duration::from_millis(20),
+            "producer was not blocked in the stalled response read"
+        );
+        assert!(
+            join_started.elapsed() < Duration::from_secs(1),
+            "blocked response read exceeded its configured deadline"
+        );
+        assert!(!destination.exists());
+        fs::remove_dir_all(&parent).expect("remove test parent");
+        server.finish();
+    }
+
+    #[test]
+    fn export_read_deadline_resets_for_a_progressing_multi_read_response() {
+        let chunks = vec![vec![1; 17], vec![2; 19], vec![3; 23]];
+        let expected = chunks.iter().flatten().copied().collect::<Vec<_>>();
+        let server = TestServer::start(
+            vec![TestResponse::ProgressingExport {
+                chunks,
+                pause: Duration::from_millis(120),
+            }],
+            false,
+        );
+        let client =
+            SandboxHttpClient::new_with_read_timeout(&server.api_url, Duration::from_millis(200))
+                .expect("HTTP client");
+        let response = client
+            .export_client
+            .get(endpoint_url(&client.api_url, &["progressing-export"]))
+            .send()
+            .expect("open progressing response");
+        let started = Instant::now();
+        let (mut body, mut producer) = spawn_export_read_ahead(response).expect("start producer");
+        let mut actual = Vec::new();
+        body.read_to_end(&mut actual)
+            .expect("read progressing body");
+        assert_eq!(producer.join(), Ok(ReadAheadProducerOutcome::CleanEof));
+        assert_eq!(actual, expected);
+        assert!(
+            started.elapsed() > Duration::from_millis(200),
+            "fixture must exceed one read deadline in total"
+        );
+        server.finish();
     }
 
     #[test]

@@ -8,8 +8,12 @@ use locality_core::hydration::{HydrationReason, HydrationRequest};
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use locality_notion::client::NotionApi;
 use locality_notion::dto::{
-    BlockDto, BlockListDto, PageDto, PageListDto, PagePropertyDto, PaginatedListDto,
-    RichTextBlockDto, RichTextDto, TextRichTextDto,
+    BlockDto, BlockListDto, ExternalFileDto, FileBlockDto, HostedFileDto, PageDto, PageListDto,
+    PagePropertyDto, PaginatedListDto, RichTextBlockDto, RichTextDto, TextRichTextDto,
+};
+use locality_notion::media::{
+    HostedMediaCaptureOutcome, PortableMediaCapture, PortableMediaCaptureFetcher,
+    PortableMediaCapturePolicy,
 };
 use locality_notion::{NotionConfig, NotionConnector};
 use locality_store::{
@@ -63,6 +67,238 @@ fn notion_connector_hydrates_stub_through_daemon_executor() {
         .expect("entity");
     assert_eq!(entity.hydration, HydrationState::Hydrated);
     assert_eq!(entity.content_hash, Some(shadow.body_hash));
+}
+
+#[test]
+fn notion_hydration_publishes_mixed_hosted_omission_and_external_reference() {
+    let hosted_ok = "https://secure.notion-static.com/ok.png?X-Amz-Signature=ok-secret";
+    let hosted_missing =
+        "https://secure.notion-static.com/missing.png?X-Amz-Signature=missing-secret";
+    let external = "https://cdn.example.com/public.png?version=exact#image";
+    let connector = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(FixtureNotionApi::page_with_blocks(
+            "page-1",
+            "Mixed Media",
+            vec![
+                hosted_media_block("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", hosted_ok, "Available"),
+                hosted_media_block(
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    hosted_missing,
+                    "Missing",
+                ),
+                external_media_block("cccccccccccccccccccccccccccccccc", external, "Public"),
+            ],
+        )),
+    )
+    .with_portable_media_capture_fetcher(
+        PortableMediaCapturePolicy::HostedPilot,
+        Arc::new(FixtureMediaFetcher(BTreeMap::from([
+            (
+                hosted_ok.to_string(),
+                HostedMediaCaptureOutcome::Captured(PortableMediaCapture {
+                    bytes: b"png".to_vec(),
+                    media_type: "image/png".to_string(),
+                }),
+            ),
+            (
+                hosted_missing.to_string(),
+                HostedMediaCaptureOutcome::Unavailable,
+            ),
+        ]))),
+    );
+    let request = HydrationRequest::new(
+        MountId::new("notion-main"),
+        RemoteId::new("page-1"),
+        "Docs/Coverage/page.md",
+        HydrationState::Stub,
+        HydrationReason::StubRead,
+    );
+
+    let hydrated = localityd::hydration::HydrationSource::fetch_render(&connector, &request)
+        .expect("mixed media hydration");
+    assert_eq!(hydrated.assets.len(), 1);
+    assert_eq!(hydrated.assets[0].bytes, b"png");
+    assert_eq!(
+        hydrated.assets[0].path,
+        PathBuf::from(".loc/media/Docs/Coverage/image-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png")
+    );
+    let markdown = locality_core::canonical::render_canonical_markdown(&hydrated.document);
+    assert!(markdown.contains(
+        "![Available](../../.loc/media/Docs/Coverage/image-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png)"
+    ));
+    assert!(
+        markdown
+            .contains("::loc{id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb type=image title=\"Missing\"}")
+    );
+    assert!(markdown.contains(&format!("![Public]({external})")));
+    assert!(!markdown.contains(hosted_ok));
+    assert!(!markdown.contains(hosted_missing));
+    assert!(!markdown.contains("missing-secret"));
+}
+
+#[test]
+fn notion_hydration_fails_closed_for_unsafe_hosted_media() {
+    let hosted = "https://secure.notion-static.com/unsafe.png?X-Amz-Signature=secret";
+    let connector = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(FixtureNotionApi::page_with_blocks(
+            "page-1",
+            "Unsafe Media",
+            vec![hosted_media_block("unsafe", hosted, "Unsafe")],
+        )),
+    )
+    .with_portable_media_capture_fetcher(
+        PortableMediaCapturePolicy::HostedPilot,
+        Arc::new(FixtureMediaFetcher(BTreeMap::from([(
+            hosted.to_string(),
+            HostedMediaCaptureOutcome::Unsafe,
+        )]))),
+    );
+    let request = HydrationRequest::new(
+        MountId::new("notion-main"),
+        RemoteId::new("page-1"),
+        "Unsafe/page.md",
+        HydrationState::Stub,
+        HydrationReason::StubRead,
+    );
+
+    let error = localityd::hydration::HydrationSource::fetch_render(&connector, &request)
+        .expect_err("unsafe hosted media must fail closed");
+    assert_eq!(
+        error.to_string(),
+        "invalid state: Notion hosted media failed safety validation"
+    );
+    assert!(!format!("{error:?}").contains("X-Amz"));
+    assert!(!format!("{error:?}").contains("secret"));
+}
+
+#[test]
+fn notion_hydration_rejects_invalid_hosted_origin_before_injected_fetcher() {
+    struct NeverCalledFetcher;
+    impl PortableMediaCaptureFetcher for NeverCalledFetcher {
+        fn fetch(
+            &self,
+            _hosted_url: &str,
+            _max_bytes: usize,
+        ) -> locality_core::LocalityResult<PortableMediaCapture> {
+            panic!("invalid hosted origin reached injected fetcher")
+        }
+    }
+
+    let connector = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(FixtureNotionApi::page_with_blocks(
+            "page-1",
+            "Invalid Hosted Origin",
+            vec![hosted_media_block(
+                "unsafe-origin",
+                "https://example.com/masquerading-as-hosted.png",
+                "Unsafe",
+            )],
+        )),
+    )
+    .with_portable_media_capture_fetcher(
+        PortableMediaCapturePolicy::HostedPilot,
+        Arc::new(NeverCalledFetcher),
+    );
+    let request = HydrationRequest::new(
+        MountId::new("notion-main"),
+        RemoteId::new("page-1"),
+        "Unsafe/page.md",
+        HydrationState::Stub,
+        HydrationReason::StubRead,
+    );
+
+    let error = localityd::hydration::HydrationSource::fetch_render(&connector, &request)
+        .expect_err("invalid hosted origin must fail closed");
+    assert_eq!(
+        error.to_string(),
+        "invalid state: Notion hosted media failed safety validation"
+    );
+}
+
+#[test]
+fn notion_hydration_fails_closed_for_malformed_hosted_expiry() {
+    let connector = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(FixtureNotionApi::page_with_blocks(
+            "page-1",
+            "Malformed Expiry",
+            vec![hosted_media_block_with_expiry(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "https://secure.notion-static.com/image.png?X-Amz-Signature=secret",
+                "Image",
+                Some("2099-01-01T00:00:00+01:00"),
+            )],
+        )),
+    );
+    let request = HydrationRequest::new(
+        MountId::new("notion-main"),
+        RemoteId::new("page-1"),
+        "Unsafe/page.md",
+        HydrationState::Stub,
+        HydrationReason::StubRead,
+    );
+
+    let error = localityd::hydration::HydrationSource::fetch_render(&connector, &request)
+        .expect_err("malformed expiry must fail closed");
+    assert_eq!(
+        error.to_string(),
+        "invalid state: Notion hosted media expiry failed safety validation"
+    );
+    assert!(!format!("{error:?}").contains("X-Amz"));
+    assert!(!format!("{error:?}").contains("secret"));
+}
+
+#[test]
+fn notion_hydration_omits_already_expired_hosted_media_without_fetching() {
+    struct NeverCalledFetcher;
+    impl PortableMediaCaptureFetcher for NeverCalledFetcher {
+        fn fetch(
+            &self,
+            _hosted_url: &str,
+            _max_bytes: usize,
+        ) -> locality_core::LocalityResult<PortableMediaCapture> {
+            panic!("expired hosted media reached fetcher")
+        }
+    }
+
+    let connector = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(FixtureNotionApi::page_with_blocks(
+            "page-1",
+            "Expired Media",
+            vec![hosted_media_block_with_expiry(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "https://secure.notion-static.com/image.png?X-Amz-Signature=secret",
+                "Expired",
+                Some("2000-01-01T00:00:00.000Z"),
+            )],
+        )),
+    )
+    .with_portable_media_capture_fetcher(
+        PortableMediaCapturePolicy::HostedPilot,
+        Arc::new(NeverCalledFetcher),
+    );
+    let request = HydrationRequest::new(
+        MountId::new("notion-main"),
+        RemoteId::new("page-1"),
+        "Expired/page.md",
+        HydrationState::Stub,
+        HydrationReason::StubRead,
+    );
+
+    let hydrated = localityd::hydration::HydrationSource::fetch_render(&connector, &request)
+        .expect("expired hosted media is an omission");
+    assert!(hydrated.assets.is_empty());
+    let markdown = locality_core::canonical::render_canonical_markdown(&hydrated.document);
+    assert!(
+        markdown
+            .contains("::loc{id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa type=image title=\"Expired\"}")
+    );
+    assert!(!markdown.contains("https://secure.notion-static.com"));
+    assert!(!markdown.contains("X-Amz"));
 }
 
 #[test]
@@ -289,6 +525,72 @@ fn rich_text_block(id: &str, kind: &str, text: &str) -> BlockDto {
     }
 
     block
+}
+
+fn hosted_media_block(id: &str, url: &str, caption: &str) -> BlockDto {
+    hosted_media_block_with_expiry(id, url, caption, Some("2099-01-01T00:00:00.000Z"))
+}
+
+fn hosted_media_block_with_expiry(
+    id: &str,
+    url: &str,
+    caption: &str,
+    expiry_time: Option<&str>,
+) -> BlockDto {
+    BlockDto {
+        id: id.to_string(),
+        kind: "image".to_string(),
+        image: Some(FileBlockDto {
+            kind: "file".to_string(),
+            external: None,
+            file: Some(HostedFileDto {
+                url: url.to_string(),
+                expiry_time: expiry_time.map(str::to_string),
+            }),
+            caption: vec![rich_text(caption)],
+        }),
+        ..BlockDto::default()
+    }
+}
+
+fn external_media_block(id: &str, url: &str, caption: &str) -> BlockDto {
+    BlockDto {
+        id: id.to_string(),
+        kind: "image".to_string(),
+        image: Some(FileBlockDto {
+            kind: "external".to_string(),
+            external: Some(ExternalFileDto {
+                url: url.to_string(),
+            }),
+            file: None,
+            caption: vec![rich_text(caption)],
+        }),
+        ..BlockDto::default()
+    }
+}
+
+struct FixtureMediaFetcher(BTreeMap<String, HostedMediaCaptureOutcome>);
+
+impl PortableMediaCaptureFetcher for FixtureMediaFetcher {
+    fn fetch(
+        &self,
+        hosted_url: &str,
+        _max_bytes: usize,
+    ) -> locality_core::LocalityResult<PortableMediaCapture> {
+        match self.fetch_outcome(hosted_url, usize::MAX) {
+            HostedMediaCaptureOutcome::Captured(capture) => Ok(capture),
+            _ => Err(locality_core::LocalityError::Io(
+                "fixture hosted media unavailable".to_string(),
+            )),
+        }
+    }
+
+    fn fetch_outcome(&self, hosted_url: &str, _max_bytes: usize) -> HostedMediaCaptureOutcome {
+        self.0
+            .get(hosted_url)
+            .cloned()
+            .unwrap_or(HostedMediaCaptureOutcome::Unavailable)
+    }
 }
 
 fn rich_text(text: &str) -> RichTextDto {

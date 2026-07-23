@@ -62,6 +62,9 @@ struct ResponseFixture {
     status: &'static str,
     headers: Vec<(&'static str, &'static str)>,
     body: Vec<u8>,
+    declared_content_length: Option<usize>,
+    split_after: Option<(usize, Duration)>,
+    staging_gate: Option<(PathBuf, PathBuf, PathBuf)>,
 }
 
 impl ResponseFixture {
@@ -70,6 +73,9 @@ impl ResponseFixture {
             status: "200 OK",
             headers: vec![("Content-Type", "application/json")],
             body: serde_json::to_vec(value).expect("serialize response"),
+            declared_content_length: None,
+            split_after: None,
+            staging_gate: None,
         }
     }
 
@@ -81,7 +87,39 @@ impl ResponseFixture {
                 ("Content-Encoding", encoding),
             ],
             body,
+            declared_content_length: None,
+            split_after: None,
+            staging_gate: None,
         }
+    }
+
+    fn streaming_export(
+        encoding: &'static str,
+        body: Vec<u8>,
+        split_after: usize,
+        pause: Duration,
+    ) -> Self {
+        Self::export(encoding, body).with_split_after(split_after, pause)
+    }
+
+    fn with_declared_content_length(mut self, length: usize) -> Self {
+        self.declared_content_length = Some(length);
+        self
+    }
+
+    fn with_split_after(mut self, bytes: usize, pause: Duration) -> Self {
+        self.split_after = Some((bytes, pause));
+        self
+    }
+
+    fn with_staging_gate(
+        mut self,
+        parent: PathBuf,
+        logical_path: PathBuf,
+        destination: PathBuf,
+    ) -> Self {
+        self.staging_gate = Some((parent, logical_path, destination));
+        self
     }
 }
 
@@ -279,6 +317,89 @@ fn zstd_bootstrap_streams_into_the_shared_materializer() {
         export.headers.get("accept-encoding").unwrap(),
         "zstd, identity"
     );
+}
+
+#[test]
+fn export_bytes_are_staged_while_the_http_response_is_still_streaming() {
+    let directory = TestDirectory::new("streaming-overlap");
+    let body = vec![0x5a; 256 * 1024];
+    let tar = tar_file(b"large.bin", &body);
+    let capability = capability();
+    let status = ready_status(
+        capability.session_id.clone(),
+        COMPONENT_VERSIONS,
+        &tar,
+        BTreeSet::from([TarContentEncoding::Identity]),
+    );
+    let destination = directory.root();
+    let response = ResponseFixture::streaming_export(
+        "identity",
+        tar,
+        512 + 64 * 1024,
+        Duration::from_millis(10),
+    )
+    .with_staging_gate(
+        destination
+            .parent()
+            .expect("destination parent")
+            .to_path_buf(),
+        PathBuf::from("large.bin"),
+        destination.clone(),
+    );
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&capability),
+        ResponseFixture::json(&status),
+        response,
+    ]);
+
+    let report = run_sandbox_init(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: destination.clone(),
+        },
+        SandboxBootstrapToken::new("bootstrap-secret").expect("token"),
+    )
+    .expect("stream and publish export");
+
+    assert_eq!(report.files, 1);
+    assert_eq!(report.materialized_bytes, body.len() as u64);
+    assert_eq!(
+        fs::read(destination.join("large.bin")).expect("read published file"),
+        body
+    );
+}
+
+#[test]
+fn truncated_http_body_producer_error_prevents_publication() {
+    let directory = TestDirectory::new("transport-truncation");
+    let tar = tar_file(b"complete-before-http-eof.txt", b"complete\n");
+    let capability = capability();
+    let status = ready_status(
+        capability.session_id.clone(),
+        COMPONENT_VERSIONS,
+        &tar,
+        BTreeSet::from([TarContentEncoding::Identity]),
+    );
+    let declared_length = tar.len() + 128;
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&capability),
+        ResponseFixture::json(&status),
+        ResponseFixture::export("identity", tar).with_declared_content_length(declared_length),
+    ]);
+
+    let error = run_sandbox_init(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: directory.root(),
+        },
+        SandboxBootstrapToken::new("bootstrap-secret").expect("token"),
+    )
+    .expect_err("an incomplete HTTP response must not publish a complete-looking tar");
+
+    assert_eq!(error.code(), "materialization_failed");
+    assert!(!directory.root().exists());
+    assert!(!error.to_string().contains("bootstrap-secret"));
+    assert!(!error.to_string().contains("capability-secret"));
 }
 
 #[test]
@@ -602,6 +723,9 @@ fn bearer_authenticated_redirect_is_not_followed() {
             status: "302 Found",
             headers: vec![("Location", "/redirected")],
             body: Vec::new(),
+            declared_content_length: None,
+            split_after: None,
+            staging_gate: None,
         },
     ]);
 
@@ -773,6 +897,9 @@ fn version_session_offer_media_and_response_encoding_are_validated() {
                 status: "200 OK",
                 headers: vec![("Content-Type", "application/octet-stream")],
                 body: tar.clone(),
+                declared_content_length: None,
+                split_after: None,
+                staging_gate: None,
             }),
             "backend_protocol_invalid",
         ),
@@ -893,6 +1020,7 @@ fn cli_forced_identity_reports_encoding_without_leaking_environment_token() {
     assert!(!stdout.contains("capability-secret"));
     assert!(!stderr.contains("cli-bootstrap-secret"));
     assert!(!stderr.contains("capability-secret"));
+    assert!(stderr.is_empty(), "profiling is opt-in: {stderr}");
     let report: serde_json::Value = serde_json::from_str(&stdout).expect("JSON report");
     assert_eq!(report["command"], "sandbox_init");
     assert_eq!(report["content_encoding"], "identity");
@@ -909,6 +1037,164 @@ fn cli_forced_identity_reports_encoding_without_leaking_environment_token() {
     let _ = server.request();
     let export = server.request();
     assert_eq!(export.headers.get("accept-encoding").unwrap(), "identity");
+}
+
+#[test]
+fn cli_profile_has_stable_monotonic_phases_and_no_request_details() {
+    let directory = TestDirectory::new("cli-profile");
+    let tar = tar_file(b"profiled.txt", b"profile-content-secret\n");
+    let capability = capability();
+    let status = ready_status(
+        capability.session_id.clone(),
+        COMPONENT_VERSIONS,
+        &tar,
+        BTreeSet::from([TarContentEncoding::Identity]),
+    );
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&capability),
+        ResponseFixture::json(&status),
+        ResponseFixture::export("identity", tar),
+    ]);
+    let root = directory.root().to_string_lossy().into_owned();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_loc"))
+        .args([
+            "sandbox",
+            "init",
+            "--api-url",
+            &server.api_url,
+            "--root",
+            &root,
+            "--encoding",
+            "identity",
+            "--profile",
+            "--json",
+        ])
+        .env("LOCALITY_BOOTSTRAP_TOKEN", "profile-bootstrap-secret")
+        .output()
+        .expect("run profiled loc sandbox init");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr UTF-8");
+    let expected_phases = [
+        "bootstrap_token_input",
+        "client_setup",
+        "bootstrap_exchange",
+        "session_status",
+        "export_open_headers",
+        "first_consumer_body_byte",
+        "stream_decode_materialize",
+        "total",
+    ];
+    let lines = stderr.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), expected_phases.len(), "{stderr}");
+    let mut previous_total_ms = 0_u128;
+    for (line, expected_phase) in lines.iter().zip(expected_phases) {
+        let prefix = format!("locality sandbox profile phase={expected_phase} phase_ms=");
+        let timing = line
+            .strip_prefix(&prefix)
+            .unwrap_or_else(|| panic!("unexpected profile line: {line}"));
+        let (phase_ms, total_ms) = timing
+            .split_once(" total_ms=")
+            .unwrap_or_else(|| panic!("profile line lacks exact timing fields: {line}"));
+        assert!(
+            !phase_ms.is_empty()
+                && phase_ms.bytes().all(|byte| byte.is_ascii_digit())
+                && !total_ms.is_empty()
+                && total_ms.bytes().all(|byte| byte.is_ascii_digit()),
+            "profile timing fields must contain only decimal milliseconds: {line}"
+        );
+        let phase_ms = phase_ms.parse::<u128>().expect("phase milliseconds");
+        let total_ms = total_ms.parse::<u128>().expect("total milliseconds");
+        assert!(
+            total_ms >= previous_total_ms,
+            "profile timings must be monotonic: {stderr}"
+        );
+        assert_eq!(
+            phase_ms,
+            total_ms - previous_total_ms,
+            "phase timing must be the delta since the prior mark: {stderr}"
+        );
+        previous_total_ms = total_ms;
+    }
+
+    for secret_or_detail in [
+        "profile-bootstrap-secret",
+        "capability-secret",
+        "session-7",
+        server.api_url.as_str(),
+        root.as_str(),
+        "application/x-tar",
+        "profile-content-secret",
+        "authorization",
+    ] {
+        assert!(
+            !stderr.contains(secret_or_detail),
+            "profile leaked forbidden detail `{secret_or_detail}`: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn cli_profile_failure_prints_completed_phases_and_total() {
+    let directory = TestDirectory::new("cli-profile-failure");
+    let tar = tar_file(b"never-exported.txt", b"never-exported-content\n");
+    let capability = capability();
+    let status = ready_status(
+        capability.session_id.clone(),
+        COMPONENT_VERSIONS,
+        &tar,
+        BTreeSet::from([TarContentEncoding::Identity]),
+    );
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&capability),
+        ResponseFixture::json(&status),
+    ]);
+    let root = directory.root().to_string_lossy().into_owned();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_loc"))
+        .args([
+            "sandbox",
+            "init",
+            "--api-url",
+            &server.api_url,
+            "--root",
+            &root,
+            "--encoding",
+            "zstd",
+            "--profile",
+        ])
+        .env("LOCALITY_BOOTSTRAP_TOKEN", "failed-profile-secret")
+        .output()
+        .expect("run failing profiled loc sandbox init");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr UTF-8");
+    let phases = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("locality sandbox profile phase="))
+        .map(|timing| timing.split_once(' ').expect("phase timing fields").0)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        phases,
+        [
+            "bootstrap_token_input",
+            "client_setup",
+            "bootstrap_exchange",
+            "session_status",
+            "total"
+        ],
+        "{stderr}"
+    );
+    assert!(!stderr.contains("failed-profile-secret"));
+    assert!(!stderr.contains("capability-secret"));
+    assert!(!stderr.contains("session-7"));
+    assert!(!stderr.contains(&server.api_url));
+    assert!(!stderr.contains(&root));
 }
 
 trait StatusFixtureExt {
@@ -1081,20 +1367,62 @@ fn read_request(stream: &mut TcpStream) -> CapturedRequest {
 }
 
 fn write_response(stream: &mut TcpStream, response: ResponseFixture) {
+    let content_length = response
+        .declared_content_length
+        .unwrap_or(response.body.len());
     write!(
         stream,
         "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        response.status,
-        response.body.len()
+        response.status, content_length
     )
     .expect("write response head");
     for (name, value) in response.headers {
         write!(stream, "{name}: {value}\r\n").expect("write response header");
     }
     write!(stream, "\r\n").expect("finish response headers");
-    stream
-        .write_all(&response.body)
-        .expect("write response body");
+    if let Some((split_after, pause)) = response.split_after {
+        let split_after = split_after.min(response.body.len());
+        stream
+            .write_all(&response.body[..split_after])
+            .expect("write first response body chunk");
+        stream.flush().expect("flush first response body chunk");
+        if let Some((parent, logical_path, destination)) = &response.staging_gate {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let staged = fs::read_dir(parent)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .any(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".locality-stage-")
+                            && entry.path().join(logical_path).is_file()
+                    });
+                if staged {
+                    assert!(
+                        !destination.exists(),
+                        "the destination must remain absent while the response is incomplete"
+                    );
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "materializer did not stage the first file while the response was paused"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        thread::sleep(pause);
+        stream
+            .write_all(&response.body[split_after..])
+            .expect("write remaining response body");
+    } else {
+        stream
+            .write_all(&response.body)
+            .expect("write response body");
+    }
     stream.flush().expect("flush response");
 }
 

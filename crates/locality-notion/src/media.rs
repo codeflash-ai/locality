@@ -66,8 +66,41 @@ pub struct PortableMediaCapture {
     pub media_type: String,
 }
 
+/// Redaction-safe result of attempting to capture one Notion-hosted asset.
+///
+/// The variants intentionally carry no provider URL or transport message. This
+/// type crosses the public portable boundary, where signed URLs and response
+/// details must never be serialized into completeness metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostedMediaCaptureOutcome {
+    Captured(PortableMediaCapture),
+    Unavailable,
+    TooLarge,
+    Unsafe,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostedMediaFailureKind {
+    Unavailable,
+    TooLarge,
+    Unsafe,
+}
+
 pub trait PortableMediaCaptureFetcher: Send + Sync {
     fn fetch(&self, hosted_url: &str, max_bytes: usize) -> LocalityResult<PortableMediaCapture>;
+
+    /// Typed capture API used by portable and desktop projection paths.
+    ///
+    /// Existing fetcher implementations remain source-compatible: their
+    /// errors conservatively become genuine unavailability, while an
+    /// oversized successful body is still classified as a policy omission.
+    fn fetch_outcome(&self, hosted_url: &str, max_bytes: usize) -> HostedMediaCaptureOutcome {
+        match self.fetch(hosted_url, max_bytes) {
+            Ok(capture) if capture.bytes.len() > max_bytes => HostedMediaCaptureOutcome::TooLarge,
+            Ok(capture) => HostedMediaCaptureOutcome::Captured(capture),
+            Err(_) => HostedMediaCaptureOutcome::Unavailable,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -77,13 +110,31 @@ struct SecurePortableMediaCaptureFetcher {
 
 impl PortableMediaCaptureFetcher for SecurePortableMediaCaptureFetcher {
     fn fetch(&self, hosted_url: &str, max_bytes: usize) -> LocalityResult<PortableMediaCapture> {
-        let mut transport = self.transport.lock().map_err(|_| {
-            LocalityError::InvalidState("portable media HTTP client lock is poisoned".to_string())
-        })?;
-        if transport.is_none() {
-            *transport = Some(ReqwestPortableMediaTransport::new()?);
+        match self.fetch_outcome(hosted_url, max_bytes) {
+            HostedMediaCaptureOutcome::Captured(capture) => Ok(capture),
+            HostedMediaCaptureOutcome::Unavailable => {
+                Err(LocalityError::Io("hosted media is unavailable".to_string()))
+            }
+            HostedMediaCaptureOutcome::TooLarge => Err(LocalityError::InvalidState(
+                "hosted media exceeds the asset limit".to_string(),
+            )),
+            HostedMediaCaptureOutcome::Unsafe => Err(LocalityError::InvalidState(
+                "hosted media failed safety validation".to_string(),
+            )),
         }
-        fetch_portable_media_with_transport(
+    }
+
+    fn fetch_outcome(&self, hosted_url: &str, max_bytes: usize) -> HostedMediaCaptureOutcome {
+        let Ok(mut transport) = self.transport.lock() else {
+            return HostedMediaCaptureOutcome::Unavailable;
+        };
+        if transport.is_none() {
+            let Ok(client) = ReqwestPortableMediaTransport::new() else {
+                return HostedMediaCaptureOutcome::Unavailable;
+            };
+            *transport = Some(client);
+        }
+        fetch_hosted_media_outcome_with_transport(
             transport
                 .as_ref()
                 .expect("portable media HTTP client was initialized above"),
@@ -179,65 +230,184 @@ impl PortableMediaHttpTransport for ReqwestPortableMediaTransport {
     }
 }
 
+#[cfg(test)]
 fn fetch_portable_media_with_transport(
     transport: &dyn PortableMediaHttpTransport,
     hosted_url: &str,
     max_bytes: usize,
 ) -> LocalityResult<PortableMediaCapture> {
-    let mut current = validate_portable_hosted_media_url(hosted_url)?;
+    match fetch_hosted_media_outcome_with_transport(transport, hosted_url, max_bytes) {
+        HostedMediaCaptureOutcome::Captured(capture) => Ok(capture),
+        HostedMediaCaptureOutcome::Unavailable => Err(LocalityError::Io(
+            "portable media is unavailable".to_string(),
+        )),
+        HostedMediaCaptureOutcome::TooLarge => Err(LocalityError::InvalidState(
+            "portable media exceeds the asset limit".to_string(),
+        )),
+        HostedMediaCaptureOutcome::Unsafe => Err(LocalityError::InvalidState(
+            "portable media failed safety validation".to_string(),
+        )),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostedMediaTransferFailure {
+    RetryableUnavailable,
+    Unavailable,
+    TooLarge,
+    Unsafe,
+}
+
+fn fetch_hosted_media_outcome_with_transport(
+    transport: &dyn PortableMediaHttpTransport,
+    hosted_url: &str,
+    max_bytes: usize,
+) -> HostedMediaCaptureOutcome {
+    fetch_hosted_media_outcome_with_policy(
+        transport,
+        hosted_url,
+        max_bytes,
+        PORTABLE_MEDIA_REQUEST_TIMEOUT,
+        MEDIA_FETCH_RETRY_DELAY,
+    )
+}
+
+fn fetch_hosted_media_outcome_with_policy(
+    transport: &dyn PortableMediaHttpTransport,
+    hosted_url: &str,
+    max_bytes: usize,
+    deadline: Duration,
+    retry_delay: Duration,
+) -> HostedMediaCaptureOutcome {
+    let clock = SystemHostedMediaRetryClock {
+        started: Instant::now(),
+    };
+    fetch_hosted_media_outcome_with_clock(
+        transport,
+        hosted_url,
+        max_bytes,
+        deadline,
+        retry_delay,
+        &clock,
+    )
+}
+
+trait HostedMediaRetryClock {
+    fn elapsed(&self) -> Duration;
+    fn sleep(&self, duration: Duration);
+}
+
+struct SystemHostedMediaRetryClock {
+    started: Instant,
+}
+
+impl HostedMediaRetryClock for SystemHostedMediaRetryClock {
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        thread::sleep(duration);
+    }
+}
+
+fn fetch_hosted_media_outcome_with_clock(
+    transport: &dyn PortableMediaHttpTransport,
+    hosted_url: &str,
+    max_bytes: usize,
+    deadline: Duration,
+    retry_delay: Duration,
+    clock: &dyn HostedMediaRetryClock,
+) -> HostedMediaCaptureOutcome {
+    let initial = match validate_portable_hosted_media_url(hosted_url) {
+        Ok(url) => url,
+        Err(_) => return HostedMediaCaptureOutcome::Unsafe,
+    };
+    for attempt in 1..=MEDIA_FETCH_ATTEMPTS {
+        match fetch_hosted_media_once(transport, &initial, max_bytes, deadline, clock) {
+            Ok(capture) => return HostedMediaCaptureOutcome::Captured(capture),
+            Err(HostedMediaTransferFailure::RetryableUnavailable)
+                if attempt < MEDIA_FETCH_ATTEMPTS && clock.elapsed() < deadline =>
+            {
+                let remaining = deadline.saturating_sub(clock.elapsed());
+                clock.sleep(retry_delay.min(remaining));
+            }
+            Err(HostedMediaTransferFailure::RetryableUnavailable)
+            | Err(HostedMediaTransferFailure::Unavailable) => {
+                return HostedMediaCaptureOutcome::Unavailable;
+            }
+            Err(HostedMediaTransferFailure::TooLarge) => {
+                return HostedMediaCaptureOutcome::TooLarge;
+            }
+            Err(HostedMediaTransferFailure::Unsafe) => {
+                return HostedMediaCaptureOutcome::Unsafe;
+            }
+        }
+    }
+    HostedMediaCaptureOutcome::Unavailable
+}
+
+fn fetch_hosted_media_once(
+    transport: &dyn PortableMediaHttpTransport,
+    initial: &reqwest::Url,
+    max_bytes: usize,
+    deadline: Duration,
+    clock: &dyn HostedMediaRetryClock,
+) -> Result<PortableMediaCapture, HostedMediaTransferFailure> {
+    let mut current = initial.clone();
     let mut visited = std::collections::BTreeSet::new();
-    let started = Instant::now();
 
     for redirects in 0..=PORTABLE_MEDIA_MAX_REDIRECTS {
         if !visited.insert(current.as_str().to_string()) {
-            return Err(LocalityError::InvalidState(
-                "portable media redirect loop rejected".to_string(),
-            ));
+            return Err(HostedMediaTransferFailure::Unsafe);
         }
-        let timeout = PORTABLE_MEDIA_REQUEST_TIMEOUT
-            .checked_sub(started.elapsed())
-            .ok_or_else(|| LocalityError::Io("portable media request timed out".to_string()))?;
-        let mut response = transport.get(current.as_str(), timeout)?;
+        let timeout = deadline
+            .checked_sub(clock.elapsed())
+            .ok_or(HostedMediaTransferFailure::RetryableUnavailable)?;
+        if timeout.is_zero() {
+            return Err(HostedMediaTransferFailure::RetryableUnavailable);
+        }
+        let mut response = transport
+            .get(current.as_str(), timeout)
+            .map_err(|_| HostedMediaTransferFailure::RetryableUnavailable)?;
 
         if response.status.is_redirection() {
             if redirects == PORTABLE_MEDIA_MAX_REDIRECTS {
-                return Err(LocalityError::InvalidState(
-                    "portable media redirect limit exceeded".to_string(),
-                ));
+                return Err(HostedMediaTransferFailure::Unsafe);
             }
-            let location = response.location.as_deref().ok_or_else(|| {
-                LocalityError::InvalidState(
-                    "portable media redirect omitted its destination".to_string(),
-                )
-            })?;
-            let destination = current.join(location).map_err(|_| {
-                LocalityError::InvalidState(
-                    "portable media redirect destination is invalid".to_string(),
-                )
-            })?;
-            current = validate_portable_hosted_media_url(destination.as_str())?;
+            let location = response
+                .location
+                .as_deref()
+                .ok_or(HostedMediaTransferFailure::Unsafe)?;
+            let destination = current
+                .join(location)
+                .map_err(|_| HostedMediaTransferFailure::Unsafe)?;
+            current = validate_portable_hosted_media_url(destination.as_str())
+                .map_err(|_| HostedMediaTransferFailure::Unsafe)?;
             continue;
         }
         if !response.status.is_success() {
-            return Err(LocalityError::Io(format!(
-                "portable media request returned HTTP {}",
-                response.status.as_u16()
-            )));
+            return Err(
+                if response.status == StatusCode::REQUEST_TIMEOUT
+                    || response.status == StatusCode::TOO_MANY_REQUESTS
+                    || response.status.is_server_error()
+                {
+                    HostedMediaTransferFailure::RetryableUnavailable
+                } else {
+                    HostedMediaTransferFailure::Unavailable
+                },
+            );
         }
         if let Some(encoding) = response.content_encoding.as_deref()
             && !encoding.eq_ignore_ascii_case("identity")
         {
-            return Err(LocalityError::InvalidState(
-                "portable media content encoding is unsupported".to_string(),
-            ));
+            return Err(HostedMediaTransferFailure::Unsafe);
         }
         if response
             .content_length
             .is_some_and(|length| length > max_bytes as u64)
         {
-            return Err(LocalityError::InvalidState(
-                "portable media content length exceeds the asset limit".to_string(),
-            ));
+            return Err(HostedMediaTransferFailure::TooLarge);
         }
 
         let mut bytes = Vec::with_capacity(
@@ -249,16 +419,15 @@ fn fetch_portable_media_with_transport(
         );
         let mut buffer = [0_u8; PORTABLE_MEDIA_READ_BUFFER_BYTES];
         loop {
-            let read = response.body.read(&mut buffer).map_err(|_| {
-                LocalityError::Io("portable media response body failed".to_string())
-            })?;
+            let read = response
+                .body
+                .read(&mut buffer)
+                .map_err(|_| HostedMediaTransferFailure::RetryableUnavailable)?;
             if read == 0 {
                 break;
             }
             if bytes.len().saturating_add(read) > max_bytes {
-                return Err(LocalityError::InvalidState(
-                    "portable media response exceeded the asset limit".to_string(),
-                ));
+                return Err(HostedMediaTransferFailure::TooLarge);
             }
             bytes.extend_from_slice(&buffer[..read]);
         }
@@ -266,9 +435,7 @@ fn fetch_portable_media_with_transport(
             .content_length
             .is_some_and(|length| length != bytes.len() as u64)
         {
-            return Err(LocalityError::InvalidState(
-                "portable media content length did not match the response body".to_string(),
-            ));
+            return Err(HostedMediaTransferFailure::RetryableUnavailable);
         }
         return Ok(PortableMediaCapture {
             bytes,
@@ -276,7 +443,7 @@ fn fetch_portable_media_with_transport(
         });
     }
 
-    unreachable!("redirect loop always returns or continues within its fixed bound")
+    Err(HostedMediaTransferFailure::Unsafe)
 }
 
 pub(crate) fn validate_portable_hosted_media_url(url: &str) -> LocalityResult<reqwest::Url> {
@@ -319,30 +486,99 @@ pub(crate) fn sanitize_portable_hosted_media_url(url: &str) -> LocalityResult<St
 /// Portable rendering never requests these URLs. Keeping validation separate
 /// from hosted-media capture makes that no-fetch boundary explicit and lets the
 /// renderer preserve the provider's exact safe spelling.
-pub(crate) fn validate_portable_external_media_url(url: &str) -> LocalityResult<()> {
-    if url.is_empty()
-        || url.len() > PORTABLE_EXTERNAL_MEDIA_MAX_URL_BYTES
-        || url
-            .chars()
-            .any(|character| character.is_ascii_control() || character.is_whitespace())
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PortableExternalMediaUrlFailure {
+    Unavailable,
+    TooLong,
+    WhitespaceOrControl,
+    Malformed,
+    NonHttps,
+    MissingHost,
+    Userinfo,
+}
+
+impl PortableExternalMediaUrlFailure {
+    pub(crate) const fn omission_code(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable_external_media",
+            Self::TooLong => "unsafe_external_media_too_long",
+            Self::WhitespaceOrControl => "unsafe_external_media_whitespace_or_control",
+            Self::Malformed => "external_media_malformed",
+            Self::NonHttps => "unsafe_external_media_non_https",
+            Self::MissingHost => "unsafe_external_media_missing_host",
+            Self::Userinfo => "unsafe_external_media_userinfo",
+        }
+    }
+}
+
+pub(crate) fn classify_portable_external_media_url(
+    url: &str,
+) -> Result<(), PortableExternalMediaUrlFailure> {
+    if url.is_empty() {
+        return Err(PortableExternalMediaUrlFailure::Unavailable);
+    }
+    if url.len() > PORTABLE_EXTERNAL_MEDIA_MAX_URL_BYTES {
+        return Err(PortableExternalMediaUrlFailure::TooLong);
+    }
+    if url
+        .chars()
+        .any(|character| character.is_ascii_control() || character.is_whitespace())
     {
-        return Err(LocalityError::InvalidState(
-            "portable external media URL is not raw-safe".to_string(),
-        ));
+        return Err(PortableExternalMediaUrlFailure::WhitespaceOrControl);
     }
     let parsed = reqwest::Url::parse(url).map_err(|_| {
-        LocalityError::InvalidState("portable external media URL is invalid".to_string())
+        if https_url_has_empty_authority(url) {
+            PortableExternalMediaUrlFailure::MissingHost
+        } else {
+            PortableExternalMediaUrlFailure::Malformed
+        }
     })?;
-    if parsed.scheme() != "https"
-        || parsed.host_str().is_none()
-        || !parsed.username().is_empty()
+    if parsed.scheme() != "https" {
+        return Err(PortableExternalMediaUrlFailure::NonHttps);
+    }
+    if parsed.host_str().is_none() {
+        return Err(PortableExternalMediaUrlFailure::MissingHost);
+    }
+    if !parsed.username().is_empty()
         || parsed.password().is_some()
+        || url_authority_has_userinfo(url)
     {
-        return Err(LocalityError::InvalidState(
-            "portable external media URL violates the HTTPS reference policy".to_string(),
-        ));
+        return Err(PortableExternalMediaUrlFailure::Userinfo);
     }
     Ok(())
+}
+
+fn https_url_has_empty_authority(url: &str) -> bool {
+    let Some(prefix) = url.get(.."https://".len()) else {
+        return false;
+    };
+    if !prefix.eq_ignore_ascii_case("https://") {
+        return false;
+    }
+    let authority_and_path = &url["https://".len()..];
+    let authority = authority_and_path
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host_and_port = authority.rsplit('@').next().unwrap_or_default();
+    host_and_port.is_empty() || host_and_port.starts_with(':')
+}
+
+fn url_authority_has_userinfo(url: &str) -> bool {
+    url.split_once("://")
+        .map(|(_, authority_and_path)| {
+            authority_and_path
+                .split(['/', '?', '#'])
+                .next()
+                .is_some_and(|authority| authority.contains('@'))
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn validate_portable_external_media_url(url: &str) -> LocalityResult<()> {
+    classify_portable_external_media_url(url).map_err(|_| {
+        LocalityError::InvalidState("portable external media URL is not allowed".to_string())
+    })
 }
 
 pub(crate) fn portable_media_expired(expiry_time: &str) -> LocalityResult<bool> {
@@ -473,7 +709,18 @@ pub struct MediaDownloadFailure {
     pub kind: String,
     pub source_url: String,
     pub local_path: PathBuf,
+    /// Redaction-safe failure code retained as a string for API compatibility.
     pub error: String,
+}
+
+impl MediaDownloadFailure {
+    pub fn outcome(&self) -> HostedMediaFailureKind {
+        match self.error.as_str() {
+            "hosted_media_too_large" => HostedMediaFailureKind::TooLarge,
+            "unsafe_hosted_media" => HostedMediaFailureKind::Unsafe,
+            _ => HostedMediaFailureKind::Unavailable,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -533,18 +780,47 @@ pub fn fetch_media_assets(assets: &[MediaAsset]) -> LocalityResult<Vec<Downloade
 }
 
 pub fn fetch_media_asset_report(assets: &[MediaAsset]) -> MediaFetchReport {
-    let client = notion_http_client();
+    let fetcher = default_portable_media_fetcher();
+    fetch_media_asset_report_with_fetcher(assets, fetcher.as_ref())
+}
+
+pub fn fetch_media_asset_report_with_fetcher(
+    assets: &[MediaAsset],
+    fetcher: &dyn PortableMediaCaptureFetcher,
+) -> MediaFetchReport {
     let mut report = MediaFetchReport::default();
 
     for asset in assets.iter().filter(|asset| should_download(asset)) {
-        match fetch_media_asset_with_retries(&client, asset) {
-            Ok(downloaded) => report.downloaded.push(downloaded),
-            Err(error) => report.failed.push(MediaDownloadFailure {
+        let outcome = if validate_portable_hosted_media_url(&asset.source_url).is_ok() {
+            fetcher.fetch_outcome(&asset.source_url, PORTABLE_MEDIA_MAX_ASSET_BYTES)
+        } else {
+            // The renderer emits MediaAsset only for structurally hosted
+            // sources. Validate again at this trust boundary so custom
+            // fetchers never receive an unsafe provider URL.
+            HostedMediaCaptureOutcome::Unsafe
+        };
+        match outcome {
+            HostedMediaCaptureOutcome::Captured(capture) => {
+                report.downloaded.push(DownloadedMediaAsset {
+                    block_id: asset.block_id.clone(),
+                    kind: asset.kind.clone(),
+                    source_url: asset.source_url.clone(),
+                    local_path: asset.local_path.clone(),
+                    bytes: capture.bytes,
+                });
+            }
+            outcome => report.failed.push(MediaDownloadFailure {
                 block_id: asset.block_id.clone(),
                 kind: asset.kind.clone(),
                 source_url: asset.source_url.clone(),
                 local_path: asset.local_path.clone(),
-                error: error.to_string(),
+                error: match outcome {
+                    HostedMediaCaptureOutcome::TooLarge => "hosted_media_too_large",
+                    HostedMediaCaptureOutcome::Unsafe => "unsafe_hosted_media",
+                    HostedMediaCaptureOutcome::Unavailable
+                    | HostedMediaCaptureOutcome::Captured(_) => "unavailable_hosted_media",
+                }
+                .to_string(),
             }),
         }
     }
@@ -552,62 +828,12 @@ pub fn fetch_media_asset_report(assets: &[MediaAsset]) -> MediaFetchReport {
     report
 }
 
-fn fetch_media_asset_with_retries(
-    client: &Client,
-    asset: &MediaAsset,
-) -> LocalityResult<DownloadedMediaAsset> {
-    let mut last_error = None;
-    for attempt in 1..=MEDIA_FETCH_ATTEMPTS {
-        match fetch_media_asset(client, asset) {
-            Ok(downloaded) => return Ok(downloaded),
-            Err(error) => {
-                last_error = Some(error);
-                if attempt < MEDIA_FETCH_ATTEMPTS {
-                    thread::sleep(MEDIA_FETCH_RETRY_DELAY);
-                }
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| LocalityError::Io("media download failed".to_string())))
-}
-
-fn fetch_media_asset(client: &Client, asset: &MediaAsset) -> LocalityResult<DownloadedMediaAsset> {
-    let response = client
-        .get(&asset.source_url)
-        .send()
-        .map_err(|error| LocalityError::Io(format!("media download failed: {error}")))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(LocalityError::Io(format!(
-            "media download returned HTTP {status} for block `{}`",
-            asset.block_id
-        )));
-    }
-    let bytes = response
-        .bytes()
-        .map_err(|error| LocalityError::Io(format!("media download body failed: {error}")))?
-        .to_vec();
-
-    Ok(DownloadedMediaAsset {
-        block_id: asset.block_id.clone(),
-        kind: asset.kind.clone(),
-        source_url: asset.source_url.clone(),
-        local_path: asset.local_path.clone(),
-        bytes,
-    })
-}
-
 fn should_download(asset: &MediaAsset) -> bool {
-    is_file_like_media_kind(&asset.kind) && is_downloadable_url(&asset.source_url)
+    is_file_like_media_kind(&asset.kind)
 }
 
 fn is_file_like_media_kind(kind: &str) -> bool {
     matches!(kind, "image" | "video" | "file" | "pdf" | "audio")
-}
-
-pub(crate) fn is_downloadable_url(url: &str) -> bool {
-    url.starts_with("http://") || url.starts_with("https://")
 }
 
 fn media_page_dir(page_path: &Path) -> PathBuf {
@@ -1043,19 +1269,20 @@ mod tests {
     #[cfg(windows)]
     use super::resolve_media_href_with_content_root;
     use super::{
-        MediaAsset, PORTABLE_MEDIA_READ_BUFFER_BYTES, PortableMediaHttpResponse,
-        PortableMediaHttpTransport, fetch_portable_media_with_transport, local_media_href,
-        media_local_path, portable_media_expired, replace_media_manifest, resolve_media_href,
-        sanitize_portable_hosted_media_url, validate_portable_hosted_media_url,
+        HostedMediaCaptureOutcome, HostedMediaRetryClock, MediaAsset,
+        PORTABLE_MEDIA_READ_BUFFER_BYTES, PortableMediaCapture, PortableMediaCaptureFetcher,
+        PortableMediaHttpResponse, PortableMediaHttpTransport,
+        fetch_hosted_media_outcome_with_clock, fetch_hosted_media_outcome_with_policy,
+        fetch_hosted_media_outcome_with_transport, fetch_portable_media_with_transport,
+        local_media_href, media_local_path, portable_media_expired, replace_media_manifest,
+        resolve_media_href, sanitize_portable_hosted_media_url, validate_portable_hosted_media_url,
     };
     use reqwest::StatusCode;
     use std::collections::VecDeque;
-    use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::io::Read;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::thread;
 
     #[test]
     fn replacing_absent_manifest_with_no_assets_does_not_create_mount_root() {
@@ -1182,26 +1409,72 @@ mod tests {
     }
 
     #[test]
-    fn downloads_file_like_media_kinds_from_http_urls() {
+    fn selects_only_file_like_media_for_hosted_validation() {
         for kind in ["image", "video", "file", "pdf", "audio"] {
             let asset = MediaAsset {
                 block_id: format!("{kind}-1"),
                 kind: kind.to_string(),
-                source_url: format!("https://example.com/{kind}.bin"),
+                source_url: format!("https://secure.notion-static.com/{kind}.bin"),
                 local_path: Path::new(".loc/media/Page/media.bin").to_path_buf(),
             };
 
             assert!(super::should_download(&asset), "{kind} should download");
         }
 
-        let relative = MediaAsset {
-            block_id: "video-1".to_string(),
-            kind: "video".to_string(),
-            source_url: "cars.mp4".to_string(),
+        let unsupported = MediaAsset {
+            block_id: "unsupported-1".to_string(),
+            kind: "bookmark".to_string(),
+            source_url: "https://example.com/cars.mp4".to_string(),
             local_path: Path::new(".loc/media/Page/video-1.mp4").to_path_buf(),
         };
 
-        assert!(!super::should_download(&relative));
+        assert!(!super::should_download(&unsupported));
+    }
+
+    #[test]
+    fn unsafe_hosted_asset_never_reaches_an_injected_fetcher() {
+        struct NeverCalledFetcher;
+        impl PortableMediaCaptureFetcher for NeverCalledFetcher {
+            fn fetch(
+                &self,
+                _hosted_url: &str,
+                _max_bytes: usize,
+            ) -> locality_core::LocalityResult<PortableMediaCapture> {
+                panic!("unsafe URL reached injected fetcher")
+            }
+        }
+
+        let report = super::fetch_media_asset_report_with_fetcher(
+            &[MediaAsset {
+                block_id: "unsafe".to_string(),
+                kind: "image".to_string(),
+                source_url: "https://example.com/not-a-hosted-origin.png".to_string(),
+                local_path: Path::new(".loc/media/Page/image.png").to_path_buf(),
+            }],
+            &NeverCalledFetcher,
+        );
+        assert!(report.downloaded.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(
+            report.failed[0].outcome(),
+            super::HostedMediaFailureKind::Unsafe
+        );
+    }
+
+    #[test]
+    fn media_download_failure_preserves_legacy_public_fields() {
+        let failure = super::MediaDownloadFailure {
+            block_id: "block".to_string(),
+            kind: "image".to_string(),
+            source_url: "https://secure.notion-static.com/image.png".to_string(),
+            local_path: Path::new(".loc/media/Page/image.png").to_path_buf(),
+            error: "legacy transport message".to_string(),
+        };
+        assert_eq!(failure.error, "legacy transport message");
+        assert_eq!(
+            failure.outcome(),
+            super::HostedMediaFailureKind::Unavailable
+        );
     }
 
     #[test]
@@ -1280,17 +1553,15 @@ mod tests {
             None,
             Vec::new(),
         )]);
-        let error = fetch_portable_media_with_transport(
-            &disallowed,
-            "https://secure.notion-static.com/first.png",
-            1024,
-        )
-        .expect_err("disallowed redirect");
         assert_eq!(
-            error.to_string(),
-            "invalid state: portable media URL host is not allowed"
+            fetch_hosted_media_outcome_with_transport(
+                &disallowed,
+                "https://secure.notion-static.com/first.png",
+                1024,
+            ),
+            HostedMediaCaptureOutcome::Unsafe
         );
-        assert!(!error.to_string().contains("token=secret"));
+        assert_eq!(disallowed.requests().len(), 1);
 
         let redirect_loop = ScriptedPortableMediaTransport::new([scripted_response(
             StatusCode::FOUND,
@@ -1301,14 +1572,12 @@ mod tests {
             Vec::new(),
         )]);
         assert_eq!(
-            fetch_portable_media_with_transport(
+            fetch_hosted_media_outcome_with_transport(
                 &redirect_loop,
                 "https://secure.notion-static.com/first.png",
                 1024,
-            )
-            .expect_err("redirect loop")
-            .to_string(),
-            "invalid state: portable media redirect loop rejected"
+            ),
+            HostedMediaCaptureOutcome::Unsafe
         );
 
         let too_many = ScriptedPortableMediaTransport::new((0..=3).map(|index| {
@@ -1325,14 +1594,12 @@ mod tests {
             )
         }));
         assert_eq!(
-            fetch_portable_media_with_transport(
+            fetch_hosted_media_outcome_with_transport(
                 &too_many,
                 "https://secure.notion-static.com/start.png",
                 1024,
-            )
-            .expect_err("redirect bound")
-            .to_string(),
-            "invalid state: portable media redirect limit exceeded"
+            ),
+            HostedMediaCaptureOutcome::Unsafe
         );
     }
 
@@ -1347,9 +1614,10 @@ mod tests {
             b"data".to_vec(),
         )]);
         assert_eq!(
-            portable_transport_error(&encoded, 4),
-            "invalid state: portable media content encoding is unsupported"
+            portable_transport_outcome(&encoded, 4),
+            HostedMediaCaptureOutcome::Unsafe
         );
+        assert_eq!(encoded.requests().len(), 1);
 
         let declared_oversize = ScriptedPortableMediaTransport::new([scripted_response(
             StatusCode::OK,
@@ -1360,22 +1628,37 @@ mod tests {
             b"data".to_vec(),
         )]);
         assert_eq!(
-            portable_transport_error(&declared_oversize, 4),
-            "invalid state: portable media content length exceeds the asset limit"
+            portable_transport_outcome(&declared_oversize, 4),
+            HostedMediaCaptureOutcome::TooLarge
         );
+        assert_eq!(declared_oversize.requests().len(), 1);
 
-        let mismatched = ScriptedPortableMediaTransport::new([scripted_response(
-            StatusCode::OK,
-            None,
-            Some("identity"),
-            Some(3),
-            Some("image/png"),
-            b"data".to_vec(),
-        )]);
+        let mismatched = ScriptedPortableMediaTransport::new([
+            scripted_response(
+                StatusCode::OK,
+                None,
+                Some("identity"),
+                Some(3),
+                Some("image/png"),
+                b"data".to_vec(),
+            ),
+            scripted_response(
+                StatusCode::OK,
+                None,
+                None,
+                Some(4),
+                Some("image/png"),
+                b"data".to_vec(),
+            ),
+        ]);
         assert_eq!(
-            portable_transport_error(&mismatched, 4),
-            "invalid state: portable media content length did not match the response body"
+            portable_transport_outcome(&mismatched, 4),
+            HostedMediaCaptureOutcome::Captured(PortableMediaCapture {
+                bytes: b"data".to_vec(),
+                media_type: "image/png".to_string(),
+            })
         );
+        assert_eq!(mismatched.requests().len(), 2);
 
         let streamed_oversize = ScriptedPortableMediaTransport::new([scripted_response(
             StatusCode::OK,
@@ -1386,9 +1669,10 @@ mod tests {
             b"12345".to_vec(),
         )]);
         assert_eq!(
-            portable_transport_error(&streamed_oversize, 4),
-            "invalid state: portable media response exceeded the asset limit"
+            portable_transport_outcome(&streamed_oversize, 4),
+            HostedMediaCaptureOutcome::TooLarge
         );
+        assert_eq!(streamed_oversize.requests().len(), 1);
     }
 
     #[test]
@@ -1424,7 +1708,9 @@ mod tests {
 
     struct ScriptedPortableMediaTransport {
         responses: Mutex<VecDeque<PortableMediaHttpResponse>>,
+        transport_failures: Mutex<usize>,
         requests: Mutex<Vec<String>>,
+        timeouts: Mutex<Vec<std::time::Duration>>,
         max_read_size: Arc<AtomicUsize>,
     }
 
@@ -1442,14 +1728,29 @@ mod tests {
                     body: Box::new(TrackingReader {
                         bytes: std::io::Cursor::new(response.body),
                         max_read_size: Arc::clone(&max_read_size),
+                        fail_next_read: response.read_error,
                     }),
                 })
                 .collect();
             Self {
                 responses: Mutex::new(responses),
+                transport_failures: Mutex::new(0),
                 requests: Mutex::new(Vec::new()),
+                timeouts: Mutex::new(Vec::new()),
                 max_read_size,
             }
+        }
+
+        fn with_transport_failures(
+            failures: usize,
+            responses: impl IntoIterator<Item = ScriptedResponse>,
+        ) -> Self {
+            let transport = Self::new(responses);
+            *transport
+                .transport_failures
+                .lock()
+                .expect("transport failures") = failures;
+            transport
         }
 
         fn requests(&self) -> Vec<String> {
@@ -1459,18 +1760,30 @@ mod tests {
         fn max_read_size(&self) -> usize {
             self.max_read_size.load(Ordering::SeqCst)
         }
+
+        fn timeouts(&self) -> Vec<std::time::Duration> {
+            self.timeouts.lock().expect("timeouts").clone()
+        }
     }
 
     impl PortableMediaHttpTransport for ScriptedPortableMediaTransport {
         fn get(
             &self,
             url: &str,
-            _timeout: std::time::Duration,
+            timeout: std::time::Duration,
         ) -> locality_core::LocalityResult<PortableMediaHttpResponse> {
             self.requests
                 .lock()
                 .expect("requests")
                 .push(url.to_string());
+            self.timeouts.lock().expect("timeouts").push(timeout);
+            let mut failures = self.transport_failures.lock().expect("transport failures");
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(locality_core::LocalityError::Io(
+                    "scripted transport failure".to_string(),
+                ));
+            }
             self.responses
                 .lock()
                 .expect("responses")
@@ -1490,6 +1803,7 @@ mod tests {
         content_length: Option<u64>,
         content_type: Option<String>,
         body: Vec<u8>,
+        read_error: bool,
     }
 
     fn scripted_response(
@@ -1507,73 +1821,290 @@ mod tests {
             content_length,
             content_type: content_type.map(str::to_string),
             body,
+            read_error: false,
         }
+    }
+
+    fn scripted_read_error_response(mut response: ScriptedResponse) -> ScriptedResponse {
+        response.read_error = true;
+        response
     }
 
     struct TrackingReader {
         bytes: std::io::Cursor<Vec<u8>>,
         max_read_size: Arc<AtomicUsize>,
+        fail_next_read: bool,
     }
 
     impl Read for TrackingReader {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
             self.max_read_size.fetch_max(buffer.len(), Ordering::SeqCst);
+            if self.fail_next_read {
+                self.fail_next_read = false;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "scripted response read failure",
+                ));
+            }
             self.bytes.read(buffer)
         }
     }
 
-    fn portable_transport_error(
+    fn portable_transport_outcome(
         transport: &ScriptedPortableMediaTransport,
         max_bytes: usize,
-    ) -> String {
-        fetch_portable_media_with_transport(
+    ) -> HostedMediaCaptureOutcome {
+        fetch_hosted_media_outcome_with_transport(
             transport,
             "https://secure.notion-static.com/image.png",
             max_bytes,
         )
-        .expect_err("transport must reject")
-        .to_string()
     }
 
     #[test]
-    fn media_fetch_retries_transient_connection_failures() {
-        let bytes = b"retry-media-bytes".to_vec();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind media test server");
-        let url = format!(
-            "http://{}/retry-image.png",
-            listener.local_addr().expect("media test server addr")
+    fn hosted_media_retries_only_transient_statuses_with_one_deadline() {
+        let transport = ScriptedPortableMediaTransport::new([
+            scripted_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                None,
+                None,
+                None,
+                None,
+                vec![],
+            ),
+            scripted_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                None,
+                None,
+                None,
+                None,
+                vec![],
+            ),
+            scripted_response(
+                StatusCode::OK,
+                None,
+                None,
+                Some(4),
+                Some("image/png"),
+                b"data".to_vec(),
+            ),
+        ]);
+        assert_eq!(
+            fetch_hosted_media_outcome_with_policy(
+                &transport,
+                "https://secure.notion-static.com/image.png",
+                1024,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_millis(1),
+            ),
+            HostedMediaCaptureOutcome::Captured(super::PortableMediaCapture {
+                bytes: b"data".to_vec(),
+                media_type: "image/png".to_string(),
+            })
         );
-        let handle = thread::spawn(move || {
-            let (first, _) = listener.accept().expect("accept failed media request");
-            drop(first);
+        assert_eq!(transport.requests().len(), 3);
+        let timeouts = transport.timeouts();
+        assert_eq!(timeouts.len(), 3);
+        assert!(timeouts.windows(2).all(|pair| pair[1] <= pair[0]));
+        assert!(
+            timeouts
+                .iter()
+                .all(|timeout| *timeout <= std::time::Duration::from_secs(1))
+        );
 
-            let (second, _) = listener.accept().expect("accept retried media request");
-            serve_test_media_response(second, &bytes);
-        });
+        let exhausted = ScriptedPortableMediaTransport::new((0..4).map(|_| {
+            scripted_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                None,
+                None,
+                None,
+                None,
+                vec![],
+            )
+        }));
+        assert_eq!(
+            fetch_hosted_media_outcome_with_policy(
+                &exhausted,
+                "https://secure.notion-static.com/image.png",
+                1024,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::ZERO,
+            ),
+            HostedMediaCaptureOutcome::Unavailable
+        );
+        assert_eq!(exhausted.requests().len(), 3);
 
-        let report = super::fetch_media_asset_report(&[MediaAsset {
-            block_id: "image-block".to_string(),
-            kind: "image".to_string(),
-            source_url: url,
-            local_path: Path::new(".loc/media/Page/image.png").to_path_buf(),
-        }]);
-
-        handle.join().expect("join media test server");
-        assert!(report.failed.is_empty(), "{report:#?}");
-        assert_eq!(report.downloaded.len(), 1, "{report:#?}");
-        assert_eq!(report.downloaded[0].bytes, b"retry-media-bytes");
+        let expired = ScriptedPortableMediaTransport::new([scripted_response(
+            StatusCode::OK,
+            None,
+            None,
+            Some(4),
+            Some("image/png"),
+            b"data".to_vec(),
+        )]);
+        assert_eq!(
+            fetch_hosted_media_outcome_with_policy(
+                &expired,
+                "https://secure.notion-static.com/image.png",
+                1024,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+            ),
+            HostedMediaCaptureOutcome::Unavailable
+        );
+        assert!(expired.requests().is_empty());
     }
 
-    fn serve_test_media_response(mut stream: TcpStream, bytes: &[u8]) {
-        let mut request = [0_u8; 1024];
-        let _ = stream.read(&mut request);
-        let headers = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            bytes.len()
+    #[test]
+    fn hosted_media_terminal_4xx_is_not_retried() {
+        let transport = ScriptedPortableMediaTransport::new([
+            scripted_response(StatusCode::NOT_FOUND, None, None, None, None, vec![]),
+            scripted_response(
+                StatusCode::OK,
+                None,
+                None,
+                Some(4),
+                Some("image/png"),
+                b"data".to_vec(),
+            ),
+        ]);
+        assert_eq!(
+            fetch_hosted_media_outcome_with_transport(
+                &transport,
+                "https://secure.notion-static.com/image.png",
+                1024,
+            ),
+            HostedMediaCaptureOutcome::Unavailable
         );
-        stream
-            .write_all(headers.as_bytes())
-            .expect("write media response headers");
-        stream.write_all(bytes).expect("write media response body");
+        assert_eq!(transport.requests().len(), 1);
+    }
+
+    #[test]
+    fn hosted_media_retries_transport_and_read_io_failures() {
+        let success = || {
+            scripted_response(
+                StatusCode::OK,
+                None,
+                None,
+                Some(4),
+                Some("image/png"),
+                b"data".to_vec(),
+            )
+        };
+        let transport_failure =
+            ScriptedPortableMediaTransport::with_transport_failures(1, [success()]);
+        assert_eq!(
+            fetch_hosted_media_outcome_with_policy(
+                &transport_failure,
+                "https://secure.notion-static.com/image.png",
+                1024,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::ZERO,
+            ),
+            HostedMediaCaptureOutcome::Captured(PortableMediaCapture {
+                bytes: b"data".to_vec(),
+                media_type: "image/png".to_string(),
+            })
+        );
+        assert_eq!(transport_failure.requests().len(), 2);
+
+        let read_failure = ScriptedPortableMediaTransport::new([
+            scripted_read_error_response(success()),
+            success(),
+        ]);
+        assert_eq!(
+            fetch_hosted_media_outcome_with_policy(
+                &read_failure,
+                "https://secure.notion-static.com/image.png",
+                1024,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::ZERO,
+            ),
+            HostedMediaCaptureOutcome::Captured(PortableMediaCapture {
+                bytes: b"data".to_vec(),
+                media_type: "image/png".to_string(),
+            })
+        );
+        assert_eq!(read_failure.requests().len(), 2);
+    }
+
+    #[derive(Default)]
+    struct ManualHostedMediaRetryClock {
+        elapsed: Mutex<std::time::Duration>,
+    }
+
+    impl ManualHostedMediaRetryClock {
+        fn advance(&self, duration: std::time::Duration) {
+            let mut elapsed = self.elapsed.lock().expect("manual elapsed");
+            *elapsed += duration;
+        }
+    }
+
+    impl HostedMediaRetryClock for ManualHostedMediaRetryClock {
+        fn elapsed(&self) -> std::time::Duration {
+            *self.elapsed.lock().expect("manual elapsed")
+        }
+
+        fn sleep(&self, duration: std::time::Duration) {
+            self.advance(duration);
+        }
+    }
+
+    struct DeadlineConsumingTransport {
+        clock: Arc<ManualHostedMediaRetryClock>,
+        timeouts: Mutex<Vec<std::time::Duration>>,
+    }
+
+    impl PortableMediaHttpTransport for DeadlineConsumingTransport {
+        fn get(
+            &self,
+            _url: &str,
+            timeout: std::time::Duration,
+        ) -> locality_core::LocalityResult<PortableMediaHttpResponse> {
+            self.timeouts
+                .lock()
+                .expect("deadline timeouts")
+                .push(timeout);
+            self.clock.advance(std::time::Duration::from_millis(600));
+            Err(locality_core::LocalityError::Io(
+                "scripted transport timeout".to_string(),
+            ))
+        }
+    }
+
+    #[test]
+    fn hosted_media_retries_share_one_total_elapsed_deadline() {
+        let clock = Arc::new(ManualHostedMediaRetryClock::default());
+        let transport = DeadlineConsumingTransport {
+            clock: Arc::clone(&clock),
+            timeouts: Mutex::new(Vec::new()),
+        };
+
+        assert_eq!(
+            fetch_hosted_media_outcome_with_clock(
+                &transport,
+                "https://secure.notion-static.com/image.png",
+                1024,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_millis(100),
+                clock.as_ref(),
+            ),
+            HostedMediaCaptureOutcome::Unavailable
+        );
+        assert_eq!(
+            transport
+                .timeouts
+                .lock()
+                .expect("deadline timeouts")
+                .as_slice(),
+            [
+                std::time::Duration::from_millis(1000),
+                std::time::Duration::from_millis(300),
+            ]
+        );
+        assert_eq!(
+            HostedMediaRetryClock::elapsed(clock.as_ref()),
+            std::time::Duration::from_millis(1300)
+        );
     }
 }

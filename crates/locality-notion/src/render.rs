@@ -13,7 +13,10 @@ use crate::dto::{
     MeetingNotesBlockDto, NotionPageBundle, PageDto, PagePropertyDto, RichTextBlockDto,
     RichTextDto, SyncedBlockDto, TableBlockDto, TableRowBlockDto, UrlBlockDto,
 };
-use crate::media::{MediaAsset, is_downloadable_url, local_media_href, media_local_path};
+use crate::media::{
+    MediaAsset, local_media_href, media_local_path, portable_media_expired,
+    validate_portable_external_media_url,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotionRenderedEntity {
@@ -74,6 +77,9 @@ pub fn render_page_bundle_with_options(
     bundle: &NotionPageBundle,
     options: &RenderOptions,
 ) -> LocalityResult<NotionRenderedEntity> {
+    if options.page_path.is_some() {
+        validate_projected_hosted_media_metadata(&bundle.blocks)?;
+    }
     let title = page_title(&bundle.page);
     let frontmatter = page_frontmatter(&bundle.page, &title);
     let mut rendered_blocks = Vec::new();
@@ -104,6 +110,31 @@ pub fn render_page_bundle_with_options(
             .filter_map(|block| block.media_asset)
             .collect(),
     })
+}
+
+fn validate_projected_hosted_media_metadata(trees: &[BlockTreeDto]) -> LocalityResult<()> {
+    for tree in trees {
+        let payload = match tree.block.kind.as_str() {
+            "image" => tree.block.image.as_ref(),
+            "video" => tree.block.video.as_ref(),
+            "file" => tree.block.file.as_ref(),
+            "pdf" => tree.block.pdf.as_ref(),
+            "audio" => tree.block.audio.as_ref(),
+            _ => None,
+        };
+        if let Some(expiry) = payload
+            .filter(|payload| payload.kind == "file" && payload.external.is_none())
+            .and_then(|payload| payload.file.as_ref())
+            .and_then(|hosted| hosted.expiry_time.as_deref())
+            && portable_media_expired(expiry).is_err()
+        {
+            return Err(LocalityError::InvalidState(
+                "Notion hosted media expiry failed safety validation".to_string(),
+            ));
+        }
+        validate_projected_hosted_media_metadata(&tree.children)?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -477,44 +508,81 @@ fn file_media_block(
     options: &RenderOptions,
 ) -> RenderedBlock {
     let mut attrs = Vec::new();
-    let mut media_asset = None;
-
     if let Some(payload) = payload {
         let title = rich_text_list_title(&payload.caption);
         if let Some(title) = title.clone() {
             attrs.push(("title", title));
         }
-        if let Some(url) = file_url(payload) {
-            let mut markdown_url = url.clone();
-            if is_downloadable_url(&url)
-                && let Some(page_path) = options.page_path.as_deref()
-            {
-                let local_path = media_local_path(page_path, &block.id, media_type, &url);
-                if options.use_local_media_for(&block.id) {
-                    markdown_url = local_media_href(page_path, &local_path);
+        let label = title.unwrap_or_else(|| media_default_label(media_type).to_string());
+
+        // Public external references are links, never downloadable projection
+        // assets. Preserve the exact provider spelling after validating the
+        // HTTPS-only reference boundary.
+        if payload.kind == "external"
+            && payload.file.is_none()
+            && let Some(url) = payload.external.as_ref().map(|external| &external.url)
+            && validate_portable_external_media_url(url).is_ok()
+        {
+            return rendered_media_link(block, media_type, &label, url, None);
+        }
+
+        // Hosted files become local only when their bytes were captured. A
+        // caller-provided local-media set is authoritative: omission renders
+        // the same URL-free directive used by portable/cloud output.
+        if payload.kind == "file"
+            && payload.external.is_none()
+            && let Some(url) = payload
+                .file
+                .as_ref()
+                .map(|hosted| &hosted.url)
+                .filter(|url| !url.is_empty())
+        {
+            if let Some(page_path) = options.page_path.as_deref() {
+                if payload
+                    .file
+                    .as_ref()
+                    .and_then(|hosted| hosted.expiry_time.as_deref())
+                    .is_some_and(|expiry| portable_media_expired(expiry) != Ok(false))
+                {
+                    return directive_block_with_attrs(block, media_type, attrs);
                 }
-                media_asset = Some(MediaAsset {
+                let local_path = media_local_path(page_path, &block.id, media_type, url);
+                if !options.use_local_media_for(&block.id) {
+                    return directive_block_with_attrs(block, media_type, attrs);
+                }
+                let href = local_media_href(page_path, &local_path);
+                let asset = MediaAsset {
                     block_id: block.id.clone(),
                     kind: media_type.to_string(),
                     source_url: url.clone(),
                     local_path,
-                });
+                };
+                return rendered_media_link(block, media_type, &label, &href, Some(asset));
             }
 
-            let label = title.unwrap_or_else(|| media_default_label(media_type).to_string());
-            let markdown_url = escape_markdown_link_href(&markdown_url);
-            let markdown = if media_type == "image" {
-                format!("![{}]({markdown_url})", escape_markdown_link_label(&label))
-            } else {
-                format!("[{}]({markdown_url})", escape_markdown_link_label(&label))
-            };
-            let mut rendered = rendered_block(markdown, Some(RemoteId::new(block.id.clone())));
-            rendered.media_asset = media_asset;
-            return rendered;
+            // Preserve the legacy direct/native V1 render shape when no
+            // projection path (and therefore no local media path) is supplied.
+            return rendered_media_link(block, media_type, &label, url, None);
         }
     }
 
-    let mut rendered = directive_block_with_attrs(block, media_type, attrs);
+    directive_block_with_attrs(block, media_type, attrs)
+}
+
+fn rendered_media_link(
+    block: &BlockDto,
+    media_type: &str,
+    label: &str,
+    url: &str,
+    media_asset: Option<MediaAsset>,
+) -> RenderedBlock {
+    let markdown_url = escape_markdown_link_href(url);
+    let markdown = if media_type == "image" {
+        format!("![{}]({markdown_url})", escape_markdown_link_label(label))
+    } else {
+        format!("[{}]({markdown_url})", escape_markdown_link_label(label))
+    };
+    let mut rendered = rendered_block(markdown, Some(RemoteId::new(block.id.clone())));
     rendered.media_asset = media_asset;
     rendered
 }
@@ -722,14 +790,6 @@ fn rich_text_list_title(rich_text: &[RichTextDto]) -> Option<String> {
     } else {
         Some(title)
     }
-}
-
-fn file_url(file: &FileBlockDto) -> Option<String> {
-    file.external
-        .as_ref()
-        .map(|external| external.url.clone())
-        .or_else(|| file.file.as_ref().map(|file| file.url.clone()))
-        .filter(|url| !url.is_empty())
 }
 
 fn render_table_tree(tree: &BlockTreeDto) -> Option<RenderedBlock> {
