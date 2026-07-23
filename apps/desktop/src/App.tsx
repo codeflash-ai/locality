@@ -99,9 +99,11 @@ import {
 import {
   connectedSourcesReadyToMount,
   isSourceConnectorId,
+  plannedSourceConnectorDefinitions,
   sourceConnectorCatalogDefinitions,
   sourceConnectorDefaultMountDirectory as sourceConnectorDefaultMountDirectoryForId,
   sourceConnectorDefaultMountId,
+  sourceConnectorDefinitions,
   sourceConnectionReady,
   sourceConnectorIds,
   sourceConnectorName,
@@ -7616,99 +7618,48 @@ function ConnectorOptions({
   busy: boolean;
   onSelect: (connector: OnboardingConnectorId) => void;
 }) {
+  const runtimeConnectors = sourceConnectorDefinitions();
+  const plannedConnectors = plannedSourceConnectorDefinitions();
+
   return (
     <div className="connector-options">
-      <button
-        type="button"
-        className={`connector-option available selectable ${selected === "notion" ? "selected" : ""}`}
-        disabled={busy}
-        onClick={() => onSelect("notion")}
-      >
-        <ConnectorIcon connector="notion" />
-        <div>
-          <strong>Notion</strong>
-          <small>Pages, databases, properties, and Markdown edits.</small>
-        </div>
-        <span>{connectedConnector === "notion" ? "Connected" : "OAuth"}</span>
-      </button>
-      <button
-        type="button"
-        className={`connector-option available selectable ${selected === "google-docs" ? "selected" : ""}`}
-        disabled={busy}
-        onClick={() => onSelect("google-docs")}
-      >
-        <ConnectorIcon connector="google-docs" />
-        <div>
-          <strong>Google Docs</strong>
-          <small>Docs and Drive folders through the same local model.</small>
-        </div>
-        <span>{connectedConnector === "google-docs" ? "Connected" : "OAuth"}</span>
-      </button>
-      <button
-        type="button"
-        className={`connector-option available selectable ${selected === "google-calendar" ? "selected" : ""}`}
-        disabled={busy}
-        onClick={() => onSelect("google-calendar")}
-      >
-        <ConnectorIcon connector="google-calendar" />
-        <div>
-          <strong>Google Calendar</strong>
-          <small>Primary calendar events and reviewed event drafts.</small>
-        </div>
-        <span>{connectedConnector === "google-calendar" ? "Connected" : "OAuth"}</span>
-      </button>
-      <button
-        type="button"
-        className={`connector-option available selectable ${selected === "gmail" ? "selected" : ""}`}
-        disabled={busy}
-        onClick={() => onSelect("gmail")}
-      >
-        <ConnectorIcon connector="gmail" />
-        <div>
-          <strong>Gmail</strong>
-          <small>Inbox and sent as files, drafts as reviewed outbound mail.</small>
-        </div>
-        <span>{connectedConnector === "gmail" ? "Connected" : "OAuth"}</span>
-      </button>
-      <button
-        type="button"
-        className={`connector-option available selectable ${selected === "granola" ? "selected" : ""}`}
-        disabled={busy}
-        onClick={() => onSelect("granola")}
-      >
-        <ConnectorIcon connector="granola" />
-        <div>
-          <strong>Granola</strong>
-          <small>Meeting summaries and transcripts as read-only files.</small>
-        </div>
-        <span>{connectedConnector === "granola" ? "Connected" : "API key"}</span>
-      </button>
-      <button
-        type="button"
-        className={`connector-option available selectable ${selected === "linear" ? "selected" : ""}`}
-        disabled={busy}
-        onClick={() => onSelect("linear")}
-      >
-        <ConnectorIcon connector="linear" />
-        <div>
-          <strong>Linear</strong>
-          <small>Issues and teams as editable Markdown files.</small>
-        </div>
-        <span>{connectedConnector === "linear" ? "Connected" : "API key"}</span>
-      </button>
-      <button
-        type="button"
-        className={`connector-option available selectable ${selected === "slack" ? "selected" : ""}`}
-        disabled={busy}
-        onClick={() => onSelect("slack")}
-      >
-        <ConnectorIcon connector="slack" />
-        <div>
-          <strong>Slack</strong>
-          <small>Channels, DMs, group DMs, and users as read-only files.</small>
-        </div>
-        <span>{connectedConnector === "slack" ? "Connected" : "OAuth"}</span>
-      </button>
+      {runtimeConnectors.map((connector) => (
+        <button
+          type="button"
+          className={`connector-option available selectable ${selected === connector.id ? "selected" : ""}`}
+          disabled={busy}
+          key={connector.id}
+          onClick={() => onSelect(connector.id)}
+        >
+          <ConnectorIcon connector={connector.id} />
+          <div>
+            <strong>{connector.name}</strong>
+            <small>{connector.projection}</small>
+          </div>
+          <span>{connectedConnector === connector.id ? "Connected" : sourceAuthModesLabel(connector.authModes)}</span>
+        </button>
+      ))}
+
+      <div className="connector-options-section">
+        <span>Planned next</span>
+      </div>
+      <div className="connector-options-planned-grid">
+        {plannedConnectors.map((connector) => (
+          <button
+            type="button"
+            className="connector-option planned"
+            disabled
+            key={connector.id}
+          >
+            <ConnectorIcon connector={connector.id} />
+            <div>
+              <strong>{connector.name}</strong>
+              <small>{connector.projection}</small>
+            </div>
+            <span>{sourceAuthModesLabel(connector.authModes)}</span>
+          </button>
+        ))}
+      </div>
     </div>
   );
 }
