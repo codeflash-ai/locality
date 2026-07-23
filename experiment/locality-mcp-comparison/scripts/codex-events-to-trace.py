@@ -69,6 +69,18 @@ def command_breakdown(command):
     return "non_loc", "unknown_command"
 
 
+def tool_breakdown(tool_name, command):
+    tool_name = tool_name or ""
+    if tool_name == "Bash":
+        return command_breakdown(command)
+    if tool_name.startswith("mcp__"):
+        mcp_name = re.sub(r"^mcp__", "", tool_name).replace("__", ":")
+        return "mcp", mcp_name or "mcp_tool"
+    if tool_name:
+        return "non_loc", tool_name
+    return command_breakdown(command)
+
+
 def span_activity(span):
     if span.get("activity"):
         return span["activity"]
@@ -301,8 +313,9 @@ def build_hook_phase_spans(records, base_ms):
             end_ms = start_ms + max(1, duration_ms)
         phase = event.get("phase") or ""
         activity = event.get("activity") or phase
+        tool_name = event.get("tool_name") or ""
         tool_command = event.get("tool_command") or event.get("command") or ""
-        tool_group, tool_command_group = command_breakdown(tool_command)
+        tool_group, tool_command_group = tool_breakdown(tool_name, tool_command)
         if phase != "tool_call":
             tool_group = ""
             tool_command_group = ""
@@ -319,7 +332,7 @@ def build_hook_phase_spans(records, base_ms):
                 "span_kind": "codex_hook_phase",
                 "phase": phase,
                 "activity": activity,
-                "tool_name": event.get("tool_name") or "",
+                "tool_name": tool_name,
                 "tool_command": tool_command,
                 "tool_group": tool_group,
                 "tool_command_group": tool_command_group,

@@ -317,4 +317,14 @@ test -s "${study_out_dir}/scenarios/scenario2/variants/notion-mcp-hooks/notion-m
 assert_contains "${study_out_dir}/summary.json" "variant_agent_event_summaries"
 assert_contains "${study_out_dir}/scenarios.tsv" "hook-study"
 
+converter_events="${tmp_root}/converter-events.jsonl"
+cat > "$converter_events" <<'JSONL'
+{"observed_at_ms":1000,"type":"harness.phase","phase":"tool_call","activity":"tool","tool_name":"mcp__notion__API_post_search","started_at_ms":1000,"ended_at_ms":1250,"duration_ms":250}
+JSONL
+python3 "${ROOT}/experiment/locality-mcp-comparison/scripts/codex-events-to-trace.py" \
+  "$converter_events" "${tmp_root}/converter" >/dev/null
+assert_contains "${tmp_root}/converter.perfetto.json" "tool:mcp:notion:API_post_search"
+assert_contains "${tmp_root}/converter.snakeviz.stats.md" "command:mcp:notion:API_post_search"
+assert_not_contains "${tmp_root}/converter.perfetto.json" "unknown_command"
+
 printf 'launch readiness MCP config tests passed\n'
