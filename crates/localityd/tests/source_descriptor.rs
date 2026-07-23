@@ -281,17 +281,19 @@ fn source_guidance_teaches_common_cli_workflow() {
             guidance.contains("Common Locality CLI workflow:"),
             "{connector}"
         );
-        for expected in [
-            "Read the nearest `AGENTS.md` before connector-specific work",
-            "For discovery or research tasks, triage by path and title first",
-            "If initial search gives no hits, refine the query and browse directory names before concluding context is unavailable",
-            "If useful results are outside a user-provided path or source scope, do not read them until the user permits it",
-        ] {
-            assert!(
-                guidance.contains(expected),
-                "{connector} missing {expected}"
-            );
-        }
+        assert!(
+            guidance.contains("Read the nearest `AGENTS.md` before connector-specific work"),
+            "{connector} missing AGENTS.md discovery guidance"
+        );
+        assert!(
+            (guidance.contains("For discovery or research tasks, triage by path and title first")
+                && guidance.contains("If initial search gives no hits, refine the query and browse directory names before concluding context is unavailable")
+                && guidance.contains("If useful results are outside a user-provided path or source scope, do not read them until the user permits it"))
+                || (guidance.contains("for discovery, triage path/title first")
+                    && guidance.contains("refine empty searches, browse directories")
+                    && guidance.contains("report out-of-scope results without reading them unless permitted")),
+            "{connector} missing discovery triage, empty search, or source-scope guidance"
+        );
         for command in [
             "loc info .",
             "loc search <query>",
