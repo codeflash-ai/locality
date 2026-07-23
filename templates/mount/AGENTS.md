@@ -15,7 +15,7 @@ Common Locality CLI workflow:
 - Use `loc diff <path>` for planned Notion operations before pushing.
 - Use `loc mv <source> <dest>` for intentional page/file moves or renames, then review with `loc diff <dest>`.
 - Push intentional changes with `loc push <path>`. Use `loc push <path>` to make Notion match local edits.
-- Use `loc pull <path>` only to force clean local files to match latest remote now.
+- Use `loc pull <path>` only to force clean local files to match latest remote.
 - If desktop Live Mode is on, safe edits may sync automatically. Use `loc live-mode status <file>` to inspect state. Do not run routine `loc pull` or `loc push` after every edit.
 - For explicit sync/update/publish requests, run `loc diff <path>` first, then `loc push <path> -y` for safe plans.
 - If push says the remote changed since last sync, run `loc pull <path>`, resolve conflict markers, rerun `loc diff <path>`, then push.
