@@ -1,0 +1,28 @@
+{
+  "versions": {
+    "session": 2,
+    "replica": 2,
+    "export_metadata": 2,
+    "writable_session_store": 1,
+    "canonical": 1,
+    "path": 1,
+    "changeset": 1
+  },
+  "session_id": "session-scope-7",
+  "export_attempt_id": "export-attempt-9",
+  "source_generations": [
+    {
+      "ordinal": 0,
+      "source_connection_id": "source-notion",
+      "source_generation_id": "generation-notion-109"
+    }
+  ],
+  "inventory_sha256": "sha256:025cdbae136931542f7fa881da423e8e1f29a6132cf26ae5f4eea53c53a8ef51",
+  "delivered_control_entry_count": 1,
+  "delivered_file_count": 2,
+  "delivered_directory_count": 2,
+  "delivered_archive_entry_count": 5,
+  "delivered_content_bytes": 17,
+  "delivered_body_sha256": "sha256:d3dc0915a66e57487d402df0642649990fc61e6128ca8a275dea1e7da93e1381",
+  "completed_at": "2026-07-23T19:00:04Z"
+}

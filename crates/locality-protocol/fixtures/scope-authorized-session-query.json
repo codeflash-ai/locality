@@ -1,0 +1,54 @@
+{
+  "versions": {
+    "session": 2,
+    "replica": 2,
+    "export_metadata": 2,
+    "writable_session_store": 1,
+    "canonical": 1,
+    "path": 1,
+    "changeset": 1
+  },
+  "tenant_id": "tenant-acme",
+  "session_id": "session-scope-7",
+  "acting_principal_id": "principal-agent",
+  "workload_id": "workload-sandbox",
+  "authorization_revision": 43,
+  "policy_revision": 18,
+  "profile_revision": 10,
+  "authorized_scopes": [
+    {
+      "ordinal": 0,
+      "source_scope_id": "scope-product",
+      "source_connection_id": "source-notion",
+      "selector": {
+        "provider": "notion",
+        "selector_version": 1,
+        "scope_kind": "page",
+        "provider_scope_id": "e07dd2a2531444aba2f452010314fb87"
+      },
+      "effective_actions": [
+        "read",
+        "download_attachment"
+      ],
+      "validated_filter_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    {
+      "ordinal": 1,
+      "source_scope_id": "scope-go-to-market",
+      "source_connection_id": "source-notion",
+      "selector": {
+        "provider": "notion",
+        "selector_version": 1,
+        "scope_kind": "page",
+        "provider_scope_id": "f525c3a7db684465a9e1d1082bea6f81"
+      },
+      "effective_actions": [
+        "read"
+      ],
+      "validated_filter_digest": null
+    }
+  ],
+  "max_files": 10000,
+  "max_directories": 10000,
+  "max_bytes": 104857600
+}
