@@ -78,6 +78,7 @@
           "connectors/notion",
           "connectors/google-docs",
           "connectors/google-calendar",
+          "connectors/linear",
           "connectors/slack"
         ]
       },

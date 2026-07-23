@@ -1,0 +1,114 @@
+---
+title: "Linear connector"
+description: "Mount Linear issues as editable Markdown with read-only context sidecars."
+---
+
+The Linear connector mounts Linear issues as local Markdown files grouped by
+team and workflow status.
+
+## Connect
+
+Create the default Linear API key connection:
+
+```bash
+printf '%s' "$LINEAR_API_KEY" | loc connect linear --api-key-stdin
+```
+
+The default connection id is `linear-default`. OAuth is not advertised until
+Locality has a Linear OAuth broker flow.
+
+## Mount
+
+```bash
+loc mount linear ~/Locality/linear --connection linear-default
+loc pull ~/Locality/linear
+```
+
+Linear mounts default to `linear-main`. In the desktop app, the Add Source
+dialog uses the same API key flow and creates or reconnects the default
+`linear-main` mount under the desktop CloudStorage root.
+
+## Projection
+
+```text
+linear-main/
+  Teams/
+    Engineering/
+      Issues/
+        Todo/
+          ENG-1 Improve sync/
+            page.md
+            comments.md
+            attachments.md
+            pull-requests.md
+            history.md
+```
+
+- team directories preserve Linear team identity;
+- status directories are keyed by team and Linear state id;
+- empty workflow states are omitted;
+- issue directories include the Linear issue identifier and title;
+- each issue body lives in `page.md`.
+
+`page.md` is canonical Markdown with Linear reference fields in frontmatter and
+the Linear issue description as the body. Rendered references use the
+`Label <id>` shape so local diff can ignore label-only refreshes while
+preserving stable Linear UUIDs.
+
+## Editable fields
+
+The issue body in `page.md` is editable. Linear descriptions are updated as a
+single remote field after review and push.
+
+Supported frontmatter edits:
+
+- `title`;
+- `Status`;
+- `Project`;
+- `Assignee`.
+
+Moving an issue folder into another `Teams/<team>/Issues/<status>/` folder
+updates the Linear team and/or status. Arbitrary creates, renames, moves at
+grouping levels, deletes, and issue creates are not supported yet.
+
+Generated lifecycle and date metadata is read-only, including `created_at`,
+`updated_at`, `archived_at`, `started_at`, `completed_at`, `canceled_at`,
+`auto_archived_at`, `auto_closed_at`, `started_triage_at`, `triaged_at`,
+`snoozed_until_at`, `added_to_cycle_at`, `added_to_project_at`,
+`added_to_team_at`, and `due_date`.
+
+## Sidecars
+
+Each issue directory can include generated read-only sidecars:
+
+- `comments.md` contains paginated issue comments in creation order;
+- `attachments.md` contains paginated issue attachments, download status, and
+  raw metadata;
+- `pull-requests.md` summarizes pull-request-shaped attachments and Linear's
+  suggested `branchName`;
+- `history.md` contains paginated issue history entries.
+
+Sidecars use `loc.type: asset` frontmatter and reject local edits before any
+Linear mutation is attempted.
+
+## Attachments
+
+Linear issue attachments are external links. During hydration of
+`attachments.md`, Locality best-effort downloads HTTP(S) attachment URLs up to
+25 MB per attachment into:
+
+```text
+.loc/linear/attachments/<issue-id>/<stable-file-name>
+```
+
+Download failures and skipped downloads do not fail hydration. Linear-hosted
+and same-GraphQL-host download URLs receive the Linear API key; third-party URLs
+are fetched without sending the Linear token.
+
+## Current limits
+
+- OAuth is not available for Linear yet.
+- Issue creates, deletes, and undo are future work.
+- Unsupported properties and generated lifecycle/date fields fail closed before
+  remote mutation.
+- Sidecars are read-only even when the mount is writable.
