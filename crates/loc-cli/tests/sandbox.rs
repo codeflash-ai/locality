@@ -1020,6 +1020,7 @@ fn cli_forced_identity_reports_encoding_without_leaking_environment_token() {
     assert!(!stdout.contains("capability-secret"));
     assert!(!stderr.contains("cli-bootstrap-secret"));
     assert!(!stderr.contains("capability-secret"));
+    assert!(stderr.is_empty(), "profiling is opt-in: {stderr}");
     let report: serde_json::Value = serde_json::from_str(&stdout).expect("JSON report");
     assert_eq!(report["command"], "sandbox_init");
     assert_eq!(report["content_encoding"], "identity");
@@ -1036,6 +1037,162 @@ fn cli_forced_identity_reports_encoding_without_leaking_environment_token() {
     let _ = server.request();
     let export = server.request();
     assert_eq!(export.headers.get("accept-encoding").unwrap(), "identity");
+}
+
+#[test]
+fn cli_profile_has_stable_monotonic_phases_and_no_request_details() {
+    let directory = TestDirectory::new("cli-profile");
+    let tar = tar_file(b"profiled.txt", b"profile-content-secret\n");
+    let capability = capability();
+    let status = ready_status(
+        capability.session_id.clone(),
+        COMPONENT_VERSIONS,
+        &tar,
+        BTreeSet::from([TarContentEncoding::Identity]),
+    );
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&capability),
+        ResponseFixture::json(&status),
+        ResponseFixture::export("identity", tar),
+    ]);
+    let root = directory.root().to_string_lossy().into_owned();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_loc"))
+        .args([
+            "sandbox",
+            "init",
+            "--api-url",
+            &server.api_url,
+            "--root",
+            &root,
+            "--encoding",
+            "identity",
+            "--profile",
+            "--json",
+        ])
+        .env("LOCALITY_BOOTSTRAP_TOKEN", "profile-bootstrap-secret")
+        .output()
+        .expect("run profiled loc sandbox init");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr UTF-8");
+    let expected_phases = [
+        "bootstrap_token_input",
+        "bootstrap_exchange",
+        "session_status",
+        "export_open_headers",
+        "first_body_byte",
+        "stream_decode_materialize",
+        "total",
+    ];
+    let lines = stderr.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), expected_phases.len(), "{stderr}");
+    let mut previous_total_ms = 0_u128;
+    for (line, expected_phase) in lines.iter().zip(expected_phases) {
+        let prefix = format!("locality sandbox profile phase={expected_phase} phase_ms=");
+        let timing = line
+            .strip_prefix(&prefix)
+            .unwrap_or_else(|| panic!("unexpected profile line: {line}"));
+        let (phase_ms, total_ms) = timing
+            .split_once(" total_ms=")
+            .unwrap_or_else(|| panic!("profile line lacks exact timing fields: {line}"));
+        assert!(
+            !phase_ms.is_empty()
+                && phase_ms.bytes().all(|byte| byte.is_ascii_digit())
+                && !total_ms.is_empty()
+                && total_ms.bytes().all(|byte| byte.is_ascii_digit()),
+            "profile timing fields must contain only decimal milliseconds: {line}"
+        );
+        let phase_ms = phase_ms.parse::<u128>().expect("phase milliseconds");
+        let total_ms = total_ms.parse::<u128>().expect("total milliseconds");
+        assert!(
+            total_ms >= previous_total_ms,
+            "profile timings must be monotonic: {stderr}"
+        );
+        assert_eq!(
+            phase_ms,
+            total_ms - previous_total_ms,
+            "phase timing must be the delta since the prior mark: {stderr}"
+        );
+        previous_total_ms = total_ms;
+    }
+
+    for secret_or_detail in [
+        "profile-bootstrap-secret",
+        "capability-secret",
+        "session-7",
+        server.api_url.as_str(),
+        root.as_str(),
+        "application/x-tar",
+        "profile-content-secret",
+        "authorization",
+    ] {
+        assert!(
+            !stderr.contains(secret_or_detail),
+            "profile leaked forbidden detail `{secret_or_detail}`: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn cli_profile_failure_prints_completed_phases_and_total() {
+    let directory = TestDirectory::new("cli-profile-failure");
+    let tar = tar_file(b"never-exported.txt", b"never-exported-content\n");
+    let capability = capability();
+    let status = ready_status(
+        capability.session_id.clone(),
+        COMPONENT_VERSIONS,
+        &tar,
+        BTreeSet::from([TarContentEncoding::Identity]),
+    );
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&capability),
+        ResponseFixture::json(&status),
+    ]);
+    let root = directory.root().to_string_lossy().into_owned();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_loc"))
+        .args([
+            "sandbox",
+            "init",
+            "--api-url",
+            &server.api_url,
+            "--root",
+            &root,
+            "--encoding",
+            "zstd",
+            "--profile",
+        ])
+        .env("LOCALITY_BOOTSTRAP_TOKEN", "failed-profile-secret")
+        .output()
+        .expect("run failing profiled loc sandbox init");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr UTF-8");
+    let phases = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("locality sandbox profile phase="))
+        .map(|timing| timing.split_once(' ').expect("phase timing fields").0)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        phases,
+        [
+            "bootstrap_token_input",
+            "bootstrap_exchange",
+            "session_status",
+            "total"
+        ],
+        "{stderr}"
+    );
+    assert!(!stderr.contains("failed-profile-secret"));
+    assert!(!stderr.contains("capability-secret"));
+    assert!(!stderr.contains("session-7"));
+    assert!(!stderr.contains(&server.api_url));
+    assert!(!stderr.contains(&root));
 }
 
 trait StatusFixtureExt {

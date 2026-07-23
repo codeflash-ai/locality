@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use locality_protocol::{
     OpaqueBootstrapExchangeRequest, SandboxSessionState, SandboxSessionStatus, SessionCapability,
@@ -46,6 +46,51 @@ const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
 const EXPORT_READ_AHEAD_CHUNK_BYTES: usize = 64 * 1024;
 const EXPORT_READ_AHEAD_CHUNKS: usize = 8;
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
+
+pub(crate) const PROFILE_BOOTSTRAP_TOKEN_INPUT: &str = "bootstrap_token_input";
+const PROFILE_BOOTSTRAP_EXCHANGE: &str = "bootstrap_exchange";
+const PROFILE_SESSION_STATUS: &str = "session_status";
+const PROFILE_EXPORT_OPEN_HEADERS: &str = "export_open_headers";
+const PROFILE_FIRST_BODY_BYTE: &str = "first_body_byte";
+const PROFILE_STREAM_DECODE_MATERIALIZE: &str = "stream_decode_materialize";
+pub(crate) const PROFILE_TOTAL: &str = "total";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SandboxProfileTiming {
+    pub phase: &'static str,
+    pub phase_ms: u128,
+    pub total_ms: u128,
+}
+
+pub(crate) struct SandboxInitProfile {
+    started: Instant,
+    last_total_ms: u128,
+    timings: Vec<SandboxProfileTiming>,
+}
+
+impl SandboxInitProfile {
+    pub(crate) fn start() -> Self {
+        Self {
+            started: Instant::now(),
+            last_total_ms: 0,
+            timings: Vec::new(),
+        }
+    }
+
+    pub(crate) fn mark(&mut self, phase: &'static str) {
+        let total_ms = self.started.elapsed().as_millis();
+        self.timings.push(SandboxProfileTiming {
+            phase,
+            phase_ms: total_ms.saturating_sub(self.last_total_ms),
+            total_ms,
+        });
+        self.last_total_ms = total_ms;
+    }
+
+    pub(crate) fn timings(&self) -> &[SandboxProfileTiming] {
+        &self.timings
+    }
+}
 
 #[derive(Clone)]
 pub struct SandboxBootstrapToken(String);
@@ -366,27 +411,50 @@ pub fn run_sandbox_init_with_encoding(
     bootstrap_token: SandboxBootstrapToken,
     content_encoding: SandboxContentEncodingPreference,
 ) -> Result<SandboxInitReport, SandboxInitError> {
+    run_sandbox_init_internal(options, bootstrap_token, content_encoding, None)
+}
+
+pub(crate) fn run_sandbox_init_with_encoding_and_profile(
+    options: SandboxInitOptions,
+    bootstrap_token: SandboxBootstrapToken,
+    content_encoding: SandboxContentEncodingPreference,
+    profile: &mut SandboxInitProfile,
+) -> Result<SandboxInitReport, SandboxInitError> {
+    run_sandbox_init_internal(options, bootstrap_token, content_encoding, Some(profile))
+}
+
+fn run_sandbox_init_internal(
+    options: SandboxInitOptions,
+    bootstrap_token: SandboxBootstrapToken,
+    content_encoding: SandboxContentEncodingPreference,
+    mut profile: Option<&mut SandboxInitProfile>,
+) -> Result<SandboxInitReport, SandboxInitError> {
     let root = absolute_destination(&options.root)?;
     validate_destination(&root)?;
     let client = SandboxHttpClient::new(&options.api_url)?;
 
     let capability = client.exchange_bootstrap(&bootstrap_token)?;
+    mark_profile(&mut profile, PROFILE_BOOTSTRAP_EXCHANGE);
     validate_capability(&capability)?;
     let status = client.session_status(&capability)?;
+    mark_profile(&mut profile, PROFILE_SESSION_STATUS);
     let (offer, expected_receipt) = validate_status(&capability, &status)?;
     validate_encoding_preference(offer, content_encoding)?;
     let limits = limits_for_offer(offer)?;
     let (encoding, response) = client.open_export(&capability, offer, content_encoding)?;
+    mark_profile(&mut profile, PROFILE_EXPORT_OPEN_HEADERS);
     let (body, mut producer) =
         spawn_export_read_ahead(response).map_err(|error| SandboxInitError::Http {
             operation: "session export read-ahead setup",
             detail: error.to_string(),
         })?;
-    let archive = ReplicaArchive::new(encoding, body);
+    let profiled_body = ProfiledExportBody::new(body, profile.as_deref_mut());
+    let archive = ReplicaArchive::new(encoding, profiled_body);
     let materialization =
         materialize_replica_archive_with_expected_receipt(archive, &root, limits, expected_receipt)
             .map_err(|error| SandboxInitError::Materialization(error.to_string()));
     let producer_outcome = producer.join();
+    mark_profile(&mut profile, PROFILE_STREAM_DECODE_MATERIALIZE);
 
     let summary = match materialization {
         Err(error) => return Err(error),
@@ -412,6 +480,41 @@ pub fn run_sandbox_init_with_encoding(
     };
 
     Ok(report(&root, &capability, encoding, summary))
+}
+
+fn mark_profile(profile: &mut Option<&mut SandboxInitProfile>, phase: &'static str) {
+    if let Some(profile) = profile.as_deref_mut() {
+        profile.mark(phase);
+    }
+}
+
+struct ProfiledExportBody<'a, Body> {
+    body: Body,
+    profile: Option<&'a mut SandboxInitProfile>,
+    observed_first_byte: bool,
+}
+
+impl<'a, Body> ProfiledExportBody<'a, Body> {
+    fn new(body: Body, profile: Option<&'a mut SandboxInitProfile>) -> Self {
+        Self {
+            body,
+            profile,
+            observed_first_byte: false,
+        }
+    }
+}
+
+impl<Body: Read> Read for ProfiledExportBody<'_, Body> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let read = self.body.read(output)?;
+        if read != 0 && !self.observed_first_byte {
+            self.observed_first_byte = true;
+            if let Some(profile) = self.profile.as_deref_mut() {
+                profile.mark(PROFILE_FIRST_BODY_BYTE);
+            }
+        }
+        Ok(read)
+    }
 }
 
 enum ReadAheadMessage {

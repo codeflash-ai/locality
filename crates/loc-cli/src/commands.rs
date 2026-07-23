@@ -110,8 +110,9 @@ use crate::push::{
 };
 use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
 use crate::sandbox::{
-    SandboxContentEncodingPreference, SandboxInitOptions, SandboxInitReport,
-    resolve_bootstrap_token, run_sandbox_init_with_encoding,
+    PROFILE_BOOTSTRAP_TOKEN_INPUT, PROFILE_TOTAL, SandboxContentEncodingPreference,
+    SandboxInitOptions, SandboxInitProfile, SandboxInitReport, resolve_bootstrap_token,
+    run_sandbox_init_with_encoding, run_sandbox_init_with_encoding_and_profile,
 };
 use crate::search::{
     SearchError, SearchOptions, SearchReport, SearchResult, is_notion_url_host, notion_id_from_url,
@@ -276,6 +277,8 @@ struct SandboxInitArgs {
     encoding: Option<SandboxEncodingArg>,
     #[arg(long, help = "Read the one-time bootstrap token from standard input")]
     bootstrap_token_stdin: bool,
+    #[arg(long, help = "Print redaction-safe phase timings to standard error")]
+    profile: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -1513,6 +1516,7 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                         "--bootstrap-token-stdin",
                         options.bootstrap_token_stdin,
                     );
+                    push_flag(&mut args, "--profile", options.profile);
                 }
             }
         }
@@ -1672,25 +1676,37 @@ fn sandbox_init(options: SandboxInitArgs, json: bool) -> i32 {
     let content_encoding = options
         .encoding
         .map_or(SandboxContentEncodingPreference::Automatic, Into::into);
-    let token = {
+    let mut profile = options.profile.then(SandboxInitProfile::start);
+    let token_result = {
         let mut stdin = io::stdin().lock();
-        match resolve_bootstrap_token(
+        resolve_bootstrap_token(
             options.bootstrap_token_stdin,
             std::env::var_os("LOCALITY_BOOTSTRAP_TOKEN"),
             &mut stdin,
-        ) {
-            Ok(token) => token,
-            Err(error) => return sandbox_init_command_error(json, error),
+        )
+    };
+    if let Some(profile) = profile.as_mut() {
+        profile.mark(PROFILE_BOOTSTRAP_TOKEN_INPUT);
+    }
+    let token = match token_result {
+        Ok(token) => token,
+        Err(error) => {
+            finish_sandbox_profile(profile.as_mut());
+            return sandbox_init_command_error(json, error);
         }
     };
-    match run_sandbox_init_with_encoding(
-        SandboxInitOptions {
-            api_url: options.api_url,
-            root: PathBuf::from(options.root),
-        },
-        token,
-        content_encoding,
-    ) {
+    let init_options = SandboxInitOptions {
+        api_url: options.api_url,
+        root: PathBuf::from(options.root),
+    };
+    let outcome = if let Some(profile) = profile.as_mut() {
+        run_sandbox_init_with_encoding_and_profile(init_options, token, content_encoding, profile)
+    } else {
+        run_sandbox_init_with_encoding(init_options, token, content_encoding)
+    };
+    finish_sandbox_profile(profile.as_mut());
+
+    match outcome {
         Ok(report) => {
             if json {
                 print_json(&report);
@@ -1700,6 +1716,21 @@ fn sandbox_init(options: SandboxInitArgs, json: bool) -> i32 {
             EXIT_SUCCESS
         }
         Err(error) => sandbox_init_command_error(json, error),
+    }
+}
+
+fn finish_sandbox_profile(profile: Option<&mut SandboxInitProfile>) {
+    let Some(profile) = profile else {
+        return;
+    };
+    profile.mark(PROFILE_TOTAL);
+    let mut stderr = io::stderr().lock();
+    for timing in profile.timings() {
+        let _ = writeln!(
+            stderr,
+            "locality sandbox profile phase={} phase_ms={} total_ms={}",
+            timing.phase, timing.phase_ms, timing.total_ms
+        );
     }
 }
 
@@ -9903,6 +9934,7 @@ mod tests {
                     "--root <PATH>",
                     "--encoding <ENCODING>",
                     "--bootstrap-token-stdin",
+                    "--profile",
                     "--json",
                 ],
             ),
@@ -10546,7 +10578,7 @@ mod tests {
     #[test]
     fn sandbox_scope_and_bootstrap_token_are_not_accepted_from_argv() {
         for args in [
-            vec!["sandbox", "init", "--profile", "pilot"],
+            vec!["sandbox", "init", "--tenant", "pilot"],
             vec!["sandbox", "init", "--bootstrap-token", "argv-secret"],
             vec!["sandbox", "init", "--bootstrap-token=argv-secret"],
         ] {
@@ -10603,6 +10635,24 @@ mod tests {
             panic!("sandbox init command expected");
         };
         assert_eq!(options.encoding, None);
+        assert!(!options.profile);
+
+        let profiled = parse_cli([
+            "sandbox",
+            "init",
+            "--api-url",
+            "https://api.locality.test",
+            "--root",
+            "/mnt/locality",
+            "--profile",
+        ]);
+        let Some(LocalityCommand::Sandbox {
+            command: SandboxCommand::Init(options),
+        }) = profiled.command
+        else {
+            panic!("sandbox init command expected");
+        };
+        assert!(options.profile);
 
         let error = Cli::try_parse_from(argv([
             "sandbox",
