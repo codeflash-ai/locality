@@ -21,20 +21,21 @@ use locality_protocol::{
     ChangesetSourceObject, ClientValidationResult, CompatibleAuthorizedSessionQuery,
     ComponentVersions, ContentVersionContract, DELIVERED_COUNT_GOLDEN_JSON, DeliveredBodyDigestV2,
     DeliveredChangesetBase, DeliveredCount, EXPORT_ATTEMPT_REQUEST_GOLDEN_JSON,
-    EXPORT_COMPLETION_RECEIPT_GOLDEN_JSON, EditedCanonicalBody, ExportAttemptLimits,
-    ExportAttemptRequest, ExportCompletionReceipt, FRESHNESS_STATUS_GOLDEN_JSON,
-    FreshnessRequirement, NotionScopeKind, ORDERED_EXPORT_ROWS_GOLDEN_JSON,
-    OpaqueBootstrapExchangeRequest, OpaqueSessionStatusRequest, OrderedExportRow,
-    OrderedSourceGeneration, PROJECTION_VERSION_GOLDEN_JSON, ProjectionVersionContract,
-    ProviderSourceScopeSelector, READY_REPLICA_REVISION_GOLDEN_JSON, ReadyReplicaRevision,
-    ReplicaFreshnessState, ReplicaFreshnessStatus, SANDBOX_SESSION_STATUS_GOLDEN_JSON,
-    SCOPE_AUTHORIZED_COMPONENT_VERSIONS, SCOPE_AUTHORIZED_SESSION_QUERY_GOLDEN_JSON,
-    SEALED_EXPORT_OFFER_GOLDEN_JSON, SESSION_PROTOCOL_ERROR_GOLDEN_JSON,
-    SOURCE_VERSION_GOLDEN_JSON, SandboxSessionState, SandboxSessionStatus,
-    ScopeAuthorizedSessionQuery, ScopeContractError, SealedExportOffer, SessionCapability,
-    SessionErrorCode, SessionProtocolError, SessionReplicaRevision, SourceVersionContract,
-    StaleSessionBehavior, TAR_EXPORT_METADATA_GOLDEN_JSON, TAR_EXPORT_OFFER_GOLDEN_JSON,
-    TarContentEncoding, TarExportMetadata, TarExportOffer, WRITABLE_EXPORT_METADATA_GOLDEN_JSON,
+    EXPORT_COMPLETION_RECEIPT_GOLDEN_JSON, EXPORT_TERMINAL_CONTROL_V2_GOLDEN_JSON,
+    EditedCanonicalBody, ExportAttemptLimits, ExportAttemptRequest, ExportCompletionReceipt,
+    ExportTerminalControlV2, FRESHNESS_STATUS_GOLDEN_JSON, FreshnessRequirement, NotionScopeKind,
+    ORDERED_EXPORT_ROWS_GOLDEN_JSON, OpaqueBootstrapExchangeRequest, OpaqueSessionStatusRequest,
+    OrderedExportRow, OrderedSourceGeneration, PROJECTION_VERSION_GOLDEN_JSON,
+    ProjectionVersionContract, ProviderSourceScopeSelector, READY_REPLICA_REVISION_GOLDEN_JSON,
+    ReadyReplicaRevision, ReplicaFreshnessState, ReplicaFreshnessStatus,
+    SANDBOX_SESSION_STATUS_GOLDEN_JSON, SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+    SCOPE_AUTHORIZED_SESSION_QUERY_GOLDEN_JSON, SEALED_EXPORT_OFFER_GOLDEN_JSON,
+    SESSION_PROTOCOL_ERROR_GOLDEN_JSON, SOURCE_VERSION_GOLDEN_JSON, SandboxSessionState,
+    SandboxSessionStatus, ScopeAuthorizedSessionQuery, ScopeAuthorizedWritableExportMetadata,
+    ScopeContractError, SealedExportOffer, SessionCapability, SessionErrorCode,
+    SessionProtocolError, SessionReplicaRevision, SourceVersionContract, StaleSessionBehavior,
+    TAR_EXPORT_METADATA_GOLDEN_JSON, TAR_EXPORT_OFFER_GOLDEN_JSON, TarContentEncoding,
+    TarExportMetadata, TarExportOffer, WRITABLE_EXPORT_METADATA_GOLDEN_JSON,
     WritableExportMetadata, WritableMetadataEntry, validate_canonical_export_records,
 };
 use serde::de::DeserializeOwned;
@@ -90,6 +91,12 @@ fn scope_authorized_export_contracts_are_exact_golden_bytes() {
         .validate_against(&offer)
         .expect("completion matches sealed metadata selection");
     assert_exact_round_trip(EXPORT_COMPLETION_RECEIPT_GOLDEN_JSON, &receipt);
+
+    let control = export_terminal_control_v2();
+    control
+        .validate_against_inventory(&offer, &canonical_export_records())
+        .expect("terminal control matches sealed inventory");
+    assert_exact_round_trip(EXPORT_TERMINAL_CONTROL_V2_GOLDEN_JSON, &control);
 
     let records = canonical_export_records();
     validate_canonical_export_records(&records).expect("canonical record order");
@@ -379,6 +386,88 @@ fn export_v2_pax_wire_contract_is_exact_and_round_trips() {
             "accepted non-canonical effective actions: {invalid}"
         );
     }
+
+    let metadata = locality_protocol::ExportV2FilePaxMetadata {
+        source_connection_id: SourceConnectionId::new("source-notion"),
+        projection_id: ProjectionId::new("projection-roadmap"),
+        winning_scope_ordinal: 3,
+        file_kind: ProjectionFileKind::Markdown,
+        effective_actions: BTreeSet::from([SourceAction::Read, SourceAction::Update]),
+        content_sha256: format!("sha256:{}", "5".repeat(64)),
+    };
+    let records = metadata
+        .to_records()
+        .expect("canonical PAX records")
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        locality_protocol::ExportV2FilePaxMetadata::from_records(&records),
+        Some(metadata)
+    );
+    let mut duplicate = records.clone();
+    duplicate.push(records[0].clone());
+    assert!(locality_protocol::ExportV2FilePaxMetadata::from_records(&duplicate).is_none());
+    let mut unknown = records.clone();
+    unknown.push(("locality.future".to_string(), "value".to_string()));
+    assert!(locality_protocol::ExportV2FilePaxMetadata::from_records(&unknown).is_none());
+    let mut noncanonical_ordinal = records;
+    noncanonical_ordinal
+        .iter_mut()
+        .find(|(key, _)| key == locality_protocol::PAX_WINNING_SCOPE_ORDINAL)
+        .expect("ordinal")
+        .1 = "03".to_string();
+    assert!(
+        locality_protocol::ExportV2FilePaxMetadata::from_records(&noncanonical_ordinal).is_none()
+    );
+}
+
+#[test]
+fn export_v2_order_and_body_digest_are_streaming_exact() {
+    let root = CanonicalFileOrderKey {
+        winning_scope_ordinal: 0,
+        parent_path: None,
+        logical_path: LogicalPath::new("README.md").expect("path"),
+        projection_id: ProjectionId::new("projection-root"),
+    };
+    let nested = CanonicalFileOrderKey {
+        winning_scope_ordinal: 0,
+        parent_path: Some(LogicalPath::new("Projects").expect("path")),
+        logical_path: LogicalPath::new("Projects/page.md").expect("path"),
+        projection_id: ProjectionId::new("projection-nested"),
+    };
+    assert!(root < nested, "root files must match SQL NULLS FIRST order");
+
+    let mut whole = DeliveredBodyDigestV2::new(1);
+    whole
+        .update_file(&ProjectionId::new("projection-root"), b"abcdefghij")
+        .expect("whole body");
+    let whole = whole.finish().expect("whole digest");
+
+    let mut streamed = DeliveredBodyDigestV2::new(1);
+    streamed
+        .begin_file(&ProjectionId::new("projection-root"), 10)
+        .expect("begin file");
+    for chunk in [b"ab".as_slice(), b"cdef".as_slice(), b"ghij".as_slice()] {
+        streamed.update_file_chunk(chunk).expect("body chunk");
+    }
+    streamed.end_file().expect("end file");
+    assert_eq!(streamed.finish().expect("streamed digest"), whole);
+}
+
+#[test]
+fn mixed_legacy_and_scope_session_queries_are_rejected() {
+    let mut mixed =
+        serde_json::from_slice::<serde_json::Value>(SCOPE_AUTHORIZED_SESSION_QUERY_GOLDEN_JSON)
+            .expect("scope fixture");
+    mixed
+        .as_object_mut()
+        .expect("object")
+        .insert("replica_revisions".to_string(), serde_json::json!([]));
+    assert!(
+        serde_json::from_value::<CompatibleAuthorizedSessionQuery>(mixed).is_err(),
+        "mixed authority shapes must not be silently reinterpreted"
+    );
 }
 
 #[test]
@@ -606,6 +695,10 @@ fn source_generations() -> Vec<OrderedSourceGeneration> {
 }
 
 fn sealed_export_offer() -> SealedExportOffer {
+    let writable_metadata_sha256 = locality_protocol::canonical_writable_metadata_sha256(
+        &scope_authorized_writable_metadata(),
+    )
+    .expect("writable metadata digest");
     SealedExportOffer {
         versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
         session_id: SessionId::new("session-scope-7"),
@@ -621,6 +714,7 @@ fn sealed_export_offer() -> SealedExportOffer {
         selected_content_bytes: 17,
         inventory_sha256: "sha256:025cdbae136931542f7fa881da423e8e1f29a6132cf26ae5f4eea53c53a8ef51"
             .to_string(),
+        writable_metadata_sha256,
         sealed_at: "2026-07-23T19:00:01Z".to_string(),
         expires_at: "2026-07-23T19:10:01Z".to_string(),
     }
@@ -641,6 +735,10 @@ fn export_completion_receipt() -> ExportCompletionReceipt {
         source_generations: source_generations(),
         inventory_sha256: "sha256:025cdbae136931542f7fa881da423e8e1f29a6132cf26ae5f4eea53c53a8ef51"
             .to_string(),
+        writable_metadata_sha256: locality_protocol::canonical_writable_metadata_sha256(
+            &scope_authorized_writable_metadata(),
+        )
+        .expect("writable metadata digest"),
         delivered_control_entry_count: 1,
         delivered_file_count: 2,
         delivered_directory_count: 2,
@@ -648,6 +746,31 @@ fn export_completion_receipt() -> ExportCompletionReceipt {
         delivered_content_bytes: 17,
         delivered_body_sha256: body_digest.finish().expect("body digest"),
         completed_at: "2026-07-23T19:00:04Z".to_string(),
+    }
+}
+
+fn scope_authorized_writable_metadata() -> ScopeAuthorizedWritableExportMetadata {
+    ScopeAuthorizedWritableExportMetadata {
+        versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+        session_id: SessionId::new("session-scope-7"),
+        export_attempt_id: ExportAttemptId::new("export-attempt-9").expect("attempt id"),
+        source_generations: source_generations(),
+        writable_entries: vec![WritableMetadataEntry {
+            projection_id: ProjectionId::new("projection-roadmap"),
+            logical_path: LogicalPath::new("Projects/Roadmap/page.md").expect("path"),
+            source_remote_ids: vec![RemoteId::new("page-roadmap")],
+            delivered_content_sha256: format!("sha256:{}", "5".repeat(64)),
+            provider_precondition: "opaque-v4".to_string(),
+            effective_actions: BTreeSet::from([SourceAction::Read, SourceAction::Update]),
+            baseline_required: true,
+        }],
+    }
+}
+
+fn export_terminal_control_v2() -> ExportTerminalControlV2 {
+    ExportTerminalControlV2 {
+        writable_metadata: scope_authorized_writable_metadata(),
+        completion_receipt: export_completion_receipt(),
     }
 }
 

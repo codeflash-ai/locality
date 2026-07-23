@@ -18,6 +18,7 @@
     }
   ],
   "inventory_sha256": "sha256:025cdbae136931542f7fa881da423e8e1f29a6132cf26ae5f4eea53c53a8ef51",
+  "writable_metadata_sha256": "sha256:a14c564c8d8950755b30115c4e8c684017662c70e7e03ead0d65a5da132474d2",
   "delivered_control_entry_count": 1,
   "delivered_file_count": 2,
   "delivered_directory_count": 2,

@@ -567,8 +567,7 @@ freshness observation, and publication state. Projection content uses immutable
 version rows plus current/version-range mappings, so publishing a generation
 does not duplicate a physical corpus. Its immutable manifest retains the exact
 scope memberships, logical paths, connector/source-supported action ceilings,
-content references,
-  hashes, sizes, connector/source-supported action ceilings, and exact attachment
+content references, hashes, sizes, and exact attachment
   object versions required for retries and audit after a newer head publishes.
 
 ```text
@@ -1189,7 +1188,7 @@ LEFT JOIN content_versions AS c
  AND c.source_connection_id = e.source_connection_id
  AND c.content_storage_id = e.content_storage_id
 ORDER BY e.winning_scope_ordinal,
-         e.parent_path COLLATE "C",
+         e.parent_path COLLATE "C" NULLS FIRST,
          e.logical_path COLLATE "C",
          e.projection_id;
 ```
@@ -1320,19 +1319,22 @@ Content-Encoding: zstd
   order, so every unique parent precedes descendants;
 - each selected projection is record class 1 and becomes one ordinary tar member with its logical
   path, size, and non-executable mode. File members follow
-  `(winning_scope_ordinal, parent_path COLLATE "C", logical_path COLLATE "C",
-  projection_id)` order;
+  `(winning_scope_ordinal, parent_path COLLATE "C" NULLS FIRST,
+  logical_path COLLATE "C", projection_id)` order;
 - each v2 file member carries bounded transient POSIX PAX fields for source
   connection ID, projection ID, winning scope ordinal, file kind, sorted
   effective actions, and content SHA-256. Public constants and parsers define
-  their exact names/encoding. They allow the client to recompute the inventory
-  and body digests but are never materialized or inserted into SQLite; directory
-  and control members carry no Locality PAX fields;
+  their exact names/encoding and bounded per-value/per-file size. Duplicate or
+  unknown `locality.*` fields are rejected. They allow the client to recompute
+  the inventory and body digests but are never materialized or inserted into
+  SQLite; directory and control members carry no Locality PAX fields;
 - v1 retains its reserved first writable-metadata member unchanged. V2 instead
   requires exactly one final record-class-2 `.loc/session.json` member combining
   that writable metadata with the completion receipt. It is bounded, canonical
   JSON, regular mode `0444`, consumed into the small SQLite store, never exposed
-  in the mount, and has no emitted `.loc/` directory header;
+  in the mount, and has no emitted `.loc/` directory header. The offer and
+  receipt both seal a domain-separated digest of the writable metadata so
+  source identities and write preconditions cannot change after preflight;
 - read-only entries create no local metadata or shadow rows;
 - selected large attachment references are fetched by the exporter and appended
   to the same stream under bounded size/scanning policy; and
@@ -2946,8 +2948,9 @@ verification, and dedicated-cell operational runbooks are complete.
   prunes the expected hash partitions, uses current-head versus historical
   revision paths correctly, and joins bodies by `content_storage_id` only after
   authorization/filter selection.
-- Ordered-ingest/export fixtures prove the single reserved control member is
-  first and counted, directory headers then use parent-first `(depth,
+- Ordered-ingest/export fixtures prove v1 keeps its reserved control member
+  first, while v2 emits parent-first directory headers, then files, then exactly
+  one final counted control member. Directory headers use `(depth,
   logical_path)` order, and file members use
   `(winning_scope_ordinal, parent_path, logical_path, projection_id)` under
   bytewise `C` collation. The order does not change logical paths or canonical

@@ -30,6 +30,7 @@
   "archive_entry_count": 5,
   "selected_content_bytes": 17,
   "inventory_sha256": "sha256:025cdbae136931542f7fa881da423e8e1f29a6132cf26ae5f4eea53c53a8ef51",
+  "writable_metadata_sha256": "sha256:a14c564c8d8950755b30115c4e8c684017662c70e7e03ead0d65a5da132474d2",
   "sealed_at": "2026-07-23T19:00:01Z",
   "expires_at": "2026-07-23T19:10:01Z"
 }

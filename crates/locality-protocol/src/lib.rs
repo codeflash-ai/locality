@@ -4,7 +4,7 @@
 //! This crate owns envelopes, not transport or persistence. In particular it
 //! contains no HTTP client, database repository, cloud SDK, or host path.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Display, Formatter};
 
 use locality_core::journal::PushOperationId;
@@ -35,6 +35,109 @@ pub const EXPORT_V2_FILE_PAX_KEYS: [&str; 6] = [
     PAX_EFFECTIVE_ACTIONS,
     PAX_CONTENT_SHA256,
 ];
+pub const MAX_EXPORT_V2_PAX_VALUE_BYTES: usize = 4 * 1024;
+pub const MAX_EXPORT_V2_FILE_PAX_BYTES: usize = 8 * 1024;
+pub const MAX_EXPORT_TERMINAL_CONTROL_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportV2FilePaxMetadata {
+    pub source_connection_id: SourceConnectionId,
+    pub projection_id: ProjectionId,
+    pub winning_scope_ordinal: u32,
+    pub file_kind: ProjectionFileKind,
+    pub effective_actions: BTreeSet<SourceAction>,
+    pub content_sha256: String,
+}
+
+impl ExportV2FilePaxMetadata {
+    pub fn from_records(records: &[(String, String)]) -> Option<Self> {
+        let mut locality_records = BTreeMap::new();
+        let mut aggregate_bytes = 0_usize;
+        for (key, value) in records {
+            if !key.starts_with("locality.") {
+                continue;
+            }
+            if !EXPORT_V2_FILE_PAX_KEYS.contains(&key.as_str())
+                || value.len() > MAX_EXPORT_V2_PAX_VALUE_BYTES
+            {
+                return None;
+            }
+            aggregate_bytes = aggregate_bytes
+                .checked_add(key.len())?
+                .checked_add(value.len())?;
+            if aggregate_bytes > MAX_EXPORT_V2_FILE_PAX_BYTES
+                || locality_records
+                    .insert(key.as_str(), value.as_str())
+                    .is_some()
+            {
+                return None;
+            }
+        }
+        if locality_records.len() != EXPORT_V2_FILE_PAX_KEYS.len() {
+            return None;
+        }
+        let ordinal = locality_records
+            .get(PAX_WINNING_SCOPE_ORDINAL)?
+            .parse::<u32>()
+            .ok()?;
+        if ordinal.to_string() != *locality_records.get(PAX_WINNING_SCOPE_ORDINAL)? {
+            return None;
+        }
+        let file_kind = projection_file_kind_from_wire_label(locality_records.get(PAX_FILE_KIND)?)?;
+        if file_kind == ProjectionFileKind::Directory {
+            return None;
+        }
+        let metadata = Self {
+            source_connection_id: SourceConnectionId::new(
+                *locality_records.get(PAX_SOURCE_CONNECTION_ID)?,
+            ),
+            projection_id: ProjectionId::new(*locality_records.get(PAX_PROJECTION_ID)?),
+            winning_scope_ordinal: ordinal,
+            file_kind,
+            effective_actions: source_actions_from_canonical_pax_value(
+                locality_records.get(PAX_EFFECTIVE_ACTIONS)?,
+            )?,
+            content_sha256: (*locality_records.get(PAX_CONTENT_SHA256)?).to_string(),
+        };
+        metadata.to_records().map(|_| metadata)
+    }
+
+    pub fn to_records(&self) -> Option<Vec<(&'static str, String)>> {
+        if self.source_connection_id.as_str().is_empty()
+            || self.projection_id.as_str().is_empty()
+            || self.file_kind == ProjectionFileKind::Directory
+            || validate_sha256("content_sha256", &self.content_sha256).is_err()
+        {
+            return None;
+        }
+        let records = vec![
+            (
+                PAX_SOURCE_CONNECTION_ID,
+                self.source_connection_id.as_str().to_string(),
+            ),
+            (PAX_PROJECTION_ID, self.projection_id.as_str().to_string()),
+            (
+                PAX_WINNING_SCOPE_ORDINAL,
+                self.winning_scope_ordinal.to_string(),
+            ),
+            (
+                PAX_FILE_KIND,
+                projection_file_kind_wire_label(&self.file_kind).to_string(),
+            ),
+            (
+                PAX_EFFECTIVE_ACTIONS,
+                canonical_effective_actions_pax_value(&self.effective_actions)?,
+            ),
+            (PAX_CONTENT_SHA256, self.content_sha256.clone()),
+        ];
+        let aggregate_bytes = records.iter().try_fold(0_usize, |total, (key, value)| {
+            (value.len() <= MAX_EXPORT_V2_PAX_VALUE_BYTES)
+                .then(|| total.checked_add(key.len())?.checked_add(value.len()))
+                .flatten()
+        })?;
+        (aggregate_bytes <= MAX_EXPORT_V2_FILE_PAX_BYTES).then_some(records)
+    }
+}
 
 pub const COMPONENT_VERSIONS: ComponentVersions = ComponentVersions {
     session: 1,
@@ -255,6 +358,7 @@ pub struct ReadyReplicaRevision {
 /// Export implementations receive this fixed value rather than raw selectors,
 /// user SQL, or client-provided authorization predicates.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorizedSessionQuery {
     pub versions: ComponentVersions,
     pub tenant_id: TenantId,
@@ -439,6 +543,7 @@ impl AuthorizedSourceScope {
 /// An authorized current-head query. Unlike [`AuthorizedSessionQuery`], this
 /// value names stable source scopes and deliberately does not pin revisions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScopeAuthorizedSessionQuery {
     pub versions: ComponentVersions,
     pub tenant_id: TenantId,
@@ -656,6 +761,7 @@ impl CanonicalExportRecord {
                 content_sha256,
                 ..
             } => {
+                validate_nonempty("projection_id", order_key.projection_id.as_str())?;
                 let expected_parent = logical_parent(&order_key.logical_path)?;
                 if order_key.parent_path != expected_parent {
                     return Err(ScopeContractError::InvalidParentPath);
@@ -676,6 +782,7 @@ pub fn validate_canonical_export_records(
 ) -> Result<(), ScopeContractError> {
     let mut control_count = 0_u64;
     let mut logical_paths = BTreeSet::new();
+    let mut projection_ids = BTreeSet::new();
     let mut directory_paths = BTreeSet::new();
     let mut previous_key = None;
     for record in records {
@@ -707,6 +814,9 @@ pub fn validate_canonical_export_records(
                 directory_paths.insert(order_key.logical_path.clone());
             }
             CanonicalExportRecord::File { order_key, .. } => {
+                if !projection_ids.insert(order_key.projection_id.clone()) {
+                    return Err(ScopeContractError::DuplicateValue("projection_id"));
+                }
                 if order_key.parent_path.as_ref().is_some_and(|parent| {
                     !parent.as_str().eq_ignore_ascii_case(".loc")
                         && !directory_paths.contains(parent)
@@ -804,6 +914,7 @@ pub struct DeliveredBodyDigestV2 {
     hasher: Sha256,
     expected_file_count: u64,
     delivered_file_count: u64,
+    remaining_file_bytes: Option<u64>,
 }
 
 impl DeliveredBodyDigestV2 {
@@ -815,17 +926,44 @@ impl DeliveredBodyDigestV2 {
             hasher,
             expected_file_count,
             delivered_file_count: 0,
+            remaining_file_bytes: None,
         }
     }
 
-    pub fn update_file(
+    pub fn begin_file(
         &mut self,
         projection_id: &ProjectionId,
-        body: &[u8],
+        byte_length: u64,
     ) -> Result<(), ScopeContractError> {
+        if self.remaining_file_bytes.is_some() {
+            return Err(ScopeContractError::InventoryDoesNotMatchOffer);
+        }
         validate_nonempty("projection_id", projection_id.as_str())?;
         update_digest_scalar(&mut self.hasher, projection_id.as_str().as_bytes())?;
-        update_digest_scalar(&mut self.hasher, body)?;
+        self.hasher.update(byte_length.to_be_bytes());
+        self.remaining_file_bytes = Some(byte_length);
+        Ok(())
+    }
+
+    pub fn update_file_chunk(&mut self, chunk: &[u8]) -> Result<(), ScopeContractError> {
+        let remaining = self
+            .remaining_file_bytes
+            .ok_or(ScopeContractError::InventoryDoesNotMatchOffer)?;
+        let chunk_length =
+            u64::try_from(chunk.len()).map_err(|_| ScopeContractError::InventoryTooLarge)?;
+        let next_remaining = remaining
+            .checked_sub(chunk_length)
+            .ok_or(ScopeContractError::InventoryDoesNotMatchOffer)?;
+        self.hasher.update(chunk);
+        self.remaining_file_bytes = Some(next_remaining);
+        Ok(())
+    }
+
+    pub fn end_file(&mut self) -> Result<(), ScopeContractError> {
+        if self.remaining_file_bytes != Some(0) {
+            return Err(ScopeContractError::InventoryDoesNotMatchOffer);
+        }
+        self.remaining_file_bytes = None;
         self.delivered_file_count = self
             .delivered_file_count
             .checked_add(1)
@@ -833,8 +971,22 @@ impl DeliveredBodyDigestV2 {
         Ok(())
     }
 
+    pub fn update_file(
+        &mut self,
+        projection_id: &ProjectionId,
+        body: &[u8],
+    ) -> Result<(), ScopeContractError> {
+        let byte_length =
+            u64::try_from(body.len()).map_err(|_| ScopeContractError::InventoryTooLarge)?;
+        self.begin_file(projection_id, byte_length)?;
+        self.update_file_chunk(body)?;
+        self.end_file()
+    }
+
     pub fn finish(self) -> Result<String, ScopeContractError> {
-        if self.delivered_file_count != self.expected_file_count {
+        if self.remaining_file_bytes.is_some()
+            || self.delivered_file_count != self.expected_file_count
+        {
             return Err(ScopeContractError::DeliveredBodyCountMismatch {
                 expected: self.expected_file_count,
                 actual: self.delivered_file_count,
@@ -1048,6 +1200,7 @@ pub struct SealedExportOffer {
     pub archive_entry_count: u64,
     pub selected_content_bytes: u64,
     pub inventory_sha256: String,
+    pub writable_metadata_sha256: String,
     pub sealed_at: String,
     pub expires_at: String,
 }
@@ -1074,6 +1227,7 @@ impl SealedExportOffer {
             self.selected_content_bytes,
         )?;
         validate_sha256("inventory_sha256", &self.inventory_sha256)?;
+        validate_sha256("writable_metadata_sha256", &self.writable_metadata_sha256)?;
         Ok(())
     }
 
@@ -1125,6 +1279,7 @@ pub struct ExportCompletionReceipt {
     pub export_attempt_id: ExportAttemptId,
     pub source_generations: Vec<OrderedSourceGeneration>,
     pub inventory_sha256: String,
+    pub writable_metadata_sha256: String,
     pub delivered_control_entry_count: u64,
     pub delivered_file_count: u64,
     pub delivered_directory_count: u64,
@@ -1132,6 +1287,185 @@ pub struct ExportCompletionReceipt {
     pub delivered_content_bytes: u64,
     pub delivered_body_sha256: String,
     pub completed_at: String,
+}
+
+/// Writable-state metadata carried by the final export-v2 control member.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeAuthorizedWritableExportMetadata {
+    pub versions: ComponentVersions,
+    pub session_id: SessionId,
+    pub export_attempt_id: ExportAttemptId,
+    pub source_generations: Vec<OrderedSourceGeneration>,
+    pub writable_entries: Vec<WritableMetadataEntry>,
+}
+
+impl ScopeAuthorizedWritableExportMetadata {
+    pub fn validate_against(&self, offer: &SealedExportOffer) -> Result<(), ScopeContractError> {
+        validate_writable_metadata_shape(self)?;
+        if self.session_id != offer.session_id
+            || self.export_attempt_id != offer.export_attempt_id
+            || self.source_generations != offer.source_generations
+            || canonical_writable_metadata_sha256(self)? != offer.writable_metadata_sha256
+        {
+            return Err(ScopeContractError::ReceiptDoesNotMatchOffer);
+        }
+        Ok(())
+    }
+}
+
+fn validate_writable_metadata_shape(
+    metadata: &ScopeAuthorizedWritableExportMetadata,
+) -> Result<(), ScopeContractError> {
+    validate_export_versions(&metadata.versions)?;
+    validate_nonempty("session_id", metadata.session_id.as_str())?;
+    validate_source_generations(&metadata.source_generations)?;
+    let mut previous_projection_id = None;
+    for entry in &metadata.writable_entries {
+        validate_nonempty("projection_id", entry.projection_id.as_str())?;
+        if previous_projection_id
+            .as_ref()
+            .is_some_and(|previous| previous >= &entry.projection_id)
+        {
+            return Err(ScopeContractError::NonCanonicalRecordOrder);
+        }
+        previous_projection_id = Some(entry.projection_id.clone());
+        if entry.source_remote_ids.is_empty() {
+            return Err(ScopeContractError::EmptyCollection("source_remote_ids"));
+        }
+        if entry
+            .source_remote_ids
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(ScopeContractError::DuplicateValue("source_remote_ids"));
+        }
+        if entry.effective_actions.is_empty() {
+            return Err(ScopeContractError::EmptyCollection("effective_actions"));
+        }
+        if !entry
+            .effective_actions
+            .iter()
+            .any(source_action_allows_mutation)
+        {
+            return Err(ScopeContractError::InvalidControlRecord);
+        }
+        validate_nonempty("provider_precondition", &entry.provider_precondition)?;
+        validate_sha256("delivered_content_sha256", &entry.delivered_content_sha256)?;
+    }
+    Ok(())
+}
+
+pub fn canonical_writable_metadata_sha256(
+    metadata: &ScopeAuthorizedWritableExportMetadata,
+) -> Result<String, ScopeContractError> {
+    validate_writable_metadata_shape(metadata)?;
+    let mut preimage = b"locality.export.writable-metadata.v2\0".to_vec();
+    append_u64(&mut preimage, u64::from(metadata.versions.session))?;
+    append_u64(&mut preimage, u64::from(metadata.versions.replica))?;
+    append_u64(&mut preimage, u64::from(metadata.versions.export_metadata))?;
+    append_u64(
+        &mut preimage,
+        u64::from(metadata.versions.writable_session_store),
+    )?;
+    append_u64(&mut preimage, u64::from(metadata.versions.canonical))?;
+    append_u64(&mut preimage, u64::from(metadata.versions.path))?;
+    append_u64(&mut preimage, u64::from(metadata.versions.changeset))?;
+    append_text(&mut preimage, metadata.session_id.as_str())?;
+    append_text(&mut preimage, metadata.export_attempt_id.as_str())?;
+    append_count(&mut preimage, metadata.source_generations.len())?;
+    for generation in &metadata.source_generations {
+        append_u64(&mut preimage, u64::from(generation.ordinal))?;
+        append_text(&mut preimage, generation.source_connection_id.as_str())?;
+        append_text(&mut preimage, generation.source_generation_id.as_str())?;
+    }
+    append_count(&mut preimage, metadata.writable_entries.len())?;
+    for entry in &metadata.writable_entries {
+        append_text(&mut preimage, entry.projection_id.as_str())?;
+        append_text(&mut preimage, entry.logical_path.as_str())?;
+        append_count(&mut preimage, entry.source_remote_ids.len())?;
+        for remote_id in &entry.source_remote_ids {
+            append_text(&mut preimage, remote_id.as_str())?;
+        }
+        append_text(&mut preimage, &entry.delivered_content_sha256)?;
+        append_text(&mut preimage, &entry.provider_precondition)?;
+        append_count(&mut preimage, entry.effective_actions.len())?;
+        for action in &entry.effective_actions {
+            append_text(&mut preimage, source_action_wire_label(action))?;
+        }
+        append_text(
+            &mut preimage,
+            if entry.baseline_required {
+                "true"
+            } else {
+                "false"
+            },
+        )?;
+    }
+    Ok(format!("sha256:{:x}", Sha256::digest(preimage)))
+}
+
+impl ExportTerminalControlV2 {
+    pub fn validate_against_inventory(
+        &self,
+        offer: &SealedExportOffer,
+        records: &[CanonicalExportRecord],
+    ) -> Result<(), ScopeContractError> {
+        self.validate_against(offer)?;
+        offer.validate_inventory(records)?;
+        let files = records
+            .iter()
+            .filter_map(|record| match record {
+                CanonicalExportRecord::File {
+                    order_key,
+                    effective_actions,
+                    content_sha256,
+                    ..
+                } => Some((
+                    &order_key.projection_id,
+                    (&order_key.logical_path, effective_actions, content_sha256),
+                )),
+                CanonicalExportRecord::Directory { .. } | CanonicalExportRecord::Control { .. } => {
+                    None
+                }
+            })
+            .collect::<BTreeMap<_, _>>();
+        for entry in &self.writable_metadata.writable_entries {
+            let Some((logical_path, effective_actions, content_sha256)) =
+                files.get(&entry.projection_id)
+            else {
+                return Err(ScopeContractError::InvalidControlRecord);
+            };
+            if *logical_path != &entry.logical_path
+                || *effective_actions != &entry.effective_actions
+                || *content_sha256 != &entry.delivered_content_sha256
+            {
+                return Err(ScopeContractError::InvalidControlRecord);
+            }
+        }
+        let mut projection_ids = BTreeSet::new();
+        for entry in &self.writable_metadata.writable_entries {
+            if !projection_ids.insert(entry.projection_id.clone()) {
+                return Err(ScopeContractError::DuplicateValue("projection_id"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Exact canonical JSON payload of the unique final `.loc/session.json`
+/// export-v2 control member. The member is consumed as transport metadata and
+/// is not materialized into the read-only tree.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportTerminalControlV2 {
+    pub writable_metadata: ScopeAuthorizedWritableExportMetadata,
+    pub completion_receipt: ExportCompletionReceipt,
+}
+
+impl ExportTerminalControlV2 {
+    pub fn validate_against(&self, offer: &SealedExportOffer) -> Result<(), ScopeContractError> {
+        self.writable_metadata.validate_against(offer)?;
+        self.completion_receipt.validate_against(offer)
+    }
 }
 
 impl ExportCompletionReceipt {
@@ -1147,6 +1481,7 @@ impl ExportCompletionReceipt {
             self.delivered_archive_entry_count,
         )?;
         validate_sha256("inventory_sha256", &self.inventory_sha256)?;
+        validate_sha256("writable_metadata_sha256", &self.writable_metadata_sha256)?;
         validate_sha256("delivered_body_sha256", &self.delivered_body_sha256)?;
         Ok(())
     }
@@ -1158,6 +1493,7 @@ impl ExportCompletionReceipt {
             || self.export_attempt_id != offer.export_attempt_id
             || self.source_generations != offer.source_generations
             || self.inventory_sha256 != offer.inventory_sha256
+            || self.writable_metadata_sha256 != offer.writable_metadata_sha256
             || self.delivered_control_entry_count != offer.control_entry_count
             || self.delivered_file_count != offer.file_count
             || self.delivered_directory_count != offer.directory_count
@@ -1705,6 +2041,13 @@ pub fn source_action_from_wire_label(value: &str) -> Option<SourceAction> {
     }
 }
 
+pub fn source_action_allows_mutation(action: &SourceAction) -> bool {
+    !matches!(
+        action,
+        SourceAction::Read | SourceAction::Search | SourceAction::DownloadAttachment
+    )
+}
+
 /// Encodes the effective actions carried by an export-v2 file PAX record.
 ///
 /// The wire value is a compact JSON array whose labels are sorted by their
@@ -1848,6 +2191,8 @@ pub const SEALED_EXPORT_OFFER_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/sealed-export-offer.json");
 pub const EXPORT_COMPLETION_RECEIPT_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/export-completion-receipt.json");
+pub const EXPORT_TERMINAL_CONTROL_V2_GOLDEN_JSON: &[u8] =
+    include_bytes!("../fixtures/export-terminal-control-v2.json");
 pub const CANONICAL_EXPORT_RECORDS_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/canonical-export-records.json");
 pub const CANONICAL_EXPORT_INVENTORY_GOLDEN_JSON: &[u8] =
