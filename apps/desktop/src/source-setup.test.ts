@@ -1,8 +1,18 @@
 import { describe, expect, it } from "vitest";
 import {
   connectedSourcesReadyToMount,
+  isSourceCatalogConnectorId,
   isSourceConnectorId,
+  plannedSourceConnectorDefinitions,
+  plannedSourceConnectorIds,
+  sourceCatalogConnectorDefinition,
+  sourceConnectorCatalogDefinitions,
   sourceConnectorIds,
+  sourceConnectorDefaultMountDirectory,
+  sourceConnectorDefaultMountId,
+  sourceConnectorDefinition,
+  sourceConnectorDefinitions,
+  sourceConnectorName,
   sourceRequiresApiKey,
   sourceSkipsManualMountStep,
   sourceMounted,
@@ -28,9 +38,16 @@ describe("source setup progress", () => {
   });
 
   it("includes connector catalog entries with their auth modes", () => {
-    expect(sourceConnectorIds()).toContain("linear");
-    expect(sourceConnectorIds()).toContain("slack");
-    expect(sourceConnectorIds()).toContain("google-calendar");
+    expect(sourceConnectorIds()).toEqual([
+      "notion",
+      "google-docs",
+      "google-calendar",
+      "gmail",
+      "granola",
+      "linear",
+      "slack",
+    ]);
+    expect(sourceConnectorDefinitions().map((connector) => connector.id)).toEqual(sourceConnectorIds());
     expect(sourceRequiresApiKey("linear")).toBe(true);
     expect(sourceRequiresApiKey("granola")).toBe(true);
     expect(sourceRequiresApiKey("slack")).toBe(false);
@@ -39,6 +56,47 @@ describe("source setup progress", () => {
     expect(sourceSkipsManualMountStep("linear")).toBe(true);
     expect(sourceSkipsManualMountStep("slack")).toBe(true);
     expect(sourceSkipsManualMountStep("google-calendar")).toBe(true);
+    expect(sourceConnectorName("google-docs")).toBe("Google Docs");
+    expect(sourceConnectorDefaultMountId("google-docs")).toBe("google-docs-main");
+    expect(sourceConnectorDefaultMountDirectory("google-docs")).toBe("google-docs-main");
+    expect(sourceConnectorDefinition("notion").availability).toBe("implemented");
+  });
+
+  it("keeps planned connector catalog entries separate from runtime setup", () => {
+    expect(plannedSourceConnectorIds()).toEqual([
+      "confluence",
+      "jira",
+      "sharepoint",
+      "onedrive",
+      "outlook-mail",
+      "outlook-calendar",
+      "microsoft-teams",
+      "github",
+      "gitlab",
+      "google-drive",
+      "dropbox",
+      "box",
+      "figma",
+      "asana",
+      "clickup",
+      "zendesk",
+      "intercom",
+      "hubspot",
+      "salesforce",
+      "fhir",
+    ]);
+    expect(sourceConnectorCatalogDefinitions()).toHaveLength(27);
+    expect(plannedSourceConnectorDefinitions()).toHaveLength(20);
+    expect(isSourceConnectorId("confluence")).toBe(false);
+    expect(isSourceCatalogConnectorId("confluence")).toBe(true);
+    expect(isSourceCatalogConnectorId("notion")).toBe(true);
+    expect(sourceCatalogConnectorDefinition("github").authModes).toEqual([
+      "oauth",
+      "github-app",
+      "personal-token",
+    ]);
+    expect(sourceCatalogConnectorDefinition("fhir").authModes).toEqual(["smart-oauth"]);
+    expect(sourceCatalogConnectorDefinition("confluence").availability).toBe("planned");
   });
 
   it("keeps connected but unmounted sources visible when another source is mounted", () => {

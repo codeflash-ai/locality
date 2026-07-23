@@ -2,8 +2,312 @@ import { classifyMountSetupError } from "./onboarding-errors";
 
 export type SourceSetupState = "idle" | "connecting" | "creating" | "changing" | "success" | "error";
 const SOURCE_CONNECTORS = ["notion", "google-docs", "google-calendar", "gmail", "granola", "linear", "slack"] as const;
+const PLANNED_SOURCE_CONNECTORS = [
+  "confluence",
+  "jira",
+  "sharepoint",
+  "onedrive",
+  "outlook-mail",
+  "outlook-calendar",
+  "microsoft-teams",
+  "github",
+  "gitlab",
+  "google-drive",
+  "dropbox",
+  "box",
+  "figma",
+  "asana",
+  "clickup",
+  "zendesk",
+  "intercom",
+  "hubspot",
+  "salesforce",
+  "fhir",
+] as const;
+
 export type SourceConnectorId = (typeof SOURCE_CONNECTORS)[number];
+export type PlannedSourceConnectorId = (typeof PLANNED_SOURCE_CONNECTORS)[number];
+export type SourceCatalogConnectorId = SourceConnectorId | PlannedSourceConnectorId;
 export type ApiKeySourceConnectorId = Extract<SourceConnectorId, "granola" | "linear">;
+export type SourceConnectorAvailability = "implemented" | "planned";
+export type SourceConnectorCategory = "knowledge" | "action" | "hybrid";
+export type SourceConnectorAuthMode = "oauth" | "api-key" | "api-token" | "personal-token" | "github-app" | "smart-oauth";
+
+export type SourceConnectorDefinition<Id extends SourceCatalogConnectorId = SourceCatalogConnectorId> = {
+  id: Id;
+  name: string;
+  description: string;
+  availability: SourceConnectorAvailability;
+  category: SourceConnectorCategory;
+  authModes: readonly SourceConnectorAuthMode[];
+  keywords: readonly string[];
+  defaultMountId?: string;
+  defaultMountDirectory?: string;
+};
+
+const SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<SourceConnectorId>[] = [
+  {
+    id: "notion",
+    name: "Notion",
+    description: "Pages and databases as folders with page.md files.",
+    availability: "implemented",
+    category: "knowledge",
+    authModes: ["oauth"],
+    keywords: ["notion", "wiki", "pages", "database", "docs"],
+    defaultMountId: "notion-main",
+    defaultMountDirectory: "notion",
+  },
+  {
+    id: "google-docs",
+    name: "Google Docs",
+    description: "Docs and Drive folders through the same local file workflow.",
+    availability: "implemented",
+    category: "knowledge",
+    authModes: ["oauth"],
+    keywords: ["google", "docs", "gdocs", "drive", "documents"],
+    defaultMountId: "google-docs-main",
+    defaultMountDirectory: "google-docs-main",
+  },
+  {
+    id: "google-calendar",
+    name: "Google Calendar",
+    description: "Primary calendar events as files, new events from reviewed drafts.",
+    availability: "implemented",
+    category: "action",
+    authModes: ["oauth"],
+    keywords: ["google", "calendar", "gcal", "events", "meet"],
+    defaultMountId: "google-calendar-main",
+    defaultMountDirectory: "google-calendar-main",
+  },
+  {
+    id: "gmail",
+    name: "Gmail",
+    description: "Inbox and sent as readable files, drafts as reviewed outbound mail.",
+    availability: "implemented",
+    category: "action",
+    authModes: ["oauth"],
+    keywords: ["gmail", "mail", "email", "inbox", "drafts"],
+    defaultMountId: "gmail-main",
+    defaultMountDirectory: "gmail-main",
+  },
+  {
+    id: "granola",
+    name: "Granola",
+    description: "Meeting summaries and raw transcripts as read-only files.",
+    availability: "implemented",
+    category: "knowledge",
+    authModes: ["api-key"],
+    keywords: ["granola", "meetings", "notes", "transcripts", "summaries"],
+    defaultMountId: "granola-main",
+    defaultMountDirectory: "granola",
+  },
+  {
+    id: "linear",
+    name: "Linear",
+    description: "Issues and teams as editable Markdown files.",
+    availability: "implemented",
+    category: "hybrid",
+    authModes: ["api-key"],
+    keywords: ["linear", "issues", "tickets", "projects", "teams"],
+    defaultMountId: "linear-main",
+    defaultMountDirectory: "linear",
+  },
+  {
+    id: "slack",
+    name: "Slack",
+    description: "Recent accessible conversations as read-only Markdown.",
+    availability: "implemented",
+    category: "knowledge",
+    authModes: ["oauth"],
+    keywords: ["slack", "channels", "private channels", "dms", "group dms", "users"],
+    defaultMountId: "slack-main",
+    defaultMountDirectory: "slack",
+  },
+];
+
+const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<PlannedSourceConnectorId>[] = [
+  {
+    id: "confluence",
+    name: "Confluence",
+    description: "Spaces, pages, and knowledge-base articles as local documents.",
+    availability: "planned",
+    category: "knowledge",
+    authModes: ["oauth", "api-token"],
+    keywords: ["atlassian", "confluence", "wiki", "spaces", "pages"],
+  },
+  {
+    id: "jira",
+    name: "Jira",
+    description: "Projects, issues, comments, and sprint context for planning workflows.",
+    availability: "planned",
+    category: "hybrid",
+    authModes: ["oauth", "api-token"],
+    keywords: ["atlassian", "jira", "issues", "sprints", "projects"],
+  },
+  {
+    id: "sharepoint",
+    name: "SharePoint",
+    description: "Team sites, libraries, pages, and enterprise documents.",
+    availability: "planned",
+    category: "knowledge",
+    authModes: ["oauth"],
+    keywords: ["microsoft", "sharepoint", "sites", "libraries", "documents"],
+  },
+  {
+    id: "onedrive",
+    name: "OneDrive",
+    description: "User and team files projected into agent-friendly folders.",
+    availability: "planned",
+    category: "knowledge",
+    authModes: ["oauth"],
+    keywords: ["microsoft", "onedrive", "files", "drive", "documents"],
+  },
+  {
+    id: "outlook-mail",
+    name: "Outlook Mail",
+    description: "Mailbox context with reviewed draft creation for outbound updates.",
+    availability: "planned",
+    category: "action",
+    authModes: ["oauth"],
+    keywords: ["microsoft", "outlook", "mail", "email", "drafts"],
+  },
+  {
+    id: "outlook-calendar",
+    name: "Outlook Calendar",
+    description: "Calendar events and scheduling drafts for Microsoft 365 teams.",
+    availability: "planned",
+    category: "action",
+    authModes: ["oauth"],
+    keywords: ["microsoft", "outlook", "calendar", "events", "meetings"],
+  },
+  {
+    id: "microsoft-teams",
+    name: "Microsoft Teams",
+    description: "Channels, chats, meetings, and team knowledge for enterprise collaboration.",
+    availability: "planned",
+    category: "knowledge",
+    authModes: ["oauth"],
+    keywords: ["microsoft", "teams", "channels", "chats", "meetings"],
+  },
+  {
+    id: "github",
+    name: "GitHub",
+    description: "Repositories, pull requests, issues, discussions, and review activity.",
+    availability: "planned",
+    category: "hybrid",
+    authModes: ["oauth", "github-app", "personal-token"],
+    keywords: ["github", "git", "repos", "pull requests", "issues"],
+  },
+  {
+    id: "gitlab",
+    name: "GitLab",
+    description: "Projects, merge requests, issues, pipelines, and release context.",
+    availability: "planned",
+    category: "hybrid",
+    authModes: ["oauth", "personal-token"],
+    keywords: ["gitlab", "git", "repos", "merge requests", "pipelines"],
+  },
+  {
+    id: "google-drive",
+    name: "Google Drive",
+    description: "Drive files, shared folders, PDFs, sheets, and presentations.",
+    availability: "planned",
+    category: "knowledge",
+    authModes: ["oauth"],
+    keywords: ["google", "drive", "files", "shared drives", "docs"],
+  },
+  {
+    id: "dropbox",
+    name: "Dropbox",
+    description: "Shared team files and folder hierarchies for document workflows.",
+    availability: "planned",
+    category: "knowledge",
+    authModes: ["oauth"],
+    keywords: ["dropbox", "files", "folders", "documents", "team"],
+  },
+  {
+    id: "box",
+    name: "Box",
+    description: "Enterprise file libraries with permission-aware local projection.",
+    availability: "planned",
+    category: "knowledge",
+    authModes: ["oauth"],
+    keywords: ["box", "files", "folders", "enterprise", "documents"],
+  },
+  {
+    id: "figma",
+    name: "Figma",
+    description: "Design files, comments, components, and product design context.",
+    availability: "planned",
+    category: "knowledge",
+    authModes: ["oauth", "personal-token"],
+    keywords: ["figma", "design", "comments", "components", "files"],
+  },
+  {
+    id: "asana",
+    name: "Asana",
+    description: "Projects, tasks, comments, and status updates for team workflows.",
+    availability: "planned",
+    category: "hybrid",
+    authModes: ["oauth", "personal-token"],
+    keywords: ["asana", "tasks", "projects", "status", "workflows"],
+  },
+  {
+    id: "clickup",
+    name: "ClickUp",
+    description: "Spaces, lists, tasks, docs, and comments for operating teams.",
+    availability: "planned",
+    category: "hybrid",
+    authModes: ["oauth", "api-token"],
+    keywords: ["clickup", "tasks", "docs", "lists", "spaces"],
+  },
+  {
+    id: "zendesk",
+    name: "Zendesk",
+    description: "Tickets, help-center articles, macros, and support context.",
+    availability: "planned",
+    category: "hybrid",
+    authModes: ["oauth", "api-token"],
+    keywords: ["zendesk", "support", "tickets", "help center", "macros"],
+  },
+  {
+    id: "intercom",
+    name: "Intercom",
+    description: "Conversations, help articles, contacts, and support workflows.",
+    availability: "planned",
+    category: "hybrid",
+    authModes: ["oauth"],
+    keywords: ["intercom", "support", "conversations", "help center", "contacts"],
+  },
+  {
+    id: "hubspot",
+    name: "HubSpot",
+    description: "CRM records, notes, tasks, emails, deals, and customer context.",
+    availability: "planned",
+    category: "hybrid",
+    authModes: ["oauth", "api-token"],
+    keywords: ["hubspot", "crm", "contacts", "deals", "tasks"],
+  },
+  {
+    id: "salesforce",
+    name: "Salesforce",
+    description: "Accounts, opportunities, cases, notes, tasks, and CRM knowledge.",
+    availability: "planned",
+    category: "hybrid",
+    authModes: ["oauth"],
+    keywords: ["salesforce", "crm", "accounts", "opportunities", "cases"],
+  },
+  {
+    id: "fhir",
+    name: "FHIR",
+    description: "Healthcare records through SMART on FHIR profiles and scoped access.",
+    availability: "planned",
+    category: "knowledge",
+    authModes: ["smart-oauth"],
+    keywords: ["fhir", "smart", "healthcare", "clinical", "ehr"],
+  },
+];
+
 export type SourceMountRetryOutcome =
   | { kind: "retry" }
   | { kind: "success" | "error"; message: string };
@@ -29,8 +333,62 @@ export function sourceConnectorIds(): SourceConnectorId[] {
   return [...SOURCE_CONNECTORS];
 }
 
+export function plannedSourceConnectorIds(): PlannedSourceConnectorId[] {
+  return [...PLANNED_SOURCE_CONNECTORS];
+}
+
+export function sourceConnectorDefinitions(): SourceConnectorDefinition<SourceConnectorId>[] {
+  return SOURCE_CONNECTOR_DEFINITIONS.map((definition) => ({ ...definition }));
+}
+
+export function plannedSourceConnectorDefinitions(): SourceConnectorDefinition<PlannedSourceConnectorId>[] {
+  return PLANNED_SOURCE_CONNECTOR_DEFINITIONS.map((definition) => ({ ...definition }));
+}
+
+export function sourceConnectorCatalogDefinitions(): SourceConnectorDefinition[] {
+  return [
+    ...sourceConnectorDefinitions(),
+    ...plannedSourceConnectorDefinitions(),
+  ];
+}
+
+export function sourceConnectorCatalogIds(): SourceCatalogConnectorId[] {
+  return [
+    ...SOURCE_CONNECTORS,
+    ...PLANNED_SOURCE_CONNECTORS,
+  ];
+}
+
+export function sourceConnectorDefinition(connector: SourceConnectorId): SourceConnectorDefinition<SourceConnectorId> {
+  const definition = SOURCE_CONNECTOR_DEFINITIONS.find((candidate) => candidate.id === connector);
+  if (!definition) {
+    throw new Error(`Unknown source connector: ${connector}`);
+  }
+  return { ...definition };
+}
+
+export function sourceCatalogConnectorDefinition(connector: SourceCatalogConnectorId): SourceConnectorDefinition {
+  const definition = sourceConnectorCatalogDefinitions().find((candidate) => candidate.id === connector);
+  if (!definition) {
+    throw new Error(`Unknown source connector: ${connector}`);
+  }
+  return definition;
+}
+
+export function sourceConnectorName(connector: SourceConnectorId): string {
+  return sourceConnectorDefinition(connector).name;
+}
+
+export function sourceConnectorDefaultMountId(connector: SourceConnectorId): string {
+  return sourceConnectorDefinition(connector).defaultMountId ?? `${connector}-main`;
+}
+
+export function sourceConnectorDefaultMountDirectory(connector: SourceConnectorId): string {
+  return sourceConnectorDefinition(connector).defaultMountDirectory ?? sourceConnectorDefaultMountId(connector);
+}
+
 export function sourceRequiresApiKey(connector: SourceConnectorId): connector is ApiKeySourceConnectorId {
-  return connector === "granola" || connector === "linear";
+  return sourceConnectorDefinition(connector).authModes.includes("api-key");
 }
 
 export function sourceSkipsManualMountStep(connector: SourceConnectorId): boolean {
@@ -79,6 +437,10 @@ export function sourceSetupProgressLabel(state: SourceSetupState, mounted: boole
 
 export function isSourceConnectorId(value: string): value is SourceConnectorId {
   return SOURCE_CONNECTORS.includes(value as SourceConnectorId);
+}
+
+export function isSourceCatalogConnectorId(value: string): value is SourceCatalogConnectorId {
+  return sourceConnectorCatalogIds().includes(value as SourceCatalogConnectorId);
 }
 
 export function sourceConnectionReady(
