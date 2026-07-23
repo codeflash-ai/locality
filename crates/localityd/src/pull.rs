@@ -538,6 +538,9 @@ where
         skipped_dirty: 0,
         conflicts: Vec::new(),
     };
+    if !should_repair_missing_media_for_mount(mount) {
+        return Ok(report);
+    }
 
     for entry in entries {
         let Some(entity) = store
@@ -567,6 +570,10 @@ where
     }
 
     Ok(report)
+}
+
+fn should_repair_missing_media_for_mount(mount: &MountConfig) -> bool {
+    mount.connector == "notion"
 }
 
 fn should_hydrate_mount_root_entry(mount: &MountConfig, entry: &TreeEntry) -> bool {
@@ -800,17 +807,18 @@ where
         + locality_store::RemoteObservationRepository,
     Source: SourceAdapter,
 {
-    if !mount.projection.uses_virtual_filesystem() {
-        return Ok(None);
-    }
-
     let Some(target) = virtual_directory_target(store, mount, relative_path)? else {
         return Ok(None);
     };
 
+    let plain_files_directory_pull = !mount.projection.uses_virtual_filesystem();
     let mut enumerated = 0;
+    let mut stubbed = 0;
     let mut row_ids = Vec::new();
-    let mut page_ids = Vec::new();
+    let mut recursive_page_ids = Vec::new();
+    let mut directory_page_ids = Vec::new();
+    let mut directory_ids = Vec::new();
+    let mut directory_move_conflicts = Vec::new();
     let is_database_directory = target.schema_database_id.is_some();
     let recursive_page_hydration =
         matches!(target.container, Some(ChildContainer::PageChildren(_)));
@@ -844,6 +852,12 @@ where
             .map_err(PullError::Store)?;
         }
         enumerated = result.entries.len();
+        let remote_move_plan = if plain_files_directory_pull {
+            remote_move_plan(store, mount, &result.entries, state_root)?
+        } else {
+            RemoteMovePlan::default()
+        };
+        directory_move_conflicts.extend(remote_move_plan.conflicts.clone());
         let should_hydrate_rows = is_database_directory
             && state_root.is_some()
             && should_hydrate_database_directory_rows(
@@ -851,25 +865,58 @@ where
                 DATABASE_DIRECTORY_ROW_HYDRATION_LIMIT,
             );
         for entry in result.entries {
-            let row_id = entry.remote_id.clone();
-            let is_row = entry.kind == EntityKind::Page;
+            let child_id = entry.remote_id.clone();
+            let child_kind = entry.kind.clone();
+            let is_page = child_kind == EntityKind::Page;
             let existing = store
                 .get_entity(&entry.mount_id, &entry.remote_id)
                 .map_err(PullError::Store)?;
-            let record = virtual_child_entity_record(entry, existing.as_ref());
+            let preserve_existing_path = remote_move_plan.should_preserve(&child_id);
+            let record = if plain_files_directory_pull {
+                merged_entity_record(&entry, existing.as_ref(), preserve_existing_path)
+            } else {
+                virtual_child_entity_record(entry.clone(), existing.as_ref())
+            };
+            let projected_entry = TreeEntry {
+                path: record.path.clone(),
+                hydration: record.hydration.clone(),
+                content_hash: record.content_hash.clone(),
+                remote_edited_at: record.remote_edited_at.clone(),
+                ..entry
+            };
             store.save_entity(record).map_err(PullError::Store)?;
-            if should_hydrate_rows && is_row {
-                row_ids.push(row_id.clone());
+            if plain_files_directory_pull {
+                rename_projection_if_needed(mount, existing.as_ref(), &projected_entry)?;
             }
-            if recursive_page_hydration && is_row {
-                page_ids.push(row_id);
+            if plain_files_directory_pull
+                && write_stub_if_needed(source, mount, &projected_entry, state_root)?
+            {
+                stubbed += 1;
+            }
+            if should_hydrate_rows && is_page && !preserve_existing_path {
+                row_ids.push(child_id.clone());
+            }
+            if recursive_page_hydration && is_page && !preserve_existing_path {
+                recursive_page_ids.push(child_id.clone());
+            } else if plain_files_directory_pull
+                && !is_database_directory
+                && is_page
+                && !preserve_existing_path
+            {
+                directory_page_ids.push(child_id.clone());
+            }
+            if plain_files_directory_pull
+                && child_kind == EntityKind::Directory
+                && !preserve_existing_path
+            {
+                directory_ids.push(child_id);
             }
         }
     }
 
     let mut hydrated = 0;
-    let mut skipped_dirty = 0;
-    let mut conflicts = Vec::new();
+    let mut skipped_dirty = directory_move_conflicts.len();
+    let mut conflicts = directory_move_conflicts;
     if let Some(database_id) = target.schema_database_id
         && let Some(state_root) = state_root
         && let Some(schema) = crate::trace::result("connector.database_schema_yaml", |span| {
@@ -909,14 +956,63 @@ where
         }
     }
 
+    if plain_files_directory_pull && !directory_ids.is_empty() {
+        let mut visited = BTreeSet::new();
+        let directory_report = collect_connector_directory_descendants(
+            store,
+            source,
+            mount,
+            directory_ids,
+            state_root,
+            &mut visited,
+        )?;
+        enumerated += directory_report.enumerated;
+        stubbed += directory_report.stubbed;
+        skipped_dirty += directory_report.conflicts.len();
+        conflicts.extend(directory_report.conflicts);
+        directory_page_ids.extend(directory_report.page_ids);
+    }
+
     if recursive_page_hydration {
         let mut visited = BTreeSet::new();
-        let recursive_report =
-            hydrate_page_descendants(store, source, mount, page_ids, state_root, &mut visited)?;
+        let recursive_report = hydrate_page_descendants(
+            store,
+            source,
+            mount,
+            recursive_page_ids,
+            state_root,
+            &mut visited,
+        )?;
         enumerated += recursive_report.enumerated;
         hydrated += recursive_report.hydrated;
         skipped_dirty += recursive_report.skipped_dirty;
         conflicts.extend(recursive_report.conflicts);
+    }
+
+    if plain_files_directory_pull {
+        for page_id in directory_page_ids {
+            let Some(page) = store
+                .get_entity(&mount.mount_id, &page_id)
+                .map_err(PullError::Store)?
+            else {
+                continue;
+            };
+            if page.kind != EntityKind::Page {
+                continue;
+            }
+            if !should_hydrate_plain_directory_page(mount, state_root, &page)? {
+                continue;
+            }
+            match hydrate_entity(store, source, mount, page, state_root)? {
+                HydrationOutcome::Hydrated | HydrationOutcome::MergedDirty => hydrated += 1,
+                HydrationOutcome::RemoteDeleted => {}
+                HydrationOutcome::SkippedDirty => skipped_dirty += 1,
+                HydrationOutcome::Conflicted(conflict) => {
+                    skipped_dirty += 1;
+                    conflicts.push(conflict);
+                }
+            }
+        }
     }
 
     Ok(Some(PullReport {
@@ -927,7 +1023,7 @@ where
         root: mount.root.display().to_string(),
         target: target_path.display().to_string(),
         enumerated,
-        stubbed: 0,
+        stubbed,
         hydrated,
         skipped_dirty,
         conflicts,
@@ -936,6 +1032,140 @@ where
 
 fn should_hydrate_database_directory_rows(row_count: usize, limit: isize) -> bool {
     limit >= 0 && row_count <= limit as usize
+}
+
+fn should_hydrate_plain_directory_page(
+    mount: &MountConfig,
+    state_root: Option<&Path>,
+    entity: &EntityRecord,
+) -> Result<bool, PullError> {
+    if entity.hydration != HydrationState::Hydrated {
+        return Ok(true);
+    }
+
+    let path = projection_content_path(state_root, mount, &entity.path)?;
+    if !path.exists() {
+        return Ok(true);
+    }
+
+    is_stub_file(&path)
+}
+
+#[derive(Debug, Default)]
+struct ConnectorDirectoryTraversalReport {
+    enumerated: usize,
+    stubbed: usize,
+    conflicts: Vec<PullConflict>,
+    page_ids: Vec<RemoteId>,
+}
+
+fn collect_connector_directory_descendants<S, Source>(
+    store: &mut S,
+    source: &Source,
+    mount: &MountConfig,
+    directory_ids: Vec<RemoteId>,
+    state_root: Option<&Path>,
+    visited: &mut BTreeSet<RemoteId>,
+) -> Result<ConnectorDirectoryTraversalReport, PullError>
+where
+    S: EntityRepository + ShadowRepository,
+    Source: SourceAdapter,
+{
+    let mut report = ConnectorDirectoryTraversalReport::default();
+
+    for directory_id in directory_ids {
+        if !visited.insert(directory_id.clone()) {
+            continue;
+        }
+        let Some(directory) = store
+            .get_entity(&mount.mount_id, &directory_id)
+            .map_err(PullError::Store)?
+        else {
+            continue;
+        };
+        if directory.kind != EntityKind::Directory {
+            continue;
+        }
+
+        let result = crate::trace::result("connector.list_children", |span| {
+            span.attr("mount_id", mount.mount_id.0.as_str());
+            span.attr("connector", mount.connector.as_str());
+            span.attr("reason", "pull_connector_directory_descendants");
+            span.attr("container", "directory_children");
+            span.attr("remote_id", directory.remote_id.0.as_str());
+            span.attr("parent_path", directory.path.display().to_string());
+            source
+                .list_children(ListChildrenRequest {
+                    mount_id: mount.mount_id.clone(),
+                    container: ChildContainer::DirectoryChildren(directory.remote_id.clone()),
+                    parent_path: directory.path.clone(),
+                })
+                .map_err(PullError::Connector)
+        })?;
+        if result.is_complete() {
+            let returned_remote_ids = result
+                .entries
+                .iter()
+                .map(|entry| entry.remote_id.clone())
+                .collect::<BTreeSet<_>>();
+            crate::virtual_fs::prune_stale_virtual_children(
+                store,
+                &mount.mount_id,
+                &directory.path,
+                &returned_remote_ids,
+            )
+            .map_err(PullError::Store)?;
+        }
+        report.enumerated += result.entries.len();
+        let remote_move_plan = remote_move_plan(store, mount, &result.entries, state_root)?;
+        report.conflicts.extend(remote_move_plan.conflicts.clone());
+
+        let mut child_directory_ids = Vec::new();
+        for entry in result.entries {
+            let child_id = entry.remote_id.clone();
+            let child_kind = entry.kind.clone();
+            let existing = store
+                .get_entity(&entry.mount_id, &entry.remote_id)
+                .map_err(PullError::Store)?;
+            let preserve_existing_path = remote_move_plan.should_preserve(&child_id);
+            let record = merged_entity_record(&entry, existing.as_ref(), preserve_existing_path);
+            let projected_entry = TreeEntry {
+                path: record.path.clone(),
+                hydration: record.hydration.clone(),
+                content_hash: record.content_hash.clone(),
+                remote_edited_at: record.remote_edited_at.clone(),
+                ..entry
+            };
+            store.save_entity(record).map_err(PullError::Store)?;
+            rename_projection_if_needed(mount, existing.as_ref(), &projected_entry)?;
+            if write_stub_if_needed(source, mount, &projected_entry, state_root)? {
+                report.stubbed += 1;
+            }
+            match child_kind {
+                EntityKind::Page if !preserve_existing_path => report.page_ids.push(child_id),
+                EntityKind::Directory if !preserve_existing_path => {
+                    child_directory_ids.push(child_id)
+                }
+                EntityKind::Database | EntityKind::Asset | EntityKind::Unknown(_) => {}
+                EntityKind::Page | EntityKind::Directory => {}
+            }
+        }
+
+        let child_report = collect_connector_directory_descendants(
+            store,
+            source,
+            mount,
+            child_directory_ids,
+            state_root,
+            visited,
+        )?;
+        report.enumerated += child_report.enumerated;
+        report.stubbed += child_report.stubbed;
+        report.conflicts.extend(child_report.conflicts);
+        report.page_ids.extend(child_report.page_ids);
+    }
+
+    Ok(report)
 }
 
 #[derive(Debug, Default)]
@@ -1378,7 +1608,7 @@ where
     match entry.kind {
         EntityKind::Page => {
             let path = mount.root.join(&entry.path);
-            if path.exists() && !is_stub_file(&path)? {
+            if path.exists() {
                 return Ok(false);
             }
             write_atomic(&path, stub_markdown(entry)?)?;
@@ -1848,19 +2078,12 @@ fn write_assets(root: &Path, assets: &[HydratedAsset]) -> Result<(), PullError> 
 }
 
 fn should_pull_mount_root(
-    mount: &MountConfig,
+    _mount: &MountConfig,
     relative_path: &Path,
-    target_path: &Path,
-    page_directory_target: bool,
+    _target_path: &Path,
+    _page_directory_target: bool,
 ) -> bool {
-    if relative_path.as_os_str().is_empty() {
-        return true;
-    }
-    if mount.projection.uses_virtual_filesystem() || page_directory_target {
-        return false;
-    }
-
-    target_path.is_dir()
+    relative_path.as_os_str().is_empty()
 }
 
 fn should_pull_workspace_virtual_mount_root(mount: &MountConfig, relative_path: &Path) -> bool {
@@ -2462,6 +2685,7 @@ mod update_required_error_code_tests {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use locality_connector::{
@@ -2593,6 +2817,76 @@ mod tests {
         assert!(!super::should_hydrate_database_directory_rows(1, -1));
         assert!(super::should_hydrate_database_directory_rows(5, 5));
         assert!(!super::should_hydrate_database_directory_rows(6, 5));
+    }
+
+    #[test]
+    fn write_stub_if_needed_does_not_rewrite_matching_stub() {
+        let fixture = PullFixture::new();
+        let source = FakePullSource::new(Vec::new(), Vec::new());
+        let entry = tree_entry(
+            &fixture.mount_id,
+            &fixture.remote_id,
+            "Roadmap",
+            "Roadmap.md",
+            HydrationState::Stub,
+        );
+        let expected = super::stub_markdown(&entry).expect("stub markdown");
+        write_atomic(&fixture.page_path, expected.clone()).expect("write existing stub");
+
+        let stubbed = super::write_stub_if_needed(&source, &fixture.mount, &entry, None)
+            .expect("write stub if needed");
+
+        assert!(!stubbed);
+        assert_eq!(
+            std::fs::read_to_string(&fixture.page_path).expect("read stub"),
+            expected
+        );
+    }
+
+    #[test]
+    fn mount_root_pull_skips_missing_media_repair_for_slack() {
+        let fixture = PullFixture::new();
+        let mut store = InMemoryStateStore::new();
+        let recent_id = RemoteId::new("slack-recent:C123");
+        let recent_path = PathBuf::from("channels/general-C123/recent.md");
+        let mount = MountConfig::new(fixture.mount_id.clone(), "slack", fixture.root.clone());
+        store.save_mount(mount.clone()).expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    fixture.mount_id.clone(),
+                    recent_id.clone(),
+                    EntityKind::Page,
+                    "general recent messages",
+                    recent_path.clone(),
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save hydrated recent");
+        let absolute_recent_path = fixture.root.join(&recent_path);
+        std::fs::create_dir_all(absolute_recent_path.parent().expect("recent parent"))
+            .expect("create recent parent");
+        write_atomic(
+            &absolute_recent_path,
+            "# general\n\n![missing](../../.loc/media/general/image.png)\n".to_string(),
+        )
+        .expect("write recent");
+        let source = FakePullSource::new(
+            vec![tree_entry(
+                &fixture.mount_id,
+                &recent_id,
+                "general recent messages",
+                "channels/general-C123/recent.md",
+                HydrationState::Stub,
+            )],
+            Vec::new(),
+        );
+
+        let report =
+            super::pull_mount_root(&mut store, &source, &mount, fixture.root.clone(), None)
+                .expect("pull slack root");
+
+        assert_eq!(report.hydrated, 0);
     }
 
     #[test]
@@ -2893,6 +3187,145 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pull_plain_directory_moves_existing_projected_child_path() {
+        let fixture = PullFixture::new();
+        let mut store = InMemoryStateStore::new();
+        let mount = MountConfig::new(fixture.mount_id.clone(), "slack", fixture.root.clone())
+            .read_only(true);
+        store.save_mount(mount.clone()).expect("save mount");
+        let channels_id = RemoteId::new("slack-folder:channels");
+        let channel_id = RemoteId::new("slack-conversation:C123");
+        store
+            .save_entity(EntityRecord::new(
+                fixture.mount_id.clone(),
+                channels_id.clone(),
+                EntityKind::Directory,
+                "channels",
+                "channels",
+            ))
+            .expect("save channels");
+        store
+            .save_entity(EntityRecord::new(
+                fixture.mount_id.clone(),
+                channel_id.clone(),
+                EntityKind::Directory,
+                "locality-old",
+                "channels/locality-old-C123",
+            ))
+            .expect("save old channel directory");
+        let old_channel_path = fixture.root.join("channels/locality-old-C123");
+        let new_channel_path = fixture.root.join("channels/locality-C123");
+        std::fs::create_dir_all(&old_channel_path).expect("create old channel projection");
+        std::fs::write(old_channel_path.join("recent.md"), "existing recent")
+            .expect("write existing child file");
+        let mut moved_channel = tree_entry(
+            &fixture.mount_id,
+            &channel_id,
+            "locality",
+            "channels/locality-C123",
+            HydrationState::Stub,
+        );
+        moved_channel.kind = EntityKind::Directory;
+        let source = FakePullSource::new(Vec::new(), Vec::new())
+            .with_children(&channels_id, vec![moved_channel]);
+
+        let report = super::pull_virtual_directory_path(
+            &mut store,
+            &source,
+            &mount,
+            Path::new("channels"),
+            fixture.root.join("channels"),
+            None,
+        )
+        .expect("pull channels directory")
+        .expect("directory pull report");
+
+        assert!(report.ok);
+        assert_eq!(report.enumerated, 1);
+        assert!(!old_channel_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(new_channel_path.join("recent.md")).expect("moved child file"),
+            "existing recent"
+        );
+        let moved = store
+            .get_entity(&fixture.mount_id, &channel_id)
+            .expect("channel lookup")
+            .expect("channel entity");
+        assert_eq!(moved.path, PathBuf::from("channels/locality-C123"));
+    }
+
+    #[test]
+    fn pull_plain_directory_skips_already_hydrated_child_projection() {
+        let fixture = PullFixture::new();
+        let mut store = InMemoryStateStore::new();
+        let mount = MountConfig::new(fixture.mount_id.clone(), "slack", fixture.root.clone())
+            .read_only(true);
+        store.save_mount(mount.clone()).expect("save mount");
+        let channels_id = RemoteId::new("slack-folder:channels");
+        let recent_id = RemoteId::new("slack-recent:C123");
+        let recent_path = PathBuf::from("channels/general-C123/recent.md");
+        store
+            .save_entity(EntityRecord::new(
+                fixture.mount_id.clone(),
+                channels_id.clone(),
+                EntityKind::Directory,
+                "channels",
+                "channels",
+            ))
+            .expect("save channels");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    fixture.mount_id.clone(),
+                    recent_id.clone(),
+                    EntityKind::Page,
+                    "general recent messages",
+                    recent_path.clone(),
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save hydrated recent");
+        let absolute_recent_path = fixture.root.join(&recent_path);
+        std::fs::create_dir_all(absolute_recent_path.parent().expect("recent parent"))
+            .expect("create recent parent");
+        write_atomic(&absolute_recent_path, "existing recent\n".to_string())
+            .expect("write existing recent");
+        let fetch_count = Arc::new(AtomicU64::new(0));
+        let source = FakePullSource::new(Vec::new(), Vec::new())
+            .with_fetch_count(fetch_count.clone())
+            .with_children(
+                &channels_id,
+                vec![tree_entry(
+                    &fixture.mount_id,
+                    &recent_id,
+                    "general recent messages",
+                    "channels/general-C123/recent.md",
+                    HydrationState::Stub,
+                )],
+            );
+
+        let report = super::pull_virtual_directory_path(
+            &mut store,
+            &source,
+            &mount,
+            Path::new("channels"),
+            fixture.root.join("channels"),
+            None,
+        )
+        .expect("pull channels directory")
+        .expect("directory pull report");
+
+        assert!(report.ok);
+        assert_eq!(report.enumerated, 1);
+        assert_eq!(report.hydrated, 0);
+        assert_eq!(fetch_count.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            std::fs::read_to_string(&absolute_recent_path).expect("read existing recent"),
+            "existing recent\n"
+        );
+    }
+
     struct PullFixture {
         mount: MountConfig,
         mount_id: MountId,
@@ -2998,6 +3431,7 @@ mod tests {
         children: BTreeMap<RemoteId, Vec<locality_core::model::TreeEntry>>,
         rendered: BTreeMap<RemoteId, HydratedEntity>,
         schemas: BTreeMap<RemoteId, String>,
+        fetch_count: Arc<AtomicU64>,
     }
 
     impl FakePullSource {
@@ -3013,7 +3447,13 @@ mod tests {
                     .map(|entity| (entity.shadow.entity_id.clone(), entity))
                     .collect(),
                 schemas: BTreeMap::new(),
+                fetch_count: Arc::new(AtomicU64::new(0)),
             }
+        }
+
+        fn with_fetch_count(mut self, fetch_count: Arc<AtomicU64>) -> Self {
+            self.fetch_count = fetch_count;
+            self
         }
 
         fn with_schema(mut self, database_id: &RemoteId, schema: &str) -> Self {
@@ -3102,6 +3542,7 @@ mod tests {
     impl HydrationSource for FakePullSource {
         fn fetch_render(&self, request: &HydrationRequest) -> LocalityResult<HydratedEntity> {
             assert_eq!(request.reason, HydrationReason::ExplicitPull);
+            self.fetch_count.fetch_add(1, Ordering::Relaxed);
             self.rendered
                 .get(&request.remote_id)
                 .cloned()

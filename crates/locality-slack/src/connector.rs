@@ -288,10 +288,17 @@ impl Connector for SlackConnector {
         };
         let mut entries = root_entries(&request.mount_id, Path::new(""), users_version);
 
-        entries.extend(conversations.iter().map(|conversation| {
+        for conversation in &conversations {
             let parent_path = Path::new(conversation_type(conversation).root_folder());
-            conversation_entry(&request.mount_id, parent_path, conversation, &users)
-        }));
+            let conversation_entry =
+                conversation_entry(&request.mount_id, parent_path, conversation, &users);
+            entries.push(conversation_entry.clone());
+            entries.push(recent_entry(
+                &request.mount_id,
+                &conversation_entry.path,
+                &conversation.id,
+            ));
+        }
         Ok(entries)
     }
 
@@ -803,7 +810,8 @@ mod tests {
     };
     use crate::render::SlackNativeBundle;
     use locality_connector::{
-        ChildContainer, Connector, FetchRequest, ListChildrenRequest, ObserveRequest,
+        ChildContainer, Connector, EnumerateRequest, FetchRequest, ListChildrenRequest,
+        ObserveRequest,
     };
     use locality_core::model::{CanonicalDocument, EntityKind, MountId, RemoteId};
     use locality_core::{LocalityError, LocalityResult};
@@ -842,6 +850,33 @@ mod tests {
                 && entry.content_hash.is_none()
         }));
         assert_eq!(result.entries[4].kind, EntityKind::Page);
+    }
+
+    #[test]
+    fn enumerate_includes_recent_markdown_for_conversations() {
+        let connector = connector_with_api(FakeSlackApi::default().with_conversations(vec![
+            SlackConversation {
+                id: "C123".to_string(),
+                name: Some("general".to_string()),
+                is_channel: true,
+                is_member: Some(true),
+                ..Default::default()
+            },
+        ]));
+
+        let entries = connector
+            .enumerate(EnumerateRequest {
+                mount_id: MountId::new("slack-main"),
+                cursor: None,
+            })
+            .expect("enumerate Slack tree");
+
+        let paths = entries
+            .iter()
+            .map(|entry| entry.path.display().to_string())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"channels/general-C123".to_string()));
+        assert!(paths.contains(&"channels/general-C123/recent.md".to_string()));
     }
 
     #[test]

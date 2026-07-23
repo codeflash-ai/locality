@@ -129,6 +129,7 @@ const EXIT_USAGE: i32 = 2;
 const EXIT_VALIDATION: i32 = 3;
 const DEFAULT_DAEMON_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_DAEMON_MUTATING_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_DAEMON_PULL_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const MIN_SLACK_HISTORY_LIMIT: u32 = 1;
 const MAX_SLACK_HISTORY_LIMIT: u32 = 15;
 const SLACK_CONVERSATION_TYPE_VALUES: &str = "public_channel,private_channel,im,mpim";
@@ -8197,7 +8198,7 @@ fn pull_direct_fallback_error(
                 "daemon_timeout",
                 format!(
                     "localityd did not respond within {}ms after the pull request was submitted; refusing direct fallback to avoid racing daemon hydration",
-                    daemon_mutating_request_timeout().as_millis()
+                    daemon_pull_request_timeout().as_millis()
                 ),
             )
             .with_suggested_command("loc daemon restart"),
@@ -8502,11 +8503,19 @@ fn daemon_mutating_request_timeout() -> Duration {
         .unwrap_or(DEFAULT_DAEMON_MUTATING_TIMEOUT)
 }
 
+fn daemon_pull_request_timeout() -> Duration {
+    std::env::var("LOCALITY_DAEMON_REQUEST_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_DAEMON_PULL_TIMEOUT)
+}
+
 fn daemon_request_timeout_for(request: &DaemonRequest) -> Duration {
     match request {
-        DaemonRequest::Pull { .. } | DaemonRequest::Push { .. } => {
-            daemon_mutating_request_timeout()
-        }
+        DaemonRequest::Pull { .. } => daemon_pull_request_timeout(),
+        DaemonRequest::Push { .. } => daemon_mutating_request_timeout(),
         _ => daemon_request_timeout(),
     }
 }
@@ -9457,14 +9466,15 @@ mod tests {
     #[cfg(target_os = "windows")]
     use super::resolve_mount_target;
     use super::{
-        Cli, ConnectReport, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_USAGE, EXIT_VALIDATION,
-        FileProviderCommandReport, PushConfirmationPromptError, SLACK_CONNECTOR_ID,
-        VirtualProjectionRegistration, absolute_command_path,
-        auto_registration_for_mounted_projection, default_mount_id_for_source,
-        diff_report_exit_code, exact_located_entity_record, file_provider_list_lines,
-        google_calendar_oauth_broker_config, google_docs_oauth_broker_config,
-        guard_linux_fuse_shared_root_unregister, guard_unresolved_linux_fuse_unregister,
-        guard_unresolved_windows_cloud_files_unregister,
+        Cli, ConnectReport, DEFAULT_DAEMON_CONTROL_TIMEOUT, DEFAULT_DAEMON_MUTATING_TIMEOUT,
+        DEFAULT_DAEMON_PULL_TIMEOUT, DaemonRequest, DaemonUnavailableReason, EXIT_SUCCESS,
+        EXIT_USAGE, EXIT_VALIDATION, FileProviderCommandReport, PushConfirmationPromptError,
+        SLACK_CONNECTOR_ID, VirtualProjectionRegistration, absolute_command_path,
+        auto_registration_for_mounted_projection, daemon_request_timeout_for,
+        default_mount_id_for_source, diff_report_exit_code, exact_located_entity_record,
+        file_provider_list_lines, google_calendar_oauth_broker_config,
+        google_docs_oauth_broker_config, guard_linux_fuse_shared_root_unregister,
+        guard_unresolved_linux_fuse_unregister, guard_unresolved_windows_cloud_files_unregister,
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
         locality_error_code, locate_result_from_report, mount_slack, mount_usage,
         mounted_projection_preflight_error, notion_authorize_url, notion_oauth_broker_config,
@@ -11326,6 +11336,40 @@ mod tests {
         let _ = fs::remove_dir_all(&state_root);
         let _ = fs::remove_dir_all(&target_root);
         let _ = fs::remove_dir_all(&other_root);
+    }
+
+    #[test]
+    fn daemon_request_timeout_for_uses_pull_specific_default() {
+        let _lock = state_root_env_lock()
+            .lock()
+            .expect("daemon timeout env lock");
+        let previous = std::env::var_os("LOCALITY_DAEMON_REQUEST_TIMEOUT_MS");
+        unsafe {
+            std::env::remove_var("LOCALITY_DAEMON_REQUEST_TIMEOUT_MS");
+        }
+
+        let pull_timeout = daemon_request_timeout_for(&DaemonRequest::Pull {
+            path: PathBuf::from("/tmp/locality-pull"),
+        });
+        let push_timeout = daemon_request_timeout_for(&DaemonRequest::Push {
+            path: PathBuf::from("/tmp/locality-push"),
+            assume_yes: false,
+            confirm_dangerous: false,
+        });
+        let status_timeout = daemon_request_timeout_for(&DaemonRequest::Status);
+
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var("LOCALITY_DAEMON_REQUEST_TIMEOUT_MS", value);
+            },
+            None => unsafe {
+                std::env::remove_var("LOCALITY_DAEMON_REQUEST_TIMEOUT_MS");
+            },
+        }
+
+        assert_eq!(pull_timeout, DEFAULT_DAEMON_PULL_TIMEOUT);
+        assert_eq!(push_timeout, DEFAULT_DAEMON_MUTATING_TIMEOUT);
+        assert_eq!(status_timeout, DEFAULT_DAEMON_CONTROL_TIMEOUT);
     }
 
     #[test]
