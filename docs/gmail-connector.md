@@ -67,9 +67,10 @@ CLI overrides:
 ## Projection And Pull
 
 By default, Pull enumerates the recent 100 inbox messages and recent 100 sent
-messages. The `draft/` folder is the local staging surface for new Gmail drafts.
-When pushed, a local draft becomes an unsent Gmail draft and is visible in the
-Gmail UI. Remote drafts created outside Locality are not enumerated yet.
+messages and recent 100 Gmail drafts. The `draft/` folder is the local staging surface
+for new Gmail drafts. When pushed, a local draft becomes an unsent Gmail draft
+and is visible in the Gmail UI; drafts created in Gmail are pulled into this
+folder too.
 
 Gmail mounts can be registered with a date window:
 
