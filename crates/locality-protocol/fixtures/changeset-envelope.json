@@ -75,6 +75,7 @@
       "blocks_archived": 0,
       "entities_created": 0,
       "entities_archived": 0,
+      "entity_bodies_updated": 0,
       "entities_moved": 0,
       "properties_updated": 0
     },
