@@ -60,6 +60,8 @@ describe("source setup progress", () => {
     expect(sourceConnectorDefaultMountId("google-docs")).toBe("google-docs-main");
     expect(sourceConnectorDefaultMountDirectory("google-docs")).toBe("google-docs-main");
     expect(sourceConnectorDefinition("notion").availability).toBe("implemented");
+    expect(sourceConnectorDefinition("notion").projection).toContain("page.md");
+    expect(sourceConnectorDefinition("slack").writeModel).toBe("Read-only.");
   });
 
   it("keeps planned connector catalog entries separate from runtime setup", () => {
@@ -97,6 +99,9 @@ describe("source setup progress", () => {
     ]);
     expect(sourceCatalogConnectorDefinition("fhir").authModes).toEqual(["smart-oauth"]);
     expect(sourceCatalogConnectorDefinition("confluence").availability).toBe("planned");
+    expect(sourceCatalogConnectorDefinition("confluence").projection).toContain("Spaces");
+    expect(sourceCatalogConnectorDefinition("github").writeModel).toContain("repository edits stay in git");
+    expect(sourceCatalogConnectorDefinition("fhir").writeModel).toContain("Read-only");
   });
 
   it("keeps connected but unmounted sources visible when another source is mounted", () => {

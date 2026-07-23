@@ -155,6 +155,8 @@ type ConnectorOption = {
   availability: SourceConnectorAvailability;
   category: SourceConnectorCategory;
   authModes: readonly SourceConnectorAuthMode[];
+  projection: string;
+  writeModel: string;
   mounted: boolean;
 };
 
@@ -3904,6 +3906,8 @@ function AddSourceDialog({
       availability: definition.availability,
       category: definition.category,
       authModes: definition.authModes,
+      projection: definition.projection,
+      writeModel: definition.writeModel,
       mounted: runtimeConnector ? sourceMounted(snapshot, runtimeConnector) : false,
     };
   });
@@ -4044,6 +4048,8 @@ function AddSourceDialog({
                         <SettingRow title="Availability" value="Planned connector" />
                         <SettingRow title="Mode" value={sourceCategoryLabel(connector.category)} />
                         <SettingRow title="Auth" value={sourceAuthModesLabel(connector.authModes)} />
+                        <SettingRow title="Projection" value={connector.projection} />
+                        <SettingRow title="Writes" value={connector.writeModel} />
                       </>
                     ) : runtimeConnector === "notion" ? (
                       <>

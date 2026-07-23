@@ -41,6 +41,8 @@ export type SourceConnectorDefinition<Id extends SourceCatalogConnectorId = Sour
   category: SourceConnectorCategory;
   authModes: readonly SourceConnectorAuthMode[];
   keywords: readonly string[];
+  projection: string;
+  writeModel: string;
   defaultMountId?: string;
   defaultMountDirectory?: string;
 };
@@ -54,6 +56,8 @@ const SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<SourceCon
     category: "knowledge",
     authModes: ["oauth"],
     keywords: ["notion", "wiki", "pages", "database", "docs"],
+    projection: "Pages and databases as folders with page.md files.",
+    writeModel: "Reviewed page, block, database row, and move updates.",
     defaultMountId: "notion-main",
     defaultMountDirectory: "notion",
   },
@@ -65,6 +69,8 @@ const SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<SourceCon
     category: "knowledge",
     authModes: ["oauth"],
     keywords: ["google", "docs", "gdocs", "drive", "documents"],
+    projection: "Docs and configured Drive folders as Markdown files.",
+    writeModel: "Reviewed document body updates.",
     defaultMountId: "google-docs-main",
     defaultMountDirectory: "google-docs-main",
   },
@@ -76,6 +82,8 @@ const SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<SourceCon
     category: "action",
     authModes: ["oauth"],
     keywords: ["google", "calendar", "gcal", "events", "meet"],
+    projection: "Primary calendar events plus a draft folder.",
+    writeModel: "Reviewed event creates from draft files.",
     defaultMountId: "google-calendar-main",
     defaultMountDirectory: "google-calendar-main",
   },
@@ -87,6 +95,8 @@ const SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<SourceCon
     category: "action",
     authModes: ["oauth"],
     keywords: ["gmail", "mail", "email", "inbox", "drafts"],
+    projection: "Inbox, sent mail, and draft files.",
+    writeModel: "Reviewed outbound mail creates from draft files.",
     defaultMountId: "gmail-main",
     defaultMountDirectory: "gmail-main",
   },
@@ -98,6 +108,8 @@ const SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<SourceCon
     category: "knowledge",
     authModes: ["api-key"],
     keywords: ["granola", "meetings", "notes", "transcripts", "summaries"],
+    projection: "Meetings with summary.md and transcript.md files.",
+    writeModel: "Read-only.",
     defaultMountId: "granola-main",
     defaultMountDirectory: "granola",
   },
@@ -109,6 +121,8 @@ const SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<SourceCon
     category: "hybrid",
     authModes: ["api-key"],
     keywords: ["linear", "issues", "tickets", "projects", "teams"],
+    projection: "Teams, issues, status folders, and issue page.md files.",
+    writeModel: "Reviewed issue body and supported frontmatter updates.",
     defaultMountId: "linear-main",
     defaultMountDirectory: "linear",
   },
@@ -120,6 +134,8 @@ const SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<SourceCon
     category: "knowledge",
     authModes: ["oauth"],
     keywords: ["slack", "channels", "private channels", "dms", "group dms", "users"],
+    projection: "Channels, DMs, group DMs, and users as Markdown context.",
+    writeModel: "Read-only.",
     defaultMountId: "slack-main",
     defaultMountDirectory: "slack",
   },
@@ -134,6 +150,8 @@ const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<P
     category: "knowledge",
     authModes: ["oauth", "api-token"],
     keywords: ["atlassian", "confluence", "wiki", "spaces", "pages"],
+    projection: "Spaces and pages as folders with page.md bodies.",
+    writeModel: "Start read-only, then reviewed page body updates.",
   },
   {
     id: "jira",
@@ -143,6 +161,8 @@ const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<P
     category: "hybrid",
     authModes: ["oauth", "api-token"],
     keywords: ["atlassian", "jira", "issues", "sprints", "projects"],
+    projection: "Projects, issues, comments, and sprint folders.",
+    writeModel: "Reviewed issue body, status, assignee, and comment drafts.",
   },
   {
     id: "sharepoint",
@@ -152,6 +172,8 @@ const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<P
     category: "knowledge",
     authModes: ["oauth"],
     keywords: ["microsoft", "sharepoint", "sites", "libraries", "documents"],
+    projection: "Sites, document libraries, pages, and files.",
+    writeModel: "Start read-only, then reviewed document updates where safe.",
   },
   {
     id: "onedrive",
@@ -161,6 +183,8 @@ const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<P
     category: "knowledge",
     authModes: ["oauth"],
     keywords: ["microsoft", "onedrive", "files", "drive", "documents"],
+    projection: "User and shared files as folder hierarchies.",
+    writeModel: "Reviewed file updates after version checks.",
   },
   {
     id: "outlook-mail",
@@ -170,6 +194,8 @@ const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<P
     category: "action",
     authModes: ["oauth"],
     keywords: ["microsoft", "outlook", "mail", "email", "drafts"],
+    projection: "Mailbox folders plus reviewed draft files.",
+    writeModel: "Reviewed outbound mail creates from draft files.",
   },
   {
     id: "outlook-calendar",
@@ -179,6 +205,8 @@ const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<P
     category: "action",
     authModes: ["oauth"],
     keywords: ["microsoft", "outlook", "calendar", "events", "meetings"],
+    projection: "Calendar events plus scheduling drafts.",
+    writeModel: "Reviewed event creates and updates after conflict checks.",
   },
   {
     id: "microsoft-teams",
@@ -188,6 +216,8 @@ const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<P
     category: "knowledge",
     authModes: ["oauth"],
     keywords: ["microsoft", "teams", "channels", "chats", "meetings"],
+    projection: "Teams, channels, chats, meetings, and users as context.",
+    writeModel: "Start read-only, then reviewed message drafts if approved.",
   },
   {
     id: "github",
@@ -197,6 +227,8 @@ const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<P
     category: "hybrid",
     authModes: ["oauth", "github-app", "personal-token"],
     keywords: ["github", "git", "repos", "pull requests", "issues"],
+    projection: "Repositories, PRs, issues, discussions, reviews, and CI context.",
+    writeModel: "Reviewed issue/comment/review drafts; repository edits stay in git.",
   },
   {
     id: "gitlab",
@@ -206,6 +238,8 @@ const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<P
     category: "hybrid",
     authModes: ["oauth", "personal-token"],
     keywords: ["gitlab", "git", "repos", "merge requests", "pipelines"],
+    projection: "Projects, MRs, issues, pipelines, releases, and reviews.",
+    writeModel: "Reviewed issue/comment/MR note drafts; repository edits stay in git.",
   },
   {
     id: "google-drive",
@@ -215,6 +249,8 @@ const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<P
     category: "knowledge",
     authModes: ["oauth"],
     keywords: ["google", "drive", "files", "shared drives", "docs"],
+    projection: "Drive files, folders, shared drives, PDFs, sheets, and slides.",
+    writeModel: "Reviewed file updates where a canonical representation is safe.",
   },
   {
     id: "dropbox",
@@ -224,6 +260,8 @@ const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<P
     category: "knowledge",
     authModes: ["oauth"],
     keywords: ["dropbox", "files", "folders", "documents", "team"],
+    projection: "Shared files and folders.",
+    writeModel: "Reviewed file updates after revision checks.",
   },
   {
     id: "box",
@@ -233,6 +271,8 @@ const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<P
     category: "knowledge",
     authModes: ["oauth"],
     keywords: ["box", "files", "folders", "enterprise", "documents"],
+    projection: "Enterprise files, folders, and shared collections.",
+    writeModel: "Reviewed file updates after version checks.",
   },
   {
     id: "figma",
@@ -242,6 +282,8 @@ const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<P
     category: "knowledge",
     authModes: ["oauth", "personal-token"],
     keywords: ["figma", "design", "comments", "components", "files"],
+    projection: "Design files, comments, components, and project metadata.",
+    writeModel: "Start read-only, then reviewed comment drafts.",
   },
   {
     id: "asana",
@@ -251,6 +293,8 @@ const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<P
     category: "hybrid",
     authModes: ["oauth", "personal-token"],
     keywords: ["asana", "tasks", "projects", "status", "workflows"],
+    projection: "Projects, tasks, comments, sections, and status updates.",
+    writeModel: "Reviewed task field updates and comment drafts.",
   },
   {
     id: "clickup",
@@ -260,6 +304,8 @@ const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<P
     category: "hybrid",
     authModes: ["oauth", "api-token"],
     keywords: ["clickup", "tasks", "docs", "lists", "spaces"],
+    projection: "Spaces, folders, lists, tasks, docs, and comments.",
+    writeModel: "Reviewed task field updates and comment drafts.",
   },
   {
     id: "zendesk",
@@ -269,6 +315,8 @@ const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<P
     category: "hybrid",
     authModes: ["oauth", "api-token"],
     keywords: ["zendesk", "support", "tickets", "help center", "macros"],
+    projection: "Tickets, help-center articles, macros, users, and organizations.",
+    writeModel: "Reviewed ticket reply drafts and article edits.",
   },
   {
     id: "intercom",
@@ -278,6 +326,8 @@ const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<P
     category: "hybrid",
     authModes: ["oauth"],
     keywords: ["intercom", "support", "conversations", "help center", "contacts"],
+    projection: "Conversations, help articles, contacts, and companies.",
+    writeModel: "Reviewed conversation reply drafts and article edits.",
   },
   {
     id: "hubspot",
@@ -287,6 +337,8 @@ const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<P
     category: "hybrid",
     authModes: ["oauth", "api-token"],
     keywords: ["hubspot", "crm", "contacts", "deals", "tasks"],
+    projection: "CRM objects, notes, tasks, emails, deals, and companies.",
+    writeModel: "Reviewed note, task, and selected CRM field updates.",
   },
   {
     id: "salesforce",
@@ -296,6 +348,8 @@ const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<P
     category: "hybrid",
     authModes: ["oauth"],
     keywords: ["salesforce", "crm", "accounts", "opportunities", "cases"],
+    projection: "Accounts, opportunities, cases, notes, tasks, and knowledge records.",
+    writeModel: "Reviewed note/task updates first; object writes require strict schema guards.",
   },
   {
     id: "fhir",
@@ -305,6 +359,8 @@ const PLANNED_SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<P
     category: "knowledge",
     authModes: ["smart-oauth"],
     keywords: ["fhir", "smart", "healthcare", "clinical", "ehr"],
+    projection: "Scoped FHIR resources as normalized read-only clinical context.",
+    writeModel: "Read-only until audit, consent, and safety workflows are designed.",
   },
 ];
 
