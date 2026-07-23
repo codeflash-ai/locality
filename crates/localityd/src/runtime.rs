@@ -28,6 +28,7 @@ use locality_core::freshness::{
     SyncJobKind,
 };
 use locality_core::hydration::{HydrationPolicy, HydrationReason, HydrationRequest};
+use locality_core::journal::JournalApplyEffect;
 use locality_core::model::{
     CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
 };
@@ -49,7 +50,7 @@ use crate::autosave::{
     active_auto_save_enrollment_for_remote_id, auto_save_enrollment_is_active,
     auto_save_target_for_write, pause_auto_save_for_remote_change,
 };
-use crate::execution::{DaemonEventReport, PushJob};
+use crate::execution::{DaemonEventReport, PushJob, PushJobReport};
 use crate::file_provider::{self, FileProviderReadReport};
 use crate::freshness::{
     FreshnessQueue, LIVE_MODE_POST_PUSH_SAME_VERSION_PROBE_WINDOW_MS, freshness_timestamp,
@@ -66,7 +67,7 @@ use crate::ipc::{
 };
 use crate::pull::run_pull_with_state_root;
 use crate::push::{
-    execute_auto_save_push_job_with_content_root, execute_push_job_with_content_root,
+    PushJobAction, execute_auto_save_push_job_with_content_root, execute_push_job_with_content_root,
 };
 use crate::reconcile::{
     DefaultFetchScheduleStrategy, FetchScheduleStrategy, MountFetchSchedule, ScheduledPullReport,
@@ -1882,17 +1883,21 @@ impl RuntimeState {
             JobCompletion::Pull {
                 response,
                 respond_to,
+            } => {
+                let _ = respond_to.send(response);
             }
-            | JobCompletion::Push {
+            JobCompletion::Push {
                 response,
                 respond_to,
             } => {
+                self.refresh_macos_file_provider_after_gmail_push(&response);
                 let _ = respond_to.send(response);
             }
             JobCompletion::AutoPush {
                 target_path,
                 response,
             } => {
+                self.refresh_macos_file_provider_after_gmail_push(&response);
                 if response.ok {
                     eprintln!(
                         "localityd auto-save push completed for `{}`",
@@ -2050,6 +2055,31 @@ impl RuntimeState {
             eprintln!(
                 "localityd failed to signal macOS File Provider for `{mount_id}:{container_identifier}`: {error}"
             );
+        }
+    }
+
+    fn refresh_macos_file_provider_after_gmail_push(&self, response: &DaemonResponse) {
+        let store = match SqliteStateStore::open(self.config.state_root.clone()) {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!(
+                    "localityd failed to open state for Gmail File Provider refresh: {error}"
+                );
+                return;
+            }
+        };
+        if let Err(error) = dispatch_gmail_push_projection_refresh(&store, response, |request| {
+            if let Err(error) = refresh_macos_file_provider_container(
+                &request.mount_id,
+                &request.container_identifier,
+            ) {
+                eprintln!(
+                    "localityd failed to refresh macOS File Provider for `{}:{}` after Gmail send: {error}",
+                    request.mount_id, request.container_identifier
+                );
+            }
+        }) {
+            eprintln!("localityd failed to plan Gmail File Provider refresh: {error}");
         }
     }
 
@@ -3356,6 +3386,124 @@ fn child_refresh_priority_label(priority: ChildRefreshPriority) -> &'static str 
         ChildRefreshPriority::Background => "background",
         ChildRefreshPriority::Interactive => "interactive",
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectionRefreshRequest {
+    mount_id: String,
+    container_identifier: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GmailPushProjectionRefresh {
+    mount_id: MountId,
+    container_identifiers: Vec<String>,
+}
+
+fn gmail_push_projection_refresh(response: &DaemonResponse) -> Option<GmailPushProjectionRefresh> {
+    if !response.ok {
+        return None;
+    }
+    let report =
+        serde_json::from_value::<PushJobReport>(response.payload.as_ref()?.clone()).ok()?;
+    if report.action != PushJobAction::Reconciled {
+        return None;
+    }
+
+    let mut container_identifiers = BTreeSet::new();
+    if let Some(plan) = report.pipeline.plan.as_ref() {
+        for operation in &plan.operations {
+            if let PushOperation::CreateEntity { parent_id, .. } = operation {
+                container_identifiers.insert(parent_id.0.clone());
+            }
+        }
+    }
+    if let Some(execution) = report.execution.as_ref() {
+        for effect in &execution.apply_effects {
+            if let JournalApplyEffect::CreatedEntity { parent_id, .. } = effect {
+                container_identifiers.insert(parent_id.0.clone());
+            }
+        }
+    }
+
+    (!container_identifiers.is_empty()).then(|| GmailPushProjectionRefresh {
+        mount_id: report.mount_id,
+        container_identifiers: container_identifiers.into_iter().collect(),
+    })
+}
+
+fn dispatch_gmail_push_projection_refresh<S, F>(
+    store: &S,
+    response: &DaemonResponse,
+    mut refresh: F,
+) -> locality_core::LocalityResult<()>
+where
+    S: MountRepository,
+    F: FnMut(ProjectionRefreshRequest),
+{
+    let Some(planned) = gmail_push_projection_refresh(response) else {
+        return Ok(());
+    };
+    let Some(mount) = store
+        .get_mount(&planned.mount_id)
+        .map_err(LocalityError::from)?
+    else {
+        return Ok(());
+    };
+    if mount.connector != "gmail" || mount.projection != ProjectionMode::MacosFileProvider {
+        return Ok(());
+    }
+
+    for container_identifier in planned.container_identifiers {
+        refresh(ProjectionRefreshRequest {
+            mount_id: planned.mount_id.0.clone(),
+            container_identifier,
+        });
+    }
+    Ok(())
+}
+
+fn refresh_macos_file_provider_container(
+    mount_id: &str,
+    container_identifier: &str,
+) -> Result<(), String> {
+    refresh_macos_file_provider_container_impl(mount_id, container_identifier)
+}
+
+#[cfg(target_os = "macos")]
+fn refresh_macos_file_provider_container_impl(
+    mount_id: &str,
+    container_identifier: &str,
+) -> Result<(), String> {
+    let Some(helper) = macos_file_provider_helper_path() else {
+        return Err("locality-file-providerctl was not found".to_string());
+    };
+    refresh_macos_file_provider_container_with(
+        mount_id,
+        container_identifier,
+        |action, identifier| run_macos_file_provider_helper_action(&helper, action, identifier),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn refresh_macos_file_provider_container_impl(
+    _mount_id: &str,
+    _container_identifier: &str,
+) -> Result<(), String> {
+    Ok(())
+}
+
+fn refresh_macos_file_provider_container_with<F>(
+    mount_id: &str,
+    container_identifier: &str,
+    mut run: F,
+) -> Result<(), String>
+where
+    F: FnMut(&str, &str) -> Result<(), String>,
+{
+    let identifier =
+        file_provider::macos_file_provider_item_identifier(mount_id, container_identifier);
+    run("signal", &identifier)
 }
 
 fn signal_macos_file_provider_enumerator(
@@ -5534,10 +5682,16 @@ mod tests {
         ChangeHintKind, FreshnessTier, RemoteObservation, RemoteVersion, SyncJob, SyncJobKind,
     };
     use locality_core::hydration::{HydrationReason, HydrationRequest};
+    use locality_core::journal::{JournalApplyEffect, JournalStatus, PushId, PushOperationId};
     use locality_core::model::{
         CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, SourceSpan,
     };
+    use locality_core::planner::{GuardrailDecision, PushOperation, PushPlan};
+    use locality_core::push::{
+        PushExecutionAction, PushExecutionResult, PushPipelineAction, PushPipelineResult,
+    };
     use locality_core::shadow::{MarkdownBlockKind, ShadowBlock, ShadowDocument};
+    use locality_core::validation::ValidationReport;
     use locality_store::{
         AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
         ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository,
@@ -5547,18 +5701,147 @@ mod tests {
         RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
     };
 
+    use crate::execution::PushJobReport;
     use crate::ipc::DaemonResponse;
+    use crate::push::PushJobAction;
     use crate::virtual_fs::VirtualFsRefreshChildrenReport;
     use crate::watcher::{FileEvent, FileEventKind};
 
     use super::{
         ActiveChildRefresh, ActiveRuntimeJob, ChildRefreshPriority, ChildRefreshQueue,
         ChildRefreshRequest, DaemonRequest, DefaultRuntimeJobRunner, JobCompletion,
-        RemoteDiscoveryHint, RuntimeJobRunner, RuntimeState, child_refresh_retry_delay,
-        execute_file_event, execute_observe_entity_job, locality_error_code,
-        observable_remote_identifier, remote_fast_forward_discovery_hints,
+        ProjectionRefreshRequest, RemoteDiscoveryHint, RuntimeJobRunner, RuntimeState,
+        child_refresh_retry_delay, dispatch_gmail_push_projection_refresh, execute_file_event,
+        execute_observe_entity_job, locality_error_code, observable_remote_identifier,
+        refresh_macos_file_provider_container_with, remote_fast_forward_discovery_hints,
         repair_clean_remote_deleted_projections, response_file_opened_observe_jobs,
     };
+
+    fn reconciled_gmail_send_response() -> DaemonResponse {
+        let draft_folder_id = RemoteId::new("gmail-folder:draft");
+        let sent_folder_id = RemoteId::new("gmail-folder:sent");
+        let sent_message_id = RemoteId::new("gmail-message:sent-1");
+        let operation_id = PushOperationId("create-gmail-draft".to_string());
+        let push_id = PushId("push-gmail-draft".to_string());
+        let apply_effect = JournalApplyEffect::CreatedEntity {
+            operation_id,
+            operation_index: 0,
+            parent_id: sent_folder_id,
+            entity_id: sent_message_id.clone(),
+        };
+        let pipeline = PushPipelineResult {
+            validation: ValidationReport::clean(),
+            plan: Some(PushPlan::new(
+                vec![draft_folder_id.clone()],
+                vec![PushOperation::CreateEntity {
+                    parent_id: draft_folder_id,
+                    parent_kind: Some(EntityKind::Directory),
+                    parent_workspace: false,
+                    title: "Test message".to_string(),
+                    properties: BTreeMap::new(),
+                    body: "Body".to_string(),
+                    source_path: "draft/test-message.md".into(),
+                }],
+            )),
+            guardrail: GuardrailDecision::Proceed,
+            action: PushPipelineAction::ProceedToApply,
+            completed_stages: Vec::new(),
+        };
+        let execution = PushExecutionResult {
+            push_id: push_id.clone(),
+            action: PushExecutionAction::Reconciled,
+            changed_remote_ids: vec![sent_message_id.clone()],
+            apply_effects: vec![apply_effect],
+            reconciled_remote_ids: vec![sent_message_id],
+            journal_status: Some(JournalStatus::Reconciled),
+            completed_stages: Vec::new(),
+        };
+        DaemonResponse::ok(PushJobReport {
+            target_path: "/tmp/gmail-main/draft/test-message.md".into(),
+            mount_id: MountId::new("gmail-main"),
+            entity_id: RemoteId::new("local:gmail-draft"),
+            pipeline,
+            readable_diff: None,
+            action: PushJobAction::Reconciled,
+            execution: Some(execution),
+            push_id: Some(push_id),
+            journal_status: Some(JournalStatus::Reconciled),
+            error: None,
+        })
+    }
+
+    #[test]
+    fn reconciled_gmail_send_refreshes_draft_and_sent_file_provider_containers() {
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(MountId::new("gmail-main"), "gmail", "/tmp/gmail-main")
+                    .projection(ProjectionMode::MacosFileProvider),
+            )
+            .expect("save Gmail mount");
+        let mut refreshes = Vec::new();
+
+        dispatch_gmail_push_projection_refresh(
+            &store,
+            &reconciled_gmail_send_response(),
+            |request| refreshes.push(request),
+        )
+        .expect("dispatch projection refresh");
+
+        assert_eq!(
+            refreshes,
+            vec![
+                ProjectionRefreshRequest {
+                    mount_id: "gmail-main".to_string(),
+                    container_identifier: "gmail-folder:draft".to_string(),
+                },
+                ProjectionRefreshRequest {
+                    mount_id: "gmail-main".to_string(),
+                    container_identifier: "gmail-folder:sent".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn gmail_send_refresh_skips_non_file_provider_mounts() {
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(MountId::new("gmail-main"), "gmail", "/tmp/gmail-main")
+                    .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save Gmail mount");
+        let mut refreshes = Vec::new();
+
+        dispatch_gmail_push_projection_refresh(
+            &store,
+            &reconciled_gmail_send_response(),
+            |request| refreshes.push(request),
+        )
+        .expect("dispatch projection refresh");
+
+        assert!(refreshes.is_empty());
+    }
+
+    #[test]
+    fn gmail_file_provider_refresh_signals_reconciled_containers() {
+        let mut actions = Vec::new();
+
+        refresh_macos_file_provider_container_with(
+            "gmail-main",
+            "gmail-folder:draft",
+            |action, identifier| {
+                actions.push((action.to_string(), identifier.to_string()));
+                Ok(())
+            },
+        )
+        .expect("signal container");
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].0, "signal");
+        assert_ne!(actions[0].1, "gmail-folder:draft");
+    }
 
     #[test]
     fn update_required_has_stable_runtime_error_code() {

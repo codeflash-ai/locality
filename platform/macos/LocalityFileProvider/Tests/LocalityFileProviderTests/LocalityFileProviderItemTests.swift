@@ -3,6 +3,37 @@ import FileProvider
 import XCTest
 
 final class LocalityFileProviderItemTests: XCTestCase {
+  func testSyncAnchorRoundTripsItemIdentifiers() throws {
+    let identifiers = Set([
+      NSFileProviderItemIdentifier("draft-message"),
+      NSFileProviderItemIdentifier("sent-message"),
+    ])
+
+    let anchor = try LocalitySyncAnchor.encode(identifiers: identifiers)
+
+    XCTAssertEqual(LocalitySyncAnchor.decode(anchor), identifiers)
+  }
+
+  func testSyncAnchorIdentifiesDeletedItems() throws {
+    let draft = NSFileProviderItemIdentifier("draft-message")
+    let retained = NSFileProviderItemIdentifier("retained-message")
+    let anchor = try LocalitySyncAnchor.encode(identifiers: Set([draft, retained]))
+    let current = Set([retained, NSFileProviderItemIdentifier("new-sent-message")])
+
+    let previous = try XCTUnwrap(LocalitySyncAnchor.decode(anchor))
+
+    XCTAssertEqual(
+      LocalitySyncAnchor.deletedIdentifiers(previous: previous, current: current),
+      [draft]
+    )
+  }
+
+  func testLegacyTimestampSyncAnchorExpires() {
+    let legacyAnchor = NSFileProviderSyncAnchor(Data("1784775141.0".utf8))
+
+    XCTAssertNil(LocalitySyncAnchor.decode(legacyAnchor))
+  }
+
   func testSharedDomainPageChildFolderAllowsAddingSubitems() {
     let item = LocalityFileProviderItem(
       metadata: metadata(

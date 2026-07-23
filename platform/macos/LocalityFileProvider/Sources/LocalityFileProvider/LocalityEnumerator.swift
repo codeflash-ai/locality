@@ -55,7 +55,8 @@ final class LocalityEnumerator: NSObject, NSFileProviderEnumerator {
         startingAt page: NSFileProviderPage
     ) {
         do {
-            observer.didEnumerate(try currentItems())
+            let items = try currentItems()
+            observer.didEnumerate(items)
             observer.finishEnumerating(upTo: nil)
         } catch {
             observer.finishEnumeratingWithError(agentFSFileProviderError(error))
@@ -65,16 +66,43 @@ final class LocalityEnumerator: NSObject, NSFileProviderEnumerator {
     func currentSyncAnchor(
         completionHandler: @escaping (NSFileProviderSyncAnchor?) -> Void
     ) {
-        completionHandler(currentSyncAnchor())
+        do {
+            let items = try currentItems()
+            completionHandler(try LocalitySyncAnchor.encode(items: items))
+        } catch {
+            completionHandler(nil)
+        }
     }
 
     func enumerateChanges(
         for observer: NSFileProviderChangeObserver,
         from syncAnchor: NSFileProviderSyncAnchor
     ) {
+        guard let previousIdentifiers = LocalitySyncAnchor.decode(syncAnchor) else {
+            observer.finishEnumeratingWithError(
+                NSError(
+                    domain: NSFileProviderErrorDomain,
+                    code: NSFileProviderError.syncAnchorExpired.rawValue
+                )
+            )
+            return
+        }
+
         do {
-            observer.didUpdate(try currentItems())
-            observer.finishEnumeratingChanges(upTo: currentSyncAnchor(), moreComing: false)
+            let items = try currentItems()
+            let currentIdentifiers = Set(items.map(\.itemIdentifier))
+            let deletedIdentifiers = LocalitySyncAnchor.deletedIdentifiers(
+                previous: previousIdentifiers,
+                current: currentIdentifiers
+            )
+            if !deletedIdentifiers.isEmpty {
+                observer.didDeleteItems(withIdentifiers: deletedIdentifiers)
+            }
+            observer.didUpdate(items)
+            observer.finishEnumeratingChanges(
+                upTo: try LocalitySyncAnchor.encode(identifiers: currentIdentifiers),
+                moreComing: false
+            )
         } catch {
             observer.finishEnumeratingWithError(agentFSFileProviderError(error))
         }
@@ -116,8 +144,47 @@ final class LocalityEnumerator: NSObject, NSFileProviderEnumerator {
         return []
     }
 
-    private func currentSyncAnchor() -> NSFileProviderSyncAnchor {
-        NSFileProviderSyncAnchor(Data(Date().timeIntervalSince1970.description.utf8))
+}
+
+enum LocalitySyncAnchor {
+    private static let schemaVersion = 1
+
+    private struct Snapshot: Codable {
+        let schemaVersion: Int
+        let itemIdentifiers: [String]
+    }
+
+    static func encode(items: [LocalityFileProviderItem]) throws -> NSFileProviderSyncAnchor {
+        try encode(identifiers: Set(items.map(\.itemIdentifier)))
+    }
+
+    static func encode(
+        identifiers: Set<NSFileProviderItemIdentifier>
+    ) throws -> NSFileProviderSyncAnchor {
+        let snapshot = Snapshot(
+            schemaVersion: schemaVersion,
+            itemIdentifiers: identifiers.map(\.rawValue).sorted()
+        )
+        return NSFileProviderSyncAnchor(try JSONEncoder().encode(snapshot))
+    }
+
+    static func decode(
+        _ syncAnchor: NSFileProviderSyncAnchor
+    ) -> Set<NSFileProviderItemIdentifier>? {
+        guard
+            let snapshot = try? JSONDecoder().decode(Snapshot.self, from: syncAnchor.rawValue),
+            snapshot.schemaVersion == schemaVersion
+        else {
+            return nil
+        }
+        return Set(snapshot.itemIdentifiers.map { NSFileProviderItemIdentifier($0) })
+    }
+
+    static func deletedIdentifiers(
+        previous: Set<NSFileProviderItemIdentifier>,
+        current: Set<NSFileProviderItemIdentifier>
+    ) -> [NSFileProviderItemIdentifier] {
+        previous.subtracting(current).sorted { $0.rawValue < $1.rawValue }
     }
 }
 

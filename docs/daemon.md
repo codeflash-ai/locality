@@ -313,6 +313,13 @@ from the legacy app-group content tree into the current content root before
 reading or writing the new root; existing current-root files are never
 overwritten.
 
+After a Gmail send reconciles, the daemon signals both structural parents
+recorded by the push: the source `draft/` folder and the destination `sent/`
+folder. File Provider sync anchors encode the prior item identifiers, so change
+enumeration reports both the deleted draft identifier and the newly updated Sent
+listing. Anchors from older installations expire cleanly and force a complete
+enumeration instead of retaining a stale draft placeholder.
+
 Scheduled reconciliation skips writing placeholder Markdown files for virtual
 filesystem projection modes such as `macos_file_provider` and `linux_fuse`; it
 updates durable entity state, queues policy hydration, and caches database
