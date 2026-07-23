@@ -850,8 +850,9 @@ fn is_simple_text_plain_draft_payload(payload: &GmailMessagePart) -> bool {
     payload.headers.iter().all(|header| {
         matches!(
             header.name.to_ascii_lowercase().as_str(),
-            "to" | "cc"
+            "received" | "to" | "cc"
                 | "bcc"
+                | "reply-to"
                 | "subject"
                 | "in-reply-to"
                 | "references"
@@ -1804,7 +1805,7 @@ mod tests {
     use locality_core::push::RemotePrecondition;
     use locality_core::search::RAW_SEARCH_METADATA_KEY;
 
-    use super::{GmailConfig, GmailConnector};
+    use super::{GmailConfig, GmailConnector, is_simple_text_plain_draft_payload};
     use crate::client::GmailApi;
     use crate::dto::{
         GmailDraft, GmailDraftCreateRequest, GmailDraftList, GmailMessage, GmailMessageList,
@@ -2635,6 +2636,28 @@ mod tests {
             calls.updated_draft_thread_ids,
             vec![Some("draft-msg-1-thread".to_string())]
         );
+    }
+
+    #[test]
+    fn draft_rewrite_allows_simple_text_plain_transport_and_reply_to_headers() {
+        let message: GmailMessage = serde_json::from_value(serde_json::json!({
+            "id": "draft-msg-reply-to",
+            "payload": {
+                "mimeType": "text/plain",
+                "headers": [
+                    { "name": "Received", "value": "by 2002:a05:1234:: with SMTP id x; Thu, 23 Jul 2026 13:04:19 -0500" },
+                    { "name": "To", "value": "me@example.com" },
+                    { "name": "Reply-To", "value": "replies@example.com" },
+                    { "name": "Subject", "value": "Reply" }
+                ],
+                "body": { "data": "Qm9keQo" }
+            }
+        }))
+        .expect("simple reply-to draft");
+
+        assert!(is_simple_text_plain_draft_payload(
+            message.payload.as_ref().expect("payload")
+        ));
     }
 
     #[test]
