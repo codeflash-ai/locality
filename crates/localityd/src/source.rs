@@ -157,9 +157,165 @@ const SOURCE_REGISTRY: &[SourceRegistration] = &[
     },
 ];
 
+const PLANNED_SOURCE_CONNECTORS: &[PlannedSourceConnectorDescriptor] = &[
+    PlannedSourceConnectorDescriptor {
+        id: "confluence",
+        display_name: "Confluence",
+        category: SourceConnectorCategory::Knowledge,
+        auth_modes: &["oauth", "api-token"],
+    },
+    PlannedSourceConnectorDescriptor {
+        id: "jira",
+        display_name: "Jira",
+        category: SourceConnectorCategory::Hybrid,
+        auth_modes: &["oauth", "api-token"],
+    },
+    PlannedSourceConnectorDescriptor {
+        id: "sharepoint",
+        display_name: "SharePoint",
+        category: SourceConnectorCategory::Knowledge,
+        auth_modes: &["oauth"],
+    },
+    PlannedSourceConnectorDescriptor {
+        id: "onedrive",
+        display_name: "OneDrive",
+        category: SourceConnectorCategory::Knowledge,
+        auth_modes: &["oauth"],
+    },
+    PlannedSourceConnectorDescriptor {
+        id: "outlook-mail",
+        display_name: "Outlook Mail",
+        category: SourceConnectorCategory::Action,
+        auth_modes: &["oauth"],
+    },
+    PlannedSourceConnectorDescriptor {
+        id: "outlook-calendar",
+        display_name: "Outlook Calendar",
+        category: SourceConnectorCategory::Action,
+        auth_modes: &["oauth"],
+    },
+    PlannedSourceConnectorDescriptor {
+        id: "microsoft-teams",
+        display_name: "Microsoft Teams",
+        category: SourceConnectorCategory::Knowledge,
+        auth_modes: &["oauth"],
+    },
+    PlannedSourceConnectorDescriptor {
+        id: "github",
+        display_name: "GitHub",
+        category: SourceConnectorCategory::Hybrid,
+        auth_modes: &["oauth", "github-app", "personal-token"],
+    },
+    PlannedSourceConnectorDescriptor {
+        id: "gitlab",
+        display_name: "GitLab",
+        category: SourceConnectorCategory::Hybrid,
+        auth_modes: &["oauth", "personal-token"],
+    },
+    PlannedSourceConnectorDescriptor {
+        id: "google-drive",
+        display_name: "Google Drive",
+        category: SourceConnectorCategory::Knowledge,
+        auth_modes: &["oauth"],
+    },
+    PlannedSourceConnectorDescriptor {
+        id: "dropbox",
+        display_name: "Dropbox",
+        category: SourceConnectorCategory::Knowledge,
+        auth_modes: &["oauth"],
+    },
+    PlannedSourceConnectorDescriptor {
+        id: "box",
+        display_name: "Box",
+        category: SourceConnectorCategory::Knowledge,
+        auth_modes: &["oauth"],
+    },
+    PlannedSourceConnectorDescriptor {
+        id: "figma",
+        display_name: "Figma",
+        category: SourceConnectorCategory::Knowledge,
+        auth_modes: &["oauth", "personal-token"],
+    },
+    PlannedSourceConnectorDescriptor {
+        id: "asana",
+        display_name: "Asana",
+        category: SourceConnectorCategory::Hybrid,
+        auth_modes: &["oauth", "personal-token"],
+    },
+    PlannedSourceConnectorDescriptor {
+        id: "clickup",
+        display_name: "ClickUp",
+        category: SourceConnectorCategory::Hybrid,
+        auth_modes: &["oauth", "api-token"],
+    },
+    PlannedSourceConnectorDescriptor {
+        id: "zendesk",
+        display_name: "Zendesk",
+        category: SourceConnectorCategory::Hybrid,
+        auth_modes: &["oauth", "api-token"],
+    },
+    PlannedSourceConnectorDescriptor {
+        id: "intercom",
+        display_name: "Intercom",
+        category: SourceConnectorCategory::Hybrid,
+        auth_modes: &["oauth"],
+    },
+    PlannedSourceConnectorDescriptor {
+        id: "hubspot",
+        display_name: "HubSpot",
+        category: SourceConnectorCategory::Hybrid,
+        auth_modes: &["oauth", "api-token"],
+    },
+    PlannedSourceConnectorDescriptor {
+        id: "salesforce",
+        display_name: "Salesforce",
+        category: SourceConnectorCategory::Hybrid,
+        auth_modes: &["oauth"],
+    },
+    PlannedSourceConnectorDescriptor {
+        id: "fhir",
+        display_name: "FHIR",
+        category: SourceConnectorCategory::Knowledge,
+        auth_modes: &["smart-oauth"],
+    },
+];
+
 #[derive(Clone, Debug, Default)]
 pub struct ResolvedSourceSet {
     sources: BTreeMap<MountId, ResolvedSource>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceConnectorCategory {
+    Knowledge,
+    Action,
+    Hybrid,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlannedSourceConnectorDescriptor {
+    id: &'static str,
+    display_name: &'static str,
+    category: SourceConnectorCategory,
+    auth_modes: &'static [&'static str],
+}
+
+impl PlannedSourceConnectorDescriptor {
+    pub fn id(&self) -> &'static str {
+        self.id
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        self.display_name
+    }
+
+    pub fn category(&self) -> SourceConnectorCategory {
+        self.category
+    }
+
+    pub fn auth_modes(&self) -> &'static [&'static str] {
+        self.auth_modes
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -390,6 +546,24 @@ pub fn supported_source_connectors() -> Vec<&'static str> {
     SOURCE_REGISTRY
         .iter()
         .map(|registration| registration.id)
+        .collect()
+}
+
+pub fn planned_source_connectors() -> Vec<&'static str> {
+    PLANNED_SOURCE_CONNECTORS
+        .iter()
+        .map(|descriptor| descriptor.id)
+        .collect()
+}
+
+pub fn planned_source_connector_descriptors() -> Vec<PlannedSourceConnectorDescriptor> {
+    PLANNED_SOURCE_CONNECTORS.to_vec()
+}
+
+pub fn source_connector_catalog_ids() -> Vec<&'static str> {
+    supported_source_connectors()
+        .into_iter()
+        .chain(planned_source_connectors())
         .collect()
 }
 

@@ -20,10 +20,11 @@ use locality_store::{
     InMemoryStateStore, MountConfig,
 };
 use localityd::source::{
-    LocalSourceValidator, ResolvedSource, ResolvedSourceSet, SourcePushValidator,
-    SourceValidationContext, VirtualRenamePolicy, resolve_source_for_mount,
-    source_create_decision_for_parent_path, source_descriptor, source_display_name,
-    source_move_decision_for_parent_path, source_write_decision_for_path,
+    LocalSourceValidator, ResolvedSource, ResolvedSourceSet, SourceConnectorCategory,
+    SourcePushValidator, SourceValidationContext, VirtualRenamePolicy,
+    planned_source_connector_descriptors, planned_source_connectors, resolve_source_for_mount,
+    source_connector_catalog_ids, source_create_decision_for_parent_path, source_descriptor,
+    source_display_name, source_move_decision_for_parent_path, source_write_decision_for_path,
     supported_source_connectors,
 };
 use std::io::{Read, Write};
@@ -964,6 +965,67 @@ fn supported_source_connectors_include_first_party_connectors() {
             "slack"
         ]
     );
+}
+
+#[test]
+fn planned_source_connectors_stay_out_of_runtime_registry() {
+    assert_eq!(
+        planned_source_connectors(),
+        vec![
+            "confluence",
+            "jira",
+            "sharepoint",
+            "onedrive",
+            "outlook-mail",
+            "outlook-calendar",
+            "microsoft-teams",
+            "github",
+            "gitlab",
+            "google-drive",
+            "dropbox",
+            "box",
+            "figma",
+            "asana",
+            "clickup",
+            "zendesk",
+            "intercom",
+            "hubspot",
+            "salesforce",
+            "fhir"
+        ]
+    );
+
+    for connector in planned_source_connectors() {
+        assert!(
+            !supported_source_connectors().contains(&connector),
+            "{connector} should not resolve until its connector crate exists"
+        );
+        assert_eq!(source_descriptor(connector).connect_command(), None);
+    }
+
+    assert_eq!(source_connector_catalog_ids().len(), 27);
+}
+
+#[test]
+fn planned_source_connector_descriptors_include_auth_and_category() {
+    let planned = planned_source_connector_descriptors();
+    let github = planned
+        .iter()
+        .find(|descriptor| descriptor.id() == "github")
+        .expect("github descriptor");
+    assert_eq!(github.display_name(), "GitHub");
+    assert_eq!(github.category(), SourceConnectorCategory::Hybrid);
+    assert_eq!(
+        github.auth_modes(),
+        &["oauth", "github-app", "personal-token"]
+    );
+
+    let fhir = planned
+        .iter()
+        .find(|descriptor| descriptor.id() == "fhir")
+        .expect("fhir descriptor");
+    assert_eq!(fhir.category(), SourceConnectorCategory::Knowledge);
+    assert_eq!(fhir.auth_modes(), &["smart-oauth"]);
 }
 
 #[test]
