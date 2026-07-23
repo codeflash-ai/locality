@@ -1389,8 +1389,14 @@ pub fn canonical_writable_metadata_sha256(
         append_text(&mut preimage, &entry.delivered_content_sha256)?;
         append_text(&mut preimage, &entry.provider_precondition)?;
         append_count(&mut preimage, entry.effective_actions.len())?;
-        for action in &entry.effective_actions {
-            append_text(&mut preimage, source_action_wire_label(action))?;
+        let mut action_labels = entry
+            .effective_actions
+            .iter()
+            .map(source_action_wire_label)
+            .collect::<Vec<_>>();
+        action_labels.sort_unstable();
+        for action_label in action_labels {
+            append_text(&mut preimage, action_label)?;
         }
         append_text(
             &mut preimage,
