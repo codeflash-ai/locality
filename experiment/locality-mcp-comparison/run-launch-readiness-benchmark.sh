@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: run-launch-readiness-benchmark.sh [--push] [--compare-mcp] [--write-mounted-page] [--scenario NAME] [--compare-hooks]
+Usage: run-launch-readiness-benchmark.sh [--push] [--compare-mcp] [--write-mounted-page] [--scenario NAME] [--compare-hooks] [--strategy NAME]
 
 Runs the Locality vs Notion MCP launch-readiness benchmark:
   1. discover prompt scenarios from prompts/Locality/*.md
@@ -21,6 +21,9 @@ Study mode:
   --compare-hooks       Run that scenario four times: Locality without hooks,
                         Locality with hooks, MCP without hooks, and MCP with
                         hooks. This implies --compare-mcp and is artifact-only.
+  --strategy NAME       Run only one strategy: locality, notion-mcp, or all.
+                        Default: all. Without --compare-mcp, all means
+                        Locality-only for backward compatibility.
 
 Important environment:
   REPO_DIR                 Repository path. Default: /home/amika/workspace/locality
@@ -68,6 +71,7 @@ WRITE_MOUNTED_PAGE="${WRITE_MOUNTED_PAGE:-0}"
 COMPARE_MCP=0
 COMPARE_HOOKS=0
 SCENARIO_FILTER="${SCENARIO_FILTER:-}"
+RUN_STRATEGY="${RUN_STRATEGY:-all}"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --push) PUSH=1; WRITE_MOUNTED_PAGE=1 ;;
@@ -84,6 +88,16 @@ while [ "$#" -gt 0 ]; do
       SCENARIO_FILTER="$1"
       ;;
     --scenario=*) SCENARIO_FILTER="${1#--scenario=}" ;;
+    --strategy)
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "--strategy requires locality, notion-mcp, or all" >&2
+        usage >&2
+        exit 2
+      fi
+      RUN_STRATEGY="$1"
+      ;;
+    --strategy=*) RUN_STRATEGY="${1#--strategy=}" ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -95,10 +109,27 @@ case "$WRITE_MOUNTED_PAGE" in
   *) echo "WRITE_MOUNTED_PAGE must be 0 or 1" >&2; exit 2 ;;
 esac
 
+case "$RUN_STRATEGY" in
+  all|locality|notion-mcp) ;;
+  *) echo "--strategy must be locality, notion-mcp, or all" >&2; exit 2 ;;
+esac
+
 if [ "$COMPARE_HOOKS" -eq 1 ]; then
   COMPARE_MCP=1
+  if [ "$RUN_STRATEGY" != "all" ]; then
+    echo "--compare-hooks requires --strategy all" >&2
+    exit 2
+  fi
   if [ "$WRITE_MOUNTED_PAGE" = "1" ] || [ "$PUSH" -eq 1 ]; then
     echo "--compare-hooks is artifact-only and cannot be combined with --write-mounted-page or --push" >&2
+    exit 2
+  fi
+fi
+
+if [ "$RUN_STRATEGY" = "notion-mcp" ]; then
+  COMPARE_MCP=1
+  if [ "$WRITE_MOUNTED_PAGE" = "1" ] || [ "$PUSH" -eq 1 ]; then
+    echo "--strategy notion-mcp is artifact-only and cannot be combined with --write-mounted-page or --push" >&2
     exit 2
   fi
 fi
@@ -151,6 +182,23 @@ TRACE_DIR="$OUT_DIR/locality-traces"
 SCENARIO_ROOT="$OUT_DIR/scenarios"
 SCENARIO_MANIFEST="$OUT_DIR/scenarios.tsv"
 CURRENT_SCENARIO="setup"
+
+RUN_LOCALITY_AGENT=0
+RUN_MCP_AGENT=0
+case "$RUN_STRATEGY" in
+  locality)
+    RUN_LOCALITY_AGENT=1
+    ;;
+  notion-mcp)
+    RUN_MCP_AGENT=1
+    ;;
+  all)
+    RUN_LOCALITY_AGENT=1
+    if [ "$COMPARE_MCP" -eq 1 ]; then
+      RUN_MCP_AGENT=1
+    fi
+    ;;
+esac
 
 case "$CODEX_HOOKS_MODE" in
   hooks|no-hooks) ;;
@@ -488,8 +536,10 @@ validate_codex_mcp_auth_inputs() {
 }
 
 prepare_codex_strategy_homes() {
-  prepare_codex_home_without_mcp "$LOCALITY_CODEX_HOME"
-  if [ "$COMPARE_MCP" -eq 1 ]; then
+  if [ "$RUN_LOCALITY_AGENT" -eq 1 ]; then
+    prepare_codex_home_without_mcp "$LOCALITY_CODEX_HOME"
+  fi
+  if [ "$RUN_MCP_AGENT" -eq 1 ]; then
     validate_codex_mcp_auth_inputs || return
     prepare_codex_home_without_mcp "$MCP_CODEX_HOME"
   fi
@@ -1168,9 +1218,11 @@ printf 'scenario\tstrategy\tvariant\thooks\tlocality_prompt\tmcp_prompt\tout_dir
 
 phase_start
 test -d "$REPO_DIR"
-test -x "$LOC_BIN"
+if [ "$RUN_LOCALITY_AGENT" -eq 1 ]; then
+  test -x "$LOC_BIN"
+fi
 git -C "$REPO_DIR" rev-parse --git-dir >/dev/null
-phase_end "locality" "validate_environment" "ok" "repo=$REPO_DIR; model=$CODEX_MODEL; effort=$CODEX_REASONING_EFFORT; scenarios=${#SCENARIO_FILES[@]}; prompts=$LOCALITY_PROMPT_DIR; write_mounted_page=$WRITE_MOUNTED_PAGE"
+phase_end "locality" "validate_environment" "ok" "repo=$REPO_DIR; model=$CODEX_MODEL; effort=$CODEX_REASONING_EFFORT; scenarios=${#SCENARIO_FILES[@]}; prompts=$LOCALITY_PROMPT_DIR; write_mounted_page=$WRITE_MOUNTED_PAGE; run_strategy=$RUN_STRATEGY"
 
 phase_start
 set +e
@@ -1178,7 +1230,7 @@ prepare_codex_strategy_homes > "$OUT_DIR/codex-strategy-setup.out" 2> "$OUT_DIR/
 CODEX_STRATEGY_SETUP_RC=$?
 set -e
 if [ "$CODEX_STRATEGY_SETUP_RC" -eq 0 ]; then
-  if [ "$COMPARE_MCP" -eq 1 ]; then
+  if [ "$RUN_MCP_AGENT" -eq 1 ]; then
     phase_end "locality" "codex_strategy_config" "ok" "locality_home=$LOCALITY_CODEX_HOME; mcp_home=$MCP_CODEX_HOME; mcp_auth=validated"
   else
     phase_end "locality" "codex_strategy_config" "ok" "locality_home=$LOCALITY_CODEX_HOME; mcp_auth=not requested"
@@ -1190,100 +1242,120 @@ else
   exit "$CODEX_STRATEGY_SETUP_RC"
 fi
 
-phase_start
-PAGE_PATH="$(run_loc_traced "target-locate" "$LOC_BIN" locate "$TARGET_URL")"
-phase_end "locality" "notion_target_locate" "ok" "path=$PAGE_PATH; trace=$TRACE_DIR/target-locate.jsonl"
-
-phase_start
-set +e
-run_loc_traced "target-pull" "$LOC_BIN" pull "$PAGE_PATH" > "$OUT_DIR/loc-pull.out" 2> "$OUT_DIR/loc-pull.err"
-PULL_RC=$?
-set -e
-PULL_DETAIL="$(tr '\n' ' ' < "$OUT_DIR/loc-pull.out" | sed 's/[[:space:]]*$//')"
-if [ "$PULL_RC" -eq 0 ]; then
-  phase_end "locality" "notion_target_prehydrate" "ok" "path=$PAGE_PATH; trace=$TRACE_DIR/target-pull.jsonl; $PULL_DETAIL"
-elif grep -qi "dirty" "$OUT_DIR/loc-pull.out" "$OUT_DIR/loc-pull.err"; then
-  phase_end "locality" "notion_target_prehydrate" "ok" "path=$PAGE_PATH; trace=$TRACE_DIR/target-pull.jsonl; pull skipped dirty target"
-else
-  phase_end "locality" "notion_target_prehydrate" "failed" "exit=$PULL_RC; path=$PAGE_PATH; trace=$TRACE_DIR/target-pull.jsonl"
-  cat "$OUT_DIR/loc-pull.out" >&2
-  cat "$OUT_DIR/loc-pull.err" >&2
-  exit "$PULL_RC"
-fi
-
-phase_start
-: > "$CONTEXT_PATHS_FILE"
-context_url_index=0
-while IFS= read -r context_url; do
-  context_url="${context_url#"${context_url%%[![:space:]]*}"}"
-  context_url="${context_url%"${context_url##*[![:space:]]}"}"
-  if [ -z "$context_url" ]; then
-    continue
-  fi
-  context_url_index=$((context_url_index + 1))
-  context_page="$(run_loc_traced "context-locate-$context_url_index" "$LOC_BIN" locate "$context_url")"
-  printf '%s\n' "$(dirname "$context_page")" >> "$CONTEXT_PATHS_FILE"
-done <<< "$CONTEXT_URLS"
-while IFS= read -r context_path; do
-  context_path="${context_path#"${context_path%%[![:space:]]*}"}"
-  context_path="${context_path%"${context_path##*[![:space:]]}"}"
-  if [ -n "$context_path" ]; then
-    printf '%s\n' "$context_path" >> "$CONTEXT_PATHS_FILE"
-  fi
-done <<< "$CONTEXT_PULL_PATHS"
-sort -u "$CONTEXT_PATHS_FILE" -o "$CONTEXT_PATHS_FILE"
-context_path_count="$(grep -cve '^[[:space:]]*$' "$CONTEXT_PATHS_FILE" 2>/dev/null || true)"
-phase_end "locality" "notion_context_locate" "ok" "urls=$context_url_index; paths=$context_path_count; traces=$TRACE_DIR/context-locate-*.jsonl"
-
-phase_start
-hydrated_count=0
-while IFS= read -r context_path; do
-  if [ -z "$context_path" ]; then
-    continue
-  fi
-  safe_name="$(trace_safe_name "$context_path")"
-  set +e
-  run_loc_traced "context-pull-$safe_name" "$LOC_BIN" pull "$context_path" --json > "$OUT_DIR/loc-context-pull-$safe_name.json" 2> "$OUT_DIR/loc-context-pull-$safe_name.err"
-  pull_rc=$?
-  set -e
-  if [ "$pull_rc" -ne 0 ] && ! grep -qi "dirty" "$OUT_DIR/loc-context-pull-$safe_name.json" "$OUT_DIR/loc-context-pull-$safe_name.err"; then
-    phase_end "locality" "notion_context_hydrate" "failed" "exit=$pull_rc; path=$context_path; trace=$TRACE_DIR/context-pull-$safe_name.jsonl"
-    cat "$OUT_DIR/loc-context-pull-$safe_name.json" >&2
-    cat "$OUT_DIR/loc-context-pull-$safe_name.err" >&2
-    exit "$pull_rc"
-  fi
-  hydrated_count=$((hydrated_count + 1))
-done < "$CONTEXT_PATHS_FILE"
-phase_end "locality" "notion_context_hydrate" "ok" "paths=$hydrated_count; list=$CONTEXT_PATHS_FILE; traces=$TRACE_DIR/context-pull-*.jsonl"
-
-phase_start
-: > "$CONTEXT_INVENTORY"
-: > "$CONTEXT_SEARCH_RESULTS"
-while IFS= read -r context_path; do
-  if [ -z "$context_path" ] || [ ! -d "$context_path" ]; then
-    continue
-  fi
-  {
-    echo "## $context_path"
-    find "$context_path" -name page.md -type f | sort
-    echo
-  } >> "$CONTEXT_INVENTORY"
-  rg -n --no-heading "$CONTEXT_SEARCH_QUERY" "$context_path" >> "$CONTEXT_SEARCH_RESULTS" 2>/dev/null || true
-done < "$CONTEXT_PATHS_FILE"
-inventory_count="$(grep -c '/page.md$' "$CONTEXT_INVENTORY" 2>/dev/null || true)"
-search_hits="$(wc -l < "$CONTEXT_SEARCH_RESULTS" | tr -d ' ')"
-phase_end "locality" "notion_context_search" "ok" "pages=$inventory_count; hits=$search_hits; query=$CONTEXT_SEARCH_QUERY"
-
-phase_start
-PARENT_DIR="$(dirname "$PAGE_PATH")"
+PAGE_PATH=""
+PARENT_DIR=""
 locality_add_dirs=()
-while IFS= read -r context_path; do
-  if [ -n "$context_path" ]; then
-    locality_add_dirs+=("$context_path")
+if [ "$RUN_LOCALITY_AGENT" -eq 1 ]; then
+  phase_start
+  PAGE_PATH="$(run_loc_traced "target-locate" "$LOC_BIN" locate "$TARGET_URL")"
+  phase_end "locality" "notion_target_locate" "ok" "path=$PAGE_PATH; trace=$TRACE_DIR/target-locate.jsonl"
+
+  phase_start
+  set +e
+  run_loc_traced "target-pull" "$LOC_BIN" pull "$PAGE_PATH" > "$OUT_DIR/loc-pull.out" 2> "$OUT_DIR/loc-pull.err"
+  PULL_RC=$?
+  set -e
+  PULL_DETAIL="$(tr '\n' ' ' < "$OUT_DIR/loc-pull.out" | sed 's/[[:space:]]*$//')"
+  if [ "$PULL_RC" -eq 0 ]; then
+    phase_end "locality" "notion_target_prehydrate" "ok" "path=$PAGE_PATH; trace=$TRACE_DIR/target-pull.jsonl; $PULL_DETAIL"
+  elif grep -qi "dirty" "$OUT_DIR/loc-pull.out" "$OUT_DIR/loc-pull.err"; then
+    phase_end "locality" "notion_target_prehydrate" "ok" "path=$PAGE_PATH; trace=$TRACE_DIR/target-pull.jsonl; pull skipped dirty target"
+  else
+    phase_end "locality" "notion_target_prehydrate" "failed" "exit=$PULL_RC; path=$PAGE_PATH; trace=$TRACE_DIR/target-pull.jsonl"
+    cat "$OUT_DIR/loc-pull.out" >&2
+    cat "$OUT_DIR/loc-pull.err" >&2
+    exit "$PULL_RC"
   fi
-done < "$CONTEXT_PATHS_FILE"
-locality_add_dirs+=("$(dirname "$PAGE_PATH")")
-phase_end "locality" "prepare_context_add_dirs" "ok" "dirs=${#locality_add_dirs[@]}"
+
+  phase_start
+  : > "$CONTEXT_PATHS_FILE"
+  context_url_index=0
+  while IFS= read -r context_url; do
+    context_url="${context_url#"${context_url%%[![:space:]]*}"}"
+    context_url="${context_url%"${context_url##*[![:space:]]}"}"
+    if [ -z "$context_url" ]; then
+      continue
+    fi
+    context_url_index=$((context_url_index + 1))
+    context_page="$(run_loc_traced "context-locate-$context_url_index" "$LOC_BIN" locate "$context_url")"
+    printf '%s\n' "$(dirname "$context_page")" >> "$CONTEXT_PATHS_FILE"
+  done <<< "$CONTEXT_URLS"
+  while IFS= read -r context_path; do
+    context_path="${context_path#"${context_path%%[![:space:]]*}"}"
+    context_path="${context_path%"${context_path##*[![:space:]]}"}"
+    if [ -n "$context_path" ]; then
+      printf '%s\n' "$context_path" >> "$CONTEXT_PATHS_FILE"
+    fi
+  done <<< "$CONTEXT_PULL_PATHS"
+  sort -u "$CONTEXT_PATHS_FILE" -o "$CONTEXT_PATHS_FILE"
+  context_path_count="$(grep -cve '^[[:space:]]*$' "$CONTEXT_PATHS_FILE" 2>/dev/null || true)"
+  phase_end "locality" "notion_context_locate" "ok" "urls=$context_url_index; paths=$context_path_count; traces=$TRACE_DIR/context-locate-*.jsonl"
+
+  phase_start
+  hydrated_count=0
+  while IFS= read -r context_path; do
+    if [ -z "$context_path" ]; then
+      continue
+    fi
+    safe_name="$(trace_safe_name "$context_path")"
+    set +e
+    run_loc_traced "context-pull-$safe_name" "$LOC_BIN" pull "$context_path" --json > "$OUT_DIR/loc-context-pull-$safe_name.json" 2> "$OUT_DIR/loc-context-pull-$safe_name.err"
+    pull_rc=$?
+    set -e
+    if [ "$pull_rc" -ne 0 ] && ! grep -qi "dirty" "$OUT_DIR/loc-context-pull-$safe_name.json" "$OUT_DIR/loc-context-pull-$safe_name.err"; then
+      phase_end "locality" "notion_context_hydrate" "failed" "exit=$pull_rc; path=$context_path; trace=$TRACE_DIR/context-pull-$safe_name.jsonl"
+      cat "$OUT_DIR/loc-context-pull-$safe_name.json" >&2
+      cat "$OUT_DIR/loc-context-pull-$safe_name.err" >&2
+      exit "$pull_rc"
+    fi
+    hydrated_count=$((hydrated_count + 1))
+  done < "$CONTEXT_PATHS_FILE"
+  phase_end "locality" "notion_context_hydrate" "ok" "paths=$hydrated_count; list=$CONTEXT_PATHS_FILE; traces=$TRACE_DIR/context-pull-*.jsonl"
+
+  phase_start
+  : > "$CONTEXT_INVENTORY"
+  : > "$CONTEXT_SEARCH_RESULTS"
+  while IFS= read -r context_path; do
+    if [ -z "$context_path" ] || [ ! -d "$context_path" ]; then
+      continue
+    fi
+    {
+      echo "## $context_path"
+      find "$context_path" -name page.md -type f | sort
+      echo
+    } >> "$CONTEXT_INVENTORY"
+    rg -n --no-heading "$CONTEXT_SEARCH_QUERY" "$context_path" >> "$CONTEXT_SEARCH_RESULTS" 2>/dev/null || true
+  done < "$CONTEXT_PATHS_FILE"
+  inventory_count="$(grep -c '/page.md$' "$CONTEXT_INVENTORY" 2>/dev/null || true)"
+  search_hits="$(wc -l < "$CONTEXT_SEARCH_RESULTS" | tr -d ' ')"
+  phase_end "locality" "notion_context_search" "ok" "pages=$inventory_count; hits=$search_hits; query=$CONTEXT_SEARCH_QUERY"
+
+  phase_start
+  PARENT_DIR="$(dirname "$PAGE_PATH")"
+  while IFS= read -r context_path; do
+    if [ -n "$context_path" ]; then
+      locality_add_dirs+=("$context_path")
+    fi
+  done < "$CONTEXT_PATHS_FILE"
+  locality_add_dirs+=("$(dirname "$PAGE_PATH")")
+  phase_end "locality" "prepare_context_add_dirs" "ok" "dirs=${#locality_add_dirs[@]}"
+else
+  : > "$CONTEXT_PATHS_FILE"
+  : > "$CONTEXT_INVENTORY"
+  : > "$CONTEXT_SEARCH_RESULTS"
+  phase_start
+  phase_end "locality" "notion_target_locate" "skipped" "run_strategy=$RUN_STRATEGY"
+  phase_start
+  phase_end "locality" "notion_target_prehydrate" "skipped" "run_strategy=$RUN_STRATEGY"
+  phase_start
+  phase_end "locality" "notion_context_locate" "skipped" "run_strategy=$RUN_STRATEGY"
+  phase_start
+  phase_end "locality" "notion_context_hydrate" "skipped" "run_strategy=$RUN_STRATEGY"
+  phase_start
+  phase_end "locality" "notion_context_search" "skipped" "run_strategy=$RUN_STRATEGY"
+  phase_start
+  phase_end "locality" "prepare_context_add_dirs" "skipped" "run_strategy=$RUN_STRATEGY"
+fi
 
 for scenario_file in "${SCENARIO_FILES[@]}"; do
   SCENARIO_NAME="$(scenario_name_for_file "$scenario_file")"
@@ -1315,13 +1387,17 @@ for scenario_file in "${SCENARIO_FILES[@]}"; do
   SCENARIO_CONTEXT_PATHS_FILE="$SCENARIO_OUT_DIR/locality-context-paths.txt"
   SCENARIO_CONTEXT_INVENTORY="$SCENARIO_OUT_DIR/locality-context-inventory.txt"
   SCENARIO_CONTEXT_SEARCH_RESULTS="$SCENARIO_OUT_DIR/locality-context-search.txt"
+  SCENARIO_MANIFEST_STRATEGY="$RUN_STRATEGY"
+  if [ "$RUN_STRATEGY" = "all" ] && [ "$RUN_MCP_AGENT" -eq 0 ]; then
+    SCENARIO_MANIFEST_STRATEGY="locality"
+  fi
 
   if [ "$COMPARE_HOOKS" -eq 1 ]; then
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$SCENARIO_NAME" "all" "hook-study" "mixed" "$LOCALITY_PROMPT_FILE" "$MCP_PROMPT_FILE" "$SCENARIO_OUT_DIR" "$SCENARIO_AGENT_OUT_DIR" "$SCENARIO_REPORT_TITLE" "$REPORT_PAGE_PATH" >> "$SCENARIO_MANIFEST"
+      "$SCENARIO_NAME" "$SCENARIO_MANIFEST_STRATEGY" "hook-study" "mixed" "$LOCALITY_PROMPT_FILE" "$MCP_PROMPT_FILE" "$SCENARIO_OUT_DIR" "$SCENARIO_AGENT_OUT_DIR" "$SCENARIO_REPORT_TITLE" "$REPORT_PAGE_PATH" >> "$SCENARIO_MANIFEST"
   else
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$SCENARIO_NAME" "all" "default" "$CODEX_HOOKS_MODE" "$LOCALITY_PROMPT_FILE" "$MCP_PROMPT_FILE" "$SCENARIO_OUT_DIR" "$SCENARIO_AGENT_OUT_DIR" "$SCENARIO_REPORT_TITLE" "$REPORT_PAGE_PATH" >> "$SCENARIO_MANIFEST"
+      "$SCENARIO_NAME" "$SCENARIO_MANIFEST_STRATEGY" "default" "$CODEX_HOOKS_MODE" "$LOCALITY_PROMPT_FILE" "$MCP_PROMPT_FILE" "$SCENARIO_OUT_DIR" "$SCENARIO_AGENT_OUT_DIR" "$SCENARIO_REPORT_TITLE" "$REPORT_PAGE_PATH" >> "$SCENARIO_MANIFEST"
   fi
 
   RUN_OUT_DIR="$OUT_DIR"
@@ -1335,44 +1411,49 @@ for scenario_file in "${SCENARIO_FILES[@]}"; do
   export REPO_DIR LOC_BIN TARGET_URL PAGE_PATH REPORT_PAGE_PATH OUT_DIR METRICS_TSV SUMMARY_JSON
   export CONTEXT_PATHS_FILE CONTEXT_INVENTORY CONTEXT_SEARCH_RESULTS CONTEXT_SEARCH_QUERY
 
-  if [ "$COMPARE_HOOKS" -eq 1 ]; then
-    if run_codex_variant_with_metric "locality" "locality" "no-hooks" "no-hooks" "$OUT_DIR/variants/locality-no-hooks" "$SCENARIO_AGENT_OUT_DIR" "$LOCALITY_PROMPT_FILE" "report-body.md" "locality-agent-final.md" "${locality_add_dirs[@]}"; then
-      :
+  if [ "$RUN_LOCALITY_AGENT" -eq 1 ]; then
+    if [ "$COMPARE_HOOKS" -eq 1 ]; then
+      if run_codex_variant_with_metric "locality" "locality" "no-hooks" "no-hooks" "$OUT_DIR/variants/locality-no-hooks" "$SCENARIO_AGENT_OUT_DIR" "$LOCALITY_PROMPT_FILE" "report-body.md" "locality-agent-final.md" "${locality_add_dirs[@]}"; then
+        :
+      else
+        agent_rc=$?
+        OUT_DIR="$RUN_OUT_DIR"
+        CONTEXT_PATHS_FILE="$RUN_CONTEXT_PATHS_FILE"
+        CONTEXT_INVENTORY="$RUN_CONTEXT_INVENTORY"
+        CONTEXT_SEARCH_RESULTS="$RUN_CONTEXT_SEARCH_RESULTS"
+        export OUT_DIR CONTEXT_PATHS_FILE CONTEXT_INVENTORY CONTEXT_SEARCH_RESULTS
+        exit "$agent_rc"
+      fi
+      if run_codex_variant_with_metric "locality" "locality" "hooks" "hooks" "$OUT_DIR/variants/locality-hooks" "$SCENARIO_AGENT_OUT_DIR" "$LOCALITY_PROMPT_FILE" "report-body.md" "locality-agent-final.md" "${locality_add_dirs[@]}"; then
+        :
+      else
+        agent_rc=$?
+        OUT_DIR="$RUN_OUT_DIR"
+        CONTEXT_PATHS_FILE="$RUN_CONTEXT_PATHS_FILE"
+        CONTEXT_INVENTORY="$RUN_CONTEXT_INVENTORY"
+        CONTEXT_SEARCH_RESULTS="$RUN_CONTEXT_SEARCH_RESULTS"
+        export OUT_DIR CONTEXT_PATHS_FILE CONTEXT_INVENTORY CONTEXT_SEARCH_RESULTS
+        exit "$agent_rc"
+      fi
     else
-      agent_rc=$?
-      OUT_DIR="$RUN_OUT_DIR"
-      CONTEXT_PATHS_FILE="$RUN_CONTEXT_PATHS_FILE"
-      CONTEXT_INVENTORY="$RUN_CONTEXT_INVENTORY"
-      CONTEXT_SEARCH_RESULTS="$RUN_CONTEXT_SEARCH_RESULTS"
-      export OUT_DIR CONTEXT_PATHS_FILE CONTEXT_INVENTORY CONTEXT_SEARCH_RESULTS
-      exit "$agent_rc"
-    fi
-    if run_codex_variant_with_metric "locality" "locality" "hooks" "hooks" "$OUT_DIR/variants/locality-hooks" "$SCENARIO_AGENT_OUT_DIR" "$LOCALITY_PROMPT_FILE" "report-body.md" "locality-agent-final.md" "${locality_add_dirs[@]}"; then
-      :
-    else
-      agent_rc=$?
-      OUT_DIR="$RUN_OUT_DIR"
-      CONTEXT_PATHS_FILE="$RUN_CONTEXT_PATHS_FILE"
-      CONTEXT_INVENTORY="$RUN_CONTEXT_INVENTORY"
-      CONTEXT_SEARCH_RESULTS="$RUN_CONTEXT_SEARCH_RESULTS"
-      export OUT_DIR CONTEXT_PATHS_FILE CONTEXT_INVENTORY CONTEXT_SEARCH_RESULTS
-      exit "$agent_rc"
+      if run_codex_variant_with_metric "locality" "locality" "$CODEX_HOOKS_MODE" "default" "$OUT_DIR" "$SCENARIO_AGENT_OUT_DIR" "$LOCALITY_PROMPT_FILE" "report-body.md" "locality-agent-final.md" "${locality_add_dirs[@]}"; then
+        :
+      else
+        agent_rc=$?
+        OUT_DIR="$RUN_OUT_DIR"
+        CONTEXT_PATHS_FILE="$RUN_CONTEXT_PATHS_FILE"
+        CONTEXT_INVENTORY="$RUN_CONTEXT_INVENTORY"
+        CONTEXT_SEARCH_RESULTS="$RUN_CONTEXT_SEARCH_RESULTS"
+        export OUT_DIR CONTEXT_PATHS_FILE CONTEXT_INVENTORY CONTEXT_SEARCH_RESULTS
+        exit "$agent_rc"
+      fi
     fi
   else
-    if run_codex_variant_with_metric "locality" "locality" "$CODEX_HOOKS_MODE" "default" "$OUT_DIR" "$SCENARIO_AGENT_OUT_DIR" "$LOCALITY_PROMPT_FILE" "report-body.md" "locality-agent-final.md" "${locality_add_dirs[@]}"; then
-      :
-    else
-      agent_rc=$?
-      OUT_DIR="$RUN_OUT_DIR"
-      CONTEXT_PATHS_FILE="$RUN_CONTEXT_PATHS_FILE"
-      CONTEXT_INVENTORY="$RUN_CONTEXT_INVENTORY"
-      CONTEXT_SEARCH_RESULTS="$RUN_CONTEXT_SEARCH_RESULTS"
-      export OUT_DIR CONTEXT_PATHS_FILE CONTEXT_INVENTORY CONTEXT_SEARCH_RESULTS
-      exit "$agent_rc"
-    fi
+    phase_start
+    phase_end "locality" "codex_exec_wall_time" "skipped" "run_strategy=$RUN_STRATEGY"
   fi
 
-  if [ "$WRITE_MOUNTED_PAGE" = "1" ]; then
+  if [ "$WRITE_MOUNTED_PAGE" = "1" ] && [ "$RUN_LOCALITY_AGENT" -eq 1 ]; then
     phase_start
     python3 - "$REPORT_PAGE_PATH" "$OUT_DIR/report-body.md" "$SCENARIO_REPORT_TITLE" <<'PY'
 import sys
@@ -1405,16 +1486,23 @@ PY
       phase_start
       phase_end "locality" "loc_push" "skipped" "dry-run; pass --push to publish"
     fi
-  else
+  elif [ "$RUN_LOCALITY_AGENT" -eq 1 ]; then
     phase_start
     phase_end "locality" "write_mounted_page" "skipped" "artifact-only; report=$OUT_DIR/report-body.md"
     phase_start
     phase_end "locality" "loc_diff" "skipped" "artifact-only; pass --write-mounted-page to diff mounted page"
     phase_start
     phase_end "locality" "loc_push" "skipped" "artifact-only; pass --push to publish"
+  else
+    phase_start
+    phase_end "locality" "write_mounted_page" "skipped" "run_strategy=$RUN_STRATEGY"
+    phase_start
+    phase_end "locality" "loc_diff" "skipped" "run_strategy=$RUN_STRATEGY"
+    phase_start
+    phase_end "locality" "loc_push" "skipped" "run_strategy=$RUN_STRATEGY"
   fi
 
-  if [ "$COMPARE_MCP" -eq 1 ]; then
+  if [ "$RUN_MCP_AGENT" -eq 1 ]; then
     phase_start
     if [ "$MCP_AUTH_CONFIGURED" -eq 0 ]; then
       set +e
