@@ -3,14 +3,6 @@ You are running the Notion-MCP launch-readiness comparison benchmark.
 User prompt:
 I need a short standup-style update for Locality based on what changed recently. Please discover the relevant context yourself, connect code changes to product or launch work where possible, and produce a grounded Markdown draft. Do not push or update any remote source.
 
-Use these context sources:
-- local git commands in `REPO_DIR`
-- Notion MCP tools for Notion search/read context
-
-Do not read mounted Locality Notion files under `/home/amika/notion`.
-Do not use `loc` commands.
-Do not create Notion pages/docs, push or update Notion, or update any remote source.
-
 Required work:
 1. Inspect recent code changes with local git commands as needed.
 2. Use Notion MCP to search/read relevant product, launch, engineering, risk, blocker, and team context.
