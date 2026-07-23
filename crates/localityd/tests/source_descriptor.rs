@@ -1019,6 +1019,12 @@ fn planned_source_connector_descriptors_include_auth_and_category() {
         github.auth_modes(),
         &["oauth", "github-app", "personal-token"]
     );
+    assert!(github.projection().contains("PRs"));
+    assert!(
+        github
+            .write_model()
+            .contains("repository edits stay in git")
+    );
 
     let fhir = planned
         .iter()
@@ -1026,6 +1032,8 @@ fn planned_source_connector_descriptors_include_auth_and_category() {
         .expect("fhir descriptor");
     assert_eq!(fhir.category(), SourceConnectorCategory::Knowledge);
     assert_eq!(fhir.auth_modes(), &["smart-oauth"]);
+    assert!(fhir.projection().contains("FHIR resources"));
+    assert!(fhir.write_model().contains("Read-only"));
 }
 
 #[test]

@@ -163,120 +163,160 @@ const PLANNED_SOURCE_CONNECTORS: &[PlannedSourceConnectorDescriptor] = &[
         display_name: "Confluence",
         category: SourceConnectorCategory::Knowledge,
         auth_modes: &["oauth", "api-token"],
+        projection: "Spaces and pages as folders with page.md bodies.",
+        write_model: "Start read-only, then reviewed page body updates.",
     },
     PlannedSourceConnectorDescriptor {
         id: "jira",
         display_name: "Jira",
         category: SourceConnectorCategory::Hybrid,
         auth_modes: &["oauth", "api-token"],
+        projection: "Projects, issues, comments, and sprint folders.",
+        write_model: "Reviewed issue body, status, assignee, and comment drafts.",
     },
     PlannedSourceConnectorDescriptor {
         id: "sharepoint",
         display_name: "SharePoint",
         category: SourceConnectorCategory::Knowledge,
         auth_modes: &["oauth"],
+        projection: "Sites, document libraries, pages, and files.",
+        write_model: "Start read-only, then reviewed document updates where safe.",
     },
     PlannedSourceConnectorDescriptor {
         id: "onedrive",
         display_name: "OneDrive",
         category: SourceConnectorCategory::Knowledge,
         auth_modes: &["oauth"],
+        projection: "User and shared files as folder hierarchies.",
+        write_model: "Reviewed file updates after version checks.",
     },
     PlannedSourceConnectorDescriptor {
         id: "outlook-mail",
         display_name: "Outlook Mail",
         category: SourceConnectorCategory::Action,
         auth_modes: &["oauth"],
+        projection: "Mailbox folders plus reviewed draft files.",
+        write_model: "Reviewed outbound mail creates from draft files.",
     },
     PlannedSourceConnectorDescriptor {
         id: "outlook-calendar",
         display_name: "Outlook Calendar",
         category: SourceConnectorCategory::Action,
         auth_modes: &["oauth"],
+        projection: "Calendar events plus scheduling drafts.",
+        write_model: "Reviewed event creates and updates after conflict checks.",
     },
     PlannedSourceConnectorDescriptor {
         id: "microsoft-teams",
         display_name: "Microsoft Teams",
         category: SourceConnectorCategory::Knowledge,
         auth_modes: &["oauth"],
+        projection: "Teams, channels, chats, meetings, and users as context.",
+        write_model: "Start read-only, then reviewed message drafts if approved.",
     },
     PlannedSourceConnectorDescriptor {
         id: "github",
         display_name: "GitHub",
         category: SourceConnectorCategory::Hybrid,
         auth_modes: &["oauth", "github-app", "personal-token"],
+        projection: "Repositories, PRs, issues, discussions, reviews, and CI context.",
+        write_model: "Reviewed issue/comment/review drafts; repository edits stay in git.",
     },
     PlannedSourceConnectorDescriptor {
         id: "gitlab",
         display_name: "GitLab",
         category: SourceConnectorCategory::Hybrid,
         auth_modes: &["oauth", "personal-token"],
+        projection: "Projects, MRs, issues, pipelines, releases, and reviews.",
+        write_model: "Reviewed issue/comment/MR note drafts; repository edits stay in git.",
     },
     PlannedSourceConnectorDescriptor {
         id: "google-drive",
         display_name: "Google Drive",
         category: SourceConnectorCategory::Knowledge,
         auth_modes: &["oauth"],
+        projection: "Drive files, folders, shared drives, PDFs, sheets, and slides.",
+        write_model: "Reviewed file updates where a canonical representation is safe.",
     },
     PlannedSourceConnectorDescriptor {
         id: "dropbox",
         display_name: "Dropbox",
         category: SourceConnectorCategory::Knowledge,
         auth_modes: &["oauth"],
+        projection: "Shared files and folders.",
+        write_model: "Reviewed file updates after revision checks.",
     },
     PlannedSourceConnectorDescriptor {
         id: "box",
         display_name: "Box",
         category: SourceConnectorCategory::Knowledge,
         auth_modes: &["oauth"],
+        projection: "Enterprise files, folders, and shared collections.",
+        write_model: "Reviewed file updates after version checks.",
     },
     PlannedSourceConnectorDescriptor {
         id: "figma",
         display_name: "Figma",
         category: SourceConnectorCategory::Knowledge,
         auth_modes: &["oauth", "personal-token"],
+        projection: "Design files, comments, components, and project metadata.",
+        write_model: "Start read-only, then reviewed comment drafts.",
     },
     PlannedSourceConnectorDescriptor {
         id: "asana",
         display_name: "Asana",
         category: SourceConnectorCategory::Hybrid,
         auth_modes: &["oauth", "personal-token"],
+        projection: "Projects, tasks, comments, sections, and status updates.",
+        write_model: "Reviewed task field updates and comment drafts.",
     },
     PlannedSourceConnectorDescriptor {
         id: "clickup",
         display_name: "ClickUp",
         category: SourceConnectorCategory::Hybrid,
         auth_modes: &["oauth", "api-token"],
+        projection: "Spaces, folders, lists, tasks, docs, and comments.",
+        write_model: "Reviewed task field updates and comment drafts.",
     },
     PlannedSourceConnectorDescriptor {
         id: "zendesk",
         display_name: "Zendesk",
         category: SourceConnectorCategory::Hybrid,
         auth_modes: &["oauth", "api-token"],
+        projection: "Tickets, help-center articles, macros, users, and organizations.",
+        write_model: "Reviewed ticket reply drafts and article edits.",
     },
     PlannedSourceConnectorDescriptor {
         id: "intercom",
         display_name: "Intercom",
         category: SourceConnectorCategory::Hybrid,
         auth_modes: &["oauth"],
+        projection: "Conversations, help articles, contacts, and companies.",
+        write_model: "Reviewed conversation reply drafts and article edits.",
     },
     PlannedSourceConnectorDescriptor {
         id: "hubspot",
         display_name: "HubSpot",
         category: SourceConnectorCategory::Hybrid,
         auth_modes: &["oauth", "api-token"],
+        projection: "CRM objects, notes, tasks, emails, deals, and companies.",
+        write_model: "Reviewed note, task, and selected CRM field updates.",
     },
     PlannedSourceConnectorDescriptor {
         id: "salesforce",
         display_name: "Salesforce",
         category: SourceConnectorCategory::Hybrid,
         auth_modes: &["oauth"],
+        projection: "Accounts, opportunities, cases, notes, tasks, and knowledge records.",
+        write_model: "Reviewed note/task updates first; object writes require strict schema guards.",
     },
     PlannedSourceConnectorDescriptor {
         id: "fhir",
         display_name: "FHIR",
         category: SourceConnectorCategory::Knowledge,
         auth_modes: &["smart-oauth"],
+        projection: "Scoped FHIR resources as normalized read-only clinical context.",
+        write_model: "Read-only until audit, consent, and safety workflows are designed.",
     },
 ];
 
@@ -298,6 +338,8 @@ pub struct PlannedSourceConnectorDescriptor {
     display_name: &'static str,
     category: SourceConnectorCategory,
     auth_modes: &'static [&'static str],
+    projection: &'static str,
+    write_model: &'static str,
 }
 
 impl PlannedSourceConnectorDescriptor {
@@ -315,6 +357,14 @@ impl PlannedSourceConnectorDescriptor {
 
     pub fn auth_modes(&self) -> &'static [&'static str] {
         self.auth_modes
+    }
+
+    pub fn projection(&self) -> &'static str {
+        self.projection
+    }
+
+    pub fn write_model(&self) -> &'static str {
+        self.write_model
     }
 }
 
