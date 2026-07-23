@@ -58,12 +58,12 @@ fn mount_writes_agent_guidance_and_claude_alias() {
     assert!(agents.contains("loc connect <provider> --no-browser"));
     assert!(agents.contains("ask the user to open it while you wait"));
     assert!(agents.contains("Read the nearest `AGENTS.md` before connector-specific work"));
-    assert!(agents.contains("For discovery or research tasks, triage by path and title first"));
-    assert!(agents.contains("If initial search gives no hits, refine the query and browse directory names before concluding context is unavailable"));
-    assert!(agents.contains("If useful results are outside a user-provided path or source scope, do not read them until the user permits it"));
+    assert!(agents.contains("for discovery, triage path/title first"));
+    assert!(agents.contains("refine empty searches, browse directories"));
+    assert!(agents.contains("report out-of-scope results without reading them unless permitted"));
     assert!(agents.contains("loc live-mode status <file>"));
     assert!(agents.contains("loc mv <source> <dest>"));
-    assert!(agents.contains("Push intentional changes with `loc push <path>`"));
+    assert!(agents.contains("Use `loc push <path>` to make Notion match local edits"));
     assert!(agents.contains("If desktop Live Mode is on"));
     assert!(agents.contains("Do not run routine `loc pull` or `loc push`"));
     assert!(agents.contains("remote changed since last sync"));
