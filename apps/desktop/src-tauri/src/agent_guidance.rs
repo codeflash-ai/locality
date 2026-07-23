@@ -421,7 +421,11 @@ Connected sources can include Notion, Google Docs, Google Calendar, Gmail, Linea
 
 - Use `loc info <path>` for mount and connector context.
 - If the user asks you to connect a provider before mounting, run `loc connect <provider> --no-browser`, share the authorization URL, and ask the user to open it while you wait for verification.
+- Read the nearest mount-local `AGENTS.md` before connector-specific work; it may narrow writable/read-only paths and creation rules.
 - Use `loc search <query>` for broader source discovery, including Google Docs, Gmail, Linear, Slack, and Granola.
+- For discovery or research tasks, triage by path and title first, then open only the most relevant Markdown files.
+- If initial search gives no hits, refine the query and browse directory names before concluding context is unavailable.
+- If useful results are outside a user-provided path or source scope, do not read them until the user permits it; report the skipped path or result as unavailable.
 - Use `loc locate <url-or-title>` for mounted Notion page or database URLs/titles.
 - Edit mounted Markdown directly for writable sources.
 - Use `loc status <path>` to inspect pending local changes.
@@ -1096,6 +1100,14 @@ mod tests {
         }
         assert!(skill.contains("ask the user to open it while you wait"));
         assert!(skill.contains("mount-local `AGENTS.md`"));
+        assert!(
+            skill.contains(
+                "Read the nearest mount-local `AGENTS.md` before connector-specific work"
+            )
+        );
+        assert!(skill.contains("For discovery or research tasks, triage by path and title first"));
+        assert!(skill.contains("If initial search gives no hits, refine the query and browse directory names before concluding context is unavailable"));
+        assert!(skill.contains("If useful results are outside a user-provided path or source scope, do not read them until the user permits it"));
         assert!(skill.contains("Calendar and Gmail mounts expose drafts"));
         assert!(skill.contains("Linear issue edits"));
         assert!(skill.contains("Linear status moves"));
