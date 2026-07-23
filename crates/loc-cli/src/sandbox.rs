@@ -43,6 +43,7 @@ const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// without imposing a 60-second total limit on a progressing export.
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const BOOTSTRAP_EXCHANGE_ATTEMPTS: usize = 2;
+const EXPORT_ATTEMPT_CREATION_ATTEMPTS: usize = 2;
 const BOOTSTRAP_IDEMPOTENCY_DOMAIN: &[u8] = b"locality.session-exchange-idempotency.v1\0";
 const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
 const EXPORT_READ_AHEAD_CHUNK_BYTES: usize = 64 * 1024;
@@ -1141,20 +1142,23 @@ impl SandboxHttpClient {
                         operation: "bootstrap exchange",
                         detail: error.without_url().to_string(),
                     };
-                    if has_retry_remaining(attempt) {
+                    if has_retry_remaining(attempt, BOOTSTRAP_EXCHANGE_ATTEMPTS) {
                         continue;
                     }
                     return Err(error);
                 }
             };
 
-            if is_retriable_bootstrap_status(response.status()) && has_retry_remaining(attempt) {
+            if is_retriable_idempotent_status(response.status())
+                && has_retry_remaining(attempt, BOOTSTRAP_EXCHANGE_ATTEMPTS)
+            {
                 continue;
             }
             match read_json_response(response, "bootstrap exchange") {
                 Ok(capability) => return Ok(capability),
                 Err(error)
-                    if has_retry_remaining(attempt) && is_ambiguous_bootstrap_error(&error) =>
+                    if has_retry_remaining(attempt, BOOTSTRAP_EXCHANGE_ATTEMPTS)
+                        && is_ambiguous_idempotent_error(&error, "bootstrap exchange") =>
                 {
                     continue;
                 }
@@ -1225,18 +1229,46 @@ impl SandboxHttpClient {
         capability: &SessionCapability,
         request: &ExportAttemptRequest,
     ) -> Result<SealedExportOffer, SandboxInitError> {
-        let response = self
-            .client
-            .post(self.export_attempts_url(capability.session_id.as_str()))
-            .header(ACCEPT, JSON_MEDIA_TYPE)
-            .bearer_auth(&capability.opaque_capability)
-            .json(request)
-            .send()
-            .map_err(|error| SandboxInitError::Http {
-                operation: "export-attempt creation",
-                detail: error.without_url().to_string(),
-            })?;
-        read_json_response(response, "export-attempt creation")
+        for attempt in 0..EXPORT_ATTEMPT_CREATION_ATTEMPTS {
+            let response = match self
+                .client
+                .post(self.export_attempts_url(capability.session_id.as_str()))
+                .header(ACCEPT, JSON_MEDIA_TYPE)
+                .bearer_auth(&capability.opaque_capability)
+                .json(request)
+                .send()
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let error = SandboxInitError::Http {
+                        operation: "export-attempt creation",
+                        detail: error.without_url().to_string(),
+                    };
+                    if has_retry_remaining(attempt, EXPORT_ATTEMPT_CREATION_ATTEMPTS) {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+
+            if is_retriable_idempotent_status(response.status())
+                && has_retry_remaining(attempt, EXPORT_ATTEMPT_CREATION_ATTEMPTS)
+            {
+                continue;
+            }
+            match read_json_response(response, "export-attempt creation") {
+                Ok(offer) => return Ok(offer),
+                Err(error)
+                    if has_retry_remaining(attempt, EXPORT_ATTEMPT_CREATION_ATTEMPTS)
+                        && is_ambiguous_idempotent_error(&error, "export-attempt creation") =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        unreachable!("export-attempt creation loop always returns")
     }
 
     fn open_export_attempt(
@@ -1332,24 +1364,24 @@ fn lower_hex(bytes: &[u8]) -> String {
     String::from_utf8(encoded).expect("lowercase hexadecimal is valid UTF-8")
 }
 
-fn has_retry_remaining(attempt: usize) -> bool {
-    attempt + 1 < BOOTSTRAP_EXCHANGE_ATTEMPTS
+fn has_retry_remaining(attempt: usize, max_attempts: usize) -> bool {
+    attempt + 1 < max_attempts
 }
 
-fn is_retriable_bootstrap_status(status: StatusCode) -> bool {
+fn is_retriable_idempotent_status(status: StatusCode) -> bool {
     matches!(
         status,
         StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
     )
 }
 
-fn is_ambiguous_bootstrap_error(error: &SandboxInitError) -> bool {
+fn is_ambiguous_idempotent_error(error: &SandboxInitError, operation: &'static str) -> bool {
     matches!(
         error,
         SandboxInitError::Http {
-            operation: "bootstrap exchange",
+            operation: actual_operation,
             ..
-        }
+        } if *actual_operation == operation
     )
 }
 
@@ -1881,6 +1913,80 @@ mod tests {
     }
 
     #[test]
+    fn dropped_export_attempt_response_retries_the_exact_sealed_request() {
+        let offer = scope_offer_fixture();
+        let response = serde_json::to_vec(&offer).expect("serialize scope offer");
+        let server = TestServer::start(
+            vec![
+                TestResponse::DropConnection,
+                TestResponse::Json {
+                    status: "200 OK",
+                    body: response,
+                },
+            ],
+            true,
+        );
+        let client = SandboxHttpClient::new(&server.api_url).expect("HTTP client");
+        let request = scope_attempt_request_fixture();
+
+        assert_eq!(
+            client
+                .create_export_attempt(&capability(), &request)
+                .expect("retry export-attempt creation"),
+            offer
+        );
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), EXPORT_ATTEMPT_CREATION_ATTEMPTS);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(
+            requests[0].path,
+            "/v1/sessions/session-idempotent/export-attempts"
+        );
+        assert_eq!(requests[0].body, requests[1].body);
+        assert_eq!(
+            serde_json::from_slice::<ExportAttemptRequest>(&requests[0].body)
+                .expect("decode captured request")
+                .idempotency_key,
+            request.idempotency_key
+        );
+    }
+
+    #[test]
+    fn export_attempt_gateway_retry_is_bounded_and_reuses_the_request() {
+        let server = TestServer::start(
+            vec![
+                TestResponse::Json {
+                    status: "503 Service Unavailable",
+                    body: Vec::new(),
+                },
+                TestResponse::Json {
+                    status: "503 Service Unavailable",
+                    body: Vec::new(),
+                },
+            ],
+            true,
+        );
+        let client = SandboxHttpClient::new(&server.api_url).expect("HTTP client");
+        let request = scope_attempt_request_fixture();
+
+        let error = client
+            .create_export_attempt(&capability(), &request)
+            .expect_err("repeated service failure must stop");
+
+        assert!(matches!(
+            error,
+            SandboxInitError::HttpStatus {
+                operation: "export-attempt creation",
+                status: StatusCode::SERVICE_UNAVAILABLE,
+            }
+        ));
+        let requests = server.finish();
+        assert_eq!(requests.len(), EXPORT_ATTEMPT_CREATION_ATTEMPTS);
+        assert_eq!(requests[0].body, requests[1].body);
+    }
+
+    #[test]
     fn bootstrap_idempotency_keys_are_stable_per_token_and_separate_between_tokens() {
         let response = serde_json::to_vec(&capability()).expect("serialize capability");
         let server = TestServer::start(
@@ -2002,6 +2108,20 @@ mod tests {
             opaque_capability: "capability-secret".to_string(),
             expires_at: "2026-07-20T12:00:00Z".to_string(),
         }
+    }
+
+    fn scope_attempt_request_fixture() -> ExportAttemptRequest {
+        serde_json::from_str(include_str!(
+            "../../locality-protocol/fixtures/export-attempt-request.json"
+        ))
+        .expect("scope export-attempt request fixture")
+    }
+
+    fn scope_offer_fixture() -> SealedExportOffer {
+        serde_json::from_str(include_str!(
+            "../../locality-protocol/fixtures/sealed-export-offer.json"
+        ))
+        .expect("sealed scope export offer fixture")
     }
 
     fn assert_bootstrap_request(request: &CapturedRequest, expected_body: &[u8]) {
