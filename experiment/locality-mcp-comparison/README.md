@@ -238,6 +238,43 @@ ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
 '
 ```
 
+## Run Natural Retrieval Batch
+
+The natural retrieval batch tests whether agents can discover relevant context
+without receiving known Notion URLs, mounted context paths, or precomputed
+inventory files. It writes artifacts under `experiment/runs-2/<batch-id>/`.
+
+```bash
+ssh -o StrictHostKeyChecking=accept-new "$SSH_TARGET" '
+  export PATH="$HOME/.cargo/bin:$PATH"
+  cd /home/amika/workspace/locality
+  NATURAL_RUNS=2 \
+  CODEX_MODEL=gpt-5.6-luna \
+  CODEX_REASONING_EFFORT=low \
+  ./experiment/locality-mcp-comparison/run-natural-retrieval-batch.sh
+'
+```
+
+For a quick smoke test, run only the first scenario, first variant, and first
+repeat:
+
+```bash
+NATURAL_SINGLE_PAIR=1 ./experiment/locality-mcp-comparison/run-natural-retrieval-batch.sh
+```
+
+Optional files-only ablation for the daily-engineering scenario:
+
+```bash
+NATURAL_INCLUDE_FILES_ONLY=1 ./experiment/locality-mcp-comparison/run-natural-retrieval-batch.sh
+```
+
+Natural retrieval batches also write:
+
+- `batch-summary.md` - raw per-run status, wall time, token, and MCP-call rows.
+- `normalized-summary.md` - mean, median, min, max, and pairwise MCP-over-Locality ratios.
+- `normalized-summary.json` - machine-readable normalized stats for notebooks or dashboards.
+- `profile-locality-vs-mcp/summary.md` under each matched pair - per-pair tool grouping and viewer file links.
+
 ## Artifacts
 
 Each run writes shared setup artifacts to:
