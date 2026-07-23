@@ -233,7 +233,7 @@ fn run_stub_access_poll_loop(
 fn poll_stub_accesses(
     state_root: &std::path::Path,
     watched_roots: &Arc<Mutex<BTreeSet<PathBuf>>>,
-    observed: &mut BTreeMap<PathBuf, SystemTime>,
+    observed: &mut BTreeMap<PathBuf, StubAccessSnapshot>,
     on_event: &impl Fn(FileEvent),
 ) -> LocalityResult<()> {
     let roots = watched_roots
@@ -277,10 +277,15 @@ fn poll_stub_accesses(
             let Ok(accessed) = metadata.accessed() else {
                 continue;
             };
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            let snapshot = StubAccessSnapshot { accessed, modified };
 
             current_stub_paths.insert(path.clone());
-            if let Some(previous) = observed.insert(path.clone(), accessed)
-                && accessed > previous
+            if let Some(previous) = observed.insert(path.clone(), snapshot)
+                && snapshot.accessed > previous.accessed
+                && snapshot.modified <= previous.modified
             {
                 on_event(FileEvent {
                     path,
@@ -292,6 +297,12 @@ fn poll_stub_accesses(
 
     observed.retain(|path, _| current_stub_paths.contains(path));
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StubAccessSnapshot {
+    accessed: SystemTime,
+    modified: SystemTime,
 }
 
 #[derive(Default)]
@@ -327,6 +338,7 @@ fn watcher_error(error: notify::Error) -> LocalityError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::FileTimes;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime};
@@ -339,7 +351,10 @@ mod tests {
     use notify::event::{AccessKind, AccessMode, DataChange, MetadataKind, ModifyKind};
     use notify::{Event, EventKind};
 
-    use super::{FileEvent, FileEventKind, file_events_from_notify_event, poll_stub_accesses};
+    use super::{
+        FileEvent, FileEventKind, StubAccessSnapshot, file_events_from_notify_event,
+        poll_stub_accesses,
+    };
 
     #[test]
     fn notify_data_modify_maps_to_write_events() {
@@ -421,10 +436,21 @@ mod tests {
             )
             .expect("save entity");
 
+        let previous_accessed = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let current_accessed = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
+        let stable_modified = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
+        set_file_times(&page_path, current_accessed, stable_modified);
+
         let watched_roots = Arc::new(Mutex::new([mount_root].into_iter().collect()));
-        let mut observed = [(page_path.clone(), SystemTime::UNIX_EPOCH)]
-            .into_iter()
-            .collect();
+        let mut observed = [(
+            page_path.clone(),
+            StubAccessSnapshot {
+                accessed: previous_accessed,
+                modified: stable_modified,
+            },
+        )]
+        .into_iter()
+        .collect();
         let events = Arc::new(Mutex::new(Vec::new()));
 
         poll_stub_accesses(&state_root, &watched_roots, &mut observed, &|event| {
@@ -439,6 +465,59 @@ mod tests {
                 kind: FileEventKind::Read,
             }]
         );
+    }
+
+    #[test]
+    fn stub_access_poll_ignores_rewrite_when_access_and_modified_times_advance() {
+        let state_root = temp_root("poll-rewrite-state");
+        let mount_root = temp_root("poll-rewrite-mount");
+        let page_path = mount_root.join("Roadmap.md");
+        std::fs::write(&page_path, "stub").expect("write stub");
+
+        let mount_id = MountId::new("notion-main");
+        let mut store = SqliteStateStore::open(state_root.clone()).expect("open store");
+        store
+            .save_mount(MountConfig::new(
+                mount_id.clone(),
+                "notion",
+                mount_root.clone(),
+            ))
+            .expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id,
+                    RemoteId::new("page-1"),
+                    EntityKind::Page,
+                    "Roadmap",
+                    "Roadmap.md",
+                )
+                .with_hydration(HydrationState::Stub),
+            )
+            .expect("save entity");
+
+        let previous = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let rewritten = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
+        set_file_times(&page_path, rewritten, rewritten);
+
+        let watched_roots = Arc::new(Mutex::new([mount_root].into_iter().collect()));
+        let mut observed = [(
+            page_path,
+            StubAccessSnapshot {
+                accessed: previous,
+                modified: previous,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        poll_stub_accesses(&state_root, &watched_roots, &mut observed, &|event| {
+            events.lock().expect("events lock").push(event);
+        })
+        .expect("poll accesses");
+
+        assert!(events.lock().expect("events lock").is_empty());
     }
 
     #[test]
@@ -471,9 +550,15 @@ mod tests {
             .expect("save entity");
 
         let watched_roots = Arc::new(Mutex::new([mount_root].into_iter().collect()));
-        let mut observed = [(database_path, SystemTime::UNIX_EPOCH)]
-            .into_iter()
-            .collect();
+        let mut observed = [(
+            database_path,
+            StubAccessSnapshot {
+                accessed: SystemTime::UNIX_EPOCH,
+                modified: SystemTime::UNIX_EPOCH,
+            },
+        )]
+        .into_iter()
+        .collect();
         let events = Arc::new(Mutex::new(Vec::new()));
 
         poll_stub_accesses(&state_root, &watched_roots, &mut observed, &|event| {
@@ -513,7 +598,15 @@ mod tests {
             .expect("save entity");
 
         let watched_roots = Arc::new(Mutex::new([mount_root].into_iter().collect()));
-        let mut observed = [(page_path, SystemTime::UNIX_EPOCH)].into_iter().collect();
+        let mut observed = [(
+            page_path,
+            StubAccessSnapshot {
+                accessed: SystemTime::UNIX_EPOCH,
+                modified: SystemTime::UNIX_EPOCH,
+            },
+        )]
+        .into_iter()
+        .collect();
         let events = Arc::new(Mutex::new(Vec::new()));
 
         poll_stub_accesses(&state_root, &watched_roots, &mut observed, &|event| {
@@ -531,5 +624,18 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1));
         std::fs::create_dir_all(&root).expect("create temp root");
         root
+    }
+
+    fn set_file_times(path: &std::path::Path, accessed: SystemTime, modified: SystemTime) {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open file for timestamp update");
+        file.set_times(
+            FileTimes::new()
+                .set_accessed(accessed)
+                .set_modified(modified),
+        )
+        .expect("set file times");
     }
 }

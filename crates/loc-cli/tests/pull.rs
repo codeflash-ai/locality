@@ -23,6 +23,11 @@ use locality_notion::dto::{
     TitleBlockDto,
 };
 use locality_notion::{NotionConfig, NotionConnector};
+use locality_slack::{
+    SlackApi, SlackAuthTestResponse, SlackConfig, SlackConnector, SlackConversation,
+    SlackConversationsListResponse, SlackHistoryResponse, SlackJoinResponse, SlackMessage,
+    SlackResponseMetadata, SlackUser, SlackUserProfile, SlackUsersListResponse,
+};
 use locality_store::{
     EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
     InMemoryStateStore, MountConfig, MountRepository, ProjectionMode, RemoteObservationRecord,
@@ -193,6 +198,78 @@ fn pull_virtual_file_target_does_not_stat_projection_path_as_directory() {
 
     let _ = fs::remove_dir_all(state_root);
     let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[test]
+fn pull_slack_channel_bucket_hydrates_recent_messages() {
+    let root = unique_temp_path("loc-cli-pull-slack");
+    fs::create_dir_all(&root).expect("create slack mount root");
+    let mount_id = MountId::new("slack-main");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(MountConfig::new(mount_id.clone(), "slack", &root).read_only(true))
+        .expect("save Slack mount");
+    let connector = SlackConnector::with_api(
+        SlackConfig::new("xoxb-test"),
+        Arc::new(PullSlackApi::default()),
+    );
+
+    run_pull(&mut store, &connector, &root).expect("initial Slack root pull");
+    assert!(root.join("channels/general-C123").is_dir());
+
+    let report =
+        run_pull(&mut store, &connector, root.join("channels")).expect("pull Slack channel bucket");
+
+    assert!(report.ok);
+    assert_eq!(report.hydrated, 1);
+    let recent_path = root.join("channels/general-C123/recent.md");
+    let recent = fs::read_to_string(&recent_path).expect("read Slack recent.md");
+    assert!(recent.contains("id: \"slack-recent:C123\""));
+    assert!(recent.contains("Hello from Slack, @Grace Hopper"));
+    let recent_entity = store
+        .find_entity_by_path(
+            &mount_id,
+            std::path::Path::new("channels/general-C123/recent.md"),
+        )
+        .expect("find Slack recent entity")
+        .expect("Slack recent entity");
+    assert_eq!(recent_entity.hydration, HydrationState::Hydrated);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn pull_slack_channel_bucket_hydrates_all_recent_messages() {
+    let root = unique_temp_path("loc-cli-pull-slack-large");
+    fs::create_dir_all(&root).expect("create slack mount root");
+    let mount_id = MountId::new("slack-main");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(MountConfig::new(mount_id, "slack", &root).read_only(true))
+        .expect("save Slack mount");
+    let history_calls = Arc::new(AtomicU64::new(0));
+    let connector = SlackConnector::with_api(
+        SlackConfig::new("xoxb-test"),
+        Arc::new(PullSlackApi::with_channel_count(2, history_calls.clone())),
+    );
+
+    run_pull(&mut store, &connector, &root).expect("initial Slack root pull");
+    let report =
+        run_pull(&mut store, &connector, root.join("channels")).expect("pull Slack channel bucket");
+
+    assert!(report.ok);
+    assert_eq!(report.hydrated, 2);
+    assert_eq!(history_calls.load(Ordering::Relaxed), 2);
+    for recent_path in [
+        root.join("channels/general-C123/recent.md"),
+        root.join("channels/alerts-C124/recent.md"),
+    ] {
+        let recent = fs::read_to_string(&recent_path).expect("read Slack recent.md");
+        assert!(!recent.contains(CanonicalDocument::STUB_MARKER), "{recent}");
+        assert!(recent.contains("Hello from Slack, @Grace Hopper"));
+    }
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[cfg(target_os = "macos")]
@@ -2841,5 +2918,169 @@ fn rich_text(text: &str) -> RichTextDto {
         plain_text: text.to_string(),
         href: None,
         annotations: Default::default(),
+    }
+}
+
+#[derive(Debug)]
+struct PullSlackApi {
+    conversations: Vec<SlackConversation>,
+    history_calls: Arc<AtomicU64>,
+}
+
+impl Default for PullSlackApi {
+    fn default() -> Self {
+        Self::with_channel_count(1, Arc::new(AtomicU64::new(0)))
+    }
+}
+
+impl PullSlackApi {
+    fn with_channel_count(count: usize, history_calls: Arc<AtomicU64>) -> Self {
+        Self {
+            conversations: (0..count).map(Self::conversation).collect(),
+            history_calls,
+        }
+    }
+
+    fn conversation(index: usize) -> SlackConversation {
+        let id = match index {
+            0 => "C123".to_string(),
+            1 => "C124".to_string(),
+            _ => format!("C{}", 123 + index),
+        };
+        let name = match index {
+            0 => "general".to_string(),
+            1 => "alerts".to_string(),
+            _ => format!("channel-{index}"),
+        };
+        SlackConversation {
+            id,
+            name: Some(name),
+            is_channel: true,
+            is_member: Some(true),
+            updated: Some(1780000000000000),
+            topic: None,
+            purpose: None,
+            ..Default::default()
+        }
+    }
+
+    fn users() -> Vec<SlackUser> {
+        vec![
+            SlackUser {
+                id: "U123".to_string(),
+                name: Some("ada".to_string()),
+                real_name: Some("Ada Lovelace".to_string()),
+                profile: Some(SlackUserProfile {
+                    real_name: Some("Ada Lovelace".to_string()),
+                    display_name: Some("Ada".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            SlackUser {
+                id: "U456".to_string(),
+                name: Some("grace".to_string()),
+                real_name: Some("Grace Hopper".to_string()),
+                profile: Some(SlackUserProfile {
+                    real_name: Some("Grace Hopper".to_string()),
+                    display_name: Some("Grace Hopper".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ]
+    }
+}
+
+impl SlackApi for PullSlackApi {
+    fn auth_test(&self) -> locality_core::LocalityResult<SlackAuthTestResponse> {
+        Ok(SlackAuthTestResponse {
+            ok: true,
+            team: Some("Test".to_string()),
+            ..Default::default()
+        })
+    }
+
+    fn conversations_list(
+        &self,
+        types: &str,
+        _cursor: Option<&str>,
+        _limit: u32,
+    ) -> locality_core::LocalityResult<SlackConversationsListResponse> {
+        let channels = if types.split(',').any(|value| value == "public_channel") {
+            self.conversations.clone()
+        } else {
+            Vec::new()
+        };
+        Ok(SlackConversationsListResponse {
+            ok: true,
+            channels,
+            response_metadata: SlackResponseMetadata::default(),
+            ..Default::default()
+        })
+    }
+
+    fn conversations_history(
+        &self,
+        channel: &str,
+        _cursor: Option<&str>,
+        _limit: u32,
+    ) -> locality_core::LocalityResult<SlackHistoryResponse> {
+        assert!(
+            self.conversations
+                .iter()
+                .any(|conversation| conversation.id == channel)
+        );
+        self.history_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(SlackHistoryResponse {
+            ok: true,
+            messages: vec![SlackMessage {
+                r#type: Some("message".to_string()),
+                user: Some("U123".to_string()),
+                text: "Hello from Slack, <@U456>".to_string(),
+                ts: "1780000000.000100".to_string(),
+                ..Default::default()
+            }],
+            response_metadata: SlackResponseMetadata::default(),
+            ..Default::default()
+        })
+    }
+
+    fn conversations_replies(
+        &self,
+        _channel: &str,
+        _thread_ts: &str,
+        _cursor: Option<&str>,
+        _limit: u32,
+    ) -> locality_core::LocalityResult<SlackHistoryResponse> {
+        Ok(SlackHistoryResponse {
+            ok: true,
+            response_metadata: SlackResponseMetadata::default(),
+            ..Default::default()
+        })
+    }
+
+    fn conversations_join(
+        &self,
+        _channel: &str,
+    ) -> locality_core::LocalityResult<SlackJoinResponse> {
+        Ok(SlackJoinResponse {
+            ok: true,
+            channel: self.conversations.first().cloned(),
+            ..Default::default()
+        })
+    }
+
+    fn users_list(
+        &self,
+        _cursor: Option<&str>,
+        _limit: u32,
+    ) -> locality_core::LocalityResult<SlackUsersListResponse> {
+        Ok(SlackUsersListResponse {
+            ok: true,
+            members: Self::users(),
+            response_metadata: SlackResponseMetadata::default(),
+            ..Default::default()
+        })
     }
 }
