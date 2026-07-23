@@ -1308,43 +1308,42 @@ Content-Encoding: zstd
 `identity` remains a required fallback and benchmark control. In either mode:
 
 - the tar is generated on demand and is never stored as a canonical artifact;
-- the sealed v2 offer distinguishes one control member, file count, directory
-  count, total archive entry count, selected content bytes, and a canonical
-  inventory digest so
-  parent directory headers cannot create an ambiguous count. It does not
+- the sealed v2 offer distinguishes file count, directory count, one terminal
+  control member, total archive entry count, selected content bytes, and a
+  canonical inventory digest so parent directory headers cannot create an
+  ambiguous count. It does not
   pre-render tar/Zstd merely to predict encoded length or stream digest; the
-  completion receipt records actual decoded/encoded bytes and stream digest
-  after the one streaming pass;
-- the reserved writable-metadata control member is archive record class 0 and
-  is always first, even when its writable-entry list is empty. It participates
-  in total archive-entry count and the canonical inventory digest;
-- directory headers are record class 1 and follow in
+  completion receipt records actual delivered file/content counts and a
+  domain-separated delivered-body digest after the one streaming pass;
+- directory headers are record class 0 and follow in
   `(depth, logical_path COLLATE "C")`
   order, so every unique parent precedes descendants;
-- each selected projection is record class 2 and becomes one ordinary tar member with its logical
+- each selected projection is record class 1 and becomes one ordinary tar member with its logical
   path, size, and non-executable mode. File members follow
   `(winning_scope_ordinal, parent_path COLLATE "C", logical_path COLLATE "C",
   projection_id)` order;
-- a reserved first member contains versioned session metadata only for writable
-  paths: projection/resource identity, delivered content hash, provider
-  precondition, effective actions, and baseline requirements. The client consumes
-  this member into its small SQLite store and does not expose it in the mount;
+- v1 retains its reserved first writable-metadata member unchanged. V2 instead
+  requires exactly one final record-class-2 `.loc/session.json` member combining
+  that writable metadata with the completion receipt. It is bounded, canonical
+  JSON, regular mode `0444`, consumed into the small SQLite store, never exposed
+  in the mount, and has no emitted `.loc/` directory header;
 - read-only entries create no local metadata or shadow rows;
 - selected large attachment references are fetched by the exporter and appended
   to the same stream under bounded size/scanning policy; and
 - the client validates and extracts into a staging directory with path, link,
   device, case, Unicode, entry-count, byte, and disk limits, then atomically
   publishes the tree only after the HTTP response, Zstd frame, tar stream, and
-  file writes terminate cleanly and its recomputed canonical inventory digest
-  equals the sealed offer.
+  file writes terminate cleanly, the final receipt is present once with no
+  following member, and its recomputed canonical inventory/body digests equal
+  the sealed offer/receipt.
 
 The v2 canonical inventory digest is SHA-256 over a domain-separated,
 length-framed binary preimage. It begins with
 `locality.export.inventory.v2\0`; every scalar is an unsigned 64-bit big-endian
 length followed by its UTF-8 or raw bytes, and every list begins with an unsigned
-64-bit big-endian count. Records follow the archive's class/order above. The
-control record includes its path plus exact body SHA-256 and length; a directory
-includes its normalized `LogicalPath`; a file includes global winning scope
+64-bit big-endian count. Only directory and file records participate, in their
+archive order; the final self-describing receipt is deliberately excluded to
+avoid a circular digest. A directory includes its normalized `LogicalPath`; a file includes global winning scope
 ordinal, source connection ID, projection ID, normalized logical path, file kind,
 sorted effective-action labels, content SHA-256, and byte length. Public exact
 goldens bind the preimage and digest so the backend and client cannot disagree
