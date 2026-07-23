@@ -6,8 +6,8 @@ We are considering whether Locality is ready for a broader launch. Review recent
 Do not create Notion pages/docs, push or update Notion, or update any remote source.
 
 Required work:
-1. Write the final Markdown assessment to `OUT_DIR/notion-mcp-report-body.md`.
-2. Write a compact trace to `OUT_DIR/notion-mcp-agent-trace.md` listing:
+1. Write the final Markdown assessment to `REPORT_FILE`.
+2. Write a compact trace to `TRACE_FILE` listing:
    - git commands used
    - Notion MCP searches/calls attempted
    - Notion pages or excerpts used

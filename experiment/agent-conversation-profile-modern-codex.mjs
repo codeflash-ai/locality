@@ -9,7 +9,14 @@ import { spawnSync } from "node:child_process";
 import { basename, extname, join, resolve } from "node:path";
 
 const DEFAULT_DURATION_MS = 1000;
-const TIMESTAMP_KEYS = ["timestamp", "created_at", "time", "ts"];
+const TIMESTAMP_KEYS = [
+  "timestamp",
+  "created_at",
+  "time",
+  "ts",
+  "observed_at_ms",
+  "started_at_ms",
+];
 const CONTAINER_KEYS = [
   "events",
   "messages",
@@ -207,6 +214,8 @@ function loadConversation(path, label, defaultDurationMs) {
         tool_name: partial.toolName,
         tool_call_id: partial.toolCallId,
         tool_command: partial.toolCommand,
+        harness_source: partial.harnessSource,
+        harness_phase: partial.harnessPhase,
         record_type: partial.recordType,
         record_subtype: partial.recordSubtype,
         attachment_type: partial.attachmentType,
@@ -391,6 +400,9 @@ function partialEventsForRecord(record, target = eventTargetForRecord(record)) {
 }
 
 function eventTargetForRecord(record) {
+  if (isPlainObject(record.event)) {
+    return mergeEventContext(record.event, record);
+  }
   if (isPlainObject(record.item)) {
     return mergeEventContext(record.item, record);
   }
@@ -409,6 +421,8 @@ function mergeEventContext(target, parent, options = {}) {
     created_at: target.created_at ?? parent.created_at,
     time: target.time ?? parent.time,
     ts: target.ts ?? parent.ts,
+    observed_at_ms: target.observed_at_ms ?? parent.observed_at_ms,
+    started_at_ms: target.started_at_ms ?? parent.started_at_ms,
     duration_ms: inheritDuration
       ? target.duration_ms ?? parent.duration_ms
       : target.duration_ms,
@@ -499,6 +513,8 @@ function partialEventFromObject(object, parent, options = {}) {
     toolName,
     toolCallId,
     toolCommand,
+    harnessSource: stringOrNull(object.harness_source ?? parent?.harness_source),
+    harnessPhase: stringOrNull(object.phase ?? parent?.phase),
     recordType,
     recordSubtype,
     attachmentType,
@@ -526,6 +542,28 @@ function classifyKind(object, parent) {
     .replace(/\s+/g, "_");
   const role = roleFor(object, parent);
   const status = String(object.status ?? parent?.status ?? "").toLowerCase();
+
+  if (rawType === "harness.phase") {
+    const phase = String(object.phase ?? object.activity ?? "")
+      .toLowerCase()
+      .replace(/\s+/g, "_");
+    if (["tool", "tool_call", "file_change"].includes(phase)) {
+      return "tool_call";
+    }
+    if (["thinking", "reasoning"].includes(phase)) {
+      return "reasoning";
+    }
+    if (["agent_response", "assistant_message", "output_response"].includes(phase)) {
+      return "assistant_message";
+    }
+    if (["input_query", "user_query", "user"].includes(phase)) {
+      return "user";
+    }
+    if (phase === "system") {
+      return "system";
+    }
+    return "unknown";
+  }
 
   if (rawType === "agent_message") {
     return "assistant_message";
@@ -646,11 +684,13 @@ function toolCallIdFor(object, parent) {
   const candidate =
     object.call_id ??
     object.callId ??
+    object.tool_call_id ??
     object.tool_use_id ??
     object.toolUseId ??
     object.id ??
     parent?.call_id ??
     parent?.callId ??
+    parent?.tool_call_id ??
     parent?.tool_use_id ??
     parent?.toolUseId ??
     parent?.id;
@@ -663,9 +703,11 @@ function toolCallIdFor(object, parent) {
 function toolCommandFor(object, parent) {
   const direct =
     object.command ??
+    object.tool_command ??
     object.input?.command ??
     object.action?.command ??
     parent?.command ??
+    parent?.tool_command ??
     parent?.input?.command ??
     parent?.action?.command;
   if (typeof direct === "string" && direct.trim() !== "") {
@@ -1108,21 +1150,32 @@ function stripShellTokenQuotes(value) {
 }
 
 function buildProfileEntries(conversation) {
-  return conversation.events
-    .map((event, index) => profileEntryForEvent(conversation, event, index))
+  const measuredHookActivities = hookMeasuredActivities(conversation);
+  const entries = conversation.events
+    .map((event, index) =>
+      profileEntryForEvent(conversation, event, index, {
+        measuredHookActivities,
+      }),
+    )
     .filter(Boolean);
+  if (!measuredHookActivities.has("reasoning")) {
+    entries.push(...inferredInitialReasoningEntries(conversation));
+  }
+  return entries;
 }
 
-function profileEntryForEvent(conversation, event, index) {
-  if (
-    event.kind === "tool_result" ||
-    event.kind === "file_change_result" ||
-    isMetadataEvent(event)
-  ) {
+function profileEntryForEvent(conversation, event, index, options = {}) {
+  if (isMetadataEvent(event)) {
     return null;
   }
 
-  const activity = activityForEvent(event);
+  const activity = profileActivityForEvent(event);
+  if (
+    event.record_type !== "harness.phase" &&
+    options.measuredHookActivities?.has(activity)
+  ) {
+    return null;
+  }
   const durationMs = profileDurationMs(event, conversation.events, index);
 
   return {
@@ -1134,12 +1187,72 @@ function profileEntryForEvent(conversation, event, index) {
     tool_group: profileToolGroupFor(event),
     tool_command_group: profileToolCommandGroupFor(event),
     tool_command: event.tool_command,
+    harness_source: event.harness_source,
+    harness_phase: event.harness_phase,
     start_ms: event.start_ms,
     end_ms: event.start_ms + durationMs,
     duration_ms: durationMs,
     timing_quality: event.timing_quality,
     excerpt: event.excerpt,
   };
+}
+
+function profileActivityForEvent(event) {
+  if (event.kind === "tool_result" || event.kind === "file_change_result") {
+    return "reasoning";
+  }
+  return activityForEvent(event);
+}
+
+function inferredInitialReasoningEntries(conversation) {
+  const entries = [];
+  for (const event of conversation.events) {
+    if (event.record_type !== "turn.started") {
+      continue;
+    }
+    const next = conversation.events.find(
+      (candidate) =>
+        candidate.start_ms > event.start_ms && !isMetadataEvent(candidate),
+    );
+    if (!next) {
+      continue;
+    }
+    const durationMs = next.start_ms - event.start_ms;
+    if (durationMs <= 0) {
+      continue;
+    }
+    entries.push({
+      conversation_label: conversation.label,
+      source_index: event.source_index,
+      activity: "reasoning",
+      kind: "reasoning",
+      tool_name: null,
+      tool_group: null,
+      tool_command_group: null,
+      tool_command: null,
+      harness_source: null,
+      harness_phase: null,
+      start_ms: event.start_ms,
+      end_ms: next.start_ms,
+      duration_ms: durationMs,
+      timing_quality: "inferred",
+      excerpt: "inferred initial model work from turn start to first Codex item",
+    });
+  }
+  return entries;
+}
+
+function hookMeasuredActivities(conversation) {
+  const activities = new Set();
+  for (const event of conversation.events) {
+    if (
+      event.record_type === "harness.phase" &&
+      event.harness_source === "codex_hook"
+    ) {
+      activities.add(activityForEvent(event));
+    }
+  }
+  return activities;
 }
 
 function profileDurationMs(event, events, index) {
@@ -1205,6 +1318,8 @@ function isMetadataEvent(event) {
     "ai-title",
     "file-history-delta",
     "file-history-snapshot",
+    "harness.hook",
+    "harness.hook_error",
     "last-prompt",
     "mode",
     "permission-mode",
@@ -1336,32 +1451,21 @@ function buildCombinedTrace(conversations) {
       args: { name: "agent conversation comparison" },
     },
   ];
+  const tracks = new Map();
 
-  conversations.forEach((conversation, index) => {
-    const tid = index + 1;
-    traceEvents.push({
-      ph: "M",
-      pid: 1,
-      tid,
-      name: "thread_name",
-      args: { name: conversation.label },
+  for (const { conversation, entry } of sortedProfileEntries(conversations)) {
+    const trackName = profileTraceTrackName(conversation, entry, {
+      includeConversation: true,
     });
-    for (const event of traceableEvents(conversation)) {
-      traceEvents.push(traceEventFor(event, 1, tid, baseMs));
-    }
-  });
+    const tid = traceTidForTrack(trackName, tracks, traceEvents);
+    traceEvents.push(profileTraceEventFor(entry, 1, tid, baseMs));
+  }
 
   return { traceEvents };
 }
 
 function buildSplitTrace(conversation) {
   const baseMs = earliestTraceStart([conversation]);
-  const tracks = [
-    ["reasoning", 1],
-    ["assistant", 2],
-    ["tools", 3],
-    ["other", 4],
-  ];
   const traceEvents = [
     {
       ph: "M",
@@ -1369,20 +1473,52 @@ function buildSplitTrace(conversation) {
       name: "process_name",
       args: { name: conversation.label },
     },
-    ...tracks.map(([name, tid]) => ({
-      ph: "M",
-      pid: 1,
-      tid,
-      name: "thread_name",
-      args: { name },
-    })),
   ];
+  const tracks = new Map();
 
-  for (const event of traceableEvents(conversation)) {
-    traceEvents.push(traceEventFor(event, 1, splitTidForKind(event.kind), baseMs));
+  for (const entry of buildProfileEntries(conversation).sort(profileEntrySort)) {
+    const trackName = profileTraceTrackName(conversation, entry, {
+      includeConversation: false,
+    });
+    const tid = traceTidForTrack(trackName, tracks, traceEvents);
+    traceEvents.push(profileTraceEventFor(entry, 1, tid, baseMs));
   }
 
   return { traceEvents };
+}
+
+function profileEntrySort(left, right) {
+  return left.start_ms - right.start_ms || left.source_index - right.source_index;
+}
+
+function profileTraceTrackName(conversation, entry, { includeConversation }) {
+  const frames = [];
+  if (includeConversation) {
+    frames.push(`conversation:${conversation.label}`);
+  }
+  frames.push(`activity:${entry.activity}`);
+  if (entry.activity === "tool") {
+    frames.push(`tool:${entry.tool_group ?? "unknown_tool"}`);
+    frames.push(`command:${toolCommandFrameName(entry)}`);
+  }
+  return frames.join(" / ");
+}
+
+function traceTidForTrack(trackName, tracks, traceEvents) {
+  const existing = tracks.get(trackName);
+  if (existing !== undefined) {
+    return existing;
+  }
+  const tid = tracks.size + 1;
+  tracks.set(trackName, tid);
+  traceEvents.push({
+    ph: "M",
+    pid: 1,
+    tid,
+    name: "thread_name",
+    args: { name: trackName },
+  });
+  return tid;
 }
 
 function buildCombinedFolded(conversations) {
@@ -1472,14 +1608,15 @@ function speedscopeStackFor(conversation, entry, includeRoot) {
   );
   if (entry.activity === "tool") {
     frames.push(speedscopeFrameName("tool", entry.tool_group ?? "unknown_tool"));
-    frames.push(
-      speedscopeFrameName(
-        "command",
-        entry.tool_command_group ?? "unknown_command",
-      ),
-    );
+    frames.push(speedscopeFrameName("command", toolCommandFrameName(entry)));
   }
   return frames;
+}
+
+function toolCommandFrameName(entry) {
+  const toolGroup = entry.tool_group ?? "unknown_tool";
+  const command = entry.tool_command_group ?? "unknown_command";
+  return `${toolGroup}:${command}`;
 }
 
 function speedscopeFrameName(prefix, value) {
@@ -1524,7 +1661,7 @@ function buildFoldedStacks(conversations, { includeRoot }) {
       );
       if (entry.activity === "tool") {
         frames.push(`tool:${entry.tool_group ?? "unknown_tool"}`);
-        frames.push(`command:${entry.tool_command_group ?? "unknown_command"}`);
+        frames.push(`command:${toolCommandFrameName(entry)}`);
       }
 
       const stack = frames.map(sanitizeFoldedFrame).join(";");
@@ -1751,11 +1888,7 @@ function buildSnakevizProfileFrames(conversations) {
 
       if (entry.activity === "tool") {
         stack.push(builder.frame(`tool:${entry.tool_group ?? "unknown_tool"}`));
-        stack.push(
-          builder.frame(
-            `command:${entry.tool_command_group ?? "unknown_command"}`,
-          ),
-        );
+        stack.push(builder.frame(`command:${toolCommandFrameName(entry)}`));
       }
 
       builder.addStack(stack, durationSeconds);
@@ -1867,6 +2000,8 @@ function traceEventFor(event, pid, tid, baseMs) {
       tool_group: event.tool_group,
       tool_command_group: event.tool_command_group,
       tool_command: event.tool_command,
+      harness_source: event.harness_source,
+      harness_phase: event.harness_phase,
       timing_quality: event.timing_quality,
       raw_type: event.raw_type,
       start_ms: event.start_ms,
@@ -1875,6 +2010,42 @@ function traceEventFor(event, pid, tid, baseMs) {
       excerpt: event.excerpt,
     },
   };
+}
+
+function profileTraceEventFor(entry, pid, tid, baseMs) {
+  return {
+    ph: "X",
+    pid,
+    tid,
+    ts: Math.max(0, Math.round((entry.start_ms - baseMs) * 1000)),
+    dur: Math.max(1, Math.round(entry.duration_ms * 1000)),
+    cat: entry.activity,
+    name: profileTraceEventName(entry),
+    args: {
+      conversation_label: entry.conversation_label,
+      source_index: entry.source_index,
+      kind: entry.kind,
+      activity: entry.activity,
+      tool_name: entry.tool_name,
+      tool_group: entry.tool_group,
+      tool_command_group: entry.tool_command_group,
+      tool_command: entry.tool_command,
+      harness_source: entry.harness_source,
+      harness_phase: entry.harness_phase,
+      timing_quality: entry.timing_quality,
+      start_ms: entry.start_ms,
+      end_ms: entry.end_ms,
+      duration_ms: entry.duration_ms,
+      excerpt: entry.excerpt,
+    },
+  };
+}
+
+function profileTraceEventName(entry) {
+  if (entry.activity === "tool") {
+    return `command:${toolCommandFrameName(entry)}`;
+  }
+  return `activity:${entry.activity}`;
 }
 
 function eventName(event) {
@@ -2097,6 +2268,8 @@ function summarizeConversation(conversation) {
         kind: entry.kind,
         tool_group: entry.tool_group,
         tool_command_group: entry.tool_command_group,
+        harness_source: entry.harness_source,
+        harness_phase: entry.harness_phase,
         duration_ms: entry.duration_ms,
         timing_quality: entry.timing_quality,
         source_index: entry.source_index,
@@ -2151,6 +2324,7 @@ function renderSummaryMarkdown(summary) {
   }
 
   lines.push("", "## Viewer Files", "");
+  lines.push("Open `*.perfetto.json` files in Perfetto or another Chrome trace viewer.");
   lines.push("Run `speedscope <file>.speedscope.json` for Speedscope profiles.");
   lines.push("Run `snakeviz <file>.snakeviz.prof` for SnakeViz profiles.");
   lines.push(
@@ -2159,6 +2333,12 @@ function renderSummaryMarkdown(summary) {
   lines.push("");
   lines.push("| Viewer | File |");
   lines.push("| --- | --- |");
+  for (const file of [
+    summary.outputs.combined,
+    ...summary.outputs.split.map((item) => item.path),
+  ]) {
+    lines.push(`| Perfetto | ${markdownTableCell(file)} |`);
+  }
   for (const file of viewerFiles(summary.outputs.speedscope)) {
     lines.push(`| Speedscope | ${markdownTableCell(file)} |`);
   }

@@ -9,8 +9,8 @@ Do not use Notion MCP or direct Notion API tools in this run.
 Do not create Notion pages/docs, push to Notion, or update any remote source.
 
 Required work:
-1. Write the final Markdown draft to `OUT_DIR/report-body.md`.
-2. Write a compact trace to `OUT_DIR/locality-agent-trace.md` listing:
+1. Write the final Markdown draft to `REPORT_FILE`.
+2. Write a compact trace to `TRACE_FILE` listing:
    - git and gh commands used
    - mounted Notion files read
    - key facts used from Locality context

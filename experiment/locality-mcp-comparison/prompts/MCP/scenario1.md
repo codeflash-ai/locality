@@ -4,7 +4,7 @@ Goal: generate the same launch-readiness report using local git metadata plus No
 
 Use these context sources:
 - local git commands in `REPO_DIR`
-- `OUT_DIR/git-data.json`
+- `GIT_DATA_FILE`
 - Notion MCP tools for Notion search/read context
 
 Do not read mounted Locality Notion files under `/home/amika/notion`.
@@ -12,7 +12,7 @@ Do not use `loc` commands.
 Do not create Notion pages/docs, push or update Notion, or update any remote source.
 
 Required work:
-1. Read `OUT_DIR/git-data.json`.
+1. Read `GIT_DATA_FILE`.
 2. Inspect relevant commits with local git commands as needed.
 3. Use Notion MCP to search/read context around:
    - Locality Launch Amika Environment
@@ -23,8 +23,8 @@ Required work:
    - connector launch readiness
    - standups and internal daily-use workflow
 4. Read the benchmark case section in the Locality Launch Amika Environment page through Notion MCP.
-5. Write the final Markdown report to `OUT_DIR/notion-mcp-report-body.md`.
-6. Write a compact trace to `OUT_DIR/notion-mcp-agent-trace.md` listing:
+5. Write the final Markdown report to `REPORT_FILE`.
+6. Write a compact trace to `TRACE_FILE` listing:
    - git commands used
    - Notion MCP searches/calls attempted
    - Notion pages or excerpts used

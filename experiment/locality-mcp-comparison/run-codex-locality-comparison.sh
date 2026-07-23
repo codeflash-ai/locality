@@ -610,7 +610,7 @@ run_profiler() {
     return 1
   fi
 
-  node "$REPO_ROOT/experiment/agent-conversation-profile.mjs" \
+  node "$REPO_ROOT/experiment/agent-conversation-profile-modern-codex.mjs" \
     --left "$left" \
     --left-label "test-with-notion-connector" \
     --right "$right" \

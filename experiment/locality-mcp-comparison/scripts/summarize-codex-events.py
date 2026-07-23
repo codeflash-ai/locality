@@ -15,6 +15,8 @@ events_tsv_path = Path(sys.argv[3])
 event_counts = Counter()
 item_counts = Counter()
 tool_counts = Counter()
+hook_counts = Counter()
+phase_counts = Counter()
 errors = []
 usage = {}
 rows = []
@@ -30,6 +32,8 @@ for line_no, line in enumerate(events_path.read_text().splitlines(), 1):
     event_type = event.get("type", "unknown")
     item = event.get("item") or {}
     item_type = item.get("type", "")
+    hook_event_name = event.get("hook_event_name") or event.get("source_hook_event_name") or ""
+    phase = event.get("phase", "")
     message = event.get("message") or item.get("message") or ""
 
     first_ms = observed_at_ms if first_ms is None else min(first_ms, observed_at_ms)
@@ -37,8 +41,14 @@ for line_no, line in enumerate(events_path.read_text().splitlines(), 1):
     event_counts[event_type] += 1
     if item_type:
         item_counts[item_type] += 1
+    if hook_event_name:
+        hook_counts[hook_event_name] += 1
+    if phase:
+        phase_counts[phase] += 1
     if "tool" in item_type or item_type in {"function_call", "local_shell_call", "mcp_tool_call"}:
         tool_counts[item_type] += 1
+    if event_type == "harness.phase" and phase == "tool_call":
+        tool_counts[event.get("tool_name") or "unknown_tool"] += 1
     if event_type == "error" or item_type == "error":
         errors.append(message)
     if "usage" in event:
@@ -50,6 +60,8 @@ for line_no, line in enumerate(events_path.read_text().splitlines(), 1):
             "observed_at_ms": observed_at_ms,
             "event_type": event_type,
             "item_type": item_type,
+            "hook_event_name": hook_event_name,
+            "phase": phase,
             "message": message.replace("\n", " ")[:500],
         }
     )
@@ -57,7 +69,15 @@ for line_no, line in enumerate(events_path.read_text().splitlines(), 1):
 with events_tsv_path.open("w", newline="") as f:
     writer = csv.DictWriter(
         f,
-        fieldnames=["line", "observed_at_ms", "event_type", "item_type", "message"],
+        fieldnames=[
+            "line",
+            "observed_at_ms",
+            "event_type",
+            "item_type",
+            "hook_event_name",
+            "phase",
+            "message",
+        ],
         delimiter="\t",
     )
     writer.writeheader()
@@ -72,6 +92,8 @@ summary = {
     "event_counts": dict(event_counts),
     "item_counts": dict(item_counts),
     "tool_counts": dict(tool_counts),
+    "hook_counts": dict(hook_counts),
+    "phase_counts": dict(phase_counts),
     "usage": usage,
     "errors": errors,
 }

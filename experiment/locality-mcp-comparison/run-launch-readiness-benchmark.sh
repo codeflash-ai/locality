@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: run-launch-readiness-benchmark.sh [--push] [--compare-mcp] [--write-mounted-page]
+Usage: run-launch-readiness-benchmark.sh [--push] [--compare-mcp] [--write-mounted-page] [--scenario NAME] [--compare-hooks]
 
 Runs the Locality vs Notion MCP launch-readiness benchmark:
   1. discover prompt scenarios from prompts/Locality/*.md
@@ -16,6 +16,12 @@ Runs the Locality vs Notion MCP launch-readiness benchmark:
   8. optionally run each matching Notion-MCP-only Codex scenario
   9. write run summary artifacts
 
+Study mode:
+  --scenario NAME       Run one prompt scenario, by basename or filename.
+  --compare-hooks       Run that scenario four times: Locality without hooks,
+                        Locality with hooks, MCP without hooks, and MCP with
+                        hooks. This implies --compare-mcp and is artifact-only.
+
 Important environment:
   REPO_DIR                 Repository path. Default: /home/amika/workspace/locality
   LOC_BIN                  loc binary. Default: $REPO_DIR/target/debug/loc
@@ -26,6 +32,14 @@ Important environment:
   CONTEXT_URLS             Newline-delimited Notion URLs to hydrate as directories.
   CODEX_MODEL              Model passed to codex exec. Default: gpt-5.6-luna
   CODEX_REASONING_EFFORT   Codex reasoning effort. Default: low
+  CODEX_SANDBOX_OUT_DIR    Agent-visible OUT_DIR for scenarios after scenario1.
+                           Default: /home/amika
+  CODEX_SANDBOX_HARDCODED_OUT_DIR
+                           Compatibility output directory for prompts that
+                           write absolute sandbox paths. Default: /home/amika
+  CODEX_HOOKS_MODE         Codex hooks mode for normal runs: hooks or no-hooks.
+                           Default: hooks. Hook comparison mode overrides this
+                           per variant.
   CODEX_EXEC_TIMEOUT_SECONDS
                            Per-strategy codex exec timeout. Default: 900. Use 0 to disable.
   LINEAR_API_KEY           Required with --compare-mcp. Linear MCP bearer token.
@@ -52,20 +66,42 @@ EOF
 PUSH=0
 WRITE_MOUNTED_PAGE="${WRITE_MOUNTED_PAGE:-0}"
 COMPARE_MCP=0
-for arg in "$@"; do
-  case "$arg" in
+COMPARE_HOOKS=0
+SCENARIO_FILTER="${SCENARIO_FILTER:-}"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
     --push) PUSH=1; WRITE_MOUNTED_PAGE=1 ;;
     --compare-mcp) COMPARE_MCP=1 ;;
+    --compare-hooks) COMPARE_HOOKS=1 ;;
     --write-mounted-page) WRITE_MOUNTED_PAGE=1 ;;
+    --scenario)
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "--scenario requires a scenario name or filename" >&2
+        usage >&2
+        exit 2
+      fi
+      SCENARIO_FILTER="$1"
+      ;;
+    --scenario=*) SCENARIO_FILTER="${1#--scenario=}" ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "unknown argument: $arg" >&2; usage >&2; exit 2 ;;
+    *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
+  shift
 done
 
 case "$WRITE_MOUNTED_PAGE" in
   0|1) ;;
   *) echo "WRITE_MOUNTED_PAGE must be 0 or 1" >&2; exit 2 ;;
 esac
+
+if [ "$COMPARE_HOOKS" -eq 1 ]; then
+  COMPARE_MCP=1
+  if [ "$WRITE_MOUNTED_PAGE" = "1" ] || [ "$PUSH" -eq 1 ]; then
+    echo "--compare-hooks is artifact-only and cannot be combined with --write-mounted-page or --push" >&2
+    exit 2
+  fi
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="${REPO_DIR:-/home/amika/workspace/locality}"
@@ -84,6 +120,9 @@ OUT_DIR="${OUT_DIR:-$REPO_DIR/experiment/runs/$RUN_ID}"
 RUN_ROOT_OUT_DIR="$OUT_DIR"
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-luna}"
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-low}"
+CODEX_SANDBOX_OUT_DIR="${CODEX_SANDBOX_OUT_DIR:-/home/amika}"
+CODEX_SANDBOX_HARDCODED_OUT_DIR="${CODEX_SANDBOX_HARDCODED_OUT_DIR:-/home/amika}"
+CODEX_HOOKS_MODE="${CODEX_HOOKS_MODE:-hooks}"
 CODEX_EXEC_TIMEOUT_SECONDS="${CODEX_EXEC_TIMEOUT_SECONDS:-900}"
 LINEAR_API_KEY="${LINEAR_API_KEY:-}"
 NOTION_API_TOKEN="${NOTION_API_TOKEN:-${NOTION_TOKEN:-${NOTION_ACCESS_TOKEN:-}}}"
@@ -112,6 +151,11 @@ TRACE_DIR="$OUT_DIR/locality-traces"
 SCENARIO_ROOT="$OUT_DIR/scenarios"
 SCENARIO_MANIFEST="$OUT_DIR/scenarios.tsv"
 CURRENT_SCENARIO="setup"
+
+case "$CODEX_HOOKS_MODE" in
+  hooks|no-hooks) ;;
+  *) echo "CODEX_HOOKS_MODE must be hooks or no-hooks" >&2; exit 2 ;;
+esac
 
 mkdir -p "$OUT_DIR" "$TRACE_DIR" "$SCENARIO_ROOT"
 export LOCALITY_TRACE_RUN_ID="$RUN_ID"
@@ -166,13 +210,22 @@ run_loc_traced() {
 
 render_locality_traces() {
   local trace_file
-  for trace_file in "$TRACE_DIR"/*.jsonl "$SCENARIO_ROOT"/*/*-agent-locality-trace.jsonl; do
+  for trace_file in "$TRACE_DIR"/*.jsonl "$SCENARIO_ROOT"/*/*-agent-locality-trace.jsonl "$SCENARIO_ROOT"/*/variants/*/*-agent-locality-trace.jsonl; do
     if [ ! -s "$trace_file" ]; then
       continue
     fi
     python3 "$SCRIPT_DIR/scripts/locality-trace-to-speedscope.py" \
       "$trace_file" "${trace_file%.jsonl}" >/dev/null
   done
+}
+
+render_codex_event_artifacts() {
+  local events_file="$1"
+  local out_prefix="$2"
+  if [ ! -s "$events_file" ]; then
+    return 0
+  fi
+  python3 "$SCRIPT_DIR/scripts/codex-events-to-trace.py" "$events_file" "$out_prefix" >/dev/null
 }
 
 strip_codex_mcp_tables() {
@@ -217,7 +270,205 @@ prepare_codex_home_without_mcp() {
   fi
 
   strip_codex_mcp_tables "$BASE_CODEX_HOME/config.toml" "$codex_home/config.toml"
+  install_codex_harness_hooks "$codex_home"
   chmod 600 "$codex_home/config.toml"
+}
+
+install_codex_harness_hooks() {
+  local codex_home="$1"
+  local hook_script="$SCRIPT_DIR/scripts/codex-live-hook.py"
+  python3 - "$codex_home/hooks.json" "$hook_script" <<'PY'
+import json
+import shlex
+import sys
+from pathlib import Path
+
+hooks_path = Path(sys.argv[1])
+hook_script = sys.argv[2]
+command = f"python3 {shlex.quote(hook_script)}"
+
+def command_hook(status_message):
+    hook = {
+        "type": "command",
+        "command": command,
+        "timeout": 10,
+    }
+    if status_message:
+        hook["statusMessage"] = status_message
+    return hook
+
+payload = {
+    "description": "Locality benchmark live Codex timing hooks.",
+    "hooks": {
+        "SessionStart": [
+            {
+                "matcher": "startup|resume|clear|compact",
+                "hooks": [command_hook(None)],
+            }
+        ],
+        "UserPromptSubmit": [
+            {
+                "hooks": [command_hook(None)],
+            }
+        ],
+        "PreToolUse": [
+            {
+                "matcher": "*",
+                "hooks": [command_hook("Recording tool start")],
+            }
+        ],
+        "PostToolUse": [
+            {
+                "matcher": "*",
+                "hooks": [command_hook("Recording tool finish")],
+            }
+        ],
+        "Stop": [
+            {
+                "hooks": [command_hook(None)],
+            }
+        ],
+    },
+}
+
+hooks_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+  chmod 600 "$codex_home/hooks.json"
+}
+
+merge_codex_event_streams() {
+  local raw_events_file="$1"
+  local hook_events_file="$2"
+  local events_file="$3"
+  python3 - "$raw_events_file" "$hook_events_file" "$events_file" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+inputs = [Path(sys.argv[1]), Path(sys.argv[2])]
+output = Path(sys.argv[3])
+records = []
+
+for source_order, path in enumerate(inputs):
+    if not path.exists():
+        continue
+    for line_order, line in enumerate(path.read_text(encoding="utf-8").splitlines()):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        records.append(
+            (
+                int(record.get("observed_at_ms") or 0),
+                source_order,
+                line_order,
+                record,
+            )
+        )
+
+records.sort(key=lambda item: (item[0], item[1], item[2]))
+output.write_text(
+    "".join(json.dumps(record, separators=(",", ":")) + "\n" for *_, record in records),
+    encoding="utf-8",
+)
+PY
+}
+
+candidate_agent_output_paths() {
+  local artifact_out_dir="$1"
+  local agent_out_dir="$2"
+  local basename="$3"
+  local sandbox_out_dir="${CODEX_SANDBOX_OUT_DIR%/}"
+  local hardcoded_out_dir="${CODEX_SANDBOX_HARDCODED_OUT_DIR%/}"
+  local candidates=(
+    "$agent_out_dir/$basename"
+    "$artifact_out_dir/$basename"
+    "$sandbox_out_dir/$basename"
+    "$hardcoded_out_dir/$basename"
+  )
+  local seen="|"
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [ -z "$candidate" ] || [ "$candidate" = "/$basename" ]; then
+      continue
+    fi
+    case "$seen" in
+      *"|$candidate|"*) continue ;;
+    esac
+    seen="$seen$candidate|"
+    printf '%s\n' "$candidate"
+  done
+}
+
+cleanup_agent_output_candidates() {
+  local artifact_out_dir="$1"
+  local agent_out_dir="$2"
+  shift 2
+  local basename
+  local candidate
+  for basename in "$@"; do
+    while IFS= read -r candidate; do
+      [ -n "$candidate" ] || continue
+      rm -f "$candidate" 2>/dev/null || true
+    done < <(candidate_agent_output_paths "$artifact_out_dir" "$agent_out_dir" "$basename")
+  done
+}
+
+retrieve_one_agent_output() {
+  local kind="$1"
+  local destination="$2"
+  local require_nonempty="$3"
+  local manifest="$4"
+  shift 4
+  local source
+  local status="missing"
+  local chosen=""
+
+  for source in "$@"; do
+    if { [ "$require_nonempty" = "1" ] && [ -s "$source" ]; } ||
+      { [ "$require_nonempty" != "1" ] && [ -f "$source" ]; }; then
+      mkdir -p "$(dirname "$destination")"
+      if [ "$source" != "$destination" ]; then
+        cp "$source" "$destination"
+        status="copied"
+      else
+        status="present"
+      fi
+      chosen="$source"
+      break
+    fi
+  done
+
+  printf '%s\t%s\t%s\t%s\n' "$kind" "$status" "$chosen" "$destination" >> "$manifest"
+  [ "$status" != "missing" ]
+}
+
+retrieve_agent_outputs() {
+  local strategy="$1"
+  local artifact_out_dir="$2"
+  local agent_out_dir="$3"
+  local report_name="$4"
+  local trace_name="$5"
+  local report_file="$6"
+  local manifest="$artifact_out_dir/$strategy-agent-artifacts.tsv"
+  local report_candidates=()
+  local trace_candidates=()
+  local candidate
+
+  printf 'kind\tstatus\tsource\tdestination\n' > "$manifest"
+  while IFS= read -r candidate; do
+    report_candidates+=("$candidate")
+  done < <(candidate_agent_output_paths "$artifact_out_dir" "$agent_out_dir" "$report_name")
+  while IFS= read -r candidate; do
+    trace_candidates+=("$candidate")
+  done < <(candidate_agent_output_paths "$artifact_out_dir" "$agent_out_dir" "$trace_name")
+
+  local report_rc=0
+  retrieve_one_agent_output "report" "$report_file" 1 "$manifest" "${report_candidates[@]}" || report_rc=$?
+  retrieve_one_agent_output "trace" "$artifact_out_dir/$trace_name" 0 "$manifest" "${trace_candidates[@]}" || true
+  return "$report_rc"
 }
 
 validate_codex_mcp_auth_inputs() {
@@ -340,20 +591,46 @@ run_codex_agent() {
   local final_file="$4"
   shift 4
   local add_dirs=("$@")
-  local events_file="$OUT_DIR/$strategy-codex-events.jsonl"
-  local err_file="$OUT_DIR/$strategy-codex.err"
-  local out_file="$OUT_DIR/$strategy-codex.out"
-  local summary_file="$OUT_DIR/$strategy-codex-summary.json"
-  local events_tsv="$OUT_DIR/$strategy-codex-events.tsv"
-  local prompt_snapshot="$OUT_DIR/$strategy-prompt.md"
-  local command_snapshot="$OUT_DIR/$strategy-codex-command.txt"
-  local agent_loc_trace="$OUT_DIR/$strategy-agent-locality-trace.jsonl"
+  local artifact_out_dir="$OUT_DIR"
+  local agent_out_dir="${CURRENT_AGENT_OUT_DIR:-$artifact_out_dir}"
+  local report_name
+  local agent_report_file
+  local agent_trace_name
+  local agent_trace_file
+  local events_file="$artifact_out_dir/$strategy-codex-events.jsonl"
+  local raw_events_file="$artifact_out_dir/$strategy-codex-events.raw.jsonl"
+  local hook_events_file="$artifact_out_dir/$strategy-codex-hooks.jsonl"
+  local hook_state_file="$artifact_out_dir/$strategy-codex-hooks.state.json"
+  local err_file="$artifact_out_dir/$strategy-codex.err"
+  local out_file="$artifact_out_dir/$strategy-codex.out"
+  local summary_file="$artifact_out_dir/$strategy-codex-summary.json"
+  local events_tsv="$artifact_out_dir/$strategy-codex-events.tsv"
+  local prompt_snapshot="$artifact_out_dir/$strategy-prompt.md"
+  local command_snapshot="$artifact_out_dir/$strategy-codex-command.txt"
+  local agent_loc_trace="$artifact_out_dir/$strategy-agent-locality-trace.jsonl"
+  local git_data_file="$artifact_out_dir/git-data.json"
   local prompt
   local run_cmd
   local codex_home
+  local hooks_mode="${CURRENT_CODEX_HOOKS_MODE:-$CODEX_HOOKS_MODE}"
+  case "$hooks_mode" in
+    hooks|no-hooks) ;;
+    *) echo "invalid Codex hooks mode: $hooks_mode" >&2; return 2 ;;
+  esac
   codex_home="$(codex_home_for_strategy "$strategy")"
   prompt="$(cat "$prompt_file")"
   cp "$prompt_file" "$prompt_snapshot"
+  mkdir -p "$artifact_out_dir" "$agent_out_dir"
+  report_name="$(basename "$report_file")"
+  agent_report_file="$agent_out_dir/$report_name"
+  case "$strategy" in
+    locality) agent_trace_name="locality-agent-trace.md" ;;
+    notion-mcp) agent_trace_name="notion-mcp-agent-trace.md" ;;
+    *) agent_trace_name="$strategy-agent-trace.md" ;;
+  esac
+  agent_trace_file="$agent_out_dir/$agent_trace_name"
+  cleanup_agent_output_candidates "$artifact_out_dir" "$agent_out_dir" "$report_name" "$agent_trace_name"
+  rm -f "$final_file"
 
   local cmd=(
     codex exec
@@ -362,9 +639,17 @@ run_codex_agent() {
     -c "model_reasoning_effort=\"$CODEX_REASONING_EFFORT\""
     --dangerously-bypass-approvals-and-sandbox
     -C "$REPO_DIR"
-    --add-dir "$OUT_DIR"
-    --output-last-message "$final_file"
+    --add-dir "$artifact_out_dir"
   )
+  if [ "$agent_out_dir" != "$artifact_out_dir" ]; then
+    cmd+=(--add-dir "$agent_out_dir")
+  fi
+  cmd+=(--output-last-message "$final_file")
+  if [ "$hooks_mode" = "hooks" ]; then
+    cmd+=(--enable hooks --dangerously-bypass-hook-trust)
+  else
+    cmd+=(--disable hooks)
+  fi
   local dir
   for dir in "${add_dirs[@]}"; do
     cmd+=(--add-dir "$dir")
@@ -380,6 +665,16 @@ run_codex_agent() {
   {
     printf 'timeout_seconds=%s\n' "$CODEX_EXEC_TIMEOUT_SECONDS"
     printf 'codex_home=%s\n' "$codex_home"
+    printf 'hooks_mode=%s\n' "$hooks_mode"
+    printf 'artifact_out_dir=%s\n' "$artifact_out_dir"
+    printf 'agent_out_dir=%s\n' "$agent_out_dir"
+    printf 'hardcoded_out_dir=%s\n' "$CODEX_SANDBOX_HARDCODED_OUT_DIR"
+    printf 'report_file=%s\n' "$agent_report_file"
+    printf 'trace_file=%s\n' "$agent_trace_file"
+    printf 'git_data_file=%s\n' "$git_data_file"
+    printf 'context_paths_file=%s\n' "$CONTEXT_PATHS_FILE"
+    printf 'context_inventory=%s\n' "$CONTEXT_INVENTORY"
+    printf 'context_search_results=%s\n' "$CONTEXT_SEARCH_RESULTS"
     printf 'codex_command='
     printf '%q ' "${cmd[@]}"
     printf '\nwrapped_command='
@@ -389,17 +684,65 @@ run_codex_agent() {
 
   set +e
   set -o pipefail
-  CODEX_HOME="$codex_home" LOCALITY_TRACE_FILE="$agent_loc_trace" LOCALITY_TRACE_RUN_ID="$RUN_ID" \
-    "${run_cmd[@]}" < /dev/null 2> "$err_file" | python3 "$SCRIPT_DIR/scripts/timestamp-jsonl.py" > "$events_file"
+  : > "$hook_events_file"
+  rm -f "$hook_state_file"
+  if [ "$hooks_mode" = "hooks" ]; then
+    CODEX_HOME="$codex_home" \
+      OUT_DIR="$agent_out_dir" \
+      AGENT_OUT_DIR="$agent_out_dir" \
+      ARTIFACT_OUT_DIR="$artifact_out_dir" \
+      SCENARIO_OUT_DIR="$artifact_out_dir" \
+      CODEX_SANDBOX_HARDCODED_OUT_DIR="$CODEX_SANDBOX_HARDCODED_OUT_DIR" \
+      REPORT_FILE="$agent_report_file" \
+      TRACE_FILE="$agent_trace_file" \
+      GIT_DATA_FILE="$git_data_file" \
+      LOCALITY_CONTEXT_PATHS_FILE="$CONTEXT_PATHS_FILE" \
+      LOCALITY_CONTEXT_INVENTORY="$CONTEXT_INVENTORY" \
+      LOCALITY_CONTEXT_SEARCH_RESULTS="$CONTEXT_SEARCH_RESULTS" \
+      CONTEXT_PATHS_FILE="$CONTEXT_PATHS_FILE" \
+      CONTEXT_INVENTORY="$CONTEXT_INVENTORY" \
+      CONTEXT_SEARCH_RESULTS="$CONTEXT_SEARCH_RESULTS" \
+      CODEX_HARNESS_HOOK_EVENTS_FILE="$hook_events_file" \
+      CODEX_HARNESS_HOOK_STATE_FILE="$hook_state_file" \
+      LOCALITY_TRACE_FILE="$agent_loc_trace" \
+      LOCALITY_TRACE_RUN_ID="$RUN_ID" \
+      "${run_cmd[@]}" < /dev/null 2> "$err_file" | python3 "$SCRIPT_DIR/scripts/timestamp-jsonl.py" > "$raw_events_file"
+  else
+    CODEX_HOME="$codex_home" \
+      OUT_DIR="$agent_out_dir" \
+      AGENT_OUT_DIR="$agent_out_dir" \
+      ARTIFACT_OUT_DIR="$artifact_out_dir" \
+      SCENARIO_OUT_DIR="$artifact_out_dir" \
+      CODEX_SANDBOX_HARDCODED_OUT_DIR="$CODEX_SANDBOX_HARDCODED_OUT_DIR" \
+      REPORT_FILE="$agent_report_file" \
+      TRACE_FILE="$agent_trace_file" \
+      GIT_DATA_FILE="$git_data_file" \
+      LOCALITY_CONTEXT_PATHS_FILE="$CONTEXT_PATHS_FILE" \
+      LOCALITY_CONTEXT_INVENTORY="$CONTEXT_INVENTORY" \
+      LOCALITY_CONTEXT_SEARCH_RESULTS="$CONTEXT_SEARCH_RESULTS" \
+      CONTEXT_PATHS_FILE="$CONTEXT_PATHS_FILE" \
+      CONTEXT_INVENTORY="$CONTEXT_INVENTORY" \
+      CONTEXT_SEARCH_RESULTS="$CONTEXT_SEARCH_RESULTS" \
+      LOCALITY_TRACE_FILE="$agent_loc_trace" \
+      LOCALITY_TRACE_RUN_ID="$RUN_ID" \
+      "${run_cmd[@]}" < /dev/null 2> "$err_file" | python3 "$SCRIPT_DIR/scripts/timestamp-jsonl.py" > "$raw_events_file"
+  fi
   local pipe_status=("${PIPESTATUS[@]}")
   local rc="${pipe_status[0]}"
   set +o pipefail
   set -e
   : > "$out_file"
 
+  local retrieve_rc=0
+  retrieve_agent_outputs "$strategy" "$artifact_out_dir" "$agent_out_dir" "$report_name" "$agent_trace_name" "$report_file" || retrieve_rc=$?
+  merge_codex_event_streams "$raw_events_file" "$hook_events_file" "$events_file"
   python3 "$SCRIPT_DIR/scripts/summarize-codex-events.py" "$events_file" "$summary_file" "$events_tsv"
+  render_codex_event_artifacts "$events_file" "$artifact_out_dir/$strategy"
   if [ "$rc" -ne 0 ]; then
     return "$rc"
+  fi
+  if [ "$retrieve_rc" -ne 0 ]; then
+    return "$retrieve_rc"
   fi
   test -s "$report_file"
 }
@@ -424,6 +767,42 @@ discover_prompt_scenarios() {
   else
     USE_LEGACY_PROMPTS=0
   fi
+}
+
+filter_prompt_scenarios() {
+  if [ -z "$SCENARIO_FILTER" ]; then
+    return
+  fi
+
+  local requested
+  local requested_base
+  local requested_stem
+  local scenario_file
+  local scenario_stem
+  local matches=()
+  requested="$SCENARIO_FILTER"
+  requested_base="$(basename "$requested")"
+  requested_stem="${requested_base%.md}"
+
+  for scenario_file in "${SCENARIO_FILES[@]}"; do
+    scenario_stem="${scenario_file%.md}"
+    if [ "$scenario_file" = "$requested_base" ] ||
+      [ "$scenario_stem" = "$requested_stem" ] ||
+      [ "$(locality_prompt_for "$scenario_file")" = "$requested" ]; then
+      matches+=("$scenario_file")
+    fi
+  done
+
+  if [ "${#matches[@]}" -eq 0 ]; then
+    echo "no prompt scenario matched --scenario $SCENARIO_FILTER" >&2
+    exit 2
+  fi
+  if [ "${#matches[@]}" -gt 1 ]; then
+    echo "--scenario $SCENARIO_FILTER matched multiple prompt scenarios" >&2
+    exit 2
+  fi
+
+  SCENARIO_FILES=("${matches[0]}")
 }
 
 locality_prompt_for() {
@@ -504,6 +883,16 @@ scenario_needs_git_metadata() {
   [ "$(scenario_name_for_file "$scenario_file")" = "scenario1" ]
 }
 
+scenario_agent_out_dir() {
+  local scenario_name="$1"
+  local scenario_out_dir="$2"
+  if [ "$scenario_name" = "scenario1" ]; then
+    printf '%s\n' "$scenario_out_dir"
+  else
+    printf '%s\n' "${CODEX_SANDBOX_OUT_DIR%/}"
+  fi
+}
+
 collect_git_metadata() {
   local out_path="$1"
   local commit_count
@@ -556,11 +945,226 @@ PY
   phase_end "locality" "git_collect" "ok" "commits=$commit_count; file=$out_path"
 }
 
+run_codex_agent_variant() {
+  local strategy="$1"
+  local hooks_mode="$2"
+  local variant_out_dir="$3"
+  local agent_out_dir="$4"
+  local prompt_file="$5"
+  local report_name="$6"
+  local final_name="$7"
+  shift 7
+
+  mkdir -p "$variant_out_dir"
+
+  local saved_out_dir="$OUT_DIR"
+  OUT_DIR="$variant_out_dir"
+  export OUT_DIR
+  CURRENT_AGENT_OUT_DIR="$agent_out_dir" CURRENT_CODEX_HOOKS_MODE="$hooks_mode" run_codex_agent "$strategy" "$prompt_file" "$OUT_DIR/$report_name" "$OUT_DIR/$final_name" "$@"
+  local rc=$?
+  OUT_DIR="$saved_out_dir"
+  export OUT_DIR
+  return "$rc"
+}
+
+run_codex_variant_with_metric() {
+  local strategy="$1"
+  local metric_strategy="$2"
+  local hooks_mode="$3"
+  local variant_label="$4"
+  local variant_out_dir="$5"
+  local agent_out_dir="$6"
+  local prompt_file="$7"
+  local report_name="$8"
+  local final_name="$9"
+  shift 9
+
+  local phase_name="codex_exec_wall_time"
+  if [ "$variant_label" != "default" ]; then
+    phase_name="codex_exec_wall_time.$variant_label"
+  fi
+
+  phase_start
+  set +e
+  run_codex_agent_variant "$strategy" "$hooks_mode" "$variant_out_dir" "$agent_out_dir" "$prompt_file" "$report_name" "$final_name" "$@"
+  local agent_rc=$?
+  set -e
+
+  if [ "$agent_rc" -eq 0 ] && [ -s "$variant_out_dir/$report_name" ]; then
+    phase_end "$metric_strategy" "$phase_name" "ok" "hooks=$hooks_mode; report=$variant_out_dir/$report_name"
+    return 0
+  fi
+
+  phase_end "$metric_strategy" "$phase_name" "failed" "hooks=$hooks_mode; exit=$agent_rc; report=$variant_out_dir/$report_name"
+  cat "$variant_out_dir/$strategy-codex.err" >&2 || true
+  if [ "$agent_rc" -ne 0 ]; then
+    return "$agent_rc"
+  fi
+  return 1
+}
+
+generate_hook_comparison_profiles() {
+  local scenario_out_dir="$1"
+  local scenario_name="$2"
+  local profile_root="$scenario_out_dir/hook-comparison"
+  local strategy
+
+  mkdir -p "$profile_root"
+  for strategy in locality notion-mcp; do
+    local no_hooks_events="$scenario_out_dir/variants/$strategy-no-hooks/$strategy-codex-events.jsonl"
+    local hooks_events="$scenario_out_dir/variants/$strategy-hooks/$strategy-codex-events.jsonl"
+    if [ ! -s "$no_hooks_events" ] || [ ! -s "$hooks_events" ]; then
+      continue
+    fi
+    node "$SCRIPT_DIR/../agent-conversation-profile-modern-codex.mjs" \
+      --left "$no_hooks_events" \
+      --left-label "$strategy-no-hooks" \
+      --right "$hooks_events" \
+      --right-label "$strategy-hooks" \
+      --out "$profile_root/$strategy" >/dev/null
+  done
+
+  python3 - "$scenario_out_dir" "$scenario_name" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+scenario_out = Path(sys.argv[1])
+scenario_name = sys.argv[2]
+strategies = ("locality", "notion-mcp")
+modes = ("no-hooks", "hooks")
+
+def load_json(path):
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+def fmt_ms(value):
+    if value is None:
+        return ""
+    value = int(value)
+    if abs(value) >= 1000:
+        return f"{value / 1000:.3f}s"
+    return f"{value}ms"
+
+def fmt_percall(duration_ms, count):
+    count = int(count or 0)
+    if count <= 0:
+        return ""
+    return fmt_ms(round(int(duration_ms or 0) / count))
+
+def cell(value):
+    text = str(value)
+    return text.replace("|", "\\|").replace("\n", " ")
+
+def conversation_for(strategy, mode):
+    summary_path = scenario_out / "hook-comparison" / strategy / "summary.json"
+    summary = load_json(summary_path)
+    label = f"{strategy}-{mode}"
+    for conversation in summary.get("conversations", []):
+        if conversation.get("label") == label:
+            return conversation
+    return {}
+
+lines = [
+    f"# Hook Comparison: {scenario_name}",
+    "",
+    "This study runs the selected prompt four ways: Locality without hooks, Locality with hooks, Notion MCP without hooks, and Notion MCP with hooks.",
+    "",
+    "Hooked runs add live `harness.phase` records for prompt handoff, thinking, tool calls, and final response spans. Hookless runs keep the raw Codex stdout event stream, so profile gaps are inferred when no native duration is present.",
+    "",
+    "## Timing Summary",
+    "",
+    "| Strategy | Mode | Codex observed | Profile wall | Measured | Inferred | Hook phases | Tool phases | User query | Reasoning | Tool | Agent response |",
+    "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+]
+
+tool_lines = [
+    "## Tool Command Breakdown",
+    "",
+    "The profiler groups Bash `loc` calls by Locality subcommand and keeps non-`loc` tools separate.",
+    "",
+]
+
+for strategy in strategies:
+    for mode in modes:
+        variant_dir = scenario_out / "variants" / f"{strategy}-{mode}"
+        event_summary = load_json(variant_dir / f"{strategy}-codex-summary.json")
+        conversation = conversation_for(strategy, mode)
+        activities = conversation.get("totals_by_activity", {})
+        phase_counts = event_summary.get("phase_counts", {})
+        hook_phase_count = sum(int(value) for value in phase_counts.values())
+        lines.append(
+            "| {strategy} | {mode} | {observed} | {wall} | {measured} | {inferred} | {hook_phases} | {tool_phases} | {user_query} | {reasoning} | {tool} | {agent_response} |".format(
+                strategy=cell(strategy),
+                mode=cell(mode),
+                observed=fmt_ms(event_summary.get("observed_duration_ms", 0)),
+                wall=fmt_ms(conversation.get("wall_time_ms")),
+                measured=fmt_ms(conversation.get("measured_duration_ms")),
+                inferred=fmt_ms(conversation.get("inferred_duration_ms")),
+                hook_phases=hook_phase_count,
+                tool_phases=phase_counts.get("tool_call", 0),
+                user_query=fmt_ms(activities.get("user_query", 0)),
+                reasoning=fmt_ms(activities.get("reasoning", 0)),
+                tool=fmt_ms(activities.get("tool", 0)),
+                agent_response=fmt_ms(activities.get("agent_response", 0)),
+            )
+        )
+
+for strategy in strategies:
+    for mode in modes:
+        conversation = conversation_for(strategy, mode)
+        commands = conversation.get("tool_commands", [])
+        tool_lines.extend([f"### {strategy} {mode}", ""])
+        if not commands:
+            tool_lines.extend(["No tool command records.", ""])
+            continue
+        tool_lines.extend([
+            "| Tool group | Command | Count | Duration | Percall |",
+            "| --- | --- | ---: | ---: | ---: |",
+        ])
+        for command in commands[:12]:
+            count = command.get("count", 0)
+            duration_ms = command.get("duration_ms", 0)
+            tool_lines.append(
+                "| {group} | {cmd} | {count} | {duration} | {percall} |".format(
+                    group=cell(command.get("tool_group", "")),
+                    cmd=cell(command.get("command", "")),
+                    count=count,
+                    duration=fmt_ms(duration_ms),
+                    percall=fmt_percall(duration_ms, count),
+                )
+            )
+        tool_lines.append("")
+
+profile_lines = [
+    "## Profile Artifacts",
+    "",
+    "| Strategy | Profile summary |",
+    "| --- | --- |",
+]
+for strategy in strategies:
+    summary_path = scenario_out / "hook-comparison" / strategy / "summary.md"
+    if summary_path.exists():
+        profile_lines.append(f"| {cell(strategy)} | {cell(summary_path)} |")
+
+(scenario_out / "hooks-comparison.md").write_text(
+    "\n".join(lines + [""] + tool_lines + profile_lines) + "\n",
+    encoding="utf-8",
+)
+PY
+}
+
 discover_prompt_scenarios
+filter_prompt_scenarios
+if [ "$COMPARE_HOOKS" -eq 1 ] && [ "${#SCENARIO_FILES[@]}" -ne 1 ]; then
+  echo "--compare-hooks requires exactly one scenario; pass --scenario when multiple scenarios exist" >&2
+  exit 2
+fi
 validate_prompt_scenarios
 
 echo -e "scenario\tstrategy\tphase\tstart_ms\tend_ms\tduration_ms\tstatus\tdetail" > "$METRICS_TSV"
-printf 'scenario\tlocality_prompt\tmcp_prompt\tout_dir\treport_title\treport_page_path\n' > "$SCENARIO_MANIFEST"
+printf 'scenario\tstrategy\tvariant\thooks\tlocality_prompt\tmcp_prompt\tout_dir\tagent_out_dir\treport_title\treport_page_path\n' > "$SCENARIO_MANIFEST"
 
 phase_start
 test -d "$REPO_DIR"
@@ -685,7 +1289,8 @@ for scenario_file in "${SCENARIO_FILES[@]}"; do
   SCENARIO_NAME="$(scenario_name_for_file "$scenario_file")"
   CURRENT_SCENARIO="$SCENARIO_NAME"
   SCENARIO_OUT_DIR="$SCENARIO_ROOT/$SCENARIO_NAME"
-  mkdir -p "$SCENARIO_OUT_DIR"
+  SCENARIO_AGENT_OUT_DIR="$(scenario_agent_out_dir "$SCENARIO_NAME" "$SCENARIO_OUT_DIR")"
+  mkdir -p "$SCENARIO_OUT_DIR" "$SCENARIO_AGENT_OUT_DIR"
   LOCALITY_PROMPT_FILE="$(locality_prompt_for "$scenario_file")"
   MCP_PROMPT_FILE="$(mcp_prompt_for "$scenario_file")"
   SCENARIO_REPORT_TITLE="$(scenario_report_title "$SCENARIO_NAME")"
@@ -711,10 +1316,14 @@ for scenario_file in "${SCENARIO_FILES[@]}"; do
   SCENARIO_CONTEXT_INVENTORY="$SCENARIO_OUT_DIR/locality-context-inventory.txt"
   SCENARIO_CONTEXT_SEARCH_RESULTS="$SCENARIO_OUT_DIR/locality-context-search.txt"
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$SCENARIO_NAME" "$LOCALITY_PROMPT_FILE" "$MCP_PROMPT_FILE" "$SCENARIO_OUT_DIR" "$SCENARIO_REPORT_TITLE" "$REPORT_PAGE_PATH" >> "$SCENARIO_MANIFEST"
+  if [ "$COMPARE_HOOKS" -eq 1 ]; then
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$SCENARIO_NAME" "all" "hook-study" "mixed" "$LOCALITY_PROMPT_FILE" "$MCP_PROMPT_FILE" "$SCENARIO_OUT_DIR" "$SCENARIO_AGENT_OUT_DIR" "$SCENARIO_REPORT_TITLE" "$REPORT_PAGE_PATH" >> "$SCENARIO_MANIFEST"
+  else
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$SCENARIO_NAME" "all" "default" "$CODEX_HOOKS_MODE" "$LOCALITY_PROMPT_FILE" "$MCP_PROMPT_FILE" "$SCENARIO_OUT_DIR" "$SCENARIO_AGENT_OUT_DIR" "$SCENARIO_REPORT_TITLE" "$REPORT_PAGE_PATH" >> "$SCENARIO_MANIFEST"
+  fi
 
-  phase_start
   RUN_OUT_DIR="$OUT_DIR"
   RUN_CONTEXT_PATHS_FILE="$CONTEXT_PATHS_FILE"
   RUN_CONTEXT_INVENTORY="$CONTEXT_INVENTORY"
@@ -725,21 +1334,42 @@ for scenario_file in "${SCENARIO_FILES[@]}"; do
   CONTEXT_SEARCH_RESULTS="$SCENARIO_CONTEXT_SEARCH_RESULTS"
   export REPO_DIR LOC_BIN TARGET_URL PAGE_PATH REPORT_PAGE_PATH OUT_DIR METRICS_TSV SUMMARY_JSON
   export CONTEXT_PATHS_FILE CONTEXT_INVENTORY CONTEXT_SEARCH_RESULTS CONTEXT_SEARCH_QUERY
-  set +e
-  run_codex_agent "locality" "$LOCALITY_PROMPT_FILE" "$OUT_DIR/report-body.md" "$OUT_DIR/locality-agent-final.md" "${locality_add_dirs[@]}"
-  agent_rc=$?
-  set -e
-  if [ "$agent_rc" -eq 0 ] && [ -s "$OUT_DIR/report-body.md" ]; then
-    phase_end "locality" "codex_exec_wall_time" "ok" "report=$OUT_DIR/report-body.md"
+
+  if [ "$COMPARE_HOOKS" -eq 1 ]; then
+    if run_codex_variant_with_metric "locality" "locality" "no-hooks" "no-hooks" "$OUT_DIR/variants/locality-no-hooks" "$SCENARIO_AGENT_OUT_DIR" "$LOCALITY_PROMPT_FILE" "report-body.md" "locality-agent-final.md" "${locality_add_dirs[@]}"; then
+      :
+    else
+      agent_rc=$?
+      OUT_DIR="$RUN_OUT_DIR"
+      CONTEXT_PATHS_FILE="$RUN_CONTEXT_PATHS_FILE"
+      CONTEXT_INVENTORY="$RUN_CONTEXT_INVENTORY"
+      CONTEXT_SEARCH_RESULTS="$RUN_CONTEXT_SEARCH_RESULTS"
+      export OUT_DIR CONTEXT_PATHS_FILE CONTEXT_INVENTORY CONTEXT_SEARCH_RESULTS
+      exit "$agent_rc"
+    fi
+    if run_codex_variant_with_metric "locality" "locality" "hooks" "hooks" "$OUT_DIR/variants/locality-hooks" "$SCENARIO_AGENT_OUT_DIR" "$LOCALITY_PROMPT_FILE" "report-body.md" "locality-agent-final.md" "${locality_add_dirs[@]}"; then
+      :
+    else
+      agent_rc=$?
+      OUT_DIR="$RUN_OUT_DIR"
+      CONTEXT_PATHS_FILE="$RUN_CONTEXT_PATHS_FILE"
+      CONTEXT_INVENTORY="$RUN_CONTEXT_INVENTORY"
+      CONTEXT_SEARCH_RESULTS="$RUN_CONTEXT_SEARCH_RESULTS"
+      export OUT_DIR CONTEXT_PATHS_FILE CONTEXT_INVENTORY CONTEXT_SEARCH_RESULTS
+      exit "$agent_rc"
+    fi
   else
-    phase_end "locality" "codex_exec_wall_time" "failed" "exit=$agent_rc"
-    cat "$OUT_DIR/locality-codex.err" >&2 || true
-    OUT_DIR="$RUN_OUT_DIR"
-    CONTEXT_PATHS_FILE="$RUN_CONTEXT_PATHS_FILE"
-    CONTEXT_INVENTORY="$RUN_CONTEXT_INVENTORY"
-    CONTEXT_SEARCH_RESULTS="$RUN_CONTEXT_SEARCH_RESULTS"
-    export OUT_DIR CONTEXT_PATHS_FILE CONTEXT_INVENTORY CONTEXT_SEARCH_RESULTS
-    exit "$agent_rc"
+    if run_codex_variant_with_metric "locality" "locality" "$CODEX_HOOKS_MODE" "default" "$OUT_DIR" "$SCENARIO_AGENT_OUT_DIR" "$LOCALITY_PROMPT_FILE" "report-body.md" "locality-agent-final.md" "${locality_add_dirs[@]}"; then
+      :
+    else
+      agent_rc=$?
+      OUT_DIR="$RUN_OUT_DIR"
+      CONTEXT_PATHS_FILE="$RUN_CONTEXT_PATHS_FILE"
+      CONTEXT_INVENTORY="$RUN_CONTEXT_INVENTORY"
+      CONTEXT_SEARCH_RESULTS="$RUN_CONTEXT_SEARCH_RESULTS"
+      export OUT_DIR CONTEXT_PATHS_FILE CONTEXT_INVENTORY CONTEXT_SEARCH_RESULTS
+      exit "$agent_rc"
+    fi
   fi
 
   if [ "$WRITE_MOUNTED_PAGE" = "1" ]; then
@@ -808,16 +1438,38 @@ PY
       phase_end "notion_mcp" "mcp_auth_setup" "skipped" "already configured; codex_home=$MCP_CODEX_HOME"
     fi
 
-    phase_start
-    set +e
-    run_codex_agent "notion-mcp" "$MCP_PROMPT_FILE" "$OUT_DIR/notion-mcp-report-body.md" "$OUT_DIR/notion-mcp-agent-final.md"
-    mcp_rc=$?
-    set -e
-    if [ "$mcp_rc" -eq 0 ] && [ -s "$OUT_DIR/notion-mcp-report-body.md" ]; then
-      phase_end "notion_mcp" "codex_exec_wall_time" "ok" "report=$OUT_DIR/notion-mcp-report-body.md"
+    if [ "$COMPARE_HOOKS" -eq 1 ]; then
+      if run_codex_variant_with_metric "notion-mcp" "notion_mcp" "no-hooks" "no-hooks" "$OUT_DIR/variants/notion-mcp-no-hooks" "$SCENARIO_AGENT_OUT_DIR" "$MCP_PROMPT_FILE" "notion-mcp-report-body.md" "notion-mcp-agent-final.md"; then
+        :
+      else
+        mcp_rc=$?
+        OUT_DIR="$RUN_OUT_DIR"
+        CONTEXT_PATHS_FILE="$RUN_CONTEXT_PATHS_FILE"
+        CONTEXT_INVENTORY="$RUN_CONTEXT_INVENTORY"
+        CONTEXT_SEARCH_RESULTS="$RUN_CONTEXT_SEARCH_RESULTS"
+        export OUT_DIR CONTEXT_PATHS_FILE CONTEXT_INVENTORY CONTEXT_SEARCH_RESULTS
+        exit "$mcp_rc"
+      fi
+      if run_codex_variant_with_metric "notion-mcp" "notion_mcp" "hooks" "hooks" "$OUT_DIR/variants/notion-mcp-hooks" "$SCENARIO_AGENT_OUT_DIR" "$MCP_PROMPT_FILE" "notion-mcp-report-body.md" "notion-mcp-agent-final.md"; then
+        :
+      else
+        mcp_rc=$?
+        OUT_DIR="$RUN_OUT_DIR"
+        CONTEXT_PATHS_FILE="$RUN_CONTEXT_PATHS_FILE"
+        CONTEXT_INVENTORY="$RUN_CONTEXT_INVENTORY"
+        CONTEXT_SEARCH_RESULTS="$RUN_CONTEXT_SEARCH_RESULTS"
+        export OUT_DIR CONTEXT_PATHS_FILE CONTEXT_INVENTORY CONTEXT_SEARCH_RESULTS
+        exit "$mcp_rc"
+      fi
     else
-      phase_end "notion_mcp" "codex_exec_wall_time" "failed" "exit=$mcp_rc"
+      run_codex_variant_with_metric "notion-mcp" "notion_mcp" "$CODEX_HOOKS_MODE" "default" "$OUT_DIR" "$SCENARIO_AGENT_OUT_DIR" "$MCP_PROMPT_FILE" "notion-mcp-report-body.md" "notion-mcp-agent-final.md" || true
     fi
+  fi
+
+  if [ "$COMPARE_HOOKS" -eq 1 ]; then
+    phase_start
+    generate_hook_comparison_profiles "$OUT_DIR" "$SCENARIO_NAME"
+    phase_end "comparison" "hook_comparison_profile" "ok" "report=$OUT_DIR/hooks-comparison.md"
   fi
 
   OUT_DIR="$RUN_OUT_DIR"
@@ -853,19 +1505,56 @@ for scenario in scenarios:
         p = scenario_out / f"{name}-codex-summary.json"
         if p.exists():
             agent_summaries[name] = json.loads(p.read_text())
+    profile_artifacts = {}
+    for name in ("locality", "notion-mcp"):
+        prefix = scenario_out / name
+        files = {
+            "transcript": prefix.with_name(prefix.name + "-transcript.md"),
+            "spans": prefix.with_name(prefix.name + "-spans.tsv"),
+            "flamegraph_folded": prefix.with_name(prefix.name + ".folded"),
+            "snakeviz": prefix.with_name(prefix.name + ".snakeviz.prof"),
+            "snakeviz_stats": prefix.with_name(prefix.name + ".snakeviz.stats.md"),
+            "speedscope": prefix.with_name(prefix.name + "-speedscope.json"),
+            "perfetto": prefix.with_name(prefix.name + ".perfetto.json"),
+        }
+        existing = {key: str(path) for key, path in files.items() if path.exists()}
+        if existing:
+            profile_artifacts[name] = existing
+    variant_summaries = {}
+    variants_root = scenario_out / "variants"
+    if variants_root.exists():
+        for variant_dir in sorted(p for p in variants_root.iterdir() if p.is_dir()):
+            variant_agent_summaries = {}
+            for name in ("locality", "notion-mcp"):
+                p = variant_dir / f"{name}-codex-summary.json"
+                if p.exists():
+                    variant_agent_summaries[name] = json.loads(p.read_text())
+            if variant_agent_summaries:
+                variant_summaries[variant_dir.name] = variant_agent_summaries
     scenario_summaries[scenario["scenario"]] = {
         "out_dir": str(scenario_out),
+        "strategy": scenario.get("strategy", ""),
+        "variant": scenario.get("variant", ""),
+        "hooks": scenario.get("hooks", ""),
+        "agent_out_dir": scenario.get("agent_out_dir", ""),
         "report_title": scenario["report_title"],
         "page_path": scenario["report_page_path"],
         "locality_prompt": scenario["locality_prompt"],
         "mcp_prompt": scenario["mcp_prompt"],
         "agent_event_summaries": agent_summaries,
+        "variant_agent_event_summaries": variant_summaries,
+        "profile_artifacts": profile_artifacts,
+        "hook_comparison_report": str(scenario_out / "hooks-comparison.md")
+        if (scenario_out / "hooks-comparison.md").exists()
+        else None,
     }
 
 locality_trace_summaries = {}
 for p in sorted((out / "locality-traces").glob("*-summary.json")):
     locality_trace_summaries[str(p.relative_to(out))] = json.loads(p.read_text())
 for p in sorted((out / "scenarios").glob("*/*-agent-locality-trace-summary.json")):
+    locality_trace_summaries[str(p.relative_to(out))] = json.loads(p.read_text())
+for p in sorted((out / "scenarios").glob("*/variants/*/*-agent-locality-trace-summary.json")):
     locality_trace_summaries[str(p.relative_to(out))] = json.loads(p.read_text())
 
 first_scenario = scenarios[0] if scenarios else {}
