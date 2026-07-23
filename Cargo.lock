@@ -2077,6 +2077,7 @@ dependencies = [
  "locality-connector",
  "locality-core",
  "locality-github",
+ "locality-gitlab",
  "locality-gmail",
  "locality-google-calendar",
  "locality-google-docs",
@@ -2135,6 +2136,7 @@ dependencies = [
  "loc-cli",
  "locality-connector",
  "locality-core",
+ "locality-gitlab",
  "locality-gmail",
  "locality-google-calendar",
  "locality-google-docs",
@@ -2173,6 +2175,19 @@ dependencies = [
 
 [[package]]
 name = "locality-github"
+version = "0.3.6"
+dependencies = [
+ "base64 0.22.1",
+ "locality-connector",
+ "locality-core",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "locality-gitlab"
 version = "0.3.6"
 dependencies = [
  "base64 0.22.1",
@@ -2319,6 +2334,7 @@ dependencies = [
  "locality-connector",
  "locality-core",
  "locality-github",
+ "locality-gitlab",
  "locality-gmail",
  "locality-google-calendar",
  "locality-google-docs",

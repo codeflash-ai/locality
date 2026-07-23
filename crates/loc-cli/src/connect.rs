@@ -5,6 +5,9 @@ use locality_connector::oauth_broker::{OAuthBrokerCodeExchange, OAuthBrokerToken
 use locality_github::{
     GITHUB_CONNECTOR_ID, GitHubApi, HttpGitHubApiClient, github_capabilities_json,
 };
+use locality_gitlab::{
+    GITLAB_CONNECTOR_ID, GitLabApi, HttpGitLabApiClient, gitlab_capabilities_json,
+};
 use locality_gmail::{
     GMAIL_CONNECTOR_ID, GMAIL_OAUTH_SCOPES, HttpGmailOAuthBrokerClient, StoredGmailCredential,
     gmail_capabilities_json, validate_gmail_oauth_scopes,
@@ -46,6 +49,7 @@ pub const DEFAULT_GOOGLE_CALENDAR_OAUTH_PROFILE_ID: &str = "google-calendar-oaut
 pub const DEFAULT_GMAIL_OAUTH_PROFILE_ID: &str = "gmail-oauth-default";
 pub const DEFAULT_SLACK_OAUTH_PROFILE_ID: &str = "slack-oauth-default";
 pub const DEFAULT_GITHUB_API_KEY_PROFILE_ID: &str = "github-api-key-default";
+pub const DEFAULT_GITLAB_API_KEY_PROFILE_ID: &str = "gitlab-api-key-default";
 pub const DEFAULT_GRANOLA_API_KEY_PROFILE_ID: &str = "granola-api-key-default";
 pub const DEFAULT_LINEAR_API_KEY_PROFILE_ID: &str = "linear-api-key-default";
 
@@ -216,6 +220,10 @@ pub trait GitHubConnectionProbe {
     fn probe(&self, api_key: &str) -> Result<String, ConnectError>;
 }
 
+pub trait GitLabConnectionProbe {
+    fn probe(&self, api_key: &str) -> Result<String, ConnectError>;
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct HttpGranolaConnectionProbe;
 
@@ -254,6 +262,20 @@ impl GitHubConnectionProbe for HttpGitHubConnectionProbe {
             .map(|user| user.login)
             .map_err(|error| {
                 ConnectError::connection_probe_failed(GITHUB_CONNECTOR_ID, error.to_string())
+            })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct HttpGitLabConnectionProbe;
+
+impl GitLabConnectionProbe for HttpGitLabConnectionProbe {
+    fn probe(&self, api_key: &str) -> Result<String, ConnectError> {
+        HttpGitLabApiClient::new(api_key)
+            .current_user()
+            .map(|user| user.username)
+            .map_err(|error| {
+                ConnectError::connection_probe_failed(GITLAB_CONNECTOR_ID, error.to_string())
             })
     }
 }
@@ -647,6 +669,73 @@ where
         connection_id: connection_id.0,
         profile_id: profile_id.0,
         connector: GITHUB_CONNECTOR_ID.to_string(),
+        display_name,
+        account_label,
+        workspace_id: None,
+        workspace_name: None,
+        auth_kind: "api_key".to_string(),
+    })
+}
+
+pub fn run_connect_gitlab<S, P>(
+    store: &mut S,
+    credentials: &dyn CredentialStore,
+    options: ConnectOptions,
+    probe: &P,
+) -> Result<ConnectReport, ConnectError>
+where
+    S: ConnectionRepository + ConnectorProfileRepository,
+    P: GitLabConnectionProbe,
+{
+    let connection_id = match options.connection_id {
+        Some(connection_id) => connection_id,
+        None => default_connection_id_for_connector(
+            store,
+            GITLAB_CONNECTOR_ID,
+            "gitlab-default",
+            "GitLab",
+        )?,
+    };
+    let account_label = Some(probe.probe(&options.token)?);
+    let secret_ref = format!("connection:{}", connection_id.0);
+    credentials
+        .put(&secret_ref, &options.token)
+        .map_err(|error| ConnectError::Credential(CredentialStorageFailure::gitlab(error)))?;
+
+    let now = timestamp();
+    let profile_id = ConnectorProfileId::new(DEFAULT_GITLAB_API_KEY_PROFILE_ID);
+    store
+        .save_connector_profile(default_gitlab_api_key_profile(now.clone()))
+        .map_err(ConnectError::Store)?;
+    let display_name = connection_id.0.clone();
+    store
+        .save_connection(ConnectionRecord {
+            connection_id: connection_id.clone(),
+            profile_id: Some(profile_id.clone()),
+            connector: GITLAB_CONNECTOR_ID.to_string(),
+            display_name: display_name.clone(),
+            account_label: account_label.clone(),
+            workspace_id: None,
+            workspace_name: None,
+            auth_kind: "api_key".to_string(),
+            secret_ref,
+            scopes: vec!["read_api".to_string(), "read_repository".to_string()],
+            capabilities_json: gitlab_capabilities_json().map_err(|error| {
+                ConnectError::CredentialEncode(CredentialEncodeFailure::gitlab(error.to_string()))
+            })?,
+            status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            expires_at: None,
+        })
+        .map_err(ConnectError::Store)?;
+
+    Ok(ConnectReport {
+        ok: true,
+        command: "connect",
+        connection_id: connection_id.0,
+        profile_id: profile_id.0,
+        connector: GITLAB_CONNECTOR_ID.to_string(),
         display_name,
         account_label,
         workspace_id: None,
@@ -1379,6 +1468,7 @@ enum CredentialFailureConnector {
     Slack,
     Granola,
     GitHub,
+    GitLab,
     Linear,
 }
 
@@ -1409,6 +1499,10 @@ impl CredentialEncodeFailure {
 
     pub fn github(message: impl Into<String>) -> Self {
         Self::new(CredentialFailureConnector::GitHub, message)
+    }
+
+    pub fn gitlab(message: impl Into<String>) -> Self {
+        Self::new(CredentialFailureConnector::GitLab, message)
     }
 
     pub fn linear(message: impl Into<String>) -> Self {
@@ -1464,6 +1558,10 @@ impl CredentialStorageFailure {
         Self::new(CredentialFailureConnector::GitHub, error)
     }
 
+    pub fn gitlab(error: CredentialError) -> Self {
+        Self::new(CredentialFailureConnector::GitLab, error)
+    }
+
     pub fn linear(error: CredentialError) -> Self {
         Self::new(CredentialFailureConnector::Linear, error)
     }
@@ -1507,6 +1605,7 @@ impl CredentialFailureConnector {
             GMAIL_CONNECTOR_ID => Self::Gmail,
             SLACK_CONNECTOR_ID => Self::Slack,
             GITHUB_CONNECTOR_ID => Self::GitHub,
+            GITLAB_CONNECTOR_ID => Self::GitLab,
             GRANOLA_CONNECTOR_ID => Self::Granola,
             LINEAR_CONNECTOR_ID => Self::Linear,
             _ => Self::Notion,
@@ -1521,6 +1620,7 @@ impl CredentialFailureConnector {
             Self::Gmail => "Gmail",
             Self::Slack => "Slack",
             Self::GitHub => "GitHub",
+            Self::GitLab => "GitLab",
             Self::Granola => "Granola",
             Self::Linear => "Linear",
         }
@@ -1534,6 +1634,7 @@ impl CredentialFailureConnector {
             Self::Gmail => "loc connect gmail",
             Self::Slack => "loc connect slack",
             Self::GitHub => "loc connect github --api-key-stdin",
+            Self::GitLab => "loc connect gitlab --api-key-stdin",
             Self::Granola => "loc connect granola --api-key-stdin",
             Self::Linear => "loc connect linear --api-key-stdin",
         }
@@ -1795,6 +1896,22 @@ fn default_github_api_key_profile(now: String) -> ConnectorProfileRecord {
     }
 }
 
+fn default_gitlab_api_key_profile(now: String) -> ConnectorProfileRecord {
+    ConnectorProfileRecord {
+        profile_id: ConnectorProfileId::new(DEFAULT_GITLAB_API_KEY_PROFILE_ID),
+        connector: GITLAB_CONNECTOR_ID.to_string(),
+        display_name: "GitLab personal access token".to_string(),
+        auth_kind: "api_key".to_string(),
+        scopes: vec!["read_api".to_string(), "read_repository".to_string()],
+        capabilities_json: gitlab_capabilities_json().unwrap_or_else(|_| "{}".to_string()),
+        enabled_actions_json: "[\"read\"]".to_string(),
+        connector_version: "gitlab.v1".to_string(),
+        status: "active".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
 fn default_linear_api_key_profile(now: String) -> ConnectorProfileRecord {
     ConnectorProfileRecord {
         profile_id: ConnectorProfileId::new(DEFAULT_LINEAR_API_KEY_PROFILE_ID),
@@ -1912,8 +2029,8 @@ mod tests {
     };
 
     use super::{
-        ConnectOptions, GitHubConnectionProbe, GranolaConnectionProbe, run_connect_github,
-        run_connect_granola,
+        ConnectOptions, GitHubConnectionProbe, GitLabConnectionProbe, GranolaConnectionProbe,
+        run_connect_github, run_connect_gitlab, run_connect_granola,
     };
 
     #[derive(Debug)]
@@ -1932,6 +2049,16 @@ mod tests {
     impl GitHubConnectionProbe for SuccessfulGitHubProbe {
         fn probe(&self, api_key: &str) -> Result<String, super::ConnectError> {
             assert_eq!(api_key, "ghp_test_secret");
+            Ok("saga4".to_string())
+        }
+    }
+
+    #[derive(Debug)]
+    struct SuccessfulGitLabProbe;
+
+    impl GitLabConnectionProbe for SuccessfulGitLabProbe {
+        fn probe(&self, api_key: &str) -> Result<String, super::ConnectError> {
+            assert_eq!(api_key, "glpat_test_secret");
             Ok("saga4".to_string())
         }
     }
@@ -1997,6 +2124,39 @@ mod tests {
                 .get("connection:github-work")
                 .expect("stored credential"),
             "ghp_test_secret"
+        );
+    }
+
+    #[test]
+    fn gitlab_connect_stores_secret_and_account_label() {
+        let mut store = InMemoryStateStore::new();
+        let credentials = InMemoryCredentialStore::new();
+        let report = run_connect_gitlab(
+            &mut store,
+            &credentials,
+            ConnectOptions {
+                connection_id: Some(ConnectionId::new("gitlab-work")),
+                token: "glpat_test_secret".to_string(),
+            },
+            &SuccessfulGitLabProbe,
+        )
+        .expect("connect GitLab");
+
+        assert_eq!(report.connector, "gitlab");
+        assert_eq!(report.auth_kind, "api_key");
+        assert_eq!(report.account_label.as_deref(), Some("saga4"));
+        let connection = store
+            .get_connection(&ConnectionId::new("gitlab-work"))
+            .expect("read connection")
+            .expect("connection");
+        assert_eq!(connection.secret_ref, "connection:gitlab-work");
+        assert_eq!(connection.account_label.as_deref(), Some("saga4"));
+        assert!(!format!("{connection:?}").contains("glpat_test_secret"));
+        assert_eq!(
+            credentials
+                .get("connection:gitlab-work")
+                .expect("stored credential"),
+            "glpat_test_secret"
         );
     }
 }

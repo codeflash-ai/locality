@@ -23,7 +23,6 @@ pub const ONEDRIVE_CONNECTOR_ID: &str = "onedrive";
 pub const OUTLOOK_MAIL_CONNECTOR_ID: &str = "outlook-mail";
 pub const OUTLOOK_CALENDAR_CONNECTOR_ID: &str = "outlook-calendar";
 pub const MICROSOFT_TEAMS_CONNECTOR_ID: &str = "microsoft-teams";
-pub const GITLAB_CONNECTOR_ID: &str = "gitlab";
 pub const GOOGLE_DRIVE_CONNECTOR_ID: &str = "google-drive";
 pub const DROPBOX_CONNECTOR_ID: &str = "dropbox";
 pub const BOX_CONNECTOR_ID: &str = "box";
@@ -169,15 +168,6 @@ pub const MICROSOFT_TEAMS_SPEC: PlannedConnectorSpec = PlannedConnectorSpec::new
     "Start read-only, then reviewed message drafts if approved.",
 );
 
-pub const GITLAB_SPEC: PlannedConnectorSpec = PlannedConnectorSpec::new(
-    GITLAB_CONNECTOR_ID,
-    "GitLab",
-    PlannedConnectorCategory::Hybrid,
-    &["oauth", "personal-token"],
-    "Projects, MRs, issues, pipelines, releases, and reviews.",
-    "Reviewed issue/comment/MR note drafts; repository edits stay in git.",
-);
-
 pub const GOOGLE_DRIVE_SPEC: PlannedConnectorSpec = PlannedConnectorSpec::new(
     GOOGLE_DRIVE_CONNECTOR_ID,
     "Google Drive",
@@ -285,7 +275,6 @@ pub const PLANNED_CONNECTOR_SPECS: &[PlannedConnectorSpec] = &[
     OUTLOOK_MAIL_SPEC,
     OUTLOOK_CALENDAR_SPEC,
     MICROSOFT_TEAMS_SPEC,
-    GITLAB_SPEC,
     GOOGLE_DRIVE_SPEC,
     DROPBOX_SPEC,
     BOX_SPEC,
@@ -409,7 +398,6 @@ mod tests {
                 "outlook-mail",
                 "outlook-calendar",
                 "microsoft-teams",
-                "gitlab",
                 "google-drive",
                 "dropbox",
                 "box",
@@ -438,9 +426,10 @@ mod tests {
 
     #[test]
     fn planned_connector_implements_connector_but_blocks_remote_io() {
-        let connector = PlannedConnector::new(GITLAB_CONNECTOR_ID).expect("gitlab connector");
+        let connector =
+            PlannedConnector::new(CONFLUENCE_CONNECTOR_ID).expect("confluence connector");
 
-        assert_eq!(connector.kind().0, GITLAB_CONNECTOR_ID);
+        assert_eq!(connector.kind().0, CONFLUENCE_CONNECTOR_ID);
         assert!(connector.capabilities().supports_oauth);
         assert!(connector.supported_push_operations().is_empty());
         assert!(matches!(

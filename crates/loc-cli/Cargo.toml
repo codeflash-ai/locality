@@ -22,6 +22,7 @@ locality-store.workspace = true
 locality-notion.workspace = true
 locality-gmail.workspace = true
 locality-github.workspace = true
+locality-gitlab.workspace = true
 locality-granola.workspace = true
 locality-google-calendar.workspace = true
 locality-linear.workspace = true

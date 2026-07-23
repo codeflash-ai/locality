@@ -12,6 +12,7 @@ members = [
   "crates/locality-google-calendar",
   "crates/locality-gmail",
   "crates/locality-github",
+  "crates/locality-gitlab",
   "crates/locality-granola",
   "crates/locality-linear",
   "crates/locality-slack",
@@ -37,6 +38,7 @@ locality-google-docs = { path = "crates/locality-google-docs" }
 locality-google-calendar = { path = "crates/locality-google-calendar" }
 locality-gmail = { path = "crates/locality-gmail" }
 locality-github = { path = "crates/locality-github" }
+locality-gitlab = { path = "crates/locality-gitlab" }
 locality-granola = { path = "crates/locality-granola" }
 locality-linear = { path = "crates/locality-linear" }
 locality-slack = { path = "crates/locality-slack" }
