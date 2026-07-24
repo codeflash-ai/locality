@@ -1467,13 +1467,7 @@ fn message_subject(message: &GmailMessage) -> String {
 }
 
 fn message_filename(message: &GmailMessage, title: &str) -> String {
-    let date = message.internal_date.as_deref().unwrap_or("unknown");
-    format!(
-        "{}-{}-{}.md",
-        safe_slug(date),
-        safe_slug(title),
-        safe_slug(&message.id)
-    )
+    format!("{}_{}.md", safe_slug(title), safe_slug(&message.id))
 }
 
 fn draft_filename(draft: &GmailDraft, title: &str) -> String {
@@ -1487,18 +1481,7 @@ fn draft_filename(draft: &GmailDraft, title: &str) -> String {
 }
 
 fn thread_directory_name(thread: &GmailThread, title: &str) -> String {
-    let date = thread
-        .messages
-        .iter()
-        .filter_map(|message| message.internal_date.as_deref())
-        .min()
-        .unwrap_or("unknown");
-    format!(
-        "{}-{}-{}",
-        safe_slug(date),
-        safe_slug(title),
-        safe_slug(&thread.id)
-    )
+    format!("{}_{}", safe_slug(title), safe_slug(&thread.id))
 }
 
 fn thread_starts_in_date_window(settings: &GmailMountSettings, thread: &GmailThread) -> bool {
@@ -2016,7 +1999,7 @@ mod tests {
                 .any(|entry| entry.remote_id == RemoteId::new("gmail-thread:inbox:thread-inbox-1"))
         );
         assert!(entries.iter().any(|entry| entry.path
-            == std::path::PathBuf::from("inbox/1720900000000-hello-thread-inbox-1/page.md")));
+            == std::path::PathBuf::from("inbox/hello_thread-inbox-1/page.md")));
         assert!(
             entries
                 .iter()
@@ -2086,7 +2069,7 @@ mod tests {
                 container: ChildContainer::PageChildren(RemoteId::new(
                     "gmail-thread:inbox:thread-inbox-1",
                 )),
-                parent_path: "inbox/1720900000000-hello-thread-inbox-1".into(),
+                parent_path: "inbox/hello_thread-inbox-1".into(),
             })
             .expect("children");
 
@@ -2097,9 +2080,7 @@ mod tests {
         );
         assert_eq!(
             result.entries[0].path,
-            std::path::PathBuf::from(
-                "inbox/1720900000000-hello-thread-inbox-1/1720900000000-hello-inbox-msg-1.md"
-            )
+            std::path::PathBuf::from("inbox/hello_thread-inbox-1/hello_inbox-msg-1.md")
         );
     }
 
@@ -2117,7 +2098,7 @@ mod tests {
                 container: ChildContainer::PageChildren(RemoteId::new(
                     "gmail-thread:inbox:thread-shared",
                 )),
-                parent_path: "inbox/1720900000000-hello-thread-shared".into(),
+                parent_path: "inbox/hello_thread-shared".into(),
             })
             .expect("inbox children");
         let sent_children = connector
@@ -2126,7 +2107,7 @@ mod tests {
                 container: ChildContainer::PageChildren(RemoteId::new(
                     "gmail-thread:sent:thread-shared",
                 )),
-                parent_path: "sent/1720900000000-hello-thread-shared".into(),
+                parent_path: "sent/hello_thread-shared".into(),
             })
             .expect("sent children");
 
@@ -2212,7 +2193,7 @@ mod tests {
         assert_eq!(observation.title, "Hello");
         assert_eq!(
             observation.projected_path,
-            std::path::PathBuf::from("inbox/1720900000000-hello-thread-inbox-1/page.md")
+            std::path::PathBuf::from("inbox/hello_thread-inbox-1/page.md")
         );
         assert!(observation.raw_metadata_json.contains("thread-inbox-1"));
         let raw_metadata: serde_json::Value =
@@ -2424,7 +2405,7 @@ mod tests {
             .expect("thread whose start is in range");
         assert_eq!(
             included.path,
-            std::path::PathBuf::from("inbox/1782993600000-hello-thread-start-in-window/page.md")
+            std::path::PathBuf::from("inbox/hello_thread-start-in-window/page.md")
         );
         assert!(
             included

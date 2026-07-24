@@ -88,9 +88,9 @@ Message view is available as an explicit compatibility projection:
 ```text
 gmail-main/
   inbox/
-    1720900000000-quarterly-update-msg-1.md
+    quarterly-update_msg-1.md
   sent/
-    1720900100000-reply-msg-2.md
+    reply_msg-2.md
   draft/
 ```
 
@@ -105,9 +105,9 @@ Thread view projects thread pages and child messages:
 ```text
 gmail-main/
   inbox/
-    1720900000000-quarterly-update-thread-a/
+    quarterly-update_thread-a/
       page.md
-      1720900000000-quarterly-update-msg-1.md
+      quarterly-update_msg-1.md
   sent/
   draft/
 ```
@@ -132,11 +132,11 @@ the draft:
 
 ```bash
 ./target/debug/loc create gmail-reply \
-  "$HOME/Locality/gmail-main/inbox/1720900000000-quarterly-update-thread-a"
+  "$HOME/Locality/gmail-main/inbox/quarterly-update_thread-a"
 
 ./target/debug/loc create gmail-reply \
-  "$HOME/Locality/gmail-main/inbox/1720900000000-quarterly-update-thread-a" \
-  --message 1720900000000-quarterly-update-msg-1.md
+  "$HOME/Locality/gmail-main/inbox/quarterly-update_thread-a" \
+  --message quarterly-update_msg-1.md
 ```
 
 The selected message must be hydrated, because Locality needs its RFC

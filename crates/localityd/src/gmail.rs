@@ -789,7 +789,7 @@ mod tests {
         let request = HydrationRequest::new(
             MountId::new("gmail-main"),
             remote_id.clone(),
-            "inbox/thread-attach/1720900000000-attachments-msg-attach.md",
+            "inbox/thread-attach/attachments_msg-attach.md",
             HydrationState::Hydrated,
             HydrationReason::ExplicitPull,
         );
