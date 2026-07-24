@@ -57,5 +57,5 @@ jobs:
           workingDirectory: apps/oauth-service
           packageManager: npm
           # Match the lockfile so CI deploy behavior stays reproducible.
-          wranglerVersion: "4.103.0"
+          wranglerVersion: "4.113.0"
           command: deploy

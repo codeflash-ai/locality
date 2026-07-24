@@ -220,6 +220,7 @@ impl OpaqueReplicaSessionService for RecordingReplicaService {
             },
             replicas: Vec::new(),
             export_offer: None,
+            export_attempt_limits: None,
             error: None,
             updated_at: "2026-07-19T12:00:00Z".to_string(),
         })

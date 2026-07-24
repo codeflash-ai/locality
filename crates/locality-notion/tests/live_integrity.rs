@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,7 +33,7 @@ const LIVE_AUDIO_URL: &str =
 
 #[test]
 #[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE"]
-fn live_page_read_edit_write_verify_integrity_with_media_download() {
+fn live_page_read_edit_write_verify_integrity_with_external_media_references() {
     let env = LiveEnv::from_env();
     let api = Arc::new(LiveNotion::new(env.token.clone()));
     let mut cleanup = LiveCleanup::new(api.clone());
@@ -61,11 +60,8 @@ fn live_page_read_edit_write_verify_integrity_with_media_download() {
         .download_rendered_media(&rendered, &env.local_dir)
         .expect("download rendered media");
     assert_eq!(media_report.failed, 0, "{media_report:#?}");
-    assert_eq!(
-        media_report.downloaded,
-        rendered.media_assets.len(),
-        "{media_report:#?}"
-    );
+    assert_eq!(media_report.downloaded, 0, "{media_report:#?}");
+    assert!(rendered.media_assets.is_empty());
 
     assert!(rendered.document.body.contains("# Heading one"));
     assert!(rendered.document.body.contains("## Heading two"));
@@ -79,31 +75,31 @@ fn live_page_read_edit_write_verify_integrity_with_media_download() {
         rendered
             .document
             .body
-            .contains("![W3C test image](../.loc/media/live-integrity/block-coverage/image-")
+            .contains(&format!("![W3C test image]({LIVE_IMAGE_URL})"))
     );
     assert!(
         rendered
             .document
             .body
-            .contains("[External video](../.loc/media/live-integrity/block-coverage/video-")
+            .contains(&format!("[External video]({LIVE_VIDEO_URL})"))
     );
     assert!(
         rendered
             .document
             .body
-            .contains("[External file](../.loc/media/live-integrity/block-coverage/file-")
+            .contains(&format!("[External file]({LIVE_PDF_URL})"))
     );
     assert!(
         rendered
             .document
             .body
-            .contains("[External PDF](../.loc/media/live-integrity/block-coverage/pdf-")
+            .contains(&format!("[External PDF]({LIVE_PDF_URL})"))
     );
     assert!(
         rendered
             .document
             .body
-            .contains("[External audio](../.loc/media/live-integrity/block-coverage/audio-")
+            .contains(&format!("[External audio]({LIVE_AUDIO_URL})"))
     );
     assert!(
         rendered
@@ -132,22 +128,6 @@ fn live_page_read_edit_write_verify_integrity_with_media_download() {
             .body
             .contains("[Locality nested child page](https://www.notion.so/")
     );
-    for kind in ["image", "video", "file", "pdf", "audio"] {
-        let asset = rendered
-            .media_assets
-            .iter()
-            .find(|asset| asset.kind == kind)
-            .unwrap_or_else(|| panic!("missing rendered {kind} media asset"));
-        let local_path = env.local_dir.join(&asset.local_path);
-        let metadata = fs::metadata(&local_path).unwrap_or_else(|error| {
-            panic!("missing downloaded {kind} media at {local_path:?}: {error}")
-        });
-        assert!(
-            metadata.len() > 0,
-            "downloaded {kind} media should be non-empty at {local_path:?}"
-        );
-    }
-
     let bundle: NotionPageBundle = serde_json::from_slice(&native.raw).expect("native bundle");
     let paragraph_id = first_block_id(&bundle, "paragraph");
     let last_block_id = bundle

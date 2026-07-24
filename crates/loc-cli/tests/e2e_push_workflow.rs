@@ -13073,11 +13073,31 @@ fn live_cyclic_diverse_page_read_noop_preserves_notion() {
             "missing {expected:?}\n{markdown}"
         );
     }
-    assert_local_image_markdown(&markdown, "Cyclic image");
-    assert_local_media_link_markdown(&markdown, "Cyclic video");
-    assert_local_media_link_markdown(&markdown, "Cyclic file");
-    assert_local_media_link_markdown(&markdown, "Cyclic PDF");
-    assert_local_media_link_markdown(&markdown, "Cyclic audio");
+    assert_external_image_markdown(
+        &markdown,
+        "Cyclic image",
+        "https://www.w3.org/Icons/w3c_home.png",
+    );
+    assert_external_media_link_markdown(
+        &markdown,
+        "Cyclic video",
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    );
+    assert_external_media_link_markdown(
+        &markdown,
+        "Cyclic file",
+        "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf",
+    );
+    assert_external_media_link_markdown(
+        &markdown,
+        "Cyclic PDF",
+        "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf",
+    );
+    assert_external_media_link_markdown(
+        &markdown,
+        "Cyclic audio",
+        "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3",
+    );
     assert!(
         !markdown.contains("type=link_to_page"),
         "link_to_page should render as a Markdown link, not a directive:\n{markdown}"
@@ -13493,11 +13513,31 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
             "missing {expected:?}\n{verified}"
         );
     }
-    assert_local_image_markdown(&verified, "Editable image changed");
-    assert_local_media_link_markdown(&verified, "Editable video changed");
-    assert_local_media_link_markdown(&verified, "Editable file changed");
-    assert_local_media_link_markdown(&verified, "Editable PDF changed");
-    assert_local_media_link_markdown(&verified, "Editable audio changed");
+    assert_external_image_markdown(
+        &verified,
+        "Editable image changed",
+        "https://www.w3.org/Icons/w3c_home.png",
+    );
+    assert_external_media_link_markdown(
+        &verified,
+        "Editable video changed",
+        "https://www.youtube.com/watch?v=oHg5SJYRHA0",
+    );
+    assert_external_media_link_markdown(
+        &verified,
+        "Editable file changed",
+        "https://www.orimi.com/pdf-test.pdf",
+    );
+    assert_external_media_link_markdown(
+        &verified,
+        "Editable PDF changed",
+        "https://www.orimi.com/pdf-test.pdf",
+    );
+    assert_external_media_link_markdown(
+        &verified,
+        "Editable audio changed",
+        "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-2.mp3",
+    );
 }
 
 #[test]
@@ -13837,14 +13877,18 @@ fn live_local_image_media_edit_uploads_and_reconciles_bytes() {
     let scratch = cleanup.create_page(
         &env.parent_page_id,
         &format!("Locality live local image {}", unique_suffix()),
-        vec![media_child(
-            "image",
-            "https://www.w3.org/Icons/w3c_home.png",
-            "Original local image",
-        )],
+        vec![paragraph_child("Base body before local image upload.")],
     );
     let connector = NotionConnector::new(live_notion_config());
     let (fixture, mut store, page_path, original) = pull_live_page(&connector, &scratch.id);
+    let original = seed_local_image_upload(
+        &fixture,
+        &mut store,
+        &connector,
+        &page_path,
+        &original,
+        "Original local image",
+    );
     assert_local_image_markdown(&original, "Original local image");
 
     let image_path = local_image_path(&fixture.root, &page_path, &original, "Original local image");
@@ -13852,8 +13896,8 @@ fn live_local_image_media_edit_uploads_and_reconciles_bytes() {
         image_path.is_file(),
         "missing local image at {image_path:?}"
     );
-    let uploaded_bytes = tiny_png_bytes();
-    fs::write(&image_path, uploaded_bytes).expect("overwrite local image bytes");
+    let uploaded_bytes = [tiny_png_bytes(), b"locality-updated"].concat();
+    fs::write(&image_path, &uploaded_bytes).expect("overwrite local image bytes");
 
     let original_image_line = markdown_image_line(&original, "Original local image");
     let image_href = markdown_link_href(original_image_line);
@@ -13918,14 +13962,20 @@ fn live_local_image_media_edit_with_escaped_caption_uploads_and_reconciles() {
     let scratch = cleanup.create_page(
         &env.parent_page_id,
         &format!("Locality live escaped local image {}", unique_suffix()),
-        vec![media_child(
-            "image",
-            "https://www.w3.org/Icons/w3c_home.png",
-            "Original escaped image",
+        vec![paragraph_child(
+            "Base body before escaped-caption image upload.",
         )],
     );
     let connector = NotionConnector::new(live_notion_config());
     let (fixture, mut store, page_path, original) = pull_live_page(&connector, &scratch.id);
+    let original = seed_local_image_upload(
+        &fixture,
+        &mut store,
+        &connector,
+        &page_path,
+        &original,
+        "Original escaped image",
+    );
     assert_local_image_markdown(&original, "Original escaped image");
 
     let image_path = local_image_path(
@@ -13938,8 +13988,8 @@ fn live_local_image_media_edit_with_escaped_caption_uploads_and_reconciles() {
         image_path.is_file(),
         "missing local image at {image_path:?}"
     );
-    let uploaded_bytes = tiny_png_bytes();
-    fs::write(&image_path, uploaded_bytes).expect("overwrite local image bytes");
+    let uploaded_bytes = [tiny_png_bytes(), b"locality-escaped-updated"].concat();
+    fs::write(&image_path, &uploaded_bytes).expect("overwrite local image bytes");
 
     let original_image_line = markdown_image_line(&original, "Original escaped image");
     let image_href = markdown_link_href(original_image_line);
@@ -15793,6 +15843,44 @@ fn pull_live_page(
     let page_path = fixture.page_file();
     let markdown = fs::read_to_string(&page_path).expect("read live page markdown");
     (fixture, store, page_path, markdown)
+}
+
+fn seed_local_image_upload(
+    fixture: &E2eFixture,
+    store: &mut InMemoryStateStore,
+    connector: &NotionConnector,
+    page_path: &Path,
+    markdown: &str,
+    caption: &str,
+) -> String {
+    let media_dir = fixture
+        .root
+        .join(".loc")
+        .join("media")
+        .join(format!("live-local-image-{}", unique_suffix()));
+    fs::create_dir_all(&media_dir).expect("create local image media dir");
+    let image_path = media_dir.join("initial.png");
+    fs::write(&image_path, tiny_png_bytes()).expect("write initial local image");
+    fs::write(
+        page_path,
+        format!("{markdown}\n![{caption}]({})\n", image_path.display()),
+    )
+    .expect("append initial local image");
+
+    let push = run_push_with_daemon(
+        store,
+        connector,
+        page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push initial local image");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+
+    fs::read_to_string(page_path).expect("read reconciled image page")
 }
 
 fn live_block_snapshot(connector: &NotionConnector, page_id: &str) -> Value {
@@ -17835,6 +17923,24 @@ fn assert_local_image_markdown(markdown: &str, caption: &str) {
 fn assert_local_media_link_markdown(markdown: &str, caption: &str) {
     let line = markdown_link_line(markdown, caption);
     assert_local_media_href(line, caption);
+}
+
+fn assert_external_image_markdown(markdown: &str, caption: &str, expected_url: &str) {
+    let line = markdown_image_line(markdown, caption);
+    assert_external_media_href(line, caption, expected_url);
+}
+
+fn assert_external_media_link_markdown(markdown: &str, caption: &str, expected_url: &str) {
+    let line = markdown_link_line(markdown, caption);
+    assert_external_media_href(line, caption, expected_url);
+}
+
+fn assert_external_media_href(line: &str, caption: &str, expected_url: &str) {
+    assert_eq!(
+        markdown_link_href(line),
+        expected_url,
+        "unexpected external media href for {caption:?}: {line:?}"
+    );
 }
 
 fn assert_local_media_href(line: &str, caption: &str) {
