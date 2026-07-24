@@ -104,6 +104,7 @@ def non_warning_errors(summary: dict) -> list[str]:
         error
         for error in errors
         if "--dangerously-bypass-hook-trust" not in str(error)
+        and "event stream lagged" not in str(error)
     ]
 
 
@@ -422,7 +423,7 @@ for item in sorted(per_strategy_data, key=lambda row: (row["scenario"], row["str
     if warning_count(codex_summary):
         lines.extend(["### Warnings", ""])
         for error in (codex_summary.get("errors") or [])[:10]:
-            if "--dangerously-bypass-hook-trust" in str(error):
+            if "--dangerously-bypass-hook-trust" in str(error) or "event stream lagged" in str(error):
                 lines.append(f"- {shorten(error, 240)}")
         lines.append("")
 
