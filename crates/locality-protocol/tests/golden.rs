@@ -4,32 +4,43 @@ use locality_core::journal::PushOperationId;
 use locality_core::model::RemoteId;
 use locality_core::planner::PlanSummary;
 use locality_core::portable::{
-    AccessSetId, ChangesetId, ContentVersionId, LogicalPath, PrincipalId, ProjectionEntry,
-    ProjectionFileKind, ProjectionId, ProjectionInput, ProjectionVersionId, ReplicaRevisionId,
-    SessionId, SourceAction, SourceConnectionId, SourceOperation, SourceOperationPlan,
-    SourceVersionId, TenantId,
+    AccessSetId, ChangesetId, ContentVersionId, ExportAttemptId, LogicalPath, PrincipalId,
+    ProjectionEntry, ProjectionFileKind, ProjectionId, ProjectionInput, ProjectionVersionId,
+    ReplicaRevisionId, SessionId, SourceAction, SourceConnectionId, SourceGenerationId,
+    SourceOperation, SourceOperationPlan, SourceScopeId, SourceVersionId, TenantId,
 };
 use locality_core::readable_diff::readable_diff_for_file;
 use locality_protocol::{
     ACCESS_SET_GOLDEN_JSON, AUTHORIZED_SESSION_QUERY_GOLDEN_JSON, AccessSetContract, AccessSubject,
-    AuditReference, AuthorizedChangesetUpload, AuthorizedSessionQuery,
-    BOOTSTRAP_EXCHANGE_GOLDEN_JSON, BootstrapExchangeRequest, CHANGESET_ENVELOPE_GOLDEN_JSON,
-    COMPONENT_VERSIONS, COMPONENT_VERSIONS_GOLDEN_JSON, CONTENT_VERSION_GOLDEN_JSON,
-    ChangesetContent, ChangesetEnvelope, ChangesetSourceObject, ClientValidationResult,
-    ComponentVersions, ContentVersionContract, DELIVERED_COUNT_GOLDEN_JSON, DeliveredChangesetBase,
-    DeliveredCount, EditedCanonicalBody, FRESHNESS_STATUS_GOLDEN_JSON, FreshnessRequirement,
+    AuditReference, AuthorizedChangesetUpload, AuthorizedSessionQuery, AuthorizedSourceScope,
+    BOOTSTRAP_EXCHANGE_GOLDEN_JSON, BootstrapExchangeRequest,
+    CANONICAL_EXPORT_INVENTORY_GOLDEN_JSON, CANONICAL_EXPORT_RECORDS_GOLDEN_JSON,
+    CHANGESET_ENVELOPE_GOLDEN_JSON, COMPONENT_VERSIONS, COMPONENT_VERSIONS_GOLDEN_JSON,
+    CONTENT_VERSION_GOLDEN_JSON, CanonicalControlOrderKey, CanonicalDirectoryOrderKey,
+    CanonicalExportRecord, CanonicalFileOrderKey, ChangesetContent, ChangesetEnvelope,
+    ChangesetSourceObject, ClientValidationResult, CompatibleAuthorizedSessionQuery,
+    ComponentVersions, ContentVersionContract, DELIVERED_COUNT_GOLDEN_JSON, DeliveredBodyDigestV2,
+    DeliveredChangesetBase, DeliveredCount, EXPORT_ATTEMPT_REQUEST_GOLDEN_JSON,
+    EXPORT_COMPLETION_RECEIPT_GOLDEN_JSON, EXPORT_TERMINAL_CONTROL_V2_GOLDEN_JSON,
+    EditedCanonicalBody, ExportAttemptLimits, ExportAttemptRequest, ExportCompletionReceipt,
+    ExportTerminalControlV2, FRESHNESS_STATUS_GOLDEN_JSON, FreshnessRequirement, NotionScopeKind,
     ORDERED_EXPORT_ROWS_GOLDEN_JSON, OpaqueBootstrapExchangeRequest, OpaqueSessionStatusRequest,
-    OrderedExportRow, PROJECTION_VERSION_GOLDEN_JSON, ProjectionVersionContract,
-    READY_REPLICA_REVISION_GOLDEN_JSON, ReadyReplicaRevision, ReplicaFreshnessState,
-    ReplicaFreshnessStatus, SANDBOX_SESSION_STATUS_GOLDEN_JSON, SESSION_PROTOCOL_ERROR_GOLDEN_JSON,
-    SOURCE_VERSION_GOLDEN_JSON, SandboxSessionState, SandboxSessionStatus, SessionCapability,
-    SessionErrorCode, SessionProtocolError, SessionReplicaRevision, SourceVersionContract,
-    StaleSessionBehavior, TAR_EXPORT_METADATA_GOLDEN_JSON, TAR_EXPORT_OFFER_GOLDEN_JSON,
-    TarContentEncoding, TarExportMetadata, TarExportOffer, WRITABLE_EXPORT_METADATA_GOLDEN_JSON,
-    WritableExportMetadata, WritableMetadataEntry,
+    OrderedExportRow, OrderedSourceGeneration, PROJECTION_VERSION_GOLDEN_JSON,
+    ProjectionVersionContract, ProviderSourceScopeSelector, READY_REPLICA_REVISION_GOLDEN_JSON,
+    ReadyReplicaRevision, ReplicaFreshnessState, ReplicaFreshnessStatus,
+    SANDBOX_SESSION_STATUS_GOLDEN_JSON, SANDBOX_SESSION_STATUS_V2_GOLDEN_JSON,
+    SCOPE_AUTHORIZED_COMPONENT_VERSIONS, SCOPE_AUTHORIZED_SESSION_QUERY_GOLDEN_JSON,
+    SEALED_EXPORT_OFFER_GOLDEN_JSON, SESSION_PROTOCOL_ERROR_GOLDEN_JSON,
+    SOURCE_VERSION_GOLDEN_JSON, SandboxSessionState, SandboxSessionStatus,
+    ScopeAuthorizedSessionQuery, ScopeAuthorizedWritableExportMetadata, ScopeContractError,
+    SealedExportOffer, SessionCapability, SessionErrorCode, SessionProtocolError,
+    SessionReplicaRevision, SourceVersionContract, StaleSessionBehavior,
+    TAR_EXPORT_METADATA_GOLDEN_JSON, TAR_EXPORT_OFFER_GOLDEN_JSON, TarContentEncoding,
+    TarExportMetadata, TarExportOffer, WRITABLE_EXPORT_METADATA_GOLDEN_JSON,
+    WritableExportMetadata, WritableMetadataEntry, validate_canonical_export_records,
 };
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 fn exact_pretty_json(value: &impl Serialize) -> Vec<u8> {
     let mut bytes = serde_json::to_vec_pretty(value).expect("serialize fixture");
@@ -46,6 +57,12 @@ where
     assert_eq!(exact_pretty_json(&decoded), golden);
 }
 
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct CanonicalInventoryGolden {
+    preimage_hex: String,
+    sha256: String,
+}
+
 #[test]
 fn component_versions_are_exact_golden_bytes() {
     assert_exact_round_trip(COMPONENT_VERSIONS_GOLDEN_JSON, &COMPONENT_VERSIONS);
@@ -54,6 +71,153 @@ fn component_versions_are_exact_golden_bytes() {
 #[test]
 fn authorized_session_query_is_exact_golden_bytes() {
     assert_exact_round_trip(AUTHORIZED_SESSION_QUERY_GOLDEN_JSON, &authorized_query());
+}
+
+#[test]
+fn scope_authorized_export_contracts_are_exact_golden_bytes() {
+    assert_exact_round_trip(
+        SANDBOX_SESSION_STATUS_V2_GOLDEN_JSON,
+        &sandbox_session_status_v2(),
+    );
+
+    let query = scope_authorized_query();
+    query.validate().expect("valid scope query");
+    assert_exact_round_trip(SCOPE_AUTHORIZED_SESSION_QUERY_GOLDEN_JSON, &query);
+
+    let request = export_attempt_request();
+    request.validate().expect("valid attempt request");
+    assert_exact_round_trip(EXPORT_ATTEMPT_REQUEST_GOLDEN_JSON, &request);
+
+    let offer = sealed_export_offer();
+    offer.validate().expect("valid sealed offer");
+    assert_exact_round_trip(SEALED_EXPORT_OFFER_GOLDEN_JSON, &offer);
+
+    let receipt = export_completion_receipt();
+    receipt
+        .validate_against(&offer)
+        .expect("completion matches sealed metadata selection");
+    assert_exact_round_trip(EXPORT_COMPLETION_RECEIPT_GOLDEN_JSON, &receipt);
+    assert_eq!(
+        locality_protocol::canonical_export_completion_receipt_sha256(&receipt)
+            .expect("completion receipt digest"),
+        "sha256:8e5e9d9e12fbb951e1127f97a2214d7462cb685973cdb6c3d8f4c540cec080ae"
+    );
+
+    let control = export_terminal_control_v2();
+    control
+        .validate_against_inventory(&offer, &canonical_export_records())
+        .expect("terminal control matches sealed inventory");
+    assert_exact_round_trip(EXPORT_TERMINAL_CONTROL_V2_GOLDEN_JSON, &control);
+
+    let records = canonical_export_records();
+    validate_canonical_export_records(&records).expect("canonical record order");
+    let preimage = locality_protocol::canonical_export_inventory_preimage(&records)
+        .expect("inventory preimage");
+    let inventory = CanonicalInventoryGolden {
+        preimage_hex: preimage.iter().map(|byte| format!("{byte:02x}")).collect(),
+        sha256: locality_protocol::canonical_export_inventory_sha256(&records)
+            .expect("inventory digest"),
+    };
+    offer
+        .validate_inventory(&records)
+        .expect("sealed offer matches exact canonical inventory");
+    assert_exact_round_trip(CANONICAL_EXPORT_INVENTORY_GOLDEN_JSON, &inventory);
+    assert_exact_round_trip(CANONICAL_EXPORT_RECORDS_GOLDEN_JSON, &records);
+}
+
+#[test]
+fn compatibility_decoder_accepts_legacy_and_scope_queries() {
+    let legacy = serde_json::from_slice::<CompatibleAuthorizedSessionQuery>(
+        AUTHORIZED_SESSION_QUERY_GOLDEN_JSON,
+    )
+    .expect("legacy query decodes");
+    assert_eq!(
+        legacy,
+        CompatibleAuthorizedSessionQuery::Legacy(authorized_query())
+    );
+
+    let scope = serde_json::from_slice::<CompatibleAuthorizedSessionQuery>(
+        SCOPE_AUTHORIZED_SESSION_QUERY_GOLDEN_JSON,
+    )
+    .expect("scope query decodes");
+    assert_eq!(
+        scope,
+        CompatibleAuthorizedSessionQuery::Scope(scope_authorized_query())
+    );
+}
+
+#[test]
+fn scope_contract_validation_rejects_ambiguous_or_inexact_values() {
+    assert!(SourceScopeId::new("").is_err());
+    assert!(ExportAttemptId::new("").is_err());
+    assert!(SourceGenerationId::new("").is_err());
+    assert!(serde_json::from_str::<SourceScopeId>("\"\"").is_err());
+
+    let mut query = scope_authorized_query();
+    query.authorized_scopes[1].ordinal = 0;
+    assert!(matches!(
+        query.validate(),
+        Err(ScopeContractError::NonCanonicalOrdinal {
+            collection: "authorized_scopes",
+            ..
+        })
+    ));
+
+    let mut offer = sealed_export_offer();
+    offer.archive_entry_count -= 1;
+    assert_eq!(
+        offer.validate(),
+        Err(ScopeContractError::InconsistentArchiveEntryCount)
+    );
+
+    let mut duplicate_generation_offer = sealed_export_offer();
+    duplicate_generation_offer
+        .source_generations
+        .push(OrderedSourceGeneration {
+            ordinal: 1,
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            source_generation_id: SourceGenerationId::new("generation-notion-110")
+                .expect("generation id"),
+        });
+    assert_eq!(
+        duplicate_generation_offer.validate(),
+        Err(ScopeContractError::DuplicateValue("source_connection_id"))
+    );
+
+    let mut receipt = export_completion_receipt();
+    receipt.inventory_sha256 = format!("sha256:{}", "A".repeat(64));
+    assert_eq!(
+        receipt.validate(),
+        Err(ScopeContractError::InvalidSha256("inventory_sha256"))
+    );
+
+    let mut request = export_attempt_request();
+    request.idempotency_key = "x".repeat(ExportAttemptRequest::MAX_IDEMPOTENCY_KEY_BYTES + 1);
+    assert!(matches!(
+        request.validate(),
+        Err(ScopeContractError::ValueTooLong {
+            field: "idempotency_key",
+            ..
+        })
+    ));
+
+    let mut records = canonical_export_records();
+    records.pop();
+    assert_eq!(
+        validate_canonical_export_records(&records),
+        Err(ScopeContractError::InvalidControlRecordCount { actual: 0 })
+    );
+
+    let implicit_control_directory = CanonicalExportRecord::Directory {
+        order_key: CanonicalDirectoryOrderKey {
+            depth: 1,
+            logical_path: LogicalPath::new(".loc").expect("path"),
+        },
+    };
+    assert_eq!(
+        implicit_control_directory.validate(),
+        Err(ScopeContractError::InvalidControlDirectory)
+    );
 }
 
 #[test]
@@ -137,6 +301,11 @@ fn capability_debug_output_is_redacted() {
     let token_only_bootstrap = OpaqueBootstrapExchangeRequest {
         bootstrap_token: "token-only-secret".to_string(),
     };
+    let export_attempt = ExportAttemptRequest {
+        opaque_session_capability: "attempt-capability-secret".to_string(),
+        idempotency_key: "attempt-idempotency-secret".to_string(),
+        ..export_attempt_request()
+    };
 
     for (debug, secret) in [
         (format!("{bootstrap:?}"), "bootstrap-secret"),
@@ -144,10 +313,172 @@ fn capability_debug_output_is_redacted() {
         (format!("{upload:?}"), "upload-secret"),
         (format!("{status:?}"), "status-secret"),
         (format!("{token_only_bootstrap:?}"), "token-only-secret"),
+        (format!("{export_attempt:?}"), "attempt-capability-secret"),
+        (format!("{export_attempt:?}"), "attempt-idempotency-secret"),
     ] {
         assert!(debug.contains("<redacted>"), "{debug}");
         assert!(!debug.contains(secret), "{debug}");
     }
+}
+
+#[test]
+fn export_v2_pax_wire_contract_is_exact_and_round_trips() {
+    assert_eq!(
+        locality_protocol::EXPORT_V2_FILE_PAX_KEYS,
+        [
+            "locality.source_connection_id",
+            "locality.projection_id",
+            "locality.winning_scope_ordinal",
+            "locality.file_kind",
+            "locality.effective_actions",
+            "locality.content_sha256",
+        ]
+    );
+
+    for kind in [
+        ProjectionFileKind::Markdown,
+        ProjectionFileKind::Text,
+        ProjectionFileKind::Json,
+        ProjectionFileKind::Yaml,
+        ProjectionFileKind::Binary,
+        ProjectionFileKind::Directory,
+    ] {
+        let label = locality_protocol::projection_file_kind_wire_label(&kind);
+        assert_eq!(
+            locality_protocol::projection_file_kind_from_wire_label(label),
+            Some(kind)
+        );
+    }
+
+    for action in [
+        SourceAction::Read,
+        SourceAction::Search,
+        SourceAction::DownloadAttachment,
+        SourceAction::Create,
+        SourceAction::Update,
+        SourceAction::Move,
+        SourceAction::Delete,
+        SourceAction::Comment,
+        SourceAction::UpdateProperties,
+        SourceAction::ManageSchema,
+    ] {
+        let label = locality_protocol::source_action_wire_label(&action);
+        assert_eq!(
+            locality_protocol::source_action_from_wire_label(label),
+            Some(action)
+        );
+    }
+
+    let actions = BTreeSet::from([
+        SourceAction::UpdateProperties,
+        SourceAction::Read,
+        SourceAction::DownloadAttachment,
+    ]);
+    let encoded = locality_protocol::canonical_effective_actions_pax_value(&actions).unwrap();
+    assert_eq!(
+        encoded,
+        r#"["download_attachment","read","update_properties"]"#
+    );
+    assert_eq!(
+        locality_protocol::source_actions_from_canonical_pax_value(&encoded),
+        Some(actions)
+    );
+    for invalid in [
+        "[]",
+        r#"["read","read"]"#,
+        r#"["read", "update"]"#,
+        r#"["update","read"]"#,
+        r#"["unknown"]"#,
+        r#"{"action":"read"}"#,
+    ] {
+        assert_eq!(
+            locality_protocol::source_actions_from_canonical_pax_value(invalid),
+            None,
+            "accepted non-canonical effective actions: {invalid}"
+        );
+    }
+
+    let metadata = locality_protocol::ExportV2FilePaxMetadata {
+        source_connection_id: SourceConnectionId::new("source-notion"),
+        projection_id: ProjectionId::new("projection-roadmap"),
+        winning_scope_ordinal: 3,
+        file_kind: ProjectionFileKind::Markdown,
+        effective_actions: BTreeSet::from([SourceAction::Read, SourceAction::Update]),
+        content_sha256: format!("sha256:{}", "5".repeat(64)),
+    };
+    let records = metadata
+        .to_records()
+        .expect("canonical PAX records")
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        locality_protocol::ExportV2FilePaxMetadata::from_records(&records),
+        Some(metadata)
+    );
+    let mut duplicate = records.clone();
+    duplicate.push(records[0].clone());
+    assert!(locality_protocol::ExportV2FilePaxMetadata::from_records(&duplicate).is_none());
+    let mut unknown = records.clone();
+    unknown.push(("locality.future".to_string(), "value".to_string()));
+    assert!(locality_protocol::ExportV2FilePaxMetadata::from_records(&unknown).is_none());
+    let mut noncanonical_ordinal = records;
+    noncanonical_ordinal
+        .iter_mut()
+        .find(|(key, _)| key == locality_protocol::PAX_WINNING_SCOPE_ORDINAL)
+        .expect("ordinal")
+        .1 = "03".to_string();
+    assert!(
+        locality_protocol::ExportV2FilePaxMetadata::from_records(&noncanonical_ordinal).is_none()
+    );
+}
+
+#[test]
+fn export_v2_order_and_body_digest_are_streaming_exact() {
+    let root = CanonicalFileOrderKey {
+        winning_scope_ordinal: 0,
+        parent_path: None,
+        logical_path: LogicalPath::new("README.md").expect("path"),
+        projection_id: ProjectionId::new("projection-root"),
+    };
+    let nested = CanonicalFileOrderKey {
+        winning_scope_ordinal: 0,
+        parent_path: Some(LogicalPath::new("Projects").expect("path")),
+        logical_path: LogicalPath::new("Projects/page.md").expect("path"),
+        projection_id: ProjectionId::new("projection-nested"),
+    };
+    assert!(root < nested, "root files must match SQL NULLS FIRST order");
+
+    let mut whole = DeliveredBodyDigestV2::new(1);
+    whole
+        .update_file(&ProjectionId::new("projection-root"), b"abcdefghij")
+        .expect("whole body");
+    let whole = whole.finish().expect("whole digest");
+
+    let mut streamed = DeliveredBodyDigestV2::new(1);
+    streamed
+        .begin_file(&ProjectionId::new("projection-root"), 10)
+        .expect("begin file");
+    for chunk in [b"ab".as_slice(), b"cdef".as_slice(), b"ghij".as_slice()] {
+        streamed.update_file_chunk(chunk).expect("body chunk");
+    }
+    streamed.end_file().expect("end file");
+    assert_eq!(streamed.finish().expect("streamed digest"), whole);
+}
+
+#[test]
+fn mixed_legacy_and_scope_session_queries_are_rejected() {
+    let mut mixed =
+        serde_json::from_slice::<serde_json::Value>(SCOPE_AUTHORIZED_SESSION_QUERY_GOLDEN_JSON)
+            .expect("scope fixture");
+    mixed
+        .as_object_mut()
+        .expect("object")
+        .insert("replica_revisions".to_string(), serde_json::json!([]));
+    assert!(
+        serde_json::from_value::<CompatibleAuthorizedSessionQuery>(mixed).is_err(),
+        "mixed authority shapes must not be silently reinterpreted"
+    );
 }
 
 #[test]
@@ -169,6 +500,12 @@ fn public_goldens_never_expose_physical_serving_identifiers() {
         SESSION_PROTOCOL_ERROR_GOLDEN_JSON,
         TAR_EXPORT_OFFER_GOLDEN_JSON,
         TAR_EXPORT_METADATA_GOLDEN_JSON,
+        SCOPE_AUTHORIZED_SESSION_QUERY_GOLDEN_JSON,
+        EXPORT_ATTEMPT_REQUEST_GOLDEN_JSON,
+        SEALED_EXPORT_OFFER_GOLDEN_JSON,
+        EXPORT_COMPLETION_RECEIPT_GOLDEN_JSON,
+        CANONICAL_EXPORT_RECORDS_GOLDEN_JSON,
+        CANONICAL_EXPORT_INVENTORY_GOLDEN_JSON,
     ] {
         let value: serde_json::Value = serde_json::from_slice(golden).expect("valid golden JSON");
         assert_forbidden_physical_keys_absent(&value);
@@ -233,9 +570,28 @@ fn sandbox_session_status() -> SandboxSessionStatus {
             wait_timeout_seconds: 30,
         },
         replicas: vec![freshness_status()],
+        export_attempt_limits: None,
         export_offer: Some(tar_export_offer()),
         error: None,
         updated_at: "2026-07-19T12:00:00Z".to_string(),
+    }
+}
+
+fn sandbox_session_status_v2() -> SandboxSessionStatus {
+    SandboxSessionStatus {
+        versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+        session_id: SessionId::new("session-7"),
+        state: SandboxSessionState::Ready,
+        freshness_requirement: FreshnessRequirement {
+            max_age_seconds: 300,
+            on_stale: StaleSessionBehavior::WaitThenFail,
+            wait_timeout_seconds: 30,
+        },
+        replicas: vec![freshness_status()],
+        export_attempt_limits: Some(attempt_limits()),
+        export_offer: None,
+        error: None,
+        updated_at: "2026-07-23T20:00:00Z".to_string(),
     }
 }
 
@@ -294,6 +650,205 @@ fn authorized_query() -> AuthorizedSessionQuery {
         max_entries: 10_000,
         max_bytes: 104_857_600,
     }
+}
+
+fn scope_authorized_query() -> ScopeAuthorizedSessionQuery {
+    ScopeAuthorizedSessionQuery {
+        versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+        tenant_id: TenantId::new("tenant-acme"),
+        session_id: SessionId::new("session-scope-7"),
+        acting_principal_id: PrincipalId::new("principal-agent"),
+        workload_id: "workload-sandbox".to_string(),
+        authorization_revision: 43,
+        policy_revision: 18,
+        profile_revision: 10,
+        authorized_scopes: vec![
+            AuthorizedSourceScope {
+                ordinal: 0,
+                source_scope_id: SourceScopeId::new("scope-product").expect("scope id"),
+                source_connection_id: SourceConnectionId::new("source-notion"),
+                selector: ProviderSourceScopeSelector::Notion {
+                    selector_version: 1,
+                    scope_kind: NotionScopeKind::Page,
+                    provider_scope_id: "e07dd2a2531444aba2f452010314fb87".to_string(),
+                },
+                effective_actions: BTreeSet::from([
+                    SourceAction::Read,
+                    SourceAction::DownloadAttachment,
+                ]),
+                validated_filter_digest: Some(format!("sha256:{}", "1".repeat(64))),
+            },
+            AuthorizedSourceScope {
+                ordinal: 1,
+                source_scope_id: SourceScopeId::new("scope-go-to-market").expect("scope id"),
+                source_connection_id: SourceConnectionId::new("source-notion"),
+                selector: ProviderSourceScopeSelector::Notion {
+                    selector_version: 1,
+                    scope_kind: NotionScopeKind::Page,
+                    provider_scope_id: "f525c3a7db684465a9e1d1082bea6f81".to_string(),
+                },
+                effective_actions: BTreeSet::from([SourceAction::Read]),
+                validated_filter_digest: None,
+            },
+        ],
+        max_files: 10_000,
+        max_directories: 10_000,
+        max_bytes: 104_857_600,
+    }
+}
+
+fn attempt_limits() -> ExportAttemptLimits {
+    ExportAttemptLimits {
+        max_files: 10_000,
+        max_directories: 10_000,
+        max_content_bytes: 104_857_600,
+    }
+}
+
+fn export_attempt_request() -> ExportAttemptRequest {
+    ExportAttemptRequest {
+        versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+        opaque_session_capability: "opaque-session-capability".to_string(),
+        idempotency_key: "mount-attempt-2026-07-23T19:00:00Z".to_string(),
+        content_encoding: TarContentEncoding::Zstd,
+        limits: attempt_limits(),
+    }
+}
+
+fn source_generations() -> Vec<OrderedSourceGeneration> {
+    vec![OrderedSourceGeneration {
+        ordinal: 0,
+        source_connection_id: SourceConnectionId::new("source-notion"),
+        source_generation_id: SourceGenerationId::new("generation-notion-109")
+            .expect("generation id"),
+    }]
+}
+
+fn sealed_export_offer() -> SealedExportOffer {
+    let writable_metadata_sha256 = locality_protocol::canonical_writable_metadata_sha256(
+        &scope_authorized_writable_metadata(),
+    )
+    .expect("writable metadata digest");
+    SealedExportOffer {
+        versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+        session_id: SessionId::new("session-scope-7"),
+        export_attempt_id: ExportAttemptId::new("export-attempt-9").expect("attempt id"),
+        source_generations: source_generations(),
+        media_type: "application/x-tar".to_string(),
+        content_encoding: TarContentEncoding::Zstd,
+        limits: attempt_limits(),
+        control_entry_count: 1,
+        file_count: 2,
+        directory_count: 2,
+        archive_entry_count: 5,
+        selected_content_bytes: 17,
+        inventory_sha256: "sha256:025cdbae136931542f7fa881da423e8e1f29a6132cf26ae5f4eea53c53a8ef51"
+            .to_string(),
+        writable_metadata_sha256,
+        sealed_at: "2026-07-23T19:00:01Z".to_string(),
+        expires_at: "2026-07-23T19:10:01Z".to_string(),
+    }
+}
+
+fn export_completion_receipt() -> ExportCompletionReceipt {
+    let mut body_digest = DeliveredBodyDigestV2::new(2);
+    body_digest
+        .update_file(&ProjectionId::new("projection-roadmap"), b"# Roadmap\n")
+        .expect("body digest");
+    body_digest
+        .update_file(&ProjectionId::new("projection-readme"), b"Public\n")
+        .expect("body digest");
+    ExportCompletionReceipt {
+        versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+        session_id: SessionId::new("session-scope-7"),
+        export_attempt_id: ExportAttemptId::new("export-attempt-9").expect("attempt id"),
+        source_generations: source_generations(),
+        inventory_sha256: "sha256:025cdbae136931542f7fa881da423e8e1f29a6132cf26ae5f4eea53c53a8ef51"
+            .to_string(),
+        writable_metadata_sha256: locality_protocol::canonical_writable_metadata_sha256(
+            &scope_authorized_writable_metadata(),
+        )
+        .expect("writable metadata digest"),
+        delivered_control_entry_count: 1,
+        delivered_file_count: 2,
+        delivered_directory_count: 2,
+        delivered_archive_entry_count: 5,
+        delivered_content_bytes: 17,
+        delivered_body_sha256: body_digest.finish().expect("body digest"),
+        completed_at: "2026-07-23T19:00:04Z".to_string(),
+    }
+}
+
+fn scope_authorized_writable_metadata() -> ScopeAuthorizedWritableExportMetadata {
+    ScopeAuthorizedWritableExportMetadata {
+        versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+        session_id: SessionId::new("session-scope-7"),
+        export_attempt_id: ExportAttemptId::new("export-attempt-9").expect("attempt id"),
+        source_generations: source_generations(),
+        writable_entries: vec![WritableMetadataEntry {
+            projection_id: ProjectionId::new("projection-roadmap"),
+            logical_path: LogicalPath::new("Projects/Roadmap/page.md").expect("path"),
+            source_remote_ids: vec![RemoteId::new("page-roadmap")],
+            delivered_content_sha256: format!("sha256:{}", "5".repeat(64)),
+            provider_precondition: "opaque-v4".to_string(),
+            effective_actions: BTreeSet::from([SourceAction::Read, SourceAction::Update]),
+            baseline_required: true,
+        }],
+    }
+}
+
+fn export_terminal_control_v2() -> ExportTerminalControlV2 {
+    ExportTerminalControlV2 {
+        writable_metadata: scope_authorized_writable_metadata(),
+        completion_receipt: export_completion_receipt(),
+    }
+}
+
+fn canonical_export_records() -> Vec<CanonicalExportRecord> {
+    vec![
+        CanonicalExportRecord::Directory {
+            order_key: CanonicalDirectoryOrderKey {
+                depth: 1,
+                logical_path: LogicalPath::new("Projects").expect("path"),
+            },
+        },
+        CanonicalExportRecord::Directory {
+            order_key: CanonicalDirectoryOrderKey {
+                depth: 2,
+                logical_path: LogicalPath::new("Projects/Roadmap").expect("path"),
+            },
+        },
+        CanonicalExportRecord::File {
+            order_key: CanonicalFileOrderKey {
+                winning_scope_ordinal: 0,
+                parent_path: Some(LogicalPath::new("Projects/Roadmap").expect("path")),
+                logical_path: LogicalPath::new("Projects/Roadmap/page.md").expect("path"),
+                projection_id: ProjectionId::new("projection-roadmap"),
+            },
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            file_kind: ProjectionFileKind::Markdown,
+            effective_actions: BTreeSet::from([SourceAction::Read, SourceAction::Update]),
+            content_sha256: format!("sha256:{}", "5".repeat(64)),
+            byte_length: 10,
+        },
+        CanonicalExportRecord::File {
+            order_key: CanonicalFileOrderKey {
+                winning_scope_ordinal: 1,
+                parent_path: None,
+                logical_path: LogicalPath::new("README.md").expect("path"),
+                projection_id: ProjectionId::new("projection-readme"),
+            },
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            file_kind: ProjectionFileKind::Markdown,
+            effective_actions: BTreeSet::from([SourceAction::Read]),
+            content_sha256: format!("sha256:{}", "6".repeat(64)),
+            byte_length: 7,
+        },
+        CanonicalExportRecord::Control {
+            order_key: CanonicalControlOrderKey { ordinal: 0 },
+            member_path: locality_protocol::RESERVED_EXPORT_METADATA_PATH.to_string(),
+        },
+    ]
 }
 
 fn source_version() -> SourceVersionContract {

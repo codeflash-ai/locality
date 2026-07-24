@@ -27,6 +27,11 @@ use rustix::fs::RenameFlags;
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat};
 
 use locality_core::portable::LogicalPath;
+use locality_protocol::{
+    CanonicalControlOrderKey, CanonicalDirectoryOrderKey, CanonicalExportRecord,
+    CanonicalFileOrderKey, DeliveredBodyDigestV2, ExportTerminalControlV2, ExportV2FilePaxMetadata,
+    MAX_EXPORT_TERMINAL_CONTROL_BYTES, SealedExportOffer,
+};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
@@ -115,6 +120,7 @@ pub enum ReplicaMaterializationError {
         expected: u64,
         actual: u64,
     },
+    ScopeExport(String),
     NonUtf8Path,
     InvalidPath {
         path: String,
@@ -219,6 +225,12 @@ impl Display for ReplicaMaterializationError {
                 formatter,
                 "replica entry-count receipt mismatch: expected {expected}, actual {actual}"
             ),
+            Self::ScopeExport(reason) => {
+                write!(
+                    formatter,
+                    "invalid scope-authorized replica stream: {reason}"
+                )
+            }
             Self::NonUtf8Path => formatter.write_str("replica tar entry path is not valid UTF-8"),
             Self::InvalidPath { path, reason } => {
                 write!(formatter, "invalid replica path `{path}`: {reason}")
@@ -304,6 +316,24 @@ pub fn materialize_replica_archive_with_expected_receipt<Body: Read>(
     expected: ExpectedReplicaMaterializationReceipt,
 ) -> Result<ReplicaMaterializationSummary, ReplicaMaterializationError> {
     materialize_replica_archive_inner(archive, destination, limits, Some(expected))
+}
+
+/// Validate and atomically publish one scope-authorized v2 replica archive.
+///
+/// V2 directories and files are consumed in canonical order, followed by one
+/// hidden `.loc/session.json` completion receipt. File PAX metadata is used
+/// only while recomputing the inventory and delivered-body digests; it is not
+/// written into the published tree.
+pub fn materialize_scope_authorized_replica_archive<Body: Read>(
+    archive: ReplicaArchive<Body>,
+    destination: &Path,
+    limits: ReplicaMaterializationLimits,
+    offer: &SealedExportOffer,
+) -> Result<ReplicaMaterializationSummary, ReplicaMaterializationError> {
+    offer
+        .validate()
+        .map_err(|error| ReplicaMaterializationError::ScopeExport(error.to_string()))?;
+    materialize_scope_authorized_replica_archive_inner(archive, destination, limits, offer)
 }
 
 fn materialize_replica_archive_inner<Body: Read>(
@@ -397,6 +427,95 @@ fn materialize_replica_archive_inner<Body: Read>(
         ));
     }
     staging.publish(destination)?;
+    Ok(summary)
+}
+
+fn materialize_scope_authorized_replica_archive_inner<Body: Read>(
+    archive: ReplicaArchive<Body>,
+    destination: &Path,
+    limits: ReplicaMaterializationLimits,
+    offer: &SealedExportOffer,
+) -> Result<ReplicaMaterializationSummary, ReplicaMaterializationError> {
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or(ReplicaMaterializationError::InvalidDestination)?;
+    if destination.file_name().is_none() {
+        return Err(ReplicaMaterializationError::InvalidDestination);
+    }
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) | Err(_) => {
+            return Err(ReplicaMaterializationError::DestinationParentMissing(
+                parent.to_path_buf(),
+            ));
+        }
+    }
+    if fs::symlink_metadata(destination).is_ok() {
+        return Err(ReplicaMaterializationError::DestinationExists(
+            destination.to_path_buf(),
+        ));
+    }
+
+    let mut staging = StagingDirectory::create(parent)?;
+    let mut summary = match archive.encoding {
+        ReplicaArchiveEncoding::Identity => {
+            let mut decoded = DecodedLimitReader::new(archive.body, limits.max_decoded_bytes);
+            let result = extract_scope_authorized_tar(&mut decoded, &staging, limits, offer);
+            let exceeded = decoded.exceeded();
+            let decoded_bytes = decoded.consumed();
+            if exceeded {
+                return Err(ReplicaMaterializationError::DecodedLimit {
+                    limit: limits.max_decoded_bytes,
+                });
+            }
+            let mut summary = result?;
+            summary.decoded_bytes = decoded_bytes;
+            summary
+        }
+        ReplicaArchiveEncoding::Zstd => {
+            let mut decoder = zstd::stream::read::Decoder::new(archive.body)
+                .map_err(|error| ReplicaMaterializationError::Decode(error.to_string()))?;
+            decoder
+                .window_log_max(limits.max_zstd_window_log)
+                .map_err(|error| ReplicaMaterializationError::Decode(error.to_string()))?;
+            let mut decoder = decoder.single_frame();
+            let (result, exceeded, decoded_bytes) = {
+                let mut decoded = DecodedLimitReader::new(&mut decoder, limits.max_decoded_bytes);
+                let result = extract_scope_authorized_tar(&mut decoded, &staging, limits, offer);
+                (result, decoded.exceeded(), decoded.consumed())
+            };
+            if exceeded {
+                return Err(ReplicaMaterializationError::DecodedLimit {
+                    limit: limits.max_decoded_bytes,
+                });
+            }
+            let mut summary = result?;
+            let mut compressed = decoder.finish();
+            if read_one(&mut compressed)
+                .map_err(|error| ReplicaMaterializationError::Decode(error.to_string()))?
+                .is_some()
+            {
+                return Err(ReplicaMaterializationError::TrailingZstdData);
+            }
+            summary.decoded_bytes = decoded_bytes;
+            summary
+        }
+    };
+
+    make_tree_read_only(&staging).map_err(|source| ReplicaMaterializationError::Write {
+        path: staging.path().to_path_buf(),
+        source,
+    })?;
+    if fs::symlink_metadata(destination).is_ok() {
+        return Err(ReplicaMaterializationError::DestinationExists(
+            destination.to_path_buf(),
+        ));
+    }
+    staging.publish(destination)?;
+    // The hidden control member is an archive entry, but not a materialized
+    // file or byte. `extract_scope_authorized_tar` already counted it here.
+    summary.entries = offer.archive_entry_count;
     Ok(summary)
 }
 
@@ -518,6 +637,274 @@ fn extract_tar<R: Read>(
 
     state.summary.directories = state.filesystem_directories.len() as u64;
     Ok(state.summary)
+}
+
+fn extract_scope_authorized_tar<R: Read>(
+    reader: &mut R,
+    staging: &StagingDirectory,
+    limits: ReplicaMaterializationLimits,
+    offer: &SealedExportOffer,
+) -> Result<ReplicaMaterializationSummary, ReplicaMaterializationError> {
+    let mut state = ExtractionState::default();
+    let mut records = Vec::new();
+    let mut terminal_control = None;
+    let mut body_digest = DeliveredBodyDigestV2::new(offer.file_count);
+    {
+        let mut archive = tar::Archive::new(reader.by_ref());
+        let entries = archive
+            .entries()
+            .map_err(|error| ReplicaMaterializationError::MalformedTar(error.to_string()))?;
+        for entry in entries {
+            let mut entry = entry
+                .map_err(|error| ReplicaMaterializationError::MalformedTar(error.to_string()))?;
+            state.summary.entries = state.summary.entries.saturating_add(1);
+            if state.summary.entries > limits.max_entries {
+                return Err(ReplicaMaterializationError::EntryLimit {
+                    limit: limits.max_entries,
+                });
+            }
+            if terminal_control.is_some() {
+                return Err(scope_export(
+                    "the completion receipt is not the final member",
+                ));
+            }
+
+            let entry_type = entry.header().entry_type();
+            let is_directory = entry_type.is_dir();
+            if !entry_type.is_file() && !is_directory {
+                return Err(scope_export("an archive member has an unsupported type"));
+            }
+            if entry.header().link_name_bytes().is_some() {
+                return Err(scope_export("an archive member contains link metadata"));
+            }
+
+            let raw_path = std::str::from_utf8(entry.path_bytes().as_ref())
+                .map_err(|_| ReplicaMaterializationError::NonUtf8Path)?
+                .to_string();
+            let normalized_path = if is_directory {
+                raw_path.strip_suffix('/').unwrap_or(&raw_path)
+            } else {
+                &raw_path
+            }
+            .to_string();
+            let pax = locality_pax_fields(&mut entry)?;
+
+            if normalized_path == locality_protocol::RESERVED_EXPORT_METADATA_PATH {
+                if !entry_type.is_file() {
+                    return Err(scope_export("the completion receipt is not a regular file"));
+                }
+                if !pax.is_empty() {
+                    return Err(scope_export(
+                        "the completion receipt has locality PAX metadata",
+                    ));
+                }
+                let mode = entry.header().mode().map_err(|error| {
+                    ReplicaMaterializationError::MalformedTar(error.to_string())
+                })?;
+                if mode != READ_ONLY_FILE_MODE {
+                    return Err(scope_export("the completion receipt mode is not 0444"));
+                }
+                if entry.size() > MAX_EXPORT_TERMINAL_CONTROL_BYTES as u64 {
+                    return Err(scope_export("the completion receipt is too large"));
+                }
+                let mut raw_control = Vec::with_capacity(entry.size() as usize);
+                entry
+                    .read_to_end(&mut raw_control)
+                    .map_err(|_| scope_export("the completion receipt is malformed"))?;
+                let parsed: ExportTerminalControlV2 = serde_json::from_slice(&raw_control)
+                    .map_err(|_| scope_export("the completion receipt is malformed"))?;
+                if serde_json::to_vec(&parsed).ok().as_deref() != Some(raw_control.as_slice()) {
+                    return Err(scope_export("the completion receipt is not canonical JSON"));
+                }
+                records.push(CanonicalExportRecord::Control {
+                    order_key: CanonicalControlOrderKey { ordinal: 0 },
+                    member_path: locality_protocol::RESERVED_EXPORT_METADATA_PATH.to_string(),
+                });
+                terminal_control = Some(parsed);
+                continue;
+            }
+
+            let path = validated_path(entry.path_bytes().as_ref(), is_directory)?;
+            state.register_path(&path, is_directory)?;
+            let mode = entry
+                .header()
+                .mode()
+                .map_err(|error| ReplicaMaterializationError::MalformedTar(error.to_string()))?;
+            if is_directory {
+                if path.eq_ignore_ascii_case(".loc") {
+                    return Err(scope_export(
+                        "the reserved .loc directory header is forbidden",
+                    ));
+                }
+                if !pax.is_empty() {
+                    return Err(scope_export("a directory member has locality PAX metadata"));
+                }
+                if mode != READ_ONLY_DIRECTORY_MODE {
+                    return Err(ReplicaMaterializationError::InvalidDirectoryMode { path, mode });
+                }
+                if entry.size() != 0 {
+                    return Err(ReplicaMaterializationError::NonEmptyDirectory { path });
+                }
+                staging.create_directory(&path)?;
+                records.push(CanonicalExportRecord::Directory {
+                    order_key: CanonicalDirectoryOrderKey {
+                        depth: path.split('/').count() as u32,
+                        logical_path: LogicalPath::new(path).map_err(|error| {
+                            scope_export(format!("a directory path is invalid: {error}"))
+                        })?,
+                    },
+                });
+                continue;
+            }
+
+            if mode != READ_ONLY_FILE_MODE {
+                return Err(ReplicaMaterializationError::InvalidFileMode { path, mode });
+            }
+            let size = entry.size();
+            if size > limits.max_file_bytes {
+                return Err(ReplicaMaterializationError::FileLimit {
+                    path,
+                    size,
+                    limit: limits.max_file_bytes,
+                });
+            }
+            let disk_size = state.summary.materialized_bytes.saturating_add(size);
+            if disk_size > limits.max_disk_bytes {
+                return Err(ReplicaMaterializationError::DiskLimit {
+                    size: disk_size,
+                    limit: limits.max_disk_bytes,
+                });
+            }
+            let metadata = ExportV2FilePaxMetadata::from_records(&pax)
+                .ok_or_else(|| scope_export("a file has invalid locality PAX metadata"))?;
+            let logical_path = LogicalPath::new(path.clone())
+                .map_err(|error| scope_export(format!("a file path is invalid: {error}")))?;
+            let parent_path = logical_path
+                .as_str()
+                .rsplit_once('/')
+                .map(|(parent, _)| LogicalPath::new(parent))
+                .transpose()
+                .map_err(|_| scope_export("a file parent path is invalid"))?;
+            body_digest
+                .begin_file(&metadata.projection_id, size)
+                .map_err(|error| scope_export(error.to_string()))?;
+            let mut hashing = FileBodyHashReader::new(&mut entry, &mut body_digest);
+            staging.write_file(&path, &mut hashing, size)?;
+            let actual_content_sha256 = hashing.finish();
+            body_digest
+                .end_file()
+                .map_err(|error| scope_export(error.to_string()))?;
+            if actual_content_sha256 != metadata.content_sha256 {
+                return Err(scope_export(
+                    "a file body does not match its content digest",
+                ));
+            }
+            records.push(CanonicalExportRecord::File {
+                order_key: CanonicalFileOrderKey {
+                    winning_scope_ordinal: metadata.winning_scope_ordinal,
+                    parent_path,
+                    logical_path,
+                    projection_id: metadata.projection_id,
+                },
+                source_connection_id: metadata.source_connection_id,
+                file_kind: metadata.file_kind,
+                effective_actions: metadata.effective_actions,
+                content_sha256: metadata.content_sha256,
+                byte_length: size,
+            });
+            state.summary.files += 1;
+            state.summary.materialized_bytes = disk_size;
+        }
+    }
+
+    let mut end_block = [0_u8; TAR_BLOCK_BYTES];
+    if reader.read_exact(&mut end_block).is_err() || end_block.iter().any(|byte| *byte != 0) {
+        return Err(ReplicaMaterializationError::MissingTarEndMarker);
+    }
+    if read_one(reader)
+        .map_err(|error| ReplicaMaterializationError::MalformedTar(error.to_string()))?
+        .is_some()
+    {
+        return Err(ReplicaMaterializationError::TrailingTarData);
+    }
+
+    let terminal_control =
+        terminal_control.ok_or_else(|| scope_export("the completion receipt is missing"))?;
+    terminal_control
+        .validate_against_inventory(offer, &records)
+        .map_err(|error| scope_export(error.to_string()))?;
+    let delivered_body_sha256 = body_digest
+        .finish()
+        .map_err(|error| scope_export(error.to_string()))?;
+    if terminal_control.completion_receipt.delivered_body_sha256 != delivered_body_sha256 {
+        return Err(scope_export(
+            "the delivered-body digest does not match the completion receipt",
+        ));
+    }
+
+    state.summary.directories = state.filesystem_directories.len() as u64;
+    Ok(state.summary)
+}
+
+fn scope_export(reason: impl Into<String>) -> ReplicaMaterializationError {
+    ReplicaMaterializationError::ScopeExport(reason.into())
+}
+
+struct FileBodyHashReader<'a, R> {
+    inner: &'a mut R,
+    content: Sha256,
+    delivered: &'a mut DeliveredBodyDigestV2,
+}
+
+impl<'a, R> FileBodyHashReader<'a, R> {
+    fn new(inner: &'a mut R, delivered: &'a mut DeliveredBodyDigestV2) -> Self {
+        Self {
+            inner,
+            content: Sha256::new(),
+            delivered,
+        }
+    }
+
+    fn finish(self) -> String {
+        format!("sha256:{:x}", self.content.finalize())
+    }
+}
+
+impl<R: Read> Read for FileBodyHashReader<'_, R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(output)?;
+        self.content.update(&output[..read]);
+        self.delivered
+            .update_file_chunk(&output[..read])
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid delivered body"))?;
+        Ok(read)
+    }
+}
+
+fn locality_pax_fields<R: Read>(
+    entry: &mut tar::Entry<'_, R>,
+) -> Result<Vec<(String, String)>, ReplicaMaterializationError> {
+    let mut fields = Vec::new();
+    let Some(extensions) = entry
+        .pax_extensions()
+        .map_err(|_| scope_export("PAX metadata is malformed"))?
+    else {
+        return Ok(fields);
+    };
+    for extension in extensions {
+        let extension = extension.map_err(|_| scope_export("PAX metadata is malformed"))?;
+        let key_bytes = extension.key_bytes();
+        if !key_bytes.starts_with(b"locality.") {
+            continue;
+        }
+        let key = std::str::from_utf8(key_bytes)
+            .map_err(|_| scope_export("a locality PAX key is not UTF-8"))?;
+        let value = extension
+            .value()
+            .map_err(|_| scope_export("a locality PAX value is not UTF-8"))?;
+        fields.push((key.to_string(), value.to_string()));
+    }
+    Ok(fields)
 }
 
 fn validated_path(

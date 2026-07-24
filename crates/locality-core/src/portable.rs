@@ -46,6 +46,64 @@ opaque_id!(ReplicaRevisionId);
 opaque_id!(ChangesetId);
 opaque_id!(AccessSetId);
 
+macro_rules! validated_opaque_id {
+    ($name:ident) => {
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Result<Self, PortableIdError> {
+                let value = value.into();
+                if value.is_empty() {
+                    return Err(PortableIdError::Empty);
+                }
+                Ok(Self(value))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::new(value).map_err(serde::de::Error::custom)
+            }
+        }
+
+        impl Display for $name {
+            fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(&self.0)
+            }
+        }
+    };
+}
+
+/// A validated opaque portable identifier cannot be the empty string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortableIdError {
+    Empty,
+}
+
+impl Display for PortableIdError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("portable identifier is empty"),
+        }
+    }
+}
+
+impl std::error::Error for PortableIdError {}
+
+validated_opaque_id!(SourceScopeId);
+validated_opaque_id!(ExportAttemptId);
+validated_opaque_id!(SourceGenerationId);
+
 /// The only reserved export member in the portable path namespace.
 ///
 /// The host consumes this member as writable-session metadata and never
@@ -53,7 +111,9 @@ opaque_id!(AccessSetId);
 /// connector-managed artifacts such as media.
 pub const RESERVED_EXPORT_METADATA_PATH: &str = ".loc/session.json";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A validated portable path. Its ordering is canonical bytewise UTF-8 order,
+/// matching PostgreSQL `COLLATE "C"` for the same encoded values.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LogicalPath(String);
 
 impl LogicalPath {

@@ -1,8 +1,8 @@
 # Cloud Sandbox Data Plane Architecture
 
-Status: proposed target architecture with a pragmatic v1 delivery path
+Status: approved target architecture with a pragmatic v1 delivery path
 
-Date: 2026-07-17
+Date: 2026-07-23
 
 Scope: Locality backend, sandbox client, connector execution, replica transfer,
 permissions, mutations, search, security, and migration
@@ -40,11 +40,13 @@ The main decisions are:
    agent sandbox. The existing direct connector mode remains available to the
    local-first desktop and headless `loc` client; a mount uses exactly one mode
    at a time.
-4. Resolve authorization and job filters once in an indexed PostgreSQL query
-   against a complete ready revision. Stream exactly the selected ordinary files
-   as a transient standard tar response with negotiated Zstandard wire
-   compression; do not build, compact, authorize, or retain profile-specific
-   packs or client-side catalogs.
+4. Authorize sessions with stable provider scopes rather than enumerated file
+   IDs. For each export attempt, revalidate current grants, freshness, filters,
+   and quotas, resolve the current complete published generation for each source
+   in one PostgreSQL snapshot, and stream exactly the selected ordinary files as
+   a transient standard tar response with negotiated Zstandard wire compression.
+   Do not build, compact, authorize, or retain profile-specific packs or
+   client-side catalogs.
 5. Materialize selected content as ordinary files on task-local disk before the
    agent starts. `rg`, `grep`, compilers, editors, and ordinary POSIX calls then
    operate at local filesystem speed with no read-time network calls.
@@ -82,9 +84,10 @@ The main decisions are:
     isolation limits prevent the service from saturating supported sandbox
     links. ClickHouse is not a v1 dependency or mutation authority.
 13. Make the three high-volume PostgreSQL serving tables locality-aware from the
-    beginning: identical small tenant/source hash partitions, monotonic
-    source/root export and content-storage IDs, a minimal baseline index set, and
-    ordered backfill writes. Do not depend on periodic heap clustering; tune
+    beginning: identical small tenant/source hash partitions, stable scope IDs,
+    canonical bytewise logical-path ordering, monotonic content-storage IDs, a
+    minimal baseline index set, and ordered backfill writes. Do not depend on a
+    globally allocated per-file export rank or periodic heap clustering; tune
     partition count, secondary indexes, and physical rewrites only from measured
     usage.
 14. Deploy the first managed cell on AWS as one container image in separate ECS
@@ -114,9 +117,10 @@ a single-tenant or Notion-only pilot. It includes:
 - coarse administrator-selected scopes such as roots, shared drives, channels,
   mailboxes, teams, or projects, plus explicit broad pilot groups/grants;
 - exact server-side authorization/profile filtering and one negotiated
-  Zstd-or-identity streaming file export per session;
+  Zstd-or-identity streaming file export per attempt;
 - ordinary task-local files, including read-only and explicitly writable paths;
-- replica-at-start freshness with no live sandbox delta stream;
+- current-complete-head selection per export attempt with no live in-place
+  sandbox delta stream; a refresh stages and atomically publishes a new tree;
 - no read-only metadata import; a small SQLite session store tracks only
   writable entries, local changes, journals, and submitted changesets;
 - PostgreSQL title/path/content search for profile discovery, with local `rg` as
@@ -460,6 +464,28 @@ Provider identities and groups link to Locality IDs through stable provider
 subject IDs. Display names are never identity, and email addresses are used for
 linking only after issuer/domain verification.
 
+### Stable Source Scopes
+
+Authorization selectors name stable provider containers and their documented
+membership semantics, not the files currently beneath them:
+
+- Notion root page or database ID, including descendants reached by connector
+  traversal;
+- Slack channel/conversation ID, including messages, threads, replies, and files
+  owned by those messages;
+- Granola collection, team, or folder ID, or an explicitly selected meeting ID;
+- Gmail mailbox plus stable label ID, with an explicit thread ID only when it is
+  intentionally selected. Arbitrary search text is a narrowing filter, not an
+  authorization scope;
+- Drive shared-drive or folder ID, including descendants; and
+- GitHub organization or repository ID.
+
+Connector traversal/provider facts write membership at ingestion. A title,
+projected path, teamspace label, or search result cannot manufacture authority.
+Attachments inherit the memberships of their owning resource. Adding or removing
+a descendant changes the next published generation and therefore the next export
+attempt; it does not require rewriting a grant/session for every file.
+
 ### 1. Source Resource
 
 A source resource is a provider-owned identity:
@@ -513,13 +539,17 @@ connector-supported action set. Effective actions are session policy, not
 intrinsic content metadata. The many-to-many `projection_inputs` relationship
 lets connectors aggregate or split resources without corrupting remote identity.
 
-The backend also assigns physical-serving hints: a stable `scope_root_id`, a
-monotonic `export_order` within that source/root, and a monotonic internal
+The backend also assigns a stable `scope_id` and a monotonic internal
 `content_storage_id` for each content version. These are not provider identity
-or wire-format fields. They let ingestion place related rows together and let
-exports read bodies in storage-friendly order without changing filesystem paths.
-Allocate ID ranges through ordinary connection-scoped database state; do not
-create a PostgreSQL sequence or partition for every tenant, source, or root.
+or wire-format fields. `scope_id` records an ingestion-derived provider
+membership such as a Notion root, Slack channel, Gmail label, Drive folder, or
+GitHub repository. Titles, projected paths, and search results never establish
+membership. The common single-membership case stores the scope directly on the
+projection row; connectors with genuine many-to-many membership use an indexed
+bridge. Ingestion writes related rows in canonical logical-path order where
+practical, but correctness and wire order never depend on a mutable allocated
+`export_order`. Do not create a PostgreSQL sequence or partition for every
+tenant, source, or scope.
 
 Its `LogicalPath` is a normalized portable relative path, not a Rust `PathBuf`
 or an OS-specific absolute path. The same `ProjectionEntry` can therefore be
@@ -529,28 +559,45 @@ path, hydration/materialization state, dirty state, and local-store identity.
 The current `TreeEntry` can remain as a compatibility adapter while connectors
 migrate; it should not become the backend's canonical source object.
 
-### 4. Replica Revision And Session Export
+### 4. Published Generation And Session Export
 
-A replica revision is a durable point-in-time publication for one source
-connection. It records the source watermark, projection revision, coverage,
+A published generation is a durable point-in-time publication for one source
+connection. It records the source watermark, projection sequence, coverage,
 freshness observation, and publication state. Projection content uses immutable
-version rows plus current/version-range mappings, so publishing a revision does
-not duplicate a physical corpus.
+version rows plus current/version-range mappings, so publishing a generation
+does not duplicate a physical corpus. Its immutable manifest retains the exact
+scope memberships, logical paths, connector/source-supported action ceilings,
+content references, hashes, sizes, and exact attachment
+  object versions required for retries and audit after a newer head publishes.
 
 ```text
 provider watermark
   -> immutable source/content versions
-  -> transactionally complete ready projection revision
+  -> transactionally complete ready published generation
 
-sandbox session + current grants + profile/runtime filters
+sandbox session + stable source scopes
+  -> export-attempt revalidation + current complete generation vector
   -> one exact PostgreSQL selection query
   -> one transient Zstd-compressed tar stream
 ```
 
 The session row records the tenant, principal/workload, profile and policy
-revisions, source watermarks, selected replica revisions, query/filter digest,
-expiry, and delivered file/byte counts. The exporter runs under the session's
+revisions, ordered stable source scopes, requested actions, query/filter digest,
+limits, and expiry. It does not enumerate projection IDs or pin source
+generations. On the first request for an export attempt, the exporter rechecks
+current provider visibility, grants, scope activity, freshness, filters, and
+quotas in one PostgreSQL MVCC snapshot, then seals an ordered
+`(source_connection_id, generation_id)` vector and exact offer to the attempt.
+A retry of that attempt reuses the vector and offer; a new attempt on the same
+session may select newer complete heads. The exporter runs under the session's
 tenant and policy context and never accepts arbitrary SQL from the client.
+
+Overlapping scopes emit a projection once. Each membership independently
+intersects the provider ceiling, tenant grant, acting-principal grant, workload
+profile, session actions, and runtime filters. The lowest configured scope
+ordinal that alone authorizes every required action wins. Partial actions from
+different scopes are never combined. Distinct projections resolving to the same
+logical path remain a hard error.
 
 Two sets remain distinct:
 
@@ -558,8 +605,10 @@ Two sets remain distinct:
   facts, profile roots, and runtime filters; and
 - **delivered set**: entries the exporter actually wrote to the response.
 
-In v1 these sets must be equal. There is no authorized overfetch or client-side
-confidentiality filtering. A trusted host-side bootstrapper may report which
+For a successfully completed attempt these sets must be equal. An aborted,
+cancelled, or disconnected attempt records an exact terminal state and may have
+delivered fewer bytes, but it never publishes the partial local tree. There is
+no authorized overfetch or client-side confidentiality filtering. A trusted host-side bootstrapper may report which
 entries were materialized, but that telemetry is not an authorization control.
 The complete delivered inventory may be retained as compact audit rows or a
 database-generated digest according to policy; it is not a reusable data
@@ -593,7 +642,7 @@ Read-only and writable content deliberately have different local costs:
 
 | Content class      | Local state                                                                                                                                      | Update behavior                                                                                                       |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------- |
-| Read-only          | One materialized file. The backend session/audit state retains its revision and delivered identity; no local shadow or metadata row is required. | Fixed for an ephemeral session. A later session receives a newer replica revision; no merge or conflict state exists. |
+| Read-only          | One materialized file. The backend attempt/audit state retains its generation vector and delivered identity; no local shadow or metadata row is required. | Fixed for one published local tree. A later refresh attempt may stage a newer complete generation and atomically replace the tree; no merge or conflict state exists. |
 | Writable but clean | Materialized working file plus a compressed/reflinked baseline and provider precondition. No local copy of remote head.                          | Eligible for local diff and explicit push.                                                                            |
 | Writable and dirty | Working bytes, retained baseline, dirty journal, and changeset state for affected entries.                                                       | Three-way comparison occurs only when provider head differs at submit/apply.                                          |
 | Conflicted         | Base, working, and fetched remote content for affected entries only.                                                                             | Kept until rebase, resolution, rejection, or retention expiry.                                                        |
@@ -626,8 +675,8 @@ first physical schema:
 | Source state | `source_resources`, `source_edges`, `source_versions`, `resource_acl_facts`, `access_sets`, `access_descriptors`, `ingest_events`, `tombstones` |
 | Content      | `content_versions`, `projection_entries`, `projection_entry_versions`, `projection_inputs`, `large_attachments`                                 |
 | Policy       | `data_grants`, `data_grant_revisions`, `workspace_profiles`, `workspace_profile_revisions`, `compiled_policy_bindings`                          |
-| Replica      | `replica_revisions`, `replica_source_watermarks`                                                                                                |
-| Runtime      | `sandbox_sessions`, `session_capabilities`, `session_deliveries`, `materialization_receipts`, `client_checkpoints`, `write_claims`, `jobs`      |
+| Replica      | `replica_revisions`, `replica_source_watermarks`, `source_scopes`, immutable generation manifests and scope memberships                         |
+| Runtime      | `sandbox_sessions`, `sandbox_session_scopes`, export attempts/offers, `session_deliveries`, `materialization_receipts`, `client_checkpoints`, `write_claims`, `jobs` |
 | Mutation     | `changesets`, `change_operations`, `approvals`, `apply_attempts`, `apply_effects`, `reconciliation_results`                                     |
 | Governance   | `audit_events`, `retention_holds`, `deletion_requests`, `export_checkpoints`                                                                    |
 
@@ -665,10 +714,10 @@ materializing every logical subtype:
 | `source_checkpoints`                                                                       | Durable cursor/fingerprint and completeness per root, channel, drive, mailbox, or other resumable connector scope.                                                                      |
 | `source_resources`, `source_edges`, `source_versions`                                      | Preserve stable provider identity, hierarchy/membership, immutable versions, current pointer, provider precondition, tombstone, and ACL observations.                                   |
 | `access_sets`, `access_set_subjects`                                                       | Normalizes equivalent observed reader sets so indexed authorization joins do not evaluate provider ACL JSON per file.                                                                   |
-| `content_versions`, `projection_entries`, `projection_entry_versions`, `projection_inputs` | Separates immutable bodies from narrow current/versioned selection rows; carries source/root/export/storage locality keys; and preserves the many-to-many source-to-filesystem mapping. |
+| `content_versions`, `projection_entries`, `projection_entry_versions`, `projection_inputs` | Separates immutable bodies from narrow current/versioned selection rows; carries source/scope/path/storage locality keys; and preserves the many-to-many source-to-filesystem mapping. |
 | `policies`, `policy_revisions`                                                             | Stores both `DataGrant` and `WorkspaceProfile` documents by kind; compiled results are rebuildable cache fields or objects.                                                             |
 | `replica_revisions`                                                                        | Records source watermark, coverage, freshness observation, projection sequence, ready state, and PostgreSQL commit/replay position.                                                     |
-| `sandbox_sessions`, `session_deliveries`                                                   | Includes capability hash/claims, pinned revisions, filter/query digest, selected/delivered counts and bytes, plus an optional exact delivered inventory when policy requires it.        |
+| `sandbox_sessions`, export attempts, `session_deliveries`                                  | Sessions include capability hash/claims, ordered stable scopes, actions, limits, and filter/query digest. Attempts bind an immutable generation vector and exact offer/receipt, selected/delivered counts and bytes, plus an optional exact delivered inventory when policy requires it. |
 | `jobs`                                                                                     | Durable leased work, provider-event dedupe, retry, cooldown, and idempotency state.                                                                                                     |
 | `search_documents`                                                                         | Rebuildable PostgreSQL full-text projection.                                                                                                                                            |
 | `changesets`, `change_operations`                                                          | Operations hold attempt, effect, reconciliation, and error JSON until scale or retention justifies separate tables.                                                                     |
@@ -679,9 +728,11 @@ the boundaries that are expensive to retrofit: tenant-leading keys and RLS,
 stable provider IDs, immutable versions/provider preconditions, resource versus
 projection identity, projection inputs, access-set IDs, policy/replica/format
 revisions, resumable checkpoint identity, idempotency keys, and audit correlation
-IDs. Also bake `source_connection_id`, `scope_root_id`, `export_order`, and
-`content_storage_id` into the serving schema because adding physical locality
-after a large corpus exists is expensive. It is safe to normalize typed
+IDs. Also bake `source_connection_id`, stable `scope_id`, canonical
+`logical_path`, and `content_storage_id` into the serving schema because adding
+membership and physical locality after a large corpus exists is expensive. Do
+not make a globally allocated export rank canonical: insertions, moves, and
+renames must not require renumbering unrelated entries. It is safe to normalize typed
 principal subtypes, webhook subscriptions, compiled policy bindings, receipts,
 approvals, apply attempts/effects, holds, or exports later through ordinary
 migrations.
@@ -810,10 +861,12 @@ The managed-cell contract is:
   service roles to their cell/tenant responsibilities, and audit database,
   object, and KMS access;
 - issue only a short-lived Locality session capability to the sandbox. The fixed
-  export endpoint binds it to tenant, workload, policy/profile revisions, source
-  revisions, and expiry. Session creation accepts only declarative values
-  validated against the published profile; export accepts no new filters and
-  neither endpoint accepts arbitrary SQL;
+  export endpoint binds it to tenant, workload, policy/profile revisions, stable
+  source scopes, actions, narrowing filters/limits, and expiry. The export
+  attempt binds the current authorized generation vector and exact offer.
+  Session creation accepts only declarative values validated against the
+  published profile; export accepts no new filters and neither endpoint accepts
+  arbitrary SQL;
 - atomically materialize into a staging directory and expose the tree only after
   the tar response completes. A truncated response is discarded and restarted;
   resumable cursors are added only if measurements justify them; and
@@ -1064,7 +1117,7 @@ The read path separates narrow selection rows from immutable bodies:
 
 ```text
 projection_entries
-  stable projection identity, current pointer, source/root/export order
+  stable projection identity, current pointer, source/scope/canonical path
 
 projection_entry_versions
   source/revision validity, logical path, root, kind, ACL set,
@@ -1084,16 +1137,19 @@ materialized columns. Connector-specific uncommon fields may remain JSONB, but
 v1 does not evaluate arbitrary user-supplied JSONPath or SQL.
 
 Each projection-version row has a validity interval or equivalent publication
-sequence. Publishing a new revision inserts only changed content/projection rows
-and closes or supersedes affected prior rows. A query for a pinned revision sees
-exactly the entries valid at that revision; it does not copy an entire physical
-snapshot.
+sequence and immutable generation membership facts. Publishing a new generation
+inserts only changed content/projection rows and closes or supersedes affected
+prior rows. Current serving rows accelerate a new attempt against the published
+head; immutable version rows reconstruct an older attempt-bound generation
+without copying rows into the session.
 
-The ordinary fast path reads the narrow current-head fields when the pinned
-revision is still the source's current ready revision. If publication advanced
-between session creation and export, the same repository falls back to the
-version-validity rows. Both paths run in the export's repeatable-read snapshot
-and must return identical logical rows for the same revision.
+The fast path reads narrow current-head rows after joining the session's small
+ordered scope set. The export-attempt transaction captures a complete authorized
+metadata manifest containing immutable inline-content or exact S3-version
+references, then closes before body streaming. A retry of the same attempt reads
+the same generation vector and manifest even after publication advances or the
+API process restarts. Active attempts and the retry/receipt retention horizon
+fence generation and attachment garbage collection.
 
 A session export is logically one fixed query:
 
@@ -1103,15 +1159,19 @@ WITH selected AS MATERIALIZED (
   SELECT e.tenant_id,
          e.source_connection_id,
          e.projection_id,
-         e.scope_root_id,
-         e.export_order,
+         min_authorizing_scope_ordinal(e) AS winning_scope_ordinal,
          e.logical_path,
+         logical_parent(e.logical_path) AS parent_path,
          e.file_kind,
          e.effective_actions,
          e.provider_version,
          e.content_storage_id,
          e.large_attachment_id
-  FROM authorized_projection_entries(:session_id, :replica_revisions) AS e
+  FROM authorized_current_projection_entries(
+         :session_id,
+         :export_attempt_id,
+         :source_generation_vector
+       ) AS e
   WHERE profile_predicates_match(e, :validated_runtime_values)
 )
 SELECT e.logical_path,
@@ -1127,10 +1187,10 @@ LEFT JOIN content_versions AS c
   ON c.tenant_id = e.tenant_id
  AND c.source_connection_id = e.source_connection_id
  AND c.content_storage_id = e.content_storage_id
-ORDER BY e.source_connection_id,
-         e.scope_root_id,
-         e.export_order,
-         e.content_storage_id;
+ORDER BY e.winning_scope_ordinal,
+         e.parent_path COLLATE "C" NULLS FIRST,
+         e.logical_path COLLATE "C",
+         e.projection_id;
 ```
 
 The real implementation expresses supported predicates as parameterized SQL and
@@ -1146,12 +1206,13 @@ file. Rejected metadata rows never fetch their content body.
 
 The baseline physical indexes are deliberately small:
 
-- current projection selection on `(tenant_id, source_connection_id,
-scope_root_id, export_order)` including only the narrow ACL, filter,
-  current-version, and `content_storage_id` fields required before body fetch;
-- historical revision lookup on `(tenant_id, source_connection_id,
-scope_root_id, projection_id, valid_from_sequence DESC)` with the closing
-  sequence available for filtering;
+- current projection selection on `(tenant_id, source_connection_id, scope_id,
+  logical_path COLLATE "C", projection_id)` including only the narrow ACL,
+  filter, current-version, and content-reference fields required before body
+  fetch;
+- historical generation lookup on `(tenant_id, source_connection_id, scope_id,
+  projection_id, valid_from_sequence DESC)` with the closing sequence and
+  canonical logical path available for filtering/order;
 - authorization lookup on `(tenant_id, subject_id, access_set_id)`; and
 - immutable body lookup on `(tenant_id, source_connection_id,
 content_storage_id)`.
@@ -1159,10 +1220,13 @@ content_storage_id)`.
 Do not add one broad covering index containing paths, bodies, and every optional
 filter. Add a time/kind/provider-specific index only after real query plans show
 that it avoids enough heap work to repay its write, WAL, vacuum, and cache cost.
-Use a custom plan for each export query shape because a broad root and a narrow
-filter can require very different plans. Session creation uses statistics for
-estimates; it does not run an exact full `COUNT(*)` pass before streaming. Hard
-entry/byte limits are enforced as rows are produced.
+Use a custom plan for each export query shape because a broad scope and a narrow
+filter can require very different plans. The index accelerates authorization and
+canonical file-path access but need not provide the entire archive order. A
+bounded metadata sort is acceptable until real plans justify another narrow
+index. Session creation uses statistics for estimates; export-attempt preflight
+performs the exact metadata selection needed to seal the offer and quotas before
+any body or S3 read.
 
 ### Revision Publication And Source Freshness
 
@@ -1177,11 +1241,12 @@ provider hint/change cursor/scheduled poll
   -> complete ready replica revision
 ```
 
-Work may span idempotent jobs, but the final publisher transaction advances a
-revision to `ready` only after all required resource, edge, ACL, content,
-projection, checkpoint, and search-input writes for its declared coverage have
-completed. A session sees the old complete revision or the new complete
-revision, never a partially rendered tree.
+Work may span idempotent jobs, but the final lease-fenced publisher transaction
+advances the current head to `ready` only after all required resource, edge,
+ACL, content, projection, scope-membership, checkpoint, and search-input writes
+for its declared coverage have completed. An export attempt sees the old
+complete generation or the new complete generation, never a partially rendered
+tree. A stale or expired worker cannot overwrite a newer published head.
 
 Each source revision records:
 
@@ -1202,8 +1267,9 @@ freshness:
   waitTimeout: 30s
 ```
 
-Session creation starts immediately when selected scopes are complete, have no
-known unapplied event, and meet `maxAge`. A known pending event or stale
+Session creation may report readiness when selected scopes are complete, have no
+known unapplied event, and meet `maxAge`; export-attempt preflight rechecks those
+facts before sealing a generation vector. A known pending event or stale
 observation is promoted ahead of backfill; the request waits only up to its
 bounded timeout. If freshness cannot be established, the API returns
 `source_bootstrapping`, `source_stale`, or `source_unavailable` with progress
@@ -1218,9 +1284,16 @@ regardless of read freshness mode.
 
 ### Consistent Streaming Export
 
-After authorizing a session and resolving the newest acceptable ready revision
-for each source, the exporter opens a read-only `REPEATABLE READ` transaction.
-The revision lookup and row stream share that database snapshot. Updates that
+For the first request of an export attempt, the exporter opens one writable
+`REPEATABLE READ` transaction, rechecks current authorization/freshness/limits,
+resolves the newest acceptable ready generation for every source, and seals the
+ordered source/generation vector plus exact selection offer. "Exact" means the
+selected manifest, counts, content bytes, and inventory digest are fixed; it
+does not require a speculative first tar/Zstd pass. The same snapshot captures
+the complete immutable metadata manifest and atomically persists the attempt,
+generation vector, exact selection offer, and retention references before
+commit. The transaction can then close while
+the exporter fetches bodies through captured immutable references. Updates that
 commit while the stream is running are not mixed into the response.
 
 The client advertises `Accept-Encoding: zstd, identity`. The preferred v1
@@ -1234,19 +1307,55 @@ Content-Encoding: zstd
 `identity` remains a required fallback and benchmark control. In either mode:
 
 - the tar is generated on demand and is never stored as a canonical artifact;
-- each selected projection becomes one ordinary tar member with its logical path,
-  size, and non-executable mode;
-- a reserved first member contains versioned session metadata only for writable
-  paths: projection/resource identity, delivered content hash, provider
-  precondition, effective actions, and baseline requirements. The client consumes
-  this member into its small SQLite store and does not expose it in the mount;
+- the sealed v2 offer distinguishes file count, directory count, one terminal
+  control member, total archive entry count, selected content bytes, and a
+  canonical inventory digest so parent directory headers cannot create an
+  ambiguous count. It does not
+  pre-render tar/Zstd merely to predict encoded length or stream digest; the
+  completion receipt records actual delivered file/content counts and a
+  domain-separated delivered-body digest after the one streaming pass;
+- directory headers are record class 0 and follow in
+  `(depth, logical_path COLLATE "C")`
+  order, so every unique parent precedes descendants;
+- each selected projection is record class 1 and becomes one ordinary tar member with its logical
+  path, size, and non-executable mode. File members follow
+  `(winning_scope_ordinal, parent_path COLLATE "C" NULLS FIRST,
+  logical_path COLLATE "C", projection_id)` order;
+- each v2 file member carries bounded transient POSIX PAX fields for source
+  connection ID, projection ID, winning scope ordinal, file kind, sorted
+  effective actions, and content SHA-256. Public constants and parsers define
+  their exact names/encoding and bounded per-value/per-file size. Duplicate or
+  unknown `locality.*` fields are rejected. They allow the client to recompute
+  the inventory and body digests but are never materialized or inserted into
+  SQLite; directory and control members carry no Locality PAX fields;
+- v1 retains its reserved first writable-metadata member unchanged. V2 instead
+  requires exactly one final record-class-2 `.loc/session.json` member combining
+  that writable metadata with the completion receipt. It is bounded, canonical
+  JSON, regular mode `0444`, consumed into the small SQLite store, never exposed
+  in the mount, and has no emitted `.loc/` directory header. The offer and
+  receipt both seal a domain-separated digest of the writable metadata so
+  source identities and write preconditions cannot change after preflight;
 - read-only entries create no local metadata or shadow rows;
 - selected large attachment references are fetched by the exporter and appended
   to the same stream under bounded size/scanning policy; and
 - the client validates and extracts into a staging directory with path, link,
   device, case, Unicode, entry-count, byte, and disk limits, then atomically
   publishes the tree only after the HTTP response, Zstd frame, tar stream, and
-  file writes terminate cleanly.
+  file writes terminate cleanly, the final receipt is present once with no
+  following member, and its recomputed canonical inventory/body digests equal
+  the sealed offer/receipt.
+
+The v2 canonical inventory digest is SHA-256 over a domain-separated,
+length-framed binary preimage. It begins with
+`locality.export.inventory.v2\0`; every scalar is an unsigned 64-bit big-endian
+length followed by its UTF-8 or raw bytes, and every list begins with an unsigned
+64-bit big-endian count. Only directory and file records participate, in their
+archive order; the final self-describing receipt is deliberately excluded to
+avoid a circular digest. A directory includes its normalized `LogicalPath`; a file includes global winning scope
+ordinal, source connection ID, projection ID, normalized logical path, file kind,
+sorted effective-action labels, content SHA-256, and byte length. Public exact
+goldens bind the preimage and digest so the backend and client cannot disagree
+about JSON formatting, collation, or field omission.
 
 Start with Zstd level 1. It normally reduces Locality's Markdown/JSON-heavy wire
 bytes substantially while retaining fast, bounded-memory streaming decode.
@@ -1271,11 +1380,13 @@ farm, or another manifest merely to claim parallel decompression. Add such
 framing only if the decoder is the measured bottleneck rather than PostgreSQL,
 the network, or filesystem entry creation.
 
-An interrupted v1 export is discarded and restarted against a newly authorized
-session snapshot. Add a logical resume cursor only when measured corpus size or
+An interrupted v1 export is discarded locally. Retrying the same export attempt
+rechecks revocation and replays its already sealed generation vector and exact
+offer; starting a new attempt rechecks all authority/freshness/quotas and may
+select newer heads. Add a logical byte cursor only when measured corpus size or
 failure rate justifies its state and consistency complexity. The session
-capability is short-lived and revocable; every retry rechecks current policy and
-freshness.
+capability is short-lived and revocable. Revocation blocks both new attempts and
+attempt retries before body/S3 access; it cannot recall bytes already delivered.
 
 The backend records source/profile/policy revisions, query digest, selected and
 delivered file/byte counts, status, duration, and failure. A customer policy may
@@ -1296,17 +1407,18 @@ sequenceDiagram
 
   O->>L: one-time bootstrap token with profile/runtime scope already sealed
   L->>A: create session
-  A->>P: authorize identity, grants, profile, freshness
-  P-->>A: acceptable ready revisions + estimates
-  A-->>L: short-lived session + revision/freshness receipt
-  L->>A: GET session file stream
-  A->>P: REPEATABLE READ authorized selection + COPY/row stream
+  A->>P: authorize identity, grants, profile, stable scopes
+  P-->>A: readiness/freshness + estimates
+  A-->>L: short-lived scope-authorized session
+  L->>A: create/open export attempt
+  A->>P: REPEATABLE READ revalidation + current heads + exact metadata
+  P-->>A: sealed generation vector + offer
   A->>B: fetch selected large attachments only
   A-->>L: transient Zstd(tar) stream
   L->>F: concurrent decode + safe staged extraction
   L->>F: writable metadata to SQLite
   L->>F: atomic publish
-  L-->>O: ready(path, revisions, file/byte counts)
+  L-->>O: ready(path, generation vector, file/byte counts)
   O->>F: start agent
 ```
 
@@ -1322,12 +1434,14 @@ than supported sandbox ingress at expected launch concurrency. Optimize the
 simple path before adding another data store:
 
 - keep authorization/filter columns narrow and separately indexed from bodies;
-- prune the three serving tables by tenant/source, select through the narrow
-  current-head or historical-revision index, and fetch bodies in
-  `(scope_root_id, export_order, content_storage_id)` order;
+- prune the three serving tables by tenant/source, join the session's small
+  ordered scope set, deduplicate overlapping memberships, select through the
+  narrow current-head or historical-generation index, and fetch bodies in
+  bounded canonical path batches through immutable content references;
 - join immutable bodies only after selection and use a bounded streaming
   transaction with backpressure;
-- assign locality keys and insert initial backfill batches in export order. New
+- assign locality keys and insert initial backfill batches in canonical
+  scope/logical-path order. New
   versions append; correctness never depends on physical heap position;
 - use LZ4 TOAST compression for new text/JSON/bytea body values when the managed
   PostgreSQL build supports it. This storage compression is transparent and
@@ -1351,10 +1465,13 @@ correctness or publication. Monitor heap/index block reads, index bloat, and
 specific serving table crosses a measured degradation threshold.
 
 A PostgreSQL read replica is the first scale-out step when it provides sufficient
-isolation. The session API routes an export to a replica only after its replay
-LSN reaches both the selected revision/policy state and the session-creation
+isolation. `POST .../export-attempts` always runs and commits its writable atomic
+selection/sealing transaction on the primary. Only the subsequent immutable
+stream may use a replica, and only after its replay LSN reaches the policy/scope
+state, session commit, attempt commit, and every selected published-generation
 commit; otherwise it waits briefly or uses the primary according to cell policy.
-Replica lag can never silently select an older revision or miss the session row.
+Replica lag can never silently select an older head or miss the session/attempt
+row.
 
 ### Deferred ClickHouse Serving Replica
 
@@ -1378,7 +1495,7 @@ sensitive-data backup/retention plane, or read-time deduplication before the
 benchmark gate is met.
 
 A disposable cached export may later accelerate a repeatedly identical
-`(tenant, policy revision, profile revision, source revisions, filter digest)`
+`(tenant, policy revision, profile revision, source generation vector, filter digest)`
 query. It is a TTL cache, not canonical state or an ACL composition primitive;
 cache misses always fall back to the database exporter and correctness never
 depends on cache compaction.
@@ -1437,7 +1554,7 @@ because that would create two independent mutation authorities.
 The materialized ordinary files are the local read representation. A small
 writable SQLite session store contains only:
 
-- mount/session identity and delivered source revisions;
+- mount/session identity and delivered export-attempt source generations;
 - write-enabled paths, projection/resource IDs, provider preconditions, and
   compact effective actions;
 - per-writable-file baseline references/hashes;
@@ -1485,16 +1602,20 @@ as `0555` or `0755`, and all data as non-executable. These modes improve agent
 behavior but are not the security boundary: an agent running as the owner may
 change modes. The backend re-authorizes every changeset operation.
 
-### Session Freshness, Not Live Sandbox Deltas
+### Current-Head Refresh, Not Live In-Place Sandbox Deltas
 
-An ephemeral sandbox uses immutable source replica revisions selected at session start. V1
-does not subscribe through SSE/WebSocket, poll for content deltas, or rewrite
-files while an agent is working. This removes daemon complexity and makes every
-local diff relative to an unambiguous delivered base.
+An ephemeral sandbox session authorizes stable source scopes. Each export
+attempt selects the current complete published generation for every source and
+materializes one immutable local tree. V1 does not subscribe through
+SSE/WebSocket, poll for content deltas, or rewrite files while an agent is using
+that tree. A requested refresh builds a new staging tree and atomically replaces
+the old read-only tree only after full validation. This removes daemon
+complexity and makes every local diff relative to an unambiguous delivered base.
 
-Correctness at write time does not depend on those revisions still being current.
-The backend reads current provider state and checks the delivered precondition
-before applying a changeset. Drift produces a no-op, rebase, or conflict.
+Correctness at write time does not depend on the delivered generations still
+being current. The backend reads current provider state and checks the delivered
+precondition before applying a changeset. Drift produces a no-op, rebase, or
+conflict.
 
 Desktop Live Mode and unusually long-running sandboxes may later use revision
 deltas. That is a separate capability negotiated by the client; it is not part
@@ -1523,7 +1644,7 @@ Where a host-side sidecar is unavailable, the sandbox may hold a short-lived
 Locality capability. It is deliberately less powerful than a provider token:
 
 - bound to tenant, session, profile revision, and action set;
-- open its exact export and/or propose changes only;
+- create/retry its scope-authorized export attempts and/or propose changes only;
 - no policy administration or arbitrary search;
 - short expiry and revocable session ID; and
 - current policy is rechecked on every submission.
@@ -1763,6 +1884,17 @@ Stable provider subject IDs link to Locality principals/groups; display names an
 unverified email matching never confer access.
 
 ### Policy Changes
+
+Each tenant has one monotonic active authorization epoch. Grant, group,
+principal-disablement, provider-credential-ceiling, source-scope activation/
+revocation, or provider ACL/access-set observation changes publish their
+immutable facts and advance that epoch in one transaction. Sessions retain the
+epoch they were issued under for audit, but
+export-attempt creation and retry require it to equal the tenant's active head
+and re-evaluate the selected scopes. This coarse v1 invalidation may revoke more
+sessions than strictly necessary, but it cannot leave a stale grant usable and
+does not require rewriting content. A later dependency-aware invalidation index
+may reduce blast radius without changing the session/scope protocol.
 
 Changing profile selection creates a new profile revision and changes only the
 next parameterized export query. Changing a `DataGrant`, group membership, or
@@ -2020,10 +2152,11 @@ source-controlled namespaces.
 
 - Default deny at control plane, database RLS, repository, search, export
   session, and apply layers.
-- A short-lived session capability opens only the fixed export compiled from its
+- A short-lived session capability opens only export attempts compiled from its
   tenant, workload/acting principal, current grants, immutable profile revision,
-  validated runtime filters, accepted source revisions, and quotas. It cannot
-  submit SQL or broaden any predicate.
+  ordered stable source scopes, validated runtime filters, actions, and quotas.
+  The attempt binds the current complete source generations and exact offer. It
+  cannot submit SQL or broaden any predicate.
 - The database query returns only exact authorized/selected rows. The client is
   never trusted to discard unauthorized paths, metadata, or plaintext.
 - Policy uses stable source/projection IDs. Paths are display and selection
@@ -2057,7 +2190,7 @@ source-controlled namespaces.
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Cross-tenant query or content access | Tenant cell routing, default-deny RLS, tenant-leading keys/predicates, non-owner application role, fixed parameterized export repositories, automated isolation tests.                                        |
 | Prompt injection and exfiltration    | No provider credentials in sandbox, deny-by-default egress, source content never becomes instructions, explicit bounded changesets, destructive-plan denial, narrow session capability.                       |
-| Stolen sandbox capability            | Short TTL, exact profile/filter/revision binding, one-session quotas, revocation, current-policy/freshness checks, no provider/database/cloud credential, and audit.                                          |
+| Stolen sandbox capability            | Short TTL, exact profile/filter/scope binding, attempt-bound generation/offer, one-session quotas, revocation, current-policy/freshness checks, no provider/database/cloud credential, and audit.             |
 | Database credential compromise       | Private networking, TLS, managed encryption, narrowly scoped non-owner roles, RLS, secret rotation, no standing human data-reader role, query/access audit, and time-bound break-glass.                       |
 | Object-store credential compromise   | Large attachments/explicit exports only, SSE-KMS, separate object/KMS roles, opaque tenant-scoped keys, no sandbox credentials, provider audit events.                                                        |
 | Malicious stream/path                | Backend-generated tar only, compressed/wire and decoded-byte limits, bounded Zstd window/buffers, safe `openat` extraction, no links/devices, path/collision/reserved-name validation, staged atomic publish. |
@@ -2108,8 +2241,9 @@ Every backend-visible action emits an append-only audit event with:
 - denial, conflict, retry, and failure reason.
 
 For bootstrap, the exact SQL-selected set and delivered set are the same security
-boundary. The backend always records its policy/profile/source revisions, query
-digest, file/byte counts, and completion. A customer policy may additionally
+boundary. The backend always records its policy/profile revisions, stable
+scopes, attempt-bound source generation vector, query digest, file/byte counts,
+and completion. A customer policy may additionally
 persist exact stable IDs in partitioned `session_deliveries`; default v1 avoids
 an O(entry count) audit-row write on every launch. A client- or trusted-host
 materialization receipt is useful telemetry but is not proof of what an
@@ -2151,7 +2285,8 @@ be explicit and benchmarked; it must not weaken the ordinary-file default.
 For a ready source, startup is a streaming pipeline rather than a build job:
 
 ```text
-session authorization + freshness/revision resolution + query startup
+session authorization + export-attempt revalidation/current-head resolution
++ exact metadata query startup
 + max(
     selected decoded bytes / database-to-exporter throughput,
     selected decoded bytes / server tar-and-Zstd throughput,
@@ -2175,7 +2310,7 @@ corpus containing many small files.
 Initial targets, validated per cell/platform rather than treated as vendor
 promises:
 
-- ready-session authorization, freshness check, revision selection, and query
+- ready-session authorization, attempt freshness check, generation selection, and query
   planning: P95 below 500 ms in-region;
 - first decoded tar byte: P95 below one second for a warm ready revision,
   excluding orchestrator scheduling;
@@ -2252,14 +2387,14 @@ extraction leaves the prior tree untouched.
 | ----------------------- | ------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | ACL/filter query        | Large joins, generic plans, or JSON evaluation delay first byte.          | Precompute indexed `access_set_id`/subject facts; materialize common filter columns; use a custom fixed query shape; inspect plans on representative cardinalities.          |
 | Metadata/body coupling  | Rejected rows still fetch large text/TOAST values.                        | Keep narrow projection-version rows separate from immutable bodies and join bodies only after exact selection.                                                               |
-| PostgreSQL storage      | Cold/random body reads cannot feed the link.                              | Prune identical tenant/source hash partitions, batch/order by root/export/storage IDs, use LZ4 TOAST, measure `EXPLAIN (ANALYZE, BUFFERS)`, and add a read replica first.    |
+| PostgreSQL storage      | Cold/random body reads cannot feed the link.                              | Prune identical tenant/source hash partitions, batch/order by scope/canonical path and immutable storage IDs, use LZ4 TOAST, measure `EXPLAIN (ANALYZE, BUFFERS)`, and add a read replica first. |
 | Long export transaction | Vacuum pressure or connection starvation.                                 | Bounded session/result limits, statement/idle timeouts, dedicated export pool, cancellation on disconnect, concurrency quotas, and monitoring.                               |
 | Exporter network/CPU    | TLS/tar/Zstd framing or internal hop limits throughput.                   | Colocate database/exporter, stream `COPY`/rows without buffering, use Zstd level 1 with bounded buffers, scale stateless exporter processes, and retain `identity` fallback. |
 | Tiny client             | Zstd decode, extraction, or hashing saturates one vCPU.                   | Concurrent single-frame decode and staged extraction with bounded ring buffers, no metadata import, CPU qualification on the smallest sandbox, and `identity` fallback.      |
 | Many small files        | Inode and directory creation dominate bytes.                              | Report entry count, stage locally, create bounded parallel directories/files only if measured safe, and consider an image fast path later.                                   |
 | Large attachments       | Database or gateway spends resources on opaque binaries.                  | Store individual immutable attachments in object storage, enforce size/scanning limits, and stream only selected references with backpressure.                               |
 | Concurrent sessions     | Exports starve ingestion, search, or mutations.                           | Separate connection pools/worker quotas, per-tenant/cell admission control, read replica routing, and ClickHouse only after the measured trigger.                            |
-| Replica lag             | Read replica serves older projection/policy or lacks the new session row. | Bind revision/policy/session state to commit LSNs and route only after replay covers all of them; wait or use primary, never silently downgrade.                             |
+| Replica lag             | Read replica serves older projection/policy or lacks the new session/attempt row. | Bind generation/policy/session/attempt state to commit LSNs and route only after replay covers all of them; wait or use primary, never silently downgrade.               |
 | Source lag              | Fast database export serves an old provider view.                         | Freshness gate, pending-event awareness, profile-priority sync, bounded wait/fail behavior, and provider preconditions for every write.                                      |
 | Repeat-session work     | Similar jobs repeatedly read/transmit the same bytes.                     | Measure first; later cache an exact immutable export under its full policy/profile/source/filter key with TTL and revocation checks.                                         |
 
@@ -2282,7 +2417,9 @@ POST /v1/workspace-profiles/{id}/plan
 
 POST /v1/sessions                            # consumes one-time bootstrap token
 GET  /v1/sessions/{id}
-GET  /v1/sessions/{id}/export               # exact authorized Zstd(tar) stream
+POST /v1/sessions/{id}/export-attempts       # revalidate, select heads, seal offer
+GET  /v1/sessions/{id}/export-attempts/{attempt_id}/export
+                                               # exact authorized Zstd(tar) stream
 POST /v1/sessions/{id}/cancel
 
 POST /v1/changesets                         # submits immutable changeset
@@ -2305,10 +2442,16 @@ sandbox v1 endpoint. Human-review and advisory-claim endpoints are later
 extensions to the changeset/session state machines, not v1 placeholders.
 
 Session creation validates identity, current policy, profile/runtime filters,
-source coverage/freshness, and quotas, then returns accepted revisions and
-estimates. The export endpoint accepts no new selectors: it rechecks current
-policy/freshness and runs the fixed session query under RLS. A sandbox receives
-no database, object-store, KMS, or provider credentials.
+stable source scopes, and declared limits, then returns readiness/freshness and
+estimates without preparing an archive. Export-attempt creation accepts no new
+selectors: it rechecks current authority/freshness/exact quotas under RLS,
+selects the current complete source-generation vector, and seals the exact
+offer. Its bounded opaque idempotency key is distinct from the server-issued
+attempt ID. Reusing the key after an ambiguous POST returns the same attempt,
+vector, and offer; a new key creates a new attempt that may select newer heads.
+The stream names the server-issued attempt. The current and
+previous protocol remain supported during rollout. A sandbox receives no
+database, object-store, KMS, or provider credentials.
 
 ## Mapping To The Current Codebase
 
@@ -2347,7 +2490,7 @@ one another; both compose lower shared crates.
 | `locality-connector`              | Define host-neutral provider ports and transfer values. It may depend on `locality-core`, but not local storage, daemon, UI, backend, or cloud infrastructure.                                                                                                                                                                                                                     |
 | First-party connector crates      | Own API clients/DTOs, OAuth metadata, provider retry classification, checkpoint/change observation, native fetch, render/parse/projection, attachment capture, ACL observations, source-specific validation, concurrency checks, apply, and read-back. The same crates run locally or in backend workers.                                                                          |
 | `locality-engine` (new)           | Own only the shared application workflows described below. It depends on `locality-core` and connector ports, but not SQLite, PostgreSQL, Tauri, filesystem watchers, cloud SDKs, or concrete HTTP transports.                                                                                                                                                                     |
-| `locality-protocol` (new)         | Own versioned session, export-metadata, freshness/revision, and changeset wire envelopes. Reuse or wrap domain values; do not create a second canonical identity, operation, or policy model.                                                                                                                                                                                      |
+| `locality-protocol` (new)         | Own versioned stable source-scope, session, export-attempt/generation-vector, exact-offer/metadata, freshness, and changeset wire envelopes. Reuse or wrap domain values; do not create a second canonical identity, operation, or policy model.                                                                                                                                     |
 | `locality-store` SQLite           | Remain the durable local-host store. Add the small writable-session repository and replica/profile/changeset component versions; do not import read-only entries or make PostgreSQL implement every local repository trait.                                                                                                                                                        |
 | `localityd`                       | Remain the shared local-host runtime for desktop, headless `loc`, and sandbox use. In direct mode it schedules connectors; in backend mode it bootstraps replicas and submits changesets. In both modes it owns watchers, atomic-write handling, local working-copy safety, status/diff acceleration, local journals, and platform projections. Sandbox v1 has no live-delta loop. |
 | `loc-cli`                         | Remain the common command/reporting library and `loc` binary. Commands call local-host/application boundaries and do not duplicate workflows for desktop, direct, or backend mode. The desktop UI may invoke the same library where appropriate.                                                                                                                                   |
@@ -2552,7 +2695,7 @@ paths.
   workspace pinned to an exact public revision.
 - Define the compact PostgreSQL physical schema with tenant/resource/version/
   projection/access-set/checkpoint/revision/idempotency boundaries, narrow
-  selection rows, separate body rows, source/root/export/storage locality keys,
+  selection rows, separate body rows, source/scope/path/storage locality keys,
   the four baseline index shapes, and identical tenant/source hash partitioning
   for only the three serving tables. Compare unpartitioned and small
   partition-count fixtures and record the initial cell default before production
@@ -2581,7 +2724,9 @@ streams without O(read-only entry count) SQLite writes.
   ECS execution roles and from the schema-owner migrator.
 - Implement tenants, real non-owner RLS, principals/groups, broad pilot
   DataGrants, WorkspaceProfiles, access sets/subjects, content/projection
-  versions, ready revisions, sessions, PostgreSQL jobs, audit, and retention.
+  versions, stable source scopes/memberships, ready generations,
+  scope-authorized sessions, attempt-bound generation vectors/offers,
+  PostgreSQL jobs, audit, and retention.
   Create the three serving tables with the selected fixed hash partitions,
   baseline indexes, LZ4 body compression where available, and table-specific
   fillfactor defaults; leave all other tables unpartitioned.
@@ -2591,8 +2736,9 @@ streams without O(read-only entry count) SQLite writes.
 - Implement resumable profile-prioritized backfill, scheduled sync/repair,
   immutable version creation, complete ready-revision publication, and the
   freshness wait/fail gate. Batch initial projection/content inserts by
-  source/root/export order and analyze large completed backfills.
-- Implement the exact parameterized ACL/profile/runtime selection query,
+  source/scope/canonical-path order and analyze large completed backfills.
+- Implement the exact parameterized current-head scope/ACL/profile/runtime
+  selection query, overlapping-scope deduplication without action composition,
   negotiated Zstd-or-identity streaming tar endpoint, bounded attachment
   resolution, concurrent bounded decoder/safe staged extractor, and atomic tree
   publication.
@@ -2603,8 +2749,10 @@ streams without O(read-only entry count) SQLite writes.
   limits.
 - Exchange a one-time orchestrator bootstrap token for a short-lived capability
   and ship token-only `loc sandbox init` with a plain-file cloud mount. Profile,
-  actor, workload, roots, actions, and runtime narrowing are sealed before token
-  issuance and cannot be supplied again by the sandbox command.
+  actor, workload, stable scopes, actions, limits, and runtime narrowing are
+  sealed before token issuance and cannot be supplied again by the sandbox
+  command. Export-attempt preflight selects current complete heads and seals the
+  exact offer; it is not performed during bootstrap exchange.
 - Enable RDS automated backups/PITR and S3 versioning/lifecycle, declare RPO/RTO,
   and complete an isolated restore drill before storing production customer
   data. Recovery verifies database state, attachments, secret references,
@@ -2635,7 +2783,7 @@ cell and schema.
 - Qualify cold/warm 1/10/50-session export throughput, database/exporter resource
   isolation, TOAST/body behavior, cancellation, quotas, and primary routing. Add
   a PostgreSQL read replica only if these measurements require it; gate routing
-  by the selected revision/policy and session commit LSNs.
+  by the selected generations/policy and session/attempt commit LSNs.
 
 Exit: several customer tenants mount at least two structurally different sources
 with independent watermarks. Remote edits converge even without webhook hints;
@@ -2712,6 +2860,13 @@ verification, and dedicated-cell operational runbooks are complete.
 - Old session/replica/export/profile/component versions open or migrate.
 - Newer required versions fail with `NeedsUpdate` and preserve pending work.
 - Backend serves current and previous negotiated export readers during rollout.
+- Existing v1 projection-pinned sessions always use their exact historical query
+  path and offer semantics; they are never reinterpreted as scope-authorized
+  current-head sessions. New issuance switches to v2 only after the v2 client,
+  protocol, repository, and endpoint are deployed together.
+- Retain legacy authority tables/readers for at least the maximum v1 session and
+  ambiguous-recovery TTL. Emit versioned use metrics, require zero live use, and
+  remove them only in a later forward cleanup migration with rollback evidence.
 - Direct-to-backend cutover preserves dirty/conflicted files, journals, virtual
   creates/moves/deletes, writable baselines, and apply effects.
 - The private backend builds against its exact public Git revision/Cargo lock;
@@ -2778,27 +2933,43 @@ verification, and dedicated-cell operational runbooks are complete.
   connector cooldown, auth failure, or replica backlog produces bounded wait and
   explicit bootstrapping/stale/unavailable outcomes—not a silent older export.
 - Updates immediately before, during, and after an export prove one repeatable-
-  read response contains one consistent accepted view.
+  read metadata selection contains one consistent accepted generation vector;
+  a stale/expired publisher cannot replace a newer head.
 
 ### PostgreSQL Export And Client
 
 - Exact query golden fixtures across broad grants, per-resource access sets,
   multiple groups/acting principals, roots, path/time/kind filters, exclusions,
   multiple sources, moves, tombstones, and profile revisions.
+- Scope fixtures cover parent/child and many-to-many overlap, configured scope
+  ordinal, one output/body fetch per projection, and proof that partial actions
+  from different scopes are never combined.
 - Schema/plan fixtures prove every serving-table access carries tenant/source,
   prunes the expected hash partitions, uses current-head versus historical
   revision paths correctly, and joins bodies by `content_storage_id` only after
   authorization/filter selection.
-- Ordered-ingest/export fixtures prove related source/root rows receive monotonic
-  export/storage IDs and the tar's entry order does not change logical paths or
-  canonical bytes. LZ4-storage and default-storage fixtures return identical
-  plaintext.
+- Ordered-ingest/export fixtures prove v1 keeps its reserved control member
+  first, while v2 emits parent-first directory headers, then files, then exactly
+  one final counted control member. Directory headers use `(depth,
+  logical_path)` order, and file members use
+  `(winning_scope_ordinal, parent_path, logical_path, projection_id)` under
+  bytewise `C` collation. The order does not change logical paths or canonical
+  bytes. LZ4-storage and default-storage fixtures return identical plaintext.
 - Query-plan tests prove authorization precedes limit/ranking/body fetch and
   rejected entries do not disclose path, title, size, count, timing-dependent
   top-K membership, or plaintext.
 - Tampered runtime values, unsupported operators/fields, SQL metacharacters,
   excessive limits, a session/profile mismatch, and direct export reuse after
   revocation are rejected.
+- Four authorized roots create four capability/session scope rows and zero
+  per-projection authority rows. A new descendant appears in a new attempt
+  without session reissuance. Retry after process restart remains on generation
+  A after B publishes, including old memberships/actions/paths/S3 versions;
+  active-attempt retention prevents premature garbage collection.
+- Credential-ceiling, provider ACL/access-set, scope, grant, group, or principal
+  revocation; stale heads; and exact entry/byte/attachment quota excess fail
+  both new attempts and old-attempt retries before any body reference or S3
+  object is opened.
 - Real non-owner RLS tests cover cross-tenant IDs/content/search/session queries,
   owner/`BYPASSRLS` regressions, transaction-pool context leakage, and repository
   predicates.
@@ -2807,6 +2978,10 @@ verification, and dedicated-cell operational runbooks are complete.
   collision, Unicode normalization, reserved metadata path, entry/byte/disk
   limits, disconnect cancellation, bounded pipeline backpressure, and atomic
   rollback.
+- Attempt-state tests cover successful selected-equals-delivered completion,
+  disconnect, cancellation, exact retry, concurrent replay, and database
+  commit-response ambiguity. Every non-success terminal state records exact
+  selected/delivered counts without exposing a partial tree.
 - Reserved writable metadata creates SQLite rows/baselines only for exact
   write-enabled entries; read-only entries create no shadow/three-tree/entity
   state and cannot become changeset operations.
@@ -2823,7 +2998,7 @@ verification, and dedicated-cell operational runbooks are complete.
   Run 1M-entry/read-replica/cache/ClickHouse qualifications only when those
   scales/features are targeted.
 - When a read replica is enabled, exports wait/use primary until replay LSN
-  covers selected revision/policy and session-creation commits; they never
+  covers selected generation/policy and session/attempt commits; they never
   silently serve older state or miss the session row.
 
 ### Policy And Security
@@ -2973,9 +3148,11 @@ queries, channel names, source content, or runtime filter values.
 - **Persist every delivered entry by default:** exact inventory rows can be
   policy-enabled for governance, but default counts/digests avoid an O(entry
   count) write on every read-heavy launch.
-- **Stream live deltas into every ephemeral sandbox:** an immutable start view
-  plus provider preconditions gives v1 correctness without rewriting files under
-  an agent. Live revisions remain a desktop/long-session extension.
+- **Stream live deltas into every ephemeral sandbox:** an immutable tree from one
+  export attempt plus provider preconditions gives v1 correctness without
+  rewriting files under an agent. A refresh uses a new current-head attempt and
+  atomic tree replacement; in-place live revisions remain a desktop/long-session
+  extension.
 
 ## Decisions To Validate, Not Reopen By Default
 
@@ -3017,9 +3194,10 @@ architecture:
   behavior; and
 - which sandbox products expose a safe post-cache, pre-agent injection hook.
 
-The architectural baseline is central continuous ingestion; complete ready
-revisions with explicit freshness; one managed PostgreSQL correctness and v1
-read-serving plane; exact server-side ACL/profile filtering; a transient
+The architectural baseline is central continuous ingestion; atomically published
+complete ready generations with explicit freshness; stable-scope session
+authority plus attempt-bound current generation vectors; one managed PostgreSQL
+correctness and v1 read-serving plane; exact server-side ACL/profile filtering; a transient
 Zstd-compressed streaming tar with `identity` fallback rather than stored packs;
 object storage only for large attachments/explicit exports; managed database
 snapshots/PITR; ordinary local files; writable-only three-tree state;

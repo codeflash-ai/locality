@@ -1,0 +1,19 @@
+{
+  "versions": {
+    "session": 2,
+    "replica": 2,
+    "export_metadata": 2,
+    "writable_session_store": 1,
+    "canonical": 1,
+    "path": 1,
+    "changeset": 1
+  },
+  "opaque_session_capability": "opaque-session-capability",
+  "idempotency_key": "mount-attempt-2026-07-23T19:00:00Z",
+  "content_encoding": "zstd",
+  "limits": {
+    "max_files": 10000,
+    "max_directories": 10000,
+    "max_content_bytes": 104857600
+  }
+}
