@@ -7,6 +7,7 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use locality_core::portable::{
     ExportAttemptId, LogicalPath, ProjectionFileKind, ProjectionId, SessionId, SourceAction,
@@ -242,6 +243,8 @@ enum V2ArchiveMutation {
     ReceiptBodyDigestMismatch,
     ReceiptGenerationMismatch,
     ReceiptCountMismatch,
+    BodyCorrupt,
+    UnauthorizedExtraPath,
 }
 
 fn v2_offer_and_archive(mutation: V2ArchiveMutation) -> (SealedExportOffer, Vec<u8>) {
@@ -371,7 +374,39 @@ fn v2_offer_and_archive(mutation: V2ArchiveMutation) -> (SealedExportOffer, Vec<
     builder
         .append_pax_extensions(pax.iter().map(|(key, value)| (*key, value.as_bytes())))
         .expect("append file PAX metadata");
-    append_test_member(&mut builder, &TestMember::file("docs/readme.md", body));
+    let delivered_body = if matches!(mutation, V2ArchiveMutation::BodyCorrupt) {
+        b"scope corrupted!\n".as_slice()
+    } else {
+        body.as_slice()
+    };
+    append_test_member(
+        &mut builder,
+        &TestMember::file("docs/readme.md", delivered_body),
+    );
+    if matches!(mutation, V2ArchiveMutation::UnauthorizedExtraPath) {
+        let extra_body = b"not authorized\n";
+        let extra_sha256 = sha256_label(Sha256::digest(extra_body).into());
+        let extra_projection_id = ProjectionId::new("projection-unauthorized");
+        let extra_pax = [
+            (PAX_SOURCE_CONNECTION_ID, source_connection_id.as_str()),
+            (PAX_PROJECTION_ID, extra_projection_id.as_str()),
+            (PAX_WINNING_SCOPE_ORDINAL, "0"),
+            (PAX_FILE_KIND, "markdown"),
+            (PAX_EFFECTIVE_ACTIONS, "[\"read\"]"),
+            (PAX_CONTENT_SHA256, extra_sha256.as_str()),
+        ];
+        builder
+            .append_pax_extensions(
+                extra_pax
+                    .iter()
+                    .map(|(key, value)| (*key, value.as_bytes())),
+            )
+            .expect("append unauthorized file PAX metadata");
+        append_test_member(
+            &mut builder,
+            &TestMember::file("docs/unauthorized.md", extra_body),
+        );
+    }
     let terminal_control = ExportTerminalControlV2 {
         writable_metadata,
         completion_receipt: receipt,
@@ -541,6 +576,16 @@ fn scope_authorized_malformed_metadata_receipts_and_order_roll_back() {
             V2ArchiveMutation::ReceiptCountMismatch,
             "completion receipt does not match sealed export offer",
         ),
+        (
+            "v2-corrupt-body",
+            V2ArchiveMutation::BodyCorrupt,
+            "a file body does not match its content digest",
+        ),
+        (
+            "v2-unauthorized-extra-path",
+            V2ArchiveMutation::UnauthorizedExtraPath,
+            "canonical export inventory does not match sealed offer",
+        ),
     ] {
         let root = TestDirectory::new(label);
         let (offer, archive) = v2_offer_and_archive(mutation);
@@ -554,6 +599,328 @@ fn scope_authorized_malformed_metadata_receipts_and_order_roll_back() {
         assert!(error.contains(expected), "{label}: {error}");
         root.assert_no_staging_or_destination();
     }
+}
+
+const REAL_WORLD_DIRECTORY_COUNT: u64 = 614;
+const REAL_WORLD_FILE_COUNT: u64 = 667;
+const REAL_WORLD_CONTENT_BYTES: u64 = 47 * 1024 * 1024;
+
+#[derive(Clone)]
+struct StressFile {
+    order_key: CanonicalFileOrderKey,
+    file_kind: ProjectionFileKind,
+    byte_length: usize,
+    fill: u8,
+}
+
+fn stress_file_body(file: &StressFile) -> Vec<u8> {
+    if file.order_key.logical_path.as_str().ends_with("page.md") {
+        return b"# General Teamspace\n\nReal-world scope fixture.\n".to_vec();
+    }
+    vec![file.fill; file.byte_length]
+}
+
+fn real_world_scope_offer_and_archive() -> (SealedExportOffer, Vec<u8>) {
+    let source_connection_id = SourceConnectionId::new("source-notion-real-world");
+    let source_generations = vec![OrderedSourceGeneration {
+        ordinal: 0,
+        source_connection_id: source_connection_id.clone(),
+        source_generation_id: SourceGenerationId::new("generation-real-world")
+            .expect("generation ID"),
+    }];
+
+    let mut directories = (0..600)
+        .map(|index| format!("root-{index:03}"))
+        .collect::<Vec<_>>();
+    let mut deep_path = "root-000".to_string();
+    for depth in 0..14 {
+        deep_path.push_str(&format!("/d{depth:02}"));
+        directories.push(deep_path.clone());
+    }
+    assert_eq!(directories.len() as u64, REAL_WORLD_DIRECTORY_COUNT);
+    directories.sort_by_key(|path| CanonicalDirectoryOrderKey {
+        depth: path.split('/').count() as u32,
+        logical_path: LogicalPath::new(path).expect("stress directory path"),
+    });
+
+    let markdown = b"# General Teamspace\n\nReal-world scope fixture.\n";
+    let binary_count = REAL_WORLD_FILE_COUNT as usize - 2;
+    let binary_bytes = REAL_WORLD_CONTENT_BYTES as usize - markdown.len();
+    let base_binary_bytes = binary_bytes / binary_count;
+    let extra_binary_bytes = binary_bytes % binary_count;
+    let mut files = Vec::with_capacity(REAL_WORLD_FILE_COUNT as usize);
+    files.push(StressFile {
+        order_key: CanonicalFileOrderKey {
+            winning_scope_ordinal: 0,
+            parent_path: Some(LogicalPath::new("root-000").expect("zero-byte parent")),
+            logical_path: LogicalPath::new("root-000/empty.bin").expect("zero-byte path"),
+            projection_id: ProjectionId::new("projection-empty"),
+        },
+        file_kind: ProjectionFileKind::Binary,
+        byte_length: 0,
+        fill: 0,
+    });
+    files.push(StressFile {
+        order_key: CanonicalFileOrderKey {
+            winning_scope_ordinal: 0,
+            parent_path: Some(LogicalPath::new(&deep_path).expect("deep parent")),
+            logical_path: LogicalPath::new(format!("{deep_path}/page.md"))
+                .expect("deep Markdown path"),
+            projection_id: ProjectionId::new("projection-page"),
+        },
+        file_kind: ProjectionFileKind::Markdown,
+        byte_length: markdown.len(),
+        fill: 0,
+    });
+    for index in 0..binary_count {
+        let parent = format!("root-{:03}", index % 100);
+        files.push(StressFile {
+            order_key: CanonicalFileOrderKey {
+                winning_scope_ordinal: 0,
+                parent_path: Some(LogicalPath::new(&parent).expect("blob parent")),
+                logical_path: LogicalPath::new(format!("{parent}/blob-{index:04}.bin"))
+                    .expect("blob path"),
+                projection_id: ProjectionId::new(format!("projection-blob-{index:04}")),
+            },
+            file_kind: ProjectionFileKind::Binary,
+            byte_length: base_binary_bytes + usize::from(index < extra_binary_bytes),
+            fill: (index % 251) as u8,
+        });
+    }
+    files.sort_by(|left, right| left.order_key.cmp(&right.order_key));
+    assert_eq!(files.len() as u64, REAL_WORLD_FILE_COUNT);
+
+    let mut builder = Builder::new(Vec::new());
+    let mut records =
+        Vec::with_capacity((REAL_WORLD_DIRECTORY_COUNT + REAL_WORLD_FILE_COUNT + 1) as usize);
+    for path in &directories {
+        let order_key = CanonicalDirectoryOrderKey {
+            depth: path.split('/').count() as u32,
+            logical_path: LogicalPath::new(path).expect("stress directory path"),
+        };
+        records.push(CanonicalExportRecord::Directory {
+            order_key: order_key.clone(),
+        });
+        append_test_member(&mut builder, &TestMember::directory(format!("{path}/")));
+    }
+
+    let mut body_digest = DeliveredBodyDigestV2::new(REAL_WORLD_FILE_COUNT);
+    let actions = BTreeSet::from([SourceAction::Read]);
+    let mut materialized_bytes = 0_u64;
+    for file in &files {
+        let body = stress_file_body(file);
+        assert_eq!(body.len(), file.byte_length);
+        materialized_bytes += body.len() as u64;
+        let content_sha256 = sha256_label(Sha256::digest(&body).into());
+        body_digest
+            .update_file(&file.order_key.projection_id, &body)
+            .expect("update stress body digest");
+        records.push(CanonicalExportRecord::File {
+            order_key: file.order_key.clone(),
+            source_connection_id: source_connection_id.clone(),
+            file_kind: file.file_kind.clone(),
+            effective_actions: actions.clone(),
+            content_sha256: content_sha256.clone(),
+            byte_length: body.len() as u64,
+        });
+        let file_kind = match file.file_kind {
+            ProjectionFileKind::Markdown => "markdown",
+            ProjectionFileKind::Binary => "binary",
+            _ => unreachable!("stress fixture only uses Markdown and binary files"),
+        };
+        let pax = [
+            (PAX_SOURCE_CONNECTION_ID, source_connection_id.as_str()),
+            (PAX_PROJECTION_ID, file.order_key.projection_id.as_str()),
+            (PAX_WINNING_SCOPE_ORDINAL, "0"),
+            (PAX_FILE_KIND, file_kind),
+            (PAX_EFFECTIVE_ACTIONS, "[\"read\"]"),
+            (PAX_CONTENT_SHA256, content_sha256.as_str()),
+        ];
+        builder
+            .append_pax_extensions(pax.iter().map(|(key, value)| (*key, value.as_bytes())))
+            .expect("append stress file PAX metadata");
+        append_test_member(
+            &mut builder,
+            &TestMember::file(file.order_key.logical_path.as_str(), body),
+        );
+    }
+    assert_eq!(materialized_bytes, REAL_WORLD_CONTENT_BYTES);
+    records.push(CanonicalExportRecord::Control {
+        order_key: CanonicalControlOrderKey { ordinal: 0 },
+        member_path: locality_protocol::RESERVED_EXPORT_METADATA_PATH.to_string(),
+    });
+
+    let writable_metadata = ScopeAuthorizedWritableExportMetadata {
+        versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+        session_id: SessionId::new("session-real-world"),
+        export_attempt_id: ExportAttemptId::new("attempt-real-world").expect("attempt ID"),
+        source_generations: source_generations.clone(),
+        writable_entries: Vec::new(),
+    };
+    let inventory_sha256 =
+        canonical_export_inventory_sha256(&records).expect("canonical stress inventory");
+    let writable_metadata_sha256 =
+        canonical_writable_metadata_sha256(&writable_metadata).expect("writable metadata digest");
+    let archive_entry_count = REAL_WORLD_DIRECTORY_COUNT + REAL_WORLD_FILE_COUNT + 1;
+    let offer = SealedExportOffer {
+        versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+        session_id: writable_metadata.session_id.clone(),
+        export_attempt_id: writable_metadata.export_attempt_id.clone(),
+        source_generations: source_generations.clone(),
+        media_type: "application/x-tar".to_string(),
+        content_encoding: TarContentEncoding::Identity,
+        limits: ExportAttemptLimits {
+            max_files: REAL_WORLD_FILE_COUNT,
+            max_directories: REAL_WORLD_DIRECTORY_COUNT,
+            max_content_bytes: REAL_WORLD_CONTENT_BYTES,
+        },
+        control_entry_count: 1,
+        file_count: REAL_WORLD_FILE_COUNT,
+        directory_count: REAL_WORLD_DIRECTORY_COUNT,
+        archive_entry_count,
+        selected_content_bytes: REAL_WORLD_CONTENT_BYTES,
+        inventory_sha256: inventory_sha256.clone(),
+        writable_metadata_sha256: writable_metadata_sha256.clone(),
+        sealed_at: "2026-07-23T20:00:00Z".to_string(),
+        expires_at: "2026-07-23T20:10:00Z".to_string(),
+    };
+    offer
+        .validate_inventory(&records)
+        .expect("valid stress offer inventory");
+    let terminal_control = ExportTerminalControlV2 {
+        writable_metadata,
+        completion_receipt: ExportCompletionReceipt {
+            versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+            session_id: offer.session_id.clone(),
+            export_attempt_id: offer.export_attempt_id.clone(),
+            source_generations,
+            inventory_sha256,
+            writable_metadata_sha256,
+            delivered_control_entry_count: 1,
+            delivered_file_count: REAL_WORLD_FILE_COUNT,
+            delivered_directory_count: REAL_WORLD_DIRECTORY_COUNT,
+            delivered_archive_entry_count: archive_entry_count,
+            delivered_content_bytes: REAL_WORLD_CONTENT_BYTES,
+            delivered_body_sha256: body_digest.finish().expect("stress body digest"),
+            completed_at: "2026-07-23T20:00:03Z".to_string(),
+        },
+    };
+    append_test_member(
+        &mut builder,
+        &TestMember::file(
+            locality_protocol::RESERVED_EXPORT_METADATA_PATH,
+            serde_json::to_vec(&terminal_control).expect("serialize stress terminal control"),
+        ),
+    );
+    builder.finish().expect("finish real-world v2 tar");
+    (
+        offer,
+        builder.into_inner().expect("collect real-world v2 tar"),
+    )
+}
+
+#[test]
+fn scope_authorized_real_world_archive_streams_identity_and_zstd_atomically() {
+    for (label, encoding, chunk_size) in [
+        (
+            "v2-real-world-identity",
+            ReplicaArchiveEncoding::Identity,
+            4093,
+        ),
+        ("v2-real-world-zstd", ReplicaArchiveEncoding::Zstd, 8191),
+    ] {
+        let root = TestDirectory::new(label);
+        let (mut offer, tar) = real_world_scope_offer_and_archive();
+        let archive = match encoding {
+            ReplicaArchiveEncoding::Identity => tar,
+            ReplicaArchiveEncoding::Zstd => {
+                offer.content_encoding = TarContentEncoding::Zstd;
+                zstd::stream::encode_all(tar.as_slice(), 1).expect("compress stress v2 tar")
+            }
+        };
+        let started = Instant::now();
+        let summary = materialize_scope_authorized_replica_archive(
+            ReplicaArchive::new(
+                encoding,
+                ChunkedReader {
+                    inner: Cursor::new(archive),
+                    chunk_size,
+                },
+            ),
+            &root.destination(),
+            ReplicaMaterializationLimits::default(),
+            &offer,
+        )
+        .expect("materialize real-world scope archive");
+        eprintln!(
+            "{label}: materialized {} files, {} directories, and {} bytes in {:?}",
+            summary.files,
+            summary.directories,
+            summary.materialized_bytes,
+            started.elapsed()
+        );
+
+        assert_eq!(summary.entries, 1_282);
+        assert_eq!(summary.files, REAL_WORLD_FILE_COUNT);
+        assert_eq!(summary.directories, REAL_WORLD_DIRECTORY_COUNT);
+        assert_eq!(summary.materialized_bytes, REAL_WORLD_CONTENT_BYTES);
+        assert_eq!(
+            fs::read(root.destination().join("root-000/empty.bin")).expect("read empty file"),
+            b""
+        );
+        assert_eq!(
+            fs::read(
+                root.destination().join(
+                    "root-000/d00/d01/d02/d03/d04/d05/d06/d07/d08/d09/d10/d11/d12/d13/page.md"
+                )
+            )
+            .expect("read deep Markdown file"),
+            b"# General Teamspace\n\nReal-world scope fixture.\n"
+        );
+        assert_eq!(
+            fs::metadata(root.destination().join("root-099/blob-0099.bin"))
+                .expect("stat repeated-parent binary")
+                .len(),
+            74_110
+        );
+        assert!(!root.destination().join(".loc").exists());
+        assert_modes(&root.destination(), 0o555);
+        assert_modes(&root.destination().join("root-000"), 0o555);
+        assert_modes(&root.destination().join("root-000/empty.bin"), 0o444);
+    }
+}
+
+#[test]
+fn scope_authorized_repeat_initialization_preserves_first_publication() {
+    let root = TestDirectory::new("v2-repeat-destination");
+    let (offer, archive) = v2_offer_and_archive(V2ArchiveMutation::None);
+    materialize_v2(
+        archive.clone(),
+        ReplicaArchiveEncoding::Identity,
+        &offer,
+        &root.destination(),
+    )
+    .expect("first initialization publishes");
+
+    let error = materialize_v2(
+        archive,
+        ReplicaArchiveEncoding::Identity,
+        &offer,
+        &root.destination(),
+    )
+    .expect_err("repeat initialization must not replace an existing destination");
+    assert_eq!(
+        error,
+        format!(
+            "replica destination already exists: {}",
+            root.destination().display()
+        )
+    );
+    assert_eq!(
+        fs::read(root.destination().join("docs/readme.md")).expect("read first publication"),
+        b"scope authorized\n"
+    );
+    assert!(!root.destination().join(".loc").exists());
 }
 
 #[test]

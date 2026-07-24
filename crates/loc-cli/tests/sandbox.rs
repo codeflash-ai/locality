@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use loc_cli::sandbox::{
     SandboxBootstrapToken, SandboxContentEncodingPreference, SandboxInitError, SandboxInitOptions,
@@ -18,15 +18,15 @@ use locality_core::portable::{
     SourceConnectionId, SourceGenerationId,
 };
 use locality_protocol::{
-    COMPONENT_VERSIONS, CanonicalControlOrderKey, CanonicalExportRecord, CanonicalFileOrderKey,
-    ComponentVersions, DeliveredBodyDigestV2, ExportAttemptLimits, ExportAttemptRequest,
-    ExportCompletionReceipt, ExportTerminalControlV2, FreshnessRequirement,
-    OpaqueBootstrapExchangeRequest, OrderedSourceGeneration, PAX_CONTENT_SHA256,
-    PAX_EFFECTIVE_ACTIONS, PAX_FILE_KIND, PAX_PROJECTION_ID, PAX_SOURCE_CONNECTION_ID,
-    PAX_WINNING_SCOPE_ORDINAL, SCOPE_AUTHORIZED_COMPONENT_VERSIONS, SandboxSessionState,
-    SandboxSessionStatus, ScopeAuthorizedWritableExportMetadata, SealedExportOffer,
-    SessionCapability, SessionErrorCode, SessionProtocolError, StaleSessionBehavior,
-    TarContentEncoding, TarExportOffer, canonical_export_inventory_sha256,
+    COMPONENT_VERSIONS, CanonicalControlOrderKey, CanonicalDirectoryOrderKey,
+    CanonicalExportRecord, CanonicalFileOrderKey, ComponentVersions, DeliveredBodyDigestV2,
+    ExportAttemptLimits, ExportAttemptRequest, ExportCompletionReceipt, ExportTerminalControlV2,
+    FreshnessRequirement, OpaqueBootstrapExchangeRequest, OrderedSourceGeneration,
+    PAX_CONTENT_SHA256, PAX_EFFECTIVE_ACTIONS, PAX_FILE_KIND, PAX_PROJECTION_ID,
+    PAX_SOURCE_CONNECTION_ID, PAX_WINNING_SCOPE_ORDINAL, SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+    SandboxSessionState, SandboxSessionStatus, ScopeAuthorizedWritableExportMetadata,
+    SealedExportOffer, SessionCapability, SessionErrorCode, SessionProtocolError,
+    StaleSessionBehavior, TarContentEncoding, TarExportOffer, canonical_export_inventory_sha256,
     canonical_writable_metadata_sha256,
 };
 use localityd::replica_materializer::ReplicaMaterializationLimits;
@@ -74,6 +74,7 @@ struct ResponseFixture {
     body: Vec<u8>,
     declared_content_length: Option<usize>,
     split_after: Option<(usize, Duration)>,
+    body_chunk_size: Option<usize>,
     staging_gate: Option<(PathBuf, PathBuf, PathBuf)>,
 }
 
@@ -85,6 +86,7 @@ impl ResponseFixture {
             body: serde_json::to_vec(value).expect("serialize response"),
             declared_content_length: None,
             split_after: None,
+            body_chunk_size: None,
             staging_gate: None,
         }
     }
@@ -99,6 +101,7 @@ impl ResponseFixture {
             body,
             declared_content_length: None,
             split_after: None,
+            body_chunk_size: None,
             staging_gate: None,
         }
     }
@@ -119,6 +122,12 @@ impl ResponseFixture {
 
     fn with_split_after(mut self, bytes: usize, pause: Duration) -> Self {
         self.split_after = Some((bytes, pause));
+        self
+    }
+
+    fn with_body_chunk_size(mut self, bytes: usize) -> Self {
+        assert!(bytes > 0, "response chunk size must be positive");
+        self.body_chunk_size = Some(bytes);
         self
     }
 
@@ -417,6 +426,116 @@ fn scope_authorized_export_attempts_materialize_identity_and_zstd() {
 }
 
 #[test]
+fn scope_authorized_real_world_export_streams_through_the_client() {
+    let directory = TestDirectory::new("scope-real-world");
+    let capability = capability();
+    let status = scope_ready_status(capability.session_id.clone());
+    let (offer, tar) = real_world_scope_export_fixture(TarContentEncoding::Zstd);
+    let compressed = zstd::stream::encode_all(tar.as_slice(), 1).expect("compress stress tar");
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&capability),
+        ResponseFixture::json(&status),
+        ResponseFixture::json(&offer),
+        ResponseFixture::export("zstd", compressed).with_body_chunk_size(4093),
+    ]);
+
+    let started = Instant::now();
+    let report = run_sandbox_init_with_encoding(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: directory.root(),
+        },
+        SandboxBootstrapToken::new("scope-real-world-bootstrap").expect("token"),
+        SandboxContentEncodingPreference::Zstd,
+    )
+    .expect("stream and materialize real-world scope export");
+    eprintln!(
+        "scope real-world client materialization: {} files, {} directories, {} bytes in {:?}",
+        report.files,
+        report.directories,
+        report.materialized_bytes,
+        started.elapsed()
+    );
+
+    assert_eq!(report.entries, 1_282);
+    assert_eq!(report.files, 667);
+    assert_eq!(report.directories, 614);
+    assert_eq!(report.materialized_bytes, 47 * 1024 * 1024);
+    assert_eq!(
+        fs::read(directory.root().join("root-000/empty.bin")).expect("read zero-byte file"),
+        b""
+    );
+    assert_eq!(
+        fs::read(
+            directory
+                .root()
+                .join("root-000/d00/d01/d02/d03/d04/d05/d06/d07/d08/d09/d10/d11/d12/d13/page.md")
+        )
+        .expect("read deep Markdown file"),
+        b"# General Teamspace\n\nReal-world scope fixture.\n"
+    );
+    assert_eq!(
+        fs::metadata(directory.root().join("root-099/blob-0099.bin"))
+            .expect("stat repeated-parent binary")
+            .len(),
+        74_110
+    );
+    assert!(!directory.root().join(".loc").exists());
+    assert_test_mode(&directory.root(), 0o555);
+    assert_test_mode(&directory.root().join("root-000/empty.bin"), 0o444);
+
+    let _ = server.request();
+    let _ = server.request();
+    let _ = server.request();
+    let export = server.request();
+    assert_eq!(export.headers.get("accept-encoding").unwrap(), "zstd");
+}
+
+#[test]
+fn scope_authorized_repeat_initialization_reports_destination_conflict() {
+    let directory = TestDirectory::new("scope-repeat-destination");
+    let capability = capability();
+    let status = scope_ready_status(capability.session_id.clone());
+    let (offer, tar) = scope_export_fixture(TarContentEncoding::Identity);
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&capability),
+        ResponseFixture::json(&status),
+        ResponseFixture::json(&offer),
+        ResponseFixture::export("identity", tar),
+    ]);
+    let options = SandboxInitOptions {
+        api_url: server.api_url.clone(),
+        root: directory.root(),
+    };
+
+    run_sandbox_init_with_encoding(
+        options.clone(),
+        SandboxBootstrapToken::new("scope-first-bootstrap").expect("token"),
+        SandboxContentEncodingPreference::Identity,
+    )
+    .expect("first initialization publishes");
+    let error = run_sandbox_init_with_encoding(
+        options,
+        SandboxBootstrapToken::new("scope-repeat-bootstrap").expect("token"),
+        SandboxContentEncodingPreference::Identity,
+    )
+    .expect_err("repeat initialization must not replace existing publication");
+
+    assert_eq!(error.code(), "destination_invalid");
+    assert!(error.to_string().contains("already exists"));
+    assert!(!error.to_string().contains("scope-repeat-bootstrap"));
+    assert_eq!(
+        fs::read(directory.root().join("readme.md")).expect("read first publication"),
+        b"scope v2\n"
+    );
+    assert!(!directory.root().join(".loc").exists());
+    for _ in 0..4 {
+        let _ = server.request();
+    }
+    server.assert_no_request();
+}
+
+#[test]
 fn malformed_scope_offer_fails_before_stream_without_identifier_leaks() {
     let directory = TestDirectory::new("scope-malformed-offer");
     let capability = capability();
@@ -458,6 +577,38 @@ fn malformed_scope_offer_fails_before_stream_without_identifier_leaks() {
     let _ = server.request();
     let _ = server.request();
     server.assert_no_request();
+}
+
+#[test]
+fn scope_authorized_extra_path_is_rejected_without_partial_publication() {
+    let directory = TestDirectory::new("scope-unauthorized-extra");
+    let capability = capability();
+    let status = scope_ready_status(capability.session_id.clone());
+    let (offer, tar) =
+        scope_export_fixture_with_unauthorized_extra(TarContentEncoding::Identity, true);
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&capability),
+        ResponseFixture::json(&status),
+        ResponseFixture::json(&offer),
+        ResponseFixture::export("identity", tar).with_body_chunk_size(73),
+    ]);
+
+    let error = run_sandbox_init_with_encoding(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: directory.root(),
+        },
+        SandboxBootstrapToken::new("scope-unauthorized-bootstrap").expect("token"),
+        SandboxContentEncodingPreference::Identity,
+    )
+    .expect_err("an extra path outside the sealed inventory must fail");
+
+    assert_eq!(error.code(), "materialization_failed");
+    assert!(!error.to_string().contains("scope-unauthorized-bootstrap"));
+    assert!(!directory.root().exists());
+    for _ in 0..4 {
+        let _ = server.request();
+    }
 }
 
 #[test]
@@ -866,6 +1017,7 @@ fn bearer_authenticated_redirect_is_not_followed() {
             body: Vec::new(),
             declared_content_length: None,
             split_after: None,
+            body_chunk_size: None,
             staging_gate: None,
         },
     ]);
@@ -1040,6 +1192,7 @@ fn version_session_offer_media_and_response_encoding_are_validated() {
                 body: tar.clone(),
                 declared_content_length: None,
                 split_after: None,
+                body_chunk_size: None,
                 staging_gate: None,
             }),
             "backend_protocol_invalid",
@@ -1422,6 +1575,13 @@ fn scope_ready_status(session_id: SessionId) -> SandboxSessionStatus {
 }
 
 fn scope_export_fixture(encoding: TarContentEncoding) -> (SealedExportOffer, Vec<u8>) {
+    scope_export_fixture_with_unauthorized_extra(encoding, false)
+}
+
+fn scope_export_fixture_with_unauthorized_extra(
+    encoding: TarContentEncoding,
+    unauthorized_extra: bool,
+) -> (SealedExportOffer, Vec<u8>) {
     let body = b"scope v2\n";
     let content_sha256 = sha256_label(body);
     let source_connection_id = SourceConnectionId::new("source-notion");
@@ -1523,6 +1683,27 @@ fn scope_export_fixture(encoding: TarContentEncoding) -> (SealedExportOffer, Vec
         .append_pax_extensions(pax.map(|(key, value)| (key, value.as_bytes())))
         .expect("append scope PAX metadata");
     append_tar_member(&mut builder, b"readme.md", body);
+    if unauthorized_extra {
+        let extra_body = b"unauthorized\n";
+        let extra_sha256 = sha256_label(extra_body);
+        let extra_projection_id = ProjectionId::new("projection-unauthorized");
+        let extra_pax = [
+            (PAX_SOURCE_CONNECTION_ID, source_connection_id.as_str()),
+            (PAX_PROJECTION_ID, extra_projection_id.as_str()),
+            (PAX_WINNING_SCOPE_ORDINAL, "0"),
+            (PAX_FILE_KIND, "markdown"),
+            (PAX_EFFECTIVE_ACTIONS, "[\"read\"]"),
+            (PAX_CONTENT_SHA256, extra_sha256.as_str()),
+        ];
+        builder
+            .append_pax_extensions(
+                extra_pax
+                    .iter()
+                    .map(|(key, value)| (*key, value.as_bytes())),
+            )
+            .expect("append unauthorized PAX metadata");
+        append_tar_member(&mut builder, b"unauthorized.md", extra_body);
+    }
     append_tar_member(
         &mut builder,
         locality_protocol::RESERVED_EXPORT_METADATA_PATH.as_bytes(),
@@ -1530,6 +1711,246 @@ fn scope_export_fixture(encoding: TarContentEncoding) -> (SealedExportOffer, Vec
     );
     builder.finish().expect("finish scope tar");
     (offer, builder.into_inner().expect("collect scope tar"))
+}
+
+#[derive(Clone)]
+struct RealWorldFile {
+    order_key: CanonicalFileOrderKey,
+    file_kind: ProjectionFileKind,
+    byte_length: usize,
+    fill: u8,
+}
+
+fn real_world_file_body(file: &RealWorldFile) -> Vec<u8> {
+    if file.order_key.logical_path.as_str().ends_with("page.md") {
+        b"# General Teamspace\n\nReal-world scope fixture.\n".to_vec()
+    } else {
+        vec![file.fill; file.byte_length]
+    }
+}
+
+fn real_world_scope_export_fixture(encoding: TarContentEncoding) -> (SealedExportOffer, Vec<u8>) {
+    const DIRECTORY_COUNT: u64 = 614;
+    const FILE_COUNT: u64 = 667;
+    const CONTENT_BYTES: u64 = 47 * 1024 * 1024;
+
+    let source_connection_id = SourceConnectionId::new("source-notion-real-world");
+    let source_generations = vec![OrderedSourceGeneration {
+        ordinal: 0,
+        source_connection_id: source_connection_id.clone(),
+        source_generation_id: SourceGenerationId::new("generation-real-world")
+            .expect("generation ID"),
+    }];
+    let mut directories = (0..600)
+        .map(|index| format!("root-{index:03}"))
+        .collect::<Vec<_>>();
+    let mut deep_path = "root-000".to_string();
+    for depth in 0..14 {
+        deep_path.push_str(&format!("/d{depth:02}"));
+        directories.push(deep_path.clone());
+    }
+    directories.sort_by_key(|path| CanonicalDirectoryOrderKey {
+        depth: path.split('/').count() as u32,
+        logical_path: LogicalPath::new(path).expect("directory path"),
+    });
+    assert_eq!(directories.len() as u64, DIRECTORY_COUNT);
+
+    let markdown = b"# General Teamspace\n\nReal-world scope fixture.\n";
+    let binary_count = FILE_COUNT as usize - 2;
+    let binary_bytes = CONTENT_BYTES as usize - markdown.len();
+    let base_binary_bytes = binary_bytes / binary_count;
+    let extra_binary_bytes = binary_bytes % binary_count;
+    let mut files = vec![
+        RealWorldFile {
+            order_key: CanonicalFileOrderKey {
+                winning_scope_ordinal: 0,
+                parent_path: Some(LogicalPath::new("root-000").expect("empty parent")),
+                logical_path: LogicalPath::new("root-000/empty.bin").expect("empty path"),
+                projection_id: ProjectionId::new("projection-empty"),
+            },
+            file_kind: ProjectionFileKind::Binary,
+            byte_length: 0,
+            fill: 0,
+        },
+        RealWorldFile {
+            order_key: CanonicalFileOrderKey {
+                winning_scope_ordinal: 0,
+                parent_path: Some(LogicalPath::new(&deep_path).expect("deep parent")),
+                logical_path: LogicalPath::new(format!("{deep_path}/page.md"))
+                    .expect("deep page path"),
+                projection_id: ProjectionId::new("projection-page"),
+            },
+            file_kind: ProjectionFileKind::Markdown,
+            byte_length: markdown.len(),
+            fill: 0,
+        },
+    ];
+    for index in 0..binary_count {
+        let parent = format!("root-{:03}", index % 100);
+        files.push(RealWorldFile {
+            order_key: CanonicalFileOrderKey {
+                winning_scope_ordinal: 0,
+                parent_path: Some(LogicalPath::new(&parent).expect("binary parent")),
+                logical_path: LogicalPath::new(format!("{parent}/blob-{index:04}.bin"))
+                    .expect("binary path"),
+                projection_id: ProjectionId::new(format!("projection-blob-{index:04}")),
+            },
+            file_kind: ProjectionFileKind::Binary,
+            byte_length: base_binary_bytes + usize::from(index < extra_binary_bytes),
+            fill: (index % 251) as u8,
+        });
+    }
+    files.sort_by(|left, right| left.order_key.cmp(&right.order_key));
+    assert_eq!(files.len() as u64, FILE_COUNT);
+
+    let mut records = Vec::with_capacity((DIRECTORY_COUNT + FILE_COUNT + 1) as usize);
+    let mut builder = Builder::new(Vec::new());
+    for path in &directories {
+        records.push(CanonicalExportRecord::Directory {
+            order_key: CanonicalDirectoryOrderKey {
+                depth: path.split('/').count() as u32,
+                logical_path: LogicalPath::new(path).expect("directory path"),
+            },
+        });
+        append_tar_directory(&mut builder, format!("{path}/").as_bytes());
+    }
+
+    let actions = BTreeSet::from([SourceAction::Read]);
+    let mut body_digest = DeliveredBodyDigestV2::new(FILE_COUNT);
+    let mut content_bytes = 0_u64;
+    for file in &files {
+        let body = real_world_file_body(file);
+        assert_eq!(body.len(), file.byte_length);
+        content_bytes += body.len() as u64;
+        let content_sha256 = sha256_label(&body);
+        body_digest
+            .update_file(&file.order_key.projection_id, &body)
+            .expect("update real-world body digest");
+        records.push(CanonicalExportRecord::File {
+            order_key: file.order_key.clone(),
+            source_connection_id: source_connection_id.clone(),
+            file_kind: file.file_kind.clone(),
+            effective_actions: actions.clone(),
+            content_sha256: content_sha256.clone(),
+            byte_length: body.len() as u64,
+        });
+        let file_kind = match file.file_kind {
+            ProjectionFileKind::Markdown => "markdown",
+            ProjectionFileKind::Binary => "binary",
+            _ => unreachable!("real-world fixture only uses Markdown and binary files"),
+        };
+        let pax = [
+            (PAX_SOURCE_CONNECTION_ID, source_connection_id.as_str()),
+            (PAX_PROJECTION_ID, file.order_key.projection_id.as_str()),
+            (PAX_WINNING_SCOPE_ORDINAL, "0"),
+            (PAX_FILE_KIND, file_kind),
+            (PAX_EFFECTIVE_ACTIONS, "[\"read\"]"),
+            (PAX_CONTENT_SHA256, content_sha256.as_str()),
+        ];
+        builder
+            .append_pax_extensions(pax.iter().map(|(key, value)| (*key, value.as_bytes())))
+            .expect("append real-world PAX metadata");
+        append_tar_member(
+            &mut builder,
+            file.order_key.logical_path.as_str().as_bytes(),
+            &body,
+        );
+    }
+    assert_eq!(content_bytes, CONTENT_BYTES);
+    records.push(CanonicalExportRecord::Control {
+        order_key: CanonicalControlOrderKey { ordinal: 0 },
+        member_path: locality_protocol::RESERVED_EXPORT_METADATA_PATH.to_string(),
+    });
+
+    let writable_metadata = ScopeAuthorizedWritableExportMetadata {
+        versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+        session_id: SessionId::new("session-7"),
+        export_attempt_id: ExportAttemptId::new("attempt-real-world").expect("attempt ID"),
+        source_generations: source_generations.clone(),
+        writable_entries: Vec::new(),
+    };
+    let inventory_sha256 =
+        canonical_export_inventory_sha256(&records).expect("canonical real-world inventory");
+    let writable_metadata_sha256 =
+        canonical_writable_metadata_sha256(&writable_metadata).expect("writable metadata digest");
+    let archive_entry_count = DIRECTORY_COUNT + FILE_COUNT + 1;
+    let offer = SealedExportOffer {
+        versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+        session_id: writable_metadata.session_id.clone(),
+        export_attempt_id: writable_metadata.export_attempt_id.clone(),
+        source_generations: source_generations.clone(),
+        media_type: "application/x-tar".to_string(),
+        content_encoding: encoding,
+        limits: ExportAttemptLimits {
+            max_files: ReplicaMaterializationLimits::default()
+                .max_entries
+                .saturating_sub(1),
+            max_directories: ReplicaMaterializationLimits::default()
+                .max_entries
+                .saturating_sub(1),
+            max_content_bytes: ReplicaMaterializationLimits::default().max_disk_bytes,
+        },
+        control_entry_count: 1,
+        file_count: FILE_COUNT,
+        directory_count: DIRECTORY_COUNT,
+        archive_entry_count,
+        selected_content_bytes: CONTENT_BYTES,
+        inventory_sha256: inventory_sha256.clone(),
+        writable_metadata_sha256: writable_metadata_sha256.clone(),
+        sealed_at: "2026-07-23T20:00:01Z".to_string(),
+        expires_at: "2026-07-23T20:10:01Z".to_string(),
+    };
+    offer
+        .validate_inventory(&records)
+        .expect("valid real-world inventory");
+    let terminal_control = ExportTerminalControlV2 {
+        writable_metadata,
+        completion_receipt: ExportCompletionReceipt {
+            versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+            session_id: offer.session_id.clone(),
+            export_attempt_id: offer.export_attempt_id.clone(),
+            source_generations,
+            inventory_sha256,
+            writable_metadata_sha256,
+            delivered_control_entry_count: 1,
+            delivered_file_count: FILE_COUNT,
+            delivered_directory_count: DIRECTORY_COUNT,
+            delivered_archive_entry_count: archive_entry_count,
+            delivered_content_bytes: CONTENT_BYTES,
+            delivered_body_sha256: body_digest.finish().expect("real-world body digest"),
+            completed_at: "2026-07-23T20:00:03Z".to_string(),
+        },
+    };
+    append_tar_member(
+        &mut builder,
+        locality_protocol::RESERVED_EXPORT_METADATA_PATH.as_bytes(),
+        &serde_json::to_vec(&terminal_control).expect("serialize terminal control"),
+    );
+    builder.finish().expect("finish real-world scope tar");
+    (
+        offer,
+        builder.into_inner().expect("collect real-world scope tar"),
+    )
+}
+
+fn append_tar_directory(builder: &mut Builder<Vec<u8>>, path: &[u8]) {
+    assert!(path.len() <= 100);
+    let mut header = Header::new_gnu();
+    header.set_entry_type(EntryType::dir());
+    header.set_mode(0o555);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header.set_size(0);
+    {
+        let bytes = header.as_mut_bytes();
+        bytes[..100].fill(0);
+        bytes[..path.len()].copy_from_slice(path);
+    }
+    header.set_cksum();
+    builder
+        .append(&header, std::io::empty())
+        .expect("append tar directory");
 }
 
 fn append_tar_member(builder: &mut Builder<Vec<u8>>, path: &[u8], body: &[u8]) {
@@ -1665,9 +2086,11 @@ fn write_response(stream: &mut TcpStream, response: ResponseFixture) {
     write!(stream, "\r\n").expect("finish response headers");
     if let Some((split_after, pause)) = response.split_after {
         let split_after = split_after.min(response.body.len());
-        stream
-            .write_all(&response.body[..split_after])
-            .expect("write first response body chunk");
+        write_response_body(
+            stream,
+            &response.body[..split_after],
+            response.body_chunk_size,
+        );
         stream.flush().expect("flush first response body chunk");
         if let Some((parent, logical_path, destination)) = &response.staging_gate {
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -1698,21 +2121,55 @@ fn write_response(stream: &mut TcpStream, response: ResponseFixture) {
             }
         }
         thread::sleep(pause);
-        stream
-            .write_all(&response.body[split_after..])
-            .expect("write remaining response body");
+        write_response_body(
+            stream,
+            &response.body[split_after..],
+            response.body_chunk_size,
+        );
     } else {
-        stream
-            .write_all(&response.body)
-            .expect("write response body");
+        write_response_body(stream, &response.body, response.body_chunk_size);
     }
     stream.flush().expect("flush response");
+}
+
+fn write_response_body(stream: &mut TcpStream, body: &[u8], chunk_size: Option<usize>) {
+    let chunk_size = chunk_size.unwrap_or(body.len().max(1));
+    for chunk in body.chunks(chunk_size) {
+        stream.write_all(chunk).expect("write response body chunk");
+    }
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+#[cfg(unix)]
+fn assert_test_mode(path: &Path, expected: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        fs::metadata(path)
+            .expect("read test mode")
+            .permissions()
+            .mode()
+            & 0o7777,
+        expected,
+        "mode for {}",
+        path.display()
+    );
+}
+
+#[cfg(not(unix))]
+fn assert_test_mode(path: &Path, _expected: u32) {
+    assert!(
+        fs::metadata(path)
+            .expect("read test permissions")
+            .permissions()
+            .readonly(),
+        "{} must be read-only",
+        path.display()
+    );
 }
 
 fn make_removable(path: &Path) {
