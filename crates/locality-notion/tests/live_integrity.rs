@@ -252,7 +252,7 @@ fn live_page_read_edit_write_verify_integrity_with_external_media_references() {
         verified_render
             .document
             .body
-            .contains("![W3C test image](../.loc/media/live-integrity/block-coverage/image-")
+            .contains(&format!("![W3C test image]({LIVE_IMAGE_URL})"))
     );
 }
 
