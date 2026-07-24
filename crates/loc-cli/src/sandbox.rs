@@ -22,8 +22,9 @@ use locality_protocol::{
 };
 use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 use localityd::replica_materializer::{
-    ExpectedReplicaMaterializationReceipt, ReplicaMaterializationLimits,
-    ReplicaMaterializationSummary, materialize_replica_archive_with_expected_receipt,
+    ExpectedReplicaMaterializationReceipt, ReplicaMaterializationError,
+    ReplicaMaterializationLimits, ReplicaMaterializationSummary,
+    materialize_replica_archive_with_expected_receipt,
     materialize_scope_authorized_replica_archive,
 };
 use reqwest::StatusCode;
@@ -44,6 +45,7 @@ const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const BOOTSTRAP_EXCHANGE_ATTEMPTS: usize = 2;
 const EXPORT_ATTEMPT_CREATION_ATTEMPTS: usize = 2;
+const EXPORT_ATTEMPT_STREAM_ATTEMPTS: usize = 2;
 const BOOTSTRAP_IDEMPOTENCY_DOMAIN: &[u8] = b"locality.session-exchange-idempotency.v1\0";
 const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
 const EXPORT_READ_AHEAD_CHUNK_BYTES: usize = 64 * 1024;
@@ -444,7 +446,7 @@ fn run_sandbox_init_internal(
     let status = client.session_status(&capability)?;
     mark_profile(&mut profile, PROFILE_SESSION_STATUS);
     let session = validate_status(&capability, &status)?;
-    let (encoding, response, limits, validation) = match session {
+    let (encoding, summary) = match session {
         ValidatedSandboxSession::Legacy {
             offer,
             expected_receipt,
@@ -452,32 +454,103 @@ fn run_sandbox_init_internal(
             validate_encoding_preference(offer, content_encoding)?;
             let limits = limits_for_offer(offer)?;
             let (encoding, response) = client.open_export(&capability, offer, content_encoding)?;
-            (
-                encoding,
+            mark_profile(&mut profile, PROFILE_EXPORT_OPEN_HEADERS);
+            let summary = materialize_export_response(
                 response,
+                encoding,
+                &root,
                 limits,
-                ExportValidation::Legacy(expected_receipt),
+                &ExportValidation::Legacy(expected_receipt),
+                profile.as_deref_mut(),
             )
+            .map_err(|failure| failure.error)?;
+            (encoding, summary)
         }
         ValidatedSandboxSession::ScopeAuthorized => {
             let request = export_attempt_request(&capability, content_encoding)?;
             let offer = client.create_export_attempt(&capability, &request)?;
             validate_scope_offer(&capability, &request, &offer)?;
             let limits = limits_for_scope_offer(&offer)?;
-            let (encoding, response) = client.open_export_attempt(&capability, &offer)?;
-            (
-                encoding,
-                response,
-                limits,
-                ExportValidation::ScopeAuthorized(offer),
-            )
+            let validation = ExportValidation::ScopeAuthorized(offer);
+            let mut last_retryable_error = None;
+            let mut completed = None;
+            for attempt in 0..EXPORT_ATTEMPT_STREAM_ATTEMPTS {
+                let (encoding, response) =
+                    match client.open_export_attempt(&capability, validation.scope_offer()) {
+                        Ok(opened) => opened,
+                        Err(failure)
+                            if failure.retryable
+                                && has_retry_remaining(attempt, EXPORT_ATTEMPT_STREAM_ATTEMPTS) =>
+                        {
+                            last_retryable_error = Some(failure.error);
+                            continue;
+                        }
+                        Err(failure) => return Err(failure.error),
+                    };
+                mark_profile(&mut profile, PROFILE_EXPORT_OPEN_HEADERS);
+                match materialize_export_response(
+                    response,
+                    encoding,
+                    &root,
+                    limits,
+                    &validation,
+                    profile.as_deref_mut(),
+                ) {
+                    Ok(summary) => {
+                        completed = Some((encoding, summary));
+                        break;
+                    }
+                    Err(failure)
+                        if failure.retryable
+                            && has_retry_remaining(attempt, EXPORT_ATTEMPT_STREAM_ATTEMPTS) =>
+                    {
+                        last_retryable_error = Some(failure.error);
+                    }
+                    Err(failure) => return Err(failure.error),
+                }
+            }
+            completed.ok_or_else(|| {
+                last_retryable_error.unwrap_or_else(|| {
+                    SandboxInitError::Materialization(
+                        "sandbox export retry ended without a result".to_string(),
+                    )
+                })
+            })?
         }
     };
-    mark_profile(&mut profile, PROFILE_EXPORT_OPEN_HEADERS);
+
+    Ok(report(&root, &capability, encoding, summary))
+}
+
+struct ExportStreamFailure {
+    error: SandboxInitError,
+    retryable: bool,
+}
+
+impl ExportStreamFailure {
+    fn fatal(error: SandboxInitError) -> Self {
+        Self {
+            error,
+            retryable: false,
+        }
+    }
+}
+
+fn materialize_export_response(
+    response: Response,
+    encoding: ReplicaArchiveEncoding,
+    root: &Path,
+    limits: ReplicaMaterializationLimits,
+    validation: &ExportValidation,
+    mut profile: Option<&mut SandboxInitProfile>,
+) -> Result<ReplicaMaterializationSummary, ExportStreamFailure> {
     let (body, mut producer) =
-        spawn_export_read_ahead(response).map_err(|error| SandboxInitError::Http {
-            operation: "session export read-ahead setup",
-            detail: error.to_string(),
+        spawn_export_read_ahead(response).map_err(|error| ExportStreamFailure {
+            error: SandboxInitError::Http {
+                operation: "session export read-ahead setup",
+                detail: error.to_string(),
+            },
+            retryable: false,
         })?;
     let profiled_body = ProfiledExportBody::new(body, profile.as_deref_mut());
     let archive = ReplicaArchive::new(encoding, profiled_body);
@@ -485,21 +558,31 @@ fn run_sandbox_init_internal(
         ExportValidation::Legacy(expected_receipt) => {
             materialize_replica_archive_with_expected_receipt(
                 archive,
-                &root,
+                root,
                 limits,
-                expected_receipt,
+                *expected_receipt,
             )
         }
         ExportValidation::ScopeAuthorized(offer) => {
-            materialize_scope_authorized_replica_archive(archive, &root, limits, &offer)
+            materialize_scope_authorized_replica_archive(archive, root, limits, offer)
         }
-    }
-    .map_err(|error| SandboxInitError::Materialization(error.to_string()));
+    };
     let producer_outcome = producer.join();
-    mark_profile(&mut profile, PROFILE_STREAM_DECODE_MATERIALIZE);
+    if let Some(profile) = profile {
+        profile.mark(PROFILE_STREAM_DECODE_MATERIALIZE);
+    }
 
-    let summary = match materialization {
-        Err(error) => return Err(error),
+    match materialization {
+        Err(error) => {
+            let retryable = matches!(
+                producer_outcome,
+                Ok(ReadAheadProducerOutcome::ErrorDelivered)
+            ) && is_retryable_truncated_materialization(&error);
+            Err(ExportStreamFailure {
+                error: SandboxInitError::Materialization(error.to_string()),
+                retryable,
+            })
+        }
         Ok(summary) => {
             match producer_outcome {
                 Ok(ReadAheadProducerOutcome::CleanEof) => {}
@@ -507,21 +590,39 @@ fn run_sandbox_init_internal(
                     ReadAheadProducerOutcome::ConsumerClosed
                     | ReadAheadProducerOutcome::ErrorDelivered,
                 ) => {
-                    return Err(SandboxInitError::Materialization(
-                        "sandbox export transport ended without a clean EOF".to_string(),
-                    ));
+                    return Err(ExportStreamFailure {
+                        error: SandboxInitError::Materialization(
+                            "sandbox export transport ended without a clean EOF".to_string(),
+                        ),
+                        retryable: false,
+                    });
                 }
                 Err(()) => {
-                    return Err(SandboxInitError::Materialization(
-                        "sandbox export read-ahead worker panicked".to_string(),
-                    ));
+                    return Err(ExportStreamFailure {
+                        error: SandboxInitError::Materialization(
+                            "sandbox export read-ahead worker panicked".to_string(),
+                        ),
+                        retryable: false,
+                    });
                 }
             }
-            summary
+            Ok(summary)
         }
-    };
+    }
+}
 
-    Ok(report(&root, &capability, encoding, summary))
+fn is_retryable_truncated_materialization(error: &ReplicaMaterializationError) -> bool {
+    match error {
+        ReplicaMaterializationError::Decode(message)
+        | ReplicaMaterializationError::MalformedTar(message) => {
+            message.contains("sandbox export transport read failed")
+        }
+        ReplicaMaterializationError::MissingTarEndMarker => true,
+        ReplicaMaterializationError::Write { source, .. } => source
+            .to_string()
+            .contains("sandbox export transport read failed"),
+        _ => false,
+    }
 }
 
 fn mark_profile(profile: &mut Option<&mut SandboxInitProfile>, phase: &'static str) {
@@ -768,6 +869,15 @@ enum ValidatedSandboxSession<'a> {
 enum ExportValidation {
     Legacy(ExpectedReplicaMaterializationReceipt),
     ScopeAuthorized(SealedExportOffer),
+}
+
+impl ExportValidation {
+    fn scope_offer(&self) -> &SealedExportOffer {
+        match self {
+            Self::ScopeAuthorized(offer) => offer,
+            Self::Legacy(_) => unreachable!("legacy export validation has no scope offer"),
+        }
+    }
 }
 
 fn validate_status<'a>(
@@ -1275,7 +1385,7 @@ impl SandboxHttpClient {
         &self,
         capability: &SessionCapability,
         offer: &SealedExportOffer,
-    ) -> Result<(ReplicaArchiveEncoding, Response), SandboxInitError> {
+    ) -> Result<(ReplicaArchiveEncoding, Response), ExportStreamFailure> {
         let response = self
             .export_client
             .get(self.export_attempt_url(
@@ -1292,22 +1402,31 @@ impl SandboxHttpClient {
             )
             .bearer_auth(&capability.opaque_capability)
             .send()
-            .map_err(|error| SandboxInitError::Http {
-                operation: "export-attempt stream",
-                detail: error.without_url().to_string(),
-            })?;
-        ensure_success(&response, "export-attempt stream")?;
-        require_media_type(response.headers(), "export-attempt stream", TAR_MEDIA_TYPE)?;
-        let encoding = response_encoding(response.headers())?;
-        if protocol_encoding(encoding) != offer.content_encoding {
-            return Err(SandboxInitError::UnsupportedExportEncoding(format!(
-                "{} (sealed {})",
-                encoding_name(encoding),
-                match offer.content_encoding {
-                    TarContentEncoding::Identity => "identity",
-                    TarContentEncoding::Zstd => "zstd",
+            .map_err(|error| {
+                let retryable = error.is_connect() || error.is_timeout() || error.is_body();
+                ExportStreamFailure {
+                    error: SandboxInitError::Http {
+                        operation: "export-attempt stream",
+                        detail: error.without_url().to_string(),
+                    },
+                    retryable,
                 }
-            )));
+            })?;
+        ensure_success(&response, "export-attempt stream").map_err(ExportStreamFailure::fatal)?;
+        require_media_type(response.headers(), "export-attempt stream", TAR_MEDIA_TYPE)
+            .map_err(ExportStreamFailure::fatal)?;
+        let encoding = response_encoding(response.headers()).map_err(ExportStreamFailure::fatal)?;
+        if protocol_encoding(encoding) != offer.content_encoding {
+            return Err(ExportStreamFailure::fatal(
+                SandboxInitError::UnsupportedExportEncoding(format!(
+                    "{} (sealed {})",
+                    encoding_name(encoding),
+                    match offer.content_encoding {
+                        TarContentEncoding::Identity => "identity",
+                        TarContentEncoding::Zstd => "zstd",
+                    }
+                )),
+            ));
         }
         Ok((encoding, response))
     }
