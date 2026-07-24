@@ -526,6 +526,110 @@ fn scope_authorized_two_truncated_gets_fail_without_stale_tree() {
 }
 
 #[test]
+fn scope_authorized_clean_eof_missing_tar_end_marker_retries_the_same_attempt_once() {
+    let directory = TestDirectory::new("scope-clean-eof-retry");
+    let capability = capability();
+    let status = scope_ready_status(capability.session_id.clone());
+    let (offer, tar) = scope_export_fixture(TarContentEncoding::Identity);
+    let truncated = without_second_tar_end_block(&tar);
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&capability),
+        ResponseFixture::json(&status),
+        ResponseFixture::json(&offer),
+        ResponseFixture::export("identity", truncated),
+        ResponseFixture::export("identity", tar),
+    ]);
+
+    let report = run_sandbox_init_with_encoding(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: directory.root(),
+        },
+        SandboxBootstrapToken::new("scope-clean-eof-bootstrap").expect("token"),
+        SandboxContentEncodingPreference::Identity,
+    )
+    .expect("retry the clean-EOF truncated sealed export attempt");
+
+    assert_eq!(report.files, 1);
+    assert_eq!(
+        fs::read(directory.root().join("readme.md")).expect("read published retry"),
+        b"scope v2\n"
+    );
+    assert_no_staging_directories(
+        directory
+            .root()
+            .parent()
+            .expect("replica destination parent"),
+    );
+
+    let bootstrap = server.request();
+    let status = server.request();
+    let attempt = server.request();
+    let first_get = server.request();
+    let second_get = server.request();
+    assert_eq!(bootstrap.method, "POST");
+    assert_eq!(status.method, "GET");
+    assert_eq!(attempt.method, "POST");
+    assert_eq!(attempt.path, "/v1/sessions/session-7/export-attempts");
+    assert_eq!(first_get.method, "GET");
+    assert_eq!(second_get.method, "GET");
+    assert_eq!(first_get.path, second_get.path);
+    assert_eq!(
+        first_get.path,
+        "/v1/sessions/session-7/export-attempts/attempt-scope/export"
+    );
+}
+
+#[test]
+fn scope_authorized_two_clean_eof_missing_tar_end_markers_exhaust_the_bounded_retry() {
+    let directory = TestDirectory::new("scope-clean-eof-twice");
+    let capability = capability();
+    let status = scope_ready_status(capability.session_id.clone());
+    let (offer, tar) = scope_export_fixture(TarContentEncoding::Identity);
+    let truncated = without_second_tar_end_block(&tar);
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&capability),
+        ResponseFixture::json(&status),
+        ResponseFixture::json(&offer),
+        ResponseFixture::export("identity", truncated.clone()),
+        ResponseFixture::export("identity", truncated),
+    ]);
+
+    let error = run_sandbox_init_with_encoding(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: directory.root(),
+        },
+        SandboxBootstrapToken::new("scope-clean-eof-bootstrap").expect("token"),
+        SandboxContentEncodingPreference::Identity,
+    )
+    .expect_err("two clean-EOF truncated responses must exhaust the bounded retry");
+
+    assert_eq!(error.code(), "materialization_failed");
+    assert!(!directory.root().exists());
+    assert_no_staging_directories(
+        directory
+            .root()
+            .parent()
+            .expect("replica destination parent"),
+    );
+    let _bootstrap = server.request();
+    let _status = server.request();
+    let attempt = server.request();
+    let first_get = server.request();
+    let second_get = server.request();
+    assert_eq!(attempt.method, "POST");
+    assert_eq!(attempt.path, "/v1/sessions/session-7/export-attempts");
+    assert_eq!(first_get.method, "GET");
+    assert_eq!(second_get.method, "GET");
+    assert_eq!(first_get.path, second_get.path);
+    assert_eq!(
+        first_get.path,
+        "/v1/sessions/session-7/export-attempts/attempt-scope/export"
+    );
+}
+
+#[test]
 fn scope_authorized_real_world_export_streams_through_the_client() {
     let directory = TestDirectory::new("scope-real-world");
     let capability = capability();
@@ -2132,6 +2236,22 @@ fn tar_file(path: &[u8], body: &[u8]) -> Vec<u8> {
     builder.append(&header, body).expect("append tar fixture");
     builder.finish().expect("finish tar fixture");
     builder.into_inner().expect("collect tar fixture")
+}
+
+fn without_second_tar_end_block(tar: &[u8]) -> Vec<u8> {
+    const TAR_BLOCK_BYTES: usize = 512;
+
+    let last_nonzero = tar
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .expect("tar fixture contains a non-zero member");
+    let member_end = (last_nonzero + 1).div_ceil(TAR_BLOCK_BYTES) * TAR_BLOCK_BYTES;
+    let truncated_len = member_end + TAR_BLOCK_BYTES;
+    assert!(
+        tar.len() >= truncated_len + TAR_BLOCK_BYTES,
+        "tar fixture must contain both end-marker blocks"
+    );
+    tar[..truncated_len].to_vec()
 }
 
 fn read_request(stream: &mut TcpStream) -> CapturedRequest {

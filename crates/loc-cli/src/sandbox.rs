@@ -574,10 +574,16 @@ fn materialize_export_response(
 
     match materialization {
         Err(error) => {
-            let retryable = matches!(
-                producer_outcome,
-                Ok(ReadAheadProducerOutcome::ErrorDelivered)
-            ) && is_retryable_truncated_materialization(&error);
+            let retryable = matches!(validation, ExportValidation::ScopeAuthorized(_))
+                && match producer_outcome {
+                    Ok(ReadAheadProducerOutcome::ErrorDelivered) => {
+                        is_retryable_truncated_materialization(&error)
+                    }
+                    Ok(ReadAheadProducerOutcome::CleanEof) => {
+                        matches!(&error, ReplicaMaterializationError::MissingTarEndMarker)
+                    }
+                    Ok(ReadAheadProducerOutcome::ConsumerClosed) | Err(()) => false,
+                };
             Err(ExportStreamFailure {
                 error: SandboxInitError::Materialization(error.to_string()),
                 retryable,
