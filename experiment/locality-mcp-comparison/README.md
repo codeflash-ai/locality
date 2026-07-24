@@ -102,6 +102,7 @@ export SSH_TARGET="$(amika sandbox ssh --print "$SANDBOX")"
 export LOCALITY_SANDBOX="$SANDBOX"
 export LOCALITY_USE_EXISTING_STATE=1
 export LOCALITY_CONTEXT_HYDRATE=0
+export LOCALITY_SKIP_TARGET_LOCATE=1
 ```
 
 If the multi-source roots are known, pass them explicitly. Use newline
@@ -117,8 +118,10 @@ EOF
 ```
 
 The worker still locates and pulls the target Notion output page unless the run
-is MCP-only. `LOCALITY_CONTEXT_HYDRATE=0` applies only to the listed context
-directories and is intended for prehydrated sandboxes.
+is MCP-only or `LOCALITY_SKIP_TARGET_LOCATE=1` is set. Use the skip flag only
+for artifact-only runs; mounted page writes and pushes need the target parent.
+`LOCALITY_CONTEXT_HYDRATE=0` applies only to the listed context directories and
+is intended for prehydrated sandboxes.
 
 Verify Locality:
 
@@ -237,6 +240,7 @@ export LOCALITY_SANDBOX="$SANDBOX"
 export MCP_SANDBOX=aseem-mcp
 export LOCALITY_USE_EXISTING_STATE=1
 export LOCALITY_CONTEXT_HYDRATE=0
+export LOCALITY_SKIP_TARGET_LOCATE=1
 
 CODEX_MODEL=gpt-5.6-luna CODEX_REASONING_EFFORT=low \
   ./experiment/locality-mcp-comparison/run-agent-comparison.sh \

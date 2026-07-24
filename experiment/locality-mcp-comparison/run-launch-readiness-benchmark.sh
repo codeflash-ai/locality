@@ -40,6 +40,9 @@ Important environment:
   LOCALITY_CONTEXT_HYDRATE Pull all context directories before running the
                            Locality agent. Default: 1. Set 0 for a sandbox that
                            already has prehydrated multi-source files.
+  LOCALITY_SKIP_TARGET_LOCATE
+                           Skip target Notion locate/pull. Use only for
+                           artifact-only runs that do not write mounted pages.
   CODEX_MODEL              Model passed to codex exec. Default: gpt-5.6-luna
   CODEX_REASONING_EFFORT   Codex reasoning effort. Default: low
   CODEX_SANDBOX_OUT_DIR    Agent-visible OUT_DIR for scenarios after scenario1.
@@ -150,6 +153,7 @@ CONTEXT_PULL_PATHS="${CONTEXT_PULL_PATHS:-}"
 CONTEXT_SEARCH_QUERY="${CONTEXT_SEARCH_QUERY:-benchmark|launch readiness|safe diff|push|review|Live Mode|File Provider|Windows Cloud Files|distribution|Homebrew|install|connector|standup|blocker|risk}"
 LOCALITY_CONTEXT_DIRS="${LOCALITY_CONTEXT_DIRS:-${LOCALITY_CONTEXT_ROOTS:-}}"
 LOCALITY_CONTEXT_HYDRATE="${LOCALITY_CONTEXT_HYDRATE:-1}"
+LOCALITY_SKIP_TARGET_LOCATE="${LOCALITY_SKIP_TARGET_LOCATE:-0}"
 SINCE="${SINCE:-24 hours ago}"
 BASE_REF="${BASE_REF:-origin/main}"
 REPORT_TZ="${REPORT_TZ:-Asia/Kolkata}"
@@ -218,6 +222,16 @@ case "$LOCALITY_CONTEXT_HYDRATE" in
   0|1) ;;
   *) echo "LOCALITY_CONTEXT_HYDRATE must be 0 or 1" >&2; exit 2 ;;
 esac
+
+case "$LOCALITY_SKIP_TARGET_LOCATE" in
+  0|1) ;;
+  *) echo "LOCALITY_SKIP_TARGET_LOCATE must be 0 or 1" >&2; exit 2 ;;
+esac
+
+if [ "$LOCALITY_SKIP_TARGET_LOCATE" = "1" ] && { [ "$WRITE_MOUNTED_PAGE" = "1" ] || [ "$PUSH" -eq 1 ]; }; then
+  echo "LOCALITY_SKIP_TARGET_LOCATE=1 is only valid for artifact-only runs" >&2
+  exit 2
+fi
 
 mkdir -p "$OUT_DIR" "$TRACE_DIR" "$SCENARIO_ROOT"
 export LOCALITY_TRACE_RUN_ID="$RUN_ID"
@@ -1311,24 +1325,32 @@ PARENT_DIR=""
 locality_add_dirs=()
 if [ "$RUN_LOCALITY_AGENT" -eq 1 ]; then
   phase_start
-  PAGE_PATH="$(run_loc_traced "target-locate" "$LOC_BIN" locate "$TARGET_URL")"
-  phase_end "locality" "notion_target_locate" "ok" "path=$PAGE_PATH; trace=$TRACE_DIR/target-locate.jsonl"
+  if [ "$LOCALITY_SKIP_TARGET_LOCATE" = "1" ]; then
+    phase_end "locality" "notion_target_locate" "skipped" "artifact-only; target locate disabled"
+  else
+    PAGE_PATH="$(run_loc_traced "target-locate" "$LOC_BIN" locate "$TARGET_URL")"
+    phase_end "locality" "notion_target_locate" "ok" "path=$PAGE_PATH; trace=$TRACE_DIR/target-locate.jsonl"
+  fi
 
   phase_start
-  set +e
-  run_loc_traced "target-pull" "$LOC_BIN" pull "$PAGE_PATH" > "$OUT_DIR/loc-pull.out" 2> "$OUT_DIR/loc-pull.err"
-  PULL_RC=$?
-  set -e
-  PULL_DETAIL="$(tr '\n' ' ' < "$OUT_DIR/loc-pull.out" | sed 's/[[:space:]]*$//')"
-  if [ "$PULL_RC" -eq 0 ]; then
-    phase_end "locality" "notion_target_prehydrate" "ok" "path=$PAGE_PATH; trace=$TRACE_DIR/target-pull.jsonl; $PULL_DETAIL"
-  elif grep -qi "dirty" "$OUT_DIR/loc-pull.out" "$OUT_DIR/loc-pull.err"; then
-    phase_end "locality" "notion_target_prehydrate" "ok" "path=$PAGE_PATH; trace=$TRACE_DIR/target-pull.jsonl; pull skipped dirty target"
+  if [ "$LOCALITY_SKIP_TARGET_LOCATE" = "1" ]; then
+    phase_end "locality" "notion_target_prehydrate" "skipped" "artifact-only; target locate disabled"
   else
-    phase_end "locality" "notion_target_prehydrate" "failed" "exit=$PULL_RC; path=$PAGE_PATH; trace=$TRACE_DIR/target-pull.jsonl"
-    cat "$OUT_DIR/loc-pull.out" >&2
-    cat "$OUT_DIR/loc-pull.err" >&2
-    exit "$PULL_RC"
+    set +e
+    run_loc_traced "target-pull" "$LOC_BIN" pull "$PAGE_PATH" > "$OUT_DIR/loc-pull.out" 2> "$OUT_DIR/loc-pull.err"
+    PULL_RC=$?
+    set -e
+    PULL_DETAIL="$(tr '\n' ' ' < "$OUT_DIR/loc-pull.out" | sed 's/[[:space:]]*$//')"
+    if [ "$PULL_RC" -eq 0 ]; then
+      phase_end "locality" "notion_target_prehydrate" "ok" "path=$PAGE_PATH; trace=$TRACE_DIR/target-pull.jsonl; $PULL_DETAIL"
+    elif grep -qi "dirty" "$OUT_DIR/loc-pull.out" "$OUT_DIR/loc-pull.err"; then
+      phase_end "locality" "notion_target_prehydrate" "ok" "path=$PAGE_PATH; trace=$TRACE_DIR/target-pull.jsonl; pull skipped dirty target"
+    else
+      phase_end "locality" "notion_target_prehydrate" "failed" "exit=$PULL_RC; path=$PAGE_PATH; trace=$TRACE_DIR/target-pull.jsonl"
+      cat "$OUT_DIR/loc-pull.out" >&2
+      cat "$OUT_DIR/loc-pull.err" >&2
+      exit "$PULL_RC"
+    fi
   fi
 
   phase_start
@@ -1401,13 +1423,17 @@ if [ "$RUN_LOCALITY_AGENT" -eq 1 ]; then
   phase_end "locality" "notion_context_search" "ok" "files=$inventory_count; hits=$search_hits; query=$CONTEXT_SEARCH_QUERY"
 
   phase_start
-  PARENT_DIR="$(dirname "$PAGE_PATH")"
+  if [ -n "$PAGE_PATH" ]; then
+    PARENT_DIR="$(dirname "$PAGE_PATH")"
+  fi
   while IFS= read -r context_path; do
     if [ -n "$context_path" ]; then
       locality_add_dirs+=("$context_path")
     fi
   done < "$CONTEXT_PATHS_FILE"
-  locality_add_dirs+=("$(dirname "$PAGE_PATH")")
+  if [ -n "$PAGE_PATH" ]; then
+    locality_add_dirs+=("$(dirname "$PAGE_PATH")")
+  fi
   phase_end "locality" "prepare_context_add_dirs" "ok" "dirs=${#locality_add_dirs[@]}"
 else
   : > "$CONTEXT_PATHS_FILE"
@@ -1440,6 +1466,10 @@ for scenario_file in "${SCENARIO_FILES[@]}"; do
   phase_start
   REPORT_PAGE_PATH=""
   if [ "$WRITE_MOUNTED_PAGE" = "1" ]; then
+    if [ -z "$PARENT_DIR" ]; then
+      echo "cannot write mounted page without target parent; unset LOCALITY_SKIP_TARGET_LOCATE" >&2
+      exit 2
+    fi
     REPORT_PAGE_PATH="$PARENT_DIR/$SCENARIO_REPORT_TITLE/page.md"
     if [ ! -f "$REPORT_PAGE_PATH" ]; then
       "$LOC_BIN" create page --title "$SCENARIO_REPORT_TITLE" --parent "$PARENT_DIR" --json > "$SCENARIO_OUT_DIR/loc-create-page.json"

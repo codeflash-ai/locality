@@ -40,6 +40,8 @@ Environment:
                                   Locality context directories.
   LOCALITY_CONTEXT_HYDRATE       Passed through to the worker. Set 0 when
                                   LOCALITY_CONTEXT_DIRS are already hydrated.
+  LOCALITY_SKIP_TARGET_LOCATE    Passed through to the worker for artifact-only
+                                  runs that do not need a mounted output page.
   SYNC_ARTIFACTS                 Copy remote OUT_DIRs back locally. Default: 1.
 
 Any remaining arguments are passed to run-launch-readiness-benchmark.sh.
@@ -145,6 +147,7 @@ forwarded_worker_env_b64() {
     LOCALITY_CONTEXT_DIRS
     LOCALITY_CONTEXT_ROOTS
     LOCALITY_CONTEXT_HYDRATE
+    LOCALITY_SKIP_TARGET_LOCATE
     LOCALITY_EXPERIMENT_TRACE_FORCE_DIRECT
     SINCE
     BASE_REF
