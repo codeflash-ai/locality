@@ -1,0 +1,39 @@
+{
+  "versions": {
+    "session": 2,
+    "replica": 2,
+    "export_metadata": 2,
+    "writable_session_store": 1,
+    "canonical": 1,
+    "path": 1,
+    "changeset": 1
+  },
+  "session_id": "session-7",
+  "state": "ready",
+  "freshness_requirement": {
+    "max_age_seconds": 300,
+    "on_stale": "wait_then_fail",
+    "wait_timeout_seconds": 30
+  },
+  "replicas": [
+    {
+      "source_connection_id": "source-notion",
+      "state": "fresh",
+      "coverage_complete": true,
+      "provider_observed_through": "notion-repair:108",
+      "last_successful_sync_at": "2026-07-19T11:58:00Z",
+      "last_repair_at": "2026-07-19T11:55:00Z",
+      "pending_events": 0,
+      "backlog": 0,
+      "provider_cooldown_until": null
+    }
+  ],
+  "export_attempt_limits": {
+    "max_files": 10000,
+    "max_directories": 10000,
+    "max_content_bytes": 104857600
+  },
+  "export_offer": null,
+  "error": null,
+  "updated_at": "2026-07-23T20:00:00Z"
+}

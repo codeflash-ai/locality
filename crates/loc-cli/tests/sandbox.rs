@@ -407,6 +407,7 @@ fn scope_authorized_export_attempts_materialize_identity_and_zstd() {
         request.validate().expect("valid export-attempt request");
         assert_eq!(request.content_encoding, protocol_encoding);
         assert_eq!(request.opaque_session_capability, "capability-secret");
+        assert_eq!(request.limits, scope_attempt_limits());
         assert!(request.idempotency_key.starts_with("loc-export-v2-"));
         assert_eq!(request.idempotency_key.len(), 78);
         idempotency_keys.push(request.idempotency_key);
@@ -478,6 +479,139 @@ fn scope_authorized_truncated_get_retries_the_same_attempt_once() {
         first_get.path,
         "/v1/sessions/session-7/export-attempts/attempt-scope/export"
     );
+}
+
+#[test]
+fn scope_authorized_status_requires_valid_export_attempt_limits() {
+    let cases = [
+        ("missing", None),
+        (
+            "zero-files",
+            Some(ExportAttemptLimits {
+                max_files: 0,
+                ..scope_attempt_limits()
+            }),
+        ),
+        (
+            "zero-directories",
+            Some(ExportAttemptLimits {
+                max_directories: 0,
+                ..scope_attempt_limits()
+            }),
+        ),
+        (
+            "zero-content-bytes",
+            Some(ExportAttemptLimits {
+                max_content_bytes: 0,
+                ..scope_attempt_limits()
+            }),
+        ),
+    ];
+
+    for (label, export_attempt_limits) in cases {
+        let directory = TestDirectory::new(label);
+        let capability = capability();
+        let mut status = scope_ready_status(capability.session_id.clone());
+        status.export_attempt_limits = export_attempt_limits;
+        let server = MockServer::start(vec![
+            ResponseFixture::json(&capability),
+            ResponseFixture::json(&status),
+        ]);
+
+        let error = run_sandbox_init(
+            SandboxInitOptions {
+                api_url: server.api_url.clone(),
+                root: directory.root(),
+            },
+            SandboxBootstrapToken::new("scope-limits-bootstrap").expect("token"),
+        )
+        .expect_err("missing or zero scope limits must fail before export-attempt creation");
+
+        assert_eq!(error.code(), "backend_protocol_invalid", "case {label}");
+        assert_eq!(
+            error.to_string(),
+            if label == "missing" {
+                "ready sandbox session is invalid: scope-authorized export-attempt limits are missing"
+            } else {
+                "ready sandbox session is invalid: scope-authorized export-attempt limits are invalid"
+            },
+            "case {label}"
+        );
+        assert!(!directory.root().exists(), "case {label}");
+        let _ = server.request();
+        let _ = server.request();
+        server.assert_no_request();
+    }
+}
+
+#[test]
+fn scope_authorized_status_rejects_attempt_limits_above_client_safety_ceiling() {
+    let maximum = ReplicaMaterializationLimits::default()
+        .max_entries
+        .saturating_sub(1);
+    let cases = [
+        (
+            "files",
+            ExportAttemptLimits {
+                max_files: maximum + 1,
+                ..scope_attempt_limits()
+            },
+            format!(
+                "sandbox export maximum file count {} exceeds client maximum {maximum}",
+                maximum + 1
+            ),
+        ),
+        (
+            "directories",
+            ExportAttemptLimits {
+                max_directories: maximum + 1,
+                ..scope_attempt_limits()
+            },
+            format!(
+                "sandbox export maximum directory count {} exceeds client maximum {maximum}",
+                maximum + 1
+            ),
+        ),
+        (
+            "content-bytes",
+            ExportAttemptLimits {
+                max_content_bytes: ReplicaMaterializationLimits::default().max_disk_bytes + 1,
+                ..scope_attempt_limits()
+            },
+            format!(
+                "sandbox export maximum content bytes {} exceeds client maximum {}",
+                ReplicaMaterializationLimits::default().max_disk_bytes + 1,
+                ReplicaMaterializationLimits::default().max_disk_bytes
+            ),
+        ),
+    ];
+
+    for (label, export_attempt_limits, expected_message) in cases {
+        let directory = TestDirectory::new(label);
+        let capability = capability();
+        let mut status = scope_ready_status(capability.session_id.clone());
+        status.export_attempt_limits = Some(export_attempt_limits);
+        let server = MockServer::start(vec![
+            ResponseFixture::json(&capability),
+            ResponseFixture::json(&status),
+        ]);
+
+        let error = run_sandbox_init(
+            SandboxInitOptions {
+                api_url: server.api_url.clone(),
+                root: directory.root(),
+            },
+            SandboxBootstrapToken::new("scope-limits-bootstrap").expect("token"),
+        )
+        .expect_err("server limits above local safety ceilings must fail before export");
+
+        assert_eq!(error.code(), "export_limit_exceeded", "case {label}");
+        assert_eq!(error.to_string(), expected_message, "case {label}");
+        assert!(!directory.root().exists(), "case {label}");
+        let _ = server.request();
+        let _ = server.request();
+        server.assert_no_request();
+    }
 }
 
 #[test]
@@ -1767,6 +1901,7 @@ fn ready_status(
             decoded_bytes: decoded_tar.len() as u64,
             decoded_tar_sha256: sha256_label(decoded_tar),
         }),
+        export_attempt_limits: None,
         error: None,
         updated_at: "2026-07-20T11:00:00Z".to_string(),
     }
@@ -1779,9 +1914,18 @@ fn scope_ready_status(session_id: SessionId) -> SandboxSessionStatus {
         state: SandboxSessionState::Ready,
         freshness_requirement: freshness_requirement(),
         replicas: Vec::new(),
+        export_attempt_limits: Some(scope_attempt_limits()),
         export_offer: None,
         error: None,
         updated_at: "2026-07-23T20:00:00Z".to_string(),
+    }
+}
+
+fn scope_attempt_limits() -> ExportAttemptLimits {
+    ExportAttemptLimits {
+        max_files: 88_001,
+        max_directories: 77_002,
+        max_content_bytes: 987_654_321,
     }
 }
 
@@ -1821,15 +1965,7 @@ fn scope_export_fixture_with_unauthorized_extra(
         source_connection_id: source_connection_id.clone(),
         source_generation_id: SourceGenerationId::new("generation-scope").expect("generation ID"),
     }];
-    let limits = ExportAttemptLimits {
-        max_files: ReplicaMaterializationLimits::default()
-            .max_entries
-            .saturating_sub(1),
-        max_directories: ReplicaMaterializationLimits::default()
-            .max_entries
-            .saturating_sub(1),
-        max_content_bytes: ReplicaMaterializationLimits::default().max_disk_bytes,
-    };
+    let limits = scope_attempt_limits();
     let inventory_sha256 = canonical_export_inventory_sha256(&records).expect("scope inventory");
     let writable_metadata = ScopeAuthorizedWritableExportMetadata {
         versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
@@ -2092,15 +2228,7 @@ fn real_world_scope_export_fixture(encoding: TarContentEncoding) -> (SealedExpor
         source_generations: source_generations.clone(),
         media_type: "application/x-tar".to_string(),
         content_encoding: encoding,
-        limits: ExportAttemptLimits {
-            max_files: ReplicaMaterializationLimits::default()
-                .max_entries
-                .saturating_sub(1),
-            max_directories: ReplicaMaterializationLimits::default()
-                .max_entries
-                .saturating_sub(1),
-            max_content_bytes: ReplicaMaterializationLimits::default().max_disk_bytes,
-        },
+        limits: scope_attempt_limits(),
         control_entry_count: 1,
         file_count: FILE_COUNT,
         directory_count: DIRECTORY_COUNT,
@@ -2198,6 +2326,7 @@ fn non_ready_status() -> SandboxSessionStatus {
         state: SandboxSessionState::Bootstrapping,
         freshness_requirement: freshness_requirement(),
         replicas: Vec::new(),
+        export_attempt_limits: None,
         export_offer: None,
         error: Some(SessionProtocolError {
             code: SessionErrorCode::Bootstrapping,

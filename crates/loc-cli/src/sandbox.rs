@@ -466,8 +466,11 @@ fn run_sandbox_init_internal(
             .map_err(|failure| failure.error)?;
             (encoding, summary)
         }
-        ValidatedSandboxSession::ScopeAuthorized => {
-            let request = export_attempt_request(&capability, content_encoding)?;
+        ValidatedSandboxSession::ScopeAuthorized {
+            export_attempt_limits,
+        } => {
+            let request =
+                export_attempt_request(&capability, content_encoding, export_attempt_limits)?;
             let offer = client.create_export_attempt(&capability, &request)?;
             validate_scope_offer(&capability, &request, &offer)?;
             let limits = limits_for_scope_offer(&offer)?;
@@ -869,7 +872,9 @@ enum ValidatedSandboxSession<'a> {
         offer: &'a TarExportOffer,
         expected_receipt: ExpectedReplicaMaterializationReceipt,
     },
-    ScopeAuthorized,
+    ScopeAuthorized {
+        export_attempt_limits: &'a ExportAttemptLimits,
+    },
 }
 
 enum ExportValidation {
@@ -918,7 +923,17 @@ fn validate_status<'a>(
                 "scope-authorized status contains a legacy export offer",
             ));
         }
-        return Ok(ValidatedSandboxSession::ScopeAuthorized);
+        let export_attempt_limits =
+            status
+                .export_attempt_limits
+                .as_ref()
+                .ok_or(SandboxInitError::InvalidReadySession(
+                    "scope-authorized export-attempt limits are missing",
+                ))?;
+        validate_negotiated_export_attempt_limits(export_attempt_limits)?;
+        return Ok(ValidatedSandboxSession::ScopeAuthorized {
+            export_attempt_limits,
+        });
     }
     let offer = status
         .export_offer
@@ -936,8 +951,8 @@ fn validate_status<'a>(
 fn export_attempt_request(
     capability: &SessionCapability,
     preference: SandboxContentEncodingPreference,
+    limits: &ExportAttemptLimits,
 ) -> Result<ExportAttemptRequest, SandboxInitError> {
-    let defaults = ReplicaMaterializationLimits::default();
     let request = ExportAttemptRequest {
         versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
         opaque_session_capability: capability.opaque_capability.clone(),
@@ -947,16 +962,44 @@ fn export_attempt_request(
             | SandboxContentEncodingPreference::Zstd => TarContentEncoding::Zstd,
             SandboxContentEncodingPreference::Identity => TarContentEncoding::Identity,
         },
-        limits: ExportAttemptLimits {
-            max_files: defaults.max_entries.saturating_sub(1),
-            max_directories: defaults.max_entries.saturating_sub(1),
-            max_content_bytes: defaults.max_disk_bytes,
-        },
+        limits: limits.clone(),
     };
     request.validate().map_err(|_| {
         SandboxInitError::InvalidExportOffer("client export-attempt request is invalid")
     })?;
     Ok(request)
+}
+
+fn validate_negotiated_export_attempt_limits(
+    limits: &ExportAttemptLimits,
+) -> Result<(), SandboxInitError> {
+    limits.validate().map_err(|_| {
+        SandboxInitError::InvalidReadySession("scope-authorized export-attempt limits are invalid")
+    })?;
+    let defaults = ReplicaMaterializationLimits::default();
+    let maximum_entries = defaults.max_entries.saturating_sub(1);
+    for (limit, offered, maximum) in [
+        ("maximum file count", limits.max_files, maximum_entries),
+        (
+            "maximum directory count",
+            limits.max_directories,
+            maximum_entries,
+        ),
+        (
+            "maximum content bytes",
+            limits.max_content_bytes,
+            defaults.max_disk_bytes,
+        ),
+    ] {
+        if offered > maximum {
+            return Err(SandboxInitError::ExportLimit {
+                limit,
+                offered,
+                maximum,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn random_export_idempotency_key() -> Result<String, SandboxInitError> {

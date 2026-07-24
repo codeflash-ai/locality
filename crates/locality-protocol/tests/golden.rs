@@ -28,12 +28,13 @@ use locality_protocol::{
     OrderedExportRow, OrderedSourceGeneration, PROJECTION_VERSION_GOLDEN_JSON,
     ProjectionVersionContract, ProviderSourceScopeSelector, READY_REPLICA_REVISION_GOLDEN_JSON,
     ReadyReplicaRevision, ReplicaFreshnessState, ReplicaFreshnessStatus,
-    SANDBOX_SESSION_STATUS_GOLDEN_JSON, SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
-    SCOPE_AUTHORIZED_SESSION_QUERY_GOLDEN_JSON, SEALED_EXPORT_OFFER_GOLDEN_JSON,
-    SESSION_PROTOCOL_ERROR_GOLDEN_JSON, SOURCE_VERSION_GOLDEN_JSON, SandboxSessionState,
-    SandboxSessionStatus, ScopeAuthorizedSessionQuery, ScopeAuthorizedWritableExportMetadata,
-    ScopeContractError, SealedExportOffer, SessionCapability, SessionErrorCode,
-    SessionProtocolError, SessionReplicaRevision, SourceVersionContract, StaleSessionBehavior,
+    SANDBOX_SESSION_STATUS_GOLDEN_JSON, SANDBOX_SESSION_STATUS_V2_GOLDEN_JSON,
+    SCOPE_AUTHORIZED_COMPONENT_VERSIONS, SCOPE_AUTHORIZED_SESSION_QUERY_GOLDEN_JSON,
+    SEALED_EXPORT_OFFER_GOLDEN_JSON, SESSION_PROTOCOL_ERROR_GOLDEN_JSON,
+    SOURCE_VERSION_GOLDEN_JSON, SandboxSessionState, SandboxSessionStatus,
+    ScopeAuthorizedSessionQuery, ScopeAuthorizedWritableExportMetadata, ScopeContractError,
+    SealedExportOffer, SessionCapability, SessionErrorCode, SessionProtocolError,
+    SessionReplicaRevision, SourceVersionContract, StaleSessionBehavior,
     TAR_EXPORT_METADATA_GOLDEN_JSON, TAR_EXPORT_OFFER_GOLDEN_JSON, TarContentEncoding,
     TarExportMetadata, TarExportOffer, WRITABLE_EXPORT_METADATA_GOLDEN_JSON,
     WritableExportMetadata, WritableMetadataEntry, validate_canonical_export_records,
@@ -74,6 +75,11 @@ fn authorized_session_query_is_exact_golden_bytes() {
 
 #[test]
 fn scope_authorized_export_contracts_are_exact_golden_bytes() {
+    assert_exact_round_trip(
+        SANDBOX_SESSION_STATUS_V2_GOLDEN_JSON,
+        &sandbox_session_status_v2(),
+    );
+
     let query = scope_authorized_query();
     query.validate().expect("valid scope query");
     assert_exact_round_trip(SCOPE_AUTHORIZED_SESSION_QUERY_GOLDEN_JSON, &query);
@@ -564,9 +570,28 @@ fn sandbox_session_status() -> SandboxSessionStatus {
             wait_timeout_seconds: 30,
         },
         replicas: vec![freshness_status()],
+        export_attempt_limits: None,
         export_offer: Some(tar_export_offer()),
         error: None,
         updated_at: "2026-07-19T12:00:00Z".to_string(),
+    }
+}
+
+fn sandbox_session_status_v2() -> SandboxSessionStatus {
+    SandboxSessionStatus {
+        versions: SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
+        session_id: SessionId::new("session-7"),
+        state: SandboxSessionState::Ready,
+        freshness_requirement: FreshnessRequirement {
+            max_age_seconds: 300,
+            on_stale: StaleSessionBehavior::WaitThenFail,
+            wait_timeout_seconds: 30,
+        },
+        replicas: vec![freshness_status()],
+        export_attempt_limits: Some(attempt_limits()),
+        export_offer: None,
+        error: None,
+        updated_at: "2026-07-23T20:00:00Z".to_string(),
     }
 }
 

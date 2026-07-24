@@ -1588,6 +1588,8 @@ pub struct SandboxSessionStatus {
     pub state: SandboxSessionState,
     pub freshness_requirement: FreshnessRequirement,
     pub replicas: Vec<ReplicaFreshnessStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_attempt_limits: Option<ExportAttemptLimits>,
     pub export_offer: Option<TarExportOffer>,
     pub error: Option<SessionProtocolError>,
     pub updated_at: String,
@@ -2198,6 +2200,8 @@ pub const BOOTSTRAP_EXCHANGE_GOLDEN_JSON: &[u8] =
 pub const FRESHNESS_STATUS_GOLDEN_JSON: &[u8] = include_bytes!("../fixtures/freshness-status.json");
 pub const SANDBOX_SESSION_STATUS_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/sandbox-session-status.json");
+pub const SANDBOX_SESSION_STATUS_V2_GOLDEN_JSON: &[u8] =
+    include_bytes!("../fixtures/sandbox-session-status-v2.json");
 pub const SESSION_PROTOCOL_ERROR_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/session-protocol-error.json");
 pub const TAR_EXPORT_OFFER_GOLDEN_JSON: &[u8] = include_bytes!("../fixtures/tar-export-offer.json");
