@@ -384,6 +384,9 @@ run_launch_strategy "$LOCALITY_SANDBOX" "locality" "$LOCALITY_REMOTE_OUT_DIR" "$
 run_launch_strategy "$MCP_SANDBOX" "notion-mcp" "$MCP_REMOTE_OUT_DIR" "$@"
 sync_artifacts "$LOCALITY_SANDBOX" "locality" "$LOCALITY_REMOTE_OUT_DIR"
 sync_artifacts "$MCP_SANDBOX" "notion-mcp" "$MCP_REMOTE_OUT_DIR"
+if [ "$SYNC_ARTIFACTS" = "1" ]; then
+  python3 "$SCRIPT_DIR/scripts/token-usage-charts.py" "$LOCAL_OUT_DIR/artifacts" "$LOCAL_OUT_DIR/token-usage" >/dev/null
+fi
 
 cat > "$LOCAL_OUT_DIR/artifacts.tsv" <<EOF
 strategy	sandbox	remote_out_dir	local_stdout	local_stderr	local_artifact_dir
@@ -396,4 +399,5 @@ echo "Locality artifacts: $LOCALITY_SANDBOX:$LOCALITY_REMOTE_OUT_DIR"
 echo "MCP artifacts: $MCP_SANDBOX:$MCP_REMOTE_OUT_DIR"
 if [ "$SYNC_ARTIFACTS" = "1" ]; then
   echo "Local copies: $LOCAL_OUT_DIR/artifacts/locality and $LOCAL_OUT_DIR/artifacts/notion-mcp"
+  echo "Token usage charts: $LOCAL_OUT_DIR/token-usage"
 fi

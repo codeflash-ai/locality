@@ -1675,3 +1675,6 @@ summary = {
 Path(summary_path).write_text(json.dumps(summary, indent=2) + "\n")
 print(json.dumps(summary, indent=2))
 PY
+
+python3 "$SCRIPT_DIR/scripts/token-usage-charts.py" "$OUT_DIR" "$OUT_DIR/token-usage" >/dev/null
+echo "Token usage charts: $OUT_DIR/token-usage"

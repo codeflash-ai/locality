@@ -320,6 +320,22 @@ Important artifacts:
 - `scenarios/<scenario>/locality.folded` and `scenarios/<scenario>/notion-mcp.folded` - FlameGraph-compatible folded stacks generated from the same timing spans.
 - `scenarios/<scenario>/locality.snakeviz.prof` and `scenarios/<scenario>/notion-mcp.snakeviz.prof` - SnakeViz-compatible synthetic pstats profiles.
 - `scenarios/<scenario>/locality.snakeviz.stats.md` and `scenarios/<scenario>/notion-mcp.snakeviz.stats.md` - text summary of the SnakeViz profile frames.
+- `token-usage/by-trial-scenario/*.svg` - stacked token-usage charts with one
+  Locality bar and one MCP bar for each trial/scenario pair.
+- `token-usage/average.svg` - stacked token-usage chart averaged over paired
+  scenarios and trials.
+- `token-usage/cost/by-trial-scenario/*.svg` - stacked cost charts using the
+  same token buckets and one Locality/MCP bar pair per trial/scenario.
+- `token-usage/cost/average.svg` - stacked cost chart averaged over paired
+  scenarios and trials.
+- `token-usage/token-usage.tsv`, `token-usage/cost-usage.tsv`, and
+  `token-usage/token-usage.json` - chart data, cost data, pricing, and manifest.
+
+Cost charts default to the `gpt-5.6-luna` Standard short-context rates used by
+the benchmark harness. Override them for Azure/internal billing with
+`CODEX_COST_INPUT_USD_PER_1M`, `CODEX_COST_CACHED_INPUT_USD_PER_1M`,
+`CODEX_COST_CACHE_WRITE_INPUT_USD_PER_1M`, `CODEX_COST_OUTPUT_USD_PER_1M`, and
+`CODEX_COST_REASONING_OUTPUT_USD_PER_1M`.
 - `locality-traces/*.jsonl` - raw Locality command and pull/hydration spans.
 - `locality-traces/*-summary.json` - top Locality spans by duration.
 - `locality-traces/*-spans.tsv` - tabular Locality span data.

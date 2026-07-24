@@ -252,6 +252,20 @@ test -s "${out_dir}/scenarios/scenario2/notion-mcp.snakeviz.prof" || fail "missi
 test -s "${out_dir}/scenarios/scenario2/notion-mcp-speedscope.json" || fail "missing MCP Speedscope profile"
 test -s "${out_dir}/scenarios/scenario2/notion-mcp.perfetto.json" || fail "missing MCP Perfetto profile"
 assert_contains "${out_dir}/summary.json" "profile_artifacts"
+test -s "${out_dir}/token-usage/average.svg" || fail "missing token usage average chart"
+test -s "${out_dir}/token-usage/cost/average.svg" || fail "missing token cost average chart"
+test -s "${out_dir}/token-usage/token-usage.tsv" || fail "missing token usage TSV"
+test -s "${out_dir}/token-usage/cost-usage.tsv" || fail "missing token cost TSV"
+find "${out_dir}/token-usage/by-trial-scenario" -name '*scenario2.svg' -print -quit | grep -q . ||
+  fail "missing scenario2 token usage chart"
+find "${out_dir}/token-usage/cost/by-trial-scenario" -name '*scenario2.svg' -print -quit | grep -q . ||
+  fail "missing scenario2 token cost chart"
+assert_contains "${out_dir}/token-usage/average.svg" "Average Token Usage"
+assert_contains "${out_dir}/token-usage/cost/average.svg" "Average Token Cost"
+assert_contains "${out_dir}/token-usage/token-usage.tsv" "fresh_input_tokens"
+assert_contains "${out_dir}/token-usage/cost-usage.tsv" "fresh_input_cost_usd"
+assert_contains "${out_dir}/token-usage/token-usage.tsv" "notion-mcp"
+assert_contains "${out_dir}/token-usage/cost-usage.tsv" "notion-mcp"
 
 scenario1_out_dir="${tmp_root}/out-scenario1"
 PATH="${fake_bin}:$PATH" \
@@ -326,5 +340,63 @@ python3 "${ROOT}/experiment/locality-mcp-comparison/scripts/codex-events-to-trac
 assert_contains "${tmp_root}/converter.perfetto.json" "tool:mcp:notion:API_post_search"
 assert_contains "${tmp_root}/converter.snakeviz.stats.md" "command:mcp:notion:API_post_search"
 assert_not_contains "${tmp_root}/converter.perfetto.json" "unknown_command"
+
+split_token_root="${tmp_root}/split-token"
+mkdir -p "$split_token_root/run1/artifacts/locality" "$split_token_root/run1/artifacts/notion-mcp"
+cat > "$split_token_root/run1/artifacts/locality/summary.json" <<'JSON'
+{
+  "metrics": [],
+  "scenarios": {
+    "scenario1": {
+      "agent_event_summaries": {
+        "locality": {
+          "usage": {
+            "input_tokens": 100,
+            "cached_input_tokens": 60,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 10,
+            "reasoning_output_tokens": 3
+          }
+        }
+      }
+    }
+  }
+}
+JSON
+cat > "$split_token_root/run1/artifacts/notion-mcp/summary.json" <<'JSON'
+{
+  "metrics": [],
+  "scenarios": {
+    "scenario1": {
+      "agent_event_summaries": {
+        "notion-mcp": {
+          "usage": {
+            "input_tokens": 200,
+            "cached_input_tokens": 50,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 20,
+            "reasoning_output_tokens": 4
+          }
+        }
+      }
+    }
+  }
+}
+JSON
+python3 "${ROOT}/experiment/locality-mcp-comparison/scripts/token-usage-charts.py" \
+  "$split_token_root" "$split_token_root/token-usage" >/dev/null
+test -s "$split_token_root/token-usage/by-trial-scenario/run1__scenario1.svg" ||
+  fail "missing split token usage scenario chart"
+test -s "$split_token_root/token-usage/average.svg" ||
+  fail "missing split token usage average chart"
+test -s "$split_token_root/token-usage/cost/average.svg" ||
+  fail "missing split token cost average chart"
+assert_contains "$split_token_root/token-usage/token-usage.tsv" "run1"$'\t'"scenario1"$'\t'"locality"$'\t'"40"$'\t'"60"
+assert_contains "$split_token_root/token-usage/token-usage.tsv" "run1"$'\t'"scenario1"$'\t'"notion-mcp"$'\t'"150"$'\t'"50"
+assert_contains "$split_token_root/token-usage/cost-usage.tsv" "fresh_input_cost_usd"
+assert_contains "$split_token_root/token-usage/cost-usage.tsv" "notion-mcp"
+assert_contains "$split_token_root/token-usage/cost/average.svg" "Average Token Cost"
+assert_contains "$split_token_root/token-usage/token-usage.json" '"paired_trial_scenario_count": 1'
+assert_contains "$split_token_root/token-usage/token-usage.json" '"pricing_usd_per_1m_tokens"'
 
 printf 'launch readiness MCP config tests passed\n'
