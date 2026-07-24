@@ -252,6 +252,10 @@ fn loopback_identity_bootstrap_sends_only_sealed_requests_and_materializes() {
     assert_eq!(bootstrap.path, "/v1/sessions");
     assert_eq!(bootstrap.headers.get("accept").unwrap(), "application/json");
     assert_eq!(
+        bootstrap.headers.get("user-agent").unwrap(),
+        "locality-loc/0.3.6"
+    );
+    assert_eq!(
         bootstrap.headers.get("content-type").unwrap(),
         "application/json"
     );

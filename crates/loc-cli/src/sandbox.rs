@@ -36,6 +36,7 @@ use sha2::{Digest, Sha256};
 
 const JSON_MEDIA_TYPE: &str = "application/json";
 const TAR_MEDIA_TYPE: &str = "application/x-tar";
+const SANDBOX_USER_AGENT: &str = concat!("locality-loc/", env!("CARGO_PKG_VERSION"));
 const MAX_JSON_RESPONSE_BYTES: u64 = 1024 * 1024;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -1253,6 +1254,7 @@ impl SandboxHttpClient {
             let _ = rustls::crypto::ring::default_provider().install_default();
         });
         let client = Client::builder()
+            .user_agent(SANDBOX_USER_AGENT)
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .timeout(HTTP_REQUEST_TIMEOUT)
