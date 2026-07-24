@@ -2,8 +2,12 @@
 
 This experiment compares two agent paths for a launch-readiness workflow:
 
-- **Locality path:** hydrate Notion through Locality, let the agent read mounted Markdown files, and write local Markdown artifacts under `OUT_DIR`.
-- **Notion MCP path:** let the agent use Notion MCP search/fetch for context, without reading mounted Locality files or using `loc`.
+- **Locality path:** hydrate or reuse prehydrated Locality files, let the agent
+  read mounted Markdown/text/JSON files across connected sources, and write
+  local Markdown artifacts under `OUT_DIR`.
+- **MCP path:** let the agent use MCP tools for Notion, Linear, and Slack when
+  configured, plus local git/`gh` for repository evidence, without reading
+  mounted Locality files or using `loc`.
 
 The benchmark case lives in Notion at:
 
@@ -33,6 +37,8 @@ The output parent page is:
   to measure prompt handoff, tool calls, model thinking spans, and final output
   response spans while the session is running.
 - `scripts/summarize-codex-events.py` - summarizes one Codex JSON trace.
+- `scripts/deep-dive-report.py` - writes a per-run Markdown index of phase
+  timings, tool buckets, timelines, and trace artifact paths.
 - `scripts/summarize-runs.py` - summarizes multiple run folders.
 
 ## Separation Rules
@@ -85,6 +91,34 @@ ssh -o StrictHostKeyChecking=accept-new "$ssh_target" '
   cargo build -p loc-cli -p localityd
 '
 ```
+
+For a sandbox that already has the desired Locality connections and hydrated
+files, use the existing state instead of creating an isolated temporary Notion
+mount:
+
+```bash
+export SANDBOX=aseem-locality
+export SSH_TARGET="$(amika sandbox ssh --print "$SANDBOX")"
+export LOCALITY_SANDBOX="$SANDBOX"
+export LOCALITY_USE_EXISTING_STATE=1
+export LOCALITY_CONTEXT_HYDRATE=0
+```
+
+If the multi-source roots are known, pass them explicitly. Use newline
+separation when paths contain spaces:
+
+```bash
+export LOCALITY_CONTEXT_DIRS="$(cat <<'EOF'
+/home/amika/notion/Go To Market/Locality Launch - Amika Environment
+/home/amika/slack
+/home/amika/linear
+EOF
+)"
+```
+
+The worker still locates and pulls the target Notion output page unless the run
+is MCP-only. `LOCALITY_CONTEXT_HYDRATE=0` applies only to the listed context
+directories and is intended for prehydrated sandboxes.
 
 Verify Locality:
 
@@ -181,14 +215,32 @@ also retrieves compatibility outputs written under
 such as `/home/amika/report-body.md`.
 
 Only `scenario1.md` receives precomputed git metadata at
-`GIT_DATA_FILE`. Other scenarios should not require that file; if they need
-repository context, they should inspect the repository directly with git.
+`GIT_DATA_FILE`. The multi-source scenarios `scenario7.md` and `scenario8.md`
+also receive this file so the agent can compare local git evidence with
+connected-source evidence. Other scenarios should not require that file; if
+they need repository context, they should inspect the repository directly with
+git.
 
 ## Run Once
 
 ```bash
 CODEX_MODEL=gpt-5.6-luna CODEX_REASONING_EFFORT=low \
   ./experiment/locality-mcp-comparison/run-agent-comparison.sh
+```
+
+Run only the two multi-source scenarios against prehydrated Locality state:
+
+```bash
+export SANDBOX=aseem-locality
+export SSH_TARGET="$(amika sandbox ssh --print "$SANDBOX")"
+export LOCALITY_SANDBOX="$SANDBOX"
+export MCP_SANDBOX=aseem-mcp
+export LOCALITY_USE_EXISTING_STATE=1
+export LOCALITY_CONTEXT_HYDRATE=0
+
+CODEX_MODEL=gpt-5.6-luna CODEX_REASONING_EFFORT=low \
+  ./experiment/locality-mcp-comparison/run-agent-comparison.sh \
+  --scenario scenario7,scenario8
 ```
 
 By default this is artifact-only. It writes local Markdown reports under
@@ -330,6 +382,10 @@ Important artifacts:
   scenarios and trials.
 - `token-usage/token-usage.tsv`, `token-usage/cost-usage.tsv`, and
   `token-usage/token-usage.json` - chart data, cost data, pricing, and manifest.
+- `deep-dive.md` - local wrapper report that indexes each scenario/strategy
+  with phase timings, event counts, token totals, tool buckets, chronological
+  tool calls, and links to the report, transcript, spans, Speedscope, Perfetto,
+  SnakeViz, and Locality trace artifacts.
 
 Cost charts default to the `gpt-5.6-luna` Standard short-context rates used by
 the benchmark harness. Override them for Azure/internal billing with

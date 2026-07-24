@@ -33,6 +33,13 @@ Environment:
   CODEX_MODEL                    Passed through to the benchmark worker.
   CODEX_REASONING_EFFORT         Passed through to the benchmark worker.
   CODEX_EXEC_TIMEOUT_SECONDS     Passed through to the benchmark worker.
+  LOCALITY_USE_EXISTING_STATE    When 1, Locality strategy uses the sandbox's
+                                  existing LOCALITY_STATE_DIR or ~/.loc instead
+                                  of creating an isolated temporary Notion mount.
+  LOCALITY_CONTEXT_DIRS          Passed through to the worker as prehydrated
+                                  Locality context directories.
+  LOCALITY_CONTEXT_HYDRATE       Passed through to the worker. Set 0 when
+                                  LOCALITY_CONTEXT_DIRS are already hydrated.
   SYNC_ARTIFACTS                 Copy remote OUT_DIRs back locally. Default: 1.
 
 Any remaining arguments are passed to run-launch-readiness-benchmark.sh.
@@ -123,6 +130,34 @@ shell_quote() {
 
 base64_one_line() {
   base64 | tr -d '\n'
+}
+
+forwarded_worker_env_b64() {
+  local name
+  local names=(
+    TARGET_URL
+    CONTEXT_URLS
+    CONTEXT_PULL_PATHS
+    CONTEXT_SEARCH_QUERY
+    LOCALITY_USE_EXISTING_STATE
+    LOCALITY_STATE_DIR
+    LOCALITY_CREDENTIAL_STORE
+    LOCALITY_CONTEXT_DIRS
+    LOCALITY_CONTEXT_ROOTS
+    LOCALITY_CONTEXT_HYDRATE
+    LOCALITY_EXPERIMENT_TRACE_FORCE_DIRECT
+    SINCE
+    BASE_REF
+    REPORT_TZ
+    REPORT_DATE
+    REPORT_TITLE
+    CODEX_HOOKS_MODE
+  )
+  for name in "${names[@]}"; do
+    if [ "${!name+x}" ]; then
+      printf 'export %s=%q\n' "$name" "${!name}"
+    fi
+  done | base64_one_line
 }
 
 amika_sandbox_ssh() {
@@ -221,9 +256,11 @@ run_launch_strategy() {
   local remote_out_dir="$3"
   local local_dir="$LOCAL_OUT_DIR/$sandbox"
   local script
+  local worker_env_b64
 
   mkdir -p "$local_dir"
   echo "Running $strategy on $sandbox"
+  worker_env_b64="$(forwarded_worker_env_b64)"
 
   script="$(cat <<'REMOTE_RUN'
 set -euo pipefail
@@ -236,7 +273,8 @@ model="$5"
 effort="$6"
 timeout_seconds="$7"
 loc_bin="$8"
-shift 8
+worker_env_b64="$9"
+shift 9
 
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 
@@ -246,6 +284,9 @@ if [ -f "$env_file" ]; then
   # shellcheck disable=SC1090
   source "$env_file"
   set +a
+fi
+if [ -n "$worker_env_b64" ]; then
+  eval "$(printf '%s' "$worker_env_b64" | base64 -d)"
 fi
 
 secret_dir="${LOCALITY_LAUNCH_READINESS_SECRET_DIR:-$HOME/.config/locality-launch-readiness/mcp}"
@@ -287,7 +328,11 @@ if [ "$strategy" = "locality" ]; then
       exit 127
     fi
   fi
-  if [ -z "${LOCALITY_STATE_DIR:-}" ]; then
+  if [ "${LOCALITY_USE_EXISTING_STATE:-0}" = "1" ]; then
+    export LOCALITY_STATE_DIR="${LOCALITY_STATE_DIR:-$HOME/.loc}"
+    "$loc_bin" connections --json >/dev/null 2>&1 ||
+      { echo "existing Locality state is not readable at LOCALITY_STATE_DIR=$LOCALITY_STATE_DIR" >&2; exit 2; }
+  elif [ -z "${LOCALITY_STATE_DIR:-}" ]; then
     if [ ! -f "$notion_token_file" ]; then
       echo "missing $notion_token_file; set LOCALITY_STATE_DIR or provide a Notion token file" >&2
       exit 2
@@ -334,6 +379,7 @@ REMOTE_RUN
     "$CODEX_REASONING_EFFORT" \
     "$CODEX_EXEC_TIMEOUT_SECONDS" \
     "$REMOTE_LOC_BIN" \
+    "$worker_env_b64" \
     "$@"
 }
 
@@ -386,6 +432,7 @@ sync_artifacts "$LOCALITY_SANDBOX" "locality" "$LOCALITY_REMOTE_OUT_DIR"
 sync_artifacts "$MCP_SANDBOX" "notion-mcp" "$MCP_REMOTE_OUT_DIR"
 if [ "$SYNC_ARTIFACTS" = "1" ]; then
   python3 "$SCRIPT_DIR/scripts/token-usage-charts.py" "$LOCAL_OUT_DIR/artifacts" "$LOCAL_OUT_DIR/token-usage" >/dev/null
+  python3 "$SCRIPT_DIR/scripts/deep-dive-report.py" "$LOCAL_OUT_DIR" "$LOCAL_OUT_DIR/deep-dive.md" >/dev/null
 fi
 
 cat > "$LOCAL_OUT_DIR/artifacts.tsv" <<EOF

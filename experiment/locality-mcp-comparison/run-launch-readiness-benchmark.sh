@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: run-launch-readiness-benchmark.sh [--push] [--compare-mcp] [--write-mounted-page] [--scenario NAME] [--compare-hooks] [--strategy NAME]
+Usage: run-launch-readiness-benchmark.sh [--push] [--compare-mcp] [--write-mounted-page] [--scenario NAME[,NAME...]] [--compare-hooks] [--strategy NAME]
 
 Runs the Locality vs Notion MCP launch-readiness benchmark:
   1. discover prompt scenarios from prompts/Locality/*.md
@@ -17,7 +17,9 @@ Runs the Locality vs Notion MCP launch-readiness benchmark:
   9. write run summary artifacts
 
 Study mode:
-  --scenario NAME       Run one prompt scenario, by basename or filename.
+  --scenario NAME       Run one or more prompt scenarios, by basename or
+                        filename. Use a comma-delimited list for multiple
+                        scenarios, for example --scenario scenario7,scenario8.
   --compare-hooks       Run that scenario four times: Locality without hooks,
                         Locality with hooks, MCP without hooks, and MCP with
                         hooks. This implies --compare-mcp and is artifact-only.
@@ -33,6 +35,11 @@ Important environment:
   MCP_PROMPT_DIR           MCP prompt directory. Default: $PROMPT_ROOT/MCP
   TARGET_URL               Notion page URL for benchmark output parent.
   CONTEXT_URLS             Newline-delimited Notion URLs to hydrate as directories.
+  LOCALITY_CONTEXT_DIRS    Newline-delimited or colon-delimited prehydrated
+                           Locality directories to add to the Locality agent.
+  LOCALITY_CONTEXT_HYDRATE Pull all context directories before running the
+                           Locality agent. Default: 1. Set 0 for a sandbox that
+                           already has prehydrated multi-source files.
   CODEX_MODEL              Model passed to codex exec. Default: gpt-5.6-luna
   CODEX_REASONING_EFFORT   Codex reasoning effort. Default: low
   CODEX_SANDBOX_OUT_DIR    Agent-visible OUT_DIR for scenarios after scenario1.
@@ -141,6 +148,8 @@ TARGET_URL="${TARGET_URL:-https://app.notion.com/p/codeflash/Amika-Test-Update-4
 CONTEXT_URLS="${CONTEXT_URLS:-https://app.notion.com/p/codeflash/Locality-Launch-Amika-Environment-3a33ac0ebb888001ac26d52f57f1deba}"
 CONTEXT_PULL_PATHS="${CONTEXT_PULL_PATHS:-}"
 CONTEXT_SEARCH_QUERY="${CONTEXT_SEARCH_QUERY:-benchmark|launch readiness|safe diff|push|review|Live Mode|File Provider|Windows Cloud Files|distribution|Homebrew|install|connector|standup|blocker|risk}"
+LOCALITY_CONTEXT_DIRS="${LOCALITY_CONTEXT_DIRS:-${LOCALITY_CONTEXT_ROOTS:-}}"
+LOCALITY_CONTEXT_HYDRATE="${LOCALITY_CONTEXT_HYDRATE:-1}"
 SINCE="${SINCE:-24 hours ago}"
 BASE_REF="${BASE_REF:-origin/main}"
 REPORT_TZ="${REPORT_TZ:-Asia/Kolkata}"
@@ -203,6 +212,11 @@ esac
 case "$CODEX_HOOKS_MODE" in
   hooks|no-hooks) ;;
   *) echo "CODEX_HOOKS_MODE must be hooks or no-hooks" >&2; exit 2 ;;
+esac
+
+case "$LOCALITY_CONTEXT_HYDRATE" in
+  0|1) ;;
+  *) echo "LOCALITY_CONTEXT_HYDRATE must be 0 or 1" >&2; exit 2 ;;
 esac
 
 mkdir -p "$OUT_DIR" "$TRACE_DIR" "$SCENARIO_ROOT"
@@ -830,16 +844,41 @@ filter_prompt_scenarios() {
   local scenario_file
   local scenario_stem
   local matches=()
-  requested="$SCENARIO_FILTER"
-  requested_base="$(basename "$requested")"
-  requested_stem="${requested_base%.md}"
+  local token_matches=()
+  local seen="|"
+  local requested_items=()
+  IFS=',' read -r -a requested_items <<< "$SCENARIO_FILTER"
 
-  for scenario_file in "${SCENARIO_FILES[@]}"; do
-    scenario_stem="${scenario_file%.md}"
-    if [ "$scenario_file" = "$requested_base" ] ||
-      [ "$scenario_stem" = "$requested_stem" ] ||
-      [ "$(locality_prompt_for "$scenario_file")" = "$requested" ]; then
-      matches+=("$scenario_file")
+  for requested in "${requested_items[@]}"; do
+    requested="${requested#"${requested%%[![:space:]]*}"}"
+    requested="${requested%"${requested##*[![:space:]]}"}"
+    if [ -z "$requested" ]; then
+      continue
+    fi
+    requested_base="$(basename "$requested")"
+    requested_stem="${requested_base%.md}"
+    token_matches=()
+
+    for scenario_file in "${SCENARIO_FILES[@]}"; do
+      scenario_stem="${scenario_file%.md}"
+      if [ "$scenario_file" = "$requested_base" ] ||
+        [ "$scenario_stem" = "$requested_stem" ] ||
+        [ "$(locality_prompt_for "$scenario_file")" = "$requested" ]; then
+        token_matches+=("$scenario_file")
+      fi
+    done
+
+    if [ "${#token_matches[@]}" -eq 0 ]; then
+      echo "no prompt scenario matched --scenario item $requested" >&2
+      exit 2
+    fi
+    if [ "${#token_matches[@]}" -gt 1 ]; then
+      echo "--scenario item $requested matched multiple prompt scenarios" >&2
+      exit 2
+    fi
+    if [[ "$seen" != *"|${token_matches[0]}|"* ]]; then
+      matches+=("${token_matches[0]}")
+      seen="$seen${token_matches[0]}|"
     fi
   done
 
@@ -847,12 +886,8 @@ filter_prompt_scenarios() {
     echo "no prompt scenario matched --scenario $SCENARIO_FILTER" >&2
     exit 2
   fi
-  if [ "${#matches[@]}" -gt 1 ]; then
-    echo "--scenario $SCENARIO_FILTER matched multiple prompt scenarios" >&2
-    exit 2
-  fi
 
-  SCENARIO_FILES=("${matches[0]}")
+  SCENARIO_FILES=("${matches[@]}")
 }
 
 locality_prompt_for() {
@@ -930,7 +965,36 @@ prepare_scenario_inputs() {
 
 scenario_needs_git_metadata() {
   local scenario_file="$1"
-  [ "$(scenario_name_for_file "$scenario_file")" = "scenario1" ]
+  case "$(scenario_name_for_file "$scenario_file")" in
+    scenario1|scenario7|scenario8) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+append_context_paths_from_var() {
+  local raw="$1"
+  if [ -z "$raw" ]; then
+    return 0
+  fi
+  LOCALITY_CONTEXT_DIRS_RAW="$raw" python3 - "$CONTEXT_PATHS_FILE" <<'PY'
+import os
+import re
+import sys
+from pathlib import Path
+
+out = Path(sys.argv[1])
+raw = os.environ.get("LOCALITY_CONTEXT_DIRS_RAW", "")
+if "\n" in raw:
+    parts = raw.splitlines()
+else:
+    parts = re.split(r":", raw)
+
+with out.open("a", encoding="utf-8") as handle:
+    for part in parts:
+        path = os.path.expanduser(part.strip())
+        if path:
+            handle.write(path + "\n")
+PY
 }
 
 scenario_agent_out_dir() {
@@ -1287,30 +1351,36 @@ if [ "$RUN_LOCALITY_AGENT" -eq 1 ]; then
       printf '%s\n' "$context_path" >> "$CONTEXT_PATHS_FILE"
     fi
   done <<< "$CONTEXT_PULL_PATHS"
+  append_context_paths_from_var "$LOCALITY_CONTEXT_DIRS"
   sort -u "$CONTEXT_PATHS_FILE" -o "$CONTEXT_PATHS_FILE"
   context_path_count="$(grep -cve '^[[:space:]]*$' "$CONTEXT_PATHS_FILE" 2>/dev/null || true)"
   phase_end "locality" "notion_context_locate" "ok" "urls=$context_url_index; paths=$context_path_count; traces=$TRACE_DIR/context-locate-*.jsonl"
 
   phase_start
   hydrated_count=0
-  while IFS= read -r context_path; do
-    if [ -z "$context_path" ]; then
-      continue
-    fi
-    safe_name="$(trace_safe_name "$context_path")"
-    set +e
-    run_loc_traced "context-pull-$safe_name" "$LOC_BIN" pull "$context_path" --json > "$OUT_DIR/loc-context-pull-$safe_name.json" 2> "$OUT_DIR/loc-context-pull-$safe_name.err"
-    pull_rc=$?
-    set -e
-    if [ "$pull_rc" -ne 0 ] && ! grep -qi "dirty" "$OUT_DIR/loc-context-pull-$safe_name.json" "$OUT_DIR/loc-context-pull-$safe_name.err"; then
-      phase_end "locality" "notion_context_hydrate" "failed" "exit=$pull_rc; path=$context_path; trace=$TRACE_DIR/context-pull-$safe_name.jsonl"
-      cat "$OUT_DIR/loc-context-pull-$safe_name.json" >&2
-      cat "$OUT_DIR/loc-context-pull-$safe_name.err" >&2
-      exit "$pull_rc"
-    fi
-    hydrated_count=$((hydrated_count + 1))
-  done < "$CONTEXT_PATHS_FILE"
-  phase_end "locality" "notion_context_hydrate" "ok" "paths=$hydrated_count; list=$CONTEXT_PATHS_FILE; traces=$TRACE_DIR/context-pull-*.jsonl"
+  if [ "$LOCALITY_CONTEXT_HYDRATE" = "1" ]; then
+    while IFS= read -r context_path; do
+      if [ -z "$context_path" ]; then
+        continue
+      fi
+      safe_name="$(trace_safe_name "$context_path")"
+      set +e
+      run_loc_traced "context-pull-$safe_name" "$LOC_BIN" pull "$context_path" --json > "$OUT_DIR/loc-context-pull-$safe_name.json" 2> "$OUT_DIR/loc-context-pull-$safe_name.err"
+      pull_rc=$?
+      set -e
+      if [ "$pull_rc" -ne 0 ] && ! grep -qi "dirty" "$OUT_DIR/loc-context-pull-$safe_name.json" "$OUT_DIR/loc-context-pull-$safe_name.err"; then
+        phase_end "locality" "notion_context_hydrate" "failed" "exit=$pull_rc; path=$context_path; trace=$TRACE_DIR/context-pull-$safe_name.jsonl"
+        cat "$OUT_DIR/loc-context-pull-$safe_name.json" >&2
+        cat "$OUT_DIR/loc-context-pull-$safe_name.err" >&2
+        exit "$pull_rc"
+      fi
+      hydrated_count=$((hydrated_count + 1))
+    done < "$CONTEXT_PATHS_FILE"
+    phase_end "locality" "notion_context_hydrate" "ok" "paths=$hydrated_count; list=$CONTEXT_PATHS_FILE; traces=$TRACE_DIR/context-pull-*.jsonl"
+  else
+    hydrated_count="$(grep -cve '^[[:space:]]*$' "$CONTEXT_PATHS_FILE" 2>/dev/null || true)"
+    phase_end "locality" "notion_context_hydrate" "skipped" "prehydrated context; paths=$hydrated_count; list=$CONTEXT_PATHS_FILE"
+  fi
 
   phase_start
   : > "$CONTEXT_INVENTORY"
@@ -1321,14 +1391,14 @@ if [ "$RUN_LOCALITY_AGENT" -eq 1 ]; then
     fi
     {
       echo "## $context_path"
-      find "$context_path" -name page.md -type f | sort
+      find "$context_path" \( -name page.md -o -name '*.md' -o -name '*.txt' -o -name '*.json' \) -type f | sort | head -5000
       echo
     } >> "$CONTEXT_INVENTORY"
     rg -n --no-heading "$CONTEXT_SEARCH_QUERY" "$context_path" >> "$CONTEXT_SEARCH_RESULTS" 2>/dev/null || true
   done < "$CONTEXT_PATHS_FILE"
-  inventory_count="$(grep -c '/page.md$' "$CONTEXT_INVENTORY" 2>/dev/null || true)"
+  inventory_count="$(grep -Ec '(\.md|\.txt|\.json)$' "$CONTEXT_INVENTORY" 2>/dev/null || true)"
   search_hits="$(wc -l < "$CONTEXT_SEARCH_RESULTS" | tr -d ' ')"
-  phase_end "locality" "notion_context_search" "ok" "pages=$inventory_count; hits=$search_hits; query=$CONTEXT_SEARCH_QUERY"
+  phase_end "locality" "notion_context_search" "ok" "files=$inventory_count; hits=$search_hits; query=$CONTEXT_SEARCH_QUERY"
 
   phase_start
   PARENT_DIR="$(dirname "$PAGE_PATH")"
