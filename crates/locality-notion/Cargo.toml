@@ -11,6 +11,7 @@ name = "locality_notion"
 path = "src/lib.rs"
 
 [dependencies]
+base64 = "0.22"
 locality-core.workspace = true
 locality-connector.workspace = true
 mime_guess = "2.0"

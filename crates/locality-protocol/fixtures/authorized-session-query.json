@@ -1,0 +1,31 @@
+{
+  "versions": {
+    "session": 1,
+    "replica": 1,
+    "export_metadata": 1,
+    "writable_session_store": 1,
+    "canonical": 1,
+    "path": 1,
+    "changeset": 1
+  },
+  "tenant_id": "tenant-acme",
+  "session_id": "session-7",
+  "acting_principal_id": "principal-agent",
+  "workload_id": "workload-sandbox",
+  "authorization_revision": 42,
+  "policy_revision": 17,
+  "profile_revision": 9,
+  "effective_actions": [
+    "read",
+    "update"
+  ],
+  "replica_revisions": [
+    {
+      "source_connection_id": "source-notion",
+      "replica_revision_id": "replica-108"
+    }
+  ],
+  "validated_filter_digest": "sha256:filter",
+  "max_entries": 10000,
+  "max_bytes": 104857600
+}

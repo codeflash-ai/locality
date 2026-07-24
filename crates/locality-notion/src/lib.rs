@@ -13,6 +13,7 @@ pub mod mapping;
 pub mod markdown_table;
 pub mod media;
 pub mod oauth;
+mod portable;
 pub mod projection;
 pub mod render;
 pub mod schema;
@@ -25,6 +26,8 @@ use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
     ConnectorCapabilities, ConnectorExecutionPolicy, ConnectorKind, EnumerateRequest, FetchRequest,
     ListChildrenRequest, ListChildrenResult, NativeEntity, ObserveRequest, ParsedEntity,
+    PortableBootstrapRequest, PortableChangeBatch, PortableFetchRequest, PortableFetchResult,
+    PortableRenderRequest, PortableRenderResult, PortableSyncRequest,
 };
 use locality_core::freshness::RemoteObservation;
 use locality_core::model::{CanonicalDocument, RemoteId, TreeEntry};
@@ -34,9 +37,12 @@ use locality_core::{LocalityError, LocalityResult};
 use crate::apply::{apply_plan, apply_undo, check_concurrency};
 use crate::client::{DEFAULT_NOTION_TOKEN_ENV, HttpNotionApi, NotionApi};
 use crate::fetch::fetch_page_bundle;
-use crate::media::{MediaDownloadReport, download_media_assets};
+use crate::media::{
+    MediaDownloadReport, MediaFetchReport, PortableMediaCaptureFetcher, PortableMediaCapturePolicy,
+    default_portable_media_fetcher, download_media_assets, fetch_media_asset_report_with_fetcher,
+};
 use crate::projection::{
-    enumerate_root_page_tree, enumerate_shared_pages, list_container_children, observe_entity,
+    enumerate_explicit_root_trees, enumerate_shared_pages, list_container_children, observe_entity,
     resolve_notion_object_path_entries, resolve_page_path_entries,
 };
 use crate::render::{
@@ -99,12 +105,20 @@ impl NotionConfig {
 pub struct NotionConnector {
     config: NotionConfig,
     api: Arc<dyn NotionApi>,
+    explicit_root_page_ids: Vec<RemoteId>,
+    explicit_root_set: bool,
+    portable_media_capture_policy: PortableMediaCapturePolicy,
+    portable_media_fetcher: Option<Arc<dyn PortableMediaCaptureFetcher>>,
 }
 
 impl std::fmt::Debug for NotionConnector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NotionConnector")
             .field("config", &self.config)
+            .field(
+                "portable_media_capture_policy",
+                &self.portable_media_capture_policy,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -115,7 +129,15 @@ impl NotionConnector {
     }
 
     pub fn with_api(config: NotionConfig, api: Arc<dyn NotionApi>) -> Self {
-        Self { config, api }
+        let explicit_root_page_ids = config.root_page_id.iter().cloned().collect();
+        Self {
+            config,
+            api,
+            explicit_root_page_ids,
+            explicit_root_set: false,
+            portable_media_capture_policy: PortableMediaCapturePolicy::Disabled,
+            portable_media_fetcher: None,
+        }
     }
 
     pub fn config(&self) -> &NotionConfig {
@@ -124,11 +146,67 @@ impl NotionConnector {
 
     pub fn with_root_page_id(&self, root_page_id: locality_core::model::RemoteId) -> Self {
         let mut config = self.config.clone();
-        config.root_page_id = Some(root_page_id);
+        config.root_page_id = Some(root_page_id.clone());
         Self {
             config,
             api: Arc::clone(&self.api),
+            explicit_root_page_ids: vec![root_page_id],
+            explicit_root_set: false,
+            portable_media_capture_policy: self.portable_media_capture_policy,
+            portable_media_fetcher: self.portable_media_fetcher.clone(),
         }
+    }
+
+    /// Select up to 16 explicit page or full-page database roots without using
+    /// provider search. Validation is deferred to enumeration/bootstrap so
+    /// malformed scopes fail through the normal connector result channel.
+    pub fn with_root_ids(&self, root_ids: impl IntoIterator<Item = RemoteId>) -> Self {
+        let explicit_root_page_ids = root_ids.into_iter().collect::<Vec<_>>();
+        let mut config = self.config.clone();
+        config.root_page_id =
+            (explicit_root_page_ids.len() == 1).then(|| explicit_root_page_ids[0].clone());
+        Self {
+            config,
+            api: Arc::clone(&self.api),
+            explicit_root_page_ids,
+            explicit_root_set: true,
+            portable_media_capture_policy: self.portable_media_capture_policy,
+            portable_media_fetcher: self.portable_media_fetcher.clone(),
+        }
+    }
+
+    /// Compatibility alias for [`Self::with_root_ids`].
+    pub fn with_root_page_ids(&self, root_page_ids: impl IntoIterator<Item = RemoteId>) -> Self {
+        self.with_root_ids(root_page_ids)
+    }
+
+    pub fn explicit_root_page_ids(&self) -> &[RemoteId] {
+        &self.explicit_root_page_ids
+    }
+
+    /// Enable or disable the portable hosted-media capture policy.
+    ///
+    /// This does not change direct fetch/render or desktop media materialization.
+    pub fn with_portable_media_capture(&self, policy: PortableMediaCapturePolicy) -> Self {
+        let mut connector = self.clone();
+        connector.portable_media_capture_policy = policy;
+        connector
+    }
+
+    /// Inject a deterministic portable media fetcher while retaining the same
+    /// connector-side URL validation and pilot byte limits.
+    pub fn with_portable_media_capture_fetcher(
+        &self,
+        policy: PortableMediaCapturePolicy,
+        fetcher: Arc<dyn PortableMediaCaptureFetcher>,
+    ) -> Self {
+        let mut connector = self.with_portable_media_capture(policy);
+        connector.portable_media_fetcher = Some(fetcher);
+        connector
+    }
+
+    pub fn portable_media_capture_policy(&self) -> PortableMediaCapturePolicy {
+        self.portable_media_capture_policy
     }
 
     pub fn render_native_entity(
@@ -170,6 +248,19 @@ impl NotionConnector {
         download_media_assets(mount_root.as_ref(), &rendered.media_assets)
     }
 
+    /// Fetch the hosted assets selected by the shared renderer.
+    ///
+    /// The optional injected fetcher is also used by daemon hydration tests;
+    /// production connectors use the hardened default transport.
+    pub fn fetch_rendered_media(&self, rendered: &NotionRenderedEntity) -> MediaFetchReport {
+        let default_fetcher = default_portable_media_fetcher();
+        let fetcher = self
+            .portable_media_fetcher
+            .as_deref()
+            .unwrap_or(default_fetcher.as_ref());
+        fetch_media_asset_report_with_fetcher(&rendered.media_assets, fetcher)
+    }
+
     pub fn database_schema_yaml(&self, database_id: &RemoteId) -> LocalityResult<String> {
         database::database_schema_yaml(self.api.as_ref(), database_id.as_str())
     }
@@ -203,7 +294,15 @@ impl NotionConnector {
 
 impl Connector for NotionConnector {
     fn with_execution_policy(&self, policy: ConnectorExecutionPolicy) -> Self {
-        Self::new(self.config.clone().with_execution_policy(policy))
+        let connector = Self::new(self.config.clone().with_execution_policy(policy));
+        let mut connector = if self.explicit_root_set {
+            connector.with_root_ids(self.explicit_root_page_ids.clone())
+        } else {
+            connector
+        };
+        connector.portable_media_capture_policy = self.portable_media_capture_policy;
+        connector.portable_media_fetcher = self.portable_media_fetcher.clone();
+        connector
     }
 
     fn kind(&self) -> ConnectorKind {
@@ -243,11 +342,56 @@ impl Connector for NotionConnector {
     }
 
     fn enumerate(&self, request: EnumerateRequest) -> LocalityResult<Vec<TreeEntry>> {
-        if let Some(root_page_id) = &self.config.root_page_id {
-            enumerate_root_page_tree(self.api.as_ref(), request.mount_id, root_page_id)
+        if self.explicit_root_set || !self.explicit_root_page_ids.is_empty() {
+            portable::validate_configured_roots(&self.explicit_root_page_ids)?;
+            Ok(enumerate_explicit_root_trees(
+                self.api.as_ref(),
+                request.mount_id,
+                &self.explicit_root_page_ids,
+            )?
+            .into_iter()
+            .map(|projected| projected.entry)
+            .collect())
         } else {
             enumerate_shared_pages(self.api.as_ref(), request.mount_id)
         }
+    }
+
+    fn bootstrap_portable(
+        &self,
+        request: PortableBootstrapRequest,
+    ) -> LocalityResult<PortableChangeBatch> {
+        portable::bootstrap(
+            self.api.as_ref(),
+            &self.explicit_root_page_ids,
+            self.explicit_root_set,
+            request,
+        )
+    }
+
+    fn sync_portable(&self, request: PortableSyncRequest) -> LocalityResult<PortableChangeBatch> {
+        portable::synchronize(
+            self.api.as_ref(),
+            &self.explicit_root_page_ids,
+            self.explicit_root_set,
+            request,
+        )
+    }
+
+    fn fetch_portable(&self, request: PortableFetchRequest) -> LocalityResult<PortableFetchResult> {
+        portable::fetch(
+            self.api.as_ref(),
+            self.portable_media_capture_policy,
+            self.portable_media_fetcher.as_deref(),
+            request,
+        )
+    }
+
+    fn render_portable(
+        &self,
+        request: &PortableRenderRequest,
+    ) -> LocalityResult<PortableRenderResult> {
+        portable::render(request)
     }
 
     fn list_children(&self, request: ListChildrenRequest) -> LocalityResult<ListChildrenResult> {

@@ -24,6 +24,44 @@ use localityd::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
 use serde_json::json;
 
 #[test]
+fn prepare_push_uses_shared_engine_for_existing_entity_plan_and_diff() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("fake");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("page-1"),
+                "Old paragraph.\n",
+                9,
+                [RemoteId::new("block-1")],
+            )
+            .expect("shadow")
+            .with_frontmatter(
+                "loc:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n",
+            ),
+        )
+        .expect("save shadow");
+    let path = fixture.write_page("Roadmap.md", "Changed paragraph.\n");
+
+    let prepared =
+        prepare_push(&store, &job(path), None, &LocalSourceValidator).expect("prepare push");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::ConfirmPlan);
+    assert_eq!(
+        prepared.pipeline.plan.expect("plan").operations,
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("block-1"),
+            content: "Changed paragraph.".to_string(),
+        }]
+    );
+    let diff = prepared.readable_diff.expect("readable diff");
+    assert_eq!(diff.files[0].path, "Roadmap.md");
+    assert!(diff.text.contains("-Old paragraph."), "{}", diff.text);
+    assert!(diff.text.contains("+Changed paragraph."), "{}", diff.text);
+}
+
+#[test]
 fn prepare_push_blocks_notion_schema_violation_for_existing_database_row() {
     let fixture = PrepareFixture::new();
     let mut store = fixture.store("notion");

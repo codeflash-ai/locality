@@ -3,12 +3,20 @@
 use locality_core::LocalityResult;
 
 use crate::client::NotionApi;
-use crate::dto::{BlockTreeDto, NotionPageBundle};
+use crate::dto::{BlockTreeDto, NotionPageBundle, PageDto};
 
 pub fn fetch_page_bundle(api: &dyn NotionApi, page_id: &str) -> LocalityResult<NotionPageBundle> {
     let page = api.retrieve_page(page_id)?;
-    let blocks = fetch_block_trees(api, page_id)?;
+    fetch_known_page_bundle(api, page_id, page)
+}
 
+/// Fetches block content after the caller has already classified an object as a page.
+pub(crate) fn fetch_known_page_bundle(
+    api: &dyn NotionApi,
+    page_id: &str,
+    page: PageDto,
+) -> LocalityResult<NotionPageBundle> {
+    let blocks = fetch_block_trees(api, page_id)?;
     Ok(NotionPageBundle { page, blocks })
 }
 

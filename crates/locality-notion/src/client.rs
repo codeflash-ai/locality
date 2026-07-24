@@ -329,6 +329,13 @@ enum NotionRetryClass {
     Mutation,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum NotionResponseInterpretation {
+    #[default]
+    Default,
+    PageLookup,
+}
+
 impl HttpNotionApi {
     pub fn new(config: NotionConfig) -> Self {
         let client = notion_http_client_builder()
@@ -339,6 +346,25 @@ impl HttpNotionApi {
     }
 
     fn get_json<T>(&self, path: &str, query: &[(&str, String)]) -> LocalityResult<T>
+    where
+        T: DeserializeOwned,
+    {
+        self.get_json_with_interpretation(path, query, NotionResponseInterpretation::Default)
+    }
+
+    fn get_page_json<T>(&self, path: &str) -> LocalityResult<T>
+    where
+        T: DeserializeOwned,
+    {
+        self.get_json_with_interpretation(path, &[], NotionResponseInterpretation::PageLookup)
+    }
+
+    fn get_json_with_interpretation<T>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+        response_interpretation: NotionResponseInterpretation,
+    ) -> LocalityResult<T>
     where
         T: DeserializeOwned,
     {
@@ -353,18 +379,24 @@ impl HttpNotionApi {
             .map(|(key, value)| ((*key).to_string(), value.clone()))
             .collect::<Vec<_>>();
 
-        self.send_request_with_retry("GET", path, NotionRetryClass::ReadSafe, || {
-            let mut request = self
-                .client
-                .get(&url)
-                .bearer_auth(&token)
-                .header("Notion-Version", DEFAULT_NOTION_VERSION);
+        self.send_request_with_retry_and_interpretation(
+            "GET",
+            path,
+            NotionRetryClass::ReadSafe,
+            response_interpretation,
+            || {
+                let mut request = self
+                    .client
+                    .get(&url)
+                    .bearer_auth(&token)
+                    .header("Notion-Version", DEFAULT_NOTION_VERSION);
 
-            for (key, value) in &query {
-                request = request.query(&[(key.as_str(), value.as_str())]);
-            }
-            request
-        })
+                for (key, value) in &query {
+                    request = request.query(&[(key.as_str(), value.as_str())]);
+                }
+                request
+            },
+        )
     }
 
     fn post_json<T>(&self, path: &str, body: impl Serialize) -> LocalityResult<T>
@@ -532,6 +564,26 @@ impl HttpNotionApi {
         method: &str,
         path: &str,
         retry_class: NotionRetryClass,
+        build_request: impl FnMut() -> reqwest::blocking::RequestBuilder,
+    ) -> LocalityResult<T>
+    where
+        T: DeserializeOwned,
+    {
+        self.send_request_with_retry_and_interpretation(
+            method,
+            path,
+            retry_class,
+            NotionResponseInterpretation::Default,
+            build_request,
+        )
+    }
+
+    fn send_request_with_retry_and_interpretation<T>(
+        &self,
+        method: &str,
+        path: &str,
+        retry_class: NotionRetryClass,
+        response_interpretation: NotionResponseInterpretation,
         mut build_request: impl FnMut() -> reqwest::blocking::RequestBuilder,
     ) -> LocalityResult<T>
     where
@@ -575,6 +627,15 @@ impl HttpNotionApi {
             let body = response
                 .text()
                 .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
+            if response_interpretation == NotionResponseInterpretation::PageLookup
+                && notion_page_lookup_reports_database(status, &body)
+            {
+                // Notion reports an object-kind mismatch as HTTP 400 rather
+                // than 404. Present it as a page miss only at this exact
+                // boundary so explicit-root traversal can try the database
+                // endpoint without weakening other validation failures.
+                return Err(LocalityError::RemoteNotFound(body));
+            }
             if is_retryable_notion_http_status(status, retry_class)
                 && attempt < DEFAULT_NOTION_RATE_LIMIT_RETRIES
             {
@@ -673,6 +734,20 @@ fn is_retryable_notion_transport_error(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
 }
 
+fn notion_page_lookup_reports_database(status: StatusCode, body: &str) -> bool {
+    if status != StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let Ok(error) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    error.get("code").and_then(Value::as_str) == Some("validation_error")
+        && error
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains(" is a database, not a page"))
+}
+
 fn retry_after_header(headers: &HeaderMap) -> Option<Duration> {
     headers
         .get(reqwest::header::RETRY_AFTER)?
@@ -710,7 +785,7 @@ impl NotionApi for HttpNotionApi {
     }
 
     fn retrieve_page(&self, page_id: &str) -> LocalityResult<PageDto> {
-        self.get_json(&format!("/v1/pages/{page_id}"), &[])
+        self.get_page_json(&format!("/v1/pages/{page_id}"))
     }
 
     fn retrieve_database(&self, database_id: &str) -> LocalityResult<DatabaseDto> {
@@ -879,8 +954,9 @@ fn data_source_search_body(start_cursor: Option<&str>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        HttpNotionApi, NotionRetryClass, data_source_search_body, notion_http_client_builder,
-        notion_network_config, rate_limit_backoff, retry_after_header,
+        HttpNotionApi, NotionResponseInterpretation, NotionRetryClass, data_source_search_body,
+        notion_http_client_builder, notion_network_config, notion_page_lookup_reports_database,
+        rate_limit_backoff, retry_after_header,
     };
     use locality_core::LocalityError;
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
@@ -929,6 +1005,59 @@ mod tests {
         assert_eq!(config.retry.max_retries, 4);
         assert_eq!(config.retry.initial_backoff, Duration::from_secs(1));
         assert_eq!(config.retry.max_backoff, Duration::from_secs(16));
+    }
+
+    #[test]
+    fn page_lookup_maps_exact_database_kind_mismatch_to_page_miss() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let url = format!("http://{}/database-root", listener.local_addr().unwrap());
+        let body = r#"{"object":"error","status":400,"code":"validation_error","message":"Provided ID 4614fba4-9bdf-45e0-a006-4f91dca082f1 is a database, not a page. Use the retrieve database API instead.","request_id":"request-1"}"#;
+        let response_body = body.as_bytes().to_vec();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            read_http_request_headers(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_body.len()
+            )
+            .expect("write headers");
+            stream.write_all(&response_body).expect("write body");
+        });
+        let api = HttpNotionApi {
+            config: crate::NotionConfig::default(),
+            client: notion_http_client_builder()
+                .timeout(Duration::from_millis(500))
+                .build()
+                .expect("build client"),
+        };
+
+        let error = api
+            .send_request_with_retry_and_interpretation::<Value>(
+                "GET",
+                "/v1/pages/database-root",
+                NotionRetryClass::ReadSafe,
+                NotionResponseInterpretation::PageLookup,
+                || api.client.get(&url),
+            )
+            .expect_err("database kind mismatch is a page miss");
+
+        server.join().expect("join server");
+        assert_eq!(error, LocalityError::RemoteNotFound(body.to_string()));
+    }
+
+    #[test]
+    fn page_lookup_does_not_reclassify_other_bad_requests() {
+        let other_validation =
+            r#"{"code":"validation_error","message":"Provided page ID is invalid."}"#;
+        assert!(!notion_page_lookup_reports_database(
+            reqwest::StatusCode::BAD_REQUEST,
+            other_validation
+        ));
+        assert!(!notion_page_lookup_reports_database(
+            reqwest::StatusCode::NOT_FOUND,
+            r#"{"code":"validation_error","message":"ID is a database, not a page"}"#
+        ));
     }
 
     #[test]

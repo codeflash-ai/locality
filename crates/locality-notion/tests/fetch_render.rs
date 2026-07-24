@@ -1,11 +1,20 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use locality_connector::{
-    ChildContainer, Connector, EnumerateRequest, FetchRequest, ListChildrenRequest,
+    ChildContainer, Connector, ConnectorExecutionPolicy, EnumerateRequest, FetchRequest,
+    ListChildrenRequest, NativeEntity, PORTABLE_SCOPE_ROOT_RELATIONSHIP, PortableBootstrapRequest,
+    PortableFetchReason, PortableFetchRequest, PortableIncompleteReason, PortableRenderRequest,
+    PortableSourceScope, PortableSyncRequest,
 };
+use locality_core::canonical::render_canonical_markdown;
 use locality_core::model::{EntityKind, MountId, RemoteId};
+use locality_core::portable::{
+    LogicalPath, ProjectionFileKind, SourceAction, SourceConnectionId, SourceEdge,
+};
 use locality_core::shadow::MarkdownBlockKind;
 use locality_notion::client::NotionApi;
 use locality_notion::dto::{
@@ -13,10 +22,15 @@ use locality_notion::dto::{
     DataSourceSummaryDto, DatabaseDto, DatabaseListDto, DateMentionDto, EmptyBlockDto,
     EquationBlockDto, EquationRichTextDto, ExternalFileDto, FileBlockDto, FilePropertyDto,
     HostedFileDto, IdRefDto, LinkDto, LinkToPageBlockDto, MeetingNotesBlockDto, MentionRichTextDto,
-    PageDto, PageListDto, PagePropertyDto, PaginatedListDto, ParentDto, RichTextAnnotationsDto,
+    NotionDatabaseBundle, NotionPortableIncompleteMediaV1, NotionPortablePageBundleV1, PageDto,
+    PageListDto, PagePropertyDto, PaginatedListDto, ParentDto, RichTextAnnotationsDto,
     RichTextBlockDto, RichTextDto, SelectOptionDto, SelectPropertySchemaDto, SyncedBlockDto,
     SyncedFromDto, TableBlockDto, TableRowBlockDto, TextRichTextDto, TitleBlockDto,
     UniqueIdPropertyDto, UrlBlockDto, VerificationPropertyDto,
+};
+use locality_notion::media::{
+    PORTABLE_MEDIA_MAX_ASSET_BYTES, PortableMediaCapture, PortableMediaCaptureFetcher,
+    PortableMediaCapturePolicy,
 };
 use locality_notion::{NotionConfig, NotionConnector};
 use serde_json::json;
@@ -1085,11 +1099,11 @@ fn render_all_known_notion_block_objects_into_markdown_or_directives() {
         "[Embed](https://example.com/embed)",
         "[Bookmark](https://example.com/bookmark)",
         "[Preview](https://example.com/preview)",
-        "![Image](../.loc/media/Docs/Coverage/image-111111111111aaaa.png)",
-        "[Video](../.loc/media/Docs/Coverage/video-222222222222bbbb.mp4)",
-        "[File](../.loc/media/Docs/Coverage/file-333333333333cccc.txt)",
-        "[PDF](../.loc/media/Docs/Coverage/pdf-444444444444dddd.pdf)",
-        "[Audio](../.loc/media/Docs/Coverage/audio-555555555555eeee.mp3)",
+        "![Image](https://example.com/image.png)",
+        "[Video](https://example.com/video.mp4)",
+        "[File](https://example.com/file.txt)",
+        "[PDF](https://example.com/file.pdf)",
+        "[Audio](https://example.com/audio.mp3)",
         "::loc{id=synced-original-1 type=synced_block}",
         "::loc{id=synced-copy-1 type=synced_block source_block_id=\"source-block-1\"}",
         "[Linked page](https://www.notion.so/target-page-1)",
@@ -1116,14 +1130,7 @@ fn render_all_known_notion_block_objects_into_markdown_or_directives() {
         );
     }
 
-    assert_eq!(
-        rendered
-            .media_assets
-            .iter()
-            .map(|asset| asset.kind.as_str())
-            .collect::<Vec<_>>(),
-        vec!["image", "video", "file", "pdf", "audio"]
-    );
+    assert!(rendered.media_assets.is_empty());
     let link_preview_shadow = rendered
         .shadow
         .blocks
@@ -1280,10 +1287,10 @@ fn render_media_blocks_as_markdown_links_and_tracks_local_paths() {
     let bundle = locality_notion::dto::NotionPageBundle {
         page: page("page-1", "Coverage"),
         blocks: vec![BlockTreeDto {
-            block: file_block(
+            block: hosted_file_block_with_caption(
                 "0123456789abcdef",
                 "image",
-                "https://example.com/image.PNG?download=1",
+                "https://secure.notion-static.com/image.PNG?download=1",
                 "Image caption",
             ),
             children: Vec::new(),
@@ -1313,37 +1320,37 @@ fn render_file_like_media_blocks_as_local_links_when_downloaded() {
         page: page("page-1", "Coverage"),
         blocks: vec![
             BlockTreeDto {
-                block: file_block(
+                block: hosted_file_block_with_caption(
                     "1111111111111111",
                     "video",
-                    "https://example.com/cars.MP4?download=1",
+                    "https://secure.notion-static.com/cars.MP4?download=1",
                     "Cars",
                 ),
                 children: Vec::new(),
             },
             BlockTreeDto {
-                block: file_block(
+                block: hosted_file_block_with_caption(
                     "2222222222222222",
                     "pdf",
-                    "https://example.com/brief.PDF?download=1",
+                    "https://secure.notion-static.com/brief.PDF?download=1",
                     "Brief",
                 ),
                 children: Vec::new(),
             },
             BlockTreeDto {
-                block: file_block(
+                block: hosted_file_block_with_caption(
                     "3333333333333333",
                     "audio",
-                    "https://example.com/theme.MP3?download=1",
+                    "https://secure.notion-static.com/theme.MP3?download=1",
                     "Theme",
                 ),
                 children: Vec::new(),
             },
             BlockTreeDto {
-                block: file_block(
+                block: hosted_file_block_with_caption(
                     "4444444444444444",
                     "file",
-                    "https://example.com/index.HTML?download=1",
+                    "https://secure.notion-static.com/index.HTML?download=1",
                     "Index",
                 ),
                 children: Vec::new(),
@@ -1389,14 +1396,14 @@ fn render_file_like_media_blocks_as_local_links_when_downloaded() {
 }
 
 #[test]
-fn render_media_blocks_can_keep_failed_downloads_as_remote_urls() {
+fn render_failed_hosted_media_as_url_free_directive() {
     let bundle = locality_notion::dto::NotionPageBundle {
         page: page("page-1", "Coverage"),
         blocks: vec![BlockTreeDto {
-            block: file_block(
+            block: hosted_file_block_with_caption(
                 "0123456789abcdef",
                 "image",
-                "https://example.com/image.PNG?download=1",
+                "https://secure.notion-static.com/image.PNG?X-Amz-Signature=secret",
                 "Image caption",
             ),
             children: Vec::new(),
@@ -1410,15 +1417,12 @@ fn render_media_blocks_can_keep_failed_downloads_as_remote_urls() {
     )
     .expect("render");
 
-    assert_eq!(rendered.media_assets.len(), 1);
-    assert_eq!(
-        rendered.media_assets[0].local_path,
-        Path::new(".loc/media/Docs/Coverage/image-0123456789abcdef.png")
-    );
+    assert!(rendered.media_assets.is_empty());
     assert_eq!(
         rendered.document.body,
-        "![Image caption](https://example.com/image.PNG?download=1)\n"
+        "::loc{id=0123456789abcdef type=image title=\"Image caption\"}\n"
     );
+    assert!(!rendered.document.body.contains("X-Amz"));
     assert_eq!(rendered.shadow.rendered_body, rendered.document.body);
 }
 
@@ -1439,12 +1443,12 @@ fn render_relative_media_url_without_local_download_asset() {
     .expect("render");
 
     assert!(rendered.media_assets.is_empty());
-    assert_eq!(rendered.document.body, "![Image](img_2.png)\n");
+    assert_eq!(rendered.document.body, "::loc{id=image-1 type=image}\n");
     assert_eq!(rendered.shadow.blocks.len(), 1);
-    assert_eq!(
-        rendered.shadow.blocks[0].remote_id,
-        RemoteId::new("image-1")
-    );
+    assert!(matches!(
+        rendered.shadow.blocks[0].kind,
+        MarkdownBlockKind::Directive { .. }
+    ));
 }
 
 #[test]
@@ -2013,6 +2017,2523 @@ fn enumerate_projects_root_page_tree_to_stable_paths() {
 }
 
 #[test]
+fn portable_bootstrap_resumes_and_completes_database_coverage() {
+    let root_page_id = RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let connector = NotionConnector::with_api(
+        NotionConfig::default().with_root_page_id(root_page_id.clone()),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::tree(
+            root_page_id.as_str(),
+        ))),
+    );
+
+    let first = connector
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            scope: PortableSourceScope::explicit_roots([root_page_id.clone()]),
+            checkpoint: None,
+            max_changes: 2,
+        })
+        .expect("first checkpoint");
+    assert_eq!(first.changes.len(), 2);
+    assert!(!first.completeness.is_complete());
+    assert!(
+        first
+            .completeness
+            .incomplete_reasons()
+            .contains(&PortableIncompleteReason::CheckpointContinuation)
+    );
+
+    let second = connector
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            scope: PortableSourceScope::explicit_roots([root_page_id]),
+            checkpoint: Some(first.next_checkpoint),
+            max_changes: 2,
+        })
+        .expect("resumed checkpoint");
+    assert_eq!(second.changes.len(), 2);
+    assert!(second.completeness.is_complete());
+    assert!(
+        !second
+            .completeness
+            .incomplete_reasons()
+            .contains(&PortableIncompleteReason::CheckpointContinuation)
+    );
+    assert!(second.completeness.incomplete_reasons().is_empty());
+
+    let synchronized = connector
+        .sync_portable(PortableSyncRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            scope: PortableSourceScope::explicit_roots([RemoteId::new(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )]),
+            checkpoint: second.next_checkpoint,
+            hints: Vec::new(),
+            max_changes: 10,
+        })
+        .expect("scheduled explicit-root synchronization");
+    assert_eq!(synchronized.changes.len(), 4);
+    assert!(synchronized.completeness.is_complete());
+}
+
+#[test]
+fn portable_bootstrap_requires_the_configured_explicit_root_without_search_fallback() {
+    let root_page_id = RemoteId::new("page-1");
+    let connector = NotionConnector::with_api(
+        NotionConfig::default().with_root_page_id(root_page_id.clone()),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::new())),
+    );
+
+    let batch = connector
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            scope: PortableSourceScope::explicit_roots([root_page_id]),
+            checkpoint: None,
+            max_changes: 100,
+        })
+        .expect("explicit-root bootstrap");
+    let direct = connector
+        .enumerate(EnumerateRequest {
+            mount_id: MountId::new("notion-main"),
+            cursor: None,
+        })
+        .expect("direct explicit-root enumeration");
+    assert!(batch.completeness.is_complete());
+    assert_eq!(batch.changes.len(), 1);
+    let direct_logical_path = direct[0]
+        .path
+        .iter()
+        .map(|component| component.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    assert_eq!(
+        batch.changes[0]
+            .logical_path
+            .as_ref()
+            .expect("portable path")
+            .as_str(),
+        direct_logical_path
+    );
+
+    let workspace_connector = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::new())),
+    );
+    let error = workspace_connector
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            scope: PortableSourceScope::explicit_roots([RemoteId::new("page-1")]),
+            checkpoint: None,
+            max_changes: 100,
+        })
+        .expect_err("workspace search must not be a portable fallback");
+    assert!(error.to_string().contains("configured root page"));
+}
+
+#[test]
+fn explicit_multi_root_paths_match_workspace_projection_and_are_order_invariant() {
+    let first_root = RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let second_root = RemoteId::new("ffffffffffffffffffffffffffffffff");
+    let workspace = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(FixtureNotionApi::multi_root_workspace()),
+    );
+    let workspace_entries = workspace
+        .enumerate(EnumerateRequest {
+            mount_id: MountId::new("notion-main"),
+            cursor: None,
+        })
+        .expect("workspace enumerate");
+
+    let explicit = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::multi_root_workspace())),
+    )
+    .with_root_ids([second_root.clone(), first_root.clone()]);
+    let explicit_entries = explicit
+        .enumerate(EnumerateRequest {
+            mount_id: MountId::new("notion-main"),
+            cursor: None,
+        })
+        .expect("explicit enumerate");
+    let paths = |entries: Vec<locality_core::model::TreeEntry>| {
+        entries
+            .into_iter()
+            .map(|entry| (entry.remote_id, entry.path))
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(paths(explicit_entries), paths(workspace_entries));
+
+    let request = |roots| PortableBootstrapRequest {
+        source_connection_id: SourceConnectionId::new("source-notion"),
+        scope: PortableSourceScope::explicit_roots(roots),
+        checkpoint: None,
+        max_changes: 2,
+    };
+    let first = explicit
+        .bootstrap_portable(request([first_root.clone(), second_root.clone()]))
+        .expect("multi-root bootstrap");
+    let reversed = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::multi_root_workspace())),
+    )
+    .with_root_ids([first_root.clone(), second_root.clone()])
+    .bootstrap_portable(request([second_root, first_root]))
+    .expect("reversed multi-root bootstrap");
+
+    assert_eq!(first, reversed);
+    assert_eq!(first.next_checkpoint.format_version, 2);
+    assert_eq!(first.changes.len(), 2, "max_changes is aggregate");
+    assert!(first.changes.iter().all(|change| {
+        change.source_object.edges.len() == 1
+            && change.source_object.edges[0].relationship == PORTABLE_SCOPE_ROOT_RELATIONSHIP
+    }));
+    assert_eq!(
+        first
+            .changes
+            .iter()
+            .map(|change| (
+                change.source_object.remote_id.as_str(),
+                change
+                    .source_object
+                    .edges
+                    .first()
+                    .expect("owning-root edge")
+                    .target_remote_id
+                    .as_str(),
+                change.logical_path.as_ref().expect("logical path").as_str(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "Roadmap aaaaaa/page.md",
+            ),
+            (
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "Roadmap aaaaaa/Notes/page.md",
+            ),
+        ]
+    );
+    let checkpoint: serde_json::Value =
+        serde_json::from_str(&first.next_checkpoint.opaque).expect("v2 checkpoint json");
+    assert_eq!(checkpoint["component_version"], 2);
+    assert_eq!(
+        checkpoint["root_remote_ids"],
+        json!([
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ffffffffffffffffffffffffffffffff"
+        ])
+    );
+
+    let one_root = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::multi_root_workspace())),
+    )
+    .with_root_ids([RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")]);
+    let mismatch = one_root
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            scope: PortableSourceScope::explicit_roots([RemoteId::new(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )]),
+            checkpoint: Some(first.next_checkpoint.clone()),
+            max_changes: 2,
+        })
+        .expect_err("checkpoint root set must match exactly");
+    assert!(mismatch.to_string().contains("does not match"));
+
+    let mut newer_checkpoint = first.next_checkpoint;
+    let mut newer_opaque: serde_json::Value =
+        serde_json::from_str(&newer_checkpoint.opaque).expect("v2 checkpoint json");
+    newer_opaque["component_version"] = json!(3);
+    newer_checkpoint.opaque = serde_json::to_string(&newer_opaque).expect("checkpoint json");
+    let newer_error = explicit
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            scope: PortableSourceScope::explicit_roots([
+                RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                RemoteId::new("ffffffffffffffffffffffffffffffff"),
+            ]),
+            checkpoint: Some(newer_checkpoint),
+            max_changes: 2,
+        })
+        .expect_err("newer component version must fail cleanly");
+    assert!(newer_error.to_string().contains("requires an update"));
+}
+
+#[test]
+fn explicit_multi_root_rejects_overlap_duplicates_empty_and_scope_mismatch() {
+    let first_root = RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let nested_root = RemoteId::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    let overlapping = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::multi_root_workspace())),
+    )
+    .with_root_ids([first_root.clone(), nested_root]);
+    let overlap_error = overlapping
+        .enumerate(EnumerateRequest {
+            mount_id: MountId::new("notion-main"),
+            cursor: None,
+        })
+        .expect_err("nested roots must be rejected");
+    assert!(overlap_error.to_string().contains("overlap"));
+
+    let duplicate = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::new())),
+    )
+    .with_root_ids([RemoteId::new("page-1"), RemoteId::new("PAGE1")]);
+    assert!(
+        duplicate
+            .enumerate(EnumerateRequest {
+                mount_id: MountId::new("notion-main"),
+                cursor: None,
+            })
+            .expect_err("duplicates must fail")
+            .to_string()
+            .contains("duplicate")
+    );
+
+    let empty = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::new())),
+    )
+    .with_root_ids([]);
+    assert!(
+        empty
+            .enumerate(EnumerateRequest {
+                mount_id: MountId::new("notion-main"),
+                cursor: None,
+            })
+            .expect_err("empty set must fail")
+            .to_string()
+            .contains("must not be empty")
+    );
+
+    let mismatch = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::multi_root_workspace())),
+    )
+    .with_root_ids([first_root]);
+    assert!(
+        mismatch
+            .bootstrap_portable(PortableBootstrapRequest {
+                source_connection_id: SourceConnectionId::new("source-notion"),
+                scope: PortableSourceScope::explicit_roots([RemoteId::new(
+                    "ffffffffffffffffffffffffffffffff",
+                )]),
+                checkpoint: None,
+                max_changes: 10,
+            })
+            .expect_err("scope mismatch must fail")
+            .to_string()
+            .contains("exactly match")
+    );
+
+    let sixteen_ids = (0..16)
+        .map(|index| RemoteId::new(format!("root-{index:02}")))
+        .collect::<Vec<_>>();
+    let sixteen = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::many_roots(16))),
+    )
+    .with_root_ids(sixteen_ids.clone());
+    assert_eq!(
+        sixteen
+            .enumerate(EnumerateRequest {
+                mount_id: MountId::new("notion-main"),
+                cursor: None,
+            })
+            .expect("sixteen roots are supported")
+            .len(),
+        16
+    );
+    let seventeen =
+        sixteen.with_root_ids(sixteen_ids.into_iter().chain([RemoteId::new("root-16")]));
+    assert_eq!(
+        seventeen
+            .enumerate(EnumerateRequest {
+                mount_id: MountId::new("notion-main"),
+                cursor: None,
+            })
+            .expect_err("seventeen roots exceed the bound")
+            .to_string(),
+        "invalid state: Notion explicit root set exceeds the limit of 16"
+    );
+}
+
+#[test]
+fn explicit_database_root_matches_workspace_projection_without_search() {
+    let database_id = RemoteId::new("root-db");
+    let workspace = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(FixtureNotionApi::workspace()),
+    );
+    let workspace_database = workspace
+        .enumerate(EnumerateRequest {
+            mount_id: MountId::new("notion-main"),
+            cursor: None,
+        })
+        .expect("workspace enumerate")
+        .into_iter()
+        .find(|entry| entry.remote_id == database_id)
+        .expect("workspace database root");
+
+    let explicit = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::workspace())),
+    )
+    .with_root_ids([database_id.clone()]);
+    let entries = explicit
+        .enumerate(EnumerateRequest {
+            mount_id: MountId::new("notion-main"),
+            cursor: None,
+        })
+        .expect("explicit database enumerate");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].kind, EntityKind::Database);
+    assert_eq!(entries[0].path, workspace_database.path);
+    assert_eq!(entries[0].path, Path::new("Tasks"));
+
+    let batch = explicit
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            scope: PortableSourceScope::explicit_roots([database_id.clone()]),
+            checkpoint: None,
+            max_changes: 10,
+        })
+        .expect("explicit database bootstrap");
+    assert_eq!(batch.changes.len(), 1);
+    assert_eq!(batch.changes[0].source_object.remote_id, database_id);
+    assert_eq!(
+        batch.changes[0].source_object.edges,
+        vec![SourceEdge {
+            relationship: PORTABLE_SCOPE_ROOT_RELATIONSHIP.to_string(),
+            target_remote_id: RemoteId::new("rootdb"),
+        }]
+    );
+    assert!(batch.changes[0].requires_fetch);
+    assert_eq!(
+        batch.changes[0]
+            .logical_path
+            .as_ref()
+            .expect("database schema path")
+            .as_str(),
+        "Tasks/_schema.yaml"
+    );
+    assert!(batch.completeness.is_complete());
+}
+
+#[test]
+fn explicit_root_page_non_not_found_error_does_not_fall_back_to_database() {
+    let connector =
+        NotionConnector::with_api(NotionConfig::default(), Arc::new(NonNotFoundPageErrorApi))
+            .with_root_ids([RemoteId::new("database-id")]);
+    let error = connector
+        .enumerate(EnumerateRequest {
+            mount_id: MountId::new("notion-main"),
+            cursor: None,
+        })
+        .expect_err("non-not-found page failure must be preserved");
+    assert_eq!(
+        error.to_string(),
+        "invalid state: injected page retrieval failure"
+    );
+}
+
+#[test]
+fn legacy_single_root_keeps_v1_checkpoint_and_v2_set_mode_rejects_it() {
+    let root = RemoteId::new("page-1");
+    let legacy = NotionConnector::with_api(
+        NotionConfig::default().with_root_page_id(root.clone()),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::new())),
+    );
+    let legacy_batch = legacy
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            scope: PortableSourceScope::explicit_roots([root.clone()]),
+            checkpoint: None,
+            max_changes: 10,
+        })
+        .expect("legacy bootstrap");
+    assert_eq!(legacy_batch.next_checkpoint.format_version, 1);
+    assert_eq!(
+        legacy_batch.next_checkpoint.opaque,
+        "{\"operation\":\"bootstrap\",\"root_remote_id\":\"page-1\",\"inventory_sha256\":\"sha256:a870998d440a30dccfac26d79f3b2345e1bbec1aa1bcdb26e3682ac92680b3dc\",\"offset\":1,\"complete\":true}"
+    );
+    assert!(legacy_batch.changes[0].source_object.edges.is_empty());
+
+    let set_mode = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::new())),
+    )
+    .with_root_page_ids([root.clone()]);
+    let error = set_mode
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            scope: PortableSourceScope::explicit_roots([root]),
+            checkpoint: Some(legacy_batch.next_checkpoint),
+            max_changes: 10,
+        })
+        .expect_err("set mode must not accept legacy checkpoints");
+    assert!(error.to_string().contains("does not match"));
+}
+
+#[test]
+fn portable_render_matches_direct_canonical_bytes_and_keys_survive_rename() {
+    let root_page_id = RemoteId::new("page-1");
+    let connector = NotionConnector::with_api(
+        NotionConfig::default().with_root_page_id(root_page_id.clone()),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::new())),
+    );
+    let fetched = connector
+        .fetch_portable(PortableFetchRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            remote_id: root_page_id,
+            reason: PortableFetchReason::Bootstrap,
+        })
+        .expect("portable fetch");
+    let direct = connector.render(&fetched.native).expect("direct render");
+
+    let before = connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            logical_path: LogicalPath::new("Roadmap/page.md").expect("path"),
+            native: fetched.native.clone(),
+            format_version: 1,
+        })
+        .expect("portable render");
+    let after = connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            logical_path: LogicalPath::new("Renamed Roadmap/page.md").expect("path"),
+            native: fetched.native,
+            format_version: 1,
+        })
+        .expect("portable renamed render");
+
+    assert_eq!(
+        before.canonical.body,
+        render_canonical_markdown(&direct).into_bytes()
+    );
+    assert_eq!(before.canonical.artifact_key, after.canonical.artifact_key);
+    assert_eq!(
+        before.projections[0].artifact.artifact_key,
+        after.projections[0].artifact.artifact_key
+    );
+    assert_eq!(
+        before.projections[0].artifact.body,
+        after.projections[0].artifact.body
+    );
+    assert_ne!(
+        before.projections[0].logical_path,
+        after.projections[0].logical_path
+    );
+}
+
+#[test]
+fn portable_database_root_fetches_and_renders_exact_shared_schema_projection() {
+    let root_page_id = RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let compact_database_id = "cccccccccccccccccccccccccccccccc";
+    let provider_database_id = "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC";
+    let compact_data_source_id = "dddddddddddddddddddddddddddddddd";
+    let provider_data_source_id = "DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD";
+    let mut api = FixtureNotionApi::tree(root_page_id.as_str());
+    let mut database = api
+        .databases
+        .get(compact_database_id)
+        .cloned()
+        .expect("database fixture");
+    database.id = provider_database_id.to_string();
+    api.databases
+        .insert(compact_database_id.to_string(), database.clone());
+    api.databases
+        .insert(provider_database_id.to_string(), database.clone());
+    let data_source = api
+        .data_sources
+        .get_mut(compact_data_source_id)
+        .expect("data-source fixture");
+    data_source.id = provider_data_source_id.to_string();
+    data_source.parent = Some(ParentDto {
+        kind: "database_id".to_string(),
+        database_id: Some(provider_database_id.to_string()),
+        ..Default::default()
+    });
+    let expected_bundle = NotionDatabaseBundle {
+        database: database.clone(),
+        data_sources: vec![data_source.clone()],
+    };
+    let connector = NotionConnector::with_api(
+        NotionConfig::default().with_root_page_id(root_page_id.clone()),
+        Arc::new(NoSearchNotionApi(api)),
+    );
+
+    let direct_entries = connector
+        .enumerate(EnumerateRequest {
+            mount_id: MountId::new("notion-main"),
+            cursor: None,
+        })
+        .expect("direct enumerate");
+    let direct_database = direct_entries
+        .iter()
+        .find(|entry| entry.kind == EntityKind::Database)
+        .expect("direct database");
+    let direct_row = direct_entries
+        .iter()
+        .find(|entry| entry.remote_id == RemoteId::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"))
+        .expect("direct row");
+
+    let batch = connector
+        .bootstrap_portable(PortableBootstrapRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            scope: PortableSourceScope::explicit_roots([root_page_id]),
+            checkpoint: None,
+            max_changes: 10,
+        })
+        .expect("portable bootstrap");
+    assert!(batch.completeness.is_complete());
+    let database_change = batch
+        .changes
+        .iter()
+        .find(|change| change.source_object.kind == EntityKind::Database)
+        .expect("portable database change");
+    let row_change = batch
+        .changes
+        .iter()
+        .find(|change| {
+            change.source_object.remote_id == RemoteId::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+        })
+        .expect("portable row change");
+    let portable_path = |path: &Path| {
+        path.iter()
+            .map(|component| component.to_str().expect("UTF-8 direct path component"))
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    assert!(database_change.requires_fetch);
+    assert_eq!(
+        database_change
+            .logical_path
+            .as_ref()
+            .expect("database schema path")
+            .as_str(),
+        format!("{}/_schema.yaml", portable_path(&direct_database.path))
+    );
+    assert_eq!(
+        row_change.logical_path.as_ref().expect("row path").as_str(),
+        portable_path(&direct_row.path)
+    );
+
+    let fetched = connector
+        .fetch_portable(PortableFetchRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            remote_id: database_change.source_object.remote_id.clone(),
+            reason: PortableFetchReason::Bootstrap,
+        })
+        .expect("portable database fetch");
+    assert_eq!(fetched.native.kind, "notion_database");
+    assert_eq!(
+        fetched.native.remote_id,
+        RemoteId::new(provider_database_id)
+    );
+    assert_eq!(
+        fetched.native.raw,
+        serde_json::to_vec(&expected_bundle).expect("exact native fixture")
+    );
+    assert_eq!(
+        fetched.provider_version.as_deref(),
+        Some(concat!(
+            "{\"format_version\":1,",
+            "\"database\":{\"id\":\"cccccccccccccccccccccccccccccccc\",",
+            "\"last_edited_time\":\"2026-06-10T01:00:00.000Z\"},",
+            "\"data_sources\":[{",
+            "\"id\":\"dddddddddddddddddddddddddddddddd\",",
+            "\"last_edited_time\":\"2026-06-10T01:01:00.000Z\"}]}"
+        ))
+    );
+
+    let rendered = connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            logical_path: database_change
+                .logical_path
+                .clone()
+                .expect("database schema path"),
+            native: fetched.native.clone(),
+            format_version: 1,
+        })
+        .expect("portable database render");
+    let exact_schema = concat!(
+        "loc:\n",
+        "  type: notion_database_schema\n",
+        "  database_id: \"CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC\"\n",
+        "title: \"Tasks\"\n",
+        "data_sources:\n",
+        "  - id: \"DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD\"\n",
+        "    name: \"Tasks\"\n",
+        "    properties:\n",
+        "      \"Name\":\n",
+        "        id: \"title\"\n",
+        "        type: \"title\"\n",
+        "      \"Status\":\n",
+        "        id: \"status-id\"\n",
+        "        type: \"select\"\n",
+        "        options:\n",
+        "          - name: \"Todo\"\n",
+        "            id: \"todo-id\"\n",
+    );
+    assert_eq!(rendered.canonical.body, exact_schema.as_bytes());
+    assert_eq!(
+        rendered.projections[0].artifact.body,
+        exact_schema.as_bytes()
+    );
+    assert_eq!(
+        connector
+            .database_schema_yaml(&RemoteId::new(provider_database_id))
+            .expect("direct schema"),
+        exact_schema
+    );
+    assert_eq!(
+        rendered.canonical.artifact_key.as_str(),
+        "notion:database:cccccccccccccccccccccccccccccccc:canonical_schema:v1"
+    );
+    assert_eq!(
+        rendered.projections[0].artifact.artifact_key.as_str(),
+        "notion:database:cccccccccccccccccccccccccccccccc:database_schema:v1"
+    );
+    assert_eq!(
+        rendered.canonical.media_type,
+        "application/yaml; charset=utf-8"
+    );
+    assert_eq!(rendered.projections[0].file_kind, ProjectionFileKind::Yaml);
+    assert_eq!(rendered.projections[0].supported_actions.len(), 2);
+    assert!(
+        rendered.projections[0]
+            .supported_actions
+            .contains(&SourceAction::Read)
+    );
+    assert!(
+        rendered.projections[0]
+            .supported_actions
+            .contains(&SourceAction::Search)
+    );
+    assert!(rendered.completeness.is_complete());
+
+    let renamed = connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            logical_path: LogicalPath::new("Renamed Tasks/_schema.yaml").expect("renamed path"),
+            native: fetched.native,
+            format_version: 1,
+        })
+        .expect("renamed database render");
+    assert_eq!(
+        rendered.canonical.artifact_key,
+        renamed.canonical.artifact_key
+    );
+    assert_eq!(
+        rendered.projections[0].artifact.artifact_key,
+        renamed.projections[0].artifact.artifact_key
+    );
+    assert_ne!(
+        rendered.projections[0].logical_path,
+        renamed.projections[0].logical_path
+    );
+}
+
+#[test]
+fn portable_database_fetch_and_render_fail_closed_on_identity_and_ownership_mismatch() {
+    let database_id = "cccccccccccccccccccccccccccccccc";
+    let data_source_id = "dddddddddddddddddddddddddddddddd";
+    let mut mismatched_api = FixtureNotionApi::tree("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    mismatched_api
+        .databases
+        .get_mut(database_id)
+        .expect("database")
+        .id = "ffffffffffffffffffffffffffffffff".to_string();
+    let mismatched_connector = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(mismatched_api)),
+    );
+    let returned_id_error = mismatched_connector
+        .fetch_portable(PortableFetchRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            remote_id: RemoteId::new(database_id),
+            reason: PortableFetchReason::Bootstrap,
+        })
+        .expect_err("different returned database ID");
+    assert_eq!(
+        returned_id_error.to_string(),
+        concat!(
+            "invalid state: Notion database bundle returned database ",
+            "`ffffffffffffffffffffffffffffffff` for requested database ",
+            "`cccccccccccccccccccccccccccccccc`"
+        )
+    );
+
+    let mut api = FixtureNotionApi::tree("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    api.data_sources
+        .get_mut(data_source_id)
+        .expect("data source")
+        .parent = Some(ParentDto {
+        kind: "database_id".to_string(),
+        database_id: Some("ffffffffffffffffffffffffffffffff".to_string()),
+        ..Default::default()
+    });
+    let connector =
+        NotionConnector::with_api(NotionConfig::default(), Arc::new(NoSearchNotionApi(api)));
+
+    let ownership_error = connector
+        .fetch_portable(PortableFetchRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            remote_id: RemoteId::new(database_id),
+            reason: PortableFetchReason::Bootstrap,
+        })
+        .expect_err("foreign data-source owner");
+    assert_eq!(
+        ownership_error.to_string(),
+        concat!(
+            "invalid state: Notion data source `dddddddddddddddddddddddddddddddd` ",
+            "belongs to database `ffffffffffffffffffffffffffffffff`, ",
+            "not `cccccccccccccccccccccccccccccccc`"
+        )
+    );
+
+    let valid_api = FixtureNotionApi::tree("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let valid_connector = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(NoSearchNotionApi(valid_api)),
+    );
+    let fetched = valid_connector
+        .fetch_portable(PortableFetchRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            remote_id: RemoteId::new(database_id),
+            reason: PortableFetchReason::Bootstrap,
+        })
+        .expect("valid database fetch");
+    let identity_error = valid_connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            logical_path: LogicalPath::new("Tasks/_schema.yaml").expect("path"),
+            native: NativeEntity {
+                remote_id: RemoteId::new("ffffffffffffffffffffffffffffffff"),
+                ..fetched.native.clone()
+            },
+            format_version: 1,
+        })
+        .expect_err("mismatched native remote ID");
+    assert_eq!(
+        identity_error.to_string(),
+        "invalid state: Notion portable database native payload does not match its remote ID"
+    );
+
+    let unsupported_kind = valid_connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            logical_path: LogicalPath::new("Tasks/_schema.yaml").expect("path"),
+            native: NativeEntity {
+                remote_id: RemoteId::new(database_id),
+                kind: "notion_database_view".to_string(),
+                raw: Vec::new(),
+            },
+            format_version: 1,
+        })
+        .expect_err("unsupported native kind");
+    assert_eq!(
+        unsupported_kind.to_string(),
+        "invalid state: Notion portable render received unsupported native kind `notion_database_view`"
+    );
+
+    let malformed = valid_connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            logical_path: LogicalPath::new("Tasks/_schema.yaml").expect("path"),
+            native: NativeEntity {
+                remote_id: RemoteId::new(database_id),
+                kind: "notion_database".to_string(),
+                raw: b"{}".to_vec(),
+            },
+            format_version: 1,
+        })
+        .expect_err("malformed database bundle");
+    assert!(
+        malformed
+            .to_string()
+            .starts_with("io error: notion database native decode failed:")
+    );
+}
+
+#[test]
+fn portable_fetch_does_not_fall_back_to_database_after_non_not_found_page_error() {
+    let connector =
+        NotionConnector::with_api(NotionConfig::default(), Arc::new(NonNotFoundPageErrorApi));
+
+    let error = connector
+        .fetch_portable(PortableFetchRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            remote_id: RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            reason: PortableFetchReason::Bootstrap,
+        })
+        .expect_err("page error must not trigger database fallback");
+
+    assert_eq!(
+        error.to_string(),
+        "invalid state: injected page retrieval failure"
+    );
+}
+
+#[test]
+fn portable_fetch_preserves_descendant_not_found_without_database_fallback() {
+    let retrieve_page_calls = Arc::new(AtomicUsize::new(0));
+    let connector = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(DescendantNotFoundApi {
+            retrieve_page_calls: Arc::clone(&retrieve_page_calls),
+        }),
+    );
+
+    let error = connector
+        .fetch_portable(PortableFetchRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            remote_id: RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            reason: PortableFetchReason::Bootstrap,
+        })
+        .expect_err("descendant block lookup must fail as a page fetch");
+
+    assert_eq!(
+        error,
+        locality_core::LocalityError::RemoteNotFound(
+            "missing descendant block `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`".to_string()
+        )
+    );
+    assert_eq!(retrieve_page_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn portable_render_marks_media_incomplete_instead_of_silently_omitting_it() {
+    let bundle = locality_notion::dto::NotionPageBundle {
+        page: page("page-media", "Media"),
+        blocks: vec![BlockTreeDto {
+            block: file_block("image-1", "image", "https://example.com/image.png", "Image"),
+            children: Vec::new(),
+        }],
+    };
+    let connector = NotionConnector::with_api(
+        NotionConfig::default().with_root_page_id(RemoteId::new("page-media")),
+        Arc::new(NoSearchNotionApi(FixtureNotionApi::new())),
+    );
+    let rendered = connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            logical_path: LogicalPath::new("Media/page.md").expect("path"),
+            native: NativeEntity {
+                remote_id: RemoteId::new("page-media"),
+                kind: "notion_page".to_string(),
+                raw: serde_json::to_vec(&bundle).expect("native fixture"),
+            },
+            format_version: 1,
+        })
+        .expect("render media page");
+
+    assert!(!rendered.completeness.is_complete());
+    assert!(rendered.completeness.incomplete_reasons().iter().any(
+        |reason| matches!(reason, PortableIncompleteReason::UnsupportedArtifact {
+            artifact_kind,
+            ..
+        } if artifact_kind == "notion_media")
+    ));
+}
+
+#[test]
+fn portable_hosted_media_capture_is_sanitized_local_and_exact() {
+    let page_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let block_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let signed_url = concat!(
+        "https://secure.notion-static.com/assets/Cover.PNG?",
+        "X-Amz-Signature=signature-secret&token=token-secret&",
+        "Authorization=Bearer%20authorization-secret#fragment-secret"
+    );
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = Arc::new(FixturePortableMediaFetcher {
+        outcomes: BTreeMap::from([(
+            signed_url.to_string(),
+            FixturePortableMediaOutcome::Success(PortableMediaCapture {
+                bytes: vec![0x89, b'P', b'N', b'G'],
+                media_type: "image/png; charset=binary".to_string(),
+            }),
+        )]),
+        calls: Arc::clone(&calls),
+    });
+    let connector = portable_media_connector(
+        page_id,
+        vec![hosted_file_block(
+            block_id,
+            "image",
+            signed_url,
+            Some("2099-06-12T10:00:00.000Z"),
+        )],
+    )
+    .with_portable_media_capture_fetcher(PortableMediaCapturePolicy::HostedPilot, fetcher.clone());
+
+    assert_eq!(
+        connector.portable_media_capture_policy(),
+        PortableMediaCapturePolicy::HostedPilot
+    );
+    let fetcher_references = Arc::strong_count(&fetcher);
+    let rooted = connector.with_root_page_id(RemoteId::new(page_id));
+    assert_eq!(Arc::strong_count(&fetcher), fetcher_references + 1);
+    assert_eq!(
+        rooted.portable_media_capture_policy(),
+        PortableMediaCapturePolicy::HostedPilot
+    );
+    drop(rooted);
+    let deferred = connector.with_execution_policy(ConnectorExecutionPolicy::DeferProviderCooldown);
+    assert_eq!(Arc::strong_count(&fetcher), fetcher_references + 1);
+    assert_eq!(
+        deferred.portable_media_capture_policy(),
+        PortableMediaCapturePolicy::HostedPilot
+    );
+    drop(deferred);
+
+    let fetched = connector
+        .fetch_portable(portable_fetch_request(page_id))
+        .expect("portable media fetch");
+    assert!(fetched.completeness.is_complete());
+    assert_eq!(fetched.native.kind, "notion_page_portable_media_v1");
+    assert_eq!(
+        calls.lock().expect("calls").as_slice(),
+        [(signed_url.to_string(), PORTABLE_MEDIA_MAX_ASSET_BYTES)]
+    );
+    let native: locality_notion::dto::NotionPortablePageBundleV1 =
+        serde_json::from_slice(&fetched.native.raw).expect("portable media native");
+    assert_eq!(native.format_version, 1);
+    assert_eq!(
+        native.captured_media,
+        vec![locality_notion::dto::NotionPortableCapturedMediaV1 {
+            block_id: block_id.to_string(),
+            kind: "image".to_string(),
+            media_type: "image/png".to_string(),
+            bytes: vec![0x89, b'P', b'N', b'G'],
+        }]
+    );
+    assert!(native.incomplete_media.is_empty());
+    let hosted = native.page.blocks[0]
+        .block
+        .image
+        .as_ref()
+        .and_then(|file| file.file.as_ref())
+        .expect("sanitized hosted file");
+    assert_eq!(
+        hosted.url,
+        "https://secure.notion-static.com/assets/Cover.PNG"
+    );
+    assert_eq!(hosted.expiry_time, None);
+    let native_raw = String::from_utf8_lossy(&fetched.native.raw);
+    assert!(native_raw.contains(r#""bytes":"iVBORw==""#));
+    assert!(!native_raw.contains(signed_url));
+    let desktop_paths = locality_notion::render::render_page_bundle_with_options(
+        &native.page,
+        &locality_notion::render::RenderOptions::with_page_path("Docs/Coverage/page.md"),
+    )
+    .expect("desktop path render");
+    assert_eq!(
+        desktop_paths.media_assets[0].local_path,
+        Path::new(".loc/media/Docs/Coverage/image-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.png")
+    );
+    for forbidden in [
+        "X-Amz-Signature",
+        "signature-secret",
+        "token-secret",
+        "Authorization",
+        "authorization-secret",
+        "fragment-secret",
+        "2099-06-12",
+    ] {
+        assert!(!native_raw.contains(forbidden));
+        assert!(!format!("{fetched:?}").contains(forbidden));
+    }
+
+    let rendered = connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            logical_path: LogicalPath::new("Docs/Coverage/page.md").expect("path"),
+            native: fetched.native,
+            format_version: 1,
+        })
+        .expect("portable media render");
+    let exact_markdown = concat!(
+        "---\n",
+        "loc:\n",
+        "  id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        "  type: page\n",
+        "  synced_at: \"2026-06-10T00:00:00.000Z\"\n",
+        "  remote_edited_at: \"2026-06-10T00:00:00.000Z\"\n",
+        "title: \"Coverage\"\n",
+        "---\n",
+        "![Image](../../.loc/media/Docs/Coverage/image-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.png)\n",
+    );
+    assert_eq!(rendered.canonical.body, exact_markdown.as_bytes());
+    assert_eq!(rendered.projections.len(), 2);
+    assert_eq!(
+        rendered.projections[0].artifact.body,
+        exact_markdown.as_bytes()
+    );
+    let binary = &rendered.projections[1];
+    assert_eq!(
+        binary.artifact.artifact_key.as_str(),
+        concat!(
+            "notion:page:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:",
+            "block:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:media:v1"
+        )
+    );
+    assert_eq!(binary.artifact.media_type, "image/png");
+    assert_eq!(binary.artifact.body, vec![0x89, b'P', b'N', b'G']);
+    assert_eq!(
+        binary.logical_path.as_str(),
+        ".loc/media/Docs/Coverage/image-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.png"
+    );
+    assert_eq!(binary.file_kind, ProjectionFileKind::Binary);
+    assert_eq!(
+        binary.supported_actions,
+        [SourceAction::Read, SourceAction::DownloadAttachment]
+            .into_iter()
+            .collect()
+    );
+    assert!(rendered.completeness.is_complete());
+    for projection in &rendered.projections {
+        let body = String::from_utf8_lossy(&projection.artifact.body);
+        assert!(!body.contains("X-Amz-Signature"));
+        assert!(!body.contains("token-secret"));
+        assert!(!body.contains("fragment-secret"));
+    }
+}
+
+#[test]
+fn portable_media_default_preserves_native_and_remains_incomplete() {
+    let page_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let signed_url = "https://secure.notion-static.com/image.png?X-Amz-Signature=direct";
+    let block = hosted_file_block(
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "image",
+        signed_url,
+        Some("2099-06-12T10:00:00.000Z"),
+    );
+    let connector = portable_media_connector(page_id, vec![block.clone()]);
+    let direct = connector
+        .fetch(FetchRequest {
+            remote_id: RemoteId::new(page_id),
+        })
+        .expect("direct fetch");
+    let fetched = connector
+        .fetch_portable(portable_fetch_request(page_id))
+        .expect("default portable fetch");
+    assert_eq!(fetched.native.kind, "notion_page");
+    assert_eq!(fetched.native.raw, direct.raw);
+    assert!(String::from_utf8_lossy(&fetched.native.raw).contains(signed_url));
+
+    let rendered = connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            logical_path: LogicalPath::new("Coverage/page.md").expect("path"),
+            native: fetched.native,
+            format_version: 1,
+        })
+        .expect("default portable render");
+    assert!(!rendered.completeness.is_complete());
+    assert_eq!(rendered.projections.len(), 1);
+}
+
+#[test]
+fn portable_external_media_is_an_exact_byte_free_reference_and_never_fetched() {
+    let page_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let block_id = "cccccccccccccccccccccccccccccccc";
+    let external_url = "https://CDN.Example.com:8443/assets/My%20Image.PNG?download=One#Section";
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = Arc::new(FixturePortableMediaFetcher {
+        outcomes: BTreeMap::new(),
+        calls: Arc::clone(&calls),
+    });
+    let block = file_block(block_id, "image", external_url, "Image caption");
+    let direct_bundle = locality_notion::dto::NotionPageBundle {
+        page: page(page_id, "Coverage"),
+        blocks: vec![BlockTreeDto {
+            block: block.clone(),
+            children: Vec::new(),
+        }],
+    };
+    let direct = locality_notion::render::render_page_bundle_with_options(
+        &direct_bundle,
+        &locality_notion::render::RenderOptions::with_page_path("Docs/Coverage/page.md")
+            .with_local_media_block_ids(Vec::<String>::new()),
+    )
+    .expect("direct external reference render");
+    let connector = portable_media_connector(page_id, vec![block])
+        .with_portable_media_capture_fetcher(PortableMediaCapturePolicy::HostedPilot, fetcher);
+
+    let fetched = connector
+        .fetch_portable(portable_fetch_request(page_id))
+        .expect("portable external reference fetch");
+    assert!(calls.lock().expect("calls").is_empty());
+    assert!(fetched.completeness.is_complete());
+    let native: NotionPortablePageBundleV1 =
+        serde_json::from_slice(&fetched.native.raw).expect("portable media native");
+    assert!(native.captured_media.is_empty());
+    assert!(native.incomplete_media.is_empty());
+    assert_eq!(
+        native.page.blocks[0]
+            .block
+            .image
+            .as_ref()
+            .and_then(|payload| payload.external.as_ref())
+            .map(|external| external.url.as_str()),
+        Some(external_url)
+    );
+
+    let rendered = connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            logical_path: LogicalPath::new("Docs/Coverage/page.md").expect("path"),
+            native: fetched.native,
+            format_version: 1,
+        })
+        .expect("portable external reference render");
+    let exact_markdown = concat!(
+        "---\n",
+        "loc:\n",
+        "  id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        "  type: page\n",
+        "  synced_at: \"2026-06-10T00:00:00.000Z\"\n",
+        "  remote_edited_at: \"2026-06-10T00:00:00.000Z\"\n",
+        "title: \"Coverage\"\n",
+        "---\n",
+        "![Image caption](https://CDN.Example.com:8443/assets/My%20Image.PNG?download=One#Section)\n",
+    );
+    assert_eq!(rendered.canonical.body, exact_markdown.as_bytes());
+    assert_eq!(
+        rendered.canonical.body,
+        render_canonical_markdown(&direct.document).as_bytes()
+    );
+    assert_eq!(rendered.projections.len(), 1);
+    assert_eq!(
+        rendered.projections[0].artifact.body,
+        exact_markdown.as_bytes()
+    );
+    assert!(rendered.completeness.is_complete());
+
+    let mut invalid_url = native.clone();
+    invalid_url.page.blocks[0]
+        .block
+        .image
+        .as_mut()
+        .expect("image payload")
+        .external
+        .as_mut()
+        .expect("external source")
+        .url = "http://example.com/not-https.png".to_string();
+    let mut mismatched_source = native;
+    mismatched_source.page.blocks[0]
+        .block
+        .image
+        .as_mut()
+        .expect("image payload")
+        .kind = "file".to_string();
+    for (case, bundle, expected) in [
+        (
+            "invalid URL",
+            invalid_url,
+            "invalid state: Notion portable external media URL is not allowed",
+        ),
+        (
+            "mismatched source",
+            mismatched_source,
+            "invalid state: Notion portable media payload type does not match its source",
+        ),
+    ] {
+        let error = connector
+            .render_portable(&portable_render_request(
+                page_id,
+                NativeEntity {
+                    remote_id: RemoteId::new(page_id),
+                    kind: "notion_page_portable_media_v1".to_string(),
+                    raw: serde_json::to_vec(&bundle).expect("tampered native"),
+                },
+            ))
+            .unwrap_err();
+        assert_eq!(error.to_string(), expected, "{case}");
+    }
+}
+
+#[test]
+fn portable_external_media_supports_every_file_like_block_without_capture() {
+    let page_id = "all-external-page";
+    let blocks = ["image", "video", "file", "pdf", "audio"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| {
+            file_block(
+                &format!("external-{kind}"),
+                kind,
+                &format!("https://example.com/{kind}?source=external&index={index}"),
+                &format!("External {kind}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let connector = portable_media_connector(page_id, blocks).with_portable_media_capture_fetcher(
+        PortableMediaCapturePolicy::HostedPilot,
+        Arc::new(FixturePortableMediaFetcher {
+            outcomes: BTreeMap::new(),
+            calls: Arc::clone(&calls),
+        }),
+    );
+
+    let fetched = connector
+        .fetch_portable(portable_fetch_request(page_id))
+        .expect("all external media fetch");
+    assert!(calls.lock().expect("calls").is_empty());
+    assert!(fetched.completeness.is_complete());
+    let native: NotionPortablePageBundleV1 =
+        serde_json::from_slice(&fetched.native.raw).expect("portable native");
+    assert!(native.captured_media.is_empty());
+    assert!(native.incomplete_media.is_empty());
+
+    let rendered = connector
+        .render_portable(&portable_render_request(page_id, fetched.native))
+        .expect("all external media render");
+    let expected_body = concat!(
+        "![External image](https://example.com/image?source=external&index=0)\n\n",
+        "[External video](https://example.com/video?source=external&index=1)\n\n",
+        "[External file](https://example.com/file?source=external&index=2)\n\n",
+        "[External pdf](https://example.com/pdf?source=external&index=3)\n\n",
+        "[External audio](https://example.com/audio?source=external&index=4)\n",
+    );
+    assert_eq!(
+        String::from_utf8(rendered.canonical.body).expect("UTF-8 Markdown"),
+        format!(
+            concat!(
+                "---\n",
+                "loc:\n",
+                "  id: all-external-page\n",
+                "  type: page\n",
+                "  synced_at: \"2026-06-10T00:00:00.000Z\"\n",
+                "  remote_edited_at: \"2026-06-10T00:00:00.000Z\"\n",
+                "title: \"Coverage\"\n",
+                "---\n",
+                "{}"
+            ),
+            expected_body
+        )
+    );
+    assert_eq!(rendered.projections.len(), 1);
+    assert!(rendered.completeness.is_complete());
+}
+
+#[test]
+fn mixed_hosted_success_omission_and_external_match_desktop_renderer_exactly() {
+    let page_id = "mixed-media-page";
+    let captured_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let omitted_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let captured_url =
+        "https://secure.notion-static.com/captured.png?X-Amz-Signature=captured-secret";
+    let omitted_url = "https://secure.notion-static.com/omitted.png?X-Amz-Signature=omitted-secret";
+    let external_url = "https://cdn.example.com/public.png?spelling=Exact#fragment";
+    let fetcher = Arc::new(FixturePortableMediaFetcher {
+        outcomes: BTreeMap::from([
+            (
+                captured_url.to_string(),
+                FixturePortableMediaOutcome::Success(PortableMediaCapture {
+                    bytes: b"captured-bytes".to_vec(),
+                    media_type: "image/png".to_string(),
+                }),
+            ),
+            (
+                omitted_url.to_string(),
+                FixturePortableMediaOutcome::Failure("temporary transport failure".to_string()),
+            ),
+        ]),
+        calls: Arc::new(Mutex::new(Vec::new())),
+    });
+    let connector = portable_media_connector(
+        page_id,
+        vec![
+            hosted_file_block(captured_id, "image", captured_url, None),
+            hosted_file_block(omitted_id, "image", omitted_url, None),
+            file_block("external-media", "image", external_url, "Public image"),
+        ],
+    )
+    .with_portable_media_capture_fetcher(PortableMediaCapturePolicy::HostedPilot, fetcher);
+
+    let fetched = connector
+        .fetch_portable(portable_fetch_request(page_id))
+        .expect("mixed portable fetch");
+    assert!(
+        fetched
+            .completeness
+            .incomplete_reasons()
+            .iter()
+            .any(|reason| {
+                matches!(reason, PortableIncompleteReason::ConnectorLimitation { code, remote_id }
+            if code == "notion_media_unavailable_hosted_media"
+                && remote_id.as_ref() == Some(&RemoteId::new(omitted_id)))
+            })
+    );
+    let native: NotionPortablePageBundleV1 =
+        serde_json::from_slice(&fetched.native.raw).expect("mixed native");
+    assert_eq!(native.captured_media.len(), 1);
+    assert_eq!(
+        native.incomplete_media,
+        vec![NotionPortableIncompleteMediaV1 {
+            block_id: omitted_id.to_string(),
+            kind: "image".to_string(),
+            code: "unavailable_hosted_media".to_string(),
+        }]
+    );
+
+    let desktop = locality_notion::render::render_page_bundle_with_options(
+        &native.page,
+        &locality_notion::render::RenderOptions::with_page_path("Docs/Mixed/page.md")
+            .with_local_media_block_ids([captured_id.to_string()]),
+    )
+    .expect("desktop shared render");
+    assert_eq!(desktop.media_assets.len(), 1);
+    assert_eq!(
+        desktop.media_assets[0].local_path,
+        Path::new(".loc/media/Docs/Mixed/image-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png")
+    );
+    assert_eq!(desktop.media_assets[0].block_id, captured_id);
+
+    let rendered = connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            logical_path: LogicalPath::new("Docs/Mixed/page.md").expect("mixed logical path"),
+            native: fetched.native,
+            format_version: 1,
+        })
+        .expect("mixed portable render");
+    let desktop_bytes = render_canonical_markdown(&desktop.document).into_bytes();
+    assert_eq!(rendered.canonical.body, desktop_bytes);
+    assert_eq!(rendered.projections.len(), 2);
+    assert_eq!(
+        rendered.projections[1].logical_path.as_str(),
+        ".loc/media/Docs/Mixed/image-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png"
+    );
+    assert_eq!(rendered.projections[1].artifact.body, b"captured-bytes");
+    let markdown = String::from_utf8(desktop_bytes).expect("UTF-8 markdown");
+    assert!(markdown.contains(
+        "![Image](../../.loc/media/Docs/Mixed/image-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png)"
+    ));
+    assert!(markdown.contains("::loc{id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb type=image}"));
+    assert!(markdown.contains(&format!("![Public image]({external_url})")));
+    for forbidden in [
+        captured_url,
+        omitted_url,
+        "captured-secret",
+        "omitted-secret",
+    ] {
+        assert!(!markdown.contains(forbidden));
+    }
+}
+
+#[test]
+fn portable_capture_keeps_pages_without_media_byte_exact() {
+    let page_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let blocks = vec![paragraph_block(
+        "paragraph-1",
+        vec![rich_text("No media here.")],
+    )];
+    let direct_connector = portable_media_connector(page_id, blocks.clone());
+    let direct_native = direct_connector
+        .fetch(FetchRequest {
+            remote_id: RemoteId::new(page_id),
+        })
+        .expect("direct fetch");
+    let direct_document = direct_connector
+        .render(&direct_native)
+        .expect("direct render");
+    let connector = portable_media_connector(page_id, blocks)
+        .with_portable_media_capture(PortableMediaCapturePolicy::HostedPilot);
+    let fetched = connector
+        .fetch_portable(portable_fetch_request(page_id))
+        .expect("portable fetch");
+    assert!(fetched.completeness.is_complete());
+    let rendered = connector
+        .render_portable(&PortableRenderRequest {
+            source_connection_id: SourceConnectionId::new("source-notion"),
+            logical_path: LogicalPath::new("Coverage/page.md").expect("path"),
+            native: fetched.native,
+            format_version: 1,
+        })
+        .expect("portable render");
+    let direct_bytes = render_canonical_markdown(&direct_document).into_bytes();
+    assert_eq!(rendered.canonical.body, direct_bytes);
+    assert_eq!(rendered.projections.len(), 1);
+    assert_eq!(rendered.projections[0].artifact.body, direct_bytes);
+    assert!(rendered.completeness.is_complete());
+}
+
+#[test]
+fn portable_media_denials_are_incomplete_and_never_publish_remote_urls() {
+    let denied = [
+        ("http", "http://secure.notion-static.com/image.png"),
+        ("ip", "https://127.0.0.1/image.png"),
+        (
+            "userinfo",
+            "https://user:pass@secure.notion-static.com/image.png",
+        ),
+        ("bad_port", "https://secure.notion-static.com:444/image.png"),
+        ("unlisted", "https://notion-static.com/image.png"),
+        (
+            "s3_prefix",
+            "https://s3.us-west-2.amazonaws.com/other/image.png",
+        ),
+    ];
+    for (index, (case, url)) in denied.into_iter().enumerate() {
+        let page_id = format!("page-denied-{index}");
+        let block_id = format!("block-denied-{index}");
+        let block = hosted_file_block(&block_id, "image", url, None);
+        let connector = portable_media_connector(&page_id, vec![block])
+            .with_portable_media_capture(PortableMediaCapturePolicy::HostedPilot);
+        let fetched = connector
+            .fetch_portable(portable_fetch_request(&page_id))
+            .unwrap_or_else(|error| panic!("{case} fetch failed closed unexpectedly: {error}"));
+        assert!(!fetched.completeness.is_complete(), "{case}");
+        assert!(fetched.completeness.incomplete_reasons().iter().any(|reason| {
+            matches!(reason, PortableIncompleteReason::ConnectorLimitation { code, remote_id }
+                if code == "notion_media_unsafe_hosted_media"
+                    && remote_id.as_ref() == Some(&RemoteId::new(block_id.clone())))
+        }));
+        let native: NotionPortablePageBundleV1 =
+            serde_json::from_slice(&fetched.native.raw).expect("denied native");
+        assert_eq!(
+            native.incomplete_media,
+            vec![NotionPortableIncompleteMediaV1 {
+                block_id: block_id.clone(),
+                kind: "image".to_string(),
+                code: "unsafe_hosted_media".to_string(),
+            }]
+        );
+        let raw = String::from_utf8_lossy(&fetched.native.raw);
+        assert!(!raw.contains(url), "{case}: {raw}");
+        let rendered = connector
+            .render_portable(&PortableRenderRequest {
+                source_connection_id: SourceConnectionId::new("source-notion"),
+                logical_path: LogicalPath::new(format!("Denied {index}/page.md")).expect("path"),
+                native: fetched.native,
+                format_version: 1,
+            })
+            .unwrap_or_else(|error| panic!("{case} render: {error}"));
+        assert!(!rendered.completeness.is_complete(), "{case}");
+        assert_eq!(rendered.projections.len(), 1, "{case}");
+        assert!(!String::from_utf8_lossy(&rendered.canonical.body).contains(url));
+    }
+}
+
+#[test]
+fn portable_external_media_fails_closed_without_fetching_bad_or_ambiguous_sources() {
+    let invalid = vec![
+        ("empty", String::new(), "unavailable_external_media"),
+        (
+            "too-long",
+            format!("https://example.com/{}", "a".repeat(8 * 1024)),
+            "unsafe_external_media_too_long",
+        ),
+        (
+            "whitespace",
+            "https://example.com/image name.png".to_string(),
+            "unsafe_external_media_whitespace_or_control",
+        ),
+        (
+            "control",
+            "https://example.com/image.png\u{7f}hidden".to_string(),
+            "unsafe_external_media_whitespace_or_control",
+        ),
+        (
+            "malformed",
+            "not-a-url".to_string(),
+            "external_media_malformed",
+        ),
+        (
+            "non-https",
+            "http://example.com/image.png".to_string(),
+            "unsafe_external_media_non_https",
+        ),
+        (
+            "missing-host",
+            "https://:443/image.png".to_string(),
+            "unsafe_external_media_missing_host",
+        ),
+        (
+            "userinfo",
+            "https://user:pass@example.com/image.png".to_string(),
+            "unsafe_external_media_userinfo",
+        ),
+        (
+            "empty-userinfo",
+            "https://@example.com/image.png".to_string(),
+            "unsafe_external_media_userinfo",
+        ),
+    ];
+    for (index, (case, url, expected_code)) in invalid.into_iter().enumerate() {
+        let page_id = format!("external-invalid-{index}");
+        let block_id = format!("external-block-{index}");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let connector = portable_media_connector(
+            &page_id,
+            vec![file_block(&block_id, "image", &url, "Image")],
+        )
+        .with_portable_media_capture_fetcher(
+            PortableMediaCapturePolicy::HostedPilot,
+            Arc::new(FixturePortableMediaFetcher {
+                outcomes: BTreeMap::new(),
+                calls: Arc::clone(&calls),
+            }),
+        );
+        let fetched = connector
+            .fetch_portable(portable_fetch_request(&page_id))
+            .unwrap_or_else(|error| panic!("{case} external fetch: {error}"));
+        assert!(calls.lock().expect("calls").is_empty(), "{case}");
+        assert!(!fetched.completeness.is_complete(), "{case}");
+        let native: NotionPortablePageBundleV1 =
+            serde_json::from_slice(&fetched.native.raw).expect("portable native");
+        assert!(native.captured_media.is_empty(), "{case}");
+        assert_eq!(
+            native.incomplete_media,
+            vec![NotionPortableIncompleteMediaV1 {
+                block_id: block_id.clone(),
+                kind: "image".to_string(),
+                code: expected_code.to_string(),
+            }],
+            "{case}"
+        );
+        assert_eq!(
+            fetched.completeness.incomplete_reasons(),
+            &[PortableIncompleteReason::ConnectorLimitation {
+                code: format!("notion_media_{expected_code}"),
+                remote_id: Some(RemoteId::new(block_id.clone())),
+            }],
+            "{case}"
+        );
+        assert_eq!(
+            native.page.blocks[0]
+                .block
+                .image
+                .as_ref()
+                .and_then(|payload| payload.external.as_ref())
+                .map(|external| external.url.as_str()),
+            Some(""),
+            "{case}"
+        );
+        let rendered = connector
+            .render_portable(&portable_render_request(
+                &page_id,
+                NativeEntity {
+                    remote_id: RemoteId::new(&page_id),
+                    kind: "notion_page_portable_media_v1".to_string(),
+                    raw: serde_json::to_vec(&native).expect("portable native"),
+                },
+            ))
+            .unwrap_or_else(|error| panic!("{case} external render: {error}"));
+        assert_eq!(rendered.projections.len(), 1, "{case}");
+        assert!(!rendered.completeness.is_complete(), "{case}");
+        if !url.is_empty() {
+            assert!(!String::from_utf8_lossy(&fetched.native.raw).contains(&url));
+            assert!(!String::from_utf8_lossy(&rendered.canonical.body).contains(&url));
+        }
+    }
+
+    let external_url = "https://example.com/public.png";
+    let hosted_url = "https://secure.notion-static.com/private.png?X-Amz-Signature=must-not-escape";
+    let mut ambiguous = file_block("ambiguous", "image", external_url, "Image");
+    ambiguous.image.as_mut().expect("image payload").file = Some(HostedFileDto {
+        url: hosted_url.to_string(),
+        expiry_time: Some("2099-01-01T00:00:00.000Z".to_string()),
+    });
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let connector = portable_media_connector("ambiguous-page", vec![ambiguous])
+        .with_portable_media_capture_fetcher(
+            PortableMediaCapturePolicy::HostedPilot,
+            Arc::new(FixturePortableMediaFetcher {
+                outcomes: BTreeMap::new(),
+                calls: Arc::clone(&calls),
+            }),
+        );
+    let fetched = connector
+        .fetch_portable(portable_fetch_request("ambiguous-page"))
+        .expect("ambiguous source becomes explicit incomplete");
+    assert!(calls.lock().expect("calls").is_empty());
+    assert!(!fetched.completeness.is_complete());
+    let native: NotionPortablePageBundleV1 =
+        serde_json::from_slice(&fetched.native.raw).expect("ambiguous native");
+    assert!(native.captured_media.is_empty());
+    assert_eq!(
+        native.incomplete_media,
+        vec![NotionPortableIncompleteMediaV1 {
+            block_id: "ambiguous".to_string(),
+            kind: "image".to_string(),
+            code: "ambiguous_file_source".to_string(),
+        }]
+    );
+    let raw = String::from_utf8_lossy(&fetched.native.raw);
+    assert!(!raw.contains(external_url));
+    assert!(!raw.contains(hosted_url));
+
+    for (case, mut block) in [
+        (
+            "external-as-file",
+            file_block("mismatch-external", "image", external_url, "Image"),
+        ),
+        (
+            "hosted-as-external",
+            hosted_file_block("mismatch-hosted", "image", hosted_url, None),
+        ),
+    ] {
+        let payload = block.image.as_mut().expect("image payload");
+        payload.kind = if payload.kind == "external" {
+            "file".to_string()
+        } else {
+            "external".to_string()
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let connector = portable_media_connector(case, vec![block])
+            .with_portable_media_capture_fetcher(
+                PortableMediaCapturePolicy::HostedPilot,
+                Arc::new(FixturePortableMediaFetcher {
+                    outcomes: BTreeMap::new(),
+                    calls: Arc::clone(&calls),
+                }),
+            );
+        assert_eq!(
+            connector
+                .fetch_portable(portable_fetch_request(case))
+                .expect_err("payload mismatch must fail")
+                .to_string(),
+            "invalid state: Notion portable media payload type does not match its source"
+        );
+        assert!(calls.lock().expect("calls").is_empty(), "{case}");
+    }
+}
+
+#[test]
+fn portable_external_media_legacy_generic_outcome_remains_readable() {
+    let page_id = "legacy-invalid-external-page";
+    let block_id = "legacy-invalid-external-block";
+    let unsafe_url = "http://user:secret@example.com/private.png";
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let connector = portable_media_connector(
+        page_id,
+        vec![file_block(block_id, "image", unsafe_url, "Private image")],
+    )
+    .with_portable_media_capture_fetcher(
+        PortableMediaCapturePolicy::HostedPilot,
+        Arc::new(FixturePortableMediaFetcher {
+            outcomes: BTreeMap::new(),
+            calls: Arc::clone(&calls),
+        }),
+    );
+    let fetched = connector
+        .fetch_portable(portable_fetch_request(page_id))
+        .expect("unsafe external fetch");
+    assert!(calls.lock().expect("calls").is_empty());
+    let current: NotionPortablePageBundleV1 =
+        serde_json::from_slice(&fetched.native.raw).expect("portable native");
+    let mut unsupported = current.clone();
+    unsupported.incomplete_media[0].code = "external_media".to_string();
+    assert_eq!(
+        connector
+            .render_portable(&portable_render_request(
+                page_id,
+                NativeEntity {
+                    remote_id: RemoteId::new(page_id),
+                    kind: "notion_page_portable_media_v1".to_string(),
+                    raw: serde_json::to_vec(&unsupported).expect("unsupported native"),
+                },
+            ))
+            .expect_err("unsupported generic outcome must fail")
+            .to_string(),
+        "invalid state: Notion portable media native payload has invalid incomplete outcomes"
+    );
+
+    for legacy_code in [
+        "unsafe_external_media",
+        "unsafe_external_media_malformed",
+        "invalid_external_media",
+    ] {
+        let mut legacy = current.clone();
+        legacy.incomplete_media[0].code = legacy_code.to_string();
+        let legacy_raw = serde_json::to_vec(&legacy).expect("legacy native");
+        assert!(!String::from_utf8_lossy(&legacy_raw).contains(unsafe_url));
+
+        let rendered = connector
+            .render_portable(&portable_render_request(
+                page_id,
+                NativeEntity {
+                    remote_id: RemoteId::new(page_id),
+                    kind: "notion_page_portable_media_v1".to_string(),
+                    raw: legacy_raw,
+                },
+            ))
+            .expect("legacy generic outcome remains readable");
+        assert_eq!(
+            rendered.completeness.incomplete_reasons(),
+            &[PortableIncompleteReason::ConnectorLimitation {
+                code: format!("notion_media_{legacy_code}"),
+                remote_id: Some(RemoteId::new(block_id)),
+            }],
+            "{legacy_code}"
+        );
+        assert!(!String::from_utf8_lossy(&rendered.canonical.body).contains(unsafe_url));
+    }
+}
+
+#[test]
+fn portable_media_expired_failed_and_oversized_captures_are_redacted() {
+    let cases = [
+        (
+            "expired",
+            "unavailable_hosted_media",
+            Some("2000-01-01T00:00:00.000Z"),
+            FixturePortableMediaOutcome::Success(PortableMediaCapture {
+                bytes: b"unused".to_vec(),
+                media_type: "image/png".to_string(),
+            }),
+        ),
+        (
+            "failed",
+            "unavailable_hosted_media",
+            Some("2099-01-01T00:00:00.000Z"),
+            FixturePortableMediaOutcome::Failure(
+                "X-Amz-Signature=must-not-escape token-secret".to_string(),
+            ),
+        ),
+        (
+            "oversized",
+            "hosted_media_too_large",
+            Some("2099-01-01T00:00:00.000Z"),
+            FixturePortableMediaOutcome::Success(PortableMediaCapture {
+                bytes: vec![0; PORTABLE_MEDIA_MAX_ASSET_BYTES + 1],
+                media_type: "image/png".to_string(),
+            }),
+        ),
+        (
+            "malformed-expiry",
+            "unsafe_hosted_media",
+            Some("2099-01-01T00:00:00+01:00"),
+            FixturePortableMediaOutcome::Success(PortableMediaCapture {
+                bytes: b"unused".to_vec(),
+                media_type: "image/png".to_string(),
+            }),
+        ),
+    ];
+    for (case, expected_code, expiry, outcome) in cases {
+        let page_id = format!("page-{case}");
+        let block_id = format!("block-{case}");
+        let url =
+            format!("https://secure.notion-static.com/{case}.png?X-Amz-Signature=signature-secret");
+        let fetcher = Arc::new(FixturePortableMediaFetcher {
+            outcomes: BTreeMap::from([(url.clone(), outcome)]),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        });
+        let connector = portable_media_connector(
+            &page_id,
+            vec![hosted_file_block(&block_id, "image", &url, expiry)],
+        )
+        .with_portable_media_capture_fetcher(PortableMediaCapturePolicy::HostedPilot, fetcher);
+        let fetched = connector
+            .fetch_portable(portable_fetch_request(&page_id))
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
+        assert!(!fetched.completeness.is_complete(), "{case}");
+        assert!(fetched.completeness.incomplete_reasons().iter().any(|reason| {
+            matches!(reason, PortableIncompleteReason::ConnectorLimitation { code, remote_id }
+                if code == &format!("notion_media_{expected_code}")
+                    && remote_id.as_ref() == Some(&RemoteId::new(block_id.clone())))
+        }));
+        let native: NotionPortablePageBundleV1 =
+            serde_json::from_slice(&fetched.native.raw).expect("incomplete native");
+        assert_eq!(
+            native.incomplete_media,
+            vec![NotionPortableIncompleteMediaV1 {
+                block_id: block_id.clone(),
+                kind: "image".to_string(),
+                code: expected_code.to_string(),
+            }]
+        );
+        let raw = String::from_utf8_lossy(&fetched.native.raw);
+        assert!(!raw.contains("X-Amz-Signature"), "{case}");
+        assert!(!raw.contains("signature-secret"), "{case}");
+        assert!(!raw.contains("token-secret"), "{case}");
+        let rendered = connector
+            .render_portable(&PortableRenderRequest {
+                source_connection_id: SourceConnectionId::new("source-notion"),
+                logical_path: LogicalPath::new(format!("{case}/page.md")).expect("path"),
+                native: fetched.native,
+                format_version: 1,
+            })
+            .expect("render incomplete media");
+        assert_eq!(rendered.projections.len(), 1, "{case}");
+        assert!(!String::from_utf8_lossy(&rendered.canonical.body).contains("https://"));
+    }
+}
+
+#[test]
+fn portable_media_sanitizes_nested_arbitrary_json_and_preserves_ordinary_values() {
+    let page_id = "arbitrary-json-page";
+    let signed_url = concat!(
+        "https://secure.notion-static.com/nested/file.pdf?",
+        "X-Amz-Credential=credential-secret&X-Amz-Signature=signature-secret&",
+        "token=token-secret#fragment-secret"
+    );
+    let ordinary_formula = json!({
+        "type": "string",
+        "string": "ordinary formula result",
+        "nested": [1, true, { "status": "ready" }]
+    });
+    let mut fixture_page = page(page_id, "Arbitrary JSON");
+    fixture_page.properties.insert(
+        "formula".to_string(),
+        PagePropertyDto {
+            kind: "formula".to_string(),
+            formula: Some(ordinary_formula.clone()),
+            ..Default::default()
+        },
+    );
+    fixture_page.properties.insert(
+        "rollup".to_string(),
+        PagePropertyDto {
+            kind: "rollup".to_string(),
+            rollup: Some(json!({
+                "type": "array",
+                "array": [{
+                    "type": "files",
+                    "files": [{
+                        "name": "private.pdf",
+                        "type": "file",
+                        "file": {
+                            "url": signed_url,
+                            "expiry_time": "2099-01-01T00:00:00.000Z",
+                            "authorization": "Bearer authorization-secret",
+                            "secret": "nested-secret"
+                        }
+                    }]
+                }]
+            })),
+            ..Default::default()
+        },
+    );
+    let mut custom = block("custom-secret", "custom_block");
+    custom.custom_block = Some(json!({
+        "payload": [{
+            "file": {
+                "url": signed_url,
+                "expiry_time": "2099-01-01T00:00:00.000Z",
+                "token": "custom-token-secret"
+            }
+        }]
+    }));
+    let connector = portable_media_connector_with_page(fixture_page, vec![custom])
+        .with_portable_media_capture(PortableMediaCapturePolicy::HostedPilot);
+
+    let fetched = connector
+        .fetch_portable(portable_fetch_request(page_id))
+        .expect("sanitized arbitrary JSON fetch");
+    assert!(!fetched.completeness.is_complete());
+    let native: NotionPortablePageBundleV1 =
+        serde_json::from_slice(&fetched.native.raw).expect("portable native");
+    assert_eq!(
+        native.page.page.properties["formula"].formula.as_ref(),
+        Some(&ordinary_formula)
+    );
+    assert_eq!(
+        native.page.page.properties["rollup"].rollup,
+        Some(json!({
+            "type": "array",
+            "array": [{
+                "type": "files",
+                "files": [{
+                    "name": "private.pdf",
+                    "type": "file",
+                    "file": { "url": "" }
+                }]
+            }],
+            "_locality_portable_media_sanitized_v1": true
+        }))
+    );
+    assert_eq!(
+        native.page.blocks[0].block.custom_block,
+        Some(json!({
+            "payload": [{ "file": { "url": "" } }],
+            "_locality_portable_media_sanitized_v1": true
+        }))
+    );
+    assert_eq!(native.incomplete_media.len(), 2);
+    assert!(native.incomplete_media.iter().all(|outcome| {
+        outcome.kind == "arbitrary_json" && outcome.code == "sanitized_embedded_media_secret"
+    }));
+    let raw = String::from_utf8_lossy(&fetched.native.raw);
+    for forbidden in [
+        signed_url,
+        "secure.notion-static.com",
+        "X-Amz",
+        "credential-secret",
+        "signature-secret",
+        "token-secret",
+        "authorization-secret",
+        "nested-secret",
+        "fragment-secret",
+        "expiry_time",
+        "2099-01-01",
+    ] {
+        assert!(!raw.contains(forbidden), "native retained {forbidden}");
+        assert!(!format!("{fetched:?}").contains(forbidden));
+    }
+    assert_eq!(
+        raw.matches("_locality_portable_media_sanitized_v1").count(),
+        2
+    );
+
+    let mut tampered = native.clone();
+    tampered
+        .page
+        .page
+        .properties
+        .get_mut("rollup")
+        .and_then(|property| property.rollup.as_mut())
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("rollup object")
+        .insert("leaked_url".to_string(), json!(signed_url));
+    let tampered_native = NativeEntity {
+        remote_id: RemoteId::new(page_id),
+        kind: "notion_page_portable_media_v1".to_string(),
+        raw: serde_json::to_vec(&tampered).expect("tampered arbitrary native"),
+    };
+    let error = connector
+        .render_portable(&portable_render_request(page_id, tampered_native))
+        .expect_err("render must revalidate arbitrary JSON");
+    assert_eq!(
+        error.to_string(),
+        "invalid state: Notion portable arbitrary JSON retained media credentials"
+    );
+    for forbidden in [signed_url, "signature-secret", "token-secret"] {
+        assert!(!format!("{error:?}").contains(forbidden));
+    }
+
+    let rendered = connector
+        .render_portable(&portable_render_request(page_id, fetched.native))
+        .expect("render sanitized arbitrary JSON");
+    assert!(!rendered.completeness.is_complete());
+    assert_eq!(rendered.projections.len(), 1);
+    let rendered_debug = format!("{rendered:?}");
+    for forbidden in ["https://", "X-Amz", "token-secret", "authorization-secret"] {
+        assert!(!rendered_debug.contains(forbidden));
+    }
+}
+
+#[test]
+fn portable_media_preserves_ordinary_authentication_words_exactly() {
+    let page_id = "ordinary-auth-words";
+    let formula = json!({
+        "type": "string",
+        "string": "Authorization approved",
+        "note": "unrelated token words remain ordinary prose"
+    });
+    let rollup = json!({
+        "type": "array",
+        "array": ["bearer bonds", "token budget approved"]
+    });
+    let mut fixture_page = page(page_id, "Ordinary Words");
+    fixture_page.properties.insert(
+        "formula".to_string(),
+        PagePropertyDto {
+            kind: "formula".to_string(),
+            formula: Some(formula.clone()),
+            ..Default::default()
+        },
+    );
+    fixture_page.properties.insert(
+        "rollup".to_string(),
+        PagePropertyDto {
+            kind: "rollup".to_string(),
+            rollup: Some(rollup.clone()),
+            ..Default::default()
+        },
+    );
+    let connector = portable_media_connector_with_page(fixture_page, Vec::new())
+        .with_portable_media_capture(PortableMediaCapturePolicy::HostedPilot);
+
+    let fetched = connector
+        .fetch_portable(portable_fetch_request(page_id))
+        .expect("ordinary prose fetch");
+    assert!(fetched.completeness.is_complete());
+    let native: NotionPortablePageBundleV1 =
+        serde_json::from_slice(&fetched.native.raw).expect("portable native");
+    assert_eq!(
+        native.page.page.properties["formula"].formula,
+        Some(formula)
+    );
+    assert_eq!(native.page.page.properties["rollup"].rollup, Some(rollup));
+    assert!(native.incomplete_media.is_empty());
+
+    let rendered = connector
+        .render_portable(&portable_render_request(page_id, fetched.native))
+        .expect("ordinary prose render");
+    assert!(rendered.completeness.is_complete());
+}
+
+#[test]
+fn portable_media_rejects_extra_typed_payloads_without_echoing_credentials() {
+    let first_url = "https://secure.notion-static.com/image.png?X-Amz-Signature=first-secret";
+    let second_url = "https://secure.notion-static.com/video.mp4?X-Amz-Signature=second-secret";
+    let mut malformed = hosted_file_block("malformed", "image", first_url, None);
+    malformed.video = hosted_file_block("unused", "video", second_url, None).video;
+    let connector = portable_media_connector("malformed-page", vec![malformed])
+        .with_portable_media_capture(PortableMediaCapturePolicy::HostedPilot);
+    let error = connector
+        .fetch_portable(portable_fetch_request("malformed-page"))
+        .expect_err("extra typed media payload must fail");
+    assert_eq!(
+        error.to_string(),
+        "invalid state: Notion portable media block must contain exactly its selected typed payload"
+    );
+    let error_debug = format!("{error:?}");
+    for forbidden in [first_url, second_url, "first-secret", "second-secret"] {
+        assert!(!error_debug.contains(forbidden));
+    }
+
+    let mut non_media = paragraph_block("paragraph", vec![rich_text("hello")]);
+    non_media.image = hosted_file_block("unused", "image", first_url, None).image;
+    let connector = portable_media_connector("non-media-page", vec![non_media])
+        .with_portable_media_capture(PortableMediaCapturePolicy::HostedPilot);
+    assert_eq!(
+        connector
+            .fetch_portable(portable_fetch_request("non-media-page"))
+            .expect_err("typed media on non-media block must fail")
+            .to_string(),
+        "invalid state: Notion portable non-media block contains a typed media payload"
+    );
+}
+
+#[test]
+fn portable_media_render_binds_every_incomplete_outcome_exactly() {
+    let page_id = "outcome-binding-page";
+    let mut fixture_page = page(page_id, "Outcome Binding");
+    fixture_page.properties.insert(
+        "attachments".to_string(),
+        PagePropertyDto {
+            kind: "files".to_string(),
+            files: vec![FilePropertyDto {
+                name: Some("private.pdf".to_string()),
+                kind: "file".to_string(),
+                external: None,
+                file: Some(HostedFileDto {
+                    url: "https://secure.notion-static.com/private.pdf?X-Amz-Signature=secret"
+                        .to_string(),
+                    expiry_time: Some("2099-01-01T00:00:00.000Z".to_string()),
+                }),
+            }],
+            ..Default::default()
+        },
+    );
+    let connector = portable_media_connector_with_page(fixture_page, Vec::new())
+        .with_portable_media_capture(PortableMediaCapturePolicy::HostedPilot);
+    let fetched = connector
+        .fetch_portable(portable_fetch_request(page_id))
+        .expect("property media fetch");
+    let native: NotionPortablePageBundleV1 =
+        serde_json::from_slice(&fetched.native.raw).expect("portable native");
+    assert_eq!(
+        native.incomplete_media,
+        vec![NotionPortableIncompleteMediaV1 {
+            block_id: "page-property-file-1".to_string(),
+            kind: "file_property".to_string(),
+            code: "unsupported_page_property_media".to_string(),
+        }]
+    );
+
+    let mut variants = Vec::new();
+    let mut missing = native.clone();
+    missing.incomplete_media.clear();
+    variants.push(missing);
+    let mut wrong_kind = native.clone();
+    wrong_kind.incomplete_media[0].kind = "image".to_string();
+    variants.push(wrong_kind);
+    let mut wrong_code = native.clone();
+    wrong_code.incomplete_media[0].code = "external_media".to_string();
+    variants.push(wrong_code);
+    let mut spurious = native.clone();
+    spurious
+        .incomplete_media
+        .push(NotionPortableIncompleteMediaV1 {
+            block_id: "spurious".to_string(),
+            kind: "file_property".to_string(),
+            code: "unsupported_page_property_media".to_string(),
+        });
+    variants.push(spurious);
+    for variant in variants {
+        let native = NativeEntity {
+            remote_id: RemoteId::new(page_id),
+            kind: "notion_page_portable_media_v1".to_string(),
+            raw: serde_json::to_vec(&variant).expect("tampered native"),
+        };
+        assert_eq!(
+            connector
+                .render_portable(&portable_render_request(page_id, native))
+                .expect_err("tampered outcome must fail")
+                .to_string(),
+            "invalid state: Notion portable media native payload has invalid incomplete outcomes"
+        );
+    }
+
+    let mut duplicate = native.clone();
+    duplicate
+        .incomplete_media
+        .push(duplicate.incomplete_media[0].clone());
+    let duplicate_native = NativeEntity {
+        remote_id: RemoteId::new(page_id),
+        kind: "notion_page_portable_media_v1".to_string(),
+        raw: serde_json::to_vec(&duplicate).expect("duplicate outcome native"),
+    };
+    assert_eq!(
+        connector
+            .render_portable(&portable_render_request(page_id, duplicate_native))
+            .expect_err("duplicate outcome must fail")
+            .to_string(),
+        "invalid state: Notion portable media native payload has duplicate incomplete outcomes"
+    );
+
+    let mut retained_secret = native;
+    retained_secret
+        .page
+        .page
+        .properties
+        .get_mut("attachments")
+        .expect("attachments")
+        .files[0]
+        .file
+        .as_mut()
+        .expect("hosted")
+        .url = "https://secure.notion-static.com/private.pdf?X-Amz-Signature=secret".to_string();
+    let tampered = NativeEntity {
+        remote_id: RemoteId::new(page_id),
+        kind: "notion_page_portable_media_v1".to_string(),
+        raw: serde_json::to_vec(&retained_secret).expect("tampered secret native"),
+    };
+    let error = connector
+        .render_portable(&portable_render_request(page_id, tampered))
+        .expect_err("render must independently reject retained credentials");
+    assert!(!format!("{error:?}").contains("X-Amz-Signature"));
+    assert!(!format!("{error:?}").contains("secret"));
+}
+
+#[test]
+fn portable_media_render_rejects_unknown_fields_without_echoing_secrets() {
+    let page_id = "unknown-fields-page";
+    let connector = portable_media_connector(
+        page_id,
+        vec![file_block(
+            "image-unknown",
+            "image",
+            "https://example.com/image.png",
+            "Image",
+        )],
+    )
+    .with_portable_media_capture(PortableMediaCapturePolicy::HostedPilot);
+    let fetched = connector
+        .fetch_portable(portable_fetch_request(page_id))
+        .expect("base portable native");
+    let raw = String::from_utf8(fetched.native.raw).expect("UTF-8 JSON");
+
+    let top_secret = concat!(
+        "https://secure.notion-static.com/top.png?",
+        "X-Amz-Signature=top-secret&token=top-token"
+    );
+    let top = format!(r#"{{"unknown_top":"{top_secret}",{}"#, &raw[1..]);
+    let deep_secret = concat!(
+        "https://secure.notion-static.com/deep.png?",
+        "X-Amz-Signature=deep-secret&token=deep-token"
+    );
+    let deep = raw.replacen(
+        r#"},"video":null"#,
+        &format!(
+            r#","unknown_nested":{{"url":"{deep_secret}","token":"deep-token"}}}},"video":null"#
+        ),
+        1,
+    );
+    assert_ne!(deep, raw);
+
+    for (tampered, secrets) in [
+        (top, ["top-secret", "top-token"]),
+        (deep, ["deep-secret", "deep-token"]),
+    ] {
+        let error = connector
+            .render_portable(&portable_render_request(
+                page_id,
+                NativeEntity {
+                    remote_id: RemoteId::new(page_id),
+                    kind: "notion_page_portable_media_v1".to_string(),
+                    raw: tampered.into_bytes(),
+                },
+            ))
+            .expect_err("unknown field must fail canonical validation");
+        assert_eq!(
+            error.to_string(),
+            "invalid state: Notion portable media native payload is not canonical"
+        );
+        for secret in secrets {
+            assert!(!format!("{error:?}").contains(secret));
+        }
+    }
+}
+
+#[test]
+fn portable_media_duplicate_and_count_limits_fail_closed() {
+    let duplicate = hosted_file_block(
+        "duplicate-block",
+        "image",
+        "https://secure.notion-static.com/image.png",
+        None,
+    );
+    let duplicate_connector =
+        portable_media_connector("duplicate-page", vec![duplicate.clone(), duplicate]);
+    let duplicate_calls = Arc::new(Mutex::new(Vec::new()));
+    let duplicate_connector = duplicate_connector.with_portable_media_capture_fetcher(
+        PortableMediaCapturePolicy::HostedPilot,
+        Arc::new(FixturePortableMediaFetcher {
+            outcomes: BTreeMap::new(),
+            calls: Arc::clone(&duplicate_calls),
+        }),
+    );
+    assert_eq!(
+        duplicate_connector
+            .fetch_portable(portable_fetch_request("duplicate-page"))
+            .expect_err("duplicate media must fail")
+            .to_string(),
+        "invalid state: Notion portable media contains a duplicate block identity"
+    );
+    assert!(duplicate_calls.lock().expect("duplicate calls").is_empty());
+
+    let too_many = (0..=128)
+        .map(|index| {
+            hosted_file_block(
+                &format!("media-{index}"),
+                "image",
+                &format!(
+                    "https://secure.notion-static.com/{index}.png?X-Amz-Signature=secret-{index}"
+                ),
+                Some("2099-01-01T00:00:00.000Z"),
+            )
+        })
+        .collect();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = Arc::new(FixturePortableMediaFetcher {
+        outcomes: BTreeMap::new(),
+        calls: Arc::clone(&calls),
+    });
+    let count_connector = portable_media_connector("count-page", too_many)
+        .with_portable_media_capture_fetcher(PortableMediaCapturePolicy::HostedPilot, fetcher);
+    let fetched = count_connector
+        .fetch_portable(portable_fetch_request("count-page"))
+        .expect("over-limit capture must become explicitly incomplete");
+    assert!(calls.lock().expect("fetch calls").is_empty());
+    assert!(!fetched.completeness.is_complete());
+    let raw = String::from_utf8_lossy(&fetched.native.raw);
+    for forbidden in ["secure.notion-static.com", "X-Amz", "secret-", "2099-01-01"] {
+        assert!(!raw.contains(forbidden));
+    }
+    let native: NotionPortablePageBundleV1 =
+        serde_json::from_slice(&fetched.native.raw).expect("over-limit native");
+    assert!(native.captured_media.is_empty());
+    assert_eq!(
+        native.incomplete_media,
+        vec![NotionPortableIncompleteMediaV1 {
+            block_id: "__locality_portable_media_limit_v1".to_string(),
+            kind: "page".to_string(),
+            code: "asset_limit_exceeded".to_string(),
+        }]
+    );
+    for extra in [
+        NotionPortableIncompleteMediaV1 {
+            block_id: "media-0".to_string(),
+            kind: "image".to_string(),
+            code: "unavailable_hosted_media".to_string(),
+        },
+        NotionPortableIncompleteMediaV1 {
+            block_id: "spurious".to_string(),
+            kind: "page".to_string(),
+            code: "asset_limit_exceeded".to_string(),
+        },
+    ] {
+        let mut tampered = native.clone();
+        tampered.incomplete_media.push(extra);
+        let error = count_connector
+            .render_portable(&portable_render_request(
+                "count-page",
+                NativeEntity {
+                    remote_id: RemoteId::new("count-page"),
+                    kind: "notion_page_portable_media_v1".to_string(),
+                    raw: serde_json::to_vec(&tampered).expect("tampered outcome native"),
+                },
+            ))
+            .expect_err("over-limit per-asset or spurious outcome must fail");
+        assert_eq!(
+            error.to_string(),
+            "invalid state: Notion portable media native payload has invalid incomplete outcomes"
+        );
+    }
+    let mut captured = native.clone();
+    captured
+        .captured_media
+        .push(locality_notion::dto::NotionPortableCapturedMediaV1 {
+            block_id: "media-0".to_string(),
+            kind: "image".to_string(),
+            media_type: "image/png".to_string(),
+            bytes: vec![1],
+        });
+    assert_eq!(
+        count_connector
+            .render_portable(&portable_render_request(
+                "count-page",
+                NativeEntity {
+                    remote_id: RemoteId::new("count-page"),
+                    kind: "notion_page_portable_media_v1".to_string(),
+                    raw: serde_json::to_vec(&captured).expect("tampered capture native"),
+                },
+            ))
+            .expect_err("over-limit capture must fail")
+            .to_string(),
+        "invalid state: Notion portable over-limit native payload contains captured media"
+    );
+    let rendered = count_connector
+        .render_portable(&portable_render_request("count-page", fetched.native))
+        .expect("render over-limit incomplete page");
+    assert!(!rendered.completeness.is_complete());
+    assert_eq!(rendered.projections.len(), 1);
+    assert_eq!(
+        rendered.projections[0].file_kind,
+        ProjectionFileKind::Markdown
+    );
+    assert!(!format!("{rendered:?}").contains("X-Amz"));
+}
+
+#[test]
+fn portable_media_large_over_limit_page_has_bounded_outcomes() {
+    const PROPERTY_ASSETS: usize = 4_096;
+    let page_id = "large-over-limit-page";
+    let property_url = concat!(
+        "https://secure.notion-static.com/property.pdf?",
+        "X-Amz-Signature=property-secret"
+    );
+    let block_url = concat!(
+        "https://secure.notion-static.com/image.png?",
+        "X-Amz-Signature=block-secret"
+    );
+    let mut fixture_page = page(page_id, "Large Over Limit");
+    fixture_page.properties.insert(
+        "attachments".to_string(),
+        PagePropertyDto {
+            kind: "files".to_string(),
+            files: (0..PROPERTY_ASSETS)
+                .map(|index| FilePropertyDto {
+                    name: Some(format!("file-{index}.pdf")),
+                    kind: "file".to_string(),
+                    external: None,
+                    file: Some(HostedFileDto {
+                        url: property_url.to_string(),
+                        expiry_time: Some("2099-01-01T00:00:00.000Z".to_string()),
+                    }),
+                })
+                .collect(),
+            ..Default::default()
+        },
+    );
+    fixture_page.properties.insert(
+        "rollup".to_string(),
+        PagePropertyDto {
+            kind: "rollup".to_string(),
+            rollup: Some(json!({
+                "type": "files",
+                "file": {
+                    "url": property_url,
+                    "expiry_time": "2099-01-01T00:00:00.000Z"
+                }
+            })),
+            ..Default::default()
+        },
+    );
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let connector = portable_media_connector_with_page(
+        fixture_page,
+        vec![hosted_file_block(
+            "large-image",
+            "image",
+            block_url,
+            Some("2099-01-01T00:00:00.000Z"),
+        )],
+    )
+    .with_portable_media_capture_fetcher(
+        PortableMediaCapturePolicy::HostedPilot,
+        Arc::new(FixturePortableMediaFetcher {
+            outcomes: BTreeMap::new(),
+            calls: Arc::clone(&calls),
+        }),
+    );
+
+    let fetched = connector
+        .fetch_portable(portable_fetch_request(page_id))
+        .expect("large over-limit fetch");
+    assert!(calls.lock().expect("media calls").is_empty());
+    let native: NotionPortablePageBundleV1 =
+        serde_json::from_slice(&fetched.native.raw).expect("large native");
+    assert!(native.captured_media.is_empty());
+    assert_eq!(native.incomplete_media.len(), 2);
+    assert!(native.incomplete_media.iter().any(|outcome| {
+        outcome.block_id == "__locality_portable_media_limit_v1"
+            && outcome.kind == "page"
+            && outcome.code == "asset_limit_exceeded"
+    }));
+    assert!(native.incomplete_media.iter().any(|outcome| {
+        outcome.kind == "arbitrary_json" && outcome.code == "sanitized_embedded_media_secret"
+    }));
+    assert!(
+        native.page.page.properties["attachments"]
+            .files
+            .iter()
+            .all(|file| file
+                .file
+                .as_ref()
+                .is_some_and(|hosted| { hosted.url.is_empty() && hosted.expiry_time.is_none() }))
+    );
+    let hosted = native.page.blocks[0]
+        .block
+        .image
+        .as_ref()
+        .and_then(|payload| payload.file.as_ref())
+        .expect("hosted block");
+    assert!(hosted.url.is_empty());
+    assert!(hosted.expiry_time.is_none());
+    let raw = String::from_utf8_lossy(&fetched.native.raw);
+    for forbidden in [
+        "secure.notion-static.com",
+        "X-Amz",
+        "property-secret",
+        "block-secret",
+        "2099-01-01",
+    ] {
+        assert!(!raw.contains(forbidden));
+    }
+
+    let rendered = connector
+        .render_portable(&portable_render_request(page_id, fetched.native))
+        .expect("large over-limit render");
+    assert_eq!(rendered.projections.len(), 1);
+    assert_eq!(
+        rendered.projections[0].file_kind,
+        ProjectionFileKind::Markdown
+    );
+}
+
+#[test]
 fn enumerate_suffixes_every_colliding_sibling_name() {
     let root_page_id = RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     let api = FixtureNotionApi::colliding_tree(root_page_id.as_str());
@@ -2234,6 +4755,85 @@ fn normalize_notion_id(input: &str) -> String {
         .collect::<String>()
 }
 
+#[derive(Clone)]
+enum FixturePortableMediaOutcome {
+    Success(PortableMediaCapture),
+    Failure(String),
+}
+
+struct FixturePortableMediaFetcher {
+    outcomes: BTreeMap<String, FixturePortableMediaOutcome>,
+    calls: Arc<Mutex<Vec<(String, usize)>>>,
+}
+
+impl PortableMediaCaptureFetcher for FixturePortableMediaFetcher {
+    fn fetch(
+        &self,
+        hosted_url: &str,
+        max_bytes: usize,
+    ) -> locality_core::LocalityResult<PortableMediaCapture> {
+        self.calls
+            .lock()
+            .expect("media fetch calls")
+            .push((hosted_url.to_string(), max_bytes));
+        match self.outcomes.get(hosted_url) {
+            Some(FixturePortableMediaOutcome::Success(capture)) => Ok(capture.clone()),
+            Some(FixturePortableMediaOutcome::Failure(error)) => {
+                Err(locality_core::LocalityError::Io(error.clone()))
+            }
+            None => Err(locality_core::LocalityError::InvalidState(
+                "unexpected fixture media URL".to_string(),
+            )),
+        }
+    }
+}
+
+fn portable_media_connector(page_id: &str, blocks: Vec<BlockDto>) -> NotionConnector {
+    portable_media_connector_with_page(page(page_id, "Coverage"), blocks)
+}
+
+fn portable_media_connector_with_page(
+    fixture_page: PageDto,
+    blocks: Vec<BlockDto>,
+) -> NotionConnector {
+    let page_id = fixture_page.id.clone();
+    let api = FixtureNotionApi {
+        pages: BTreeMap::from([(page_id.clone(), fixture_page)]),
+        children: BTreeMap::from([(
+            (page_id.clone(), None),
+            PaginatedListDto {
+                results: blocks,
+                next_cursor: None,
+                has_more: false,
+            },
+        )]),
+        databases: BTreeMap::new(),
+        data_sources: BTreeMap::new(),
+        data_source_pages: BTreeMap::new(),
+    };
+    NotionConnector::with_api(
+        NotionConfig::default().with_root_page_id(RemoteId::new(page_id)),
+        Arc::new(NoSearchNotionApi(api)),
+    )
+}
+
+fn portable_fetch_request(page_id: &str) -> PortableFetchRequest {
+    PortableFetchRequest {
+        source_connection_id: SourceConnectionId::new("source-notion"),
+        remote_id: RemoteId::new(page_id),
+        reason: PortableFetchReason::Bootstrap,
+    }
+}
+
+fn portable_render_request(page_id: &str, native: NativeEntity) -> PortableRenderRequest {
+    PortableRenderRequest {
+        source_connection_id: SourceConnectionId::new("source-notion"),
+        logical_path: LogicalPath::new(format!("{page_id}/page.md")).expect("portable path"),
+        native,
+        format_version: 1,
+    }
+}
+
 #[derive(Debug)]
 struct FixtureNotionApi {
     pages: BTreeMap<String, PageDto>,
@@ -2288,6 +4888,26 @@ impl FixtureNotionApi {
         }
     }
 
+    fn many_roots(count: usize) -> Self {
+        let pages = (0..count)
+            .map(|index| {
+                let id = format!("root-{index:02}");
+                (id.clone(), page(&id, &format!("Root {index:02}")))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let children = pages
+            .keys()
+            .map(|id| ((id.clone(), None), PaginatedListDto::default()))
+            .collect();
+        Self {
+            pages,
+            children,
+            databases: BTreeMap::new(),
+            data_sources: BTreeMap::new(),
+            data_source_pages: BTreeMap::new(),
+        }
+    }
+
     fn tree(root_page_id: &str) -> Self {
         let child_page_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let database_id = "cccccccccccccccccccccccccccccccc";
@@ -2323,6 +4943,7 @@ impl FixtureNotionApi {
             database_id.to_string(),
             DatabaseDto {
                 id: database_id.to_string(),
+                last_edited_time: Some("2026-06-10T01:00:00.000Z".to_string()),
                 title: vec![rich_text("Tasks")],
                 data_sources: vec![DataSourceSummaryDto {
                     id: data_source_id.to_string(),
@@ -2335,7 +4956,13 @@ impl FixtureNotionApi {
             data_source_id.to_string(),
             DataSourceDto {
                 id: data_source_id.to_string(),
+                parent: Some(ParentDto {
+                    kind: "database_id".to_string(),
+                    database_id: Some(database_id.to_string()),
+                    ..Default::default()
+                }),
                 name: Some("Tasks".to_string()),
+                last_edited_time: Some("2026-06-10T01:01:00.000Z".to_string()),
                 properties: BTreeMap::from([
                     (
                         "Name".to_string(),
@@ -2480,6 +5107,65 @@ impl FixtureNotionApi {
             ]),
             children: BTreeMap::new(),
             databases: BTreeMap::from([(root_database.id.clone(), root_database)]),
+            data_sources: BTreeMap::new(),
+            data_source_pages: BTreeMap::new(),
+        }
+    }
+
+    fn multi_root_workspace() -> Self {
+        let first_root_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let nested_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let second_root_id = "ffffffffffffffffffffffffffffffff";
+        let first_root = page_with_parent(
+            first_root_id,
+            "Roadmap",
+            Some(ParentDto {
+                kind: "workspace".to_string(),
+                workspace: Some(true),
+                ..Default::default()
+            }),
+        );
+        let nested = page_with_parent(
+            nested_id,
+            "Notes",
+            Some(ParentDto {
+                kind: "page_id".to_string(),
+                page_id: Some(first_root_id.to_string()),
+                ..Default::default()
+            }),
+        );
+        let second_root = page_with_parent(
+            second_root_id,
+            "Roadmap",
+            Some(ParentDto {
+                kind: "workspace".to_string(),
+                workspace: Some(true),
+                ..Default::default()
+            }),
+        );
+        let children = BTreeMap::from([
+            (
+                (first_root_id.to_string(), None),
+                PaginatedListDto {
+                    results: vec![child_page_block(nested_id, "Notes")],
+                    next_cursor: None,
+                    has_more: false,
+                },
+            ),
+            ((nested_id.to_string(), None), PaginatedListDto::default()),
+            (
+                (second_root_id.to_string(), None),
+                PaginatedListDto::default(),
+            ),
+        ]);
+        Self {
+            pages: BTreeMap::from([
+                (first_root.id.clone(), first_root),
+                (nested.id.clone(), nested),
+                (second_root.id.clone(), second_root),
+            ]),
+            children,
+            databases: BTreeMap::new(),
             data_sources: BTreeMap::new(),
             data_source_pages: BTreeMap::new(),
         }
@@ -2758,7 +5444,7 @@ impl FixtureNotionApi {
 impl NotionApi for FixtureNotionApi {
     fn retrieve_page(&self, page_id: &str) -> locality_core::LocalityResult<PageDto> {
         self.pages.get(page_id).cloned().ok_or_else(|| {
-            locality_core::LocalityError::InvalidState(format!("missing fixture page {page_id}"))
+            locality_core::LocalityError::RemoteNotFound(format!("missing fixture page {page_id}"))
         })
     }
 
@@ -2854,6 +5540,188 @@ impl NotionApi for FixtureNotionApi {
         Err(locality_core::LocalityError::NotImplemented(
             "fixture delete block",
         ))
+    }
+}
+
+#[derive(Debug)]
+struct NonNotFoundPageErrorApi;
+
+impl NotionApi for NonNotFoundPageErrorApi {
+    fn retrieve_page(&self, _page_id: &str) -> locality_core::LocalityResult<PageDto> {
+        Err(locality_core::LocalityError::InvalidState(
+            "injected page retrieval failure".to_string(),
+        ))
+    }
+
+    fn retrieve_database(&self, _database_id: &str) -> locality_core::LocalityResult<DatabaseDto> {
+        panic!("database fallback must only follow RemoteNotFound")
+    }
+
+    fn retrieve_block_children(
+        &self,
+        _block_id: &str,
+        _start_cursor: Option<&str>,
+    ) -> locality_core::LocalityResult<BlockListDto> {
+        unreachable!("page failure must stop traversal")
+    }
+
+    fn search_pages(
+        &self,
+        _start_cursor: Option<&str>,
+    ) -> locality_core::LocalityResult<PageListDto> {
+        panic!("explicit-root traversal must not call search")
+    }
+
+    fn update_block(
+        &self,
+        _block_id: &str,
+        _body: serde_json::Value,
+    ) -> locality_core::LocalityResult<BlockDto> {
+        unreachable!("page failure must stop traversal")
+    }
+
+    fn append_block_children(
+        &self,
+        _block_id: &str,
+        _body: serde_json::Value,
+    ) -> locality_core::LocalityResult<BlockListDto> {
+        unreachable!("page failure must stop traversal")
+    }
+
+    fn delete_block(&self, _block_id: &str) -> locality_core::LocalityResult<BlockDto> {
+        unreachable!("page failure must stop traversal")
+    }
+}
+
+#[derive(Debug)]
+struct DescendantNotFoundApi {
+    retrieve_page_calls: Arc<AtomicUsize>,
+}
+
+impl NotionApi for DescendantNotFoundApi {
+    fn retrieve_page(&self, page_id: &str) -> locality_core::LocalityResult<PageDto> {
+        self.retrieve_page_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(page(page_id, "Known page"))
+    }
+
+    fn retrieve_database(&self, _database_id: &str) -> locality_core::LocalityResult<DatabaseDto> {
+        panic!("a descendant block error must not trigger database fallback")
+    }
+
+    fn retrieve_block_children(
+        &self,
+        block_id: &str,
+        _start_cursor: Option<&str>,
+    ) -> locality_core::LocalityResult<BlockListDto> {
+        if block_id == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+            return Ok(PaginatedListDto {
+                results: vec![
+                    toggle_block("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "Nested").with_children(),
+                ],
+                next_cursor: None,
+                has_more: false,
+            });
+        }
+        Err(locality_core::LocalityError::RemoteNotFound(format!(
+            "missing descendant block `{block_id}`"
+        )))
+    }
+
+    fn search_pages(
+        &self,
+        _start_cursor: Option<&str>,
+    ) -> locality_core::LocalityResult<PageListDto> {
+        panic!("portable fetch must not search")
+    }
+
+    fn update_block(
+        &self,
+        _block_id: &str,
+        _body: serde_json::Value,
+    ) -> locality_core::LocalityResult<BlockDto> {
+        unreachable!("not used by portable read tests")
+    }
+
+    fn append_block_children(
+        &self,
+        _block_id: &str,
+        _body: serde_json::Value,
+    ) -> locality_core::LocalityResult<BlockListDto> {
+        unreachable!("not used by portable read tests")
+    }
+
+    fn delete_block(&self, _block_id: &str) -> locality_core::LocalityResult<BlockDto> {
+        unreachable!("not used by portable read tests")
+    }
+}
+
+#[derive(Debug)]
+struct NoSearchNotionApi(FixtureNotionApi);
+
+impl NotionApi for NoSearchNotionApi {
+    fn retrieve_page(&self, page_id: &str) -> locality_core::LocalityResult<PageDto> {
+        self.0.retrieve_page(page_id)
+    }
+
+    fn retrieve_database(&self, database_id: &str) -> locality_core::LocalityResult<DatabaseDto> {
+        self.0.retrieve_database(database_id)
+    }
+
+    fn retrieve_data_source(
+        &self,
+        data_source_id: &str,
+    ) -> locality_core::LocalityResult<DataSourceDto> {
+        self.0.retrieve_data_source(data_source_id)
+    }
+
+    fn query_data_source(
+        &self,
+        data_source_id: &str,
+        start_cursor: Option<&str>,
+    ) -> locality_core::LocalityResult<PageListDto> {
+        self.0.query_data_source(data_source_id, start_cursor)
+    }
+
+    fn retrieve_block_children(
+        &self,
+        block_id: &str,
+        start_cursor: Option<&str>,
+    ) -> locality_core::LocalityResult<BlockListDto> {
+        self.0.retrieve_block_children(block_id, start_cursor)
+    }
+
+    fn search_pages(
+        &self,
+        _start_cursor: Option<&str>,
+    ) -> locality_core::LocalityResult<PageListDto> {
+        panic!("portable explicit-root traversal must not call Notion search")
+    }
+
+    fn search_databases(
+        &self,
+        _start_cursor: Option<&str>,
+    ) -> locality_core::LocalityResult<DatabaseListDto> {
+        panic!("portable explicit-root traversal must not call Notion search")
+    }
+
+    fn update_block(
+        &self,
+        _block_id: &str,
+        _body: serde_json::Value,
+    ) -> locality_core::LocalityResult<BlockDto> {
+        unreachable!("not used by portable read tests")
+    }
+
+    fn append_block_children(
+        &self,
+        _block_id: &str,
+        _body: serde_json::Value,
+    ) -> locality_core::LocalityResult<BlockListDto> {
+        unreachable!("not used by portable read tests")
+    }
+
+    fn delete_block(&self, _block_id: &str) -> locality_core::LocalityResult<BlockDto> {
+        unreachable!("not used by portable read tests")
     }
 }
 
@@ -3036,6 +5904,43 @@ fn file_block(id: &str, kind: &str, url: &str, caption: &str) -> BlockDto {
         "audio" => block.audio = payload,
         _ => panic!("unsupported fixture file block kind: {kind}"),
     }
+    block
+}
+
+fn hosted_file_block(id: &str, kind: &str, url: &str, expiry_time: Option<&str>) -> BlockDto {
+    let mut block = block(id, kind);
+    let payload = Some(FileBlockDto {
+        kind: "file".to_string(),
+        external: None,
+        file: Some(HostedFileDto {
+            url: url.to_string(),
+            expiry_time: expiry_time.map(str::to_string),
+        }),
+        caption: Vec::new(),
+    });
+    match kind {
+        "image" => block.image = payload,
+        "video" => block.video = payload,
+        "file" => block.file = payload,
+        "pdf" => block.pdf = payload,
+        "audio" => block.audio = payload,
+        _ => panic!("unsupported hosted fixture file block kind: {kind}"),
+    }
+    block
+}
+
+fn hosted_file_block_with_caption(id: &str, kind: &str, url: &str, caption: &str) -> BlockDto {
+    let mut block = hosted_file_block(id, kind, url, None);
+    let payload = match kind {
+        "image" => block.image.as_mut(),
+        "video" => block.video.as_mut(),
+        "file" => block.file.as_mut(),
+        "pdf" => block.pdf.as_mut(),
+        "audio" => block.audio.as_mut(),
+        _ => None,
+    }
+    .expect("hosted media payload");
+    payload.caption = vec![rich_text(caption)];
     block
 }
 

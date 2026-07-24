@@ -9,7 +9,7 @@ use locality_core::validation::{ValidationIssue, ValidationReport};
 use locality_core::{LocalityError, LocalityResult};
 use locality_notion::client::DEFAULT_NOTION_TOKEN_ENV;
 use locality_notion::dto::NotionPageBundle;
-use locality_notion::media::fetch_media_asset_report;
+use locality_notion::media::HostedMediaFailureKind;
 use locality_notion::oauth::{
     HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NotionOAuthBrokerRefresh,
     NotionOAuthRefresh, StoredNotionCredential,
@@ -577,7 +577,16 @@ impl HydrationSource for NotionConnector {
         let bundle = serde_json::from_slice::<NotionPageBundle>(&native.raw).map_err(|error| {
             locality_core::LocalityError::Io(format!("notion native decode failed: {error}"))
         })?;
-        let fetched = fetch_media_asset_report(&rendered.media_assets);
+        let fetched = self.fetch_rendered_media(&rendered);
+        if fetched
+            .failed
+            .iter()
+            .any(|failure| failure.outcome() == HostedMediaFailureKind::Unsafe)
+        {
+            return Err(LocalityError::InvalidState(
+                "Notion hosted media failed safety validation".to_string(),
+            ));
+        }
         if !fetched.failed.is_empty() {
             let local_media_block_ids = fetched
                 .downloaded

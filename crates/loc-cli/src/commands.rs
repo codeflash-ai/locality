@@ -7,7 +7,7 @@ use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use locality_connector::ConnectorUndoApplier;
 use locality_connector::oauth_broker::OAuthBrokerStart;
 use locality_core::LocalityError;
@@ -109,6 +109,11 @@ use crate::push::{
     run_push_with_state_root, select_push_targets,
 };
 use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
+use crate::sandbox::{
+    PROFILE_BOOTSTRAP_TOKEN_INPUT, PROFILE_TOTAL, SandboxContentEncodingPreference,
+    SandboxInitOptions, SandboxInitProfile, SandboxInitReport, resolve_bootstrap_token,
+    run_sandbox_init_with_encoding, run_sandbox_init_with_encoding_and_profile,
+};
 use crate::search::{
     SearchError, SearchOptions, SearchReport, SearchResult, is_notion_url_host, notion_id_from_url,
     run_search, run_search_with_access_roots, source_url_host,
@@ -192,6 +197,11 @@ enum LocalityCommand {
     },
     #[command(about = "Run read-only diagnostics for daemon, mounts, providers, and auth")]
     Doctor,
+    #[command(about = "Bootstrap a sealed read-only sandbox replica")]
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommand,
+    },
     #[command(about = "Search local mount metadata without contacting remote sources")]
     Search(SearchArgs),
     #[command(about = "Locate a mounted Notion page or database and print its local path")]
@@ -241,6 +251,59 @@ enum LocalityCommand {
         #[command(subcommand)]
         command: FileProviderCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum SandboxCommand {
+    #[command(about = "Initialize a sealed read-only sandbox replica")]
+    Init(SandboxInitArgs),
+}
+
+#[derive(Debug, Args)]
+struct SandboxInitArgs {
+    #[arg(long, value_name = "URL", help = "Locality backend API origin")]
+    api_url: String,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Absent destination path for the read-only replica"
+    )]
+    root: String,
+    #[arg(
+        long,
+        value_enum,
+        value_name = "ENCODING",
+        help = "Require zstd or identity export encoding"
+    )]
+    encoding: Option<SandboxEncodingArg>,
+    #[arg(long, help = "Read the one-time bootstrap token from standard input")]
+    bootstrap_token_stdin: bool,
+    #[arg(long, help = "Print redaction-safe phase timings to standard error")]
+    profile: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SandboxEncodingArg {
+    Zstd,
+    Identity,
+}
+
+impl SandboxEncodingArg {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Zstd => "zstd",
+            Self::Identity => "identity",
+        }
+    }
+}
+
+impl From<SandboxEncodingArg> for SandboxContentEncodingPreference {
+    fn from(value: SandboxEncodingArg) -> Self {
+        match value {
+            SandboxEncodingArg::Zstd => Self::Zstd,
+            SandboxEncodingArg::Identity => Self::Identity,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -1069,6 +1132,17 @@ impl Drop for TerminalSpinner {
 }
 
 pub fn dispatch(args: &[String]) -> i32 {
+    if forbidden_bootstrap_token_argument(args) {
+        return command_error(
+            args.iter().any(|arg| arg == "--json"),
+            CommandError::new(
+                "sandbox init",
+                "bootstrap_token_argv_forbidden",
+                "bootstrap tokens are accepted only through LOCALITY_BOOTSTRAP_TOKEN or --bootstrap-token-stdin",
+            ),
+            EXIT_USAGE,
+        );
+    }
     let cli = match parse_cli(args) {
         Ok(cli) => cli,
         Err(error) => {
@@ -1097,6 +1171,9 @@ pub fn dispatch(args: &[String]) -> i32 {
         LocalityCommand::Status(_) => status(&legacy_args[1..], json),
         LocalityCommand::LiveMode { .. } => live_mode(&legacy_args[1..], json),
         LocalityCommand::Doctor => doctor(json),
+        LocalityCommand::Sandbox {
+            command: SandboxCommand::Init(options),
+        } => sandbox_init(options, json),
         LocalityCommand::Search(_) => search(&legacy_args[1..], json),
         LocalityCommand::Locate(_) => locate(&legacy_args[1..], json),
         LocalityCommand::Create { .. } => create(&legacy_args[1..], json),
@@ -1115,6 +1192,11 @@ pub fn dispatch(args: &[String]) -> i32 {
         LocalityCommand::Mcp => mcp(),
         LocalityCommand::FileProvider { .. } => file_provider(&legacy_args[1..], json),
     }
+}
+
+fn forbidden_bootstrap_token_argument(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "--bootstrap-token" || arg.starts_with("--bootstrap-token="))
 }
 
 fn parse_cli(args: &[String]) -> Result<Cli, clap::Error> {
@@ -1420,6 +1502,25 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
             }
         }
         LocalityCommand::Doctor => args.push("doctor".to_string()),
+        LocalityCommand::Sandbox { command } => {
+            args.push("sandbox".to_string());
+            match command {
+                SandboxCommand::Init(options) => {
+                    args.push("init".to_string());
+                    push_flag_value(&mut args, "--api-url", &options.api_url);
+                    push_flag_value(&mut args, "--root", &options.root);
+                    if let Some(encoding) = options.encoding {
+                        push_flag_value(&mut args, "--encoding", encoding.as_str());
+                    }
+                    push_flag(
+                        &mut args,
+                        "--bootstrap-token-stdin",
+                        options.bootstrap_token_stdin,
+                    );
+                    push_flag(&mut args, "--profile", options.profile);
+                }
+            }
+        }
         LocalityCommand::Search(options) => {
             args.push("search".to_string());
             for query_part in &options.query {
@@ -1570,6 +1671,93 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
         }
     }
     args
+}
+
+fn sandbox_init(options: SandboxInitArgs, json: bool) -> i32 {
+    let content_encoding = options
+        .encoding
+        .map_or(SandboxContentEncodingPreference::Automatic, Into::into);
+    let mut profile = options.profile.then(SandboxInitProfile::start);
+    let token_result = {
+        let mut stdin = io::stdin().lock();
+        resolve_bootstrap_token(
+            options.bootstrap_token_stdin,
+            std::env::var_os("LOCALITY_BOOTSTRAP_TOKEN"),
+            &mut stdin,
+        )
+    };
+    if let Some(profile) = profile.as_mut() {
+        profile.mark(PROFILE_BOOTSTRAP_TOKEN_INPUT);
+    }
+    let token = match token_result {
+        Ok(token) => token,
+        Err(error) => {
+            finish_sandbox_profile(profile.as_mut());
+            return sandbox_init_command_error(json, error);
+        }
+    };
+    let init_options = SandboxInitOptions {
+        api_url: options.api_url,
+        root: PathBuf::from(options.root),
+    };
+    let outcome = if let Some(profile) = profile.as_mut() {
+        run_sandbox_init_with_encoding_and_profile(init_options, token, content_encoding, profile)
+    } else {
+        run_sandbox_init_with_encoding(init_options, token, content_encoding)
+    };
+    finish_sandbox_profile(profile.as_mut());
+
+    match outcome {
+        Ok(report) => {
+            if json {
+                print_json(&report);
+            } else {
+                print_sandbox_init_report(&report);
+            }
+            EXIT_SUCCESS
+        }
+        Err(error) => sandbox_init_command_error(json, error),
+    }
+}
+
+fn finish_sandbox_profile(profile: Option<&mut SandboxInitProfile>) {
+    let Some(profile) = profile else {
+        return;
+    };
+    profile.mark(PROFILE_TOTAL);
+    let mut stderr = io::stderr().lock();
+    for timing in profile.timings() {
+        let _ = writeln!(
+            stderr,
+            "locality sandbox profile phase={} phase_ms={} total_ms={}",
+            timing.phase, timing.phase_ms, timing.total_ms
+        );
+    }
+}
+
+fn sandbox_init_command_error(json: bool, error: crate::sandbox::SandboxInitError) -> i32 {
+    let exit_code = if error.is_usage_error() {
+        EXIT_USAGE
+    } else {
+        match error.code() {
+            "backend_request_failed" | "materialization_failed" => EXIT_INTERNAL,
+            _ => EXIT_VALIDATION,
+        }
+    };
+    command_error(
+        json,
+        CommandError::new("sandbox init", error.code(), error.to_string()),
+        exit_code,
+    )
+}
+
+fn print_sandbox_init_report(report: &SandboxInitReport) {
+    println!("sandbox ready at {}", report.root);
+    println!("session: {}", report.session_id);
+    println!(
+        "materialized: {} files, {} directories, {} bytes ({})",
+        report.files, report.directories, report.materialized_bytes, report.content_encoding
+    );
 }
 
 fn mcp() -> i32 {
@@ -9468,8 +9656,9 @@ mod tests {
     use super::{
         Cli, ConnectReport, DEFAULT_DAEMON_CONTROL_TIMEOUT, DEFAULT_DAEMON_MUTATING_TIMEOUT,
         DEFAULT_DAEMON_PULL_TIMEOUT, DaemonRequest, DaemonUnavailableReason, EXIT_SUCCESS,
-        EXIT_USAGE, EXIT_VALIDATION, FileProviderCommandReport, PushConfirmationPromptError,
-        SLACK_CONNECTOR_ID, VirtualProjectionRegistration, absolute_command_path,
+        EXIT_USAGE, EXIT_VALIDATION, FileProviderCommandReport, LocalityCommand,
+        PushConfirmationPromptError, SLACK_CONNECTOR_ID, SandboxCommand, SandboxEncodingArg,
+        VirtualProjectionRegistration, absolute_command_path,
         auto_registration_for_mounted_projection, daemon_request_timeout_for,
         default_mount_id_for_source, diff_report_exit_code, exact_located_entity_record,
         file_provider_list_lines, google_calendar_oauth_broker_config,
@@ -9747,6 +9936,18 @@ mod tests {
             (
                 vec!["doctor", "--help"],
                 vec!["Usage: loc doctor", "Run read-only diagnostics", "--json"],
+            ),
+            (
+                vec!["sandbox", "init", "--help"],
+                vec![
+                    "Usage: loc sandbox init",
+                    "--api-url <URL>",
+                    "--root <PATH>",
+                    "--encoding <ENCODING>",
+                    "--bootstrap-token-stdin",
+                    "--profile",
+                    "--json",
+                ],
             ),
             (
                 vec!["search", "--help"],
@@ -10040,6 +10241,32 @@ mod tests {
         assert_eq!(
             legacy_args_for_command(cli.command.as_ref().expect("command")),
             vec!["live-mode", "status", "Roadmap/page.md"]
+        );
+
+        let cli = parse_cli([
+            "sandbox",
+            "init",
+            "--api-url",
+            "https://api.locality.test",
+            "--root",
+            "/mnt/locality",
+            "--encoding",
+            "zstd",
+            "--bootstrap-token-stdin",
+        ]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec![
+                "sandbox",
+                "init",
+                "--api-url",
+                "https://api.locality.test",
+                "--root",
+                "/mnt/locality",
+                "--encoding",
+                "zstd",
+                "--bootstrap-token-stdin"
+            ]
         );
 
         let cli = parse_cli([
@@ -10357,6 +10584,102 @@ mod tests {
             legacy_args_for_command(cli.command.as_ref().expect("command")),
             vec!["log", "Roadmap.md", "--push-id", "push-1", "--diff"]
         );
+    }
+
+    #[test]
+    fn sandbox_scope_and_bootstrap_token_are_not_accepted_from_argv() {
+        for args in [
+            vec!["sandbox", "init", "--tenant", "pilot"],
+            vec!["sandbox", "init", "--bootstrap-token", "argv-secret"],
+            vec!["sandbox", "init", "--bootstrap-token=argv-secret"],
+        ] {
+            let owned = args
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .collect::<Vec<_>>();
+            if args.iter().any(|arg| arg.starts_with("--bootstrap-token")) {
+                assert!(super::forbidden_bootstrap_token_argument(&owned));
+            } else {
+                let error = Cli::try_parse_from(argv(args)).expect_err("scope flag rejected");
+                assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+            }
+        }
+    }
+
+    #[test]
+    fn sandbox_encoding_parser_is_typed_optional_and_exact() {
+        for (value, expected) in [
+            ("zstd", SandboxEncodingArg::Zstd),
+            ("identity", SandboxEncodingArg::Identity),
+        ] {
+            let cli = parse_cli([
+                "sandbox",
+                "init",
+                "--api-url",
+                "https://api.locality.test",
+                "--root",
+                "/mnt/locality",
+                "--encoding",
+                value,
+            ]);
+            let Some(LocalityCommand::Sandbox {
+                command: SandboxCommand::Init(options),
+            }) = cli.command
+            else {
+                panic!("sandbox init command expected");
+            };
+            assert_eq!(options.encoding, Some(expected));
+        }
+
+        let automatic = parse_cli([
+            "sandbox",
+            "init",
+            "--api-url",
+            "https://api.locality.test",
+            "--root",
+            "/mnt/locality",
+        ]);
+        let Some(LocalityCommand::Sandbox {
+            command: SandboxCommand::Init(options),
+        }) = automatic.command
+        else {
+            panic!("sandbox init command expected");
+        };
+        assert_eq!(options.encoding, None);
+        assert!(!options.profile);
+
+        let profiled = parse_cli([
+            "sandbox",
+            "init",
+            "--api-url",
+            "https://api.locality.test",
+            "--root",
+            "/mnt/locality",
+            "--profile",
+        ]);
+        let Some(LocalityCommand::Sandbox {
+            command: SandboxCommand::Init(options),
+        }) = profiled.command
+        else {
+            panic!("sandbox init command expected");
+        };
+        assert!(options.profile);
+
+        let error = Cli::try_parse_from(argv([
+            "sandbox",
+            "init",
+            "--api-url",
+            "https://api.locality.test",
+            "--root",
+            "/mnt/locality",
+            "--encoding",
+            "gzip",
+        ]))
+        .expect_err("unsupported encoding rejected by parser");
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
+        let message = error.to_string();
+        assert!(message.contains("invalid value 'gzip'"));
+        assert!(message.contains("[possible values: zstd, identity]"));
     }
 
     #[test]

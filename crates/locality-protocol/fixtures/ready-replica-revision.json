@@ -1,0 +1,9 @@
+{
+  "tenant_id": "tenant-acme",
+  "source_connection_id": "source-notion",
+  "replica_revision_id": "replica-108",
+  "source_watermark": "notion-cursor:108",
+  "projection_revision": 73,
+  "coverage_complete": true,
+  "published_at": "2026-07-19T11:59:00Z"
+}

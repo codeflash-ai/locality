@@ -1,0 +1,43 @@
+{
+  "versions": {
+    "session": 1,
+    "replica": 1,
+    "export_metadata": 1,
+    "writable_session_store": 1,
+    "canonical": 1,
+    "path": 1,
+    "changeset": 1
+  },
+  "session_id": "session-7",
+  "state": "ready",
+  "freshness_requirement": {
+    "max_age_seconds": 300,
+    "on_stale": "wait_then_fail",
+    "wait_timeout_seconds": 30
+  },
+  "replicas": [
+    {
+      "source_connection_id": "source-notion",
+      "state": "fresh",
+      "coverage_complete": true,
+      "provider_observed_through": "notion-repair:108",
+      "last_successful_sync_at": "2026-07-19T11:58:00Z",
+      "last_repair_at": "2026-07-19T11:55:00Z",
+      "pending_events": 0,
+      "backlog": 0,
+      "provider_cooldown_until": null
+    }
+  ],
+  "export_offer": {
+    "media_type": "application/x-tar",
+    "supported_content_encodings": [
+      "identity",
+      "zstd"
+    ],
+    "selected_entries": 2,
+    "decoded_bytes": 3072,
+    "decoded_tar_sha256": "sha256:decoded-tar"
+  },
+  "error": null,
+  "updated_at": "2026-07-19T12:00:00Z"
+}

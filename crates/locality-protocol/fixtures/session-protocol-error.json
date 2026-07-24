@@ -1,0 +1,6 @@
+{
+  "code": "needs_update",
+  "message": "session protocol version 2 requires a newer client",
+  "retriable": false,
+  "retry_after_seconds": null
+}

@@ -1,0 +1,56 @@
+[
+  {
+    "record_class": "directory",
+    "order_key": {
+      "depth": 1,
+      "logical_path": "Projects"
+    }
+  },
+  {
+    "record_class": "directory",
+    "order_key": {
+      "depth": 2,
+      "logical_path": "Projects/Roadmap"
+    }
+  },
+  {
+    "record_class": "file",
+    "order_key": {
+      "winning_scope_ordinal": 0,
+      "parent_path": "Projects/Roadmap",
+      "logical_path": "Projects/Roadmap/page.md",
+      "projection_id": "projection-roadmap"
+    },
+    "source_connection_id": "source-notion",
+    "file_kind": "markdown",
+    "effective_actions": [
+      "read",
+      "update"
+    ],
+    "content_sha256": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+    "byte_length": 10
+  },
+  {
+    "record_class": "file",
+    "order_key": {
+      "winning_scope_ordinal": 1,
+      "parent_path": null,
+      "logical_path": "README.md",
+      "projection_id": "projection-readme"
+    },
+    "source_connection_id": "source-notion",
+    "file_kind": "markdown",
+    "effective_actions": [
+      "read"
+    ],
+    "content_sha256": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+    "byte_length": 7
+  },
+  {
+    "record_class": "control",
+    "order_key": {
+      "ordinal": 0
+    },
+    "member_path": ".loc/session.json"
+  }
+]

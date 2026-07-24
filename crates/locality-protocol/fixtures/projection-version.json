@@ -1,0 +1,30 @@
+{
+  "tenant_id": "tenant-acme",
+  "source_connection_id": "source-notion",
+  "projection_version_id": "projection-version-roadmap-v4",
+  "projection": {
+    "projection_id": "projection-roadmap",
+    "logical_path": "Projects/Roadmap/page.md",
+    "content_version_id": "content-roadmap-v4",
+    "inputs": [
+      {
+        "source_remote_id": "page-roadmap",
+        "source_version_id": "source-version-roadmap-v4"
+      }
+    ],
+    "file_kind": "markdown",
+    "format_version": 1,
+    "supported_actions": [
+      "read",
+      "search",
+      "download_attachment",
+      "create",
+      "update",
+      "move",
+      "delete",
+      "comment",
+      "update_properties",
+      "manage_schema"
+    ]
+  }
+}
