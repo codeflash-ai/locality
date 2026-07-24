@@ -98,6 +98,20 @@ def usage_totals(summary: dict) -> dict:
     return buckets
 
 
+def non_warning_errors(summary: dict) -> list[str]:
+    errors = summary.get("errors") or []
+    return [
+        error
+        for error in errors
+        if "--dangerously-bypass-hook-trust" not in str(error)
+    ]
+
+
+def warning_count(summary: dict) -> int:
+    errors = summary.get("errors") or []
+    return len(errors) - len(non_warning_errors(summary))
+
+
 def strategy_roots(root: Path) -> dict[str, Path]:
     candidates = {}
     artifacts = root / "artifacts"
@@ -271,7 +285,9 @@ for strategy, strategy_root in roots.items():
             {
                 "scenario": scenario,
                 "strategy": strategy,
-                "status": "errors" if codex_summary.get("errors") else "ok",
+                "status": "errors"
+                if non_warning_errors(codex_summary)
+                else ("ok_with_warnings" if warning_count(codex_summary) else "ok"),
                 "duration_ms": codex_summary.get("observed_duration_ms", 0),
                 "events": codex_summary.get("event_count", 0),
                 "tokens": tokens,
@@ -357,11 +373,11 @@ for item in sorted(per_strategy_data, key=lambda row: (row["scenario"], row["str
     tokens = usage_totals(codex_summary)
     lines.extend(
         [
-            "| Codex observed | Events | Input | Cached input | Output | Reasoning output | Total tokens | Errors |",
-            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Codex observed | Events | Input | Cached input | Output | Reasoning output | Total tokens | Errors | Warnings |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             f"| {fmt_ms(codex_summary.get('observed_duration_ms'))} | {codex_summary.get('event_count', 0)} | "
             f"{tokens['input']} | {tokens['cached_input']} | {tokens['output']} | {tokens['reasoning_output']} | "
-            f"{tokens['total']} | {len(codex_summary.get('errors') or [])} |",
+            f"{tokens['total']} | {len(non_warning_errors(codex_summary))} | {warning_count(codex_summary)} |",
             "",
         ]
     )
@@ -397,10 +413,17 @@ for item in sorted(per_strategy_data, key=lambda row: (row["scenario"], row["str
             lines.append(f"| {label} | `{cell(rel(path))}` |")
     lines.append("")
 
-    if codex_summary.get("errors"):
+    if non_warning_errors(codex_summary):
         lines.extend(["### Errors", ""])
-        for error in codex_summary["errors"][:10]:
+        for error in non_warning_errors(codex_summary)[:10]:
             lines.append(f"- {shorten(error, 240)}")
+        lines.append("")
+
+    if warning_count(codex_summary):
+        lines.extend(["### Warnings", ""])
+        for error in (codex_summary.get("errors") or [])[:10]:
+            if "--dangerously-bypass-hook-trust" in str(error):
+                lines.append(f"- {shorten(error, 240)}")
         lines.append("")
 
     if strategy == "locality":
