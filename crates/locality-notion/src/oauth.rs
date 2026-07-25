@@ -5,6 +5,7 @@
 //! values.
 
 use std::fmt;
+use std::time::Duration;
 
 use locality_core::{LocalityError, LocalityResult};
 use reqwest::{Url, blocking::Client};
@@ -21,6 +22,7 @@ pub const DEFAULT_LOCALITY_NOTION_OAUTH_BROKER_URL: &str =
     "https://afs-oauth-broker.saurabh-b07.workers.dev";
 
 const REDACTED: &str = "<redacted>";
+const NOTION_OAUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn redacted_if_present(value: &Option<String>) -> Option<&'static str> {
     value.as_ref().map(|_| REDACTED)
@@ -449,6 +451,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
 
     use locality_core::LocalityError;
     use reqwest::Url;
@@ -780,6 +783,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn direct_exchange_has_a_hard_request_deadline() {
+        let (token_url, server) = spawn_slow_server(Duration::from_millis(250));
+        let client =
+            HttpNotionOAuthClient::with_token_url_and_timeout(token_url, Duration::from_millis(25));
+        let started = Instant::now();
+
+        let error = client
+            .exchange_code(&NotionOAuthCodeExchange {
+                client_id: "client-id".to_string(),
+                client_secret: "client-secret".to_string(),
+                code: "authorization-code".to_string(),
+                redirect_uri: "https://api.dev.locality.dev/v1/oauth/notion/callback".to_string(),
+            })
+            .expect_err("slow exchange must time out");
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            matches!(error, LocalityError::Io(message) if message.starts_with("notion oauth request failed:"))
+        );
+        server.join().expect("server thread");
+    }
+
+    fn spawn_slow_server(delay: Duration) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request).expect("read request");
+            thread::sleep(delay);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            );
+        });
+        (url, server)
+    }
+
     fn spawn_error_server(body: &'static str) -> (String, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let url = format!("http://{}", listener.local_addr().expect("local addr"));
@@ -812,6 +853,7 @@ mod tests {
 pub struct HttpNotionOAuthClient {
     client: Client,
     token_url: String,
+    request_timeout: Duration,
 }
 
 impl Default for HttpNotionOAuthClient {
@@ -825,6 +867,7 @@ impl HttpNotionOAuthClient {
         Self {
             client: notion_http_client(),
             token_url: format!("{DEFAULT_NOTION_API_BASE_URL}/v1/oauth/token"),
+            request_timeout: NOTION_OAUTH_REQUEST_TIMEOUT,
         }
     }
 
@@ -833,6 +876,16 @@ impl HttpNotionOAuthClient {
         Self {
             client: notion_http_client(),
             token_url: token_url.into(),
+            request_timeout: NOTION_OAUTH_REQUEST_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_token_url_and_timeout(token_url: impl Into<String>, request_timeout: Duration) -> Self {
+        Self {
+            client: notion_http_client(),
+            token_url: token_url.into(),
+            request_timeout,
         }
     }
 
@@ -874,6 +927,7 @@ impl HttpNotionOAuthClient {
             .basic_auth(client_id, Some(client_secret))
             .header("Notion-Version", DEFAULT_NOTION_VERSION)
             .json(&body)
+            .timeout(self.request_timeout)
             .send()
             .map_err(|error| LocalityError::Io(format!("notion oauth request failed: {error}")))?;
         let status = response.status();
