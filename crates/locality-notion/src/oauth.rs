@@ -4,6 +4,8 @@
 //! credential store. SQLite stores metadata and a `secret_ref`, never these
 //! values.
 
+use std::fmt;
+
 use locality_core::{LocalityError, LocalityResult};
 use reqwest::{Url, blocking::Client};
 use serde::de::DeserializeOwned;
@@ -18,7 +20,13 @@ pub const DEFAULT_NOTION_OAUTH_AUTHORIZE_URL: &str = "https://api.notion.com/v1/
 pub const DEFAULT_LOCALITY_NOTION_OAUTH_BROKER_URL: &str =
     "https://afs-oauth-broker.saurabh-b07.workers.dev";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+const REDACTED: &str = "<redacted>";
+
+fn redacted_if_present(value: &Option<String>) -> Option<&'static str> {
+    value.as_ref().map(|_| REDACTED)
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct NotionOAuthCodeExchange {
     pub client_id: String,
     pub client_secret: String,
@@ -26,11 +34,34 @@ pub struct NotionOAuthCodeExchange {
     pub redirect_uri: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl fmt::Debug for NotionOAuthCodeExchange {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NotionOAuthCodeExchange")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &REDACTED)
+            .field("code", &REDACTED)
+            .field("redirect_uri", &self.redirect_uri)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct NotionOAuthRefresh {
     pub client_id: String,
     pub client_secret: String,
     pub refresh_token: String,
+}
+
+impl fmt::Debug for NotionOAuthRefresh {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NotionOAuthRefresh")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &REDACTED)
+            .field("refresh_token", &REDACTED)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,7 +69,7 @@ pub struct NotionOAuthBrokerStart {
     pub redirect_uri: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct NotionOAuthBrokerStartResponse {
     pub connector: String,
     pub client_id: String,
@@ -47,6 +78,21 @@ pub struct NotionOAuthBrokerStartResponse {
     pub session: String,
     pub state: String,
     pub expires_in: u64,
+}
+
+impl fmt::Debug for NotionOAuthBrokerStartResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NotionOAuthBrokerStartResponse")
+            .field("connector", &self.connector)
+            .field("client_id", &self.client_id)
+            .field("authorization_url", &REDACTED)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("session", &REDACTED)
+            .field("state", &REDACTED)
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
 }
 
 impl NotionOAuthBrokerStartResponse {
@@ -60,7 +106,7 @@ impl NotionOAuthBrokerStartResponse {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NotionOAuthBrokerCodeExchange {
     pub session: String,
     pub state: String,
@@ -68,13 +114,38 @@ pub struct NotionOAuthBrokerCodeExchange {
     pub redirect_uri: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl fmt::Debug for NotionOAuthBrokerCodeExchange {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NotionOAuthBrokerCodeExchange")
+            .field("session", &REDACTED)
+            .field("state", &REDACTED)
+            .field("code", &REDACTED)
+            .field("redirect_uri", &self.redirect_uri)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct NotionOAuthBrokerRefresh {
     pub refresh_token: Option<String>,
     pub refresh_token_handle: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for NotionOAuthBrokerRefresh {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NotionOAuthBrokerRefresh")
+            .field("refresh_token", &redacted_if_present(&self.refresh_token))
+            .field(
+                "refresh_token_handle",
+                &redacted_if_present(&self.refresh_token_handle),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotionOAuthToken {
     pub access_token: String,
     pub token_type: Option<String>,
@@ -90,7 +161,30 @@ pub struct NotionOAuthToken {
     pub duplicated_template_id: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for NotionOAuthToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NotionOAuthToken")
+            .field("access_token", &REDACTED)
+            .field("token_type", &self.token_type)
+            .field("refresh_token", &redacted_if_present(&self.refresh_token))
+            .field("refresh_token_kind", &self.refresh_token_kind)
+            .field(
+                "refresh_token_handle",
+                &redacted_if_present(&self.refresh_token_handle),
+            )
+            .field("expires_in", &self.expires_in)
+            .field("bot_id", &self.bot_id)
+            .field("workspace_id", &self.workspace_id)
+            .field("workspace_name", &self.workspace_name)
+            .field("workspace_icon", &self.workspace_icon)
+            .field("owner", &self.owner)
+            .field("duplicated_template_id", &self.duplicated_template_id)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredNotionCredential {
     pub kind: String,
     pub access_token: String,
@@ -105,6 +199,33 @@ pub struct StoredNotionCredential {
     pub refresh_token_handle: Option<String>,
     pub acquired_at: u64,
     pub expires_at: Option<u64>,
+}
+
+impl fmt::Debug for StoredNotionCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StoredNotionCredential")
+            .field("kind", &self.kind)
+            .field("access_token", &REDACTED)
+            .field("refresh_token", &redacted_if_present(&self.refresh_token))
+            .field("token_type", &self.token_type)
+            .field("oauth_client_id", &self.oauth_client_id)
+            .field(
+                "oauth_client_secret",
+                &redacted_if_present(&self.oauth_client_secret),
+            )
+            .field("oauth_broker_url", &self.oauth_broker_url)
+            .field("workspace_id", &self.workspace_id)
+            .field("workspace_name", &self.workspace_name)
+            .field("bot_id", &self.bot_id)
+            .field(
+                "refresh_token_handle",
+                &redacted_if_present(&self.refresh_token_handle),
+            )
+            .field("acquired_at", &self.acquired_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 impl StoredNotionCredential {
@@ -311,11 +432,8 @@ impl HttpNotionOAuthBrokerClient {
             })?;
         let status = response.status();
         if !status.is_success() {
-            let body = response
-                .text()
-                .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
             return Err(LocalityError::Io(format!(
-                "notion oauth broker returned HTTP {status}: {body}"
+                "notion oauth broker returned HTTP {status}"
             )));
         }
         response.json().map_err(|error| {
@@ -328,11 +446,18 @@ impl HttpNotionOAuthBrokerClient {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread::{self, JoinHandle};
+
+    use locality_core::LocalityError;
     use reqwest::Url;
 
     use super::{
-        DEFAULT_NOTION_OAUTH_AUTHORIZE_URL, NotionOAuthBrokerStartResponse, NotionOAuthToken,
-        StoredNotionCredential, normalize_notion_authorization_url,
+        DEFAULT_NOTION_OAUTH_AUTHORIZE_URL, HttpNotionOAuthBrokerClient, HttpNotionOAuthClient,
+        NotionOAuthBrokerCodeExchange, NotionOAuthBrokerRefresh, NotionOAuthBrokerStartResponse,
+        NotionOAuthCodeExchange, NotionOAuthRefresh, NotionOAuthToken, StoredNotionCredential,
+        normalize_notion_authorization_url,
     };
 
     #[test]
@@ -488,6 +613,191 @@ mod tests {
         assert_eq!(refreshed.expires_at, Some(7400));
     }
 
+    #[test]
+    fn oauth_debug_output_is_exact_and_redacted() {
+        let code_exchange = NotionOAuthCodeExchange {
+            client_id: "client-id".to_string(),
+            client_secret: "client-secret".to_string(),
+            code: "authorization-code".to_string(),
+            redirect_uri: "http://localhost/callback".to_string(),
+        };
+        let refresh = NotionOAuthRefresh {
+            client_id: "client-id".to_string(),
+            client_secret: "client-secret".to_string(),
+            refresh_token: "refresh-token".to_string(),
+        };
+        let broker_start = NotionOAuthBrokerStartResponse {
+            connector: "notion".to_string(),
+            client_id: "client-id".to_string(),
+            authorization_url: "https://api.notion.com/v1/oauth/authorize?state=secret-state"
+                .to_string(),
+            redirect_uri: "http://localhost/callback".to_string(),
+            session: "secret-session".to_string(),
+            state: "secret-state".to_string(),
+            expires_in: 300,
+        };
+        let broker_exchange = NotionOAuthBrokerCodeExchange {
+            session: "secret-session".to_string(),
+            state: "secret-state".to_string(),
+            code: "authorization-code".to_string(),
+            redirect_uri: "http://localhost/callback".to_string(),
+        };
+        let broker_refresh = NotionOAuthBrokerRefresh {
+            refresh_token: Some("refresh-token".to_string()),
+            refresh_token_handle: Some("refresh-handle".to_string()),
+        };
+        let token = NotionOAuthToken {
+            access_token: "access-token".to_string(),
+            token_type: Some("bearer".to_string()),
+            refresh_token: Some("refresh-token".to_string()),
+            refresh_token_kind: Some("handle".to_string()),
+            refresh_token_handle: Some("refresh-handle".to_string()),
+            expires_in: Some(3600),
+            bot_id: Some("bot-id".to_string()),
+            workspace_id: Some("workspace-id".to_string()),
+            workspace_name: Some("Workspace".to_string()),
+            workspace_icon: None,
+            owner: None,
+            duplicated_template_id: None,
+        };
+        let stored = StoredNotionCredential {
+            kind: "oauth".to_string(),
+            access_token: "access-token".to_string(),
+            refresh_token: Some("refresh-token".to_string()),
+            token_type: Some("bearer".to_string()),
+            oauth_client_id: Some("client-id".to_string()),
+            oauth_client_secret: Some("client-secret".to_string()),
+            oauth_broker_url: Some("https://auth.example.test".to_string()),
+            workspace_id: Some("workspace-id".to_string()),
+            workspace_name: Some("Workspace".to_string()),
+            bot_id: Some("bot-id".to_string()),
+            refresh_token_handle: Some("refresh-handle".to_string()),
+            acquired_at: 100,
+            expires_at: Some(3700),
+        };
+
+        assert_eq!(
+            format!("{code_exchange:?}"),
+            "NotionOAuthCodeExchange { client_id: \"client-id\", client_secret: \"<redacted>\", code: \"<redacted>\", redirect_uri: \"http://localhost/callback\" }"
+        );
+        assert_eq!(
+            format!("{refresh:?}"),
+            "NotionOAuthRefresh { client_id: \"client-id\", client_secret: \"<redacted>\", refresh_token: \"<redacted>\" }"
+        );
+        assert_eq!(
+            format!("{broker_start:?}"),
+            "NotionOAuthBrokerStartResponse { connector: \"notion\", client_id: \"client-id\", authorization_url: \"<redacted>\", redirect_uri: \"http://localhost/callback\", session: \"<redacted>\", state: \"<redacted>\", expires_in: 300 }"
+        );
+        assert_eq!(
+            format!("{broker_exchange:?}"),
+            "NotionOAuthBrokerCodeExchange { session: \"<redacted>\", state: \"<redacted>\", code: \"<redacted>\", redirect_uri: \"http://localhost/callback\" }"
+        );
+        assert_eq!(
+            format!("{broker_refresh:?}"),
+            "NotionOAuthBrokerRefresh { refresh_token: Some(\"<redacted>\"), refresh_token_handle: Some(\"<redacted>\") }"
+        );
+        assert_eq!(
+            format!("{token:?}"),
+            "NotionOAuthToken { access_token: \"<redacted>\", token_type: Some(\"bearer\"), refresh_token: Some(\"<redacted>\"), refresh_token_kind: Some(\"handle\"), refresh_token_handle: Some(\"<redacted>\"), expires_in: Some(3600), bot_id: Some(\"bot-id\"), workspace_id: Some(\"workspace-id\"), workspace_name: Some(\"Workspace\"), workspace_icon: None, owner: None, duplicated_template_id: None }"
+        );
+        assert_eq!(
+            format!("{stored:?}"),
+            "StoredNotionCredential { kind: \"oauth\", access_token: \"<redacted>\", refresh_token: Some(\"<redacted>\"), token_type: Some(\"bearer\"), oauth_client_id: Some(\"client-id\"), oauth_client_secret: Some(\"<redacted>\"), oauth_broker_url: Some(\"https://auth.example.test\"), workspace_id: Some(\"workspace-id\"), workspace_name: Some(\"Workspace\"), bot_id: Some(\"bot-id\"), refresh_token_handle: Some(\"<redacted>\"), acquired_at: 100, expires_at: Some(3700) }"
+        );
+    }
+
+    #[test]
+    fn stored_notion_credential_json_remains_exact_and_round_trips() {
+        let expected = r#"{"kind":"oauth","access_token":"access-token","refresh_token":"refresh-token","token_type":"bearer","oauth_client_id":"client-id","oauth_client_secret":"client-secret","oauth_broker_url":"https://auth.example.test","workspace_id":"workspace-id","workspace_name":"Workspace","bot_id":"bot-id","refresh_token_handle":"refresh-handle","acquired_at":100,"expires_at":3700}"#;
+        let stored = StoredNotionCredential {
+            kind: "oauth".to_string(),
+            access_token: "access-token".to_string(),
+            refresh_token: Some("refresh-token".to_string()),
+            token_type: Some("bearer".to_string()),
+            oauth_client_id: Some("client-id".to_string()),
+            oauth_client_secret: Some("client-secret".to_string()),
+            oauth_broker_url: Some("https://auth.example.test".to_string()),
+            workspace_id: Some("workspace-id".to_string()),
+            workspace_name: Some("Workspace".to_string()),
+            bot_id: Some("bot-id".to_string()),
+            refresh_token_handle: Some("refresh-handle".to_string()),
+            acquired_at: 100,
+            expires_at: Some(3700),
+        };
+
+        assert_eq!(serde_json::to_string(&stored).expect("serialize"), expected);
+        let decoded: StoredNotionCredential =
+            serde_json::from_str(expected).expect("deserialize existing credential JSON");
+        assert_eq!(decoded, stored);
+        assert_eq!(
+            serde_json::to_string(&decoded).expect("reserialize"),
+            expected
+        );
+    }
+
+    #[test]
+    fn broker_upstream_error_is_exact_and_omits_response_body() {
+        let (broker_url, server) = spawn_error_server(
+            r#"{"code":"authorization-code","refresh_token_handle":"refresh-handle"}"#,
+        );
+        let client = HttpNotionOAuthBrokerClient::new(broker_url);
+
+        let error = client
+            .exchange_code(&NotionOAuthBrokerCodeExchange {
+                session: "secret-session".to_string(),
+                state: "secret-state".to_string(),
+                code: "authorization-code".to_string(),
+                redirect_uri: "http://localhost/callback".to_string(),
+            })
+            .expect_err("broker rejects code");
+
+        server.join().expect("server thread");
+        assert_eq!(
+            error,
+            LocalityError::Io("notion oauth broker returned HTTP 400 Bad Request".to_string())
+        );
+    }
+
+    #[test]
+    fn direct_upstream_error_is_exact_and_omits_response_body() {
+        let (token_url, server) =
+            spawn_error_server(r#"{"code":"authorization-code","client_secret":"client-secret"}"#);
+        let client = HttpNotionOAuthClient::with_token_url(token_url);
+
+        let error = client
+            .exchange_code(&NotionOAuthCodeExchange {
+                client_id: "client-id".to_string(),
+                client_secret: "client-secret".to_string(),
+                code: "authorization-code".to_string(),
+                redirect_uri: "http://localhost/callback".to_string(),
+            })
+            .expect_err("Notion rejects code");
+
+        server.join().expect("server thread");
+        assert_eq!(
+            error,
+            LocalityError::Io("notion oauth returned HTTP 400 Bad Request".to_string())
+        );
+    }
+
+    fn spawn_error_server(body: &'static str) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request).expect("read request");
+            write!(
+                stream,
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write response");
+        });
+        (url, server)
+    }
+
     fn query_value(url: &Url, name: &str) -> Option<String> {
         url.query_pairs()
             .find_map(|(key, value)| (key == name).then(|| value.into_owned()))
@@ -498,15 +808,31 @@ mod tests {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct HttpNotionOAuthClient {
     client: Client,
+    token_url: String,
+}
+
+impl Default for HttpNotionOAuthClient {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HttpNotionOAuthClient {
     pub fn new() -> Self {
         Self {
             client: notion_http_client(),
+            token_url: format!("{DEFAULT_NOTION_API_BASE_URL}/v1/oauth/token"),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_token_url(token_url: impl Into<String>) -> Self {
+        Self {
+            client: notion_http_client(),
+            token_url: token_url.into(),
         }
     }
 
@@ -544,7 +870,7 @@ impl HttpNotionOAuthClient {
     ) -> LocalityResult<NotionOAuthToken> {
         let response = self
             .client
-            .post(format!("{DEFAULT_NOTION_API_BASE_URL}/v1/oauth/token"))
+            .post(&self.token_url)
             .basic_auth(client_id, Some(client_secret))
             .header("Notion-Version", DEFAULT_NOTION_VERSION)
             .json(&body)
@@ -552,11 +878,8 @@ impl HttpNotionOAuthClient {
             .map_err(|error| LocalityError::Io(format!("notion oauth request failed: {error}")))?;
         let status = response.status();
         if !status.is_success() {
-            let body = response
-                .text()
-                .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
             return Err(LocalityError::Io(format!(
-                "notion oauth returned HTTP {status}: {body}"
+                "notion oauth returned HTTP {status}"
             )));
         }
         response.json().map_err(|error| {
