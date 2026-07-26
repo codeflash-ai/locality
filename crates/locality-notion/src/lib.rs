@@ -16,6 +16,7 @@ pub mod oauth;
 mod portable;
 pub mod projection;
 pub mod render;
+pub mod root_setup;
 pub mod schema;
 
 use std::collections::BTreeSet;
@@ -48,6 +49,7 @@ use crate::projection::{
 use crate::render::{
     NotionRenderedEntity, RenderOptions, render_native_entity, render_native_entity_with_options,
 };
+use crate::root_setup::NotionRootSetup;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct NotionConfig {
@@ -142,6 +144,12 @@ impl NotionConnector {
 
     pub fn config(&self) -> &NotionConfig {
         &self.config
+    }
+
+    /// Return the provider-specific, metadata-only facade used to choose and
+    /// revalidate explicit Notion roots during source setup.
+    pub fn root_setup(&self) -> NotionRootSetup {
+        NotionRootSetup::with_api(Arc::clone(&self.api))
     }
 
     pub fn with_root_page_id(&self, root_page_id: locality_core::model::RemoteId) -> Self {
