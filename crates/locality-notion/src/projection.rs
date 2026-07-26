@@ -90,7 +90,7 @@ fn retrieve_explicit_root(
     }
 }
 
-fn validate_explicit_root_identity(
+pub(crate) fn validate_explicit_root_identity(
     requested: &RemoteId,
     returned: &str,
     kind: &str,
@@ -521,7 +521,7 @@ impl TreeEntrySink for ExplicitRootSink<'_> {
     }
 }
 
-fn explicit_root_identity_key(value: &str) -> String {
+pub(crate) fn explicit_root_identity_key(value: &str) -> String {
     value
         .chars()
         .filter(|character| *character != '-')
@@ -1192,7 +1192,7 @@ fn notion_source_url(id: &str) -> String {
     format!("https://www.notion.so/{}", compact_notion_id(id))
 }
 
-fn database_title(database: &DatabaseDto) -> Option<String> {
+pub(crate) fn database_title(database: &DatabaseDto) -> Option<String> {
     let title = rich_text_plain_text(&database.title);
     if title.trim().is_empty() {
         None
