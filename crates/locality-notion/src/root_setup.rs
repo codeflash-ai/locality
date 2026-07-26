@@ -338,6 +338,7 @@ fn bounded_title(title: String) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, VecDeque};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use locality_core::model::RemoteId;
@@ -549,6 +550,23 @@ mod tests {
                 "search_databases:<first>:limit=1:returned=1"
             ]
         );
+    }
+
+    #[test]
+    fn discovery_fails_closed_before_an_unbounded_database_search_fallback() {
+        let inner = Arc::new(FakeNotionApi::default());
+        inner.push_page_search(page_list(Vec::new(), None));
+        let api = Arc::new(UnboundedOnlyNotionApi {
+            inner,
+            unbounded_database_calls: AtomicUsize::new(0),
+        });
+
+        assert_eq!(
+            NotionRootSetup::with_api(api.clone())
+                .discover_candidates(NotionRootDiscoveryOptions::new(1, 1).expect("options")),
+            Err(LocalityError::Unsupported("bounded Notion database search"))
+        );
+        assert_eq!(api.unbounded_database_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -912,6 +930,65 @@ mod tests {
 
         fn delete_block(&self, _block_id: &str) -> LocalityResult<BlockDto> {
             Err(LocalityError::NotImplemented("delete fake block"))
+        }
+    }
+
+    struct UnboundedOnlyNotionApi {
+        inner: Arc<FakeNotionApi>,
+        unbounded_database_calls: AtomicUsize,
+    }
+
+    impl std::fmt::Debug for UnboundedOnlyNotionApi {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("UnboundedOnlyNotionApi")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl NotionApi for UnboundedOnlyNotionApi {
+        fn retrieve_page(&self, page_id: &str) -> LocalityResult<PageDto> {
+            self.inner.retrieve_page(page_id)
+        }
+
+        fn retrieve_database(&self, database_id: &str) -> LocalityResult<DatabaseDto> {
+            self.inner.retrieve_database(database_id)
+        }
+
+        fn retrieve_block_children(
+            &self,
+            block_id: &str,
+            start_cursor: Option<&str>,
+        ) -> LocalityResult<BlockListDto> {
+            self.inner.retrieve_block_children(block_id, start_cursor)
+        }
+
+        fn search_pages(&self, start_cursor: Option<&str>) -> LocalityResult<PageListDto> {
+            self.inner.search_pages(start_cursor)
+        }
+
+        fn search_databases(&self, start_cursor: Option<&str>) -> LocalityResult<DatabaseListDto> {
+            self.unbounded_database_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.search_databases(start_cursor)
+        }
+
+        fn update_block(
+            &self,
+            block_id: &str,
+            body: serde_json::Value,
+        ) -> LocalityResult<BlockDto> {
+            self.inner.update_block(block_id, body)
+        }
+
+        fn append_block_children(
+            &self,
+            block_id: &str,
+            body: serde_json::Value,
+        ) -> LocalityResult<BlockListDto> {
+            self.inner.append_block_children(block_id, body)
+        }
+
+        fn delete_block(&self, block_id: &str) -> LocalityResult<BlockDto> {
+            self.inner.delete_block(block_id)
         }
     }
 

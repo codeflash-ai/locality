@@ -152,16 +152,17 @@ pub trait NotionApi: std::fmt::Debug + Send + Sync {
         Err(LocalityError::NotImplemented("search Notion databases"))
     }
     /// Search database metadata while allowing callers to bound provider-side
-    /// work. Existing implementations remain source-compatible and may fall
-    /// back to their unbounded page implementation; the HTTP client enforces
-    /// the requested result bound before retrieving database metadata.
+    /// work. Existing implementations remain source-compatible, but the
+    /// default fails closed so setup cannot silently use an unbounded search.
+    /// The HTTP client enforces the requested result bound before retrieving
+    /// database metadata.
     fn search_databases_bounded(
         &self,
         start_cursor: Option<&str>,
         max_results: usize,
     ) -> LocalityResult<DatabaseListDto> {
-        let _ = max_results;
-        self.search_databases(start_cursor)
+        let _ = (start_cursor, max_results);
+        Err(LocalityError::Unsupported("bounded Notion database search"))
     }
     fn update_block(&self, block_id: &str, body: serde_json::Value) -> LocalityResult<BlockDto>;
     fn move_block(
