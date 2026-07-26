@@ -947,6 +947,15 @@ operation.
 6. A workspace profile becomes `ready` only when its selected roots have a
    complete initial replica revision or an explicitly documented partial policy.
 
+Before the first replica exists, the connection workflow may run one bounded,
+metadata-only provider search to help an administrator choose the initial data
+ceiling. This is an onboarding exception, not the steady-state source picker:
+the result is explicitly advisory and truncated, the administrator may enter a
+stable provider ID that search did not return, and a worker directly retrieves
+and revalidates every selected root before configuration or backfill begins.
+The provider credential remains worker-only. Once a replica exists, normal
+source pickers query it and never synchronously crawl the provider.
+
 If a source is still backfilling, a sandbox request fails quickly with
 `source_bootstrapping` and progress. It never starts another crawl or silently
 serves a structurally incomplete mount as complete.
