@@ -151,6 +151,18 @@ pub trait NotionApi: std::fmt::Debug + Send + Sync {
         let _ = start_cursor;
         Err(LocalityError::NotImplemented("search Notion databases"))
     }
+    /// Search database metadata while allowing callers to bound provider-side
+    /// work. Existing implementations remain source-compatible and may fall
+    /// back to their unbounded page implementation; the HTTP client enforces
+    /// the requested result bound before retrieving database metadata.
+    fn search_databases_bounded(
+        &self,
+        start_cursor: Option<&str>,
+        max_results: usize,
+    ) -> LocalityResult<DatabaseListDto> {
+        let _ = max_results;
+        self.search_databases(start_cursor)
+    }
     fn update_block(&self, block_id: &str, body: serde_json::Value) -> LocalityResult<BlockDto>;
     fn move_block(
         &self,
@@ -850,21 +862,25 @@ impl NotionApi for HttpNotionApi {
     }
 
     fn search_databases(&self, start_cursor: Option<&str>) -> LocalityResult<DatabaseListDto> {
-        let data_sources: DataSourceListDto =
-            self.post_read_json("/v1/search", data_source_search_body(start_cursor))?;
-        let mut seen = BTreeSet::new();
+        self.search_databases_bounded(start_cursor, 100)
+    }
+
+    fn search_databases_bounded(
+        &self,
+        start_cursor: Option<&str>,
+        max_results: usize,
+    ) -> LocalityResult<DatabaseListDto> {
+        if max_results == 0 {
+            return Ok(DatabaseListDto::default());
+        }
+        let max_results = max_results.min(100);
+        let data_sources: DataSourceListDto = self.post_read_json(
+            "/v1/search",
+            data_source_search_body(start_cursor, max_results),
+        )?;
         let mut databases = Vec::new();
-        for data_source in data_sources.results {
-            let Some(database_id) = data_source
-                .parent
-                .as_ref()
-                .and_then(|parent| parent.database_id.as_deref())
-            else {
-                continue;
-            };
-            if seen.insert(database_id.to_string()) {
-                databases.push(self.retrieve_database(database_id)?);
-            }
+        for database_id in unique_database_ids(&data_sources.results, max_results) {
+            databases.push(self.retrieve_database(&database_id)?);
         }
 
         Ok(DatabaseListDto {
@@ -931,9 +947,9 @@ impl NotionApi for HttpNotionApi {
     }
 }
 
-fn data_source_search_body(start_cursor: Option<&str>) -> Value {
+fn data_source_search_body(start_cursor: Option<&str>, page_size: usize) -> Value {
     let mut body = json!({
-        "page_size": 100,
+        "page_size": page_size,
         "filter": {
             "property": "object",
             "value": "data_source"
@@ -951,13 +967,30 @@ fn data_source_search_body(start_cursor: Option<&str>) -> Value {
     body
 }
 
+fn unique_database_ids(data_sources: &[DataSourceDto], max_results: usize) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    data_sources
+        .iter()
+        .filter_map(|data_source| {
+            data_source
+                .parent
+                .as_ref()
+                .and_then(|parent| parent.database_id.as_deref())
+        })
+        .filter(|database_id| seen.insert((*database_id).to_string()))
+        .take(max_results)
+        .map(str::to_string)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         HttpNotionApi, NotionResponseInterpretation, NotionRetryClass, data_source_search_body,
         notion_http_client_builder, notion_network_config, notion_page_lookup_reports_database,
-        rate_limit_backoff, retry_after_header,
+        rate_limit_backoff, retry_after_header, unique_database_ids,
     };
+    use crate::dto::{DataSourceDto, ParentDto};
     use locality_core::LocalityError;
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
     use serde_json::Value;
@@ -972,11 +1005,39 @@ mod tests {
 
     #[test]
     fn search_databases_uses_current_notion_data_source_filter() {
-        let body = data_source_search_body(Some("cursor-1"));
+        let body = data_source_search_body(Some("cursor-1"), 1);
 
         assert_eq!(body["filter"]["property"], "object");
         assert_eq!(body["filter"]["value"], "data_source");
         assert_eq!(body["start_cursor"], "cursor-1");
+        assert_eq!(body["page_size"], 1);
+    }
+
+    #[test]
+    fn bounded_database_search_selects_only_the_requested_unique_metadata_retrievals() {
+        let data_sources = vec![
+            data_source("source-1", "database-1"),
+            data_source("source-2", "database-1"),
+            data_source("source-3", "database-2"),
+        ];
+
+        assert_eq!(unique_database_ids(&data_sources, 1), vec!["database-1"]);
+        assert_eq!(
+            unique_database_ids(&data_sources, 2),
+            vec!["database-1", "database-2"]
+        );
+    }
+
+    fn data_source(id: &str, database_id: &str) -> DataSourceDto {
+        DataSourceDto {
+            id: id.to_string(),
+            parent: Some(ParentDto {
+                kind: "database_id".to_string(),
+                database_id: Some(database_id.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
     }
 
     #[test]
