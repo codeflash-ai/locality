@@ -28,7 +28,6 @@ export function gmailAuthorizeUrl(env: BrokerEnv, redirectUri: string, state: st
   url.searchParams.set("state", state);
   url.searchParams.set("access_type", "offline");
   url.searchParams.set("prompt", "consent");
-  url.searchParams.set("include_granted_scopes", "true");
   return url.toString();
 }
 

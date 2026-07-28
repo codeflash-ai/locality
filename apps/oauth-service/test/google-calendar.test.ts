@@ -89,7 +89,7 @@ describe("Google Calendar OAuth broker", () => {
     );
     expect(authorizationUrl.searchParams.get("access_type")).toBe("offline");
     expect(authorizationUrl.searchParams.get("prompt")).toBe("consent");
-    expect(authorizationUrl.searchParams.get("include_granted_scopes")).toBe("true");
+    expect(authorizationUrl.searchParams.get("include_granted_scopes")).toBeNull();
     expect(body.redirect_uri).toBe("http://localhost:8757/oauth/google-calendar/callback");
     expect(body.session).toBeTruthy();
     expect(body.state).toBeTruthy();

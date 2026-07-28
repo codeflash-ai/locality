@@ -289,6 +289,7 @@ describe("auth broker", () => {
     expect(body.authorization_url).toContain("response_type=code");
     expect(body.authorization_url).toContain("access_type=offline");
     expect(body.authorization_url).toContain("prompt=consent");
+    expect(body.authorization_url).not.toContain("include_granted_scopes");
     expect(body.authorization_url).toContain(
       "scope=openid+email+profile+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdocuments+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.file+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.metadata"
     );
@@ -427,7 +428,7 @@ describe("auth broker", () => {
     );
     expect(authorizationUrl.searchParams.get("access_type")).toBe("offline");
     expect(authorizationUrl.searchParams.get("prompt")).toBe("consent");
-    expect(authorizationUrl.searchParams.get("include_granted_scopes")).toBe("true");
+    expect(authorizationUrl.searchParams.get("include_granted_scopes")).toBeNull();
     expect(body.redirect_uri).toBe("http://localhost:8757/oauth/google-calendar/callback");
     expect(body.session).toBeTruthy();
     expect(body.state).toBeTruthy();
@@ -513,6 +514,7 @@ describe("auth broker", () => {
     expect(authorizationUrl.searchParams.get("scope")).not.toContain("https://mail.google.com/");
     expect(authorizationUrl.searchParams.get("access_type")).toBe("offline");
     expect(authorizationUrl.searchParams.get("prompt")).toBe("consent");
+    expect(authorizationUrl.searchParams.get("include_granted_scopes")).toBeNull();
     expect(body.redirect_uri).toBe("http://localhost:8757/oauth/gmail/callback");
     expect(body.session).toBeTruthy();
     expect(body.state).toBeTruthy();

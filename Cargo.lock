@@ -2352,8 +2352,8 @@ dependencies = [
  "sha2",
  "tar",
  "unicode-normalization",
- "zstd",
  "windows-sys 0.61.2",
+ "zstd",
 ]
 
 [[package]]
