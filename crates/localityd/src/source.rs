@@ -753,7 +753,7 @@ fn gmail_mount_guidance() -> String {
         "{}\n\
 Gmail facts:\n\
 - This mount projects Gmail inbox/, sent/, and draft/ folders.\n\
-- inbox/ and sent/ are read-only. Create a Markdown file directly under draft/ to send mail.\n\
+- inbox/ and sent/ are read-only. Create a Markdown file directly under draft/ to create an unsent Gmail draft.\n\
 - Draft creates require `to` frontmatter and either `subject` or `title` frontmatter.\n",
         generic_mount_guidance("Gmail")
     )
