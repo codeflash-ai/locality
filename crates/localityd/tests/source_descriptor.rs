@@ -1,6 +1,8 @@
+use locality_browser::BROWSER_CONNECTOR_ID;
+use locality_browser::BrowserMountSettings;
 use locality_confluence::{CONFLUENCE_CONNECTOR_ID, StoredConfluenceCredential};
-use locality_connector::Connector;
 use locality_connector::oauth_broker::OAuthBrokerToken;
+use locality_connector::{ChildContainer, Connector, FetchRequest, ListChildrenRequest};
 use locality_core::canonical::parse_canonical_markdown;
 use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_core::push::BodyDiffMode;
@@ -31,10 +33,12 @@ use localityd::source::{
     source_display_name, source_move_decision_for_parent_path, source_write_decision_for_path,
     supported_source_connectors,
 };
+use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::path::PathBuf;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[test]
 fn notion_descriptor_exposes_cli_and_mount_metadata() {
@@ -131,6 +135,131 @@ fn gmail_descriptor_comes_from_registry() {
         descriptor.create_entity_parent_kinds(),
         &[EntityKind::Directory]
     );
+}
+
+#[test]
+fn browser_descriptor_is_authless_read_only_capture_source() {
+    let descriptor = source_descriptor(BROWSER_CONNECTOR_ID);
+
+    assert_eq!(descriptor.id(), "browser");
+    assert_eq!(descriptor.display_name(), "Browser");
+    assert_eq!(descriptor.default_mount_id(), "browser-main");
+    assert_eq!(descriptor.connect_command(), None);
+    assert_eq!(descriptor.auth_env_var(), None);
+    assert!(!descriptor.supports_oauth());
+    assert!(descriptor.create_entity_parent_kinds().is_empty());
+    assert!(descriptor.move_entity_parent_kinds().is_empty());
+    assert!(
+        descriptor
+            .mount_guidance()
+            .contains("Browser sessions are read-only captures")
+    );
+    assert!(
+        descriptor
+            .mount_guidance()
+            .contains("Saved HTML and screenshot artifact paths")
+    );
+    assert_eq!(
+        descriptor.periodic_discovery_interval(),
+        Some(Duration::from_secs(300))
+    );
+    assert_eq!(descriptor.max_background_discovery_workers(), 2);
+}
+
+#[test]
+fn browser_rejects_every_write_create_and_move_path() {
+    let mut mount = MountConfig::new(
+        MountId::new("browser-main"),
+        BROWSER_CONNECTOR_ID,
+        "/tmp/locality/browser",
+    );
+    mount.read_only = false;
+
+    assert!(
+        !source_write_decision_for_path(&mount, std::path::Path::new("Sessions/launch/session.md"))
+            .is_writable()
+    );
+    assert!(
+        !source_create_decision_for_parent_path(&mount, std::path::Path::new("Sessions/launch"))
+            .is_writable()
+    );
+    assert!(
+        !source_move_decision_for_parent_path(&mount, std::path::Path::new("Sessions/launch"))
+            .is_writable()
+    );
+}
+
+#[test]
+fn resolving_browser_mount_reads_saved_capture_sessions_without_credentials() {
+    let capture_root = temp_browser_capture_root();
+    let sessions_dir = capture_root.join("sessions");
+    fs::create_dir_all(&sessions_dir).expect("create browser sessions dir");
+    fs::write(
+        sessions_dir.join("launch.json"),
+        r#"{
+          "id": "launch",
+          "title": "Launch research",
+          "browser": "Chrome",
+          "captured_at": "2026-07-28T09:00:00Z",
+          "windows": [{
+            "id": "window-1",
+            "tabs": [{
+              "id": "tab-1",
+              "title": "Pricing research",
+              "url": "https://www.locality.dev/pricing",
+              "markdown": "Captured pricing notes for the launch plan.",
+              "selected_text": "Agent-readable browser context"
+            }]
+          }]
+        }"#,
+    )
+    .expect("write browser session");
+    let settings_json = BrowserMountSettings::with_capture_root(capture_root.display().to_string())
+        .to_json()
+        .expect("browser settings");
+    let mount = MountConfig::new(
+        MountId::new("browser-main"),
+        BROWSER_CONNECTOR_ID,
+        "/tmp/locality/browser",
+    )
+    .read_only(true)
+    .with_settings_json(settings_json);
+    let store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+
+    let source =
+        resolve_source_for_mount(&store, &credentials, &mount).expect("resolve browser source");
+
+    let ResolvedSource::Browser(connector) = source else {
+        panic!("expected browser source");
+    };
+    let sessions = connector
+        .list_children(ListChildrenRequest {
+            mount_id: MountId::new("browser-main"),
+            container: ChildContainer::DirectoryChildren(RemoteId::new("browser:sessions")),
+            parent_path: PathBuf::from("Sessions"),
+        })
+        .expect("list saved sessions");
+    assert_eq!(sessions.entries.len(), 1);
+    let tab_native = connector
+        .fetch(FetchRequest {
+            remote_id: RemoteId::new("browser:tab:launch:tab-1"),
+        })
+        .expect("fetch captured tab");
+    let tab_doc = connector.render(&tab_native).expect("render captured tab");
+    assert!(tab_doc.frontmatter.contains("connector: browser"));
+    assert!(
+        tab_doc
+            .frontmatter
+            .contains("url: \"https://www.locality.dev/pricing\"")
+    );
+    assert!(
+        tab_doc
+            .body
+            .contains("Captured pricing notes for the launch plan.")
+    );
+
+    let _ = fs::remove_dir_all(capture_root);
 }
 
 #[test]
@@ -1162,6 +1291,7 @@ fn supported_source_connectors_include_first_party_connectors() {
             "google-docs",
             "google-calendar",
             "gmail",
+            "browser",
             "confluence",
             "github",
             "gitlab",
@@ -1206,7 +1336,7 @@ fn planned_source_connectors_stay_out_of_runtime_registry() {
         assert_eq!(source_descriptor(connector).connect_command(), None);
     }
 
-    assert_eq!(source_connector_catalog_ids().len(), 27);
+    assert_eq!(source_connector_catalog_ids().len(), 28);
 }
 
 #[test]
@@ -2578,4 +2708,15 @@ fn local_google_docs_validator_blocks_inline_image_block_edits() {
         report.issues[0].code,
         "google_docs_inline_object_edit_unsupported"
     );
+}
+
+fn temp_browser_capture_root() -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "locality-browser-source-test-{}-{unique}",
+        std::process::id()
+    ))
 }

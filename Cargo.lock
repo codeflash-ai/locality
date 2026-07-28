@@ -2074,6 +2074,7 @@ name = "loc-cli"
 version = "0.3.6"
 dependencies = [
  "clap",
+ "locality-browser",
  "locality-confluence",
  "locality-connector",
  "locality-core",
@@ -2092,6 +2093,16 @@ dependencies = [
  "serde",
  "serde_json",
  "yaml_serde",
+]
+
+[[package]]
+name = "locality-browser"
+version = "0.3.6"
+dependencies = [
+ "locality-connector",
+ "locality-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2148,6 +2159,7 @@ name = "locality-desktop"
 version = "0.3.6"
 dependencies = [
  "loc-cli",
+ "locality-browser",
  "locality-confluence",
  "locality-connector",
  "locality-core",
@@ -2346,6 +2358,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "getrandom 0.3.4",
+ "locality-browser",
  "locality-confluence",
  "locality-connector",
  "locality-core",
