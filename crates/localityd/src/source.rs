@@ -307,6 +307,23 @@ pub fn source_write_decision_for_path(
     SourceWriteDecision::Writable
 }
 
+pub fn source_delete_decision_for_path(
+    mount: &MountConfig,
+    relative_path: &Path,
+) -> SourceWriteDecision {
+    if mount.read_only {
+        return SourceWriteDecision::ReadOnly {
+            reason: "mount is read-only",
+        };
+    }
+    if mount.connector == "gmail" {
+        return SourceWriteDecision::ReadOnly {
+            reason: "Gmail draft deletion is not supported",
+        };
+    }
+    source_write_decision_for_path(mount, relative_path)
+}
+
 pub fn source_create_decision_for_parent_path(
     mount: &MountConfig,
     parent_path: &Path,
@@ -469,7 +486,7 @@ fn gmail_source_descriptor() -> SourceDescriptor {
         create_entity_parent_kinds: vec![EntityKind::Directory],
         move_entity_parent_kinds: vec![EntityKind::Directory],
         periodic_discovery_interval: None,
-        body_diff_mode: BodyDiffMode::Block,
+        body_diff_mode: BodyDiffMode::WholeEntity,
         virtual_rename_policy: VirtualRenamePolicy::FilenameDerived,
         max_background_discovery_workers: 4,
     }
@@ -753,7 +770,7 @@ fn gmail_mount_guidance() -> String {
         "{}\n\
 Gmail facts:\n\
 - This mount projects Gmail inbox/, sent/, and draft/ folders.\n\
-- inbox/ and sent/ are read-only. Create a Markdown file directly under draft/ to send mail.\n\
+- inbox/ and sent/ are read-only. Create a Markdown file directly under draft/ to create an unsent Gmail draft.\n\
 - Draft creates require `to` frontmatter and either `subject` or `title` frontmatter.\n",
         generic_mount_guidance("Gmail")
     )

@@ -3,16 +3,20 @@ use std::fmt;
 use locality_core::{LocalityError, LocalityResult};
 use serde::{Deserialize, Deserializer, Serialize, de};
 
+pub const GMAIL_PROJECTION_LAYOUT_VERSION: u32 = 2;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GmailMountSettings {
     pub gmail: GmailSettings,
+    pub projection_layout_version: u32,
 }
 
 impl Default for GmailMountSettings {
     fn default() -> Self {
         Self {
             gmail: GmailSettings::default(),
+            projection_layout_version: GMAIL_PROJECTION_LAYOUT_VERSION,
         }
     }
 }
@@ -20,9 +24,10 @@ impl Default for GmailMountSettings {
 impl GmailMountSettings {
     pub fn from_json(value: &str) -> LocalityResult<Self> {
         if value.trim().is_empty() {
-            return Ok(Self::default());
+            return Err(legacy_implicit_projection_settings());
         }
-        serde_json::from_str::<Self>(value).map_err(|error| {
+
+        let raw = serde_json::from_str::<serde_json::Value>(value).map_err(|error| {
             LocalityError::Validation(vec![locality_core::validation::ValidationIssue::new(
                 "gmail_mount_settings_invalid",
                 std::path::PathBuf::new(),
@@ -30,7 +35,26 @@ impl GmailMountSettings {
                 format!("Gmail mount settings JSON is invalid: {error}"),
                 Some("remount Gmail with valid --after/--before/--view options".to_string()),
             )])
-        })
+        })?;
+        if raw.as_object().is_some_and(serde_json::Map::is_empty) {
+            return Err(legacy_implicit_projection_settings());
+        }
+
+        let settings = serde_json::from_value::<Self>(raw).map_err(|error| {
+            LocalityError::Validation(vec![locality_core::validation::ValidationIssue::new(
+                "gmail_mount_settings_invalid",
+                std::path::PathBuf::new(),
+                Some(1),
+                format!("Gmail mount settings JSON is invalid: {error}"),
+                Some("remount Gmail with valid --after/--before/--view options".to_string()),
+            )])
+        })?;
+        if settings.projection_layout_version != GMAIL_PROJECTION_LAYOUT_VERSION {
+            return Err(projection_layout_version_error(
+                settings.projection_layout_version,
+            ));
+        }
+        Ok(settings)
     }
 
     pub fn to_json(&self) -> LocalityResult<String> {
@@ -42,14 +66,36 @@ impl GmailMountSettings {
         Ok(Self {
             gmail: GmailSettings {
                 date_window: Some(GmailDateWindow::new(after, before)?),
-                view: GmailProjectionView::Messages,
+                view: GmailProjectionView::Threads,
             },
+            projection_layout_version: GMAIL_PROJECTION_LAYOUT_VERSION,
         })
     }
 
     pub fn with_view(mut self, view: GmailProjectionView) -> Self {
         self.gmail.view = view;
         self
+    }
+}
+
+fn legacy_implicit_projection_settings() -> LocalityError {
+    LocalityError::Validation(vec![locality_core::validation::ValidationIssue::new(
+        "gmail_projection_layout_upgrade_required",
+        std::path::PathBuf::new(),
+        Some(1),
+        "Gmail mount uses legacy implicit settings (`{}`), whose message layout cannot be safely changed in place to the thread-default layout",
+        Some(
+            "preserve the existing mount with `--view messages`, or create a new mount ID and root for the thread layout"
+                .to_string(),
+        ),
+    )])
+}
+
+fn projection_layout_version_error(version: u32) -> LocalityError {
+    LocalityError::UpdateRequired {
+        component: "gmail:projection_layout".to_string(),
+        found: i64::from(version),
+        supported: i64::from(GMAIL_PROJECTION_LAYOUT_VERSION),
     }
 }
 
@@ -64,7 +110,7 @@ impl Default for GmailSettings {
     fn default() -> Self {
         Self {
             date_window: None,
-            view: GmailProjectionView::Messages,
+            view: GmailProjectionView::Threads,
         }
     }
 }
@@ -78,7 +124,7 @@ pub enum GmailProjectionView {
 
 impl Default for GmailProjectionView {
     fn default() -> Self {
-        Self::Messages
+        Self::Threads
     }
 }
 
@@ -258,23 +304,57 @@ fn error_message(error: LocalityError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{GmailMountSettings, GmailProjectionView, GmailSearchDate};
+    use super::{
+        GMAIL_PROJECTION_LAYOUT_VERSION, GmailMountSettings, GmailProjectionView, GmailSearchDate,
+    };
     use locality_core::LocalityError;
 
     #[test]
-    fn default_settings_keep_message_view_without_date_window() {
-        let settings = GmailMountSettings::from_json("{}").expect("settings");
+    fn default_settings_keep_thread_view_without_date_window() {
+        let settings = GmailMountSettings::default();
 
         assert_eq!(settings.gmail.date_window, None);
-        assert_eq!(settings.gmail.view, GmailProjectionView::Messages);
+        assert_eq!(settings.gmail.view, GmailProjectionView::Threads);
+        assert_eq!(
+            settings.projection_layout_version,
+            GMAIL_PROJECTION_LAYOUT_VERSION
+        );
     }
 
     #[test]
-    fn blank_settings_decode_as_default() {
-        let settings = GmailMountSettings::from_json(" \n\t ").expect("settings");
+    fn legacy_implicit_settings_fail_before_changing_projection_layout() {
+        for json in ["{}", " \n\t "] {
+            let error = GmailMountSettings::from_json(json)
+                .expect_err("legacy implicit settings require an explicit layout");
+            let LocalityError::Validation(issues) = error else {
+                panic!("expected validation error");
+            };
 
-        assert_eq!(settings.gmail.date_window, None);
+            assert_eq!(issues.len(), 1);
+            assert_eq!(issues[0].code, "gmail_projection_layout_upgrade_required");
+            assert_eq!(
+                issues[0].message,
+                "Gmail mount uses legacy implicit settings (`{}`), whose message layout cannot be safely changed in place to the thread-default layout"
+            );
+            assert_eq!(
+                issues[0].suggested_fix.as_deref(),
+                Some(
+                    "preserve the existing mount with `--view messages`, or create a new mount ID and root for the thread layout"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_unversioned_message_view_remains_an_unambiguous_opt_in() {
+        let settings = GmailMountSettings::from_json(r#"{"gmail":{"view":"messages"}}"#)
+            .expect("explicit message view");
+
         assert_eq!(settings.gmail.view, GmailProjectionView::Messages);
+        assert_eq!(
+            settings.projection_layout_version,
+            GMAIL_PROJECTION_LAYOUT_VERSION
+        );
     }
 
     #[test]
@@ -293,7 +373,7 @@ mod tests {
         let json = settings.to_json().expect("json");
         assert_eq!(
             json,
-            r#"{"gmail":{"date_window":{"after":"2026-07-01","before":"2026-07-15"},"view":"threads"}}"#
+            r#"{"gmail":{"date_window":{"after":"2026-07-01","before":"2026-07-15"},"view":"threads"},"projection_layout_version":2}"#
         );
 
         let parsed = GmailMountSettings::from_json(&json).expect("parsed json");
@@ -303,6 +383,30 @@ mod tests {
             parsed.gmail.date_window.as_ref().expect("window").query(),
             "after:2026/07/01 before:2026/07/15"
         );
+    }
+
+    #[test]
+    fn newer_projection_layout_version_fails_cleanly() {
+        let error = GmailMountSettings::from_json(
+            r#"{"gmail":{"view":"threads"},"projection_layout_version":3}"#,
+        )
+        .expect_err("newer layout requires a newer build");
+        assert_eq!(
+            error,
+            LocalityError::UpdateRequired {
+                component: "gmail:projection_layout".to_string(),
+                found: 3,
+                supported: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn date_window_keeps_thread_view_without_an_explicit_override() {
+        let settings =
+            GmailMountSettings::with_date_window("2026-07-01", "2026-07-15").expect("date window");
+
+        assert_eq!(settings.gmail.view, GmailProjectionView::Threads);
     }
 
     #[test]

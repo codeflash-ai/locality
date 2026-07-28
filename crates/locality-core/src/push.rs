@@ -344,8 +344,12 @@ pub fn plan_push_pipeline(request: PushPipelineRequest<'_>) -> PushPipelineResul
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PushExecutionRequest {
-    /// Stable push identifier used by journals and connector idempotency keys.
+    /// Stable push identifier used by the local journal and, by default,
+    /// connector idempotency keys.
     pub push_id: PushId,
+    /// Optional prior push identifier used solely to derive connector
+    /// idempotency keys when resuming an incomplete operation.
+    pub idempotency_push_id: Option<PushId>,
     /// Mount being mutated.
     pub mount_id: MountId,
     /// Validated and approved pipeline result to execute.
@@ -365,6 +369,7 @@ impl PushExecutionRequest {
     pub fn new(push_id: PushId, mount_id: MountId, pipeline: PushPipelineResult) -> Self {
         Self {
             push_id,
+            idempotency_push_id: None,
             mount_id,
             pipeline,
             preimages: Vec::new(),
@@ -376,6 +381,11 @@ impl PushExecutionRequest {
 
     pub fn with_preimages(mut self, preimages: Vec<JournalPreimage>) -> Self {
         self.preimages = preimages;
+        self
+    }
+
+    pub fn with_idempotency_push_id(mut self, push_id: PushId) -> Self {
+        self.idempotency_push_id = Some(push_id);
         self
     }
 
@@ -550,12 +560,16 @@ where
         ));
     };
     let remote_ids = plan.affected_entities.clone();
+    let idempotency_push_id = request
+        .idempotency_push_id
+        .as_ref()
+        .unwrap_or(&request.push_id);
     let operation_ids = plan
         .operations
         .iter()
         .enumerate()
         .map(|(index, operation)| {
-            PushOperationId::for_operation(&request.push_id, index, operation)
+            PushOperationId::for_operation(idempotency_push_id, index, operation)
         })
         .collect::<Vec<_>>();
 
@@ -574,7 +588,7 @@ where
     host.update_status(&request.push_id, JournalStatus::Applying)?;
 
     if let Err(error) = host.check(PushConcurrencyRequest {
-        push_id: &request.push_id,
+        push_id: idempotency_push_id,
         mount_id: &request.mount_id,
         plan: &plan,
         operation_ids: &operation_ids,
@@ -586,7 +600,7 @@ where
     }
 
     let apply_result = match host.apply(PushApplyRequest {
-        push_id: &request.push_id,
+        push_id: idempotency_push_id,
         mount_id: &request.mount_id,
         plan: &plan,
         operation_ids: &operation_ids,

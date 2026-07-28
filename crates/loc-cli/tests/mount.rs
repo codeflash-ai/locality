@@ -925,7 +925,7 @@ fn cli_mount_gmail_persists_date_window_and_thread_view() {
     assert_eq!(report["connector"], "gmail", "{report:#?}");
     assert_eq!(
         report["settings_json"],
-        r#"{"gmail":{"date_window":{"after":"2026-07-01","before":"2026-07-15"},"view":"threads"}}"#,
+        r#"{"gmail":{"date_window":{"after":"2026-07-01","before":"2026-07-15"},"view":"threads"},"projection_layout_version":2}"#,
         "{report:#?}"
     );
 
@@ -936,7 +936,7 @@ fn cli_mount_gmail_persists_date_window_and_thread_view() {
         .expect("mount exists");
     assert_eq!(
         mount.settings_json,
-        r#"{"gmail":{"date_window":{"after":"2026-07-01","before":"2026-07-15"},"view":"threads"}}"#
+        r#"{"gmail":{"date_window":{"after":"2026-07-01","before":"2026-07-15"},"view":"threads"},"projection_layout_version":2}"#
     );
 }
 
@@ -1184,7 +1184,7 @@ fn cli_mount_gmail_rejects_reversed_or_equal_date_windows_with_detail() {
 }
 
 #[test]
-fn cli_mount_gmail_default_settings_are_suppressed() {
+fn cli_mount_gmail_default_settings_persist_thread_layout_version() {
     let fixture = MountFixture::new("loc-cli-gmail-default-settings");
     fs::create_dir_all(&fixture.root).expect("create fixture root");
     let state_root = fixture.root.join("state");
@@ -1207,7 +1207,9 @@ fn cli_mount_gmail_default_settings_are_suppressed() {
         "--json",
     ]));
 
-    assert_eq!(report["settings_json"], "{}", "{report:#?}");
+    let expected_settings =
+        r#"{"gmail":{"date_window":null,"view":"threads"},"projection_layout_version":2}"#;
+    assert_eq!(report["settings_json"], expected_settings, "{report:#?}");
 
     let human_mount_root = fixture.root.join("gmail-human");
     let human_mount_root_arg = human_mount_root.display().to_string();
@@ -1232,7 +1234,10 @@ fn cli_mount_gmail_default_settings_are_suppressed() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.contains("settings:"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("settings: {expected_settings}")),
+        "{stdout}"
+    );
 
     let store = SqliteStateStore::open(state_root).expect("open state");
     let json_mount = store
@@ -1243,8 +1248,8 @@ fn cli_mount_gmail_default_settings_are_suppressed() {
         .get_mount(&MountId::new("gmail-human"))
         .expect("load human mount")
         .expect("human mount exists");
-    assert_eq!(json_mount.settings_json, "{}");
-    assert_eq!(human_mount.settings_json, "{}");
+    assert_eq!(json_mount.settings_json, expected_settings);
+    assert_eq!(human_mount.settings_json, expected_settings);
 }
 
 #[test]

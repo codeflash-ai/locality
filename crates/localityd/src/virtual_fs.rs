@@ -30,8 +30,8 @@ use crate::hydration::{
 };
 use crate::shadow_match::parsed_matches_shadow;
 use crate::source::{
-    VirtualRenamePolicy, source_create_decision_for_parent_path, source_descriptor,
-    source_move_decision_for_parent_path, source_write_decision_for_path,
+    VirtualRenamePolicy, source_create_decision_for_parent_path, source_delete_decision_for_path,
+    source_descriptor, source_move_decision_for_parent_path, source_write_decision_for_path,
 };
 
 pub const ROOT_CONTAINER_IDENTIFIER: &str = "root";
@@ -1658,6 +1658,7 @@ where
             let mutation = pending_page_directory_mutation(&mutations, identifier)?
                 .ok_or_else(|| missing_identifier(identifier))?
                 .clone();
+            ensure_source_path_deletable(&mount, &mutation.projected_path)?;
             let path = content_path_for_relative(content_root, &mutation.projected_path)?;
             let _ = std::fs::remove_file(path);
             store
@@ -1680,11 +1681,12 @@ where
                 "only page directories can be deleted by the virtual filesystem",
             ));
         }
-        ensure_source_path_writable(&mount, &entity.path)?;
+        ensure_source_path_deletable(&mount, &entity.path)?;
         return record_virtual_fs_page_delete(store, content_root, &mount, &entities, entity, true);
     }
 
     if let Some(mutation) = local_mutation(store, mount_id, identifier)? {
+        ensure_source_path_deletable(&mount, &mutation.projected_path)?;
         let path = content_path_for_relative(content_root, &mutation.projected_path)?;
         let _ = std::fs::remove_file(path);
         store
@@ -1701,7 +1703,7 @@ where
             "only page.md files can be deleted by the virtual filesystem",
         ));
     }
-    ensure_source_path_writable(&mount, &entity.path)?;
+    ensure_source_path_deletable(&mount, &entity.path)?;
     record_virtual_fs_page_delete(store, content_root, &mount, &entities, entity, false)
 }
 
@@ -3835,6 +3837,15 @@ fn missing_identifier(identifier: &str) -> LocalityError {
 
 fn ensure_source_path_writable(mount: &MountConfig, relative_path: &Path) -> LocalityResult<()> {
     match source_write_decision_for_path(mount, relative_path) {
+        crate::source::SourceWriteDecision::Writable => Ok(()),
+        crate::source::SourceWriteDecision::ReadOnly { reason } => {
+            Err(LocalityError::Unsupported(reason))
+        }
+    }
+}
+
+fn ensure_source_path_deletable(mount: &MountConfig, relative_path: &Path) -> LocalityResult<()> {
+    match source_delete_decision_for_path(mount, relative_path) {
         crate::source::SourceWriteDecision::Writable => Ok(()),
         crate::source::SourceWriteDecision::ReadOnly { reason } => {
             Err(LocalityError::Unsupported(reason))
@@ -8669,6 +8680,41 @@ mod tests {
             .expect("mutation");
         assert_eq!(mutation.mutation_kind, VirtualMutationKind::Delete);
 
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn trash_gmail_draft_is_rejected_without_recording_a_delete_mutation() {
+        let mount_id = MountId::new("gmail-main");
+        let state_root = temp_root("loc-virtual-fs-trash-gmail-draft");
+        let content_root = state_root.join("content/gmail-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount_with_connector(&mount_id, "gmail"))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("gmail-draft-1"),
+                EntityKind::Page,
+                "Draft reply",
+                "draft/reply.md",
+            ))
+            .expect("save draft");
+
+        let error = trash_virtual_fs_item(&mut store, &content_root, &mount_id, "gmail-draft-1")
+            .expect_err("Gmail draft deletion must be blocked");
+
+        assert_eq!(
+            error,
+            LocalityError::Unsupported("Gmail draft deletion is not supported")
+        );
+        assert!(
+            store
+                .list_virtual_mutations(&mount_id)
+                .expect("list mutations")
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(state_root);
     }
 

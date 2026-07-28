@@ -91,6 +91,41 @@ fn executor_copies_request_metadata_and_readable_diff_to_journal() {
 }
 
 #[test]
+fn executor_can_reuse_connector_idempotency_without_reusing_the_local_journal_id() {
+    let events = event_log();
+    let mut host = RecordingHost::new(events);
+    let local_push_id = PushId("push-retry".to_string());
+    let original_push_id = PushId("push-original".to_string());
+
+    let result = execute_journaled_push_with_host(
+        &mut host,
+        PushExecutionRequest::new(local_push_id.clone(), mount_id(), approved_pipeline())
+            .with_idempotency_push_id(original_push_id.clone()),
+    )
+    .expect("retry execution");
+
+    assert_eq!(result.push_id, local_push_id);
+    assert_eq!(
+        host.journal.entry.as_ref().expect("journal").push_id,
+        local_push_id
+    );
+    assert_eq!(
+        host.concurrency.seen_push_id,
+        Some(original_push_id.clone())
+    );
+    assert_eq!(host.applier.seen_push_id, Some(original_push_id.clone()));
+    assert_eq!(host.reconciler.seen_push_id, Some(local_push_id));
+    let JournalApplyEffect::UpdatedBlock { operation_id, .. } = &result.apply_effects[0] else {
+        panic!("expected updated block effect")
+    };
+    assert!(
+        operation_id
+            .0
+            .starts_with(&format!("{}:", original_push_id.0))
+    );
+}
+
+#[test]
 fn executor_does_not_journal_or_apply_until_pipeline_is_approved() {
     let events = event_log();
     let mut host = RecordingHost::new(events.clone());

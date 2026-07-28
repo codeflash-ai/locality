@@ -18,8 +18,8 @@ The connector projects a fixed mailbox shape:
     draft/
 ```
 
-`inbox/` and `sent/` are read-only. `draft/` is the local write surface for
-outbound mail.
+`inbox/` and `sent/` are read-only. `draft/` mirrors Gmail drafts and is the
+local write surface for unsent draft creation and edits.
 
 ## OAuth
 
@@ -66,9 +66,10 @@ CLI overrides:
 
 ## Projection And Pull
 
-By default, Pull enumerates the recent 100 inbox messages and recent 100 sent
-messages. The `draft/` folder is created locally, but the connector does not
-enumerate remote Gmail drafts.
+By default, Pull enumerates the recent 100 inbox threads, recent 100 sent
+threads, and recent 100 Gmail drafts. The `draft/` folder contains both drafts
+created in Gmail and local changes to those drafts. `loc push` creates or updates
+an unsent Gmail UI draft; it never sends mail.
 
 Gmail mounts can be registered with a date window:
 
@@ -82,21 +83,21 @@ Date-window mounts use Gmail search query dates and page through all matching
 messages for `inbox/` and `sent/` instead of stopping after the first recent 100
 results.
 
-Message view is the default projection:
+Message view is available as an explicit compatibility projection:
 
 ```text
 gmail-main/
   inbox/
-    1720900000000-quarterly-update-msg-1.md
+    quarterly-update_msg-1.md
   sent/
-    1720900100000-reply-msg-2.md
+    reply_msg-2.md
   draft/
 ```
 
-Thread view is opt-in:
+Thread view is the default:
 
 ```bash
-./target/debug/loc mount gmail ~/Locality/gmail-main --view threads
+./target/debug/loc mount gmail ~/Locality/gmail-main
 ```
 
 Thread view projects thread pages and child messages:
@@ -104,15 +105,43 @@ Thread view projects thread pages and child messages:
 ```text
 gmail-main/
   inbox/
-    1720900000000-quarterly-update-thread-a/
+    quarterly-update_thread-a/
       page.md
-      1720900000000-quarterly-update-msg-1.md
+      quarterly-update_msg-1.md
   sent/
   draft/
 ```
 
-Inbox, sent, and thread content is read-only. Creating a Markdown file directly
-under `draft/` remains the send surface.
+New mounts persist Gmail projection layout version `2` together with the
+explicit `threads` view. A mount created by an older Locality version with
+implicit `{}` settings used the old flat-message default; Locality refuses to
+reinterpret that mount in place because doing so would leave old message files
+beside new thread directories. Preserve that mount by registering it explicitly
+with `--view messages`, or create a new mount ID and root for thread view after
+reviewing any local work in the old mount.
+
+Inbox and sent content is read-only. Draft files are editable: creating a
+Markdown file directly under `draft/` creates an unsent Gmail draft when pushed,
+and editing a projected draft updates it. Locality has no send endpoint; send
+the completed draft from the Gmail UI.
+
+To reply in an existing thread, create the draft from its hydrated thread
+directory. Locality uses the latest child message by default, or the explicitly
+selected message, and carries the Gmail thread ID plus RFC reply headers into
+the draft:
+
+```bash
+./target/debug/loc create gmail-reply \
+  "$HOME/Locality/gmail-main/inbox/quarterly-update_thread-a"
+
+./target/debug/loc create gmail-reply \
+  "$HOME/Locality/gmail-main/inbox/quarterly-update_thread-a" \
+  --message quarterly-update_msg-1.md
+```
+
+The selected message must be hydrated, because Locality needs its RFC
+`Message-ID` metadata to produce a correctly threaded reply. The command writes
+a new file directly under `draft/`; review it with `loc diff` before pushing.
 
 ## Attachments
 
@@ -126,21 +155,23 @@ thread and writes them under:
 ```
 
 Rendered message frontmatter includes attachment filename, MIME type, size,
-Gmail attachment ID, and the local path. Draft sends still reject `attachment`
-or `attachments` frontmatter; outbound attachments require a separate design.
+Gmail attachment ID, and the local path. Draft creation rejects `attachment` or
+`attachments` frontmatter. To avoid rewriting content Locality cannot preserve,
+V1 updates are limited to simple `text/plain` drafts with no attachments,
+multipart/HTML content, or custom MIME headers. Edit other drafts in Gmail.
 
 ## Write Policy
 
 `inbox/` and `sent/` are read-only. File Provider and source write policy should
 reject edits and deletes there.
 
-Creating a Markdown file directly under `draft/` is writable:
+Creating or editing a Markdown file directly under `draft/` is writable:
 
 ```text
 draft/reply.md
 ```
 
-Nested draft files are rejected:
+Nested draft files are rejected, and draft deletion is unsupported:
 
 ```text
 draft/replies/reply.md
@@ -160,9 +191,12 @@ subject: Follow up
 Thanks for the notes. I will follow up here.
 ```
 
-`loc push` for a Gmail draft creates a Gmail draft and immediately sends it.
-Push is the send action. Attachments are not supported for Gmail draft sends in
-v1; `attachment` or `attachments` frontmatter is rejected.
+`loc push` for a Gmail draft creates a new unsent Gmail draft or updates an
+existing simple text-only draft. Locality has no send endpoint: send it from the
+Gmail UI after review. Attachments are not supported for Gmail draft creation or
+updates in v1; `attachment` or `attachments` frontmatter is rejected. HTML,
+multipart, or custom-MIME drafts must be edited in Gmail so their content is not
+lost.
 
 On macOS File Provider mounts, the push journal remembers the temporary local
 draft identifier before sending. Once Gmail apply and read-back both succeed,
@@ -190,7 +224,7 @@ Force enumeration:
 ./target/debug/loc pull --json "$HOME/Locality/gmail-main"
 ```
 
-Review and send a draft:
+Review and create or update a Gmail UI draft:
 
 ```bash
 ./target/debug/loc status "$HOME/Locality/gmail-main/draft/reply.md"

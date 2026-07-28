@@ -47,6 +47,12 @@ pub enum ConnectorResolveError {
         profile_id: String,
         suggested_command: String,
     },
+    UpdateRequired {
+        component: String,
+        found: i64,
+        supported: i64,
+    },
+    ConnectorSettingsInvalid(String),
     CredentialStoreUnavailable(String),
 }
 
@@ -59,6 +65,8 @@ impl ConnectorResolveError {
             Self::AuthRequired { .. } => "auth_required",
             Self::ConnectionRevoked { .. } => "connection_revoked",
             Self::AuthProfileUnavailable { .. } => "auth_profile_unavailable",
+            Self::UpdateRequired { .. } => "update_required",
+            Self::ConnectorSettingsInvalid(_) => "connector_settings_invalid",
             Self::CredentialStoreUnavailable(_) => "credential_store_unavailable",
         }
     }
@@ -83,6 +91,14 @@ impl ConnectorResolveError {
             Self::AuthProfileUnavailable { profile_id, .. } => {
                 format!("connector profile `{profile_id}` is unavailable")
             }
+            Self::UpdateRequired {
+                component,
+                found,
+                supported,
+            } => format!(
+                "update required for {component}: found version {found}, supported version {supported}"
+            ),
+            Self::ConnectorSettingsInvalid(message) => message.clone(),
             Self::CredentialStoreUnavailable(message) => message.clone(),
         }
     }
@@ -108,7 +124,18 @@ impl ConnectorResolveError {
 
 impl From<ConnectorResolveError> for LocalityError {
     fn from(value: ConnectorResolveError) -> Self {
-        LocalityError::InvalidState(value.message())
+        match value {
+            ConnectorResolveError::UpdateRequired {
+                component,
+                found,
+                supported,
+            } => LocalityError::UpdateRequired {
+                component,
+                found,
+                supported,
+            },
+            other => LocalityError::InvalidState(other.message()),
+        }
     }
 }
 

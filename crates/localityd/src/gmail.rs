@@ -1,19 +1,25 @@
+use std::collections::BTreeSet;
 use std::path::{Component, Path};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use locality_connector::oauth_broker::OAuthBrokerRefresh;
 use locality_connector::{Connector, EnumerateRequest, FetchRequest};
+use locality_core::canonical::{
+    LocalityMetadata, ParsedCanonicalDocument, parse_canonical_markdown, render_canonical_markdown,
+};
 use locality_core::diff::property_value_from_frontmatter;
 use locality_core::hydration::HydrationRequest;
-use locality_core::model::{RemoteId, TreeEntry};
+use locality_core::model::{CanonicalDocument, RemoteId, TreeEntry};
 use locality_core::planner::PropertyValue;
 use locality_core::validation::{ValidationIssue, ValidationReport};
 use locality_core::{LocalityError, LocalityResult};
 use locality_gmail::attachments::{GmailAttachmentSpec, decode_attachment_body};
 use locality_gmail::client::GmailApi;
 use locality_gmail::render::{
-    GmailNativeBundle, GmailThreadMessageNativeBundle, GmailThreadNativeBundle, remote_version,
-    render_gmail_message, render_gmail_thread, render_gmail_thread_message, thread_remote_version,
+    GmailDraftNativeBundle, GmailNativeBundle, GmailThreadMessageNativeBundle,
+    GmailThreadNativeBundle, draft_remote_version, remote_version, render_gmail_draft,
+    render_gmail_message, render_gmail_thread, render_gmail_thread_message,
+    thread_bundle_remote_version,
 };
 use locality_gmail::{
     GMAIL_CONNECTOR_ID, GmailConfig, GmailConnector, GmailMountSettings, GmailOAuthScopeError,
@@ -110,13 +116,23 @@ fn gmail_config_from_mount(
     token: String,
     mount: &MountConfig,
 ) -> Result<GmailConfig, ConnectorResolveError> {
-    let settings = GmailMountSettings::from_json(&mount.settings_json).map_err(|error| {
-        ConnectorResolveError::CredentialStoreUnavailable(format!(
-            "Gmail mount `{}` settings are invalid: {}",
-            mount.mount_id.0,
-            gmail_settings_error_message(error)
-        ))
-    })?;
+    let settings =
+        GmailMountSettings::from_json(&mount.settings_json).map_err(|error| match error {
+            LocalityError::UpdateRequired {
+                component,
+                found,
+                supported,
+            } => ConnectorResolveError::UpdateRequired {
+                component,
+                found,
+                supported,
+            },
+            other => ConnectorResolveError::ConnectorSettingsInvalid(format!(
+                "Gmail mount `{}` settings are invalid: {}",
+                mount.mount_id.0,
+                gmail_settings_error_message(other)
+            )),
+        })?;
     Ok(GmailConfig::new(token).with_settings(settings))
 }
 
@@ -335,15 +351,64 @@ pub(crate) fn validate_gmail_changed_frontmatter(
     context: SourceValidationContext<'_>,
 ) -> LocalityResult<ValidationReport> {
     let mut report = ValidationReport::clean();
-    if gmail_mailbox_from_path(context.relative_path)
-        .is_some_and(|mailbox| matches!(mailbox, "inbox" | "sent"))
-    {
+    if !is_direct_draft_child(context.relative_path) {
         report.push(ValidationIssue::new(
             "gmail_read_only_mailbox",
             context.relative_path,
             Some(1),
-            "Gmail inbox and sent items are read-only",
-            Some("create a new Markdown file directly under draft/ to send mail".to_string()),
+            "Gmail inbox, sent mail, and thread projections are read-only",
+            Some(
+                "edit an existing Markdown file directly under draft/ or create a new unsent Gmail draft there"
+                    .to_string(),
+            ),
+        ));
+        return Ok(report);
+    }
+
+    validate_gmail_draft_required_fields(context, &mut report);
+
+    let Some(shadow) = context.shadow else {
+        return Ok(report);
+    };
+    let shadow = parse_canonical_markdown(&render_canonical_markdown(&CanonicalDocument::new(
+        shadow.frontmatter.clone(),
+        shadow.rendered_body.clone(),
+    )))
+    .map_err(|error| {
+        LocalityError::InvalidState(format!(
+            "synced Gmail shadow frontmatter is no longer parseable: {error}"
+        ))
+    })?;
+
+    if !gmail_identity_metadata_matches(
+        shadow.frontmatter.loc.as_ref(),
+        context.parsed.frontmatter.loc.as_ref(),
+    ) {
+        report.push(ValidationIssue::new(
+            "gmail_immutable_identity",
+            context.relative_path,
+            Some(1),
+            "Gmail Locality identity metadata is read-only",
+            Some("restore the generated `loc` frontmatter".to_string()),
+        ));
+    }
+
+    for key in frontmatter_changed_keys(&shadow, context.parsed) {
+        if matches!(key.as_str(), "to" | "cc" | "bcc" | "subject") {
+            continue;
+        }
+        if key == "gmail"
+            && shadow.frontmatter.properties.get("gmail")
+                == context.parsed.frontmatter.properties.get("gmail")
+        {
+            continue;
+        }
+        report.push(ValidationIssue::new(
+            "gmail_immutable_frontmatter",
+            context.relative_path,
+            Some(1),
+            format!("Gmail frontmatter `{key}` is read-only"),
+            Some(format!("restore generated Gmail `{key}` frontmatter")),
         ));
     }
     Ok(report)
@@ -364,6 +429,25 @@ pub(crate) fn validate_gmail_create_frontmatter(
         ));
     }
 
+    validate_gmail_draft_required_fields(context, &mut report);
+
+    if gmail_draft_frontmatter_has_attachments(&context.parsed.frontmatter.properties) {
+        report.push(ValidationIssue::new(
+            "gmail_attachments_unsupported",
+            context.relative_path,
+            Some(1),
+            "Gmail draft creation does not support attachments",
+            Some("remove attachment frontmatter".to_string()),
+        ));
+    }
+
+    Ok(report)
+}
+
+fn validate_gmail_draft_required_fields(
+    context: SourceValidationContext<'_>,
+    report: &mut ValidationReport,
+) {
     let has_subject = frontmatter_string(&context.parsed.frontmatter.properties, "subject")
         .as_deref()
         .is_some_and(|subject| !subject.trim().is_empty())
@@ -392,18 +476,38 @@ pub(crate) fn validate_gmail_create_frontmatter(
             Some("add `to: [\"name@example.com\"]` to the frontmatter".to_string()),
         ));
     }
+}
 
-    if gmail_draft_frontmatter_has_attachments(&context.parsed.frontmatter.properties) {
-        report.push(ValidationIssue::new(
-            "gmail_attachments_unsupported",
-            context.relative_path,
-            Some(1),
-            "Gmail draft sends do not support attachments",
-            Some("remove attachment frontmatter".to_string()),
-        ));
+fn gmail_identity_metadata_matches(
+    synced: Option<&LocalityMetadata>,
+    edited: Option<&LocalityMetadata>,
+) -> bool {
+    match (synced, edited) {
+        (Some(synced), Some(edited)) => {
+            synced.id == edited.id
+                && synced.entity_type == edited.entity_type
+                && synced.raw_entity_type == edited.raw_entity_type
+                && synced.parent == edited.parent
+        }
+        (None, None) => true,
+        _ => false,
     }
+}
 
-    Ok(report)
+fn frontmatter_changed_keys(
+    synced: &ParsedCanonicalDocument,
+    edited: &ParsedCanonicalDocument,
+) -> BTreeSet<String> {
+    synced
+        .frontmatter
+        .properties
+        .keys()
+        .chain(edited.frontmatter.properties.keys())
+        .filter(|key| {
+            synced.frontmatter.properties.get(*key) != edited.frontmatter.properties.get(*key)
+        })
+        .cloned()
+        .collect()
 }
 
 fn gmail_draft_frontmatter_has_attachments(
@@ -449,15 +553,6 @@ fn frontmatter_string(
         })
 }
 
-fn gmail_mailbox_from_path(path: &Path) -> Option<&str> {
-    path.components()
-        .next()
-        .and_then(|component| match component {
-            Component::Normal(value) => value.to_str(),
-            _ => None,
-        })
-}
-
 fn is_direct_draft_child(path: &Path) -> bool {
     let mut components = path.components();
     matches!(
@@ -481,7 +576,22 @@ impl HydrationSource for GmailConnector {
             return Ok(HydratedEntity {
                 document: rendered.document,
                 shadow: rendered.shadow,
-                remote_edited_at: Some(thread_remote_version(&bundle.thread)),
+                remote_edited_at: Some(thread_bundle_remote_version(&bundle)),
+                assets,
+            });
+        }
+
+        if native.kind == "gmail_draft" {
+            let bundle =
+                serde_json::from_slice::<GmailDraftNativeBundle>(&native.raw).map_err(|error| {
+                    LocalityError::Io(format!("gmail draft native decode failed: {error}"))
+                })?;
+            let rendered = render_gmail_draft(&bundle)?;
+            let assets = gmail_attachment_assets(self.api(), &rendered.attachment_specs)?;
+            return Ok(HydratedEntity {
+                document: rendered.document,
+                shadow: rendered.shadow,
+                remote_edited_at: Some(draft_remote_version(&bundle.draft_id, &bundle.message)),
                 assets,
             });
         }
@@ -567,7 +677,7 @@ mod tests {
     use locality_gmail::attachments::attachment_local_path;
     use locality_gmail::client::GmailApi;
     use locality_gmail::dto::{
-        GmailDraft, GmailDraftCreateRequest, GmailDraftSendRequest, GmailMessage, GmailMessageList,
+        GmailDraft, GmailDraftCreateRequest, GmailDraftList, GmailMessage, GmailMessageList,
         GmailMessagePartBody, GmailThread, GmailThreadList,
     };
 
@@ -646,8 +756,12 @@ mod tests {
         assert_eq!(hydrated.assets[0].bytes, b"attachment bytes");
         assert_eq!(
             hydrated.remote_edited_at,
-            Some(locality_gmail::render::thread_remote_version(
-                &thread_fixture("thread-attach")
+            Some(locality_gmail::render::thread_bundle_remote_version(
+                &GmailThreadNativeBundle {
+                    mailbox: "inbox".to_string(),
+                    thread: thread_fixture("thread-attach"),
+                    associated_drafts: Vec::new(),
+                }
             ))
         );
         assert!(
@@ -675,7 +789,7 @@ mod tests {
         let request = HydrationRequest::new(
             MountId::new("gmail-main"),
             remote_id.clone(),
-            "inbox/thread-attach/1720900000000-attachments-msg-attach.md",
+            "inbox/thread-attach/attachments_msg-attach.md",
             HydrationState::Hydrated,
             HydrationReason::ExplicitPull,
         );
@@ -702,6 +816,41 @@ mod tests {
         assert_eq!(
             calls.attachments,
             vec![("msg-attach".to_string(), "attach-1".to_string())]
+        );
+    }
+
+    #[test]
+    fn gmail_hydration_renders_remote_draft_with_stable_draft_identity() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+        let request = HydrationRequest::new(
+            MountId::new("gmail-main"),
+            RemoteId::new("gmail-draft:draft-1"),
+            "draft/attachments-draft-1.md",
+            HydrationState::Hydrated,
+            HydrationReason::ExplicitPull,
+        );
+
+        let hydrated = connector.fetch_render(&request).expect("hydrate draft");
+
+        assert_eq!(hydrated.shadow.entity_id.as_str(), "gmail-draft:draft-1");
+        assert!(
+            hydrated
+                .document
+                .frontmatter
+                .contains("draft_id: \"draft-1\"")
+        );
+        assert_eq!(hydrated.assets.len(), 1);
+        assert_eq!(
+            hydrated.remote_edited_at,
+            Some(locality_gmail::render::draft_remote_version(
+                "draft-1",
+                &message_fixture("draft-msg-1"),
+            ))
+        );
+        assert_eq!(
+            api.calls.lock().expect("calls").attachments,
+            vec![("draft-msg-1".to_string(), "attach-1".to_string())]
         );
     }
 
@@ -794,7 +943,30 @@ mod tests {
             panic!("not used")
         }
 
-        fn send_draft(&self, _request: GmailDraftSendRequest) -> LocalityResult<GmailMessage> {
+        fn list_drafts(
+            &self,
+            _max_results: u32,
+            _page_token: Option<&str>,
+        ) -> LocalityResult<GmailDraftList> {
+            Ok(GmailDraftList::default())
+        }
+
+        fn get_draft_metadata(&self, _draft_id: &str) -> LocalityResult<GmailDraft> {
+            panic!("not used")
+        }
+
+        fn get_draft_full(&self, _draft_id: &str) -> LocalityResult<GmailDraft> {
+            Ok(GmailDraft {
+                id: _draft_id.to_string(),
+                message: message_fixture("draft-msg-1"),
+            })
+        }
+
+        fn update_draft(
+            &self,
+            _draft_id: &str,
+            _request: GmailDraftCreateRequest,
+        ) -> LocalityResult<GmailDraft> {
             panic!("not used")
         }
     }
