@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use loc_cli::mount::{GuidanceFileAction, MountOptions, run_mount};
+use locality_browser::BrowserMountSettings;
 use locality_connector::ConnectorCapabilities;
 use locality_core::model::{MountId, RemoteId};
 use locality_gmail::{GMAIL_OAUTH_SCOPES, gmail_capabilities_json};
@@ -1091,6 +1092,52 @@ fn cli_mount_gmail_rejects_invalid_view_before_connection_resolution() {
             .contains("unsupported Gmail view `bogus`"),
         "{body:#?}"
     );
+}
+
+#[test]
+fn cli_mount_browser_creates_read_only_capture_mount() {
+    let fixture = MountFixture::new("loc-cli-browser-mount");
+    fs::create_dir_all(&fixture.root).expect("create fixture root");
+    let state_root = fixture.root.join("state");
+    let capture_root = fixture.root.join("captures");
+    let mount_root = fixture.root.join("browser");
+    let capture_root_arg = capture_root.display().to_string();
+    let mount_root_arg = mount_root.display().to_string();
+    let loc = env!("CARGO_BIN_EXE_loc");
+
+    let body = loc_json_ok(loc_command(loc, &state_root).args([
+        "mount",
+        "browser",
+        mount_root_arg.as_str(),
+        "--capture-root",
+        capture_root_arg.as_str(),
+        "--projection",
+        "plain-files",
+        "--json",
+    ]));
+
+    assert_eq!(body["connector"], "browser", "{body:#?}");
+    assert_eq!(body["mount_id"], "browser-main", "{body:#?}");
+    assert_eq!(body["read_only"], true, "{body:#?}");
+    assert_eq!(body["connection_id"], serde_json::Value::Null, "{body:#?}");
+    assert!(
+        capture_root.join("sessions").is_dir(),
+        "browser mount should create the sessions capture folder"
+    );
+
+    let store = SqliteStateStore::open(state_root).expect("open state");
+    let mount = store
+        .get_mount(&MountId::new("browser-main"))
+        .expect("load mount")
+        .expect("browser mount exists");
+    assert!(mount.read_only);
+    assert_eq!(mount.connection_id, None);
+    assert_eq!(mount.remote_root_id, None);
+    let settings = BrowserMountSettings::from_json(&mount.settings_json).expect("browser settings");
+    assert_eq!(settings.capture_root().expect("capture root"), capture_root);
+    let agents = read_to_string(mount_root.join("AGENTS.md"));
+    assert!(agents.contains("# Locality Browser Mount"));
+    assert!(agents.contains("Browser sessions are read-only captures"));
 }
 
 #[test]

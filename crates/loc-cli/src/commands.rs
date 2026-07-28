@@ -8,6 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
+use locality_browser::{BROWSER_CONNECTOR_ID, BrowserMountSettings};
 use locality_confluence::CONFLUENCE_CONNECTOR_ID;
 use locality_connector::ConnectorUndoApplier;
 use locality_connector::oauth_broker::OAuthBrokerStart;
@@ -533,6 +534,8 @@ enum MountCommand {
     GoogleCalendar(MountGoogleCalendarArgs),
     #[command(about = "Mount Gmail")]
     Gmail(MountGmailArgs),
+    #[command(about = "Mount saved browser sessions read-only")]
+    Browser(MountBrowserArgs),
     #[command(about = "Mount Slack read-only")]
     Slack(MountSlackArgs),
     #[command(about = "Mount Granola meeting notes read-only")]
@@ -701,6 +704,33 @@ struct MountGmailArgs {
         help = "Gmail projection view. Defaults to messages."
     )]
     view: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct MountBrowserArgs {
+    #[arg(
+        value_name = "path",
+        help = "Local directory where browser captures should be projected."
+    )]
+    path: String,
+    #[arg(
+        long,
+        value_name = "path",
+        help = "Directory containing browser capture session JSON files under sessions/."
+    )]
+    capture_root: String,
+    #[arg(
+        long,
+        value_name = "id",
+        help = "Mount id to save. Defaults to browser-main."
+    )]
+    mount_id: Option<String>,
+    #[arg(
+        long,
+        value_name = "mode",
+        help = "Projection mode. Supported values depend on the host platform."
+    )]
+    projection: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1414,6 +1444,17 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                     push_optional_flag_value(&mut args, "--before", options.before.as_deref());
                     push_optional_flag_value(&mut args, "--view", options.view.as_deref());
                     push_flag(&mut args, "--read-only", options.read_only);
+                }
+                MountCommand::Browser(options) => {
+                    args.push("browser".to_string());
+                    args.push(options.path.clone());
+                    push_flag_value(&mut args, "--capture-root", &options.capture_root);
+                    push_optional_flag_value(&mut args, "--mount-id", options.mount_id.as_deref());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--projection",
+                        options.projection.as_deref(),
+                    );
                 }
                 MountCommand::Slack(options) => {
                     args.push("slack".to_string());
@@ -3426,6 +3467,10 @@ fn mount(args: &[String], json: bool) -> i32 {
             Ok(settings_json) => settings_json,
             Err(error) => return command_error(json, error, EXIT_USAGE),
         },
+        BROWSER_CONNECTOR_ID => match browser_mount_settings_json(args) {
+            Ok(settings_json) => settings_json,
+            Err(error) => return command_error(json, error, EXIT_USAGE),
+        },
         GOOGLE_CALENDAR_CONNECTOR_ID => match google_calendar_mount_settings_json(args) {
             Ok(settings_json) => settings_json,
             Err(error) => return command_error(json, error, EXIT_USAGE),
@@ -3456,6 +3501,7 @@ fn mount(args: &[String], json: bool) -> i32 {
     );
     let read_only = has_flag(args, "--read-only")
         || descriptor.id() == GRANOLA_CONNECTOR_ID
+        || descriptor.id() == BROWSER_CONNECTOR_ID
         || descriptor.id() == CONFLUENCE_CONNECTOR_ID;
     if let Some(error) = mounted_projection_preflight_error(
         projection.clone(),
@@ -3840,6 +3886,33 @@ fn google_calendar_mount_settings_json(args: &[String]) -> Result<String, Comman
     })
 }
 
+fn browser_mount_settings_json(args: &[String]) -> Result<String, CommandError> {
+    let Some(capture_root) = flag_value(args, "--capture-root") else {
+        return Err(CommandError::new(
+            "mount",
+            "browser_capture_root_required",
+            "loc mount browser requires --capture-root <path>",
+        ));
+    };
+    let capture_root = PathBuf::from(capture_root);
+    let absolute = absolute_command_path(&capture_root);
+    let sessions_dir = absolute.join("sessions");
+    if let Err(error) = std::fs::create_dir_all(&sessions_dir) {
+        return Err(CommandError::new(
+            "mount",
+            "browser_capture_root_invalid",
+            format!(
+                "failed to create browser capture sessions directory `{}`: {error}",
+                sessions_dir.display()
+            ),
+        ));
+    }
+    let settings = BrowserMountSettings::with_capture_root(absolute.display().to_string());
+    settings.to_json().map_err(|error| {
+        CommandError::new("mount", "browser_settings_encode_failed", error.to_string())
+    })
+}
+
 fn locality_error_message(error: LocalityError) -> String {
     match error {
         LocalityError::Validation(issues) => issues
@@ -3948,6 +4021,20 @@ fn mount_remote_root_id(
                     "mount",
                     "usage",
                     "loc mount gmail does not accept Notion or Google Docs root flags",
+                ));
+            }
+            Ok(None)
+        }
+        BROWSER_CONNECTOR_ID => {
+            if has_flag(args, "--workspace")
+                || flag_value(args, "--root-page").is_some()
+                || flag_value(args, "--workspace-folder").is_some()
+                || flag_value(args, "--connection").is_some()
+            {
+                return Err(CommandError::new(
+                    "mount",
+                    "usage",
+                    "loc mount browser uses --capture-root <path> and does not accept remote source flags",
                 ));
             }
             Ok(None)
@@ -8632,6 +8719,17 @@ fn resolve_mount_connection(
     args: &[String],
     descriptor: &SourceDescriptor,
 ) -> Result<Option<ConnectionId>, CommandError> {
+    if descriptor.id() == BROWSER_CONNECTOR_ID {
+        if flag_value(args, "--connection").is_some() {
+            return Err(CommandError::new(
+                "mount",
+                "usage",
+                "loc mount browser does not use saved source connections",
+            ));
+        }
+        return Ok(None);
+    }
+
     if let Some(connection_id) = flag_value(args, "--connection") {
         let connection_id = ConnectionId::new(connection_id);
         let connection = store
@@ -9324,7 +9422,7 @@ fn projection_mode_for_target(args: &[String], target_os: &str) -> Result<Projec
 
 fn mount_usage() -> String {
     format!(
-        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-calendar <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--read-only] [--json]\n       loc mount slack <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--history-limit 1-15] [--types public_channel,private_channel,im,mpim] [--json]\n       loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--json]\n       loc mount linear <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]",
+        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-calendar <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--read-only] [--json]\n       loc mount browser <path> --capture-root <path> [--mount-id <id>] [--projection {0}] [--json]\n       loc mount slack <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--history-limit 1-15] [--types public_channel,private_channel,im,mpim] [--json]\n       loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--json]\n       loc mount linear <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]",
         projection_usage_options_for_target(std::env::consts::OS)
     )
 }
@@ -9533,6 +9631,7 @@ fn takes_value(arg: &str) -> bool {
             | "--after"
             | "--before"
             | "--view"
+            | "--capture-root"
             | "--history-limit"
             | "--types"
             | "--helper"
@@ -9792,11 +9891,11 @@ mod tests {
         Cli, ConnectReport, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_USAGE, EXIT_VALIDATION,
         FileProviderCommandReport, PushConfirmationPromptError, SLACK_CONNECTOR_ID,
         VirtualProjectionRegistration, absolute_command_path,
-        auto_registration_for_mounted_projection, default_mount_id_for_source,
-        diff_report_exit_code, exact_located_entity_record, file_provider_list_lines,
-        google_calendar_oauth_broker_config, google_docs_oauth_broker_config,
-        guard_linux_fuse_shared_root_unregister, guard_unresolved_linux_fuse_unregister,
-        guard_unresolved_windows_cloud_files_unregister,
+        auto_registration_for_mounted_projection, browser_mount_settings_json,
+        default_mount_id_for_source, diff_report_exit_code, exact_located_entity_record,
+        file_provider_list_lines, google_calendar_oauth_broker_config,
+        google_docs_oauth_broker_config, guard_linux_fuse_shared_root_unregister,
+        guard_unresolved_linux_fuse_unregister, guard_unresolved_windows_cloud_files_unregister,
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
         locality_error_code, locate_result_from_report, mount_slack, mount_usage,
         mounted_projection_preflight_error, notion_authorize_url, notion_oauth_broker_config,
@@ -9844,6 +9943,7 @@ mod tests {
                     "google-docs",
                     "google-calendar",
                     "gmail",
+                    "browser",
                     "slack",
                     "granola",
                     "linear",
@@ -10023,6 +10123,14 @@ mod tests {
                     "Mount Gmail",
                     "--connection",
                     "--projection",
+                ],
+            ),
+            (
+                vec!["mount", "browser", "--help"],
+                vec![
+                    "Usage: loc mount browser",
+                    "Mount saved browser sessions read-only",
+                    "--capture-root",
                 ],
             ),
             (
@@ -10321,10 +10429,32 @@ mod tests {
         assert!(usage.contains("loc mount google-calendar"));
         assert!(usage.contains("--after YYYY-MM-DD --before YYYY-MM-DD"));
         assert!(usage.contains("--view messages|threads"));
+        assert!(usage.contains("loc mount browser <path> --capture-root <path>"));
         assert!(usage.contains("--history-limit 1-15"));
         assert!(usage.contains("--types public_channel,private_channel,im,mpim"));
         assert!(!usage.contains("--auto-join-public-channels"));
         assert!(usage.contains("loc mount linear <path>"));
+    }
+
+    #[test]
+    fn browser_mount_settings_create_capture_sessions_directory() {
+        let capture_root = unique_temp_path("loc-browser-captures");
+        let args = vec![
+            "mount".to_string(),
+            "browser".to_string(),
+            "/tmp/locality/browser".to_string(),
+            "--capture-root".to_string(),
+            capture_root.display().to_string(),
+        ];
+
+        let settings_json = browser_mount_settings_json(&args).expect("browser settings");
+        let settings = locality_browser::BrowserMountSettings::from_json(&settings_json)
+            .expect("parse settings");
+
+        assert_eq!(settings.capture_root().expect("capture root"), capture_root);
+        assert!(capture_root.join("sessions").is_dir());
+
+        let _ = fs::remove_dir_all(capture_root);
     }
 
     #[test]
