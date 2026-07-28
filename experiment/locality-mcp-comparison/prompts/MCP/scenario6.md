@@ -20,4 +20,4 @@ Report format:
 
 ## Risks, Gaps, And Limitations
 
-The draft should be concise, specific, and grounded in evidence. If a claim cannot be verified from loc, git, gh, or mounted Locality context, say so.
+The draft should be concise, specific, and grounded in evidence. If a claim cannot be verified from git, gh, say so.
