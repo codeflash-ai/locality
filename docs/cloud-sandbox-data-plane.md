@@ -1447,6 +1447,9 @@ simple path before adding another data store:
   ordered scope set, deduplicate overlapping memberships, select through the
   narrow current-head or historical-generation index, and fetch bodies in
   bounded canonical path batches through immutable content references;
+- bound each body batch by both entry count and declared bytes, fetch its
+  immutable PostgreSQL rows with one ordered set query, and resolve selected
+  object attachments with fixed concurrency while preserving archive order;
 - join immutable bodies only after selection and use a bounded streaming
   transaction with backpressure;
 - assign locality keys and insert initial backfill batches in canonical

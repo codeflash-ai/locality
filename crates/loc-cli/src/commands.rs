@@ -1733,6 +1733,12 @@ fn finish_sandbox_profile(profile: Option<&mut SandboxInitProfile>) {
             timing.phase, timing.phase_ms, timing.total_ms
         );
     }
+    let transport = profile.export_transport_metrics();
+    let _ = writeln!(
+        stderr,
+        "locality sandbox profile transport_wait_ms={} transport_read_calls={} transport_wire_bytes={}",
+        transport.wait_ms, transport.read_calls, transport.wire_bytes
+    );
 }
 
 fn sandbox_init_command_error(json: bool, error: crate::sandbox::SandboxInitError) -> i32 {
