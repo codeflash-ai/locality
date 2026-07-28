@@ -67,8 +67,10 @@ CLI overrides:
 ## Projection And Pull
 
 By default, Pull enumerates the recent 100 inbox messages and recent 100 sent
-messages. The `draft/` folder is created locally, but the connector does not
-enumerate remote Gmail drafts.
+messages and recent 100 Gmail drafts. The `draft/` folder is the local staging surface
+for new Gmail drafts. When pushed, a local draft becomes an unsent Gmail draft
+and is visible in the Gmail UI; drafts created in Gmail are pulled into this
+folder too.
 
 Gmail mounts can be registered with a date window:
 
@@ -112,7 +114,7 @@ gmail-main/
 ```
 
 Inbox, sent, and thread content is read-only. Creating a Markdown file directly
-under `draft/` remains the send surface.
+under `draft/` creates an unsent Gmail draft when pushed.
 
 ## Attachments
 
@@ -160,9 +162,9 @@ subject: Follow up
 Thanks for the notes. I will follow up here.
 ```
 
-`loc push` for a Gmail draft creates a Gmail draft and immediately sends it.
-Push is the send action. Attachments are not supported for Gmail draft sends in
-v1; `attachment` or `attachments` frontmatter is rejected.
+`loc push` for a Gmail draft creates an unsent Gmail draft. Send it from the
+Gmail UI after review. Attachments are not supported for Gmail draft creation
+in v1; `attachment` or `attachments` frontmatter is rejected.
 
 On macOS File Provider mounts, the push journal remembers the temporary local
 draft identifier before sending. Once Gmail apply and read-back both succeed,
@@ -190,7 +192,7 @@ Force enumeration:
 ./target/debug/loc pull --json "$HOME/Locality/gmail-main"
 ```
 
-Review and send a draft:
+Review and create a Gmail UI draft:
 
 ```bash
 ./target/debug/loc status "$HOME/Locality/gmail-main/draft/reply.md"
