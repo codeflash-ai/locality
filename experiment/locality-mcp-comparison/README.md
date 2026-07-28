@@ -77,18 +77,18 @@ for sandbox in "$LOCALITY_SANDBOX" "$MCP_SANDBOX"; do
 done
 ```
 
-Build `loc` on the Locality sandbox if `/usr/bin/loc` is not already installed;
-the split wrapper defaults `REMOTE_LOC_BIN` to `/usr/bin/loc`:
+Verify `loc` is installed on the Locality sandbox. The split wrapper defaults
+`REMOTE_LOC_BIN` to `/usr/bin/loc` and intentionally does not build the CLI from
+source; if the installed binary is missing, the Locality run should fail until
+the sandbox is fixed.
 
 ```bash
+export REMOTE_LOC_BIN="${REMOTE_LOC_BIN:-/usr/bin/loc}"
 ssh_target="$(amika sandbox ssh --print "$LOCALITY_SANDBOX")"
-ssh -o StrictHostKeyChecking=accept-new "$ssh_target" '
-  export PATH="$HOME/.cargo/bin:$PATH"
-  cd /home/amika/workspace/locality
-  cargo build -p loc-cli -p localityd
-'
-
-export REMOTE_LOC_BIN=/home/amika/workspace/locality/target/debug/loc
+ssh -o StrictHostKeyChecking=accept-new "$ssh_target" "
+  test -x '$REMOTE_LOC_BIN' &&
+    '$REMOTE_LOC_BIN' --version
+"
 ```
 
 Prepare the Locality sandbox with the mounted files the benchmark should use.
@@ -120,13 +120,12 @@ EOF
 Verify the files are present on the Locality sandbox:
 
 ```bash
+export REMOTE_LOC_BIN="${REMOTE_LOC_BIN:-/usr/bin/loc}"
 ssh_target="$(amika sandbox ssh --print "$LOCALITY_SANDBOX")"
-ssh -o StrictHostKeyChecking=accept-new "$ssh_target" '
-  export PATH="$HOME/.cargo/bin:$PATH"
-  cd /home/amika/workspace/locality
-  target/debug/loc connections --json || true
+ssh -o StrictHostKeyChecking=accept-new "$ssh_target" "
+  '$REMOTE_LOC_BIN' connections --json || true
   find ~/Locality ~/notion ~/slack ~/linear -maxdepth 3 -type f 2>/dev/null | head
-'
+"
 ```
 
 ## Run Claude Comparison
