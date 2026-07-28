@@ -1,6 +1,11 @@
 I need a short standup-style update for Locality based on what changed recently. Please discover the relevant context yourself, connect code changes from `~/workspace/locality` to product or launch work where possible, and produce a grounded Markdown draft. Do not push or update any remote source.
 
-Do not use direct Notion API tools in this run. Do not create a new notion page or modify existing notion pages.
+Use the Notion MCP server you have access to for product and launch context, and
+use the codebase at `~/workspace/locality` for repository evidence.
+
+Do not use direct non-MCP Notion APIs or browser automation in this run. Do not
+read mounted Locality files under `~/Locality`. Do not create a new notion page
+or modify existing notion pages.
 
 Write the final Markdown report to `/home/amika/final_report.md`.
 
@@ -18,4 +23,5 @@ Report format:
 
 ## Evidence Notes
 
-The update should be short, specific, and grounded in evidence. If a claim cannot be verified from git, gh, or Locality context, say so.
+The update should be short, specific, and grounded in evidence. If a claim cannot
+be verified from git, gh, MCP results, or command outputs, say so.
