@@ -38,8 +38,10 @@ cat > "${fake_bin}/amika" <<'SH'
 set -euo pipefail
 
 printf 'amika' >> "${FAKE_AMIKA_LOG:?}"
+joined_args=""
 for arg in "$@"; do
   printf ' %q' "$arg" >> "$FAKE_AMIKA_LOG"
+  joined_args="${joined_args} ${arg}"
 done
 printf '\n' >> "$FAKE_AMIKA_LOG"
 
@@ -53,13 +55,44 @@ if [ "${3:-}" = "--print" ]; then
   exit 0
 fi
 
+if [ -n "${FAKE_AMIKA_CONCURRENCY_DIR:-}" ]; then
+  strategy=""
+  other_strategy=""
+  case "$joined_args" in
+    *launch-readiness-testrun-locality*)
+      strategy="locality"
+      other_strategy="notion-mcp"
+      ;;
+    *launch-readiness-testrun-mcp*)
+      strategy="notion-mcp"
+      other_strategy="locality"
+      ;;
+  esac
+  if [ -n "$strategy" ]; then
+    mkdir -p "$FAKE_AMIKA_CONCURRENCY_DIR"
+    : > "$FAKE_AMIKA_CONCURRENCY_DIR/$strategy.started"
+    attempt=0
+    while [ "$attempt" -lt 30 ] && [ ! -f "$FAKE_AMIKA_CONCURRENCY_DIR/$other_strategy.started" ]; do
+      sleep 0.1
+      attempt=$((attempt + 1))
+    done
+    if [ ! -f "$FAKE_AMIKA_CONCURRENCY_DIR/$other_strategy.started" ]; then
+      printf '%s did not overlap %s\n' "$strategy" "$other_strategy" >&2
+      exit 42
+    fi
+    : > "$FAKE_AMIKA_CONCURRENCY_DIR/$strategy.overlapped"
+  fi
+fi
+
 printf 'fake remote ok\n'
 SH
 chmod +x "${fake_bin}/amika"
 
 run_default_out="${tmp_root}/default-out"
+concurrency_dir="${tmp_root}/concurrency"
 PATH="${fake_bin}:$PATH" \
   FAKE_AMIKA_LOG="$fake_log" \
+  FAKE_AMIKA_CONCURRENCY_DIR="$concurrency_dir" \
   RUN_ID="testrun" \
   SYNC_ARTIFACTS=0 \
   LOCAL_OUT_DIR="$run_default_out" \
@@ -73,10 +106,13 @@ assert_contains "$run_default_out/run.env" "mcp_sandbox=aseem-mcp"
 assert_contains "$run_default_out/run.env" "remote_worktree=/home/amika/workspace/locality-launch-readiness-testrun"
 assert_contains "$run_default_out/run.env" "locality_remote_out_dir=/home/amika/workspace/locality-launch-readiness-testrun/target/launch-readiness-testrun-locality"
 assert_contains "$run_default_out/run.env" "mcp_remote_out_dir=/home/amika/workspace/locality-launch-readiness-testrun/target/launch-readiness-testrun-mcp"
-assert_contains "$run_default_out/run.env" "remote_loc_bin=/home/amika/workspace/locality/target/debug/loc"
+assert_contains "$run_default_out/run.env" "remote_loc_bin=/usr/bin/loc"
 assert_contains "$run_default_out/run.env" "sync_artifacts=0"
+assert_contains "$run_default_out/run.env" "strategy_execution=parallel"
 assert_contains "$run_default_out/artifacts.tsv" "locality"$'\t'"aseem-locality"
 assert_contains "$run_default_out/artifacts.tsv" "notion-mcp"$'\t'"aseem-mcp"
+test -f "$concurrency_dir/locality.overlapped" || fail "Locality launch did not overlap MCP launch"
+test -f "$concurrency_dir/notion-mcp.overlapped" || fail "MCP launch did not overlap Locality launch"
 
 assert_contains "$fake_log" "aseem-locality"
 assert_contains "$fake_log" "aseem-mcp"
@@ -98,7 +134,7 @@ PATH="${fake_bin}:$PATH" \
   REMOTE_WORKTREE="/tmp/custom-worktree" \
   REMOTE_LOC_BIN="/opt/locality/bin/loc" \
   LOCAL_OUT_DIR="$custom_out" \
-  "$WRAPPER" --write-mounted-page >/dev/null
+  "$WRAPPER" --scenario custom-scenario >/dev/null
 
 assert_contains "$custom_out/run.env" "locality_sandbox=custom-locality"
 assert_contains "$custom_out/run.env" "mcp_sandbox=custom-mcp"
@@ -106,7 +142,8 @@ assert_contains "$custom_out/run.env" "remote_worktree=/tmp/custom-worktree"
 assert_contains "$custom_out/run.env" "remote_loc_bin=/opt/locality/bin/loc"
 assert_contains "$custom_log" "custom-locality"
 assert_contains "$custom_log" "custom-mcp"
-assert_contains "$custom_log" "--write-mounted-page"
+assert_contains "$custom_log" "--scenario"
+assert_contains "$custom_log" "custom-scenario"
 
 set +e
 PATH="${fake_bin}:$PATH" \
@@ -137,5 +174,19 @@ if [ "$strategy_rc" -eq 0 ]; then
   fail "--strategy should be rejected by the split wrapper"
 fi
 assert_contains "${tmp_root}/strategy.err" "owns --strategy"
+
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="${tmp_root}/unsupported.log" \
+  RUN_ID="unsupported" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/unsupported-out" \
+  "$WRAPPER" --write-mounted-page >/dev/null 2>"${tmp_root}/unsupported.err"
+unsupported_rc=$?
+set -e
+if [ "$unsupported_rc" -eq 0 ]; then
+  fail "--write-mounted-page should be rejected by the split wrapper"
+fi
+assert_contains "${tmp_root}/unsupported.err" "not supported"
 
 printf 'launch readiness Amika split wrapper tests passed\n'

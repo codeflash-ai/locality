@@ -77,16 +77,18 @@ for sandbox in "$LOCALITY_SANDBOX" "$MCP_SANDBOX"; do
 done
 ```
 
-Build `loc` on the Locality sandbox; the split wrapper defaults
-`REMOTE_LOC_BIN` to this binary:
+Verify `loc` is installed on the Locality sandbox. The split wrapper defaults
+`REMOTE_LOC_BIN` to `/usr/bin/loc` and intentionally does not build the CLI from
+source; if the installed binary is missing, the Locality run should fail until
+the sandbox is fixed.
 
 ```bash
+export REMOTE_LOC_BIN="${REMOTE_LOC_BIN:-/usr/bin/loc}"
 ssh_target="$(amika sandbox ssh --print "$LOCALITY_SANDBOX")"
-ssh -o StrictHostKeyChecking=accept-new "$ssh_target" '
-  export PATH="$HOME/.cargo/bin:$PATH"
-  cd /home/amika/workspace/locality
-  cargo build -p loc-cli -p localityd
-'
+ssh -o StrictHostKeyChecking=accept-new "$ssh_target" "
+  test -x '$REMOTE_LOC_BIN' &&
+    '$REMOTE_LOC_BIN' --version
+"
 ```
 
 Prepare the Locality sandbox with the mounted files the benchmark should use.
@@ -118,13 +120,12 @@ EOF
 Verify the files are present on the Locality sandbox:
 
 ```bash
+export REMOTE_LOC_BIN="${REMOTE_LOC_BIN:-/usr/bin/loc}"
 ssh_target="$(amika sandbox ssh --print "$LOCALITY_SANDBOX")"
-ssh -o StrictHostKeyChecking=accept-new "$ssh_target" '
-  export PATH="$HOME/.cargo/bin:$PATH"
-  cd /home/amika/workspace/locality
-  target/debug/loc connections --json || true
+ssh -o StrictHostKeyChecking=accept-new "$ssh_target" "
+  '$REMOTE_LOC_BIN' connections --json || true
   find ~/Locality ~/notion ~/slack ~/linear -maxdepth 3 -type f 2>/dev/null | head
-'
+"
 ```
 
 ## Run Claude Comparison
@@ -252,9 +253,10 @@ LOCALITY_SANDBOX=my-locality MCP_SANDBOX=my-mcp \
 ```
 
 The wrapper prepares a clean detached worktree in each sandbox from
-`BENCHMARK_REF` and then runs `run-launch-readiness-benchmark.sh --strategy
-locality` or `--strategy notion-mcp` inside the matching sandbox. Set
-`SYNC_ARTIFACTS=0` to leave outputs only on the remote sandboxes.
+`BENCHMARK_REF` and runs both strategy pipelines concurrently:
+`run-launch-readiness-benchmark.sh --strategy locality` in the Locality sandbox
+and `run-launch-readiness-benchmark.sh --strategy notion-mcp` in the MCP
+sandbox. Set `SYNC_ARTIFACTS=0` to leave outputs only on the remote sandboxes.
 
 Hooks are enabled by default. The runner installs a benchmark-owned `hooks.json`
 into each per-strategy `CODEX_HOME` and starts Codex with

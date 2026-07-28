@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF'
 Usage: run-agent-comparison.sh [--out-dir <path>] [--remote-worktree <path>] [benchmark args...]
 
-Runs the launch-readiness benchmark on two Amika sandboxes:
+Runs the launch-readiness benchmark concurrently on two Amika sandboxes:
   - Locality strategy on LOCALITY_SANDBOX
   - MCP strategy on MCP_SANDBOX
 
@@ -783,6 +783,53 @@ run_launch_strategy_with_args() {
   fi
 }
 
+run_strategy_pipeline() {
+  local sandbox="$1"
+  local strategy="$2"
+  local remote_out_dir="$3"
+
+  prepare_worktree "$sandbox"
+  sync_local_experiment "$sandbox"
+  run_launch_strategy_with_args "$sandbox" "$strategy" "$remote_out_dir"
+  sync_artifacts "$sandbox" "$strategy" "$remote_out_dir"
+}
+
+wait_for_strategy_pipeline() {
+  local pid="$1"
+  local strategy="$2"
+  local rc
+
+  set +e
+  wait "$pid"
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    echo "$strategy pipeline failed with exit code $rc" >&2
+  fi
+  return "$rc"
+}
+
+stop_strategy_pipelines() {
+  local rc=$?
+  local pid
+
+  trap - INT TERM
+  for pid in "${locality_pipeline_pid:-}" "${mcp_pipeline_pid:-}"; do
+    if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
+      kill "$pid" >/dev/null 2>&1 || true
+    fi
+  done
+  exit "$rc"
+}
+
+write_artifacts_manifest() {
+  cat > "$LOCAL_OUT_DIR/artifacts.tsv" <<EOF
+strategy	sandbox	remote_out_dir	local_stdout	local_stderr	local_artifact_dir
+locality	$LOCALITY_SANDBOX	$LOCALITY_REMOTE_OUT_DIR	$LOCAL_OUT_DIR/$LOCALITY_SANDBOX/locality.out	$LOCAL_OUT_DIR/$LOCALITY_SANDBOX/locality.err	$LOCAL_OUT_DIR/artifacts/locality
+notion-mcp	$MCP_SANDBOX	$MCP_REMOTE_OUT_DIR	$LOCAL_OUT_DIR/$MCP_SANDBOX/notion-mcp.out	$LOCAL_OUT_DIR/$MCP_SANDBOX/notion-mcp.err	$LOCAL_OUT_DIR/artifacts/notion-mcp
+EOF
+}
+
 {
   printf 'run_id=%s\n' "$RUN_ID"
   printf 'locality_sandbox=%s\n' "$LOCALITY_SANDBOX"
@@ -799,6 +846,7 @@ run_launch_strategy_with_args() {
   printf 'codex_exec_timeout_seconds=%s\n' "$CODEX_EXEC_TIMEOUT_SECONDS"
   printf 'sync_local_experiment=%s\n' "$SYNC_LOCAL_EXPERIMENT"
   printf 'sync_artifacts=%s\n' "$SYNC_ARTIFACTS"
+  printf 'strategy_execution=parallel\n'
   printf 'benchmark_args='
   if [ "${#BENCHMARK_ARGS[@]}" -gt 0 ]; then
     printf '%q ' "${BENCHMARK_ARGS[@]}"
@@ -807,25 +855,33 @@ run_launch_strategy_with_args() {
 } > "$LOCAL_OUT_DIR/run.env"
 
 load_mcp_credentials_from_zshrc
-prepare_worktree "$LOCALITY_SANDBOX"
-prepare_worktree "$MCP_SANDBOX"
-sync_local_experiment "$LOCALITY_SANDBOX"
-sync_local_experiment "$MCP_SANDBOX"
-run_launch_strategy_with_args "$LOCALITY_SANDBOX" "locality" "$LOCALITY_REMOTE_OUT_DIR"
-run_launch_strategy_with_args "$MCP_SANDBOX" "notion-mcp" "$MCP_REMOTE_OUT_DIR"
-sync_artifacts "$LOCALITY_SANDBOX" "locality" "$LOCALITY_REMOTE_OUT_DIR"
-sync_artifacts "$MCP_SANDBOX" "notion-mcp" "$MCP_REMOTE_OUT_DIR"
+write_artifacts_manifest
+
+echo "Launching Locality and MCP strategy pipelines in parallel"
+trap stop_strategy_pipelines INT TERM
+run_strategy_pipeline "$LOCALITY_SANDBOX" "locality" "$LOCALITY_REMOTE_OUT_DIR" &
+locality_pipeline_pid=$!
+run_strategy_pipeline "$MCP_SANDBOX" "notion-mcp" "$MCP_REMOTE_OUT_DIR" &
+mcp_pipeline_pid=$!
+
+locality_pipeline_rc=0
+mcp_pipeline_rc=0
+wait_for_strategy_pipeline "$locality_pipeline_pid" "locality" || locality_pipeline_rc=$?
+wait_for_strategy_pipeline "$mcp_pipeline_pid" "notion-mcp" || mcp_pipeline_rc=$?
+trap - INT TERM
+
+if [ "$locality_pipeline_rc" -ne 0 ] || [ "$mcp_pipeline_rc" -ne 0 ]; then
+  echo "Launch-readiness strategy pipelines failed: locality=$locality_pipeline_rc notion-mcp=$mcp_pipeline_rc" >&2
+  if [ "$locality_pipeline_rc" -ne 0 ]; then
+    exit "$locality_pipeline_rc"
+  fi
+  exit "$mcp_pipeline_rc"
+fi
 
 if [ "$SYNC_ARTIFACTS" = "1" ]; then
   python3 "$SCRIPT_DIR/scripts/token-usage-charts.py" "$LOCAL_OUT_DIR/artifacts" "$LOCAL_OUT_DIR/token-usage" >/dev/null
   python3 "$SCRIPT_DIR/scripts/deep-dive-report.py" "$LOCAL_OUT_DIR" "$LOCAL_OUT_DIR/deep-dive.md" >/dev/null
 fi
-
-cat > "$LOCAL_OUT_DIR/artifacts.tsv" <<EOF
-strategy	sandbox	remote_out_dir	local_stdout	local_stderr	local_artifact_dir
-locality	$LOCALITY_SANDBOX	$LOCALITY_REMOTE_OUT_DIR	$LOCAL_OUT_DIR/$LOCALITY_SANDBOX/locality.out	$LOCAL_OUT_DIR/$LOCALITY_SANDBOX/locality.err	$LOCAL_OUT_DIR/artifacts/locality
-notion-mcp	$MCP_SANDBOX	$MCP_REMOTE_OUT_DIR	$LOCAL_OUT_DIR/$MCP_SANDBOX/notion-mcp.out	$LOCAL_OUT_DIR/$MCP_SANDBOX/notion-mcp.err	$LOCAL_OUT_DIR/artifacts/notion-mcp
-EOF
 
 echo "Wrote split Amika launch-readiness metadata to $LOCAL_OUT_DIR"
 echo "Locality artifacts: $LOCALITY_SANDBOX:$LOCALITY_REMOTE_OUT_DIR"
