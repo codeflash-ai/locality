@@ -77,8 +77,8 @@ for sandbox in "$LOCALITY_SANDBOX" "$MCP_SANDBOX"; do
 done
 ```
 
-Build `loc` on the Locality sandbox; the split wrapper defaults
-`REMOTE_LOC_BIN` to this binary:
+Build `loc` on the Locality sandbox if `/usr/bin/loc` is not already installed;
+the split wrapper defaults `REMOTE_LOC_BIN` to `/usr/bin/loc`:
 
 ```bash
 ssh_target="$(amika sandbox ssh --print "$LOCALITY_SANDBOX")"
@@ -87,6 +87,8 @@ ssh -o StrictHostKeyChecking=accept-new "$ssh_target" '
   cd /home/amika/workspace/locality
   cargo build -p loc-cli -p localityd
 '
+
+export REMOTE_LOC_BIN=/home/amika/workspace/locality/target/debug/loc
 ```
 
 Prepare the Locality sandbox with the mounted files the benchmark should use.
@@ -252,9 +254,10 @@ LOCALITY_SANDBOX=my-locality MCP_SANDBOX=my-mcp \
 ```
 
 The wrapper prepares a clean detached worktree in each sandbox from
-`BENCHMARK_REF` and then runs `run-launch-readiness-benchmark.sh --strategy
-locality` or `--strategy notion-mcp` inside the matching sandbox. Set
-`SYNC_ARTIFACTS=0` to leave outputs only on the remote sandboxes.
+`BENCHMARK_REF` and runs both strategy pipelines concurrently:
+`run-launch-readiness-benchmark.sh --strategy locality` in the Locality sandbox
+and `run-launch-readiness-benchmark.sh --strategy notion-mcp` in the MCP
+sandbox. Set `SYNC_ARTIFACTS=0` to leave outputs only on the remote sandboxes.
 
 Hooks are enabled by default. The runner installs a benchmark-owned `hooks.json`
 into each per-strategy `CODEX_HOME` and starts Codex with
