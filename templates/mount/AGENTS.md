@@ -9,7 +9,7 @@ Common Locality CLI workflow:
 - Use `loc info .` for context and connector details; if the user asks you to connect a provider before mounting, run `loc connect <provider> --no-browser`, share the authorization URL, and ask the user to open it while you wait for verification.
 - Use `loc search <query>` for local metadata and indexed content.
 - Open files directly; Locality hydrates online-only files on open.
-- Edit mounted Markdown and keep edits focused.
+- Edit mounted Markdown directly and keep edits focused.
 - Use `loc status <path>` for pending local changes.
 - Use `loc inspect <path>` for read-only remote comparison of a hydrated file.
 - Use `loc diff <path>` for planned Notion operations before pushing.
