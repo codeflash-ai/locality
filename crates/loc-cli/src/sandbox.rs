@@ -1974,18 +1974,23 @@ mod tests {
 
     #[test]
     fn export_read_deadline_resets_for_a_progressing_multi_read_response() {
+        const READ_DEADLINE: Duration = Duration::from_millis(500);
+        const CHUNK_PAUSE: Duration = Duration::from_millis(300);
+
         let chunks = vec![vec![1; 17], vec![2; 19], vec![3; 23]];
         let expected = chunks.iter().flatten().copied().collect::<Vec<_>>();
         let server = TestServer::start(
             vec![TestResponse::ProgressingExport {
                 chunks,
-                pause: Duration::from_millis(120),
+                // Two pauses make the total transfer exceed READ_DEADLINE,
+                // while each individual pause leaves enough scheduling margin
+                // to remain below it on loaded CI runners.
+                pause: CHUNK_PAUSE,
             }],
             false,
         );
-        let client =
-            SandboxHttpClient::new_with_read_timeout(&server.api_url, Duration::from_millis(200))
-                .expect("HTTP client");
+        let client = SandboxHttpClient::new_with_read_timeout(&server.api_url, READ_DEADLINE)
+            .expect("HTTP client");
         let response = client
             .export_client
             .get(endpoint_url(&client.api_url, &["progressing-export"]))
@@ -1999,7 +2004,7 @@ mod tests {
         assert_eq!(producer.join(), Ok(ReadAheadProducerOutcome::CleanEof));
         assert_eq!(actual, expected);
         assert!(
-            started.elapsed() > Duration::from_millis(200),
+            started.elapsed() > READ_DEADLINE,
             "fixture must exceed one read deadline in total"
         );
         server.finish();
