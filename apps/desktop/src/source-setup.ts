@@ -6,6 +6,7 @@ const SOURCE_CONNECTORS = [
   "google-docs",
   "google-calendar",
   "gmail",
+  "browser",
   "granola",
   "confluence",
   "github",
@@ -37,9 +38,10 @@ export type SourceConnectorId = (typeof SOURCE_CONNECTORS)[number];
 export type PlannedSourceConnectorId = (typeof PLANNED_SOURCE_CONNECTORS)[number];
 export type SourceCatalogConnectorId = SourceConnectorId | PlannedSourceConnectorId;
 export type ApiKeySourceConnectorId = Extract<SourceConnectorId, "confluence" | "github" | "gitlab" | "granola" | "linear">;
+export type LocalFolderSourceConnectorId = Extract<SourceConnectorId, "browser">;
 export type SourceConnectorAvailability = "implemented" | "planned";
 export type SourceConnectorCategory = "knowledge" | "action" | "hybrid";
-export type SourceConnectorAuthMode = "oauth" | "api-key" | "api-token" | "personal-token" | "github-app" | "smart-oauth";
+export type SourceConnectorAuthMode = "oauth" | "api-key" | "api-token" | "personal-token" | "github-app" | "smart-oauth" | "local-folder";
 
 export type SourceConnectorDefinition<Id extends SourceCatalogConnectorId = SourceCatalogConnectorId> = {
   id: Id;
@@ -107,6 +109,19 @@ const SOURCE_CONNECTOR_DEFINITIONS: readonly SourceConnectorDefinition<SourceCon
     writeModel: "Reviewed outbound mail creates from draft files.",
     defaultMountId: "gmail-main",
     defaultMountDirectory: "gmail-main",
+  },
+  {
+    id: "browser",
+    name: "Browser",
+    description: "Saved tab sessions as searchable local Markdown with links to archived artifacts.",
+    availability: "implemented",
+    category: "knowledge",
+    authModes: ["local-folder"],
+    keywords: ["browser", "chrome", "tabs", "web", "research", "archive"],
+    projection: "Browser sessions, tab lists, and captured pages.",
+    writeModel: "Read-only.",
+    defaultMountId: "browser-main",
+    defaultMountDirectory: "browser",
   },
   {
     id: "granola",
@@ -459,6 +474,10 @@ export function sourceConnectorDefaultMountDirectory(connector: SourceConnectorI
 
 export function sourceRequiresApiKey(connector: SourceConnectorId): connector is ApiKeySourceConnectorId {
   return sourceConnectorDefinition(connector).authModes.includes("api-key");
+}
+
+export function sourceUsesLocalFolder(connector: SourceConnectorId): connector is LocalFolderSourceConnectorId {
+  return sourceConnectorDefinition(connector).authModes.includes("local-folder");
 }
 
 export function sourceSkipsManualMountStep(connector: SourceConnectorId): boolean {

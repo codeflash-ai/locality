@@ -54,6 +54,7 @@ use loc_cli::search::{
     run_search_with_access_roots, source_url_host,
 };
 use loc_cli::status::{StatusOptions, StatusState, StatusSyncState, run_status};
+use locality_browser::{BROWSER_CONNECTOR_ID, BrowserMountSettings};
 use locality_confluence::CONFLUENCE_CONNECTOR_ID;
 #[cfg(test)]
 use locality_connector::ConnectorCapabilities;
@@ -448,6 +449,7 @@ struct CreateDesktopMountRequest {
     read_only: bool,
     notion_root_page: Option<String>,
     google_docs_workspace_folder: Option<String>,
+    browser_capture_root: Option<String>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1428,6 +1430,7 @@ async fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
             read_only: false,
             notion_root_page: None,
             google_docs_workspace_folder: None,
+            browser_capture_root: None,
         },
     )
     .await
@@ -1563,6 +1566,7 @@ fn connect_granola_blocking(api_key: String) -> Result<String, String> {
         read_only: !desktop_mount_is_editable_by_default("granola"),
         notion_root_page: None,
         google_docs_workspace_folder: None,
+        browser_capture_root: None,
     })
 }
 
@@ -1614,6 +1618,7 @@ fn connect_linear_blocking(api_key: String) -> Result<String, String> {
         read_only: !desktop_mount_is_editable_by_default("linear"),
         notion_root_page: None,
         google_docs_workspace_folder: None,
+        browser_capture_root: None,
     })
 }
 
@@ -1665,6 +1670,7 @@ fn connect_github_blocking(api_key: String) -> Result<String, String> {
         read_only: !desktop_mount_is_editable_by_default("github"),
         notion_root_page: None,
         google_docs_workspace_folder: None,
+        browser_capture_root: None,
     })
 }
 
@@ -1716,6 +1722,7 @@ fn connect_gitlab_blocking(api_key: String) -> Result<String, String> {
         read_only: !desktop_mount_is_editable_by_default(GITLAB_CONNECTOR_ID),
         notion_root_page: None,
         google_docs_workspace_folder: None,
+        browser_capture_root: None,
     })
 }
 
@@ -1782,6 +1789,7 @@ fn connect_confluence_blocking(
         read_only: !desktop_mount_is_editable_by_default(CONFLUENCE_CONNECTOR_ID),
         notion_root_page: None,
         google_docs_workspace_folder: None,
+        browser_capture_root: None,
     })
 }
 
@@ -2443,6 +2451,7 @@ fn run_workspace_mount_onboarding_blocking(
         read_only: false,
         notion_root_page: None,
         google_docs_workspace_folder: None,
+        browser_capture_root: None,
     }) {
         Ok(message) => workspace_mount_onboarding_report(
             MacosWorkspaceMountOnboardingState::Created,
@@ -7807,6 +7816,7 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
         None => preferred_connection_id_for_connector(&store, &connector)?,
     };
     let read_only = request.read_only
+        || connector == BROWSER_CONNECTOR_ID
         || connector == GITLAB_CONNECTOR_ID
         || connector == "granola"
         || connector == SLACK_CONNECTOR_ID;
@@ -7848,6 +7858,7 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
             Some(folder_id)
         }
         GOOGLE_CALENDAR_CONNECTOR_ID
+        | BROWSER_CONNECTOR_ID
         | "gmail"
         | GITLAB_CONNECTOR_ID
         | "granola"
@@ -7860,7 +7871,25 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
     } else {
         None
     };
-    let settings_json = if connector == SLACK_CONNECTOR_ID {
+    let settings_json = if connector == BROWSER_CONNECTOR_ID {
+        let capture_root = request
+            .browser_capture_root
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(resolve_browser_capture_root)
+            .unwrap_or_else(default_browser_capture_root);
+        let sessions_dir = capture_root.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).map_err(|error| {
+            format!(
+                "Could not create browser capture sessions folder `{}`: {error}",
+                sessions_dir.display()
+            )
+        })?;
+        BrowserMountSettings::with_capture_root(capture_root.display().to_string())
+            .to_json()
+            .map_err(|error| format!("Could not encode Browser mount settings: {error}"))?
+    } else if connector == SLACK_CONNECTOR_ID {
         SlackMountSettings::default()
             .to_json()
             .map_err(|error| format!("Could not encode Slack mount settings: {error}"))?
@@ -7935,6 +7964,7 @@ fn desktop_mount_creation_supports_connector(connector: &str) -> bool {
             | "google-docs"
             | GOOGLE_CALENDAR_CONNECTOR_ID
             | "gmail"
+            | BROWSER_CONNECTOR_ID
             | CONFLUENCE_CONNECTOR_ID
             | "github"
             | GITLAB_CONNECTOR_ID
@@ -7947,8 +7977,43 @@ fn desktop_mount_creation_supports_connector(connector: &str) -> bool {
 fn desktop_mount_is_editable_by_default(connector: &str) -> bool {
     !matches!(
         connector,
-        CONFLUENCE_CONNECTOR_ID | "github" | GITLAB_CONNECTOR_ID | "granola" | "slack"
+        BROWSER_CONNECTOR_ID
+            | CONFLUENCE_CONNECTOR_ID
+            | "github"
+            | GITLAB_CONNECTOR_ID
+            | "granola"
+            | "slack"
     )
+}
+
+fn default_browser_capture_root() -> PathBuf {
+    let home = platform_user_home().unwrap_or_else(|| PathBuf::from("."));
+
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library")
+            .join("Application Support")
+            .join("Locality")
+            .join("browser-captures")
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        home.join(".local")
+            .join("share")
+            .join("locality")
+            .join("browser-captures")
+    }
+}
+
+fn resolve_browser_capture_root(value: &str) -> PathBuf {
+    match expand_tilde(value) {
+        Ok(path) if path.is_absolute() => path,
+        Ok(path) => platform_user_home()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(path),
+        Err(_) => PathBuf::from(value),
+    }
 }
 
 fn desktop_mount_by_id(store: &SqliteStateStore, mount_id: &str) -> Result<MountConfig, String> {
@@ -7962,6 +8027,9 @@ fn preferred_connection_id_for_connector(
     store: &SqliteStateStore,
     connector: &str,
 ) -> Result<Option<ConnectionId>, String> {
+    if connector == BROWSER_CONNECTOR_ID {
+        return Ok(None);
+    }
     if connector == "notion" {
         return preferred_notion_connection_id(store);
     }
@@ -13021,6 +13089,7 @@ mod tests {
             read_only: false,
             notion_root_page: Some("should-not-be-used".to_string()),
             google_docs_workspace_folder: Some("should-not-be-used".to_string()),
+            browser_capture_root: None,
         });
 
         if let Err(error) = &result {
@@ -15281,6 +15350,8 @@ mod tests {
         ));
         assert!(super::desktop_mount_creation_supports_connector("linear"));
         assert!(super::desktop_mount_is_editable_by_default("linear"));
+        assert!(super::desktop_mount_creation_supports_connector("browser"));
+        assert!(!super::desktop_mount_is_editable_by_default("browser"));
         assert!(super::desktop_mount_creation_supports_connector("github"));
         assert!(!super::desktop_mount_is_editable_by_default("github"));
         assert!(super::desktop_mount_creation_supports_connector(

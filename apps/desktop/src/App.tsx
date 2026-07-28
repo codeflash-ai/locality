@@ -114,6 +114,7 @@ import {
   sourceSetupIsActiveConnector,
   sourceSetupIsBusy,
   sourceSetupProgressLabel,
+  sourceUsesLocalFolder,
   type ApiKeySourceConnectorId,
   type SourceCatalogConnectorId,
   type SourceConnectorId,
@@ -743,6 +744,8 @@ function suggestedAgentPrompt(mountPath: string, connector: OnboardingConnectorI
       return `Use Locality to inspect my Google Calendar source. Open the files under ${mountPath}, review calendar events with normal file tools, and prepare new event drafts for Locality review before creating them.`;
     case "gmail":
       return `Use Locality to inspect my Gmail source. Open the files under ${mountPath}, search mail with normal file tools, and prepare draft updates only when the mounted draft files support it. Leave outbound changes for Locality review.`;
+    case "browser":
+      return `Use Locality to inspect my saved browser sessions. Open the files under ${mountPath}, search captured pages with normal file tools, and cite the browser files you used. Browser captures are read-only in Locality, so do not try to push edits back.`;
     case "confluence":
       return `Use Locality to inspect my Confluence spaces. Open the files under ${mountPath}, search spaces and pages with normal file tools, and cite the Confluence files you used. Confluence is read-only in Locality, so do not try to push edits back.`;
     case "github":
@@ -771,7 +774,7 @@ function onboardingConnectorFromSnapshot(snapshot: DesktopSnapshot): OnboardingC
 }
 
 function connectorUsesOAuth(connector: OnboardingConnectorId) {
-  return !sourceRequiresApiKey(connector);
+  return !sourceRequiresApiKey(connector) && !sourceUsesLocalFolder(connector);
 }
 
 function connectorSkipsMountStep(connector: OnboardingConnectorId) {
@@ -810,6 +813,8 @@ function onboardingConnectorDescription(
         return "Google Calendar is ready. Locality mounted primary calendar events as local files under CloudStorage.";
       case "gmail":
         return "Gmail is ready. Locality mounted mailboxes as local files under CloudStorage.";
+      case "browser":
+        return "Browser captures are ready. Locality mounted saved sessions and captured tabs as read-only local files.";
       case "confluence":
         return "Confluence is ready. Locality mounted spaces and pages as read-only local files under CloudStorage.";
       case "github":
@@ -835,6 +840,8 @@ function onboardingConnectorDescription(
         return "A browser window is open. Approve Google Calendar access, then Locality will create the local calendar folder.";
       case "gmail":
         return "A browser window is open. Approve Gmail access, then Locality will create the local mailbox folder.";
+      case "browser":
+        return "Locality is preparing the local browser capture folder.";
       case "confluence":
         return "Locality is validating the Confluence site, account email, and API token before creating a read-only folder.";
       case "github":
@@ -859,6 +866,8 @@ function onboardingConnectorDescription(
       return "Connect Google Calendar during setup so agents can review events and prepare new event drafts through local files.";
     case "gmail":
       return "Connect Gmail during setup so agents can search mailboxes and prepare reviewed draft work from local files.";
+    case "browser":
+      return "Choose a local capture folder to mount saved browser sessions and tabs as read-only files for agents.";
     case "confluence":
       return "Enter your Confluence Cloud site URL, Atlassian account email, and API token to mount spaces and pages as local read-only files.";
     case "github":
@@ -884,6 +893,8 @@ function onboardingConnectorPills(connector: OnboardingConnectorId) {
       return ["Google OAuth", "Primary calendar", "Event drafts"];
     case "gmail":
       return ["Google OAuth", "Mailbox files", "Draft review"];
+    case "browser":
+      return ["Local folder", "Read-only", "Saved tabs"];
     case "confluence":
       return ["API token", "Read-only", "Spaces and pages"];
     case "github":
@@ -909,6 +920,8 @@ function onboardingReadyCopy(connector: OnboardingConnectorId) {
       return "Your Google Calendar source is ready as local files. Agents can review events and prepare new event drafts before anything is created remotely.";
     case "gmail":
       return "Your Gmail source is ready as local files. Agents can search mailbox content and prepare reviewed draft work without leaving the filesystem.";
+    case "browser":
+      return "Your saved browser sessions are ready as local read-only files. Agents can search captured pages without keeping every tab open.";
     case "confluence":
       return "Your Confluence spaces are ready as local read-only files. Agents can search pages and space summaries with normal file tools, while Locality keeps Confluence protected from edits.";
     case "github":
@@ -925,7 +938,7 @@ function onboardingReadyCopy(connector: OnboardingConnectorId) {
 }
 
 function onboardingPromptHint(connector: OnboardingConnectorId) {
-  return connector === "github" || connector === "gitlab" || connector === "granola" || connector === "confluence" || connector === "slack"
+  return connector === "browser" || connector === "github" || connector === "gitlab" || connector === "granola" || connector === "confluence" || connector === "slack"
     ? "Ask an agent to use the mounted read-only files."
     : "Claude and Codex are now set up to use Locality.";
 }
@@ -2186,6 +2199,10 @@ function Onboarding({
       case "gmail":
       case "slack":
         await connectOAuthOnboarding(selectedOnboardingConnector);
+        return;
+      case "browser":
+        setOauthReady(true);
+        setStep(4);
         return;
       case "granola":
         await connectGranolaOnboarding();
@@ -3474,6 +3491,7 @@ function MountsView({
   const [pendingMountRetry, setPendingMountRetry] = useState<{
     connector: SourceConnectorId;
     googleDocsWorkspaceFolder?: string;
+    browserCaptureRoot?: string;
   } | null>(null);
   const sourceFinderRevealRequestedRef = useRef(false);
   const sourceSetupBusy = sourceSetupIsBusy(sourceDialogState);
@@ -3511,6 +3529,7 @@ function MountsView({
           const mountReport = await createConnectorMount(
             pendingMountRetry.connector,
             pendingMountRetry.googleDocsWorkspaceFolder,
+            pendingMountRetry.browserCaptureRoot,
           );
           const outcome = sourceMountRetryOutcome(mountReport);
           if (outcome.kind === "retry") {
@@ -3557,6 +3576,7 @@ function MountsView({
   function beginSourceFileProviderRecovery(
     connector: SourceConnectorId,
     googleDocsWorkspaceFolder: string | undefined,
+    browserCaptureRoot?: string,
   ) {
     setActionError("");
     setSourceDialogOpen(true);
@@ -3568,7 +3588,7 @@ function MountsView({
       message: "In Finder, click Enable for Locality.",
       path: sourceDefaultPath(snapshot, connector),
     });
-    setPendingMountRetry({ connector, googleDocsWorkspaceFolder });
+    setPendingMountRetry({ connector, googleDocsWorkspaceFolder, browserCaptureRoot });
   }
 
   async function revealSourceFileProviderEnablement() {
@@ -3585,6 +3605,7 @@ function MountsView({
   async function createConnectorMount(
     connector: SourceConnectorId,
     googleDocsWorkspaceFolder?: string,
+    browserCaptureRoot?: string,
   ): Promise<ActionReport> {
     if (creating) {
       return { ok: false, message: "Source setup is already running." };
@@ -3603,10 +3624,13 @@ function MountsView({
                 path: sourceDefaultPath(snapshot, connector),
                 mountId: sourceMountId(connector),
                 connectionId: null,
-                readOnly: connector === "github" || connector === "gitlab" || connector === "granola" || connector === "confluence" || connector === "slack",
+                readOnly: connector === "browser" || connector === "github" || connector === "gitlab" || connector === "granola" || connector === "confluence" || connector === "slack",
                 notionRootPage: null,
                 googleDocsWorkspaceFolder: connector === "google-docs"
                   ? googleDocsWorkspaceFolder?.trim() || "Locality"
+                  : null,
+                browserCaptureRoot: connector === "browser"
+                  ? browserCaptureRoot?.trim() || sourceDefaultBrowserCapturePath()
                   : null,
               },
             },
@@ -3614,7 +3638,7 @@ function MountsView({
       );
       if (!report.ok) {
         if (classifyMountSetupError(report.message).kind === "file-provider-disabled") {
-          beginSourceFileProviderRecovery(connector, googleDocsWorkspaceFolder);
+          beginSourceFileProviderRecovery(connector, googleDocsWorkspaceFolder, browserCaptureRoot);
           return report;
         }
         setActionError(report.message);
@@ -3625,7 +3649,7 @@ function MountsView({
     } catch (error) {
       const message = errorMessage(error);
       if (classifyMountSetupError(message).kind === "file-provider-disabled") {
-        beginSourceFileProviderRecovery(connector, googleDocsWorkspaceFolder);
+        beginSourceFileProviderRecovery(connector, googleDocsWorkspaceFolder, browserCaptureRoot);
         return { ok: false, message };
       }
       setActionError(message);
@@ -3678,6 +3702,9 @@ function MountsView({
     if (sourceRequiresApiKey(connector)) {
       return { ok: false, message: `${sourceDisplayName(connector)} requires an API key.` };
     }
+    if (sourceUsesLocalFolder(connector)) {
+      return { ok: true, message: `${sourceDisplayName(connector)} uses a local capture folder.` };
+    }
 
     const command = oauthConnectCommand(connector);
     setActionError("");
@@ -3697,7 +3724,7 @@ function MountsView({
 
   async function runSourceDialogAction(
     connector: SourceConnectorId,
-    options?: { googleDocsWorkspaceFolder?: string },
+    options?: { googleDocsWorkspaceFolder?: string; browserCaptureRoot?: string },
   ) {
     if (sourceSetupBusy) {
       return;
@@ -3717,7 +3744,11 @@ function MountsView({
     setSourceDialogState(nextState);
     try {
       if (connectorReady && !connectorHasMount) {
-        const mountReport = await createConnectorMount(connector, options?.googleDocsWorkspaceFolder);
+        const mountReport = await createConnectorMount(
+          connector,
+          options?.googleDocsWorkspaceFolder,
+          options?.browserCaptureRoot,
+        );
         if (classifyMountSetupError(mountReport.message).kind === "file-provider-disabled") {
           return;
         }
@@ -3738,7 +3769,11 @@ function MountsView({
       }
 
       setSourceDialogState("creating");
-      const mountReport = await createConnectorMount(connector, options?.googleDocsWorkspaceFolder);
+      const mountReport = await createConnectorMount(
+        connector,
+        options?.googleDocsWorkspaceFolder,
+        options?.browserCaptureRoot,
+      );
       if (classifyMountSetupError(mountReport.message).kind === "file-provider-disabled") {
         return;
       }
@@ -4025,7 +4060,10 @@ function AddSourceDialog({
   activeConnector: SourceConnectorId | null;
   message: string;
   fileProviderEnablement: FileProviderEnablementReport | null;
-  onAction: (connector: SourceConnectorId, options?: { googleDocsWorkspaceFolder?: string }) => void;
+  onAction: (
+    connector: SourceConnectorId,
+    options?: { googleDocsWorkspaceFolder?: string; browserCaptureRoot?: string },
+  ) => void;
   onApiKeyAction: (
     connector: ApiKeySourceConnectorId,
     apiKey: string,
@@ -4037,6 +4075,7 @@ function AddSourceDialog({
   const [query, setQuery] = useState("");
   const [viewMode, setViewMode] = useState<SourceListViewMode>("list");
   const [googleDocsWorkspaceFolder, setGoogleDocsWorkspaceFolder] = useState("Locality");
+  const [browserCaptureRoot, setBrowserCaptureRoot] = useState(sourceDefaultBrowserCapturePath());
   const [githubApiKey, setGithubApiKey] = useState("");
   const [gitlabApiKey, setGitlabApiKey] = useState("");
   const [granolaApiKey, setGranolaApiKey] = useState("");
@@ -4217,6 +4256,12 @@ function AddSourceDialog({
                         <SettingRow title="Calendar" value="Primary calendar" />
                         <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
                       </>
+                    ) : runtimeConnector === "browser" ? (
+                      <>
+                        <SettingRow title="Content" value="Saved browser sessions and captured tabs" />
+                        <SettingRow title="Capture folder" value={browserCaptureRoot || sourceDefaultBrowserCapturePath()} />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, runtimeConnector)} />
+                      </>
                     ) : runtimeConnector === "confluence" ? (
                       <>
                         <SettingRow title="Content" value="Spaces, space summaries, pages" />
@@ -4265,6 +4310,16 @@ function AddSourceDialog({
                         value={googleDocsWorkspaceFolder}
                         placeholder="Folder name, URL, or ID"
                         onChange={(event) => setGoogleDocsWorkspaceFolder(event.target.value)}
+                      />
+                    </label>
+                  )}
+                  {runtimeConnector === "browser" && !connector.mounted && (
+                    <label className="source-inline-field">
+                      <span>Capture folder</span>
+                      <input
+                        value={browserCaptureRoot}
+                        placeholder={sourceDefaultBrowserCapturePath()}
+                        onChange={(event) => setBrowserCaptureRoot(event.target.value)}
                       />
                     </label>
                   )}
@@ -4378,9 +4433,13 @@ function AddSourceDialog({
                     <PrimaryButton
                       compact
                       busy={connectorBusy}
-                      disabled={disabled || (runtimeConnector === "google-docs" && !googleDocsWorkspaceFolder.trim())}
+                      disabled={
+                        disabled ||
+                        (runtimeConnector === "google-docs" && !googleDocsWorkspaceFolder.trim()) ||
+                        (runtimeConnector === "browser" && !browserCaptureRoot.trim())
+                      }
                       icon={sourceActionIcon(runtimeConnector, needsConnection)}
-                      onClick={() => onAction(runtimeConnector, { googleDocsWorkspaceFolder })}
+                      onClick={() => onAction(runtimeConnector, { googleDocsWorkspaceFolder, browserCaptureRoot })}
                     >
                       {connectorBusy ? sourceSetupProgressLabel(state, connector.mounted) : actionLabel}
                     </PrimaryButton>
@@ -4431,6 +4490,9 @@ function sourceConnectorStatus(snapshot: DesktopSnapshot, connector: SourceConne
   if (sourceMounted(snapshot, connector)) {
     return "Mounted";
   }
+  if (sourceUsesLocalFolder(connector)) {
+    return "Folder needed";
+  }
   if (sourceConnectionReady(snapshot, connector)) {
     return "Folder needed";
   }
@@ -4447,6 +4509,12 @@ function sourceConnectionStatusReady(status: string) {
 
 function sourceDefaultPathPrefix() {
   return isMacRuntime() ? "~/Library/CloudStorage/Locality" : "~/Locality";
+}
+
+function sourceDefaultBrowserCapturePath() {
+  return isMacRuntime()
+    ? "~/Library/Application Support/Locality/browser-captures"
+    : "~/.local/share/locality/browser-captures";
 }
 
 function sourceDefaultMountDirectory(connector: SourceConnectorId) {
@@ -4476,6 +4544,9 @@ function sourceActionLabel(
   if (connector !== "notion") {
     if (state.mounted) {
       return "Mounted";
+    }
+    if (connector === "browser") {
+      return "Mount Captures";
     }
     return state.needsFolder ? "Create Folder" : "Connect & Mount";
   }
@@ -4524,6 +4595,8 @@ function sourceAuthModeLabel(authMode: SourceConnectorAuthMode) {
       return "GitHub App";
     case "smart-oauth":
       return "SMART OAuth";
+    case "local-folder":
+      return "Local folder";
   }
 }
 
@@ -4591,6 +4664,13 @@ function apiKeyHelpText(connector: ApiKeySourceConnectorId) {
 }
 
 function ConnectorIcon({ connector }: { connector: SourceCatalogConnectorId }) {
+  if (connector === "browser") {
+    return (
+      <span className="connector-icon browser generic" aria-hidden="true">
+        <Monitor />
+      </span>
+    );
+  }
   const iconUrl = isSourceConnectorId(connector) ? CONNECTOR_ICON_URLS[connector] : null;
   if (!iconUrl) {
     return (

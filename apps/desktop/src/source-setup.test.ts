@@ -15,6 +15,7 @@ import {
   sourceConnectorName,
   sourceRequiresApiKey,
   sourceSkipsManualMountStep,
+  sourceUsesLocalFolder,
   sourceMounted,
   sourceMountRetryOutcome,
   sourceSetupIsActiveConnector,
@@ -43,6 +44,7 @@ describe("source setup progress", () => {
       "google-docs",
       "google-calendar",
       "gmail",
+      "browser",
       "granola",
       "confluence",
       "github",
@@ -56,6 +58,8 @@ describe("source setup progress", () => {
     expect(sourceRequiresApiKey("github")).toBe(true);
     expect(sourceRequiresApiKey("gitlab")).toBe(true);
     expect(sourceRequiresApiKey("granola")).toBe(true);
+    expect(sourceRequiresApiKey("browser")).toBe(false);
+    expect(sourceUsesLocalFolder("browser")).toBe(true);
     expect(sourceRequiresApiKey("slack")).toBe(false);
     expect(sourceRequiresApiKey("google-calendar")).toBe(false);
     expect(sourceRequiresApiKey("gmail")).toBe(false);
@@ -71,6 +75,8 @@ describe("source setup progress", () => {
     expect(sourceConnectorDefinition("confluence").projection).toContain("Spaces");
     expect(sourceConnectorDefinition("github").writeModel).toContain("repository edits stay in git");
     expect(sourceConnectorDefinition("gitlab").projection).toContain("merge requests");
+    expect(sourceConnectorDefinition("browser").writeModel).toBe("Read-only.");
+    expect(sourceConnectorDefaultMountId("browser")).toBe("browser-main");
   });
 
   it("keeps planned connector catalog entries separate from runtime setup", () => {
@@ -93,7 +99,7 @@ describe("source setup progress", () => {
       "salesforce",
       "fhir",
     ]);
-    expect(sourceConnectorCatalogDefinitions()).toHaveLength(27);
+    expect(sourceConnectorCatalogDefinitions()).toHaveLength(28);
     expect(plannedSourceConnectorDefinitions()).toHaveLength(17);
     expect(isSourceConnectorId("confluence")).toBe(true);
     expect(isSourceCatalogConnectorId("confluence")).toBe(true);
