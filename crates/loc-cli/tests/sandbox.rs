@@ -1686,6 +1686,7 @@ fn cli_forced_identity_reports_encoding_without_leaking_environment_token() {
 fn cli_profile_has_stable_monotonic_phases_and_no_request_details() {
     let directory = TestDirectory::new("cli-profile");
     let tar = tar_file(b"profiled.txt", b"profile-content-secret\n");
+    let expected_wire_bytes = tar.len();
     let capability = capability();
     let status = ready_status(
         capability.session_id.clone(),
@@ -1734,9 +1735,13 @@ fn cli_profile_has_stable_monotonic_phases_and_no_request_details() {
         "total",
     ];
     let lines = stderr.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), expected_phases.len(), "{stderr}");
+    assert_eq!(lines.len(), expected_phases.len() + 1, "{stderr}");
     let mut previous_total_ms = 0_u128;
-    for (line, expected_phase) in lines.iter().zip(expected_phases) {
+    for (line, expected_phase) in lines
+        .iter()
+        .take(expected_phases.len())
+        .zip(expected_phases)
+    {
         let prefix = format!("locality sandbox profile phase={expected_phase} phase_ms=");
         let timing = line
             .strip_prefix(&prefix)
@@ -1764,6 +1769,23 @@ fn cli_profile_has_stable_monotonic_phases_and_no_request_details() {
         );
         previous_total_ms = total_ms;
     }
+
+    let transport = lines.last().expect("transport profile line");
+    let transport = transport
+        .strip_prefix("locality sandbox profile transport_wait_ms=")
+        .unwrap_or_else(|| panic!("unexpected transport profile line: {transport}"));
+    let (wait_ms, transport) = transport
+        .split_once(" transport_read_calls=")
+        .expect("transport wait field");
+    let (read_calls, wire_bytes) = transport
+        .split_once(" transport_wire_bytes=")
+        .expect("transport read fields");
+    assert!(wait_ms.bytes().all(|byte| byte.is_ascii_digit()));
+    assert!(read_calls.parse::<u64>().expect("transport read calls") > 0);
+    assert_eq!(
+        wire_bytes.parse::<usize>().expect("transport wire bytes"),
+        expected_wire_bytes
+    );
 
     for secret_or_detail in [
         "profile-bootstrap-secret",

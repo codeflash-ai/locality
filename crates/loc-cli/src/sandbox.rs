@@ -73,6 +73,16 @@ pub(crate) struct SandboxInitProfile {
     started: Instant,
     last_total_ms: u128,
     timings: Vec<SandboxProfileTiming>,
+    export_transport_wait: Duration,
+    export_transport_read_calls: u64,
+    export_transport_wire_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SandboxExportTransportMetrics {
+    pub wait_ms: u128,
+    pub read_calls: u64,
+    pub wire_bytes: u64,
 }
 
 impl SandboxInitProfile {
@@ -81,6 +91,9 @@ impl SandboxInitProfile {
             started: Instant::now(),
             last_total_ms: 0,
             timings: Vec::new(),
+            export_transport_wait: Duration::ZERO,
+            export_transport_read_calls: 0,
+            export_transport_wire_bytes: 0,
         }
     }
 
@@ -96,6 +109,22 @@ impl SandboxInitProfile {
 
     pub(crate) fn timings(&self) -> &[SandboxProfileTiming] {
         &self.timings
+    }
+
+    fn observe_export_transport_read(&mut self, wait: Duration, bytes: usize) {
+        self.export_transport_wait = self.export_transport_wait.saturating_add(wait);
+        self.export_transport_read_calls = self.export_transport_read_calls.saturating_add(1);
+        self.export_transport_wire_bytes = self
+            .export_transport_wire_bytes
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+    }
+
+    pub(crate) fn export_transport_metrics(&self) -> SandboxExportTransportMetrics {
+        SandboxExportTransportMetrics {
+            wait_ms: self.export_transport_wait.as_millis(),
+            read_calls: self.export_transport_read_calls,
+            wire_bytes: self.export_transport_wire_bytes,
+        }
     }
 }
 
@@ -659,7 +688,13 @@ impl<'a, Body> ProfiledExportBody<'a, Body> {
 
 impl<Body: Read> Read for ProfiledExportBody<'_, Body> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        let read = self.body.read(output)?;
+        let started = Instant::now();
+        let result = self.body.read(output);
+        let wait = started.elapsed();
+        if let Some(profile) = self.profile.as_deref_mut() {
+            profile.observe_export_transport_read(wait, result.as_ref().copied().unwrap_or(0));
+        }
+        let read = result?;
         if read != 0 && !self.observed_first_byte {
             self.observed_first_byte = true;
             if let Some(profile) = self.profile.as_deref_mut() {
