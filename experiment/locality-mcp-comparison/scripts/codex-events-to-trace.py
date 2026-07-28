@@ -8,6 +8,15 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+SENSITIVE_KEY_RE = re.compile(
+    r"(api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|authorization|cookie|bearer)",
+    re.IGNORECASE,
+)
+MAX_TOOL_ARG_STRING_CHARS = 4000
+MAX_TOOL_ARG_LIST_ITEMS = 100
+MAX_TOOL_ARG_DICT_ITEMS = 200
+MAX_TOOL_ARG_DEPTH = 8
+
 
 def usage() -> None:
     raise SystemExit(
@@ -30,6 +39,66 @@ def shorten(value, limit=220):
         value = json.dumps(value, sort_keys=True)
     value = re.sub(r"\s+", " ", value).strip()
     return value if len(value) <= limit else value[: limit - 1] + "..."
+
+
+def sanitize_tool_args(value, depth=0):
+    if depth >= MAX_TOOL_ARG_DEPTH:
+        return "[MAX_DEPTH]"
+    if isinstance(value, dict):
+        sanitized = {}
+        for index, key in enumerate(sorted(value.keys(), key=str)):
+            if index >= MAX_TOOL_ARG_DICT_ITEMS:
+                sanitized["__truncated_keys__"] = len(value) - MAX_TOOL_ARG_DICT_ITEMS
+                break
+            key_text = str(key)
+            if SENSITIVE_KEY_RE.search(key_text):
+                sanitized[key_text] = "[REDACTED]"
+            else:
+                sanitized[key_text] = sanitize_tool_args(value[key], depth + 1)
+        return sanitized
+    if isinstance(value, list):
+        items = [sanitize_tool_args(item, depth + 1) for item in value[:MAX_TOOL_ARG_LIST_ITEMS]]
+        if len(value) > MAX_TOOL_ARG_LIST_ITEMS:
+            items.append({"__truncated_items__": len(value) - MAX_TOOL_ARG_LIST_ITEMS})
+        return items
+    if isinstance(value, str):
+        if len(value) > MAX_TOOL_ARG_STRING_CHARS:
+            return value[:MAX_TOOL_ARG_STRING_CHARS] + f"...[truncated {len(value) - MAX_TOOL_ARG_STRING_CHARS} chars]"
+        return value
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return str(value)
+
+
+def stable_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def parse_json_value(value):
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def normalized_tool_args_json(value):
+    if value is None or value == "":
+        return ""
+    return stable_json(sanitize_tool_args(parse_json_value(value)))
+
+
+def normalize_tool_args_keys(value, args_json=""):
+    if isinstance(value, list):
+        return ",".join(str(item) for item in value)
+    if isinstance(value, str):
+        return value
+    if args_json:
+        parsed = parse_json_value(args_json)
+        if isinstance(parsed, dict):
+            return ",".join(sorted(str(key) for key in parsed.keys()))
+    return ""
 
 
 def shell_words(command):
@@ -141,8 +210,16 @@ def perfetto_args(span):
         "tool_command",
         "tool_group",
         "tool_command_group",
+        "tool_args_json",
+        "tool_args_keys",
     ]
-    return {field: span.get(field, "") for field in fields if span.get(field, "") != ""}
+    args = {field: span.get(field, "") for field in fields if span.get(field, "") != ""}
+    tool_args_json = span.get("tool_args_json") or ""
+    if tool_args_json:
+        parsed = parse_json_value(tool_args_json)
+        if isinstance(parsed, (dict, list)):
+            args["tool_args"] = parsed
+    return args
 
 
 def read_records(path):
@@ -224,6 +301,72 @@ def item_label(record):
     return item_type or record["event_type"]
 
 
+def first_present(container, keys):
+    for key in keys:
+        if isinstance(container, dict) and key in container:
+            return container[key]
+    return None
+
+
+def tool_args_from_record(record):
+    event = record["event"]
+    item = record["item"]
+
+    if event.get("tool_args_json"):
+        args_json = normalized_tool_args_json(event.get("tool_args_json"))
+        return (
+            args_json,
+            normalize_tool_args_keys(event.get("tool_args_keys"), args_json),
+        )
+    if "tool_args" in event:
+        args_json = normalized_tool_args_json(event.get("tool_args"))
+        return args_json, normalize_tool_args_keys(event.get("tool_args_keys"), args_json)
+
+    value = first_present(item, ("arguments", "args", "input", "parameters", "tool_input"))
+    if value is None:
+        value = first_present(event, ("arguments", "args", "input", "parameters", "tool_input"))
+    args_json = normalized_tool_args_json(value)
+    return args_json, normalize_tool_args_keys(None, args_json)
+
+
+def tool_fields_from_record(record):
+    event = record["event"]
+    item = record["item"]
+    item_type = record["item_type"]
+    tool_name = ""
+    tool_command = ""
+    tool_group = ""
+    tool_command_group = ""
+    tool_args_json = ""
+    tool_args_keys = ""
+
+    if item_type in {"local_shell_call", "command_execution"}:
+        command = item.get("command") or item.get("cmd") or item.get("argv") or event.get("command")
+        tool_name = "Bash"
+        tool_command = command if isinstance(command, str) else stable_json(command) if command else ""
+    elif item_type == "mcp_tool_call":
+        server = item.get("server") or item.get("server_name") or event.get("server") or "mcp"
+        tool = item.get("tool") or item.get("name") or event.get("tool") or event.get("name") or "tool"
+        tool_name = f"mcp__{server}__{tool}"
+        tool_args_json, tool_args_keys = tool_args_from_record(record)
+    elif item_type in {"function_call", "tool_call"}:
+        tool_name = item.get("name") or item.get("tool") or event.get("name") or "tool"
+        if str(tool_name).startswith("mcp__"):
+            tool_args_json, tool_args_keys = tool_args_from_record(record)
+
+    if tool_name:
+        tool_group, tool_command_group = tool_breakdown(tool_name, tool_command)
+
+    return {
+        "tool_name": tool_name,
+        "tool_command": tool_command,
+        "tool_group": tool_group,
+        "tool_command_group": tool_command_group,
+        "tool_args_json": tool_args_json,
+        "tool_args_keys": tool_args_keys,
+    }
+
+
 def span_label(left, right):
     left_type = left["event_type"]
     left_item = left["item_type"]
@@ -265,6 +408,7 @@ def build_observed_spans(records, base_ms):
         end_ms = right["observed_at_ms"]
         if end_ms <= start_ms:
             continue
+        tool_fields = tool_fields_from_record(left)
         spans.append(
             {
                 "name": span_label(left, right),
@@ -278,10 +422,7 @@ def build_observed_spans(records, base_ms):
                 "span_kind": "observed_gap",
                 "phase": "",
                 "activity": "observed_gap",
-                "tool_name": "",
-                "tool_command": "",
-                "tool_group": "",
-                "tool_command_group": "",
+                **tool_fields,
             }
         )
     return spans
@@ -316,9 +457,13 @@ def build_hook_phase_spans(records, base_ms):
         tool_name = event.get("tool_name") or ""
         tool_command = event.get("tool_command") or event.get("command") or ""
         tool_group, tool_command_group = tool_breakdown(tool_name, tool_command)
+        tool_args_json = event.get("tool_args_json") or normalized_tool_args_json(event.get("tool_args"))
+        tool_args_keys = normalize_tool_args_keys(event.get("tool_args_keys"), tool_args_json)
         if phase != "tool_call":
             tool_group = ""
             tool_command_group = ""
+            tool_args_json = ""
+            tool_args_keys = ""
         spans.append(
             {
                 "name": hook_phase_label(record),
@@ -336,6 +481,8 @@ def build_hook_phase_spans(records, base_ms):
                 "tool_command": tool_command,
                 "tool_group": tool_group,
                 "tool_command_group": tool_command_group,
+                "tool_args_json": tool_args_json,
+                "tool_args_keys": tool_args_keys,
             }
         )
     return spans
@@ -360,6 +507,8 @@ def extract_transcript_text(record):
         parts.append("phase=" + shorten(event.get("phase"), 120))
     if event.get("tool_command"):
         parts.append("tool_command=" + shorten(event.get("tool_command"), 600))
+    if event.get("tool_args_json"):
+        parts.append("tool_args_json=" + shorten(event.get("tool_args_json"), 1200))
     return " | ".join(part for part in parts if part)
 
 
@@ -381,6 +530,7 @@ for record in records:
         start = open_spans.pop(ident)
         start_ms = start["observed_at_ms"]
         end_ms = max(record["observed_at_ms"], start_ms)
+        tool_fields = tool_fields_from_record(start)
         paired_spans.append(
             {
                 "name": item_label(start),
@@ -394,15 +544,13 @@ for record in records:
                 "span_kind": "item_pair",
                 "phase": "",
                 "activity": "item_pair",
-                "tool_name": "",
-                "tool_command": "",
-                "tool_group": "",
-                "tool_command_group": "",
+                **tool_fields,
             }
         )
 
 for ident, start in open_spans.items():
     end_ms = records[-1]["observed_at_ms"]
+    tool_fields = tool_fields_from_record(start)
     paired_spans.append(
         {
             "name": item_label(start),
@@ -416,10 +564,7 @@ for ident, start in open_spans.items():
             "span_kind": "open_item",
             "phase": "",
             "activity": "open_item",
-            "tool_name": "",
-            "tool_command": "",
-            "tool_group": "",
-            "tool_command_group": "",
+            **tool_fields,
         }
     )
 
@@ -476,6 +621,8 @@ with spans_path.open("w", newline="") as f:
             "tool_command",
             "tool_group",
             "tool_command_group",
+            "tool_args_json",
+            "tool_args_keys",
         ],
         delimiter="\t",
     )

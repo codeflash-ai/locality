@@ -7,7 +7,7 @@ Usage: run-agent-comparison.sh [--out-dir <path>] [--remote-worktree <path>] [be
 
 Runs the launch-readiness benchmark on two Amika sandboxes:
   - Locality strategy on LOCALITY_SANDBOX
-  - Notion MCP strategy on MCP_SANDBOX
+  - MCP strategy on MCP_SANDBOX
 
 Defaults:
   LOCALITY_SANDBOX=aseem-locality
@@ -26,26 +26,36 @@ Environment:
   REMOTE_SOURCE_REPO             Existing git checkout inside each sandbox.
   REMOTE_WORKTREE_ROOT           Parent for clean detached benchmark worktrees.
   REMOTE_WORKTREE                Exact clean detached worktree path.
-  REMOTE_LOC_BIN                 loc binary inside the sandboxes.
-                                  Default: <REMOTE_SOURCE_REPO>/target/debug/loc.
+  REMOTE_LOC_BIN                 installed loc binary in the Locality sandbox.
+                                  Default: /usr/bin/loc. Only required for
+                                  Locality strategy runs.
   BENCHMARK_REF                  Git ref checked out in each sandbox. Default: origin/main.
   AMIKA_SANDBOX_FLAGS            Optional flags passed to amika sandbox ssh.
+  AMIKA_SSH_FORCE_TTY            Use direct ssh -tt for unhealthy sandboxes
+                                  that reject non-interactive exec. Default: 0.
   CODEX_MODEL                    Passed through to the benchmark worker.
   CODEX_REASONING_EFFORT         Passed through to the benchmark worker.
   CODEX_EXEC_TIMEOUT_SECONDS     Passed through to the benchmark worker.
-  LOCALITY_USE_EXISTING_STATE    When 1, Locality strategy uses the sandbox's
-                                  existing LOCALITY_STATE_DIR or ~/.loc instead
-                                  of creating an isolated temporary Notion mount.
-  LOCALITY_CONTEXT_DIRS          Passed through to the worker as prehydrated
-                                  Locality context directories.
-  LOCALITY_CONTEXT_HYDRATE       Passed through to the worker. Set 0 when
-                                  LOCALITY_CONTEXT_DIRS are already hydrated.
-  LOCALITY_SKIP_TARGET_LOCATE    Passed through to the worker for artifact-only
-                                  runs that do not need a mounted output page.
+  CODEX_HOOKS_MODE               Passed through to the benchmark worker.
+  AGENT_REPORT_PATH              Agent report path. Default: /home/amika/final_report.md.
+  LOCALITY_CONTEXT_DIRS          Prehydrated Locality roots for the Locality worker.
+  LOCALITY_CONTEXT_ROOTS         Alias accepted by the worker.
+  LINEAR_API_KEY                 MCP credential forwarded when set.
+  NOTION_API_TOKEN               MCP credential forwarded when set.
+                                  NOTION_TOKEN and NOTION_ACCESS_TOKEN are aliases.
+  SLACK_BOT_TOKEN                Required Slack MCP credential for MCP runs.
+  SLACK_TEAM_ID                  Required Slack team id for MCP runs.
+  SLACK_CHANNEL_IDS              Optional comma-delimited Slack channel allowlist.
+  SYNC_LOCAL_EXPERIMENT          Copy this local comparison harness into each
+                                  remote worktree before running. Default: 0.
   SYNC_ARTIFACTS                 Copy remote OUT_DIRs back locally. Default: 1.
 
+MCP credentials can also live in the MCP sandbox under:
+  ~/.config/locality-launch-readiness/mcp/{linear-api-key,notion-token,slack-bot-token,slack-team-id,slack-channel-ids}
+
 Any remaining arguments are passed to run-launch-readiness-benchmark.sh.
-Do not pass --strategy; this wrapper owns the split strategy execution.
+This wrapper owns split strategy execution; --compare-mcp is accepted as a no-op
+compatibility flag and --strategy is rejected.
 EOF
 }
 
@@ -59,7 +69,8 @@ REMOTE_SOURCE_REPO="${REMOTE_SOURCE_REPO:-/home/amika/workspace/locality}"
 REMOTE_WORKTREE_ROOT="${REMOTE_WORKTREE_ROOT:-/home/amika/workspace}"
 REMOTE_WORKTREE="${REMOTE_WORKTREE:-$REMOTE_WORKTREE_ROOT/locality-launch-readiness-$RUN_ID}"
 BENCHMARK_REF="${BENCHMARK_REF:-origin/main}"
-REMOTE_LOC_BIN="${REMOTE_LOC_BIN:-$REMOTE_SOURCE_REPO/target/debug/loc}"
+REMOTE_LOC_BIN="${REMOTE_LOC_BIN:-/usr/bin/loc}"
+AMIKA_SSH_FORCE_TTY="${AMIKA_SSH_FORCE_TTY:-0}"
 
 LOCAL_OUT_DIR="${LOCAL_OUT_DIR:-${OUT_DIR:-$REPO_ROOT/target/launch-readiness-amika/$RUN_ID}}"
 LOCALITY_REMOTE_OUT_DIR_INPUT="${LOCALITY_REMOTE_OUT_DIR:-}"
@@ -67,7 +78,10 @@ MCP_REMOTE_OUT_DIR_INPUT="${MCP_REMOTE_OUT_DIR:-}"
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-luna}"
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-low}"
 CODEX_EXEC_TIMEOUT_SECONDS="${CODEX_EXEC_TIMEOUT_SECONDS:-900}"
+SYNC_LOCAL_EXPERIMENT="${SYNC_LOCAL_EXPERIMENT:-0}"
 SYNC_ARTIFACTS="${SYNC_ARTIFACTS:-1}"
+
+declare -a BENCHMARK_ARGS=()
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -95,12 +109,28 @@ while [ "$#" -gt 0 ]; do
       echo "run-agent-comparison.sh owns --strategy; set LOCALITY_SANDBOX/MCP_SANDBOX or pass benchmark args only" >&2
       exit 2
       ;;
-    --compare-hooks)
-      echo "--compare-hooks is not supported by the split-sandbox wrapper; run the worker directly for hook studies" >&2
+    --compare-mcp)
+      shift
+      ;;
+    --compare-hooks|--push|--write-mounted-page)
+      echo "$1 is not supported by the simplified split-sandbox wrapper" >&2
       exit 2
       ;;
+    --scenario)
+      if [ "$#" -lt 2 ]; then
+        echo "--scenario requires a value" >&2
+        exit 2
+      fi
+      BENCHMARK_ARGS+=("$1" "$2")
+      shift 2
+      ;;
+    --scenario=*)
+      BENCHMARK_ARGS+=("$1")
+      shift
+      ;;
     *)
-      break
+      BENCHMARK_ARGS+=("$1")
+      shift
       ;;
   esac
 done
@@ -126,6 +156,54 @@ if [ -n "${AMIKA_SANDBOX_FLAGS:-}" ]; then
   read -r -a AMIKA_FLAGS <<< "$AMIKA_SANDBOX_FLAGS"
 fi
 
+load_mcp_credentials_from_zshrc() {
+  command -v zsh >/dev/null 2>&1 || return 0
+
+  local output
+  output="$(
+    zsh -ic '
+      print -r -- __LOCALITY_MCP_ENV_BEGIN__
+      for name in LINEAR_API_KEY NOTION_API_TOKEN NOTION_TOKEN NOTION_ACCESS_TOKEN SLACK_BOT_TOKEN SLACK_TEAM_ID SLACK_CHANNEL_IDS; do
+        value="${(P)name}"
+        if [[ -n "$value" ]]; then
+          printf "%s=" "$name"
+          printf "%s" "$value" | base64 | tr -d "\n"
+          printf "\n"
+        fi
+      done
+      print -r -- __LOCALITY_MCP_ENV_END__
+    ' 2>/dev/null
+  )" || return 0
+
+  local in_block=0
+  local line name encoded decoded
+  while IFS= read -r line; do
+    case "$line" in
+      __LOCALITY_MCP_ENV_BEGIN__)
+        in_block=1
+        continue
+        ;;
+      __LOCALITY_MCP_ENV_END__)
+        break
+        ;;
+    esac
+    [ "$in_block" -eq 1 ] || continue
+    name="${line%%=*}"
+    encoded="${line#*=}"
+    case "$name" in
+      LINEAR_API_KEY|NOTION_API_TOKEN|NOTION_TOKEN|NOTION_ACCESS_TOKEN|SLACK_BOT_TOKEN|SLACK_TEAM_ID|SLACK_CHANNEL_IDS)
+        if [ -z "${!name:-}" ] && [ -n "$encoded" ]; then
+          decoded="$(printf '%s' "$encoded" | base64 -d 2>/dev/null || true)"
+          if [ -n "$decoded" ]; then
+            printf -v "$name" '%s' "$decoded"
+            export "$name"
+          fi
+        fi
+        ;;
+    esac
+  done <<< "$output"
+}
+
 shell_quote() {
   printf "%q" "$1"
 }
@@ -135,27 +213,31 @@ base64_one_line() {
 }
 
 forwarded_worker_env_b64() {
+  local strategy="${1:-all}"
   local name
   local names=(
-    TARGET_URL
-    CONTEXT_URLS
-    CONTEXT_PULL_PATHS
-    CONTEXT_SEARCH_QUERY
-    LOCALITY_USE_EXISTING_STATE
-    LOCALITY_STATE_DIR
-    LOCALITY_CREDENTIAL_STORE
+    AGENT_REPORT_PATH
+    CODEX_HOOKS_MODE
     LOCALITY_CONTEXT_DIRS
     LOCALITY_CONTEXT_ROOTS
-    LOCALITY_CONTEXT_HYDRATE
-    LOCALITY_SKIP_TARGET_LOCATE
-    LOCALITY_EXPERIMENT_TRACE_FORCE_DIRECT
-    SINCE
-    BASE_REF
-    REPORT_TZ
-    REPORT_DATE
-    REPORT_TITLE
-    CODEX_HOOKS_MODE
+    LOCALITY_STATE_DIR
+    LOCALITY_CREDENTIAL_STORE
+    PROMPT_ROOT
+    LOCALITY_PROMPT_DIR
+    MCP_PROMPT_DIR
   )
+  local credential_names=(
+    LINEAR_API_KEY
+    NOTION_API_TOKEN
+    NOTION_TOKEN
+    NOTION_ACCESS_TOKEN
+    SLACK_BOT_TOKEN
+    SLACK_TEAM_ID
+    SLACK_CHANNEL_IDS
+  )
+  if [ "$strategy" = "notion-mcp" ] || [ "$strategy" = "all" ]; then
+    names+=("${credential_names[@]}")
+  fi
   for name in "${names[@]}"; do
     if [ "${!name+x}" ]; then
       printf 'export %s=%q\n' "$name" "${!name}"
@@ -164,6 +246,19 @@ forwarded_worker_env_b64() {
 }
 
 amika_sandbox_ssh() {
+  if [ "$AMIKA_SSH_FORCE_TTY" = "1" ]; then
+    local sandbox="$1"
+    shift
+    if [ "${1:-}" = "--" ]; then
+      shift
+    fi
+    if [ -r /dev/tty ]; then
+      ssh -tt -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new "$(amika_sandbox_ssh_target "$sandbox")" "$@" < /dev/tty
+    else
+      ssh -tt -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new "$(amika_sandbox_ssh_target "$sandbox")" "$@"
+    fi
+    return
+  fi
   if [ "${#AMIKA_FLAGS[@]}" -gt 0 ]; then
     amika sandbox ssh "${AMIKA_FLAGS[@]}" "$@"
   else
@@ -196,8 +291,34 @@ run_remote_script() {
   for arg in "$@"; do
     remote_command+=" $(shell_quote "$arg")"
   done
+  if [ "$AMIKA_SSH_FORCE_TTY" = "1" ]; then
+    remote_command="$remote_command; remote_rc=\$?; printf '\n__AMIKA_REMOTE_RC__=%s\n' \"\$remote_rc\"; exit 0"
+  fi
   remote_shell_command="bash -lc $(shell_quote "$remote_command")"
-  amika_sandbox_ssh "$sandbox" -- "$remote_shell_command" > "$stdout_file" 2> "$stderr_file"
+  local attempt=1
+  local max_attempts=1
+  [ "$AMIKA_SSH_FORCE_TTY" = "1" ] && max_attempts=5
+  while [ "$attempt" -le "$max_attempts" ]; do
+    set +e
+    amika_sandbox_ssh "$sandbox" -- "$remote_shell_command" > "$stdout_file" 2> "$stderr_file"
+    local_rc=$?
+    set -e
+    if [ "$AMIKA_SSH_FORCE_TTY" = "1" ]; then
+      local remote_rc
+      remote_rc="$(sed -n 's/.*__AMIKA_REMOTE_RC__=//p' "$stdout_file" | tr -d '\r' | tail -1)"
+      if [ -n "$remote_rc" ]; then
+        return "$remote_rc"
+      fi
+      if [ "$attempt" -lt "$max_attempts" ]; then
+        printf 'retrying forced-tty command after missing remote rc marker; attempt=%s rc=%s\n' "$attempt" "$local_rc" >> "$stderr_file"
+        sleep "$attempt"
+      fi
+    else
+      return "$local_rc"
+    fi
+    attempt=$((attempt + 1))
+  done
+  return "$local_rc"
 }
 
 prepare_worktree() {
@@ -221,7 +342,22 @@ if [ ! -d "$source_repo/.git" ] && [ ! -f "$source_repo/.git" ]; then
 fi
 
 cd "$source_repo"
-git fetch origin
+git update-index -q --refresh
+if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+  echo "source repository is not clean before pull: $source_repo" >&2
+  git status --short --untracked-files=all >&2
+  exit 2
+fi
+
+git fetch --prune origin
+git checkout --detach "$ref"
+
+git update-index -q --refresh
+if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+  echo "source repository is not clean after pull: $source_repo" >&2
+  git status --short --untracked-files=all >&2
+  exit 2
+fi
 
 if [ -e "$worktree" ]; then
   if ! git -C "$worktree" rev-parse --git-dir >/dev/null 2>&1; then
@@ -253,17 +389,247 @@ REMOTE_PREPARE
     "$BENCHMARK_REF"
 }
 
+sync_local_experiment() {
+  local sandbox="$1"
+  local local_dir="$LOCAL_OUT_DIR/$sandbox"
+  local remote_dir="$REMOTE_WORKTREE/experiment/locality-mcp-comparison"
+  local script
+  local ssh_target
+
+  if [ "$SYNC_LOCAL_EXPERIMENT" != "1" ]; then
+    return 0
+  fi
+
+  mkdir -p "$local_dir"
+  echo "Syncing local comparison harness into $sandbox:$remote_dir"
+  if [ "$AMIKA_SSH_FORCE_TTY" = "1" ]; then
+    local archive_b64="$local_dir/local-experiment.tar.gz.b64"
+    local remote_b64="/tmp/locality-mcp-comparison-$RUN_ID-$sandbox.b64"
+    local remote_chunk_dir="/tmp/locality-mcp-comparison-$RUN_ID-$sandbox-chunks"
+    local chunk
+    local chunk_index=0
+    COPYFILE_DISABLE=1 tar -czf - -C "$SCRIPT_DIR" . | base64 | tr -d '\n' > "$archive_b64"
+
+    script="$(cat <<'REMOTE_SYNC_INIT'
+set -euo pipefail
+rm -f "$1"
+rm -rf "$2"
+mkdir -p "$2"
+REMOTE_SYNC_INIT
+)"
+    run_remote_script \
+      "$sandbox" \
+      "$local_dir/sync-local-experiment-init.out" \
+      "$local_dir/sync-local-experiment-init.err" \
+      "$script" \
+      "$remote_b64" \
+      "$remote_chunk_dir"
+
+    while IFS= read -r chunk; do
+      chunk_index=$((chunk_index + 1))
+      local chunk_file="$remote_chunk_dir/chunk-$(printf '%05d' "$chunk_index")"
+      local chunk_file_q
+      local chunk_q
+      local remote_cmd
+      local chunk_attempt=1
+      local chunk_ok=0
+      chunk_file_q="$(shell_quote "$chunk_file")"
+      chunk_q="$(shell_quote "$chunk")"
+      remote_cmd="set -euo pipefail; mkdir -p $(shell_quote "$remote_chunk_dir"); printf %s $chunk_q > $chunk_file_q; printf '\n__AMIKA_REMOTE_RC__=0\n'"
+      while [ "$chunk_attempt" -le 5 ]; do
+        set +e
+        amika_sandbox_ssh "$sandbox" -- "bash -lc $(shell_quote "$remote_cmd")" \
+          > "$local_dir/sync-local-experiment-chunk-$chunk_index.out" \
+          2> "$local_dir/sync-local-experiment-chunk-$chunk_index.err"
+        set -e
+        if sed -n 's/.*__AMIKA_REMOTE_RC__=//p' "$local_dir/sync-local-experiment-chunk-$chunk_index.out" | tr -d '\r' | grep -qx '0'; then
+          chunk_ok=1
+          break
+        fi
+        if [ "$chunk_attempt" -lt 5 ]; then
+          sleep "$chunk_attempt"
+        fi
+        chunk_attempt=$((chunk_attempt + 1))
+      done
+      if [ "$chunk_ok" -ne 1 ]; then
+        echo "failed to upload harness chunk $chunk_index to $sandbox" >&2
+        return 255
+      fi
+    done < <(fold -w 4000 "$archive_b64")
+
+    script="$(cat <<'REMOTE_SYNC_EXTRACT'
+set -euo pipefail
+remote_b64="$1"
+dest="$2"
+chunk_dir="$3"
+tmp="$(mktemp -d)"
+cat "$chunk_dir"/chunk-* > "$remote_b64"
+tr -d '\r\n' < "$remote_b64" | base64 -d > "$tmp/payload.tgz"
+rm -rf "$dest"
+mkdir -p "$dest"
+tar -xzf "$tmp/payload.tgz" -C "$dest"
+rm -f "$remote_b64"
+rm -rf "$chunk_dir"
+rm -rf "$tmp"
+test -s "$dest/run-launch-readiness-benchmark.sh"
+REMOTE_SYNC_EXTRACT
+)"
+    run_remote_script \
+      "$sandbox" \
+      "$local_dir/sync-local-experiment.out" \
+      "$local_dir/sync-local-experiment.err" \
+      "$script" \
+      "$remote_b64" \
+      "$remote_dir" \
+      "$remote_chunk_dir"
+
+    script="$(cat <<'REMOTE_SYNC_VERIFY'
+set -euo pipefail
+test -s "$1/run-launch-readiness-benchmark.sh"
+REMOTE_SYNC_VERIFY
+)"
+    run_remote_script \
+      "$sandbox" \
+      "$local_dir/sync-local-experiment-verify.out" \
+      "$local_dir/sync-local-experiment-verify.err" \
+      "$script" \
+      "$remote_dir"
+    return
+  fi
+
+  script="$(cat <<'REMOTE_SYNC_PREP'
+set -euo pipefail
+mkdir -p "$1"
+REMOTE_SYNC_PREP
+)"
+  run_remote_script \
+    "$sandbox" \
+    "$local_dir/sync-local-experiment.out" \
+    "$local_dir/sync-local-experiment.err" \
+    "$script" \
+    "$remote_dir"
+
+  ssh_target="$(amika_sandbox_ssh_target "$sandbox")"
+  if ! command -v rsync >/dev/null 2>&1; then
+    echo "rsync is required when SYNC_LOCAL_EXPERIMENT=1" >&2
+    exit 127
+  fi
+  rsync -az --delete "$SCRIPT_DIR/" "$ssh_target:$remote_dir/"
+}
+
 run_launch_strategy() {
   local sandbox="$1"
   local strategy="$2"
   local remote_out_dir="$3"
+  shift 3
   local local_dir="$LOCAL_OUT_DIR/$sandbox"
   local script
   local worker_env_b64
 
   mkdir -p "$local_dir"
   echo "Running $strategy on $sandbox"
-  worker_env_b64="$(forwarded_worker_env_b64)"
+  worker_env_b64="$(forwarded_worker_env_b64 "$strategy")"
+
+  if [ "$AMIKA_SSH_FORCE_TTY" = "1" ]; then
+    local remote_benchmark_args=""
+    local arg
+    local remote_cmd
+    local remote_cmd_b64
+    local remote_shell_command
+    local local_rc
+    for arg in "$@"; do
+      remote_benchmark_args+=" $(shell_quote "$arg")"
+    done
+    remote_cmd="$(cat <<REMOTE_TTY_RUN
+set -euo pipefail
+strategy=$(shell_quote "$strategy")
+repo_dir=$(shell_quote "$REMOTE_WORKTREE")
+out_dir=$(shell_quote "$remote_out_dir")
+run_id=$(shell_quote "$RUN_ID")
+model=$(shell_quote "$CODEX_MODEL")
+effort=$(shell_quote "$CODEX_REASONING_EFFORT")
+timeout_seconds=$(shell_quote "$CODEX_EXEC_TIMEOUT_SECONDS")
+loc_bin=$(shell_quote "$REMOTE_LOC_BIN")
+worker_env_b64=$(shell_quote "$worker_env_b64")
+benchmark_args=($remote_benchmark_args)
+export PATH="\$HOME/.cargo/bin:\$HOME/.local/bin:\$PATH"
+env_file="\${LOCALITY_EXPERIMENT_ENV:-\$HOME/.config/locality-experiment/env}"
+if [ -f "\$env_file" ]; then
+  set -a
+  source "\$env_file"
+  set +a
+fi
+if [ -n "\$worker_env_b64" ]; then
+  eval "\$(printf '%s' "\$worker_env_b64" | base64 -d)"
+fi
+read_secret_if_unset() {
+  local name="\$1"
+  local file="\$2"
+  if [ -z "\${!name:-}" ] && [ -f "\$file" ]; then
+    export "\$name=\$(cat "\$file")"
+  fi
+}
+secret_dir="\${LOCALITY_LAUNCH_READINESS_SECRET_DIR:-\$HOME/.config/locality-launch-readiness/mcp}"
+if [ "\$strategy" = "notion-mcp" ]; then
+  read_secret_if_unset LINEAR_API_KEY "\$secret_dir/linear-api-key"
+  if [ -z "\${NOTION_API_TOKEN:-\${NOTION_TOKEN:-\${NOTION_ACCESS_TOKEN:-}}}" ] && [ -f "\$secret_dir/notion-token" ]; then
+    export NOTION_API_TOKEN="\$(cat "\$secret_dir/notion-token")"
+  fi
+  read_secret_if_unset SLACK_BOT_TOKEN "\$secret_dir/slack-bot-token"
+  read_secret_if_unset SLACK_TEAM_ID "\$secret_dir/slack-team-id"
+  read_secret_if_unset SLACK_CHANNEL_IDS "\$secret_dir/slack-channel-ids"
+fi
+if [ "\$strategy" = "locality" ]; then
+  if [ ! -x "\$loc_bin" ]; then
+    if command -v loc >/dev/null 2>&1; then
+      loc_bin="\$(command -v loc)"
+    else
+      echo "installed loc is required for Locality runs; not executable or not found: \$loc_bin" >&2
+      printf '\n__AMIKA_REMOTE_RC__=127\n'
+      exit 0
+    fi
+  fi
+fi
+export RUN_ID="\$run_id"
+export REPO_DIR="\$repo_dir"
+export OUT_DIR="\$out_dir"
+export CODEX_MODEL="\$model"
+export CODEX_REASONING_EFFORT="\$effort"
+export CODEX_EXEC_TIMEOUT_SECONDS="\$timeout_seconds"
+export AGENT_REPORT_PATH="\${AGENT_REPORT_PATH:-/home/amika/final_report.md}"
+if [ "\$strategy" = "locality" ]; then
+  export LOC_BIN="\${LOC_BIN:-\$loc_bin}"
+fi
+cd "\$repo_dir"
+set +e
+"\$repo_dir/experiment/locality-mcp-comparison/run-launch-readiness-benchmark.sh" --strategy "\$strategy" "\${benchmark_args[@]}"
+remote_rc=\$?
+printf '\n__AMIKA_REMOTE_RC__=%s\n' "\$remote_rc"
+exit 0
+REMOTE_TTY_RUN
+)"
+    remote_cmd_b64="$(printf '%s' "$remote_cmd" | base64_one_line)"
+    remote_shell_command="printf %s $(shell_quote "$remote_cmd_b64") | base64 -d | bash"
+    local attempt=1
+    local max_attempts=5
+    local remote_rc
+    while [ "$attempt" -le "$max_attempts" ]; do
+      set +e
+      amika_sandbox_ssh "$sandbox" -- "bash -lc $(shell_quote "$remote_shell_command")" > "$local_dir/$strategy.out" 2> "$local_dir/$strategy.err"
+      local_rc=$?
+      set -e
+      remote_rc="$(sed -n 's/.*__AMIKA_REMOTE_RC__=//p' "$local_dir/$strategy.out" | tr -d '\r' | tail -1)"
+      if [ -n "$remote_rc" ]; then
+        return "$remote_rc"
+      fi
+      if [ "$attempt" -lt "$max_attempts" ]; then
+        printf 'retrying forced-tty launch after missing remote rc marker; attempt=%s rc=%s\n' "$attempt" "$local_rc" >> "$local_dir/$strategy.err"
+        sleep "$attempt"
+      fi
+      attempt=$((attempt + 1))
+    done
+    return "$local_rc"
+  fi
 
   script="$(cat <<'REMOTE_RUN'
 set -euo pipefail
@@ -278,93 +644,69 @@ timeout_seconds="$7"
 loc_bin="$8"
 worker_env_b64="$9"
 shift 9
+echo "remote_launch stage=args strategy=$strategy" >&2
 
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 
 env_file="${LOCALITY_EXPERIMENT_ENV:-$HOME/.config/locality-experiment/env}"
 if [ -f "$env_file" ]; then
+  echo "remote_launch stage=source_env" >&2
   set -a
   # shellcheck disable=SC1090
   source "$env_file"
   set +a
 fi
 if [ -n "$worker_env_b64" ]; then
+  echo "remote_launch stage=eval_forwarded_env" >&2
   eval "$(printf '%s' "$worker_env_b64" | base64 -d)"
 fi
+echo "remote_launch stage=env_ready" >&2
+
+read_secret_if_unset() {
+  local name="$1"
+  local file="$2"
+  if [ -z "${!name:-}" ] && [ -f "$file" ]; then
+    export "$name=$(cat "$file")"
+  fi
+}
 
 secret_dir="${LOCALITY_LAUNCH_READINESS_SECRET_DIR:-$HOME/.config/locality-launch-readiness/mcp}"
-notion_token_file="${NOTION_API_TOKEN_FILE:-$secret_dir/notion-token}"
-linear_key_file="${LINEAR_API_KEY_FILE:-$secret_dir/linear-api-key}"
-slack_bot_token_file="${SLACK_BOT_TOKEN_FILE:-$secret_dir/slack-bot-token}"
-slack_team_id_file="${SLACK_TEAM_ID_FILE:-$secret_dir/slack-team-id}"
-slack_channel_ids_file="${SLACK_CHANNEL_IDS_FILE:-$secret_dir/slack-channel-ids}"
-
-if [ -z "${AZURE_OPENAI_API_KEY:-}" ]; then
-  echo "AZURE_OPENAI_API_KEY is missing in $env_file or the sandbox environment" >&2
-  exit 2
-fi
-
 if [ "$strategy" = "notion-mcp" ]; then
-  if [ -z "${LINEAR_API_KEY:-}" ] && [ -f "$linear_key_file" ]; then
-    export LINEAR_API_KEY="$(cat "$linear_key_file")"
+  read_secret_if_unset LINEAR_API_KEY "$secret_dir/linear-api-key"
+  if [ -z "${NOTION_API_TOKEN:-${NOTION_TOKEN:-${NOTION_ACCESS_TOKEN:-}}}" ] && [ -f "$secret_dir/notion-token" ]; then
+    export NOTION_API_TOKEN="$(cat "$secret_dir/notion-token")"
   fi
-  if [ -z "${NOTION_API_TOKEN:-${NOTION_TOKEN:-${NOTION_ACCESS_TOKEN:-}}}" ] && [ -f "$notion_token_file" ]; then
-    export NOTION_API_TOKEN="$(cat "$notion_token_file")"
-  fi
-  if [ -z "${SLACK_BOT_TOKEN:-}" ] && [ -f "$slack_bot_token_file" ]; then
-    export SLACK_BOT_TOKEN="$(cat "$slack_bot_token_file")"
-  fi
-  if [ -z "${SLACK_TEAM_ID:-}" ] && [ -f "$slack_team_id_file" ]; then
-    export SLACK_TEAM_ID="$(cat "$slack_team_id_file")"
-  fi
-  if [ -z "${SLACK_CHANNEL_IDS:-}" ] && [ -f "$slack_channel_ids_file" ]; then
-    export SLACK_CHANNEL_IDS="$(cat "$slack_channel_ids_file")"
-  fi
+  read_secret_if_unset SLACK_BOT_TOKEN "$secret_dir/slack-bot-token"
+  read_secret_if_unset SLACK_TEAM_ID "$secret_dir/slack-team-id"
+  read_secret_if_unset SLACK_CHANNEL_IDS "$secret_dir/slack-channel-ids"
 fi
 
 if [ "$strategy" = "locality" ]; then
+  echo "remote_launch stage=loc_check" >&2
   if [ ! -x "$loc_bin" ]; then
     if command -v loc >/dev/null 2>&1; then
       loc_bin="$(command -v loc)"
     else
-      echo "loc binary is not executable: $loc_bin" >&2
+      echo "installed loc is required for Locality runs; not executable or not found: $loc_bin" >&2
       exit 127
     fi
   fi
-  if [ "${LOCALITY_USE_EXISTING_STATE:-0}" = "1" ]; then
-    export LOCALITY_STATE_DIR="${LOCALITY_STATE_DIR:-$HOME/.loc}"
-    "$loc_bin" connections --json >/dev/null 2>&1 ||
-      { echo "existing Locality state is not readable at LOCALITY_STATE_DIR=$LOCALITY_STATE_DIR" >&2; exit 2; }
-  elif [ -z "${LOCALITY_STATE_DIR:-}" ]; then
-    if [ ! -f "$notion_token_file" ]; then
-      echo "missing $notion_token_file; set LOCALITY_STATE_DIR or provide a Notion token file" >&2
-      exit 2
-    fi
-    export LOCALITY_STATE_DIR="$out_dir/loc-state"
-    export LOCALITY_CREDENTIAL_STORE="${LOCALITY_CREDENTIAL_STORE:-file}"
-    mkdir -p "$LOCALITY_STATE_DIR" "$out_dir/mount/notion"
-    if ! "$loc_bin" connect notion --name launch-readiness --token-stdin < "$notion_token_file" >/dev/null; then
-      "$loc_bin" connections --json 2>/dev/null | grep -F -q '"launch-readiness"' ||
-        { echo "could not configure launch-readiness Notion connection" >&2; exit 2; }
-    fi
-    if ! "$loc_bin" mount notion --workspace --connection launch-readiness --mount-id launch-readiness --read-only "$out_dir/mount/notion" >/dev/null; then
-      "$loc_bin" status "$out_dir/mount/notion" --json >/dev/null 2>&1 ||
-        { echo "could not configure launch-readiness Notion mount" >&2; exit 2; }
-    fi
-  fi
 fi
+echo "remote_launch stage=exports" >&2
 
 export RUN_ID="$run_id"
 export REPO_DIR="$repo_dir"
 export OUT_DIR="$out_dir"
-export CODEX_SANDBOX_OUT_DIR="$out_dir"
-export CODEX_SANDBOX_HARDCODED_OUT_DIR="$out_dir"
 export CODEX_MODEL="$model"
 export CODEX_REASONING_EFFORT="$effort"
 export CODEX_EXEC_TIMEOUT_SECONDS="$timeout_seconds"
-export LOC_BIN="${LOC_BIN:-$loc_bin}"
+export AGENT_REPORT_PATH="${AGENT_REPORT_PATH:-/home/amika/final_report.md}"
+if [ "$strategy" = "locality" ]; then
+  export LOC_BIN="${LOC_BIN:-$loc_bin}"
+fi
 
 cd "$repo_dir"
+echo "remote_launch stage=worker" >&2
 "$repo_dir/experiment/locality-mcp-comparison/run-launch-readiness-benchmark.sh" --strategy "$strategy" "$@"
 REMOTE_RUN
 )"
@@ -398,9 +740,28 @@ sync_artifacts() {
   fi
 
   mkdir -p "$dest"
-  ssh_target="$(amika_sandbox_ssh_target "$sandbox")"
   echo "Syncing $strategy artifacts from $sandbox:$remote_out_dir"
+  if [ "$AMIKA_SSH_FORCE_TTY" = "1" ]; then
+    local archive_b64="$LOCAL_OUT_DIR/$sandbox/$strategy-artifacts.tar.gz.b64"
+    local remote_out_dir_q
+    local remote_cmd
+    local ssh_rc
+    mkdir -p "$LOCAL_OUT_DIR/$sandbox"
+    remote_out_dir_q="$(shell_quote "$remote_out_dir")"
+    remote_cmd="set -euo pipefail; cd $remote_out_dir_q; tar -czf - . | base64"
+    set +e
+    amika_sandbox_ssh "$sandbox" -- "bash -lc $(shell_quote "$remote_cmd")" > "$archive_b64"
+    ssh_rc=$?
+    set -e
+    rm -rf "$dest"
+    mkdir -p "$dest"
+    if ! tr -d '\r' < "$archive_b64" | base64 -d | tar -xzf - -C "$dest"; then
+      return "$ssh_rc"
+    fi
+    return
+  fi
 
+  ssh_target="$(amika_sandbox_ssh_target "$sandbox")"
   if command -v rsync >/dev/null 2>&1; then
     rsync -az --delete "$ssh_target:$remote_out_dir/" "$dest/"
   elif command -v scp >/dev/null 2>&1; then
@@ -411,6 +772,17 @@ sync_artifacts() {
   fi
 }
 
+run_launch_strategy_with_args() {
+  local sandbox="$1"
+  local strategy="$2"
+  local remote_out_dir="$3"
+  if [ "${#BENCHMARK_ARGS[@]}" -gt 0 ]; then
+    run_launch_strategy "$sandbox" "$strategy" "$remote_out_dir" "${BENCHMARK_ARGS[@]}"
+  else
+    run_launch_strategy "$sandbox" "$strategy" "$remote_out_dir"
+  fi
+}
+
 {
   printf 'run_id=%s\n' "$RUN_ID"
   printf 'locality_sandbox=%s\n' "$LOCALITY_SANDBOX"
@@ -418,21 +790,32 @@ sync_artifacts() {
   printf 'remote_source_repo=%s\n' "$REMOTE_SOURCE_REPO"
   printf 'remote_worktree=%s\n' "$REMOTE_WORKTREE"
   printf 'remote_loc_bin=%s\n' "$REMOTE_LOC_BIN"
+  printf 'amika_ssh_force_tty=%s\n' "$AMIKA_SSH_FORCE_TTY"
   printf 'benchmark_ref=%s\n' "$BENCHMARK_REF"
   printf 'locality_remote_out_dir=%s\n' "$LOCALITY_REMOTE_OUT_DIR"
   printf 'mcp_remote_out_dir=%s\n' "$MCP_REMOTE_OUT_DIR"
   printf 'codex_model=%s\n' "$CODEX_MODEL"
   printf 'codex_reasoning_effort=%s\n' "$CODEX_REASONING_EFFORT"
   printf 'codex_exec_timeout_seconds=%s\n' "$CODEX_EXEC_TIMEOUT_SECONDS"
+  printf 'sync_local_experiment=%s\n' "$SYNC_LOCAL_EXPERIMENT"
   printf 'sync_artifacts=%s\n' "$SYNC_ARTIFACTS"
+  printf 'benchmark_args='
+  if [ "${#BENCHMARK_ARGS[@]}" -gt 0 ]; then
+    printf '%q ' "${BENCHMARK_ARGS[@]}"
+  fi
+  printf '\n'
 } > "$LOCAL_OUT_DIR/run.env"
 
+load_mcp_credentials_from_zshrc
 prepare_worktree "$LOCALITY_SANDBOX"
 prepare_worktree "$MCP_SANDBOX"
-run_launch_strategy "$LOCALITY_SANDBOX" "locality" "$LOCALITY_REMOTE_OUT_DIR" "$@"
-run_launch_strategy "$MCP_SANDBOX" "notion-mcp" "$MCP_REMOTE_OUT_DIR" "$@"
+sync_local_experiment "$LOCALITY_SANDBOX"
+sync_local_experiment "$MCP_SANDBOX"
+run_launch_strategy_with_args "$LOCALITY_SANDBOX" "locality" "$LOCALITY_REMOTE_OUT_DIR"
+run_launch_strategy_with_args "$MCP_SANDBOX" "notion-mcp" "$MCP_REMOTE_OUT_DIR"
 sync_artifacts "$LOCALITY_SANDBOX" "locality" "$LOCALITY_REMOTE_OUT_DIR"
 sync_artifacts "$MCP_SANDBOX" "notion-mcp" "$MCP_REMOTE_OUT_DIR"
+
 if [ "$SYNC_ARTIFACTS" = "1" ]; then
   python3 "$SCRIPT_DIR/scripts/token-usage-charts.py" "$LOCAL_OUT_DIR/artifacts" "$LOCAL_OUT_DIR/token-usage" >/dev/null
   python3 "$SCRIPT_DIR/scripts/deep-dive-report.py" "$LOCAL_OUT_DIR" "$LOCAL_OUT_DIR/deep-dive.md" >/dev/null
@@ -450,4 +833,5 @@ echo "MCP artifacts: $MCP_SANDBOX:$MCP_REMOTE_OUT_DIR"
 if [ "$SYNC_ARTIFACTS" = "1" ]; then
   echo "Local copies: $LOCAL_OUT_DIR/artifacts/locality and $LOCAL_OUT_DIR/artifacts/notion-mcp"
   echo "Token usage charts: $LOCAL_OUT_DIR/token-usage"
+  echo "Deep-dive report: $LOCAL_OUT_DIR/deep-dive.md"
 fi

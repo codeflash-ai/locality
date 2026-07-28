@@ -2,6 +2,7 @@
 import datetime
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -10,6 +11,15 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - benchmark harness is POSIX today.
     fcntl = None
+
+SENSITIVE_KEY_RE = re.compile(
+    r"(api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|authorization|cookie|bearer)",
+    re.IGNORECASE,
+)
+MAX_TOOL_ARG_STRING_CHARS = 4000
+MAX_TOOL_ARG_LIST_ITEMS = 100
+MAX_TOOL_ARG_DICT_ITEMS = 200
+MAX_TOOL_ARG_DEPTH = 8
 
 
 def main():
@@ -185,12 +195,59 @@ def summarized_tool_payload(payload):
 
     command = tool_input.get("command")
     tool_name = payload.get("tool_name") or "unknown_tool"
-    return {
+    summary = {
         "tool_name": tool_name,
         "tool_call_id": payload.get("tool_use_id"),
         "tool_command": command if isinstance(command, str) else None,
         "command": command if isinstance(command, str) else None,
     }
+    if is_mcp_tool(tool_name):
+        tool_args = sanitize_tool_args(tool_input)
+        summary.update(
+            {
+                "tool_args": tool_args,
+                "tool_args_json": stable_json(tool_args),
+                "tool_args_keys": sorted(str(key) for key in tool_args.keys()),
+            }
+        )
+    return summary
+
+
+def is_mcp_tool(tool_name):
+    return isinstance(tool_name, str) and tool_name.startswith("mcp__")
+
+
+def sanitize_tool_args(value, depth=0):
+    if depth >= MAX_TOOL_ARG_DEPTH:
+        return "[MAX_DEPTH]"
+    if isinstance(value, dict):
+        sanitized = {}
+        for index, key in enumerate(sorted(value.keys(), key=str)):
+            if index >= MAX_TOOL_ARG_DICT_ITEMS:
+                sanitized["__truncated_keys__"] = len(value) - MAX_TOOL_ARG_DICT_ITEMS
+                break
+            key_text = str(key)
+            if SENSITIVE_KEY_RE.search(key_text):
+                sanitized[key_text] = "[REDACTED]"
+            else:
+                sanitized[key_text] = sanitize_tool_args(value[key], depth + 1)
+        return sanitized
+    if isinstance(value, list):
+        items = [sanitize_tool_args(item, depth + 1) for item in value[:MAX_TOOL_ARG_LIST_ITEMS]]
+        if len(value) > MAX_TOOL_ARG_LIST_ITEMS:
+            items.append({"__truncated_items__": len(value) - MAX_TOOL_ARG_LIST_ITEMS})
+        return items
+    if isinstance(value, str):
+        if len(value) > MAX_TOOL_ARG_STRING_CHARS:
+            return value[:MAX_TOOL_ARG_STRING_CHARS] + f"...[truncated {len(value) - MAX_TOOL_ARG_STRING_CHARS} chars]"
+        return value
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return str(value)
+
+
+def stable_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
 def phase_record(

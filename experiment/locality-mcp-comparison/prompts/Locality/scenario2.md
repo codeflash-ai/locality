@@ -1,20 +1,8 @@
-You are running the Locality-backed launch-readiness benchmark.
+You are preparing a launch gate memo for Locality. Find the relevant notionproject context and recent code changes from `~/workspace/locality`, decide what is actually proven, what is still unverified, and what should block launch. Produce a concise Markdown memo.
 
-User prompt:
-Act like you are preparing a launch gate memo for Locality. Find the relevant project context and recent code changes, decide what is actually proven, what is still unverified, and what should block launch. Produce a concise Markdown memo. Do not push anything.
+Do not use direct Notion API tools in this run. Do not create a new notion page or modify existing notion pages.
 
-Use locality, git and gh for your tasks
-
-Do not use Notion MCP or direct Notion API tools in this run.
-Do not create Notion pages/docs, push to Notion, or update any remote source.
-
-Required work:
-1. Write the final Markdown memo to `REPORT_FILE`.
-2. Write a compact trace to `TRACE_FILE` listing:
-   - git and gh commands used
-   - mounted Notion files read
-   - key facts used from Locality context
-   - limitations
+Write the final Markdown report to `/home/amika/final_report.md`.
 
 Report format:
 

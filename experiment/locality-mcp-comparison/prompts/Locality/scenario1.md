@@ -1,29 +1,6 @@
-You are running the Locality-backed launch-readiness benchmark.
+Generate a concise, accurate launch-readiness report for `Locality` from the local git checkout at `~/workspace/locality` plus Notion information exposed as local files at `~/Locality/Notion`.
 
-Goal: generate a concise, accurate launch-readiness report from the local git checkout plus hydrated Notion context exposed as local files by Locality.
-
-Use only these context sources:
-- local git commands in `REPO_DIR`
-- mounted Locality files under the paths listed in `CONTEXT_PATHS_FILE` or `LOCALITY_CONTEXT_PATHS_FILE`
-- `CONTEXT_INVENTORY` or `LOCALITY_CONTEXT_INVENTORY`
-- `CONTEXT_SEARCH_RESULTS` or `LOCALITY_CONTEXT_SEARCH_RESULTS`
-- `GIT_DATA_FILE`
-
-Do not use Notion MCP or direct Notion API tools in this run.
-Do not create Notion pages/docs, push to Notion, or update any remote source.
-
-Required work:
-1. Read `GIT_DATA_FILE`.
-2. Inspect relevant commits with `git show`, `git diff --stat`, and file reads as needed.
-3. Read the hydrated Notion context inventory and search hits.
-4. Open the most relevant mounted `page.md` files to connect git work to launch context.
-5. Read the benchmark case section in the Locality Launch Amika Environment page.
-6. Write the final Markdown report to `REPORT_FILE`.
-7. Write a compact trace to `TRACE_FILE` listing:
-   - git commands used
-   - mounted Notion files read
-   - key facts used from Notion
-   - limitations
+Write the final Markdown report to `/home/amika/final_report.md`. Do not create a new notion page or modify existing notion pages.
 
 Report format:
 

@@ -1,15 +1,8 @@
-You are running the Notion-MCP launch-readiness comparison benchmark.
+Prepare today's engineering update for the team. Look at recent repository work from `~/workspace/locality` and any relevant company context you can access. Summarize what changed, why it matters, risks, blockers, and suggested next actions.
 
-User prompt:
-Prepare today's engineering update for the team. Look at recent repository work and any relevant company context you can access. Summarize what changed, why it matters, risks, blockers, and suggested next actions. Write the result as a Markdown draft. Do not create Notion pages/docs, push or update Notion, or update any remote source.
+Do not use direct Notion API tools in this run. Do not create a new notion page or modify existing notion pages.
 
-Required work:
-1. Write the final Markdown draft to `REPORT_FILE`.
-2. Write a compact trace to `TRACE_FILE` listing:
-   - git commands used
-   - Notion MCP searches/calls attempted
-   - Notion pages or excerpts used
-   - limitations
+Write the final Markdown report to `/home/amika/final_report.md`.
 
 Report format:
 
@@ -25,4 +18,4 @@ Report format:
 
 ## Evidence Notes
 
-The update should be concise, specific, and grounded in evidence. If a claim cannot be verified from git or Notion MCP context, say so.
+The update should be concise, specific, and grounded in evidence. If a claim cannot be verified from git, gh, or Locality context, say so.
