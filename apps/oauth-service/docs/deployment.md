@@ -20,40 +20,35 @@ wrangler secret put LOCALITY_SLACK_CLIENT_ID
 wrangler secret put LOCALITY_SLACK_CLIENT_SECRET
 ```
 
-Configure the Notion public integration with the exact hosted broker callback
-before deploying `LOCALITY_NOTION_HOSTED_CALLBACK_URI`:
+Register the exact hosted broker callbacks with each provider before deploying
+matching `LOCALITY_<CONNECTOR>_HOSTED_CALLBACK_URI` values:
 
 ```text
 https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/notion/callback
+https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-docs/callback
+https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-calendar/callback
+https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/gmail/callback
+https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/slack/callback
 ```
 
-`LOCALITY_NOTION_HOSTED_CALLBACK_URI` must exactly match the reachable Worker
-callback URL registered in Notion. That can be the `workers.dev` URL above or a
-custom domain such as `https://auth.locality.dev/v1/oauth/notion/callback`.
+The Google OAuth client must include the Google Docs, Google Calendar, and Gmail
+hosted callback URIs. Slack must include the Slack hosted callback URI. Notion
+must include the Notion hosted callback URI. Each hosted variable must exactly
+match the reachable Worker callback URL registered with the provider. That can
+be the `workers.dev` URL above or a custom domain such as
+`https://auth.locality.dev/v1/oauth/notion/callback`.
 
-Keep the local loopback callbacks in the broker allowlist for the CLI handoff:
+Keep the local loopback callbacks in the broker allowlists for the CLI handoff:
 
 ```text
 http://localhost:8757/oauth/notion/callback
 http://127.0.0.1:8757/oauth/notion/callback
-```
-
-Configure one Google OAuth client with the exact localhost callbacks used by
-Locality for Google Docs, Google Calendar, and Gmail:
-
-```text
 http://localhost:8757/oauth/google-docs/callback
 http://127.0.0.1:8757/oauth/google-docs/callback
 http://localhost:8757/oauth/google-calendar/callback
 http://127.0.0.1:8757/oauth/google-calendar/callback
 http://localhost:8757/oauth/gmail/callback
 http://127.0.0.1:8757/oauth/gmail/callback
-```
-
-Configure the Slack OAuth app with the exact localhost callbacks used by
-Locality:
-
-```text
 http://localhost:8757/oauth/slack/callback
 http://127.0.0.1:8757/oauth/slack/callback
 ```
@@ -87,12 +82,15 @@ Optional broker environment overrides for connector local testing:
 
 ```text
 LOCALITY_GOOGLE_CALENDAR_REDIRECT_URIS=http://localhost:8757/oauth/google-calendar/callback,http://127.0.0.1:8757/oauth/google-calendar/callback
+LOCALITY_GOOGLE_CALENDAR_HOSTED_CALLBACK_URI=https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-calendar/callback
 LOCALITY_GOOGLE_CALENDAR_AUTH_BASE_URL=https://accounts.google.com
 LOCALITY_GOOGLE_CALENDAR_API_BASE_URL=https://oauth2.googleapis.com
 LOCALITY_GMAIL_REDIRECT_URIS=http://localhost:8757/oauth/gmail/callback,http://127.0.0.1:8757/oauth/gmail/callback
+LOCALITY_GMAIL_HOSTED_CALLBACK_URI=https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/gmail/callback
 LOCALITY_GMAIL_AUTH_BASE_URL=https://accounts.google.com
 LOCALITY_GMAIL_API_BASE_URL=https://oauth2.googleapis.com
 LOCALITY_SLACK_REDIRECT_URIS=http://localhost:8757/oauth/slack/callback,http://127.0.0.1:8757/oauth/slack/callback
+LOCALITY_SLACK_HOSTED_CALLBACK_URI=https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/slack/callback
 LOCALITY_SLACK_AUTH_BASE_URL=https://slack.com
 LOCALITY_SLACK_API_BASE_URL=https://slack.com/api
 ```

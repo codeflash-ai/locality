@@ -56,16 +56,13 @@ Deployment controls to add before public launch:
 
 ## Redirects
 
-The broker keeps two Notion redirect boundaries separate:
+The broker keeps two redirect boundaries separate for every OAuth connector:
 
-- `LOCALITY_NOTION_REDIRECT_URIS` is a loopback-only allowlist for local CLI callbacks such as `http://localhost:8757/oauth/notion/callback`.
-- `LOCALITY_NOTION_HOSTED_CALLBACK_URI` is one exact HTTPS callback served by this broker at `/v1/oauth/notion/callback`.
+- `LOCALITY_<CONNECTOR>_REDIRECT_URIS` is a loopback-only allowlist for local callbacks such as `http://localhost:8757/oauth/gmail/callback`.
+- `LOCALITY_<CONNECTOR>_HOSTED_CALLBACK_URI` is one exact HTTPS callback served by this broker at the connector's `/v1/oauth/<connector>/callback` path.
 
-When hosted handoff is enabled, the Notion authorization request uses the hosted
-callback URI. The callback route verifies a signed state payload before
+When hosted handoff is enabled, the provider authorization request uses the
+hosted callback URI. The callback route verifies a signed state payload before
 redirecting to a loopback URI from the allowlist. The token exchange also uses
 the hosted callback URI so the provider sees the same redirect URI in both OAuth
 steps.
-
-Google Docs, Google Calendar, Gmail, and Slack continue to accept only their
-configured loopback callback URLs in this implementation.

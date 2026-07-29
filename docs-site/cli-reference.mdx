@@ -30,7 +30,7 @@ loc push --json <path> -y
 
 | Task | Commands | Use when |
 | --- | --- | --- |
-| Connect accounts | `connect`, `connections`, `profiles`, `connection show`, `disconnect` | You need to authenticate Notion or Google Docs and inspect saved connection metadata. |
+| Connect accounts | `connect`, `connections`, `profiles`, `connection show`, `disconnect` | You need to authenticate Notion, Google Docs, Google Calendar, Gmail, or Slack and inspect saved connection metadata. |
 | Register local files | `mount notion`, `mount google-docs`, `file-provider register`, `pull` | You want a remote workspace to appear as local Markdown. |
 | Navigate mounted content | `search`, `info`, `status`, `inspect` | You need to find content or understand what Locality knows about a path. |
 | Review sync state | `status`, `diff`, `pull`, `push`, `restore`, `log`, `undo` | You are deciding whether to update local files or write local edits back to the source. |
@@ -128,6 +128,8 @@ loc connect google-docs [--name <id>] [--no-browser] [--broker-url <url>] [--red
 Use this before mounting a Google Drive workspace folder that contains Google
 Docs. Non-Google-Docs Drive files are ignored by the Google Docs connector.
 
+The default broker is `https://afs-oauth-broker.saurabh-b07.workers.dev`; override it with `--broker-url <url>`, `LOCALITY_GOOGLE_DOCS_OAUTH_BROKER_URL`, or `LOCALITY_AUTH_BROKER_URL`. The default local callback is `http://localhost:8757/oauth/google-docs/callback`; override it with `--redirect-uri <uri>` or `LOCALITY_GOOGLE_DOCS_OAUTH_REDIRECT_URI`. In production the broker may use its own HTTPS provider callback registered on the provider app, then hand the browser back to the local callback. The command still stores the resulting OAuth credential locally.
+
 Key arguments:
 
 | Argument | Meaning |
@@ -141,6 +143,87 @@ Example:
 
 ```bash
 loc connect google-docs --name google-docs-default
+```
+
+### `loc connect google-calendar`
+
+Connect Google Calendar through the Locality OAuth broker.
+
+```bash
+loc connect google-calendar [--name <id>] [--no-browser] [--broker-url <url>] [--redirect-uri <uri>]
+```
+
+Use this before mounting primary-calendar events.
+
+The default broker is `https://afs-oauth-broker.saurabh-b07.workers.dev`; override it with `--broker-url <url>`, `LOCALITY_GOOGLE_CALENDAR_OAUTH_BROKER_URL`, or `LOCALITY_AUTH_BROKER_URL`. The default local callback is `http://localhost:8757/oauth/google-calendar/callback`; override it with `--redirect-uri <uri>` or `LOCALITY_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI`. In production the broker may use its own HTTPS provider callback registered on the provider app, then hand the browser back to the local callback. The command still stores the resulting OAuth credential locally.
+
+Key arguments:
+
+| Argument | Meaning |
+| --- | --- |
+| `--name <id>` | Connection id to save. Runtime default is `google-calendar-default` when no active Google Calendar connection exists; pass an explicit name for reproducible setup. |
+| `--no-browser` | Print the OAuth URL instead of opening it. |
+| `--broker-url <url>` | Override the OAuth broker base URL. |
+| `--redirect-uri <uri>` | Override the local callback URI. |
+
+Example:
+
+```bash
+loc connect google-calendar --name google-calendar-default
+```
+
+### `loc connect gmail`
+
+Connect Gmail through the Locality OAuth broker.
+
+```bash
+loc connect gmail [--name <id>] [--no-browser] [--broker-url <url>] [--redirect-uri <uri>]
+```
+
+Use this before mounting Gmail inbox, sent, and draft folders.
+
+The default broker is `https://afs-oauth-broker.saurabh-b07.workers.dev`; override it with `--broker-url <url>`, `LOCALITY_GMAIL_OAUTH_BROKER_URL`, or `LOCALITY_AUTH_BROKER_URL`. The default local callback is `http://localhost:8757/oauth/gmail/callback`; override it with `--redirect-uri <uri>` or `LOCALITY_GMAIL_OAUTH_REDIRECT_URI`. In production the broker may use its own HTTPS provider callback registered on the provider app, then hand the browser back to the local callback. The command still stores the resulting OAuth credential locally.
+
+Key arguments:
+
+| Argument | Meaning |
+| --- | --- |
+| `--name <id>` | Connection id to save. Runtime default is `gmail-default` when no active Gmail connection exists; pass an explicit name for reproducible setup. |
+| `--no-browser` | Print the OAuth URL instead of opening it. |
+| `--broker-url <url>` | Override the OAuth broker base URL. |
+| `--redirect-uri <uri>` | Override the local callback URI. |
+
+Example:
+
+```bash
+loc connect gmail --name gmail-default
+```
+
+### `loc connect slack`
+
+Connect Slack through the Locality OAuth broker.
+
+```bash
+loc connect slack [--name <id>] [--no-browser] [--broker-url <url>] [--redirect-uri <uri>]
+```
+
+Use this before mounting Slack conversation history.
+
+The default broker is `https://afs-oauth-broker.saurabh-b07.workers.dev`; override it with `--broker-url <url>`, `LOCALITY_SLACK_OAUTH_BROKER_URL`, or `LOCALITY_AUTH_BROKER_URL`. The default local callback is `http://localhost:8757/oauth/slack/callback`; override it with `--redirect-uri <uri>` or `LOCALITY_SLACK_OAUTH_REDIRECT_URI`. In production the broker may use its own HTTPS provider callback registered on the provider app, then hand the browser back to the local callback. The command still stores the resulting OAuth credential locally.
+
+Key arguments:
+
+| Argument | Meaning |
+| --- | --- |
+| `--name <id>` | Connection id to save. Runtime default is `slack-default` when no active Slack connection exists; pass an explicit name for reproducible setup. |
+| `--no-browser` | Print the OAuth URL instead of opening it. |
+| `--broker-url <url>` | Override the OAuth broker base URL. |
+| `--redirect-uri <uri>` | Override the local callback URI. |
+
+Example:
+
+```bash
+loc connect slack --name slack-default
 ```
 
 ### Inspect and remove connections

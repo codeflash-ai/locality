@@ -59,25 +59,40 @@ Response:
 }
 ```
 
-When `LOCALITY_NOTION_HOSTED_CALLBACK_URI` is set, `redirect_uri` remains the local loopback URI where the CLI listens. `authorization_redirect_uri` and `exchange_redirect_uri` are the HTTPS provider callback URI registered with Notion. The browser first returns to the broker callback, and the broker redirects the browser to `redirect_uri` with the provider code or error. The CLI then exchanges the code using `exchange_redirect_uri`, so Notion sees the same redirect URI during authorization and token exchange.
+When `LOCALITY_<CONNECTOR>_HOSTED_CALLBACK_URI` is set, `redirect_uri`
+remains the local loopback URI where the client listens.
+`authorization_redirect_uri` and `exchange_redirect_uri` are the HTTPS provider
+callback URI registered with the provider. The browser first returns to the
+broker callback, and the broker redirects the browser to `redirect_uri` with the
+provider code or error. The client then exchanges the code using
+`exchange_redirect_uri`, so the provider sees the same redirect URI during
+authorization and token exchange.
 
-### `GET /v1/oauth/notion/callback`
+### `GET /v1/oauth/<connector>/callback`
 
-This browser-facing route is used only when `LOCALITY_NOTION_HOSTED_CALLBACK_URI`
-is configured. It accepts Notion's `code` and `state`, verifies the signed
-local-handoff state, and returns `303 See Other` to the loopback callback held
-inside that state.
+Hosted callback routes exist for:
+
+- `/v1/oauth/notion/callback`
+- `/v1/oauth/google-docs/callback`
+- `/v1/oauth/google-calendar/callback`
+- `/v1/oauth/gmail/callback`
+- `/v1/oauth/slack/callback`
+
+These browser-facing routes are used only when the corresponding
+`LOCALITY_<CONNECTOR>_HOSTED_CALLBACK_URI` is configured. A route accepts
+provider `code` and `state`, verifies the signed local-handoff state, and
+returns `303 See Other` to the loopback callback held inside that state.
 
 Success redirects to:
 
 ```text
-http://localhost:8757/oauth/notion/callback?state=...&code=...
+http://localhost:8757/oauth/<connector>/callback?state=...&code=...
 ```
 
 Provider denial redirects to:
 
 ```text
-http://localhost:8757/oauth/notion/callback?state=...&error=access_denied&error_description=...
+http://localhost:8757/oauth/<connector>/callback?state=...&error=access_denied&error_description=...
 ```
 
 The route sets `Cache-Control: no-store` and `Referrer-Policy: no-referrer`.
@@ -131,8 +146,10 @@ Response:
   "client_id": "public-client-id",
   "authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?...",
   "redirect_uri": "http://localhost:8757/oauth/google-docs/callback",
+  "authorization_redirect_uri": "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-docs/callback",
+  "exchange_redirect_uri": "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-docs/callback",
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-local-handoff-state",
   "expires_in": 600
 }
 ```
@@ -144,11 +161,14 @@ Request:
 ```json
 {
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-local-handoff-state",
   "code": "provider-authorization-code",
-  "redirect_uri": "http://localhost:8757/oauth/google-docs/callback"
+  "redirect_uri": "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-docs/callback"
 }
 ```
+
+Clients should send the returned `exchange_redirect_uri`; without hosted
+handoff, this remains the local loopback redirect.
 
 Response includes the Google OAuth access token, granted scopes, optional ID
 token, and either `refresh_token_handle` or `refresh_token`, depending on
@@ -187,8 +207,10 @@ Response:
   "client_id": "public-client-id",
   "authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?...",
   "redirect_uri": "http://localhost:8757/oauth/google-calendar/callback",
+  "authorization_redirect_uri": "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-calendar/callback",
+  "exchange_redirect_uri": "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-calendar/callback",
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-local-handoff-state",
   "expires_in": 600
 }
 ```
@@ -200,11 +222,14 @@ Request:
 ```json
 {
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-local-handoff-state",
   "code": "provider-authorization-code",
-  "redirect_uri": "http://localhost:8757/oauth/google-calendar/callback"
+  "redirect_uri": "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-calendar/callback"
 }
 ```
+
+Clients should send the returned `exchange_redirect_uri`; without hosted
+handoff, this remains the local loopback redirect.
 
 Response includes the Google OAuth access token for Calendar event scopes,
 granted scopes, optional ID token, `workspace_id: "primary"`,
@@ -239,8 +264,10 @@ Response:
   "client_id": "public-client-id",
   "authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?...",
   "redirect_uri": "http://localhost:8757/oauth/gmail/callback",
+  "authorization_redirect_uri": "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/gmail/callback",
+  "exchange_redirect_uri": "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/gmail/callback",
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-local-handoff-state",
   "expires_in": 600
 }
 ```
@@ -252,11 +279,14 @@ Request:
 ```json
 {
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-local-handoff-state",
   "code": "provider-authorization-code",
-  "redirect_uri": "http://localhost:8757/oauth/gmail/callback"
+  "redirect_uri": "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/gmail/callback"
 }
 ```
+
+Clients should send the returned `exchange_redirect_uri`; without hosted
+handoff, this remains the local loopback redirect.
 
 Response includes the Google OAuth access token for Gmail read/compose scopes,
 granted scopes, optional ID token, and either `refresh_token_handle` or
@@ -290,8 +320,10 @@ Response:
   "client_id": "public-client-id",
   "authorization_url": "https://slack.com/oauth/v2/authorize?...",
   "redirect_uri": "http://localhost:8757/oauth/slack/callback",
+  "authorization_redirect_uri": "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/slack/callback",
+  "exchange_redirect_uri": "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/slack/callback",
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-local-handoff-state",
   "expires_in": 600
 }
 ```
@@ -303,11 +335,14 @@ Request:
 ```json
 {
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-local-handoff-state",
   "code": "provider-authorization-code",
-  "redirect_uri": "http://localhost:8757/oauth/slack/callback"
+  "redirect_uri": "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/slack/callback"
 }
 ```
+
+Clients should send the returned `exchange_redirect_uri`; without hosted
+handoff, this remains the local loopback redirect.
 
 Response includes the Slack OAuth access token, granted read-only scopes,
 workspace identifiers, bot user ID, and either `refresh_token_handle` or
@@ -351,7 +386,7 @@ npm run check
 Optional connector overrides:
 
 - `LOCALITY_NOTION_REDIRECT_URIS`, `LOCALITY_GOOGLE_DOCS_REDIRECT_URIS`, `LOCALITY_GOOGLE_CALENDAR_REDIRECT_URIS`, `LOCALITY_GMAIL_REDIRECT_URIS`, `LOCALITY_SLACK_REDIRECT_URIS`: comma-separated allowed loopback redirect URIs.
-- `LOCALITY_NOTION_HOSTED_CALLBACK_URI`: exact HTTPS broker callback URI registered with the Notion public integration for hosted local handoff.
+- `LOCALITY_NOTION_HOSTED_CALLBACK_URI`, `LOCALITY_GOOGLE_DOCS_HOSTED_CALLBACK_URI`, `LOCALITY_GOOGLE_CALENDAR_HOSTED_CALLBACK_URI`, `LOCALITY_GMAIL_HOSTED_CALLBACK_URI`, `LOCALITY_SLACK_HOSTED_CALLBACK_URI`: exact HTTPS broker callback URI registered with the provider app for hosted local handoff.
 - `LOCALITY_NOTION_AUTH_BASE_URL`, `LOCALITY_GOOGLE_DOCS_AUTH_BASE_URL`, `LOCALITY_GOOGLE_CALENDAR_AUTH_BASE_URL`, `LOCALITY_GMAIL_AUTH_BASE_URL`, `LOCALITY_SLACK_AUTH_BASE_URL`: provider authorization base URL.
 - `LOCALITY_NOTION_API_BASE_URL`, `LOCALITY_GOOGLE_DOCS_API_BASE_URL`, `LOCALITY_GOOGLE_CALENDAR_API_BASE_URL`, `LOCALITY_GMAIL_API_BASE_URL`, `LOCALITY_SLACK_API_BASE_URL`: provider token API base URL.
 
