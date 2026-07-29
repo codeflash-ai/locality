@@ -24,6 +24,19 @@ assert_not_contains() {
   fi
 }
 
+assert_png() {
+  local path="$1"
+  test -s "$path" || fail "missing PNG ${path}"
+  python3 - "$path" <<'PY' || fail "invalid PNG ${path}"
+import sys
+from pathlib import Path
+
+data = Path(sys.argv[1]).read_bytes()
+if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+    raise SystemExit(1)
+PY
+}
+
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/loc-launch-readiness-mcp-test.XXXXXX")"
 cleanup() {
   rm -rf "$tmp_root"
@@ -253,19 +266,29 @@ test -s "${out_dir}/scenarios/scenario2/notion-mcp-speedscope.json" || fail "mis
 test -s "${out_dir}/scenarios/scenario2/notion-mcp.perfetto.json" || fail "missing MCP Perfetto profile"
 assert_contains "${out_dir}/summary.json" "profile_artifacts"
 test -s "${out_dir}/token-usage/average.svg" || fail "missing token usage average chart"
+assert_png "${out_dir}/token-usage/average.png"
 test -s "${out_dir}/token-usage/cost/average.svg" || fail "missing token cost average chart"
+assert_png "${out_dir}/token-usage/cost/average.png"
 test -s "${out_dir}/token-usage/token-usage.tsv" || fail "missing token usage TSV"
 test -s "${out_dir}/token-usage/cost-usage.tsv" || fail "missing token cost TSV"
 find "${out_dir}/token-usage/by-trial-scenario" -name '*scenario2.svg' -print -quit | grep -q . ||
   fail "missing scenario2 token usage chart"
+scenario_token_png="$(find "${out_dir}/token-usage/by-trial-scenario" -name '*scenario2.png' -print -quit)"
+test -n "$scenario_token_png" || fail "missing scenario2 token usage PNG chart"
+assert_png "$scenario_token_png"
 find "${out_dir}/token-usage/cost/by-trial-scenario" -name '*scenario2.svg' -print -quit | grep -q . ||
   fail "missing scenario2 token cost chart"
+scenario_cost_png="$(find "${out_dir}/token-usage/cost/by-trial-scenario" -name '*scenario2.png' -print -quit)"
+test -n "$scenario_cost_png" || fail "missing scenario2 token cost PNG chart"
+assert_png "$scenario_cost_png"
 assert_contains "${out_dir}/token-usage/average.svg" "Average Token Usage"
 assert_contains "${out_dir}/token-usage/cost/average.svg" "Average Token Cost"
 assert_contains "${out_dir}/token-usage/token-usage.tsv" "fresh_input_tokens"
 assert_contains "${out_dir}/token-usage/cost-usage.tsv" "fresh_input_cost_usd"
 assert_contains "${out_dir}/token-usage/token-usage.tsv" "notion-mcp"
 assert_contains "${out_dir}/token-usage/cost-usage.tsv" "notion-mcp"
+assert_contains "${out_dir}/token-usage/token-usage.json" '"average_chart_png"'
+assert_contains "${out_dir}/token-usage/token-usage.json" '"cost_chart_png"'
 
 scenario1_out_dir="${tmp_root}/out-scenario1"
 PATH="${fake_bin}:$PATH" \
@@ -387,10 +410,13 @@ python3 "${ROOT}/experiment/locality-mcp-comparison/scripts/token-usage-charts.p
   "$split_token_root" "$split_token_root/token-usage" >/dev/null
 test -s "$split_token_root/token-usage/by-trial-scenario/run1__scenario1.svg" ||
   fail "missing split token usage scenario chart"
+assert_png "$split_token_root/token-usage/by-trial-scenario/run1__scenario1.png"
 test -s "$split_token_root/token-usage/average.svg" ||
   fail "missing split token usage average chart"
+assert_png "$split_token_root/token-usage/average.png"
 test -s "$split_token_root/token-usage/cost/average.svg" ||
   fail "missing split token cost average chart"
+assert_png "$split_token_root/token-usage/cost/average.png"
 assert_contains "$split_token_root/token-usage/token-usage.tsv" "run1"$'\t'"scenario1"$'\t'"locality"$'\t'"40"$'\t'"60"
 assert_contains "$split_token_root/token-usage/token-usage.tsv" "run1"$'\t'"scenario1"$'\t'"notion-mcp"$'\t'"150"$'\t'"50"
 assert_contains "$split_token_root/token-usage/cost-usage.tsv" "fresh_input_cost_usd"
@@ -398,5 +424,6 @@ assert_contains "$split_token_root/token-usage/cost-usage.tsv" "notion-mcp"
 assert_contains "$split_token_root/token-usage/cost/average.svg" "Average Token Cost"
 assert_contains "$split_token_root/token-usage/token-usage.json" '"paired_trial_scenario_count": 1'
 assert_contains "$split_token_root/token-usage/token-usage.json" '"pricing_usd_per_1m_tokens"'
+assert_contains "$split_token_root/token-usage/token-usage.json" '"chart_png"'
 
 printf 'launch readiness MCP config tests passed\n'

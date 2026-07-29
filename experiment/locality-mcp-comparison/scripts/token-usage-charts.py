@@ -4,7 +4,9 @@ import html
 import json
 import os
 import re
+import struct
 import sys
+import zlib
 from pathlib import Path
 
 
@@ -42,7 +44,7 @@ PRICING_ENV = {
 def usage() -> None:
     print(
         "usage: token-usage-charts.py <run-or-runs-root> [out-dir]\n"
-        "writes stacked token and cost SVGs, TSV data, token-usage.json, and index.md",
+        "writes stacked token and cost SVG/PNG charts, TSV data, token-usage.json, and index.md",
         file=sys.stderr,
     )
 
@@ -180,6 +182,226 @@ def fmt_usd(value: float) -> str:
     return "$0"
 
 
+FONT_5X7 = {
+    " ": ["...", "...", "...", "...", "...", "...", "..."],
+    "!": [".#.", ".#.", ".#.", ".#.", ".#.", "...", ".#."],
+    "$": [".###.", "#.#..", "#.#..", ".###.", "..#.#", "..#.#", ".###."],
+    "(": ["..#.", ".#..", "#...", "#...", "#...", ".#..", "..#."],
+    ")": ["#...", ".#..", "..#.", "..#.", "..#.", ".#..", "#..."],
+    ",": ["...", "...", "...", "...", "...", ".#.", "#.."],
+    "-": [".....", ".....", ".....", "####.", ".....", ".....", "....."],
+    ".": ["...", "...", "...", "...", "...", ".#.", ".#."],
+    "/": ["....#", "...#.", "..#..", ".#...", "#....", ".....", "....."],
+    ":": ["...", ".#.", ".#.", "...", ".#.", ".#.", "..."],
+    "?": [".###.", "#...#", "....#", "...#.", "..#..", ".....", "..#.."],
+    "_": [".....", ".....", ".....", ".....", ".....", ".....", "#####"],
+    "0": [".###.", "#...#", "#..##", "#.#.#", "##..#", "#...#", ".###."],
+    "1": ["..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###."],
+    "2": [".###.", "#...#", "....#", "...#.", "..#..", ".#...", "#####"],
+    "3": ["####.", "....#", "...#.", "..##.", "....#", "#...#", ".###."],
+    "4": ["...#.", "..##.", ".#.#.", "#..#.", "#####", "...#.", "...#."],
+    "5": ["#####", "#....", "####.", "....#", "....#", "#...#", ".###."],
+    "6": [".###.", "#...#", "#....", "####.", "#...#", "#...#", ".###."],
+    "7": ["#####", "....#", "...#.", "..#..", ".#...", ".#...", ".#..."],
+    "8": [".###.", "#...#", "#...#", ".###.", "#...#", "#...#", ".###."],
+    "9": [".###.", "#...#", "#...#", ".####", "....#", "#...#", ".###."],
+    "A": [".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"],
+    "B": ["####.", "#...#", "#...#", "####.", "#...#", "#...#", "####."],
+    "C": [".###.", "#...#", "#....", "#....", "#....", "#...#", ".###."],
+    "D": ["####.", "#...#", "#...#", "#...#", "#...#", "#...#", "####."],
+    "E": ["#####", "#....", "#....", "####.", "#....", "#....", "#####"],
+    "F": ["#####", "#....", "#....", "####.", "#....", "#....", "#...."],
+    "G": [".###.", "#...#", "#....", "#.###", "#...#", "#...#", ".###."],
+    "H": ["#...#", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"],
+    "I": ["#####", "..#..", "..#..", "..#..", "..#..", "..#..", "#####"],
+    "J": ["..###", "...#.", "...#.", "...#.", "...#.", "#..#.", ".##.."],
+    "K": ["#...#", "#..#.", "#.#..", "##...", "#.#..", "#..#.", "#...#"],
+    "L": ["#....", "#....", "#....", "#....", "#....", "#....", "#####"],
+    "M": ["#...#", "##.##", "#.#.#", "#...#", "#...#", "#...#", "#...#"],
+    "N": ["#...#", "##..#", "#.#.#", "#..##", "#...#", "#...#", "#...#"],
+    "O": [".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."],
+    "P": ["####.", "#...#", "#...#", "####.", "#....", "#....", "#...."],
+    "Q": [".###.", "#...#", "#...#", "#...#", "#.#.#", "#..#.", ".##.#"],
+    "R": ["####.", "#...#", "#...#", "####.", "#.#..", "#..#.", "#...#"],
+    "S": [".####", "#....", "#....", ".###.", "....#", "....#", "####."],
+    "T": ["#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.."],
+    "U": ["#...#", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."],
+    "V": ["#...#", "#...#", "#...#", "#...#", "#...#", ".#.#.", "..#.."],
+    "W": ["#...#", "#...#", "#...#", "#...#", "#.#.#", "##.##", "#...#"],
+    "X": ["#...#", "#...#", ".#.#.", "..#..", ".#.#.", "#...#", "#...#"],
+    "Y": ["#...#", "#...#", ".#.#.", "..#..", "..#..", "..#..", "..#.."],
+    "Z": ["#####", "....#", "...#.", "..#..", ".#...", "#....", "#####"],
+}
+
+
+def parse_color(value: str) -> tuple[int, int, int]:
+    value = value.strip()
+    if not value.startswith("#") or len(value) != 7:
+        raise ValueError(f"unsupported color {value!r}")
+    return tuple(int(value[index : index + 2], 16) for index in (1, 3, 5))
+
+
+def png_chunk(kind: bytes, payload: bytes) -> bytes:
+    return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+
+
+def write_png(path: Path, width: int, height: int, pixels: bytearray) -> None:
+    raw_rows = bytearray()
+    row_width = width * 3
+    for y in range(height):
+        raw_rows.append(0)
+        start = y * row_width
+        raw_rows.extend(pixels[start : start + row_width])
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", ihdr)
+        + png_chunk(b"IDAT", zlib.compress(bytes(raw_rows), 9))
+        + png_chunk(b"IEND", b"")
+    )
+
+
+def fill_rect(pixels: bytearray, width: int, height: int, x: float, y: float, w: float, h: float, color: str) -> None:
+    red, green, blue = parse_color(color)
+    left = max(0, int(round(x)))
+    top = max(0, int(round(y)))
+    right = min(width, int(round(x + w)))
+    bottom = min(height, int(round(y + h)))
+    for py in range(top, bottom):
+        row_offset = py * width * 3
+        for px in range(left, right):
+            offset = row_offset + px * 3
+            pixels[offset : offset + 3] = bytes((red, green, blue))
+
+
+def png_text_width(text: str, scale: int) -> int:
+    width = 0
+    for char in text.upper():
+        glyph = FONT_5X7.get(char, FONT_5X7["?"])
+        width += len(glyph[0]) * scale + scale
+    return max(0, width - scale)
+
+
+def draw_png_text(
+    pixels: bytearray,
+    width: int,
+    height: int,
+    x: float,
+    baseline_y: float,
+    text: str,
+    size: int = 13,
+    anchor: str = "start",
+    weight: str = "400",
+) -> None:
+    scale = 2 if size >= 16 else 1
+    text = text.upper()
+    cursor_x = int(round(x))
+    if anchor == "middle":
+        cursor_x -= png_text_width(text, scale) // 2
+    baseline = int(round(baseline_y))
+    top = baseline - 7 * scale
+    color = "#202124"
+    bold_offsets = (0, 1) if weight != "400" and scale > 1 else (0,)
+
+    for char in text:
+        glyph = FONT_5X7.get(char, FONT_5X7["?"])
+        for row_index, pattern in enumerate(glyph):
+            for col_index, pixel in enumerate(pattern):
+                if pixel != "#":
+                    continue
+                for x_offset in bold_offsets:
+                    fill_rect(
+                        pixels,
+                        width,
+                        height,
+                        cursor_x + col_index * scale + x_offset,
+                        top + row_index * scale,
+                        scale,
+                        scale,
+                        color,
+                    )
+        cursor_x += (len(glyph[0]) + 1) * scale
+
+
+def write_chart_png(
+    path: Path,
+    title: str,
+    rows: dict,
+    components: tuple,
+    total_key: str,
+    formatter,
+    notes: list[str] | None = None,
+) -> None:
+    width = 980
+    height = 320
+    margin_left = 160
+    bar_x = margin_left
+    bar_width = 640
+    bar_height = 38
+    row_gap = 72
+    first_y = 96
+    max_total = max((rows.get(strategy, {}).get(total_key, 0) for strategy in STRATEGIES), default=0) or 1
+    notes = notes or []
+
+    pixels = bytearray(parse_color("#ffffff") * width * height)
+    draw_png_text(pixels, width, height, 24, 34, title, size=18, weight="700")
+
+    legend_x = 24
+    legend_y = 62
+    for key, label, color in components:
+        fill_rect(pixels, width, height, legend_x, legend_y - 11, 12, 12, color)
+        draw_png_text(pixels, width, height, legend_x + 18, legend_y, label, size=12)
+        legend_x += 148
+
+    for index, strategy in enumerate(STRATEGIES):
+        row = rows.get(strategy)
+        y = first_y + index * row_gap
+        label = "MCP" if strategy == "notion-mcp" else "Locality"
+        total = row.get(total_key, 0) if row else 0
+        draw_png_text(pixels, width, height, 24, y + 25, label, size=14, weight="700")
+        fill_rect(pixels, width, height, bar_x, y, bar_width, bar_height, "#f1f3f4")
+        x = bar_x
+        if row:
+            for key, component_label, color in components:
+                value = row.get(key, 0)
+                if value <= 0:
+                    continue
+                segment_width = bar_width * value / max_total
+                fill_rect(pixels, width, height, x, y, segment_width, bar_height, color)
+                if segment_width >= 58:
+                    draw_png_text(
+                        pixels,
+                        width,
+                        height,
+                        x + segment_width / 2,
+                        y + 24,
+                        formatter(value),
+                        size=11,
+                        anchor="middle",
+                        weight="700",
+                    )
+                x += segment_width
+        else:
+            draw_png_text(pixels, width, height, bar_x + 12, y + 24, "missing", size=12)
+        draw_png_text(pixels, width, height, bar_x + bar_width + 18, y + 24, formatter(total), size=13, weight="700")
+
+    axis_y = first_y + 2 * row_gap - 14
+    fill_rect(pixels, width, height, bar_x, axis_y, bar_width, 1, "#dadce0")
+    for tick in range(5):
+        value = max_total * tick / 4
+        x = bar_x + bar_width * tick / 4
+        fill_rect(pixels, width, height, x, axis_y, 1, 5, "#dadce0")
+        draw_png_text(pixels, width, height, x, axis_y + 21, formatter(value), size=11, anchor="middle")
+
+    note_y = height - 48
+    for note in notes[:2]:
+        draw_png_text(pixels, width, height, 24, note_y, note, size=12)
+        note_y += 18
+
+    write_png(path, width, height, pixels)
+
+
 def svg_text(x: float, y: float, text: str, size: int = 13, anchor: str = "start", weight: str = "400") -> str:
     return (
         f'<text x="{x:.1f}" y="{y:.1f}" font-family="Arial, sans-serif" '
@@ -197,6 +419,7 @@ def write_chart(
     formatter,
     notes: list[str] | None = None,
 ) -> None:
+    notes = notes or []
     width = 980
     height = 320
     margin_left = 160
@@ -262,7 +485,6 @@ def write_chart(
         parts.append(f'<line x1="{x:.1f}" y1="{axis_y}" x2="{x:.1f}" y2="{axis_y + 5}" stroke="#dadce0"/>')
         parts.append(svg_text(x, axis_y + 21, formatter(value), size=11, anchor="middle"))
 
-    notes = notes or []
     note_y = height - 48
     for note in notes[:2]:
         parts.append(svg_text(24, note_y, note, size=12))
@@ -270,6 +492,7 @@ def write_chart(
 
     parts.append("</svg>")
     path.write_text("\n".join(parts) + "\n")
+    write_chart_png(path.with_suffix(".png"), title, rows, components, total_key, formatter, notes)
 
 
 summary_paths = sorted(path for path in root.glob("**/summary.json") if is_run_summary(path))
@@ -322,7 +545,9 @@ for (trial, scenario), group in sorted(groups.items()):
         notes,
     )
     group["chart"] = str(chart_path)
+    group["chart_png"] = str(chart_path.with_suffix(".png"))
     group["cost_chart"] = str(cost_chart_path)
+    group["cost_chart_png"] = str(cost_chart_path.with_suffix(".png"))
     if all(strategy in strategies for strategy in STRATEGIES):
         paired_groups.append(group)
     for strategy in STRATEGIES:
@@ -447,7 +672,9 @@ manifest = {
     "trial_scenario_count": len(groups),
     "paired_trial_scenario_count": len(paired_groups),
     "average_chart": str(average_chart),
+    "average_chart_png": str(average_chart.with_suffix(".png")),
     "cost_average_chart": str(cost_average_chart),
+    "cost_average_chart_png": str(cost_average_chart.with_suffix(".png")),
     "records_tsv": str(tsv_path),
     "cost_records_tsv": str(cost_tsv_path),
     "pricing_usd_per_1m_tokens": PRICING_USD_PER_1M,
@@ -456,7 +683,9 @@ manifest = {
             "trial": group["trial"],
             "scenario": group["scenario"],
             "chart": group["chart"],
+            "chart_png": group["chart_png"],
             "cost_chart": group["cost_chart"],
+            "cost_chart_png": group["cost_chart_png"],
             "strategies": sorted(group["strategies"].keys()),
             "source_summaries": sorted(set(group["source_summaries"])),
         }
@@ -472,8 +701,8 @@ index_lines = [
     f"Root: `{root}`",
     f"Paired scenario/trial groups: `{len(paired_groups)}`",
     "",
-    f"- Average chart: `{average_chart.name}`",
-    f"- Average cost chart: `cost/{cost_average_chart.name}`",
+    f"- Average chart: `{average_chart.name}`, `{average_chart.with_suffix('.png').name}`",
+    f"- Average cost chart: `cost/{cost_average_chart.name}`, `cost/{cost_average_chart.with_suffix('.png').name}`",
     f"- Records TSV: `{tsv_path.name}`",
     f"- Cost TSV: `{cost_tsv_path.name}`",
     f"- Manifest: `{manifest_path.name}`",
@@ -486,7 +715,9 @@ for chart in manifest["charts"]:
     index_lines.append(
         f"- `{chart['trial']}` / `{chart['scenario']}`: "
         f"`by-trial-scenario/{Path(chart['chart']).name}`, "
-        f"`cost/by-trial-scenario/{Path(chart['cost_chart']).name}`"
+        f"`by-trial-scenario/{Path(chart['chart_png']).name}`, "
+        f"`cost/by-trial-scenario/{Path(chart['cost_chart']).name}`, "
+        f"`cost/by-trial-scenario/{Path(chart['cost_chart_png']).name}`"
     )
 index_path = out_dir / "index.md"
 index_path.write_text("\n".join(index_lines) + "\n")

@@ -607,9 +607,11 @@ run_codex_agent() {
     cmd+=(--disable hooks)
   fi
   local dir
-  for dir in "${add_dirs[@]}"; do
-    [ -d "$dir" ] && cmd+=(--add-dir "$dir")
-  done
+  if [ "${#add_dirs[@]}" -gt 0 ]; then
+    for dir in "${add_dirs[@]}"; do
+      [ -d "$dir" ] && cmd+=(--add-dir "$dir")
+    done
+  fi
   cmd+=("$prompt")
 
   local run_cmd=()
@@ -773,10 +775,23 @@ for scenario_file in "${SCENARIO_FILES[@]}"; do
 
   if [ "$RUN_LOCALITY_AGENT" -eq 1 ]; then
     phase_start
-    if run_codex_agent "locality" "$LOCALITY_PROMPT_FILE" "$SCENARIO_OUT_DIR" "report-body.md" "locality-agent-final.md" "${locality_add_dirs[@]}"; then
+    if [ "${#locality_add_dirs[@]}" -gt 0 ]; then
+      if run_codex_agent "locality" "$LOCALITY_PROMPT_FILE" "$SCENARIO_OUT_DIR" "report-body.md" "locality-agent-final.md" "${locality_add_dirs[@]}"; then
+        codex_rc=0
+      else
+        codex_rc=$?
+      fi
+    else
+      if run_codex_agent "locality" "$LOCALITY_PROMPT_FILE" "$SCENARIO_OUT_DIR" "report-body.md" "locality-agent-final.md"; then
+        codex_rc=0
+      else
+        codex_rc=$?
+      fi
+    fi
+    if [ "$codex_rc" -eq 0 ]; then
       phase_end "locality" "codex_exec_wall_time" "ok" "hooks=$CODEX_HOOKS_MODE; report=$SCENARIO_OUT_DIR/report-body.md"
     else
-      rc=$?
+      rc=$codex_rc
       phase_end "locality" "codex_exec_wall_time" "failed" "exit=$rc; report=$SCENARIO_OUT_DIR/report-body.md"
       exit "$rc"
     fi
