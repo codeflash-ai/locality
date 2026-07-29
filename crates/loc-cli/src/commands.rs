@@ -112,7 +112,10 @@ use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
 use crate::sandbox::{
     PROFILE_BOOTSTRAP_TOKEN_INPUT, PROFILE_TOTAL, SandboxContentEncodingPreference,
     SandboxInitOptions, SandboxInitProfile, SandboxInitReport, resolve_bootstrap_token,
-    run_sandbox_init_with_encoding, run_sandbox_init_with_encoding_and_profile,
+    resolve_profile_key, resolve_session_credential, run_sandbox_init_with_encoding,
+    run_sandbox_init_with_encoding_and_profile, run_sandbox_init_with_profile_key,
+    run_sandbox_init_with_profile_key_and_profile, run_sandbox_init_with_session_credential,
+    run_sandbox_init_with_session_credential_and_profile,
 };
 use crate::search::{
     SearchError, SearchOptions, SearchReport, SearchResult, is_notion_url_host, notion_id_from_url,
@@ -278,6 +281,16 @@ struct SandboxInitArgs {
     encoding: Option<SandboxEncodingArg>,
     #[arg(long, help = "Read the one-time bootstrap token from standard input")]
     bootstrap_token_stdin: bool,
+    #[arg(
+        long,
+        help = "Read a reusable Workspace Profile key from standard input"
+    )]
+    profile_key_stdin: bool,
+    #[arg(
+        long,
+        help = "Read an ephemeral Workspace Profile session JSON document from standard input"
+    )]
+    session_credential_stdin: bool,
     #[arg(long, help = "Print redaction-safe phase timings to standard error")]
     profile: bool,
 }
@@ -1132,13 +1145,13 @@ impl Drop for TerminalSpinner {
 }
 
 pub fn dispatch(args: &[String]) -> i32 {
-    if forbidden_bootstrap_token_argument(args) {
+    if forbidden_secret_argument(args) {
         return command_error(
             args.iter().any(|arg| arg == "--json"),
             CommandError::new(
                 "sandbox init",
-                "bootstrap_token_argv_forbidden",
-                "bootstrap tokens are accepted only through LOCALITY_BOOTSTRAP_TOKEN or --bootstrap-token-stdin",
+                "sandbox_credential_argv_forbidden",
+                "sandbox credentials are accepted only through their environment variables or stdin flags",
             ),
             EXIT_USAGE,
         );
@@ -1194,9 +1207,15 @@ pub fn dispatch(args: &[String]) -> i32 {
     }
 }
 
-fn forbidden_bootstrap_token_argument(args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| arg == "--bootstrap-token" || arg.starts_with("--bootstrap-token="))
+fn forbidden_secret_argument(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        arg == "--bootstrap-token"
+            || arg.starts_with("--bootstrap-token=")
+            || arg == "--profile-key"
+            || arg.starts_with("--profile-key=")
+            || arg == "--session-credential"
+            || arg.starts_with("--session-credential=")
+    })
 }
 
 fn parse_cli(args: &[String]) -> Result<Cli, clap::Error> {
@@ -1517,6 +1536,12 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                         "--bootstrap-token-stdin",
                         options.bootstrap_token_stdin,
                     );
+                    push_flag(&mut args, "--profile-key-stdin", options.profile_key_stdin);
+                    push_flag(
+                        &mut args,
+                        "--session-credential-stdin",
+                        options.session_credential_stdin,
+                    );
                     push_flag(&mut args, "--profile", options.profile);
                 }
             }
@@ -1678,19 +1703,53 @@ fn sandbox_init(options: SandboxInitArgs, json: bool) -> i32 {
         .encoding
         .map_or(SandboxContentEncodingPreference::Automatic, Into::into);
     let mut profile = options.profile.then(SandboxInitProfile::start);
-    let token_result = {
+    let bootstrap_environment = std::env::var_os("LOCALITY_BOOTSTRAP_TOKEN");
+    let profile_key_environment = std::env::var_os("LOCALITY_PROFILE_KEY");
+    let session_credential_environment = std::env::var_os("LOCALITY_SESSION_CREDENTIAL");
+    let uses_bootstrap = options.bootstrap_token_stdin || bootstrap_environment.is_some();
+    let uses_profile_key = options.profile_key_stdin || profile_key_environment.is_some();
+    let uses_session_credential =
+        options.session_credential_stdin || session_credential_environment.is_some();
+    if usize::from(uses_bootstrap)
+        + usize::from(uses_profile_key)
+        + usize::from(uses_session_credential)
+        > 1
+    {
+        return sandbox_init_command_error(
+            json,
+            crate::sandbox::SandboxInitError::AmbiguousSandboxCredential,
+        );
+    }
+    let credential_result = {
         let mut stdin = io::stdin().lock();
-        resolve_bootstrap_token(
-            options.bootstrap_token_stdin,
-            std::env::var_os("LOCALITY_BOOTSTRAP_TOKEN"),
-            &mut stdin,
-        )
+        if uses_profile_key {
+            resolve_profile_key(
+                options.profile_key_stdin,
+                profile_key_environment,
+                &mut stdin,
+            )
+            .map(SandboxInitCredential::ProfileKey)
+        } else if uses_session_credential {
+            resolve_session_credential(
+                options.session_credential_stdin,
+                session_credential_environment,
+                &mut stdin,
+            )
+            .map(SandboxInitCredential::Session)
+        } else {
+            resolve_bootstrap_token(
+                options.bootstrap_token_stdin,
+                bootstrap_environment,
+                &mut stdin,
+            )
+            .map(SandboxInitCredential::Bootstrap)
+        }
     };
     if let Some(profile) = profile.as_mut() {
         profile.mark(PROFILE_BOOTSTRAP_TOKEN_INPUT);
     }
-    let token = match token_result {
-        Ok(token) => token,
+    let credential = match credential_result {
+        Ok(credential) => credential,
         Err(error) => {
             finish_sandbox_profile(profile.as_mut());
             return sandbox_init_command_error(json, error);
@@ -1700,10 +1759,40 @@ fn sandbox_init(options: SandboxInitArgs, json: bool) -> i32 {
         api_url: options.api_url,
         root: PathBuf::from(options.root),
     };
-    let outcome = if let Some(profile) = profile.as_mut() {
-        run_sandbox_init_with_encoding_and_profile(init_options, token, content_encoding, profile)
-    } else {
-        run_sandbox_init_with_encoding(init_options, token, content_encoding)
+    let outcome = match (credential, profile.as_mut()) {
+        (SandboxInitCredential::Bootstrap(token), Some(profile)) => {
+            run_sandbox_init_with_encoding_and_profile(
+                init_options,
+                token,
+                content_encoding,
+                profile,
+            )
+        }
+        (SandboxInitCredential::Bootstrap(token), None) => {
+            run_sandbox_init_with_encoding(init_options, token, content_encoding)
+        }
+        (SandboxInitCredential::ProfileKey(key), Some(profile)) => {
+            run_sandbox_init_with_profile_key_and_profile(
+                init_options,
+                key,
+                content_encoding,
+                profile,
+            )
+        }
+        (SandboxInitCredential::ProfileKey(key), None) => {
+            run_sandbox_init_with_profile_key(init_options, key, content_encoding)
+        }
+        (SandboxInitCredential::Session(capability), Some(profile)) => {
+            run_sandbox_init_with_session_credential_and_profile(
+                init_options,
+                capability,
+                content_encoding,
+                profile,
+            )
+        }
+        (SandboxInitCredential::Session(capability), None) => {
+            run_sandbox_init_with_session_credential(init_options, capability, content_encoding)
+        }
     };
     finish_sandbox_profile(profile.as_mut());
 
@@ -1718,6 +1807,12 @@ fn sandbox_init(options: SandboxInitArgs, json: bool) -> i32 {
         }
         Err(error) => sandbox_init_command_error(json, error),
     }
+}
+
+enum SandboxInitCredential {
+    Bootstrap(crate::sandbox::SandboxBootstrapToken),
+    ProfileKey(crate::sandbox::SandboxProfileKey),
+    Session(locality_protocol::SessionCapability),
 }
 
 fn finish_sandbox_profile(profile: Option<&mut SandboxInitProfile>) {
@@ -9951,6 +10046,8 @@ mod tests {
                     "--root <PATH>",
                     "--encoding <ENCODING>",
                     "--bootstrap-token-stdin",
+                    "--profile-key-stdin",
+                    "--session-credential-stdin",
                     "--profile",
                     "--json",
                 ],
@@ -10593,18 +10690,26 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_scope_and_bootstrap_token_are_not_accepted_from_argv() {
+    fn sandbox_scope_and_credentials_are_not_accepted_from_argv() {
         for args in [
             vec!["sandbox", "init", "--tenant", "pilot"],
             vec!["sandbox", "init", "--bootstrap-token", "argv-secret"],
             vec!["sandbox", "init", "--bootstrap-token=argv-secret"],
+            vec!["sandbox", "init", "--profile-key", "argv-secret"],
+            vec!["sandbox", "init", "--profile-key=argv-secret"],
+            vec!["sandbox", "init", "--session-credential", "argv-secret"],
+            vec!["sandbox", "init", "--session-credential=argv-secret"],
         ] {
             let owned = args
                 .iter()
                 .map(|arg| (*arg).to_string())
                 .collect::<Vec<_>>();
-            if args.iter().any(|arg| arg.starts_with("--bootstrap-token")) {
-                assert!(super::forbidden_bootstrap_token_argument(&owned));
+            if args.iter().any(|arg| {
+                arg.starts_with("--bootstrap-token")
+                    || arg.starts_with("--profile-key")
+                    || arg.starts_with("--session-credential")
+            }) {
+                assert!(super::forbidden_secret_argument(&owned));
             } else {
                 let error = Cli::try_parse_from(argv(args)).expect_err("scope flag rejected");
                 assert_eq!(error.kind(), ErrorKind::UnknownArgument);

@@ -2137,9 +2137,19 @@ source-controlled namespaces.
 
 - Humans authenticate through enterprise OIDC/SAML; groups arrive through SCIM
   or explicit mapping.
-- The common v1 sandbox path is an orchestrator-injected, single-use bootstrap
-  token with a very short TTL. Its exchange is audited, consumes the token, and
-  returns a narrower session capability; durable tenant API keys are not used.
+- A Workspace Profile may have a revocable reusable launch key. The key binds
+  the stable profile identity, not one immutable revision: each successful
+  launch resolves and captures the latest published profile revision. Updating
+  the profile therefore does not require replacing launcher credentials.
+- The preferred hosted path keeps the reusable key in the orchestrator. It
+  calls `POST /v1/workspace-profile-sessions` and injects only the returned
+  short-lived session capability into the sandbox. A trusted developer may
+  give the reusable key directly to `loc`, which performs the same exchange.
+  Reusable keys never authorize provider APIs and PostgreSQL stores only their
+  hashes.
+- Existing one-time bootstrap tokens remain supported for launchers that mint
+  fully sealed authority before sandbox startup. Their exchange is audited,
+  consumes the token, and returns a narrower session capability.
 - Bootstrap and session capabilities are opaque cryptographically random values,
   not self-authorizing JWTs. PostgreSQL stores only their hashes, expiry,
   one-time/usage state, tenant, principal, profile, action, and revocation
@@ -2427,6 +2437,8 @@ POST /v1/workspace-profiles
 POST /v1/workspace-profiles/{id}/revisions
 POST /v1/workspace-profiles/{id}/plan
 
+POST /v1/workspace-profile-sessions          # reusable profile key -> ephemeral session
+
 POST /v1/sessions                            # consumes one-time bootstrap token
 GET  /v1/sessions/{id}
 POST /v1/sessions/{id}/export-attempts       # revalidate, select heads, seal offer
@@ -2448,6 +2460,14 @@ capability, and expiry; it cannot create a second session or extend authority.
 The backend derives the recoverable capability with a domain-separated keyed
 hash and PostgreSQL stores only token, idempotency-key, and capability hashes,
 never the plaintext values or an encrypted response blob.
+
+`POST /v1/workspace-profile-sessions` authenticates with a reusable Workspace
+Profile key and requires an exact caller-generated idempotency key. It resolves
+the latest published revision, captures that revision for the new session, and
+returns the ordinary short-lived session capability. Exact retries return the
+same result. A later profile edit affects only newly created sessions; existing
+sessions retain the revision they captured. The endpoint accepts no tenant,
+principal, source, root, filter, action, or profile-revision override.
 
 An SSE/revision-delta endpoint is a later desktop/long-session extension, not a
 sandbox v1 endpoint. Human-review and advisory-claim endpoints are later
