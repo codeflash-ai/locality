@@ -68,10 +68,11 @@ async function signPayload(payload: unknown, secret: string): Promise<string> {
 }
 
 async function verifyPayload<T>(token: string, secret: string, label: "session" | "state"): Promise<T> {
-  const [body, signature] = token.split(".");
-  if (!body || !signature) {
+  const parts = token.split(".");
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
     throw badRequest(`invalid_${label}`, `OAuth ${label} token is malformed`);
   }
+  const [body, signature] = parts;
   const expected = await hmacSha256Base64Url(secret, body);
   if (!constantTimeEqual(signature, expected)) {
     throw unauthorized(`invalid_${label}`, `OAuth ${label} token signature is invalid`);

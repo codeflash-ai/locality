@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { signLocalHandoffState, verifyLocalHandoffState } from "../src/security/session";
+import { signLocalHandoffState, signSession, verifyLocalHandoffState } from "../src/security/session";
 
 const secret = "test-session-secret-with-enough-entropy";
 
@@ -66,6 +66,47 @@ describe("local OAuth handoff state", () => {
 
     await expect(verifyLocalHandoffState(tampered, secret, 1785326401)).rejects.toMatchObject({
       status: 401,
+      code: "invalid_state"
+    });
+  });
+
+  it("rejects a local handoff state token with extra segments", async () => {
+    const token = await signLocalHandoffState(
+      {
+        v: 1,
+        kind: "local_handoff",
+        connector: "notion",
+        local_redirect_uri: "http://localhost:8757/oauth/notion/callback",
+        provider_redirect_uri: "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/notion/callback",
+        iat: 1785326400,
+        exp: 1785327000,
+        nonce: "nonce-1"
+      },
+      secret
+    );
+
+    await expect(verifyLocalHandoffState(`${token}.extra`, secret, 1785326401)).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_state"
+    });
+  });
+
+  it("rejects a signed OAuth session payload as local handoff state", async () => {
+    const token = await signSession(
+      {
+        v: 1,
+        connector: "notion",
+        state: "state-1",
+        redirect_uri: "http://localhost:8757/oauth/notion/callback",
+        iat: 1785326400,
+        exp: 1785327000,
+        nonce: "nonce-1"
+      },
+      secret
+    );
+
+    await expect(verifyLocalHandoffState(token, secret, 1785326401)).rejects.toMatchObject({
+      status: 400,
       code: "invalid_state"
     });
   });
