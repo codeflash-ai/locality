@@ -2208,7 +2208,7 @@ fn connect_google_docs(args: &[String], json: bool) -> i32 {
     let authorization = match run_local_oauth_authorization(
         "Google Docs",
         &start.authorization_url,
-        &start.redirect_uri,
+        start.local_redirect_uri(),
         &start.state,
         has_flag(args, "--no-browser"),
         json,
@@ -2222,6 +2222,7 @@ fn connect_google_docs(args: &[String], json: bool) -> i32 {
             );
         }
     };
+    let exchange_redirect_uri = start.exchange_redirect_uri().to_string();
     let options = GoogleDocsBrokerOAuthConnectOptions {
         connection_id: flag_value(args, "--name").map(ConnectionId::new),
         broker_url: broker_config.broker_url,
@@ -2229,7 +2230,7 @@ fn connect_google_docs(args: &[String], json: bool) -> i32 {
         session: start.session,
         state: start.state,
         code: authorization.code,
-        redirect_uri: start.redirect_uri,
+        redirect_uri: exchange_redirect_uri,
     };
     match run_connect_google_docs_broker_oauth(&mut store, credentials.as_ref(), options, &broker) {
         Ok(report) if json => {
@@ -2283,7 +2284,7 @@ fn connect_google_calendar(args: &[String], json: bool) -> i32 {
     let authorization = match run_local_oauth_authorization(
         "Google Calendar",
         &start.authorization_url,
-        &start.redirect_uri,
+        start.local_redirect_uri(),
         &start.state,
         has_flag(args, "--no-browser"),
         json,
@@ -2297,6 +2298,7 @@ fn connect_google_calendar(args: &[String], json: bool) -> i32 {
             );
         }
     };
+    let exchange_redirect_uri = start.exchange_redirect_uri().to_string();
     let options = GoogleCalendarBrokerOAuthConnectOptions {
         connection_id: flag_value(args, "--name").map(ConnectionId::new),
         broker_url: broker_config.broker_url,
@@ -2304,7 +2306,7 @@ fn connect_google_calendar(args: &[String], json: bool) -> i32 {
         session: start.session,
         state: start.state,
         code: authorization.code,
-        redirect_uri: start.redirect_uri,
+        redirect_uri: exchange_redirect_uri,
     };
     match run_connect_google_calendar_broker_oauth(
         &mut store,
@@ -2363,7 +2365,7 @@ fn connect_gmail(args: &[String], json: bool) -> i32 {
     let authorization = match run_local_oauth_authorization(
         "Gmail",
         &start.authorization_url,
-        &start.redirect_uri,
+        start.local_redirect_uri(),
         &start.state,
         has_flag(args, "--no-browser"),
         json,
@@ -2373,6 +2375,7 @@ fn connect_gmail(args: &[String], json: bool) -> i32 {
             return command_error(json, gmail_local_oauth_command_error(error), EXIT_INTERNAL);
         }
     };
+    let exchange_redirect_uri = start.exchange_redirect_uri().to_string();
     let options = GmailBrokerOAuthConnectOptions {
         connection_id: flag_value(args, "--name").map(ConnectionId::new),
         broker_url: broker_config.broker_url,
@@ -2380,7 +2383,7 @@ fn connect_gmail(args: &[String], json: bool) -> i32 {
         session: start.session,
         state: start.state,
         code: authorization.code,
-        redirect_uri: start.redirect_uri,
+        redirect_uri: exchange_redirect_uri,
     };
     match run_connect_gmail_broker_oauth(&mut store, credentials.as_ref(), options, &broker) {
         Ok(report) if json => {
@@ -2434,7 +2437,7 @@ fn connect_slack(args: &[String], json: bool) -> i32 {
     let authorization = match run_local_oauth_authorization(
         "Slack",
         &start.authorization_url,
-        &start.redirect_uri,
+        start.local_redirect_uri(),
         &start.state,
         has_flag(args, "--no-browser"),
         json,
@@ -2444,6 +2447,7 @@ fn connect_slack(args: &[String], json: bool) -> i32 {
             return command_error(json, slack_local_oauth_command_error(error), EXIT_INTERNAL);
         }
     };
+    let exchange_redirect_uri = start.exchange_redirect_uri().to_string();
     let options = SlackBrokerOAuthConnectOptions {
         connection_id: flag_value(args, "--name").map(ConnectionId::new),
         broker_url: broker_config.broker_url,
@@ -2451,7 +2455,7 @@ fn connect_slack(args: &[String], json: bool) -> i32 {
         session: start.session,
         state: start.state,
         code: authorization.code,
-        redirect_uri: start.redirect_uri,
+        redirect_uri: exchange_redirect_uri,
     };
     match run_connect_slack_broker_oauth(&mut store, credentials.as_ref(), options, &broker) {
         Ok(report) if json => {

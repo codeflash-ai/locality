@@ -10190,12 +10190,13 @@ fn connect_google_docs_with_broker(
     let authorization = run_local_oauth_authorization(
         "Google Docs",
         &start.authorization_url,
-        &start.redirect_uri,
+        start.local_redirect_uri(),
         &start.state,
         !open_browser,
         true,
     )
     .map_err(|error| error.message)?;
+    let exchange_redirect_uri = start.exchange_redirect_uri().to_string();
     let options = GoogleDocsBrokerOAuthConnectOptions {
         connection_id: None,
         broker_url,
@@ -10203,7 +10204,7 @@ fn connect_google_docs_with_broker(
         session: start.session,
         state: start.state,
         code: authorization.code,
-        redirect_uri: start.redirect_uri,
+        redirect_uri: exchange_redirect_uri,
     };
 
     let report =
@@ -10242,12 +10243,13 @@ fn connect_google_calendar_with_broker(
     let authorization = run_local_oauth_authorization(
         "Google Calendar",
         &start.authorization_url,
-        &start.redirect_uri,
+        start.local_redirect_uri(),
         &start.state,
         !open_browser,
         true,
     )
     .map_err(|error| error.message)?;
+    let exchange_redirect_uri = start.exchange_redirect_uri().to_string();
     let options = GoogleCalendarBrokerOAuthConnectOptions {
         connection_id: Some(ConnectionId::new("google-calendar-default")),
         broker_url,
@@ -10255,7 +10257,7 @@ fn connect_google_calendar_with_broker(
         session: start.session,
         state: start.state,
         code: authorization.code,
-        redirect_uri: start.redirect_uri,
+        redirect_uri: exchange_redirect_uri,
     };
 
     let report = run_connect_google_calendar_broker_oauth(
@@ -10300,12 +10302,13 @@ fn connect_gmail_with_broker(state_root: PathBuf, open_browser: bool) -> Result<
     let authorization = run_local_oauth_authorization(
         "Gmail",
         &start.authorization_url,
-        &start.redirect_uri,
+        start.local_redirect_uri(),
         &start.state,
         !open_browser,
         true,
     )
     .map_err(|error| error.message)?;
+    let exchange_redirect_uri = start.exchange_redirect_uri().to_string();
     let options = GmailBrokerOAuthConnectOptions {
         connection_id: None,
         broker_url,
@@ -10313,7 +10316,7 @@ fn connect_gmail_with_broker(state_root: PathBuf, open_browser: bool) -> Result<
         session: start.session,
         state: start.state,
         code: authorization.code,
-        redirect_uri: start.redirect_uri,
+        redirect_uri: exchange_redirect_uri,
     };
 
     let report = run_connect_gmail_broker_oauth(&mut store, credentials.as_ref(), options, &broker)
@@ -10351,12 +10354,13 @@ fn connect_slack_with_broker(state_root: PathBuf, open_browser: bool) -> Result<
     let authorization = run_local_oauth_authorization(
         "Slack",
         &start.authorization_url,
-        &start.redirect_uri,
+        start.local_redirect_uri(),
         &start.state,
         !open_browser,
         true,
     )
     .map_err(|error| error.message)?;
+    let exchange_redirect_uri = start.exchange_redirect_uri().to_string();
     let options = SlackBrokerOAuthConnectOptions {
         connection_id: None,
         broker_url,
@@ -10364,7 +10368,7 @@ fn connect_slack_with_broker(state_root: PathBuf, open_browser: bool) -> Result<
         session: start.session,
         state: start.state,
         code: authorization.code,
-        redirect_uri: start.redirect_uri,
+        redirect_uri: exchange_redirect_uri,
     };
 
     let report = run_connect_slack_broker_oauth(&mut store, credentials.as_ref(), options, &broker)
