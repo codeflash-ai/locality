@@ -10125,7 +10125,7 @@ fn connect_notion_with_broker(state_root: PathBuf, open_browser: bool) -> Result
     let authorization = run_local_oauth_authorization(
         "Notion",
         &authorization_url,
-        &start.redirect_uri,
+        start.local_redirect_uri(),
         &start.state,
         !open_browser,
         true,
@@ -10135,6 +10135,7 @@ fn connect_notion_with_broker(state_root: PathBuf, open_browser: bool) -> Result
     let previous_connection = connection_id
         .as_ref()
         .and_then(|connection_id| store.get_connection(connection_id).ok().flatten());
+    let exchange_redirect_uri = start.exchange_redirect_uri().to_string();
     let options = BrokerOAuthConnectOptions {
         connection_id,
         broker_url,
@@ -10142,7 +10143,7 @@ fn connect_notion_with_broker(state_root: PathBuf, open_browser: bool) -> Result
         session: start.session,
         state: start.state,
         code: authorization.code,
-        redirect_uri: start.redirect_uri,
+        redirect_uri: exchange_redirect_uri,
     };
 
     let report =

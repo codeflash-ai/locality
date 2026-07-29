@@ -2011,7 +2011,7 @@ fn connect(args: &[String], json: bool) -> i32 {
         let authorization = match run_local_oauth_authorization(
             "Notion",
             &authorization_url,
-            &start.redirect_uri,
+            start.local_redirect_uri(),
             &start.state,
             has_flag(args, "--no-browser"),
             json,
@@ -2021,6 +2021,7 @@ fn connect(args: &[String], json: bool) -> i32 {
                 return command_error(json, local_oauth_command_error(error), EXIT_INTERNAL);
             }
         };
+        let exchange_redirect_uri = start.exchange_redirect_uri().to_string();
         let options = BrokerOAuthConnectOptions {
             connection_id: flag_value(args, "--name").map(ConnectionId::new),
             broker_url: broker_config.broker_url,
@@ -2028,7 +2029,7 @@ fn connect(args: &[String], json: bool) -> i32 {
             session: start.session,
             state: start.state,
             code: authorization.code,
-            redirect_uri: start.redirect_uri,
+            redirect_uri: exchange_redirect_uri,
         };
         return match run_connect_notion_broker_oauth(
             &mut store,

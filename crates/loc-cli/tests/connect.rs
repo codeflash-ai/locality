@@ -232,7 +232,7 @@ fn connect_notion_oauth_stores_oauth_bundle_and_metadata() {
 fn connect_notion_broker_oauth_stores_refresh_handle_without_client_secret() {
     let mut store = InMemoryStateStore::new();
     let credentials = InMemoryCredentialStore::new();
-    let exchange = FakeBrokerOAuthExchange;
+    let exchange = FakeBrokerOAuthExchange::default();
 
     let report = run_connect_notion_broker_oauth(
         &mut store,
@@ -278,6 +278,50 @@ fn connect_notion_broker_oauth_stores_refresh_handle_without_client_secret() {
     assert!(!json.contains("opaque-refresh-handle"));
     assert!(!json.contains("client-secret"));
     assert!(!json.contains("secret_ref"));
+}
+
+#[test]
+fn connect_notion_broker_oauth_can_store_local_credentials_after_hosted_exchange_redirect() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+
+    let report = run_connect_notion_broker_oauth(
+        &mut store,
+        &credentials,
+        BrokerOAuthConnectOptions {
+            connection_id: Some(ConnectionId::new("notion-hosted")),
+            broker_url: "https://afs-oauth-broker.saurabh-b07.workers.dev".to_string(),
+            client_id: "client-id".to_string(),
+            session: "broker-session".to_string(),
+            state: "state-1".to_string(),
+            code: "oauth-code".to_string(),
+            redirect_uri:
+                "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/notion/callback"
+                    .to_string(),
+        },
+        &FakeBrokerOAuthExchange {
+            expected_redirect_uri:
+                "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/notion/callback",
+        },
+    )
+    .expect("broker OAuth connect");
+
+    assert_eq!(report.connection_id, "notion-hosted");
+    assert_eq!(report.auth_kind, "oauth");
+    let saved = store
+        .get_connection(&ConnectionId::new("notion-hosted"))
+        .expect("get connection")
+        .expect("saved connection");
+    assert_eq!(saved.auth_kind, "oauth");
+    assert_eq!(saved.secret_ref, "connection:notion-hosted");
+    let secret = credentials
+        .get("connection:notion-hosted")
+        .expect("credential saved");
+    assert!(
+        secret
+            .contains("\"oauth_broker_url\":\"https://afs-oauth-broker.saurabh-b07.workers.dev\"")
+    );
+    assert!(secret.contains("\"refresh_token_handle\":\"opaque-refresh-handle\""));
 }
 
 #[test]
@@ -1132,7 +1176,17 @@ impl NotionOAuthExchange for FakeOAuthExchange {
 }
 
 #[derive(Clone, Debug)]
-struct FakeBrokerOAuthExchange;
+struct FakeBrokerOAuthExchange {
+    expected_redirect_uri: &'static str,
+}
+
+impl Default for FakeBrokerOAuthExchange {
+    fn default() -> Self {
+        Self {
+            expected_redirect_uri: "http://localhost:8757/oauth/notion/callback",
+        }
+    }
+}
 
 impl NotionOAuthBrokerExchange for FakeBrokerOAuthExchange {
     fn exchange_code(
@@ -1142,10 +1196,7 @@ impl NotionOAuthBrokerExchange for FakeBrokerOAuthExchange {
         assert_eq!(request.session, "broker-session");
         assert_eq!(request.state, "state-1");
         assert_eq!(request.code, "oauth-code");
-        assert_eq!(
-            request.redirect_uri,
-            "http://localhost:8757/oauth/notion/callback"
-        );
+        assert_eq!(request.redirect_uri, self.expected_redirect_uri);
         Ok(NotionOAuthToken {
             access_token: "oauth-access-token".to_string(),
             token_type: Some("bearer".to_string()),
