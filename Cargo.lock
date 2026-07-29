@@ -2309,6 +2309,7 @@ dependencies = [
  "chrono",
  "locality-connector",
  "locality-core",
+ "locality-protocol",
  "reqwest",
  "rustls",
  "serde",

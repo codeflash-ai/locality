@@ -1,0 +1,35 @@
+{
+  "installation_id": "0198f3c2-7d4e-7a61-8b25-4f9c8d7e6a10",
+  "headers": {"Authorization": "Bearer xoxb-secret"},
+  "cookies": "session=secret",
+  "channel": {
+    "team_id": "T08LOCALITY1",
+    "id": "C08ENGINEER1",
+    "name": "engineering",
+    "topic": null,
+    "purpose": null,
+    "created_ts": "1780000000.000100",
+    "updated_ts": null,
+    "sharing": "private",
+    "permalink": "https://example.slack.com/archives/C08ENGINEER1"
+  },
+  "users": [],
+  "messages": [],
+  "threads": [],
+  "files": [
+    {
+      "channel_id": "C08ENGINEER1",
+      "id": "F08PLAN0001",
+      "user_id": null,
+      "name": "plan.pdf",
+      "title": "Plan",
+      "mimetype": "application/pdf",
+      "byte_length": 1024,
+      "created_ts": "1780000000.000100",
+      "deleted": false,
+      "url_private": "https://files.slack.com/files-pri/secret",
+      "download_url": "https://files.slack.com/download/secret",
+      "raw_response": "opaque provider bytes"
+    }
+  ]
+}

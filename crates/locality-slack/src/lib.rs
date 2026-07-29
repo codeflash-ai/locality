@@ -2,6 +2,7 @@ pub mod client;
 pub mod connector;
 pub mod dto;
 pub mod oauth;
+pub mod portable;
 pub mod render;
 pub mod settings;
 
