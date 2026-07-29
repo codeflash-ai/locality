@@ -72,30 +72,31 @@ def fmt_ms(value) -> str:
 
 def usage_totals(summary: dict) -> dict:
     usage = summary.get("usage") or {}
-    buckets = {
-        "input": 0,
-        "cached_input": 0,
-        "output": 0,
-        "reasoning_output": 0,
-        "total": 0,
+
+    def usage_int(key: str) -> int:
+        try:
+            return int(float(usage.get(key) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    input_tokens = usage_int("input_tokens")
+    cached_input = usage_int("cached_input_tokens")
+    cache_write_input = usage_int("cache_write_input_tokens")
+    output_tokens = usage_int("output_tokens")
+    reasoning_output = usage_int("reasoning_output_tokens")
+    fresh_input = max(input_tokens - cached_input - cache_write_input, 0)
+    visible_output = max(output_tokens - reasoning_output, 0)
+
+    return {
+        "input": input_tokens,
+        "output": output_tokens,
+        "fresh_input": fresh_input,
+        "cached_input": cached_input,
+        "cache_write_input": cache_write_input,
+        "visible_output": visible_output,
+        "reasoning_output": reasoning_output,
+        "total": fresh_input + cached_input + cache_write_input + visible_output + reasoning_output,
     }
-    for key, value in usage.items():
-        if not isinstance(value, int):
-            continue
-        lowered = key.lower()
-        if "cached" in lowered and "input" in lowered:
-            buckets["cached_input"] += value
-        elif "reasoning" in lowered and "output" in lowered:
-            buckets["reasoning_output"] += value
-        elif "input" in lowered:
-            buckets["input"] += value
-        elif "output" in lowered:
-            buckets["output"] += value
-        elif lowered == "total_tokens":
-            buckets["total"] += value
-    if buckets["total"] == 0:
-        buckets["total"] = buckets["input"] + buckets["cached_input"] + buckets["output"] + buckets["reasoning_output"]
-    return buckets
 
 
 def non_warning_errors(summary: dict) -> list[str]:
@@ -374,10 +375,11 @@ for item in sorted(per_strategy_data, key=lambda row: (row["scenario"], row["str
     tokens = usage_totals(codex_summary)
     lines.extend(
         [
-            "| Codex observed | Events | Input | Cached input | Output | Reasoning output | Total tokens | Errors | Warnings |",
-            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Codex observed | Events | Fresh input | Cached input | Cache write input | Visible output | Reasoning output | Total tokens | Errors | Warnings |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             f"| {fmt_ms(codex_summary.get('observed_duration_ms'))} | {codex_summary.get('event_count', 0)} | "
-            f"{tokens['input']} | {tokens['cached_input']} | {tokens['output']} | {tokens['reasoning_output']} | "
+            f"{tokens['fresh_input']} | {tokens['cached_input']} | {tokens['cache_write_input']} | "
+            f"{tokens['visible_output']} | {tokens['reasoning_output']} | "
             f"{tokens['total']} | {len(non_warning_errors(codex_summary))} | {warning_count(codex_summary)} |",
             "",
         ]
