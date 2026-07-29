@@ -11,21 +11,28 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=tests/live_connector_common.sh
 source "$script_dir/live_connector_common.sh"
 
-require_linux_fuse
-require_live_env \
-  LOCALITY_SLACK_LIVE_CREDENTIAL_JSON \
-  LOCALITY_SLACK_LIVE_CONVERSATION_ID
-
 loc_bin="${LOCALITY_BIN:-./target/debug/loc}"
 localityd_bin="${LOCALITYD_BIN:-./target/debug/localityd}"
 fuse_bin="${LOCALITY_FUSE_BIN:-./target/debug/locality-fuse}"
 connection_id="${LOCALITY_SLACK_LIVE_CONNECTION_ID:-slack-live}"
 mount_id="${LOCALITY_SLACK_LIVE_MOUNT_ID:-slack-live}"
-slack_types="${LOCALITY_SLACK_LIVE_TYPES:-public_channel,private_channel,im,mpim}"
+slack_types="${LOCALITY_SLACK_LIVE_TYPES:-private_channel,im,mpim}"
 
 if [[ ! "$connection_id" =~ ^[A-Za-z0-9._-]+$ || ! "$mount_id" =~ ^[A-Za-z0-9._-]+$ ]]; then
   live_fail "live Slack mount or connection id has an invalid shape"
 fi
+IFS=',' read -r -a slack_type_parts <<<"$slack_types"
+for slack_type in "${slack_type_parts[@]}"; do
+  slack_type="${slack_type//[[:space:]]/}"
+  if [[ "$slack_type" == "public_channel" ]]; then
+    live_fail "live Slack VFS test refuses public_channel because Slack mounts auto-join public channels before reading"
+  fi
+done
+
+require_linux_fuse
+require_live_env \
+  LOCALITY_SLACK_LIVE_CREDENTIAL_JSON \
+  LOCALITY_SLACK_LIVE_CONVERSATION_ID
 
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/loc-live-slack-vfs.XXXXXX")"
 state_root="$tmp_root/state"

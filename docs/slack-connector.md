@@ -93,7 +93,10 @@ search results.
 `tests/live_slack_vfs_read.sh` exercises the live Slack API, CLI
 mount/pull/status, daemon, and Linux FUSE projection by reading a known
 conversation's `recent.md` and verifying Slack remains read-only through the
-mounted filesystem and product push validation.
+mounted filesystem and product push validation. The live script refuses
+`public_channel` mounts because Slack public-channel reads can auto-join
+channels; use a private channel, DM, or group DM where the app is already
+present.
 
 To reuse a stored `connection:slack-live` credential in isolated test state:
 
@@ -101,11 +104,12 @@ To reuse a stored `connection:slack-live` credential in isolated test state:
 secret_ref='connection:slack-live'
 secret_hex="$(printf '%s' "$secret_ref" | od -An -tx1 -v | tr -d ' \n')"
 export LOCALITY_SLACK_LIVE_CREDENTIAL_JSON="$(cat "$HOME/.loc/credentials/$secret_hex")"
-export LOCALITY_SLACK_LIVE_CONVERSATION_ID='C0123456789'
+export LOCALITY_SLACK_LIVE_CONVERSATION_ID='G0123456789'
 ```
 
 Set `LOCALITY_SLACK_LIVE_TYPES` when the target conversation is not covered by
-the default `public_channel,private_channel,im,mpim` type set.
+the default `private_channel,im,mpim` type set. Do not set `public_channel` for
+this live test.
 
 ```bash
 LOCALITY_LIVE_SLACK_VFS=1 tests/live_slack_vfs_read.sh

@@ -12,6 +12,7 @@ on:
       - "crates/**"
       - "platform/linux/locality-fuse/**"
       - "tests/live_connector_common.sh"
+      - "tests/live_connector_common_selftest.sh"
       - "tests/live_google_docs_vfs_roundtrip.sh"
       - "tests/live_google_calendar_vfs_roundtrip.sh"
       - "tests/live_gmail_vfs_roundtrip.sh"
@@ -29,6 +30,23 @@ permissions:
   contents: read
 
 jobs:
+  harness-selftest:
+    name: Live connector harness self-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install harness dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+      - name: Run live connector harness self-test
+        run: |
+          bash -n tests/live_connector_common.sh tests/live_connector_common_selftest.sh
+          LOCALITY_LIVE_COMMON_SELFTEST=1 tests/live_connector_common_selftest.sh
+
   google-docs-live:
     name: Google Docs Linux FUSE live e2e
     runs-on: ubuntu-latest

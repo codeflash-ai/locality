@@ -146,14 +146,15 @@ export LOCALITY_GMAIL_LIVE_TO_EMAIL=...
 LOCALITY_LIVE_GMAIL_VFS=1 tests/live_gmail_vfs_roundtrip.sh
 ```
 
-Run Slack read-only against a stable conversation that the app can access:
+Run Slack read-only against a stable private channel, DM, or group DM where the
+app is already present:
 
 ```sh
 secret_ref='connection:slack-live'
 secret_hex="$(printf '%s' "$secret_ref" | od -An -tx1 -v | tr -d ' \n')"
 export LOCALITY_SLACK_LIVE_CREDENTIAL_JSON="$(cat "$HOME/.loc/credentials/$secret_hex")"
 export LOCALITY_SLACK_LIVE_CONVERSATION_ID=...
-export LOCALITY_SLACK_LIVE_TYPES=public_channel,private_channel
+export LOCALITY_SLACK_LIVE_TYPES=private_channel,im,mpim
 LOCALITY_LIVE_SLACK_VFS=1 tests/live_slack_vfs_read.sh
 ```
 
@@ -189,7 +190,7 @@ The non-Notion connector workflow uses the `connector-live-e2e` environment:
 | `LOCALITY_GMAIL_LIVE_TO_EMAIL` | yes | Recipient address for the unsent Gmail draft created and deleted by the live test. |
 | `LOCALITY_SLACK_LIVE_CREDENTIAL_JSON` | yes | Stored Slack OAuth credential JSON, normally copied from `connection:slack-live`. |
 | `LOCALITY_SLACK_LIVE_CONVERSATION_ID` | yes | Stable Slack conversation id for read-only recent-message projection. |
-| `LOCALITY_SLACK_LIVE_TYPES` | no | Optional Slack mount type list, for example `public_channel,private_channel`. |
+| `LOCALITY_SLACK_LIVE_TYPES` | no | Optional Slack mount type list for non-public conversations, for example `private_channel,im,mpim`. |
 | `LINEAR_API_KEY` | yes | Linear API key with access to the scratch issue. |
 | `LOCALITY_LINEAR_LIVE_ISSUE_ID` | yes | Stable scratch Linear issue id whose body can be edited and restored. |
 
@@ -267,10 +268,10 @@ Coverage labels:
 
 | Test | Kind | Behaviors covered |
 |---|---|---|
-| `tests/live_google_docs_vfs_roundtrip.sh` | Live Linux FUSE product path | Seeds a stored Google Docs credential into isolated state, mounts a scratch Drive workspace folder, creates a document through a FUSE `page.md`, verifies `diff` and `push`, pulls the document back through the real Google Docs and Drive APIs, and trashes the scratch Drive file. Covers the live create/edit/read-back side of E2E-037. |
+| `tests/live_google_docs_vfs_roundtrip.sh` | Live Linux FUSE product path | Seeds a stored Google Docs credential into isolated state, mounts a scratch Drive workspace folder, creates a document through a FUSE `page.md`, verifies `diff` and `push`, pulls the document back through the real Google Docs and Drive APIs, edits the created document through mounted Markdown, pulls the edit back, and trashes the scratch Drive file. Covers the live create/edit/read-back side of E2E-037. |
 | `tests/live_google_calendar_vfs_roundtrip.sh` | Live Linux FUSE product path | Seeds a stored Google Calendar credential, creates a calendar event from a local draft under the mounted filesystem, verifies the event projection after pull, and deletes the scratch event through the Calendar API. Covers the live draft-create path for Google Calendar. |
 | `tests/live_gmail_vfs_roundtrip.sh` | Live Linux FUSE product path | Seeds a stored Gmail credential, creates an unsent Gmail UI draft from a mounted `draft/` Markdown file, verifies the projected Gmail draft maps to the created message, and deletes the draft through the Gmail API. Covers the live Gmail draft-create path. |
-| `tests/live_slack_vfs_read.sh` | Live Linux FUSE product path | Seeds a stored Slack credential, mounts selected Slack conversation types read-only, resolves the configured conversation by identity metadata, hydrates its `recent.md`, verifies status stays clean, and proves push is blocked before Slack writes. Covers the live Slack read-only projection and write guardrail. |
+| `tests/live_slack_vfs_read.sh` | Live Linux FUSE product path | Seeds a stored Slack credential, mounts selected non-public Slack conversation types read-only, resolves the configured conversation by identity metadata, hydrates its `recent.md`, verifies status stays clean, and proves push is blocked before Slack writes. Covers the live Slack read-only projection and write guardrail. |
 | `tests/live_linear_vfs_roundtrip.sh` | Live Linux FUSE product path | Seeds a Linear API key credential, mounts Linear through the real daemon and FUSE helper, finds the configured issue by frontmatter identity, appends a body marker, pushes and pulls it back, then restores only the original body under current generated frontmatter. Covers the live Linear issue edit/read-back/restore path. |
 
 ## Live Notion Test Coverage Map
@@ -430,7 +431,7 @@ Coverage labels:
 | Google Docs connector | Partial live plus local guardrails | Local e2e uses the real Google Docs connector with fake Drive/Docs APIs for workspace-folder enumeration, online-only stubs, explicit hydration, local Markdown document create, supported text edit push, journal/reconcile/status-clean behavior, and mounted Markdown guardrails for rendered inline objects, tables, invalid Locality frontmatter, and unsupported document-structure directives before journal/apply. The live Linux FUSE script covers real Drive/Docs create, edit, pull-back, and cleanup against a scratch folder. |
 | Google Calendar connector | Live draft create path | The live Linux FUSE script creates a real Calendar event from a mounted draft, verifies the projected event after pull, and deletes the scratch event through the Calendar API. |
 | Gmail connector | Live draft create path | The live Linux FUSE script creates an unsent Gmail draft from mounted Markdown, verifies it projects with the created message identity, and deletes the draft through the Gmail API. |
-| Slack connector | Covered live read-only | The live Linux FUSE script hydrates a configured conversation's `recent.md` by identity, verifies the mount stays clean, and verifies push/write attempts are blocked before remote Slack writes. |
+| Slack connector | Covered live read-only | The live Linux FUSE script hydrates a configured non-public conversation's `recent.md` by identity, verifies the mount stays clean, and verifies push/write attempts are blocked before remote Slack writes. |
 | Linear connector | Live issue edit path | The live Linux FUSE script edits a configured scratch issue body, verifies push and pull-back, then restores the original body while preserving current generated frontmatter. |
 | Packaging/notarization | Manual/publish covered | `make publish` validates signing, stapling, and DMG integrity outside CI. |
 

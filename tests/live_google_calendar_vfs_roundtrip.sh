@@ -40,11 +40,16 @@ initial_pull_report="$tmp_root/initial-pull.json"
 diff_report="$tmp_root/diff.json"
 push_report="$tmp_root/push.json"
 pull_after_push_report="$tmp_root/pull-after-push.json"
+calendar_search_report="$tmp_root/calendar-events.json"
 credential_path=""
 daemon_pid=""
 fuse_pid=""
 event_id=""
 event_deleted=0
+event_cleanup_needed=0
+summary=""
+location=""
+marker=""
 step="initializing"
 
 start_epoch="$(date -u -d '+2 hours' +%s)"
@@ -53,6 +58,8 @@ event_start="$(date -u -d "@$start_epoch" +%Y-%m-%dT%H:%M:%SZ)"
 event_end="$(date -u -d "@$end_epoch" +%Y-%m-%dT%H:%M:%SZ)"
 window_after="$(date -u -d "@$((start_epoch - 86400))" +%Y-%m-%d)"
 window_before="$(date -u -d "@$((start_epoch + 172800))" +%Y-%m-%d)"
+cleanup_time_min="$(date -u -d "@$((start_epoch - 300))" +%Y-%m-%dT%H:%M:%SZ)"
+cleanup_time_max="$(date -u -d "@$((end_epoch + 300))" +%Y-%m-%dT%H:%M:%SZ)"
 unique="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 
 assert_json_field_equals() {
@@ -107,11 +114,64 @@ wait_for_marker_under_events() {
   live_fail "created Google Calendar marker was not visible under events/ after pull"
 }
 
+find_created_calendar_event() {
+  local access_token="$1"
+
+  if [[ -z "${summary:-}" ]]; then
+    return 1
+  fi
+
+  if ! curl -fsS --get "https://www.googleapis.com/calendar/v3/calendars/primary/events" \
+    -H "Authorization: Bearer $access_token" \
+    --data-urlencode "q=$summary" \
+    --data-urlencode "timeMin=$cleanup_time_min" \
+    --data-urlencode "timeMax=$cleanup_time_max" \
+    --data-urlencode "singleEvents=true" \
+    --data-urlencode "maxResults=10" \
+    --data-urlencode "fields=items(id,summary,location,description)" \
+    >"$calendar_search_report" 2>>"$command_log"; then
+    return 1
+  fi
+
+  python3 - "$calendar_search_report" "$summary" "$location" "$marker" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+summary = sys.argv[2]
+location = sys.argv[3]
+marker = sys.argv[4]
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+for item in data.get("items") or []:
+    if not isinstance(item, dict):
+        continue
+    if item.get("summary") != summary:
+        continue
+    if location and item.get("location") != location:
+        continue
+    description = item.get("description") or ""
+    if marker and description and marker not in description:
+        continue
+    event_id = item.get("id")
+    if event_id:
+        print(event_id)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
 delete_created_calendar_event() {
   local mode="${1:-best_effort}"
   local access_token
 
-  if [[ -z "$event_id" || "$event_deleted" == "1" ]]; then
+  if [[ "$event_deleted" == "1" ]]; then
+    return 0
+  fi
+  if [[ -z "$event_id" && "$event_cleanup_needed" != "1" ]]; then
     return 0
   fi
   if [[ -z "$credential_path" ]]; then
@@ -122,6 +182,17 @@ delete_created_calendar_event() {
   if [[ -z "$access_token" ]]; then
     if [[ "$mode" == "required" ]]; then
       live_fail "could not read Google Calendar OAuth access token for cleanup"
+    fi
+    return 1
+  fi
+
+  if [[ -z "$event_id" ]]; then
+    event_id="$(find_created_calendar_event "$access_token" 2>/dev/null || true)"
+  fi
+  if [[ -z "$event_id" ]]; then
+    unset access_token
+    if [[ "$mode" == "required" ]]; then
+      live_fail "could not find created Google Calendar event during cleanup"
     fi
     return 1
   fi
@@ -150,7 +221,7 @@ on_error() {
 
 cleanup() {
   set +e
-  if [[ -n "${event_id:-}" && "$event_deleted" != "1" ]]; then
+  if [[ "$event_deleted" != "1" && ( -n "${event_id:-}" || "$event_cleanup_needed" == "1" ) ]]; then
     delete_created_calendar_event best_effort >/dev/null 2>&1 || \
       echo "warning: failed to delete created Google Calendar event during cleanup" >&2
   fi
@@ -228,6 +299,7 @@ assert_json_ok "$diff_report" "Google Calendar diff report"
 assert_json_field_equals "$diff_report" "action" "confirm_plan" "Google Calendar diff report"
 
 step="pushing created Google Calendar draft"
+event_cleanup_needed=1
 LOCALITY_STATE_DIR="$state_root" "$loc_bin" push --json -y "$draft_path" \
   >"$push_report" 2>>"$command_log"
 assert_json_ok "$push_report" "Google Calendar push report"
@@ -254,5 +326,6 @@ wait_for_marker_under_events "$marker"
 
 step="deleting created Google Calendar event"
 delete_created_calendar_event required
+event_cleanup_needed=0
 
 echo "live Google Calendar API, CLI, daemon, and Linux FUSE create checks passed"

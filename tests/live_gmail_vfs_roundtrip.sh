@@ -43,6 +43,7 @@ diff_report="$tmp_root/diff.json"
 push_report="$tmp_root/push.json"
 pull_after_push_report="$tmp_root/pull-after-push.json"
 drafts_list_report="$tmp_root/gmail-drafts.json"
+draft_get_report="$tmp_root/gmail-draft.json"
 credential_path=""
 daemon_pid=""
 fuse_pid=""
@@ -50,6 +51,9 @@ message_id=""
 raw_message_id=""
 draft_id=""
 draft_deleted=0
+draft_cleanup_needed=0
+subject=""
+marker=""
 step="initializing"
 
 assert_json_field_equals() {
@@ -218,6 +222,25 @@ for draft in data.get("drafts") or []:
 PY
 }
 
+gmail_draft_ids() {
+  local drafts_json_path="$1"
+
+  python3 - "$drafts_json_path" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+for draft in data.get("drafts") or []:
+    if isinstance(draft, dict) and draft.get("id"):
+        print(draft["id"])
+PY
+}
+
 gmail_drafts_next_page_token() {
   local drafts_json_path="$1"
 
@@ -237,6 +260,36 @@ if token:
 PY
 }
 
+gmail_draft_subject_matches() {
+  local draft_json_path="$1"
+  local expected_subject="$2"
+
+  python3 - "$draft_json_path" "$expected_subject" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+expected_subject = sys.argv[2]
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+message = data.get("message")
+if not isinstance(message, dict):
+    raise SystemExit(1)
+payload = message.get("payload")
+if not isinstance(payload, dict):
+    raise SystemExit(1)
+for header in payload.get("headers") or []:
+    if not isinstance(header, dict):
+        continue
+    if header.get("name", "").lower() == "subject" and header.get("value") == expected_subject:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
 delete_created_gmail_draft() {
   local mode="${1:-best_effort}"
   local access_token
@@ -244,7 +297,7 @@ delete_created_gmail_draft() {
   if [[ "$draft_deleted" == "1" ]]; then
     return 0
   fi
-  if [[ -z "$draft_id" && -z "$raw_message_id" ]]; then
+  if [[ -z "$draft_id" && -z "$raw_message_id" && "$draft_cleanup_needed" != "1" ]]; then
     return 0
   fi
   if [[ -z "$credential_path" ]]; then
@@ -261,6 +314,7 @@ delete_created_gmail_draft() {
 
   if [[ -z "$draft_id" ]]; then
     local page_token=""
+    local candidate_draft_id
     while :; do
       local curl_args=(
         -fsS
@@ -282,7 +336,23 @@ delete_created_gmail_draft() {
         return 1
       fi
 
-      draft_id="$(find_gmail_draft_id "$drafts_list_report" "$raw_message_id" 2>/dev/null || true)"
+      if [[ -n "$raw_message_id" ]]; then
+        draft_id="$(find_gmail_draft_id "$drafts_list_report" "$raw_message_id" 2>/dev/null || true)"
+      fi
+      if [[ -z "$draft_id" && -n "${subject:-}" ]]; then
+        while IFS= read -r candidate_draft_id; do
+          [[ -z "$candidate_draft_id" ]] && continue
+          if curl -fsS --get "https://gmail.googleapis.com/gmail/v1/users/me/drafts/$candidate_draft_id" \
+            -H "Authorization: Bearer $access_token" \
+            --data-urlencode "format=metadata" \
+            --data-urlencode "metadataHeaders=Subject" \
+            >"$draft_get_report" 2>>"$command_log" \
+            && gmail_draft_subject_matches "$draft_get_report" "$subject"; then
+            draft_id="$candidate_draft_id"
+            break
+          fi
+        done < <(gmail_draft_ids "$drafts_list_report" 2>/dev/null || true)
+      fi
       if [[ -n "$draft_id" ]]; then
         break
       fi
@@ -307,6 +377,7 @@ delete_created_gmail_draft() {
     draft_id=""
     raw_message_id=""
     message_id=""
+    draft_cleanup_needed=0
     unset access_token
     return 0
   fi
@@ -327,7 +398,8 @@ on_error() {
 
 cleanup() {
   set +e
-  if [[ "$draft_deleted" != "1" && ( -n "${draft_id:-}" || -n "${raw_message_id:-}" ) ]]; then
+  if [[ "$draft_deleted" != "1" \
+    && ( -n "${draft_id:-}" || -n "${raw_message_id:-}" || "$draft_cleanup_needed" == "1" ) ]]; then
     delete_created_gmail_draft best_effort >/dev/null 2>&1 || \
       echo "warning: failed to delete created Gmail draft during cleanup" >&2
   fi
@@ -402,6 +474,7 @@ assert_json_ok "$diff_report" "Gmail diff report"
 assert_json_field_equals "$diff_report" "action" "confirm_plan" "Gmail diff report"
 
 step="pushing created Gmail draft"
+draft_cleanup_needed=1
 LOCALITY_STATE_DIR="$state_root" "$loc_bin" push --json -y "$draft_path" \
   >"$push_report" 2>>"$command_log"
 assert_json_ok "$push_report" "Gmail push report"

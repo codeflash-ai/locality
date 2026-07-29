@@ -123,8 +123,10 @@ Live testing found and fixed several integration issues:
 `tests/live_google_docs_vfs_roundtrip.sh` exercises the live Google Docs API,
 CLI mount/pull/diff/push paths, `localityd`, and the Linux FUSE projection. It
 uses isolated Locality state and a temporary shared root, creates one generated
-Google Docs page through the mounted filesystem, verifies the marker survives a
-pull after push, and trashes the created Drive file during cleanup.
+Google Docs page through the mounted filesystem, verifies the create marker
+survives a pull after push, edits the created document through mounted
+`page.md`, verifies the edit marker survives another pull, and trashes the
+created Drive file during cleanup.
 
 Set the required environment from a stored `connection:google-docs-live`
 credential and choose a scratch workspace folder:
