@@ -1623,6 +1623,34 @@ impl Debug for SessionCapability {
     }
 }
 
+/// Session created from a reusable key bound to a stable Workspace Profile.
+///
+/// The server resolves and records the profile's latest active revision for
+/// every new session. The reusable profile key is never returned in this
+/// response and the sandbox receives only the ordinary short-lived session
+/// capability.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceProfileSession {
+    pub session_id: SessionId,
+    pub opaque_capability: String,
+    pub expires_at: String,
+    pub profile_id: String,
+    pub profile_revision: u64,
+}
+
+impl Debug for WorkspaceProfileSession {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkspaceProfileSession")
+            .field("session_id", &self.session_id)
+            .field("opaque_capability", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .field("profile_id", &self.profile_id)
+            .field("profile_revision", &self.profile_revision)
+            .finish()
+    }
+}
+
 /// Versioned request for a backend-authorized working session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRequest {
@@ -2197,6 +2225,8 @@ pub const CHANGESET_ENVELOPE_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/changeset-envelope.json");
 pub const BOOTSTRAP_EXCHANGE_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/bootstrap-exchange.json");
+pub const WORKSPACE_PROFILE_SESSION_GOLDEN_JSON: &[u8] =
+    include_bytes!("../fixtures/workspace-profile-session.json");
 pub const FRESHNESS_STATUS_GOLDEN_JSON: &[u8] = include_bytes!("../fixtures/freshness-status.json");
 pub const SANDBOX_SESSION_STATUS_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/sandbox-session-status.json");

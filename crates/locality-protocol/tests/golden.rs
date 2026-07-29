@@ -36,8 +36,9 @@ use locality_protocol::{
     SealedExportOffer, SessionCapability, SessionErrorCode, SessionProtocolError,
     SessionReplicaRevision, SourceVersionContract, StaleSessionBehavior,
     TAR_EXPORT_METADATA_GOLDEN_JSON, TAR_EXPORT_OFFER_GOLDEN_JSON, TarContentEncoding,
-    TarExportMetadata, TarExportOffer, WRITABLE_EXPORT_METADATA_GOLDEN_JSON,
-    WritableExportMetadata, WritableMetadataEntry, validate_canonical_export_records,
+    TarExportMetadata, TarExportOffer, WORKSPACE_PROFILE_SESSION_GOLDEN_JSON,
+    WRITABLE_EXPORT_METADATA_GOLDEN_JSON, WorkspaceProfileSession, WritableExportMetadata,
+    WritableMetadataEntry, validate_canonical_export_records,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -276,6 +277,21 @@ fn freshness_session_and_tar_export_values_are_exact_golden_bytes() {
         &sandbox_session_status(),
     );
     assert_exact_round_trip(SESSION_PROTOCOL_ERROR_GOLDEN_JSON, &needs_update_error());
+}
+
+#[test]
+fn workspace_profile_session_is_exact_golden_bytes_and_redacts_credential() {
+    let session = WorkspaceProfileSession {
+        session_id: SessionId::new("session-profile-7"),
+        opaque_capability: "opaque-session-capability".to_string(),
+        expires_at: "2026-07-29T01:00:00Z".to_string(),
+        profile_id: "00000000-0000-0000-0000-000000000007".to_string(),
+        profile_revision: 9,
+    };
+    assert_exact_round_trip(WORKSPACE_PROFILE_SESSION_GOLDEN_JSON, &session);
+    let debug = format!("{session:?}");
+    assert!(!debug.contains("opaque-session-capability"));
+    assert!(debug.contains("<redacted>"));
 }
 
 #[test]
