@@ -209,7 +209,7 @@ loc connect slack [--name <id>] [--no-browser] [--broker-url <url>] [--redirect-
 
 Use this before mounting Slack conversation history.
 
-The default broker is `https://afs-oauth-broker.saurabh-b07.workers.dev`; override it with `--broker-url <url>`, `LOCALITY_SLACK_OAUTH_BROKER_URL`, or `LOCALITY_AUTH_BROKER_URL`. The default local callback is `http://localhost:8757/oauth/slack/callback`; override it with `--redirect-uri <uri>` or `LOCALITY_SLACK_OAUTH_REDIRECT_URI`. In production the broker may use its own HTTPS provider callback registered on the provider app, then hand the browser back to the local callback. The command still stores the resulting OAuth credential locally.
+The default broker is `https://afs-oauth-broker.saurabh-b07.workers.dev`; override it with `--broker-url <url>`, `LOCALITY_SLACK_OAUTH_BROKER_URL`, or `LOCALITY_AUTH_BROKER_URL`. The default local callback is `http://localhost:8757/oauth/slack/callback`; override it with `--redirect-uri <uri>` or `LOCALITY_SLACK_OAUTH_REDIRECT_URI`. In production the Slack provider app registers the broker's hosted HTTPS callback, and the broker hands the browser back to the local callback. The command still stores the resulting OAuth credential locally.
 
 Key arguments:
 
