@@ -125,6 +125,11 @@ block next to the old block, journal the created block ID, then archive the old
 block. Auto-save treats replacements as review-required because the old remote
 block ID is removed.
 
+The Notion connector defers standalone block archives until all other writes
+finish, then archives nested descendants before their ancestors. This keeps
+later child updates and deletes valid when one approved plan removes a parent
+block and also changes or removes blocks beneath it.
+
 `CreateEntity` is the connector-neutral shape for local file creation. For the filesystem projection it carries the parent remote ID, user title, initial property values, initial body, and the source path that produced the create request. Connectors assign the real remote ID and return a `CreatedEntity` apply effect; reconciliation then reads the created remote entity back, materializes the canonical projected path, saves the shadow, and lets undo archive the created entity by ID.
 
 ## Undo Contract

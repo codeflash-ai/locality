@@ -979,6 +979,93 @@ fn apply_normalizes_append_after_nested_block_to_direct_child_ancestor() {
 }
 
 #[test]
+fn apply_defers_archives_until_child_updates_finish_and_archives_deepest_first() {
+    let mut parent = callout_block("parent-1", "Parent");
+    parent.has_children = true;
+    let mut api = RecordingNotionApi::with_blocks("2026-06-10T00:00:00.000Z", vec![parent]);
+    api.children.insert(
+        ("parent-1".to_string(), None),
+        PaginatedListDto {
+            results: vec![paragraph_block("child-1", "Before.", false)],
+            next_cursor: None,
+            has_more: false,
+        },
+    );
+    let api = Arc::new(api);
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![
+            PushOperation::ArchiveBlock {
+                block_id: RemoteId::new("parent-1"),
+            },
+            PushOperation::ArchiveBlock {
+                block_id: RemoteId::new("child-1"),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("child-1"),
+                content: "After.".to_string(),
+            },
+        ],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let result = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("apply");
+
+    assert_eq!(
+        result.effects,
+        vec![
+            JournalApplyEffect::UpdatedBlock {
+                operation_id: operation_ids[2].clone(),
+                operation_index: 2,
+                block_id: RemoteId::new("child-1"),
+            },
+            JournalApplyEffect::ArchivedBlock {
+                operation_id: operation_ids[1].clone(),
+                operation_index: 1,
+                block_id: RemoteId::new("child-1"),
+            },
+            JournalApplyEffect::ArchivedBlock {
+                operation_id: operation_ids[0].clone(),
+                operation_index: 0,
+                block_id: RemoteId::new("parent-1"),
+            },
+        ]
+    );
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [
+            WriteCall::Update {
+                block_id: "child-1".to_string(),
+                body: json!({
+                    "paragraph": {
+                        "rich_text": rich_text_json("After."),
+                    },
+                }),
+            },
+            WriteCall::Delete {
+                block_id: "child-1".to_string(),
+            },
+            WriteCall::Delete {
+                block_id: "parent-1".to_string(),
+            },
+        ]
+    );
+}
+
+#[test]
 fn apply_appends_tier_one_markdown_block_shapes() {
     let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
     let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());

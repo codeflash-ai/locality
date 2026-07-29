@@ -94,6 +94,13 @@ pub fn apply_plan(
 
     let mut operation_index = 0usize;
     while operation_index < request.plan.operations.len() {
+        if matches!(
+            request.plan.operations[operation_index],
+            PushOperation::ArchiveBlock { .. }
+        ) {
+            operation_index += 1;
+            continue;
+        }
         let step = lower_notion_apply_step(
             &request.plan.operations,
             operation_index,
@@ -257,14 +264,9 @@ pub fn apply_plan(
                             block_id: block_id.clone(),
                         });
                     }
-                    PushOperation::ArchiveBlock { block_id } => {
-                        api.delete_block(block_id.as_str())?;
-                        effects.push(JournalApplyEffect::ArchivedBlock {
-                            operation_id: request.operation_ids[operation_index].clone(),
-                            operation_index,
-                            block_id: block_id.clone(),
-                        });
-                    }
+                    PushOperation::ArchiveBlock { .. } => unreachable!(
+                        "standalone Notion block archives are deferred until other writes finish"
+                    ),
                     PushOperation::UpdateProperties {
                         entity_id,
                         properties,
@@ -456,6 +458,21 @@ pub fn apply_plan(
                 }
             }
         }
+    }
+
+    for operation_index in
+        deferred_archive_operation_indices(&request.plan.operations, &block_parents)
+    {
+        let PushOperation::ArchiveBlock { block_id } = &request.plan.operations[operation_index]
+        else {
+            unreachable!("deferred Notion archive index must reference an archive operation");
+        };
+        api.delete_block(block_id.as_str())?;
+        effects.push(JournalApplyEffect::ArchivedBlock {
+            operation_id: request.operation_ids[operation_index].clone(),
+            operation_index,
+            block_id: block_id.clone(),
+        });
     }
 
     for remote_id in &request.plan.affected_entities {
@@ -823,6 +840,38 @@ fn archived_block_ids(operations: &[PushOperation]) -> BTreeSet<RemoteId> {
             _ => None,
         })
         .collect()
+}
+
+fn deferred_archive_operation_indices(
+    operations: &[PushOperation],
+    block_parents: &BlockParentIndex,
+) -> Vec<usize> {
+    let mut indices = operations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, operation)| match operation {
+            PushOperation::ArchiveBlock { block_id } => {
+                Some((index, block_depth(block_id, block_parents)))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    indices.sort_by_key(|(index, depth)| (Reverse(*depth), *index));
+    indices.into_iter().map(|(index, _)| index).collect()
+}
+
+fn block_depth(block_id: &RemoteId, block_parents: &BlockParentIndex) -> usize {
+    let mut depth = 0;
+    let mut current = block_id;
+    let mut seen = BTreeSet::new();
+    while seen.insert(current.clone()) {
+        let Some(parent) = block_parents.direct_parents.get(current) else {
+            break;
+        };
+        depth += 1;
+        current = parent;
+    }
+    depth
 }
 
 fn database_create_parent_ids(operations: &[PushOperation]) -> BTreeSet<RemoteId> {
