@@ -1,0 +1,129 @@
+{
+  "snapshot": {
+    "installation_id": "0198f3c2-7d4e-7a61-8b25-4f9c8d7e6a10",
+    "channel": {
+      "team_id": "T08LOCALITY1",
+      "channel_id": "C08ENGINEER1",
+      "name": "engineering",
+      "topic": "Build deterministic Locality exports",
+      "purpose": "Engineering coordination",
+      "created_at": "2026-05-28T20:26:40.000100Z",
+      "updated_at": "2026-05-28T20:28:20.000200Z",
+      "sharing": "externally_shared_private"
+    },
+    "users": [
+      {
+        "team_id": "T08LOCALITY1",
+        "user_id": "U08ADA00001",
+        "name": "ada",
+        "display_name": "Ada",
+        "real_name": "Ada Lovelace",
+        "is_bot": false,
+        "deleted": false,
+        "updated_at": null
+      },
+      {
+        "team_id": "T08LOCALITY1",
+        "user_id": "U08GRACE001",
+        "name": "grace",
+        "display_name": "Grace",
+        "real_name": "Grace Hopper",
+        "is_bot": false,
+        "deleted": false,
+        "updated_at": "2026-05-28T20:30:00.000300Z"
+      }
+    ],
+    "messages": [
+      {
+        "channel_id": "C08ENGINEER1",
+        "message_id": "1780000000.000100",
+        "posted_at": "2026-05-28T20:26:40.000100Z",
+        "thread_root_message_id": null,
+        "user_id": "U08ADA00001",
+        "text": "Root message",
+        "edited_at": "2026-05-28T20:26:41.000200Z",
+        "deleted": false,
+        "file_ids": [
+          "F08PLAN0001",
+          "F08PLAN0002"
+        ]
+      },
+      {
+        "channel_id": "C08ENGINEER1",
+        "message_id": "1780000001.000200",
+        "posted_at": "2026-05-28T20:26:41.000200Z",
+        "thread_root_message_id": "1780000000.000100",
+        "user_id": "U08GRACE001",
+        "text": "First reply",
+        "edited_at": null,
+        "deleted": true,
+        "file_ids": []
+      },
+      {
+        "channel_id": "C08ENGINEER1",
+        "message_id": "1780000002.000300",
+        "posted_at": "2026-05-28T20:26:42.000300Z",
+        "thread_root_message_id": "1780000000.000100",
+        "user_id": "U08ADA00001",
+        "text": "Second reply",
+        "edited_at": null,
+        "deleted": false,
+        "file_ids": []
+      }
+    ],
+    "threads": [
+      {
+        "channel_id": "C08ENGINEER1",
+        "root_message_id": "1780000000.000100",
+        "reply_message_ids": [
+          "1780000001.000200",
+          "1780000002.000300"
+        ]
+      }
+    ],
+    "files": [
+      {
+        "channel_id": "C08ENGINEER1",
+        "file_id": "F08PLAN0001",
+        "user_id": "U08ADA00001",
+        "name": "plan.pdf",
+        "title": "Plan",
+        "mimetype": "application/pdf",
+        "byte_length": 1024,
+        "created_at": "2026-05-28T20:26:40.000100Z",
+        "deleted": false,
+        "capture_receipt": {
+          "status": "bytes_not_captured"
+        }
+      },
+      {
+        "channel_id": "C08ENGINEER1",
+        "file_id": "F08PLAN0002",
+        "user_id": "U08GRACE001",
+        "name": "diagram.png",
+        "title": "Architecture diagram",
+        "mimetype": "image/png",
+        "byte_length": 2048,
+        "created_at": "2026-05-28T20:26:42.000300Z",
+        "deleted": true,
+        "capture_receipt": {
+          "status": "bytes_not_captured"
+        }
+      }
+    ]
+  },
+  "operational_status": {
+    "status_format_version": 1,
+    "installation_id": "0198f3c2-7d4e-7a61-8b25-4f9c8d7e6a10",
+    "team_id": "T08LOCALITY1",
+    "channel_id": "C08ENGINEER1",
+    "authorized_history_start_at": "2026-01-01T00:00:00Z",
+    "sharing": "externally_shared_private",
+    "coverage_start_at": "2026-01-01T00:00:00Z",
+    "coverage_end_at": "2026-06-02T00:00:00Z",
+    "coverage_complete": true,
+    "freshness_state": "fresh",
+    "freshness_observed_through": "2026-06-02T00:00:00Z",
+    "last_successful_sync_at": "2026-06-02T00:00:07Z"
+  }
+}
