@@ -4,6 +4,8 @@
 //! This crate owns envelopes, not transport or persistence. In particular it
 //! contains no HTTP client, database repository, cloud SDK, or host path.
 
+pub mod workspace_layout;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Display, Formatter};
 

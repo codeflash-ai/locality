@@ -1,0 +1,26 @@
+{
+  "layout_version": 1,
+  "layout_digest": "sha256:6d739ad2748910520e4df1d680e9ea78a94230d0751e6346d3f5d3c57b9259b5",
+  "entries": [
+    {
+      "scope_ordinal": 0,
+      "mount_id": "mount-zeta",
+      "target": "Sales"
+    },
+    {
+      "scope_ordinal": 1,
+      "mount_id": "mount-alpha",
+      "target": "Engineering"
+    },
+    {
+      "scope_ordinal": 2,
+      "mount_id": "mount-zeta",
+      "target": "Sales"
+    },
+    {
+      "scope_ordinal": 3,
+      "mount_id": "mount-alpha",
+      "target": "Engineering"
+    }
+  ]
+}

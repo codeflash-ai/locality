@@ -29,5 +29,6 @@ pub mod shadow;
 pub mod sync;
 pub mod undo;
 pub mod validation;
+pub mod workspace_layout;
 
 pub use error::{LocalityError, LocalityResult};

@@ -11,8 +11,10 @@ name = "locality_core"
 path = "src/lib.rs"
 
 [dependencies]
+caseless.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 similar = "3.1.1"
+unicode-normalization-v16.workspace = true
 yaml_serde = "0.10"
 
 [dev-dependencies]

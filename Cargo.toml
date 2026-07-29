@@ -41,3 +41,5 @@ locality-gmail = { path = "crates/locality-gmail" }
 locality-granola = { path = "crates/locality-granola" }
 locality-linear = { path = "crates/locality-linear" }
 locality-slack = { path = "crates/locality-slack" }
+caseless = "=0.2.2"
+unicode-normalization-v16 = { package = "unicode-normalization", version = "=0.1.24" }
