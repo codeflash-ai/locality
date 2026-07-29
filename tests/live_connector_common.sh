@@ -22,34 +22,30 @@ require_live_env() {
   done
 }
 
-_live_skip_or_fail() {
-  local message="$1"
-  if [[ "${LOCALITY_LIVE_FUSE_REQUIRED:-}" == "1" || "${LOCALITY_FUSE_SMOKE_REQUIRED:-}" == "1" ]]; then
-    echo "$message" >&2
-    exit 1
-  fi
-  echo "$message"
-  exit 0
-}
-
 require_linux_fuse() {
   if [[ "$(uname -s)" != "Linux" ]]; then
-    _live_skip_or_fail "skip: live connector Linux FUSE tests require Linux"
+    live_fail "live connector Linux FUSE tests require Linux"
+    return 1
   fi
   if [[ ! -e /dev/fuse ]]; then
-    _live_skip_or_fail "skip: /dev/fuse is not available on this runner"
+    live_fail "/dev/fuse is not available on this runner"
+    return 1
   fi
   if ! command -v fusermount3 >/dev/null 2>&1; then
-    _live_skip_or_fail "skip: fusermount3 is not installed"
+    live_fail "fusermount3 is not installed"
+    return 1
   fi
   if ! command -v mountpoint >/dev/null 2>&1; then
-    _live_skip_or_fail "skip: mountpoint is not installed"
+    live_fail "mountpoint is not installed"
+    return 1
   fi
   if ! command -v python3 >/dev/null 2>&1; then
-    _live_skip_or_fail "skip: python3 is not installed"
+    live_fail "python3 is not installed"
+    return 1
   fi
   if ! command -v sqlite3 >/dev/null 2>&1; then
-    _live_skip_or_fail "skip: sqlite3 is not installed"
+    live_fail "sqlite3 is not installed"
+    return 1
   fi
 }
 

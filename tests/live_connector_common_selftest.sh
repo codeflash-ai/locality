@@ -40,6 +40,44 @@ cleanup() {
 }
 trap cleanup EXIT
 
+assert_require_linux_fuse_fails_with_path() {
+  local label="$1"
+  local expected="$2"
+  local fake_path="$3"
+  local error_path="$tmp_root/require-linux-fuse-$label.err"
+  local actual
+
+  if (PATH="$fake_path" require_linux_fuse) 2>"$error_path"; then
+    live_fail "require_linux_fuse accepted $label"
+  fi
+  actual="$(cat "$error_path")"
+  if [[ "$actual" != "$expected" ]]; then
+    live_fail "require_linux_fuse reported an unexpected $label error: $actual"
+  fi
+}
+
+non_linux_fake_path="$tmp_root/require-fuse-non-linux-bin"
+mkdir -p "$non_linux_fake_path"
+cat >"$non_linux_fake_path/uname" <<'SH'
+#!/bin/sh
+printf '%s\n' Darwin
+SH
+chmod +x "$non_linux_fake_path/uname"
+assert_require_linux_fuse_fails_with_path \
+  "non-linux" \
+  "live connector Linux FUSE tests require Linux" \
+  "$non_linux_fake_path"
+
+if [[ "$(uname -s)" == "Linux" && ! -e /dev/fuse ]]; then
+  missing_fuse_error="$tmp_root/require-linux-fuse-missing-dev-fuse.err"
+  if require_linux_fuse 2>"$missing_fuse_error"; then
+    live_fail "require_linux_fuse accepted a missing /dev/fuse"
+  fi
+  if [[ "$(cat "$missing_fuse_error")" != "/dev/fuse is not available on this runner" ]]; then
+    live_fail "require_linux_fuse reported an unexpected missing-/dev/fuse error"
+  fi
+fi
+
 if [[ "$(uname -s)" == "Linux" && -e /dev/fuse ]]; then
   require_fuse_fake_path="$tmp_root/require-fuse-bin"
   mkdir -p "$require_fuse_fake_path"
@@ -55,6 +93,10 @@ SH
 #!/bin/sh
 exit 0
 SH
+  cat >"$require_fuse_fake_path/python3" <<'SH'
+#!/bin/sh
+exit 0
+SH
   cat >"$require_fuse_fake_path/sqlite3" <<'SH'
 #!/bin/sh
 exit 0
@@ -63,29 +105,47 @@ SH
     "$require_fuse_fake_path/uname" \
     "$require_fuse_fake_path/fusermount3" \
     "$require_fuse_fake_path/mountpoint" \
+    "$require_fuse_fake_path/python3" \
     "$require_fuse_fake_path/sqlite3"
 
-  missing_python_error="$tmp_root/require-linux-fuse-missing-python.err"
-  if (PATH="$require_fuse_fake_path" LOCALITY_LIVE_FUSE_REQUIRED=1 require_linux_fuse) 2>"$missing_python_error"; then
-    live_fail "require_linux_fuse accepted a missing python3 command"
-  fi
-  if [[ "$(cat "$missing_python_error")" != "skip: python3 is not installed" ]]; then
-    live_fail "require_linux_fuse reported an unexpected missing-python3 error"
-  fi
+  rm -f "$require_fuse_fake_path/fusermount3"
+  assert_require_linux_fuse_fails_with_path \
+    "missing-fusermount3" \
+    "fusermount3 is not installed" \
+    "$require_fuse_fake_path"
+  cat >"$require_fuse_fake_path/fusermount3" <<'SH'
+#!/bin/sh
+exit 0
+SH
+  chmod +x "$require_fuse_fake_path/fusermount3"
 
+  rm -f "$require_fuse_fake_path/mountpoint"
+  assert_require_linux_fuse_fails_with_path \
+    "missing-mountpoint" \
+    "mountpoint is not installed" \
+    "$require_fuse_fake_path"
+  cat >"$require_fuse_fake_path/mountpoint" <<'SH'
+#!/bin/sh
+exit 0
+SH
+  chmod +x "$require_fuse_fake_path/mountpoint"
+
+  rm -f "$require_fuse_fake_path/python3"
+  assert_require_linux_fuse_fails_with_path \
+    "missing-python3" \
+    "python3 is not installed" \
+    "$require_fuse_fake_path"
   cat >"$require_fuse_fake_path/python3" <<'SH'
 #!/bin/sh
 exit 0
 SH
   chmod +x "$require_fuse_fake_path/python3"
+
   rm -f "$require_fuse_fake_path/sqlite3"
-  missing_sqlite_error="$tmp_root/require-linux-fuse-missing-sqlite.err"
-  if (PATH="$require_fuse_fake_path" LOCALITY_LIVE_FUSE_REQUIRED=1 require_linux_fuse) 2>"$missing_sqlite_error"; then
-    live_fail "require_linux_fuse accepted a missing sqlite3 command"
-  fi
-  if [[ "$(cat "$missing_sqlite_error")" != "skip: sqlite3 is not installed" ]]; then
-    live_fail "require_linux_fuse reported an unexpected missing-sqlite3 error"
-  fi
+  assert_require_linux_fuse_fails_with_path \
+    "missing-sqlite3" \
+    "sqlite3 is not installed" \
+    "$require_fuse_fake_path"
 fi
 
 state_root="$tmp_root/state"
