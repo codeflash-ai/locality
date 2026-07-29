@@ -5,6 +5,7 @@ const DEFAULT_NOTION_REDIRECT_URIS = [
   "http://localhost:8757/oauth/notion/callback",
   "http://127.0.0.1:8757/oauth/notion/callback"
 ];
+const NOTION_HOSTED_CALLBACK_PATH = "/v1/oauth/notion/callback";
 
 const DEFAULT_GOOGLE_DOCS_REDIRECT_URIS = [
   "http://localhost:8757/oauth/google-docs/callback",
@@ -32,6 +33,47 @@ export function allowedNotionRedirectUris(env: BrokerEnv): string[] {
 
 export function validateNotionRedirectUri(env: BrokerEnv, redirectUri: string): string {
   return validateLoopbackRedirectUri("Notion", allowedNotionRedirectUris(env), redirectUri);
+}
+
+export function hostedNotionCallbackUri(env: BrokerEnv): string | undefined {
+  const value = env.LOCALITY_NOTION_HOSTED_CALLBACK_URI?.trim();
+  if (!value) {
+    return undefined;
+  }
+  return validateHostedNotionCallbackUri(value);
+}
+
+export function validateHostedNotionCallbackUri(callbackUri: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(callbackUri);
+  } catch {
+    throw badRequest("invalid_hosted_callback_uri", "hosted Notion callback URI must be a valid URL");
+  }
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    parsed.hostname === "" ||
+    parsed.port !== "" ||
+    parsed.pathname !== NOTION_HOSTED_CALLBACK_PATH ||
+    parsed.search !== "" ||
+    parsed.hash !== ""
+  ) {
+    throw badRequest(
+      "invalid_hosted_callback_uri",
+      "hosted Notion callback URI must be an HTTPS URL at /v1/oauth/notion/callback without userinfo, port, query, or fragment"
+    );
+  }
+  return parsed.toString();
+}
+
+export function validateNotionExchangeRedirectUri(env: BrokerEnv, redirectUri: string): string {
+  const hosted = hostedNotionCallbackUri(env);
+  if (hosted && redirectUri === hosted) {
+    return redirectUri;
+  }
+  return validateNotionRedirectUri(env, redirectUri);
 }
 
 export function allowedGoogleDocsRedirectUris(env: BrokerEnv): string[] {

@@ -18,13 +18,21 @@ import { exchangeNotionCode, notionAuthorizeUrl, refreshNotionToken, type Notion
 import { exchangeSlackCode, refreshSlackToken, slackAuthorizeUrl, type SlackTokenResponse } from "./oauth/slack";
 import { randomBase64Url, decryptJsonHandle, encryptJsonHandle } from "./security/crypto";
 import {
+  hostedNotionCallbackUri,
   validateGmailRedirectUri,
   validateGoogleCalendarRedirectUri,
   validateGoogleDocsRedirectUri,
+  validateNotionExchangeRedirectUri,
   validateNotionRedirectUri,
   validateSlackRedirectUri
 } from "./security/redirects";
-import { nowSeconds, signSession, verifySession } from "./security/session";
+import {
+  nowSeconds,
+  signLocalHandoffState,
+  signSession,
+  verifyLocalHandoffState,
+  verifySession
+} from "./security/session";
 import type { ApiErrorBody, BrokerEnv, ConnectorId } from "./types";
 
 const SESSION_TTL_SECONDS = 10 * 60;
@@ -34,11 +42,25 @@ interface StartRequest {
   redirect_uri?: string;
 }
 
+interface NotionStartRedirects {
+  localRedirectUri: string;
+  authorizationRedirectUri: string;
+  exchangeRedirectUri: string;
+  hostedHandoff: boolean;
+}
+
 interface ExchangeRequest {
   session?: string;
   state?: string;
   code?: string;
   redirect_uri?: string;
+}
+
+interface HostedCallbackQuery {
+  state?: string;
+  code?: string;
+  error?: string;
+  error_description?: string;
 }
 
 interface RefreshRequest {
@@ -93,18 +115,32 @@ app.get("/.well-known/loc-auth-broker", (c) =>
 
 app.post("/v1/oauth/notion/start", async (c) => {
   const body = await optionalJson<StartRequest>(c.req.raw);
-  const redirectUri = validateNotionRedirectUri(
+  const redirects = notionStartRedirects(
     c.env,
     body.redirect_uri ?? "http://localhost:8757/oauth/notion/callback"
   );
   const now = nowSeconds();
-  const state = randomBase64Url();
+  const state = redirects.hostedHandoff
+    ? await signLocalHandoffState(
+        {
+          v: 1,
+          kind: "local_handoff",
+          connector: "notion",
+          local_redirect_uri: redirects.localRedirectUri,
+          provider_redirect_uri: redirects.authorizationRedirectUri,
+          iat: now,
+          exp: now + SESSION_TTL_SECONDS,
+          nonce: randomBase64Url()
+        },
+        requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
+      )
+    : randomBase64Url();
   const session = await signSession(
     {
       v: 1,
       connector: "notion",
       state,
-      redirect_uri: redirectUri,
+      redirect_uri: redirects.exchangeRedirectUri,
       iat: now,
       exp: now + SESSION_TTL_SECONDS,
       nonce: randomBase64Url()
@@ -114,12 +150,44 @@ app.post("/v1/oauth/notion/start", async (c) => {
   return c.json({
     connector: "notion",
     client_id: c.env.LOCALITY_NOTION_CLIENT_ID,
-    authorization_url: notionAuthorizeUrl(c.env, redirectUri, state),
-    redirect_uri: redirectUri,
+    authorization_url: notionAuthorizeUrl(c.env, redirects.authorizationRedirectUri, state),
+    redirect_uri: redirects.localRedirectUri,
+    authorization_redirect_uri: redirects.authorizationRedirectUri,
+    exchange_redirect_uri: redirects.exchangeRedirectUri,
     session,
     state,
     expires_in: SESSION_TTL_SECONDS
   });
+});
+
+app.get("/v1/oauth/notion/callback", async (c) => {
+  const query = c.req.query() as HostedCallbackQuery;
+  const state = callbackString(query.state, "state", 8192);
+  const payload = await verifyLocalHandoffState(
+    state,
+    requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
+  );
+  if (payload.connector !== "notion") {
+    throw badRequest("invalid_state", "OAuth state connector is invalid");
+  }
+  const expectedProviderRedirectUri = hostedNotionCallbackUri(c.env);
+  if (!expectedProviderRedirectUri || payload.provider_redirect_uri !== expectedProviderRedirectUri) {
+    throw badRequest("invalid_state", "OAuth state provider redirect is invalid");
+  }
+  const localRedirectUri = validateNotionRedirectUri(c.env, payload.local_redirect_uri);
+  const redirect = new URL(localRedirectUri);
+  redirect.searchParams.set("state", state);
+  const providerError = optionalCallbackString(query.error, "error", 256);
+  if (providerError) {
+    redirect.searchParams.set("error", providerError);
+    const description = optionalCallbackString(query.error_description, "error_description", 1024);
+    if (description) {
+      redirect.searchParams.set("error_description", description);
+    }
+    return localCallbackRedirect(redirect.toString());
+  }
+  redirect.searchParams.set("code", callbackString(query.code, "code", 4096));
+  return localCallbackRedirect(redirect.toString());
 });
 
 app.post("/v1/oauth/notion/exchange", async (c) => {
@@ -127,7 +195,7 @@ app.post("/v1/oauth/notion/exchange", async (c) => {
   const session = requireString(body.session, "session");
   const state = requireString(body.state, "state");
   const code = requireString(body.code, "code");
-  const redirectUri = validateNotionRedirectUri(c.env, requireString(body.redirect_uri, "redirect_uri"));
+  const redirectUri = validateNotionExchangeRedirectUri(c.env, requireString(body.redirect_uri, "redirect_uri"));
   const payload = await verifySession(
     session,
     requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
@@ -521,6 +589,60 @@ function requireString(value: string | undefined, field: string): string {
     throw badRequest("missing_field", `${field} is required`);
   }
   return value;
+}
+
+function notionStartRedirects(env: BrokerEnv, requestedRedirectUri: string): NotionStartRedirects {
+  const localRedirectUri = validateNotionRedirectUri(env, requestedRedirectUri);
+  const hostedCallbackUri = hostedNotionCallbackUri(env);
+  if (!hostedCallbackUri) {
+    return {
+      localRedirectUri,
+      authorizationRedirectUri: localRedirectUri,
+      exchangeRedirectUri: localRedirectUri,
+      hostedHandoff: false
+    };
+  }
+  return {
+    localRedirectUri,
+    authorizationRedirectUri: hostedCallbackUri,
+    exchangeRedirectUri: hostedCallbackUri,
+    hostedHandoff: true
+  };
+}
+
+function callbackString(value: string | undefined, field: string, maxBytes: number): string {
+  if (!value || value.trim() === "" || new TextEncoder().encode(value).byteLength > maxBytes || hasControlCharacter(value)) {
+    throw badRequest("invalid_callback", `${field} is invalid`);
+  }
+  return value;
+}
+
+function optionalCallbackString(value: string | undefined, field: string, maxBytes: number): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  return callbackString(value, field, maxBytes);
+}
+
+function hasControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.charCodeAt(0);
+    if (codePoint < 0x20 || codePoint === 0x7f) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function localCallbackRedirect(location: string): Response {
+  return new Response(null, {
+    status: 303,
+    headers: {
+      "Cache-Control": "no-store",
+      "Referrer-Policy": "no-referrer",
+      Location: location
+    }
+  });
 }
 
 function tokenMode(env: BrokerEnv): "handle" | "raw" {
