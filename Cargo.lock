@@ -2307,10 +2307,12 @@ dependencies = [
 name = "locality-protocol"
 version = "0.3.3"
 dependencies = [
+ "caseless",
  "locality-core",
  "serde",
  "serde_json",
  "sha2",
+ "unicode-normalization 0.1.24",
 ]
 
 [[package]]

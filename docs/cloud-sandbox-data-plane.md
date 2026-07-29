@@ -1371,6 +1371,21 @@ sorted effective-action labels, content SHA-256, and byte length. Public exact
 goldens bind the preimage and digest so the backend and client cannot disagree
 about JSON formatting, collation, or field omission.
 
+HTTP API generation 2 adds a separate workspace inventory domain and does not
+change the flat API-v1 archive. Every authorized directory or file retains its
+connector logical path and is mapped through the sealed scope ordinal and mount
+to `<target>/<logical-path>`. The inventory emits each authorized target root,
+including empty targets, and the terminal control plus completion receipt repeat
+the layout version/digest, session and export-attempt IDs, inventory digest,
+target declarations, and exact counts. The shared pure planner rejects unknown
+ordinals, mounts, or targets; a file whose source is absent from the sealed
+source-generation vector or differs from its sealed scope-to-source authority;
+unsafe or colliding portable paths; links/devices; and any stream where the
+unique control member is not last. Inventory decoding always recomputes these
+facts against the session layout and offer. Terminal-control JSON is accepted
+only in its exact compact canonical encoding. Absolute host roots are outside
+this protocol and are never serialized.
+
 Start with Zstd level 1. It normally reduces Locality's Markdown/JSON-heavy wire
 bytes substantially while retaining fast, bounded-memory streaming decode.
 Use one ordinary Zstd frame with no dictionary, seek table, per-tenant tuning,
