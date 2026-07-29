@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use locality_connector::ConnectorUndoApplier;
-use locality_connector::oauth_broker::OAuthBrokerStart;
+use locality_connector::oauth_broker::{OAuthBrokerStart, OAuthBrokerStartResponse};
 use locality_core::LocalityError;
 use locality_core::freshness::RemoteVersion;
 use locality_core::hydration::{HydrationReason, HydrationRequest};
@@ -2169,6 +2169,136 @@ fn remove_path_if_exists(path: &Path) -> Result<(), String> {
     .map_err(|error| format!("Could not remove `{}`: {error}", path.display()))
 }
 
+struct BrokerOAuthCommandStart {
+    provider_name: &'static str,
+    start: OAuthBrokerStartResponse,
+    connection_id: Option<ConnectionId>,
+    broker_url: String,
+    no_browser: bool,
+    json: bool,
+}
+
+struct BrokerOAuthExchangeOptionsInput {
+    connection_id: Option<ConnectionId>,
+    broker_url: String,
+    client_id: String,
+    session: String,
+    state: String,
+    code: String,
+    redirect_uri: String,
+}
+
+#[derive(Debug)]
+enum BrokerOAuthCommandFlowError {
+    LocalOAuth(LocalOAuthError),
+    Connect(ConnectError),
+}
+
+fn run_broker_oauth_command_flow<O, Authorize, BuildOptions, Connect>(
+    command: BrokerOAuthCommandStart,
+    authorize: Authorize,
+    build_options: BuildOptions,
+    connect: Connect,
+) -> Result<ConnectReport, BrokerOAuthCommandFlowError>
+where
+    Authorize: FnOnce(
+        &str,
+        &str,
+        &str,
+        &str,
+        bool,
+        bool,
+    ) -> Result<LocalOAuthAuthorization, LocalOAuthError>,
+    BuildOptions: FnOnce(BrokerOAuthExchangeOptionsInput) -> O,
+    Connect: FnOnce(O) -> Result<ConnectReport, ConnectError>,
+{
+    let BrokerOAuthCommandStart {
+        provider_name,
+        start,
+        connection_id,
+        broker_url,
+        no_browser,
+        json,
+    } = command;
+    let authorization = authorize(
+        provider_name,
+        &start.authorization_url,
+        start.local_redirect_uri(),
+        &start.state,
+        no_browser,
+        json,
+    )
+    .map_err(BrokerOAuthCommandFlowError::LocalOAuth)?;
+    let exchange_redirect_uri = start.exchange_redirect_uri().to_string();
+    let options = build_options(BrokerOAuthExchangeOptionsInput {
+        connection_id,
+        broker_url,
+        client_id: start.client_id,
+        session: start.session,
+        state: start.state,
+        code: authorization.code,
+        redirect_uri: exchange_redirect_uri,
+    });
+
+    connect(options).map_err(BrokerOAuthCommandFlowError::Connect)
+}
+
+fn google_docs_broker_oauth_connect_options(
+    input: BrokerOAuthExchangeOptionsInput,
+) -> GoogleDocsBrokerOAuthConnectOptions {
+    GoogleDocsBrokerOAuthConnectOptions {
+        connection_id: input.connection_id,
+        broker_url: input.broker_url,
+        client_id: input.client_id,
+        session: input.session,
+        state: input.state,
+        code: input.code,
+        redirect_uri: input.redirect_uri,
+    }
+}
+
+fn google_calendar_broker_oauth_connect_options(
+    input: BrokerOAuthExchangeOptionsInput,
+) -> GoogleCalendarBrokerOAuthConnectOptions {
+    GoogleCalendarBrokerOAuthConnectOptions {
+        connection_id: input.connection_id,
+        broker_url: input.broker_url,
+        client_id: input.client_id,
+        session: input.session,
+        state: input.state,
+        code: input.code,
+        redirect_uri: input.redirect_uri,
+    }
+}
+
+fn gmail_broker_oauth_connect_options(
+    input: BrokerOAuthExchangeOptionsInput,
+) -> GmailBrokerOAuthConnectOptions {
+    GmailBrokerOAuthConnectOptions {
+        connection_id: input.connection_id,
+        broker_url: input.broker_url,
+        client_id: input.client_id,
+        session: input.session,
+        state: input.state,
+        code: input.code,
+        redirect_uri: input.redirect_uri,
+    }
+}
+
+fn slack_broker_oauth_connect_options(
+    input: BrokerOAuthExchangeOptionsInput,
+) -> SlackBrokerOAuthConnectOptions {
+    SlackBrokerOAuthConnectOptions {
+        connection_id: input.connection_id,
+        broker_url: input.broker_url,
+        client_id: input.client_id,
+        session: input.session,
+        state: input.state,
+        code: input.code,
+        redirect_uri: input.redirect_uri,
+    }
+}
+
 fn connect_google_docs(args: &[String], json: bool) -> i32 {
     let state_root = default_state_root();
     let mut store = match SqliteStateStore::open(state_root.clone()) {
@@ -2205,34 +2335,21 @@ fn connect_google_docs(args: &[String], json: bool) -> i32 {
             );
         }
     };
-    let authorization = match run_local_oauth_authorization(
-        "Google Docs",
-        &start.authorization_url,
-        start.local_redirect_uri(),
-        &start.state,
-        has_flag(args, "--no-browser"),
-        json,
+    match run_broker_oauth_command_flow(
+        BrokerOAuthCommandStart {
+            provider_name: "Google Docs",
+            start,
+            connection_id: flag_value(args, "--name").map(ConnectionId::new),
+            broker_url: broker_config.broker_url,
+            no_browser: has_flag(args, "--no-browser"),
+            json,
+        },
+        run_local_oauth_authorization,
+        google_docs_broker_oauth_connect_options,
+        |options| {
+            run_connect_google_docs_broker_oauth(&mut store, credentials.as_ref(), options, &broker)
+        },
     ) {
-        Ok(authorization) => authorization,
-        Err(error) => {
-            return command_error(
-                json,
-                google_docs_local_oauth_command_error(error),
-                EXIT_INTERNAL,
-            );
-        }
-    };
-    let exchange_redirect_uri = start.exchange_redirect_uri().to_string();
-    let options = GoogleDocsBrokerOAuthConnectOptions {
-        connection_id: flag_value(args, "--name").map(ConnectionId::new),
-        broker_url: broker_config.broker_url,
-        client_id: start.client_id,
-        session: start.session,
-        state: start.state,
-        code: authorization.code,
-        redirect_uri: exchange_redirect_uri,
-    };
-    match run_connect_google_docs_broker_oauth(&mut store, credentials.as_ref(), options, &broker) {
         Ok(report) if json => {
             print_json(&report);
             EXIT_SUCCESS
@@ -2241,7 +2358,14 @@ fn connect_google_docs(args: &[String], json: bool) -> i32 {
             print_connect_report(&report);
             EXIT_SUCCESS
         }
-        Err(error) => connect_command_error("connect", json, error),
+        Err(BrokerOAuthCommandFlowError::LocalOAuth(error)) => command_error(
+            json,
+            google_docs_local_oauth_command_error(error),
+            EXIT_INTERNAL,
+        ),
+        Err(BrokerOAuthCommandFlowError::Connect(error)) => {
+            connect_command_error("connect", json, error)
+        }
     }
 }
 
@@ -2281,38 +2405,25 @@ fn connect_google_calendar(args: &[String], json: bool) -> i32 {
             );
         }
     };
-    let authorization = match run_local_oauth_authorization(
-        "Google Calendar",
-        &start.authorization_url,
-        start.local_redirect_uri(),
-        &start.state,
-        has_flag(args, "--no-browser"),
-        json,
-    ) {
-        Ok(authorization) => authorization,
-        Err(error) => {
-            return command_error(
-                json,
-                google_calendar_local_oauth_command_error(error),
-                EXIT_INTERNAL,
-            );
-        }
-    };
-    let exchange_redirect_uri = start.exchange_redirect_uri().to_string();
-    let options = GoogleCalendarBrokerOAuthConnectOptions {
-        connection_id: flag_value(args, "--name").map(ConnectionId::new),
-        broker_url: broker_config.broker_url,
-        client_id: start.client_id,
-        session: start.session,
-        state: start.state,
-        code: authorization.code,
-        redirect_uri: exchange_redirect_uri,
-    };
-    match run_connect_google_calendar_broker_oauth(
-        &mut store,
-        credentials.as_ref(),
-        options,
-        &broker,
+    match run_broker_oauth_command_flow(
+        BrokerOAuthCommandStart {
+            provider_name: "Google Calendar",
+            start,
+            connection_id: flag_value(args, "--name").map(ConnectionId::new),
+            broker_url: broker_config.broker_url,
+            no_browser: has_flag(args, "--no-browser"),
+            json,
+        },
+        run_local_oauth_authorization,
+        google_calendar_broker_oauth_connect_options,
+        |options| {
+            run_connect_google_calendar_broker_oauth(
+                &mut store,
+                credentials.as_ref(),
+                options,
+                &broker,
+            )
+        },
     ) {
         Ok(report) if json => {
             print_json(&report);
@@ -2322,7 +2433,14 @@ fn connect_google_calendar(args: &[String], json: bool) -> i32 {
             print_connect_report(&report);
             EXIT_SUCCESS
         }
-        Err(error) => connect_command_error("connect", json, error),
+        Err(BrokerOAuthCommandFlowError::LocalOAuth(error)) => command_error(
+            json,
+            google_calendar_local_oauth_command_error(error),
+            EXIT_INTERNAL,
+        ),
+        Err(BrokerOAuthCommandFlowError::Connect(error)) => {
+            connect_command_error("connect", json, error)
+        }
     }
 }
 
@@ -2362,30 +2480,21 @@ fn connect_gmail(args: &[String], json: bool) -> i32 {
             );
         }
     };
-    let authorization = match run_local_oauth_authorization(
-        "Gmail",
-        &start.authorization_url,
-        start.local_redirect_uri(),
-        &start.state,
-        has_flag(args, "--no-browser"),
-        json,
+    match run_broker_oauth_command_flow(
+        BrokerOAuthCommandStart {
+            provider_name: "Gmail",
+            start,
+            connection_id: flag_value(args, "--name").map(ConnectionId::new),
+            broker_url: broker_config.broker_url,
+            no_browser: has_flag(args, "--no-browser"),
+            json,
+        },
+        run_local_oauth_authorization,
+        gmail_broker_oauth_connect_options,
+        |options| {
+            run_connect_gmail_broker_oauth(&mut store, credentials.as_ref(), options, &broker)
+        },
     ) {
-        Ok(authorization) => authorization,
-        Err(error) => {
-            return command_error(json, gmail_local_oauth_command_error(error), EXIT_INTERNAL);
-        }
-    };
-    let exchange_redirect_uri = start.exchange_redirect_uri().to_string();
-    let options = GmailBrokerOAuthConnectOptions {
-        connection_id: flag_value(args, "--name").map(ConnectionId::new),
-        broker_url: broker_config.broker_url,
-        client_id: start.client_id,
-        session: start.session,
-        state: start.state,
-        code: authorization.code,
-        redirect_uri: exchange_redirect_uri,
-    };
-    match run_connect_gmail_broker_oauth(&mut store, credentials.as_ref(), options, &broker) {
         Ok(report) if json => {
             print_json(&report);
             EXIT_SUCCESS
@@ -2394,7 +2503,12 @@ fn connect_gmail(args: &[String], json: bool) -> i32 {
             print_connect_report(&report);
             EXIT_SUCCESS
         }
-        Err(error) => connect_command_error("connect", json, error),
+        Err(BrokerOAuthCommandFlowError::LocalOAuth(error)) => {
+            command_error(json, gmail_local_oauth_command_error(error), EXIT_INTERNAL)
+        }
+        Err(BrokerOAuthCommandFlowError::Connect(error)) => {
+            connect_command_error("connect", json, error)
+        }
     }
 }
 
@@ -2434,30 +2548,21 @@ fn connect_slack(args: &[String], json: bool) -> i32 {
             );
         }
     };
-    let authorization = match run_local_oauth_authorization(
-        "Slack",
-        &start.authorization_url,
-        start.local_redirect_uri(),
-        &start.state,
-        has_flag(args, "--no-browser"),
-        json,
+    match run_broker_oauth_command_flow(
+        BrokerOAuthCommandStart {
+            provider_name: "Slack",
+            start,
+            connection_id: flag_value(args, "--name").map(ConnectionId::new),
+            broker_url: broker_config.broker_url,
+            no_browser: has_flag(args, "--no-browser"),
+            json,
+        },
+        run_local_oauth_authorization,
+        slack_broker_oauth_connect_options,
+        |options| {
+            run_connect_slack_broker_oauth(&mut store, credentials.as_ref(), options, &broker)
+        },
     ) {
-        Ok(authorization) => authorization,
-        Err(error) => {
-            return command_error(json, slack_local_oauth_command_error(error), EXIT_INTERNAL);
-        }
-    };
-    let exchange_redirect_uri = start.exchange_redirect_uri().to_string();
-    let options = SlackBrokerOAuthConnectOptions {
-        connection_id: flag_value(args, "--name").map(ConnectionId::new),
-        broker_url: broker_config.broker_url,
-        client_id: start.client_id,
-        session: start.session,
-        state: start.state,
-        code: authorization.code,
-        redirect_uri: exchange_redirect_uri,
-    };
-    match run_connect_slack_broker_oauth(&mut store, credentials.as_ref(), options, &broker) {
         Ok(report) if json => {
             print_json(&report);
             EXIT_SUCCESS
@@ -2466,7 +2571,12 @@ fn connect_slack(args: &[String], json: bool) -> i32 {
             print_connect_report(&report);
             EXIT_SUCCESS
         }
-        Err(error) => connect_command_error("connect", json, error),
+        Err(BrokerOAuthCommandFlowError::LocalOAuth(error)) => {
+            command_error(json, slack_local_oauth_command_error(error), EXIT_INTERNAL)
+        }
+        Err(BrokerOAuthCommandFlowError::Connect(error)) => {
+            connect_command_error("connect", json, error)
+        }
     }
 }
 
@@ -9638,6 +9748,7 @@ mod tests {
     use clap::Parser;
     use clap::error::ErrorKind;
 
+    use locality_connector::oauth_broker::OAuthBrokerStartResponse;
     use locality_core::LocalityError;
     use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
     use locality_core::shadow::ShadowDocument;
@@ -9650,7 +9761,7 @@ mod tests {
 
     use crate::diff::{DiffReport, GuardrailOutput, PlanSummaryOutput};
     use crate::history::{JournalEntryOutput, LogReport};
-    use crate::local_oauth::{local_redirect, parse_oauth_callback};
+    use crate::local_oauth::{LocalOAuthAuthorization, local_redirect, parse_oauth_callback};
     use crate::push::PushReport;
     use crate::search::{
         SearchOptions, SearchRemoteState, SearchReport, SearchResult, SearchSafety,
@@ -9659,24 +9770,28 @@ mod tests {
     #[cfg(target_os = "windows")]
     use super::resolve_mount_target;
     use super::{
-        Cli, ConnectReport, DEFAULT_DAEMON_CONTROL_TIMEOUT, DEFAULT_DAEMON_MUTATING_TIMEOUT,
+        BrokerOAuthCommandStart, BrokerOAuthExchangeOptionsInput, Cli, ConnectReport,
+        DEFAULT_DAEMON_CONTROL_TIMEOUT, DEFAULT_DAEMON_MUTATING_TIMEOUT,
         DEFAULT_DAEMON_PULL_TIMEOUT, DaemonRequest, DaemonUnavailableReason, EXIT_SUCCESS,
         EXIT_USAGE, EXIT_VALIDATION, FileProviderCommandReport, LocalityCommand,
         PushConfirmationPromptError, SLACK_CONNECTOR_ID, SandboxCommand, SandboxEncodingArg,
         VirtualProjectionRegistration, absolute_command_path,
         auto_registration_for_mounted_projection, daemon_request_timeout_for,
         default_mount_id_for_source, diff_report_exit_code, exact_located_entity_record,
-        file_provider_list_lines, google_calendar_oauth_broker_config,
-        google_docs_oauth_broker_config, guard_linux_fuse_shared_root_unregister,
-        guard_unresolved_linux_fuse_unregister, guard_unresolved_windows_cloud_files_unregister,
+        file_provider_list_lines, gmail_broker_oauth_connect_options,
+        google_calendar_broker_oauth_connect_options, google_calendar_oauth_broker_config,
+        google_docs_broker_oauth_connect_options, google_docs_oauth_broker_config,
+        guard_linux_fuse_shared_root_unregister, guard_unresolved_linux_fuse_unregister,
+        guard_unresolved_windows_cloud_files_unregister,
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
         locality_error_code, locate_result_from_report, mount_slack, mount_usage,
         mounted_projection_preflight_error, notion_authorize_url, notion_oauth_broker_config,
         print_push_confirmation_preview, projection_mode_for_target,
         projection_usage_options_for_target, prompt_for_push_confirmation,
         pull_direct_fallback_error, push_confirmation_preview_matches_displayed,
-        push_preview_plan_matches, should_prompt_for_push_confirmation,
-        should_refresh_notion_url_search, slack_mount_missing_path_error,
+        push_preview_plan_matches, run_broker_oauth_command_flow,
+        should_prompt_for_push_confirmation, should_refresh_notion_url_search,
+        slack_broker_oauth_connect_options, slack_mount_missing_path_error,
         slack_oauth_broker_config, spinner_config_for_command, spinner_enabled,
         status as run_status_command, validate_virtual_projection_registration,
         write_connect_report, write_log_report,
@@ -9692,6 +9807,147 @@ mod tests {
             }),
             "update_required"
         );
+    }
+
+    #[test]
+    fn broker_oauth_command_flow_splits_local_listener_and_hosted_exchange_redirects() {
+        assert_broker_oauth_command_flow_splits_redirects(
+            "Google Docs",
+            "google-docs",
+            "docs-hosted-command",
+            "http://localhost:8757/oauth/google-docs/callback",
+            "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-docs/callback",
+            google_docs_broker_oauth_connect_options,
+            |options, connection_id, hosted_redirect_uri| {
+                assert_eq!(
+                    options.connection_id.as_ref().map(ConnectionId::as_str),
+                    Some(connection_id)
+                );
+                assert_eq!(options.redirect_uri, hosted_redirect_uri);
+            },
+        );
+        assert_broker_oauth_command_flow_splits_redirects(
+            "Google Calendar",
+            "google-calendar",
+            "google-calendar-hosted-command",
+            "http://localhost:8757/oauth/google-calendar/callback",
+            "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-calendar/callback",
+            google_calendar_broker_oauth_connect_options,
+            |options, connection_id, hosted_redirect_uri| {
+                assert_eq!(
+                    options.connection_id.as_ref().map(ConnectionId::as_str),
+                    Some(connection_id)
+                );
+                assert_eq!(options.redirect_uri, hosted_redirect_uri);
+            },
+        );
+        assert_broker_oauth_command_flow_splits_redirects(
+            "Gmail",
+            "gmail",
+            "gmail-hosted-command",
+            "http://localhost:8757/oauth/gmail/callback",
+            "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/gmail/callback",
+            gmail_broker_oauth_connect_options,
+            |options, connection_id, hosted_redirect_uri| {
+                assert_eq!(
+                    options.connection_id.as_ref().map(ConnectionId::as_str),
+                    Some(connection_id)
+                );
+                assert_eq!(options.redirect_uri, hosted_redirect_uri);
+            },
+        );
+        assert_broker_oauth_command_flow_splits_redirects(
+            "Slack",
+            "slack",
+            "slack-hosted-command",
+            "http://localhost:8757/oauth/slack/callback",
+            "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/slack/callback",
+            slack_broker_oauth_connect_options,
+            |options, connection_id, hosted_redirect_uri| {
+                assert_eq!(
+                    options.connection_id.as_ref().map(ConnectionId::as_str),
+                    Some(connection_id)
+                );
+                assert_eq!(options.redirect_uri, hosted_redirect_uri);
+            },
+        );
+    }
+
+    fn assert_broker_oauth_command_flow_splits_redirects<O>(
+        provider_name: &'static str,
+        connector_id: &'static str,
+        connection_id: &'static str,
+        local_redirect_uri: &'static str,
+        hosted_redirect_uri: &'static str,
+        build_options: impl FnOnce(BrokerOAuthExchangeOptionsInput) -> O,
+        assert_options: impl FnOnce(&O, &'static str, &'static str),
+    ) {
+        let start = OAuthBrokerStartResponse {
+            connector: connector_id.to_string(),
+            client_id: "client-id".to_string(),
+            authorization_url: "https://broker.example.test/authorize".to_string(),
+            redirect_uri: local_redirect_uri.to_string(),
+            authorization_redirect_uri: Some(hosted_redirect_uri.to_string()),
+            exchange_redirect_uri: Some(hosted_redirect_uri.to_string()),
+            session: "broker-session".to_string(),
+            state: "state-1".to_string(),
+            expires_in: 600,
+        };
+
+        let report = run_broker_oauth_command_flow(
+            BrokerOAuthCommandStart {
+                provider_name,
+                start,
+                connection_id: Some(ConnectionId::new(connection_id)),
+                broker_url: "https://afs-oauth-broker.saurabh-b07.workers.dev".to_string(),
+                no_browser: true,
+                json: true,
+            },
+            |actual_provider_name,
+             authorization_url,
+             redirect_uri,
+             expected_state,
+             no_browser,
+             json| {
+                assert_eq!(actual_provider_name, provider_name);
+                assert_eq!(authorization_url, "https://broker.example.test/authorize");
+                assert_eq!(redirect_uri, local_redirect_uri);
+                assert_eq!(expected_state, "state-1");
+                assert!(no_browser);
+                assert!(json);
+                Ok(LocalOAuthAuthorization {
+                    code: "oauth-code".to_string(),
+                })
+            },
+            build_options,
+            |options| {
+                assert_options(&options, connection_id, hosted_redirect_uri);
+                Ok(connect_report_for_command_flow(connector_id, connection_id))
+            },
+        )
+        .expect("broker OAuth command flow");
+
+        assert_eq!(report.connector, connector_id);
+        assert_eq!(report.connection_id, connection_id);
+        assert_eq!(report.auth_kind, "oauth");
+    }
+
+    fn connect_report_for_command_flow(
+        connector_id: &'static str,
+        connection_id: &'static str,
+    ) -> ConnectReport {
+        ConnectReport {
+            ok: true,
+            command: "connect",
+            connection_id: connection_id.to_string(),
+            profile_id: format!("{connector_id}-oauth-default"),
+            connector: connector_id.to_string(),
+            display_name: connector_id.to_string(),
+            account_label: Some("user@example.com".to_string()),
+            workspace_id: None,
+            workspace_name: None,
+            auth_kind: "oauth".to_string(),
+        }
     }
 
     #[test]
