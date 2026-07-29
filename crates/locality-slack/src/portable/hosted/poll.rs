@@ -95,6 +95,33 @@ pub struct HostedSlackPollOutputV1 {
     pub operational_status: HostedSlackOperationalStatusV1,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostedSlackPageReferenceClosureV1 {
+    pub user_ids: Vec<String>,
+    pub file_ids: Vec<String>,
+}
+
+pub fn hosted_slack_history_page_reference_closure_v1(
+    checkpoint: &HostedSlackPollCheckpointV1,
+    page: &HostedSlackHistoryPageV1,
+) -> Result<HostedSlackPageReferenceClosureV1, HostedSlackPollError> {
+    page.validate()?;
+    validate_history_page_scope(checkpoint, page)?;
+    let accepted = accepted_history_evidence_page(checkpoint, page)?;
+    Ok(page_reference_closure(
+        accepted.messages.iter().map(|wrapped| &wrapped.message),
+    ))
+}
+
+pub fn hosted_slack_replies_page_reference_closure_v1(
+    checkpoint: &HostedSlackPollCheckpointV1,
+    page: &HostedSlackRepliesPageV1,
+) -> Result<HostedSlackPageReferenceClosureV1, HostedSlackPollError> {
+    page.validate()?;
+    validate_replies_page_scope(checkpoint, page)?;
+    Ok(page_reference_closure(page.messages.iter()))
+}
+
 impl HostedSlackHistoryPageV1 {
     pub fn validate(&self) -> Result<(), HostedSlackPollError> {
         validate_page_versions(self.page_format_version, self.minimum_reader_version)?;
@@ -1219,6 +1246,25 @@ fn accepted_replies_evidence_page(source: &HostedSlackRepliesPageV1) -> HostedSl
     accepted.users = users;
     accepted.files = files;
     accepted
+}
+
+fn page_reference_closure<'a>(
+    messages: impl Iterator<Item = &'a RawHostedSlackMessage>,
+) -> HostedSlackPageReferenceClosureV1 {
+    let messages = messages.collect::<Vec<_>>();
+    let user_ids = messages
+        .iter()
+        .filter_map(|message| message.user_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let file_ids = messages
+        .iter()
+        .flat_map(|message| message.file_ids.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    HostedSlackPageReferenceClosureV1 { user_ids, file_ids }
 }
 
 fn retained_page_metadata<'a>(

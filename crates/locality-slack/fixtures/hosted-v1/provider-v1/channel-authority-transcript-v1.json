@@ -1,0 +1,9 @@
+[
+  {
+    "operation": "verify_installation"
+  },
+  {
+    "operation": "conversations_info",
+    "channel_id": "C08ENGINEER1"
+  }
+]

@@ -1,0 +1,37 @@
+[
+  {
+    "operation": "verify_installation"
+  },
+  {
+    "operation": "conversations_info",
+    "channel_id": "C08ENGINEER1"
+  },
+  {
+    "operation": "conversations_history",
+    "request": {
+      "installation_id": "0198f3c2-7d4e-7a61-8b25-4f9c8d7e6a10",
+      "team_id": "T08LOCALITY1",
+      "channel_id": "C08ENGINEER1",
+      "phase": "historical_history",
+      "oldest": "1767225599.999999",
+      "latest": "1780272000.000000",
+      "inclusive": false,
+      "cursor": null,
+      "limit": 15
+    }
+  },
+  {
+    "operation": "conversations_history",
+    "request": {
+      "installation_id": "0198f3c2-7d4e-7a61-8b25-4f9c8d7e6a10",
+      "team_id": "T08LOCALITY1",
+      "channel_id": "C08ENGINEER1",
+      "phase": "historical_history",
+      "oldest": "1767225599.999999",
+      "latest": "1780272000.000000",
+      "inclusive": false,
+      "cursor": "history-next",
+      "limit": 15
+    }
+  }
+]
