@@ -45,6 +45,12 @@ require_linux_fuse() {
   if ! command -v mountpoint >/dev/null 2>&1; then
     _live_skip_or_fail "skip: mountpoint is not installed"
   fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    _live_skip_or_fail "skip: python3 is not installed"
+  fi
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    _live_skip_or_fail "skip: sqlite3 is not installed"
+  fi
 }
 
 sql_text_literal() {

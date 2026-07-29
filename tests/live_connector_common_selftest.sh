@@ -40,6 +40,54 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if [[ "$(uname -s)" == "Linux" && -e /dev/fuse ]]; then
+  require_fuse_fake_path="$tmp_root/require-fuse-bin"
+  mkdir -p "$require_fuse_fake_path"
+  cat >"$require_fuse_fake_path/uname" <<'SH'
+#!/bin/sh
+printf '%s\n' Linux
+SH
+  cat >"$require_fuse_fake_path/fusermount3" <<'SH'
+#!/bin/sh
+exit 0
+SH
+  cat >"$require_fuse_fake_path/mountpoint" <<'SH'
+#!/bin/sh
+exit 0
+SH
+  cat >"$require_fuse_fake_path/sqlite3" <<'SH'
+#!/bin/sh
+exit 0
+SH
+  chmod +x \
+    "$require_fuse_fake_path/uname" \
+    "$require_fuse_fake_path/fusermount3" \
+    "$require_fuse_fake_path/mountpoint" \
+    "$require_fuse_fake_path/sqlite3"
+
+  missing_python_error="$tmp_root/require-linux-fuse-missing-python.err"
+  if (PATH="$require_fuse_fake_path" LOCALITY_LIVE_FUSE_REQUIRED=1 require_linux_fuse) 2>"$missing_python_error"; then
+    live_fail "require_linux_fuse accepted a missing python3 command"
+  fi
+  if [[ "$(cat "$missing_python_error")" != "skip: python3 is not installed" ]]; then
+    live_fail "require_linux_fuse reported an unexpected missing-python3 error"
+  fi
+
+  cat >"$require_fuse_fake_path/python3" <<'SH'
+#!/bin/sh
+exit 0
+SH
+  chmod +x "$require_fuse_fake_path/python3"
+  rm -f "$require_fuse_fake_path/sqlite3"
+  missing_sqlite_error="$tmp_root/require-linux-fuse-missing-sqlite.err"
+  if (PATH="$require_fuse_fake_path" LOCALITY_LIVE_FUSE_REQUIRED=1 require_linux_fuse) 2>"$missing_sqlite_error"; then
+    live_fail "require_linux_fuse accepted a missing sqlite3 command"
+  fi
+  if [[ "$(cat "$missing_sqlite_error")" != "skip: sqlite3 is not installed" ]]; then
+    live_fail "require_linux_fuse reported an unexpected missing-sqlite3 error"
+  fi
+fi
+
 state_root="$tmp_root/state"
 credential_json='{"kind":"oauth","connector":"google-docs","access_token":"selftest-token"}'
 
