@@ -45,6 +45,7 @@ pull_after_push_report="$tmp_root/pull-after-push.json"
 drafts_list_report="$tmp_root/gmail-drafts.json"
 draft_get_report="$tmp_root/gmail-draft.json"
 credential_path=""
+oauth_refresh_marker=""
 daemon_pid=""
 fuse_pid=""
 message_id=""
@@ -398,6 +399,13 @@ on_error() {
 
 cleanup() {
   set +e
+  if [[ -n "${credential_path:-}" && -n "${oauth_refresh_marker:-}" ]]; then
+    export_refreshed_oauth_credential_if_requested \
+      "$credential_path" \
+      "gmail" \
+      "$oauth_refresh_marker" \
+      "Gmail live credential" >/dev/null 2>&1 || true
+  fi
   if [[ "$draft_deleted" != "1" \
     && ( -n "${draft_id:-}" || -n "${raw_message_id:-}" || "$draft_cleanup_needed" == "1" ) ]]; then
     delete_created_gmail_draft best_effort >/dev/null 2>&1 || \
@@ -429,6 +437,15 @@ seed_connector_credential \
   "$connection_id" \
   "$LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON"
 credential_path="$(credential_file_path "$state_root" "connection:$connection_id")"
+require_oauth_credential_file "$credential_path" "gmail" "Gmail live credential"
+if [[ -n "${LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT:-}" && "${LOCALITY_LIVE_FORCE_OAUTH_REFRESH:-0}" != "1" ]]; then
+  live_fail "LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT requires LOCALITY_LIVE_FORCE_OAUTH_REFRESH=1"
+fi
+if [[ "${LOCALITY_LIVE_FORCE_OAUTH_REFRESH:-0}" == "1" ]]; then
+  step="forcing Gmail OAuth credential refresh"
+  force_oauth_credential_refresh "$credential_path" "gmail" "Gmail live credential"
+  oauth_refresh_marker="$(oauth_credential_refresh_marker "$credential_path" "gmail" "Gmail live credential")"
+fi
 unset LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON
 
 step="registering Gmail Linux FUSE mount"
@@ -454,6 +471,19 @@ step="pulling Gmail workspace"
 LOCALITY_STATE_DIR="$state_root" "$loc_bin" pull --json "$mount_root" \
   >"$initial_pull_report" 2>>"$command_log"
 assert_json_ok "$initial_pull_report" "Gmail initial pull report"
+if [[ -n "$oauth_refresh_marker" ]]; then
+  step="verifying Gmail OAuth credential refresh"
+  assert_oauth_credential_refreshed \
+    "$credential_path" \
+    "gmail" \
+    "$oauth_refresh_marker" \
+    "Gmail live credential"
+  export_refreshed_oauth_credential_if_requested \
+    "$credential_path" \
+    "gmail" \
+    "$oauth_refresh_marker" \
+    "Gmail live credential"
+fi
 wait_for_draft_dir
 
 unique="$(date -u +%Y%m%dT%H%M%SZ)-$$"

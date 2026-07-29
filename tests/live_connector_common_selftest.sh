@@ -235,6 +235,65 @@ if [[ "$plain_secret" != "selftest-api-key" ]]; then
   live_fail "credential_access_token did not return the seeded plain API key"
 fi
 
+refreshable_secret_ref="connection:gmail-live"
+refreshable_secret_path="$(credential_file_path "$state_root" "$refreshable_secret_ref")"
+refreshable_credential_json='{"kind":"oauth","connector":"gmail","access_token":"gmail-access-token-1","token_type":"Bearer","oauth_client_id":"client","oauth_broker_url":"https://auth.example.test","account_id":"acct-1","account_label":"selftest@example.com","workspace_id":"gmail","workspace_name":"Gmail","scopes":["https://www.googleapis.com/auth/gmail.readonly","https://www.googleapis.com/auth/gmail.compose"],"refresh_token_handle":"refresh-handle-1","acquired_at":100,"expires_at":4102444800}'
+write_file_credential "$state_root" "$refreshable_secret_ref" "$refreshable_credential_json"
+require_oauth_credential_file "$refreshable_secret_path" "gmail" "self-test Gmail credential"
+
+missing_refresh_secret_ref="connection:gmail-missing-refresh"
+missing_refresh_secret_path="$(credential_file_path "$state_root" "$missing_refresh_secret_ref")"
+write_file_credential \
+  "$state_root" \
+  "$missing_refresh_secret_ref" \
+  '{"kind":"oauth","connector":"gmail","access_token":"gmail-access-token-1","oauth_broker_url":"https://auth.example.test","acquired_at":100,"expires_at":4102444800}'
+missing_refresh_error="$tmp_root/missing-refresh.err"
+if require_oauth_credential_file "$missing_refresh_secret_path" "gmail" "self-test missing-refresh credential" 2>"$missing_refresh_error"; then
+  live_fail "require_oauth_credential_file accepted a credential without a refresh handle"
+fi
+if ! grep -Fq "self-test missing-refresh credential missing refresh_token_handle" "$missing_refresh_error"; then
+  live_fail "require_oauth_credential_file did not explain the missing refresh handle"
+fi
+if grep -Fq "gmail-access-token-1" "$missing_refresh_error"; then
+  live_fail "require_oauth_credential_file leaked the access token in its error"
+fi
+
+force_oauth_credential_refresh "$refreshable_secret_path" "gmail" "self-test Gmail credential"
+forced_expires_at="$(json_field "$refreshable_secret_path" "expires_at")"
+forced_acquired_at="$(json_field "$refreshable_secret_path" "acquired_at")"
+if [[ "$forced_expires_at" != "1" || "$forced_acquired_at" != "1" ]]; then
+  live_fail "force_oauth_credential_refresh did not force the credential expiry"
+fi
+refresh_marker="$(oauth_credential_refresh_marker "$refreshable_secret_path" "gmail" "self-test Gmail credential")"
+refreshed_acquired_at="$(( $(date -u +%s) + 1 ))"
+refreshed_expires_at="$(( $(date -u +%s) + 3600 ))"
+write_file_credential \
+  "$state_root" \
+  "$refreshable_secret_ref" \
+  "{\"kind\":\"oauth\",\"connector\":\"gmail\",\"access_token\":\"gmail-access-token-2\",\"token_type\":\"Bearer\",\"oauth_client_id\":\"client\",\"oauth_broker_url\":\"https://auth.example.test\",\"account_id\":\"acct-1\",\"account_label\":\"selftest@example.com\",\"workspace_id\":\"gmail\",\"workspace_name\":\"Gmail\",\"scopes\":[\"https://www.googleapis.com/auth/gmail.readonly\",\"https://www.googleapis.com/auth/gmail.compose\"],\"refresh_token_handle\":\"refresh-handle-2\",\"acquired_at\":$refreshed_acquired_at,\"expires_at\":$refreshed_expires_at}"
+assert_oauth_credential_refreshed "$refreshable_secret_path" "gmail" "$refresh_marker" "self-test Gmail credential"
+
+helper_exported_refreshable_secret_path="$tmp_root/helper-exported/gmail-credential.json"
+LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT="$helper_exported_refreshable_secret_path" \
+  export_refreshed_oauth_credential_if_requested \
+    "$refreshable_secret_path" \
+    "gmail" \
+    "$refresh_marker" \
+    "self-test Gmail credential"
+if [[ "$(cat "$helper_exported_refreshable_secret_path")" != "$(cat "$refreshable_secret_path")" ]]; then
+  live_fail "export_refreshed_oauth_credential_if_requested did not copy the refreshed credential"
+fi
+
+exported_refreshable_secret_path="$tmp_root/exported/gmail-credential.json"
+export_oauth_credential_file \
+  "$refreshable_secret_path" \
+  "$exported_refreshable_secret_path" \
+  "gmail" \
+  "self-test Gmail credential"
+if [[ "$(cat "$exported_refreshable_secret_path")" != "$(cat "$refreshable_secret_path")" ]]; then
+  live_fail "export_oauth_credential_file did not copy the refreshed credential"
+fi
+
 fake_bin_dir="$tmp_root/bin"
 mkdir -p "$fake_bin_dir"
 fake_loc="$fake_bin_dir/loc"

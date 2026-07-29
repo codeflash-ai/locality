@@ -46,6 +46,8 @@ initial_pull_report="$tmp_root/initial-pull.json"
 push_report="$tmp_root/push.json"
 status_report="$tmp_root/status.json"
 original_copy="$tmp_root/recent-original.md"
+credential_path=""
+oauth_refresh_marker=""
 daemon_pid=""
 fuse_pid=""
 recent_path=""
@@ -286,6 +288,13 @@ on_error() {
 
 cleanup() {
   set +e
+  if [[ -n "${credential_path:-}" && -n "${oauth_refresh_marker:-}" ]]; then
+    export_refreshed_oauth_credential_if_requested \
+      "$credential_path" \
+      "slack" \
+      "$oauth_refresh_marker" \
+      "Slack live credential" >/dev/null 2>&1 || true
+  fi
   stop_live_processes "$locality_root" "$fuse_pid" "$daemon_pid"
   unset LOCALITY_SLACK_LIVE_CREDENTIAL_JSON
   if [[ "${LOCALITY_SLACK_LIVE_KEEP_TMP:-}" == "1" ]]; then
@@ -311,6 +320,16 @@ seed_connector_credential \
   "slack" \
   "$connection_id" \
   "$LOCALITY_SLACK_LIVE_CREDENTIAL_JSON"
+credential_path="$(credential_file_path "$state_root" "connection:$connection_id")"
+require_oauth_credential_file "$credential_path" "slack" "Slack live credential"
+if [[ -n "${LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT:-}" && "${LOCALITY_LIVE_FORCE_OAUTH_REFRESH:-0}" != "1" ]]; then
+  live_fail "LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT requires LOCALITY_LIVE_FORCE_OAUTH_REFRESH=1"
+fi
+if [[ "${LOCALITY_LIVE_FORCE_OAUTH_REFRESH:-0}" == "1" ]]; then
+  step="forcing Slack OAuth credential refresh"
+  force_oauth_credential_refresh "$credential_path" "slack" "Slack live credential"
+  oauth_refresh_marker="$(oauth_credential_refresh_marker "$credential_path" "slack" "Slack live credential")"
+fi
 unset LOCALITY_SLACK_LIVE_CREDENTIAL_JSON
 
 step="registering Slack Linux FUSE mount"
@@ -338,6 +357,19 @@ step="pulling Slack workspace"
 LOCALITY_STATE_DIR="$state_root" "$loc_bin" pull --json "$mount_root" \
   >"$initial_pull_report" 2>>"$command_log"
 assert_json_ok "$initial_pull_report" "Slack initial pull report"
+if [[ -n "$oauth_refresh_marker" ]]; then
+  step="verifying Slack OAuth credential refresh"
+  assert_oauth_credential_refreshed \
+    "$credential_path" \
+    "slack" \
+    "$oauth_refresh_marker" \
+    "Slack live credential"
+  export_refreshed_oauth_credential_if_requested \
+    "$credential_path" \
+    "slack" \
+    "$oauth_refresh_marker" \
+    "Slack live credential"
+fi
 
 step="finding configured Slack conversation recent.md"
 recent_path="$(wait_for_target_recent "$LOCALITY_SLACK_LIVE_CONVERSATION_ID")"

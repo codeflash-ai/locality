@@ -138,6 +138,10 @@ export LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON="$(cat "$HOME/.loc/credentials/
 export LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER='Locality Live E2E'
 ```
 
+Use the full stored credential JSON. The live harness requires
+`access_token`, `oauth_broker_url`, `refresh_token_handle`, and numeric
+`expires_at` so it can exercise broker refresh when the token expires.
+
 Run the gated test explicitly:
 
 ```bash

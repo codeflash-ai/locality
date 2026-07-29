@@ -145,6 +145,235 @@ print(token)
 PY
 }
 
+require_oauth_credential_file() {
+  if [[ $# -lt 2 || $# -gt 3 ]]; then
+    live_fail "require_oauth_credential_file requires a credential path, connector, and optional label"
+    return 1
+  fi
+
+  local secret_path="$1"
+  local connector="$2"
+  local label="${3:-$connector OAuth credential}"
+
+  python3 - "$secret_path" "$connector" "$label" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+connector = sys.argv[2]
+label = sys.argv[3]
+
+def fail(message):
+    raise SystemExit(f"{label} {message}")
+
+try:
+    text = path.read_text(encoding="utf-8").strip()
+except OSError as error:
+    fail(f"could not be read from {path}: {error}")
+if not text:
+    fail("is empty")
+try:
+    credential = json.loads(text)
+except json.JSONDecodeError as error:
+    fail(f"is not valid JSON: {error}")
+if not isinstance(credential, dict):
+    fail("must be a JSON object")
+
+if credential.get("kind") != "oauth":
+    fail("must have kind=oauth")
+if credential.get("connector") != connector:
+    fail(f"must have connector={connector}")
+
+for field in ("access_token", "oauth_broker_url", "refresh_token_handle"):
+    value = credential.get(field)
+    if not isinstance(value, str) or not value.strip():
+        fail(f"missing {field}")
+
+expires_at = credential.get("expires_at")
+if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)) or expires_at <= 0:
+    fail("missing numeric expires_at")
+PY
+}
+
+force_oauth_credential_refresh() {
+  if [[ $# -lt 2 || $# -gt 3 ]]; then
+    live_fail "force_oauth_credential_refresh requires a credential path, connector, and optional label"
+    return 1
+  fi
+
+  local secret_path="$1"
+  local connector="$2"
+  local label="${3:-$connector OAuth credential}"
+
+  require_oauth_credential_file "$secret_path" "$connector" "$label"
+  python3 - "$secret_path" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+credential = json.loads(path.read_text(encoding="utf-8"))
+credential["acquired_at"] = 1
+credential["expires_at"] = 1
+path.write_text(
+    json.dumps(credential, separators=(",", ":"), sort_keys=True),
+    encoding="utf-8",
+)
+PY
+  chmod 600 "$secret_path" >/dev/null 2>&1 || true
+}
+
+oauth_credential_refresh_marker() {
+  if [[ $# -lt 2 || $# -gt 3 ]]; then
+    live_fail "oauth_credential_refresh_marker requires a credential path, connector, and optional label"
+    return 1
+  fi
+
+  local secret_path="$1"
+  local connector="$2"
+  local label="${3:-$connector OAuth credential}"
+
+  require_oauth_credential_file "$secret_path" "$connector" "$label"
+  python3 - "$secret_path" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+credential = json.loads(path.read_text(encoding="utf-8"))
+
+def digest(value):
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+marker = {
+    "access_token_sha256": digest(credential.get("access_token", "")),
+    "acquired_at": credential.get("acquired_at"),
+    "expires_at": credential.get("expires_at"),
+    "refresh_token_handle_sha256": digest(credential.get("refresh_token_handle", "")),
+}
+print(json.dumps(marker, separators=(",", ":"), sort_keys=True))
+PY
+}
+
+assert_oauth_credential_refreshed() {
+  if [[ $# -lt 3 || $# -gt 4 ]]; then
+    live_fail "assert_oauth_credential_refreshed requires a credential path, connector, marker JSON, and optional label"
+    return 1
+  fi
+
+  local secret_path="$1"
+  local connector="$2"
+  local marker_json="$3"
+  local label="${4:-$connector OAuth credential}"
+
+  require_oauth_credential_file "$secret_path" "$connector" "$label"
+  python3 - "$secret_path" "$marker_json" "$label" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+import time
+
+path = pathlib.Path(sys.argv[1])
+marker_json = sys.argv[2]
+label = sys.argv[3]
+
+def fail(message):
+    raise SystemExit(f"{label} {message}")
+
+try:
+    marker = json.loads(marker_json)
+except json.JSONDecodeError as error:
+    fail(f"refresh marker was not valid JSON: {error}")
+if not isinstance(marker, dict):
+    fail("refresh marker must be a JSON object")
+
+credential = json.loads(path.read_text(encoding="utf-8"))
+
+def digest(value):
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+old_access_digest = marker.get("access_token_sha256")
+new_access_digest = digest(credential.get("access_token", ""))
+if old_access_digest and old_access_digest == new_access_digest:
+    fail("was not refreshed: access_token did not change")
+
+old_acquired_at = marker.get("acquired_at")
+new_acquired_at = credential.get("acquired_at")
+if (
+    isinstance(old_acquired_at, bool)
+    or isinstance(new_acquired_at, bool)
+    or not isinstance(old_acquired_at, (int, float))
+    or not isinstance(new_acquired_at, (int, float))
+    or new_acquired_at <= old_acquired_at
+):
+    fail("was not refreshed: acquired_at did not advance")
+
+old_expires_at = marker.get("expires_at")
+new_expires_at = credential.get("expires_at")
+if (
+    isinstance(old_expires_at, bool)
+    or isinstance(new_expires_at, bool)
+    or not isinstance(old_expires_at, (int, float))
+    or not isinstance(new_expires_at, (int, float))
+    or new_expires_at <= old_expires_at
+):
+    fail("was not refreshed: expires_at did not advance")
+
+if new_expires_at <= int(time.time()) + 60:
+    fail("was refreshed but expires_at is still within the refresh window")
+PY
+}
+
+export_oauth_credential_file() {
+  if [[ $# -lt 3 || $# -gt 4 ]]; then
+    live_fail "export_oauth_credential_file requires a source path, destination path, connector, and optional label"
+    return 1
+  fi
+
+  local source_path="$1"
+  local destination_path="$2"
+  local connector="$3"
+  local label="${4:-$connector OAuth credential}"
+  local destination_dir
+  local temp_path
+
+  require_oauth_credential_file "$source_path" "$connector" "$label"
+  destination_dir="$(dirname "$destination_path")"
+  mkdir -p "$destination_dir"
+  temp_path="$(mktemp "$destination_dir/.oauth-credential.XXXXXX")"
+  cp "$source_path" "$temp_path"
+  chmod 600 "$temp_path" >/dev/null 2>&1 || true
+  mv "$temp_path" "$destination_path"
+}
+
+export_refreshed_oauth_credential_if_requested() {
+  if [[ $# -lt 3 || $# -gt 4 ]]; then
+    live_fail "export_refreshed_oauth_credential_if_requested requires a source path, connector, marker JSON, and optional label"
+    return 1
+  fi
+
+  local source_path="$1"
+  local connector="$2"
+  local marker_json="$3"
+  local label="${4:-$connector OAuth credential}"
+
+  if [[ -z "${LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT:-}" || -z "$marker_json" ]]; then
+    return 0
+  fi
+  if [[ -s "$LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT" ]]; then
+    return 0
+  fi
+  assert_oauth_credential_refreshed "$source_path" "$connector" "$marker_json" "$label"
+  export_oauth_credential_file \
+    "$source_path" \
+    "$LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT" \
+    "$connector" \
+    "$label"
+}
+
 json_field() {
   local json_source="$1"
   local field_path="$2"

@@ -145,6 +145,10 @@ secret_hex="$(printf '%s' "$secret_ref" | od -An -tx1 -v | tr -d ' \n')"
 export LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON="$(cat "$HOME/.loc/credentials/$secret_hex")"
 ```
 
+Use the full stored credential JSON. The live harness requires
+`access_token`, `oauth_broker_url`, `refresh_token_handle`, and numeric
+`expires_at` so it can exercise broker refresh when the token expires.
+
 Run the gated live test:
 
 ```bash

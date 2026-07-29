@@ -107,6 +107,10 @@ export LOCALITY_SLACK_LIVE_CREDENTIAL_JSON="$(cat "$HOME/.loc/credentials/$secre
 export LOCALITY_SLACK_LIVE_CONVERSATION_ID='G0123456789'
 ```
 
+Use the full stored credential JSON. The live harness requires
+`access_token`, `oauth_broker_url`, `refresh_token_handle`, and numeric
+`expires_at` so it can exercise broker refresh when the token expires.
+
 Set `LOCALITY_SLACK_LIVE_TYPES` when the target conversation is not covered by
 the default `private_channel,im,mpim` type set. Do not set `public_channel` for
 this live test.

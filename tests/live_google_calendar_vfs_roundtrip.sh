@@ -42,6 +42,7 @@ push_report="$tmp_root/push.json"
 pull_after_push_report="$tmp_root/pull-after-push.json"
 calendar_search_report="$tmp_root/calendar-events.json"
 credential_path=""
+oauth_refresh_marker=""
 daemon_pid=""
 fuse_pid=""
 event_id=""
@@ -221,6 +222,13 @@ on_error() {
 
 cleanup() {
   set +e
+  if [[ -n "${credential_path:-}" && -n "${oauth_refresh_marker:-}" ]]; then
+    export_refreshed_oauth_credential_if_requested \
+      "$credential_path" \
+      "google-calendar" \
+      "$oauth_refresh_marker" \
+      "Google Calendar live credential" >/dev/null 2>&1 || true
+  fi
   if [[ "$event_deleted" != "1" && ( -n "${event_id:-}" || "$event_cleanup_needed" == "1" ) ]]; then
     delete_created_calendar_event best_effort >/dev/null 2>&1 || \
       echo "warning: failed to delete created Google Calendar event during cleanup" >&2
@@ -251,6 +259,15 @@ seed_connector_credential \
   "$connection_id" \
   "$LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON"
 credential_path="$(credential_file_path "$state_root" "connection:$connection_id")"
+require_oauth_credential_file "$credential_path" "google-calendar" "Google Calendar live credential"
+if [[ -n "${LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT:-}" && "${LOCALITY_LIVE_FORCE_OAUTH_REFRESH:-0}" != "1" ]]; then
+  live_fail "LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT requires LOCALITY_LIVE_FORCE_OAUTH_REFRESH=1"
+fi
+if [[ "${LOCALITY_LIVE_FORCE_OAUTH_REFRESH:-0}" == "1" ]]; then
+  step="forcing Google Calendar OAuth credential refresh"
+  force_oauth_credential_refresh "$credential_path" "google-calendar" "Google Calendar live credential"
+  oauth_refresh_marker="$(oauth_credential_refresh_marker "$credential_path" "google-calendar" "Google Calendar live credential")"
+fi
 unset LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON
 
 step="registering Google Calendar Linux FUSE mount"
@@ -277,6 +294,19 @@ step="pulling Google Calendar workspace"
 LOCALITY_STATE_DIR="$state_root" "$loc_bin" pull --json "$mount_root" \
   >"$initial_pull_report" 2>>"$command_log"
 assert_json_ok "$initial_pull_report" "Google Calendar initial pull report"
+if [[ -n "$oauth_refresh_marker" ]]; then
+  step="verifying Google Calendar OAuth credential refresh"
+  assert_oauth_credential_refreshed \
+    "$credential_path" \
+    "google-calendar" \
+    "$oauth_refresh_marker" \
+    "Google Calendar live credential"
+  export_refreshed_oauth_credential_if_requested \
+    "$credential_path" \
+    "google-calendar" \
+    "$oauth_refresh_marker" \
+    "Google Calendar live credential"
+fi
 wait_for_draft_dir
 
 summary="Locality live calendar $unique"

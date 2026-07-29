@@ -120,6 +120,16 @@ secret_hex="$(printf '%s' "$secret_ref" | od -An -tx1 -v | tr -d ' \n')"
 export LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON="$(cat "$HOME/.loc/credentials/$secret_hex")"
 ```
 
+The credential value must be the full stored OAuth JSON, not only an access
+token. The live harness validates that each OAuth credential includes
+`access_token`, `oauth_broker_url`, `refresh_token_handle`, and numeric
+`expires_at` fields. If `LOCALITY_LIVE_FORCE_OAUTH_REFRESH=1` is set, the
+harness forces only the isolated test copy to expire, verifies the first pull
+refreshes it through the broker, and confirms the credential file was rewritten
+with a new access token and future expiry. Set
+`LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT=/path/to/credential.json` together with
+forced refresh to export that rewritten JSON for manual rotation.
+
 Run Google Docs against a scratch Drive workspace folder:
 
 ```sh
@@ -168,7 +178,14 @@ LOCALITY_LIVE_LINEAR_VFS=1 tests/live_linear_vfs_roundtrip.sh
 
 GitHub Actions runs `.github/workflows/connector-live-e2e.yml` for relevant
 changes on `main`, weekly, and on manual dispatch. The workflow uses the
-`connector-live-e2e` environment and uploads no artifacts.
+`connector-live-e2e` environment and uploads no artifacts. Normal push and
+schedule runs validate refresh-capable OAuth credential JSON but never write
+back to GitHub Secrets. Manual dispatch can set `force_oauth_refresh=true` to
+exercise the broker refresh path. Manual dispatch can also set
+`persist_rotated_oauth_secrets=true`; in that mode each OAuth job requires
+`LOCALITY_SECRET_ROTATOR_TOKEN`, exports its refreshed credential JSON after the
+first successful pull, and uses `gh secret set --env connector-live-e2e` to
+replace the corresponding environment secret.
 
 ## Live Connector E2E Secrets
 
@@ -193,6 +210,7 @@ The non-Notion connector workflow uses the `connector-live-e2e` environment:
 | `LOCALITY_SLACK_LIVE_TYPES` | no | Optional Slack mount type list for non-public conversations, for example `private_channel,im,mpim`. |
 | `LINEAR_API_KEY` | yes | Linear API key with access to the scratch issue. |
 | `LOCALITY_LINEAR_LIVE_ISSUE_ID` | yes | Stable scratch Linear issue id whose body can be edited and restored. |
+| `LOCALITY_SECRET_ROTATOR_TOKEN` | only for manual rotation | GitHub token used only when `workflow_dispatch` sets both `force_oauth_refresh=true` and `persist_rotated_oauth_secrets=true`; it must be able to update `connector-live-e2e` environment secrets. |
 
 ## Expected Behavior Coverage
 

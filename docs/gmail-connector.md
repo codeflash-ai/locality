@@ -188,6 +188,10 @@ export LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON="$(cat "$HOME/.loc/credentials/$secre
 export LOCALITY_GMAIL_LIVE_TO_EMAIL='you@example.com'
 ```
 
+Use the full stored credential JSON. The live harness requires
+`access_token`, `oauth_broker_url`, `refresh_token_handle`, and numeric
+`expires_at` so it can exercise broker refresh when the token expires.
+
 Run the gated live check:
 
 ```bash
