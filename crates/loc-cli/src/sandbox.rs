@@ -19,6 +19,7 @@ use locality_protocol::{
     ExportAttemptLimits, ExportAttemptRequest, OpaqueBootstrapExchangeRequest,
     SCOPE_AUTHORIZED_COMPONENT_VERSIONS, SandboxSessionState, SandboxSessionStatus,
     SealedExportOffer, SessionCapability, SessionErrorCode, TarContentEncoding, TarExportOffer,
+    WorkspaceProfileSession,
 };
 use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 use localityd::replica_materializer::{
@@ -38,6 +39,7 @@ const JSON_MEDIA_TYPE: &str = "application/json";
 const TAR_MEDIA_TYPE: &str = "application/x-tar";
 const SANDBOX_USER_AGENT: &str = concat!("locality-loc/", env!("CARGO_PKG_VERSION"));
 const MAX_JSON_RESPONSE_BYTES: u64 = 1024 * 1024;
+const MAX_SESSION_CREDENTIAL_BYTES: u64 = 16 * 1024;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Reqwest's blocking response reapplies the client's operation timeout to
@@ -145,6 +147,33 @@ impl SandboxBootstrapToken {
     }
 }
 
+#[derive(Clone)]
+pub struct SandboxProfileKey(String);
+
+impl SandboxProfileKey {
+    pub fn new(value: impl Into<String>) -> Result<Self, SandboxInitError> {
+        let value = value.into();
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(SandboxInitError::InvalidProfileKey);
+        }
+        Ok(Self(value))
+    }
+
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Debug for SandboxProfileKey {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SandboxProfileKey(<redacted>)")
+    }
+}
+
 impl Debug for SandboxBootstrapToken {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("SandboxBootstrapToken(<redacted>)")
@@ -209,6 +238,13 @@ pub enum SandboxInitError {
     AmbiguousBootstrapToken,
     InvalidBootstrapToken,
     BootstrapTokenEnvironmentNotUnicode,
+    MissingProfileKey,
+    InvalidProfileKey,
+    ProfileKeyEnvironmentNotUnicode,
+    MissingSessionCredential,
+    InvalidSessionCredential,
+    SessionCredentialEnvironmentNotUnicode,
+    AmbiguousSandboxCredential,
     ReadBootstrapToken(io::Error),
     InvalidApiUrl(&'static str),
     CurrentDirectory(io::Error),
@@ -262,6 +298,13 @@ impl SandboxInitError {
             Self::InvalidBootstrapToken | Self::BootstrapTokenEnvironmentNotUnicode => {
                 "bootstrap_token_invalid"
             }
+            Self::MissingProfileKey
+            | Self::InvalidProfileKey
+            | Self::ProfileKeyEnvironmentNotUnicode => "profile_key_invalid",
+            Self::MissingSessionCredential
+            | Self::InvalidSessionCredential
+            | Self::SessionCredentialEnvironmentNotUnicode => "session_credential_invalid",
+            Self::AmbiguousSandboxCredential => "sandbox_credential_ambiguous",
             Self::ReadBootstrapToken(_) => "bootstrap_token_read_failed",
             Self::InvalidApiUrl(_) => "api_url_invalid",
             Self::CurrentDirectory(_) => "current_directory_failed",
@@ -291,6 +334,13 @@ impl SandboxInitError {
                 | Self::AmbiguousBootstrapToken
                 | Self::InvalidBootstrapToken
                 | Self::BootstrapTokenEnvironmentNotUnicode
+                | Self::MissingProfileKey
+                | Self::InvalidProfileKey
+                | Self::ProfileKeyEnvironmentNotUnicode
+                | Self::MissingSessionCredential
+                | Self::InvalidSessionCredential
+                | Self::SessionCredentialEnvironmentNotUnicode
+                | Self::AmbiguousSandboxCredential
                 | Self::ReadBootstrapToken(_)
                 | Self::InvalidApiUrl(_)
                 | Self::CurrentDirectory(_)
@@ -316,6 +366,27 @@ impl Display for SandboxInitError {
             Self::BootstrapTokenEnvironmentNotUnicode => {
                 formatter.write_str("LOCALITY_BOOTSTRAP_TOKEN is not valid Unicode")
             }
+            Self::MissingProfileKey => formatter.write_str(
+                "provide the Workspace Profile key through LOCALITY_PROFILE_KEY or --profile-key-stdin",
+            ),
+            Self::InvalidProfileKey => formatter.write_str(
+                "Workspace Profile key must contain exactly 64 lowercase hexadecimal characters",
+            ),
+            Self::ProfileKeyEnvironmentNotUnicode => {
+                formatter.write_str("LOCALITY_PROFILE_KEY is not valid Unicode")
+            }
+            Self::MissingSessionCredential => formatter.write_str(
+                "provide the ephemeral session credential through LOCALITY_SESSION_CREDENTIAL or --session-credential-stdin",
+            ),
+            Self::InvalidSessionCredential => formatter.write_str(
+                "ephemeral session credential must be a valid WorkspaceProfileSession JSON document",
+            ),
+            Self::SessionCredentialEnvironmentNotUnicode => {
+                formatter.write_str("LOCALITY_SESSION_CREDENTIAL is not valid Unicode")
+            }
+            Self::AmbiguousSandboxCredential => formatter.write_str(
+                "provide either a bootstrap token or a Workspace Profile key, not both",
+            ),
             Self::ReadBootstrapToken(error) => {
                 write!(formatter, "failed to read bootstrap token from stdin: {error}")
             }
@@ -420,6 +491,69 @@ pub fn resolve_bootstrap_token(
     SandboxBootstrapToken::new(value)
 }
 
+pub fn resolve_profile_key(
+    use_stdin: bool,
+    environment: Option<OsString>,
+    stdin: &mut impl Read,
+) -> Result<SandboxProfileKey, SandboxInitError> {
+    if use_stdin && environment.is_some() {
+        return Err(SandboxInitError::AmbiguousSandboxCredential);
+    }
+    let value = if use_stdin {
+        let mut value = String::new();
+        stdin
+            .read_to_string(&mut value)
+            .map_err(SandboxInitError::ReadBootstrapToken)?;
+        value.trim_end_matches(['\r', '\n']).to_string()
+    } else if let Some(value) = environment {
+        value
+            .into_string()
+            .map_err(|_| SandboxInitError::ProfileKeyEnvironmentNotUnicode)?
+    } else {
+        return Err(SandboxInitError::MissingProfileKey);
+    };
+    SandboxProfileKey::new(value)
+}
+
+pub fn resolve_session_credential(
+    use_stdin: bool,
+    environment: Option<OsString>,
+    stdin: &mut impl Read,
+) -> Result<SessionCapability, SandboxInitError> {
+    if use_stdin && environment.is_some() {
+        return Err(SandboxInitError::AmbiguousSandboxCredential);
+    }
+    let value = if use_stdin {
+        let mut value = String::new();
+        stdin
+            .take(MAX_SESSION_CREDENTIAL_BYTES + 1)
+            .read_to_string(&mut value)
+            .map_err(SandboxInitError::ReadBootstrapToken)?;
+        value
+    } else if let Some(value) = environment {
+        value
+            .into_string()
+            .map_err(|_| SandboxInitError::SessionCredentialEnvironmentNotUnicode)?
+    } else {
+        return Err(SandboxInitError::MissingSessionCredential);
+    };
+    if value.len() as u64 > MAX_SESSION_CREDENTIAL_BYTES {
+        return Err(SandboxInitError::InvalidSessionCredential);
+    }
+    let session: WorkspaceProfileSession =
+        serde_json::from_str(&value).map_err(|_| SandboxInitError::InvalidSessionCredential)?;
+    if session.profile_id.is_empty() || session.profile_revision == 0 {
+        return Err(SandboxInitError::InvalidSessionCredential);
+    }
+    let capability = SessionCapability {
+        session_id: session.session_id,
+        opaque_capability: session.opaque_capability,
+        expires_at: session.expires_at,
+    };
+    validate_capability(&capability)?;
+    Ok(capability)
+}
+
 pub fn run_sandbox_init(
     options: SandboxInitOptions,
     bootstrap_token: SandboxBootstrapToken,
@@ -447,7 +581,38 @@ pub fn run_sandbox_init_with_encoding(
     bootstrap_token: SandboxBootstrapToken,
     content_encoding: SandboxContentEncodingPreference,
 ) -> Result<SandboxInitReport, SandboxInitError> {
-    run_sandbox_init_internal(options, bootstrap_token, content_encoding, None)
+    run_sandbox_init_internal(
+        options,
+        SandboxCredential::Bootstrap(bootstrap_token),
+        content_encoding,
+        None,
+    )
+}
+
+pub fn run_sandbox_init_with_profile_key(
+    options: SandboxInitOptions,
+    profile_key: SandboxProfileKey,
+    content_encoding: SandboxContentEncodingPreference,
+) -> Result<SandboxInitReport, SandboxInitError> {
+    run_sandbox_init_internal(
+        options,
+        SandboxCredential::ProfileKey(profile_key),
+        content_encoding,
+        None,
+    )
+}
+
+pub fn run_sandbox_init_with_session_credential(
+    options: SandboxInitOptions,
+    capability: SessionCapability,
+    content_encoding: SandboxContentEncodingPreference,
+) -> Result<SandboxInitReport, SandboxInitError> {
+    run_sandbox_init_internal(
+        options,
+        SandboxCredential::Session(capability),
+        content_encoding,
+        None,
+    )
 }
 
 pub(crate) fn run_sandbox_init_with_encoding_and_profile(
@@ -456,12 +621,51 @@ pub(crate) fn run_sandbox_init_with_encoding_and_profile(
     content_encoding: SandboxContentEncodingPreference,
     profile: &mut SandboxInitProfile,
 ) -> Result<SandboxInitReport, SandboxInitError> {
-    run_sandbox_init_internal(options, bootstrap_token, content_encoding, Some(profile))
+    run_sandbox_init_internal(
+        options,
+        SandboxCredential::Bootstrap(bootstrap_token),
+        content_encoding,
+        Some(profile),
+    )
+}
+
+pub(crate) fn run_sandbox_init_with_profile_key_and_profile(
+    options: SandboxInitOptions,
+    profile_key: SandboxProfileKey,
+    content_encoding: SandboxContentEncodingPreference,
+    profile: &mut SandboxInitProfile,
+) -> Result<SandboxInitReport, SandboxInitError> {
+    run_sandbox_init_internal(
+        options,
+        SandboxCredential::ProfileKey(profile_key),
+        content_encoding,
+        Some(profile),
+    )
+}
+
+pub(crate) fn run_sandbox_init_with_session_credential_and_profile(
+    options: SandboxInitOptions,
+    capability: SessionCapability,
+    content_encoding: SandboxContentEncodingPreference,
+    profile: &mut SandboxInitProfile,
+) -> Result<SandboxInitReport, SandboxInitError> {
+    run_sandbox_init_internal(
+        options,
+        SandboxCredential::Session(capability),
+        content_encoding,
+        Some(profile),
+    )
+}
+
+enum SandboxCredential {
+    Bootstrap(SandboxBootstrapToken),
+    ProfileKey(SandboxProfileKey),
+    Session(SessionCapability),
 }
 
 fn run_sandbox_init_internal(
     options: SandboxInitOptions,
-    bootstrap_token: SandboxBootstrapToken,
+    credential: SandboxCredential,
     content_encoding: SandboxContentEncodingPreference,
     mut profile: Option<&mut SandboxInitProfile>,
 ) -> Result<SandboxInitReport, SandboxInitError> {
@@ -470,7 +674,15 @@ fn run_sandbox_init_internal(
     let client = SandboxHttpClient::new(&options.api_url)?;
     mark_profile(&mut profile, PROFILE_CLIENT_SETUP);
 
-    let capability = client.exchange_bootstrap(&bootstrap_token)?;
+    let capability = match credential {
+        SandboxCredential::Bootstrap(bootstrap_token) => {
+            client.exchange_bootstrap(&bootstrap_token)?
+        }
+        SandboxCredential::ProfileKey(profile_key) => {
+            client.create_workspace_profile_session(&profile_key)?
+        }
+        SandboxCredential::Session(capability) => capability,
+    };
     mark_profile(&mut profile, PROFILE_BOOTSTRAP_EXCHANGE);
     validate_capability(&capability)?;
     let status = client.session_status(&capability)?;
@@ -1365,6 +1577,65 @@ impl SandboxHttpClient {
         unreachable!("bootstrap exchange attempt loop always returns")
     }
 
+    fn create_workspace_profile_session(
+        &self,
+        profile_key: &SandboxProfileKey,
+    ) -> Result<SessionCapability, SandboxInitError> {
+        let idempotency_key = random_idempotency_key()?;
+        for attempt in 0..BOOTSTRAP_EXCHANGE_ATTEMPTS {
+            let response = match self
+                .client
+                .post(self.workspace_profile_sessions_url())
+                .header(ACCEPT, JSON_MEDIA_TYPE)
+                .header(IDEMPOTENCY_KEY_HEADER, &idempotency_key)
+                .bearer_auth(profile_key.expose())
+                .send()
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let error = SandboxInitError::Http {
+                        operation: "Workspace Profile session creation",
+                        detail: error.without_url().to_string(),
+                    };
+                    if has_retry_remaining(attempt, BOOTSTRAP_EXCHANGE_ATTEMPTS) {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            if is_retriable_idempotent_status(response.status())
+                && has_retry_remaining(attempt, BOOTSTRAP_EXCHANGE_ATTEMPTS)
+            {
+                continue;
+            }
+            let session: WorkspaceProfileSession =
+                match read_json_response(response, "Workspace Profile session creation") {
+                    Ok(session) => session,
+                    Err(error)
+                        if has_retry_remaining(attempt, BOOTSTRAP_EXCHANGE_ATTEMPTS)
+                            && is_ambiguous_idempotent_error(
+                                &error,
+                                "Workspace Profile session creation",
+                            ) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+            if session.profile_id.is_empty() || session.profile_revision == 0 {
+                return Err(SandboxInitError::InvalidCapability(
+                    "Workspace Profile identity is invalid",
+                ));
+            }
+            return Ok(SessionCapability {
+                session_id: session.session_id,
+                opaque_capability: session.opaque_capability,
+                expires_at: session.expires_at,
+            });
+        }
+        unreachable!("profile session attempt loop always returns")
+    }
+
     fn session_status(
         &self,
         capability: &SessionCapability,
@@ -1521,6 +1792,10 @@ impl SandboxHttpClient {
         endpoint_url(&self.api_url, &["v1", "sessions"])
     }
 
+    fn workspace_profile_sessions_url(&self) -> reqwest::Url {
+        endpoint_url(&self.api_url, &["v1", "workspace-profile-sessions"])
+    }
+
     fn session_url(&self, session_id: &str) -> reqwest::Url {
         endpoint_url(&self.api_url, &["v1", "sessions", session_id])
     }
@@ -1557,6 +1832,15 @@ fn derive_idempotency_key(token: &SandboxBootstrapToken) -> String {
     hasher.update(token.expose().as_bytes());
     let digest = hasher.finalize();
     lower_hex(&digest)
+}
+
+fn random_idempotency_key() -> Result<String, SandboxInitError> {
+    let mut random = [0_u8; 32];
+    getrandom::fill(&mut random).map_err(|_| SandboxInitError::Http {
+        operation: "Workspace Profile session credential setup",
+        detail: "secure random generation failed".to_string(),
+    })?;
+    Ok(lower_hex(&random))
 }
 
 fn lower_hex(bytes: &[u8]) -> String {
@@ -1701,6 +1985,36 @@ mod tests {
     use locality_core::portable::SessionId;
 
     use super::*;
+
+    #[test]
+    fn session_credential_json_is_validated_without_exposing_the_capability() {
+        let json = r#"{
+            "session_id":"session-profile-7",
+            "opaque_capability":"opaque-session-capability",
+            "expires_at":"2026-07-29T01:00:00Z",
+            "profile_id":"00000000-0000-0000-0000-000000000007",
+            "profile_revision":9
+        }"#;
+        let capability = resolve_session_credential(true, None, &mut json.as_bytes())
+            .expect("valid profile session JSON");
+        assert_eq!(capability.session_id.as_str(), "session-profile-7");
+        assert_eq!(capability.opaque_capability, "opaque-session-capability");
+        assert!(!format!("{capability:?}").contains("opaque-session-capability"));
+    }
+
+    #[test]
+    fn session_credential_rejects_missing_profile_identity() {
+        let json = r#"{
+            "session_id":"session-profile-7",
+            "opaque_capability":"opaque-session-capability",
+            "expires_at":"2026-07-29T01:00:00Z",
+            "profile_id":"",
+            "profile_revision":0
+        }"#;
+        let error = resolve_session_credential(true, None, &mut json.as_bytes())
+            .expect_err("profile identity is mandatory");
+        assert!(matches!(error, SandboxInitError::InvalidSessionCredential));
+    }
 
     struct FixedChunkBody {
         reads: Arc<AtomicUsize>,

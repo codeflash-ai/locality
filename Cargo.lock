@@ -2086,6 +2086,7 @@ name = "loc-cli"
 version = "0.3.6"
 dependencies = [
  "clap",
+ "getrandom 0.4.2",
  "locality-connector",
  "locality-core",
  "locality-gmail",
