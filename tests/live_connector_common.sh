@@ -9,10 +9,14 @@ live_fail() {
 }
 
 require_live_env() {
-  local command
-  for command in "$@"; do
-    if ! command -v "$command" >/dev/null 2>&1; then
-      live_fail "missing required live connector dependency: $command"
+  local name
+  for name in "$@"; do
+    if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      live_fail "invalid environment variable name: $name"
+      return 1
+    fi
+    if [[ -z "${!name:-}" ]]; then
+      live_fail "missing $name"
       return 1
     fi
   done
@@ -91,10 +95,15 @@ write_file_credential() {
 }
 
 credential_access_token() {
-  local state_root="$1"
-  local secret_ref="$2"
   local secret_path
-  secret_path="$(credential_file_path "$state_root" "$secret_ref")"
+  if [[ $# -eq 1 ]]; then
+    secret_path="$1"
+  elif [[ $# -eq 2 ]]; then
+    secret_path="$(credential_file_path "$1" "$2")"
+  else
+    live_fail "credential_access_token requires a credential path or state root plus secret ref"
+    return 1
+  fi
   python3 - "$secret_path" <<'PY'
 import json
 import pathlib
@@ -104,16 +113,21 @@ path = pathlib.Path(sys.argv[1])
 secret = path.read_text(encoding="utf-8").strip()
 if not secret:
     raise SystemExit(f"credential secret at {path} is empty")
-if secret.startswith("{"):
+try:
     parsed = json.loads(secret)
+except json.JSONDecodeError as error:
+    if secret.lstrip().startswith(("{", "[")):
+        raise SystemExit(f"credential secret at {path} was not valid JSON: {error}") from error
+    token = secret
+else:
+    if not isinstance(parsed, dict):
+        raise SystemExit(f"credential secret at {path} must be a JSON object or plain secret")
     token = (
         parsed.get("access_token")
         or parsed.get("token")
         or parsed.get("api_key")
         or ""
     )
-else:
-    token = secret
 token = str(token).strip()
 if not token:
     raise SystemExit(f"credential secret at {path} did not contain an access token")
@@ -157,24 +171,54 @@ PY
 }
 
 assert_json_ok() {
-  local json_source="$1"
+  local report_path="$1"
   local label="${2:-JSON}"
-  python3 - "$json_source" "$label" <<'PY'
+  python3 - "$report_path" "$label" <<'PY'
 import json
-import os
 import pathlib
 import sys
 
-source = sys.argv[1]
+path = pathlib.Path(sys.argv[1])
 label = sys.argv[2]
-if os.path.isfile(source):
-    text = pathlib.Path(source).read_text(encoding="utf-8")
-else:
-    text = source
+try:
+    text = path.read_text(encoding="utf-8")
+except OSError as error:
+    raise SystemExit(f"{label} could not be read from {path}: {error}") from error
+try:
+    report = json.loads(text)
+except Exception as error:
+    raise SystemExit(f"{label} was not valid JSON at {path}: {error}") from error
+if not isinstance(report, dict):
+    raise SystemExit(f"{label} did not report ok=true at {path}: top-level JSON was not an object")
+if report.get("ok") is not True:
+    details = []
+    for key in ("ok", "status", "code", "error_code"):
+        value = report.get(key)
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            details.append(f"{key}={value!r}")
+    error = report.get("error")
+    if isinstance(error, dict):
+        code = error.get("code")
+        if isinstance(code, (str, int, float, bool)) or code is None:
+            details.append(f"error.code={code!r}")
+    suffix = f" ({', '.join(details)})" if details else ""
+    raise SystemExit(f"{label} did not report ok=true at {path}{suffix}")
+PY
+}
+
+_assert_json_text_valid() {
+  local json_text="$1"
+  local label="${2:-JSON}"
+  python3 - "$json_text" "$label" <<'PY'
+import json
+import sys
+
+text = sys.argv[1]
+label = sys.argv[2]
 try:
     json.loads(text)
 except Exception as error:
-    raise SystemExit(f"{label} was not valid JSON: {error}")
+    raise SystemExit(f"{label} was not valid JSON: {error}") from error
 PY
 }
 
@@ -187,6 +231,17 @@ connector_profile_id() {
     granola) printf '%s\n' "granola-api-key-default" ;;
     linear) printf '%s\n' "linear-api-key-default" ;;
     *) live_fail "unsupported live connector: $1" ;;
+  esac
+}
+
+_live_is_connector() {
+  case "$1" in
+    google-docs | google-calendar | gmail | slack | granola | linear)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
   esac
 }
 
@@ -311,6 +366,15 @@ _live_resolve_bin() {
   fi
 }
 
+_live_arg_looks_like_bin() {
+  local candidate="$1"
+  local expected_name="$2"
+  local basename
+  basename="${candidate%/}"
+  basename="${basename##*/}"
+  [[ ! -d "$candidate" && ( -x "$candidate" || "$basename" == "$expected_name" ) ]]
+}
+
 _live_loc_bin() {
   _live_resolve_bin "${loc_bin:-${LOCALITY_BIN:-./target/debug/loc}}"
 }
@@ -324,9 +388,18 @@ _live_fuse_bin() {
 }
 
 init_live_state() {
-  local state_root="$1"
+  local state_root
   local resolved_loc_bin
-  resolved_loc_bin="$(_live_loc_bin)"
+  if [[ $# -eq 1 ]]; then
+    state_root="$1"
+    resolved_loc_bin="$(_live_loc_bin)"
+  elif [[ $# -eq 2 ]]; then
+    resolved_loc_bin="$(_live_resolve_bin "$1")"
+    state_root="$2"
+  else
+    live_fail "init_live_state requires a state root or loc binary plus state root"
+    return 1
+  fi
   if [[ ! -x "$resolved_loc_bin" ]]; then
     live_fail "loc binary is not executable: $resolved_loc_bin"
   fi
@@ -336,17 +409,39 @@ init_live_state() {
 }
 
 seed_connector_credential() {
-  local state_root="$1"
-  local connector="$2"
-  local connection_id="$3"
-  local credential_secret="$4"
-  local display_name="${5:-$connection_id}"
-  local account_label="${6:-}"
-  local workspace_id="${7:-}"
-  local workspace_name="${8:-}"
-  local expires_at="${9:-}"
+  local resolved_loc_bin=""
+  local state_root
+  local connector
+  local connection_id
+  local credential_secret
+  if [[ $# -ge 5 ]] && ! _live_is_connector "${2:-}"; then
+    resolved_loc_bin="$(_live_resolve_bin "$1")"
+    state_root="$2"
+    connector="$3"
+    connection_id="$4"
+    credential_secret="$5"
+    shift 5
+  elif [[ $# -ge 4 ]]; then
+    state_root="$1"
+    connector="$2"
+    connection_id="$3"
+    credential_secret="$4"
+    shift 4
+  else
+    live_fail "seed_connector_credential requires connector credential details"
+    return 1
+  fi
+  local display_name="${1:-$connection_id}"
+  local account_label="${2:-}"
+  local workspace_id="${3:-}"
+  local workspace_name="${4:-}"
+  local expires_at="${5:-}"
 
-  init_live_state "$state_root"
+  if [[ -n "$resolved_loc_bin" ]]; then
+    init_live_state "$resolved_loc_bin" "$state_root"
+  else
+    init_live_state "$state_root"
+  fi
 
   local db="$state_root/state.sqlite3"
   local secret_ref="connection:$connection_id"
@@ -368,9 +463,9 @@ seed_connector_credential() {
   profile_display_name="$(connector_display_name "$connector")"
   now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-  assert_json_ok "$scopes_json" "$connector scopes JSON"
-  assert_json_ok "$capabilities_json" "$connector capabilities JSON"
-  assert_json_ok "$enabled_actions_json" "$connector enabled actions JSON"
+  _assert_json_text_valid "$scopes_json" "$connector scopes JSON"
+  _assert_json_text_valid "$capabilities_json" "$connector capabilities JSON"
+  _assert_json_text_valid "$enabled_actions_json" "$connector enabled actions JSON"
   write_file_credential "$state_root" "$secret_ref" "$credential_secret"
 
   local profile_id_sql
@@ -497,9 +592,18 @@ SQL
 }
 
 build_live_binaries() {
-  loc_bin="$(_live_loc_bin)"
-  localityd_bin="$(_live_localityd_bin)"
-  fuse_bin="$(_live_fuse_bin)"
+  if [[ $# -eq 0 ]]; then
+    loc_bin="$(_live_loc_bin)"
+    localityd_bin="$(_live_localityd_bin)"
+    fuse_bin="$(_live_fuse_bin)"
+  elif [[ $# -eq 3 ]]; then
+    loc_bin="$(_live_resolve_bin "$1")"
+    localityd_bin="$(_live_resolve_bin "$2")"
+    fuse_bin="$(_live_resolve_bin "$3")"
+  else
+    live_fail "build_live_binaries requires no arguments or loc, localityd, and FUSE binary paths"
+    return 1
+  fi
   if [[ ! -x "$loc_bin" || ! -x "$localityd_bin" || ! -x "$fuse_bin" ]]; then
     (cd "$live_connector_repo_root" && cargo build -p loc-cli -p localityd -p locality-fuse)
   fi
@@ -509,9 +613,21 @@ build_live_binaries() {
 }
 
 wait_for_daemon() {
-  local state_root="$1"
-  local resolved_loc_bin="${2:-$(_live_loc_bin)}"
-  local log_path="${3:-${daemon_log:-}}"
+  local state_root
+  local resolved_loc_bin
+  local log_path
+  if [[ $# -ge 2 ]] && _live_arg_looks_like_bin "$1" "loc"; then
+    resolved_loc_bin="$(_live_resolve_bin "$1")"
+    state_root="$2"
+    log_path="${3:-${daemon_log:-}}"
+  elif [[ $# -ge 1 ]]; then
+    state_root="$1"
+    resolved_loc_bin="$(_live_resolve_bin "${2:-$(_live_loc_bin)}")"
+    log_path="${3:-${daemon_log:-}}"
+  else
+    live_fail "wait_for_daemon requires a state root or loc binary plus state root"
+    return 1
+  fi
   local attempts="${LOCALITY_LIVE_DAEMON_WAIT_ATTEMPTS:-120}"
   local attempt
   for ((attempt = 1; attempt <= attempts; attempt++)); do
@@ -555,28 +671,53 @@ wait_for_fuse() {
 }
 
 start_live_daemon() {
-  local state_root="$1"
-  local log_path="$2"
-  local resolved_localityd_bin="${3:-$(_live_localityd_bin)}"
-  local resolved_loc_bin="${4:-$(_live_loc_bin)}"
+  local state_root
+  local log_path
+  local resolved_localityd_bin
+  if [[ $# -ge 3 ]] && _live_arg_looks_like_bin "$1" "localityd"; then
+    resolved_localityd_bin="$(_live_resolve_bin "$1")"
+    state_root="$2"
+    log_path="$3"
+  elif [[ $# -ge 2 ]]; then
+    state_root="$1"
+    log_path="$2"
+    resolved_localityd_bin="$(_live_resolve_bin "${3:-$(_live_localityd_bin)}")"
+  else
+    live_fail "start_live_daemon requires localityd, state root, and log path"
+    return 1
+  fi
   mkdir -p "$(dirname "$log_path")"
   LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_TCP_ADDR=off \
     "$resolved_localityd_bin" >"$log_path" 2>&1 &
   localityd_pid="$!"
-  wait_for_daemon "$state_root" "$resolved_loc_bin" "$log_path"
+  printf '%s\n' "$localityd_pid"
 }
 
 start_live_fuse() {
-  local state_root="$1"
-  local root="$2"
-  local log_path="$3"
-  local resolved_fuse_bin="${4:-$(_live_fuse_bin)}"
+  local state_root
+  local root
+  local log_path
+  local resolved_fuse_bin
+  if [[ $# -ge 4 ]] && _live_arg_looks_like_bin "$1" "locality-fuse"; then
+    resolved_fuse_bin="$(_live_resolve_bin "$1")"
+    state_root="$2"
+    root="$3"
+    log_path="$4"
+  elif [[ $# -ge 3 ]]; then
+    state_root="$1"
+    root="$2"
+    log_path="$3"
+    resolved_fuse_bin="$(_live_resolve_bin "${4:-$(_live_fuse_bin)}")"
+  else
+    live_fail "start_live_fuse requires FUSE binary, state root, root, and log path"
+    return 1
+  fi
   mkdir -p "$(dirname "$log_path")" "$root"
   LOCALITY_STATE_DIR="$state_root" "$resolved_fuse_bin" \
     --state-dir "$state_root" \
     --mountpoint "$root" >"$log_path" 2>&1 &
   fuse_pid="$!"
-  wait_for_fuse "$root" "$fuse_pid" "$log_path"
+  printf '%s\n' "$fuse_pid"
 }
 
 stop_live_processes() {
