@@ -296,8 +296,15 @@ if [[ "$original_hash" != "$after_write_hash" ]]; then
 fi
 
 step="verifying Slack read-only push validation"
-LOCALITY_STATE_DIR="$state_root" "$loc_bin" push --json -y "$recent_path" \
-  >"$push_report" 2>>"$command_log" || true
+if LOCALITY_STATE_DIR="$state_root" "$loc_bin" push --json -y "$recent_path" \
+  >"$push_report" 2>>"$command_log"; then
+  push_status=0
+else
+  push_status="$?"
+fi
+if [[ "$push_status" == "0" ]]; then
+  live_fail "Slack read-only push unexpectedly exited successfully"
+fi
 assert_push_blocked_as_read_only "$push_report"
 
 step="checking Slack mount status"
