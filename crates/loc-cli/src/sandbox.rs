@@ -1608,20 +1608,23 @@ impl SandboxHttpClient {
             {
                 continue;
             }
-            let session: WorkspaceProfileSession =
-                match read_json_response(response, "Workspace Profile session creation") {
-                    Ok(session) => session,
-                    Err(error)
-                        if has_retry_remaining(attempt, BOOTSTRAP_EXCHANGE_ATTEMPTS)
-                            && is_ambiguous_idempotent_error(
-                                &error,
-                                "Workspace Profile session creation",
-                            ) =>
-                    {
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
+            let session: WorkspaceProfileSession = match read_json_response_with_status(
+                response,
+                "Workspace Profile session creation",
+                StatusCode::CREATED,
+            ) {
+                Ok(session) => session,
+                Err(error)
+                    if has_retry_remaining(attempt, BOOTSTRAP_EXCHANGE_ATTEMPTS)
+                        && is_ambiguous_idempotent_error(
+                            &error,
+                            "Workspace Profile session creation",
+                        ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if session.profile_id.is_empty() || session.profile_revision == 0 {
                 return Err(SandboxInitError::InvalidCapability(
                     "Workspace Profile identity is invalid",
@@ -1884,10 +1887,18 @@ fn endpoint_url(base: &reqwest::Url, segments: &[&str]) -> reqwest::Url {
 }
 
 fn read_json_response<T: DeserializeOwned>(
-    mut response: Response,
+    response: Response,
     operation: &'static str,
 ) -> Result<T, SandboxInitError> {
-    ensure_success(&response, operation)?;
+    read_json_response_with_status(response, operation, StatusCode::OK)
+}
+
+fn read_json_response_with_status<T: DeserializeOwned>(
+    mut response: Response,
+    operation: &'static str,
+    expected_status: StatusCode,
+) -> Result<T, SandboxInitError> {
+    ensure_status(&response, operation, expected_status)?;
     require_media_type(response.headers(), operation, JSON_MEDIA_TYPE)?;
     let mut bytes = Vec::new();
     response
@@ -1911,7 +1922,15 @@ fn read_json_response<T: DeserializeOwned>(
 }
 
 fn ensure_success(response: &Response, operation: &'static str) -> Result<(), SandboxInitError> {
-    if response.status() == StatusCode::OK {
+    ensure_status(response, operation, StatusCode::OK)
+}
+
+fn ensure_status(
+    response: &Response,
+    operation: &'static str,
+    expected_status: StatusCode,
+) -> Result<(), SandboxInitError> {
+    if response.status() == expected_status {
         Ok(())
     } else {
         Err(SandboxInitError::HttpStatus {
@@ -2354,6 +2373,47 @@ mod tests {
         assert_eq!(
             idempotency_key(&requests[0]),
             "fe1fd6a544a78d3a3087bf1517b0ca83b6d122bf1d88d1eddc264e883500bded"
+        );
+    }
+
+    #[test]
+    fn workspace_profile_session_creation_accepts_exact_created_status() {
+        let session = WorkspaceProfileSession {
+            session_id: SessionId::new("session-profile-created"),
+            opaque_capability: "ephemeral-session-secret".to_string(),
+            expires_at: "2026-07-29T08:00:00Z".to_string(),
+            profile_id: "00000000-0000-0000-0000-000000000007".to_string(),
+            profile_revision: 9,
+        };
+        let server = TestServer::start(
+            vec![TestResponse::Json {
+                status: "201 Created",
+                body: serde_json::to_vec(&session).expect("serialize profile session"),
+            }],
+            true,
+        );
+        let client = SandboxHttpClient::new(&server.api_url).expect("HTTP client");
+        let profile_key = SandboxProfileKey::new("a".repeat(64)).expect("profile key");
+
+        assert_eq!(
+            client
+                .create_workspace_profile_session(&profile_key)
+                .expect("created profile session"),
+            SessionCapability {
+                session_id: session.session_id,
+                opaque_capability: session.opaque_capability,
+                expires_at: session.expires_at,
+            }
+        );
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/v1/workspace-profile-sessions");
+        assert_eq!(requests[0].body, Vec::<u8>::new());
+        let expected_authorization = format!("Bearer {}", "a".repeat(64));
+        assert_eq!(
+            requests[0].headers.get("authorization").map(String::as_str),
+            Some(expected_authorization.as_str())
         );
     }
 
