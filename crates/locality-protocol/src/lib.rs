@@ -38,6 +38,8 @@ pub const EXPORT_V2_FILE_PAX_KEYS: [&str; 6] = [
 pub const MAX_EXPORT_V2_PAX_VALUE_BYTES: usize = 4 * 1024;
 pub const MAX_EXPORT_V2_FILE_PAX_BYTES: usize = 8 * 1024;
 pub const MAX_EXPORT_TERMINAL_CONTROL_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_SLACK_TEAM_ID_BYTES: usize = 32;
+pub const MAX_SLACK_CHANNEL_ID_BYTES: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExportV2FilePaxMetadata {
@@ -397,6 +399,7 @@ pub enum ProviderSourceScopeSelector {
         selector_version: u16,
         conversation_id: String,
     },
+    HostedSlackChannel(HostedSlackChannelSelector),
     Granola {
         selector_version: u16,
         scope_kind: GranolaScopeKind,
@@ -418,6 +421,132 @@ pub enum ProviderSourceScopeSelector {
         scope_kind: GithubScopeKind,
         provider_scope_id: String,
     },
+}
+
+/// One immutable hosted Slack installation identity.
+///
+/// The wire form is one non-nil canonical lowercase hyphenated Locality UUID.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct SlackInstallationId(String);
+
+impl SlackInstallationId {
+    pub fn new(value: impl Into<String>) -> Result<Self, SlackInstallationIdError> {
+        let value = value.into();
+        if !is_canonical_lowercase_hyphenated_uuid(&value) {
+            return Err(SlackInstallationIdError::NonCanonical);
+        }
+        if value.bytes().all(|byte| byte == b'0' || byte == b'-') {
+            return Err(SlackInstallationIdError::Nil);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Display for SlackInstallationId {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.0, formatter)
+    }
+}
+
+impl Debug for SlackInstallationId {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "SlackInstallationId({})", self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SlackInstallationId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlackInstallationIdError {
+    NonCanonical,
+    Nil,
+}
+
+impl Display for SlackInstallationIdError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonCanonical => formatter
+                .write_str("Slack installation ID must be a canonical lowercase hyphenated UUID"),
+            Self::Nil => formatter.write_str("Slack installation ID must not be the nil UUID"),
+        }
+    }
+}
+
+impl std::error::Error for SlackInstallationIdError {}
+
+fn is_canonical_lowercase_hyphenated_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)
+            }
+        })
+}
+
+/// V1 sharing facts sealed into a hosted Slack channel authorization scope.
+///
+/// There is intentionally no unknown value: future wire labels fail to decode
+/// and therefore cannot confer authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlackChannelSharingClassification {
+    Public,
+    Private,
+    ExternallySharedPublic,
+    ExternallySharedPrivate,
+}
+
+/// Immutable provider facts required to authorize one hosted Slack channel.
+///
+/// Credentials, URLs, provider cursors, and mutable display names are not
+/// protocol fields. Unknown fields fail closed on decode.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedSlackChannelSelector {
+    pub selector_version: u16,
+    pub installation_id: SlackInstallationId,
+    pub team_id: String,
+    pub channel_id: String,
+    pub authorized_history_start_at: String,
+    pub sharing: SlackChannelSharingClassification,
+}
+
+impl HostedSlackChannelSelector {
+    pub fn validate(&self) -> Result<(), ScopeContractError> {
+        if self.selector_version != 1 {
+            return Err(ScopeContractError::UnsupportedSelectorVersion {
+                version: self.selector_version,
+            });
+        }
+        validate_canonical_slack_id("team_id", &self.team_id, b"T", MAX_SLACK_TEAM_ID_BYTES)?;
+        validate_canonical_slack_id(
+            "channel_id",
+            &self.channel_id,
+            b"CG",
+            MAX_SLACK_CHANNEL_ID_BYTES,
+        )?;
+        validate_canonical_utc_timestamp(
+            "authorized_history_start_at",
+            &self.authorized_history_start_at,
+        )?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -478,6 +607,7 @@ impl ProviderSourceScopeSelector {
             | Self::Github {
                 selector_version, ..
             } => *selector_version,
+            Self::HostedSlackChannel(selector) => selector.selector_version,
         };
         if selector_version != 1 {
             return Err(ScopeContractError::UnsupportedSelectorVersion {
@@ -501,6 +631,7 @@ impl ProviderSourceScopeSelector {
             Self::Slack {
                 conversation_id, ..
             } => validate_nonempty("conversation_id", conversation_id)?,
+            Self::HostedSlackChannel(selector) => selector.validate()?,
             Self::Gmail {
                 mailbox_id,
                 provider_scope_id,
@@ -2261,6 +2392,8 @@ pub enum ScopeContractError {
         maximum_bytes: usize,
         actual_bytes: usize,
     },
+    InvalidSlackId(&'static str),
+    InvalidCanonicalUtcTimestamp(&'static str),
     InvalidSha256(&'static str),
     InconsistentArchiveEntryCount,
     SelectionExceedsLimits,
@@ -2329,6 +2462,14 @@ impl Display for ScopeContractError {
                 formatter,
                 "{field} is {actual_bytes} bytes, exceeding {maximum_bytes} bytes"
             ),
+            Self::InvalidSlackId(field) => write!(
+                formatter,
+                "{field} must be a canonical bounded Slack identifier"
+            ),
+            Self::InvalidCanonicalUtcTimestamp(field) => write!(
+                formatter,
+                "{field} must use canonical UTC form YYYY-MM-DDTHH:MM:SSZ"
+            ),
             Self::InvalidSha256(field) => {
                 write!(
                     formatter,
@@ -2390,6 +2531,95 @@ fn validate_nonempty(field: &'static str, value: &str) -> Result<(), ScopeContra
         return Err(ScopeContractError::EmptyField(field));
     }
     Ok(())
+}
+
+fn validate_canonical_slack_id(
+    field: &'static str,
+    value: &str,
+    allowed_prefixes: &[u8],
+    maximum_bytes: usize,
+) -> Result<(), ScopeContractError> {
+    validate_nonempty(field, value)?;
+    if value.len() > maximum_bytes {
+        return Err(ScopeContractError::ValueTooLong {
+            field,
+            maximum_bytes,
+            actual_bytes: value.len(),
+        });
+    }
+    let bytes = value.as_bytes();
+    if bytes.len() < 2
+        || !allowed_prefixes.contains(&bytes[0])
+        || !bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return Err(ScopeContractError::InvalidSlackId(field));
+    }
+    Ok(())
+}
+
+fn validate_canonical_utc_timestamp(
+    field: &'static str,
+    value: &str,
+) -> Result<(), ScopeContractError> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return Err(ScopeContractError::InvalidCanonicalUtcTimestamp(field));
+    }
+    let Some(year) = parse_ascii_decimal(&bytes[0..4]) else {
+        return Err(ScopeContractError::InvalidCanonicalUtcTimestamp(field));
+    };
+    let Some(month) = parse_ascii_decimal(&bytes[5..7]) else {
+        return Err(ScopeContractError::InvalidCanonicalUtcTimestamp(field));
+    };
+    let Some(day) = parse_ascii_decimal(&bytes[8..10]) else {
+        return Err(ScopeContractError::InvalidCanonicalUtcTimestamp(field));
+    };
+    let Some(hour) = parse_ascii_decimal(&bytes[11..13]) else {
+        return Err(ScopeContractError::InvalidCanonicalUtcTimestamp(field));
+    };
+    let Some(minute) = parse_ascii_decimal(&bytes[14..16]) else {
+        return Err(ScopeContractError::InvalidCanonicalUtcTimestamp(field));
+    };
+    let Some(second) = parse_ascii_decimal(&bytes[17..19]) else {
+        return Err(ScopeContractError::InvalidCanonicalUtcTimestamp(field));
+    };
+    if year == 0
+        || !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return Err(ScopeContractError::InvalidCanonicalUtcTimestamp(field));
+    }
+    Ok(())
+}
+
+fn parse_ascii_decimal(bytes: &[u8]) -> Option<u32> {
+    bytes.iter().try_fold(0_u32, |value, byte| {
+        byte.is_ascii_digit()
+            .then(|| value * 10 + u32::from(*byte - b'0'))
+    })
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 fn append_count(output: &mut Vec<u8>, count: usize) -> Result<(), ScopeContractError> {
@@ -2623,6 +2853,10 @@ pub const TAR_EXPORT_METADATA_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/tar-export-metadata.json");
 pub const SCOPE_AUTHORIZED_SESSION_QUERY_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/scope-authorized-session-query.json");
+pub const SLACK_SELECTOR_V1_GOLDEN_JSON: &[u8] =
+    include_bytes!("../fixtures/slack-selector-v1.json");
+pub const HOSTED_SLACK_CHANNEL_SELECTOR_V1_GOLDEN_JSON: &[u8] =
+    include_bytes!("../fixtures/hosted-slack-channel-selector-v1.json");
 pub const EXPORT_ATTEMPT_REQUEST_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/export-attempt-request.json");
 pub const SEALED_EXPORT_OFFER_GOLDEN_JSON: &[u8] =
