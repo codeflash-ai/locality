@@ -1,0 +1,25 @@
+{
+  "epochs": {
+    "demand_epoch": "12",
+    "received_epoch": "12",
+    "processed_epoch": "11",
+    "applied_epoch": "10"
+  },
+  "required_coverage": {
+    "format_version": 1,
+    "minimum_class": "overlap",
+    "provider_cut": {
+      "format_version": 1,
+      "minimum_reader_version": 1,
+      "opaque_provider_value": "notion:last-edited-time:2026-07-29T12:00:00Z"
+    },
+    "authority_epoch": "7",
+    "connector_version": "locality-notion/0.3.3",
+    "configuration_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "checkpoint": {
+    "format_version": 1,
+    "minimum_reader_version": 1,
+    "opaque_provider_value": "notion:cursor:108"
+  }
+}

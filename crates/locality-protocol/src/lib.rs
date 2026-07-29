@@ -1094,6 +1094,388 @@ pub struct FreshnessRequirement {
     pub wait_timeout_seconds: u64,
 }
 
+/// A non-negative freshness fence that fits a checked PostgreSQL `BIGINT`.
+///
+/// The wire representation is a canonical quoted decimal string so clients
+/// cannot lose precision when decoding JSON.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FreshnessEpoch(i64);
+
+impl FreshnessEpoch {
+    pub const ZERO: Self = Self(0);
+    pub const MAX: Self = Self(i64::MAX);
+
+    pub const fn new(value: i64) -> Option<Self> {
+        if value < 0 { None } else { Some(Self(value)) }
+    }
+
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+
+    pub const fn checked_next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+}
+
+impl Serialize for FreshnessEpoch {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for FreshnessEpoch {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        let value = encoded
+            .parse::<i64>()
+            .map_err(|_| serde::de::Error::custom("invalid freshness epoch"))?;
+        if value < 0 || value.to_string() != encoded {
+            return Err(serde::de::Error::custom("invalid freshness epoch"));
+        }
+        Ok(Self(value))
+    }
+}
+
+/// Monotonic control fences for one stable source scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeFreshnessEpochs {
+    pub demand_epoch: FreshnessEpoch,
+    pub received_epoch: FreshnessEpoch,
+    pub processed_epoch: FreshnessEpoch,
+    pub applied_epoch: FreshnessEpoch,
+}
+
+impl ScopeFreshnessEpochs {
+    pub fn validate(&self) -> Result<(), FreshnessModelError> {
+        if self.applied_epoch <= self.processed_epoch
+            && self.processed_epoch <= self.received_epoch
+            && self.received_epoch <= self.demand_epoch
+        {
+            Ok(())
+        } else {
+            Err(FreshnessModelError::InvalidEpochOrder)
+        }
+    }
+}
+
+/// Required or proven scope traversal strength.
+///
+/// Unknown future values are retained as [`Self::Unknown`] and fail closed in
+/// ordering and coverage operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshnessCoverageClass {
+    Incremental,
+    Overlap,
+    FullRepair,
+    #[serde(other)]
+    Unknown,
+}
+
+impl FreshnessCoverageClass {
+    const fn rank(self) -> Option<u8> {
+        match self {
+            Self::Incremental => Some(0),
+            Self::Overlap => Some(1),
+            Self::FullRepair => Some(2),
+            Self::Unknown => None,
+        }
+    }
+
+    pub const fn join(self, other: Self) -> Self {
+        match (self.rank(), other.rank()) {
+            (Some(left), Some(right)) if left >= right => self,
+            (Some(_), Some(_)) => other,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub const fn minimum(self, other: Self) -> Self {
+        match (self.rank(), other.rank()) {
+            (Some(left), Some(right)) if left <= right => self,
+            (Some(_), Some(_)) => other,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub const fn satisfies(self, minimum: Self) -> bool {
+        match (self.rank(), minimum.rank()) {
+            (Some(actual), Some(required)) => actual >= required,
+            _ => false,
+        }
+    }
+}
+
+impl PartialOrd for FreshnessCoverageClass {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.rank()?.partial_cmp(&other.rank()?)
+    }
+}
+
+pub const FRESHNESS_CHECKPOINT_READER_VERSION: u16 = 1;
+pub const FRESHNESS_COVERAGE_FORMAT_VERSION: u16 = 1;
+pub const MAX_FRESHNESS_CHECKPOINT_OPAQUE_BYTES: usize = 16 * 1024;
+pub const MAX_FRESHNESS_CONNECTOR_VERSION_CHARS: usize = 128;
+pub const MAX_FRESHNESS_CONNECTOR_VERSION_BYTES: usize = 512;
+
+/// A bounded provider checkpoint whose contents remain connector-owned.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreshnessCheckpointEnvelope {
+    pub format_version: u16,
+    pub minimum_reader_version: u16,
+    pub opaque_provider_value: String,
+}
+
+impl Debug for FreshnessCheckpointEnvelope {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FreshnessCheckpointEnvelope")
+            .field("format_version", &self.format_version)
+            .field("minimum_reader_version", &self.minimum_reader_version)
+            .field("opaque_provider_value", &"<redacted>")
+            .finish()
+    }
+}
+
+impl FreshnessCheckpointEnvelope {
+    pub fn validate(&self) -> Result<(), FreshnessModelError> {
+        if self.format_version == 0 || self.minimum_reader_version == 0 {
+            return Err(FreshnessModelError::NonPositiveEnvelopeVersion);
+        }
+        if self.minimum_reader_version > self.format_version
+            || self.minimum_reader_version > FRESHNESS_CHECKPOINT_READER_VERSION
+        {
+            return Err(FreshnessModelError::IncompatibleCheckpointVersions {
+                format_version: self.format_version,
+                minimum_reader_version: self.minimum_reader_version,
+                supported_reader_version: FRESHNESS_CHECKPOINT_READER_VERSION,
+            });
+        }
+        if self.opaque_provider_value.is_empty() {
+            return Err(FreshnessModelError::EmptyOpaqueProviderValue);
+        }
+        if self.opaque_provider_value.len() > MAX_FRESHNESS_CHECKPOINT_OPAQUE_BYTES {
+            return Err(FreshnessModelError::OpaqueProviderValueTooLong {
+                maximum_bytes: MAX_FRESHNESS_CHECKPOINT_OPAQUE_BYTES,
+                actual_bytes: self.opaque_provider_value.len(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Connector-neutral requirements or proof for one freshness reconciliation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreshnessCoverageEnvelope {
+    pub format_version: u16,
+    pub minimum_class: FreshnessCoverageClass,
+    pub provider_cut: Option<FreshnessCheckpointEnvelope>,
+    pub authority_epoch: FreshnessEpoch,
+    pub connector_version: String,
+    pub configuration_sha256: String,
+}
+
+impl FreshnessCoverageEnvelope {
+    pub fn validate(&self) -> Result<(), FreshnessModelError> {
+        if self.format_version != FRESHNESS_COVERAGE_FORMAT_VERSION {
+            return Err(FreshnessModelError::UnsupportedCoverageFormatVersion {
+                version: self.format_version,
+            });
+        }
+        if self.minimum_class == FreshnessCoverageClass::Unknown {
+            return Err(FreshnessModelError::UnknownCoverageClass);
+        }
+        if self.connector_version.is_empty() {
+            return Err(FreshnessModelError::EmptyConnectorVersion);
+        }
+        if self.connector_version.len() > MAX_FRESHNESS_CONNECTOR_VERSION_BYTES {
+            return Err(FreshnessModelError::ConnectorVersionTooLong {
+                maximum_bytes: MAX_FRESHNESS_CONNECTOR_VERSION_BYTES,
+                actual_bytes: self.connector_version.len(),
+            });
+        }
+        let connector_version_chars = self.connector_version.chars().count();
+        if connector_version_chars > MAX_FRESHNESS_CONNECTOR_VERSION_CHARS {
+            return Err(FreshnessModelError::ConnectorVersionTooManyCharacters {
+                maximum_characters: MAX_FRESHNESS_CONNECTOR_VERSION_CHARS,
+                actual_characters: connector_version_chars,
+            });
+        }
+        if self.connector_version.trim() != self.connector_version {
+            return Err(FreshnessModelError::ConnectorVersionHasSurroundingWhitespace);
+        }
+        if self.connector_version.chars().any(char::is_control) {
+            return Err(FreshnessModelError::ConnectorVersionContainsControl);
+        }
+        if validate_sha256("configuration_sha256", &self.configuration_sha256).is_err() {
+            return Err(FreshnessModelError::InvalidConfigurationSha256);
+        }
+        if let Some(provider_cut) = &self.provider_cut {
+            provider_cut.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Joins requirements only when provider-cut ordering is unambiguous.
+    pub fn join(&self, other: &Self) -> Option<Self> {
+        self.validate().ok()?;
+        other.validate().ok()?;
+        if self.format_version != other.format_version
+            || self.connector_version != other.connector_version
+            || self.configuration_sha256 != other.configuration_sha256
+        {
+            return None;
+        }
+        let provider_cut = match (&self.provider_cut, &other.provider_cut) {
+            (None, None) => None,
+            (Some(cut), None) | (None, Some(cut)) => Some(cut.clone()),
+            (Some(left), Some(right)) if left == right => Some(left.clone()),
+            (Some(_), Some(_)) => return None,
+        };
+        Some(Self {
+            format_version: self.format_version,
+            minimum_class: self.minimum_class.join(other.minimum_class),
+            provider_cut,
+            authority_epoch: self.authority_epoch.max(other.authority_epoch),
+            connector_version: self.connector_version.clone(),
+            configuration_sha256: self.configuration_sha256.clone(),
+        })
+    }
+
+    /// Reports coverage only when opaque provider-cut comparison is exact.
+    pub fn satisfies(&self, minimum: &Self) -> Option<bool> {
+        self.validate().ok()?;
+        minimum.validate().ok()?;
+        if self.format_version != minimum.format_version
+            || self.connector_version != minimum.connector_version
+            || self.configuration_sha256 != minimum.configuration_sha256
+        {
+            return None;
+        }
+        let provider_cut_satisfied = match (&self.provider_cut, &minimum.provider_cut) {
+            (_, None) => true,
+            (None, Some(_)) => false,
+            (Some(actual), Some(required)) if actual == required => true,
+            (Some(_), Some(_)) => return None,
+        };
+        Some(
+            provider_cut_satisfied
+                && self.minimum_class.satisfies(minimum.minimum_class)
+                && self.authority_epoch >= minimum.authority_epoch,
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FreshnessModelError {
+    InvalidEpochOrder,
+    NonPositiveEnvelopeVersion,
+    IncompatibleCheckpointVersions {
+        format_version: u16,
+        minimum_reader_version: u16,
+        supported_reader_version: u16,
+    },
+    EmptyOpaqueProviderValue,
+    OpaqueProviderValueTooLong {
+        maximum_bytes: usize,
+        actual_bytes: usize,
+    },
+    UnsupportedCoverageFormatVersion {
+        version: u16,
+    },
+    UnknownCoverageClass,
+    EmptyConnectorVersion,
+    ConnectorVersionTooLong {
+        maximum_bytes: usize,
+        actual_bytes: usize,
+    },
+    ConnectorVersionTooManyCharacters {
+        maximum_characters: usize,
+        actual_characters: usize,
+    },
+    ConnectorVersionHasSurroundingWhitespace,
+    ConnectorVersionContainsControl,
+    InvalidConfigurationSha256,
+}
+
+impl Display for FreshnessModelError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidEpochOrder => formatter.write_str(
+                "freshness epochs must satisfy applied_epoch <= processed_epoch <= received_epoch <= demand_epoch",
+            ),
+            Self::NonPositiveEnvelopeVersion => {
+                formatter.write_str("freshness envelope versions must be positive")
+            }
+            Self::IncompatibleCheckpointVersions {
+                format_version,
+                minimum_reader_version,
+                supported_reader_version,
+            } => write!(
+                formatter,
+                "checkpoint format version {format_version} requires reader version {minimum_reader_version}, supported reader version is {supported_reader_version}"
+            ),
+            Self::EmptyOpaqueProviderValue => {
+                formatter.write_str("opaque provider checkpoint must not be empty")
+            }
+            Self::OpaqueProviderValueTooLong {
+                maximum_bytes,
+                actual_bytes,
+            } => write!(
+                formatter,
+                "opaque provider checkpoint is {actual_bytes} bytes, exceeding {maximum_bytes} bytes"
+            ),
+            Self::UnsupportedCoverageFormatVersion { version } => {
+                write!(
+                    formatter,
+                    "freshness coverage format version {version} is unsupported"
+                )
+            }
+            Self::UnknownCoverageClass => {
+                formatter.write_str("unknown freshness coverage class cannot prove coverage")
+            }
+            Self::EmptyConnectorVersion => {
+                formatter.write_str("connector_version must not be empty")
+            }
+            Self::ConnectorVersionTooLong {
+                maximum_bytes,
+                actual_bytes,
+            } => write!(
+                formatter,
+                "connector_version is {actual_bytes} bytes, exceeding {maximum_bytes} bytes"
+            ),
+            Self::ConnectorVersionTooManyCharacters {
+                maximum_characters,
+                actual_characters,
+            } => write!(
+                formatter,
+                "connector_version is {actual_characters} characters, exceeding {maximum_characters} characters"
+            ),
+            Self::ConnectorVersionHasSurroundingWhitespace => {
+                formatter.write_str("connector_version must not have surrounding whitespace")
+            }
+            Self::ConnectorVersionContainsControl => {
+                formatter.write_str("connector_version must not contain control characters")
+            }
+            Self::InvalidConfigurationSha256 => formatter.write_str(
+                "configuration_sha256 must be `sha256:` plus 64 lowercase hex digits",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FreshnessModelError {}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplicaFreshnessState {
@@ -2228,6 +2610,8 @@ pub const BOOTSTRAP_EXCHANGE_GOLDEN_JSON: &[u8] =
 pub const WORKSPACE_PROFILE_SESSION_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/workspace-profile-session.json");
 pub const FRESHNESS_STATUS_GOLDEN_JSON: &[u8] = include_bytes!("../fixtures/freshness-status.json");
+pub const SCOPE_FRESHNESS_CONTROL_GOLDEN_JSON: &[u8] =
+    include_bytes!("../fixtures/scope-freshness-control.json");
 pub const SANDBOX_SESSION_STATUS_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/sandbox-session-status.json");
 pub const SANDBOX_SESSION_STATUS_V2_GOLDEN_JSON: &[u8] =

@@ -23,20 +23,23 @@ use locality_protocol::{
     DeliveredChangesetBase, DeliveredCount, EXPORT_ATTEMPT_REQUEST_GOLDEN_JSON,
     EXPORT_COMPLETION_RECEIPT_GOLDEN_JSON, EXPORT_TERMINAL_CONTROL_V2_GOLDEN_JSON,
     EditedCanonicalBody, ExportAttemptLimits, ExportAttemptRequest, ExportCompletionReceipt,
-    ExportTerminalControlV2, FRESHNESS_STATUS_GOLDEN_JSON, FreshnessRequirement, NotionScopeKind,
+    ExportTerminalControlV2, FRESHNESS_COVERAGE_FORMAT_VERSION, FRESHNESS_STATUS_GOLDEN_JSON,
+    FreshnessCheckpointEnvelope, FreshnessCoverageClass, FreshnessCoverageEnvelope, FreshnessEpoch,
+    FreshnessModelError, FreshnessRequirement, MAX_FRESHNESS_CHECKPOINT_OPAQUE_BYTES,
+    MAX_FRESHNESS_CONNECTOR_VERSION_BYTES, MAX_FRESHNESS_CONNECTOR_VERSION_CHARS, NotionScopeKind,
     ORDERED_EXPORT_ROWS_GOLDEN_JSON, OpaqueBootstrapExchangeRequest, OpaqueSessionStatusRequest,
     OrderedExportRow, OrderedSourceGeneration, PROJECTION_VERSION_GOLDEN_JSON,
     ProjectionVersionContract, ProviderSourceScopeSelector, READY_REPLICA_REVISION_GOLDEN_JSON,
     ReadyReplicaRevision, ReplicaFreshnessState, ReplicaFreshnessStatus,
     SANDBOX_SESSION_STATUS_GOLDEN_JSON, SANDBOX_SESSION_STATUS_V2_GOLDEN_JSON,
     SCOPE_AUTHORIZED_COMPONENT_VERSIONS, SCOPE_AUTHORIZED_SESSION_QUERY_GOLDEN_JSON,
-    SEALED_EXPORT_OFFER_GOLDEN_JSON, SESSION_PROTOCOL_ERROR_GOLDEN_JSON,
-    SOURCE_VERSION_GOLDEN_JSON, SandboxSessionState, SandboxSessionStatus,
-    ScopeAuthorizedSessionQuery, ScopeAuthorizedWritableExportMetadata, ScopeContractError,
-    SealedExportOffer, SessionCapability, SessionErrorCode, SessionProtocolError,
-    SessionReplicaRevision, SourceVersionContract, StaleSessionBehavior,
-    TAR_EXPORT_METADATA_GOLDEN_JSON, TAR_EXPORT_OFFER_GOLDEN_JSON, TarContentEncoding,
-    TarExportMetadata, TarExportOffer, WORKSPACE_PROFILE_SESSION_GOLDEN_JSON,
+    SCOPE_FRESHNESS_CONTROL_GOLDEN_JSON, SEALED_EXPORT_OFFER_GOLDEN_JSON,
+    SESSION_PROTOCOL_ERROR_GOLDEN_JSON, SOURCE_VERSION_GOLDEN_JSON, SandboxSessionState,
+    SandboxSessionStatus, ScopeAuthorizedSessionQuery, ScopeAuthorizedWritableExportMetadata,
+    ScopeContractError, ScopeFreshnessEpochs, SealedExportOffer, SessionCapability,
+    SessionErrorCode, SessionProtocolError, SessionReplicaRevision, SourceVersionContract,
+    StaleSessionBehavior, TAR_EXPORT_METADATA_GOLDEN_JSON, TAR_EXPORT_OFFER_GOLDEN_JSON,
+    TarContentEncoding, TarExportMetadata, TarExportOffer, WORKSPACE_PROFILE_SESSION_GOLDEN_JSON,
     WRITABLE_EXPORT_METADATA_GOLDEN_JSON, WorkspaceProfileSession, WritableExportMetadata,
     WritableMetadataEntry, validate_canonical_export_records,
 };
@@ -62,6 +65,13 @@ where
 struct CanonicalInventoryGolden {
     preimage_hex: String,
     sha256: String,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ScopeFreshnessControlGolden {
+    epochs: ScopeFreshnessEpochs,
+    required_coverage: FreshnessCoverageEnvelope,
+    checkpoint: FreshnessCheckpointEnvelope,
 }
 
 #[test]
@@ -277,6 +287,245 @@ fn freshness_session_and_tar_export_values_are_exact_golden_bytes() {
         &sandbox_session_status(),
     );
     assert_exact_round_trip(SESSION_PROTOCOL_ERROR_GOLDEN_JSON, &needs_update_error());
+}
+
+#[test]
+fn scope_freshness_control_is_exact_golden_bytes() {
+    let control = scope_freshness_control();
+    control.epochs.validate().expect("ordered freshness epochs");
+    control
+        .required_coverage
+        .validate()
+        .expect("valid required coverage");
+    control.checkpoint.validate().expect("valid checkpoint");
+    assert_exact_round_trip(SCOPE_FRESHNESS_CONTROL_GOLDEN_JSON, &control);
+}
+
+#[test]
+fn freshness_epoch_encoding_is_canonical_and_checked() {
+    assert_eq!(
+        serde_json::to_string(&FreshnessEpoch::MAX).expect("serialize maximum epoch"),
+        r#""9223372036854775807""#
+    );
+    assert_eq!(
+        serde_json::from_str::<FreshnessEpoch>(r#""9223372036854775807""#)
+            .expect("decode maximum epoch"),
+        FreshnessEpoch::MAX
+    );
+    assert_eq!(FreshnessEpoch::new(-1), None);
+    assert_eq!(FreshnessEpoch::ZERO.get(), 0);
+    assert_eq!(FreshnessEpoch::ZERO.checked_next(), FreshnessEpoch::new(1));
+    assert_eq!(FreshnessEpoch::MAX.checked_next(), None);
+
+    for invalid in [
+        "0",
+        "-1",
+        r#""""#,
+        r#""-1""#,
+        r#""+1""#,
+        r#"" 1""#,
+        r#""1 ""#,
+        r#""00""#,
+        r#""01""#,
+        r#""9223372036854775808""#,
+        "null",
+        "[]",
+    ] {
+        assert!(
+            serde_json::from_str::<FreshnessEpoch>(invalid).is_err(),
+            "accepted invalid freshness epoch: {invalid}"
+        );
+    }
+}
+
+#[test]
+fn scope_freshness_epochs_enforce_fence_order() {
+    let ordered = ScopeFreshnessEpochs {
+        demand_epoch: epoch(4),
+        received_epoch: epoch(3),
+        processed_epoch: epoch(2),
+        applied_epoch: epoch(1),
+    };
+    assert_eq!(ordered.validate(), Ok(()));
+    assert!(ordered.applied_epoch < ordered.processed_epoch);
+    assert!(ordered.processed_epoch < ordered.received_epoch);
+    assert!(ordered.received_epoch < ordered.demand_epoch);
+
+    for invalid in [
+        ScopeFreshnessEpochs {
+            received_epoch: epoch(5),
+            ..ordered
+        },
+        ScopeFreshnessEpochs {
+            processed_epoch: epoch(4),
+            ..ordered
+        },
+        ScopeFreshnessEpochs {
+            applied_epoch: epoch(3),
+            ..ordered
+        },
+    ] {
+        assert_eq!(
+            invalid.validate(),
+            Err(FreshnessModelError::InvalidEpochOrder)
+        );
+    }
+}
+
+#[test]
+fn freshness_coverage_classes_join_and_fail_closed() {
+    use FreshnessCoverageClass::{FullRepair, Incremental, Overlap, Unknown};
+
+    assert!(Incremental < Overlap);
+    assert!(Overlap < FullRepair);
+    assert_eq!(Incremental.join(Overlap), Overlap);
+    assert_eq!(FullRepair.join(Overlap), FullRepair);
+    assert_eq!(Incremental.minimum(FullRepair), Incremental);
+    assert!(FullRepair.satisfies(Overlap));
+    assert!(!Incremental.satisfies(Overlap));
+
+    let future = serde_json::from_str::<FreshnessCoverageClass>(r#""future_repair""#)
+        .expect("unknown future class decodes");
+    assert_eq!(future, Unknown);
+    assert_eq!(Unknown.partial_cmp(&Unknown), None);
+    assert_eq!(Overlap.join(Unknown), Unknown);
+    assert_eq!(Overlap.minimum(Unknown), Unknown);
+    assert!(!FullRepair.satisfies(Unknown));
+    assert!(!Unknown.satisfies(Incremental));
+}
+
+#[test]
+fn freshness_envelopes_validate_and_compare_only_exact_cuts() {
+    let base_checkpoint = checkpoint("provider-cut-12");
+    assert_eq!(base_checkpoint.validate(), Ok(()));
+
+    let mut invalid_checkpoint = base_checkpoint.clone();
+    invalid_checkpoint.format_version = 0;
+    assert_eq!(
+        invalid_checkpoint.validate(),
+        Err(FreshnessModelError::NonPositiveEnvelopeVersion)
+    );
+    invalid_checkpoint = base_checkpoint.clone();
+    invalid_checkpoint.minimum_reader_version = 2;
+    assert!(matches!(
+        invalid_checkpoint.validate(),
+        Err(FreshnessModelError::IncompatibleCheckpointVersions { .. })
+    ));
+    invalid_checkpoint = base_checkpoint.clone();
+    invalid_checkpoint.opaque_provider_value.clear();
+    assert_eq!(
+        invalid_checkpoint.validate(),
+        Err(FreshnessModelError::EmptyOpaqueProviderValue)
+    );
+    invalid_checkpoint = base_checkpoint.clone();
+    invalid_checkpoint.opaque_provider_value =
+        "x".repeat(MAX_FRESHNESS_CHECKPOINT_OPAQUE_BYTES + 1);
+    assert!(matches!(
+        invalid_checkpoint.validate(),
+        Err(FreshnessModelError::OpaqueProviderValueTooLong { .. })
+    ));
+
+    let minimum = coverage(
+        FreshnessCoverageClass::Overlap,
+        Some(base_checkpoint.clone()),
+    );
+    assert_eq!(minimum.validate(), Ok(()));
+    let mut actual = minimum.clone();
+    actual.minimum_class = FreshnessCoverageClass::FullRepair;
+    actual.authority_epoch = epoch(8);
+    assert_eq!(actual.satisfies(&minimum), Some(true));
+
+    let mut different_connector = actual.clone();
+    different_connector.connector_version = "locality-notion/0.3.4".to_string();
+    assert_eq!(actual.join(&different_connector), None);
+    assert_eq!(actual.satisfies(&different_connector), None);
+
+    let mut different_configuration = actual.clone();
+    different_configuration.configuration_sha256 = canonical_sha256('b');
+    assert_eq!(actual.join(&different_configuration), None);
+    assert_eq!(actual.satisfies(&different_configuration), None);
+
+    let without_cut = coverage(FreshnessCoverageClass::Incremental, None);
+    let joined = without_cut.join(&minimum).expect("one cut is unambiguous");
+    assert_eq!(joined.minimum_class, FreshnessCoverageClass::Overlap);
+    assert_eq!(joined.provider_cut, Some(base_checkpoint));
+
+    let different_cut = coverage(
+        FreshnessCoverageClass::FullRepair,
+        Some(checkpoint("provider-cut-13")),
+    );
+    assert_eq!(minimum.join(&different_cut), None);
+    assert_eq!(different_cut.satisfies(&minimum), None);
+
+    let mut invalid_coverage = minimum.clone();
+    invalid_coverage.format_version = FRESHNESS_COVERAGE_FORMAT_VERSION + 1;
+    assert!(matches!(
+        invalid_coverage.validate(),
+        Err(FreshnessModelError::UnsupportedCoverageFormatVersion { .. })
+    ));
+    invalid_coverage = minimum;
+    invalid_coverage.minimum_class = FreshnessCoverageClass::Unknown;
+    assert_eq!(
+        invalid_coverage.validate(),
+        Err(FreshnessModelError::UnknownCoverageClass)
+    );
+
+    let boundary_connector_version = "\u{1f980}".repeat(MAX_FRESHNESS_CONNECTOR_VERSION_CHARS);
+    assert_eq!(boundary_connector_version.chars().count(), 128);
+    assert_eq!(boundary_connector_version.len(), 512);
+    for connector_version in ["x".to_string(), boundary_connector_version.clone()] {
+        let mut boundary_identity = actual.clone();
+        boundary_identity.connector_version = connector_version;
+        assert_eq!(boundary_identity.validate(), Ok(()));
+    }
+
+    for (connector_version, expected) in [
+        ("".to_string(), FreshnessModelError::EmptyConnectorVersion),
+        (
+            format!("{boundary_connector_version}x"),
+            FreshnessModelError::ConnectorVersionTooLong {
+                maximum_bytes: MAX_FRESHNESS_CONNECTOR_VERSION_BYTES,
+                actual_bytes: MAX_FRESHNESS_CONNECTOR_VERSION_BYTES + 1,
+            },
+        ),
+        (
+            "x".repeat(MAX_FRESHNESS_CONNECTOR_VERSION_CHARS + 1),
+            FreshnessModelError::ConnectorVersionTooManyCharacters {
+                maximum_characters: MAX_FRESHNESS_CONNECTOR_VERSION_CHARS,
+                actual_characters: MAX_FRESHNESS_CONNECTOR_VERSION_CHARS + 1,
+            },
+        ),
+        (
+            " locality-notion/0.3.3".to_string(),
+            FreshnessModelError::ConnectorVersionHasSurroundingWhitespace,
+        ),
+        (
+            "locality-notion/0.3.3 ".to_string(),
+            FreshnessModelError::ConnectorVersionHasSurroundingWhitespace,
+        ),
+        (
+            "locality-notion/0.3.3\u{7f}".to_string(),
+            FreshnessModelError::ConnectorVersionContainsControl,
+        ),
+    ] {
+        let mut invalid_identity = actual.clone();
+        invalid_identity.connector_version = connector_version;
+        assert_eq!(invalid_identity.validate(), Err(expected));
+    }
+
+    for invalid_sha256 in [
+        "",
+        "sha256:abc",
+        "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "md5:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+        let mut invalid_identity = actual.clone();
+        invalid_identity.configuration_sha256 = invalid_sha256.to_string();
+        assert_eq!(
+            invalid_identity.validate(),
+            Err(FreshnessModelError::InvalidConfigurationSha256)
+        );
+    }
 }
 
 #[test]
@@ -512,6 +761,7 @@ fn public_goldens_never_expose_physical_serving_identifiers() {
         CHANGESET_ENVELOPE_GOLDEN_JSON,
         BOOTSTRAP_EXCHANGE_GOLDEN_JSON,
         FRESHNESS_STATUS_GOLDEN_JSON,
+        SCOPE_FRESHNESS_CONTROL_GOLDEN_JSON,
         SANDBOX_SESSION_STATUS_GOLDEN_JSON,
         SESSION_PROTOCOL_ERROR_GOLDEN_JSON,
         TAR_EXPORT_OFFER_GOLDEN_JSON,
@@ -545,6 +795,52 @@ fn freshness_status() -> ReplicaFreshnessStatus {
         pending_events: 0,
         backlog: 0,
         provider_cooldown_until: None,
+    }
+}
+
+fn epoch(value: i64) -> FreshnessEpoch {
+    FreshnessEpoch::new(value).expect("non-negative fixture epoch")
+}
+
+fn checkpoint(opaque_provider_value: &str) -> FreshnessCheckpointEnvelope {
+    FreshnessCheckpointEnvelope {
+        format_version: 1,
+        minimum_reader_version: 1,
+        opaque_provider_value: opaque_provider_value.to_string(),
+    }
+}
+
+fn coverage(
+    minimum_class: FreshnessCoverageClass,
+    provider_cut: Option<FreshnessCheckpointEnvelope>,
+) -> FreshnessCoverageEnvelope {
+    FreshnessCoverageEnvelope {
+        format_version: FRESHNESS_COVERAGE_FORMAT_VERSION,
+        minimum_class,
+        provider_cut,
+        authority_epoch: epoch(7),
+        connector_version: "locality-notion/0.3.3".to_string(),
+        configuration_sha256: canonical_sha256('a'),
+    }
+}
+
+fn canonical_sha256(hex_digit: char) -> String {
+    format!("sha256:{}", hex_digit.to_string().repeat(64))
+}
+
+fn scope_freshness_control() -> ScopeFreshnessControlGolden {
+    ScopeFreshnessControlGolden {
+        epochs: ScopeFreshnessEpochs {
+            demand_epoch: epoch(12),
+            received_epoch: epoch(12),
+            processed_epoch: epoch(11),
+            applied_epoch: epoch(10),
+        },
+        required_coverage: coverage(
+            FreshnessCoverageClass::Overlap,
+            Some(checkpoint("notion:last-edited-time:2026-07-29T12:00:00Z")),
+        ),
+        checkpoint: checkpoint("notion:cursor:108"),
     }
 }
 
