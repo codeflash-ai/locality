@@ -237,9 +237,12 @@ best_effort_restore_original() {
     >"$cleanup_diff_report" 2>>"$command_log" || return 1
   assert_json_ok "$cleanup_diff_report" "Linear cleanup diff report" || return 1
   action="$(json_field "$cleanup_diff_report" "action" 2>/dev/null || true)"
-  if [[ "$action" != "confirm_plan" ]]; then
-    return 1
+  if [[ "$action" == "noop" ]]; then
+    cleanup_restore_needed=0
+    return 0
   fi
+  [[ "$action" == "confirm_plan" ]] || return 1
+
   LOCALITY_STATE_DIR="$state_root" "$loc_bin" push --json -y "$target" \
     >"$cleanup_push_report" 2>>"$command_log" || return 1
   assert_json_ok "$cleanup_push_report" "Linear cleanup push report" || return 1
@@ -309,6 +312,7 @@ issue_path="$(wait_for_target_issue "$LOCALITY_LINEAR_LIVE_ISSUE_ID")"
 step="saving original Linear issue page"
 cp "$issue_path" "$original_copy"
 original_saved=1
+cleanup_restore_needed=1
 
 unique="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 marker="Locality live Linear VFS marker $unique"
@@ -323,7 +327,6 @@ assert_json_ok "$diff_report" "Linear diff report"
 assert_json_field_equals "$diff_report" "action" "confirm_plan" "Linear diff report"
 
 step="pushing edited Linear issue page"
-cleanup_restore_needed=1
 LOCALITY_STATE_DIR="$state_root" "$loc_bin" push --json -y "$issue_path" \
   >"$push_report" 2>>"$command_log"
 assert_json_ok "$push_report" "Linear push report"
