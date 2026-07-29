@@ -96,6 +96,8 @@ Use this before mounting Notion. The default path uses Locality's OAuth broker,
 opens a browser, and stores credentials in the local credential store. Locality
 can mount only pages and workspaces shared with the Notion integration.
 
+The default broker is `https://afs-oauth-broker.saurabh-b07.workers.dev`; override it with `--broker-url <url>`, `LOCALITY_NOTION_OAUTH_BROKER_URL`, or `LOCALITY_AUTH_BROKER_URL`. The default local callback is `http://localhost:8757/oauth/notion/callback`; override it with `--redirect-uri <uri>` or `LOCALITY_NOTION_OAUTH_REDIRECT_URI`. In production the broker may use its own HTTPS provider callback registered on the Notion public integration, then hand the browser back to the local callback. The command still stores the resulting OAuth credential locally.
+
 Key arguments:
 
 | Argument | Meaning |

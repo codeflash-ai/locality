@@ -18,11 +18,16 @@ wrangler secret put LOCALITY_GOOGLE_CLIENT_ID
 wrangler secret put LOCALITY_GOOGLE_CLIENT_SECRET
 wrangler secret put LOCALITY_SLACK_CLIENT_ID
 wrangler secret put LOCALITY_SLACK_CLIENT_SECRET
-wrangler deploy
 ```
 
-Configure the Notion OAuth integration with the exact localhost callback used by
-Locality:
+Configure the Notion public integration with the exact hosted broker callback
+before deploying `LOCALITY_NOTION_HOSTED_CALLBACK_URI`:
+
+```text
+https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/notion/callback
+```
+
+Keep the local loopback callbacks in the broker allowlist for the CLI handoff:
 
 ```text
 http://localhost:8757/oauth/notion/callback
@@ -47,6 +52,12 @@ Locality:
 ```text
 http://localhost:8757/oauth/slack/callback
 http://127.0.0.1:8757/oauth/slack/callback
+```
+
+Deploy after secrets and provider callback URLs are in place:
+
+```sh
+wrangler deploy
 ```
 
 Use a stable production URL such as:

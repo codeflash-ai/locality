@@ -14,7 +14,7 @@ only performs the confidential token exchange and refresh calls.
 loc CLI -> broker /start
 loc CLI <- authorization_url, state, signed session
 loc CLI -> browser -> provider OAuth consent
-provider -> localhost callback on the user's machine
+provider -> localhost callback, or broker hosted callback -> localhost callback
 loc CLI -> broker /exchange with code, state, session, redirect_uri
 broker -> provider token endpoint with client_secret
 broker -> loc CLI with access token and refresh handle
@@ -51,11 +51,38 @@ Response:
   "client_id": "public-client-id",
   "authorization_url": "https://api.notion.com/v1/oauth/authorize?...",
   "redirect_uri": "http://localhost:8757/oauth/notion/callback",
+  "authorization_redirect_uri": "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/notion/callback",
+  "exchange_redirect_uri": "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/notion/callback",
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-local-handoff-state",
   "expires_in": 600
 }
 ```
+
+When `LOCALITY_NOTION_HOSTED_CALLBACK_URI` is set, `redirect_uri` remains the local loopback URI where the CLI listens. `authorization_redirect_uri` and `exchange_redirect_uri` are the HTTPS provider callback URI registered with Notion. The browser first returns to the broker callback, and the broker redirects the browser to `redirect_uri` with the provider code or error. The CLI then exchanges the code using `exchange_redirect_uri`, so Notion sees the same redirect URI during authorization and token exchange.
+
+### `GET /v1/oauth/notion/callback`
+
+This browser-facing route is used only when `LOCALITY_NOTION_HOSTED_CALLBACK_URI`
+is configured. It accepts Notion's `code` and `state`, verifies the signed
+local-handoff state, and returns `303 See Other` to the loopback callback held
+inside that state.
+
+Success redirects to:
+
+```text
+http://localhost:8757/oauth/notion/callback?state=...&code=...
+```
+
+Provider denial redirects to:
+
+```text
+http://localhost:8757/oauth/notion/callback?state=...&error=access_denied&error_description=...
+```
+
+The route sets `Cache-Control: no-store` and `Referrer-Policy: no-referrer`.
+It does not persist provider codes, tokens, refresh handles, or local callback
+URIs.
 
 ### `POST /v1/oauth/notion/exchange`
 
@@ -321,6 +348,7 @@ npm run check
 Optional connector overrides:
 
 - `LOCALITY_NOTION_REDIRECT_URIS`, `LOCALITY_GOOGLE_DOCS_REDIRECT_URIS`, `LOCALITY_GOOGLE_CALENDAR_REDIRECT_URIS`, `LOCALITY_GMAIL_REDIRECT_URIS`, `LOCALITY_SLACK_REDIRECT_URIS`: comma-separated allowed loopback redirect URIs.
+- `LOCALITY_NOTION_HOSTED_CALLBACK_URI`: exact HTTPS broker callback URI registered with the Notion public integration for hosted local handoff.
 - `LOCALITY_NOTION_AUTH_BASE_URL`, `LOCALITY_GOOGLE_DOCS_AUTH_BASE_URL`, `LOCALITY_GOOGLE_CALENDAR_AUTH_BASE_URL`, `LOCALITY_GMAIL_AUTH_BASE_URL`, `LOCALITY_SLACK_AUTH_BASE_URL`: provider authorization base URL.
 - `LOCALITY_NOTION_API_BASE_URL`, `LOCALITY_GOOGLE_DOCS_API_BASE_URL`, `LOCALITY_GOOGLE_CALENDAR_API_BASE_URL`, `LOCALITY_GMAIL_API_BASE_URL`, `LOCALITY_SLACK_API_BASE_URL`: provider token API base URL.
 
