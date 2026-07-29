@@ -164,6 +164,16 @@ seed_connector_credential \
 credential_path="$(credential_file_path "$state_root" "connection:$connection_id")"
 unset LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON
 
+step="registering Google Docs Linux FUSE mount"
+LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_DISABLE=1 \
+  "$loc_bin" mount google-docs "$mount_root" \
+    --workspace-folder "$LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER" \
+    --connection "$connection_id" \
+    --mount-id "$mount_id" \
+    --projection linux-fuse \
+    --json >"$mount_report" 2>>"$command_log"
+assert_json_ok "$mount_report" "Google Docs mount report"
+
 step="starting localityd"
 daemon_pid="$(start_live_daemon "$localityd_bin" "$state_root" "$daemon_log")"
 wait_for_daemon "$loc_bin" "$state_root"
@@ -171,15 +181,6 @@ wait_for_daemon "$loc_bin" "$state_root"
 step="starting locality-fuse"
 fuse_pid="$(start_live_fuse "$fuse_bin" "$state_root" "$locality_root" "$fuse_log")"
 wait_for_fuse "$locality_root" "$fuse_pid"
-
-step="registering Google Docs Linux FUSE mount"
-LOCALITY_STATE_DIR="$state_root" "$loc_bin" mount google-docs "$mount_root" \
-  --workspace-folder "$LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER" \
-  --connection "$connection_id" \
-  --mount-id "$mount_id" \
-  --projection linux-fuse \
-  --json >"$mount_report" 2>>"$command_log"
-assert_json_ok "$mount_report" "Google Docs mount report"
 wait_for_projected_mount_root
 
 step="pulling Google Docs workspace"
