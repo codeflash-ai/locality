@@ -70,14 +70,17 @@ Finder must enter the File Provider domain so directory listings call
 `file_provider_children` on `localityd`.
 
 Mount activation signals the shared domain root after adding a source. A newly
-registered domain also receives one working-set signal to seed macOS's initially
-empty File Provider database. Later source mounts do not repeat that global
-signal: their reimport and readiness repair stay scoped to the new mount-point
-identifier. Because macOS creates a source folder asynchronously, Locality waits
-for it before inspecting it and retries the scoped refresh once. Automatic
-activation never resets or re-registers the shared domain. Reconnecting an
-existing source retries this activation path instead of only reloading daemon
-mounts.
+registered domain also receives a working-set signal to seed macOS's initially
+empty File Provider database. Because macOS may retain the registration while
+discarding its visible source folders, Locality applies the same seed to a reused
+domain whose root has only hidden system items such as `.Trash`. The scoped
+retry repeats the seed only while that root remains empty. When a sibling source
+folder is visible, later source mounts do not send the global signal: their
+reimport and readiness repair stay scoped to the new mount-point identifier.
+Because macOS creates a source folder asynchronously, Locality waits for it
+before inspecting it and retries the scoped refresh once. Automatic activation
+never resets or re-registers the shared domain. Reconnecting an existing source
+retries this activation path instead of only reloading daemon mounts.
 
 Delete support still returns unsupported. Creates and renames are represented as
 daemon virtual mutations and stay pending until the normal review and push flow

@@ -8801,6 +8801,18 @@ fn activate_virtual_projection_mount(
         wait_for_virtual_projection_mount_point_children(state_root, mount)?;
     }
     let macos_domain_registration = register_virtual_projection(state_root, mount)?;
+    let seed_macos_working_set =
+        virtual_projection_mount_activation_seeds_working_set(mount, macos_domain_registration);
+    if seed_macos_working_set {
+        desktop_log(
+            "info",
+            "file_provider.working_set_seed",
+            format!(
+                "seeding macOS File Provider working set for mount `{}` because the shared domain is newly registered or has no visible source folders",
+                mount.mount_id.0
+            ),
+        );
+    }
     prefetch_virtual_projection_root(state_root, mount)?;
     if wait_for_entities
         && !virtual_projection_waits_for_mount_point_children_before_registration(&mount.projection)
@@ -8808,7 +8820,7 @@ fn activate_virtual_projection_mount(
         wait_for_mount_entities(state_root, &mount.mount_id)?;
     }
     ensure_virtual_projection_runtime(state_root, mount)?;
-    refresh_virtual_projection_mount_activation(mount, macos_domain_registration);
+    refresh_virtual_projection_mount_activation(mount, seed_macos_working_set);
     recover_virtual_projection_mount_root_if_needed(state_root, mount)?;
     desktop_log(
         "info",
@@ -8885,7 +8897,11 @@ fn recover_macos_file_provider_mount_root_if_needed(
     );
     prefetch_virtual_projection_root(state_root, mount)?;
     ensure_virtual_projection_runtime(state_root, mount)?;
-    refresh_virtual_projection_mount_activation(mount, MacosFileProviderDomainRegistration::Reused);
+    let seed_macos_working_set = virtual_projection_mount_activation_seeds_working_set(
+        mount,
+        MacosFileProviderDomainRegistration::Reused,
+    );
+    refresh_virtual_projection_mount_activation(mount, seed_macos_working_set);
 
     wait_for_macos_file_provider_mount_root_recovery(
         &root,
@@ -9806,11 +9822,9 @@ fn signal_virtual_projection_refresh(mount: &MountConfig) {
     }
 }
 
-fn refresh_virtual_projection_mount_activation(
-    mount: &MountConfig,
-    domain_registration: MacosFileProviderDomainRegistration,
-) {
-    for action in virtual_projection_mount_activation_refresh_actions(mount, domain_registration) {
+fn refresh_virtual_projection_mount_activation(mount: &MountConfig, seed_macos_working_set: bool) {
+    for action in virtual_projection_mount_activation_refresh_actions(mount, seed_macos_working_set)
+    {
         run_virtual_projection_refresh_action(mount, &action);
     }
 }
@@ -9848,14 +9862,14 @@ fn virtual_projection_refresh_actions(mount: &MountConfig) -> Vec<VirtualProject
 
 fn virtual_projection_mount_activation_refresh_actions(
     mount: &MountConfig,
-    domain_registration: MacosFileProviderDomainRegistration,
+    seed_macos_working_set: bool,
 ) -> Vec<VirtualProjectionRefreshAction> {
     if mount.projection == ProjectionMode::MacosFileProvider {
         let mut actions = vec![
             VirtualProjectionRefreshAction::Signal(ROOT_CONTAINER_IDENTIFIER.to_string()),
             VirtualProjectionRefreshAction::ReimportThenSignal(mount_point_identifier(mount)),
         ];
-        if domain_registration == MacosFileProviderDomainRegistration::Created {
+        if seed_macos_working_set {
             actions.push(VirtualProjectionRefreshAction::Signal(
                 "working-set".to_string(),
             ));
@@ -9863,6 +9877,38 @@ fn virtual_projection_mount_activation_refresh_actions(
         return actions;
     }
     virtual_projection_refresh_actions(mount)
+}
+
+fn virtual_projection_mount_activation_seeds_working_set(
+    mount: &MountConfig,
+    domain_registration: MacosFileProviderDomainRegistration,
+) -> bool {
+    if mount.projection != ProjectionMode::MacosFileProvider {
+        return false;
+    }
+    if domain_registration == MacosFileProviderDomainRegistration::Created {
+        return true;
+    }
+
+    mount_access_root(mount)
+        .parent()
+        .is_some_and(macos_file_provider_domain_root_is_visibly_empty)
+}
+
+fn macos_file_provider_domain_root_is_visibly_empty(root: &Path) -> bool {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => return error.kind() == io::ErrorKind::NotFound,
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        if !entry.file_name().to_string_lossy().starts_with('.') {
+            return false;
+        }
+    }
+    true
 }
 
 fn refresh_virtual_projection_container(
@@ -12087,7 +12133,8 @@ mod tests {
         live_mode_should_reconcile_local_target_for_key, live_mode_target,
         live_mode_tick_from_snapshot, live_mode_wake_generation, load_desktop_activity,
         macos_app_bundle_for_exe, macos_file_provider_child_item_count,
-        macos_file_provider_domain_registration, macos_file_provider_mount_root_health_error,
+        macos_file_provider_domain_registration, macos_file_provider_domain_root_is_visibly_empty,
+        macos_file_provider_mount_root_health_error,
         macos_file_provider_mount_root_inspection_recovery_reason,
         macos_file_provider_mount_root_is_missing, macos_file_provider_mount_root_recovery_reason,
         mark_mount_live_mode_syncing, mount_has_pending_local_changes,
@@ -15050,10 +15097,7 @@ mod tests {
         .projection(ProjectionMode::MacosFileProvider);
 
         assert_eq!(
-            virtual_projection_mount_activation_refresh_actions(
-                &mount,
-                MacosFileProviderDomainRegistration::Reused,
-            ),
+            virtual_projection_mount_activation_refresh_actions(&mount, false),
             vec![
                 VirtualProjectionRefreshAction::Signal("root".to_string()),
                 VirtualProjectionRefreshAction::ReimportThenSignal(
@@ -15064,7 +15108,7 @@ mod tests {
     }
 
     #[test]
-    fn macos_file_provider_new_domain_seeds_the_working_set_once() {
+    fn macos_file_provider_new_domain_seeds_the_working_set() {
         let mount = MountConfig::new(
             MountId::new("notion-main"),
             "notion",
@@ -15073,16 +15117,39 @@ mod tests {
         .projection(ProjectionMode::MacosFileProvider);
 
         assert_eq!(
-            virtual_projection_mount_activation_refresh_actions(
-                &mount,
-                MacosFileProviderDomainRegistration::Created,
-            ),
+            virtual_projection_mount_activation_refresh_actions(&mount, true),
             vec![
                 VirtualProjectionRefreshAction::Signal("root".to_string()),
                 VirtualProjectionRefreshAction::ReimportThenSignal("mount:notion-main".to_string(),),
                 VirtualProjectionRefreshAction::Signal("working-set".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn macos_file_provider_retained_empty_domain_requires_working_set_seed() {
+        let temp = TestTempDir::new("desktop-file-provider-retained-empty-domain");
+        let domain_root = temp.path().join("Locality");
+        fs::create_dir_all(domain_root.join(".Trash")).expect("create File Provider trash");
+        fs::write(domain_root.join(".DS_Store"), "metadata").expect("create hidden metadata");
+
+        assert!(macos_file_provider_domain_root_is_visibly_empty(
+            &domain_root
+        ));
+
+        fs::create_dir(domain_root.join("notion")).expect("create visible Notion mount");
+        assert!(!macos_file_provider_domain_root_is_visibly_empty(
+            &domain_root
+        ));
+    }
+
+    #[test]
+    fn macos_file_provider_missing_domain_root_requires_working_set_seed() {
+        let temp = TestTempDir::new("desktop-file-provider-missing-domain-root");
+
+        assert!(macos_file_provider_domain_root_is_visibly_empty(
+            &temp.path().join("Locality")
+        ));
     }
 
     #[test]
