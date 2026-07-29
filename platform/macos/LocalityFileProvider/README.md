@@ -69,14 +69,15 @@ in Finder. Opening the raw mount root is not enough to test lazy enumeration:
 Finder must enter the File Provider domain so directory listings call
 `file_provider_children` on `localityd`.
 
-Mount activation signals the shared domain root after adding a source. A newly
-registered domain also receives a working-set signal to seed macOS's initially
-empty File Provider database. Because macOS may retain the registration while
-discarding its visible source folders, Locality applies the same seed to a reused
-domain whose root has only hidden system items such as `.Trash`. The scoped
-retry repeats the seed only while that root remains empty. When a sibling source
-folder is visible, later source mounts do not send the global signal: their
-reimport and readiness repair stay scoped to the new mount-point identifier.
+Mount activation signals the working-set enumerator after adding a source
+because macOS can ignore a root-container signal when no root enumerator is
+active. Compact working-set sync anchors reference rebuildable item-version
+snapshots in the File Provider app-group cache; subsequent change enumerations
+report only new, changed, or deleted items while anchors stay within macOS's
+500-byte limit. A missing or incompatible snapshot expires its anchor and falls
+back to a clean enumeration. Adding a source can therefore insert its mount
+point and immediate children without updating an unchanged sibling subtree.
+Reimport and readiness repair stay scoped to the new mount-point identifier.
 Because macOS creates a source folder asynchronously, Locality waits for it
 before inspecting it and retries the scoped refresh once. Automatic activation
 never resets or re-registers the shared domain. Reconnecting an existing source

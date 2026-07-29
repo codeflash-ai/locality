@@ -210,21 +210,19 @@ encountered during later source setup. Slow approval remains a guided waiting
 state; missing helpers or extensions remain explicit setup failures.
 
 Later source mounts reuse the existing shared File Provider domain. Adding a
-top-level source folder such as `google-calendar-main` signals the domain root
-enumerator so macOS can discover that one child, but must not reimport the
-shared root, replace its registration, or disturb sibling mounts such as
-`notion`. A newly created domain also receives a non-destructive working-set
-signal after its first source is ready; macOS requires that initial enumeration
-to seed the otherwise-empty File Provider database. macOS can retain a domain
-registration while discarding all of its visible source folders, so activation
-also seeds a reused domain when its root contains no visible entries other than
-system-owned hidden items such as `.Trash`. The scoped retry repeats that seed
-only while the root remains empty. Later source activation does not signal the
-working set when any sibling source folder is visible. Registration is
-idempotent when the shared domain already exists; automatic setup treats that
-registration as authoritative rather than removing and recreating it to repair
-metadata.
-Reimport and readiness repair stay scoped to the new mount-point identifier.
+top-level source folder such as `google-calendar-main` signals the working-set
+enumerator because macOS can drop root-container signals when no root enumerator
+is active. Compact working-set sync anchors reference rebuildable item-version
+snapshots in the File Provider app-group cache, so change enumeration reports
+only new, changed, or deleted items while the anchor stays below macOS's
+500-byte limit. A missing or incompatible cached snapshot expires the anchor
+and lets macOS perform a clean enumeration. Adding Calendar therefore inserts
+the Calendar mount and its children without re-reporting or reimporting an
+unchanged `notion` subtree. The shared root is never reimported or
+re-registered. Registration is idempotent when the domain already exists;
+automatic setup treats that registration as authoritative rather than removing
+and recreating it to repair metadata. Reimport and readiness repair stay scoped
+to the new mount-point identifier.
 Mount-point appearance gets an initial 30-second wait and one 30-second scoped
 refresh window; if it is still unavailable, Locality reports a recoverable
 preparation warning without resetting the domain. Whole-domain unregister or

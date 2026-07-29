@@ -94,8 +94,7 @@ private enum Command {
           domain: DomainReport(existing),
           domains: nil,
           url: nil,
-          message: "already registered \(mountId)",
-          registrationCreated: false
+          message: "already registered \(mountId)"
         )
       }
 
@@ -121,8 +120,7 @@ private enum Command {
           domain: DomainReport(existing),
           domains: nil,
           url: nil,
-          message: "already registered \(mountId)",
-          registrationCreated: false
+          message: "already registered \(mountId)"
         )
       }
       return FileProviderCtlReport(
@@ -131,8 +129,7 @@ private enum Command {
         domain: DomainReport(domain),
         domains: nil,
         url: nil,
-        message: "registered \(mountId)",
-        registrationCreated: true
+        message: "registered \(mountId)"
       )
     case .open(let mountId):
       guard let domain = try getDomains().first(where: { $0.identifier.rawValue == mountId }) else {
@@ -286,25 +283,6 @@ private struct FileProviderCtlReport: Encodable {
   let domains: [DomainReport]?
   let url: String?
   let message: String
-  let registrationCreated: Bool?
-
-  init(
-    ok: Bool,
-    action: String,
-    domain: DomainReport?,
-    domains: [DomainReport]?,
-    url: String?,
-    message: String,
-    registrationCreated: Bool? = nil
-  ) {
-    self.ok = ok
-    self.action = action
-    self.domain = domain
-    self.domains = domains
-    self.url = url
-    self.message = message
-    self.registrationCreated = registrationCreated
-  }
 }
 
 private struct DomainReport: Encodable {

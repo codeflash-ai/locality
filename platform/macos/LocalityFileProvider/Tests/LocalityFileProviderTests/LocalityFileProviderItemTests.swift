@@ -4,22 +4,117 @@ import XCTest
 
 final class LocalityFileProviderItemTests: XCTestCase {
   func testCurrentSyncAnchorIsRecognized() throws {
-    let anchor = try LocalitySyncAnchor.next()
+    let (store, directory) = makeSyncAnchorStore()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let anchor = try LocalitySyncAnchor.next(store: store)
 
     XCTAssertTrue(LocalitySyncAnchor.isCurrent(anchor))
   }
 
   func testSuccessiveSyncAnchorsAdvance() throws {
-    let first = try LocalitySyncAnchor.next()
-    let second = try LocalitySyncAnchor.next()
+    let (store, directory) = makeSyncAnchorStore()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let first = try LocalitySyncAnchor.next(store: store)
+    let second = try LocalitySyncAnchor.next(store: store)
 
     XCTAssertNotEqual(first, second)
+  }
+
+  func testSyncAnchorStaysWithinFileProviderSizeLimit() throws {
+    let (store, directory) = makeSyncAnchorStore()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let items = (0..<1000).map { index in
+      item(identifier: "item-\(index)", filename: "Item \(index)", kind: "file")
+    }
+
+    let anchor = try LocalitySyncAnchor.next(items: items, store: store)
+
+    XCTAssertLessThanOrEqual(anchor.rawValue.count, 500)
   }
 
   func testLegacyTimestampSyncAnchorExpires() {
     let legacyAnchor = NSFileProviderSyncAnchor(Data("1784775141.0".utf8))
 
     XCTAssertFalse(LocalitySyncAnchor.isCurrent(legacyAnchor))
+  }
+
+  func testPreviousAndNewerSchemaSyncAnchorsExpire() {
+    for schemaVersion in [1, 3] {
+      let data = Data(
+        """
+        {"schemaVersion":\(schemaVersion),"nonce":"00000000-0000-0000-0000-000000000000","items":[]}
+        """.utf8
+      )
+
+      XCTAssertFalse(LocalitySyncAnchor.isCurrent(NSFileProviderSyncAnchor(data)))
+    }
+  }
+
+  func testSyncChangesOnlyReportsNewItems() throws {
+    let (store, directory) = makeSyncAnchorStore()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let notion = item(identifier: "mount:notion-main", filename: "notion", kind: "folder")
+    let anchor = try LocalitySyncAnchor.next(items: [notion], store: store)
+    let unchangedNotion = item(
+      identifier: "mount:notion-main",
+      filename: "notion",
+      kind: "folder"
+    )
+    let calendar = item(
+      identifier: "mount:google-calendar-main",
+      filename: "google-calendar-main",
+      kind: "folder"
+    )
+
+    let changes = try XCTUnwrap(
+      LocalitySyncAnchor.changes(
+        since: anchor,
+        currentItems: [unchangedNotion, calendar],
+        store: store
+      )
+    )
+
+    XCTAssertEqual(changes.updatedItems.map(\.itemIdentifier.rawValue), ["mount:google-calendar-main"])
+    XCTAssertTrue(changes.deletedIdentifiers.isEmpty)
+  }
+
+  func testSyncChangesReportsChangedAndDeletedItems() throws {
+    let (store, directory) = makeSyncAnchorStore()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let notion = item(identifier: "mount:notion-main", filename: "notion", kind: "folder")
+    let removed = item(identifier: "mount:removed", filename: "removed", kind: "folder")
+    let anchor = try LocalitySyncAnchor.next(items: [notion, removed], store: store)
+    let renamedNotion = item(
+      identifier: "mount:notion-main",
+      filename: "notion-renamed",
+      kind: "folder"
+    )
+
+    let changes = try XCTUnwrap(
+      LocalitySyncAnchor.changes(
+        since: anchor,
+        currentItems: [renamedNotion],
+        store: store
+      )
+    )
+
+    XCTAssertEqual(changes.updatedItems.map(\.itemIdentifier.rawValue), ["mount:notion-main"])
+    XCTAssertEqual(changes.deletedIdentifiers.map(\.rawValue), ["mount:removed"])
+  }
+
+  func testMissingSyncSnapshotExpiresAnchor() throws {
+    let (store, directory) = makeSyncAnchorStore()
+    let notion = item(identifier: "mount:notion-main", filename: "notion", kind: "folder")
+    let anchor = try LocalitySyncAnchor.next(items: [notion], store: store)
+    try FileManager.default.removeItem(at: directory)
+
+    XCTAssertNil(
+      LocalitySyncAnchor.changes(
+        since: anchor,
+        currentItems: [notion],
+        store: store
+      )
+    )
   }
 
   func testMissingReconciledLocalItemCanBeDeleted() {
@@ -208,5 +303,17 @@ final class LocalityFileProviderItemTests: XCTestCase {
       materializedPath: nil,
       byteSize: nil
     )
+  }
+
+  private func item(identifier: String, filename: String, kind: String) -> LocalityFileProviderItem {
+    LocalityFileProviderItem(
+      metadata: metadata(identifier: identifier, filename: filename, kind: kind)
+    )
+  }
+
+  private func makeSyncAnchorStore() -> (LocalitySyncAnchorStore, URL) {
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent("LocalitySyncAnchorTests-\(UUID().uuidString)", isDirectory: true)
+    return (LocalitySyncAnchorStore(directory: directory), directory)
   }
 }
