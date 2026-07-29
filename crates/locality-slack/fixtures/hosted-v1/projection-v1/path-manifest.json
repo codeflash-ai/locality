@@ -1,0 +1,20 @@
+{
+  "path_format_version": 1,
+  "channel": "channels/engineering-C08ENGINEER1/channel.md",
+  "threads": [
+    {
+      "root_message_id": "1780000000.000100",
+      "logical_path": "channels/engineering-C08ENGINEER1/threads/2026/05/2026-05-28-1780000000-000100-root-message.md"
+    }
+  ],
+  "files": [
+    {
+      "file_id": "F08PLAN0001",
+      "logical_path": "channels/engineering-C08ENGINEER1/files/plan-pdf-F08PLAN0001/metadata.md"
+    },
+    {
+      "file_id": "F08PLAN0002",
+      "logical_path": "channels/engineering-C08ENGINEER1/files/diagram-png-F08PLAN0002/metadata.md"
+    }
+  ]
+}

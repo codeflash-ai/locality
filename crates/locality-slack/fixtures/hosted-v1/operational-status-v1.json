@@ -1,0 +1,14 @@
+{
+  "status_format_version": 1,
+  "installation_id": "0198f3c2-7d4e-7a61-8b25-4f9c8d7e6a10",
+  "team_id": "T08LOCALITY1",
+  "channel_id": "C08ENGINEER1",
+  "authorized_history_start_at": "2026-01-01T00:00:00Z",
+  "sharing": "externally_shared_private",
+  "coverage_start_at": "2026-01-01T00:00:00Z",
+  "coverage_end_at": "2026-06-01T00:00:00Z",
+  "coverage_complete": true,
+  "freshness_state": "fresh",
+  "freshness_observed_through": "2026-06-01T00:00:00Z",
+  "last_successful_sync_at": "2026-06-01T00:00:05Z"
+}

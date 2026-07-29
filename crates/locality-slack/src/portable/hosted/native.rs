@@ -5,7 +5,8 @@ use locality_protocol::{SlackChannelSharingClassification, SlackInstallationId};
 use serde::{Deserialize, Serialize};
 
 use super::identity::{
-    HostedSlackPortableError, validate_bounded_text, validate_collection_len, validate_slack_id,
+    HostedSlackPortableError, validate_bounded_metadata_text, validate_bounded_text,
+    validate_collection_len, validate_slack_id,
 };
 
 pub const MAX_HOSTED_SLACK_NAME_BYTES: usize = 512;
@@ -123,8 +124,36 @@ pub struct HostedSlackChannel {
 }
 
 impl HostedSlackChannel {
+    pub fn team_id(&self) -> &str {
+        &self.team_id
+    }
+
+    pub fn channel_id(&self) -> &str {
+        &self.channel_id
+    }
+
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn topic(&self) -> Option<&str> {
+        self.topic.as_deref()
+    }
+
+    pub fn purpose(&self) -> Option<&str> {
+        self.purpose.as_deref()
+    }
+
+    pub fn created_at(&self) -> &str {
+        &self.created_at
+    }
+
+    pub fn updated_at(&self) -> Option<&str> {
+        self.updated_at.as_deref()
+    }
+
+    pub fn sharing(&self) -> SlackChannelSharingClassification {
+        self.sharing
     }
 }
 
@@ -134,13 +163,13 @@ impl TryFrom<RawHostedSlackChannel> for HostedSlackChannel {
     fn try_from(raw: RawHostedSlackChannel) -> Result<Self, Self::Error> {
         validate_slack_id("channel.team_id", &raw.team_id, b"T")?;
         validate_slack_id("channel.id", &raw.id, b"CG")?;
-        validate_bounded_text("channel.name", &raw.name, MAX_HOSTED_SLACK_NAME_BYTES)?;
-        validate_optional_text(
+        validate_bounded_metadata_text("channel.name", &raw.name, MAX_HOSTED_SLACK_NAME_BYTES)?;
+        validate_optional_metadata_text(
             "channel.topic",
             raw.topic.as_deref(),
             MAX_HOSTED_SLACK_TOPIC_BYTES,
         )?;
-        validate_optional_text(
+        validate_optional_metadata_text(
             "channel.purpose",
             raw.purpose.as_deref(),
             MAX_HOSTED_SLACK_TOPIC_BYTES,
@@ -180,6 +209,30 @@ impl HostedSlackUser {
     pub fn user_id(&self) -> &str {
         &self.user_id
     }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    pub fn real_name(&self) -> &str {
+        &self.real_name
+    }
+
+    pub fn is_bot(&self) -> bool {
+        self.is_bot
+    }
+
+    pub fn deleted(&self) -> bool {
+        self.deleted
+    }
+
+    pub fn updated_at(&self) -> Option<&str> {
+        self.updated_at.as_deref()
+    }
 }
 
 impl TryFrom<RawHostedSlackUser> for HostedSlackUser {
@@ -193,7 +246,7 @@ impl TryFrom<RawHostedSlackUser> for HostedSlackUser {
             ("user.display_name", raw.display_name.as_str()),
             ("user.real_name", raw.real_name.as_str()),
         ] {
-            validate_bounded_text(field, value, MAX_HOSTED_SLACK_NAME_BYTES)?;
+            validate_bounded_metadata_text(field, value, MAX_HOSTED_SLACK_NAME_BYTES)?;
         }
         let updated_at = raw
             .updated_ts
@@ -229,6 +282,34 @@ pub struct HostedSlackMessage {
 impl HostedSlackMessage {
     pub fn message_id(&self) -> &str {
         &self.message_id
+    }
+
+    pub fn posted_at(&self) -> &str {
+        &self.posted_at
+    }
+
+    pub fn thread_root_message_id(&self) -> Option<&str> {
+        self.thread_root_message_id.as_deref()
+    }
+
+    pub fn user_id(&self) -> Option<&str> {
+        self.user_id.as_deref()
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn edited_at(&self) -> Option<&str> {
+        self.edited_at.as_deref()
+    }
+
+    pub fn deleted(&self) -> bool {
+        self.deleted
+    }
+
+    pub fn file_ids(&self) -> &[String] {
+        &self.file_ids
     }
 }
 
@@ -285,6 +366,10 @@ pub struct HostedSlackThread {
 impl HostedSlackThread {
     pub fn root_message_id(&self) -> &str {
         &self.root_message_id
+    }
+
+    pub fn reply_message_ids(&self) -> &[String] {
+        &self.reply_message_ids
     }
 }
 
@@ -355,6 +440,34 @@ impl HostedSlackFileMetadata {
         &self.file_id
     }
 
+    pub fn user_id(&self) -> Option<&str> {
+        self.user_id.as_deref()
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn mimetype(&self) -> &str {
+        &self.mimetype
+    }
+
+    pub fn byte_length(&self) -> u64 {
+        self.byte_length
+    }
+
+    pub fn created_at(&self) -> &str {
+        &self.created_at
+    }
+
+    pub fn deleted(&self) -> bool {
+        self.deleted
+    }
+
     pub fn capture_receipt(&self) -> &HostedSlackFileCaptureReceipt {
         &self.capture_receipt
     }
@@ -369,13 +482,9 @@ impl TryFrom<RawHostedSlackFileMetadata> for HostedSlackFileMetadata {
         if let Some(user_id) = &raw.user_id {
             validate_slack_id("file.user_id", user_id, b"UW")?;
         }
-        for (field, value) in [
-            ("file.name", raw.name.as_str()),
-            ("file.title", raw.title.as_str()),
-            ("file.mimetype", raw.mimetype.as_str()),
-        ] {
-            validate_bounded_text(field, value, MAX_HOSTED_SLACK_NAME_BYTES)?;
-        }
+        validate_bounded_metadata_text("file.name", &raw.name, MAX_HOSTED_SLACK_NAME_BYTES)?;
+        validate_bounded_metadata_text("file.title", &raw.title, MAX_HOSTED_SLACK_NAME_BYTES)?;
+        validate_mimetype(&raw.mimetype)?;
         Ok(Self {
             channel_id: raw.channel_id,
             file_id: raw.id,
@@ -402,8 +511,28 @@ pub struct HostedSlackNativeSnapshot {
 }
 
 impl HostedSlackNativeSnapshot {
+    pub fn installation_id(&self) -> &SlackInstallationId {
+        &self.installation_id
+    }
+
     pub fn channel(&self) -> &HostedSlackChannel {
         &self.channel
+    }
+
+    pub fn users(&self) -> &[HostedSlackUser] {
+        &self.users
+    }
+
+    pub fn messages(&self) -> &[HostedSlackMessage] {
+        &self.messages
+    }
+
+    pub fn threads(&self) -> &[HostedSlackThread] {
+        &self.threads
+    }
+
+    pub fn files(&self) -> &[HostedSlackFileMetadata] {
+        &self.files
     }
 
     pub fn channel_identity(&self) -> (&SlackInstallationId, &str, &str) {
@@ -727,15 +856,41 @@ fn validate_snapshot_graph(
     Ok(())
 }
 
-fn validate_optional_text(
+fn validate_optional_metadata_text(
     field: &'static str,
     value: Option<&str>,
     maximum_bytes: usize,
 ) -> Result<(), HostedSlackPortableError> {
     value
-        .map(|value| validate_bounded_text(field, value, maximum_bytes))
+        .map(|value| validate_bounded_metadata_text(field, value, maximum_bytes))
         .transpose()
         .map(|_| ())
+}
+
+fn validate_mimetype(value: &str) -> Result<(), HostedSlackPortableError> {
+    validate_bounded_metadata_text("file.mimetype", value, MAX_HOSTED_SLACK_NAME_BYTES)?;
+    let Some((type_name, subtype_name)) = value.split_once('/') else {
+        return Err(HostedSlackPortableError::InvalidMimetype);
+    };
+    if subtype_name.contains('/')
+        || !valid_mimetype_component(type_name)
+        || !valid_mimetype_component(subtype_name)
+    {
+        return Err(HostedSlackPortableError::InvalidMimetype);
+    }
+    Ok(())
+}
+
+fn valid_mimetype_component(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    matches!(bytes.next(), Some(byte) if byte.is_ascii_alphanumeric())
+        && bytes.all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#' | b'$' | b'&' | b'^' | b'_' | b'.' | b'+' | b'-'
+                )
+        })
 }
 
 fn validate_slack_timestamp(

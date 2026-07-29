@@ -129,6 +129,8 @@ pub enum HostedSlackPortableError {
         actual_bytes: usize,
     },
     InvalidTimestamp(&'static str),
+    MetadataContainsControl(&'static str),
+    InvalidMimetype,
     CollectionTooLarge {
         field: &'static str,
         maximum: usize,
@@ -165,6 +167,14 @@ impl Display for HostedSlackPortableError {
             Self::InvalidTimestamp(field) => {
                 write!(formatter, "{field} must be a canonical Slack timestamp")
             }
+            Self::MetadataContainsControl(field) => {
+                write!(
+                    formatter,
+                    "{field} must not contain Unicode control characters"
+                )
+            }
+            Self::InvalidMimetype => formatter
+                .write_str("file.mimetype must use the supported type/subtype ASCII grammar"),
             Self::CollectionTooLarge {
                 field,
                 maximum,
@@ -228,6 +238,18 @@ pub(crate) fn validate_bounded_text(
             maximum_bytes,
             actual_bytes: value.len(),
         });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_bounded_metadata_text(
+    field: &'static str,
+    value: &str,
+    maximum_bytes: usize,
+) -> Result<(), HostedSlackPortableError> {
+    validate_bounded_text(field, value, maximum_bytes)?;
+    if value.chars().any(char::is_control) {
+        return Err(HostedSlackPortableError::MetadataContainsControl(field));
     }
     Ok(())
 }
