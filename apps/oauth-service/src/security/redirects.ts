@@ -44,6 +44,7 @@ export function hostedNotionCallbackUri(env: BrokerEnv): string | undefined {
 }
 
 export function validateHostedNotionCallbackUri(callbackUri: string): string {
+  const hasExplicitPort = hasExplicitAuthorityPort(callbackUri);
   let parsed: URL;
   try {
     parsed = new URL(callbackUri);
@@ -55,6 +56,7 @@ export function validateHostedNotionCallbackUri(callbackUri: string): string {
     parsed.username !== "" ||
     parsed.password !== "" ||
     parsed.hostname === "" ||
+    hasExplicitPort ||
     parsed.port !== "" ||
     parsed.pathname !== NOTION_HOSTED_CALLBACK_PATH ||
     parsed.search !== "" ||
@@ -66,6 +68,18 @@ export function validateHostedNotionCallbackUri(callbackUri: string): string {
     );
   }
   return parsed.toString();
+}
+
+function hasExplicitAuthorityPort(value: string): boolean {
+  const authority = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/([^/?#]*)/.exec(value)?.[1];
+  if (!authority) {
+    return false;
+  }
+  const host = authority.slice(authority.lastIndexOf("@") + 1);
+  if (host.startsWith("[")) {
+    return host.includes("]:");
+  }
+  return host.includes(":");
 }
 
 export function validateNotionExchangeRedirectUri(env: BrokerEnv, redirectUri: string): string {

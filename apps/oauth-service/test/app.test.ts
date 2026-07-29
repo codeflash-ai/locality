@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import app from "../src/app";
 import { hmacSha256Base64Url, utf8Base64Url } from "../src/security/crypto";
+import { signLocalHandoffState } from "../src/security/session";
 import type { BrokerEnv } from "../src/types";
 
 interface StartResponse {
@@ -56,6 +57,8 @@ const env: BrokerEnv = {
   LOCALITY_SLACK_AUTH_BASE_URL: "https://slack-auth.example.test",
   LOCALITY_SLACK_REDIRECT_URIS: "http://localhost:8757/oauth/slack/callback"
 };
+
+const hostedNotionCallbackUri = "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/notion/callback";
 
 describe("auth broker", () => {
   const originalFetch = globalThis.fetch;
@@ -150,6 +153,23 @@ describe("auth broker", () => {
     expect(body.session).not.toBe(body.state);
   });
 
+  it("rejects hosted Notion callback config with an explicit default HTTPS port", async () => {
+    const response = await app.request(
+      "/v1/oauth/notion/start",
+      { method: "POST" },
+      {
+        ...env,
+        LOCALITY_NOTION_HOSTED_CALLBACK_URI:
+          "https://afs-oauth-broker.saurabh-b07.workers.dev:443/v1/oauth/notion/callback"
+      }
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "invalid_hosted_callback_uri" }
+    });
+  });
+
   it("redirects a valid hosted Notion callback to the local loopback listener", async () => {
     const hostedEnv: BrokerEnv = {
       ...env,
@@ -222,6 +242,52 @@ describe("auth broker", () => {
     });
   });
 
+  it("rejects hosted Notion callback state with an unallowed local redirect URI", async () => {
+    const hostedEnv: BrokerEnv = {
+      ...env,
+      LOCALITY_NOTION_REDIRECT_URIS: "http://localhost:8757/oauth/notion/callback",
+      LOCALITY_NOTION_HOSTED_CALLBACK_URI: hostedNotionCallbackUri
+    };
+    const state = await signedLocalHandoffState({
+      local_redirect_uri: "http://localhost:9999/oauth/notion/callback"
+    });
+
+    const callback = await app.request(
+      `/v1/oauth/notion/callback?code=authorization-code&state=${encodeURIComponent(state)}`,
+      { method: "GET" },
+      hostedEnv
+    );
+
+    expect(callback.status).toBe(400);
+    expect(callback.headers.get("location")).toBeNull();
+    await expect(callback.json()).resolves.toMatchObject({
+      error: { code: "redirect_uri_not_allowed" }
+    });
+  });
+
+  it("rejects hosted Notion callback state with the wrong provider redirect URI", async () => {
+    const hostedEnv: BrokerEnv = {
+      ...env,
+      LOCALITY_NOTION_REDIRECT_URIS: "http://localhost:8757/oauth/notion/callback",
+      LOCALITY_NOTION_HOSTED_CALLBACK_URI: hostedNotionCallbackUri
+    };
+    const state = await signedLocalHandoffState({
+      provider_redirect_uri: "https://other-broker.example.test/v1/oauth/notion/callback"
+    });
+
+    const callback = await app.request(
+      `/v1/oauth/notion/callback?code=authorization-code&state=${encodeURIComponent(state)}`,
+      { method: "GET" },
+      hostedEnv
+    );
+
+    expect(callback.status).toBe(400);
+    expect(callback.headers.get("location")).toBeNull();
+    await expect(callback.json()).resolves.toMatchObject({
+      error: { code: "invalid_state" }
+    });
+  });
+
   it("exchanges hosted Notion authorization codes with the hosted redirect URI", async () => {
     const hostedEnv: BrokerEnv = {
       ...env,
@@ -264,6 +330,39 @@ describe("auth broker", () => {
       code: "authorization-code",
       redirect_uri: "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/notion/callback"
     });
+  });
+
+  it("rejects hosted Notion exchange with an arbitrary redirect URI", async () => {
+    const hostedEnv: BrokerEnv = {
+      ...env,
+      LOCALITY_NOTION_REDIRECT_URIS: "http://localhost:8757/oauth/notion/callback",
+      LOCALITY_NOTION_HOSTED_CALLBACK_URI: hostedNotionCallbackUri
+    };
+    const startResponse = await app.request("/v1/oauth/notion/start", { method: "POST" }, hostedEnv);
+    const start = (await startResponse.json()) as StartResponse;
+    const fetchMock = vi.fn(async () => Response.json({ access_token: "unexpected" }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const response = await app.request(
+      "/v1/oauth/notion/exchange",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          session: start.session,
+          state: start.state,
+          code: "authorization-code",
+          redirect_uri: "https://attacker.example.test/v1/oauth/notion/callback"
+        })
+      },
+      hostedEnv
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "invalid_redirect_uri" }
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("rejects unconfigured redirect URIs", async () => {
@@ -1067,4 +1166,26 @@ async function startSlackSession() {
   const response = await app.request("/v1/oauth/slack/start", { method: "POST" }, env);
   expect(response.status).toBe(200);
   return response.json() as Promise<StartResponse>;
+}
+
+async function signedLocalHandoffState(
+  overrides: Partial<{
+    local_redirect_uri: string;
+    provider_redirect_uri: string;
+  }> = {}
+) {
+  const now = Math.floor(Date.now() / 1000);
+  return signLocalHandoffState(
+    {
+      v: 1,
+      kind: "local_handoff",
+      connector: "notion",
+      local_redirect_uri: overrides.local_redirect_uri ?? "http://localhost:8757/oauth/notion/callback",
+      provider_redirect_uri: overrides.provider_redirect_uri ?? hostedNotionCallbackUri,
+      iat: now,
+      exp: now + 600,
+      nonce: "test-nonce"
+    },
+    env.LOCALITY_BROKER_SESSION_SECRET
+  );
 }
