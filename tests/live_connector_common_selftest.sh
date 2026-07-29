@@ -56,6 +56,27 @@ assert_require_linux_fuse_fails_with_path() {
   fi
 }
 
+assert_wait_failure_keeps_log_private() {
+  local label="$1"
+  local error_path="$2"
+  local expected_message="$3"
+  local expected_log_line="$4"
+  local sentinel="$5"
+  local actual
+
+  if grep -Fq "$sentinel" "$error_path"; then
+    live_fail "$label leaked private log content"
+  fi
+  if ! grep -Fqx "$expected_message" "$error_path"; then
+    actual="$(cat "$error_path")"
+    live_fail "$label did not report the expected failure message: $actual"
+  fi
+  if ! grep -Fqx "$expected_log_line" "$error_path"; then
+    actual="$(cat "$error_path")"
+    live_fail "$label did not report the retained log path: $actual"
+  fi
+}
+
 non_linux_fake_path="$tmp_root/require-fuse-non-linux-bin"
 mkdir -p "$non_linux_fake_path"
 cat >"$non_linux_fake_path/uname" <<'SH'
@@ -217,6 +238,7 @@ fi
 fake_bin_dir="$tmp_root/bin"
 mkdir -p "$fake_bin_dir"
 fake_loc="$fake_bin_dir/loc"
+fake_not_ready_loc="$fake_bin_dir/loc-not-ready"
 fake_localityd="$fake_bin_dir/localityd"
 fake_fuse="$fake_bin_dir/locality-fuse"
 fake_mountpoint="$fake_bin_dir/mountpoint"
@@ -228,6 +250,15 @@ if [[ "${1:-}" == "daemon" && "${2:-}" == "status" ]]; then
   exit 0
 fi
 printf '%s\n' '{"ok":true}'
+SH
+
+cat >"$fake_not_ready_loc" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "daemon" && "${2:-}" == "status" ]]; then
+  printf '%s\n' '{"state":"starting"}'
+  exit 0
+fi
+exit 1
 SH
 
 cat >"$fake_localityd" <<'SH'
@@ -272,9 +303,47 @@ fi
 exit 1
 SH
 
-chmod +x "$fake_loc" "$fake_localityd" "$fake_fuse" "$fake_mountpoint"
+chmod +x "$fake_loc" "$fake_not_ready_loc" "$fake_localityd" "$fake_fuse" "$fake_mountpoint"
 
 build_live_binaries "$fake_loc" "$fake_localityd" "$fake_fuse"
+
+private_log_sentinel="selftest-secret-provider-payload"
+daemon_failure_log="$tmp_root/localityd-failure.log"
+daemon_failure_error="$tmp_root/localityd-failure.err"
+printf '%s\n' "$private_log_sentinel" >"$daemon_failure_log"
+if LOCALITY_LIVE_DAEMON_WAIT_ATTEMPTS=1 wait_for_daemon "$fake_not_ready_loc" "$state_root" "$daemon_failure_log" 2>"$daemon_failure_error"; then
+  live_fail "wait_for_daemon accepted a daemon that never became ready"
+fi
+assert_wait_failure_keeps_log_private \
+  "wait_for_daemon" \
+  "$daemon_failure_error" \
+  "localityd did not become ready" \
+  "localityd log retained at: $daemon_failure_log" \
+  "$private_log_sentinel"
+
+fake_unmounted_bin_dir="$tmp_root/unmounted-bin"
+mkdir -p "$fake_unmounted_bin_dir"
+cat >"$fake_unmounted_bin_dir/mountpoint" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+chmod +x "$fake_unmounted_bin_dir/mountpoint"
+fuse_failure_log="$tmp_root/locality-fuse-failure.log"
+fuse_failure_error="$tmp_root/locality-fuse-failure.err"
+printf '%s\n' "$private_log_sentinel" >"$fuse_failure_log"
+old_path="$PATH"
+PATH="$fake_unmounted_bin_dir:$PATH"
+if LOCALITY_LIVE_FUSE_WAIT_ATTEMPTS=1 wait_for_fuse "$tmp_root/unmounted-root" "" "$fuse_failure_log" 2>"$fuse_failure_error"; then
+  PATH="$old_path"
+  live_fail "wait_for_fuse accepted a mount that never became ready"
+fi
+PATH="$old_path"
+assert_wait_failure_keeps_log_private \
+  "wait_for_fuse" \
+  "$fuse_failure_error" \
+  "locality-fuse did not become ready" \
+  "locality-fuse log retained at: $fuse_failure_log" \
+  "$private_log_sentinel"
 
 daemon_log="$tmp_root/localityd.log"
 fake_daemon_pid="$(start_live_daemon "$fake_localityd" "$state_root" "$daemon_log")"

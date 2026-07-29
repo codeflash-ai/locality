@@ -8,6 +8,14 @@ live_fail() {
   return 1
 }
 
+_live_report_retained_log() {
+  local label="$1"
+  local log_path="${2:-}"
+  if [[ -n "$log_path" ]]; then
+    echo "$label log retained at: $log_path" >&2
+  fi
+}
+
 require_live_env() {
   local name
   for name in "$@"; do
@@ -640,9 +648,7 @@ wait_for_daemon() {
     sleep 0.25
   done
   echo "localityd did not become ready" >&2
-  if [[ -n "$log_path" && -f "$log_path" ]]; then
-    cat "$log_path" >&2 || true
-  fi
+  _live_report_retained_log "localityd" "$log_path"
   return 1
 }
 
@@ -658,17 +664,13 @@ wait_for_fuse() {
     fi
     if [[ -n "$watched_fuse_pid" ]] && ! kill -0 "$watched_fuse_pid" >/dev/null 2>&1; then
       echo "locality-fuse stopped before its mount became ready" >&2
-      if [[ -n "$log_path" && -f "$log_path" ]]; then
-        cat "$log_path" >&2 || true
-      fi
+      _live_report_retained_log "locality-fuse" "$log_path"
       return 1
     fi
     sleep 0.25
   done
   echo "locality-fuse did not become ready" >&2
-  if [[ -n "$log_path" && -f "$log_path" ]]; then
-    cat "$log_path" >&2 || true
-  fi
+  _live_report_retained_log "locality-fuse" "$log_path"
   return 1
 }
 
