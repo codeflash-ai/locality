@@ -1,0 +1,40 @@
+{
+  "checkpoint_format_version": 1,
+  "minimum_reader_version": 1,
+  "poll_kind": "bootstrap",
+  "installation_id": "0198f3c2-7d4e-7a61-8b25-4f9c8d7e6a10",
+  "team_id": "T08LOCALITY1",
+  "channel_id": "C08ENGINEER1",
+  "sharing": "externally_shared_private",
+  "channel": {
+    "team_id": "T08LOCALITY1",
+    "id": "C08ENGINEER1",
+    "name": "engineering",
+    "topic": "Build deterministic Locality exports",
+    "purpose": "Engineering coordination",
+    "created_ts": "1780000000.000100",
+    "updated_ts": "1780000100.000200",
+    "sharing": "externally_shared_private"
+  },
+  "authorized_history_start_at": "2026-01-01T00:00:00Z",
+  "backfill_cut_at": "2026-06-01T00:00:00Z",
+  "poll_cut_at": null,
+  "phase": "historical_history",
+  "history_cursor": null,
+  "current_root_message_id": null,
+  "reply_cursor": null,
+  "completed_roots": [],
+  "latest_observed_message_timestamp": null,
+  "poll_overlap_watermark": "2026-05-28T20:00:00Z",
+  "last_page_observed_at": null,
+  "candidate": {
+    "users": [],
+    "messages": [],
+    "files": [],
+    "root_expectations": [],
+    "stage_root_ids": [],
+    "stage_yielded_reply_root_ids": [],
+    "current_root_reply_message_ids": []
+  },
+  "evidence": []
+}

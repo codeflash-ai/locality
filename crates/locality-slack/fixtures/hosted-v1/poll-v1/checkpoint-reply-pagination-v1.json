@@ -1,0 +1,148 @@
+{
+  "checkpoint_format_version": 1,
+  "minimum_reader_version": 1,
+  "poll_kind": "bootstrap",
+  "installation_id": "0198f3c2-7d4e-7a61-8b25-4f9c8d7e6a10",
+  "team_id": "T08LOCALITY1",
+  "channel_id": "C08ENGINEER1",
+  "sharing": "externally_shared_private",
+  "channel": {
+    "team_id": "T08LOCALITY1",
+    "id": "C08ENGINEER1",
+    "name": "engineering",
+    "topic": "Build deterministic Locality exports",
+    "purpose": "Engineering coordination",
+    "created_ts": "1780000000.000100",
+    "updated_ts": "1780000100.000200",
+    "sharing": "externally_shared_private"
+  },
+  "authorized_history_start_at": "2026-01-01T00:00:00Z",
+  "backfill_cut_at": "2026-06-01T00:00:00Z",
+  "poll_cut_at": null,
+  "phase": "historical_replies",
+  "history_cursor": null,
+  "current_root_message_id": "1780000000.000100",
+  "reply_cursor": "reply-page-2",
+  "completed_roots": [],
+  "latest_observed_message_timestamp": "1780000001.000200",
+  "poll_overlap_watermark": "2026-05-28T20:00:00Z",
+  "last_page_observed_at": "2026-06-01T00:00:03Z",
+  "candidate": {
+    "users": [
+      {
+        "team_id": "T08LOCALITY1",
+        "id": "U08ADA00001",
+        "name": "ada",
+        "display_name": "Ada",
+        "real_name": "Ada Lovelace",
+        "is_bot": false,
+        "deleted": false,
+        "updated_ts": null
+      },
+      {
+        "team_id": "T08LOCALITY1",
+        "id": "U08GRACE001",
+        "name": "grace",
+        "display_name": "Grace",
+        "real_name": "Grace Hopper",
+        "is_bot": false,
+        "deleted": false,
+        "updated_ts": "1780000200.000300"
+      }
+    ],
+    "messages": [
+      {
+        "channel_id": "C08ENGINEER1",
+        "ts": "1780000000.000100",
+        "thread_ts": null,
+        "user_id": "U08ADA00001",
+        "text": "Root message",
+        "edited_ts": "1780000001.000200",
+        "deleted": false,
+        "file_ids": [
+          "F08PLAN0002",
+          "F08PLAN0001"
+        ]
+      },
+      {
+        "channel_id": "C08ENGINEER1",
+        "ts": "1780000001.000200",
+        "thread_ts": "1780000000.000100",
+        "user_id": "U08GRACE001",
+        "text": "First reply",
+        "edited_ts": null,
+        "deleted": true,
+        "file_ids": []
+      }
+    ],
+    "files": [
+      {
+        "channel_id": "C08ENGINEER1",
+        "id": "F08PLAN0001",
+        "user_id": "U08ADA00001",
+        "name": "plan.pdf",
+        "title": "Plan",
+        "mimetype": "application/pdf",
+        "byte_length": 1024,
+        "created_ts": "1780000000.000100",
+        "deleted": false
+      },
+      {
+        "channel_id": "C08ENGINEER1",
+        "id": "F08PLAN0002",
+        "user_id": "U08GRACE001",
+        "name": "diagram.png",
+        "title": "Architecture diagram",
+        "mimetype": "image/png",
+        "byte_length": 2048,
+        "created_ts": "1780000002.000300",
+        "deleted": true
+      }
+    ],
+    "root_expectations": [
+      {
+        "root_message_id": "1780000000.000100",
+        "expected_reply_count": 2
+      }
+    ],
+    "stage_root_ids": [
+      "1780000000.000100"
+    ],
+    "stage_yielded_reply_root_ids": [],
+    "current_root_reply_message_ids": [
+      "1780000001.000200"
+    ]
+  },
+  "evidence": [
+    {
+      "kind": "applied_page",
+      "page": {
+        "phase": "historical_history",
+        "root_message_id": null,
+        "request_cursor": null,
+        "next_cursor": "history-page-2",
+        "canonical_page_json": "{\"page_format_version\":1,\"minimum_reader_version\":1,\"poll_kind\":\"bootstrap\",\"phase\":\"historical_history\",\"installation_id\":\"0198f3c2-7d4e-7a61-8b25-4f9c8d7e6a10\",\"team_id\":\"T08LOCALITY1\",\"channel_id\":\"C08ENGINEER1\",\"sharing\":\"externally_shared_private\",\"authorized_history_start_at\":\"2026-01-01T00:00:00Z\",\"backfill_cut_at\":\"2026-06-01T00:00:00Z\",\"poll_cut_at\":null,\"poll_overlap_watermark\":\"2026-05-28T20:00:00Z\",\"request_cursor\":null,\"next_cursor\":\"history-page-2\",\"observed_at\":\"2026-06-01T00:00:01Z\",\"messages\":[{\"message\":{\"channel_id\":\"C08ENGINEER1\",\"ts\":\"1780000000.000100\",\"thread_ts\":null,\"user_id\":\"U08ADA00001\",\"text\":\"Root message\",\"edited_ts\":\"1780000001.000200\",\"deleted\":false,\"file_ids\":[\"F08PLAN0002\",\"F08PLAN0001\"]},\"reply_count\":2},{\"message\":{\"channel_id\":\"C08ENGINEER1\",\"ts\":\"1780000002.000300\",\"thread_ts\":\"1780000000.000100\",\"user_id\":\"U08ADA00001\",\"text\":\"Second reply\",\"edited_ts\":null,\"deleted\":false,\"file_ids\":[]},\"reply_count\":0}],\"users\":[{\"team_id\":\"T08LOCALITY1\",\"id\":\"U08ADA00001\",\"name\":\"ada\",\"display_name\":\"Ada\",\"real_name\":\"Ada Lovelace\",\"is_bot\":false,\"deleted\":false,\"updated_ts\":null},{\"team_id\":\"T08LOCALITY1\",\"id\":\"U08GRACE001\",\"name\":\"grace\",\"display_name\":\"Grace\",\"real_name\":\"Grace Hopper\",\"is_bot\":false,\"deleted\":false,\"updated_ts\":\"1780000200.000300\"}],\"files\":[{\"channel_id\":\"C08ENGINEER1\",\"id\":\"F08PLAN0001\",\"user_id\":\"U08ADA00001\",\"name\":\"plan.pdf\",\"title\":\"Plan\",\"mimetype\":\"application/pdf\",\"byte_length\":1024,\"created_ts\":\"1780000000.000100\",\"deleted\":false},{\"channel_id\":\"C08ENGINEER1\",\"id\":\"F08PLAN0002\",\"user_id\":\"U08GRACE001\",\"name\":\"diagram.png\",\"title\":\"Architecture diagram\",\"mimetype\":\"image/png\",\"byte_length\":2048,\"created_ts\":\"1780000002.000300\",\"deleted\":true}]}"
+      }
+    },
+    {
+      "kind": "applied_page",
+      "page": {
+        "phase": "historical_history",
+        "root_message_id": null,
+        "request_cursor": "history-page-2",
+        "next_cursor": null,
+        "canonical_page_json": "{\"page_format_version\":1,\"minimum_reader_version\":1,\"poll_kind\":\"bootstrap\",\"phase\":\"historical_history\",\"installation_id\":\"0198f3c2-7d4e-7a61-8b25-4f9c8d7e6a10\",\"team_id\":\"T08LOCALITY1\",\"channel_id\":\"C08ENGINEER1\",\"sharing\":\"externally_shared_private\",\"authorized_history_start_at\":\"2026-01-01T00:00:00Z\",\"backfill_cut_at\":\"2026-06-01T00:00:00Z\",\"poll_cut_at\":null,\"poll_overlap_watermark\":\"2026-05-28T20:00:00Z\",\"request_cursor\":\"history-page-2\",\"next_cursor\":null,\"observed_at\":\"2026-06-01T00:00:02Z\",\"messages\":[],\"users\":[],\"files\":[]}"
+      }
+    },
+    {
+      "kind": "applied_page",
+      "page": {
+        "phase": "historical_replies",
+        "root_message_id": "1780000000.000100",
+        "request_cursor": null,
+        "next_cursor": "reply-page-2",
+        "canonical_page_json": "{\"page_format_version\":1,\"minimum_reader_version\":1,\"poll_kind\":\"bootstrap\",\"phase\":\"historical_replies\",\"installation_id\":\"0198f3c2-7d4e-7a61-8b25-4f9c8d7e6a10\",\"team_id\":\"T08LOCALITY1\",\"channel_id\":\"C08ENGINEER1\",\"sharing\":\"externally_shared_private\",\"authorized_history_start_at\":\"2026-01-01T00:00:00Z\",\"backfill_cut_at\":\"2026-06-01T00:00:00Z\",\"poll_cut_at\":null,\"poll_overlap_watermark\":\"2026-05-28T20:00:00Z\",\"root_message_id\":\"1780000000.000100\",\"root_reply_count\":2,\"request_cursor\":null,\"next_cursor\":\"reply-page-2\",\"observed_at\":\"2026-06-01T00:00:03Z\",\"messages\":[{\"channel_id\":\"C08ENGINEER1\",\"ts\":\"1780000000.000100\",\"thread_ts\":null,\"user_id\":\"U08ADA00001\",\"text\":\"Root message\",\"edited_ts\":\"1780000001.000200\",\"deleted\":false,\"file_ids\":[\"F08PLAN0002\",\"F08PLAN0001\"]},{\"channel_id\":\"C08ENGINEER1\",\"ts\":\"1780000001.000200\",\"thread_ts\":\"1780000000.000100\",\"user_id\":\"U08GRACE001\",\"text\":\"First reply\",\"edited_ts\":null,\"deleted\":true,\"file_ids\":[]}],\"users\":[],\"files\":[]}"
+      }
+    }
+  ]
+}

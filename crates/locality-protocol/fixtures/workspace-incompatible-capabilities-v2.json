@@ -1,0 +1,37 @@
+{
+  "code": "incompatible_capabilities",
+  "message": "client capabilities cannot safely open this workspace session",
+  "retriable": false,
+  "required_api_generation": 2,
+  "minimum_layout_version": 1,
+  "required_capabilities": [
+    {
+      "name": "workspace_layout",
+      "version": 1
+    },
+    {
+      "name": "atomic_root_publication",
+      "version": 1
+    },
+    {
+      "name": "path_ceilings",
+      "version": 1,
+      "max_component_utf8_bytes": 255,
+      "max_component_utf16_units": 255,
+      "max_path_utf8_bytes": 1024,
+      "max_path_utf16_units": 1024
+    },
+    {
+      "name": "tar_encodings",
+      "version": 1,
+      "encodings": [
+        "identity",
+        "zstd"
+      ]
+    },
+    {
+      "name": "freshness_wait",
+      "version": 1
+    }
+  ]
+}

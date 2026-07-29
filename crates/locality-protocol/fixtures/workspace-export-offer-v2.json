@@ -1,0 +1,48 @@
+{
+  "api_generation": 2,
+  "profile_id": "018f4f6e-9f2c-7b1a-8c3d-4e5f60718293",
+  "profile_revision": 7,
+  "layout_version": 1,
+  "layout_digest": "sha256:6d739ad2748910520e4df1d680e9ea78a94230d0751e6346d3f5d3c57b9259b5",
+  "offer": {
+    "versions": {
+      "session": 2,
+      "replica": 2,
+      "export_metadata": 2,
+      "writable_session_store": 1,
+      "canonical": 1,
+      "path": 1,
+      "changeset": 1
+    },
+    "session_id": "session-scope-7",
+    "export_attempt_id": "export-attempt-9",
+    "source_generations": [
+      {
+        "ordinal": 0,
+        "source_connection_id": "source-drive",
+        "source_generation_id": "generation-drive-44"
+      },
+      {
+        "ordinal": 1,
+        "source_connection_id": "source-notion",
+        "source_generation_id": "generation-notion-109"
+      }
+    ],
+    "media_type": "application/x-tar",
+    "content_encoding": "zstd",
+    "limits": {
+      "max_files": 10000,
+      "max_directories": 10000,
+      "max_content_bytes": 104857600
+    },
+    "control_entry_count": 1,
+    "file_count": 2,
+    "directory_count": 2,
+    "archive_entry_count": 5,
+    "selected_content_bytes": 17,
+    "inventory_sha256": "sha256:025cdbae136931542f7fa881da423e8e1f29a6132cf26ae5f4eea53c53a8ef51",
+    "writable_metadata_sha256": "sha256:a14c564c8d8950755b30115c4e8c684017662c70e7e03ead0d65a5da132474d2",
+    "sealed_at": "2026-07-23T19:00:01Z",
+    "expires_at": "2026-07-23T19:10:01Z"
+  }
+}

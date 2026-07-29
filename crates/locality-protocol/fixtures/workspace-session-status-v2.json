@@ -1,0 +1,54 @@
+{
+  "api_generation": 2,
+  "versions": {
+    "session": 2,
+    "replica": 2,
+    "export_metadata": 2,
+    "writable_session_store": 1,
+    "canonical": 1,
+    "path": 1,
+    "changeset": 1
+  },
+  "session_id": "session-scope-7",
+  "profile_id": "018f4f6e-9f2c-7b1a-8c3d-4e5f60718293",
+  "profile_revision": 7,
+  "layout_version": 1,
+  "layout_digest": "sha256:6d739ad2748910520e4df1d680e9ea78a94230d0751e6346d3f5d3c57b9259b5",
+  "state": "ready",
+  "freshness_requirement": {
+    "max_age_seconds": 300,
+    "on_stale": "wait_then_fail",
+    "wait_timeout_seconds": 30
+  },
+  "replicas": [
+    {
+      "source_connection_id": "source-drive",
+      "state": "fresh",
+      "coverage_complete": true,
+      "provider_observed_through": "drive-repair:43",
+      "last_successful_sync_at": "2026-07-19T11:58:00Z",
+      "last_repair_at": "2026-07-19T11:55:00Z",
+      "pending_events": 0,
+      "backlog": 0,
+      "provider_cooldown_until": null
+    },
+    {
+      "source_connection_id": "source-notion",
+      "state": "fresh",
+      "coverage_complete": true,
+      "provider_observed_through": "notion-repair:108",
+      "last_successful_sync_at": "2026-07-19T11:58:00Z",
+      "last_repair_at": "2026-07-19T11:55:00Z",
+      "pending_events": 0,
+      "backlog": 0,
+      "provider_cooldown_until": null
+    }
+  ],
+  "export_attempt_limits": {
+    "max_files": 10000,
+    "max_directories": 10000,
+    "max_content_bytes": 104857600
+  },
+  "error": null,
+  "updated_at": "2026-07-23T20:00:00Z"
+}
