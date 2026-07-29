@@ -150,6 +150,7 @@ export function validateHostedConnectorCallbackUri(
   callbackUri: string
 ): string {
   const hasExplicitPort = hasExplicitAuthorityPort(callbackUri);
+  const hasEmptyQueryOrFragmentDelimiter = /[?#]$/.test(callbackUri);
   let parsed: URL;
   try {
     parsed = new URL(callbackUri);
@@ -165,6 +166,7 @@ export function validateHostedConnectorCallbackUri(
     parsed.password !== "" ||
     parsed.hostname === "" ||
     hasExplicitPort ||
+    hasEmptyQueryOrFragmentDelimiter ||
     parsed.port !== "" ||
     parsed.pathname !== config.hostedCallbackPath ||
     parsed.search !== "" ||

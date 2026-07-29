@@ -305,6 +305,45 @@ describe("auth broker", () => {
     });
   });
 
+  it.each(["?", "#"])(
+    "rejects hosted Google Docs callback config with a bare %s delimiter",
+    async (delimiter) => {
+      const response = await app.request(
+        "/v1/oauth/google-docs/start",
+        { method: "POST" },
+        withHostedEnv(
+          "LOCALITY_GOOGLE_DOCS_HOSTED_CALLBACK_URI",
+          `${brokerOrigin}/v1/oauth/google-docs/callback${delimiter}`
+        )
+      );
+
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "invalid_hosted_callback_uri" }
+      });
+    }
+  );
+
+  it("rejects a local handoff state sent to another connector callback route", async () => {
+    const state = await signedLocalHandoffState({
+      connector: "google-docs",
+      local_redirect_uri: "http://localhost:8757/oauth/google-docs/callback",
+      provider_redirect_uri: `${brokerOrigin}/v1/oauth/google-docs/callback`
+    });
+
+    const callback = await app.request(
+      `/v1/oauth/gmail/callback?code=authorization-code&state=${encodeURIComponent(state)}`,
+      { method: "GET" },
+      withHostedEnv("LOCALITY_GMAIL_HOSTED_CALLBACK_URI", `${brokerOrigin}/v1/oauth/gmail/callback`)
+    );
+
+    expect(callback.status).toBe(400);
+    expect(callback.headers.get("location")).toBeNull();
+    await expect(callback.json()).resolves.toMatchObject({
+      error: { code: "invalid_state" }
+    });
+  });
+
   describe.each(hostedConnectorCases)("$connector hosted handoff", (caseDef) => {
     it("starts OAuth with hosted provider callback and local loopback handoff", async () => {
       const body = await startHostedSession(caseDef);
