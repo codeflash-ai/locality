@@ -15,15 +15,15 @@ COMPONENTS = (
     ("fresh_input_tokens", "Fresh input", "#4C78A8"),
     ("cached_input_tokens", "Cached input", "#72B7B2"),
     ("cache_write_input_tokens", "Cache write input", "#F58518"),
-    ("visible_output_tokens", "Output", "#54A24B"),
     ("reasoning_output_tokens", "Reasoning output", "#E45756"),
+    ("visible_output_tokens", "Output", "#54A24B"),
 )
 COST_COMPONENTS = (
     ("fresh_input_cost_usd", "Fresh input", "#4C78A8"),
     ("cached_input_cost_usd", "Cached input", "#72B7B2"),
     ("cache_write_input_cost_usd", "Cache write input", "#F58518"),
-    ("visible_output_cost_usd", "Output", "#54A24B"),
     ("reasoning_output_cost_usd", "Reasoning output", "#E45756"),
+    ("visible_output_cost_usd", "Output", "#54A24B"),
 )
 DEFAULT_PRICING_USD_PER_1M = {
     "fresh_input_tokens": 1.00,
