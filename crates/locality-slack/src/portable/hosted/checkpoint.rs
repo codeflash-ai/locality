@@ -247,6 +247,14 @@ impl HostedSlackPollCheckpointV1 {
         &self.candidate
     }
 
+    pub fn root_expected_reply_count(&self, root_message_id: &str) -> Option<u32> {
+        self.candidate
+            .root_expectations
+            .iter()
+            .find(|expectation| expectation.root_message_id == root_message_id)
+            .map(|expectation| expectation.expected_reply_count)
+    }
+
     pub fn new(
         selector: &HostedSlackChannelSelector,
         channel: RawHostedSlackChannel,
