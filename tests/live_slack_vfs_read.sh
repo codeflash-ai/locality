@@ -69,20 +69,49 @@ wait_for_projected_mount_root() {
   live_fail "Slack FUSE mount root did not appear at $mount_root"
 }
 
-find_recent_by_frontmatter() {
+state_recent_relative_path() {
   local conversation_id="$1"
-  local candidate
+  local remote_id="slack-recent:$conversation_id"
+  local mount_id_sql
+  local remote_id_sql
+  local result
 
-  while IFS= read -r -d '' candidate; do
-    if grep -Fq "connector: slack" "$candidate" 2>/dev/null \
-      && { grep -Fq "conversation_id: \"$conversation_id\"" "$candidate" 2>/dev/null \
-        || grep -Fq "conversation_id: $conversation_id" "$candidate" 2>/dev/null; }; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done < <(find "$mount_root" -type f -name recent.md -print0 2>>"$command_log" || true)
+  if [[ ! -s "$state_root/state.sqlite3" ]]; then
+    return 1
+  fi
 
-  return 1
+  mount_id_sql="$(sql_text_literal "$mount_id")"
+  remote_id_sql="$(sql_text_literal "$remote_id")"
+  if ! result="$(sqlite3 -cmd '.timeout 10000' "$state_root/state.sqlite3" \
+    "SELECT path FROM entities WHERE mount_id = $mount_id_sql AND remote_id = $remote_id_sql LIMIT 1;" \
+    2>>"$command_log")"; then
+    return 1
+  fi
+  if [[ -z "$result" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$result"
+}
+
+recent_path_from_state() {
+  local conversation_id="$1"
+  local relative_path
+
+  relative_path="$(state_recent_relative_path "$conversation_id" || true)"
+  if [[ -z "$relative_path" ]]; then
+    return 1
+  fi
+  if [[ "$relative_path" == /* \
+    || "$relative_path" == "." \
+    || "$relative_path" == ".." \
+    || "$relative_path" == ../* \
+    || "$relative_path" == */../* \
+    || "$relative_path" == */.. \
+    || "$relative_path" != */recent.md ]]; then
+    live_fail "Slack state resolved an unsafe or unexpected recent.md path"
+  fi
+
+  printf '%s/%s\n' "$mount_root" "$relative_path"
 }
 
 find_recent_by_path_suffix() {
@@ -107,8 +136,8 @@ wait_for_target_recent() {
   local match
 
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    match="$(find_recent_by_frontmatter "$conversation_id" 2>/dev/null || true)"
-    if [[ -n "$match" ]]; then
+    match="$(recent_path_from_state "$conversation_id" || true)"
+    if [[ -n "$match" && -e "$match" ]]; then
       printf '%s\n' "$match"
       return 0
     fi
@@ -190,22 +219,54 @@ if not contains_slack_read_only(report):
 PY
 }
 
-assert_status_json_valid() {
+assert_status_clean_for_target() {
   local report_path="$1"
+  local target_path="$2"
+  local relative_path="${target_path#"$mount_root"/}"
 
-  python3 - "$report_path" <<'PY'
+  python3 - "$report_path" "$target_path" "$relative_path" <<'PY'
 import json
 import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
+target_path = sys.argv[2]
+relative_path = sys.argv[3]
 try:
     report = json.loads(path.read_text(encoding="utf-8"))
 except Exception as error:
     raise SystemExit(f"Slack status report was not valid JSON: {error}") from error
 
-if isinstance(report, dict) and "ok" in report and report["ok"] is not True:
-    raise SystemExit("Slack status report included ok but it was not true")
+if not isinstance(report, dict):
+    raise SystemExit("Slack status report was not a JSON object")
+if report.get("ok") is not True:
+    raise SystemExit("Slack status report did not include ok=true")
+if report.get("clean") is not True:
+    raise SystemExit("Slack status report did not include clean=true")
+
+selected = []
+for mount in report.get("mounts") or []:
+    if not isinstance(mount, dict):
+        continue
+    for entry in mount.get("entries") or []:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("absolute_path") == target_path or entry.get("path") == relative_path:
+            selected.append(entry)
+
+if not selected:
+    raise SystemExit("Slack status report omitted the selected recent.md entry")
+
+allowed_sync_states = {"all_synced", "checking_freshness"}
+for entry in selected:
+    if entry.get("state") != "clean":
+        raise SystemExit("Slack selected recent.md status was not clean")
+    if entry.get("sync_state") not in allowed_sync_states:
+        raise SystemExit("Slack selected recent.md had an unexpected sync_state")
+    if entry.get("pending_journal_count") != 0:
+        raise SystemExit("Slack selected recent.md had pending journals")
+    if entry.get("failed_journal_count") != 0:
+        raise SystemExit("Slack selected recent.md had failed journals")
 PY
 }
 
@@ -307,9 +368,9 @@ if [[ "$push_status" == "0" ]]; then
 fi
 assert_push_blocked_as_read_only "$push_report"
 
-step="checking Slack mount status"
-LOCALITY_STATE_DIR="$state_root" "$loc_bin" status --json "$mount_root" \
+step="checking Slack recent.md status"
+LOCALITY_STATE_DIR="$state_root" "$loc_bin" status --json "$recent_path" \
   >"$status_report" 2>>"$command_log"
-assert_status_json_valid "$status_report"
+assert_status_clean_for_target "$status_report" "$recent_path"
 
 echo "live Slack API, CLI, daemon, and Linux FUSE read-only checks passed"
