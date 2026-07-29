@@ -118,7 +118,8 @@ pub fn plan_journal_undo(entry: &JournalEntry) -> UndoPlan {
     let mut operations = Vec::new();
     let mut unsupported = Vec::new();
 
-    for (operation_index, operation) in entry.plan.operations.iter().enumerate().rev() {
+    for operation_index in reverse_apply_operation_indices(entry) {
+        let operation = &entry.plan.operations[operation_index];
         match operation {
             PushOperation::UpdateBlock { block_id, .. } => {
                 match find_preimage_block(entry, block_id) {
@@ -391,6 +392,61 @@ pub fn plan_journal_undo(entry: &JournalEntry) -> UndoPlan {
         unsupported,
         status,
     }
+}
+
+fn reverse_apply_operation_indices(entry: &JournalEntry) -> Vec<usize> {
+    let operation_count = entry.plan.operations.len();
+    let fallback = || (0..operation_count).rev().collect::<Vec<_>>();
+    let non_archive_indices = entry
+        .plan
+        .operations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, operation)| {
+            (!matches!(
+                operation,
+                PushOperation::ArchiveBlock { .. } | PushOperation::ArchiveEntity { .. }
+            ))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let archive_indices = entry
+        .plan
+        .operations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, operation)| {
+            matches!(
+                operation,
+                PushOperation::ArchiveBlock { .. } | PushOperation::ArchiveEntity { .. }
+            )
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if archive_indices.is_empty() {
+        return fallback();
+    }
+
+    let mut apply_order = Vec::with_capacity(operation_count);
+
+    for effect in &entry.apply_effects {
+        let operation_index = effect.operation_index();
+        if operation_index < operation_count && !apply_order.contains(&operation_index) {
+            apply_order.push(operation_index);
+        }
+    }
+
+    if apply_order.len() != operation_count
+        || !apply_order.starts_with(&non_archive_indices)
+        || apply_order[non_archive_indices.len()..]
+            .iter()
+            .any(|index| !archive_indices.contains(index))
+    {
+        return fallback();
+    }
+
+    apply_order.reverse();
+    apply_order
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

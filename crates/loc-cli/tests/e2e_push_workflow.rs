@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, hash_map::DefaultHasher};
+use std::collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -4729,6 +4729,224 @@ fn large_archive_plan_requires_confirm_before_journaled_apply() {
     .expect("status after confirmed large archive");
     assert!(status.clean, "{status:#?}");
     assert_eq!(status.summary.dirty, 0, "{status:#?}");
+}
+
+#[test]
+fn nested_archive_push_and_undo_preserve_hierarchy_and_order() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let api = Arc::new(MutableNotionApi::with_nested_blocks(
+        vec![
+            paragraph_block("survivor-1", "Original survivor."),
+            paragraph_block_with_children("parent-1", "Parent paragraph."),
+        ],
+        BTreeMap::from([
+            (
+                "parent-1".to_string(),
+                vec![paragraph_block_with_children("child-1", "Child paragraph.")],
+            ),
+            (
+                "child-1".to_string(),
+                vec![paragraph_block("grandchild-1", "Grandchild paragraph.")],
+            ),
+        ]),
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("page-1")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
+        },
+    )
+    .expect("mount nested archive fixture");
+    run_pull(&mut store, &connector, &fixture.root).expect("pull nested archive page");
+
+    let page_path = fixture.page_file();
+    let original = fs::read_to_string(&page_path).expect("read nested archive page");
+    let frontmatter_end = original
+        .find("\n---\n")
+        .map(|index| index + "\n---\n".len())
+        .expect("canonical frontmatter terminator");
+    fs::write(
+        &page_path,
+        format!("{}Updated survivor.\n", &original[..frontmatter_end]),
+    )
+    .expect("update survivor and remove nested blocks");
+
+    let diff = run_diff(&store, &page_path).expect("diff nested archive plan");
+    assert!(diff.ok, "{diff:#?}");
+    assert_eq!(diff.action, "confirm_plan", "{diff:#?}");
+    let plan = diff.plan.as_ref().expect("nested archive plan");
+    assert_eq!(plan.summary.blocks_updated, 1, "{plan:#?}");
+    assert_eq!(plan.summary.blocks_archived, 3, "{plan:#?}");
+    assert_eq!(
+        plan.operations
+            .iter()
+            .filter_map(|operation| match operation {
+                PushOperationOutput::ArchiveBlock { block_id } => Some(block_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        ["parent-1", "child-1", "grandchild-1"],
+        "planner should preserve parent-first shadow order before connector lowering"
+    );
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push nested archive plan");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+    assert_eq!(push.apply_effect_count, 4, "{push:#?}");
+    let push_id = push.push_id.clone().expect("nested archive push id");
+
+    assert_eq!(
+        api.calls.lock().expect("calls").as_slice(),
+        [
+            WriteCall::Update {
+                block_id: "survivor-1".to_string(),
+            },
+            WriteCall::Delete {
+                block_id: "grandchild-1".to_string(),
+            },
+            WriteCall::Delete {
+                block_id: "child-1".to_string(),
+            },
+            WriteCall::Delete {
+                block_id: "parent-1".to_string(),
+            },
+        ]
+    );
+
+    let status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(page_path.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status after nested archive push");
+    assert!(status.clean, "{status:#?}");
+    assert_eq!(status.summary.dirty, 0, "{status:#?}");
+
+    let mut undo_applier = ConnectorUndoApplier::new(&connector);
+    let undo = run_undo_with_applier(&mut store, push_id, &mut undo_applier)
+        .expect("undo nested archive push");
+    assert!(undo.ok, "{undo:#?}");
+    assert_eq!(undo.action, "reverse_applied", "{undo:#?}");
+    assert_eq!(undo.status, "reverted", "{undo:#?}");
+    assert_eq!(
+        undo.undo_plan
+            .as_ref()
+            .expect("nested archive undo plan")
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                UndoOperationOutput::RestoreArchivedBlock { block_id, .. } => {
+                    Some(block_id.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        ["parent-1", "child-1", "grandchild-1"]
+    );
+
+    assert_eq!(
+        api.calls.lock().expect("calls").as_slice(),
+        [
+            WriteCall::Update {
+                block_id: "survivor-1".to_string(),
+            },
+            WriteCall::Delete {
+                block_id: "grandchild-1".to_string(),
+            },
+            WriteCall::Delete {
+                block_id: "child-1".to_string(),
+            },
+            WriteCall::Delete {
+                block_id: "parent-1".to_string(),
+            },
+            WriteCall::Restore {
+                block_id: "parent-1".to_string(),
+            },
+            WriteCall::Restore {
+                block_id: "child-1".to_string(),
+            },
+            WriteCall::Restore {
+                block_id: "grandchild-1".to_string(),
+            },
+            WriteCall::Update {
+                block_id: "survivor-1".to_string(),
+            },
+        ]
+    );
+
+    let root_children = api
+        .retrieve_block_children("page-1", None)
+        .expect("restored root children");
+    assert_eq!(
+        root_children
+            .results
+            .iter()
+            .map(|block| block.id.as_str())
+            .collect::<Vec<_>>(),
+        ["survivor-1", "parent-1"]
+    );
+    let parent_children = api
+        .retrieve_block_children("parent-1", None)
+        .expect("restored parent children");
+    assert_eq!(
+        parent_children
+            .results
+            .iter()
+            .map(|block| block.id.as_str())
+            .collect::<Vec<_>>(),
+        ["child-1"]
+    );
+    let child_children = api
+        .retrieve_block_children("child-1", None)
+        .expect("restored child children");
+    assert_eq!(
+        child_children
+            .results
+            .iter()
+            .map(|block| block.id.as_str())
+            .collect::<Vec<_>>(),
+        ["grandchild-1"]
+    );
+
+    let restored = fs::read_to_string(&page_path).expect("read nested archive undo result");
+    for expected in [
+        "Original survivor.",
+        "Parent paragraph.",
+        "Child paragraph.",
+        "Grandchild paragraph.",
+    ] {
+        assert!(restored.contains(expected), "{restored}");
+    }
+    let restored_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(page_path),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status after nested archive undo");
+    assert!(restored_status.clean, "{restored_status:#?}");
 }
 
 #[test]
@@ -16920,6 +17138,9 @@ impl NotionApi for RecursivePageDirectoryNotionApi {
 struct MutableNotionApi {
     page: Mutex<PageDto>,
     blocks: Mutex<Vec<BlockDto>>,
+    nested_children: Mutex<BTreeMap<String, Vec<BlockDto>>>,
+    parent_by_block: BTreeMap<String, String>,
+    archived_blocks: Mutex<BTreeSet<String>>,
     database: Mutex<Option<DatabaseDto>>,
     data_source: Mutex<Option<DataSourceDto>>,
     block_children_calls: AtomicUsize,
@@ -16945,15 +17166,37 @@ impl MutableNotionApi {
     }
 
     fn with_page_and_blocks(page: PageDto, blocks: Vec<BlockDto>) -> Self {
+        let parent_by_block = blocks
+            .iter()
+            .map(|block| (block.id.clone(), page.id.clone()))
+            .collect();
         Self {
             page: Mutex::new(page),
             blocks: Mutex::new(blocks),
+            nested_children: Mutex::new(BTreeMap::new()),
+            parent_by_block,
+            archived_blocks: Mutex::new(BTreeSet::new()),
             database: Mutex::new(None),
             data_source: Mutex::new(None),
             block_children_calls: AtomicUsize::new(0),
             append_count: Mutex::new(0),
             calls: Mutex::new(Vec::new()),
         }
+    }
+
+    fn with_nested_blocks(
+        blocks: Vec<BlockDto>,
+        nested_children: BTreeMap<String, Vec<BlockDto>>,
+    ) -> Self {
+        let mut api = Self::with_blocks(blocks);
+        for (parent_id, children) in &nested_children {
+            for child in children {
+                api.parent_by_block
+                    .insert(child.id.clone(), parent_id.clone());
+            }
+        }
+        api.nested_children = Mutex::new(nested_children);
+        api
     }
 
     fn with_page_blocks_and_database_schema(
@@ -16965,6 +17208,9 @@ impl MutableNotionApi {
         Self {
             page: Mutex::new(page),
             blocks: Mutex::new(blocks),
+            nested_children: Mutex::new(BTreeMap::new()),
+            parent_by_block: BTreeMap::new(),
+            archived_blocks: Mutex::new(BTreeSet::new()),
             database: Mutex::new(Some(database)),
             data_source: Mutex::new(Some(data_source)),
             block_children_calls: AtomicUsize::new(0),
@@ -16975,6 +17221,22 @@ impl MutableNotionApi {
 
     fn block_children_count(&self) -> usize {
         self.block_children_calls.load(Ordering::SeqCst)
+    }
+
+    fn is_archived_or_has_archived_ancestor(&self, block_id: &str) -> bool {
+        let archived = self.archived_blocks.lock().expect("archived blocks");
+        let mut current = Some(block_id);
+        let mut seen = BTreeSet::new();
+        while let Some(block_id) = current {
+            if !seen.insert(block_id) {
+                break;
+            }
+            if archived.contains(block_id) {
+                return true;
+            }
+            current = self.parent_by_block.get(block_id).map(String::as_str);
+        }
+        false
     }
 }
 
@@ -17026,15 +17288,24 @@ impl NotionApi for MutableNotionApi {
     ) -> locality_core::LocalityResult<BlockListDto> {
         self.block_children_calls.fetch_add(1, Ordering::SeqCst);
         let page_id = self.page.lock().expect("page").id.clone();
-        if block_id == page_id {
-            Ok(PaginatedListDto {
-                results: self.blocks.lock().expect("blocks").clone(),
-                next_cursor: None,
-                has_more: false,
-            })
+        let results = if block_id == page_id {
+            self.blocks.lock().expect("blocks").clone()
         } else {
-            Ok(PaginatedListDto::default())
-        }
+            self.nested_children
+                .lock()
+                .expect("nested children")
+                .get(block_id)
+                .cloned()
+                .unwrap_or_default()
+        };
+        Ok(PaginatedListDto {
+            results: results
+                .into_iter()
+                .filter(|block| !self.is_archived_or_has_archived_ancestor(&block.id))
+                .collect(),
+            next_cursor: None,
+            has_more: false,
+        })
     }
 
     fn search_pages(
@@ -17106,6 +17377,52 @@ impl NotionApi for MutableNotionApi {
     }
 
     fn update_block(&self, block_id: &str, body: Value) -> locality_core::LocalityResult<BlockDto> {
+        if body.get("in_trash").and_then(Value::as_bool) == Some(false) {
+            self.archived_blocks
+                .lock()
+                .expect("archived blocks")
+                .remove(block_id);
+            if self.is_archived_or_has_archived_ancestor(block_id) {
+                self.archived_blocks
+                    .lock()
+                    .expect("archived blocks")
+                    .insert(block_id.to_string());
+                return Err(locality_core::LocalityError::InvalidState(format!(
+                    "cannot restore block {block_id} beneath an archived ancestor"
+                )));
+            }
+            self.calls.lock().expect("calls").push(WriteCall::Restore {
+                block_id: block_id.to_string(),
+            });
+            if let Some(block) = self
+                .blocks
+                .lock()
+                .expect("blocks")
+                .iter()
+                .find(|block| block.id == block_id)
+                .cloned()
+            {
+                return Ok(block);
+            }
+            for children in self
+                .nested_children
+                .lock()
+                .expect("nested children")
+                .values()
+            {
+                if let Some(block) = children.iter().find(|block| block.id == block_id) {
+                    return Ok(block.clone());
+                }
+            }
+            return Err(locality_core::LocalityError::InvalidState(format!(
+                "missing archived block {block_id}"
+            )));
+        }
+        if self.is_archived_or_has_archived_ancestor(block_id) {
+            return Err(locality_core::LocalityError::InvalidState(format!(
+                "cannot update block {block_id} beneath an archived ancestor"
+            )));
+        }
         self.calls.lock().expect("calls").push(WriteCall::Update {
             block_id: block_id.to_string(),
         });
@@ -17114,6 +17431,14 @@ impl NotionApi for MutableNotionApi {
         if let Some(block) = blocks.iter_mut().find(|block| block.id == block_id) {
             *block = paragraph_block(block_id, &text);
             return Ok(block.clone());
+        }
+        drop(blocks);
+        let mut nested_children = self.nested_children.lock().expect("nested children");
+        for children in nested_children.values_mut() {
+            if let Some(block) = children.iter_mut().find(|block| block.id == block_id) {
+                *block = paragraph_block(block_id, &text);
+                return Ok(block.clone());
+            }
         }
         Ok(paragraph_block(block_id, &text))
     }
@@ -17169,12 +17494,28 @@ impl NotionApi for MutableNotionApi {
     }
 
     fn delete_block(&self, block_id: &str) -> locality_core::LocalityResult<BlockDto> {
+        if self.is_archived_or_has_archived_ancestor(block_id) {
+            return Err(locality_core::LocalityError::InvalidState(format!(
+                "cannot archive block {block_id} beneath an archived ancestor"
+            )));
+        }
         self.calls.lock().expect("calls").push(WriteCall::Delete {
             block_id: block_id.to_string(),
         });
-        let mut blocks = self.blocks.lock().expect("blocks");
-        if let Some(index) = blocks.iter().position(|block| block.id == block_id) {
-            return Ok(blocks.remove(index));
+        self.archived_blocks
+            .lock()
+            .expect("archived blocks")
+            .insert(block_id.to_string());
+        let blocks = self.blocks.lock().expect("blocks");
+        if let Some(block) = blocks.iter().find(|block| block.id == block_id) {
+            return Ok(block.clone());
+        }
+        drop(blocks);
+        let nested_children = self.nested_children.lock().expect("nested children");
+        for children in nested_children.values() {
+            if let Some(block) = children.iter().find(|block| block.id == block_id) {
+                return Ok(block.clone());
+            }
         }
         Ok(paragraph_block(block_id, ""))
     }
@@ -17314,6 +17655,9 @@ enum WriteCall {
         parent: Value,
     },
     Delete {
+        block_id: String,
+    },
+    Restore {
         block_id: String,
     },
 }
@@ -17574,6 +17918,12 @@ fn paragraph_block(id: &str, text: &str) -> BlockDto {
         rich_text: vec![rich_text(text)],
         color: None,
     });
+    block
+}
+
+fn paragraph_block_with_children(id: &str, text: &str) -> BlockDto {
+    let mut block = paragraph_block(id, text);
+    block.has_children = true;
     block
 }
 

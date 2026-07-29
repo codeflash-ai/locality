@@ -58,7 +58,7 @@ use crate::repository::{
 const DB_FILE: &str = "state.sqlite3";
 const SCHEMA_VERSION: i64 = 20;
 const ENTITY_SEARCH_COMPONENT_VERSION: i64 = 2;
-const JOURNALS_COMPONENT_VERSION: i64 = 3;
+const JOURNALS_COMPONENT_VERSION: i64 = 4;
 const LINUX_FUSE_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const WINDOWS_CLOUD_FILES_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const RETIRED_NOTION_WORKSPACE_ROOTS_COMPONENT_ID: &str = "projection:notion_workspace_roots";
@@ -2747,7 +2747,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         ensure_state_components_allow_schema_migration(connection, user_version)?;
         migrate_linux_fuse_projection_layout_to_v2(connection, false)?;
         migrate_windows_cloud_files_projection_layout_to_v2(connection, false)?;
-        migrate_journals_component_to_v3(connection)?;
+        migrate_journals_component_to_v4(connection)?;
         migrate_virtual_mutations_component_to_v3(connection)?;
         migrate_entity_search_component_to_v2(connection)?;
         return Ok(());
@@ -3369,7 +3369,7 @@ fn state_component_issue_allows_schema_migration(
             component_id,
             found,
             current: JOURNALS_COMPONENT_VERSION,
-        } if component_id == "durable:journals" && matches!(*found, 1 | 2)
+        } if component_id == "durable:journals" && matches!(*found, 1..=3)
     ) || matches!(
         issue,
         StateCompatibilityIssue::OlderComponent {
@@ -4137,7 +4137,7 @@ fn migrate_virtual_mutations_component_to_v3(connection: &Connection) -> StoreRe
     migrate_state_component_to_current(connection, "durable:virtual_mutations")
 }
 
-fn migrate_journals_component_to_v3(connection: &Connection) -> StoreResult<()> {
+fn migrate_journals_component_to_v4(connection: &Connection) -> StoreResult<()> {
     migrate_state_component_to_current(connection, "durable:journals")
 }
 

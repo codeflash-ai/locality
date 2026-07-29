@@ -239,6 +239,40 @@ pub enum JournalApplyEffect {
     },
 }
 
+impl JournalApplyEffect {
+    pub fn operation_index(&self) -> usize {
+        match self {
+            Self::UpdatedBlock {
+                operation_index, ..
+            }
+            | Self::CreatedBlock {
+                operation_index, ..
+            }
+            | Self::MovedBlock {
+                operation_index, ..
+            }
+            | Self::ArchivedBlock {
+                operation_index, ..
+            }
+            | Self::ArchivedEntity {
+                operation_index, ..
+            }
+            | Self::UpdatedEntityBody {
+                operation_index, ..
+            }
+            | Self::UpdatedProperties {
+                operation_index, ..
+            }
+            | Self::MovedEntity {
+                operation_index, ..
+            }
+            | Self::CreatedEntity {
+                operation_index, ..
+            } => *operation_index,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalPreimage {
     pub entity_id: RemoteId,

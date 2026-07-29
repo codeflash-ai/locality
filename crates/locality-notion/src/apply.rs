@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
 
 use locality_connector::{ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult};
-use locality_core::canonical::{Directive, parse_directive_line};
 use locality_core::journal::JournalApplyEffect;
 use locality_core::model::RemoteId;
 use locality_core::planner::{PropertyValue, PushOperation};
@@ -94,6 +93,13 @@ pub fn apply_plan(
 
     let mut operation_index = 0usize;
     while operation_index < request.plan.operations.len() {
+        if matches!(
+            request.plan.operations[operation_index],
+            PushOperation::ArchiveBlock { .. } | PushOperation::ArchiveEntity { .. }
+        ) {
+            operation_index += 1;
+            continue;
+        }
         let step = lower_notion_apply_step(
             &request.plan.operations,
             operation_index,
@@ -257,13 +263,10 @@ pub fn apply_plan(
                             block_id: block_id.clone(),
                         });
                     }
-                    PushOperation::ArchiveBlock { block_id } => {
-                        api.delete_block(block_id.as_str())?;
-                        effects.push(JournalApplyEffect::ArchivedBlock {
-                            operation_id: request.operation_ids[operation_index].clone(),
-                            operation_index,
-                            block_id: block_id.clone(),
-                        });
+                    PushOperation::ArchiveBlock { .. } | PushOperation::ArchiveEntity { .. } => {
+                        unreachable!(
+                            "standalone Notion archives are deferred until other writes finish"
+                        )
                     }
                     PushOperation::UpdateProperties {
                         entity_id,
@@ -373,17 +376,6 @@ pub fn apply_plan(
                             entity_id: created_id,
                         });
                     }
-                    PushOperation::ArchiveEntity { entity_id } => {
-                        api.delete_block(entity_id.as_str())?;
-                        if !changed_remote_ids.contains(entity_id) {
-                            changed_remote_ids.push(entity_id.clone());
-                        }
-                        effects.push(JournalApplyEffect::ArchivedEntity {
-                            operation_id: request.operation_ids[operation_index].clone(),
-                            operation_index,
-                            entity_id: entity_id.clone(),
-                        });
-                    }
                     PushOperation::UpdateEntityBody { .. } => {
                         return Err(LocalityError::Unsupported(
                             "whole-entity body updates for Notion",
@@ -458,6 +450,33 @@ pub fn apply_plan(
         }
     }
 
+    for operation_index in
+        deferred_archive_operation_indices(&request.plan.operations, &block_parents)
+    {
+        match &request.plan.operations[operation_index] {
+            PushOperation::ArchiveBlock { block_id } => {
+                api.delete_block(block_id.as_str())?;
+                effects.push(JournalApplyEffect::ArchivedBlock {
+                    operation_id: request.operation_ids[operation_index].clone(),
+                    operation_index,
+                    block_id: block_id.clone(),
+                });
+            }
+            PushOperation::ArchiveEntity { entity_id } => {
+                api.delete_block(entity_id.as_str())?;
+                if !changed_remote_ids.contains(entity_id) {
+                    changed_remote_ids.push(entity_id.clone());
+                }
+                effects.push(JournalApplyEffect::ArchivedEntity {
+                    operation_id: request.operation_ids[operation_index].clone(),
+                    operation_index,
+                    entity_id: entity_id.clone(),
+                });
+            }
+            _ => unreachable!("deferred Notion archive index must reference an archive operation"),
+        }
+    }
+
     for remote_id in &request.plan.affected_entities {
         if !create_parent_ids.contains(remote_id) && !changed_remote_ids.contains(remote_id) {
             changed_remote_ids.push(remote_id.clone());
@@ -506,15 +525,14 @@ pub fn apply_undo(
             UndoOperation::ArchiveCreatedBlock { block_id } => {
                 api.delete_block(block_id.as_str())?;
             }
-            UndoOperation::RestoreArchivedBlock {
-                parent_id,
-                after,
-                content,
-                native_kind,
-                ..
-            } => {
-                let child = restore_archived_block_child(api, content, native_kind.as_deref())?;
-                api.append_block_children(parent_id.as_str(), append_body(child, after.as_ref()))?;
+            UndoOperation::RestoreArchivedBlock { block_id, .. } => {
+                let restored = api.update_block(block_id.as_str(), json!({ "in_trash": false }))?;
+                if restored.id != block_id.0 || restored.archived || restored.in_trash {
+                    return Err(LocalityError::InvalidState(format!(
+                        "Notion did not restore archived block `{}` in place",
+                        block_id.0
+                    )));
+                }
             }
             UndoOperation::ArchiveCreatedEntity { entity_id, .. } => {
                 api.delete_block(entity_id.as_str())?;
@@ -631,13 +649,6 @@ fn prevalidate_undo_plan(api: &dyn NotionApi, plan: &UndoPlan) -> LocalityResult
                 }
                 parse_supported_block(content, None, None)?;
             }
-            UndoOperation::RestoreArchivedBlock {
-                content,
-                native_kind,
-                ..
-            } => {
-                restore_archived_block_child(api, content, native_kind.as_deref())?;
-            }
             UndoOperation::RestoreProperties {
                 entity_id,
                 previous,
@@ -669,6 +680,7 @@ fn prevalidate_undo_plan(api: &dyn NotionApi, plan: &UndoPlan) -> LocalityResult
                 return Err(LocalityError::Unsupported(unsupported_undo_name(operation)));
             }
             UndoOperation::ArchiveCreatedBlock { .. }
+            | UndoOperation::RestoreArchivedBlock { .. }
             | UndoOperation::ArchiveCreatedEntity { .. }
             | UndoOperation::RestoreArchivedEntity { .. } => {}
         }
@@ -719,75 +731,6 @@ fn prevalidate_table_update(
     Ok(())
 }
 
-fn restore_archived_block_child(
-    api: &dyn NotionApi,
-    content: &str,
-    native_kind: Option<&str>,
-) -> LocalityResult<Value> {
-    let trimmed = content.trim();
-    if let Some(directive) = parse_directive_line(trimmed, 1) {
-        return restore_directive_child(&directive);
-    }
-
-    if native_kind.unwrap_or("link_to_page") == "link_to_page"
-        && let Some((label, href, consumed)) = parse_markdown_link(trimmed)
-        && consumed == trimmed.len()
-        && let Some(target_id) = notion_page_id_from_href(&href)
-    {
-        match label.as_str() {
-            "Linked page" => {
-                return Ok(json!({
-                    "object": "block",
-                    "type": "link_to_page",
-                    "link_to_page": {
-                        "type": "page_id",
-                        "page_id": target_id,
-                    },
-                }));
-            }
-            "Linked database" => {
-                return Ok(json!({
-                    "object": "block",
-                    "type": "link_to_page",
-                    "link_to_page": {
-                        "type": "database_id",
-                        "database_id": target_id,
-                    },
-                }));
-            }
-            _ => {}
-        }
-    }
-
-    parse_append_block(api, content, None).map(|patch| patch.append_child())
-}
-
-fn restore_directive_child(directive: &Directive) -> LocalityResult<Value> {
-    let directive_type = directive
-        .directive_type
-        .as_deref()
-        .ok_or(LocalityError::Unsupported(
-            "restoring archived Notion directive blocks without a type",
-        ))?;
-    match directive_type {
-        "table_of_contents" => {
-            let payload = directive
-                .attributes
-                .get("color")
-                .map(|color| json!({ "color": color }))
-                .unwrap_or_else(|| json!({}));
-            Ok(json!({
-                "object": "block",
-                "type": "table_of_contents",
-                "table_of_contents": payload,
-            }))
-        }
-        _ => Err(LocalityError::Unsupported(
-            "restoring this archived Notion directive block type",
-        )),
-    }
-}
-
 fn validate_operation_ids(request: &ApplyPlanRequest<'_>) -> LocalityResult<()> {
     if request.operation_ids.len() != request.plan.operations.len() {
         return Err(LocalityError::InvalidState(format!(
@@ -823,6 +766,41 @@ fn archived_block_ids(operations: &[PushOperation]) -> BTreeSet<RemoteId> {
             _ => None,
         })
         .collect()
+}
+
+fn deferred_archive_operation_indices(
+    operations: &[PushOperation],
+    block_parents: &BlockParentIndex,
+) -> Vec<usize> {
+    let mut indices = operations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, operation)| match operation {
+            PushOperation::ArchiveBlock { block_id } => {
+                Some((index, block_depth(block_id, block_parents), 0usize))
+            }
+            PushOperation::ArchiveEntity { entity_id } => {
+                Some((index, block_depth(entity_id, block_parents), 1usize))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    indices.sort_by_key(|(index, depth, kind)| (Reverse(*depth), *kind, *index));
+    indices.into_iter().map(|(index, _, _)| index).collect()
+}
+
+fn block_depth(block_id: &RemoteId, block_parents: &BlockParentIndex) -> usize {
+    let mut depth = 0;
+    let mut current = block_id;
+    let mut seen = BTreeSet::new();
+    while seen.insert(current.clone()) {
+        let Some(parent) = block_parents.direct_parents.get(current) else {
+            break;
+        };
+        depth += 1;
+        current = parent;
+    }
+    depth
 }
 
 fn database_create_parent_ids(operations: &[PushOperation]) -> BTreeSet<RemoteId> {
@@ -4243,6 +4221,37 @@ fn unsupported_undo_name(operation: &UndoOperation) -> &'static str {
 mod tests {
     use super::*;
     use crate::dto::{LinkDto, TextRichTextDto};
+
+    #[test]
+    fn deferred_archive_indices_order_descendants_before_ancestors_and_entities() {
+        let operations = vec![
+            PushOperation::ArchiveEntity {
+                entity_id: RemoteId::new("page-1"),
+            },
+            PushOperation::ArchiveBlock {
+                block_id: RemoteId::new("parent-1"),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("child-1"),
+                content: "Updated child.".to_string(),
+            },
+            PushOperation::ArchiveBlock {
+                block_id: RemoteId::new("child-1"),
+            },
+        ];
+        let block_parents = BlockParentIndex {
+            direct_parents: BTreeMap::from([
+                (RemoteId::new("parent-1"), RemoteId::new("page-1")),
+                (RemoteId::new("child-1"), RemoteId::new("parent-1")),
+            ]),
+            containing_pages: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            deferred_archive_operation_indices(&operations, &block_parents),
+            vec![3, 1, 0]
+        );
+    }
 
     #[test]
     fn rich_text_payload_splits_text_content_at_notion_limit() {
