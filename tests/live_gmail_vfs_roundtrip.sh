@@ -90,33 +90,101 @@ wait_for_draft_dir() {
   live_fail "Gmail draft directory did not appear under the mount"
 }
 
+projected_gmail_draft_matches_message() {
+  local path="$1"
+  local searched_message_id="$2"
+
+  python3 - "$path" "$searched_message_id" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+searched_message_id = sys.argv[2]
+try:
+    text = path.read_text(encoding="utf-8")
+except OSError:
+    raise SystemExit(1)
+
+lines = text.splitlines()
+if lines and lines[0].strip() == "---":
+    frontmatter = []
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        frontmatter.append(line)
+else:
+    frontmatter = lines
+
+def scalar(value):
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+def key_value(line, key):
+    match = re.match(rf"^\s*{re.escape(key)}:\s*(.*?)\s*$", line)
+    if not match:
+        return None
+    return scalar(match.group(1))
+
+def block_key(line):
+    match = re.match(r"^(\s*)([A-Za-z0-9_.-]+):\s*$", line)
+    if not match:
+        return None
+    return (len(match.group(1)), match.group(2))
+
+has_gmail_connector = any(key_value(line, "connector") == "gmail" for line in frontmatter)
+has_draft_mailbox = False
+has_matching_message_id = False
+active_block = None
+active_indent = -1
+
+for line in frontmatter:
+    stripped = line.strip()
+    if not stripped:
+        continue
+
+    indent = len(line) - len(line.lstrip(" "))
+    if active_block is not None and indent <= active_indent:
+        active_block = None
+        active_indent = -1
+
+    block = block_key(line)
+    if block is not None:
+        active_indent, active_block = block
+        continue
+
+    if active_block == "gmail":
+        if key_value(line, "mailbox") == "draft":
+            has_draft_mailbox = True
+        if key_value(line, "message_id") == searched_message_id:
+            has_matching_message_id = True
+    elif active_block == "loc" and key_value(line, "id") == searched_message_id:
+        has_matching_message_id = True
+
+if has_gmail_connector and has_draft_mailbox and has_matching_message_id:
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
 wait_for_marker_under_draft() {
   local marker="$1"
-  local original_path="$2"
+  local searched_message_id="$2"
   local draft_dir="$mount_root/draft"
   local attempts="${LOCALITY_GMAIL_LIVE_MARKER_WAIT_ATTEMPTS:-120}"
-  local original_accept_attempt="${LOCALITY_GMAIL_LIVE_ORIGINAL_ACCEPT_ATTEMPT:-8}"
   local attempt
-  local found_original
   local match_path
 
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    found_original=0
     if [[ -d "$draft_dir" ]]; then
       while IFS= read -r match_path; do
         [[ -z "$match_path" ]] && continue
-        if [[ "$match_path" != "$original_path" ]]; then
+        if projected_gmail_draft_matches_message "$match_path" "$searched_message_id"; then
           return 0
         fi
-        if grep -Fq "connector: gmail" "$match_path" 2>/dev/null \
-          && grep -Fq "mailbox: draft" "$match_path" 2>/dev/null; then
-          return 0
-        fi
-        found_original=1
       done < <(grep -R -F -l -- "$marker" "$draft_dir" 2>/dev/null || true)
-      if [[ "$found_original" == "1" && "$attempt" -ge "$original_accept_attempt" ]]; then
-        return 0
-      fi
     fi
     sleep 0.25
   done
@@ -150,6 +218,25 @@ for draft in data.get("drafts") or []:
 PY
 }
 
+gmail_drafts_next_page_token() {
+  local drafts_json_path="$1"
+
+  python3 - "$drafts_json_path" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+token = data.get("nextPageToken")
+if token:
+    print(token)
+PY
+}
+
 delete_created_gmail_draft() {
   local mode="${1:-best_effort}"
   local access_token
@@ -173,16 +260,38 @@ delete_created_gmail_draft() {
   fi
 
   if [[ -z "$draft_id" ]]; then
-    if ! curl -fsS "https://gmail.googleapis.com/gmail/v1/users/me/drafts?maxResults=100" \
-      -H "Authorization: Bearer $access_token" \
-      >"$drafts_list_report" 2>>"$command_log"; then
-      unset access_token
-      if [[ "$mode" == "required" ]]; then
-        live_fail "failed to list Gmail drafts during cleanup"
+    local page_token=""
+    while :; do
+      local curl_args=(
+        -fsS
+        --get
+        "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
+        -H
+        "Authorization: Bearer $access_token"
+        --data-urlencode
+        "maxResults=100"
+      )
+      if [[ -n "$page_token" ]]; then
+        curl_args+=(--data-urlencode "pageToken=$page_token")
       fi
-      return 1
-    fi
-    draft_id="$(find_gmail_draft_id "$drafts_list_report" "$raw_message_id" 2>/dev/null || true)"
+      if ! curl "${curl_args[@]}" >"$drafts_list_report" 2>>"$command_log"; then
+        unset access_token
+        if [[ "$mode" == "required" ]]; then
+          live_fail "failed to list Gmail drafts during cleanup"
+        fi
+        return 1
+      fi
+
+      draft_id="$(find_gmail_draft_id "$drafts_list_report" "$raw_message_id" 2>/dev/null || true)"
+      if [[ -n "$draft_id" ]]; then
+        break
+      fi
+      page_token="$(gmail_drafts_next_page_token "$drafts_list_report" 2>/dev/null || true)"
+      if [[ -z "$page_token" ]]; then
+        break
+      fi
+    done
+
     if [[ -z "$draft_id" ]]; then
       unset access_token
       if [[ "$mode" == "required" ]]; then
@@ -315,7 +424,7 @@ LOCALITY_STATE_DIR="$state_root" "$loc_bin" pull --json "$mount_root" \
 assert_json_ok "$pull_after_push_report" "Gmail pull-after-push report"
 
 step="verifying created Gmail draft marker under draft"
-wait_for_marker_under_draft "$marker" "$draft_path"
+wait_for_marker_under_draft "$marker" "$raw_message_id"
 
 step="deleting created Gmail draft"
 delete_created_gmail_draft required
