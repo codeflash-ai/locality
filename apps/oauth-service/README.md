@@ -91,11 +91,14 @@ Request:
 ```json
 {
   "session": "signed-session",
-  "state": "opaque-state",
+  "state": "signed-local-handoff-state",
   "code": "provider-authorization-code",
-  "redirect_uri": "http://localhost:8757/oauth/notion/callback"
+  "redirect_uri": "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/notion/callback"
 }
 ```
+
+Clients should send the returned `exchange_redirect_uri`; without hosted
+handoff, this remains the local loopback redirect.
 
 Response includes the provider access token and either `refresh_token_handle` or
 `refresh_token`, depending on `LOCALITY_TOKEN_MODE`.

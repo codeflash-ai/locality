@@ -27,6 +27,10 @@ before deploying `LOCALITY_NOTION_HOSTED_CALLBACK_URI`:
 https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/notion/callback
 ```
 
+`LOCALITY_NOTION_HOSTED_CALLBACK_URI` must exactly match the reachable Worker
+callback URL registered in Notion. That can be the `workers.dev` URL above or a
+custom domain such as `https://auth.locality.dev/v1/oauth/notion/callback`.
+
 Keep the local loopback callbacks in the broker allowlist for the CLI handoff:
 
 ```text
