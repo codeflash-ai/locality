@@ -54,13 +54,16 @@ restore_diff_report="$tmp_root/restore-diff.json"
 restore_push_report="$tmp_root/restore-push.json"
 cleanup_diff_report="$tmp_root/cleanup-diff.json"
 cleanup_push_report="$tmp_root/cleanup-push.json"
+cleanup_pull_report="$tmp_root/cleanup-pull.json"
 original_copy="$tmp_root/original-page.md"
+original_body_copy="$tmp_root/original-body.md"
 restored_copy="$tmp_root/restored-page.md"
 daemon_pid=""
 fuse_pid=""
 issue_path=""
 original_saved=0
 cleanup_restore_needed=0
+remote_mutation_attempted=0
 
 assert_json_field_equals() {
   local report_path="$1"
@@ -101,11 +104,66 @@ wait_for_projected_mount_root() {
   live_fail "Linear FUSE mount root did not appear at $mount_root"
 }
 
+extract_page_body() {
+  local source_path="$1"
+  local body_path="$2"
+
+  python3 - "$source_path" "$body_path" <<'PY' 2>>"$command_log"
+import pathlib
+import sys
+
+source_path = pathlib.Path(sys.argv[1])
+body_path = pathlib.Path(sys.argv[2])
+
+def page_body(text, label):
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        raise SystemExit(f"{label} page.md did not start with frontmatter")
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            return "".join(lines[index + 1 :])
+    raise SystemExit(f"{label} page.md frontmatter was not terminated")
+
+body_path.write_text(
+    page_body(source_path.read_text(encoding="utf-8"), "Linear original"),
+    encoding="utf-8",
+)
+PY
+}
+
+restore_original_body_under_current_frontmatter() {
+  local target_path="$1"
+
+  python3 - "$target_path" "$original_body_copy" <<'PY' 2>>"$command_log"
+import pathlib
+import sys
+
+target_path = pathlib.Path(sys.argv[1])
+body_path = pathlib.Path(sys.argv[2])
+
+def current_frontmatter(text):
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        raise SystemExit("Linear target page.md did not start with frontmatter")
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            frontmatter = "".join(lines[: index + 1])
+            if not frontmatter.endswith(("\n", "\r")):
+                frontmatter += "\n"
+            return frontmatter
+    raise SystemExit("Linear target page.md frontmatter was not terminated")
+
+frontmatter = current_frontmatter(target_path.read_text(encoding="utf-8"))
+body = body_path.read_text(encoding="utf-8")
+target_path.write_text(frontmatter + body, encoding="utf-8")
+PY
+}
+
 find_issue_by_frontmatter() {
   local issue_id="$1"
   local match
 
-  match="$(python3 - "$mount_root" "$issue_id" <<'PY' 2>>"$command_log" || true
+  if match="$(python3 - "$mount_root" "$issue_id" <<'PY' 2>>"$command_log"
 import os
 import pathlib
 import re
@@ -138,6 +196,13 @@ def scalar_value(line, key):
         value = value[1:-1]
     return value
 
+def block_key(line):
+    match = re.match(r"^(\s*)([A-Za-z0-9_.-]+):\s*$", line)
+    if not match:
+        return None
+    return (len(match.group(1)), match.group(2))
+
+matches = []
 for current_root, dirs, files in os.walk(root):
     dirs.sort()
     files.sort()
@@ -147,29 +212,45 @@ for current_root, dirs, files in os.walk(root):
     frontmatter = frontmatter_lines(path)
     if frontmatter is None:
         continue
-    has_linear_connector = any(
-        scalar_value(line, "connector") == "linear" for line in frontmatter
-    )
-    has_issue_id = any(scalar_value(line, "id") == issue_id for line in frontmatter)
+
+    has_linear_connector = False
+    has_issue_id = False
+    active_block = None
+    active_indent = -1
+    for line in frontmatter:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if active_block is not None and indent <= active_indent:
+            active_block = None
+            active_indent = -1
+
+        block = block_key(line)
+        if block is not None:
+            active_indent, active_block = block
+            continue
+
+        if active_block == "loc":
+            if scalar_value(line, "connector") == "linear":
+                has_linear_connector = True
+            if scalar_value(line, "id") == issue_id:
+                has_issue_id = True
+
     if has_linear_connector and has_issue_id:
-        print(path)
-        raise SystemExit(0)
+        matches.append(path)
+
+if len(matches) == 1:
+    print(matches[0])
+    raise SystemExit(0)
 
 raise SystemExit(1)
 PY
-)"
-  if [[ -n "$match" ]]; then
+  )"; then
+    [[ -n "$match" ]] || return 1
     printf '%s\n' "$match"
     return 0
   fi
-
-  while IFS= read -r match; do
-    [[ -z "$match" ]] && continue
-    if grep -Fq "connector: linear" "$match" 2>>"$command_log"; then
-      printf '%s\n' "$match"
-      return 0
-    fi
-  done < <(grep -R -F -l -- "id: $issue_id" "$mount_root" --include page.md 2>>"$command_log" || true)
 
   return 1
 }
@@ -221,18 +302,27 @@ best_effort_restore_original() {
   local target="$issue_path"
   local action
 
-  if [[ "$cleanup_restore_needed" != "1" || "$original_saved" != "1" || ! -f "$original_copy" ]]; then
+  if [[ "$cleanup_restore_needed" != "1" \
+    || "$original_saved" != "1" \
+    || ! -f "$original_copy" \
+    || ! -f "$original_body_copy" ]]; then
     return 0
   fi
 
-  if [[ -z "$target" || ! -f "$target" ]]; then
+  if [[ "$remote_mutation_attempted" == "1" ]]; then
+    LOCALITY_STATE_DIR="$state_root" "$loc_bin" pull --json "$mount_root" \
+      >"$cleanup_pull_report" 2>>"$command_log" || return 1
+    assert_json_ok "$cleanup_pull_report" "Linear cleanup pull report" || return 1
+    target="$(find_issue_by_frontmatter "$LOCALITY_LINEAR_LIVE_ISSUE_ID" 2>/dev/null || true)"
+    issue_path="$target"
+  elif [[ -z "$target" || ! -f "$target" ]]; then
     target="$(find_issue_by_frontmatter "$LOCALITY_LINEAR_LIVE_ISSUE_ID" 2>/dev/null || true)"
   fi
   if [[ -z "$target" || ! -f "$target" ]]; then
     return 1
   fi
 
-  cp "$original_copy" "$target" 2>>"$command_log" || return 1
+  restore_original_body_under_current_frontmatter "$target" || return 1
   LOCALITY_STATE_DIR="$state_root" "$loc_bin" diff --json "$target" \
     >"$cleanup_diff_report" 2>>"$command_log" || return 1
   assert_json_ok "$cleanup_diff_report" "Linear cleanup diff report" || return 1
@@ -311,6 +401,7 @@ issue_path="$(wait_for_target_issue "$LOCALITY_LINEAR_LIVE_ISSUE_ID")"
 
 step="saving original Linear issue page"
 cp "$issue_path" "$original_copy"
+extract_page_body "$original_copy" "$original_body_copy"
 original_saved=1
 cleanup_restore_needed=1
 
@@ -327,6 +418,7 @@ assert_json_ok "$diff_report" "Linear diff report"
 assert_json_field_equals "$diff_report" "action" "confirm_plan" "Linear diff report"
 
 step="pushing edited Linear issue page"
+remote_mutation_attempted=1
 LOCALITY_STATE_DIR="$state_root" "$loc_bin" push --json -y "$issue_path" \
   >"$push_report" 2>>"$command_log"
 assert_json_ok "$push_report" "Linear push report"
@@ -341,7 +433,7 @@ step="verifying Linear issue marker after pull"
 wait_for_marker_in_target_issue "$marker"
 
 step="restoring original Linear issue page"
-cp "$original_copy" "$issue_path"
+restore_original_body_under_current_frontmatter "$issue_path"
 cp "$issue_path" "$restored_copy"
 
 step="diffing restored Linear issue page"
