@@ -9,6 +9,9 @@ separates:
   Notion content.
 - **Live Granola e2e**: runs read-only against a stable meeting through the real
   Granola public API, CLI, daemon, and Linux FUSE filesystem path.
+- **Live non-Notion connector e2e**: runs against real Google Docs, Google
+  Calendar, Gmail, Slack, and Linear APIs through the CLI, daemon, and Linux
+  FUSE filesystem path.
 - **Local behavior e2e**: exercises the Locality architecture with fake connectors,
   local state, or seeded filesystem mounts.
 - **Manual macOS coverage**: requires a signed app, File Provider approval, and
@@ -100,6 +103,96 @@ disposable scratch Notion pages. During that live Windows run, `loc doctor
 --json` must pass against the same state directory after the daemon and Cloud
 Files provider are running.
 
+## How To Run Other Live Connector E2E
+
+These scripts require Linux with `/dev/fuse` and `fusermount3` available. Each
+script creates an isolated Locality state directory, runs through the real
+`loc`, `localityd`, and `locality-fuse` binaries, and keeps command/provider
+payloads out of test output.
+
+For Google OAuth and Slack credentials, a local run can reuse a stored
+connection credential by reading its hex-encoded secret reference from
+`~/.loc/credentials`:
+
+```sh
+secret_ref='connection:google-docs-live'
+secret_hex="$(printf '%s' "$secret_ref" | od -An -tx1 -v | tr -d ' \n')"
+export LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON="$(cat "$HOME/.loc/credentials/$secret_hex")"
+```
+
+Run Google Docs against a scratch Drive workspace folder:
+
+```sh
+export LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER=...
+LOCALITY_LIVE_GOOGLE_DOCS_VFS=1 tests/live_google_docs_vfs_roundtrip.sh
+```
+
+Run Google Calendar against the primary calendar:
+
+```sh
+secret_ref='connection:google-calendar-live'
+secret_hex="$(printf '%s' "$secret_ref" | od -An -tx1 -v | tr -d ' \n')"
+export LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON="$(cat "$HOME/.loc/credentials/$secret_hex")"
+LOCALITY_LIVE_GOOGLE_CALENDAR_VFS=1 tests/live_google_calendar_vfs_roundtrip.sh
+```
+
+Run Gmail against a test mailbox and a safe recipient address:
+
+```sh
+secret_ref='connection:gmail-live'
+secret_hex="$(printf '%s' "$secret_ref" | od -An -tx1 -v | tr -d ' \n')"
+export LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON="$(cat "$HOME/.loc/credentials/$secret_hex")"
+export LOCALITY_GMAIL_LIVE_TO_EMAIL=...
+LOCALITY_LIVE_GMAIL_VFS=1 tests/live_gmail_vfs_roundtrip.sh
+```
+
+Run Slack read-only against a stable conversation that the app can access:
+
+```sh
+secret_ref='connection:slack-live'
+secret_hex="$(printf '%s' "$secret_ref" | od -An -tx1 -v | tr -d ' \n')"
+export LOCALITY_SLACK_LIVE_CREDENTIAL_JSON="$(cat "$HOME/.loc/credentials/$secret_hex")"
+export LOCALITY_SLACK_LIVE_CONVERSATION_ID=...
+export LOCALITY_SLACK_LIVE_TYPES=public_channel,private_channel
+LOCALITY_LIVE_SLACK_VFS=1 tests/live_slack_vfs_read.sh
+```
+
+Run Linear against a stable scratch issue:
+
+```sh
+export LINEAR_API_KEY=...
+export LOCALITY_LINEAR_LIVE_ISSUE_ID=...
+LOCALITY_LIVE_LINEAR_VFS=1 tests/live_linear_vfs_roundtrip.sh
+```
+
+GitHub Actions runs `.github/workflows/connector-live-e2e.yml` for relevant
+changes on `main`, weekly, and on manual dispatch. The workflow uses the
+`connector-live-e2e` environment and uploads no artifacts.
+
+## Live Connector E2E Secrets
+
+The existing Granola workflow uses the `granola-live-e2e` environment:
+
+| Secret | Required | Purpose |
+|---|---:|---|
+| `GRANOLA_API_KEY` | yes | Granola Business or Enterprise API key for live public API reads. |
+| `LOCALITY_GRANOLA_LIVE_NOTE_ID` | yes | Stable Granola note id with retained transcript for read-only VFS checks. |
+
+The non-Notion connector workflow uses the `connector-live-e2e` environment:
+
+| Secret | Required | Purpose |
+|---|---:|---|
+| `LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON` | yes | Stored Google Docs OAuth credential JSON, normally copied from `connection:google-docs-live`. |
+| `LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER` | yes | Scratch Drive folder name or id used by the Google Docs live test. |
+| `LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON` | yes | Stored Google Calendar OAuth credential JSON, normally copied from `connection:google-calendar-live`. |
+| `LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON` | yes | Stored Gmail OAuth credential JSON, normally copied from `connection:gmail-live`. |
+| `LOCALITY_GMAIL_LIVE_TO_EMAIL` | yes | Recipient address for the unsent Gmail draft created and deleted by the live test. |
+| `LOCALITY_SLACK_LIVE_CREDENTIAL_JSON` | yes | Stored Slack OAuth credential JSON, normally copied from `connection:slack-live`. |
+| `LOCALITY_SLACK_LIVE_CONVERSATION_ID` | yes | Stable Slack conversation id for read-only recent-message projection. |
+| `LOCALITY_SLACK_LIVE_TYPES` | no | Optional Slack mount type list, for example `public_channel,private_channel`. |
+| `LINEAR_API_KEY` | yes | Linear API key with access to the scratch issue. |
+| `LOCALITY_LINEAR_LIVE_ISSUE_ID` | yes | Stable scratch Linear issue id whose body can be edited and restored. |
+
 ## Expected Behavior Coverage
 
 The E2E-024 runtime coverage includes mocked Notion 429 handling: scheduled
@@ -109,15 +202,16 @@ pull resumes after its eligible retry time.
 
 Coverage labels:
 
-- **Covered live**: exercised against real Notion and verified after API reads.
-- **Partial live**: real Notion is involved, but not through the full product
-  surface or not for the whole behavior.
+- **Covered live**: exercised against the real provider API and verified after
+  provider reads.
+- **Partial live**: a real provider API is involved, but not through the full
+  product surface or not for the whole behavior.
 - **Local only**: covered with fake connectors, seeded state, FUSE smoke, or
-  unit/integration tests, but not against real Notion.
+  unit/integration tests, but not against a real provider API.
 - **Manual only**: expected product behavior exists but is only manually tested.
 - **Gap**: important behavior not yet covered by e2e tests.
 
-| ID | Expected e2e behavior | Current live Notion coverage | Local/CI coverage | Current gap |
+| ID | Expected e2e behavior | Current live provider coverage | Local/CI coverage | Current gap |
 |---|---|---|---|---|
 | E2E-001 | OAuth broker connections store refresh handles/metadata without shipping or persisting connector client secrets locally. | Local only | `crates/loc-cli/tests/connect.rs` covers broker secret separation with fake brokers; `crates/loc-cli/tests/e2e_push_workflow.rs::broker_oauth_connect_stores_refresh_handle_without_leaking_secret_material` and `crates/loc-cli/tests/e2e_push_workflow.rs::google_docs_broker_oauth_connect_stores_refresh_handle_without_leaking_secret_material` cover the Notion and Google Docs workflow paths with the file credential store and connection reports. | Add broker-backed live auth smoke tests, likely outside normal CI unless using test OAuth integrations. |
 | E2E-002 | New install/onboarding can reset stale local beta state, install the terminal-visible `loc` command, then proceed through connection and mount setup. | Partial local | Desktop command/unit coverage, manual DMG testing, `crates/loc-cli/tests/e2e_push_workflow.rs::cli_reset_requires_yes_and_clears_isolated_state_without_deleting_visible_files`, `crates/loc-cli/tests/e2e_push_workflow.rs::cli_mount_blocks_revoked_connection_before_creating_mount`, and `crates/loc-cli/tests/e2e_push_workflow.rs::cli_mount_blocks_missing_connection_credential_before_creating_mount` for command-level reset and mount setup guardrails. | CLI binary coverage verifies confirmed reset clears isolated Locality state and credentials without deleting visible files; full desktop install/onboarding reset still needs a desktop automation harness or scripted signed-app smoke on macOS. |
@@ -153,9 +247,9 @@ Coverage labels:
 | E2E-032 | `loc doctor` performs read-only diagnostics for state, connection, credential, and mount health without leaking credentials. | Covered live | `crates/loc-cli/tests/doctor.rs`; `crates/loc-cli/tests/e2e_push_workflow.rs::cli_doctor_reports_missing_mount_credential_without_leaking_secret_ref`. | Covered through the stored-credential live `loc` binary workflow, local diagnostic tests, and a local CLI-binary workflow that verifies a mounted active connection with a missing credential reports reconnect guidance without leaking `secret_ref`. |
 | E2E-033 | `loc restore` discards local-only edits from the synced shadow, returns status clean, and does not require a remote write or remote credential. | Covered live for plain-file mounted workflow and local virtual projection workflow | `crates/loc-cli/tests/restore.rs`; `crates/loc-cli/tests/e2e_push_workflow.rs::virtual_projection_modes_restore_discards_cached_edit_and_status_returns_clean`; `crates/loc-cli/tests/e2e_push_workflow.rs::conflicted_pull_restore_requires_force_and_restores_remote_shadow`; `crates/loc-cli/tests/e2e_push_workflow.rs::cli_restore_missing_mount_credential_restores_from_local_shadow`. | Covered through the stored-credential live `loc` binary workflow, local restore tests, an e2e virtual projection restore across macOS File Provider, Linux FUSE, and Windows Cloud Files modes that rewrites the daemon content cache instead of the visible mount file, local e2e conflict recovery that verifies unforced restore blocks while forced restore removes conflict markers and returns status clean without connector writes, and a local CLI-binary workflow that restores a dirty mounted page from shadow even when the Notion credential file is missing. |
 | E2E-034 | A read-only mounted workspace allows local inspection but blocks `diff`/`push` before journaling or remote writes. | Covered live | `crates/loc-cli/tests/push.rs::push_read_only_mount_blocks_write`; `crates/loc-cli/tests/e2e_push_workflow.rs::read_only_virtual_projection_modes_reject_local_mutations_without_dirty_state`; virtual filesystem read-only write/create/rename/delete tests. | Covered through a stored-credential live `loc` binary workflow that verifies Notion remains unchanged and no journal is written, plus local e2e coverage that macOS File Provider, Linux FUSE, and Windows Cloud Files virtual projection modes reject write/create/rename/delete attempts before dirtying state or recording mutations. |
-| E2E-035 | Google Docs mounted Markdown blocks unsupported rendered inline-object/table edits/moves/deletes, invalid Locality frontmatter, and unsupported document-structure directives before journaling or connector writes. | Local only | `crates/loc-cli/tests/e2e_push_workflow.rs::google_docs_rendered_inline_object_and_table_guardrails_block_before_journaled_apply`; `crates/loc-cli/tests/e2e_push_workflow.rs::google_docs_frontmatter_and_unsupported_structure_blocks_before_journaled_apply`. | Local workflow coverage verifies `diff` and daemon-backed `push` stop before concurrency checks, journal creation, or connector apply. Live Google Docs API e2e remains a gap. |
+| E2E-035 | Google Docs mounted Markdown blocks unsupported rendered inline-object/table edits/moves/deletes, invalid Locality frontmatter, and unsupported document-structure directives before journaling or connector writes. | Local only | `crates/loc-cli/tests/e2e_push_workflow.rs::google_docs_rendered_inline_object_and_table_guardrails_block_before_journaled_apply`; `crates/loc-cli/tests/e2e_push_workflow.rs::google_docs_frontmatter_and_unsupported_structure_blocks_before_journaled_apply`. | Local workflow coverage verifies `diff` and daemon-backed `push` stop before concurrency checks, journal creation, or connector apply. Live API guardrail coverage remains a gap. |
 | E2E-036 | Mount setup writes concise agent guidance that explains filesystem-first editing, Live Mode behavior, review/push commands, Notion page/database shape, and untrusted remote content boundaries without turning guidance files into synced entities. | Local only | `crates/loc-cli/tests/mount.rs`; `crates/loc-cli/tests/e2e_push_workflow.rs::mount_agent_guidance_matches_filesystem_workflow_and_does_not_dirty_status`. | Local e2e coverage mounts through the workflow path, verifies `AGENTS.md`/`CLAUDE.md` content and custom-guidance preservation, pulls a page, and verifies guidance files do not dirty status or appear as synced entries. |
-| E2E-037 | Google Docs workspace-folder mounts enumerate Drive folders/docs as online-only Markdown stubs, hydrate docs on explicit open/pull, create new docs from local Markdown, push supported document text edits through the Google Docs connector, and reconcile status clean. | Local only | `crates/loc-cli/tests/e2e_push_workflow.rs::google_docs_workspace_folder_pull_stubs_nested_docs_without_hydrating_folder`; `crates/loc-cli/tests/e2e_push_workflow.rs::google_docs_mount_pull_edit_push_reconciles_clean_with_real_connector`; `crates/loc-cli/tests/e2e_push_workflow.rs::google_docs_mount_create_push_reconciles_clean_with_real_connector`. | Local e2e uses the real Google Docs connector with fake Drive/Docs APIs to verify folder mounts do not hydrate folders as docs, nested docs remain online-only until explicitly pulled, local Markdown creates resolve to the workspace folder parent, supported text edits produce Docs batch updates, and daemon-backed push reconciles clean. Live Google Docs API e2e remains a gap. |
+| E2E-037 | Google Docs workspace-folder mounts enumerate Drive folders/docs as online-only Markdown stubs, hydrate docs on explicit open/pull, create new docs from local Markdown, push supported document text edits through the Google Docs connector, and reconcile status clean. | Partial live | `crates/loc-cli/tests/e2e_push_workflow.rs::google_docs_workspace_folder_pull_stubs_nested_docs_without_hydrating_folder`; `crates/loc-cli/tests/e2e_push_workflow.rs::google_docs_mount_pull_edit_push_reconciles_clean_with_real_connector`; `crates/loc-cli/tests/e2e_push_workflow.rs::google_docs_mount_create_push_reconciles_clean_with_real_connector`; `tests/live_google_docs_vfs_roundtrip.sh`. | Local e2e uses the real Google Docs connector with fake Drive/Docs APIs to verify folder mounts do not hydrate folders as docs, nested docs remain online-only until explicitly pulled, local Markdown creates resolve to the workspace folder parent, supported text edits produce Docs batch updates, and daemon-backed push reconciles clean. The live Linux FUSE path creates a real Google Doc in a scratch Drive folder, pushes a Markdown edit, pulls it back, and cleans up the Drive file. Broader live guardrails and OAuth broker UX remain manual. |
 | E2E-038 | Credential-backed mounted setup and commands fail closed when the stored secret is missing, report reconnect guidance without leaking credential storage internals, and do not materialize, rewrite, or journal local work. | Local only | `crates/loc-cli/tests/e2e_push_workflow.rs::cli_mount_blocks_missing_connection_credential_before_creating_mount`; `crates/loc-cli/tests/e2e_push_workflow.rs::cli_status_and_info_missing_mount_credential_stay_local_without_leaking_secret_ref`; `crates/loc-cli/tests/e2e_push_workflow.rs::cli_search_missing_mount_credential_returns_local_index_without_leaking_secret_ref`; `crates/loc-cli/tests/e2e_push_workflow.rs::cli_log_and_undo_prepared_journal_missing_credential_stay_local_without_secret_ref`; `crates/loc-cli/tests/e2e_push_workflow.rs::cli_connection_reports_and_disconnect_missing_credential_without_leaking_secret_ref`; `crates/loc-cli/tests/e2e_push_workflow.rs::cli_pull_missing_mount_credential_blocks_before_writing_files`; `crates/loc-cli/tests/e2e_push_workflow.rs::cli_push_missing_mount_credential_blocks_before_journal`; `crates/loc-cli/tests/e2e_push_workflow.rs::cli_inspect_missing_mount_credential_reports_reconnect_without_mutating`; `crates/loc-cli/tests/e2e_push_workflow.rs::cli_doctor_reports_missing_mount_credential_without_leaking_secret_ref`; `crates/loc-cli/tests/doctor.rs`. | Live binary workflow covers the healthy stored-credential path; local e2e covers missing-credential local read/navigation surfaces (`status`, `info`, `search`, `connections`, `connection show`, `log`), local recovery (`diff`, `restore`, local prepared-journal `undo`, `disconnect`), and fail-closed remote-dependent commands: mount setup before mount state writes, diagnostics, pull before connector fetch or local writes, push before journal creation, and inspect before remote comparison or local mutation. |
 | E2E-039 | Granola connects with an API key, paginates and incrementally lists real notes, retrieves and renders a stable summary/transcript pair, mounts meetings through the real CLI/daemon/Linux FUSE path, remains clean on repeat discovery, and rejects filesystem writes. | Covered live | `crates/locality-granola/tests/live_integrity.rs::live_public_api_paginates_fetches_transcript_and_renders_canonical_files`; `tests/live_granola_vfs_read.sh`; Granola connector, renderer, discovery-checkpoint, and virtual read-only tests. | The live suite is read-only against an existing generic meeting, runs with isolated local state, verifies no credential appears in reports or SQLite, and emits privacy-safe failure diagnostics. Real macOS File Provider remains a signed-app manual smoke because hosted runners cannot exercise a logged-in Finder session reliably. |
 | E2E-040 | Creating an untracked Notion database `_schema.yaml` under an existing page plans, creates, reads back, and reconciles a real database whose generated schema can immediately validate and create rows. | Covered live | `crates/loc-cli/tests/e2e_push_workflow.rs::live_locality_database_draft_creates_reconciles_and_accepts_rows`; database draft parser/apply, daemon reconciliation, CLI create, and virtual projection tests. | The live test creates a scratch parent, creates the database only through Locality's draft/diff/push path, verifies database and data-source properties through the API, verifies canonical assigned IDs locally, creates a row through the reconciled schema, and archives all scratch content. |
@@ -168,6 +262,16 @@ Coverage labels:
 |---|---|---|
 | `crates/locality-granola/tests/live_integrity.rs::live_public_api_paginates_fetches_transcript_and_renders_canonical_files` | Live connector | Uses the official public API to verify the first page, cursor pagination when present, stable-note metadata and transcript retrieval, canonical summary/transcript frontmatter, speaker-first compact transcript headings, and an `updated_after` request. Covers the connector-facing part of E2E-039. |
 | `tests/live_granola_vfs_read.sh` | Live Linux FUSE product path | Uses an isolated state root and the real `loc`, `localityd`, and `locality-fuse` binaries to connect, register a read-only mount, enumerate meetings through a kernel directory listing, verify the durable incremental checkpoint, hydrate the encrypted-ID fixture through filesystem reads, verify canonical files and clean status, reject a filesystem write without changing bytes, repeat incremental discovery without duplicate identities/paths, and run `loc doctor`. Because GitHub-hosted runners lack a user systemd session, the test starts the FUSE helper directly and requires `doctor` to report only the corresponding `provider_unregistered` lifecycle error while the daemon, credential, mount, and helper remain healthy. Covers the mounted product path of E2E-039. |
+
+## Live Non-Notion Connector Test Coverage Map
+
+| Test | Kind | Behaviors covered |
+|---|---|---|
+| `tests/live_google_docs_vfs_roundtrip.sh` | Live Linux FUSE product path | Seeds a stored Google Docs credential into isolated state, mounts a scratch Drive workspace folder, creates a document through a FUSE `page.md`, verifies `diff` and `push`, pulls the document back through the real Google Docs and Drive APIs, and trashes the scratch Drive file. Covers the live create/edit/read-back side of E2E-037. |
+| `tests/live_google_calendar_vfs_roundtrip.sh` | Live Linux FUSE product path | Seeds a stored Google Calendar credential, creates a calendar event from a local draft under the mounted filesystem, verifies the event projection after pull, and deletes the scratch event through the Calendar API. Covers the live draft-create path for Google Calendar. |
+| `tests/live_gmail_vfs_roundtrip.sh` | Live Linux FUSE product path | Seeds a stored Gmail credential, creates an unsent Gmail UI draft from a mounted `draft/` Markdown file, verifies the projected Gmail draft maps to the created message, and deletes the draft through the Gmail API. Covers the live Gmail draft-create path. |
+| `tests/live_slack_vfs_read.sh` | Live Linux FUSE product path | Seeds a stored Slack credential, mounts selected Slack conversation types read-only, resolves the configured conversation by identity metadata, hydrates its `recent.md`, verifies status stays clean, and proves push is blocked before Slack writes. Covers the live Slack read-only projection and write guardrail. |
+| `tests/live_linear_vfs_roundtrip.sh` | Live Linux FUSE product path | Seeds a Linear API key credential, mounts Linear through the real daemon and FUSE helper, finds the configured issue by frontmatter identity, appends a body marker, pushes and pulls it back, then restores only the original body under current generated frontmatter. Covers the live Linear issue edit/read-back/restore path. |
 
 ## Live Notion Test Coverage Map
 
@@ -322,7 +426,12 @@ Coverage labels:
 | Read-only mount policy | Covered live for plain-file mounted workflow and local shared virtual projections | The stored-credential live binary workflow verifies a read-only scratch mount blocks local push planning before journal/remote writes and leaves Notion unchanged. Local e2e verifies read-only macOS File Provider, Linux FUSE, and Windows Cloud Files virtual projection modes reject write/create/rename/delete attempts without dirtying local state. |
 | Freshness/drift/auto-fast-forward | Partial live | Live tests cover drift preflight, dirty-pull conflict recovery, fast-forward apply/skip behavior, scheduled pull queuing/applying a remote fast-forward, scheduled-pull idle ticks against real Notion without repeated enumeration or duplicate queue growth, and daemon runtime wall-clock polling against real Notion within the active-interval API budget. Local e2e coverage verifies larger-tree scheduled pulls stay as metadata stubs, queue only policy hydration, keep idle ticks from enumerating or growing queued work, simulate an hour of scheduler ticks within the configured API poll budget, assert daemon runtime wall-clock polling stays within the active interval, and cap workspace-virtual freshness jobs while prioritizing dirty/conflicted/active/remote-hint pages; longer production-daemon soak testing remains outside normal CI. |
 | OAuth broker | Local only | Secret separation is tested in connector-focused tests and in the workflow e2e file with the file credential store and connection report surfaces; real OAuth UX/broker round-trip is manual. |
-| Google Docs connector | Local workflow plus guardrails | Local e2e uses the real Google Docs connector with fake Drive/Docs APIs for workspace-folder enumeration, online-only stubs, explicit hydration, local Markdown document create, supported text edit push, journal/reconcile/status-clean behavior, and mounted Markdown guardrails for rendered inline objects, tables, invalid Locality frontmatter, and unsupported document-structure directives before journal/apply. Live Google Docs read/write and OAuth broker smoke remain open. |
+| Granola connector | Covered live read-only | The public API integrity test and Linux FUSE product-path test verify real note enumeration, summary/transcript rendering, incremental discovery, clean status, and read-only write rejection without exposing meeting payloads. |
+| Google Docs connector | Partial live plus local guardrails | Local e2e uses the real Google Docs connector with fake Drive/Docs APIs for workspace-folder enumeration, online-only stubs, explicit hydration, local Markdown document create, supported text edit push, journal/reconcile/status-clean behavior, and mounted Markdown guardrails for rendered inline objects, tables, invalid Locality frontmatter, and unsupported document-structure directives before journal/apply. The live Linux FUSE script covers real Drive/Docs create, edit, pull-back, and cleanup against a scratch folder. |
+| Google Calendar connector | Live draft create path | The live Linux FUSE script creates a real Calendar event from a mounted draft, verifies the projected event after pull, and deletes the scratch event through the Calendar API. |
+| Gmail connector | Live draft create path | The live Linux FUSE script creates an unsent Gmail draft from mounted Markdown, verifies it projects with the created message identity, and deletes the draft through the Gmail API. |
+| Slack connector | Covered live read-only | The live Linux FUSE script hydrates a configured conversation's `recent.md` by identity, verifies the mount stays clean, and verifies push/write attempts are blocked before remote Slack writes. |
+| Linear connector | Live issue edit path | The live Linux FUSE script edits a configured scratch issue body, verifies push and pull-back, then restores the original body while preserving current generated frontmatter. |
 | Packaging/notarization | Manual/publish covered | `make publish` validates signing, stapling, and DMG integrity outside CI. |
 
 ## Remaining Recommended Live E2E Additions
@@ -342,6 +451,7 @@ locate coverage.
    state, and low idle CPU.
 3. **OAuth broker smoke**: use a test Notion integration and broker deployment
    to verify the local client receives/stores only the broker refresh handle.
-4. **Google Docs live e2e**: use a test Google OAuth integration and scratch
-   Drive folder to verify connect, mount, pull, guarded edits, push, and cleanup
-   against the real Google Docs and Drive APIs.
+4. **Broader non-Notion live edge cases**: expand the Google Docs, Google
+   Calendar, Gmail, Slack, and Linear scripts from happy-path smoke coverage
+   into representative guardrails, conflict/drift checks, and OAuth broker UX
+   checks where the provider test accounts can support them safely.

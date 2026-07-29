@@ -8,16 +8,8 @@ on:
       - ".github/workflows/connector-live-e2e.yml"
       - "Cargo.toml"
       - "Cargo.lock"
-      - "crates/locality-connector/**"
-      - "crates/locality-core/**"
-      - "crates/locality-store/**"
-      - "crates/localityd/**"
-      - "crates/loc-cli/**"
-      - "crates/locality-google-docs/**"
-      - "crates/locality-google-calendar/**"
-      - "crates/locality-gmail/**"
-      - "crates/locality-slack/**"
-      - "crates/locality-linear/**"
+      - "rust-toolchain.toml"
+      - "crates/**"
       - "platform/linux/locality-fuse/**"
       - "tests/live_connector_common.sh"
       - "tests/live_google_docs_vfs_roundtrip.sh"
@@ -42,10 +34,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: connector-live-e2e
-    env:
-      LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON }}
-      LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER: ${{ secrets.LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER }}
-      LOCALITY_LIVE_GOOGLE_DOCS_VFS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -66,6 +54,9 @@ jobs:
             sqlite3
       - name: Check live Google Docs secrets and FUSE device
         shell: bash
+        env:
+          LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON }}
+          LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER: ${{ secrets.LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER }}
         run: |
           missing=()
           [ -n "$LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON" ] || missing+=("LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON")
@@ -79,6 +70,10 @@ jobs:
             exit 1
           fi
       - name: Run live Google Docs Linux FUSE e2e
+        env:
+          LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON }}
+          LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER: ${{ secrets.LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER }}
+          LOCALITY_LIVE_GOOGLE_DOCS_VFS: "1"
         run: tests/live_google_docs_vfs_roundtrip.sh
 
   google-calendar-live:
@@ -86,9 +81,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: connector-live-e2e
-    env:
-      LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON }}
-      LOCALITY_LIVE_GOOGLE_CALENDAR_VFS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -109,6 +101,8 @@ jobs:
             sqlite3
       - name: Check live Google Calendar secrets and FUSE device
         shell: bash
+        env:
+          LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON }}
         run: |
           missing=()
           [ -n "$LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON" ] || missing+=("LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON")
@@ -121,6 +115,9 @@ jobs:
             exit 1
           fi
       - name: Run live Google Calendar Linux FUSE e2e
+        env:
+          LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON }}
+          LOCALITY_LIVE_GOOGLE_CALENDAR_VFS: "1"
         run: tests/live_google_calendar_vfs_roundtrip.sh
 
   gmail-live:
@@ -128,10 +125,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: connector-live-e2e
-    env:
-      LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON }}
-      LOCALITY_GMAIL_LIVE_TO_EMAIL: ${{ secrets.LOCALITY_GMAIL_LIVE_TO_EMAIL }}
-      LOCALITY_LIVE_GMAIL_VFS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -152,6 +145,9 @@ jobs:
             sqlite3
       - name: Check live Gmail secrets and FUSE device
         shell: bash
+        env:
+          LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON }}
+          LOCALITY_GMAIL_LIVE_TO_EMAIL: ${{ secrets.LOCALITY_GMAIL_LIVE_TO_EMAIL }}
         run: |
           missing=()
           [ -n "$LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON" ] || missing+=("LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON")
@@ -165,6 +161,10 @@ jobs:
             exit 1
           fi
       - name: Run live Gmail Linux FUSE e2e
+        env:
+          LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON }}
+          LOCALITY_GMAIL_LIVE_TO_EMAIL: ${{ secrets.LOCALITY_GMAIL_LIVE_TO_EMAIL }}
+          LOCALITY_LIVE_GMAIL_VFS: "1"
         run: tests/live_gmail_vfs_roundtrip.sh
 
   slack-live:
@@ -172,11 +172,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: connector-live-e2e
-    env:
-      LOCALITY_SLACK_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_SLACK_LIVE_CREDENTIAL_JSON }}
-      LOCALITY_SLACK_LIVE_CONVERSATION_ID: ${{ secrets.LOCALITY_SLACK_LIVE_CONVERSATION_ID }}
-      LOCALITY_SLACK_LIVE_TYPES: ${{ secrets.LOCALITY_SLACK_LIVE_TYPES }}
-      LOCALITY_LIVE_SLACK_VFS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -197,6 +192,9 @@ jobs:
             sqlite3
       - name: Check live Slack secrets and FUSE device
         shell: bash
+        env:
+          LOCALITY_SLACK_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_SLACK_LIVE_CREDENTIAL_JSON }}
+          LOCALITY_SLACK_LIVE_CONVERSATION_ID: ${{ secrets.LOCALITY_SLACK_LIVE_CONVERSATION_ID }}
         run: |
           missing=()
           [ -n "$LOCALITY_SLACK_LIVE_CREDENTIAL_JSON" ] || missing+=("LOCALITY_SLACK_LIVE_CREDENTIAL_JSON")
@@ -210,6 +208,11 @@ jobs:
             exit 1
           fi
       - name: Run live Slack Linux FUSE e2e
+        env:
+          LOCALITY_SLACK_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_SLACK_LIVE_CREDENTIAL_JSON }}
+          LOCALITY_SLACK_LIVE_CONVERSATION_ID: ${{ secrets.LOCALITY_SLACK_LIVE_CONVERSATION_ID }}
+          LOCALITY_SLACK_LIVE_TYPES: ${{ secrets.LOCALITY_SLACK_LIVE_TYPES }}
+          LOCALITY_LIVE_SLACK_VFS: "1"
         run: tests/live_slack_vfs_read.sh
 
   linear-live:
@@ -217,10 +220,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: connector-live-e2e
-    env:
-      LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
-      LOCALITY_LINEAR_LIVE_ISSUE_ID: ${{ secrets.LOCALITY_LINEAR_LIVE_ISSUE_ID }}
-      LOCALITY_LIVE_LINEAR_VFS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -241,6 +240,9 @@ jobs:
             sqlite3
       - name: Check live Linear secrets and FUSE device
         shell: bash
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          LOCALITY_LINEAR_LIVE_ISSUE_ID: ${{ secrets.LOCALITY_LINEAR_LIVE_ISSUE_ID }}
         run: |
           missing=()
           [ -n "$LINEAR_API_KEY" ] || missing+=("LINEAR_API_KEY")
@@ -254,4 +256,8 @@ jobs:
             exit 1
           fi
       - name: Run live Linear Linux FUSE e2e
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          LOCALITY_LINEAR_LIVE_ISSUE_ID: ${{ secrets.LOCALITY_LINEAR_LIVE_ISSUE_ID }}
+          LOCALITY_LIVE_LINEAR_VFS: "1"
         run: tests/live_linear_vfs_roundtrip.sh
