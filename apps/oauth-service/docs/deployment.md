@@ -81,6 +81,14 @@ return the same shared Google OAuth client ID.
 Optional broker environment overrides for connector local testing:
 
 ```text
+LOCALITY_NOTION_REDIRECT_URIS=http://localhost:8757/oauth/notion/callback,http://127.0.0.1:8757/oauth/notion/callback
+LOCALITY_NOTION_HOSTED_CALLBACK_URI=https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/notion/callback
+LOCALITY_NOTION_AUTH_BASE_URL=https://api.notion.com
+LOCALITY_NOTION_API_BASE_URL=https://api.notion.com
+LOCALITY_GOOGLE_DOCS_REDIRECT_URIS=http://localhost:8757/oauth/google-docs/callback,http://127.0.0.1:8757/oauth/google-docs/callback
+LOCALITY_GOOGLE_DOCS_HOSTED_CALLBACK_URI=https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-docs/callback
+LOCALITY_GOOGLE_DOCS_AUTH_BASE_URL=https://accounts.google.com
+LOCALITY_GOOGLE_DOCS_API_BASE_URL=https://oauth2.googleapis.com
 LOCALITY_GOOGLE_CALENDAR_REDIRECT_URIS=http://localhost:8757/oauth/google-calendar/callback,http://127.0.0.1:8757/oauth/google-calendar/callback
 LOCALITY_GOOGLE_CALENDAR_HOSTED_CALLBACK_URI=https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-calendar/callback
 LOCALITY_GOOGLE_CALENDAR_AUTH_BASE_URL=https://accounts.google.com

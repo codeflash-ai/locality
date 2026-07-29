@@ -128,7 +128,7 @@ loc connect google-docs [--name <id>] [--no-browser] [--broker-url <url>] [--red
 Use this before mounting a Google Drive workspace folder that contains Google
 Docs. Non-Google-Docs Drive files are ignored by the Google Docs connector.
 
-The default broker is `https://afs-oauth-broker.saurabh-b07.workers.dev`; override it with `--broker-url <url>`, `LOCALITY_GOOGLE_DOCS_OAUTH_BROKER_URL`, or `LOCALITY_AUTH_BROKER_URL`. The default local callback is `http://localhost:8757/oauth/google-docs/callback`; override it with `--redirect-uri <uri>` or `LOCALITY_GOOGLE_DOCS_OAUTH_REDIRECT_URI`. In production the broker may use its own HTTPS provider callback registered on the provider app, then hand the browser back to the local callback. The command still stores the resulting OAuth credential locally.
+The default broker is `https://afs-oauth-broker.saurabh-b07.workers.dev`; override it with `--broker-url <url>`, `LOCALITY_GOOGLE_DOCS_OAUTH_BROKER_URL`, or `LOCALITY_AUTH_BROKER_URL`. The default local callback is `http://localhost:8757/oauth/google-docs/callback`; override it with `--redirect-uri <uri>` or `LOCALITY_GOOGLE_DOCS_OAUTH_REDIRECT_URI`. In production the shared Google OAuth client registers the broker's hosted HTTPS callback URIs for Google Docs, Google Calendar, and Gmail, and the broker hands the browser back to the local callback. Broker `LOCALITY_*_REDIRECT_URIS` allowlists keep the local loopback callbacks for that browser handoff. The command still stores the resulting OAuth credential locally.
 
 Key arguments:
 
@@ -155,7 +155,7 @@ loc connect google-calendar [--name <id>] [--no-browser] [--broker-url <url>] [-
 
 Use this before mounting primary-calendar events.
 
-The default broker is `https://afs-oauth-broker.saurabh-b07.workers.dev`; override it with `--broker-url <url>`, `LOCALITY_GOOGLE_CALENDAR_OAUTH_BROKER_URL`, or `LOCALITY_AUTH_BROKER_URL`. The default local callback is `http://localhost:8757/oauth/google-calendar/callback`; override it with `--redirect-uri <uri>` or `LOCALITY_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI`. In production the broker may use its own HTTPS provider callback registered on the provider app, then hand the browser back to the local callback. The command still stores the resulting OAuth credential locally.
+The default broker is `https://afs-oauth-broker.saurabh-b07.workers.dev`; override it with `--broker-url <url>`, `LOCALITY_GOOGLE_CALENDAR_OAUTH_BROKER_URL`, or `LOCALITY_AUTH_BROKER_URL`. The default local callback is `http://localhost:8757/oauth/google-calendar/callback`; override it with `--redirect-uri <uri>` or `LOCALITY_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI`. In production the shared Google OAuth client registers the broker's hosted HTTPS callback URIs for Google Docs, Google Calendar, and Gmail, and the broker hands the browser back to the local callback. Broker `LOCALITY_*_REDIRECT_URIS` allowlists keep the local loopback callbacks for that browser handoff. The command still stores the resulting OAuth credential locally.
 
 Key arguments:
 
@@ -182,7 +182,7 @@ loc connect gmail [--name <id>] [--no-browser] [--broker-url <url>] [--redirect-
 
 Use this before mounting Gmail inbox, sent, and draft folders.
 
-The default broker is `https://afs-oauth-broker.saurabh-b07.workers.dev`; override it with `--broker-url <url>`, `LOCALITY_GMAIL_OAUTH_BROKER_URL`, or `LOCALITY_AUTH_BROKER_URL`. The default local callback is `http://localhost:8757/oauth/gmail/callback`; override it with `--redirect-uri <uri>` or `LOCALITY_GMAIL_OAUTH_REDIRECT_URI`. In production the broker may use its own HTTPS provider callback registered on the provider app, then hand the browser back to the local callback. The command still stores the resulting OAuth credential locally.
+The default broker is `https://afs-oauth-broker.saurabh-b07.workers.dev`; override it with `--broker-url <url>`, `LOCALITY_GMAIL_OAUTH_BROKER_URL`, or `LOCALITY_AUTH_BROKER_URL`. The default local callback is `http://localhost:8757/oauth/gmail/callback`; override it with `--redirect-uri <uri>` or `LOCALITY_GMAIL_OAUTH_REDIRECT_URI`. In production the shared Google OAuth client registers the broker's hosted HTTPS callback URIs for Google Docs, Google Calendar, and Gmail, and the broker hands the browser back to the local callback. Broker `LOCALITY_*_REDIRECT_URIS` allowlists keep the local loopback callbacks for that browser handoff. The command still stores the resulting OAuth credential locally.
 
 Key arguments:
 
