@@ -1992,6 +1992,7 @@ fn connect(args: &[String], json: bool) -> i32 {
         let broker = HttpNotionOAuthBrokerClient::new(broker_config.broker_url.clone());
         let start = match broker.start(&NotionOAuthBrokerStart {
             redirect_uri: broker_config.redirect_uri,
+            hosted_callback_handoff: true,
         }) {
             Ok(start) => start,
             Err(error) => {
@@ -2320,6 +2321,7 @@ fn connect_google_docs(args: &[String], json: bool) -> i32 {
     let start = match broker.start(&OAuthBrokerStart {
         connector: GOOGLE_DOCS_CONNECTOR_ID.to_string(),
         redirect_uri: broker_config.redirect_uri,
+        hosted_callback_handoff: true,
     }) {
         Ok(start) => start,
         Err(error) => {
@@ -2390,6 +2392,7 @@ fn connect_google_calendar(args: &[String], json: bool) -> i32 {
     let start = match broker.start(&OAuthBrokerStart {
         connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
         redirect_uri: broker_config.redirect_uri,
+        hosted_callback_handoff: true,
     }) {
         Ok(start) => start,
         Err(error) => {
@@ -2465,6 +2468,7 @@ fn connect_gmail(args: &[String], json: bool) -> i32 {
     let start = match broker.start(&OAuthBrokerStart {
         connector: GMAIL_CONNECTOR_ID.to_string(),
         redirect_uri: broker_config.redirect_uri,
+        hosted_callback_handoff: true,
     }) {
         Ok(start) => start,
         Err(error) => {
@@ -2533,6 +2537,7 @@ fn connect_slack(args: &[String], json: bool) -> i32 {
     let start = match broker.start(&OAuthBrokerStart {
         connector: SLACK_CONNECTOR_ID.to_string(),
         redirect_uri: broker_config.redirect_uri,
+        hosted_callback_handoff: true,
     }) {
         Ok(start) => start,
         Err(error) => {

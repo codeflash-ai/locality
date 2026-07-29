@@ -4,6 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub struct OAuthBrokerStart {
     pub connector: String,
     pub redirect_uri: String,
+    pub hosted_callback_handoff: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +99,7 @@ mod tests {
         let request = OAuthBrokerStart {
             connector: "google-docs".to_string(),
             redirect_uri: "http://localhost:8757/oauth/google-docs/callback".to_string(),
+            hosted_callback_handoff: true,
         };
 
         let json = serde_json::to_value(&request).expect("serialize request");
@@ -107,6 +109,7 @@ mod tests {
             json["redirect_uri"],
             "http://localhost:8757/oauth/google-docs/callback"
         );
+        assert_eq!(json["hosted_callback_handoff"], true);
     }
 
     #[test]

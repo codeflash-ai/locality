@@ -39,7 +39,8 @@ Request:
 
 ```json
 {
-  "redirect_uri": "http://localhost:8757/oauth/notion/callback"
+  "redirect_uri": "http://localhost:8757/oauth/notion/callback",
+  "hosted_callback_handoff": true
 }
 ```
 
@@ -59,14 +60,16 @@ Response:
 }
 ```
 
-When `LOCALITY_<CONNECTOR>_HOSTED_CALLBACK_URI` is set, `redirect_uri`
-remains the local loopback URI where the client listens.
-`authorization_redirect_uri` and `exchange_redirect_uri` are the HTTPS provider
-callback URI registered with the provider. The browser first returns to the
-broker callback, and the broker redirects the browser to `redirect_uri` with the
-provider code or error. The client then exchanges the code using
-`exchange_redirect_uri`, so the provider sees the same redirect URI during
-authorization and token exchange.
+When `hosted_callback_handoff` is `true` and
+`LOCALITY_<CONNECTOR>_HOSTED_CALLBACK_URI` is set, `redirect_uri` remains the
+local loopback URI where the client listens. `authorization_redirect_uri` and
+`exchange_redirect_uri` are the HTTPS provider callback URI registered with the
+provider. The browser first returns to the broker callback, and the broker
+redirects the browser to `redirect_uri` with the provider code or error. The
+client then exchanges the code using `exchange_redirect_uri`, so the provider
+sees the same redirect URI during authorization and token exchange. Older
+clients that omit `hosted_callback_handoff` stay on the direct loopback flow and
+do not receive hosted callback fields.
 
 ### `GET /v1/oauth/<connector>/callback`
 
@@ -134,7 +137,8 @@ Request:
 
 ```json
 {
-  "redirect_uri": "http://localhost:8757/oauth/google-docs/callback"
+  "redirect_uri": "http://localhost:8757/oauth/google-docs/callback",
+  "hosted_callback_handoff": true
 }
 ```
 
@@ -190,7 +194,8 @@ Request:
 
 ```json
 {
-  "redirect_uri": "http://localhost:8757/oauth/google-calendar/callback"
+  "redirect_uri": "http://localhost:8757/oauth/google-calendar/callback",
+  "hosted_callback_handoff": true
 }
 ```
 
@@ -252,7 +257,8 @@ Request:
 
 ```json
 {
-  "redirect_uri": "http://localhost:8757/oauth/gmail/callback"
+  "redirect_uri": "http://localhost:8757/oauth/gmail/callback",
+  "hosted_callback_handoff": true
 }
 ```
 
@@ -308,7 +314,8 @@ Request:
 
 ```json
 {
-  "redirect_uri": "http://localhost:8757/oauth/slack/callback"
+  "redirect_uri": "http://localhost:8757/oauth/slack/callback",
+  "hosted_callback_handoff": true
 }
 ```
 

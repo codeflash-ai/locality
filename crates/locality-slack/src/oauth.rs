@@ -455,6 +455,7 @@ mod tests {
             .start(&OAuthBrokerStart {
                 connector: "slack".to_string(),
                 redirect_uri: DEFAULT_SLACK_OAUTH_REDIRECT_URI.to_string(),
+                hosted_callback_handoff: true,
             })
             .expect_err("non-success broker response");
 

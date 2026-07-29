@@ -538,6 +538,7 @@ mod tests {
             .start(&OAuthBrokerStart {
                 connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
                 redirect_uri: DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI.to_string(),
+                hosted_callback_handoff: true,
             })
             .expect("start response");
 
@@ -682,6 +683,7 @@ mod tests {
             .start(&OAuthBrokerStart {
                 connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
                 redirect_uri: DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI.to_string(),
+                hosted_callback_handoff: true,
             })
             .expect_err("status should fail");
 
@@ -705,6 +707,7 @@ mod tests {
             .start(&OAuthBrokerStart {
                 connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
                 redirect_uri: DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI.to_string(),
+                hosted_callback_handoff: true,
             })
             .expect_err("decode should fail");
 
@@ -728,6 +731,7 @@ mod tests {
             .start(&OAuthBrokerStart {
                 connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
                 redirect_uri: DEFAULT_GOOGLE_CALENDAR_OAUTH_REDIRECT_URI.to_string(),
+                hosted_callback_handoff: true,
             })
             .expect_err("request should fail");
 

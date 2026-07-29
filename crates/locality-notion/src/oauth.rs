@@ -69,6 +69,7 @@ impl fmt::Debug for NotionOAuthRefresh {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotionOAuthBrokerStart {
     pub redirect_uri: String,
+    pub hosted_callback_handoff: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize)]
@@ -413,6 +414,7 @@ impl HttpNotionOAuthBrokerClient {
             "/v1/oauth/notion/start",
             json!({
                 "redirect_uri": request.redirect_uri,
+                "hosted_callback_handoff": request.hosted_callback_handoff,
             }),
         )
     }

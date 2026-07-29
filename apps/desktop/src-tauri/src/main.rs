@@ -10118,6 +10118,7 @@ fn connect_notion_with_broker(state_root: PathBuf, open_browser: bool) -> Result
     let start = broker
         .start(&NotionOAuthBrokerStart {
             redirect_uri: redirect_uri.clone(),
+            hosted_callback_handoff: true,
         })
         .map_err(|error| format!("Could not start Notion OAuth broker flow: {error}"))?;
     let authorization_url = start.normalized_authorization_url();
@@ -10185,6 +10186,7 @@ fn connect_google_docs_with_broker(
         .start(&OAuthBrokerStart {
             connector: GOOGLE_DOCS_CONNECTOR_ID.to_string(),
             redirect_uri,
+            hosted_callback_handoff: true,
         })
         .map_err(|error| format!("Could not start Google Docs OAuth broker flow: {error}"))?;
     let authorization = run_local_oauth_authorization(
@@ -10238,6 +10240,7 @@ fn connect_google_calendar_with_broker(
         .start(&OAuthBrokerStart {
             connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
             redirect_uri,
+            hosted_callback_handoff: true,
         })
         .map_err(|error| format!("Could not start Google Calendar OAuth broker flow: {error}"))?;
     let authorization = run_local_oauth_authorization(
@@ -10297,6 +10300,7 @@ fn connect_gmail_with_broker(state_root: PathBuf, open_browser: bool) -> Result<
         .start(&OAuthBrokerStart {
             connector: GMAIL_CONNECTOR_ID.to_string(),
             redirect_uri,
+            hosted_callback_handoff: true,
         })
         .map_err(|error| format!("Could not start Gmail OAuth broker flow: {error}"))?;
     let authorization = run_local_oauth_authorization(
@@ -10349,6 +10353,7 @@ fn connect_slack_with_broker(state_root: PathBuf, open_browser: bool) -> Result<
         .start(&OAuthBrokerStart {
             connector: SLACK_CONNECTOR_ID.to_string(),
             redirect_uri,
+            hosted_callback_handoff: true,
         })
         .map_err(|error| format!("Could not start Slack OAuth broker flow: {error}"))?;
     let authorization = run_local_oauth_authorization(

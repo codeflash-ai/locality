@@ -248,7 +248,18 @@ describe("auth broker", () => {
         "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/notion/callback"
     };
 
-    const response = await app.request("/v1/oauth/notion/start", { method: "POST" }, hostedEnv);
+    const response = await app.request(
+      "/v1/oauth/notion/start",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          redirect_uri: "http://localhost:8757/oauth/notion/callback",
+          hosted_callback_handoff: true
+        })
+      },
+      hostedEnv
+    );
 
     expect(response.status).toBe(200);
     const body = (await response.json()) as StartResponse & {
@@ -275,7 +286,14 @@ describe("auth broker", () => {
   it("rejects hosted Notion callback config with an explicit default HTTPS port", async () => {
     const response = await app.request(
       "/v1/oauth/notion/start",
-      { method: "POST" },
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          redirect_uri: "http://localhost:8757/oauth/notion/callback",
+          hosted_callback_handoff: true
+        })
+      },
       {
         ...env,
         LOCALITY_NOTION_HOSTED_CALLBACK_URI:
@@ -292,7 +310,14 @@ describe("auth broker", () => {
   it("rejects hosted Google Docs callback config with an explicit default HTTPS port", async () => {
     const response = await app.request(
       "/v1/oauth/google-docs/start",
-      { method: "POST" },
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          redirect_uri: "http://localhost:8757/oauth/google-docs/callback",
+          hosted_callback_handoff: true
+        })
+      },
       withHostedEnv(
         "LOCALITY_GOOGLE_DOCS_HOSTED_CALLBACK_URI",
         "https://afs-oauth-broker.saurabh-b07.workers.dev:443/v1/oauth/google-docs/callback"
@@ -310,7 +335,14 @@ describe("auth broker", () => {
     async (delimiter) => {
       const response = await app.request(
         "/v1/oauth/google-docs/start",
-        { method: "POST" },
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            redirect_uri: "http://localhost:8757/oauth/google-docs/callback",
+            hosted_callback_handoff: true
+          })
+        },
         withHostedEnv(
           "LOCALITY_GOOGLE_DOCS_HOSTED_CALLBACK_URI",
           `${brokerOrigin}/v1/oauth/google-docs/callback${delimiter}`
@@ -345,6 +377,51 @@ describe("auth broker", () => {
   });
 
   describe.each(hostedConnectorCases)("$connector hosted handoff", (caseDef) => {
+    it("keeps older start clients on direct local redirect flow", async () => {
+      const startResponse = await app.request(
+        caseDef.startPath,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ redirect_uri: caseDef.localRedirectUri })
+        },
+        caseDef.hostedEnv
+      );
+
+      expect(startResponse.status).toBe(200);
+      const start = await startResponse.json() as StartResponse;
+      expect(start.redirect_uri).toBe(caseDef.localRedirectUri);
+      expect(start.authorization_redirect_uri).toBeUndefined();
+      expect(start.exchange_redirect_uri).toBeUndefined();
+      const authorizationUrl = new URL(start.authorization_url);
+      expect(authorizationUrl.searchParams.get("redirect_uri")).toBe(caseDef.localRedirectUri);
+
+      const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        Response.json(caseDef.tokenResponse)
+      );
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+      const exchange = await app.request(
+        caseDef.exchangePath,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            session: start.session,
+            state: start.state,
+            code: "authorization-code",
+            redirect_uri: start.redirect_uri
+          })
+        },
+        caseDef.hostedEnv
+      );
+
+      expect(exchange.status).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const requestBody = caseDef.upstreamBody((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
+      expect(upstreamBodyParam(requestBody, "redirect_uri")).toBe(caseDef.localRedirectUri);
+    });
+
     it("starts OAuth with hosted provider callback and local loopback handoff", async () => {
       const body = await startHostedSession(caseDef);
 
@@ -524,8 +601,7 @@ describe("auth broker", () => {
       LOCALITY_NOTION_HOSTED_CALLBACK_URI:
         "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/notion/callback"
     };
-    const startResponse = await app.request("/v1/oauth/notion/start", { method: "POST" }, hostedEnv);
-    const start = (await startResponse.json()) as StartResponse;
+    const start = await startHostedNotionSession(hostedEnv);
 
     const callback = await app.request(
       `/v1/oauth/notion/callback?code=authorization-code&state=${encodeURIComponent(start.state)}`,
@@ -550,8 +626,7 @@ describe("auth broker", () => {
       LOCALITY_NOTION_HOSTED_CALLBACK_URI:
         "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/notion/callback"
     };
-    const startResponse = await app.request("/v1/oauth/notion/start", { method: "POST" }, hostedEnv);
-    const start = (await startResponse.json()) as StartResponse;
+    const start = await startHostedNotionSession(hostedEnv);
 
     const callback = await app.request(
       `/v1/oauth/notion/callback?error=access_denied&error_description=User%20cancelled&state=${encodeURIComponent(start.state)}`,
@@ -642,8 +717,7 @@ describe("auth broker", () => {
       LOCALITY_NOTION_HOSTED_CALLBACK_URI:
         "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/notion/callback"
     };
-    const startResponse = await app.request("/v1/oauth/notion/start", { method: "POST" }, hostedEnv);
-    const start = (await startResponse.json()) as StartResponse & { exchange_redirect_uri: string };
+    const start = (await startHostedNotionSession(hostedEnv)) as StartResponse & { exchange_redirect_uri: string };
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
       Response.json({
         access_token: "access-token",
@@ -685,8 +759,7 @@ describe("auth broker", () => {
       LOCALITY_NOTION_REDIRECT_URIS: "http://localhost:8757/oauth/notion/callback",
       LOCALITY_NOTION_HOSTED_CALLBACK_URI: hostedNotionCallbackUri
     };
-    const startResponse = await app.request("/v1/oauth/notion/start", { method: "POST" }, hostedEnv);
-    const start = (await startResponse.json()) as StartResponse;
+    const start = await startHostedNotionSession(hostedEnv);
     const fetchMock = vi.fn(async () => Response.json({ access_token: "unexpected" }));
     globalThis.fetch = fetchMock as unknown as typeof fetch;
 
@@ -1515,13 +1588,33 @@ async function startSlackSession() {
   return response.json() as Promise<StartResponse>;
 }
 
+async function startHostedNotionSession(hostedEnv: BrokerEnv) {
+  const response = await app.request(
+    "/v1/oauth/notion/start",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        redirect_uri: "http://localhost:8757/oauth/notion/callback",
+        hosted_callback_handoff: true
+      })
+    },
+    hostedEnv
+  );
+  expect(response.status).toBe(200);
+  return response.json() as Promise<StartResponse>;
+}
+
 async function startHostedSession(caseDef: HostedConnectorCase) {
   const response = await app.request(
     caseDef.startPath,
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ redirect_uri: caseDef.localRedirectUri })
+      body: JSON.stringify({
+        redirect_uri: caseDef.localRedirectUri,
+        hosted_callback_handoff: true
+      })
     },
     caseDef.hostedEnv
   );

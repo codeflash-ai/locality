@@ -44,6 +44,7 @@ const OPERATIONAL_SECRET_MIN_LENGTH = 32;
 
 interface StartRequest {
   redirect_uri?: string;
+  hosted_callback_handoff?: boolean;
 }
 
 interface StartRedirects {
@@ -459,7 +460,8 @@ async function startOAuthConnector(env: BrokerEnv, connector: ConnectorId, body:
     env,
     connector,
     runtime,
-    body.redirect_uri ?? runtime.defaultLocalRedirectUri
+    body.redirect_uri ?? runtime.defaultLocalRedirectUri,
+    body.hosted_callback_handoff === true
   );
   const now = nowSeconds();
   const secret = requireOperationalSecret(env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET");
@@ -495,8 +497,12 @@ async function startOAuthConnector(env: BrokerEnv, connector: ConnectorId, body:
     client_id: runtime.clientId(env),
     authorization_url: runtime.authorizeUrl(env, redirects.authorizationRedirectUri, state),
     redirect_uri: redirects.localRedirectUri,
-    authorization_redirect_uri: redirects.authorizationRedirectUri,
-    exchange_redirect_uri: redirects.exchangeRedirectUri,
+    ...(redirects.hostedHandoff
+      ? {
+          authorization_redirect_uri: redirects.authorizationRedirectUri,
+          exchange_redirect_uri: redirects.exchangeRedirectUri
+        }
+      : {}),
     session,
     state,
     expires_in: SESSION_TTL_SECONDS
@@ -558,9 +564,18 @@ function startRedirects(
   env: BrokerEnv,
   connector: ConnectorId,
   runtime: OAuthConnectorRuntime<unknown>,
-  requestedRedirectUri: string
+  requestedRedirectUri: string,
+  hostedCallbackHandoff: boolean
 ): StartRedirects {
   const localRedirectUri = runtime.validateLocalRedirectUri(env, requestedRedirectUri);
+  if (!hostedCallbackHandoff) {
+    return {
+      localRedirectUri,
+      authorizationRedirectUri: localRedirectUri,
+      exchangeRedirectUri: localRedirectUri,
+      hostedHandoff: false
+    };
+  }
   const hostedCallbackUri = hostedConnectorCallbackUri(env, connector);
   if (!hostedCallbackUri) {
     return {

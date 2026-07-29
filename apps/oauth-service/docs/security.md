@@ -61,8 +61,10 @@ The broker keeps two redirect boundaries separate for every OAuth connector:
 - `LOCALITY_<CONNECTOR>_REDIRECT_URIS` is a loopback-only allowlist for local callbacks such as `http://localhost:8757/oauth/gmail/callback`.
 - `LOCALITY_<CONNECTOR>_HOSTED_CALLBACK_URI` is one exact HTTPS callback served by this broker at the connector's `/v1/oauth/<connector>/callback` path.
 
-When hosted handoff is enabled, the provider authorization request uses the
-hosted callback URI. The callback route verifies a signed state payload before
-redirecting to a loopback URI from the allowlist. The token exchange also uses
-the hosted callback URI so the provider sees the same redirect URI in both OAuth
-steps.
+When hosted handoff is enabled by both a configured hosted callback URI and a
+start request with `hosted_callback_handoff: true`, the provider authorization
+request uses the hosted callback URI. The callback route verifies a signed state
+payload before redirecting to a loopback URI from the allowlist. The token
+exchange also uses the hosted callback URI so the provider sees the same
+redirect URI in both OAuth steps. Clients that do not opt in stay on the direct
+loopback flow.
