@@ -180,7 +180,7 @@ export function mountFileIndexProgressValue(mount: MountSummary): string | null 
 }
 
 export function compactPath(path: string, maxLength = 64): string {
-  const trimmed = path.trim();
+  const trimmed = homeRelativePath(path.trim());
   if (trimmed.length <= maxLength) {
     return trimmed;
   }
@@ -205,6 +205,16 @@ export function compactPath(path: string, maxLength = 64): string {
   }
 
   return best || truncateLeading(trimmed, maxLength);
+}
+
+function homeRelativePath(path: string): string {
+  if (/^\/(?:Users|home)\/[^/]+(?:\/|$)/.test(path)) {
+    return path.replace(/^\/(?:Users|home)\/[^/]+/, "~");
+  }
+  if (/^[A-Za-z]:\\Users\\[^\\]+(?:\\|$)/i.test(path)) {
+    return path.replace(/^[A-Za-z]:\\Users\\[^\\]+/i, "~");
+  }
+  return path;
 }
 
 function isReadyStatus(status: string): boolean {

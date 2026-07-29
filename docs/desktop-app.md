@@ -209,6 +209,19 @@ The same readiness probe and automatic retry handle a disabled File Provider
 encountered during later source setup. Slow approval remains a guided waiting
 state; missing helpers or extensions remain explicit setup failures.
 
+Later source mounts reuse the existing shared File Provider domain. Adding a
+top-level source folder such as `google-calendar-main` signals the domain root
+enumerator so macOS can discover that one child, but must not reimport the
+shared root, replace its registration, or disturb sibling mounts such as
+`notion`. Registration is idempotent when the shared domain already exists;
+automatic setup treats that registration as authoritative rather than removing
+and recreating it to repair metadata. Reimport and readiness repair stay scoped
+to the new mount-point identifier. Mount-point appearance gets an initial
+30-second wait and one 30-second scoped refresh window; if it is still
+unavailable, Locality reports a recoverable preparation warning without
+resetting the domain. Whole-domain unregister or reset is reserved for explicit
+repair flows, never automatic source activation.
+
 The final ready screen must not appear until File Provider approval, the
 CloudStorage root, and the mount root are all verified successfully.
 

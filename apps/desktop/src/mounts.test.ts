@@ -75,7 +75,7 @@ describe("mount display helpers", () => {
       title: "Notion",
       subtitle: "CodeFlash / notion",
       localPath: "/home/ada/Locality/notion",
-      displayPath: "/home/ada/Locality/notion",
+      displayPath: "~/Locality/notion",
       projection: "Linux FUSE",
       access: "Edit enabled",
       content: "24 items, 3 pending",
@@ -192,9 +192,21 @@ describe("mount display helpers", () => {
 
   it("compacts long paths from the middle so filenames remain visible", () => {
     expect(compactPath("/home/ada/Locality/notion/Engineering/Roadmap 2026/page.md", 42)).toBe(
-      "/.../Engineering/Roadmap 2026/page.md",
+      "~/.../Engineering/Roadmap 2026/page.md",
     );
     expect(compactPath("~/Library/CloudStorage/Locality/notion", 64)).toBe(
+      "~/Library/CloudStorage/Locality/notion",
+    );
+  });
+
+  it("shows macOS source mounts relative to the home directory", () => {
+    expect(
+      compactPath(
+        "/Users/saurabh/Library/CloudStorage/Locality/google-calendar-main",
+        64,
+      ),
+    ).toBe("~/Library/CloudStorage/Locality/google-calendar-main");
+    expect(compactPath("/Users/saurabh/Library/CloudStorage/Locality/notion", 64)).toBe(
       "~/Library/CloudStorage/Locality/notion",
     );
   });

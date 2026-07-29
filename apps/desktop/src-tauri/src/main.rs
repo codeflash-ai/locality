@@ -176,7 +176,7 @@ const VIRTUAL_PROJECTION_SOURCE_READY_TIMEOUT: Duration = Duration::from_secs(30
 const VIRTUAL_PROJECTION_SOURCE_READY_POLL: Duration = Duration::from_millis(250);
 const VIRTUAL_PROJECTION_SOURCE_READY_LOG_EVERY: Duration = Duration::from_secs(2);
 #[cfg(target_os = "macos")]
-const MACOS_FILE_PROVIDER_MOUNT_ROOT_APPEAR_TIMEOUT: Duration = Duration::from_secs(5);
+const MACOS_FILE_PROVIDER_MOUNT_ROOT_APPEAR_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(target_os = "macos")]
 const MACOS_FILE_PROVIDER_MOUNT_ROOT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const LIVE_MODE_RUNNER_ACTIVE_INTERVAL: Duration = Duration::from_millis(500);
@@ -8808,7 +8808,7 @@ fn activate_virtual_projection_mount(
         wait_for_mount_entities(state_root, &mount.mount_id)?;
     }
     ensure_virtual_projection_runtime(state_root, mount)?;
-    signal_virtual_projection_refresh(mount);
+    refresh_virtual_projection_mount_activation(mount);
     recover_virtual_projection_mount_root_if_needed(state_root, mount)?;
     desktop_log(
         "info",
@@ -8877,25 +8877,15 @@ fn recover_macos_file_provider_mount_root_if_needed(
 
     desktop_log(
         "warn",
-        "file_provider.recover_started",
+        "file_provider.mount_repair_started",
         format!(
-            "recovering macOS File Provider domain for mount `{}` after activation: {reason}",
+            "refreshing macOS File Provider mount `{}` after activation without resetting the shared domain: {reason}",
             mount.mount_id.0
         ),
     );
-    reset_macos_file_provider_domain(&reason)?;
-    register_macos_virtual_projection(&mount.mount_id.0, &mount.root.display().to_string())?;
-    macos_file_provider_domain_url(localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
-        .map_err(|error| {
-            format!(
-                "Could not open macOS File Provider domain after recovery for `{}`: {}",
-                mount.mount_id.0,
-                error.message()
-            )
-        })?;
     prefetch_virtual_projection_root(state_root, mount)?;
     ensure_virtual_projection_runtime(state_root, mount)?;
-    signal_virtual_projection_refresh(mount);
+    refresh_virtual_projection_mount_activation(mount);
 
     wait_for_macos_file_provider_mount_root_recovery(
         &root,
@@ -8905,9 +8895,9 @@ fn recover_macos_file_provider_mount_root_if_needed(
 
     desktop_log(
         "info",
-        "file_provider.recover_finished",
+        "file_provider.mount_repair_finished",
         format!(
-            "recovered macOS File Provider domain for mount `{}`",
+            "refreshed macOS File Provider mount `{}` without resetting the shared domain",
             mount.mount_id.0
         ),
     );
@@ -8937,7 +8927,7 @@ fn wait_for_macos_file_provider_mount_root_recovery(
 
         if Instant::now() >= deadline {
             return Err(format!(
-                "macOS File Provider recovery did not produce a healthy mount root `{}`: {reason}",
+                "macOS File Provider did not finish preparing mount root `{}`: {reason}",
                 root.display()
             ));
         }
@@ -9000,22 +8990,10 @@ fn evaluate_macos_file_provider_mount_root(root: &Path) -> Result<String, String
     Ok(details)
 }
 
-#[cfg(target_os = "macos")]
-fn reset_macos_file_provider_domain(reason: &str) -> Result<(), String> {
-    run_macos_file_provider_helper("reset", Vec::new())
-        .map(|_| ())
-        .map_err(|error| {
-            format!(
-                "Could not reset macOS File Provider domain while recovering from `{reason}`: {}",
-                error.message()
-            )
-        })
-}
-
 fn macos_file_provider_mount_root_health_error(root: &Path, details: &str) -> Option<String> {
     if details.contains("uploadingError") || details.contains("NSCocoaErrorDomain Code=3328") {
         return Some(format!(
-            "The macOS File Provider mount root `{}` is in a local-upload error state. Run clean-start or reset the Locality File Provider domain, then reconnect Notion.",
+            "The macOS File Provider mount root `{}` is in a local-upload error state. Locality left the shared File Provider domain and other source folders unchanged; review File Provider diagnostics before repairing this mount.",
             root.display()
         ));
     }
@@ -9802,42 +9780,82 @@ fn running_daemon_build(state_root: &Path) -> Option<DaemonBuildInfo> {
         .map(|report| report.build)
 }
 
-fn signal_virtual_projection_refresh(mount: &MountConfig) {
-    for identifier in virtual_projection_refresh_signal_identifiers(mount) {
-        if let Err(error) = signal_virtual_projection_container(mount, &identifier) {
-            desktop_log(
-                "warn",
-                "file_provider.signal_failed",
-                format!(
-                    "could not signal {}:{} refresh: {error}",
-                    mount.mount_id.0, identifier
-                ),
-            );
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VirtualProjectionRefreshAction {
+    Signal(String),
+    ReimportThenSignal(String),
+}
+
+impl VirtualProjectionRefreshAction {
+    fn identifier(&self) -> &str {
+        match self {
+            Self::Signal(identifier) | Self::ReimportThenSignal(identifier) => identifier,
         }
     }
 }
 
-fn virtual_projection_refresh_signal_identifiers(mount: &MountConfig) -> Vec<String> {
+fn signal_virtual_projection_refresh(mount: &MountConfig) {
+    for action in virtual_projection_refresh_actions(mount) {
+        run_virtual_projection_refresh_action(mount, &action);
+    }
+}
+
+fn refresh_virtual_projection_mount_activation(mount: &MountConfig) {
+    for action in virtual_projection_mount_activation_refresh_actions(mount) {
+        run_virtual_projection_refresh_action(mount, &action);
+    }
+}
+
+fn run_virtual_projection_refresh_action(
+    mount: &MountConfig,
+    action: &VirtualProjectionRefreshAction,
+) {
+    if let Err(error) = refresh_virtual_projection_container(mount, &action) {
+        desktop_log(
+            "warn",
+            "file_provider.signal_failed",
+            format!(
+                "could not signal {}:{} refresh: {error}",
+                mount.mount_id.0,
+                action.identifier()
+            ),
+        );
+    }
+}
+
+fn virtual_projection_refresh_actions(mount: &MountConfig) -> Vec<VirtualProjectionRefreshAction> {
     if mount.projection == ProjectionMode::MacosFileProvider {
         return vec![
-            ROOT_CONTAINER_IDENTIFIER.to_string(),
-            mount_point_identifier(mount),
-            "working-set".to_string(),
+            VirtualProjectionRefreshAction::Signal(ROOT_CONTAINER_IDENTIFIER.to_string()),
+            VirtualProjectionRefreshAction::ReimportThenSignal(mount_point_identifier(mount)),
+            VirtualProjectionRefreshAction::Signal("working-set".to_string()),
         ];
     }
     vec![
-        ROOT_CONTAINER_IDENTIFIER.to_string(),
-        mount_point_identifier(mount),
+        VirtualProjectionRefreshAction::Signal(ROOT_CONTAINER_IDENTIFIER.to_string()),
+        VirtualProjectionRefreshAction::Signal(mount_point_identifier(mount)),
     ]
 }
 
-fn signal_virtual_projection_container(
+fn virtual_projection_mount_activation_refresh_actions(
     mount: &MountConfig,
-    container_identifier: &str,
+) -> Vec<VirtualProjectionRefreshAction> {
+    if mount.projection == ProjectionMode::MacosFileProvider {
+        return vec![
+            VirtualProjectionRefreshAction::Signal(ROOT_CONTAINER_IDENTIFIER.to_string()),
+            VirtualProjectionRefreshAction::ReimportThenSignal(mount_point_identifier(mount)),
+        ];
+    }
+    virtual_projection_refresh_actions(mount)
+}
+
+fn refresh_virtual_projection_container(
+    mount: &MountConfig,
+    action: &VirtualProjectionRefreshAction,
 ) -> Result<(), String> {
     match mount.projection {
         ProjectionMode::MacosFileProvider => {
-            refresh_macos_virtual_projection(&mount.mount_id.0, container_identifier)
+            refresh_macos_virtual_projection(&mount.mount_id.0, action)
         }
         ProjectionMode::LinuxFuse
         | ProjectionMode::PlainFiles
@@ -9846,13 +9864,19 @@ fn signal_virtual_projection_container(
 }
 
 #[cfg(target_os = "macos")]
-fn refresh_macos_virtual_projection(mount_id: &str, identifier: &str) -> Result<(), String> {
-    if identifier == "working-set" {
-        return signal_macos_virtual_projection(mount_id, identifier);
+fn refresh_macos_virtual_projection(
+    mount_id: &str,
+    action: &VirtualProjectionRefreshAction,
+) -> Result<(), String> {
+    match action {
+        VirtualProjectionRefreshAction::Signal(identifier) => {
+            signal_macos_virtual_projection(mount_id, identifier)
+        }
+        VirtualProjectionRefreshAction::ReimportThenSignal(identifier) => {
+            reimport_macos_virtual_projection(mount_id, identifier)
+                .or_else(|_| signal_macos_virtual_projection(mount_id, identifier))
+        }
     }
-
-    reimport_macos_virtual_projection(mount_id, identifier)
-        .or_else(|_| signal_macos_virtual_projection(mount_id, identifier))
 }
 
 #[cfg(target_os = "macos")]
@@ -9903,7 +9927,10 @@ fn run_macos_file_provider_refresh_action(
 }
 
 #[cfg(not(target_os = "macos"))]
-fn refresh_macos_virtual_projection(_mount_id: &str, _identifier: &str) -> Result<(), String> {
+fn refresh_macos_virtual_projection(
+    _mount_id: &str,
+    _action: &VirtualProjectionRefreshAction,
+) -> Result<(), String> {
     Ok(())
 }
 
@@ -10512,7 +10539,7 @@ fn recoverable_macos_file_provider_activation_error(message: &str) -> bool {
         || message.contains("registered but not enabled")
         || message.contains("did not return a CloudStorage URL")
         || message.contains("macOS has not created")
-        || (message.contains("did not produce a healthy mount root")
+        || (message.contains("did not finish preparing mount root")
             && macos_file_provider_mount_root_is_missing(message))
 }
 
@@ -12001,12 +12028,13 @@ mod tests {
         ActionReport, DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION,
         LIVE_MODE_REMOTE_FAST_FORWARD_LEASE, LIVE_MODE_RUNNER_ACTIVE_INTERVAL,
         LIVE_MODE_RUNNER_PERIODIC_RECHECK, MonitorScreenBounds, PendingChange, ScreenBounds,
-        TerminalCliLinkState, TrayVisualState, acknowledge_install_state_at, activity_timestamp,
-        clear_mount_cached_projection, clear_state_root_contents, clear_visible_projection_paths,
-        conflict_preview, connection_metadata_changed, current_daemon_build_id,
-        current_desktop_build_id, diff_report_message, exact_located_entity_record,
-        exact_notion_entry_matches, failed_push_summary, has_unresolved_conflict_markers,
-        hydration_after_editor_write, inspect_install_state, install_terminal_cli_link_at,
+        TerminalCliLinkState, TrayVisualState, VirtualProjectionRefreshAction,
+        acknowledge_install_state_at, activity_timestamp, clear_mount_cached_projection,
+        clear_state_root_contents, clear_visible_projection_paths, conflict_preview,
+        connection_metadata_changed, current_daemon_build_id, current_desktop_build_id,
+        diff_report_message, exact_located_entity_record, exact_notion_entry_matches,
+        failed_push_summary, has_unresolved_conflict_markers, hydration_after_editor_write,
+        inspect_install_state, install_terminal_cli_link_at,
         install_terminal_cli_link_in_path_dirs, is_notion_access_lost_message,
         is_unsupported_schema_version_message, live_mode_claim_remote_fast_forward_key,
         live_mode_enabled_mount, live_mode_local_reconcile_targets_for_mount_at,
@@ -12032,8 +12060,8 @@ mod tests {
         summarize_virtual_projection_children, terminal_cli_link_state, tray_icon_image,
         tray_icon_should_use_template, tray_popover_anchor, tray_popover_position,
         unsupported_notion_locator_url_message, validate_mount_root,
-        validate_source_action_confirmation, virtual_projection_prefetch_container_identifiers,
-        virtual_projection_refresh_signal_identifiers,
+        validate_source_action_confirmation, virtual_projection_mount_activation_refresh_actions,
+        virtual_projection_prefetch_container_identifiers, virtual_projection_refresh_actions,
         virtual_projection_source_ready_timeout_message,
         virtual_projection_waits_for_mount_point_children_before_registration,
         wait_for_live_mode_state_change, wake_live_mode_runner, write_terminal_cli_path_section,
@@ -14445,9 +14473,9 @@ mod tests {
     }
 
     #[test]
-    fn file_provider_missing_child_mount_after_recovery_is_recoverable() {
+    fn file_provider_missing_child_mount_while_preparing_is_recoverable() {
         assert!(super::recoverable_macos_file_provider_activation_error(
-            "macOS File Provider recovery did not produce a healthy mount root `/Users/codeflash/Library/CloudStorage/Locality/linear`: Could not inspect macOS File Provider mount root `/Users/codeflash/Library/CloudStorage/Locality/linear`: Error: Error Domain=NSPOSIXErrorDomain Code=2 \"Couldn't find a file for /Users/codeflash/Library/CloudStorage/Locality/linear\" UserInfo={NSDescription=Couldn't find a file for /Users/codeflash/Library/CloudStorage/Locality/linear}"
+            "macOS File Provider did not finish preparing mount root `/Users/codeflash/Library/CloudStorage/Locality/linear`: Could not inspect macOS File Provider mount root `/Users/codeflash/Library/CloudStorage/Locality/linear`: Error: Error Domain=NSPOSIXErrorDomain Code=2 \"Couldn't find a file for /Users/codeflash/Library/CloudStorage/Locality/linear\" UserInfo={NSDescription=Couldn't find a file for /Users/codeflash/Library/CloudStorage/Locality/linear}"
         ));
     }
 
@@ -14970,7 +14998,27 @@ mod tests {
     }
 
     #[test]
-    fn virtual_projection_refresh_signals_macos_file_provider_visible_containers() {
+    fn macos_file_provider_refresh_is_scoped_to_the_new_mount() {
+        let mount = MountConfig::new(
+            MountId::new("google-calendar-main"),
+            "google-calendar",
+            "/tmp/Locality/google-calendar-main",
+        )
+        .projection(ProjectionMode::MacosFileProvider);
+
+        assert_eq!(
+            virtual_projection_mount_activation_refresh_actions(&mount),
+            vec![
+                VirtualProjectionRefreshAction::Signal("root".to_string()),
+                VirtualProjectionRefreshAction::ReimportThenSignal(
+                    "mount:google-calendar-main".to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn macos_file_provider_visible_refresh_never_reimports_the_shared_root() {
         let mount = MountConfig::new(
             MountId::new("notion-main"),
             "notion",
@@ -14979,12 +15027,25 @@ mod tests {
         .projection(ProjectionMode::MacosFileProvider);
 
         assert_eq!(
-            virtual_projection_refresh_signal_identifiers(&mount),
+            virtual_projection_refresh_actions(&mount),
             vec![
-                "root".to_string(),
-                "mount:notion-main".to_string(),
-                "working-set".to_string(),
+                VirtualProjectionRefreshAction::Signal("root".to_string()),
+                VirtualProjectionRefreshAction::ReimportThenSignal("mount:notion-main".to_string(),),
+                VirtualProjectionRefreshAction::Signal("working-set".to_string()),
             ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_file_provider_mount_preparation_uses_non_trivial_waits() {
+        assert_eq!(
+            super::MACOS_FILE_PROVIDER_MOUNT_ROOT_APPEAR_TIMEOUT,
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            super::MACOS_FILE_PROVIDER_MOUNT_ROOT_RECOVERY_TIMEOUT,
+            Duration::from_secs(30)
         );
     }
 
