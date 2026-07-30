@@ -36,11 +36,22 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 tar = { version = "0.4", default-features = false }
+caseless.workspace = true
 unicode-normalization = { version = "=0.1.25", git = "https://github.com/unicode-rs/unicode-normalization.git", rev = "576ae0b1407dd14854876c93f1a348df0c19dffe" }
 zstd = { version = "0.13", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.4", features = ["fs"] }
 
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = [
+  "Wdk_Foundation",
+  "Wdk_Storage_FileSystem",
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+] }

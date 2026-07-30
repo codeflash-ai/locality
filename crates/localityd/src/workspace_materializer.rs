@@ -5,16 +5,15 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
-
 use locality_protocol::workspace_api_v2::{WorkspaceExportOfferV2, WorkspaceProfileSessionV2};
 use locality_protocol::workspace_export_v2::WorkspaceExportTerminalControlV2;
 use serde::{Deserialize, Serialize};
 
 use crate::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 use crate::replica_materializer::{
-    ReplicaMaterializationError, StagingDirectory, remove_workspace_generation,
+    ReplicaMaterializationError, StagingDirectory, WorkspaceGenerationIdentity,
+    remove_workspace_generation, repair_workspace_generation,
+    workspace_generation_identity_if_exists,
 };
 use crate::workspace_archive::{
     ValidatedWorkspaceArchive, WorkspaceArchiveError, WorkspaceArchiveLimits, WorkspaceArchiveSink,
@@ -145,15 +144,24 @@ impl StagedWorkspaceMaterialization {
 
     /// Atomically publish a workspace that does not already exist.
     pub fn publish_initial(
+        self,
+        destination: &Path,
+    ) -> Result<PublishedWorkspace, WorkspaceMaterializationError> {
+        let expected_staging = self.staging.identity()?;
+        self.publish_initial_expected(destination, expected_staging)
+    }
+
+    fn publish_initial_expected(
         mut self,
         destination: &Path,
+        expected_staging: WorkspaceGenerationIdentity,
     ) -> Result<PublishedWorkspace, WorkspaceMaterializationError> {
         if fs::symlink_metadata(destination).is_ok() {
             return Err(WorkspaceMaterializationError::DestinationExists(
                 destination.to_path_buf(),
             ));
         }
-        self.staging.publish(destination)?;
+        self.staging.publish(destination, expected_staging)?;
         self.staging.sync_parent()?;
         Ok(PublishedWorkspace {
             validated: self.validated,
@@ -167,10 +175,25 @@ impl StagedWorkspaceMaterialization {
     /// Platforms without a trustworthy directory-exchange primitive return an
     /// unsupported filesystem error without changing the existing root.
     pub fn publish_exchange(
-        mut self,
+        self,
         destination: &Path,
     ) -> Result<PublishedWorkspace, WorkspaceMaterializationError> {
-        let old_generation = self.staging.exchange(destination)?;
+        let expected_staging = self.staging.identity()?;
+        let expected_destination = generation_identity(destination)?
+            .ok_or_else(|| WorkspaceMaterializationError::DestinationExists(destination.into()))?
+            .into();
+        self.publish_exchange_expected(destination, expected_staging, expected_destination)
+    }
+
+    fn publish_exchange_expected(
+        mut self,
+        destination: &Path,
+        expected_staging: WorkspaceGenerationIdentity,
+        expected_destination: WorkspaceGenerationIdentity,
+    ) -> Result<PublishedWorkspace, WorkspaceMaterializationError> {
+        let old_generation =
+            self.staging
+                .exchange(destination, expected_staging, expected_destination)?;
         Ok(PublishedWorkspace {
             validated: self.validated,
             decoded_bytes: self.decoded_bytes,
@@ -204,6 +227,7 @@ pub enum WorkspacePublicationCheckpoint {
     JournalDurable,
     PublicationComplete,
     ReceiptDurable,
+    CleanupComplete,
 }
 
 /// Fault-injection and host-observation seam. Production callers use `()`;
@@ -235,6 +259,28 @@ struct PublicationJournal {
 struct GenerationIdentity {
     device: u64,
     inode: u64,
+    #[serde(default)]
+    inode_high: u64,
+}
+
+impl From<GenerationIdentity> for WorkspaceGenerationIdentity {
+    fn from(identity: GenerationIdentity) -> Self {
+        Self {
+            device: identity.device,
+            inode: identity.inode,
+            inode_high: identity.inode_high,
+        }
+    }
+}
+
+impl From<WorkspaceGenerationIdentity> for GenerationIdentity {
+    fn from(identity: WorkspaceGenerationIdentity) -> Self {
+        Self {
+            device: identity.device,
+            inode: identity.inode,
+            inode_high: identity.inode_high,
+        }
+    }
 }
 
 /// Complete generation-2 materialization entry point for Desktop, `loc`, and
@@ -292,7 +338,7 @@ pub fn publish_staged_workspace_with_hooks<H: WorkspacePublicationHooks>(
         version: 1,
         destination_name: path_file_name(destination)?,
         staging_name,
-        new_identity: generation_identity(staged.staging.path())?,
+        new_identity: Some(staged.staging.identity()?.into()),
         old_identity: if destination_exists {
             generation_identity(destination)?
         } else {
@@ -310,9 +356,16 @@ pub fn publish_staged_workspace_with_hooks<H: WorkspacePublicationHooks>(
     }
 
     let publication = if destination_exists {
-        staged.publish_exchange(destination)
+        staged.publish_exchange_expected(
+            destination,
+            required_identity(journal.new_identity, "new journal generation")?.into(),
+            required_identity(journal.old_identity, "old journal generation")?.into(),
+        )
     } else {
-        staged.publish_initial(destination)
+        staged.publish_initial_expected(
+            destination,
+            required_identity(journal.new_identity, "new journal generation")?.into(),
+        )
     };
     let published = match publication {
         Ok(published) => published,
@@ -338,12 +391,20 @@ pub fn publish_staged_workspace_with_hooks<H: WorkspacePublicationHooks>(
         });
     }
     if let Some(old_generation) = &published.old_generation {
-        remove_workspace_generation(old_generation).map_err(|source| {
-            WorkspaceMaterializationError::Journal {
-                path: old_generation.clone(),
-                source,
-            }
+        remove_workspace_generation(
+            old_generation,
+            required_identity(journal.old_identity, "old journal generation")?.into(),
+        )
+        .map_err(|source| WorkspaceMaterializationError::Journal {
+            path: old_generation.clone(),
+            source,
         })?;
+    }
+    if let Err(source) = hooks.checkpoint(WorkspacePublicationCheckpoint::CleanupComplete) {
+        return Err(WorkspaceMaterializationError::Journal {
+            path: paths.journal,
+            source,
+        });
     }
     remove_journal_if_present(&paths)?;
     Ok(published)
@@ -378,24 +439,23 @@ pub fn recover_workspace_publication(
 
     if journal.old_identity.is_none() {
         if identity_matches(destination_identity, journal.new_identity) {
+            repair_generation(
+                destination,
+                required_identity(journal.new_identity, "new generation")?,
+            )?;
             replace_durable_receipt(&paths, &journal.new_receipt)?;
-            if staging.exists() {
-                remove_workspace_generation(&staging).map_err(|source| {
-                    WorkspaceMaterializationError::Journal {
-                        path: staging.clone(),
-                        source,
-                    }
-                })?;
+            if staging_identity.is_some() {
+                return Err(WorkspaceMaterializationError::RecoveryConflict(
+                    "initial publication left an unexpected staging generation".to_string(),
+                ));
             }
         } else if identity_matches(staging_identity, journal.new_identity)
             && destination_identity.is_none()
         {
-            remove_workspace_generation(&staging).map_err(|source| {
-                WorkspaceMaterializationError::Journal {
-                    path: staging.clone(),
-                    source,
-                }
-            })?;
+            remove_generation(
+                &staging,
+                required_identity(journal.new_identity, "new generation")?,
+            )?;
         } else if destination_identity.is_some() || staging_identity.is_some() {
             return Err(WorkspaceMaterializationError::RecoveryConflict(
                 "initial publication paths do not match the durable journal".to_string(),
@@ -408,29 +468,51 @@ pub fn recover_workspace_publication(
     if identity_matches(destination_identity, journal.new_identity)
         && identity_matches(staging_identity, journal.old_identity)
     {
+        repair_generation(
+            destination,
+            required_identity(journal.new_identity, "new generation")?,
+        )?;
         replace_durable_receipt(&paths, &journal.new_receipt)?;
-        remove_workspace_generation(&staging).map_err(|source| {
-            WorkspaceMaterializationError::Journal {
-                path: staging.clone(),
-                source,
-            }
-        })?;
+        remove_generation(
+            &staging,
+            required_identity(journal.old_identity, "old generation")?,
+        )?;
         remove_journal_if_present(&paths)?;
         return Ok(());
     }
     if identity_matches(destination_identity, journal.old_identity)
         && identity_matches(staging_identity, journal.new_identity)
     {
-        remove_workspace_generation(&staging).map_err(|source| {
-            WorkspaceMaterializationError::Journal {
-                path: staging.clone(),
-                source,
-            }
-        })?;
+        repair_generation(
+            destination,
+            required_identity(journal.old_identity, "old generation")?,
+        )?;
+        remove_generation(
+            &staging,
+            required_identity(journal.new_identity, "new generation")?,
+        )?;
         remove_journal_if_present(&paths)?;
         return Ok(());
     }
     if identity_matches(destination_identity, journal.old_identity) && staging_identity.is_none() {
+        repair_generation(
+            destination,
+            required_identity(journal.old_identity, "old generation")?,
+        )?;
+        remove_journal_if_present(&paths)?;
+        return Ok(());
+    }
+    if identity_matches(destination_identity, journal.new_identity) && staging_identity.is_none() {
+        let receipt = load_workspace_publication_receipt(destination)?;
+        if receipt.as_ref() != Some(&journal.new_receipt) {
+            return Err(WorkspaceMaterializationError::RecoveryConflict(
+                "new generation cleanup completed without its durable receipt".to_string(),
+            ));
+        }
+        repair_generation(
+            destination,
+            required_identity(journal.new_identity, "new generation")?,
+        )?;
         remove_journal_if_present(&paths)?;
         return Ok(());
     }
@@ -608,36 +690,23 @@ fn path_file_name(path: &Path) -> Result<String, WorkspaceMaterializationError> 
 }
 
 fn ordinary_directory_exists(path: &Path) -> Result<bool, WorkspaceMaterializationError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(true),
-        Ok(_) => Err(WorkspaceMaterializationError::RecoveryConflict(
-            "workspace root is not an ordinary directory".to_string(),
-        )),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(source) => Err(WorkspaceMaterializationError::Journal {
+    workspace_generation_identity_if_exists(path)
+        .map(|identity| identity.is_some())
+        .map_err(|source| WorkspaceMaterializationError::Journal {
             path: path.to_path_buf(),
             source,
-        }),
-    }
+        })
 }
 
 fn generation_identity_if_exists(
     path: &Path,
 ) -> Result<Option<GenerationIdentity>, WorkspaceMaterializationError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-            generation_identity_from_metadata(&metadata).map(Some)
-        }
-        Ok(_) => Err(WorkspaceMaterializationError::RecoveryConflict(format!(
-            "publication path `{}` is not an ordinary directory",
-            path.display()
-        ))),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(WorkspaceMaterializationError::Journal {
+    workspace_generation_identity_if_exists(path)
+        .map(|identity| identity.map(Into::into))
+        .map_err(|source| WorkspaceMaterializationError::Journal {
             path: path.to_path_buf(),
             source,
-        }),
-    }
+        })
 }
 
 fn generation_identity(
@@ -653,34 +722,49 @@ fn generation_identity(
         .map(Some)
 }
 
-#[cfg(unix)]
-fn generation_identity_from_metadata(
-    metadata: &fs::Metadata,
-) -> Result<GenerationIdentity, WorkspaceMaterializationError> {
-    Ok(GenerationIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-#[cfg(not(unix))]
-fn generation_identity_from_metadata(
-    _metadata: &fs::Metadata,
-) -> Result<GenerationIdentity, WorkspaceMaterializationError> {
-    Ok(GenerationIdentity {
-        device: 0,
-        inode: 0,
-    })
-}
-
 fn identity_matches(
     actual: Option<GenerationIdentity>,
     expected: Option<GenerationIdentity>,
 ) -> bool {
     match expected {
         Some(expected) => actual == Some(expected),
-        None => actual.is_some(),
+        None => false,
     }
+}
+
+fn required_identity(
+    identity: Option<GenerationIdentity>,
+    label: &str,
+) -> Result<GenerationIdentity, WorkspaceMaterializationError> {
+    identity.ok_or_else(|| {
+        WorkspaceMaterializationError::RecoveryConflict(format!(
+            "durable journal is missing {label} identity"
+        ))
+    })
+}
+
+fn remove_generation(
+    path: &Path,
+    expected: GenerationIdentity,
+) -> Result<(), WorkspaceMaterializationError> {
+    remove_workspace_generation(path, expected.into()).map_err(|source| {
+        WorkspaceMaterializationError::Journal {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
+}
+
+fn repair_generation(
+    path: &Path,
+    expected: GenerationIdentity,
+) -> Result<(), WorkspaceMaterializationError> {
+    repair_workspace_generation(path, expected.into()).map_err(|source| {
+        WorkspaceMaterializationError::Journal {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
 }
 
 /// Decode and validate an export entirely inside a no-follow sibling staging
