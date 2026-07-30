@@ -1914,10 +1914,13 @@ unverified email matching never confer access.
 ### Policy Changes
 
 Each tenant has one monotonic active authorization epoch. Grant, group,
-principal-disablement, provider-credential-ceiling, source-scope activation/
+principal-disablement, tenant-membership activation/deactivation/role, Workspace
+Profile assignment, provider-credential-ceiling, source-scope activation/
 revocation, or provider ACL/access-set observation changes publish their
-immutable facts and advance that epoch in one transaction. Sessions retain the
-epoch they were issued under for audit, but
+immutable facts and advance that epoch in one transaction. Membership demotion
+and assignment removal also revoke affected reusable launch keys and active
+session capabilities in that transaction. Sessions retain the epoch they were
+issued under for audit, but
 export-attempt creation and retry require it to equal the tenant's active head
 and re-evaluate the selected scopes. This coarse v1 invalidation may revoke more
 sessions than strictly necessary, but it cannot leave a stale grant usable and
@@ -1925,11 +1928,12 @@ does not require rewriting content. A later dependency-aware invalidation index
 may reduce blast radius without changing the session/scope protocol.
 
 Changing profile selection creates a new profile revision and changes only the
-next parameterized export query. Changing a `DataGrant`, group membership, or
-native ACL updates indexed policy/access facts and invalidates affected session
-capabilities; content rows are not rewritten. New sessions always evaluate the
-new revision/ACL epoch. Existing sessions may continue to read bytes already
-delivered until sandbox destruction, but:
+next parameterized export query. Changing a `DataGrant`, group membership,
+tenant membership role/state, Workspace Profile assignment, or native ACL
+updates indexed policy/access facts and invalidates affected launch keys and
+session capabilities; content rows are not rewritten. New sessions always
+evaluate the new revision/ACL epoch. Existing sessions may continue to read
+bytes already delivered until sandbox destruction, but:
 
 - an invalidated session cannot open or restart its export;
 - backend search uses current policy;
@@ -3065,6 +3069,10 @@ verification, and dedicated-cell operational runbooks are complete.
 
 - Grant/profile narrowing and revocation during session creation, export,
   search, changeset submission, and apply.
+- Membership demotion/deactivation and Workspace Profile assignment removal
+  during launch, export creation/retry, search, changeset submission, and push;
+  affected reusable keys and active sessions are revoked in the same epoch
+  transaction and cannot resume under stale authority.
 - Pilot-grant replacement by narrower grants without content rewrite or export-
   protocol migration; workload/`actingFor` intersection and forged claims.
 - Expired, stolen, replayed, cancelled, and over-quota bootstrap/session
