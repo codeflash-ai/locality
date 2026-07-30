@@ -221,6 +221,7 @@ pub struct WorkspacePublicationReceipt {
     pub version: u16,
     pub terminal_control: WorkspaceExportTerminalControlV2,
     pub decoded_bytes: u64,
+    generation_identity: GenerationIdentity,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -263,6 +264,8 @@ struct GenerationIdentity {
     #[serde(default)]
     inode_high: u64,
 }
+
+const PUBLICATION_STATE_VERSION: u16 = 2;
 
 impl From<GenerationIdentity> for WorkspaceGenerationIdentity {
     fn from(identity: GenerationIdentity) -> Self {
@@ -318,36 +321,40 @@ pub fn publish_staged_workspace_with_hooks<H: WorkspacePublicationHooks>(
         ));
     }
     let destination_exists = ordinary_directory_exists(destination)?;
-    let old_receipt = if destination_exists {
-        Some(
-            load_workspace_publication_receipt(destination)?.ok_or_else(|| {
-                WorkspaceMaterializationError::RecoveryConflict(
-                    "an existing workspace root has no durable active receipt".to_string(),
-                )
-            })?,
-        )
+    let new_identity: GenerationIdentity = staged.staging.identity()?.into();
+    let old_identity = if destination_exists {
+        generation_identity(destination)?
+    } else {
+        None
+    };
+    let old_receipt = if let Some(identity) = old_identity {
+        let receipt = load_workspace_publication_receipt(destination)?.ok_or_else(|| {
+            WorkspaceMaterializationError::RecoveryConflict(
+                "an existing workspace root has no durable active receipt".to_string(),
+            )
+        })?;
+        validate_receipt_binding(&receipt, identity, "active workspace receipt")?;
+        Some(receipt)
     } else {
         None
     };
     let staging_name = path_file_name(staged.staging.path())?;
     let new_receipt = WorkspacePublicationReceipt {
-        version: 1,
+        version: PUBLICATION_STATE_VERSION,
         terminal_control: staged.validated.terminal_control.clone(),
         decoded_bytes: staged.decoded_bytes,
+        generation_identity: new_identity,
     };
     let journal = PublicationJournal {
-        version: 1,
+        version: PUBLICATION_STATE_VERSION,
         destination_name: path_file_name(destination)?,
         staging_name,
-        new_identity: Some(staged.staging.identity()?.into()),
-        old_identity: if destination_exists {
-            generation_identity(destination)?
-        } else {
-            None
-        },
+        new_identity: Some(new_identity),
+        old_identity,
         old_receipt,
         new_receipt,
     };
+    validate_journal_receipt_bindings(&journal)?;
     create_durable_journal(&paths, &journal)?;
     if let Err(source) = hooks.checkpoint(WorkspacePublicationCheckpoint::JournalDurable) {
         return Err(WorkspaceMaterializationError::Journal {
@@ -357,6 +364,7 @@ pub fn publish_staged_workspace_with_hooks<H: WorkspacePublicationHooks>(
     }
 
     let publication = if destination_exists {
+        validate_journal_receipt_bindings(&journal)?;
         staged.publish_exchange_expected(
             destination,
             required_identity(journal.new_identity, "new journal generation")?.into(),
@@ -384,7 +392,7 @@ pub fn publish_staged_workspace_with_hooks<H: WorkspacePublicationHooks>(
             source,
         });
     }
-    replace_durable_receipt(&paths, &journal.new_receipt)?;
+    replace_durable_receipt(&paths, destination, &journal.new_receipt)?;
     if let Err(source) = hooks.checkpoint(WorkspacePublicationCheckpoint::ReceiptDurable) {
         return Err(WorkspaceMaterializationError::Journal {
             path: paths.journal,
@@ -392,6 +400,15 @@ pub fn publish_staged_workspace_with_hooks<H: WorkspacePublicationHooks>(
         });
     }
     if let Some(old_generation) = &published.old_generation {
+        validate_receipt_binding(
+            journal.old_receipt.as_ref().ok_or_else(|| {
+                WorkspaceMaterializationError::RecoveryConflict(
+                    "refresh journal has no old-generation receipt".to_string(),
+                )
+            })?,
+            required_identity(journal.old_identity, "old journal generation")?,
+            "old-generation cleanup receipt",
+        )?;
         remove_workspace_generation(
             old_generation,
             required_identity(journal.old_identity, "old journal generation")?.into(),
@@ -422,11 +439,14 @@ pub fn recover_workspace_publication(
         return Ok(());
     }
     let journal: PublicationJournal = read_json(&paths.journal)?;
-    if journal.version != 1 || journal.destination_name != path_file_name(destination)? {
+    if journal.version != PUBLICATION_STATE_VERSION
+        || journal.destination_name != path_file_name(destination)?
+    {
         return Err(WorkspaceMaterializationError::RecoveryConflict(
             "journal version or destination binding is invalid".to_string(),
         ));
     }
+    validate_journal_receipt_bindings(&journal)?;
     if !journal.staging_name.starts_with(".locality-stage-")
         || journal.staging_name.contains(['/', '\\'])
     {
@@ -437,14 +457,25 @@ pub fn recover_workspace_publication(
     let staging = paths.parent.join(&journal.staging_name);
     let destination_identity = generation_identity_if_exists(destination)?;
     let staging_identity = generation_identity_if_exists(&staging)?;
+    let active_receipt = load_workspace_publication_receipt(destination)?;
 
     if journal.old_identity.is_none() {
         if identity_matches(destination_identity, journal.new_identity) {
+            if let Some(receipt) = active_receipt.as_ref() {
+                validate_active_receipt_matches(
+                    receipt,
+                    &[(
+                        &journal.new_receipt,
+                        journal.new_receipt.generation_identity,
+                    )],
+                    "initial publication receipt",
+                )?;
+            }
             repair_generation(
                 destination,
                 required_identity(journal.new_identity, "new generation")?,
             )?;
-            replace_durable_receipt(&paths, &journal.new_receipt)?;
+            replace_durable_receipt(&paths, destination, &journal.new_receipt)?;
             if staging_identity.is_some() {
                 return Err(WorkspaceMaterializationError::RecoveryConflict(
                     "initial publication left an unexpected staging generation".to_string(),
@@ -453,11 +484,19 @@ pub fn recover_workspace_publication(
         } else if identity_matches(staging_identity, journal.new_identity)
             && destination_identity.is_none()
         {
+            if active_receipt.is_some() {
+                return Err(WorkspaceMaterializationError::RecoveryConflict(
+                    "unpublished initial generation has a stale active receipt".to_string(),
+                ));
+            }
             remove_generation(
                 &staging,
                 required_identity(journal.new_identity, "new generation")?,
             )?;
-        } else if destination_identity.is_some() || staging_identity.is_some() {
+        } else if destination_identity.is_some()
+            || staging_identity.is_some()
+            || active_receipt.is_some()
+        {
             return Err(WorkspaceMaterializationError::RecoveryConflict(
                 "initial publication paths do not match the durable journal".to_string(),
             ));
@@ -469,11 +508,34 @@ pub fn recover_workspace_publication(
     if identity_matches(destination_identity, journal.new_identity)
         && identity_matches(staging_identity, journal.old_identity)
     {
+        validate_active_receipt_matches(
+            active_receipt.as_ref().ok_or_else(|| {
+                WorkspaceMaterializationError::RecoveryConflict(
+                    "exchanged workspace has no active receipt".to_string(),
+                )
+            })?,
+            &[
+                (
+                    journal.old_receipt.as_ref().expect("validated old receipt"),
+                    required_identity(journal.old_identity, "old generation")?,
+                ),
+                (
+                    &journal.new_receipt,
+                    required_identity(journal.new_identity, "new generation")?,
+                ),
+            ],
+            "exchanged workspace receipt",
+        )?;
         repair_generation(
             destination,
             required_identity(journal.new_identity, "new generation")?,
         )?;
-        replace_durable_receipt(&paths, &journal.new_receipt)?;
+        replace_durable_receipt(&paths, destination, &journal.new_receipt)?;
+        validate_receipt_binding(
+            journal.old_receipt.as_ref().expect("validated old receipt"),
+            required_identity(journal.old_identity, "old generation")?,
+            "recovery cleanup receipt",
+        )?;
         remove_generation(
             &staging,
             required_identity(journal.old_identity, "old generation")?,
@@ -484,6 +546,18 @@ pub fn recover_workspace_publication(
     if identity_matches(destination_identity, journal.old_identity)
         && identity_matches(staging_identity, journal.new_identity)
     {
+        validate_active_receipt_matches(
+            active_receipt.as_ref().ok_or_else(|| {
+                WorkspaceMaterializationError::RecoveryConflict(
+                    "pre-exchange workspace has no active receipt".to_string(),
+                )
+            })?,
+            &[(
+                journal.old_receipt.as_ref().expect("validated old receipt"),
+                required_identity(journal.old_identity, "old generation")?,
+            )],
+            "pre-exchange workspace receipt",
+        )?;
         repair_generation(
             destination,
             required_identity(journal.old_identity, "old generation")?,
@@ -496,6 +570,18 @@ pub fn recover_workspace_publication(
         return Ok(());
     }
     if identity_matches(destination_identity, journal.old_identity) && staging_identity.is_none() {
+        validate_active_receipt_matches(
+            active_receipt.as_ref().ok_or_else(|| {
+                WorkspaceMaterializationError::RecoveryConflict(
+                    "rolled-back workspace has no active receipt".to_string(),
+                )
+            })?,
+            &[(
+                journal.old_receipt.as_ref().expect("validated old receipt"),
+                required_identity(journal.old_identity, "old generation")?,
+            )],
+            "rolled-back workspace receipt",
+        )?;
         repair_generation(
             destination,
             required_identity(journal.old_identity, "old generation")?,
@@ -504,12 +590,18 @@ pub fn recover_workspace_publication(
         return Ok(());
     }
     if identity_matches(destination_identity, journal.new_identity) && staging_identity.is_none() {
-        let receipt = load_workspace_publication_receipt(destination)?;
-        if receipt.as_ref() != Some(&journal.new_receipt) {
-            return Err(WorkspaceMaterializationError::RecoveryConflict(
-                "new generation cleanup completed without its durable receipt".to_string(),
-            ));
-        }
+        validate_active_receipt_matches(
+            active_receipt.as_ref().ok_or_else(|| {
+                WorkspaceMaterializationError::RecoveryConflict(
+                    "new generation cleanup completed without its durable receipt".to_string(),
+                )
+            })?,
+            &[(
+                &journal.new_receipt,
+                required_identity(journal.new_identity, "new generation")?,
+            )],
+            "post-cleanup workspace receipt",
+        )?;
         repair_generation(
             destination,
             required_identity(journal.new_identity, "new generation")?,
@@ -530,6 +622,30 @@ pub fn load_workspace_publication_receipt(
         return Ok(None);
     }
     read_json(&paths.receipt).map(Some)
+}
+
+/// Recovers any local publication journal and confirms that an existing root
+/// is the exact filesystem generation named by its durable V2 receipt.
+pub fn recover_and_verify_workspace_publication_state(
+    destination: &Path,
+) -> Result<bool, WorkspaceMaterializationError> {
+    let paths = PublicationPaths::new(destination)?;
+    if paths.journal.exists() {
+        recover_workspace_publication(destination)?;
+    }
+    let Some(identity) = generation_identity_if_exists(destination)? else {
+        if paths.receipt.exists() {
+            return Err(WorkspaceMaterializationError::RecoveryConflict(
+                "workspace receipt exists without its published generation".to_string(),
+            ));
+        }
+        return Ok(false);
+    };
+    let Some(receipt) = load_workspace_publication_receipt(destination)? else {
+        return Ok(false);
+    };
+    validate_receipt_binding(&receipt, identity, "active workspace receipt")?;
+    Ok(true)
 }
 
 struct PublicationPaths {
@@ -575,8 +691,15 @@ fn create_durable_journal(
 
 fn replace_durable_receipt(
     paths: &PublicationPaths,
+    destination: &Path,
     receipt: &WorkspacePublicationReceipt,
 ) -> Result<(), WorkspaceMaterializationError> {
+    let identity = generation_identity_if_exists(destination)?.ok_or_else(|| {
+        WorkspaceMaterializationError::RecoveryConflict(
+            "cannot publish a receipt without its workspace generation".to_string(),
+        )
+    })?;
+    validate_receipt_binding(receipt, identity, "durable workspace receipt")?;
     let bytes = serde_json::to_vec(receipt)
         .map_err(|error| WorkspaceMaterializationError::RecoveryConflict(error.to_string()))?;
     let temporary = write_durable_temporary(paths, "receipt", &bytes)?;
@@ -591,6 +714,50 @@ fn replace_durable_receipt(
         path: paths.parent.clone(),
         source,
     })
+}
+
+fn validate_receipt_binding(
+    receipt: &WorkspacePublicationReceipt,
+    expected: GenerationIdentity,
+    context: &str,
+) -> Result<(), WorkspaceMaterializationError> {
+    if receipt.version != PUBLICATION_STATE_VERSION || receipt.generation_identity != expected {
+        return Err(WorkspaceMaterializationError::RecoveryConflict(format!(
+            "{context} does not match the published filesystem generation"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_journal_receipt_bindings(
+    journal: &PublicationJournal,
+) -> Result<(), WorkspaceMaterializationError> {
+    let new_identity = required_identity(journal.new_identity, "new journal generation")?;
+    validate_receipt_binding(&journal.new_receipt, new_identity, "new journal receipt")?;
+    match (journal.old_identity, journal.old_receipt.as_ref()) {
+        (None, None) => Ok(()),
+        (Some(identity), Some(receipt)) => {
+            validate_receipt_binding(receipt, identity, "old journal receipt")
+        }
+        _ => Err(WorkspaceMaterializationError::RecoveryConflict(
+            "journal old generation and receipt presence disagree".to_string(),
+        )),
+    }
+}
+
+fn validate_active_receipt_matches(
+    active: &WorkspacePublicationReceipt,
+    candidates: &[(&WorkspacePublicationReceipt, GenerationIdentity)],
+    context: &str,
+) -> Result<(), WorkspaceMaterializationError> {
+    for (candidate, identity) in candidates {
+        if active == *candidate {
+            return validate_receipt_binding(active, *identity, context);
+        }
+    }
+    Err(WorkspaceMaterializationError::RecoveryConflict(format!(
+        "{context} is stale or belongs to another filesystem generation"
+    )))
 }
 
 fn write_durable_temporary(
