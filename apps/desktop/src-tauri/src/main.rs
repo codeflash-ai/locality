@@ -47,6 +47,10 @@ use loc_cli::push::{
     PushOptions, PushReport, push_report_exit_code, run_push_with_daemon_at_state_root,
 };
 use loc_cli::restore::{RestoreOptions, run_restore};
+use loc_cli::sandbox::{
+    SandboxContentEncodingPreference, SandboxInitOptions, SandboxInitReport, SandboxProfileKey,
+    run_sandbox_init_with_profile_key,
+};
 use loc_cli::search::{
     SearchOptions, SearchResult, is_notion_url_host, notion_id_from_url,
     run_search_with_access_roots, source_url_host,
@@ -451,6 +455,14 @@ struct CreateDesktopMountRequest {
 struct WorkspaceMountOnboardingRequest {
     path: String,
     action: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PortableWorkspaceMaterializationRequest {
+    api_url: String,
+    root: String,
+    profile_key: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1427,6 +1439,27 @@ async fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
         },
     )
     .await
+}
+
+#[tauri::command]
+async fn materialize_portable_workspace(
+    request: PortableWorkspaceMaterializationRequest,
+) -> Result<SandboxInitReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let profile_key = SandboxProfileKey::new(request.profile_key)
+            .map_err(|error| format!("Portable workspace credential is invalid: {error}"))?;
+        run_sandbox_init_with_profile_key(
+            SandboxInitOptions {
+                api_url: request.api_url,
+                root: PathBuf::from(request.root),
+            },
+            profile_key,
+            SandboxContentEncodingPreference::Automatic,
+        )
+        .map_err(|error| format!("Portable workspace materialization failed: {error}"))
+    })
+    .await
+    .map_err(|error| format!("Portable workspace worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -18106,6 +18139,7 @@ fn main() {
             ensure_runtime_ready,
             ensure_terminal_cli_available,
             create_workspace_mount,
+            materialize_portable_workspace,
             create_desktop_mount,
             connect_granola,
             connect_linear,
