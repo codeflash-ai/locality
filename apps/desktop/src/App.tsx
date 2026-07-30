@@ -111,6 +111,7 @@ import {
   type SourceSetupState,
 } from "./source-setup";
 import {
+  invokePortableWorkspace,
   portableWorkspaceSuccessMessage,
   validatePortableWorkspaceForm,
   workspaceWorkflowCommand,
@@ -6161,20 +6162,20 @@ function SettingsView({
     setPortableWorkspaceState("materializing");
     setPortableWorkspaceMessage("Negotiating and materializing the hosted workspace…");
     try {
-      const report = await callCommand<PortableWorkspaceReport>(
-        workspaceWorkflowCommand("hosted"),
-        { request: validation.request },
-        {
-          ok: true,
-          root: validation.request.root,
-          session_id: "demo-session",
-          content_encoding: "identity",
-          entries: 0,
-          files: 0,
-          directories: 0,
-          materialized_bytes: 0,
-          decoded_bytes: 0,
-        },
+      const fallback: PortableWorkspaceReport = {
+        ok: true,
+        root: validation.request.root,
+        session_id: "demo-session",
+        content_encoding: "identity",
+        entries: 0,
+        files: 0,
+        directories: 0,
+        materialized_bytes: 0,
+        decoded_bytes: 0,
+      };
+      const report = await invokePortableWorkspace(
+        (command, args) => callCommand<PortableWorkspaceReport>(command, args, fallback),
+        validation.request,
       );
       setPortableProfileKey("");
       setPortableWorkspaceState("success");

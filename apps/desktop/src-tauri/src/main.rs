@@ -49,7 +49,7 @@ use loc_cli::push::{
 use loc_cli::restore::{RestoreOptions, run_restore};
 use loc_cli::sandbox::{
     SandboxContentEncodingPreference, SandboxInitOptions, SandboxInitReport, SandboxProfileKey,
-    run_sandbox_init_with_profile_key,
+    run_sandbox_init_with_profile_key, validate_sandbox_api_url,
 };
 use loc_cli::search::{
     SearchOptions, SearchResult, is_notion_url_host, notion_id_from_url,
@@ -1445,14 +1445,10 @@ async fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
 async fn materialize_portable_workspace(
     request: PortableWorkspaceMaterializationRequest,
 ) -> Result<SandboxInitReport, String> {
+    let (options, profile_key) = portable_workspace_options(request)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let profile_key = SandboxProfileKey::new(request.profile_key)
-            .map_err(|error| format!("Portable workspace credential is invalid: {error}"))?;
         run_sandbox_init_with_profile_key(
-            SandboxInitOptions {
-                api_url: request.api_url,
-                root: PathBuf::from(request.root),
-            },
+            options,
             profile_key,
             SandboxContentEncodingPreference::Automatic,
         )
@@ -1460,6 +1456,26 @@ async fn materialize_portable_workspace(
     })
     .await
     .map_err(|error| format!("Portable workspace worker failed: {error}"))?
+}
+
+fn portable_workspace_options(
+    request: PortableWorkspaceMaterializationRequest,
+) -> Result<(SandboxInitOptions, SandboxProfileKey), String> {
+    validate_sandbox_api_url(&request.api_url)
+        .map_err(|error| format!("Portable workspace API URL is invalid: {error}"))?;
+    let root = PathBuf::from(request.root);
+    if !root.is_absolute() {
+        return Err("Portable workspace root must be an absolute path".to_string());
+    }
+    let profile_key = SandboxProfileKey::new(request.profile_key)
+        .map_err(|error| format!("Portable workspace credential is invalid: {error}"))?;
+    Ok((
+        SandboxInitOptions {
+            api_url: request.api_url,
+            root,
+        },
+        profile_key,
+    ))
 }
 
 #[tauri::command]
@@ -12114,6 +12130,50 @@ mod tests {
     #[test]
     fn desktop_state_root_absolutizes_relative_fallbacks() {
         assert!(super::absolute_state_root(PathBuf::from(".loc")).is_absolute());
+    }
+
+    #[test]
+    fn portable_workspace_invoke_boundary_rejects_invalid_urls_and_relative_roots() {
+        for api_url in [
+            "https://workspace.example.test/api",
+            "https://user@workspace.example.test",
+            "https://workspace.example.test?tenant=7",
+            "https://workspace.example.test#fragment",
+            "http://workspace.example.test",
+        ] {
+            let error =
+                super::portable_workspace_options(super::PortableWorkspaceMaterializationRequest {
+                    api_url: api_url.to_string(),
+                    root: std::env::temp_dir().join("Locality").display().to_string(),
+                    profile_key: "a".repeat(64),
+                })
+                .expect_err("invalid Desktop API URL must fail before invocation");
+            assert!(error.contains("API URL is invalid"), "{api_url}: {error}");
+        }
+
+        let error =
+            super::portable_workspace_options(super::PortableWorkspaceMaterializationRequest {
+                api_url: "https://workspace.example.test".to_string(),
+                root: "relative/Locality".to_string(),
+                profile_key: "a".repeat(64),
+            })
+            .expect_err("relative Desktop root must fail before invocation");
+        assert!(error.contains("absolute path"));
+    }
+
+    #[test]
+    fn portable_workspace_invoke_boundary_accepts_https_and_loopback_http() {
+        for api_url in ["https://workspace.example.test", "http://127.0.0.1:8080"] {
+            let (options, _) =
+                super::portable_workspace_options(super::PortableWorkspaceMaterializationRequest {
+                    api_url: api_url.to_string(),
+                    root: std::env::temp_dir().join("Locality").display().to_string(),
+                    profile_key: "a".repeat(64),
+                })
+                .expect("valid Desktop workspace request");
+            assert_eq!(options.api_url, api_url);
+            assert!(options.root.is_absolute());
+        }
     }
 
     #[cfg(unix)]
