@@ -453,6 +453,10 @@ The authorization vocabulary is:
 - **principal**: a human or service identity that can authenticate and be
   audited; every workload binds a service principal even when it also acts for
   a human;
+- **tenant membership**: a Locality-owned `Owner`, `Admin`, or `Developer`
+  control-plane role for one human principal. Identity providers authenticate
+  humans and report upstream membership, but Locality rechecks the current
+  product role for every privileged transaction;
 - **group**: a tenant-owned set of principals, usually synchronized from an IdP
   or explicitly managed in Locality; and
 - **grant**: an administrator-owned, versioned rule assigning subjects a maximum
@@ -460,9 +464,10 @@ The authorization vocabulary is:
   credentials and never implies that every resource visible to a connector is
   visible to its subjects.
 
-Provider identities and groups link to Locality IDs through stable provider
-subject IDs. Display names are never identity, and email addresses are used for
-linking only after issuer/domain verification.
+Provider organizations, identities, memberships, and groups link to Locality
+IDs through explicit mappings and stable provider subject IDs. They do not
+replace tenant or principal primary keys. Display names are never identity, and
+an invitation email is metadata rather than an account-linking key.
 
 ### Stable Source Scopes
 
@@ -1825,14 +1830,25 @@ sizes, or operation counts.
 
 ### Who Configures A Sandbox Job
 
-Responsibility is deliberately split:
+Responsibility is deliberately split. The Locality organization roles are
+`Owner`, `Admin`, and `Developer`; there is no read-only Viewer persona because
+an agent developer must be able to launch assigned Workspace Profiles:
 
-| Role                 | Decision                                                                                                                        |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| Tenant administrator | Connects sources, chooses the source visibility ceiling, manages principals/groups, and publishes `DataGrant` revisions.        |
-| Workflow owner       | Publishes a `WorkspaceProfile` selecting mounts, filters, requested actions, and limits inside that ceiling.                    |
-| Sandbox orchestrator | Starts a session for an approved workload, immutable profile revision, acting principal, TTL, and optional narrowing filters.   |
-| Agent                | Uses the already materialized view and proposes changes. It cannot edit grants, change `actingFor`, or broaden filters/actions. |
+| Role                 | Decision                                                                                                                         |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Owner                | Manages authentication, Owners, Admins, Developers, sources, grants, profiles, assignments, and organization settings.          |
+| Admin                | Manages Developers, sources, grants, profiles, assignments, and operations, but cannot add, demote, or remove an Owner.          |
+| Developer            | Uses assigned Workspace Profiles and manages only their own launch keys, sandbox sessions, and activity.                        |
+| Workflow owner       | A capability, not an organization role: publishes a `WorkspaceProfile` selecting mounts and limits when their role permits it.  |
+| Sandbox orchestrator | Starts a session for an approved workload, latest published profile revision captured immutably at launch, acting principal, TTL, and optional narrowing filters. |
+| Agent                | Uses the materialized view and proposes changes. It cannot edit grants, change `actingFor`, or broaden filters or actions.       |
+
+No organization role alone grants source data. A Developer launch requires an
+explicit assignment to the stable Workspace Profile, and the effective data is
+still the intersection of the immutable session-captured profile revision, Data
+Grants, provider ACL, source state, and session limits. Removing a membership or
+assignment revokes the affected launch authority. Concurrent changes must never
+leave a tenant without an active Owner.
 
 `actingFor` is never arbitrary request text. For an interactive launch it comes
 from the authenticated launcher; for a scheduled job it is an administrator-
@@ -1898,10 +1914,13 @@ unverified email matching never confer access.
 ### Policy Changes
 
 Each tenant has one monotonic active authorization epoch. Grant, group,
-principal-disablement, provider-credential-ceiling, source-scope activation/
+principal-disablement, tenant-membership activation/deactivation/role, Workspace
+Profile assignment, provider-credential-ceiling, source-scope activation/
 revocation, or provider ACL/access-set observation changes publish their
-immutable facts and advance that epoch in one transaction. Sessions retain the
-epoch they were issued under for audit, but
+immutable facts and advance that epoch in one transaction. Membership demotion
+and assignment removal also revoke affected reusable launch keys and active
+session capabilities in that transaction. Sessions retain the epoch they were
+issued under for audit, but
 export-attempt creation and retry require it to equal the tenant's active head
 and re-evaluate the selected scopes. This coarse v1 invalidation may revoke more
 sessions than strictly necessary, but it cannot leave a stale grant usable and
@@ -1909,11 +1928,12 @@ does not require rewriting content. A later dependency-aware invalidation index
 may reduce blast radius without changing the session/scope protocol.
 
 Changing profile selection creates a new profile revision and changes only the
-next parameterized export query. Changing a `DataGrant`, group membership, or
-native ACL updates indexed policy/access facts and invalidates affected session
-capabilities; content rows are not rewritten. New sessions always evaluate the
-new revision/ACL epoch. Existing sessions may continue to read bytes already
-delivered until sandbox destruction, but:
+next parameterized export query. Changing a `DataGrant`, group membership,
+tenant membership role/state, Workspace Profile assignment, or native ACL
+updates indexed policy/access facts and invalidates affected launch keys and
+session capabilities; content rows are not rewritten. New sessions always
+evaluate the new revision/ACL epoch. Existing sessions may continue to read
+bytes already delivered until sandbox destruction, but:
 
 - an invalidated session cannot open or restart its export;
 - backend search uses current policy;
@@ -2135,8 +2155,20 @@ source-controlled namespaces.
 
 ### Authentication
 
-- Humans authenticate through enterprise OIDC/SAML; groups arrive through SCIM
-  or explicit mapping.
+- Humans authenticate through a managed OIDC/SAML boundary. V1 uses WorkOS
+  AuthKit for Google login, enterprise SSO, and MFA. WorkOS owns credential and
+  upstream membership lifecycle; Locality owns tenant routing, product roles,
+  Workspace Profile assignments, RLS, and audit.
+- A verified provider instance, organization ID, and subject ID resolve to one
+  active Locality membership. Email and display name never supply tenant or
+  principal authority. The database rechecks current membership during every
+  privileged transaction, so demotion or revocation does not wait for the
+  browser session to expire.
+- Browser sessions are server-created, sealed, secure, HTTP-only host cookies
+  shared across API tasks. OAuth state and PKCE verifier material are sealed and
+  short lived. Provider tokens never enter the administration JavaScript app.
+- Signed identity-provider webhooks are idempotent reconciliation hints; a
+  worker reads authoritative provider state before changing Locality membership.
 - A Workspace Profile may have a revocable reusable launch key. The key binds
   the stable profile identity, not one immutable revision: each successful
   launch resolves and captures the latest published profile revision. Updating
@@ -3037,6 +3069,10 @@ verification, and dedicated-cell operational runbooks are complete.
 
 - Grant/profile narrowing and revocation during session creation, export,
   search, changeset submission, and apply.
+- Membership demotion/deactivation and Workspace Profile assignment removal
+  during launch, export creation/retry, search, changeset submission, and push;
+  affected reusable keys and active sessions are revoked in the same epoch
+  transaction and cannot resume under stale authority.
 - Pilot-grant replacement by narrower grants without content rewrite or export-
   protocol migration; workload/`actingFor` intersection and forged claims.
 - Expired, stolen, replayed, cancelled, and over-quota bootstrap/session
