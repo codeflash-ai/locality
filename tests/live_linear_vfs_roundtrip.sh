@@ -17,6 +17,7 @@ on_error() {
   local code=$?
   echo "live Linear VFS round trip failed during: $step" >&2
   echo "privacy-safe diagnostics: exit=$code" >&2
+  emit_live_debug_diagnostics "Linear VFS round trip" || true
   return "$code"
 }
 

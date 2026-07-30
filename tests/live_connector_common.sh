@@ -16,6 +16,226 @@ _live_report_retained_log() {
   fi
 }
 
+_live_debug_sanitize_file() {
+  local path="$1"
+  local mode="${2:-text}"
+  local max_lines="${3:-${LOCALITY_LIVE_DEBUG_TAIL_LINES:-160}}"
+
+  if [[ ! -s "$path" ]]; then
+    return 0
+  fi
+
+  python3 - "$path" "$mode" "$max_lines" <<'PY'
+import json
+import os
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+mode = sys.argv[2]
+max_lines = int(sys.argv[3])
+
+SENSITIVE_ENV_NAME = re.compile(
+    r"(TOKEN|SECRET|CREDENTIAL|PASSWORD|API_KEY|AUTH|ISSUE_ID|"
+    r"CONVERSATION_ID|TO_EMAIL|EMAIL|REFRESH)",
+    re.IGNORECASE,
+)
+SENSITIVE_KEY_FRAGMENTS = (
+    "token",
+    "secret",
+    "credential",
+    "authorization",
+    "api_key",
+    "password",
+    "refresh",
+    "client_secret",
+    "cookie",
+)
+IDENTIFIER_KEYS = {
+    "id",
+    "remote_id",
+    "remote_ids",
+    "changed_remote_ids",
+    "message_id",
+    "thread_id",
+    "draft_id",
+    "conversation_id",
+    "issue_id",
+    "document_id",
+    "event_id",
+    "channel_id",
+}
+PII_KEYS = {
+    "email",
+    "to",
+    "from",
+    "cc",
+    "bcc",
+    "recipient",
+    "recipients",
+    "account_label",
+}
+
+
+def sensitive_env_values():
+    values = []
+    for name, value in os.environ.items():
+        if not value or not SENSITIVE_ENV_NAME.search(name):
+            continue
+        value = str(value)
+        if len(value) < 4 or value in {"true", "false", "none", "null"}:
+            continue
+        values.append(value)
+    values.sort(key=len, reverse=True)
+    return values
+
+
+ENV_VALUES = sensitive_env_values()
+
+
+def redact_text(text):
+    if not text:
+        return text
+    for value in ENV_VALUES:
+        text = text.replace(value, "<redacted>")
+    replacements = [
+        (r"(?i)(authorization:\s*bearer\s+)[^\s]+", r"\1<redacted>"),
+        (r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1<redacted>"),
+        (r"lin_api_[A-Za-z0-9]+", "<redacted>"),
+        (r"ya29\.[A-Za-z0-9._-]+", "<redacted>"),
+        (r"xox[a-zA-Z]-[A-Za-z0-9-]+", "<redacted>"),
+        (r"gh[pousr]_[A-Za-z0-9_]+", "<redacted>"),
+        (r"AIza[0-9A-Za-z_-]{20,}", "<redacted>"),
+        (
+            r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+            "<redacted>",
+        ),
+        (
+            r'(?i)("?(?:access_token|refresh_token_handle|api_key|token|secret|credential|authorization|client_secret|password)"?\s*[:=]\s*)("[^"]*"|[^,\s}]+)',
+            r"\1<redacted>",
+        ),
+    ]
+    for pattern, replacement in replacements:
+        text = re.sub(pattern, replacement, text)
+    return text
+
+
+def is_sensitive_key(key):
+    lowered = str(key).lower()
+    return any(fragment in lowered for fragment in SENSITIVE_KEY_FRAGMENTS)
+
+
+def sanitize_json(value, key=""):
+    key_lower = str(key).lower()
+    if isinstance(value, dict):
+        return {k: sanitize_json(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        if key_lower in IDENTIFIER_KEYS or key_lower in PII_KEYS or is_sensitive_key(key):
+            return ["<redacted>" for _ in value]
+        return [sanitize_json(item, key) for item in value]
+    if isinstance(value, str):
+        if key_lower in IDENTIFIER_KEYS or key_lower in PII_KEYS or is_sensitive_key(key):
+            return "<redacted>"
+        return redact_text(value)
+    return value
+
+
+try:
+    raw_text = path.read_text(encoding="utf-8", errors="replace")
+except OSError as error:
+    print(f"could not read {path}: {error}", file=sys.stderr)
+    raise SystemExit(0)
+
+if mode == "json":
+    try:
+        parsed = json.loads(raw_text)
+    except Exception:
+        text = raw_text
+    else:
+        text = json.dumps(sanitize_json(parsed), indent=2, sort_keys=True)
+        max_bytes = int(os.environ.get("LOCALITY_LIVE_DEBUG_JSON_BYTES", "20000"))
+        if len(text.encode("utf-8")) > max_bytes:
+            text = text.encode("utf-8")[:max_bytes].decode("utf-8", errors="replace")
+            text += "\n... <truncated>"
+else:
+    lines = raw_text.splitlines()
+    if max_lines > 0 and len(lines) > max_lines:
+        text = f"... showing last {max_lines} of {len(lines)} lines ...\n"
+        text += "\n".join(lines[-max_lines:])
+    else:
+        text = "\n".join(lines)
+
+print(redact_text(text))
+PY
+}
+
+_live_debug_emit_file() {
+  local label="$1"
+  local path="$2"
+  local mode="${3:-text}"
+  local max_lines="${4:-${LOCALITY_LIVE_DEBUG_TAIL_LINES:-160}}"
+
+  if [[ -z "$path" || ! -s "$path" ]]; then
+    return 0
+  fi
+
+  {
+    echo "::group::privacy-safe diagnostics: $label"
+    echo "path: $path"
+    _live_debug_sanitize_file "$path" "$mode" "$max_lines"
+    echo "::endgroup::"
+  } >&2
+}
+
+_live_debug_emit_var_file() {
+  local var_name="$1"
+  local label="$2"
+  local mode="${3:-text}"
+  local max_lines="${4:-${LOCALITY_LIVE_DEBUG_TAIL_LINES:-160}}"
+  local path="${!var_name:-}"
+
+  _live_debug_emit_file "$label" "$path" "$mode" "$max_lines"
+}
+
+emit_live_debug_diagnostics() {
+  local label="${1:-live connector}"
+  local report_var
+  local log_var
+
+  echo "privacy-safe diagnostics: $label" >&2
+  for report_var in \
+    mount_report \
+    connect_report \
+    initial_pull_report \
+    first_pull_report \
+    second_pull_report \
+    diff_report \
+    push_report \
+    pull_after_push_report \
+    edit_diff_report \
+    edit_push_report \
+    pull_after_edit_report \
+    restore_diff_report \
+    restore_push_report \
+    cleanup_diff_report \
+    cleanup_push_report \
+    cleanup_pull_report \
+    status_report \
+    info_report \
+    doctor_report \
+    drive_search_report \
+    calendar_search_report \
+    drafts_list_report \
+    draft_get_report; do
+    _live_debug_emit_var_file "$report_var" "$report_var" json
+  done
+
+  for log_var in command_log daemon_log fuse_log; do
+    _live_debug_emit_var_file "$log_var" "$log_var" text
+  done
+}
+
 require_live_env() {
   local name
   for name in "$@"; do
