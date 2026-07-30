@@ -4134,7 +4134,7 @@ function AddSourceDialog({
                       </label>
                       <p className="quiet-note">
                         {apiKeyConnector === "linear"
-                          ? "Create a key in Linear Settings > API > Personal API keys."
+                          ? "Create a key in Linear Settings > Security & Access > Personal API keys."
                           : "Create a key in Granola Settings > Connectors > API keys. Business or Enterprise is required."}
                       </p>
                     </>
