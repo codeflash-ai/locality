@@ -1019,7 +1019,7 @@ impl ExtractionState {
 }
 
 #[cfg(not(unix))]
-fn write_file_at_path<R: Read>(
+fn write_file_at_path<R: Read + ?Sized>(
     path: &Path,
     reader: &mut R,
     expected_size: u64,
@@ -1089,6 +1089,41 @@ fn make_child_directories_read_only(directory: &OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn sync_directory_tree(directory: &OwnedFd) -> io::Result<()> {
+    let entries = Dir::read_from(directory)?;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let metadata = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        match FileType::from_raw_mode(metadata.st_mode) {
+            FileType::Directory => {
+                let child = open_directory_at(directory, name)?;
+                sync_directory_tree(&child)?;
+            }
+            FileType::RegularFile => {
+                let file = rustix::fs::openat(
+                    directory,
+                    name,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )?;
+                rustix::fs::fsync(&file)?;
+            }
+            _ => {
+                return Err(io::Error::other(format!(
+                    "staging tree contains a non-file, non-directory entry: {}",
+                    name.to_string_lossy()
+                )));
+            }
+        }
+    }
+    rustix::fs::fsync(directory).map_err(Into::into)
+}
+
 #[cfg(not(unix))]
 fn make_tree_read_only(staging: &StagingDirectory) -> io::Result<()> {
     let root = staging.path();
@@ -1116,6 +1151,45 @@ fn collect_directories(root: &Path, directories: &mut Vec<PathBuf>) -> io::Resul
         }
     }
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_path_tree(root: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(io::Error::other(
+                "staging tree contains a symbolic link or reparse point",
+            ));
+        }
+        if file_type.is_dir() {
+            sync_path_tree(&entry.path())?;
+        } else if file_type.is_file() {
+            fs::File::open(entry.path())?.sync_all()?;
+        } else {
+            return Err(io::Error::other(
+                "staging tree contains a non-file, non-directory entry",
+            ));
+        }
+    }
+    sync_directory_if_supported(root)
+}
+
+#[cfg(not(unix))]
+fn sync_directory_if_supported(path: &Path) -> io::Result<()> {
+    match fs::File::open(path).and_then(|directory| directory.sync_all()) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(not(unix))]
@@ -1235,6 +1309,53 @@ fn rename_directory_noreplace(
     .map_err(Into::into)
 }
 
+#[cfg(target_os = "linux")]
+fn workspace_root_is_linux_mount_point(path: &Path) -> Result<bool, ReplicaMaterializationError> {
+    let canonical = fs::canonicalize(path).map_err(ReplicaMaterializationError::Publish)?;
+    let mountinfo =
+        fs::read("/proc/self/mountinfo").map_err(ReplicaMaterializationError::Publish)?;
+    for line in mountinfo.split(|byte| *byte == b'\n') {
+        let Some(separator) = line.windows(3).position(|window| window == b" - ") else {
+            continue;
+        };
+        let Some(encoded_mount_point) = line[..separator].split(|byte| *byte == b' ').nth(4) else {
+            continue;
+        };
+        let mount_point = PathBuf::from(OsString::from_vec(decode_mountinfo_path(
+            encoded_mount_point,
+        )?));
+        if mount_point == canonical {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn decode_mountinfo_path(input: &[u8]) -> Result<Vec<u8>, ReplicaMaterializationError> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut cursor = 0;
+    while cursor < input.len() {
+        if input[cursor] != b'\\' {
+            output.push(input[cursor]);
+            cursor += 1;
+            continue;
+        }
+        let digits = input.get(cursor + 1..cursor + 4).ok_or_else(|| {
+            ReplicaMaterializationError::Publish(io::Error::other("malformed mountinfo escape"))
+        })?;
+        if !digits.iter().all(u8::is_ascii_digit) {
+            return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                "malformed mountinfo escape",
+            )));
+        }
+        let value = (digits[0] - b'0') * 64 + (digits[1] - b'0') * 8 + (digits[2] - b'0');
+        output.push(value);
+        cursor += 4;
+    }
+    Ok(output)
+}
+
 #[cfg(all(
     unix,
     not(any(target_vendor = "apple", target_os = "linux", target_os = "android"))
@@ -1293,7 +1414,7 @@ fn remove_open_staging_directory(parent: &OwnedFd, root: &OwnedFd, hinted_name: 
     unlink_named_entry(parent, hinted_name);
 }
 
-struct StagingDirectory {
+pub(crate) struct StagingDirectory {
     path: PathBuf,
     #[cfg(unix)]
     parent: OwnedFd,
@@ -1305,7 +1426,7 @@ struct StagingDirectory {
 }
 
 impl StagingDirectory {
-    fn create(parent: &Path) -> Result<Self, ReplicaMaterializationError> {
+    pub(crate) fn create(parent: &Path) -> Result<Self, ReplicaMaterializationError> {
         // The pre-open metadata check alone is not enough: the path can be
         // replaced with a symlink before `open`. Keep the descriptor anchored
         // to the requested directory and let the identity checks below detect
@@ -1394,8 +1515,121 @@ impl StagingDirectory {
         )))
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn finalize_durable(&self) -> Result<(), ReplicaMaterializationError> {
+        make_tree_read_only(self).map_err(|source| ReplicaMaterializationError::Write {
+            path: self.path.clone(),
+            source,
+        })?;
+        #[cfg(unix)]
+        sync_directory_tree(&self.root).map_err(|source| ReplicaMaterializationError::Write {
+            path: self.path.clone(),
+            source,
+        })?;
+        #[cfg(not(unix))]
+        sync_path_tree(&self.path).map_err(|source| ReplicaMaterializationError::Write {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    pub(crate) fn sync_parent(&self) -> Result<(), ReplicaMaterializationError> {
+        #[cfg(unix)]
+        {
+            rustix::fs::fsync(&self.parent)
+                .map_err(io::Error::from)
+                .map_err(ReplicaMaterializationError::Publish)
+        }
+        #[cfg(not(unix))]
+        {
+            let parent = self
+                .path
+                .parent()
+                .ok_or(ReplicaMaterializationError::InvalidDestination)?;
+            sync_directory_if_supported(parent).map_err(ReplicaMaterializationError::Publish)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn exchange(
+        &mut self,
+        destination: &Path,
+    ) -> Result<PathBuf, ReplicaMaterializationError> {
+        let parent_path = self
+            .path
+            .parent()
+            .ok_or(ReplicaMaterializationError::InvalidDestination)?
+            .to_path_buf();
+        if destination.parent() != Some(parent_path.as_path()) {
+            return Err(ReplicaMaterializationError::InvalidDestination);
+        }
+        let destination_name = destination
+            .file_name()
+            .ok_or(ReplicaMaterializationError::InvalidDestination)?;
+        let root_identity = rustix::fs::fstat(&self.root)
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        let old_identity =
+            rustix::fs::statat(&self.parent, destination_name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        if FileType::from_raw_mode(old_identity.st_mode) != FileType::Directory {
+            return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                "workspace publication root is not an ordinary directory",
+            )));
+        }
+        let parent_identity = rustix::fs::fstat(&self.parent)
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        if old_identity.st_dev != parent_identity.st_dev
+            || workspace_root_is_linux_mount_point(destination)?
+        {
+            return Err(ReplicaMaterializationError::Publish(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "workspace publication root is a mount point or different filesystem",
+            )));
+        }
+        if !named_entry_matches(&self.parent, &self.name, &root_identity).unwrap_or(false) {
+            return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                "workspace staging root identity changed before exchange",
+            )));
+        }
+        let old_path = self.path.clone();
+        rustix::fs::renameat_with(
+            &self.parent,
+            &self.name,
+            &self.parent,
+            destination_name,
+            RenameFlags::EXCHANGE,
+        )
+        .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        self.published = true;
+        if !named_entry_matches(&self.parent, destination_name, &root_identity).unwrap_or(false)
+            || !named_entry_matches(&self.parent, &self.name, &old_identity).unwrap_or(false)
+        {
+            return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                "workspace root identity changed during atomic exchange",
+            )));
+        }
+        rustix::fs::fchmod(&self.root, Mode::from_raw_mode(0o555))
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        rustix::fs::fsync(&self.root)
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        self.path = destination.to_path_buf();
+        self.sync_parent()?;
+        Ok(old_path)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn exchange(
+        &mut self,
+        _destination: &Path,
+    ) -> Result<PathBuf, ReplicaMaterializationError> {
+        Err(ReplicaMaterializationError::Publish(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic workspace directory exchange is unavailable on this platform",
+        )))
     }
 
     #[cfg(unix)]
@@ -1428,7 +1662,10 @@ impl StagingDirectory {
     }
 
     #[cfg(unix)]
-    fn create_directory(&self, logical_path: &str) -> Result<(), ReplicaMaterializationError> {
+    pub(crate) fn create_directory(
+        &self,
+        logical_path: &str,
+    ) -> Result<(), ReplicaMaterializationError> {
         self.open_or_create_directory(logical_path)
             .map(|_| ())
             .map_err(|source| ReplicaMaterializationError::Write {
@@ -1438,14 +1675,17 @@ impl StagingDirectory {
     }
 
     #[cfg(not(unix))]
-    fn create_directory(&self, logical_path: &str) -> Result<(), ReplicaMaterializationError> {
+    pub(crate) fn create_directory(
+        &self,
+        logical_path: &str,
+    ) -> Result<(), ReplicaMaterializationError> {
         let path = self.path.join(logical_path);
         fs::create_dir_all(&path)
             .map_err(|source| ReplicaMaterializationError::Write { path, source })
     }
 
     #[cfg(unix)]
-    fn write_file<R: Read>(
+    pub(crate) fn write_file<R: Read + ?Sized>(
         &self,
         logical_path: &str,
         reader: &mut R,
@@ -1502,7 +1742,7 @@ impl StagingDirectory {
     }
 
     #[cfg(not(unix))]
-    fn write_file<R: Read>(
+    pub(crate) fn write_file<R: Read + ?Sized>(
         &self,
         logical_path: &str,
         reader: &mut R,
@@ -1519,7 +1759,10 @@ impl StagingDirectory {
     }
 
     #[cfg(unix)]
-    fn publish(&mut self, destination: &Path) -> Result<(), ReplicaMaterializationError> {
+    pub(crate) fn publish(
+        &mut self,
+        destination: &Path,
+    ) -> Result<(), ReplicaMaterializationError> {
         let parent_path = self
             .path
             .parent()
@@ -1577,7 +1820,10 @@ impl StagingDirectory {
     }
 
     #[cfg(not(unix))]
-    fn publish(&mut self, destination: &Path) -> Result<(), ReplicaMaterializationError> {
+    pub(crate) fn publish(
+        &mut self,
+        destination: &Path,
+    ) -> Result<(), ReplicaMaterializationError> {
         match fs::rename(&self.path, destination) {
             Ok(()) => {
                 if let Err(error) = set_directory_read_only(destination) {
