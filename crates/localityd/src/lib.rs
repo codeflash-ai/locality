@@ -33,6 +33,7 @@ pub mod trace;
 pub mod virtual_fs;
 pub mod virtual_projection;
 pub mod watcher;
+pub mod workspace_archive;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
