@@ -1,0 +1,30 @@
+{
+  "directories": [
+    { "path": "Engineering", "scope_ordinal": null },
+    { "path": "Sales", "scope_ordinal": null },
+    { "path": "Sales/Projects", "scope_ordinal": 0 },
+    { "path": "Sales/Projects/Roadmap", "scope_ordinal": 0 }
+  ],
+  "files": [
+    {
+      "path": "Sales/Projects/Roadmap/page.md",
+      "logical_path": "Projects/Roadmap/page.md",
+      "scope_ordinal": 0,
+      "projection_id": "projection-roadmap",
+      "source_connection_id": "source-notion",
+      "file_kind": "markdown",
+      "effective_actions": ["read", "update"],
+      "content": "# Roadmap\n"
+    },
+    {
+      "path": "Sales/README.md",
+      "logical_path": "README.md",
+      "scope_ordinal": 2,
+      "projection_id": "projection-readme",
+      "source_connection_id": "source-notion",
+      "file_kind": "markdown",
+      "effective_actions": ["read"],
+      "content": "Public\n"
+    }
+  ]
+}
