@@ -1257,6 +1257,116 @@ fn daemon_push_reconciles_google_calendar_draft_create_to_canonical_event_filena
 }
 
 #[test]
+fn daemon_push_reconciles_long_google_calendar_event_id_to_filesystem_safe_filename() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let source_path = Path::new("draft/design-review.md");
+    let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(
+        &cache_path,
+        "---\ntitle: Design review\nsummary: Design review\nstart:\n  dateTime: \"2026-07-20T10:00:00-07:00\"\nend:\n  dateTime: \"2026-07-20T10:30:00-07:00\"\n---\nAgenda\n",
+    )
+    .expect("cache file");
+
+    let draft_folder_id = RemoteId::new("google-calendar-folder:draft");
+    let events_folder_id = RemoteId::new("google-calendar-folder:events");
+    let long_event_id = format!("loc{}", "a".repeat(1024));
+    let event_id_hash = locality_core::shadow::stable_hash(&long_event_id);
+    let created_remote_id = RemoteId::new(format!("google-calendar-event:primary:{long_event_id}"));
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "google-calendar", &fixture.root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            draft_folder_id.clone(),
+            EntityKind::Directory,
+            "draft",
+            "draft",
+        ))
+        .expect("save draft folder");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            events_folder_id.clone(),
+            EntityKind::Directory,
+            "events",
+            "events",
+        ))
+        .expect("save events folder");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:calendar-draft",
+            VirtualMutationKind::Create,
+            None,
+            Some(draft_folder_id),
+            "draft/design-review.md",
+            Some(cache_path),
+        ))
+        .expect("save mutation");
+    let source = FakePushSource::default()
+        .with_created_entity(
+            created_remote_id.clone(),
+            rendered_google_calendar_entity(
+                created_remote_id.as_str(),
+                "Design review",
+                "2026-07-20T10:00:00-07:00",
+                "Agenda",
+            ),
+        )
+        .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
+            operation_id: PushOperationId("create-calendar-draft".to_string()),
+            operation_index: 0,
+            parent_id: events_folder_id,
+            entity_id: created_remote_id.clone(),
+        }]);
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join(source_path),
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &source,
+        Some(&state_root),
+    )
+    .expect("push google calendar draft with long event id");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    let event = store
+        .get_entity(&fixture.mount_id, &created_remote_id)
+        .expect("get created event")
+        .expect("created event entity");
+    let filename = event
+        .path
+        .file_name()
+        .expect("event filename")
+        .to_string_lossy();
+    assert!(
+        filename.len() <= 255,
+        "filename component must fit common filesystem limits: {}",
+        filename.len()
+    );
+    assert!(filename.starts_with("20260720-100000-design-review-"));
+    assert!(filename.ends_with(".md"));
+    assert!(
+        filename.contains(&event_id_hash[..16]),
+        "shortened event ids should keep a stable hash suffix"
+    );
+    assert!(content_root.join(&event.path).exists());
+    assert!(!content_root.join(source_path).exists());
+}
+
+#[test]
 fn daemon_push_accepts_google_calendar_summary_only_draft_create() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join(".state");

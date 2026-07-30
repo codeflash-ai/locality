@@ -17,6 +17,7 @@ use locality_core::model::{
 };
 use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind};
 use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
+use locality_core::shadow::stable_hash;
 use locality_core::validation::ValidationIssue;
 use locality_core::{LocalityError, LocalityResult};
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,8 @@ const LOCAL_DRAFT_REMOTE_ID: &str = "google-calendar-draft:local";
 const GOOGLE_CALENDAR_DRAFT_NATIVE_KIND: &str = "google_calendar_draft";
 const LOCAL_DRAFT_EVENT_ID: &str = "locality-google-calendar-draft-local";
 const LOCAL_DRAFT_CONFERENCE_REQUEST_ID: &str = "locality-google-calendar-conference-local";
+const EVENT_FILENAME_SLUG_MAX_LEN: usize = 96;
+const EVENT_FILENAME_HASH_LEN: usize = 16;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct GoogleCalendarConfig {
@@ -1119,7 +1122,23 @@ fn safe_slug(value: &str) -> String {
     if slug.is_empty() {
         "untitled".to_string()
     } else {
-        slug.to_string()
+        bound_slug(slug, value)
+    }
+}
+
+fn bound_slug(slug: &str, source: &str) -> String {
+    if slug.len() <= EVENT_FILENAME_SLUG_MAX_LEN {
+        return slug.to_string();
+    }
+
+    let hash = stable_hash(source);
+    let hash = &hash[..EVENT_FILENAME_HASH_LEN];
+    let prefix_len = EVENT_FILENAME_SLUG_MAX_LEN.saturating_sub(hash.len() + 1);
+    let prefix = slug[..prefix_len].trim_matches('-');
+    if prefix.is_empty() {
+        hash.to_string()
+    } else {
+        format!("{prefix}-{hash}")
     }
 }
 
@@ -1539,6 +1558,29 @@ google_calendar:
         assert_eq!(
             connector.supported_push_operations(),
             [PushOperationKind::CreateEntity].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn event_filename_bounds_long_event_ids_to_filesystem_component_limit() {
+        let long_event_id = format!("loc{}", "a".repeat(1024));
+        let filename = super::event_filename(&event_fixture("event-1"), &long_event_id);
+        let event_id_hash = locality_core::shadow::stable_hash(&long_event_id);
+
+        assert!(
+            filename.len() <= 255,
+            "filename component must fit common filesystem limits: {}",
+            filename.len()
+        );
+        assert!(filename.starts_with("20260720-100000-design-review-"));
+        assert!(filename.ends_with(".md"));
+        assert!(
+            filename.len() < long_event_id.len(),
+            "long event ids should be shortened in filenames"
+        );
+        assert!(
+            filename.contains(&event_id_hash[..16]),
+            "shortened event ids should keep a stable hash suffix"
         );
     }
 
