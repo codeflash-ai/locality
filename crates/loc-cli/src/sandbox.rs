@@ -15,6 +15,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use locality_protocol::workspace_api_v2::{WorkspaceExportOfferV2, WorkspaceProfileSessionV2};
 use locality_protocol::{
     ExportAttemptLimits, ExportAttemptRequest, OpaqueBootstrapExchangeRequest,
     SCOPE_AUTHORIZED_COMPONENT_VERSIONS, SandboxSessionState, SandboxSessionStatus,
@@ -27,6 +28,10 @@ use localityd::replica_materializer::{
     ReplicaMaterializationLimits, ReplicaMaterializationSummary,
     materialize_replica_archive_with_expected_receipt,
     materialize_scope_authorized_replica_archive,
+};
+use localityd::workspace_materializer::{
+    PublishedWorkspace, WorkspaceMaterializationError, WorkspaceMaterializationLimits,
+    materialize_workspace_archive_durable,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
@@ -563,6 +568,20 @@ pub fn run_sandbox_init(
         bootstrap_token,
         SandboxContentEncodingPreference::Automatic,
     )
+}
+
+/// Headless `loc` integration for an authenticated generation-2 export.
+///
+/// Desktop calls the same public localityd materializer directly. Keeping this
+/// additive entry point separate leaves every API-v1 bootstrap path unchanged.
+pub fn materialize_workspace_export_v2<Body: Read>(
+    archive: ReplicaArchive<Body>,
+    destination: &Path,
+    limits: WorkspaceMaterializationLimits,
+    session: &WorkspaceProfileSessionV2,
+    offer: &WorkspaceExportOfferV2,
+) -> Result<PublishedWorkspace, WorkspaceMaterializationError> {
+    materialize_workspace_archive_durable(archive, destination, limits, session, offer)
 }
 
 /// Initializes a sandbox with an explicit export content-negotiation policy.

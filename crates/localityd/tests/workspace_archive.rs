@@ -27,7 +27,11 @@ use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 use localityd::workspace_archive::{
     WorkspaceArchiveLimits, WorkspaceArchiveSink, validate_workspace_tar,
 };
-use localityd::workspace_materializer::{WorkspaceMaterializationLimits, stage_workspace_archive};
+use localityd::workspace_materializer::{
+    WorkspaceMaterializationLimits, WorkspacePublicationCheckpoint, WorkspacePublicationHooks,
+    load_workspace_publication_receipt, materialize_workspace_archive_durable,
+    publish_staged_workspace_with_hooks, recover_workspace_publication, stage_workspace_archive,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -443,6 +447,85 @@ fn archive_adapter_rejects_nonfinal_control_and_unsafe_types() {
 }
 
 #[test]
+fn archive_adapter_rejects_links_devices_and_fifos_before_staging_bodies() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    for (label, entry_type) in [
+        ("symlink", EntryType::symlink()),
+        ("hardlink", EntryType::hard_link()),
+        ("block", EntryType::block_special()),
+        ("character", EntryType::character_special()),
+        ("fifo", EntryType::fifo()),
+    ] {
+        let mut builder = Builder::new(Vec::new());
+        let mut header = Header::new_gnu();
+        header.set_entry_type(entry_type);
+        header.set_mode(0o555);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        header.set_size(0);
+        header.set_path("Sales/hostile").expect("hostile path");
+        if matches!(label, "symlink" | "hardlink") {
+            header.set_link_name("../../escape").expect("link target");
+        }
+        header.set_cksum();
+        builder
+            .append(&header, io::empty())
+            .expect("append hostile entry");
+        builder.finish().expect("finish hostile archive");
+        let mut sink = MemorySink::default();
+        let error = validate_workspace_tar(
+            &mut Cursor::new(builder.into_inner().expect("hostile bytes")),
+            &mut sink,
+            WorkspaceArchiveLimits::default(),
+            &contract.session,
+            &contract.offer,
+        )
+        .expect_err("special entry must fail");
+        assert!(
+            error.to_string().contains("special entries are forbidden"),
+            "case {label}: {error}"
+        );
+        assert!(sink.files.is_empty(), "case {label} staged a file");
+    }
+}
+
+#[test]
+fn archive_adapter_rejects_trailing_data_and_casefold_collisions() {
+    let valid_fixture = fixture();
+    let contract = contract(&valid_fixture);
+    let mut trailing = archive(&valid_fixture, &contract.control);
+    trailing.extend_from_slice(b"trailing");
+    let mut sink = MemorySink::default();
+    let error = validate_workspace_tar(
+        &mut Cursor::new(trailing),
+        &mut sink,
+        WorkspaceArchiveLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect_err("trailing data must fail");
+    assert!(error.to_string().contains("trailing data"));
+
+    let mut collision = fixture();
+    collision.directories.push(FixtureDirectory {
+        path: "Sales/projects".to_string(),
+        scope_ordinal: Some(0),
+    });
+    let mut sink = MemorySink::default();
+    let error = validate_workspace_tar(
+        &mut Cursor::new(archive(&collision, &contract.control)),
+        &mut sink,
+        WorkspaceArchiveLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect_err("case-fold collision must fail");
+    assert!(error.to_string().contains("case-fold collision"));
+}
+
+#[test]
 fn staged_identity_and_zstd_archives_publish_complete_read_only_roots() {
     for encoding in [
         ReplicaArchiveEncoding::Identity,
@@ -516,9 +599,12 @@ fn truncated_staging_never_changes_an_existing_root() {
     directory.assert_only(&["Locality"]);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    unix,
+    any(target_vendor = "apple", target_os = "linux", target_os = "android")
+))]
 #[test]
-fn linux_refresh_atomically_exchanges_complete_generation_roots() {
+fn supported_unix_refresh_atomically_exchanges_complete_generation_roots() {
     let fixture = fixture();
     let contract = contract(&fixture);
     let directory = TestDirectory::new("exchange");
@@ -551,7 +637,10 @@ fn linux_refresh_atomically_exchanges_complete_generation_roots() {
     );
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(
+    unix,
+    any(target_vendor = "apple", target_os = "linux", target_os = "android")
+)))]
 #[test]
 fn unsupported_exchange_preserves_the_existing_root() {
     let fixture = fixture();
@@ -577,6 +666,210 @@ fn unsupported_exchange_preserves_the_existing_root() {
     assert_eq!(
         fs::read(directory.root().join("old.txt")).expect("old root survives"),
         b"old generation\n"
+    );
+}
+
+struct FailAt(WorkspacePublicationCheckpoint);
+
+impl WorkspacePublicationHooks for FailAt {
+    fn checkpoint(&mut self, checkpoint: WorkspacePublicationCheckpoint) -> io::Result<()> {
+        if checkpoint == self.0 {
+            return Err(io::Error::other("injected durable-boundary failure"));
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn durable_entry_point_persists_receipt_for_loc_and_desktop_callers() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("durable-entry-point");
+
+    let published = materialize_workspace_archive_durable(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("durably materialize workspace");
+    let receipt = load_workspace_publication_receipt(&directory.root())
+        .expect("load publication receipt")
+        .expect("active receipt");
+
+    assert_eq!(receipt.terminal_control, contract.control);
+    assert_eq!(receipt.decoded_bytes, published.decoded_bytes);
+    assert!(
+        !directory
+            .0
+            .join(".locality-Locality.publication.json")
+            .exists()
+    );
+}
+
+#[test]
+fn injected_barrier_failure_leaves_old_root_and_recovery_discards_staging() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("barrier-failure");
+    materialize_workspace_archive_durable(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("publish old root");
+    let old_body = fs::read(directory.root().join("Sales/README.md")).expect("old body");
+    let staged = stage_workspace_archive(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("stage refresh");
+
+    publish_staged_workspace_with_hooks(
+        staged,
+        &directory.root(),
+        &mut FailAt(WorkspacePublicationCheckpoint::JournalDurable),
+    )
+    .expect_err("injected barrier failure");
+    assert_eq!(
+        fs::read(directory.root().join("Sales/README.md")).expect("old root survives"),
+        old_body
+    );
+
+    recover_workspace_publication(&directory.root()).expect("recover failed refresh");
+    assert!(
+        !directory
+            .0
+            .join(".locality-Locality.publication.json")
+            .exists()
+    );
+    assert_eq!(
+        fs::read(directory.root().join("Sales/README.md")).expect("old root remains"),
+        old_body
+    );
+}
+
+#[test]
+fn crash_after_initial_publish_recovers_receipt_without_partial_tree() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("initial-crash");
+    let staged = stage_workspace_archive(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("stage initial root");
+
+    publish_staged_workspace_with_hooks(
+        staged,
+        &directory.root(),
+        &mut FailAt(WorkspacePublicationCheckpoint::PublicationComplete),
+    )
+    .expect_err("simulate crash after publish");
+    assert_eq!(
+        fs::read(directory.root().join("Sales/README.md")).expect("complete new root"),
+        b"Public\n"
+    );
+    assert!(
+        load_workspace_publication_receipt(&directory.root())
+            .expect("receipt query")
+            .is_none()
+    );
+
+    recover_workspace_publication(&directory.root()).expect("recover initial publication");
+    assert_eq!(
+        load_workspace_publication_receipt(&directory.root())
+            .expect("receipt query")
+            .expect("recovered receipt")
+            .terminal_control,
+        contract.control
+    );
+}
+
+#[cfg(all(
+    unix,
+    any(target_vendor = "apple", target_os = "linux", target_os = "android")
+))]
+#[test]
+fn crash_after_exchange_retains_old_generation_until_receipt_recovery() {
+    use std::os::unix::fs::MetadataExt;
+
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("exchange-crash");
+    materialize_workspace_archive_durable(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("publish old generation");
+    let old_inode = fs::metadata(directory.root())
+        .expect("old root metadata")
+        .ino();
+    let staged = stage_workspace_archive(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("stage refresh");
+    let staging_path = staged.staging_path().to_path_buf();
+
+    publish_staged_workspace_with_hooks(
+        staged,
+        &directory.root(),
+        &mut FailAt(WorkspacePublicationCheckpoint::PublicationComplete),
+    )
+    .expect_err("simulate crash after exchange");
+    assert_ne!(
+        fs::metadata(directory.root())
+            .expect("new root metadata")
+            .ino(),
+        old_inode
+    );
+    assert_eq!(
+        fs::metadata(&staging_path)
+            .expect("retained old generation")
+            .ino(),
+        old_inode
+    );
+
+    recover_workspace_publication(&directory.root()).expect("recover exchanged root");
+    assert!(!staging_path.exists());
+    assert!(
+        load_workspace_publication_receipt(&directory.root())
+            .expect("receipt query")
+            .is_some()
     );
 }
 

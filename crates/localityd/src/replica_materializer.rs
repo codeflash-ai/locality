@@ -1310,7 +1310,7 @@ fn rename_directory_noreplace(
 }
 
 #[cfg(target_os = "linux")]
-fn workspace_root_is_linux_mount_point(path: &Path) -> Result<bool, ReplicaMaterializationError> {
+fn workspace_root_is_mount_point(path: &Path) -> Result<bool, ReplicaMaterializationError> {
     let canonical = fs::canonicalize(path).map_err(ReplicaMaterializationError::Publish)?;
     let mountinfo =
         fs::read("/proc/self/mountinfo").map_err(ReplicaMaterializationError::Publish)?;
@@ -1331,6 +1331,11 @@ fn workspace_root_is_linux_mount_point(path: &Path) -> Result<bool, ReplicaMater
     Ok(false)
 }
 
+#[cfg(not(target_os = "linux"))]
+fn workspace_root_is_mount_point(_path: &Path) -> Result<bool, ReplicaMaterializationError> {
+    Ok(false)
+}
+
 #[cfg(target_os = "linux")]
 fn decode_mountinfo_path(input: &[u8]) -> Result<Vec<u8>, ReplicaMaterializationError> {
     let mut output = Vec::with_capacity(input.len());
@@ -1344,7 +1349,7 @@ fn decode_mountinfo_path(input: &[u8]) -> Result<Vec<u8>, ReplicaMaterialization
         let digits = input.get(cursor + 1..cursor + 4).ok_or_else(|| {
             ReplicaMaterializationError::Publish(io::Error::other("malformed mountinfo escape"))
         })?;
-        if !digits.iter().all(u8::is_ascii_digit) {
+        if !digits.iter().all(|digit| matches!(digit, b'0'..=b'7')) {
             return Err(ReplicaMaterializationError::Publish(io::Error::other(
                 "malformed mountinfo escape",
             )));
@@ -1412,6 +1417,46 @@ fn remove_open_staging_directory(parent: &OwnedFd, root: &OwnedFd, hinted_name: 
     // expected name. Remove that entry without following it. A non-empty
     // replacement directory is deliberately left untouched.
     unlink_named_entry(parent, hinted_name);
+}
+
+pub(crate) fn remove_workspace_generation(path: &Path) -> io::Result<()> {
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| io::Error::other("workspace generation has no parent"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("workspace generation has no file name"))?;
+    #[cfg(unix)]
+    {
+        let parent = rustix::fs::open(
+            parent_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let root = rustix::fs::openat(
+            &parent,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        remove_directory_contents(&root);
+        rustix::fs::unlinkat(&parent, name, AtFlags::REMOVEDIR)?;
+        rustix::fs::fsync(&parent)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(io::Error::other(
+                "workspace generation is not an ordinary directory",
+            ));
+        }
+        make_tree_removable(path);
+        fs::remove_dir_all(path)?;
+        sync_directory_if_supported(parent_path)
+    }
 }
 
 pub(crate) struct StagingDirectory {
@@ -1554,7 +1599,10 @@ impl StagingDirectory {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        unix,
+        any(target_vendor = "apple", target_os = "linux", target_os = "android")
+    ))]
     pub(crate) fn exchange(
         &mut self,
         destination: &Path,
@@ -1583,7 +1631,7 @@ impl StagingDirectory {
         let parent_identity = rustix::fs::fstat(&self.parent)
             .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
         if old_identity.st_dev != parent_identity.st_dev
-            || workspace_root_is_linux_mount_point(destination)?
+            || workspace_root_is_mount_point(destination)?
         {
             return Err(ReplicaMaterializationError::Publish(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -1621,7 +1669,10 @@ impl StagingDirectory {
         Ok(old_path)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(
+        unix,
+        any(target_vendor = "apple", target_os = "linux", target_os = "android")
+    )))]
     pub(crate) fn exchange(
         &mut self,
         _destination: &Path,
