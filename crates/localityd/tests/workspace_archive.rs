@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::io::{self, Cursor, Read};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use locality_core::model::RemoteId;
 use locality_core::portable::{
@@ -20,13 +23,57 @@ use locality_protocol::{
     PAX_WINNING_SCOPE_ORDINAL, ScopeAuthorizedWritableExportMetadata, WritableMetadataEntry,
     canonical_writable_metadata_sha256,
 };
+use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 use localityd::workspace_archive::{
     WorkspaceArchiveLimits, WorkspaceArchiveSink, validate_workspace_tar,
 };
+use localityd::workspace_materializer::{WorkspaceMaterializationLimits, stage_workspace_archive};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tar::{Builder, EntryType, Header};
+
+static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct TestDirectory(PathBuf);
+
+impl TestDirectory {
+    fn new(label: &str) -> Self {
+        let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "locality-workspace-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).expect("create test directory");
+        Self(path)
+    }
+
+    fn root(&self) -> PathBuf {
+        self.0.join("Locality")
+    }
+
+    fn assert_only(&self, expected: &[&str]) {
+        let mut names = fs::read_dir(&self.0)
+            .expect("read test directory")
+            .map(|entry| {
+                entry
+                    .expect("read entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, expected);
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        make_removable(&self.0);
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
 
 #[derive(Deserialize)]
 struct Fixture {
@@ -393,4 +440,173 @@ fn archive_adapter_rejects_nonfinal_control_and_unsafe_types() {
     )
     .expect_err("member after control must fail");
     assert!(error.to_string().contains("control member is not final"));
+}
+
+#[test]
+fn staged_identity_and_zstd_archives_publish_complete_read_only_roots() {
+    for encoding in [
+        ReplicaArchiveEncoding::Identity,
+        ReplicaArchiveEncoding::Zstd,
+    ] {
+        let fixture = fixture();
+        let contract = contract(&fixture);
+        let tar = archive(&fixture, &contract.control);
+        let body = match encoding {
+            ReplicaArchiveEncoding::Identity => tar,
+            ReplicaArchiveEncoding::Zstd => {
+                zstd::stream::encode_all(tar.as_slice(), 1).expect("encode workspace fixture")
+            }
+        };
+        let directory = TestDirectory::new(match encoding {
+            ReplicaArchiveEncoding::Identity => "identity",
+            ReplicaArchiveEncoding::Zstd => "zstd",
+        });
+
+        let staged = stage_workspace_archive(
+            ReplicaArchive::new(encoding, Cursor::new(body)),
+            &directory.root(),
+            WorkspaceMaterializationLimits::default(),
+            &contract.session,
+            &contract.offer,
+        )
+        .expect("stage workspace");
+        assert!(!directory.root().exists());
+        assert!(staged.staging_path().exists());
+        let published = staged
+            .publish_initial(&directory.root())
+            .expect("publish workspace");
+
+        assert_eq!(published.validated.files, 2);
+        assert_eq!(
+            fs::read(directory.root().join("Sales/README.md")).expect("read published file"),
+            b"Public\n"
+        );
+        assert!(directory.root().join("Engineering").is_dir());
+        directory.assert_only(&["Locality"]);
+        assert_read_only(&directory.root());
+        assert_read_only(&directory.root().join("Sales/README.md"));
+    }
+}
+
+#[test]
+fn truncated_staging_never_changes_an_existing_root() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let mut tar = archive(&fixture, &contract.control);
+    tar.truncate(tar.len() - 700);
+    let directory = TestDirectory::new("truncated-refresh");
+    fs::create_dir(directory.root()).expect("create old root");
+    fs::write(directory.root().join("old.txt"), b"old generation\n").expect("write old root");
+
+    let error = stage_workspace_archive(
+        ReplicaArchive::new(ReplicaArchiveEncoding::Identity, Cursor::new(tar)),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .err()
+    .expect("truncated archive must not stage");
+    assert!(error.to_string().contains("workspace tar"));
+
+    assert_eq!(
+        fs::read(directory.root().join("old.txt")).expect("old root survives"),
+        b"old generation\n"
+    );
+    directory.assert_only(&["Locality"]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_refresh_atomically_exchanges_complete_generation_roots() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("exchange");
+    fs::create_dir(directory.root()).expect("create old root");
+    fs::write(directory.root().join("old.txt"), b"old generation\n").expect("write old root");
+    let staged = stage_workspace_archive(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("stage refresh");
+
+    let published = staged
+        .publish_exchange(&directory.root())
+        .expect("atomic exchange");
+    let old_generation = published.old_generation.expect("retained old generation");
+
+    assert_eq!(
+        fs::read(directory.root().join("Sales/README.md")).expect("new root"),
+        b"Public\n"
+    );
+    assert_eq!(
+        fs::read(old_generation.join("old.txt")).expect("old generation retained"),
+        b"old generation\n"
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn unsupported_exchange_preserves_the_existing_root() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("unsupported-exchange");
+    fs::create_dir(directory.root()).expect("create old root");
+    fs::write(directory.root().join("old.txt"), b"old generation\n").expect("write old root");
+    let staged = stage_workspace_archive(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("stage refresh");
+    let error = staged
+        .publish_exchange(&directory.root())
+        .expect_err("platform must fail closed without exchange");
+    assert!(error.to_string().contains("exchange is unavailable"));
+    assert_eq!(
+        fs::read(directory.root().join("old.txt")).expect("old root survives"),
+        b"old generation\n"
+    );
+}
+
+fn assert_read_only(path: &Path) {
+    assert!(
+        fs::metadata(path)
+            .expect("read path metadata")
+            .permissions()
+            .readonly(),
+        "{} is not read-only",
+        path.display()
+    );
+}
+
+fn make_removable(path: &Path) {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.is_dir() {
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(false);
+        let _ = fs::set_permissions(path, permissions);
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                make_removable(&entry.path());
+            }
+        }
+    } else {
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(false);
+        let _ = fs::set_permissions(path, permissions);
+    }
 }
