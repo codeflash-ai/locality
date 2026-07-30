@@ -1099,7 +1099,22 @@ fn rejects_staging_root_replaced_by_symlink_before_publication() {
             .contains("staging root identity changed before publication"),
         "rejection identifies the root publication race: {error}"
     );
-    root.assert_no_staging_or_destination();
+    assert!(!root.destination().exists());
+    let substituted = fs::read_dir(&root.0)
+        .expect("read staging parent")
+        .map(|entry| entry.expect("read staging entry").path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".locality-stage-"))
+        })
+        .expect("substituted staging name is deliberately preserved");
+    assert!(
+        fs::symlink_metadata(&substituted)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(
         fs::read(outside.0.join("sentinel.txt")).expect("read untouched sentinel"),
         b"outside\n"

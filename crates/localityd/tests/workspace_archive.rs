@@ -525,6 +525,77 @@ fn archive_adapter_rejects_trailing_data_and_casefold_collisions() {
     assert!(error.to_string().contains("case-fold collision"));
 }
 
+struct PanicAfterHeader {
+    header: Cursor<Vec<u8>>,
+}
+
+impl Read for PanicAfterHeader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if self.header.position() == self.header.get_ref().len() as u64 {
+            panic!("extension body was read before its raw header was rejected");
+        }
+        self.header.read(output)
+    }
+}
+
+fn hostile_extension_header(entry_type: EntryType, size: u64) -> Vec<u8> {
+    let mut header = Header::new_ustar();
+    header
+        .set_path("PaxHeaders/hostile")
+        .expect("set extension path");
+    header.set_entry_type(entry_type);
+    header.set_mode(0o444);
+    header.set_size(size);
+    header.set_cksum();
+    header.as_bytes().to_vec()
+}
+
+#[test]
+fn raw_tar_gate_rejects_pax_and_gnu_metadata_before_buffering_bodies() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    for (label, entry_type, size, expected) in [
+        ("oversized PAX", EntryType::XHeader, 16_385, "PAX extension"),
+        ("GNU long name", EntryType::GNULongName, 8, "GNU long-name"),
+        ("GNU long link", EntryType::GNULongLink, 8, "GNU long-name"),
+    ] {
+        let mut reader = PanicAfterHeader {
+            header: Cursor::new(hostile_extension_header(entry_type, size)),
+        };
+        let mut sink = MemorySink::default();
+        let error = validate_workspace_tar(
+            &mut reader,
+            &mut sink,
+            WorkspaceArchiveLimits::default(),
+            &contract.session,
+            &contract.offer,
+        )
+        .expect_err(label);
+        assert!(
+            error.to_string().contains(expected),
+            "case {label}: {error}"
+        );
+        assert!(sink.files.is_empty(), "case {label} staged content");
+    }
+
+    let mut trailing_extension = archive(&fixture, &contract.control);
+    trailing_extension.truncate(trailing_extension.len() - 1024);
+    trailing_extension.extend_from_slice(&hostile_extension_header(EntryType::XHeader, 6));
+    let mut extension_body = [0_u8; 512];
+    extension_body[..6].copy_from_slice(b"6 a=b\n");
+    trailing_extension.extend_from_slice(&extension_body);
+    trailing_extension.extend_from_slice(&[0_u8; 1024]);
+    let error = validate_workspace_tar(
+        &mut Cursor::new(trailing_extension),
+        &mut MemorySink::default(),
+        WorkspaceArchiveLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect_err("terminal control must be the final raw member");
+    assert!(error.to_string().contains("not followed"), "{error}");
+}
+
 #[test]
 fn staged_identity_and_zstd_archives_publish_complete_read_only_roots() {
     for encoding in [
@@ -569,6 +640,37 @@ fn staged_identity_and_zstd_archives_publish_complete_read_only_roots() {
         assert_read_only(&directory.root());
         assert_read_only(&directory.root().join("Sales/README.md"));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn destination_preflight_rejects_casefold_spelling_collisions() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("destination-spelling");
+    fs::create_dir(directory.0.join("locality")).expect("create colliding sibling");
+    let staged = stage_workspace_archive(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("stage workspace");
+    let error = staged
+        .publish_initial(&directory.root())
+        .expect_err("colliding destination spelling must fail");
+    assert!(error.to_string().contains("already exists"), "{error}");
+    assert!(directory.0.join("locality").is_dir());
+    let spellings = fs::read_dir(&directory.0)
+        .expect("read destination parent")
+        .map(|entry| entry.expect("read sibling").file_name())
+        .collect::<Vec<_>>();
+    assert!(spellings.contains(&"locality".into()));
+    assert!(!spellings.contains(&"Locality".into()));
 }
 
 #[test]
@@ -675,6 +777,28 @@ impl WorkspacePublicationHooks for FailAt {
     fn checkpoint(&mut self, checkpoint: WorkspacePublicationCheckpoint) -> io::Result<()> {
         if checkpoint == self.0 {
             return Err(io::Error::other("injected durable-boundary failure"));
+        }
+        Ok(())
+    }
+}
+
+struct SubstituteAt {
+    checkpoint: WorkspacePublicationCheckpoint,
+    path: PathBuf,
+    retained: PathBuf,
+}
+
+impl WorkspacePublicationHooks for SubstituteAt {
+    fn checkpoint(&mut self, checkpoint: WorkspacePublicationCheckpoint) -> io::Result<()> {
+        if checkpoint == self.checkpoint {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&self.path, fs::Permissions::from_mode(0o755))?;
+            }
+            fs::rename(&self.path, &self.retained)?;
+            fs::create_dir(&self.path)?;
+            fs::write(self.path.join("substitute.txt"), b"must survive\n")?;
         }
         Ok(())
     }
@@ -871,6 +995,157 @@ fn crash_after_exchange_retains_old_generation_until_receipt_recovery() {
             .expect("receipt query")
             .is_some()
     );
+}
+
+#[cfg(all(
+    unix,
+    any(target_vendor = "apple", target_os = "linux", target_os = "android")
+))]
+#[test]
+fn recovery_accepts_new_root_after_durable_receipt_and_completed_cleanup() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("post-cleanup-recovery");
+    materialize_workspace_archive_durable(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("publish old generation");
+    let staged = stage_workspace_archive(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("stage refresh");
+    let staging = staged.staging_path().to_path_buf();
+    publish_staged_workspace_with_hooks(
+        staged,
+        &directory.root(),
+        &mut FailAt(WorkspacePublicationCheckpoint::CleanupComplete),
+    )
+    .expect_err("simulate crash after old-generation cleanup");
+    assert!(!staging.exists(), "old generation cleanup completed");
+
+    fs::set_permissions(&directory.root(), fs::Permissions::from_mode(0o755))
+        .expect("damage published root mode");
+    recover_workspace_publication(&directory.root()).expect("recover post-cleanup state");
+    assert_read_only(&directory.root());
+    assert!(
+        !directory
+            .0
+            .join(".locality-Locality.publication.json")
+            .exists()
+    );
+}
+
+#[cfg(all(
+    unix,
+    any(target_vendor = "apple", target_os = "linux", target_os = "android")
+))]
+#[test]
+fn publication_and_cleanup_never_delete_substituted_generation_paths() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("identity-substitution");
+    materialize_workspace_archive_durable(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("publish old generation");
+    fs::set_permissions(&directory.root(), fs::Permissions::from_mode(0o755))
+        .expect("make root replaceable for race injection");
+
+    let staged = stage_workspace_archive(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("stage substituted publication");
+    let staging = staged.staging_path().to_path_buf();
+    let retained_destination = directory.0.join("retained-destination");
+    publish_staged_workspace_with_hooks(
+        staged,
+        &directory.root(),
+        &mut SubstituteAt {
+            checkpoint: WorkspacePublicationCheckpoint::JournalDurable,
+            path: directory.root(),
+            retained: retained_destination.clone(),
+        },
+    )
+    .expect_err("destination substitution must fail closed");
+    let substitute = [directory.root(), staging.clone()]
+        .into_iter()
+        .find(|path| path.join("substitute.txt").exists())
+        .expect("substitute survives at one side of an atomic exchange");
+    assert_eq!(
+        fs::read(substitute.join("substitute.txt")).unwrap(),
+        b"must survive\n"
+    );
+    assert!(retained_destination.join("Sales/README.md").exists());
+
+    make_removable(&substitute);
+    fs::remove_dir_all(&substitute).expect("remove test substitute");
+    if directory.root().exists() {
+        make_removable(&directory.root());
+        fs::remove_dir_all(directory.root()).expect("remove exchanged root");
+    }
+    fs::rename(&retained_destination, directory.root()).expect("restore journal destination");
+    recover_workspace_publication(&directory.root()).expect("recover failed exchange");
+
+    let staged = stage_workspace_archive(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("stage cleanup substitution");
+    let staging = staged.staging_path().to_path_buf();
+    let retained_old = directory.0.join("retained-old-generation");
+    publish_staged_workspace_with_hooks(
+        staged,
+        &directory.root(),
+        &mut SubstituteAt {
+            checkpoint: WorkspacePublicationCheckpoint::ReceiptDurable,
+            path: staging.clone(),
+            retained: retained_old.clone(),
+        },
+    )
+    .expect_err("cleanup substitution must fail closed");
+    assert_eq!(
+        fs::read(staging.join("substitute.txt")).expect("cleanup substitute survives"),
+        b"must survive\n"
+    );
+    assert!(retained_old.join("Sales/README.md").exists());
 }
 
 fn assert_read_only(path: &Path) {

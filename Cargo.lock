@@ -2345,8 +2345,10 @@ name = "localityd"
 version = "0.3.6"
 dependencies = [
  "base64 0.22.1",
+ "caseless",
  "chrono",
  "getrandom 0.3.4",
+ "libc",
  "locality-connector",
  "locality-core",
  "locality-engine",

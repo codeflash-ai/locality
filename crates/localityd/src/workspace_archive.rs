@@ -17,13 +17,173 @@ use locality_protocol::workspace_export_v2::{
 };
 use locality_protocol::{
     DeliveredBodyDigestV2, ExportV2FilePaxMetadata, MAX_EXPORT_TERMINAL_CONTROL_BYTES,
-    PAX_WINNING_SCOPE_ORDINAL, RESERVED_EXPORT_METADATA_PATH,
+    MAX_EXPORT_V2_FILE_PAX_BYTES, PAX_WINNING_SCOPE_ORDINAL, RESERVED_EXPORT_METADATA_PATH,
 };
 use sha2::{Digest, Sha256};
 
 const TAR_BLOCK_BYTES: usize = 512;
 const READ_ONLY_FILE_MODE: u32 = 0o444;
 const READ_ONLY_DIRECTORY_MODE: u32 = 0o555;
+const MAX_TAR_EXTENSION_CHAIN: usize = 4;
+const MAX_TAR_EXTENSION_BYTES: u64 = (MAX_EXPORT_V2_FILE_PAX_BYTES as u64) * 2;
+const MAX_TAR_EXTENSION_CHAIN_BYTES: u64 = MAX_TAR_EXTENSION_BYTES * 2;
+
+struct BoundedTarReader<'a, R> {
+    inner: &'a mut R,
+    header: [u8; TAR_BLOCK_BYTES],
+    header_len: usize,
+    header_offset: usize,
+    body_remaining: u64,
+    extension_count: usize,
+    extension_bytes: u64,
+}
+
+impl<'a, R> BoundedTarReader<'a, R> {
+    fn new(inner: &'a mut R) -> Self {
+        Self {
+            inner,
+            header: [0; TAR_BLOCK_BYTES],
+            header_len: 0,
+            header_offset: TAR_BLOCK_BYTES,
+            body_remaining: 0,
+            extension_count: 0,
+            extension_bytes: 0,
+        }
+    }
+
+    fn validate_header(&mut self) -> io::Result<()> {
+        if self.header.iter().all(|byte| *byte == 0) {
+            if self.extension_count != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "PAX extension is not followed by an archive member",
+                ));
+            }
+            self.body_remaining = 0;
+            self.extension_count = 0;
+            self.extension_bytes = 0;
+            return Ok(());
+        }
+        let size = parse_raw_tar_size(&self.header[124..136])?;
+        self.body_remaining = size
+            .checked_add((TAR_BLOCK_BYTES - 1) as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "tar size overflow"))?
+            / TAR_BLOCK_BYTES as u64
+            * TAR_BLOCK_BYTES as u64;
+        match self.header[156] {
+            b'x' => {
+                if size > MAX_TAR_EXTENSION_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "PAX extension is {size} bytes, exceeding {MAX_TAR_EXTENSION_BYTES}"
+                        ),
+                    ));
+                }
+                self.extension_count = self.extension_count.saturating_add(1);
+                self.extension_bytes = self.extension_bytes.saturating_add(size);
+                if self.extension_count > MAX_TAR_EXTENSION_CHAIN
+                    || self.extension_bytes > MAX_TAR_EXTENSION_CHAIN_BYTES
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "PAX extension chain exceeds its metadata bound",
+                    ));
+                }
+            }
+            b'g' => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "global PAX extensions are forbidden",
+                ));
+            }
+            b'L' | b'K' => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "GNU long-name and long-link extensions are forbidden",
+                ));
+            }
+            _ => {
+                self.extension_count = 0;
+                self.extension_bytes = 0;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read> Read for BoundedTarReader<'_, R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.header_offset < TAR_BLOCK_BYTES {
+            let available = TAR_BLOCK_BYTES - self.header_offset;
+            let copied = available.min(output.len());
+            output[..copied].copy_from_slice(
+                &self.header[self.header_offset..self.header_offset.saturating_add(copied)],
+            );
+            self.header_offset += copied;
+            return Ok(copied);
+        }
+        if self.body_remaining > 0 {
+            let allowed = usize::try_from(self.body_remaining)
+                .unwrap_or(usize::MAX)
+                .min(output.len());
+            let read = self.inner.read(&mut output[..allowed])?;
+            self.body_remaining = self.body_remaining.saturating_sub(read as u64);
+            return Ok(read);
+        }
+
+        self.header_len = 0;
+        while self.header_len < TAR_BLOCK_BYTES {
+            let read = self.inner.read(&mut self.header[self.header_len..])?;
+            if read == 0 {
+                if self.header_len == 0 {
+                    return Ok(0);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated tar header block",
+                ));
+            }
+            self.header_len += read;
+        }
+        self.validate_header()?;
+        self.header_offset = 0;
+        self.read(output)
+    }
+}
+
+fn parse_raw_tar_size(field: &[u8]) -> io::Result<u64> {
+    if field.first().is_some_and(|byte| byte & 0x80 != 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "base-256 tar sizes are forbidden",
+        ));
+    }
+    let start = field
+        .iter()
+        .position(|byte| *byte != b' ')
+        .unwrap_or(field.len());
+    let end = field
+        .iter()
+        .rposition(|byte| !matches!(*byte, 0 | b' '))
+        .map_or(start, |index| index + 1);
+    let digits = &field[start..end];
+    if !digits.iter().all(|byte| matches!(*byte, b'0'..=b'7')) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid tar size",
+        ));
+    }
+    digits.iter().try_fold(0_u64, |value, byte| {
+        value
+            .checked_mul(8)
+            .and_then(|value| value.checked_add(u64::from(*byte - b'0')))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "tar size overflow"))
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorkspaceArchiveLimits {
@@ -182,9 +342,10 @@ pub fn validate_workspace_tar<R: Read, S: WorkspaceArchiveSink>(
     let mut files = 0_u64;
     let mut directories = 0_u64;
     let mut content_bytes = 0_u64;
+    let mut bounded = BoundedTarReader::new(reader);
 
     {
-        let mut archive = tar::Archive::new(reader.by_ref());
+        let mut archive = tar::Archive::new(&mut bounded);
         let entries = archive
             .entries()
             .map_err(|error| WorkspaceArchiveError::MalformedTar(error.to_string()))?;
@@ -381,11 +542,12 @@ pub fn validate_workspace_tar<R: Read, S: WorkspaceArchiveSink>(
     }
 
     let mut end_block = [0_u8; TAR_BLOCK_BYTES];
-    if reader.read_exact(&mut end_block).is_err() || end_block.iter().any(|byte| *byte != 0) {
+    if bounded.read_exact(&mut end_block).is_err() || end_block.iter().any(|byte| *byte != 0) {
         return Err(WorkspaceArchiveError::MissingTarEndMarker);
     }
     let mut trailing = [0_u8; 1];
-    if reader
+    if bounded
+        .inner
         .read(&mut trailing)
         .map_err(|error| WorkspaceArchiveError::MalformedTar(error.to_string()))?
         != 0
