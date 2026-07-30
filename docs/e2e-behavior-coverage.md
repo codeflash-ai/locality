@@ -177,10 +177,10 @@ LOCALITY_LIVE_LINEAR_VFS=1 tests/live_linear_vfs_roundtrip.sh
 ```
 
 GitHub Actions runs `.github/workflows/connector-live-e2e.yml` for relevant
-changes on `main`, weekly, and on manual dispatch. The workflow uses the
+changes on `main` and on manual dispatch. The workflow uses the
 `connector-live-e2e` environment and uploads no artifacts. Normal push and
-schedule runs validate refresh-capable OAuth credential JSON but never write
-back to GitHub Secrets. Manual dispatch can set `force_oauth_refresh=true` to
+push runs validate refresh-capable OAuth credential JSON but never write back
+to GitHub Secrets. Manual dispatch can set `force_oauth_refresh=true` to
 exercise the broker refresh path. Manual dispatch can also set
 `persist_rotated_oauth_secrets=true`; in that mode each OAuth job requires
 `LOCALITY_SECRET_ROTATOR_TOKEN`, exports its refreshed credential JSON after the
