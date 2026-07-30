@@ -129,6 +129,32 @@ Agenda:
 with `sendUpdates=all`. Setting `google_calendar.conference: google_meet`
 requests a Google Meet link with `conferenceDataVersion=1`.
 
+## Live E2E
+
+`tests/live_google_calendar_vfs_roundtrip.sh` exercises the live Google
+Calendar API, CLI mount/pull/diff/push path, daemon, and Linux FUSE projection.
+It creates a scratch draft event through the mounted `draft/` directory,
+verifies the pushed event appears under `events/`, and deletes the event through
+Google Calendar API cleanup.
+
+To reuse a stored `connection:google-calendar-live` credential:
+
+```bash
+secret_ref='connection:google-calendar-live'
+secret_hex="$(printf '%s' "$secret_ref" | od -An -tx1 -v | tr -d ' \n')"
+export LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON="$(cat "$HOME/.loc/credentials/$secret_hex")"
+```
+
+Use the full stored credential JSON. The live harness requires
+`access_token`, `oauth_broker_url`, `refresh_token_handle`, and numeric
+`expires_at` so it can exercise broker refresh when the token expires.
+
+Run the gated live test:
+
+```bash
+LOCALITY_LIVE_GOOGLE_CALENDAR_VFS=1 tests/live_google_calendar_vfs_roundtrip.sh
+```
+
 ## Useful Commands
 
 Connect with the local broker:

@@ -104,6 +104,27 @@ Sidecar remote ids use `linear-context:<issue_id>:comments`,
 `linear-context:<issue_id>:history`. Apply and concurrency checks reject these
 ids as read-only before any `issueUpdate` mutation is attempted.
 
+## Live E2E
+
+`tests/live_linear_vfs_roundtrip.sh` exercises the live Linear API, CLI
+mount/pull/diff/push flow, daemon, and Linux FUSE projection. It edits one
+existing scratch issue body through the mounted `page.md`, pushes the marker to
+Linear, pulls it back, and restores the original issue content before exiting.
+
+Set the API key and scratch issue UUID before running it:
+
+```bash
+export LINEAR_API_KEY='lin_api_...'
+export LOCALITY_LINEAR_LIVE_ISSUE_ID='xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+```
+
+The issue should be scratch content because the test temporarily appends a
+unique marker to the issue body and then restores the saved original content.
+
+```bash
+LOCALITY_LIVE_LINEAR_VFS=1 tests/live_linear_vfs_roundtrip.sh
+```
+
 ## Attachments
 
 Linear issue attachments are external links. During hydration of

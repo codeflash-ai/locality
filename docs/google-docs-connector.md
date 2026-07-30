@@ -118,6 +118,36 @@ Live testing found and fixed several integration issues:
 - The OAuth broker project must have both Google Docs API and Google Drive API
   enabled.
 
+## Live E2E
+
+`tests/live_google_docs_vfs_roundtrip.sh` exercises the live Google Docs API,
+CLI mount/pull/diff/push paths, `localityd`, and the Linux FUSE projection. It
+uses isolated Locality state and a temporary shared root, creates one generated
+Google Docs page through the mounted filesystem, verifies the create marker
+survives a pull after push, edits the created document through mounted
+`page.md`, verifies the edit marker survives another pull, and trashes the
+created Drive file during cleanup.
+
+Set the required environment from a stored `connection:google-docs-live`
+credential and choose a scratch workspace folder:
+
+```bash
+secret_ref='connection:google-docs-live'
+secret_hex="$(printf '%s' "$secret_ref" | od -An -tx1 -v | tr -d ' \n')"
+export LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON="$(cat "$HOME/.loc/credentials/$secret_hex")"
+export LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER='Locality Live E2E'
+```
+
+Use the full stored credential JSON. The live harness requires
+`access_token`, `oauth_broker_url`, `refresh_token_handle`, and numeric
+`expires_at` so it can exercise broker refresh when the token expires.
+
+Run the gated test explicitly:
+
+```bash
+LOCALITY_LIVE_GOOGLE_DOCS_VFS=1 tests/live_google_docs_vfs_roundtrip.sh
+```
+
 ## Useful Commands
 
 Connect with the local broker:

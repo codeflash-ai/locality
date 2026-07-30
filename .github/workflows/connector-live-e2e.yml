@@ -1,0 +1,418 @@
+name: connector-live-e2e
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/connector-live-e2e.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/**"
+      - "platform/linux/locality-fuse/**"
+      - "tests/live_connector_common.sh"
+      - "tests/live_connector_common_selftest.sh"
+      - "tests/live_google_docs_vfs_roundtrip.sh"
+      - "tests/live_google_calendar_vfs_roundtrip.sh"
+      - "tests/live_gmail_vfs_roundtrip.sh"
+      - "tests/live_slack_vfs_read.sh"
+      - "tests/live_linear_vfs_roundtrip.sh"
+  workflow_dispatch:
+    inputs:
+      force_oauth_refresh:
+        description: "Force OAuth connector credentials to refresh through the broker before live operations"
+        required: false
+        default: false
+        type: boolean
+      persist_rotated_oauth_secrets:
+        description: "Persist refreshed OAuth credential JSON back to connector-live-e2e environment secrets"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: connector-live-e2e
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  harness-selftest:
+    name: Live connector harness self-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install harness dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+      - name: Run live connector harness self-test
+        run: |
+          bash -n tests/live_connector_common.sh tests/live_connector_common_selftest.sh
+          LOCALITY_LIVE_COMMON_SELFTEST=1 tests/live_connector_common_selftest.sh
+
+  google-docs-live:
+    name: Google Docs Linux FUSE live e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: connector-live-e2e
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install FUSE dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            fuse3 \
+            libfuse3-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            pkg-config \
+            sqlite3
+      - name: Check live Google Docs secrets and FUSE device
+        shell: bash
+        env:
+          LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON }}
+          LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER: ${{ secrets.LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER }}
+          LOCALITY_LIVE_FORCE_OAUTH_REFRESH_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.force_oauth_refresh == true && '1' || '0' }}
+          LOCALITY_LIVE_PERSIST_ROTATED_OAUTH_SECRETS: ${{ github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true && '1' || '0' }}
+          LOCALITY_SECRET_ROTATOR_TOKEN: ${{ secrets.LOCALITY_SECRET_ROTATOR_TOKEN }}
+        run: |
+          missing=()
+          [ -n "$LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON" ] || missing+=("LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON")
+          [ -n "$LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER" ] || missing+=("LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER")
+          if [ "$LOCALITY_LIVE_PERSIST_ROTATED_OAUTH_SECRETS" = "1" ]; then
+            if [ "$LOCALITY_LIVE_FORCE_OAUTH_REFRESH_INPUT" != "1" ]; then
+              echo "::error::persist_rotated_oauth_secrets requires force_oauth_refresh"
+              exit 1
+            fi
+            [ -n "$LOCALITY_SECRET_ROTATOR_TOKEN" ] || missing+=("LOCALITY_SECRET_ROTATOR_TOKEN")
+          fi
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Google Docs live e2e missing required environment secrets: ${missing[*]}"
+            exit 1
+          fi
+          if [ ! -e /dev/fuse ]; then
+            echo "::error::/dev/fuse is unavailable; the live connector Linux FUSE e2e cannot run"
+            exit 1
+          fi
+      - name: Run live Google Docs Linux FUSE e2e
+        env:
+          LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON }}
+          LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER: ${{ secrets.LOCALITY_GOOGLE_DOCS_LIVE_WORKSPACE_FOLDER }}
+          LOCALITY_LIVE_GOOGLE_DOCS_VFS: "1"
+          LOCALITY_LIVE_FORCE_OAUTH_REFRESH: ${{ github.event_name == 'workflow_dispatch' && inputs.force_oauth_refresh == true && '1' || '0' }}
+          LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true && format('{0}/locality-google-docs-live-credential.json', runner.temp) || '' }}
+        run: tests/live_google_docs_vfs_roundtrip.sh
+      - name: Persist refreshed Google Docs credential
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.LOCALITY_SECRET_ROTATOR_TOKEN }}
+          ROTATED_CREDENTIAL_PATH: ${{ runner.temp }}/locality-google-docs-live-credential.json
+        run: |
+          trap 'rm -f "$ROTATED_CREDENTIAL_PATH"' EXIT
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::LOCALITY_SECRET_ROTATOR_TOKEN is required to persist rotated OAuth secrets"
+            exit 1
+          fi
+          if [ ! -s "$ROTATED_CREDENTIAL_PATH" ]; then
+            echo "::error::refreshed Google Docs credential was not exported; check the live e2e failure above"
+            exit 1
+          fi
+          gh secret set LOCALITY_GOOGLE_DOCS_LIVE_CREDENTIAL_JSON \
+            --repo "$GITHUB_REPOSITORY" \
+            --env connector-live-e2e \
+            < "$ROTATED_CREDENTIAL_PATH"
+
+  google-calendar-live:
+    name: Google Calendar Linux FUSE live e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: connector-live-e2e
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install FUSE dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            fuse3 \
+            libfuse3-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            pkg-config \
+            sqlite3
+      - name: Check live Google Calendar secrets and FUSE device
+        shell: bash
+        env:
+          LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON }}
+          LOCALITY_LIVE_FORCE_OAUTH_REFRESH_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.force_oauth_refresh == true && '1' || '0' }}
+          LOCALITY_LIVE_PERSIST_ROTATED_OAUTH_SECRETS: ${{ github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true && '1' || '0' }}
+          LOCALITY_SECRET_ROTATOR_TOKEN: ${{ secrets.LOCALITY_SECRET_ROTATOR_TOKEN }}
+        run: |
+          missing=()
+          [ -n "$LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON" ] || missing+=("LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON")
+          if [ "$LOCALITY_LIVE_PERSIST_ROTATED_OAUTH_SECRETS" = "1" ]; then
+            if [ "$LOCALITY_LIVE_FORCE_OAUTH_REFRESH_INPUT" != "1" ]; then
+              echo "::error::persist_rotated_oauth_secrets requires force_oauth_refresh"
+              exit 1
+            fi
+            [ -n "$LOCALITY_SECRET_ROTATOR_TOKEN" ] || missing+=("LOCALITY_SECRET_ROTATOR_TOKEN")
+          fi
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Google Calendar live e2e missing required environment secrets: ${missing[*]}"
+            exit 1
+          fi
+          if [ ! -e /dev/fuse ]; then
+            echo "::error::/dev/fuse is unavailable; the live connector Linux FUSE e2e cannot run"
+            exit 1
+          fi
+      - name: Run live Google Calendar Linux FUSE e2e
+        env:
+          LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON }}
+          LOCALITY_LIVE_GOOGLE_CALENDAR_VFS: "1"
+          LOCALITY_LIVE_FORCE_OAUTH_REFRESH: ${{ github.event_name == 'workflow_dispatch' && inputs.force_oauth_refresh == true && '1' || '0' }}
+          LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true && format('{0}/locality-google-calendar-live-credential.json', runner.temp) || '' }}
+        run: tests/live_google_calendar_vfs_roundtrip.sh
+      - name: Persist refreshed Google Calendar credential
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.LOCALITY_SECRET_ROTATOR_TOKEN }}
+          ROTATED_CREDENTIAL_PATH: ${{ runner.temp }}/locality-google-calendar-live-credential.json
+        run: |
+          trap 'rm -f "$ROTATED_CREDENTIAL_PATH"' EXIT
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::LOCALITY_SECRET_ROTATOR_TOKEN is required to persist rotated OAuth secrets"
+            exit 1
+          fi
+          if [ ! -s "$ROTATED_CREDENTIAL_PATH" ]; then
+            echo "::error::refreshed Google Calendar credential was not exported; check the live e2e failure above"
+            exit 1
+          fi
+          gh secret set LOCALITY_GOOGLE_CALENDAR_LIVE_CREDENTIAL_JSON \
+            --repo "$GITHUB_REPOSITORY" \
+            --env connector-live-e2e \
+            < "$ROTATED_CREDENTIAL_PATH"
+
+  gmail-live:
+    name: Gmail Linux FUSE live e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: connector-live-e2e
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install FUSE dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            fuse3 \
+            libfuse3-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            pkg-config \
+            sqlite3
+      - name: Check live Gmail secrets and FUSE device
+        shell: bash
+        env:
+          LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON }}
+          LOCALITY_GMAIL_LIVE_TO_EMAIL: ${{ secrets.LOCALITY_GMAIL_LIVE_TO_EMAIL }}
+          LOCALITY_LIVE_FORCE_OAUTH_REFRESH_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.force_oauth_refresh == true && '1' || '0' }}
+          LOCALITY_LIVE_PERSIST_ROTATED_OAUTH_SECRETS: ${{ github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true && '1' || '0' }}
+          LOCALITY_SECRET_ROTATOR_TOKEN: ${{ secrets.LOCALITY_SECRET_ROTATOR_TOKEN }}
+        run: |
+          missing=()
+          [ -n "$LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON" ] || missing+=("LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON")
+          [ -n "$LOCALITY_GMAIL_LIVE_TO_EMAIL" ] || missing+=("LOCALITY_GMAIL_LIVE_TO_EMAIL")
+          if [ "$LOCALITY_LIVE_PERSIST_ROTATED_OAUTH_SECRETS" = "1" ]; then
+            if [ "$LOCALITY_LIVE_FORCE_OAUTH_REFRESH_INPUT" != "1" ]; then
+              echo "::error::persist_rotated_oauth_secrets requires force_oauth_refresh"
+              exit 1
+            fi
+            [ -n "$LOCALITY_SECRET_ROTATOR_TOKEN" ] || missing+=("LOCALITY_SECRET_ROTATOR_TOKEN")
+          fi
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Gmail live e2e missing required environment secrets: ${missing[*]}"
+            exit 1
+          fi
+          if [ ! -e /dev/fuse ]; then
+            echo "::error::/dev/fuse is unavailable; the live connector Linux FUSE e2e cannot run"
+            exit 1
+          fi
+      - name: Run live Gmail Linux FUSE e2e
+        env:
+          LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON }}
+          LOCALITY_GMAIL_LIVE_TO_EMAIL: ${{ secrets.LOCALITY_GMAIL_LIVE_TO_EMAIL }}
+          LOCALITY_LIVE_GMAIL_VFS: "1"
+          LOCALITY_LIVE_FORCE_OAUTH_REFRESH: ${{ github.event_name == 'workflow_dispatch' && inputs.force_oauth_refresh == true && '1' || '0' }}
+          LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true && format('{0}/locality-gmail-live-credential.json', runner.temp) || '' }}
+        run: tests/live_gmail_vfs_roundtrip.sh
+      - name: Persist refreshed Gmail credential
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.LOCALITY_SECRET_ROTATOR_TOKEN }}
+          ROTATED_CREDENTIAL_PATH: ${{ runner.temp }}/locality-gmail-live-credential.json
+        run: |
+          trap 'rm -f "$ROTATED_CREDENTIAL_PATH"' EXIT
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::LOCALITY_SECRET_ROTATOR_TOKEN is required to persist rotated OAuth secrets"
+            exit 1
+          fi
+          if [ ! -s "$ROTATED_CREDENTIAL_PATH" ]; then
+            echo "::error::refreshed Gmail credential was not exported; check the live e2e failure above"
+            exit 1
+          fi
+          gh secret set LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON \
+            --repo "$GITHUB_REPOSITORY" \
+            --env connector-live-e2e \
+            < "$ROTATED_CREDENTIAL_PATH"
+
+  slack-live:
+    name: Slack Linux FUSE live e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: connector-live-e2e
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install FUSE dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            fuse3 \
+            libfuse3-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            pkg-config \
+            sqlite3
+      - name: Check live Slack secrets and FUSE device
+        shell: bash
+        env:
+          LOCALITY_SLACK_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_SLACK_LIVE_CREDENTIAL_JSON }}
+          LOCALITY_SLACK_LIVE_CONVERSATION_ID: ${{ secrets.LOCALITY_SLACK_LIVE_CONVERSATION_ID }}
+          LOCALITY_LIVE_FORCE_OAUTH_REFRESH_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.force_oauth_refresh == true && '1' || '0' }}
+          LOCALITY_LIVE_PERSIST_ROTATED_OAUTH_SECRETS: ${{ github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true && '1' || '0' }}
+          LOCALITY_SECRET_ROTATOR_TOKEN: ${{ secrets.LOCALITY_SECRET_ROTATOR_TOKEN }}
+        run: |
+          missing=()
+          [ -n "$LOCALITY_SLACK_LIVE_CREDENTIAL_JSON" ] || missing+=("LOCALITY_SLACK_LIVE_CREDENTIAL_JSON")
+          [ -n "$LOCALITY_SLACK_LIVE_CONVERSATION_ID" ] || missing+=("LOCALITY_SLACK_LIVE_CONVERSATION_ID")
+          if [ "$LOCALITY_LIVE_PERSIST_ROTATED_OAUTH_SECRETS" = "1" ]; then
+            if [ "$LOCALITY_LIVE_FORCE_OAUTH_REFRESH_INPUT" != "1" ]; then
+              echo "::error::persist_rotated_oauth_secrets requires force_oauth_refresh"
+              exit 1
+            fi
+            [ -n "$LOCALITY_SECRET_ROTATOR_TOKEN" ] || missing+=("LOCALITY_SECRET_ROTATOR_TOKEN")
+          fi
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Slack live e2e missing required environment secrets: ${missing[*]}"
+            exit 1
+          fi
+          if [ ! -e /dev/fuse ]; then
+            echo "::error::/dev/fuse is unavailable; the live connector Linux FUSE e2e cannot run"
+            exit 1
+          fi
+      - name: Run live Slack Linux FUSE e2e
+        env:
+          LOCALITY_SLACK_LIVE_CREDENTIAL_JSON: ${{ secrets.LOCALITY_SLACK_LIVE_CREDENTIAL_JSON }}
+          LOCALITY_SLACK_LIVE_CONVERSATION_ID: ${{ secrets.LOCALITY_SLACK_LIVE_CONVERSATION_ID }}
+          LOCALITY_SLACK_LIVE_TYPES: ${{ secrets.LOCALITY_SLACK_LIVE_TYPES }}
+          LOCALITY_LIVE_SLACK_VFS: "1"
+          LOCALITY_LIVE_FORCE_OAUTH_REFRESH: ${{ github.event_name == 'workflow_dispatch' && inputs.force_oauth_refresh == true && '1' || '0' }}
+          LOCALITY_LIVE_ROTATED_CREDENTIAL_OUTPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true && format('{0}/locality-slack-live-credential.json', runner.temp) || '' }}
+        run: tests/live_slack_vfs_read.sh
+      - name: Persist refreshed Slack credential
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.persist_rotated_oauth_secrets == true }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.LOCALITY_SECRET_ROTATOR_TOKEN }}
+          ROTATED_CREDENTIAL_PATH: ${{ runner.temp }}/locality-slack-live-credential.json
+        run: |
+          trap 'rm -f "$ROTATED_CREDENTIAL_PATH"' EXIT
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::LOCALITY_SECRET_ROTATOR_TOKEN is required to persist rotated OAuth secrets"
+            exit 1
+          fi
+          if [ ! -s "$ROTATED_CREDENTIAL_PATH" ]; then
+            echo "::error::refreshed Slack credential was not exported; check the live e2e failure above"
+            exit 1
+          fi
+          gh secret set LOCALITY_SLACK_LIVE_CREDENTIAL_JSON \
+            --repo "$GITHUB_REPOSITORY" \
+            --env connector-live-e2e \
+            < "$ROTATED_CREDENTIAL_PATH"
+
+  linear-live:
+    name: Linear Linux FUSE live e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: connector-live-e2e
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install FUSE dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            fuse3 \
+            libfuse3-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            pkg-config \
+            sqlite3
+      - name: Check live Linear secrets and FUSE device
+        shell: bash
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          LOCALITY_LINEAR_LIVE_ISSUE_ID: ${{ secrets.LOCALITY_LINEAR_LIVE_ISSUE_ID }}
+        run: |
+          missing=()
+          [ -n "$LINEAR_API_KEY" ] || missing+=("LINEAR_API_KEY")
+          [ -n "$LOCALITY_LINEAR_LIVE_ISSUE_ID" ] || missing+=("LOCALITY_LINEAR_LIVE_ISSUE_ID")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Linear live e2e missing required environment secrets: ${missing[*]}"
+            exit 1
+          fi
+          if [ ! -e /dev/fuse ]; then
+            echo "::error::/dev/fuse is unavailable; the live connector Linux FUSE e2e cannot run"
+            exit 1
+          fi
+      - name: Run live Linear Linux FUSE e2e
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          LOCALITY_LINEAR_LIVE_ISSUE_ID: ${{ secrets.LOCALITY_LINEAR_LIVE_ISSUE_ID }}
+          LOCALITY_LIVE_LINEAR_VFS: "1"
+        run: tests/live_linear_vfs_roundtrip.sh

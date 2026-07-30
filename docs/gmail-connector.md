@@ -172,6 +172,32 @@ Locality removes that exact File Provider item and signals both the `draft/` and
 `sent/` containers. Remote or unconfirmed item deletion remains blocked. This
 does not require the user to run `loc pull` or refresh Finder.
 
+## Live E2E
+
+`tests/live_gmail_vfs_roundtrip.sh` exercises the live Gmail API, CLI
+mount/pull/diff/push, daemon, and Linux FUSE projection. It creates an unsent
+Gmail draft through the mounted `draft/` folder, verifies the draft projection,
+and deletes the Gmail draft through Gmail API cleanup.
+
+Use a stored `connection:gmail-live` credential and a recipient address:
+
+```bash
+secret_ref='connection:gmail-live'
+secret_hex="$(printf '%s' "$secret_ref" | od -An -tx1 -v | tr -d ' \n')"
+export LOCALITY_GMAIL_LIVE_CREDENTIAL_JSON="$(cat "$HOME/.loc/credentials/$secret_hex")"
+export LOCALITY_GMAIL_LIVE_TO_EMAIL='you@example.com'
+```
+
+Use the full stored credential JSON. The live harness requires
+`access_token`, `oauth_broker_url`, `refresh_token_handle`, and numeric
+`expires_at` so it can exercise broker refresh when the token expires.
+
+Run the gated live check:
+
+```bash
+LOCALITY_LIVE_GMAIL_VFS=1 tests/live_gmail_vfs_roundtrip.sh
+```
+
 ## Useful Commands
 
 Connect with the local broker:

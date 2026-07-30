@@ -88,6 +88,37 @@ deletes, push writes, undo writes, and autosave writes under Slack mounts.
 V1 does not post messages, subscribe to Slack events, or store arbitrary Slack
 search results.
 
+## Live E2E
+
+`tests/live_slack_vfs_read.sh` exercises the live Slack API, CLI
+mount/pull/status, daemon, and Linux FUSE projection by reading a known
+conversation's `recent.md` and verifying Slack remains read-only through the
+mounted filesystem and product push validation. The live script refuses
+`public_channel` mounts because Slack public-channel reads can auto-join
+channels; use a private channel, DM, or group DM where the app is already
+present.
+
+To reuse a stored `connection:slack-live` credential in isolated test state:
+
+```bash
+secret_ref='connection:slack-live'
+secret_hex="$(printf '%s' "$secret_ref" | od -An -tx1 -v | tr -d ' \n')"
+export LOCALITY_SLACK_LIVE_CREDENTIAL_JSON="$(cat "$HOME/.loc/credentials/$secret_hex")"
+export LOCALITY_SLACK_LIVE_CONVERSATION_ID='G0123456789'
+```
+
+Use the full stored credential JSON. The live harness requires
+`access_token`, `oauth_broker_url`, `refresh_token_handle`, and numeric
+`expires_at` so it can exercise broker refresh when the token expires.
+
+Set `LOCALITY_SLACK_LIVE_TYPES` when the target conversation is not covered by
+the default `private_channel,im,mpim` type set. Do not set `public_channel` for
+this live test.
+
+```bash
+LOCALITY_LIVE_SLACK_VFS=1 tests/live_slack_vfs_read.sh
+```
+
 ## Useful commands
 
 ```bash
