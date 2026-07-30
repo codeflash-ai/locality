@@ -1840,15 +1840,15 @@ an agent developer must be able to launch assigned Workspace Profiles:
 | Admin                | Manages Developers, sources, grants, profiles, assignments, and operations, but cannot add, demote, or remove an Owner.          |
 | Developer            | Uses assigned Workspace Profiles and manages only their own launch keys, sandbox sessions, and activity.                        |
 | Workflow owner       | A capability, not an organization role: publishes a `WorkspaceProfile` selecting mounts and limits when their role permits it.  |
-| Sandbox orchestrator | Starts a session for an approved workload, current profile revision, acting principal, TTL, and optional narrowing filters.     |
+| Sandbox orchestrator | Starts a session for an approved workload, latest published profile revision captured immutably at launch, acting principal, TTL, and optional narrowing filters. |
 | Agent                | Uses the materialized view and proposes changes. It cannot edit grants, change `actingFor`, or broaden filters or actions.       |
 
 No organization role alone grants source data. A Developer launch requires an
 explicit assignment to the stable Workspace Profile, and the effective data is
-still the intersection of current profile revision, Data Grants, provider ACL,
-source state, and session limits. Removing a membership or assignment revokes
-the affected launch authority. Concurrent changes must never leave a tenant
-without an active Owner.
+still the intersection of the immutable session-captured profile revision, Data
+Grants, provider ACL, source state, and session limits. Removing a membership or
+assignment revokes the affected launch authority. Concurrent changes must never
+leave a tenant without an active Owner.
 
 `actingFor` is never arbitrary request text. For an interactive launch it comes
 from the authenticated launcher; for a scheduled job it is an administrator-
