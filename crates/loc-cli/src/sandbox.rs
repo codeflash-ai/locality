@@ -35,7 +35,8 @@ use localityd::replica_materializer::{
 use localityd::workspace_archive::WorkspaceArchiveLimits;
 use localityd::workspace_materializer::{
     PublishedWorkspace, WorkspaceMaterializationError, WorkspaceMaterializationLimits,
-    materialize_workspace_archive_durable, recover_workspace_publication,
+    materialize_workspace_archive_durable, recover_and_verify_workspace_publication_state,
+    recover_workspace_publication,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
@@ -702,7 +703,13 @@ fn run_sandbox_init_internal(
 ) -> Result<SandboxInitReport, SandboxInitError> {
     let root = absolute_destination(&options.root)?;
     validate_destination_parent(&root)?;
-    if !matches!(&credential, SandboxCredential::ProfileKey(_)) {
+    if matches!(&credential, SandboxCredential::ProfileKey(_)) {
+        let verified_v2_state = recover_and_verify_workspace_publication_state(&root)
+            .map_err(|error| SandboxInitError::Materialization(error.to_string()))?;
+        if !verified_v2_state {
+            validate_destination_absent(&root)?;
+        }
+    } else {
         validate_destination_absent(&root)?;
     }
     let client = SandboxHttpClient::new(&options.api_url)?;
@@ -1655,6 +1662,39 @@ struct SandboxHttpClient {
     api_url: reqwest::Url,
 }
 
+/// Validates the exact API URL shape accepted by sandbox and portable
+/// workspace clients without performing network I/O.
+pub fn validate_sandbox_api_url(api_url: &str) -> Result<(), SandboxInitError> {
+    parse_sandbox_api_url(api_url).map(|_| ())
+}
+
+fn parse_sandbox_api_url(api_url: &str) -> Result<reqwest::Url, SandboxInitError> {
+    let api_url = reqwest::Url::parse(api_url)
+        .map_err(|_| SandboxInitError::InvalidApiUrl("URL cannot be parsed"))?;
+    if !matches!(api_url.scheme(), "http" | "https") {
+        return Err(SandboxInitError::InvalidApiUrl(
+            "scheme must be http or https",
+        ));
+    }
+    require_api_host(&api_url)?;
+    if !api_url.username().is_empty() || api_url.password().is_some() {
+        return Err(SandboxInitError::InvalidApiUrl(
+            "embedded credentials are not allowed",
+        ));
+    }
+    if api_url.query().is_some() || api_url.fragment().is_some() {
+        return Err(SandboxInitError::InvalidApiUrl(
+            "query strings and fragments are not allowed",
+        ));
+    }
+    if api_url.path() != "/" && !api_url.path().is_empty() {
+        return Err(SandboxInitError::InvalidApiUrl(
+            "URL must not contain a path",
+        ));
+    }
+    Ok(api_url)
+}
+
 impl SandboxHttpClient {
     fn new(api_url: &str) -> Result<Self, SandboxInitError> {
         Self::new_with_read_timeout(api_url, HTTP_READ_TIMEOUT)
@@ -1664,29 +1704,7 @@ impl SandboxHttpClient {
         api_url: &str,
         read_timeout: Duration,
     ) -> Result<Self, SandboxInitError> {
-        let api_url = reqwest::Url::parse(api_url)
-            .map_err(|_| SandboxInitError::InvalidApiUrl("URL cannot be parsed"))?;
-        if !matches!(api_url.scheme(), "http" | "https") {
-            return Err(SandboxInitError::InvalidApiUrl(
-                "scheme must be http or https",
-            ));
-        }
-        require_api_host(&api_url)?;
-        if !api_url.username().is_empty() || api_url.password().is_some() {
-            return Err(SandboxInitError::InvalidApiUrl(
-                "embedded credentials are not allowed",
-            ));
-        }
-        if api_url.query().is_some() || api_url.fragment().is_some() {
-            return Err(SandboxInitError::InvalidApiUrl(
-                "query strings and fragments are not allowed",
-            ));
-        }
-        if api_url.path() != "/" && !api_url.path().is_empty() {
-            return Err(SandboxInitError::InvalidApiUrl(
-                "URL must not contain a path",
-            ));
-        }
+        let api_url = parse_sandbox_api_url(api_url)?;
         REQWEST_CRYPTO_PROVIDER.get_or_init(|| {
             let _ = rustls::crypto::ring::default_provider().install_default();
         });

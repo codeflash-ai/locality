@@ -827,11 +827,147 @@ fn durable_entry_point_persists_receipt_for_loc_and_desktop_callers() {
 
     assert_eq!(receipt.terminal_control, contract.control);
     assert_eq!(receipt.decoded_bytes, published.decoded_bytes);
+    assert_eq!(receipt.version, 2);
+    let receipt_json = serde_json::to_value(&receipt).expect("serialize receipt");
+    assert!(receipt_json["generation_identity"]["inode"].is_u64());
     assert!(
         !directory
             .0
             .join(".locality-Locality.publication.json")
             .exists()
+    );
+}
+
+#[test]
+fn stale_receipt_cannot_authorize_exchange_after_root_rename() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("stale-receipt-rename");
+    materialize_workspace_archive_durable(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("publish identity-bound receipt");
+    let renamed = directory.0.join("renamed-generation");
+    make_removable(&directory.root());
+    fs::rename(directory.root(), &renamed).expect("rename published generation");
+    fs::create_dir(directory.root()).expect("create unrelated replacement root");
+    fs::write(directory.root().join("unrelated.txt"), b"must survive\n")
+        .expect("write unrelated replacement");
+
+    let error = materialize_workspace_archive_durable(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect_err("stale sibling receipt must not authorize exchange");
+
+    assert!(error.to_string().contains("filesystem generation"));
+    assert_eq!(
+        fs::read(directory.root().join("unrelated.txt")).expect("replacement survives"),
+        b"must survive\n"
+    );
+    assert!(renamed.join("Sales/README.md").is_file());
+}
+
+#[test]
+fn stale_receipt_cannot_authorize_exchange_after_root_delete_and_recreate() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("stale-receipt-delete");
+    materialize_workspace_archive_durable(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("publish identity-bound receipt");
+    make_removable(&directory.root());
+    fs::remove_dir_all(directory.root()).expect("delete published generation");
+    fs::create_dir(directory.root()).expect("recreate unrelated root");
+    fs::write(directory.root().join("unrelated.txt"), b"must survive\n")
+        .expect("write unrelated replacement");
+
+    let error = materialize_workspace_archive_durable(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect_err("receipt for deleted generation must not authorize exchange");
+
+    assert!(error.to_string().contains("filesystem generation"));
+    assert_eq!(
+        fs::read(directory.root().join("unrelated.txt")).expect("replacement survives"),
+        b"must survive\n"
+    );
+}
+
+#[test]
+fn forged_receipt_identity_cannot_authorize_exchange_or_cleanup() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("forged-receipt-identity");
+    materialize_workspace_archive_durable(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("publish identity-bound receipt");
+    let receipt_path = directory.0.join(".locality-Locality.receipt.json");
+    let mut receipt: Value =
+        serde_json::from_slice(&fs::read(&receipt_path).expect("read receipt"))
+            .expect("decode receipt");
+    let inode = receipt["generation_identity"]["inode"]
+        .as_u64()
+        .expect("receipt inode");
+    receipt["generation_identity"]["inode"] = Value::from(inode.wrapping_add(1));
+    fs::write(
+        &receipt_path,
+        serde_json::to_vec(&receipt).expect("encode forged receipt"),
+    )
+    .expect("forge receipt identity");
+
+    let error = materialize_workspace_archive_durable(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect_err("forged receipt must not authorize refresh");
+
+    assert!(error.to_string().contains("filesystem generation"));
+    assert_eq!(
+        fs::read(directory.root().join("Sales/README.md")).expect("old root survives"),
+        b"Public\n"
     );
 }
 

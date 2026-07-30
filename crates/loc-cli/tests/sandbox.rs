@@ -896,20 +896,10 @@ fn scope_authorized_repeat_initialization_reports_destination_conflict() {
 }
 
 #[test]
-fn generation1_profile_fallback_preserves_destination_exists_behavior() {
+fn generation1_profile_existing_root_preserves_early_destination_exists_without_network() {
     let directory = TestDirectory::new("profile-v1-existing-destination");
     fs::create_dir(directory.root()).expect("create existing V1 destination");
-    let profile_session = serde_json::json!({
-        "session_id": "session-profile-v1",
-        "opaque_capability": "profile-session-capability",
-        "expires_at": "2026-07-29T08:00:00Z",
-        "profile_id": "00000000-0000-0000-0000-000000000007",
-        "profile_revision": 9
-    });
-    let server = MockServer::start(vec![
-        ResponseFixture::json(&serde_json::json!({})).with_status("404 Not Found"),
-        ResponseFixture::json(&profile_session).with_status("201 Created"),
-    ]);
+    let server = MockServer::start(Vec::new());
 
     let error = run_sandbox_init_with_profile_key(
         SandboxInitOptions {
@@ -923,10 +913,6 @@ fn generation1_profile_fallback_preserves_destination_exists_behavior() {
 
     assert_eq!(error.code(), "destination_invalid");
     assert!(error.to_string().contains("already exists"));
-    assert_eq!(server.request().path, "/v2/workspace-profile-sessions");
-    let fallback = server.request();
-    assert_eq!(fallback.path, "/v1/workspace-profile-sessions");
-    assert!(fallback.body.is_empty(), "V1 request remains bodyless");
     server.assert_no_request();
 }
 
