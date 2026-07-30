@@ -217,6 +217,7 @@ on_error() {
   local code=$?
   echo "live Google Calendar VFS round trip failed during: $step" >&2
   echo "privacy-safe diagnostics: exit=$code" >&2
+  emit_live_debug_diagnostics "Google Calendar VFS round trip" || true
   return "$code"
 }
 

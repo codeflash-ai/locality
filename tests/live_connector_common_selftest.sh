@@ -195,6 +195,66 @@ if ! grep -Fq "self-test not-ok report did not report ok=true" "$not_ok_error"; 
   live_fail "assert_json_ok did not explain the ok=false failure"
 fi
 
+export LINEAR_API_KEY="lin_api_selftestsecret"
+export LOCALITY_LINEAR_LIVE_ISSUE_ID="lin_selftest_secret_issue"
+export LOCALITY_GMAIL_LIVE_TO_EMAIL="private-selftest@example.com"
+debug_report="$tmp_root/debug-report.json"
+debug_command_log="$tmp_root/debug-commands.err.log"
+debug_daemon_log="$tmp_root/debug-localityd.log"
+debug_fuse_log="$tmp_root/debug-locality-fuse.log"
+debug_output="$tmp_root/debug-output.err"
+cat >"$debug_report" <<'JSON'
+{
+  "ok": false,
+  "status": "error",
+  "code": "selftest_permission_denied",
+  "error": {
+    "code": "linear_push_failed",
+    "message": "failed to update lin_selftest_secret_issue for private-selftest@example.com with lin_api_selftestsecret"
+  },
+  "changed_remote_ids": ["lin_selftest_secret_issue"],
+  "access_token": "ya29.selftest-secret-access-token"
+}
+JSON
+cat >"$debug_command_log" <<'LOG'
+curl failed with Authorization: Bearer ya29.selftest-secret-access-token
+linear key was lin_api_selftestsecret
+LOG
+cat >"$debug_daemon_log" <<'LOG'
+localityd is running with private-selftest@example.com
+LOG
+cat >"$debug_fuse_log" <<'LOG'
+fuse saw lin_selftest_secret_issue
+LOG
+
+push_report="$debug_report" \
+  command_log="$debug_command_log" \
+  daemon_log="$debug_daemon_log" \
+  fuse_log="$debug_fuse_log" \
+  emit_live_debug_diagnostics "Self-test connector" 2>"$debug_output"
+if ! grep -Fq "privacy-safe diagnostics: Self-test connector" "$debug_output"; then
+  live_fail "debug diagnostics did not include the connector label"
+fi
+if ! grep -Fq "selftest_permission_denied" "$debug_output"; then
+  live_fail "debug diagnostics did not include the report error code"
+fi
+if ! grep -Fq "linear_push_failed" "$debug_output"; then
+  live_fail "debug diagnostics did not include the nested error code"
+fi
+if ! grep -Fq "<redacted>" "$debug_output"; then
+  live_fail "debug diagnostics did not show redaction placeholders"
+fi
+for leaked_debug_value in \
+  "lin_api_selftestsecret" \
+  "lin_selftest_secret_issue" \
+  "private-selftest@example.com" \
+  "ya29.selftest-secret-access-token"; do
+  if grep -Fq "$leaked_debug_value" "$debug_output"; then
+    live_fail "debug diagnostics leaked $leaked_debug_value"
+  fi
+done
+unset LINEAR_API_KEY LOCALITY_LINEAR_LIVE_ISSUE_ID LOCALITY_GMAIL_LIVE_TO_EMAIL
+
 init_live_state "$loc_bin" "$state_root"
 seed_connector_credential "$loc_bin" "$state_root" "google-docs" "google-docs-live" "$credential_json"
 

@@ -394,6 +394,7 @@ on_error() {
   local code=$?
   echo "live Gmail VFS round trip failed during: $step" >&2
   echo "privacy-safe diagnostics: exit=$code" >&2
+  emit_live_debug_diagnostics "Gmail VFS round trip" || true
   return "$code"
 }
 

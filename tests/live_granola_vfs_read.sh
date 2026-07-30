@@ -6,6 +6,11 @@ if [[ "${LOCALITY_LIVE_GRANOLA_VFS:-}" != "1" ]]; then
   exit 0
 fi
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=tests/live_connector_common.sh
+source "$script_dir/live_connector_common.sh"
+
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "skip: live Granola VFS test requires Linux"
   exit 0
@@ -71,6 +76,7 @@ on_error() {
   local code=$?
   echo "live Granola VFS test failed during: $step" >&2
   echo "privacy-safe diagnostics: exit=$code" >&2
+  emit_live_debug_diagnostics "Granola VFS read test" || true
   if [[ -n "$localityd_pid" ]]; then
     if kill -0 "$localityd_pid" >/dev/null 2>&1; then
       echo "privacy-safe diagnostics: daemon=running" >&2

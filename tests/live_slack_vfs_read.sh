@@ -283,6 +283,7 @@ on_error() {
   local code=$?
   echo "live Slack VFS read-only test failed during: $step" >&2
   echo "privacy-safe diagnostics: exit=$code" >&2
+  emit_live_debug_diagnostics "Slack VFS read-only test" || true
   return "$code"
 }
 
