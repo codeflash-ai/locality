@@ -117,6 +117,66 @@ final class LocalityFileProviderItemTests: XCTestCase {
     )
   }
 
+  func testWorkingSetUsesRecursiveCachedDomainItemsWithoutPerFolderRequests() throws {
+    let client = RecordingEnumerationClient(
+      workingSet: LocalityDomainChildrenPayload(
+        domainId: "loc",
+        children: [
+          LocalityDomainChild(
+            mountId: "notion-main",
+            item: metadata(
+              identifier: "mount:notion-main",
+              filename: "notion",
+              kind: "folder"
+            )
+          ),
+          LocalityDomainChild(
+            mountId: "notion-main",
+            item: metadata(
+              identifier: "children:company",
+              parentIdentifier: "mount:notion-main",
+              filename: "Company",
+              kind: "folder"
+            )
+          ),
+          LocalityDomainChild(
+            mountId: "notion-main",
+            item: metadata(
+              identifier: "children:compliance",
+              parentIdentifier: "children:company",
+              filename: "Compliance",
+              kind: "folder"
+            )
+          ),
+          LocalityDomainChild(
+            mountId: "notion-main",
+            item: metadata(
+              identifier: "compliance",
+              parentIdentifier: "children:compliance",
+              filename: "page.md",
+              kind: "file"
+            )
+          ),
+        ]
+      )
+    )
+    let enumerator = LocalityEnumerator(
+      client: client,
+      domainId: "loc",
+      includeDomainWorkingSet: true
+    )
+
+    let items = try enumerator.currentItems()
+
+    XCTAssertEqual(items.map(\.filename), ["notion", "Company", "Compliance", "page.md"])
+    XCTAssertEqual(client.workingSetRequests, ["loc"])
+    XCTAssertTrue(client.domainChildrenRequests.isEmpty)
+    XCTAssertTrue(client.childRequests.isEmpty)
+    XCTAssertEqual(items[1].parentItemIdentifier, items[0].itemIdentifier)
+    XCTAssertEqual(items[2].parentItemIdentifier, items[1].itemIdentifier)
+    XCTAssertEqual(items[3].parentItemIdentifier, items[2].itemIdentifier)
+  }
+
   func testMissingReconciledLocalItemCanBeDeleted() {
     let error = LocalityDaemonClientError.daemonError(
       code: "invalid_state",
@@ -283,6 +343,7 @@ final class LocalityFileProviderItemTests: XCTestCase {
 
   private func metadata(
     identifier: String,
+    parentIdentifier: String = LocalityIdentifier.root,
     filename: String,
     kind: String,
     entityKind: String? = nil,
@@ -290,7 +351,7 @@ final class LocalityFileProviderItemTests: XCTestCase {
   ) -> LocalityItemMetadata {
     LocalityItemMetadata(
       identifier: identifier,
-      parentIdentifier: LocalityIdentifier.root,
+      parentIdentifier: parentIdentifier,
       filename: filename,
       kind: kind,
       entityKind: entityKind,
@@ -315,5 +376,35 @@ final class LocalityFileProviderItemTests: XCTestCase {
     let directory = FileManager.default.temporaryDirectory
       .appendingPathComponent("LocalitySyncAnchorTests-\(UUID().uuidString)", isDirectory: true)
     return (LocalitySyncAnchorStore(directory: directory), directory)
+  }
+}
+
+private final class RecordingEnumerationClient: LocalityEnumerationClient {
+  private let workingSet: LocalityDomainChildrenPayload
+  private(set) var childRequests: [(String, String)] = []
+  private(set) var domainChildrenRequests: [String] = []
+  private(set) var workingSetRequests: [String] = []
+
+  init(workingSet: LocalityDomainChildrenPayload) {
+    self.workingSet = workingSet
+  }
+
+  func children(mountId: String, containerIdentifier: String) throws -> LocalityChildrenPayload {
+    childRequests.append((mountId, containerIdentifier))
+    return LocalityChildrenPayload(
+      mountId: mountId,
+      containerIdentifier: containerIdentifier,
+      children: []
+    )
+  }
+
+  func domainChildren(domainId: String) throws -> LocalityDomainChildrenPayload {
+    domainChildrenRequests.append(domainId)
+    return LocalityDomainChildrenPayload(domainId: domainId, children: [])
+  }
+
+  func domainWorkingSet(domainId: String) throws -> LocalityDomainChildrenPayload {
+    workingSetRequests.append(domainId)
+    return workingSet
   }
 }

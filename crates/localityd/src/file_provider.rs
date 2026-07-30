@@ -17,6 +17,7 @@ use locality_store::{
     ProjectionMode, ShadowRepository, StoreError, VirtualMutationRepository,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -102,6 +103,56 @@ where
             item: shared_domain_mount_point_item(&mount),
         })
         .collect();
+
+    Ok(FileProviderDomainChildrenReport {
+        domain_id: domain_id.to_string(),
+        children,
+    })
+}
+
+pub fn file_provider_domain_working_set<S>(
+    store: &S,
+    state_root: &Path,
+    domain_id: &str,
+) -> LocalityResult<FileProviderDomainChildrenReport>
+where
+    S: MountRepository + EntityRepository + VirtualMutationRepository,
+{
+    let domain = file_provider_domain_children(store, domain_id)?;
+    let mut children = Vec::new();
+
+    for mount_root in domain.children {
+        let mount_id = MountId::new(mount_root.mount_id.clone());
+        let content_root = virtual_fs::virtual_fs_content_root(state_root, &mount_id);
+        let mut pending_containers = VecDeque::from([mount_root.item.identifier.clone()]);
+        let mut visited_containers = BTreeSet::new();
+        let mut visited_items = BTreeSet::new();
+        children.push(mount_root);
+
+        while let Some(container_identifier) = pending_containers.pop_front() {
+            if !visited_containers.insert(container_identifier.clone()) {
+                continue;
+            }
+            let report = virtual_fs::virtual_fs_children_with_content_root(
+                store,
+                &content_root,
+                &mount_id,
+                &container_identifier,
+            )?;
+            for item in report.children {
+                if !visited_items.insert(item.identifier.clone()) {
+                    continue;
+                }
+                if item.kind == FileProviderItemKind::Folder {
+                    pending_containers.push_back(item.identifier.clone());
+                }
+                children.push(FileProviderDomainChild {
+                    mount_id: mount_id.0.clone(),
+                    item,
+                });
+            }
+        }
+    }
 
     Ok(FileProviderDomainChildrenReport {
         domain_id: domain_id.to_string(),
@@ -4048,6 +4099,139 @@ mod tests {
         assert_eq!(report.children[1].mount_id, "notion-main");
         assert_eq!(report.children[1].item.filename, "notion-main");
         assert_eq!(report.children[1].item.identifier, "mount:notion-main");
+    }
+
+    #[test]
+    fn shared_macos_file_provider_working_set_recursively_lists_cached_items() {
+        let state_root = temp_root("locality-file-provider-working-set");
+        let mount_id = MountId::new("notion-main");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(
+                    mount_id.clone(),
+                    "notion",
+                    state_root.join("visible/notion"),
+                )
+                .projection(ProjectionMode::MacosFileProvider),
+            )
+            .expect("save notion mount");
+        for (remote_id, title, path) in [
+            ("company", "Company", "Company/page.md"),
+            ("compliance", "Compliance", "Company/Compliance/page.md"),
+            (
+                "privacy",
+                "Privacy Policy",
+                "Company/Compliance/Privacy Policy/page.md",
+            ),
+        ] {
+            store
+                .save_entity(EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new(remote_id),
+                    EntityKind::Page,
+                    title,
+                    path,
+                ))
+                .expect("save nested Notion page");
+        }
+
+        let report =
+            file_provider_domain_working_set(&store, &state_root, MACOS_FILE_PROVIDER_DOMAIN_ID)
+                .expect("working set");
+        let items = report
+            .children
+            .iter()
+            .map(|child| {
+                (
+                    child.mount_id.as_str(),
+                    child.item.identifier.as_str(),
+                    child.item.parent_identifier.as_deref(),
+                    child.item.filename.as_str(),
+                    child.item.path.as_str(),
+                    &child.item.kind,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            items,
+            vec![
+                (
+                    "notion-main",
+                    "mount:notion-main",
+                    Some("root"),
+                    "notion",
+                    "notion",
+                    &FileProviderItemKind::Folder,
+                ),
+                (
+                    "notion-main",
+                    "guidance:AGENTS.md",
+                    Some("mount:notion-main"),
+                    "AGENTS.md",
+                    "AGENTS.md",
+                    &FileProviderItemKind::File,
+                ),
+                (
+                    "notion-main",
+                    "guidance:CLAUDE.md",
+                    Some("mount:notion-main"),
+                    "CLAUDE.md",
+                    "CLAUDE.md",
+                    &FileProviderItemKind::File,
+                ),
+                (
+                    "notion-main",
+                    "children:company",
+                    Some("mount:notion-main"),
+                    "Company",
+                    "Company",
+                    &FileProviderItemKind::Folder,
+                ),
+                (
+                    "notion-main",
+                    "children:compliance",
+                    Some("children:company"),
+                    "Compliance",
+                    "Company/Compliance",
+                    &FileProviderItemKind::Folder,
+                ),
+                (
+                    "notion-main",
+                    "company",
+                    Some("children:company"),
+                    "page.md",
+                    "Company/page.md",
+                    &FileProviderItemKind::File,
+                ),
+                (
+                    "notion-main",
+                    "compliance",
+                    Some("children:compliance"),
+                    "page.md",
+                    "Company/Compliance/page.md",
+                    &FileProviderItemKind::File,
+                ),
+                (
+                    "notion-main",
+                    "children:privacy",
+                    Some("children:compliance"),
+                    "Privacy Policy",
+                    "Company/Compliance/Privacy Policy",
+                    &FileProviderItemKind::Folder,
+                ),
+                (
+                    "notion-main",
+                    "privacy",
+                    Some("children:privacy"),
+                    "page.md",
+                    "Company/Compliance/Privacy Policy/page.md",
+                    &FileProviderItemKind::File,
+                ),
+            ]
+        );
+        let _ = fs::remove_dir_all(state_root);
     }
 
     #[test]

@@ -377,6 +377,15 @@ Implementation:
 macOS `enumerateItems` calls into the daemon children path. The daemon client
 maps provider children requests to `DaemonRequest::FileProviderChildren`.
 
+The special working-set enumerator uses
+`DaemonRequest::FileProviderDomainWorkingSet`. That request recursively flattens
+the complete projection already present in durable daemon state, including
+nested page directories and their `page.md` files, without running connector
+child enumeration. This lets macOS seed nested placeholders in one ingestion
+pass even when earlier per-container signals arrived before parent placeholders
+existed. Item-version snapshots make later working-set signals delta-aware, so
+unchanged sibling mounts are not re-reported.
+
 Fetching file contents uses a different path: `fetchContents` calls the daemon
 read/materialize path, which can hydrate. Folder enumeration itself is child
 metadata listing.

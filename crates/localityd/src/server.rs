@@ -376,7 +376,8 @@ fn trace_daemon_request_attrs(span: &mut crate::trace::TraceSpan, request: &Daem
             span.attr("projection_root", projection_root.display().to_string());
             span.attr("projection", projection.as_str());
         }
-        DaemonRequest::FileProviderDomainChildren { domain_id } => {
+        DaemonRequest::FileProviderDomainChildren { domain_id }
+        | DaemonRequest::FileProviderDomainWorkingSet { domain_id } => {
             span.attr("domain_id", domain_id.as_str());
         }
         DaemonRequest::Ping

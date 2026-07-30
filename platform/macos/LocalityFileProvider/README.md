@@ -71,13 +71,16 @@ Finder must enter the File Provider domain so directory listings call
 
 Mount activation signals the working-set enumerator after adding a source
 because macOS can ignore a root-container signal when no root enumerator is
-active. Compact working-set sync anchors reference rebuildable item-version
-snapshots in the File Provider app-group cache; subsequent change enumerations
-report only new, changed, or deleted items while anchors stay within macOS's
-500-byte limit. A missing or incompatible snapshot expires its anchor and falls
-back to a clean enumeration. Adding a source can therefore insert its mount
-point and immediate children without updating an unchanged sibling subtree.
-Reimport and readiness repair stay scoped to the new mount-point identifier.
+active. The working set recursively reads every already-known item from local
+daemon state, without calling connector APIs, so macOS can ingest cached nested
+directories before Finder opens them. Compact sync anchors reference
+rebuildable item-version snapshots in the File Provider app-group cache;
+subsequent change enumerations report only new, changed, or deleted items while
+anchors stay within macOS's 500-byte limit. A missing or incompatible snapshot
+expires its anchor and falls back to a clean enumeration. Adding a source can
+therefore insert its mount point and cached descendants without updating an
+unchanged sibling subtree. Reimport and readiness repair stay scoped to the new
+mount-point identifier.
 Because macOS creates a source folder asynchronously, Locality waits for it
 before inspecting it and retries the scoped refresh once. Automatic activation
 never resets or re-registers the shared domain. Reconnecting an existing source

@@ -259,6 +259,13 @@ final class LocalityDaemonClient: @unchecked Sendable {
     ])
   }
 
+  func domainWorkingSet(domainId: String) throws -> LocalityDomainChildrenPayload {
+    try request([
+      "command": "file_provider_domain_working_set",
+      "domain_id": domainId,
+    ])
+  }
+
   func materialize(mountId: String, identifier: String) throws -> LocalityMaterializePayload {
     try request([
       "command": "file_provider_materialize",

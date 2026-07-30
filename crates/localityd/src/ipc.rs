@@ -103,6 +103,9 @@ pub enum DaemonRequest {
     FileProviderDomainChildren {
         domain_id: String,
     },
+    FileProviderDomainWorkingSet {
+        domain_id: String,
+    },
 }
 
 impl DaemonRequest {
@@ -132,6 +135,7 @@ impl DaemonRequest {
             Self::FileProviderMaterialize { .. } => "file_provider_materialize",
             Self::FileProviderRead { .. } => "file_provider_read",
             Self::FileProviderDomainChildren { .. } => "file_provider_domain_children",
+            Self::FileProviderDomainWorkingSet { .. } => "file_provider_domain_working_set",
         }
     }
 }
@@ -783,6 +787,22 @@ mod tests {
                 identifier: "page-1".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn file_provider_domain_working_set_command_decodes() {
+        let request: DaemonRequest = serde_json::from_str(
+            r#"{"command":"file_provider_domain_working_set","domain_id":"loc"}"#,
+        )
+        .expect("decode File Provider working-set request");
+
+        assert_eq!(
+            request,
+            DaemonRequest::FileProviderDomainWorkingSet {
+                domain_id: "loc".to_string(),
+            }
+        );
+        assert_eq!(request.command_name(), "file_provider_domain_working_set");
     }
 
     #[test]

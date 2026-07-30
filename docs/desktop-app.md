@@ -212,14 +212,17 @@ state; missing helpers or extensions remain explicit setup failures.
 Later source mounts reuse the existing shared File Provider domain. Adding a
 top-level source folder such as `google-calendar-main` signals the working-set
 enumerator because macOS can drop root-container signals when no root enumerator
-is active. Compact working-set sync anchors reference rebuildable item-version
-snapshots in the File Provider app-group cache, so change enumeration reports
-only new, changed, or deleted items while the anchor stays below macOS's
-500-byte limit. A missing or incompatible cached snapshot expires the anchor
-and lets macOS perform a clean enumeration. Adding Calendar therefore inserts
-the Calendar mount and its children without re-reporting or reimporting an
-unchanged `notion` subtree. The shared root is never reimported or
-re-registered. Registration is idempotent when the domain already exists;
+is active. The working set reads the complete known projection recursively from
+durable local daemon state; it must not make connector API requests while
+enumerating folders. This seeds already-discovered nested Notion directories in
+macOS before the user opens them. Compact sync anchors reference rebuildable
+item-version snapshots in the File Provider app-group cache, so later change
+enumeration reports only new, changed, or deleted items while the anchor stays
+below macOS's 500-byte limit. A missing or incompatible cached snapshot expires
+the anchor and lets macOS perform a clean enumeration. Adding Calendar therefore
+inserts the Calendar mount and its cached descendants without re-reporting or
+reimporting an unchanged `notion` subtree. The shared root is never reimported
+or re-registered. Registration is idempotent when the domain already exists;
 automatic setup treats that registration as authoritative rather than removing
 and recreating it to repair metadata. Reimport and readiness repair stay scoped
 to the new mount-point identifier.
@@ -234,8 +237,9 @@ CloudStorage root, and the mount root are all verified successfully.
 Do not show hydration queues, polling intervals, or low-level daemon concepts in
 the onboarding UI. Do not make the user wait for the full workspace projection
 or initial sync to finish before moving forward. Once Notion is connected, Locality
-should begin prefetching top-level directories and files so the chosen mount
-point feels populated quickly. The UI should not show an extra checklist screen
+should begin background discovery and recursively publish all already-cached
+directory and file metadata to File Provider so navigating those folders does
+not wait on a live Notion request. The UI should not show an extra checklist screen
 where most items complete instantly; once the folder and agent instructions are
 ready, route directly to the final ready screen and show background sync as a
 short supporting detail rather than a task the user waits on.

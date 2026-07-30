@@ -470,6 +470,17 @@ pub trait RuntimeJobRunner: Send + Sync + 'static {
             "runtime runner does not handle File Provider domain enumeration",
         )
     }
+
+    fn run_file_provider_domain_working_set(
+        &self,
+        _state_root: PathBuf,
+        _domain_id: String,
+    ) -> DaemonResponse {
+        DaemonResponse::error(
+            "unsupported",
+            "runtime runner does not handle File Provider working-set enumeration",
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -897,6 +908,21 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             Err(error) => return DaemonResponse::error("store_open_failed", error.to_string()),
         };
         match file_provider::file_provider_domain_children(&store, &domain_id) {
+            Ok(report) => DaemonResponse::ok(report),
+            Err(error) => DaemonResponse::error(locality_error_code(&error), error.to_string()),
+        }
+    }
+
+    fn run_file_provider_domain_working_set(
+        &self,
+        state_root: PathBuf,
+        domain_id: String,
+    ) -> DaemonResponse {
+        let store = match SqliteStateStore::open(state_root.clone()) {
+            Ok(store) => store,
+            Err(error) => return DaemonResponse::error("store_open_failed", error.to_string()),
+        };
+        match file_provider::file_provider_domain_working_set(&store, &state_root, &domain_id) {
             Ok(report) => DaemonResponse::ok(report),
             Err(error) => DaemonResponse::error(locality_error_code(&error), error.to_string()),
         }
@@ -1771,6 +1797,13 @@ impl RuntimeState {
                 let response = self
                     .runner
                     .run_file_provider_domain_children(self.config.state_root.clone(), domain_id);
+                let _ = respond_to.send(response);
+            }
+            DaemonRequest::FileProviderDomainWorkingSet { domain_id } => {
+                let response = self.runner.run_file_provider_domain_working_set(
+                    self.config.state_root.clone(),
+                    domain_id,
+                );
                 let _ = respond_to.send(response);
             }
             DaemonRequest::VirtualFsCommitWrite {
