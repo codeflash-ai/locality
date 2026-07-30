@@ -1,0 +1,148 @@
+{
+  "completion_receipt": {
+    "metadata": {
+      "api_generation": 2,
+      "declared_archive_entry_count": 7,
+      "declared_content_bytes": 17,
+      "declared_control_entry_count": 1,
+      "declared_directory_count": 4,
+      "declared_file_count": 2,
+      "export_attempt_id": "export-attempt-9",
+      "inventory_sha256": "sha256:17cbdbe75be9c9ca3115d211621cd73874b2f0e66179ec96fba20ea5d59f8e10",
+      "layout_digest": "sha256:6d739ad2748910520e4df1d680e9ea78a94230d0751e6346d3f5d3c57b9259b5",
+      "layout_version": 1,
+      "profile_id": "018f4f6e-9f2c-7b1a-8c3d-4e5f60718293",
+      "profile_revision": 7,
+      "scope_sources": [
+        { "scope_ordinal": 0, "source_connection_id": "source-notion" },
+        { "scope_ordinal": 1, "source_connection_id": "source-drive" },
+        { "scope_ordinal": 2, "source_connection_id": "source-notion" },
+        { "scope_ordinal": 3, "source_connection_id": "source-drive" }
+      ],
+      "session_id": "session-scope-7",
+      "target_directories": [
+        {
+          "content_bytes": 0,
+          "directory_count": 1,
+          "file_count": 0,
+          "mount_id": "mount-alpha",
+          "target": "Engineering"
+        },
+        {
+          "content_bytes": 17,
+          "directory_count": 3,
+          "file_count": 2,
+          "mount_id": "mount-zeta",
+          "target": "Sales"
+        }
+      ]
+    },
+    "receipt": {
+      "completed_at": "2026-07-23T19:00:04Z",
+      "delivered_archive_entry_count": 7,
+      "delivered_body_sha256": "sha256:d3dc0915a66e57487d402df0642649990fc61e6128ca8a275dea1e7da93e1381",
+      "delivered_content_bytes": 17,
+      "delivered_control_entry_count": 1,
+      "delivered_directory_count": 4,
+      "delivered_file_count": 2,
+      "export_attempt_id": "export-attempt-9",
+      "inventory_sha256": "sha256:17cbdbe75be9c9ca3115d211621cd73874b2f0e66179ec96fba20ea5d59f8e10",
+      "session_id": "session-scope-7",
+      "source_generations": [
+        {
+          "ordinal": 0,
+          "source_connection_id": "source-drive",
+          "source_generation_id": "generation-drive-44"
+        },
+        {
+          "ordinal": 1,
+          "source_connection_id": "source-notion",
+          "source_generation_id": "generation-notion-109"
+        }
+      ],
+      "versions": {
+        "canonical": 1,
+        "changeset": 1,
+        "export_metadata": 2,
+        "path": 1,
+        "replica": 2,
+        "session": 2,
+        "writable_session_store": 1
+      },
+      "writable_metadata_sha256": "sha256:9dc7b5498386580c1578a0a7e46c6eef9d12f54dc66241aec63074c9395d00dd"
+    }
+  },
+  "metadata": {
+    "api_generation": 2,
+    "declared_archive_entry_count": 7,
+    "declared_content_bytes": 17,
+    "declared_control_entry_count": 1,
+    "declared_directory_count": 4,
+    "declared_file_count": 2,
+    "export_attempt_id": "export-attempt-9",
+    "inventory_sha256": "sha256:17cbdbe75be9c9ca3115d211621cd73874b2f0e66179ec96fba20ea5d59f8e10",
+    "layout_digest": "sha256:6d739ad2748910520e4df1d680e9ea78a94230d0751e6346d3f5d3c57b9259b5",
+    "layout_version": 1,
+    "profile_id": "018f4f6e-9f2c-7b1a-8c3d-4e5f60718293",
+    "profile_revision": 7,
+    "scope_sources": [
+      { "scope_ordinal": 0, "source_connection_id": "source-notion" },
+      { "scope_ordinal": 1, "source_connection_id": "source-drive" },
+      { "scope_ordinal": 2, "source_connection_id": "source-notion" },
+      { "scope_ordinal": 3, "source_connection_id": "source-drive" }
+    ],
+    "session_id": "session-scope-7",
+    "target_directories": [
+      {
+        "content_bytes": 0,
+        "directory_count": 1,
+        "file_count": 0,
+        "mount_id": "mount-alpha",
+        "target": "Engineering"
+      },
+      {
+        "content_bytes": 17,
+        "directory_count": 3,
+        "file_count": 2,
+        "mount_id": "mount-zeta",
+        "target": "Sales"
+      }
+    ]
+  },
+  "writable_metadata": {
+    "export_attempt_id": "export-attempt-9",
+    "session_id": "session-scope-7",
+    "source_generations": [
+      {
+        "ordinal": 0,
+        "source_connection_id": "source-drive",
+        "source_generation_id": "generation-drive-44"
+      },
+      {
+        "ordinal": 1,
+        "source_connection_id": "source-notion",
+        "source_generation_id": "generation-notion-109"
+      }
+    ],
+    "versions": {
+      "canonical": 1,
+      "changeset": 1,
+      "export_metadata": 2,
+      "path": 1,
+      "replica": 2,
+      "session": 2,
+      "writable_session_store": 1
+    },
+    "writable_entries": [
+      {
+        "baseline_required": true,
+        "delivered_content_sha256": "sha256:eae710439b6ab1e8e034479e4785fddf64058bbe4b746003e659498e618ae760",
+        "effective_actions": ["read", "update"],
+        "logical_path": "Projects/Roadmap/page.md",
+        "projection_id": "projection-roadmap",
+        "provider_precondition": "opaque-v4",
+        "source_remote_ids": ["page-roadmap"]
+      }
+    ]
+  }
+}

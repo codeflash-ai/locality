@@ -11,25 +11,38 @@ use std::time::{Duration, Instant};
 
 use loc_cli::sandbox::{
     SandboxBootstrapToken, SandboxContentEncodingPreference, SandboxInitError, SandboxInitOptions,
-    resolve_bootstrap_token, run_sandbox_init, run_sandbox_init_with_encoding,
+    SandboxProfileKey, resolve_bootstrap_token, run_sandbox_init, run_sandbox_init_with_encoding,
+    run_sandbox_init_with_profile_key,
 };
 use locality_core::portable::{
     ExportAttemptId, LogicalPath, ProjectionFileKind, ProjectionId, SessionId, SourceAction,
     SourceConnectionId, SourceGenerationId,
 };
+use locality_protocol::workspace_api_v2::{
+    WORKSPACE_EXPORT_OFFER_V2_GOLDEN_JSON, WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON,
+    WORKSPACE_SESSION_STATUS_V2_GOLDEN_JSON, WorkspaceExportOfferV2, WorkspaceProfileSessionV2,
+};
+use locality_protocol::workspace_export_v2::WorkspaceExportTerminalControlV2;
 use locality_protocol::{
     COMPONENT_VERSIONS, CanonicalControlOrderKey, CanonicalDirectoryOrderKey,
     CanonicalExportRecord, CanonicalFileOrderKey, ComponentVersions, DeliveredBodyDigestV2,
     ExportAttemptLimits, ExportAttemptRequest, ExportCompletionReceipt, ExportTerminalControlV2,
-    FreshnessRequirement, OpaqueBootstrapExchangeRequest, OrderedSourceGeneration,
-    PAX_CONTENT_SHA256, PAX_EFFECTIVE_ACTIONS, PAX_FILE_KIND, PAX_PROJECTION_ID,
-    PAX_SOURCE_CONNECTION_ID, PAX_WINNING_SCOPE_ORDINAL, SCOPE_AUTHORIZED_COMPONENT_VERSIONS,
-    SandboxSessionState, SandboxSessionStatus, ScopeAuthorizedWritableExportMetadata,
-    SealedExportOffer, SessionCapability, SessionErrorCode, SessionProtocolError,
-    StaleSessionBehavior, TarContentEncoding, TarExportOffer, canonical_export_inventory_sha256,
-    canonical_writable_metadata_sha256,
+    ExportV2FilePaxMetadata, FreshnessRequirement, OpaqueBootstrapExchangeRequest,
+    OrderedSourceGeneration, PAX_CONTENT_SHA256, PAX_EFFECTIVE_ACTIONS, PAX_FILE_KIND,
+    PAX_PROJECTION_ID, PAX_SOURCE_CONNECTION_ID, PAX_WINNING_SCOPE_ORDINAL,
+    SCOPE_AUTHORIZED_COMPONENT_VERSIONS, SandboxSessionState, SandboxSessionStatus,
+    ScopeAuthorizedWritableExportMetadata, SealedExportOffer, SessionCapability, SessionErrorCode,
+    SessionProtocolError, StaleSessionBehavior, TarContentEncoding, TarExportOffer,
+    canonical_export_inventory_sha256, canonical_writable_metadata_sha256,
 };
+use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 use localityd::replica_materializer::ReplicaMaterializationLimits;
+use localityd::workspace_materializer::{
+    WorkspaceMaterializationLimits, WorkspacePublicationCheckpoint, WorkspacePublicationHooks,
+    publish_staged_workspace_with_hooks, stage_workspace_archive,
+};
+use serde::Deserialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tar::{Builder, EntryType, Header};
 
@@ -117,6 +130,11 @@ impl ResponseFixture {
 
     fn with_declared_content_length(mut self, length: usize) -> Self {
         self.declared_content_length = Some(length);
+        self
+    }
+
+    fn with_status(mut self, status: &'static str) -> Self {
+        self.status = status;
         self
     }
 
@@ -875,6 +893,112 @@ fn scope_authorized_repeat_initialization_reports_destination_conflict() {
         let _ = server.request();
     }
     server.assert_no_request();
+}
+
+#[test]
+fn generation1_profile_fallback_preserves_destination_exists_behavior() {
+    let directory = TestDirectory::new("profile-v1-existing-destination");
+    fs::create_dir(directory.root()).expect("create existing V1 destination");
+    let profile_session = serde_json::json!({
+        "session_id": "session-profile-v1",
+        "opaque_capability": "profile-session-capability",
+        "expires_at": "2026-07-29T08:00:00Z",
+        "profile_id": "00000000-0000-0000-0000-000000000007",
+        "profile_revision": 9
+    });
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&serde_json::json!({})).with_status("404 Not Found"),
+        ResponseFixture::json(&profile_session).with_status("201 Created"),
+    ]);
+
+    let error = run_sandbox_init_with_profile_key(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: directory.root(),
+        },
+        SandboxProfileKey::new("b".repeat(64)).expect("profile key"),
+        SandboxContentEncodingPreference::Automatic,
+    )
+    .expect_err("V1 profile fallback must reject an existing destination");
+
+    assert_eq!(error.code(), "destination_invalid");
+    assert!(error.to_string().contains("already exists"));
+    assert_eq!(server.request().path, "/v2/workspace-profile-sessions");
+    let fallback = server.request();
+    assert_eq!(fallback.path, "/v1/workspace-profile-sessions");
+    assert!(fallback.body.is_empty(), "V1 request remains bodyless");
+    server.assert_no_request();
+}
+
+#[cfg(all(
+    unix,
+    any(target_vendor = "apple", target_os = "linux", target_os = "android")
+))]
+#[test]
+fn generation2_profile_retry_recovers_interrupted_publication_through_loc_entrypoint() {
+    let directory = TestDirectory::new("workspace-v2-recovery");
+    let (session, offer, tar) = workspace_v2_fixture();
+    let compressed = zstd::stream::encode_all(tar.as_slice(), 1).expect("compress workspace tar");
+    let first_server = workspace_v2_server(&session, &offer, compressed.clone());
+    let options = SandboxInitOptions {
+        api_url: first_server.api_url.clone(),
+        root: directory.root(),
+    };
+    let profile_key = SandboxProfileKey::new("a".repeat(64)).expect("profile key");
+
+    run_sandbox_init_with_profile_key(
+        options,
+        profile_key.clone(),
+        SandboxContentEncodingPreference::Automatic,
+    )
+    .expect("initial generation-2 publication");
+    for _ in 0..4 {
+        let _ = first_server.request();
+    }
+
+    let staged = stage_workspace_archive(
+        ReplicaArchive::new(ReplicaArchiveEncoding::Identity, Cursor::new(tar.clone())),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &session,
+        &offer,
+    )
+    .expect("stage interrupted refresh");
+    let mut fail = FailWorkspacePublicationAt(WorkspacePublicationCheckpoint::ReceiptDurable);
+    publish_staged_workspace_with_hooks(staged, &directory.root(), &mut fail)
+        .expect_err("inject crash after durable receipt");
+    let journal = directory.0.join(".locality-replica.publication.json");
+    assert!(
+        journal.exists(),
+        "interrupted publication keeps its journal"
+    );
+
+    let retry_server = workspace_v2_server(&session, &offer, compressed);
+    let report = run_sandbox_init_with_profile_key(
+        SandboxInitOptions {
+            api_url: retry_server.api_url.clone(),
+            root: directory.root(),
+        },
+        profile_key,
+        SandboxContentEncodingPreference::Automatic,
+    )
+    .expect("loc entrypoint recovers and retries generation 2");
+
+    assert_eq!(report.files, 2);
+    assert_eq!(
+        fs::read(directory.root().join("Sales/README.md")).expect("read recovered workspace"),
+        b"Public\n"
+    );
+    assert!(
+        !journal.exists(),
+        "successful retry removes publication journal"
+    );
+    let negotiation = retry_server.request();
+    assert_eq!(negotiation.path, "/v2/workspace-profile-sessions");
+    for _ in 0..3 {
+        let _ = retry_server.request();
+    }
+    retry_server.assert_no_request();
 }
 
 #[test]
@@ -2296,6 +2420,115 @@ fn real_world_scope_export_fixture(encoding: TarContentEncoding) -> (SealedExpor
         offer,
         builder.into_inner().expect("collect real-world scope tar"),
     )
+}
+
+#[derive(Deserialize)]
+struct WorkspaceV2ArchiveFixture {
+    directories: Vec<WorkspaceV2DirectoryFixture>,
+    files: Vec<WorkspaceV2FileFixture>,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceV2DirectoryFixture {
+    path: String,
+    scope_ordinal: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceV2FileFixture {
+    path: String,
+    scope_ordinal: u32,
+    projection_id: String,
+    source_connection_id: String,
+    file_kind: ProjectionFileKind,
+    effective_actions: BTreeSet<SourceAction>,
+    content: String,
+}
+
+fn workspace_v2_fixture() -> (WorkspaceProfileSessionV2, WorkspaceExportOfferV2, Vec<u8>) {
+    let session = WorkspaceProfileSessionV2::decode_json(WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON)
+        .expect("workspace session fixture");
+    let control: WorkspaceExportTerminalControlV2 =
+        serde_json::from_slice(include_bytes!("fixtures/workspace-v2-control.json"))
+            .expect("workspace control fixture");
+    let mut offer_json: Value =
+        serde_json::from_slice(WORKSPACE_EXPORT_OFFER_V2_GOLDEN_JSON).expect("workspace offer");
+    offer_json["offer"]["inventory_sha256"] =
+        Value::String(control.metadata.inventory_sha256().to_string());
+    offer_json["offer"]["writable_metadata_sha256"] = Value::String(
+        canonical_writable_metadata_sha256(&control.writable_metadata)
+            .expect("workspace writable digest"),
+    );
+    let offer: WorkspaceExportOfferV2 =
+        serde_json::from_value(offer_json).expect("bound workspace offer");
+    let fixture: WorkspaceV2ArchiveFixture = serde_json::from_slice(include_bytes!(
+        "../../localityd/fixtures/workspace-materializer-v2.json"
+    ))
+    .expect("workspace archive fixture");
+    let mut builder = Builder::new(Vec::new());
+    for directory in &fixture.directories {
+        if let Some(scope_ordinal) = directory.scope_ordinal {
+            builder
+                .append_pax_extensions([(
+                    PAX_WINNING_SCOPE_ORDINAL,
+                    scope_ordinal.to_string().as_bytes(),
+                )])
+                .expect("workspace directory PAX");
+        }
+        append_tar_directory(&mut builder, directory.path.as_bytes());
+    }
+    for file in &fixture.files {
+        let metadata = ExportV2FilePaxMetadata {
+            source_connection_id: SourceConnectionId::new(&file.source_connection_id),
+            projection_id: ProjectionId::new(&file.projection_id),
+            winning_scope_ordinal: file.scope_ordinal,
+            file_kind: file.file_kind.clone(),
+            effective_actions: file.effective_actions.clone(),
+            content_sha256: sha256_label(file.content.as_bytes()),
+        };
+        let pax = metadata.to_records().expect("workspace file PAX");
+        builder
+            .append_pax_extensions(pax.iter().map(|(key, value)| (*key, value.as_bytes())))
+            .expect("append workspace file PAX");
+        append_tar_member(&mut builder, file.path.as_bytes(), file.content.as_bytes());
+    }
+    append_tar_member(
+        &mut builder,
+        locality_protocol::RESERVED_EXPORT_METADATA_PATH.as_bytes(),
+        &serde_json::to_vec(&control).expect("serialize workspace control"),
+    );
+    builder.finish().expect("finish workspace tar");
+    (
+        session,
+        offer,
+        builder.into_inner().expect("collect workspace tar"),
+    )
+}
+
+fn workspace_v2_server(
+    session: &WorkspaceProfileSessionV2,
+    offer: &WorkspaceExportOfferV2,
+    compressed_tar: Vec<u8>,
+) -> MockServer {
+    let status: Value = serde_json::from_slice(WORKSPACE_SESSION_STATUS_V2_GOLDEN_JSON)
+        .expect("workspace status fixture");
+    MockServer::start(vec![
+        ResponseFixture::json(session).with_status("201 Created"),
+        ResponseFixture::json(&status),
+        ResponseFixture::json(offer),
+        ResponseFixture::export("zstd", compressed_tar),
+    ])
+}
+
+struct FailWorkspacePublicationAt(WorkspacePublicationCheckpoint);
+
+impl WorkspacePublicationHooks for FailWorkspacePublicationAt {
+    fn checkpoint(&mut self, checkpoint: WorkspacePublicationCheckpoint) -> std::io::Result<()> {
+        if checkpoint == self.0 {
+            return Err(std::io::Error::other("injected loc publication crash"));
+        }
+        Ok(())
+    }
 }
 
 fn append_tar_directory(builder: &mut Builder<Vec<u8>>, path: &[u8]) {

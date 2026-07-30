@@ -204,6 +204,48 @@ fn identity_archive_publishes_only_read_only_files_and_directories() {
     assert_modes(&root.destination().join("top.txt"), 0o444);
 }
 
+#[cfg(unix)]
+#[test]
+fn generation1_accepts_case_folded_destination_sibling_on_case_sensitive_unix() {
+    let root = TestDirectory::new("v1-casefold-destination");
+    fs::create_dir(root.0.join("REPLICA")).expect("create distinct case-fold sibling");
+    if root.destination().exists() {
+        return;
+    }
+
+    materialize_identity(
+        tar_archive(&[TestMember::file("readme.md", b"generation 1\n")]),
+        &root.destination(),
+        ReplicaMaterializationLimits::default(),
+    )
+    .expect("generation 1 keeps Linux case-sensitive destination behavior");
+
+    assert_eq!(
+        fs::read(root.destination().join("readme.md")).expect("read V1 publication"),
+        b"generation 1\n"
+    );
+    assert!(root.0.join("REPLICA").is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn generation1_accepts_non_nfc_destination_spelling_on_unix() {
+    let root = TestDirectory::new("v1-non-nfc-destination");
+    let destination = root.0.join("re\u{301}plica");
+
+    materialize_identity(
+        tar_archive(&[TestMember::file("readme.md", b"generation 1\n")]),
+        &destination,
+        ReplicaMaterializationLimits::default(),
+    )
+    .expect("generation 1 keeps exact non-NFC Linux destination behavior");
+
+    assert_eq!(
+        fs::read(destination.join("readme.md")).expect("read V1 publication"),
+        b"generation 1\n"
+    );
+}
+
 #[test]
 fn exact_receipt_identity_archive_publishes_after_decoded_tar_verification() {
     let root = TestDirectory::new("identity-receipt");

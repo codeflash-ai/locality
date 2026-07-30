@@ -2343,6 +2343,25 @@ impl StagingDirectory {
         destination: &Path,
         expected_staging: WorkspaceGenerationIdentity,
     ) -> Result<(), ReplicaMaterializationError> {
+        self.publish_with_destination_policy(destination, expected_staging, false)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn publish_portable_workspace(
+        &mut self,
+        destination: &Path,
+        expected_staging: WorkspaceGenerationIdentity,
+    ) -> Result<(), ReplicaMaterializationError> {
+        self.publish_with_destination_policy(destination, expected_staging, true)
+    }
+
+    #[cfg(unix)]
+    fn publish_with_destination_policy(
+        &mut self,
+        destination: &Path,
+        expected_staging: WorkspaceGenerationIdentity,
+        portable_spelling: bool,
+    ) -> Result<(), ReplicaMaterializationError> {
         let parent_path = self
             .path
             .parent()
@@ -2373,13 +2392,17 @@ impl StagingDirectory {
             )));
         }
 
-        preflight_new_destination_spelling(&self.parent, destination_name).map_err(|error| {
-            if error.kind() == io::ErrorKind::AlreadyExists {
-                ReplicaMaterializationError::DestinationExists(destination.to_path_buf())
-            } else {
-                ReplicaMaterializationError::Publish(error)
-            }
-        })?;
+        if portable_spelling {
+            preflight_new_destination_spelling(&self.parent, destination_name).map_err(
+                |error| {
+                    if error.kind() == io::ErrorKind::AlreadyExists {
+                        ReplicaMaterializationError::DestinationExists(destination.to_path_buf())
+                    } else {
+                        ReplicaMaterializationError::Publish(error)
+                    }
+                },
+            )?;
+        }
         let immediate_parent = verify_anchored_parent(&self.parent, &parent_path)
             .map_err(ReplicaMaterializationError::Publish)?;
         let immediate_root = rustix::fs::fstat(&self.root)
@@ -2424,6 +2447,15 @@ impl StagingDirectory {
         }
         self.published = true;
         Ok(())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn publish_portable_workspace(
+        &mut self,
+        destination: &Path,
+        expected_staging: WorkspaceGenerationIdentity,
+    ) -> Result<(), ReplicaMaterializationError> {
+        self.publish(destination, expected_staging)
     }
 
     #[cfg(windows)]
@@ -2495,6 +2527,15 @@ impl StagingDirectory {
         self.name = destination_name.to_os_string();
         self.published = true;
         Ok(())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub(crate) fn publish_portable_workspace(
+        &mut self,
+        destination: &Path,
+        expected_staging: WorkspaceGenerationIdentity,
+    ) -> Result<(), ReplicaMaterializationError> {
+        self.publish(destination, expected_staging)
     }
 
     #[cfg(not(any(unix, windows)))]

@@ -161,7 +161,8 @@ impl StagedWorkspaceMaterialization {
                 destination.to_path_buf(),
             ));
         }
-        self.staging.publish(destination, expected_staging)?;
+        self.staging
+            .publish_portable_workspace(destination, expected_staging)?;
         self.staging.sync_parent()?;
         Ok(PublishedWorkspace {
             validated: self.validated,
