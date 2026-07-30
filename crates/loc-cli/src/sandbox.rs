@@ -35,7 +35,7 @@ use localityd::replica_materializer::{
 use localityd::workspace_archive::WorkspaceArchiveLimits;
 use localityd::workspace_materializer::{
     PublishedWorkspace, WorkspaceMaterializationError, WorkspaceMaterializationLimits,
-    materialize_workspace_archive_durable,
+    materialize_workspace_archive_durable, recover_workspace_publication,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
@@ -701,7 +701,10 @@ fn run_sandbox_init_internal(
     mut profile: Option<&mut SandboxInitProfile>,
 ) -> Result<SandboxInitReport, SandboxInitError> {
     let root = absolute_destination(&options.root)?;
-    validate_destination(&root)?;
+    validate_destination_parent(&root)?;
+    if !matches!(&credential, SandboxCredential::ProfileKey(_)) {
+        validate_destination_absent(&root)?;
+    }
     let client = SandboxHttpClient::new(&options.api_url)?;
     mark_profile(&mut profile, PROFILE_CLIENT_SETUP);
 
@@ -711,12 +714,17 @@ fn run_sandbox_init_internal(
         }
         SandboxCredential::ProfileKey(profile_key) => {
             match client.create_workspace_profile_session_negotiated(&profile_key)? {
-                WorkspaceProfileNegotiation::Generation1(capability) => capability,
+                WorkspaceProfileNegotiation::Generation1(capability) => {
+                    validate_destination_absent(&root)?;
+                    capability
+                }
                 WorkspaceProfileNegotiation::Generation2 {
                     session,
                     capabilities,
                 } => {
                     mark_profile(&mut profile, PROFILE_BOOTSTRAP_EXCHANGE);
+                    recover_workspace_publication(&root)
+                        .map_err(|error| SandboxInitError::Materialization(error.to_string()))?;
                     return run_generation2_workspace_init(
                         &client,
                         &root,
@@ -1256,7 +1264,7 @@ fn absolute_destination(path: &Path) -> Result<PathBuf, SandboxInitError> {
     }
 }
 
-fn validate_destination(root: &Path) -> Result<(), SandboxInitError> {
+fn validate_destination_parent(root: &Path) -> Result<(), SandboxInitError> {
     let parent = root
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1272,6 +1280,10 @@ fn validate_destination(root: &Path) -> Result<(), SandboxInitError> {
             ));
         }
     }
+    Ok(())
+}
+
+fn validate_destination_absent(root: &Path) -> Result<(), SandboxInitError> {
     if fs::symlink_metadata(root).is_ok() {
         return Err(SandboxInitError::DestinationExists(root.to_path_buf()));
     }
