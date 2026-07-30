@@ -110,6 +110,7 @@ describe("desktop dark theme UI", () => {
   });
 
   it("keeps home stat dark surfaces tokenized", () => {
+    const baseStat = cssBlock(".home-stat");
     const stat = cssBlock(':root[data-theme="dark"] .home-stat');
     const hover = cssBlock(':root[data-theme="dark"] button.home-stat:hover');
     const label = cssBlock(':root[data-theme="dark"] .home-stat span');
@@ -117,15 +118,18 @@ describe("desktop dark theme UI", () => {
     const warn = cssBlock(':root[data-theme="dark"] .home-stat strong.warn');
     const danger = cssBlock(':root[data-theme="dark"] .home-stat strong.danger');
 
-    expectTokenizedColors(stat, ["border-color", "background", "color"]);
-    expect(stat).toContain("box-shadow: var(--surface-shadow);");
+    expect(baseStat).toContain("border: 1px solid var(--line);");
+    expect(baseStat).toContain("background: var(--surface);");
+    expect(baseStat).toContain("box-shadow: var(--surface-shadow);");
+    expect(baseStat).toContain("color: var(--ink);");
+    expect(stat).toContain("color: var(--ink);");
     expect(hover).toContain("border-color: var(--control-border-hover);");
     expect(hover).toContain("background: var(--surface-hover);");
     expect(label).toContain("color: var(--muted);");
     expect(value).toContain("color: var(--ink);");
     expect(warn).toContain("color: var(--status-warn-text);");
     expect(danger).toContain("color: var(--status-danger-text);");
-    for (const block of [stat, hover, label, value, warn, danger]) {
+    for (const block of [baseStat, stat, hover, label, value, warn, danger]) {
       expectNoRawSurfaceColors(block);
     }
   });
@@ -141,19 +145,7 @@ describe("desktop dark theme UI", () => {
     expect(cssBlock(".sidebar-collapsed .status-pill.warn")).toContain("background: var(--status-warn-text);");
     expect(cssBlock(".sidebar-collapsed .status-pill.danger")).toContain("background: var(--status-danger-text);");
 
-    const darkReady = cssBlock(':root[data-theme="dark"] .status-pill.ready');
-    const darkWarn = cssBlock(':root[data-theme="dark"] .status-pill.warn');
-    const darkDanger = cssBlock(':root[data-theme="dark"] .status-pill.danger');
-
-    expect(darkReady).toContain("background: var(--status-ready-bg);");
-    expect(darkReady).toContain("color: var(--status-ready-text);");
-    expect(darkWarn).toContain("background: var(--status-warn-bg);");
-    expect(darkWarn).toContain("color: var(--status-warn-text);");
-    expect(darkDanger).toContain("background: var(--status-danger-bg);");
-    expect(darkDanger).toContain("color: var(--status-danger-text);");
-    for (const block of [darkReady, darkWarn, darkDanger]) {
-      expectNoRawSurfaceColors(block);
-    }
+    expect(styles).not.toMatch(/:root\[data-theme="dark"\] \.status-pill\.(ready|warn|danger)/);
   });
 
   it("keeps Live Mode tooltips on semantic tooltip tokens", () => {
@@ -164,7 +156,7 @@ describe("desktop dark theme UI", () => {
 
     expect(tooltip).toContain("border: 1px solid var(--line);");
     expect(tooltip).toContain("background: var(--tooltip-bg);");
-    expect(tooltip).toContain("box-shadow: var(--surface-shadow);");
+    expect(tooltip).toContain("box-shadow: var(--tight-shadow);");
     expect(tooltip).toContain("color: var(--tooltip-text);");
     expect(darkTooltip).toContain("border-color: var(--line);");
     expect(darkTooltip).toContain("background: var(--tooltip-bg);");
