@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use super::checkpoint::{
-    HostedSlackPollCheckpointV1, HostedSlackPollError, HostedSlackPollPhaseV1,
+    HostedSlackPollCheckpointV1, HostedSlackPollError, HostedSlackPollKindV2,
+    HostedSlackPollPhaseV1,
 };
 use super::identity::{
     HostedSlackInstallationBinding, HostedSlackObservedInstallationIdentity,
@@ -29,10 +30,11 @@ use super::native::{
 };
 use super::poll::{
     HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1, HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2,
-    HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V1,
-    HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2, HostedSlackHistoryMessageV1,
-    HostedSlackHistoryPageV1, HostedSlackPollOutputV1, HostedSlackRepliesPageV1,
-    hosted_slack_history_page_reference_closure_v1, hosted_slack_replies_page_reference_closure_v1,
+    HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3, HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V1,
+    HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2,
+    HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3, HostedSlackHistoryMessageV1,
+    HostedSlackHistoryPageV2, HostedSlackPollOutputV1, HostedSlackRepliesPageV2,
+    hosted_slack_history_page_reference_closure_v2, hosted_slack_replies_page_reference_closure_v2,
 };
 
 pub const HOSTED_SLACK_PROVIDER_PAGE_LIMIT_V1: u32 = 15;
@@ -647,7 +649,7 @@ pub async fn drive_hosted_slack_poll_v1<P: HostedSlackProviderPort>(
                 enrich_history_page(provider, checkpoint, control, &mut request_count, &mut page)
                     .await?;
                 ensure_active(control)?;
-                checkpoint.apply_history_page(&page)?;
+                checkpoint.apply_history_page_v2(&page)?;
                 applied_pages += 1;
             }
             HostedSlackPollPhaseV1::HistoricalReplies | HostedSlackPollPhaseV1::CatchUpReplies => {
@@ -670,7 +672,7 @@ pub async fn drive_hosted_slack_poll_v1<P: HostedSlackProviderPort>(
                     Err(HostedSlackProviderError::ThreadNotFound) => {
                         let page = deleted_root_reconciliation_page(checkpoint, &request)?;
                         ensure_active(control)?;
-                        checkpoint.apply_replies_page(&page)?;
+                        checkpoint.apply_replies_page_v2(&page)?;
                         applied_pages += 1;
                         continue;
                     }
@@ -680,7 +682,7 @@ pub async fn drive_hosted_slack_poll_v1<P: HostedSlackProviderPort>(
                 enrich_replies_page(provider, checkpoint, control, &mut request_count, &mut page)
                     .await?;
                 ensure_active(control)?;
-                checkpoint.apply_replies_page(&page)?;
+                checkpoint.apply_replies_page_v2(&page)?;
                 applied_pages += 1;
             }
         }
@@ -876,11 +878,25 @@ fn replies_request(
     })
 }
 
+fn poll_page_version(checkpoint: &HostedSlackPollCheckpointV1) -> (u16, u16) {
+    if checkpoint.poll_kind_v2() == HostedSlackPollKindV2::Incremental {
+        (
+            HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3,
+            HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3,
+        )
+    } else {
+        (
+            HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1,
+            HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V1,
+        )
+    }
+}
+
 fn history_poll_page(
     checkpoint: &HostedSlackPollCheckpointV1,
     request: &HostedSlackHistoryRequestV1,
     response: HostedSlackProviderMessagePageV1,
-) -> Result<HostedSlackHistoryPageV1, HostedSlackProviderError> {
+) -> Result<HostedSlackHistoryPageV2, HostedSlackProviderError> {
     let next_cursor = validate_provider_pagination(request.cursor.as_deref(), &response)?;
     let messages = response
         .messages
@@ -904,10 +920,11 @@ fn history_poll_page(
         })
         .collect::<Result<Vec<_>, HostedSlackProviderError>>()?;
     let selector = checkpoint.selector();
-    let page = HostedSlackHistoryPageV1 {
-        page_format_version: HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1,
-        minimum_reader_version: HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V1,
-        poll_kind: checkpoint.poll_kind(),
+    let (page_format_version, minimum_reader_version) = poll_page_version(checkpoint);
+    let page = HostedSlackHistoryPageV2 {
+        page_format_version,
+        minimum_reader_version,
+        poll_kind: checkpoint.poll_kind_v2(),
         phase: request.phase,
         installation_id: selector.installation_id,
         team_id: selector.team_id,
@@ -932,7 +949,7 @@ fn replies_poll_page(
     checkpoint: &HostedSlackPollCheckpointV1,
     request: &HostedSlackRepliesRequestV1,
     response: HostedSlackProviderMessagePageV1,
-) -> Result<HostedSlackRepliesPageV1, HostedSlackProviderError> {
+) -> Result<HostedSlackRepliesPageV2, HostedSlackProviderError> {
     let next_cursor = validate_provider_pagination(request.cursor.as_deref(), &response)?;
     let root_reply_count = if request.cursor.is_none() {
         response
@@ -961,10 +978,11 @@ fn replies_poll_page(
             ))?
     };
     let selector = checkpoint.selector();
-    let page = HostedSlackRepliesPageV1 {
-        page_format_version: HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1,
-        minimum_reader_version: HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V1,
-        poll_kind: checkpoint.poll_kind(),
+    let (page_format_version, minimum_reader_version) = poll_page_version(checkpoint);
+    let page = HostedSlackRepliesPageV2 {
+        page_format_version,
+        minimum_reader_version,
+        poll_kind: checkpoint.poll_kind_v2(),
         phase: request.phase,
         installation_id: selector.installation_id,
         team_id: selector.team_id,
@@ -994,7 +1012,7 @@ fn replies_poll_page(
 fn deleted_root_reconciliation_page(
     checkpoint: &HostedSlackPollCheckpointV1,
     request: &HostedSlackRepliesRequestV1,
-) -> Result<HostedSlackRepliesPageV1, HostedSlackProviderError> {
+) -> Result<HostedSlackRepliesPageV2, HostedSlackProviderError> {
     let mut root = checkpoint
         .candidate()
         .messages()
@@ -1009,10 +1027,22 @@ fn deleted_root_reconciliation_page(
     root.deleted = true;
     root.file_ids.clear();
     let selector = checkpoint.selector();
-    let page = HostedSlackRepliesPageV1 {
-        page_format_version: HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2,
-        minimum_reader_version: HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2,
-        poll_kind: checkpoint.poll_kind(),
+    let (page_format_version, minimum_reader_version) =
+        if checkpoint.poll_kind_v2() == HostedSlackPollKindV2::Incremental {
+            (
+                HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3,
+                HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3,
+            )
+        } else {
+            (
+                HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2,
+                HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2,
+            )
+        };
+    let page = HostedSlackRepliesPageV2 {
+        page_format_version,
+        minimum_reader_version,
+        poll_kind: checkpoint.poll_kind_v2(),
         phase: request.phase,
         installation_id: selector.installation_id,
         team_id: selector.team_id,
@@ -1071,9 +1101,9 @@ async fn enrich_history_page<P: HostedSlackProviderPort>(
     checkpoint: &HostedSlackPollCheckpointV1,
     control: &HostedSlackDriveControlV1,
     request_count: &mut usize,
-    page: &mut HostedSlackHistoryPageV1,
+    page: &mut HostedSlackHistoryPageV2,
 ) -> Result<(), HostedSlackProviderError> {
-    let closure = hosted_slack_history_page_reference_closure_v1(checkpoint, page)?;
+    let closure = hosted_slack_history_page_reference_closure_v2(checkpoint, page)?;
     let (users, files) = fetch_reference_metadata(
         provider,
         checkpoint,
@@ -1094,9 +1124,9 @@ async fn enrich_replies_page<P: HostedSlackProviderPort>(
     checkpoint: &HostedSlackPollCheckpointV1,
     control: &HostedSlackDriveControlV1,
     request_count: &mut usize,
-    page: &mut HostedSlackRepliesPageV1,
+    page: &mut HostedSlackRepliesPageV2,
 ) -> Result<(), HostedSlackProviderError> {
-    let closure = hosted_slack_replies_page_reference_closure_v1(checkpoint, page)?;
+    let closure = hosted_slack_replies_page_reference_closure_v2(checkpoint, page)?;
     let (users, files) = fetch_reference_metadata(
         provider,
         checkpoint,
@@ -3151,7 +3181,7 @@ mod tests {
         .unwrap();
         let request = history_request(&checkpoint).unwrap();
         let history = history_poll_page(&checkpoint, &request, provider_page).unwrap();
-        checkpoint.apply_history_page(&history).unwrap();
+        checkpoint.apply_history_page_v2(&history).unwrap();
         assert_eq!(
             checkpoint.phase(),
             HostedSlackPollPhaseV1::AwaitingCatchUpCut
