@@ -3,11 +3,12 @@ use locality_protocol::freshness_delivery::{
     GENERATION_DELTA_RECEIPT_V1_GOLDEN_JSON, GENERATION_DELTA_V1_GOLDEN_JSON, GenerationDelta,
     GenerationDeltaTerminalReceipt,
 };
+use locality_protocol::freshness_delivery_transport::GenerationTransportCapabilities;
 use locality_store::{
     GenerationApplyJournalRecord, GenerationApplyOutcome, GenerationApplyStatus,
     GenerationDeliveryRepository, GenerationInodeEvidenceRecord, GenerationPathRecord,
-    ObservedGenerationRecord, PreparedGenerationApply, PreparedGenerationApplyV2, StoreError,
-    StoreResult,
+    ObservedGenerationRecord, PreparedGenerationApply, PreparedGenerationApplyV2,
+    PreparedGenerationApplyV3, StoreError, StoreResult,
 };
 
 struct LegacyGenerationRepository;
@@ -151,17 +152,26 @@ fn original_repository_implementation_uses_safe_additive_defaults() {
     let delta: GenerationDelta = serde_json::from_slice(GENERATION_DELTA_V1_GOLDEN_JSON).unwrap();
     let receipt: GenerationDeltaTerminalReceipt =
         serde_json::from_slice(GENERATION_DELTA_RECEIPT_V1_GOLDEN_JSON).unwrap();
+    let prepared = PreparedGenerationApply {
+        delta,
+        receipt,
+        receipt_sha256: String::new(),
+        stage_root: String::new(),
+        created_at: String::new(),
+    };
     let error = repository
-        .reserve_generation_apply_v2(PreparedGenerationApplyV2::new(
-            PreparedGenerationApply {
-                delta,
-                receipt,
-                receipt_sha256: String::new(),
-                stage_root: String::new(),
-                created_at: String::new(),
-            },
-            true,
-        ))
+        .reserve_generation_apply_v2(PreparedGenerationApplyV2::new(prepared.clone(), true))
         .expect_err("legacy repository must not silently lose a required acknowledgment");
+    assert!(matches!(error, StoreError::InvalidState(_)));
+
+    let error = repository
+        .reserve_generation_apply_v3(PreparedGenerationApplyV3::new(
+            prepared,
+            GenerationTransportCapabilities {
+                terminal_receipt_acknowledgments: true,
+                ..GenerationTransportCapabilities::legacy()
+            },
+        ))
+        .expect_err("legacy repository must not silently lose a negotiated selection");
     assert!(matches!(error, StoreError::InvalidState(_)));
 }

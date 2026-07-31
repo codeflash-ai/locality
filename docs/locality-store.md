@@ -62,6 +62,10 @@
   that mount has an active journal, preventing source resets from orphaning it.
 - SQLite schema v25 / generation-delivery component v4 adds durable pending
   terminal-acknowledgment state without storing a private route or credential.
+- SQLite schema v26 / generation-delivery component v5 binds the complete
+  authenticated transport selection to each apply journal. Exact retries and
+  recovery therefore preserve body-window bounds, acknowledgment state, and
+  selected pin-lease policy without renegotiating an in-flight apply.
 - SQLite records component versions for durable subsystems so compatibility is
   decided from persisted state contracts instead of desktop build IDs.
 - SQLite enables WAL mode, a busy timeout, foreign keys, and `PRAGMA user_version` schema versioning.

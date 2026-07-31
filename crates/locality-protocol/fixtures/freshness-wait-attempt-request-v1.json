@@ -4,5 +4,34 @@
   "api_generation": 2,
   "session_id": "session-scope-7",
   "idempotency_key": "wait-export-018f4f6e",
-  "original_deadline_at": "2026-07-31T12:00:30Z"
+  "capabilities": [
+    {
+      "name": "workspace_layout",
+      "version": 1
+    },
+    {
+      "name": "atomic_root_publication",
+      "version": 1
+    },
+    {
+      "name": "path_ceilings",
+      "version": 1,
+      "max_component_utf8_bytes": 255,
+      "max_component_utf16_units": 255,
+      "max_path_utf8_bytes": 1024,
+      "max_path_utf16_units": 1024
+    },
+    {
+      "name": "tar_encodings",
+      "version": 1,
+      "encodings": [
+        "identity",
+        "zstd"
+      ]
+    },
+    {
+      "name": "freshness_wait",
+      "version": 1
+    }
+  ]
 }

@@ -1,8 +1,9 @@
 //! Capability-gated, HTTP-neutral freshness wait-attempt contracts.
 //!
-//! These values bind a durable multi-source wait to its caller idempotency key
-//! and original deadline. They deliberately contain no tenant route, provider
-//! cursor, job identity, lease token, database key, or persistence behavior.
+//! The client offers workspace capabilities. An authenticated response selects
+//! `freshness_wait: 1`, binds a trusted creation time and sealed freshness
+//! requirement, and derives one immutable server deadline. These values contain
+//! no tenant route, provider cursor, job identity, lease token, or persistence.
 
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Display, Formatter};
@@ -10,9 +11,12 @@ use std::fmt::{Debug, Display, Formatter};
 use locality_core::portable::{SessionId, SourceConnectionId};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::FreshnessEpoch;
 use crate::freshness_delivery::{FreshnessReasonCode, FreshnessRetry, FreshnessRetryClass};
-use crate::workspace_api_v2::{WORKSPACE_HTTP_API_GENERATION_V2, WorkspaceClientCapabilitiesV2};
+use crate::workspace_api_v2::{
+    WORKSPACE_CAPABILITY_VERSION_V1, WORKSPACE_HTTP_API_GENERATION_V2,
+    WorkspaceClientCapabilitiesV2,
+};
+use crate::{FreshnessEpoch, FreshnessRequirement, StaleSessionBehavior};
 
 pub const FRESHNESS_WAIT_FORMAT_VERSION: u16 = 1;
 pub const FRESHNESS_WAIT_READER_VERSION: u16 = 1;
@@ -21,16 +25,18 @@ pub const MAX_FRESHNESS_WAIT_ATTEMPT_BYTES: usize = 64 * 1024;
 pub const MAX_FRESHNESS_WAIT_SOURCES: usize = 64;
 pub const MAX_FRESHNESS_WAIT_ID_BYTES: usize = 128;
 pub const MAX_FRESHNESS_WAIT_IDEMPOTENCY_KEY_BYTES: usize = 128;
-pub const MAX_FRESHNESS_WAIT_DURATION_SECONDS: i64 = 5 * 60;
+pub const MAX_FRESHNESS_WAIT_DURATION_SECONDS: u64 = 5 * 60;
 pub const MAX_FRESHNESS_WAIT_POLL_AFTER_SECONDS: u64 = 60 * 60;
+pub const MAX_FRESHNESS_WAIT_FUTURE_SKEW_SECONDS: i64 = 5;
 
 pub const FRESHNESS_WAIT_ATTEMPT_REQUEST_V1_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/freshness-wait-attempt-request-v1.json");
 pub const FRESHNESS_WAIT_ATTEMPT_V1_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/freshness-wait-attempt-v1.json");
 
-/// Starts or resumes one durable wait. Reusing the idempotency key with a
-/// different session or deadline is a contract mismatch, not a new wait.
+/// Starts or resumes one durable wait. Capability offers are intentionally not
+/// immutable attempt identity: a later poll may offer more capabilities as long
+/// as it still includes the server's already-selected wait version.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct FreshnessWaitAttemptRequest {
     pub format_version: u16,
@@ -38,39 +44,21 @@ pub struct FreshnessWaitAttemptRequest {
     pub api_generation: u16,
     pub session_id: SessionId,
     pub idempotency_key: String,
-    pub original_deadline_at: String,
+    pub capabilities: WorkspaceClientCapabilitiesV2,
 }
 
 impl FreshnessWaitAttemptRequest {
-    pub fn decode_json(
-        input: &[u8],
-        capabilities: &WorkspaceClientCapabilitiesV2,
-    ) -> Result<Self, FreshnessWaitContractError> {
+    pub fn decode_json(input: &[u8]) -> Result<Self, FreshnessWaitContractError> {
         validate_encoding_length(input.len(), MAX_FRESHNESS_WAIT_REQUEST_BYTES)?;
         let request: Self = serde_json::from_slice(input)
             .map_err(|error| FreshnessWaitContractError::InvalidJson(error.to_string()))?;
-        request.validate(capabilities)?;
+        request.validate()?;
         Ok(request)
     }
 
-    pub fn validate(
-        &self,
-        capabilities: &WorkspaceClientCapabilitiesV2,
-    ) -> Result<(), FreshnessWaitContractError> {
-        self.validate_shape()?;
-        if !capabilities.supports_freshness_wait() {
-            return Err(FreshnessWaitContractError::CapabilityRequired);
-        }
-        validate_encoded(self, MAX_FRESHNESS_WAIT_REQUEST_BYTES)
-    }
-
-    fn validate_shape(&self) -> Result<(), FreshnessWaitContractError> {
+    pub fn validate(&self) -> Result<(), FreshnessWaitContractError> {
         validate_versions(self.format_version, self.minimum_reader_version)?;
-        if self.api_generation != WORKSPACE_HTTP_API_GENERATION_V2 {
-            return Err(FreshnessWaitContractError::UnsupportedApiGeneration {
-                actual: self.api_generation,
-            });
-        }
+        validate_api_generation(self.api_generation)?;
         validate_opaque(
             "session_id",
             self.session_id.as_str(),
@@ -81,7 +69,10 @@ impl FreshnessWaitAttemptRequest {
             &self.idempotency_key,
             MAX_FRESHNESS_WAIT_IDEMPOTENCY_KEY_BYTES,
         )?;
-        validate_timestamp(&self.original_deadline_at)
+        if !self.capabilities.supports_freshness_wait() {
+            return Err(FreshnessWaitContractError::CapabilityRequired);
+        }
+        validate_encoded(self, MAX_FRESHNESS_WAIT_REQUEST_BYTES)
     }
 }
 
@@ -94,7 +85,7 @@ impl Debug for FreshnessWaitAttemptRequest {
             .field("api_generation", &self.api_generation)
             .field("session_id", &self.session_id)
             .field("idempotency_key", &"<redacted>")
-            .field("original_deadline_at", &self.original_deadline_at)
+            .field("capabilities", &self.capabilities)
             .finish()
     }
 }
@@ -107,7 +98,7 @@ struct FreshnessWaitAttemptRequestWire {
     api_generation: u16,
     session_id: SessionId,
     idempotency_key: String,
-    original_deadline_at: String,
+    capabilities: WorkspaceClientCapabilitiesV2,
 }
 
 impl<'de> Deserialize<'de> for FreshnessWaitAttemptRequest {
@@ -122,10 +113,38 @@ impl<'de> Deserialize<'de> for FreshnessWaitAttemptRequest {
             api_generation: wire.api_generation,
             session_id: wire.session_id,
             idempotency_key: wire.idempotency_key,
-            original_deadline_at: wire.original_deadline_at,
+            capabilities: wire.capabilities,
         };
-        request.validate_shape().map_err(serde::de::Error::custom)?;
+        request.validate().map_err(serde::de::Error::custom)?;
         Ok(request)
+    }
+}
+
+/// Authenticated server selection. It is immutable once an attempt is created
+/// and is checked against every later client offer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshnessWaitCapabilitySelection {
+    pub version: u16,
+}
+
+impl FreshnessWaitCapabilitySelection {
+    pub fn v1() -> Self {
+        Self {
+            version: WORKSPACE_CAPABILITY_VERSION_V1,
+        }
+    }
+
+    pub fn validate_against(
+        &self,
+        capabilities: &WorkspaceClientCapabilitiesV2,
+    ) -> Result<(), FreshnessWaitContractError> {
+        if self.version != WORKSPACE_CAPABILITY_VERSION_V1
+            || capabilities.freshness_wait_version() != Some(self.version)
+        {
+            return Err(FreshnessWaitContractError::SelectionNotOffered);
+        }
+        Ok(())
     }
 }
 
@@ -139,8 +158,6 @@ pub enum FreshnessWaitSourceState {
     Unknown,
 }
 
-/// Captured demand fence and current applied progress for one configured
-/// source. Ordinals preserve the session's source order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct FreshnessWaitSourceTarget {
     pub ordinal: u32,
@@ -239,10 +256,8 @@ impl FreshnessWaitSourceTarget {
     }
 }
 
-/// Advice for the next short, independently authorized status read.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct FreshnessWaitPollMetadata {
-    pub sequence: u64,
     pub observed_at: String,
     pub retry: FreshnessRetry,
 }
@@ -250,7 +265,6 @@ pub struct FreshnessWaitPollMetadata {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FreshnessWaitPollMetadataWire {
-    sequence: u64,
     observed_at: String,
     retry: StrictFreshnessRetryWire,
 }
@@ -262,7 +276,6 @@ impl<'de> Deserialize<'de> for FreshnessWaitPollMetadata {
     {
         let wire = FreshnessWaitPollMetadataWire::deserialize(deserializer)?;
         let poll = Self {
-            sequence: wire.sequence,
             observed_at: wire.observed_at,
             retry: wire.retry.into(),
         };
@@ -277,8 +290,7 @@ impl FreshnessWaitPollMetadata {
         self.retry
             .validate()
             .map_err(|_| FreshnessWaitContractError::InvalidRetry)?;
-        if self.sequence == 0
-            || self.retry.class != FreshnessRetryClass::AfterDelay
+        if self.retry.class != FreshnessRetryClass::AfterDelay
             || !matches!(
                 self.retry.retry_after_seconds,
                 Some(1..=MAX_FRESHNESS_WAIT_POLL_AFTER_SECONDS)
@@ -300,13 +312,12 @@ pub enum FreshnessWaitTerminalOutcome {
     Unknown,
 }
 
-/// Terminal result. Deadline expiry is distinct from a provider/control-plane
-/// failure so a client can render and retry it without parsing text.
+/// Aggregate terminal advice is deliberately absent. Source reason/retry pairs
+/// remain authoritative and ordered; clients never receive a lossy derived
+/// reason or retry tuple.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct FreshnessWaitTerminal {
     pub outcome: FreshnessWaitTerminalOutcome,
-    pub reason: Option<FreshnessReasonCode>,
-    pub retry: FreshnessRetry,
     pub completed_at: String,
 }
 
@@ -314,8 +325,6 @@ pub struct FreshnessWaitTerminal {
 #[serde(deny_unknown_fields)]
 struct FreshnessWaitTerminalWire {
     outcome: FreshnessWaitTerminalOutcome,
-    reason: Option<FreshnessReasonCode>,
-    retry: StrictFreshnessRetryWire,
     completed_at: String,
 }
 
@@ -327,8 +336,6 @@ impl<'de> Deserialize<'de> for FreshnessWaitTerminal {
         let wire = FreshnessWaitTerminalWire::deserialize(deserializer)?;
         let terminal = Self {
             outcome: wire.outcome,
-            reason: wire.reason,
-            retry: wire.retry.into(),
             completed_at: wire.completed_at,
         };
         terminal.validate().map_err(serde::de::Error::custom)?;
@@ -339,29 +346,10 @@ impl<'de> Deserialize<'de> for FreshnessWaitTerminal {
 impl FreshnessWaitTerminal {
     pub fn validate(&self) -> Result<(), FreshnessWaitContractError> {
         validate_timestamp(&self.completed_at)?;
-        validate_reason(self.reason)?;
-        self.retry
-            .validate()
-            .map_err(|_| FreshnessWaitContractError::InvalidRetry)?;
-        match self.outcome {
-            FreshnessWaitTerminalOutcome::Satisfied
-                if self.reason.is_none()
-                    && self.retry.class == FreshnessRetryClass::Never
-                    && self.retry.retry_after_seconds.is_none() =>
-            {
-                Ok(())
-            }
-            FreshnessWaitTerminalOutcome::DeadlineExceeded
-            | FreshnessWaitTerminalOutcome::Failed
-                if self.reason.is_some() =>
-            {
-                Ok(())
-            }
-            FreshnessWaitTerminalOutcome::Unknown => {
-                Err(FreshnessWaitContractError::UnknownTerminalOutcome)
-            }
-            _ => Err(FreshnessWaitContractError::AmbiguousTerminalOutcome),
+        if self.outcome == FreshnessWaitTerminalOutcome::Unknown {
+            return Err(FreshnessWaitContractError::UnknownTerminalOutcome);
         }
+        Ok(())
     }
 }
 
@@ -374,22 +362,23 @@ pub enum FreshnessWaitAggregateState {
     Unknown,
 }
 
-/// Durable status snapshot for one wait attempt. The attempt identity,
-/// idempotency identity, session, and deadline are immutable across polls.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct FreshnessWaitAttempt {
     pub format_version: u16,
     pub minimum_reader_version: u16,
     pub api_generation: u16,
+    pub selected_capability: FreshnessWaitCapabilitySelection,
     pub wait_attempt_id: String,
     pub session_id: SessionId,
     pub idempotency_key: String,
+    pub freshness_requirement: FreshnessRequirement,
+    pub created_at: String,
     pub original_deadline_at: String,
+    pub sequence: u64,
     pub source_targets: Vec<FreshnessWaitSourceTarget>,
     pub state: FreshnessWaitAggregateState,
     pub poll: Option<FreshnessWaitPollMetadata>,
     pub terminal: Option<FreshnessWaitTerminal>,
-    pub created_at: String,
     pub updated_at: String,
 }
 
@@ -397,46 +386,26 @@ impl FreshnessWaitAttempt {
     pub fn decode_json(
         input: &[u8],
         request: &FreshnessWaitAttemptRequest,
-        capabilities: &WorkspaceClientCapabilitiesV2,
+        authenticated_server_time: &str,
     ) -> Result<Self, FreshnessWaitContractError> {
         validate_encoding_length(input.len(), MAX_FRESHNESS_WAIT_ATTEMPT_BYTES)?;
         let attempt: Self = serde_json::from_slice(input)
             .map_err(|error| FreshnessWaitContractError::InvalidJson(error.to_string()))?;
-        attempt.validate_against(request, capabilities)?;
+        attempt.validate_against_at(request, authenticated_server_time)?;
         Ok(attempt)
     }
 
+    pub fn derive_original_deadline_at(
+        created_at: &str,
+        freshness_requirement: &FreshnessRequirement,
+    ) -> Result<String, FreshnessWaitContractError> {
+        validate_freshness_requirement(freshness_requirement)?;
+        add_timestamp_seconds(created_at, freshness_requirement.wait_timeout_seconds)
+    }
+
     pub fn validate(&self) -> Result<(), FreshnessWaitContractError> {
-        self.validate_shape()?;
-        validate_encoded(self, MAX_FRESHNESS_WAIT_ATTEMPT_BYTES)
-    }
-
-    pub fn validate_against(
-        &self,
-        request: &FreshnessWaitAttemptRequest,
-        capabilities: &WorkspaceClientCapabilitiesV2,
-    ) -> Result<(), FreshnessWaitContractError> {
-        request.validate(capabilities)?;
-        self.validate()?;
-        if self.format_version != request.format_version
-            || self.minimum_reader_version != request.minimum_reader_version
-            || self.api_generation != request.api_generation
-            || self.session_id != request.session_id
-            || self.idempotency_key != request.idempotency_key
-            || self.original_deadline_at != request.original_deadline_at
-        {
-            return Err(FreshnessWaitContractError::AttemptBindingMismatch);
-        }
-        Ok(())
-    }
-
-    fn validate_shape(&self) -> Result<(), FreshnessWaitContractError> {
         validate_versions(self.format_version, self.minimum_reader_version)?;
-        if self.api_generation != WORKSPACE_HTTP_API_GENERATION_V2 {
-            return Err(FreshnessWaitContractError::UnsupportedApiGeneration {
-                actual: self.api_generation,
-            });
-        }
+        validate_api_generation(self.api_generation)?;
         validate_opaque(
             "wait_attempt_id",
             &self.wait_attempt_id,
@@ -452,12 +421,14 @@ impl FreshnessWaitAttempt {
             &self.idempotency_key,
             MAX_FRESHNESS_WAIT_IDEMPOTENCY_KEY_BYTES,
         )?;
-        validate_timestamp(&self.original_deadline_at)?;
+        validate_freshness_requirement(&self.freshness_requirement)?;
         validate_timestamp(&self.created_at)?;
+        validate_timestamp(&self.original_deadline_at)?;
         validate_timestamp(&self.updated_at)?;
-        let wait_duration_seconds = seconds_between(&self.created_at, &self.original_deadline_at)?;
-        if self.created_at > self.updated_at
-            || !(1..=MAX_FRESHNESS_WAIT_DURATION_SECONDS).contains(&wait_duration_seconds)
+        if self.original_deadline_at
+            != Self::derive_original_deadline_at(&self.created_at, &self.freshness_requirement)?
+            || self.updated_at < self.created_at
+            || self.sequence == 0
         {
             return Err(FreshnessWaitContractError::InvalidAttemptTimeline);
         }
@@ -482,7 +453,134 @@ impl FreshnessWaitAttempt {
                 return Err(FreshnessWaitContractError::AmbiguousTerminalOutcome);
             }
         }
-        validate_aggregate_state(self)
+        validate_aggregate_state(self)?;
+        validate_encoded(self, MAX_FRESHNESS_WAIT_ATTEMPT_BYTES)
+    }
+
+    pub fn validate_against(
+        &self,
+        request: &FreshnessWaitAttemptRequest,
+    ) -> Result<(), FreshnessWaitContractError> {
+        request.validate()?;
+        self.validate()?;
+        self.selected_capability
+            .validate_against(&request.capabilities)?;
+        if self.format_version != request.format_version
+            || self.minimum_reader_version != request.minimum_reader_version
+            || self.api_generation != request.api_generation
+            || self.session_id != request.session_id
+            || self.idempotency_key != request.idempotency_key
+        {
+            return Err(FreshnessWaitContractError::AttemptBindingMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn validate_at(
+        &self,
+        authenticated_server_time: &str,
+    ) -> Result<(), FreshnessWaitContractError> {
+        self.validate()?;
+        validate_timestamp(authenticated_server_time)?;
+        if seconds_between(&self.created_at, authenticated_server_time)?
+            < -MAX_FRESHNESS_WAIT_FUTURE_SKEW_SECONDS
+            || seconds_between(&self.updated_at, authenticated_server_time)?
+                < -MAX_FRESHNESS_WAIT_FUTURE_SKEW_SECONDS
+        {
+            return Err(FreshnessWaitContractError::TimestampBeyondAllowedSkew);
+        }
+        if self.state == FreshnessWaitAggregateState::Waiting
+            && authenticated_server_time >= self.original_deadline_at.as_str()
+        {
+            return Err(FreshnessWaitContractError::AttemptPastDeadline);
+        }
+        Ok(())
+    }
+
+    pub fn validate_against_at(
+        &self,
+        request: &FreshnessWaitAttemptRequest,
+        authenticated_server_time: &str,
+    ) -> Result<(), FreshnessWaitContractError> {
+        self.validate_against(request)?;
+        self.validate_at(authenticated_server_time)
+    }
+
+    /// Accepts an exact replay or the next immutable snapshot. Sequence and
+    /// time advance strictly, applied epochs never decrease, source targets and
+    /// order cannot change, and a terminal snapshot absorbs all successors.
+    pub fn validate_successor(
+        &self,
+        previous: &Self,
+        request: &FreshnessWaitAttemptRequest,
+        authenticated_server_time: &str,
+    ) -> Result<(), FreshnessWaitContractError> {
+        self.validate_against_at(request, authenticated_server_time)?;
+        previous.validate()?;
+        previous
+            .selected_capability
+            .validate_against(&request.capabilities)?;
+        if self == previous {
+            return Ok(());
+        }
+        if previous.state == FreshnessWaitAggregateState::Terminal {
+            return Err(FreshnessWaitContractError::TerminalAttemptChanged);
+        }
+        if self.sequence
+            != previous
+                .sequence
+                .checked_add(1)
+                .ok_or(FreshnessWaitContractError::NonMonotonicAttemptSequence)?
+        {
+            return Err(FreshnessWaitContractError::NonMonotonicAttemptSequence);
+        }
+        if !self.same_immutable_attempt(previous) {
+            return Err(FreshnessWaitContractError::AttemptBindingMismatch);
+        }
+        if self.updated_at <= previous.updated_at {
+            return Err(FreshnessWaitContractError::NonMonotonicAttemptTime);
+        }
+        for (prior, next) in previous
+            .source_targets
+            .iter()
+            .zip(self.source_targets.iter())
+        {
+            if prior.state == FreshnessWaitSourceState::Satisfied
+                && next.state != FreshnessWaitSourceState::Satisfied
+            {
+                return Err(FreshnessWaitContractError::SourceTerminalStateChanged);
+            }
+            if prior.state == FreshnessWaitSourceState::Failed {
+                return Err(FreshnessWaitContractError::SourceTerminalStateChanged);
+            }
+            if next.applied_epoch < prior.applied_epoch {
+                return Err(FreshnessWaitContractError::AppliedEpochRegressed);
+            }
+        }
+        Ok(())
+    }
+
+    fn same_immutable_attempt(&self, other: &Self) -> bool {
+        self.format_version == other.format_version
+            && self.minimum_reader_version == other.minimum_reader_version
+            && self.api_generation == other.api_generation
+            && self.selected_capability == other.selected_capability
+            && self.wait_attempt_id == other.wait_attempt_id
+            && self.session_id == other.session_id
+            && self.idempotency_key == other.idempotency_key
+            && self.freshness_requirement == other.freshness_requirement
+            && self.created_at == other.created_at
+            && self.original_deadline_at == other.original_deadline_at
+            && self.source_targets.len() == other.source_targets.len()
+            && self
+                .source_targets
+                .iter()
+                .zip(other.source_targets.iter())
+                .all(|(left, right)| {
+                    left.ordinal == right.ordinal
+                        && left.source_connection_id == right.source_connection_id
+                        && left.target_epoch == right.target_epoch
+                })
     }
 }
 
@@ -493,17 +591,38 @@ impl Debug for FreshnessWaitAttempt {
             .field("format_version", &self.format_version)
             .field("minimum_reader_version", &self.minimum_reader_version)
             .field("api_generation", &self.api_generation)
+            .field("selected_capability", &self.selected_capability)
             .field("wait_attempt_id", &"<redacted>")
             .field("session_id", &self.session_id)
             .field("idempotency_key", &"<redacted>")
+            .field("freshness_requirement", &self.freshness_requirement)
+            .field("created_at", &self.created_at)
             .field("original_deadline_at", &self.original_deadline_at)
+            .field("sequence", &self.sequence)
             .field("source_targets", &self.source_targets)
             .field("state", &self.state)
             .field("poll", &self.poll)
             .field("terminal", &self.terminal)
-            .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)
             .finish()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictFreshnessRequirementWire {
+    max_age_seconds: u64,
+    on_stale: StaleSessionBehavior,
+    wait_timeout_seconds: u64,
+}
+
+impl From<StrictFreshnessRequirementWire> for FreshnessRequirement {
+    fn from(wire: StrictFreshnessRequirementWire) -> Self {
+        Self {
+            max_age_seconds: wire.max_age_seconds,
+            on_stale: wire.on_stale,
+            wait_timeout_seconds: wire.wait_timeout_seconds,
+        }
     }
 }
 
@@ -513,15 +632,18 @@ struct FreshnessWaitAttemptWire {
     format_version: u16,
     minimum_reader_version: u16,
     api_generation: u16,
+    selected_capability: FreshnessWaitCapabilitySelection,
     wait_attempt_id: String,
     session_id: SessionId,
     idempotency_key: String,
+    freshness_requirement: StrictFreshnessRequirementWire,
+    created_at: String,
     original_deadline_at: String,
+    sequence: u64,
     source_targets: Vec<FreshnessWaitSourceTarget>,
     state: FreshnessWaitAggregateState,
     poll: Option<FreshnessWaitPollMetadata>,
     terminal: Option<FreshnessWaitTerminal>,
-    created_at: String,
     updated_at: String,
 }
 
@@ -535,18 +657,21 @@ impl<'de> Deserialize<'de> for FreshnessWaitAttempt {
             format_version: wire.format_version,
             minimum_reader_version: wire.minimum_reader_version,
             api_generation: wire.api_generation,
+            selected_capability: wire.selected_capability,
             wait_attempt_id: wire.wait_attempt_id,
             session_id: wire.session_id,
             idempotency_key: wire.idempotency_key,
+            freshness_requirement: wire.freshness_requirement.into(),
+            created_at: wire.created_at,
             original_deadline_at: wire.original_deadline_at,
+            sequence: wire.sequence,
             source_targets: wire.source_targets,
             state: wire.state,
             poll: wire.poll,
             terminal: wire.terminal,
-            created_at: wire.created_at,
             updated_at: wire.updated_at,
         };
-        attempt.validate_shape().map_err(serde::de::Error::custom)?;
+        attempt.validate().map_err(serde::de::Error::custom)?;
         Ok(attempt)
     }
 }
@@ -557,10 +682,12 @@ pub enum FreshnessWaitContractError {
     InvalidVersionEnvelope,
     UnsupportedApiGeneration { actual: u16 },
     CapabilityRequired,
+    SelectionNotOffered,
     InvalidJson(String),
     EncodingTooLarge { actual: usize, maximum: usize },
     InvalidOpaqueValue(&'static str),
     InvalidTimestamp,
+    InvalidFreshnessRequirement,
     InvalidRetry,
     InvalidPollMetadata,
     InvalidSourceCount { actual: usize },
@@ -574,7 +701,14 @@ pub enum FreshnessWaitContractError {
     UnknownTerminalOutcome,
     AmbiguousTerminalOutcome,
     InvalidAttemptTimeline,
+    TimestampBeyondAllowedSkew,
+    AttemptPastDeadline,
     AttemptBindingMismatch,
+    NonMonotonicAttemptSequence,
+    NonMonotonicAttemptTime,
+    AppliedEpochRegressed,
+    SourceTerminalStateChanged,
+    TerminalAttemptChanged,
 }
 
 impl Display for FreshnessWaitContractError {
@@ -594,6 +728,9 @@ impl Display for FreshnessWaitContractError {
             Self::CapabilityRequired => {
                 formatter.write_str("freshness_wait capability version 1 is required")
             }
+            Self::SelectionNotOffered => {
+                formatter.write_str("server freshness wait selection was not offered by the client")
+            }
             Self::InvalidJson(error) => write!(formatter, "invalid freshness wait JSON: {error}"),
             Self::EncodingTooLarge { actual, maximum } => write!(
                 formatter,
@@ -604,6 +741,9 @@ impl Display for FreshnessWaitContractError {
             }
             Self::InvalidTimestamp => {
                 formatter.write_str("invalid canonical freshness wait timestamp")
+            }
+            Self::InvalidFreshnessRequirement => {
+                formatter.write_str("invalid sealed freshness wait requirement")
             }
             Self::InvalidRetry => formatter.write_str("invalid freshness wait retry metadata"),
             Self::InvalidPollMetadata => {
@@ -641,8 +781,28 @@ impl Display for FreshnessWaitContractError {
             Self::InvalidAttemptTimeline => {
                 formatter.write_str("freshness wait attempt timeline is invalid")
             }
+            Self::TimestampBeyondAllowedSkew => {
+                formatter.write_str("freshness wait timestamp is beyond allowed server clock skew")
+            }
+            Self::AttemptPastDeadline => formatter
+                .write_str("waiting freshness attempt is already past its durable deadline"),
             Self::AttemptBindingMismatch => {
-                formatter.write_str("freshness wait attempt does not match its idempotent request")
+                formatter.write_str("freshness wait attempt changed immutable identity or targets")
+            }
+            Self::NonMonotonicAttemptSequence => {
+                formatter.write_str("freshness wait sequence is not the exact successor")
+            }
+            Self::NonMonotonicAttemptTime => {
+                formatter.write_str("freshness wait update time did not advance")
+            }
+            Self::AppliedEpochRegressed => {
+                formatter.write_str("freshness wait applied epoch regressed")
+            }
+            Self::SourceTerminalStateChanged => {
+                formatter.write_str("freshness wait source terminal state changed")
+            }
+            Self::TerminalAttemptChanged => {
+                formatter.write_str("terminal freshness wait attempt is absorbing")
             }
         }
     }
@@ -650,19 +810,33 @@ impl Display for FreshnessWaitContractError {
 
 impl std::error::Error for FreshnessWaitContractError {}
 
-fn validate_versions(
-    format_version: u16,
-    minimum_reader_version: u16,
-) -> Result<(), FreshnessWaitContractError> {
-    if format_version == 0 || minimum_reader_version == 0 || minimum_reader_version > format_version
-    {
+fn validate_versions(format: u16, minimum: u16) -> Result<(), FreshnessWaitContractError> {
+    if format == 0 || minimum == 0 || minimum > format {
         return Err(FreshnessWaitContractError::InvalidVersionEnvelope);
     }
-    if minimum_reader_version > FRESHNESS_WAIT_READER_VERSION {
+    if minimum > FRESHNESS_WAIT_READER_VERSION {
         return Err(FreshnessWaitContractError::UpdateRequired {
-            minimum: minimum_reader_version,
+            minimum,
             supported: FRESHNESS_WAIT_READER_VERSION,
         });
+    }
+    Ok(())
+}
+
+fn validate_api_generation(actual: u16) -> Result<(), FreshnessWaitContractError> {
+    if actual != WORKSPACE_HTTP_API_GENERATION_V2 {
+        return Err(FreshnessWaitContractError::UnsupportedApiGeneration { actual });
+    }
+    Ok(())
+}
+
+fn validate_freshness_requirement(
+    requirement: &FreshnessRequirement,
+) -> Result<(), FreshnessWaitContractError> {
+    if requirement.on_stale != StaleSessionBehavior::WaitThenFail
+        || !(1..=MAX_FRESHNESS_WAIT_DURATION_SECONDS).contains(&requirement.wait_timeout_seconds)
+    {
+        return Err(FreshnessWaitContractError::InvalidFreshnessRequirement);
     }
     Ok(())
 }
@@ -683,7 +857,7 @@ fn validate_encoded<T: Serialize>(
     maximum: usize,
 ) -> Result<(), FreshnessWaitContractError> {
     let actual = serde_json::to_vec(value)
-        .expect("serializing a typed freshness wait value cannot fail")
+        .expect("typed freshness wait serialization")
         .len();
     validate_encoding_length(actual, maximum)
 }
@@ -765,7 +939,7 @@ fn validate_aggregate_state(
         attempt.terminal.as_ref(),
     ) {
         (FreshnessWaitAggregateState::Waiting, Some(_), None)
-            if waiting > 0 && failed == 0 && attempt.updated_at <= attempt.original_deadline_at =>
+            if waiting > 0 && failed == 0 && attempt.updated_at < attempt.original_deadline_at =>
         {
             Ok(())
         }
@@ -779,21 +953,12 @@ fn validate_aggregate_state(
             FreshnessWaitTerminalOutcome::DeadlineExceeded
                 if waiting > 0
                     && failed == 0
-                    && attempt.source_targets.iter().any(|target| {
-                        target.state == FreshnessWaitSourceState::Waiting
-                            && target.reason == terminal.reason
-                    })
                     && terminal.completed_at >= attempt.original_deadline_at =>
             {
                 Ok(())
             }
             FreshnessWaitTerminalOutcome::Failed
-                if failed > 0
-                    && terminal.completed_at <= attempt.original_deadline_at
-                    && attempt.source_targets.iter().any(|target| {
-                        target.state == FreshnessWaitSourceState::Failed
-                            && target.reason == terminal.reason
-                    }) =>
+                if failed > 0 && terminal.completed_at <= attempt.original_deadline_at =>
             {
                 Ok(())
             }
@@ -807,10 +972,19 @@ fn validate_aggregate_state(
 }
 
 fn seconds_between(start: &str, end: &str) -> Result<i64, FreshnessWaitContractError> {
-    let start = canonical_timestamp_seconds(start)?;
-    let end = canonical_timestamp_seconds(end)?;
-    end.checked_sub(start)
-        .ok_or(FreshnessWaitContractError::InvalidPollMetadata)
+    canonical_timestamp_seconds(end)?
+        .checked_sub(canonical_timestamp_seconds(start)?)
+        .ok_or(FreshnessWaitContractError::InvalidAttemptTimeline)
+}
+
+fn add_timestamp_seconds(value: &str, seconds: u64) -> Result<String, FreshnessWaitContractError> {
+    let base = canonical_timestamp_seconds(value)?;
+    let seconds =
+        i64::try_from(seconds).map_err(|_| FreshnessWaitContractError::InvalidAttemptTimeline)?;
+    format_timestamp_seconds(
+        base.checked_add(seconds)
+            .ok_or(FreshnessWaitContractError::InvalidAttemptTimeline)?,
+    )
 }
 
 fn canonical_timestamp_seconds(value: &str) -> Result<i64, FreshnessWaitContractError> {
@@ -828,13 +1002,36 @@ fn canonical_timestamp_seconds(value: &str) -> Result<i64, FreshnessWaitContract
     let hour = decimal(11..13).ok_or(FreshnessWaitContractError::InvalidTimestamp)?;
     let minute = decimal(14..16).ok_or(FreshnessWaitContractError::InvalidTimestamp)?;
     let second = decimal(17..19).ok_or(FreshnessWaitContractError::InvalidTimestamp)?;
-
     year -= i64::from(month <= 2);
     let era = year.div_euclid(400);
     let year_of_era = year - era * 400;
     let adjusted_month = month + if month > 2 { -3 } else { 9 };
     let day_of_year = (153 * adjusted_month + 2) / 5 + day - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    let days_since_epoch = era * 146_097 + day_of_era - 719_468;
-    Ok(days_since_epoch * 86_400 + hour * 3_600 + minute * 60 + second)
+    Ok((era * 146_097 + day_of_era - 719_468) * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+fn format_timestamp_seconds(value: i64) -> Result<String, FreshnessWaitContractError> {
+    let days = value.div_euclid(86_400);
+    let seconds = value.rem_euclid(86_400);
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    if !(1..=9999).contains(&year) {
+        return Err(FreshnessWaitContractError::InvalidAttemptTimeline);
+    }
+    let hour = seconds / 3_600;
+    let minute = seconds % 3_600 / 60;
+    let second = seconds % 60;
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
+    ))
 }

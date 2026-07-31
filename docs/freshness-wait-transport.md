@@ -8,17 +8,36 @@ generation-pin lifecycle.
 
 ## Identity and replay
 
-A `FreshnessWaitAttemptRequest` binds the workspace session, bounded caller
-idempotency key, and original canonical UTC deadline. A retry with the same key
-must observe the same durable attempt; changing its session or deadline is a
-binding mismatch and cannot silently extend the wait. The returned
-`FreshnessWaitAttempt` repeats those immutable facts and adds a bounded opaque
-wait-attempt ID.
+A `FreshnessWaitAttemptRequest` carries the workspace session, bounded caller
+idempotency key, and the client's complete capability offer. It does not carry
+a client-authored deadline. An authenticated server response selects
+`freshness_wait: 1` and seals the trusted `created_at` plus the session's
+`FreshnessRequirement`. The only legal durable deadline is:
 
-The contract is available only after `freshness_wait: 1` negotiation. Clients
-without that capability retain the existing immediate stale-result behavior
-and never enter this polling protocol. The request and response also carry a
-format/minimum-reader envelope; version 1 requires workspace HTTP API
+`original_deadline_at = created_at + wait_timeout_seconds`
+
+The sealed wait timeout must be positive, must use `on_stale: wait_then_fail`,
+and cannot exceed five minutes. A waiting snapshot is rejected at or after that
+deadline. Creation and update timestamps more than five seconds ahead of
+authenticated server time are also rejected, making clock-skew and
+already-expired responses explicit failures instead of implicit deadline
+extension.
+
+The returned `FreshnessWaitAttempt` adds a bounded opaque wait-attempt ID and a
+positive sequence. An exact snapshot replay is valid. A changed successor must
+advance sequence by exactly one and advance update time; applied epochs cannot
+decrease. Attempt ID, session, idempotency key, selected capability, sealed
+requirement, creation time, derived deadline, source order, source identities,
+and target epochs are immutable. Satisfied or failed sources cannot reopen, and
+an aggregate terminal snapshot absorbs every changed successor.
+
+The contract is available only after `freshness_wait: 1` negotiation. The
+request capability set is always a client offer. `selected_capability` in the
+authenticated response is the immutable server selection and must remain in
+every later offer, but it never replaces or narrows the client's future offers.
+Clients without that capability retain the existing immediate stale-result
+behavior and never enter this polling protocol. The request and response also
+carry a format/minimum-reader envelope; version 1 requires workspace HTTP API
 generation 2.
 
 ## Multi-source progress
@@ -41,10 +60,11 @@ and source arrays beyond the fixed bound are rejected.
 
 ## Polling and terminal outcomes
 
-An aggregate `waiting` attempt has poll metadata and no terminal result. Poll
-metadata carries a positive sequence, snapshot observation time, and
-`after_delay` retry advice capped at one hour. Validation rejects advice that
-would schedule the next useful poll after the immutable deadline.
+An aggregate `waiting` attempt has poll metadata and no terminal result. The
+attempt carries the positive sequence; poll metadata carries the snapshot
+observation time and `after_delay` retry advice capped at one hour. Validation
+rejects advice that would schedule the next useful poll after the immutable
+deadline.
 
 An aggregate `terminal` attempt has no poll metadata and exactly one terminal
 outcome:
@@ -54,8 +74,9 @@ outcome:
   deadline; or
 - `failed`: at least one source reached a typed terminal failure.
 
-Deadline and failure reasons must match an affected source. This prevents a
-multi-source response from reporting an unrelated aggregate explanation.
+Aggregate terminal reason and retry advice are intentionally absent. Ordered
+per-source reason/retry tuples are authoritative, avoiding a lossy or
+nondeterministic derived aggregate choice when several sources fail.
 Cancellation or disconnect is intentionally absent: it does not cancel the
 durable refresh.
 

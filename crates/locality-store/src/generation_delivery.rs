@@ -9,11 +9,12 @@ use locality_core::portable::{ProjectionId, SourceConnectionId, SourceGeneration
 use locality_protocol::freshness_delivery::{
     GenerationDelta, GenerationDeltaTerminalReceipt, GenerationFileIdentity,
 };
+use locality_protocol::freshness_delivery_transport::GenerationTransportCapabilities;
 use serde::{Deserialize, Serialize};
 
 use crate::{StoreError, StoreResult};
 
-pub const GENERATION_DELIVERY_COMPONENT_VERSION: i64 = 4;
+pub const GENERATION_DELIVERY_COMPONENT_VERSION: i64 = 5;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservedGenerationRecord {
@@ -159,6 +160,26 @@ impl PreparedGenerationApplyV2 {
     }
 }
 
+/// Reservation envelope that durably binds the complete authenticated server
+/// selection. The selection controls every replay of this apply.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedGenerationApplyV3 {
+    pub apply: PreparedGenerationApply,
+    pub selected_capabilities: GenerationTransportCapabilities,
+}
+
+impl PreparedGenerationApplyV3 {
+    pub const fn new(
+        apply: PreparedGenerationApply,
+        selected_capabilities: GenerationTransportCapabilities,
+    ) -> Self {
+        Self {
+            apply,
+            selected_capabilities,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GenerationApplyJournalRecord {
     pub delta: GenerationDelta,
@@ -170,6 +191,14 @@ pub struct GenerationApplyJournalRecord {
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
+}
+
+/// Additive journal view containing the immutable negotiated transport
+/// selection without changing the original public journal struct.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NegotiatedGenerationApplyJournalRecord {
+    pub apply: GenerationApplyJournalRecord,
+    pub selected_capabilities: GenerationTransportCapabilities,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -226,6 +255,25 @@ pub trait GenerationDeliveryRepository {
         self.reserve_generation_apply(prepared.apply)
     }
 
+    /// Additive V3 reservation. Legacy repositories may safely accept only the
+    /// legacy selection, which requires no negotiated durable behavior.
+    fn reserve_generation_apply_v3(
+        &mut self,
+        prepared: PreparedGenerationApplyV3,
+    ) -> StoreResult<NegotiatedGenerationApplyJournalRecord> {
+        if prepared.selected_capabilities != GenerationTransportCapabilities::legacy() {
+            return Err(StoreError::InvalidState(
+                "generation repository does not support durable transport selection".to_string(),
+            ));
+        }
+        self.reserve_generation_apply(prepared.apply).map(|apply| {
+            NegotiatedGenerationApplyJournalRecord {
+                apply,
+                selected_capabilities: GenerationTransportCapabilities::legacy(),
+            }
+        })
+    }
+
     fn mark_generation_apply_started(
         &mut self,
         delta_id: &str,
@@ -244,6 +292,18 @@ pub trait GenerationDeliveryRepository {
         &self,
         delta_id: &str,
     ) -> StoreResult<Option<GenerationApplyJournalRecord>>;
+
+    fn get_generation_apply_v2(
+        &self,
+        delta_id: &str,
+    ) -> StoreResult<Option<NegotiatedGenerationApplyJournalRecord>> {
+        self.get_generation_apply(delta_id).map(|journal| {
+            journal.map(|apply| NegotiatedGenerationApplyJournalRecord {
+                apply,
+                selected_capabilities: GenerationTransportCapabilities::legacy(),
+            })
+        })
+    }
 
     fn list_active_generation_applies(&self) -> StoreResult<Vec<GenerationApplyJournalRecord>>;
 

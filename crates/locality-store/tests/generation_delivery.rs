@@ -13,12 +13,16 @@ use locality_protocol::freshness_delivery::{
     FRESHNESS_DELIVERY_READER_VERSION, GENERATION_DELTA_FORMAT_VERSION, GenerationDelta,
     GenerationDeltaEntry, GenerationDeltaTerminalReceipt, GenerationFileIdentity,
 };
+use locality_protocol::freshness_delivery_transport::{
+    GenerationBodyWindowCapability, GenerationPinFallbackPolicy, GenerationPinLeaseCapability,
+    GenerationTransportCapabilities,
+};
 use locality_protocol::workspace_layout::LayoutDigest;
 use locality_store::{
     ConnectionId, GenerationApplyOutcome, GenerationApplyStatus, GenerationDeliveryRepository,
     GenerationPathRecord, GenerationPathState, MountConfig, MountRepository,
-    ObservedGenerationRecord, PreparedGenerationApply, PreparedGenerationApplyV2, SqliteStateStore,
-    StoreError,
+    ObservedGenerationRecord, PreparedGenerationApply, PreparedGenerationApplyV2,
+    PreparedGenerationApplyV3, SqliteStateStore, StoreError,
 };
 
 fn digest(character: char) -> String {
@@ -247,6 +251,60 @@ fn completed_required_acknowledgment_is_durable_exact_and_idempotent() {
 }
 
 #[test]
+fn complete_negotiated_transport_selection_is_immutable_and_survives_reopen() {
+    let fixture = Fixture::new("durable-complete-transport-selection");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let delta = delta();
+    let receipt = receipt(&delta);
+    let prepared = PreparedGenerationApply {
+        delta: delta.clone(),
+        receipt: receipt.clone(),
+        receipt_sha256: receipt.canonical_sha256().unwrap(),
+        stage_root: "generation-delivery/selection".to_string(),
+        created_at: "2026-07-31T12:01:00Z".to_string(),
+    };
+    let selected = GenerationTransportCapabilities {
+        body_windows: Some(GenerationBodyWindowCapability {
+            max_window_bytes: 256 * 1024,
+        }),
+        terminal_receipt_acknowledgments: true,
+        generation_pin_leases: Some(GenerationPinLeaseCapability {
+            min_lease_seconds: 60,
+            max_lease_seconds: 900,
+            max_active_leases_per_device: 8,
+            fallback_policies: vec![
+                GenerationPinFallbackPolicy::RequireExact,
+                GenerationPinFallbackPolicy::UseLatestRetained,
+            ],
+        }),
+        ..GenerationTransportCapabilities::legacy()
+    };
+    store
+        .reserve_generation_apply_v3(PreparedGenerationApplyV3::new(
+            prepared.clone(),
+            selected.clone(),
+        ))
+        .unwrap();
+    drop(store);
+
+    let mut reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    let stored = reopened
+        .get_generation_apply_v2(&delta.delta_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.selected_capabilities, selected);
+
+    let mut changed = selected;
+    changed.body_windows.as_mut().unwrap().max_window_bytes /= 2;
+    assert!(
+        reopened
+            .reserve_generation_apply_v3(PreparedGenerationApplyV3::new(prepared, changed))
+            .is_err()
+    );
+}
+
+#[test]
 fn schema_24_component_v3_migrates_existing_journals_without_pending_acknowledgments() {
     use rusqlite::Connection;
 
@@ -283,6 +341,7 @@ fn schema_24_component_v3_migrates_existing_journals_without_pending_acknowledgm
         .execute_batch(
             "ALTER TABLE generation_apply_journals DROP COLUMN acknowledged_at;
              ALTER TABLE generation_apply_journals DROP COLUMN acknowledgment_required;
+             ALTER TABLE generation_apply_journals DROP COLUMN selected_capabilities_json;
              UPDATE state_components
              SET version = 3, min_reader_version = 3
              WHERE component_id = 'durable:generation_delivery';
@@ -299,6 +358,14 @@ fn schema_24_component_v3_migrates_existing_journals_without_pending_acknowledgm
         .unwrap()
         .unwrap();
     assert_eq!(journal.delta.delta_id, delta.delta_id);
+    assert_eq!(
+        reopened
+            .get_generation_apply_v2(&delta.delta_id)
+            .unwrap()
+            .unwrap()
+            .selected_capabilities,
+        GenerationTransportCapabilities::legacy()
+    );
     assert!(
         reopened
             .list_pending_generation_acknowledgments(&fixture.mount_id)
@@ -317,8 +384,79 @@ fn schema_24_component_v3_migrates_existing_journals_without_pending_acknowledgm
     let user_version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(component, (4, 4));
-    assert_eq!(user_version, 25);
+    assert_eq!(component, (5, 5));
+    assert_eq!(user_version, 26);
+}
+
+#[test]
+fn schema_25_component_v4_migrates_pending_acknowledgment_selection() {
+    use rusqlite::Connection;
+
+    let fixture = Fixture::new("migration-v25-component-v4-pending-ack");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let delta = delta();
+    let receipt = receipt(&delta);
+    store
+        .reserve_generation_apply_v2(PreparedGenerationApplyV2::new(
+            PreparedGenerationApply {
+                delta: delta.clone(),
+                receipt: receipt.clone(),
+                receipt_sha256: receipt.canonical_sha256().unwrap(),
+                stage_root: "generation-delivery/prior-v4-ack".to_string(),
+                created_at: "2026-07-31T12:01:00Z".to_string(),
+            },
+            true,
+        ))
+        .unwrap();
+    store
+        .record_generation_apply_outcome(
+            &delta.delta_id,
+            0,
+            GenerationApplyOutcome::Applied,
+            "2026-07-31T12:02:00Z",
+        )
+        .unwrap();
+    store
+        .complete_generation_apply(&delta.delta_id, "2026-07-31T12:03:00Z")
+        .unwrap();
+    let db_path = store.db_path.clone();
+    drop(store);
+
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE generation_apply_journals DROP COLUMN selected_capabilities_json;
+             UPDATE state_components
+             SET version = 4, min_reader_version = 4
+             WHERE component_id = 'durable:generation_delivery';
+             UPDATE state_components SET version = 25
+             WHERE component_id = 'core:schema';
+             PRAGMA user_version = 25;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    let selected = reopened
+        .get_generation_apply_v2(&delta.delta_id)
+        .unwrap()
+        .unwrap()
+        .selected_capabilities;
+    assert_eq!(
+        selected,
+        GenerationTransportCapabilities {
+            terminal_receipt_acknowledgments: true,
+            ..GenerationTransportCapabilities::legacy()
+        }
+    );
+    assert_eq!(
+        reopened
+            .list_pending_generation_acknowledgments(&fixture.mount_id)
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -680,7 +818,7 @@ fn schema_20_migration_preserves_pending_local_state_and_adds_delivery_tables() 
         fs::read(fixture.mount_root.join("dirty.md")).unwrap(),
         b"local pending bytes"
     );
-    assert_eq!(SqliteStateStore::current_schema_version(), 25);
+    assert_eq!(SqliteStateStore::current_schema_version(), 26);
     assert!(
         reopened
             .get_observed_generation(&fixture.mount_id)
@@ -749,7 +887,7 @@ fn genuine_schema_21_component_v1_fixture_migrates_without_losing_active_state()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(component, (4, 4));
+    assert_eq!(component, (5, 5));
     let error = reopened
         .clear_mount_source_state(&fixture.mount_id)
         .expect_err("migrated active journal must fence source reset");
@@ -757,10 +895,10 @@ fn genuine_schema_21_component_v1_fixture_migrates_without_losing_active_state()
 }
 
 #[test]
-fn partial_v2_v4_generation_migration_is_atomic_and_resumable_per_column() {
+fn partial_v2_v5_generation_migration_is_atomic_and_resumable_per_column() {
     use rusqlite::Connection;
 
-    let fixture = Fixture::new("partial-v2-v4-migration");
+    let fixture = Fixture::new("partial-v2-v5-migration");
     let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
     seed(&mut store, &fixture);
     let db_path = store.db_path.clone();
@@ -855,8 +993,8 @@ fn partial_v2_v4_generation_migration_is_atomic_and_resumable_per_column() {
     let user_version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(component, (4, 4));
-    assert_eq!(user_version, 25);
+    assert_eq!(component, (5, 5));
+    assert_eq!(user_version, 26);
     assert_eq!(
         reopened.list_generation_paths(&fixture.mount_id).unwrap()[0].local_logical_path,
         "Roadmap.md"

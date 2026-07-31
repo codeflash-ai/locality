@@ -183,11 +183,13 @@ impl WorkspaceClientCapabilitiesV2 {
     }
 
     pub fn supports_freshness_wait(&self) -> bool {
-        self.0.iter().any(|capability| {
-            matches!(
-                capability,
-                WorkspaceClientCapabilityV2::FreshnessWait { .. }
-            )
+        self.freshness_wait_version().is_some()
+    }
+
+    pub fn freshness_wait_version(&self) -> Option<u16> {
+        self.0.iter().find_map(|capability| match capability {
+            WorkspaceClientCapabilityV2::FreshnessWait { version } => Some(*version),
+            _ => None,
         })
     }
 

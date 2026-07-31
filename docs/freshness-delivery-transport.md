@@ -18,21 +18,29 @@ minimum reader remains 1, ignore unknown object fields, and fail with
 `UpdateRequired` when a value requires a newer reader. Missing capability and
 version fields decode as the legacy V1 whole-body transport.
 
-The client advertises `GenerationTransportCapabilities` with the next-delta
-request. The authenticated response may select only a subset with limits no
-larger than the offer. The three V1 capabilities are bounded content body
-windows, idempotent terminal receipt acknowledgments, and device-scoped
-generation pin leases. Local sync validates the selected set immediately after
-the poll returns and before the returned delivery can cause journal,
-filesystem, or observed-generation mutations. Startup recovery and
-reconciliation still run before polling. The immutable validated selection
-controls the complete returned-delivery apply.
+The client advertises `GenerationTransportCapabilities` with every next-delta
+request. That value remains a client offer across polls. The authenticated
+`AuthorizedGenerationDeliveryPoll` response carries a separate server
+selection, which may select only a subset with limits no larger than the offer;
+it must not replace or narrow a later client offer. The three V1 capabilities
+are bounded content body windows, idempotent terminal receipt acknowledgments,
+and device-scoped generation pin leases. Local sync validates the selected set
+immediately after the poll returns and before the returned delivery can cause
+journal, filesystem, or observed-generation mutations. Startup recovery and
+reconciliation still run before polling.
+
+For a returned delivery, SQLite durably stores the complete authenticated
+selection alongside the apply journal, including body-window bounds,
+acknowledgment selection, and pin-lease policy. An exact reservation replay must
+match that complete selection. Recovery uses the stored selection, so adapter
+configuration changes cannot renegotiate an in-flight apply.
 
 An existing adapter can continue implementing the original
 `GenerationDeliveryTransport` trait and `GenerationDeliveryRequest` without
-source changes. `next_delta_versioned` is an additive default adapter method,
-and `GenerationTransport` is a compatibility alias. The default capability set
-is legacy, and the existing `open_content` stream remains the fallback.
+source changes. `next_delta_versioned` and `next_delta_poll` are additive
+default adapter methods, and `GenerationTransport` is a compatibility alias.
+The compatibility response selects the legacy transport. The default client
+offer is legacy, and the existing `open_content` stream remains the fallback.
 Selecting a capability and then omitting its response is a contract error;
 selection never silently falls back.
 

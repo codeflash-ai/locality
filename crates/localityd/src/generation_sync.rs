@@ -31,7 +31,7 @@ use locality_protocol::freshness_delivery_transport::{
 use locality_store::{
     GenerationApplyOutcome, GenerationApplyStatus, GenerationDeliveryRepository,
     GenerationInodeEvidenceRecord, GenerationPathRecord, GenerationPathState, MountRepository,
-    PreparedGenerationApply, PreparedGenerationApplyV2, SqliteStateStore,
+    PreparedGenerationApply, PreparedGenerationApplyV3, SqliteStateStore,
 };
 use sha2::{Digest, Sha256};
 
@@ -65,6 +65,15 @@ pub struct AuthorizedGenerationDelivery {
     pub terminal_receipt: GenerationDeltaTerminalReceipt,
 }
 
+/// One authenticated poll result. The client offer remains in the request;
+/// this envelope carries the server's selected subset even when no delta is
+/// available, so a transport never mutates its future client offer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizedGenerationDeliveryPoll {
+    pub selected_capabilities: GenerationTransportCapabilities,
+    pub delivery: Option<AuthorizedGenerationDelivery>,
+}
+
 /// Legacy local adapter request retained source-compatibly. Versioned portable
 /// negotiation is exposed by the additive transport extension method below.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,9 +97,8 @@ pub struct AuthorizedGenerationBodyWindow {
 pub trait GenerationDeliveryTransport {
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Capabilities offered before `next_delta` and selected afterward. An
-    /// adapter that negotiates with a server may update its returned value when
-    /// the authenticated metadata response is accepted.
+    /// Stable client offer. Authenticated server selection is returned by
+    /// [`Self::next_delta_poll`] and must never replace or narrow this offer.
     fn capabilities(&self) -> GenerationTransportCapabilities {
         GenerationTransportCapabilities::legacy()
     }
@@ -111,6 +119,19 @@ pub trait GenerationDeliveryTransport {
             source_connection_id: request.source_connection_id.clone(),
             observed_generation_id: request.observed_generation_id.clone(),
         })
+    }
+
+    /// Additive authenticated poll envelope. Legacy adapters select the legacy
+    /// whole-body contract and continue through `next_delta_versioned`.
+    fn next_delta_poll(
+        &mut self,
+        request: &VersionedGenerationDeliveryRequest,
+    ) -> Result<AuthorizedGenerationDeliveryPoll, Self::Error> {
+        self.next_delta_versioned(request)
+            .map(|delivery| AuthorizedGenerationDeliveryPoll {
+                selected_capabilities: GenerationTransportCapabilities::legacy(),
+                delivery,
+            })
     }
 
     fn open_content(
@@ -208,15 +229,14 @@ where
             observed_generation_id: observed.generation_id,
             capabilities,
         };
-        let delivery = self
+        let poll = self
             .transport
-            .next_delta_versioned(&request)
+            .next_delta_poll(&request)
             .map_err(|error| GenerationSyncError::Transport(error.to_string()))?;
-        let selected = self.transport.capabilities();
-        selected
+        poll.selected_capabilities
             .validate_selection(&request.capabilities)
             .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
-        let Some(delivery) = delivery else {
+        let Some(delivery) = poll.delivery else {
             return Ok(GenerationSyncSummary::default());
         };
         let acknowledgment =
@@ -228,9 +248,9 @@ where
             mount_root,
             delivery,
             &mut self.transport,
-            &selected,
+            &poll.selected_capabilities,
         )?;
-        if selected.terminal_receipt_acknowledgments {
+        if poll.selected_capabilities.terminal_receipt_acknowledgments {
             acknowledge_terminal_receipt(store, &mut self.transport, &acknowledgment)?;
         }
         Ok(summary)
@@ -394,9 +414,12 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
         .unwrap_or_else(GenerationTransportCapabilities::legacy);
 
     let mut retained = reconcile_generation_staging_locked(store)?;
-    let existing = store.get_generation_apply(&delivery.delta.delta_id)?;
+    let existing = store.get_generation_apply_v2(&delivery.delta.delta_id)?;
     if let Some(existing) = &existing {
-        if existing.delta != delivery.delta || existing.receipt != delivery.terminal_receipt {
+        if existing.apply.delta != delivery.delta
+            || existing.apply.receipt != delivery.terminal_receipt
+            || existing.selected_capabilities != capabilities
+        {
             return Err(GenerationSyncError::JournalMismatch);
         }
     }
@@ -404,10 +427,10 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
     let secure_mount = SecureMount::open(mount_root).map_err(GenerationSyncError::MountAccess)?;
     reconcile_completed_mount_inode_evidence(store, mount_id, &secure_mount)?;
     if let Some(existing) = &existing
-        && existing.status == GenerationApplyStatus::Completed
+        && existing.apply.status == GenerationApplyStatus::Completed
     {
         let replay = store
-            .get_generation_apply(&existing.delta.delta_id)?
+            .get_generation_apply(&existing.apply.delta.delta_id)?
             .ok_or(GenerationSyncError::JournalMismatch)?;
         return Ok(summary(&replay, true));
     }
@@ -421,7 +444,7 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
         .canonical_sha256()
         .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
     let created_at = delivery.terminal_receipt.completed_at.clone();
-    let journal = store.reserve_generation_apply_v2(PreparedGenerationApplyV2::new(
+    let negotiated_journal = store.reserve_generation_apply_v3(PreparedGenerationApplyV3::new(
         PreparedGenerationApply {
             delta: delivery.delta,
             receipt: delivery.terminal_receipt,
@@ -429,8 +452,10 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
             stage_root: path_to_portable_text(&stage_relative)?,
             created_at: created_at.clone(),
         },
-        capabilities.terminal_receipt_acknowledgments,
+        capabilities.clone(),
     ))?;
+    let capabilities = negotiated_journal.selected_capabilities;
+    let journal = negotiated_journal.apply;
     let already_recorded = journal
         .outcomes
         .iter()
@@ -2202,7 +2227,6 @@ mod tests {
         versioned_requests: Vec<VersionedGenerationDeliveryRequest>,
         capabilities: GenerationTransportCapabilities,
         selected_capabilities: Option<GenerationTransportCapabilities>,
-        delta_polled: bool,
         body_window_requests: Vec<GenerationBodyWindowRequest>,
         acknowledgment_requests: Vec<GenerationDeliveryAcknowledgmentRequest>,
         acknowledgment_failures_remaining: usize,
@@ -2215,13 +2239,7 @@ mod tests {
         type Error = FakeTransportError;
 
         fn capabilities(&self) -> GenerationTransportCapabilities {
-            if self.delta_polled {
-                self.selected_capabilities
-                    .clone()
-                    .unwrap_or_else(|| self.capabilities.clone())
-            } else {
-                self.capabilities.clone()
-            }
+            self.capabilities.clone()
         }
 
         fn next_delta(
@@ -2233,7 +2251,6 @@ mod tests {
                 before_next_delta()?;
             }
             self.requests.push(request.clone());
-            self.delta_polled = true;
             Ok(self.deliveries.pop_front())
         }
 
@@ -2246,6 +2263,20 @@ mod tests {
                 mount_id: MountId::new(request.mount_id.as_str()),
                 source_connection_id: request.source_connection_id.clone(),
                 observed_generation_id: request.observed_generation_id.clone(),
+            })
+        }
+
+        fn next_delta_poll(
+            &mut self,
+            request: &VersionedGenerationDeliveryRequest,
+        ) -> Result<AuthorizedGenerationDeliveryPoll, Self::Error> {
+            let delivery = self.next_delta_versioned(request)?;
+            Ok(AuthorizedGenerationDeliveryPoll {
+                selected_capabilities: self
+                    .selected_capabilities
+                    .clone()
+                    .unwrap_or_else(|| self.capabilities.clone()),
+                delivery,
             })
         }
 
@@ -3308,8 +3339,21 @@ mod tests {
         );
         assert_eq!(client.transport().acknowledgment_requests.len(), 1);
         assert_eq!(
+            store
+                .get_generation_apply_v2("delta-windowed-content")
+                .unwrap()
+                .unwrap()
+                .selected_capabilities,
+            client.transport().capabilities
+        );
+        assert_eq!(
             client.transport().versioned_requests[0].capabilities,
             client.transport().capabilities
+        );
+        assert_eq!(
+            client.transport().capabilities(),
+            client.transport().capabilities,
+            "authenticated selection must not mutate the next client offer"
         );
     }
 
