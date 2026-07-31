@@ -6189,7 +6189,7 @@ function SettingsView({
   const settingsSections: Array<{ id: SettingsSection; label: string; description: string }> = [
     { id: "general", label: "General", description: "Startup and desktop behavior" },
     { id: "sources", label: "Sources", description: "Connected workspaces and local folders" },
-    { id: "hosted", label: "Hosted", description: "Portable generation-2 workspaces" },
+    { id: "hosted", label: "Hosted (preview)", description: "Manual portable materializer" },
     { id: "sync", label: "Sync", description: "Live Mode and review policy" },
     { id: "activity", label: "Activity", description: "Recent events and debug queue" },
     { id: "agents", label: "Agents", description: "Local agent instructions" },
@@ -6275,9 +6275,9 @@ function SettingsView({
 
           {settingsSection === "hosted" && (
             <section className="panel settings-section-panel portable-workspace-panel">
-              <PanelTitle title="Hosted portable workspace" />
+              <PanelTitle title="Hosted materializer preview" />
               <p className="quiet-note">
-                Materialize or recover a complete generation-2 workspace. This is separate from local source mounts.
+                Manually materialize or recover a generation-2 workspace. This preview is not yet bound to Desktop sources, mounts, or stored credentials.
               </p>
               <div className="portable-workspace-fields">
                 <label className="source-inline-field">

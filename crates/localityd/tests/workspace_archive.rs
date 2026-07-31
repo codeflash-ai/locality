@@ -28,9 +28,12 @@ use localityd::workspace_archive::{
     WorkspaceArchiveLimits, WorkspaceArchiveSink, validate_workspace_tar,
 };
 use localityd::workspace_materializer::{
-    WorkspaceMaterializationLimits, WorkspacePublicationCheckpoint, WorkspacePublicationHooks,
-    load_workspace_publication_receipt, materialize_workspace_archive_durable,
-    publish_staged_workspace_with_hooks, recover_workspace_publication, stage_workspace_archive,
+    PublishedWorkspace, StagedWorkspaceMaterialization, WorkspaceMaterializationError,
+    WorkspaceMaterializationLimits, WorkspaceOwnershipCapability, WorkspacePublicationCheckpoint,
+    WorkspacePublicationHooks, load_workspace_publication_receipt,
+    materialize_workspace_archive_durable as materialize_workspace_archive_durable_secure,
+    publish_staged_workspace_with_hooks as publish_staged_workspace_with_hooks_secure,
+    recover_workspace_publication as recover_workspace_publication_secure, stage_workspace_archive,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -281,6 +284,39 @@ fn contract(fixture: &Fixture) -> Contract {
         offer,
         control,
     }
+}
+
+fn test_ownership() -> WorkspaceOwnershipCapability {
+    WorkspaceOwnershipCapability::new([0x5a; 32])
+}
+
+fn materialize_workspace_archive_durable<Body: Read>(
+    archive: ReplicaArchive<Body>,
+    destination: &Path,
+    limits: WorkspaceMaterializationLimits,
+    session: &WorkspaceProfileSessionV2,
+    offer: &WorkspaceExportOfferV2,
+) -> Result<PublishedWorkspace, WorkspaceMaterializationError> {
+    materialize_workspace_archive_durable_secure(
+        archive,
+        destination,
+        limits,
+        session,
+        offer,
+        &test_ownership(),
+    )
+}
+
+fn publish_staged_workspace_with_hooks<H: WorkspacePublicationHooks>(
+    staged: StagedWorkspaceMaterialization,
+    destination: &Path,
+    hooks: &mut H,
+) -> Result<PublishedWorkspace, WorkspaceMaterializationError> {
+    publish_staged_workspace_with_hooks_secure(staged, destination, &test_ownership(), hooks)
+}
+
+fn recover_workspace_publication(destination: &Path) -> Result<(), WorkspaceMaterializationError> {
+    recover_workspace_publication_secure(destination, &test_ownership())
 }
 
 fn sha256_label(bytes: &[u8]) -> String {
@@ -827,9 +863,11 @@ fn durable_entry_point_persists_receipt_for_loc_and_desktop_callers() {
 
     assert_eq!(receipt.terminal_control, contract.control);
     assert_eq!(receipt.decoded_bytes, published.decoded_bytes);
-    assert_eq!(receipt.version, 2);
+    assert_eq!(receipt.version, 3);
     let receipt_json = serde_json::to_value(&receipt).expect("serialize receipt");
     assert!(receipt_json["generation_identity"]["inode"].is_u64());
+    assert!(receipt_json["ownership_marker_identity"]["inode"].is_u64());
+    assert!(receipt_json["ownership_tag"].as_str().is_some());
     assert!(
         !directory
             .0
@@ -873,7 +911,7 @@ fn stale_receipt_cannot_authorize_exchange_after_root_rename() {
     )
     .expect_err("stale sibling receipt must not authorize exchange");
 
-    assert!(error.to_string().contains("filesystem generation"));
+    assert!(error.to_string().contains(".locality-ownership-v3"));
     assert_eq!(
         fs::read(directory.root().join("unrelated.txt")).expect("replacement survives"),
         b"must survive\n"
@@ -915,7 +953,7 @@ fn stale_receipt_cannot_authorize_exchange_after_root_delete_and_recreate() {
     )
     .expect_err("receipt for deleted generation must not authorize exchange");
 
-    assert!(error.to_string().contains("filesystem generation"));
+    assert!(error.to_string().contains(".locality-ownership-v3"));
     assert_eq!(
         fs::read(directory.root().join("unrelated.txt")).expect("replacement survives"),
         b"must survive\n"
@@ -923,7 +961,7 @@ fn stale_receipt_cannot_authorize_exchange_after_root_delete_and_recreate() {
 }
 
 #[test]
-fn forged_receipt_identity_cannot_authorize_exchange_or_cleanup() {
+fn forged_matching_receipt_cannot_authorize_exchange_or_cleanup() {
     let fixture = fixture();
     let contract = contract(&fixture);
     let directory = TestDirectory::new("forged-receipt-identity");
@@ -942,15 +980,15 @@ fn forged_receipt_identity_cannot_authorize_exchange_or_cleanup() {
     let mut receipt: Value =
         serde_json::from_slice(&fs::read(&receipt_path).expect("read receipt"))
             .expect("decode receipt");
-    let inode = receipt["generation_identity"]["inode"]
+    let decoded_bytes = receipt["decoded_bytes"]
         .as_u64()
-        .expect("receipt inode");
-    receipt["generation_identity"]["inode"] = Value::from(inode.wrapping_add(1));
+        .expect("receipt decoded bytes");
+    receipt["decoded_bytes"] = Value::from(decoded_bytes.wrapping_add(1));
     fs::write(
         &receipt_path,
         serde_json::to_vec(&receipt).expect("encode forged receipt"),
     )
-    .expect("forge receipt identity");
+    .expect("forge matching receipt");
 
     let error = materialize_workspace_archive_durable(
         ReplicaArchive::new(
@@ -964,9 +1002,46 @@ fn forged_receipt_identity_cannot_authorize_exchange_or_cleanup() {
     )
     .expect_err("forged receipt must not authorize refresh");
 
-    assert!(error.to_string().contains("filesystem generation"));
+    assert!(error.to_string().contains("authenticated"));
     assert_eq!(
         fs::read(directory.root().join("Sales/README.md")).expect("old root survives"),
+        b"Public\n"
+    );
+}
+
+#[test]
+fn receipt_cannot_be_reused_with_another_profile_capability() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("receipt-capability-reuse");
+    materialize_workspace_archive_durable(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("publish capability-bound receipt");
+
+    let error = materialize_workspace_archive_durable_secure(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+        &WorkspaceOwnershipCapability::new([0x6b; 32]),
+    )
+    .expect_err("another profile capability must not reuse the receipt");
+
+    assert!(error.to_string().contains("authenticated"));
+    assert_eq!(
+        fs::read(directory.root().join("Sales/README.md")).expect("owned root survives"),
         b"Public\n"
     );
 }

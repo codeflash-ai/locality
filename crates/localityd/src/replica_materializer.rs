@@ -1491,6 +1491,60 @@ pub(crate) fn workspace_generation_identity_if_exists(
     Ok(Some(workspace_identity_from_stat(&stat)))
 }
 
+#[cfg(unix)]
+pub(crate) fn workspace_generation_file_identity(
+    root: &Path,
+    name: &str,
+) -> io::Result<WorkspaceGenerationIdentity> {
+    let (parent, root_name) = open_anchored_parent(root)?;
+    let root = rustix::fs::openat(
+        &parent,
+        &root_name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let file = rustix::fs::openat(
+        &root,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let stat = rustix::fs::fstat(&file)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(io::Error::other(
+            "workspace ownership marker is not an ordinary file",
+        ));
+    }
+    Ok(workspace_identity_from_stat(&stat))
+}
+
+#[cfg(windows)]
+pub(crate) fn workspace_generation_file_identity(
+    root: &Path,
+    name: &str,
+) -> io::Result<WorkspaceGenerationIdentity> {
+    let root = WindowsDirectory::open_absolute(root)?;
+    root.file_identity(OsStr::new(name))
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn workspace_generation_file_identity(
+    root: &Path,
+    name: &str,
+) -> io::Result<WorkspaceGenerationIdentity> {
+    let metadata = fs::symlink_metadata(root.join(name))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::other(
+            "workspace ownership marker is not an ordinary file",
+        ));
+    }
+    Ok(WorkspaceGenerationIdentity {
+        device: 0,
+        inode: 0,
+        inode_high: 0,
+    })
+}
+
 #[cfg(windows)]
 pub(crate) fn workspace_generation_identity_if_exists(
     path: &Path,
@@ -1965,6 +2019,41 @@ impl StagingDirectory {
                         "workspace staging root disappeared",
                     ))
                 })
+        }
+    }
+
+    pub(crate) fn file_identity(
+        &self,
+        name: &str,
+    ) -> Result<WorkspaceGenerationIdentity, ReplicaMaterializationError> {
+        #[cfg(unix)]
+        {
+            let file = rustix::fs::openat(
+                &self.root,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+            let stat = rustix::fs::fstat(&file)
+                .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+                return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                    "workspace ownership marker is not an ordinary file",
+                )));
+            }
+            Ok(workspace_identity_from_stat(&stat))
+        }
+        #[cfg(windows)]
+        {
+            self.root
+                .file_identity(OsStr::new(name))
+                .map_err(ReplicaMaterializationError::Publish)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            workspace_generation_file_identity(&self.path, name)
+                .map_err(ReplicaMaterializationError::Publish)
         }
     }
 

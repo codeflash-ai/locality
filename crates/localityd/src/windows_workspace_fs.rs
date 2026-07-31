@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::mem::{size_of, zeroed};
+use std::mem::{offset_of, size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -137,7 +137,12 @@ impl WindowsDirectory {
         Ok(handle)
     }
 
+    pub(crate) fn file_identity(&self, name: &OsStr) -> io::Result<WorkspaceGenerationIdentity> {
+        handle_identity(&self.open_file_handle(name)?)
+    }
+
     pub(crate) fn remove_contents(&self, named_path: &Path) -> io::Result<()> {
+        self.clear_read_only()?;
         for entry in std::fs::read_dir(named_path)? {
             let entry = entry?;
             let name = entry.file_name();
@@ -169,33 +174,28 @@ impl WindowsDirectory {
     pub(crate) fn sync(&self) -> io::Result<()> {
         // SAFETY: the handle remains owned for the duration of the call.
         if unsafe { FlushFileBuffers(raw_handle(&self.handle)) } == 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            if matches!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::InvalidInput
+                    | io::ErrorKind::Unsupported
+            ) {
+                // Windows does not guarantee that directory handles support
+                // FlushFileBuffers. File bodies are flushed separately.
+                return Ok(());
+            }
+            return Err(error);
         }
         Ok(())
     }
 
     pub(crate) fn set_read_only(&self) -> io::Result<()> {
-        let mut basic = FILE_BASIC_INFO::default();
-        query_handle(
-            &self.handle,
-            FileBasicInfo,
-            (&mut basic as *mut FILE_BASIC_INFO).cast(),
-            size_of::<FILE_BASIC_INFO>(),
-        )?;
-        basic.FileAttributes |= FILE_ATTRIBUTE_READONLY;
-        // SAFETY: pointers and length describe the live `FILE_BASIC_INFO`.
-        if unsafe {
-            SetFileInformationByHandle(
-                raw_handle(&self.handle),
-                FileBasicInfo,
-                (&basic as *const FILE_BASIC_INFO).cast(),
-                size_of::<FILE_BASIC_INFO>() as u32,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        set_handle_read_only(&self.handle, true)
+    }
+
+    pub(crate) fn clear_read_only(&self) -> io::Result<()> {
+        set_handle_read_only(&self.handle, false)
     }
 
     pub(crate) fn rename_no_replace(
@@ -209,7 +209,7 @@ impl WindowsDirectory {
             .checked_mul(2)
             .and_then(|length| u32::try_from(length).ok())
             .ok_or_else(|| io::Error::other("workspace destination name is too long"))?;
-        let fixed = size_of::<FILE_RENAME_INFO>() - size_of::<u16>();
+        let fixed = offset_of!(FILE_RENAME_INFO, FileName);
         let total = fixed
             .checked_add(name.len().saturating_mul(2))
             .ok_or_else(|| io::Error::other("workspace rename buffer overflow"))?;
@@ -235,6 +235,34 @@ impl WindowsDirectory {
         }
         Ok(())
     }
+}
+
+fn set_handle_read_only(handle: &OwnedHandle, read_only: bool) -> io::Result<()> {
+    let mut basic = FILE_BASIC_INFO::default();
+    query_handle(
+        handle,
+        FileBasicInfo,
+        (&mut basic as *mut FILE_BASIC_INFO).cast(),
+        size_of::<FILE_BASIC_INFO>(),
+    )?;
+    if read_only {
+        basic.FileAttributes |= FILE_ATTRIBUTE_READONLY;
+    } else {
+        basic.FileAttributes &= !FILE_ATTRIBUTE_READONLY;
+    }
+    // SAFETY: pointers and length describe the live `FILE_BASIC_INFO`.
+    if unsafe {
+        SetFileInformationByHandle(
+            raw_handle(handle),
+            FileBasicInfo,
+            (&basic as *const FILE_BASIC_INFO).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 pub(crate) fn set_file_read_only(file: &File) -> io::Result<()> {
@@ -263,6 +291,7 @@ pub(crate) fn set_file_read_only(file: &File) -> io::Result<()> {
 }
 
 fn mark_handle_delete(handle: &OwnedHandle) -> io::Result<()> {
+    set_handle_read_only(handle, false)?;
     let disposition = FILE_DISPOSITION_INFO_EX {
         Flags: FILE_DISPOSITION_FLAG_DELETE
             | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS

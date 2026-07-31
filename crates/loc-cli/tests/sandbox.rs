@@ -38,8 +38,8 @@ use locality_protocol::{
 use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 use localityd::replica_materializer::ReplicaMaterializationLimits;
 use localityd::workspace_materializer::{
-    WorkspaceMaterializationLimits, WorkspacePublicationCheckpoint, WorkspacePublicationHooks,
-    publish_staged_workspace_with_hooks, stage_workspace_archive,
+    WorkspaceMaterializationLimits, WorkspaceOwnershipCapability, WorkspacePublicationCheckpoint,
+    WorkspacePublicationHooks, publish_staged_workspace_with_hooks, stage_workspace_archive,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -951,8 +951,13 @@ fn generation2_profile_retry_recovers_interrupted_publication_through_loc_entryp
     )
     .expect("stage interrupted refresh");
     let mut fail = FailWorkspacePublicationAt(WorkspacePublicationCheckpoint::ReceiptDurable);
-    publish_staged_workspace_with_hooks(staged, &directory.root(), &mut fail)
-        .expect_err("inject crash after durable receipt");
+    publish_staged_workspace_with_hooks(
+        staged,
+        &directory.root(),
+        &WorkspaceOwnershipCapability::new([0xaa; 32]),
+        &mut fail,
+    )
+    .expect_err("inject crash after durable receipt");
     let journal = directory.0.join(".locality-replica.publication.json");
     assert!(
         journal.exists(),

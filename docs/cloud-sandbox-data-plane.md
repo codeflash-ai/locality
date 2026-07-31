@@ -874,7 +874,11 @@ The managed-cell contract is:
   arbitrary SQL;
 - atomically materialize into a staging directory and expose the tree only after
   the tar response completes. A truncated response is discarded and restarted;
-  resumable cursors are added only if measurements justify them; and
+  resumable cursors are added only if measurements justify them. Local refresh
+  receipts and crash journals are HMAC-authenticated with a capability derived
+  from the Workspace Profile key and bind both the root and a materializer-made
+  marker identity; writable sibling JSON or a reused directory inode is not
+  ownership authority; and
 - destroy plaintext task volumes with the sandbox. `grep` requires plaintext
   local files, so the sandbox filesystem and process boundary remain part of the
   trusted execution environment.

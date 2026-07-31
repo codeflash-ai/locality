@@ -12163,7 +12163,11 @@ mod tests {
 
     #[test]
     fn portable_workspace_invoke_boundary_accepts_https_and_loopback_http() {
-        for api_url in ["https://workspace.example.test", "http://127.0.0.1:8080"] {
+        for api_url in [
+            "https://workspace.example.test",
+            "http://127.0.0.1:8080",
+            "http://127.1:8080",
+        ] {
             let (options, _) =
                 super::portable_workspace_options(super::PortableWorkspaceMaterializationRequest {
                     api_url: api_url.to_string(),

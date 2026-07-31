@@ -63,7 +63,7 @@ export function validatePortableWorkspaceForm(
     if (parsed.pathname !== "/") {
       return { ok: false, message: "The hosted workspace API URL must not contain a path." };
     }
-    if (parsed.protocol === "http:" && !isLoopbackHostname(rawApiHostname(apiUrl))) {
+    if (parsed.protocol === "http:" && !isLoopbackHostname(parsed.hostname)) {
       return { ok: false, message: "HTTP is allowed only for a loopback hosted workspace." };
     }
   } catch {
@@ -87,15 +87,6 @@ function isLoopbackHostname(hostname: string): boolean {
   return octets.length === 4
     && octets.every((octet) => /^\d{1,3}$/.test(octet) && Number(octet) <= 255)
     && Number(octets[0]) === 127;
-}
-
-function rawApiHostname(apiUrl: string): string {
-  const authority = apiUrl.slice(apiUrl.indexOf("//") + 2).split(/[/?#]/, 1)[0];
-  const hostAndPort = authority.slice(authority.lastIndexOf("@") + 1);
-  if (hostAndPort.startsWith("[")) {
-    return hostAndPort.slice(0, hostAndPort.indexOf("]") + 1);
-  }
-  return hostAndPort.split(":", 1)[0];
 }
 
 function isAbsoluteWorkspaceRoot(root: string): boolean {

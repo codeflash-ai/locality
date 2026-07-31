@@ -35,8 +35,8 @@ use localityd::replica_materializer::{
 use localityd::workspace_archive::WorkspaceArchiveLimits;
 use localityd::workspace_materializer::{
     PublishedWorkspace, WorkspaceMaterializationError, WorkspaceMaterializationLimits,
-    materialize_workspace_archive_durable, recover_and_verify_workspace_publication_state,
-    recover_workspace_publication,
+    WorkspaceOwnershipCapability, materialize_workspace_archive_durable,
+    recover_and_verify_workspace_publication_state, recover_workspace_publication,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
@@ -175,6 +175,14 @@ impl SandboxProfileKey {
 
     fn expose(&self) -> &str {
         &self.0
+    }
+
+    fn ownership_capability(&self) -> WorkspaceOwnershipCapability {
+        let mut secret = [0_u8; 32];
+        for (output, pair) in secret.iter_mut().zip(self.0.as_bytes().chunks_exact(2)) {
+            *output = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
+        }
+        WorkspaceOwnershipCapability::new(secret)
     }
 }
 
@@ -585,8 +593,9 @@ pub fn materialize_workspace_export_v2<Body: Read>(
     limits: WorkspaceMaterializationLimits,
     session: &WorkspaceProfileSessionV2,
     offer: &WorkspaceExportOfferV2,
+    ownership: &WorkspaceOwnershipCapability,
 ) -> Result<PublishedWorkspace, WorkspaceMaterializationError> {
-    materialize_workspace_archive_durable(archive, destination, limits, session, offer)
+    materialize_workspace_archive_durable(archive, destination, limits, session, offer, ownership)
 }
 
 /// Initializes a sandbox with an explicit export content-negotiation policy.
@@ -703,8 +712,12 @@ fn run_sandbox_init_internal(
 ) -> Result<SandboxInitReport, SandboxInitError> {
     let root = absolute_destination(&options.root)?;
     validate_destination_parent(&root)?;
-    if matches!(&credential, SandboxCredential::ProfileKey(_)) {
-        let verified_v2_state = recover_and_verify_workspace_publication_state(&root)
+    let ownership = match &credential {
+        SandboxCredential::ProfileKey(profile_key) => Some(profile_key.ownership_capability()),
+        _ => None,
+    };
+    if let Some(ownership) = ownership.as_ref() {
+        let verified_v2_state = recover_and_verify_workspace_publication_state(&root, ownership)
             .map_err(|error| SandboxInitError::Materialization(error.to_string()))?;
         if !verified_v2_state {
             validate_destination_absent(&root)?;
@@ -730,7 +743,10 @@ fn run_sandbox_init_internal(
                     capabilities,
                 } => {
                     mark_profile(&mut profile, PROFILE_BOOTSTRAP_EXCHANGE);
-                    recover_workspace_publication(&root)
+                    let ownership = ownership
+                        .as_ref()
+                        .expect("profile-key ownership capability");
+                    recover_workspace_publication(&root, ownership)
                         .map_err(|error| SandboxInitError::Materialization(error.to_string()))?;
                     return run_generation2_workspace_init(
                         &client,
@@ -738,6 +754,7 @@ fn run_sandbox_init_internal(
                         content_encoding,
                         session,
                         capabilities,
+                        ownership,
                         profile,
                     );
                 }
@@ -835,6 +852,7 @@ fn run_generation2_workspace_init(
     content_encoding: SandboxContentEncodingPreference,
     session: WorkspaceProfileSessionV2,
     capabilities: WorkspaceClientCapabilitiesV2,
+    ownership: &WorkspaceOwnershipCapability,
     mut profile: Option<&mut SandboxInitProfile>,
 ) -> Result<SandboxInitReport, SandboxInitError> {
     let capability = SessionCapability {
@@ -877,7 +895,7 @@ fn run_generation2_workspace_init(
     mark_profile(&mut profile, PROFILE_EXPORT_OPEN_HEADERS);
     let limits = workspace_limits_for_offer(&offer)?;
     let published = materialize_workspace_export_response(
-        response, encoding, root, limits, &session, &offer, profile,
+        response, encoding, root, limits, &session, &offer, ownership, profile,
     )?;
     let summary = ReplicaMaterializationSummary {
         entries: published.validated.archive_entries,
@@ -924,6 +942,7 @@ fn materialize_workspace_export_response(
     limits: WorkspaceMaterializationLimits,
     session: &WorkspaceProfileSessionV2,
     offer: &WorkspaceExportOfferV2,
+    ownership: &WorkspaceOwnershipCapability,
     mut profile: Option<&mut SandboxInitProfile>,
 ) -> Result<PublishedWorkspace, SandboxInitError> {
     let (body, mut producer) =
@@ -933,7 +952,8 @@ fn materialize_workspace_export_response(
         })?;
     let profiled_body = ProfiledExportBody::new(body, profile.as_deref_mut());
     let archive = ReplicaArchive::new(encoding, profiled_body);
-    let materialization = materialize_workspace_export_v2(archive, root, limits, session, offer);
+    let materialization =
+        materialize_workspace_export_v2(archive, root, limits, session, offer, ownership);
     let producer_outcome = producer.join();
     if let Some(profile) = profile {
         profile.mark(PROFILE_STREAM_DECODE_MATERIALIZE);

@@ -64,7 +64,6 @@ describe("hosted portable workspace", () => {
     ["https://workspace.example.test?tenant=7", "The hosted workspace API URL must not contain a query or fragment."],
     ["https://workspace.example.test#tenant", "The hosted workspace API URL must not contain a query or fragment."],
     ["http://workspace.example.test", "HTTP is allowed only for a loopback hosted workspace."],
-    ["http://127.1", "HTTP is allowed only for a loopback hosted workspace."],
   ])("matches Rust URL rejection for %s", (apiUrl, message) => {
     expect(validatePortableWorkspaceForm({
       apiUrl,
@@ -75,7 +74,7 @@ describe("hosted portable workspace", () => {
 
   it("accepts loopback HTTP and rejects relative roots", () => {
     expect(validatePortableWorkspaceForm({
-      apiUrl: "http://127.0.0.1:8080",
+      apiUrl: "http://127.1:8080",
       root: "/mnt/locality",
       profileKey: "a".repeat(64),
     }).ok).toBe(true);
