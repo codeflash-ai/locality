@@ -2028,8 +2028,26 @@ pub(crate) fn remove_workspace_generation(
         .ok_or_else(|| io::Error::other("workspace generation has no file name"))?;
     #[cfg(windows)]
     {
+        let validation_parent = WindowsDirectory::open_absolute_read_only(parent_path)?;
+        let validation_root = validation_parent.open_directory_read_only(name)?;
+        if validation_root.identity()? != expected {
+            return Err(io::Error::other(
+                "workspace generation identity changed before cleanup",
+            ));
+        }
+        let marker =
+            validation_root.file_binding(OsStr::new(marker_name), expected_marker_content.len())?;
+        if marker.identity != expected_marker || marker.content != expected_marker_content {
+            return Err(io::Error::other(
+                "workspace ownership marker changed before cleanup",
+            ));
+        }
+        validation_root.preflight_contents(path, expected.device)?;
+        drop(validation_root);
+        drop(validation_parent);
+
         let parent = WindowsDirectory::open_absolute(parent_path)?;
-        let root = parent.open_directory(name)?;
+        let root = parent.open_directory_for_cleanup(name)?;
         if root.identity()? != expected {
             return Err(io::Error::other(
                 "workspace generation identity changed before cleanup",
@@ -2042,14 +2060,8 @@ pub(crate) fn remove_workspace_generation(
             ));
         }
         root.preflight_contents(path, expected.device)?;
-        let marker = root.file_binding(OsStr::new(marker_name), expected_marker_content.len())?;
-        if marker.identity != expected_marker || marker.content != expected_marker_content {
-            return Err(io::Error::other(
-                "workspace ownership marker changed before cleanup",
-            ));
-        }
         root.remove_contents(path, expected.device)?;
-        if parent.open_directory(name)?.identity()? != expected {
+        if parent.open_directory_read_only(name)?.identity()? != expected {
             return Err(io::Error::other(
                 "workspace generation identity changed before removal",
             ));
@@ -2123,8 +2135,18 @@ pub(crate) fn repair_workspace_generation(
         let name = path
             .file_name()
             .ok_or_else(|| io::Error::other("workspace generation has no file name"))?;
+        let validation_parent = WindowsDirectory::open_absolute_read_only(parent_path)?;
+        let validation_root = validation_parent.open_directory_read_only(name)?;
+        if validation_root.identity()? != expected {
+            return Err(io::Error::other(
+                "workspace generation identity changed before mode repair",
+            ));
+        }
+        drop(validation_root);
+        drop(validation_parent);
+
         let parent = WindowsDirectory::open_absolute(parent_path)?;
-        let root = parent.open_directory(name)?;
+        let root = parent.open_directory_for_attributes(name)?;
         if root.identity()? != expected {
             return Err(io::Error::other(
                 "workspace generation identity changed before mode repair",
@@ -2132,7 +2154,7 @@ pub(crate) fn repair_workspace_generation(
         }
         root.set_read_only()?;
         root.sync()?;
-        if parent.open_directory(name)?.identity()? != expected {
+        if parent.open_directory_read_only(name)?.identity()? != expected {
             return Err(io::Error::other(
                 "workspace generation identity changed while mode was repaired",
             ));
@@ -2938,7 +2960,7 @@ impl StagingDirectory {
         let destination_name = destination
             .file_name()
             .ok_or(ReplicaMaterializationError::InvalidDestination)?;
-        let named_parent = WindowsDirectory::open_absolute(parent_path)
+        let named_parent = WindowsDirectory::open_absolute_read_only(parent_path)
             .map_err(ReplicaMaterializationError::Publish)?;
         if named_parent
             .identity()
@@ -2957,7 +2979,7 @@ impl StagingDirectory {
                 "workspace staging or parent identity changed before publication",
             )));
         }
-        match self.parent.open_directory(destination_name) {
+        match self.parent.open_directory_read_only(destination_name) {
             Ok(_) => {
                 return Err(ReplicaMaterializationError::DestinationExists(
                     destination.to_path_buf(),
@@ -2971,7 +2993,7 @@ impl StagingDirectory {
             .map_err(ReplicaMaterializationError::Publish)?;
         let published = self
             .parent
-            .open_directory(destination_name)
+            .open_directory_read_only(destination_name)
             .map_err(ReplicaMaterializationError::Publish)?;
         if published
             .identity()
@@ -3024,9 +3046,10 @@ impl Drop for StagingDirectory {
             }
             #[cfg(windows)]
             {
-                if let (Ok(expected), Ok(named)) =
-                    (self.root.identity(), self.parent.open_directory(&self.name))
-                    && named.identity().ok() == Some(expected)
+                if let (Ok(expected), Ok(named)) = (
+                    self.root.identity(),
+                    self.parent.open_directory_read_only(&self.name),
+                ) && named.identity().ok() == Some(expected)
                 {
                     let _ = self
                         .root
@@ -3034,7 +3057,7 @@ impl Drop for StagingDirectory {
                         .and_then(|()| self.root.remove_contents(&self.path, expected.device));
                     if self
                         .parent
-                        .open_directory(&self.name)
+                        .open_directory_read_only(&self.name)
                         .and_then(|directory| directory.identity())
                         .ok()
                         == Some(expected)
