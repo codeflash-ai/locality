@@ -14,7 +14,7 @@ Do not use direct non-MCP Notion/Linear/Slack APIs or browser automation in this
 run. Do not read mounted Locality files under `~/Locality`. Do not create a new
 notion page or modify existing notion pages.
 
-Write the final Markdown report to `/home/amika/final_report.md`.
+Write the final Markdown report to `/home/ubuntu/final_report.md`.
 
 Report format:
 

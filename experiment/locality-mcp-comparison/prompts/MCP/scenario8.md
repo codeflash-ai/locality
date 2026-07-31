@@ -8,7 +8,7 @@ Use the MCP servers you have acces to and the codebase at `~/workspace/locality`
 Do not use direct Notion/Linear/Slack APIs, or browser automation in this run. Do not create a release, create docs, push
 changes, post messages, close issues, or update any remote source.
 
-Write the final Markdown report to `/home/amika/final_report.md`.
+Write the final Markdown report to `/home/ubuntu/final_report.md`.
 
 Report format:
 

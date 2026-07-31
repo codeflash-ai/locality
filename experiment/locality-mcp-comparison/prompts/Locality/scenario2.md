@@ -2,7 +2,7 @@ You are preparing a launch gate memo for Locality. Find the relevant notionproje
 
 Do not use direct Notion API tools in this run. Do not create a new notion page or modify existing notion pages.
 
-Write the final Markdown report to `/home/amika/final_report.md`.
+Write the final Markdown report to `/home/ubuntu/final_report.md`.
 
 Report format:
 

@@ -9,22 +9,22 @@ Runs the artifact-only Locality vs MCP benchmark from paired prompt files:
   prompts/Locality/*.md
   prompts/MCP/*.md
 
-The simplified prompts write their report to /home/amika/final_report.md.
+The simplified prompts write their report to /home/ubuntu/final_report.md.
 This runner copies that file into the scenario artifact directory as:
   - report-body.md for Locality
   - notion-mcp-report-body.md for MCP
 
 Important environment:
-  REPO_DIR                 Repository path. Default: /home/amika/workspace/locality
+  REPO_DIR                 Repository path. Default: /home/ubuntu/workspace/locality
   LOC_BIN                  installed loc binary for Locality runs.
                            Default: loc found on PATH. No source-build fallback.
   PROMPT_ROOT              Prompt root. Default: <script-dir>/prompts
   LOCALITY_PROMPT_DIR      Default: $PROMPT_ROOT/Locality
   MCP_PROMPT_DIR           Default: $PROMPT_ROOT/MCP
   LOCALITY_CONTEXT_DIRS    Newline-delimited or colon-delimited mounted Locality roots.
-                           If unset, existing /home/amika/Locality/{Notion,Slack,Linear}
-                           and lowercase legacy roots are added when present.
-  CODEX_MODEL              Default: gpt-5.6-luna
+                           If unset, existing /home/ubuntu/Locality/{notion,slack,linear}
+                           and legacy roots are added when present.
+  CODEX_MODEL              Default: gpt-5.6-sol
   CODEX_REASONING_EFFORT   Default: low
   CODEX_HOOKS_MODE         hooks or no-hooks. Default: hooks
   CODEX_EXEC_TIMEOUT_SECONDS
@@ -33,7 +33,7 @@ Important environment:
                            Delete Codex rollout/session history after each
                            scenario to keep sandbox disk usage bounded.
                            Default: 1.
-  AGENT_REPORT_PATH        Agent-written report path. Default: /home/amika/final_report.md
+  AGENT_REPORT_PATH        Agent-written report path. Default: /home/ubuntu/final_report.md
   LINEAR_API_KEY           Required for MCP strategy.
   NOTION_API_TOKEN         Required for MCP strategy. NOTION_TOKEN and
                            NOTION_ACCESS_TOKEN are accepted aliases.
@@ -88,19 +88,19 @@ case "$RUN_STRATEGY" in
 esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="${REPO_DIR:-/home/amika/workspace/locality}"
+REPO_DIR="${REPO_DIR:-/home/ubuntu/workspace/locality}"
 LOC_BIN="${LOC_BIN:-$(command -v loc 2>/dev/null || true)}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT_DIR="${OUT_DIR:-$REPO_DIR/experiment/runs/$RUN_ID}"
 PROMPT_ROOT="${PROMPT_ROOT:-$SCRIPT_DIR/prompts}"
 LOCALITY_PROMPT_DIR="${LOCALITY_PROMPT_DIR:-$PROMPT_ROOT/Locality}"
 MCP_PROMPT_DIR="${MCP_PROMPT_DIR:-$PROMPT_ROOT/MCP}"
-CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-luna}"
+CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-sol}"
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-low}"
 CODEX_HOOKS_MODE="${CODEX_HOOKS_MODE:-hooks}"
 CODEX_EXEC_TIMEOUT_SECONDS="${CODEX_EXEC_TIMEOUT_SECONDS:-900}"
 CLEAN_CODEX_SESSION_STATE="${CLEAN_CODEX_SESSION_STATE:-1}"
-AGENT_REPORT_PATH="${AGENT_REPORT_PATH:-/home/amika/final_report.md}"
+AGENT_REPORT_PATH="${AGENT_REPORT_PATH:-/home/ubuntu/final_report.md}"
 LOCALITY_CONTEXT_DIRS="${LOCALITY_CONTEXT_DIRS:-${LOCALITY_CONTEXT_ROOTS:-}}"
 BASE_CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 CODEX_STRATEGY_ROOT="${CODEX_STRATEGY_ROOT:-$OUT_DIR/codex}"
@@ -529,6 +529,9 @@ prepare_locality_context_files() {
   else
     local dir
     for dir in \
+      "$HOME/Locality/notion" \
+      "$HOME/Locality/slack" \
+      "$HOME/Locality/linear" \
       "$HOME/Locality/Notion" \
       "$HOME/Locality/Slack" \
       "$HOME/Locality/Linear" \

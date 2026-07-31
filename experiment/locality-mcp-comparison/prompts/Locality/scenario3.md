@@ -2,7 +2,7 @@ We are considering whether Locality is ready for a broader launch. Review recent
 
 Do not use direct Notion API tools in this run. Do not create a new notion page or modify existing notion pages.
 
-Write the final Markdown report to `/home/amika/final_report.md`.
+Write the final Markdown report to `/home/ubuntu/final_report.md`.
 
 Report format:
 

@@ -6,7 +6,7 @@ Use these context sources:
 - local git commands in `REPO_DIR`
 - Notion MCP tools for Notion search/read context
 
-Do not read mounted Locality Notion files under `/home/amika/notion`.
+Do not read mounted Locality Notion files under `/home/ubuntu/notion`.
 Do not use `loc` commands.
 Do not create Notion pages/docs, push or update Notion, or update any remote source.
 

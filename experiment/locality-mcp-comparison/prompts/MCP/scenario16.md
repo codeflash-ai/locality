@@ -11,7 +11,7 @@ not read mounted Locality files under `~/Locality`. Do not create a release,
 create docs, post messages, close issues, push changes, or update any remote
 source.
 
-Write the final Markdown report to `/home/amika/final_report.md`.
+Write the final Markdown report to `/home/ubuntu/final_report.md`.
 
 Report format:
 

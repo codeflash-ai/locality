@@ -1,6 +1,6 @@
-Generate a concise, accurate launch-readiness report for `Locality` from the local git checkout at `~/workspace/locality` plus Notion information exposed as local files at `~/Locality/Notion`.
+Generate a concise, accurate launch-readiness report for `Locality` from the local git checkout at `~/workspace/locality` plus Notion information exposed as local files at `~/Locality/notion`.
 
-Write the final Markdown report to `/home/amika/final_report.md`. Do not create a new notion page or modify existing notion pages.
+Write the final Markdown report to `/home/ubuntu/final_report.md`. Do not create a new notion page or modify existing notion pages.
 
 Report format:
 

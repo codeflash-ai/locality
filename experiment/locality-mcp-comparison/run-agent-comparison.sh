@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF'
 Usage: run-agent-comparison.sh [--out-dir <path>] [--remote-worktree <path>] [benchmark args...]
 
-Runs the launch-readiness benchmark concurrently on two Amika sandboxes:
+Runs the launch-readiness benchmark concurrently on two remote sandboxes or instances:
   - Locality strategy on LOCALITY_SANDBOX
   - MCP strategy on MCP_SANDBOX
 
@@ -13,15 +13,15 @@ Defaults:
   LOCALITY_SANDBOX=aseem-locality
   MCP_SANDBOX=aseem-mcp
   LOCAL_OUT_DIR=target/launch-readiness-amika/<UTC_RUN_ID>/
-  REMOTE_SOURCE_REPO=/home/amika/workspace/locality
-  REMOTE_WORKTREE=/home/amika/workspace/locality-launch-readiness-<UTC_RUN_ID>
+  REMOTE_SOURCE_REPO=/home/ubuntu/workspace/locality
+  REMOTE_WORKTREE=/home/ubuntu/workspace/locality-launch-readiness-<UTC_RUN_ID>
   LOCALITY_REMOTE_OUT_DIR=<REMOTE_WORKTREE>/target/launch-readiness-<UTC_RUN_ID>-locality
   MCP_REMOTE_OUT_DIR=<REMOTE_WORKTREE>/target/launch-readiness-<UTC_RUN_ID>-mcp
 
 Environment:
   RUN_ID                         Run id shared by both sandboxes.
-  LOCALITY_SANDBOX               Amika sandbox for Locality runs.
-  MCP_SANDBOX                    Amika sandbox for MCP runs.
+  LOCALITY_SANDBOX               Label or Amika sandbox for Locality runs.
+  MCP_SANDBOX                    Label or Amika sandbox for MCP runs.
   LOCAL_OUT_DIR or OUT_DIR       Local metadata/log output directory.
   REMOTE_SOURCE_REPO             Existing git checkout inside each sandbox.
   REMOTE_WORKTREE_ROOT           Parent for clean detached benchmark worktrees.
@@ -30,14 +30,22 @@ Environment:
                                   Default: /usr/bin/loc. Only required for
                                   Locality strategy runs.
   BENCHMARK_REF                  Git ref checked out in each sandbox. Default: origin/main.
+  REMOTE_PROVIDER                Remote backend: amika or ssh. Default: amika.
   AMIKA_SANDBOX_FLAGS            Optional flags passed to amika sandbox ssh.
   AMIKA_SSH_FORCE_TTY            Use direct ssh -tt for unhealthy sandboxes
                                   that reject non-interactive exec. Default: 0.
+  LOCALITY_SSH_TARGET            SSH target for Locality when REMOTE_PROVIDER=ssh.
+                                  Example: ubuntu@203.0.113.10.
+  MCP_SSH_TARGET                 SSH target for MCP when REMOTE_PROVIDER=ssh.
+  SSH_OPTIONS                    Optional SSH options for REMOTE_PROVIDER=ssh.
+                                  Example: -i /path/key.pem -o BatchMode=yes.
   CODEX_MODEL                    Passed through to the benchmark worker.
   CODEX_REASONING_EFFORT         Passed through to the benchmark worker.
   CODEX_EXEC_TIMEOUT_SECONDS     Passed through to the benchmark worker.
   CODEX_HOOKS_MODE               Passed through to the benchmark worker.
-  AGENT_REPORT_PATH              Agent report path. Default: /home/amika/final_report.md.
+  AZURE_OPENAI_API_KEY           Forwarded to remote Codex when set locally.
+  AZURE_OPENAI_BASE_URL          Forwarded to remote Codex when set locally.
+  AGENT_REPORT_PATH              Agent report path. Default: /home/ubuntu/final_report.md.
   LOCALITY_CONTEXT_DIRS          Prehydrated Locality roots for the Locality worker.
   LOCALITY_CONTEXT_ROOTS         Alias accepted by the worker.
   LINEAR_API_KEY                 MCP credential forwarded when set.
@@ -65,17 +73,21 @@ RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 
 LOCALITY_SANDBOX="${LOCALITY_SANDBOX:-aseem-locality}"
 MCP_SANDBOX="${MCP_SANDBOX:-aseem-mcp}"
-REMOTE_SOURCE_REPO="${REMOTE_SOURCE_REPO:-/home/amika/workspace/locality}"
-REMOTE_WORKTREE_ROOT="${REMOTE_WORKTREE_ROOT:-/home/amika/workspace}"
+REMOTE_SOURCE_REPO="${REMOTE_SOURCE_REPO:-/home/ubuntu/workspace/locality}"
+REMOTE_WORKTREE_ROOT="${REMOTE_WORKTREE_ROOT:-/home/ubuntu/workspace}"
 REMOTE_WORKTREE="${REMOTE_WORKTREE:-$REMOTE_WORKTREE_ROOT/locality-launch-readiness-$RUN_ID}"
 BENCHMARK_REF="${BENCHMARK_REF:-origin/main}"
 REMOTE_LOC_BIN="${REMOTE_LOC_BIN:-/usr/bin/loc}"
+REMOTE_PROVIDER="${REMOTE_PROVIDER:-amika}"
 AMIKA_SSH_FORCE_TTY="${AMIKA_SSH_FORCE_TTY:-0}"
+LOCALITY_SSH_TARGET="${LOCALITY_SSH_TARGET:-}"
+MCP_SSH_TARGET="${MCP_SSH_TARGET:-}"
+SSH_OPTIONS="${SSH_OPTIONS:-}"
 
 LOCAL_OUT_DIR="${LOCAL_OUT_DIR:-${OUT_DIR:-$REPO_ROOT/target/launch-readiness-amika/$RUN_ID}}"
 LOCALITY_REMOTE_OUT_DIR_INPUT="${LOCALITY_REMOTE_OUT_DIR:-}"
 MCP_REMOTE_OUT_DIR_INPUT="${MCP_REMOTE_OUT_DIR:-}"
-CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-luna}"
+CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-sol}"
 CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-low}"
 CODEX_EXEC_TIMEOUT_SECONDS="${CODEX_EXEC_TIMEOUT_SECONDS:-900}"
 SYNC_LOCAL_EXPERIMENT="${SYNC_LOCAL_EXPERIMENT:-0}"
@@ -139,13 +151,33 @@ LOCALITY_REMOTE_OUT_DIR="${LOCALITY_REMOTE_OUT_DIR_INPUT:-$REMOTE_WORKTREE/targe
 MCP_REMOTE_OUT_DIR="${MCP_REMOTE_OUT_DIR_INPUT:-$REMOTE_WORKTREE/target/launch-readiness-$RUN_ID-mcp}"
 
 if [ "$LOCALITY_SANDBOX" = "$MCP_SANDBOX" ]; then
-  echo "LOCALITY_SANDBOX and MCP_SANDBOX must be different Amika sandboxes" >&2
+  echo "LOCALITY_SANDBOX and MCP_SANDBOX must be different labels or sandboxes" >&2
   exit 2
 fi
 
-if ! command -v amika >/dev/null 2>&1; then
-  echo "amika is not available on PATH" >&2
-  exit 127
+case "$REMOTE_PROVIDER" in
+  amika|ssh) ;;
+  *) echo "REMOTE_PROVIDER must be amika or ssh" >&2; exit 2 ;;
+esac
+
+if [ "$REMOTE_PROVIDER" = "amika" ]; then
+  if ! command -v amika >/dev/null 2>&1; then
+    echo "amika is not available on PATH" >&2
+    exit 127
+  fi
+else
+  if [ -z "$LOCALITY_SSH_TARGET" ] || [ -z "$MCP_SSH_TARGET" ]; then
+    echo "LOCALITY_SSH_TARGET and MCP_SSH_TARGET are required when REMOTE_PROVIDER=ssh" >&2
+    exit 2
+  fi
+  if [ "$LOCALITY_SSH_TARGET" = "$MCP_SSH_TARGET" ]; then
+    echo "LOCALITY_SSH_TARGET and MCP_SSH_TARGET must be different when REMOTE_PROVIDER=ssh" >&2
+    exit 2
+  fi
+  if ! command -v ssh >/dev/null 2>&1; then
+    echo "ssh is required when REMOTE_PROVIDER=ssh" >&2
+    exit 127
+  fi
 fi
 
 mkdir -p "$LOCAL_OUT_DIR"
@@ -156,6 +188,11 @@ if [ -n "${AMIKA_SANDBOX_FLAGS:-}" ]; then
   read -r -a AMIKA_FLAGS <<< "$AMIKA_SANDBOX_FLAGS"
 fi
 
+declare -a SSH_ARGS=()
+if [ -n "$SSH_OPTIONS" ]; then
+  read -r -a SSH_ARGS <<< "$SSH_OPTIONS"
+fi
+
 load_mcp_credentials_from_zshrc() {
   command -v zsh >/dev/null 2>&1 || return 0
 
@@ -163,7 +200,7 @@ load_mcp_credentials_from_zshrc() {
   output="$(
     zsh -ic '
       print -r -- __LOCALITY_MCP_ENV_BEGIN__
-      for name in LINEAR_API_KEY NOTION_API_TOKEN NOTION_TOKEN NOTION_ACCESS_TOKEN SLACK_BOT_TOKEN SLACK_TEAM_ID SLACK_CHANNEL_IDS; do
+      for name in AZURE_OPENAI_API_KEY AZURE_OPENAI_BASE_URL LINEAR_API_KEY NOTION_API_TOKEN NOTION_TOKEN NOTION_ACCESS_TOKEN SLACK_BOT_TOKEN SLACK_TEAM_ID SLACK_CHANNEL_IDS; do
         value="${(P)name}"
         if [[ -n "$value" ]]; then
           printf "%s=" "$name"
@@ -191,7 +228,7 @@ load_mcp_credentials_from_zshrc() {
     name="${line%%=*}"
     encoded="${line#*=}"
     case "$name" in
-      LINEAR_API_KEY|NOTION_API_TOKEN|NOTION_TOKEN|NOTION_ACCESS_TOKEN|SLACK_BOT_TOKEN|SLACK_TEAM_ID|SLACK_CHANNEL_IDS)
+      AZURE_OPENAI_API_KEY|AZURE_OPENAI_BASE_URL|LINEAR_API_KEY|NOTION_API_TOKEN|NOTION_TOKEN|NOTION_ACCESS_TOKEN|SLACK_BOT_TOKEN|SLACK_TEAM_ID|SLACK_CHANNEL_IDS)
         if [ -z "${!name:-}" ] && [ -n "$encoded" ]; then
           decoded="$(printf '%s' "$encoded" | base64 -d 2>/dev/null || true)"
           if [ -n "$decoded" ]; then
@@ -218,6 +255,8 @@ forwarded_worker_env_b64() {
   local names=(
     AGENT_REPORT_PATH
     CODEX_HOOKS_MODE
+    AZURE_OPENAI_API_KEY
+    AZURE_OPENAI_BASE_URL
     LOCALITY_CONTEXT_DIRS
     LOCALITY_CONTEXT_ROOTS
     LOCALITY_STATE_DIR
@@ -246,7 +285,7 @@ forwarded_worker_env_b64() {
 }
 
 amika_sandbox_ssh() {
-  if [ "$AMIKA_SSH_FORCE_TTY" = "1" ]; then
+  if remote_force_tty; then
     local sandbox="$1"
     shift
     if [ "${1:-}" = "--" ]; then
@@ -274,6 +313,51 @@ amika_sandbox_ssh_target() {
   fi
 }
 
+remote_force_tty() {
+  [ "$REMOTE_PROVIDER" = "amika" ] && [ "$AMIKA_SSH_FORCE_TTY" = "1" ]
+}
+
+remote_ssh_target() {
+  local sandbox="$1"
+  if [ "$REMOTE_PROVIDER" = "amika" ]; then
+    amika_sandbox_ssh_target "$sandbox"
+    return
+  fi
+
+  if [ "$sandbox" = "$LOCALITY_SANDBOX" ]; then
+    printf '%s\n' "$LOCALITY_SSH_TARGET"
+  elif [ "$sandbox" = "$MCP_SANDBOX" ]; then
+    printf '%s\n' "$MCP_SSH_TARGET"
+  else
+    echo "unknown SSH sandbox label: $sandbox" >&2
+    return 2
+  fi
+}
+
+remote_ssh() {
+  local sandbox="$1"
+  shift
+
+  if [ "$REMOTE_PROVIDER" = "amika" ]; then
+    amika_sandbox_ssh "$sandbox" "$@"
+    return
+  fi
+
+  if [ "${1:-}" = "--" ]; then
+    shift
+  fi
+  ssh "${SSH_ARGS[@]}" "$(remote_ssh_target "$sandbox")" "$@"
+}
+
+remote_rsync_ssh_command() {
+  local command="ssh"
+  local arg
+  for arg in "${SSH_ARGS[@]}"; do
+    command+=" $(shell_quote "$arg")"
+  done
+  printf '%s\n' "$command"
+}
+
 run_remote_script() {
   local sandbox="$1"
   local stdout_file="$2"
@@ -291,19 +375,19 @@ run_remote_script() {
   for arg in "$@"; do
     remote_command+=" $(shell_quote "$arg")"
   done
-  if [ "$AMIKA_SSH_FORCE_TTY" = "1" ]; then
+  if remote_force_tty; then
     remote_command="$remote_command; remote_rc=\$?; printf '\n__AMIKA_REMOTE_RC__=%s\n' \"\$remote_rc\"; exit 0"
   fi
   remote_shell_command="bash -lc $(shell_quote "$remote_command")"
   local attempt=1
   local max_attempts=1
-  [ "$AMIKA_SSH_FORCE_TTY" = "1" ] && max_attempts=5
+  remote_force_tty && max_attempts=5
   while [ "$attempt" -le "$max_attempts" ]; do
     set +e
-    amika_sandbox_ssh "$sandbox" -- "$remote_shell_command" > "$stdout_file" 2> "$stderr_file"
+    remote_ssh "$sandbox" -- "$remote_shell_command" > "$stdout_file" 2> "$stderr_file"
     local_rc=$?
     set -e
-    if [ "$AMIKA_SSH_FORCE_TTY" = "1" ]; then
+    if remote_force_tty; then
       local remote_rc
       remote_rc="$(sed -n 's/.*__AMIKA_REMOTE_RC__=//p' "$stdout_file" | tr -d '\r' | tail -1)"
       if [ -n "$remote_rc" ]; then
@@ -438,7 +522,7 @@ REMOTE_SYNC_INIT
       remote_cmd="set -euo pipefail; mkdir -p $(shell_quote "$remote_chunk_dir"); printf %s $chunk_q > $chunk_file_q; printf '\n__AMIKA_REMOTE_RC__=0\n'"
       while [ "$chunk_attempt" -le 5 ]; do
         set +e
-        amika_sandbox_ssh "$sandbox" -- "bash -lc $(shell_quote "$remote_cmd")" \
+        remote_ssh "$sandbox" -- "bash -lc $(shell_quote "$remote_cmd")" \
           > "$local_dir/sync-local-experiment-chunk-$chunk_index.out" \
           2> "$local_dir/sync-local-experiment-chunk-$chunk_index.err"
         set -e
@@ -509,12 +593,16 @@ REMOTE_SYNC_PREP
     "$script" \
     "$remote_dir"
 
-  ssh_target="$(amika_sandbox_ssh_target "$sandbox")"
+  ssh_target="$(remote_ssh_target "$sandbox")"
   if ! command -v rsync >/dev/null 2>&1; then
     echo "rsync is required when SYNC_LOCAL_EXPERIMENT=1" >&2
     exit 127
   fi
-  rsync -az --delete "$SCRIPT_DIR/" "$ssh_target:$remote_dir/"
+  if [ "$REMOTE_PROVIDER" = "ssh" ]; then
+    rsync -az --delete -e "$(remote_rsync_ssh_command)" "$SCRIPT_DIR/" "$ssh_target:$remote_dir/"
+  else
+    rsync -az --delete "$SCRIPT_DIR/" "$ssh_target:$remote_dir/"
+  fi
 }
 
 run_launch_strategy() {
@@ -530,7 +618,7 @@ run_launch_strategy() {
   echo "Running $strategy on $sandbox"
   worker_env_b64="$(forwarded_worker_env_b64 "$strategy")"
 
-  if [ "$AMIKA_SSH_FORCE_TTY" = "1" ]; then
+  if remote_force_tty; then
     local remote_benchmark_args=""
     local arg
     local remote_cmd
@@ -596,7 +684,7 @@ export OUT_DIR="\$out_dir"
 export CODEX_MODEL="\$model"
 export CODEX_REASONING_EFFORT="\$effort"
 export CODEX_EXEC_TIMEOUT_SECONDS="\$timeout_seconds"
-export AGENT_REPORT_PATH="\${AGENT_REPORT_PATH:-/home/amika/final_report.md}"
+export AGENT_REPORT_PATH="\${AGENT_REPORT_PATH:-/home/ubuntu/final_report.md}"
 if [ "\$strategy" = "locality" ]; then
   export LOC_BIN="\${LOC_BIN:-\$loc_bin}"
 fi
@@ -615,7 +703,7 @@ REMOTE_TTY_RUN
     local remote_rc
     while [ "$attempt" -le "$max_attempts" ]; do
       set +e
-      amika_sandbox_ssh "$sandbox" -- "bash -lc $(shell_quote "$remote_shell_command")" > "$local_dir/$strategy.out" 2> "$local_dir/$strategy.err"
+      remote_ssh "$sandbox" -- "bash -lc $(shell_quote "$remote_shell_command")" > "$local_dir/$strategy.out" 2> "$local_dir/$strategy.err"
       local_rc=$?
       set -e
       remote_rc="$(sed -n 's/.*__AMIKA_REMOTE_RC__=//p' "$local_dir/$strategy.out" | tr -d '\r' | tail -1)"
@@ -700,7 +788,7 @@ export OUT_DIR="$out_dir"
 export CODEX_MODEL="$model"
 export CODEX_REASONING_EFFORT="$effort"
 export CODEX_EXEC_TIMEOUT_SECONDS="$timeout_seconds"
-export AGENT_REPORT_PATH="${AGENT_REPORT_PATH:-/home/amika/final_report.md}"
+export AGENT_REPORT_PATH="${AGENT_REPORT_PATH:-/home/ubuntu/final_report.md}"
 if [ "$strategy" = "locality" ]; then
   export LOC_BIN="${LOC_BIN:-$loc_bin}"
 fi
@@ -741,7 +829,7 @@ sync_artifacts() {
 
   mkdir -p "$dest"
   echo "Syncing $strategy artifacts from $sandbox:$remote_out_dir"
-  if [ "$AMIKA_SSH_FORCE_TTY" = "1" ]; then
+  if remote_force_tty; then
     local archive_b64="$LOCAL_OUT_DIR/$sandbox/$strategy-artifacts.tar.gz.b64"
     local remote_out_dir_q
     local remote_cmd
@@ -750,7 +838,7 @@ sync_artifacts() {
     remote_out_dir_q="$(shell_quote "$remote_out_dir")"
     remote_cmd="set -euo pipefail; cd $remote_out_dir_q; tar -czf - . | base64"
     set +e
-    amika_sandbox_ssh "$sandbox" -- "bash -lc $(shell_quote "$remote_cmd")" > "$archive_b64"
+    remote_ssh "$sandbox" -- "bash -lc $(shell_quote "$remote_cmd")" > "$archive_b64"
     ssh_rc=$?
     set -e
     rm -rf "$dest"
@@ -761,11 +849,19 @@ sync_artifacts() {
     return
   fi
 
-  ssh_target="$(amika_sandbox_ssh_target "$sandbox")"
+  ssh_target="$(remote_ssh_target "$sandbox")"
   if command -v rsync >/dev/null 2>&1; then
-    rsync -az --delete "$ssh_target:$remote_out_dir/" "$dest/"
+    if [ "$REMOTE_PROVIDER" = "ssh" ]; then
+      rsync -az --delete -e "$(remote_rsync_ssh_command)" "$ssh_target:$remote_out_dir/" "$dest/"
+    else
+      rsync -az --delete "$ssh_target:$remote_out_dir/" "$dest/"
+    fi
   elif command -v scp >/dev/null 2>&1; then
-    scp -r "$ssh_target:$remote_out_dir/." "$dest/"
+    if [ "$REMOTE_PROVIDER" = "ssh" ]; then
+      scp "${SSH_ARGS[@]}" -r "$ssh_target:$remote_out_dir/." "$dest/"
+    else
+      scp -r "$ssh_target:$remote_out_dir/." "$dest/"
+    fi
   else
     echo "rsync or scp is required to sync remote artifacts" >&2
     return 127
@@ -834,6 +930,12 @@ EOF
   printf 'run_id=%s\n' "$RUN_ID"
   printf 'locality_sandbox=%s\n' "$LOCALITY_SANDBOX"
   printf 'mcp_sandbox=%s\n' "$MCP_SANDBOX"
+  printf 'remote_provider=%s\n' "$REMOTE_PROVIDER"
+  if [ "$REMOTE_PROVIDER" = "ssh" ]; then
+    printf 'locality_ssh_target=%s\n' "$LOCALITY_SSH_TARGET"
+    printf 'mcp_ssh_target=%s\n' "$MCP_SSH_TARGET"
+    printf 'ssh_options=%s\n' "$SSH_OPTIONS"
+  fi
   printf 'remote_source_repo=%s\n' "$REMOTE_SOURCE_REPO"
   printf 'remote_worktree=%s\n' "$REMOTE_WORKTREE"
   printf 'remote_loc_bin=%s\n' "$REMOTE_LOC_BIN"
@@ -883,7 +985,7 @@ if [ "$SYNC_ARTIFACTS" = "1" ]; then
   python3 "$SCRIPT_DIR/scripts/deep-dive-report.py" "$LOCAL_OUT_DIR" "$LOCAL_OUT_DIR/deep-dive.md" >/dev/null
 fi
 
-echo "Wrote split Amika launch-readiness metadata to $LOCAL_OUT_DIR"
+echo "Wrote split launch-readiness metadata to $LOCAL_OUT_DIR"
 echo "Locality artifacts: $LOCALITY_SANDBOX:$LOCALITY_REMOTE_OUT_DIR"
 echo "MCP artifacts: $MCP_SANDBOX:$MCP_REMOTE_OUT_DIR"
 if [ "$SYNC_ARTIFACTS" = "1" ]; then

@@ -9,7 +9,7 @@ Do not use Notion MCP, Linear MCP, Slack MCP, direct Notion/Linear/Slack APIs,
 or browser automation in this run. Do not create a release, create docs, push
 changes, post messages, close issues, or update any remote source.
 
-Write the final Markdown report to `/home/amika/final_report.md`.
+Write the final Markdown report to `/home/ubuntu/final_report.md`.
 
 Report format:
 
