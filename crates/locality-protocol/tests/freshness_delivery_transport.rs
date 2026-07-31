@@ -3,12 +3,14 @@ use locality_core::portable::{
 };
 use locality_core::workspace_layout::PortableMountId;
 use locality_protocol::freshness_delivery::{
-    GENERATION_DELTA_RECEIPT_V1_GOLDEN_JSON, GenerationDeltaTerminalReceipt, GenerationFileIdentity,
+    GENERATION_DELTA_RECEIPT_V1_GOLDEN_JSON, GenerationDeltaTerminalReceipt,
+    GenerationFileIdentity, MAX_GENERATION_DELTA_METADATA_BYTES,
 };
 use locality_protocol::freshness_delivery_transport::{
     GENERATION_BODY_WINDOW_CONTENT_TYPE, GENERATION_BODY_WINDOW_FRAME_V1_GOLDEN_HEX,
     GENERATION_BODY_WINDOW_METADATA_V1_GOLDEN_JSON, GENERATION_BODY_WINDOW_REQUEST_V1_GOLDEN_JSON,
-    GENERATION_DELIVERY_ACKNOWLEDGMENT_V1_GOLDEN_JSON, GENERATION_DELIVERY_POLL_V1_GOLDEN_JSON,
+    GENERATION_DELIVERY_ACKNOWLEDGMENT_V1_GOLDEN_JSON,
+    GENERATION_DELIVERY_POLL_ENVELOPE_HEADROOM_BYTES, GENERATION_DELIVERY_POLL_V1_GOLDEN_JSON,
     GENERATION_DELIVERY_REQUEST_V1_GOLDEN_JSON, GENERATION_PIN_LEASE_V1_GOLDEN_JSON,
     GENERATION_TRANSPORT_CAPABILITIES_V1_GOLDEN_JSON, GENERATION_TRANSPORT_FORMAT_VERSION,
     GENERATION_TRANSPORT_READER_VERSION, GenerationBodyRange, GenerationBodyWindowCapability,
@@ -247,11 +249,22 @@ fn poll_envelope_statuses_are_bounded_and_bound_to_the_request() {
         })
     );
 
+    let normal_delivery = serde_json::to_vec(&polls.delivery).unwrap();
+    assert!(normal_delivery.len() < MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES);
+    GenerationDeliveryPollResponse::decode_json(&normal_delivery, &request)
+        .expect("normal delivery poll");
+
+    assert_eq!(
+        MAX_GENERATION_DELTA_METADATA_BYTES + GENERATION_DELIVERY_POLL_ENVELOPE_HEADROOM_BYTES,
+        MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES
+    );
+    let mut boundary = serde_json::to_vec(&polls.no_delivery).unwrap();
+    boundary.resize(MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES, b' ');
+    GenerationDeliveryPollResponse::decode_json(&boundary, &request)
+        .expect("poll at exact response boundary");
+    boundary.push(b' ');
     assert!(matches!(
-        GenerationDeliveryPollResponse::decode_json(
-            &vec![b' '; MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES + 1],
-            &request,
-        ),
+        GenerationDeliveryPollResponse::decode_json(&boundary, &request),
         Err(GenerationTransportContractError::EncodingTooLarge { .. })
     ));
 }

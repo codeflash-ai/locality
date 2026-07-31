@@ -16,6 +16,7 @@ use crate::FreshnessEpoch;
 use crate::freshness_delivery::{
     FreshnessReasonCode, FreshnessRetry, GenerationDelta, GenerationDeltaTerminalReceipt,
     GenerationFileIdentity, MAX_DELIVERY_ID_BYTES, MAX_DELIVERY_TIMESTAMP_BYTES,
+    MAX_GENERATION_DELTA_METADATA_BYTES,
 };
 
 pub const GENERATION_TRANSPORT_FORMAT_VERSION: u16 = 1;
@@ -23,6 +24,7 @@ pub const GENERATION_TRANSPORT_READER_VERSION: u16 = 1;
 pub const MAX_GENERATION_TRANSPORT_CAPABILITIES_BYTES: usize = 4 * 1024;
 pub const MAX_GENERATION_TRANSPORT_REQUEST_BYTES: usize = 16 * 1024;
 pub const MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+pub const GENERATION_DELIVERY_POLL_ENVELOPE_HEADROOM_BYTES: usize = 1024 * 1024;
 pub const MAX_GENERATION_BODY_WINDOW_METADATA_BYTES: usize = 16 * 1024;
 pub const MAX_GENERATION_BODY_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
 pub const GENERATION_DELIVERY_POLL_CONTENT_TYPE: &str = "application/json";
@@ -36,6 +38,24 @@ pub const MAX_GENERATION_PIN_RETRY_AFTER_SECONDS: u64 = 60 * 60;
 pub const MAX_OPAQUE_DEVICE_SCOPE_ID_BYTES: usize = 128;
 pub const MAX_OPAQUE_PIN_LEASE_ID_BYTES: usize = 256;
 pub const MAX_GENERATION_PIN_OPERATION_ID_BYTES: usize = 128;
+
+const MAX_ESCAPED_DELIVERY_ID_BYTES: usize = 6 * MAX_DELIVERY_ID_BYTES;
+const MAX_ESCAPED_DELIVERY_TIMESTAMP_BYTES: usize = 6 * MAX_DELIVERY_TIMESTAMP_BYTES;
+// Deliberately overcounts V1's identifiers, timestamps, fixed JSON syntax, and
+// numeric/enum fields in addition to the independently bounded capabilities.
+const MAX_GENERATION_DELIVERY_POLL_ENVELOPE_REQUIRED_BYTES: usize =
+    MAX_GENERATION_TRANSPORT_CAPABILITIES_BYTES
+        + 16 * MAX_ESCAPED_DELIVERY_ID_BYTES
+        + 4 * MAX_ESCAPED_DELIVERY_TIMESTAMP_BYTES
+        + 64 * 1024;
+const _: () = assert!(
+    MAX_GENERATION_DELTA_METADATA_BYTES + GENERATION_DELIVERY_POLL_ENVELOPE_HEADROOM_BYTES
+        <= MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES
+);
+const _: () = assert!(
+    MAX_GENERATION_DELIVERY_POLL_ENVELOPE_REQUIRED_BYTES
+        <= GENERATION_DELIVERY_POLL_ENVELOPE_HEADROOM_BYTES
+);
 
 pub const GENERATION_TRANSPORT_CAPABILITIES_V1_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/generation-transport-capabilities-v1.json");
@@ -367,9 +387,10 @@ impl GenerationDeliveryPollResponse {
             _ => return Err(GenerationTransportContractError::AmbiguousPollResponse),
         }
 
-        let encoded = serde_json::to_vec(self)
-            .expect("serializing a typed generation delivery poll response cannot fail");
-        validate_encoding_length_against(encoded.len(), MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES)
+        validate_encoding_length_against(
+            serialized_json_len(self),
+            MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES,
+        )
     }
 }
 
@@ -1459,6 +1480,32 @@ fn validate_encoding_length_against(
     } else {
         Ok(())
     }
+}
+
+#[derive(Default)]
+struct JsonLengthWriter {
+    len: usize,
+}
+
+impl std::io::Write for JsonLengthWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.len = self
+            .len
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("JSON length overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_len(value: &impl Serialize) -> usize {
+    let mut writer = JsonLengthWriter::default();
+    serde_json::to_writer(&mut writer, value)
+        .expect("serializing a typed generation transport value cannot fail");
+    writer.len
 }
 
 fn validate_body_frame_length(actual: usize) -> Result<(), GenerationTransportContractError> {

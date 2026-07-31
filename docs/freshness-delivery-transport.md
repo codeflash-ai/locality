@@ -27,7 +27,12 @@ adapter maps that portable value to its local daemon result after authentication
 the protocol value contains no reader or stream type.
 
 The poll response uses `Content-Type: application/json`, is capped at 64 MiB,
-and has exactly one of these status/payload combinations:
+and reserves 1 MiB for its bounded envelope and terminal receipt. A complete
+delta's exact compact serde JSON is capped at 63 MiB, so every delta accepted by
+the public contract fits in one V1 poll response without metadata pagination.
+The entry-count ceiling remains 100,000. Delta validation counts serializer
+output without allocating a second metadata-sized buffer. The response has
+exactly one of these status/payload combinations:
 
 - `delivery` has one delta and terminal receipt and no error.
 - `no_delivery` has neither a delivery nor an error.
@@ -187,6 +192,8 @@ is integrated with generation selection.
 | --- | ---: |
 | Capability JSON | 4 KiB |
 | Request/metadata JSON | 16 KiB |
+| Complete delta metadata JSON | 63 MiB |
+| Poll envelope and terminal-receipt headroom | 1 MiB |
 | Poll response JSON | 64 MiB |
 | Body window | 4 MiB |
 | Body-window frame | 4-byte prefix + 16 KiB metadata + 4 MiB body |

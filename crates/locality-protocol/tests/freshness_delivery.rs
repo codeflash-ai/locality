@@ -9,9 +9,9 @@ use locality_protocol::freshness_delivery::{
     GENERATION_DELTA_PREIMAGE_V1_GOLDEN_JSON, GENERATION_DELTA_RECEIPT_V1_GOLDEN_JSON,
     GENERATION_DELTA_V1_GOLDEN_JSON, GENERATION_TARGET_INVENTORY_V1_VECTORS_JSON, GenerationDelta,
     GenerationDeltaEntry, GenerationDeltaTerminalReceipt, GenerationFileIdentity,
-    MAX_GENERATION_DELTA_CONTENT_BYTES, MAX_GENERATION_FILE_BYTES, ProviderHealth,
-    ProviderHealthState, ProviderWorkerProgress, PublicationGenerationHealth,
-    PublicationGenerationState, canonical_target_inventory_preimage,
+    MAX_GENERATION_DELTA_CONTENT_BYTES, MAX_GENERATION_DELTA_METADATA_BYTES,
+    MAX_GENERATION_FILE_BYTES, ProviderHealth, ProviderHealthState, ProviderWorkerProgress,
+    PublicationGenerationHealth, PublicationGenerationState, canonical_target_inventory_preimage,
     canonical_target_inventory_sha256,
 };
 use locality_protocol::workspace_layout::LayoutDigest;
@@ -475,4 +475,30 @@ fn empty_delta_advances_generation_and_content_limits_are_bounded() {
         oversized_delta.validate(),
         Err(FreshnessDeliveryError::DeltaContentTooLarge { .. })
     ));
+}
+
+#[test]
+fn structurally_valid_delta_rejects_oversized_exact_json_metadata() {
+    let mut oversized = delta();
+    let escaped_id_tail = "\0".repeat(123);
+    let escaped_content_id = "\0".repeat(128);
+    oversized.entries = (0..42_000)
+        .map(|index| GenerationDeltaEntry {
+            old: None,
+            new: Some(identity(
+                &format!("{index:05}{escaped_id_tail}"),
+                &format!("file-{index:05}"),
+                &escaped_content_id,
+                '3',
+                1,
+            )),
+        })
+        .collect();
+
+    let actual = oversized.serialized_metadata_len().unwrap();
+    assert!(actual > MAX_GENERATION_DELTA_METADATA_BYTES);
+    assert_eq!(
+        oversized.validate(),
+        Err(FreshnessDeliveryError::DeltaMetadataTooLarge { actual })
+    );
 }

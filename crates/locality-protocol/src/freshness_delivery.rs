@@ -21,6 +21,10 @@ use crate::workspace_layout::LayoutDigest;
 pub const FRESHNESS_DELIVERY_READER_VERSION: u16 = 1;
 pub const GENERATION_DELTA_FORMAT_VERSION: u16 = 1;
 pub const MAX_GENERATION_DELTA_ENTRIES: usize = 100_000;
+/// Maximum compact JSON metadata for one complete delta. The transport reserves
+/// the remaining 1 MiB of its 64 MiB poll response for the envelope and terminal
+/// receipt, so V1 never requires metadata pagination.
+pub const MAX_GENERATION_DELTA_METADATA_BYTES: usize = 63 * 1024 * 1024;
 pub const MAX_GENERATION_FILE_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_GENERATION_DELTA_CONTENT_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_DELIVERY_ID_BYTES: usize = 128;
@@ -455,7 +459,22 @@ impl GenerationDelta {
                 actual: changed_content_bytes,
             });
         }
+        let metadata_bytes = self.serialized_metadata_len()?;
+        if metadata_bytes > MAX_GENERATION_DELTA_METADATA_BYTES {
+            return Err(FreshnessDeliveryError::DeltaMetadataTooLarge {
+                actual: metadata_bytes,
+            });
+        }
         Ok(())
+    }
+
+    /// Exact byte length of this delta's compact serde JSON representation.
+    /// Counting writes avoids allocating a second metadata-sized buffer.
+    pub fn serialized_metadata_len(&self) -> Result<usize, FreshnessDeliveryError> {
+        let mut writer = JsonLengthWriter::default();
+        serde_json::to_writer(&mut writer, self)
+            .map_err(|_| FreshnessDeliveryError::CanonicalValueTooLarge)?;
+        Ok(writer.len)
     }
 
     pub fn canonical_preimage(&self) -> Result<Vec<u8>, FreshnessDeliveryError> {
@@ -635,6 +654,7 @@ pub enum FreshnessDeliveryError {
     TooManyDeltaEntries { actual: usize },
     FileContentTooLarge { actual: u64 },
     DeltaContentTooLarge { actual: u64 },
+    DeltaMetadataTooLarge { actual: usize },
     NonCanonicalDeltaOrder,
     NonCanonicalTargetInventoryOrder,
     CrossEntryPathReuse,
@@ -702,6 +722,10 @@ impl Display for FreshnessDeliveryError {
                 formatter,
                 "delta contains {actual} content bytes, exceeding {MAX_GENERATION_DELTA_CONTENT_BYTES}"
             ),
+            Self::DeltaMetadataTooLarge { actual } => write!(
+                formatter,
+                "delta metadata encoding is {actual} bytes, exceeding {MAX_GENERATION_DELTA_METADATA_BYTES}"
+            ),
             Self::NonCanonicalDeltaOrder => {
                 formatter.write_str("delta entries are not in canonical order")
             }
@@ -727,6 +751,25 @@ impl Display for FreshnessDeliveryError {
 }
 
 impl std::error::Error for FreshnessDeliveryError {}
+
+#[derive(Default)]
+struct JsonLengthWriter {
+    len: usize,
+}
+
+impl std::io::Write for JsonLengthWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.len = self
+            .len
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("JSON length overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 fn validate_versions(
     format_version: u16,
