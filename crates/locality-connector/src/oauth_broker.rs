@@ -4,6 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub struct OAuthBrokerStart {
     pub connector: String,
     pub redirect_uri: String,
+    pub hosted_callback_handoff: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -12,9 +13,31 @@ pub struct OAuthBrokerStartResponse {
     pub client_id: String,
     pub authorization_url: String,
     pub redirect_uri: String,
+    #[serde(default)]
+    pub authorization_redirect_uri: Option<String>,
+    #[serde(default)]
+    pub exchange_redirect_uri: Option<String>,
     pub session: String,
     pub state: String,
     pub expires_in: u64,
+}
+
+impl OAuthBrokerStartResponse {
+    pub fn local_redirect_uri(&self) -> &str {
+        &self.redirect_uri
+    }
+
+    pub fn authorization_redirect_uri(&self) -> &str {
+        self.authorization_redirect_uri
+            .as_deref()
+            .unwrap_or(&self.redirect_uri)
+    }
+
+    pub fn exchange_redirect_uri(&self) -> &str {
+        self.exchange_redirect_uri
+            .as_deref()
+            .unwrap_or(&self.redirect_uri)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,13 +92,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{OAuthBrokerStart, OAuthBrokerToken};
+    use super::{OAuthBrokerStart, OAuthBrokerStartResponse, OAuthBrokerToken};
 
     #[test]
     fn start_request_carries_connector_and_redirect_uri() {
         let request = OAuthBrokerStart {
             connector: "google-docs".to_string(),
             redirect_uri: "http://localhost:8757/oauth/google-docs/callback".to_string(),
+            hosted_callback_handoff: true,
         };
 
         let json = serde_json::to_value(&request).expect("serialize request");
@@ -84,6 +108,72 @@ mod tests {
         assert_eq!(
             json["redirect_uri"],
             "http://localhost:8757/oauth/google-docs/callback"
+        );
+        assert_eq!(json["hosted_callback_handoff"], true);
+    }
+
+    #[test]
+    fn start_response_defaults_hosted_redirects_to_local_redirect() {
+        let payload = serde_json::json!({
+            "connector": "google-docs",
+            "client_id": "google-client-id",
+            "authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?client_id=google-client-id",
+            "redirect_uri": "http://localhost:8757/oauth/google-docs/callback",
+            "session": "session-1",
+            "state": "state-1",
+            "expires_in": 600
+        });
+
+        let response: OAuthBrokerStartResponse =
+            serde_json::from_value(payload).expect("decode start response");
+
+        assert_eq!(
+            response.local_redirect_uri(),
+            "http://localhost:8757/oauth/google-docs/callback"
+        );
+        assert_eq!(
+            response.authorization_redirect_uri(),
+            "http://localhost:8757/oauth/google-docs/callback"
+        );
+        assert_eq!(
+            response.exchange_redirect_uri(),
+            "http://localhost:8757/oauth/google-docs/callback"
+        );
+    }
+
+    #[test]
+    fn start_response_uses_hosted_redirects_when_present() {
+        let response = OAuthBrokerStartResponse {
+            connector: "gmail".to_string(),
+            client_id: "google-client-id".to_string(),
+            authorization_url:
+                "https://accounts.google.com/o/oauth2/v2/auth?client_id=google-client-id"
+                    .to_string(),
+            redirect_uri: "http://localhost:8757/oauth/gmail/callback".to_string(),
+            authorization_redirect_uri: Some(
+                "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/gmail/callback"
+                    .to_string(),
+            ),
+            exchange_redirect_uri: Some(
+                "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/gmail/callback"
+                    .to_string(),
+            ),
+            session: "session-1".to_string(),
+            state: "state-1".to_string(),
+            expires_in: 600,
+        };
+
+        assert_eq!(
+            response.local_redirect_uri(),
+            "http://localhost:8757/oauth/gmail/callback"
+        );
+        assert_eq!(
+            response.authorization_redirect_uri(),
+            "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/gmail/callback"
+        );
+        assert_eq!(
+            response.exchange_redirect_uri(),
+            "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/gmail/callback"
         );
     }
 

@@ -10195,6 +10195,7 @@ fn connect_notion_with_broker(state_root: PathBuf, open_browser: bool) -> Result
     let start = broker
         .start(&NotionOAuthBrokerStart {
             redirect_uri: redirect_uri.clone(),
+            hosted_callback_handoff: true,
         })
         .map_err(|error| format!("Could not start Notion OAuth broker flow: {error}"))?;
     let authorization_url = start.normalized_authorization_url();
@@ -10202,7 +10203,7 @@ fn connect_notion_with_broker(state_root: PathBuf, open_browser: bool) -> Result
     let authorization = run_local_oauth_authorization(
         "Notion",
         &authorization_url,
-        &start.redirect_uri,
+        start.local_redirect_uri(),
         &start.state,
         !open_browser,
         true,
@@ -10212,6 +10213,7 @@ fn connect_notion_with_broker(state_root: PathBuf, open_browser: bool) -> Result
     let previous_connection = connection_id
         .as_ref()
         .and_then(|connection_id| store.get_connection(connection_id).ok().flatten());
+    let exchange_redirect_uri = start.exchange_redirect_uri().to_string();
     let options = BrokerOAuthConnectOptions {
         connection_id,
         broker_url,
@@ -10219,7 +10221,7 @@ fn connect_notion_with_broker(state_root: PathBuf, open_browser: bool) -> Result
         session: start.session,
         state: start.state,
         code: authorization.code,
-        redirect_uri: start.redirect_uri,
+        redirect_uri: exchange_redirect_uri,
     };
 
     let report =
@@ -10261,17 +10263,19 @@ fn connect_google_docs_with_broker(
         .start(&OAuthBrokerStart {
             connector: GOOGLE_DOCS_CONNECTOR_ID.to_string(),
             redirect_uri,
+            hosted_callback_handoff: true,
         })
         .map_err(|error| format!("Could not start Google Docs OAuth broker flow: {error}"))?;
     let authorization = run_local_oauth_authorization(
         "Google Docs",
         &start.authorization_url,
-        &start.redirect_uri,
+        start.local_redirect_uri(),
         &start.state,
         !open_browser,
         true,
     )
     .map_err(|error| error.message)?;
+    let exchange_redirect_uri = start.exchange_redirect_uri().to_string();
     let options = GoogleDocsBrokerOAuthConnectOptions {
         connection_id: None,
         broker_url,
@@ -10279,7 +10283,7 @@ fn connect_google_docs_with_broker(
         session: start.session,
         state: start.state,
         code: authorization.code,
-        redirect_uri: start.redirect_uri,
+        redirect_uri: exchange_redirect_uri,
     };
 
     let report =
@@ -10313,17 +10317,19 @@ fn connect_google_calendar_with_broker(
         .start(&OAuthBrokerStart {
             connector: GOOGLE_CALENDAR_CONNECTOR_ID.to_string(),
             redirect_uri,
+            hosted_callback_handoff: true,
         })
         .map_err(|error| format!("Could not start Google Calendar OAuth broker flow: {error}"))?;
     let authorization = run_local_oauth_authorization(
         "Google Calendar",
         &start.authorization_url,
-        &start.redirect_uri,
+        start.local_redirect_uri(),
         &start.state,
         !open_browser,
         true,
     )
     .map_err(|error| error.message)?;
+    let exchange_redirect_uri = start.exchange_redirect_uri().to_string();
     let options = GoogleCalendarBrokerOAuthConnectOptions {
         connection_id: Some(ConnectionId::new("google-calendar-default")),
         broker_url,
@@ -10331,7 +10337,7 @@ fn connect_google_calendar_with_broker(
         session: start.session,
         state: start.state,
         code: authorization.code,
-        redirect_uri: start.redirect_uri,
+        redirect_uri: exchange_redirect_uri,
     };
 
     let report = run_connect_google_calendar_broker_oauth(
@@ -10371,17 +10377,19 @@ fn connect_gmail_with_broker(state_root: PathBuf, open_browser: bool) -> Result<
         .start(&OAuthBrokerStart {
             connector: GMAIL_CONNECTOR_ID.to_string(),
             redirect_uri,
+            hosted_callback_handoff: true,
         })
         .map_err(|error| format!("Could not start Gmail OAuth broker flow: {error}"))?;
     let authorization = run_local_oauth_authorization(
         "Gmail",
         &start.authorization_url,
-        &start.redirect_uri,
+        start.local_redirect_uri(),
         &start.state,
         !open_browser,
         true,
     )
     .map_err(|error| error.message)?;
+    let exchange_redirect_uri = start.exchange_redirect_uri().to_string();
     let options = GmailBrokerOAuthConnectOptions {
         connection_id: None,
         broker_url,
@@ -10389,7 +10397,7 @@ fn connect_gmail_with_broker(state_root: PathBuf, open_browser: bool) -> Result<
         session: start.session,
         state: start.state,
         code: authorization.code,
-        redirect_uri: start.redirect_uri,
+        redirect_uri: exchange_redirect_uri,
     };
 
     let report = run_connect_gmail_broker_oauth(&mut store, credentials.as_ref(), options, &broker)
@@ -10422,17 +10430,19 @@ fn connect_slack_with_broker(state_root: PathBuf, open_browser: bool) -> Result<
         .start(&OAuthBrokerStart {
             connector: SLACK_CONNECTOR_ID.to_string(),
             redirect_uri,
+            hosted_callback_handoff: true,
         })
         .map_err(|error| format!("Could not start Slack OAuth broker flow: {error}"))?;
     let authorization = run_local_oauth_authorization(
         "Slack",
         &start.authorization_url,
-        &start.redirect_uri,
+        start.local_redirect_uri(),
         &start.state,
         !open_browser,
         true,
     )
     .map_err(|error| error.message)?;
+    let exchange_redirect_uri = start.exchange_redirect_uri().to_string();
     let options = SlackBrokerOAuthConnectOptions {
         connection_id: None,
         broker_url,
@@ -10440,7 +10450,7 @@ fn connect_slack_with_broker(state_root: PathBuf, open_browser: bool) -> Result<
         session: start.session,
         state: start.state,
         code: authorization.code,
-        redirect_uri: start.redirect_uri,
+        redirect_uri: exchange_redirect_uri,
     };
 
     let report = run_connect_slack_broker_oauth(&mut store, credentials.as_ref(), options, &broker)

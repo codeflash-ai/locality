@@ -69,6 +69,7 @@ impl fmt::Debug for NotionOAuthRefresh {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotionOAuthBrokerStart {
     pub redirect_uri: String,
+    pub hosted_callback_handoff: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize)]
@@ -77,6 +78,10 @@ pub struct NotionOAuthBrokerStartResponse {
     pub client_id: String,
     pub authorization_url: String,
     pub redirect_uri: String,
+    #[serde(default)]
+    pub authorization_redirect_uri: Option<String>,
+    #[serde(default)]
+    pub exchange_redirect_uri: Option<String>,
     pub session: String,
     pub state: String,
     pub expires_in: u64,
@@ -90,6 +95,11 @@ impl fmt::Debug for NotionOAuthBrokerStartResponse {
             .field("client_id", &self.client_id)
             .field("authorization_url", &REDACTED)
             .field("redirect_uri", &self.redirect_uri)
+            .field(
+                "authorization_redirect_uri",
+                &self.authorization_redirect_uri,
+            )
+            .field("exchange_redirect_uri", &self.exchange_redirect_uri)
             .field("session", &REDACTED)
             .field("state", &REDACTED)
             .field("expires_in", &self.expires_in)
@@ -102,9 +112,25 @@ impl NotionOAuthBrokerStartResponse {
         normalize_notion_authorization_url(
             &self.authorization_url,
             &self.client_id,
-            &self.redirect_uri,
+            self.authorization_redirect_uri(),
             &self.state,
         )
+    }
+
+    pub fn local_redirect_uri(&self) -> &str {
+        &self.redirect_uri
+    }
+
+    pub fn authorization_redirect_uri(&self) -> &str {
+        self.authorization_redirect_uri
+            .as_deref()
+            .unwrap_or(&self.redirect_uri)
+    }
+
+    pub fn exchange_redirect_uri(&self) -> &str {
+        self.exchange_redirect_uri
+            .as_deref()
+            .unwrap_or(&self.redirect_uri)
     }
 }
 
@@ -388,6 +414,7 @@ impl HttpNotionOAuthBrokerClient {
             "/v1/oauth/notion/start",
             json!({
                 "redirect_uri": request.redirect_uri,
+                "hosted_callback_handoff": request.hosted_callback_handoff,
             }),
         )
     }
@@ -472,6 +499,8 @@ mod tests {
                 "https://api.notion.com/v1/oauth/authorize?client_id=client-id&prompt=select"
                     .to_string(),
             redirect_uri: "http://localhost:8757/oauth/notion/callback".to_string(),
+            authorization_redirect_uri: None,
+            exchange_redirect_uri: None,
             session: "session-1".to_string(),
             state: "state-1".to_string(),
             expires_in: 300,
@@ -492,6 +521,43 @@ mod tests {
             Some("http://localhost:8757/oauth/notion/callback")
         );
         assert_eq!(query_value(&url, "state").as_deref(), Some("state-1"));
+    }
+
+    #[test]
+    fn broker_start_response_uses_hosted_authorization_redirect_when_present() {
+        let start = NotionOAuthBrokerStartResponse {
+            connector: "notion".to_string(),
+            client_id: "client-id".to_string(),
+            authorization_url: "https://api.notion.com/v1/oauth/authorize?client_id=wrong"
+                .to_string(),
+            redirect_uri: "http://localhost:8757/oauth/notion/callback".to_string(),
+            authorization_redirect_uri: Some(
+                "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/notion/callback"
+                    .to_string(),
+            ),
+            exchange_redirect_uri: Some(
+                "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/notion/callback"
+                    .to_string(),
+            ),
+            session: "session-1".to_string(),
+            state: "state-1".to_string(),
+            expires_in: 300,
+        };
+
+        let url = Url::parse(&start.normalized_authorization_url()).expect("normalized URL");
+
+        assert_eq!(
+            query_value(&url, "redirect_uri").as_deref(),
+            Some("https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/notion/callback")
+        );
+        assert_eq!(
+            start.local_redirect_uri(),
+            "http://localhost:8757/oauth/notion/callback"
+        );
+        assert_eq!(
+            start.exchange_redirect_uri(),
+            "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/notion/callback"
+        );
     }
 
     #[test]
@@ -635,6 +701,8 @@ mod tests {
             authorization_url: "https://api.notion.com/v1/oauth/authorize?state=secret-state"
                 .to_string(),
             redirect_uri: "http://localhost/callback".to_string(),
+            authorization_redirect_uri: None,
+            exchange_redirect_uri: None,
             session: "secret-session".to_string(),
             state: "secret-state".to_string(),
             expires_in: 300,
@@ -689,7 +757,7 @@ mod tests {
         );
         assert_eq!(
             format!("{broker_start:?}"),
-            "NotionOAuthBrokerStartResponse { connector: \"notion\", client_id: \"client-id\", authorization_url: \"<redacted>\", redirect_uri: \"http://localhost/callback\", session: \"<redacted>\", state: \"<redacted>\", expires_in: 300 }"
+            "NotionOAuthBrokerStartResponse { connector: \"notion\", client_id: \"client-id\", authorization_url: \"<redacted>\", redirect_uri: \"http://localhost/callback\", authorization_redirect_uri: None, exchange_redirect_uri: None, session: \"<redacted>\", state: \"<redacted>\", expires_in: 300 }"
         );
         assert_eq!(
             format!("{broker_exchange:?}"),

@@ -26,8 +26,19 @@ The Google Docs OAuth flow uses the Locality OAuth broker and requests:
 - `https://www.googleapis.com/auth/drive.metadata`
 
 The broker uses the shared `LOCALITY_GOOGLE_CLIENT_ID` and
-`LOCALITY_GOOGLE_CLIENT_SECRET` pair for both Google Docs and Gmail. The Google
-OAuth client must allow the Google Docs and Gmail localhost callbacks.
+`LOCALITY_GOOGLE_CLIENT_SECRET` pair for Google Docs, Google Calendar, and
+Gmail. In production, the Google OAuth client must register the hosted HTTPS
+callbacks used by the broker:
+
+```text
+https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-docs/callback
+https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-calendar/callback
+https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/gmail/callback
+```
+
+The localhost callbacks remain broker loopback allowlists for the local handoff.
+Developer-owned or direct OAuth setups may still register and use local callbacks
+where applicable.
 
 `documents` is used for Google Docs body read/write. `drive.file` keeps write
 access limited to app-created or explicitly granted files. `drive.metadata`

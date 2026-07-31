@@ -44,8 +44,18 @@ http://127.0.0.1:8757/oauth/google-calendar/callback
 
 Google Calendar, Gmail, and Google Docs share the same broker-configured Google
 OAuth client: `LOCALITY_GOOGLE_CLIENT_ID` and
-`LOCALITY_GOOGLE_CLIENT_SECRET`. Register each connector's localhost callback
-on that Google OAuth client.
+`LOCALITY_GOOGLE_CLIENT_SECRET`. In production, the Google OAuth client must
+register the hosted HTTPS callbacks used by the broker:
+
+```text
+https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-docs/callback
+https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-calendar/callback
+https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/gmail/callback
+```
+
+The localhost callbacks remain broker loopback allowlists for the local handoff.
+Developer-owned or direct OAuth setups may still register and use local callbacks
+where applicable.
 
 The broker requests these scopes:
 
