@@ -21,9 +21,10 @@ describe("onboarding layout styles", () => {
     expect(styles).toMatch(/\.agent-demo-command\s*\{[\s\S]*?overflow-wrap:\s*anywhere;/s);
   });
 
-  it("keeps the onboarding demo video in a stable native-looking frame", () => {
-    expect(styles).toMatch(/\.onboarding-video-demo\s*\{[\s\S]*?aspect-ratio:\s*143 \/ 90;/s);
-    expect(styles).toMatch(/\.onboarding-video-demo video\s*\{[\s\S]*?object-fit:\s*cover;/s);
+  it("keeps the onboarding editor mock in a stable native-looking frame", () => {
+    expect(styles).toMatch(/\.onboarding-editor-demo\s*\{[\s\S]*?min-height:\s*440px;/s);
+    expect(styles).toMatch(/\.editor-demo-body\s*\{[\s\S]*?grid-template-columns:\s*140px minmax\(0, 1fr\);/s);
+    expect(styles).toMatch(/\.editor-demo-document pre\s*\{[\s\S]*?white-space:\s*pre-wrap;/s);
   });
 
   it("keeps the first onboarding screen from overlapping at the native default width", () => {

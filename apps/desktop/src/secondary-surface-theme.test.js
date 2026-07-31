@@ -59,16 +59,31 @@ describe("desktop secondary surface theme contract", () => {
     expect(cssBlock(".onboarding-pill-row span,\n.onboarding-pill,\n.connector-option > span,\n.demo-tile span,\n.review-strip span")).toContain("border: 1px solid var(--chip-border);");
     expect(cssBlock(".onboarding-pill-row span,\n.onboarding-pill,\n.connector-option > span,\n.demo-tile span,\n.review-strip span")).toContain("background: var(--chip-bg);");
     expect(cssBlock(".onboarding-pill-row span,\n.onboarding-pill,\n.connector-option > span,\n.demo-tile span,\n.review-strip span")).toContain("color: var(--chip-text);");
-    expectCssBlock(".onboarding-product-demo", [
-      "background: var(--code-bg);",
-      "color: var(--ink);",
+    expectCssBlock(".onboarding-editor-demo", [
+      "border: 1px solid var(--onboarding-demo-line);",
+      "background: var(--onboarding-demo-bg);",
+      "color: var(--onboarding-demo-text);",
       "box-shadow: var(--modal-shadow);",
     ]);
-    expectCssBlock(".onboarding-video-demo", [
-      "border: 1px solid var(--line);",
-      "background: var(--code-bg);",
-      "box-shadow: var(--modal-shadow);",
+    expectCssBlock(".editor-demo-toolbar", [
+      "border-bottom: 1px solid var(--onboarding-demo-line);",
+      "background: var(--onboarding-demo-panel-bg);",
     ]);
+    expectCssBlock(".editor-demo-toolbar span", [
+      "background: var(--onboarding-demo-chip-bg);",
+      "color: var(--onboarding-demo-muted);",
+    ]);
+    expectCssBlock(".editor-demo-sidebar", [
+      "border-right: 1px solid var(--onboarding-demo-line);",
+      "background: var(--onboarding-demo-panel-bg);",
+    ]);
+    expectCssBlock(".editor-demo-sidebar small", ["color: var(--onboarding-demo-muted);"]);
+    expectCssBlock(".editor-demo-line", ["color: var(--onboarding-demo-muted);"]);
+    expectCssBlock(".editor-demo-line.active", [
+      "background: var(--onboarding-demo-active-bg);",
+      "color: var(--onboarding-demo-active-text);",
+    ]);
+    expectCssBlock(".editor-demo-document pre", ["color: var(--onboarding-demo-text);"]);
     expectCssBlock(".demo-tile", ["border: 1px solid var(--line);", "background: var(--surface-muted);"]);
     expectCssBlock(".demo-tile p,\n.demo-tile code", ["color: var(--muted);"]);
     expectCssBlock(".agent-workspace-demo", ["background: var(--surface);", "box-shadow: var(--surface-shadow);"]);
@@ -106,8 +121,14 @@ describe("desktop secondary surface theme contract", () => {
     expect(cssBlock(".progress-list li.done span,\n.progress-list li.active span")).toContain("color: var(--accent-ink);");
     expect(cssBlock(".progress-list li.active span")).toContain("background: transparent;");
 
-    expectNoRawSurfaceColors(cssBlock(".onboarding-product-demo"));
-    expectNoRawSurfaceColors(cssBlock(".onboarding-video-demo"));
+    expectNoRawSurfaceColors(cssBlock(".onboarding-editor-demo"));
+    expectNoRawSurfaceColors(cssBlock(".editor-demo-toolbar"));
+    expectNoRawSurfaceColors(cssBlock(".editor-demo-toolbar span"));
+    expectNoRawSurfaceColors(cssBlock(".editor-demo-sidebar"));
+    expectNoRawSurfaceColors(cssBlock(".editor-demo-sidebar small"));
+    expectNoRawSurfaceColors(cssBlock(".editor-demo-line"));
+    expectNoRawSurfaceColors(cssBlock(".editor-demo-line.active"));
+    expectNoRawSurfaceColors(cssBlock(".editor-demo-document pre"));
     expectNoRawSurfaceColors(cssBlock(".brand-tile"));
     expectNoRawSurfaceColors(cssBlock(".brand-tile.notion"));
     expectNoRawSurfaceColors(cssBlock(".progress-list span"));

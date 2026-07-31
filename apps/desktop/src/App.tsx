@@ -130,7 +130,6 @@ import localityShortLightUrl from "./assets/brand/locality-short-light.svg";
 
 const distributionChannel = (import.meta.env.VITE_LOCALITY_DISTRIBUTION_CHANNEL || "direct").toLowerCase();
 const appStoreDistribution = distributionChannel === "mas";
-const onboardingDemoVideoUrl = import.meta.env.VITE_LOCALITY_ONBOARDING_DEMO_VIDEO_URL?.trim() || "";
 
 type AppView = "home" | "files" | "mount" | "pending" | "review" | "activity" | "settings";
 type LocateState = "idle" | "preparing" | "ready" | "error";
@@ -2415,21 +2414,22 @@ function Onboarding({
         {step === 1 && (
           <SetupContent variant="hero" side={<ProductLoopDemo />}>
             <div>
-              <div className="eyebrow">Meet Locality</div>
+              <div className="eyebrow"><span />Meet Locality</div>
               <h1>Turn work apps into agent-ready files.</h1>
               <p>
-                Locality turns tools like Notion into a local folder. Agents edit Markdown you can
-                inspect, while Locality keeps the connected app in sync after review.
+                Locality turns tools like Notion into a local folder. Agents edit
+                Markdown you can inspect, while Locality keeps the connected app
+                in sync after review.
               </p>
             </div>
             <div className="button-row">
-              <PrimaryButton onClick={() => setStep(3)}>Get Started</PrimaryButton>
-              <SecondaryButton onClick={() => openOptionalGuide(1)}>How agents use it</SecondaryButton>
+              <PrimaryButton icon={<ChevronRight />} onClick={() => setStep(3)}>Get Started</PrimaryButton>
+              <SecondaryButton icon={<ChevronRight />} onClick={() => openOptionalGuide(1)}>How agents use it</SecondaryButton>
             </div>
             <div className="onboarding-pill-row">
-              <span>Finder-native files</span>
-              <span>Markdown edits</span>
-              <span>Review before sync</span>
+              <span><FolderOpen />Finder-native files</span>
+              <span><Code2 />Markdown edits</span>
+              <span><Check />Review before sync</span>
             </div>
           </SetupContent>
         )}
@@ -7614,57 +7614,52 @@ function ViewHeader({
 }
 
 function ProductLoopDemo() {
-  const [videoAvailable, setVideoAvailable] = useState(Boolean(onboardingDemoVideoUrl));
-
-  if (onboardingDemoVideoUrl && videoAvailable) {
-    return (
-      <div className="onboarding-video-demo">
-        <video
-          aria-label="Locality product demo"
-          autoPlay
-          loop
-          muted
-          playsInline
-          preload="auto"
-          onError={() => setVideoAvailable(false)}
-        >
-          <source src={onboardingDemoVideoUrl} type="video/mp4" />
-        </video>
-      </div>
-    );
-  }
-
   return (
-    <div className="onboarding-product-demo">
-      <div className="demo-tile-grid">
-        <div className="demo-tile">
-          <div>
-            <strong>Notion</strong>
-            <span>Connected</span>
+    <div className="onboarding-editor-demo" aria-label="Local Markdown preview">
+      <div className="editor-demo-toolbar">
+        <i />
+        <i />
+        <i />
+        <span><Code2 />release-notes.md</span>
+      </div>
+      <div className="editor-demo-body">
+        <div className="editor-demo-sidebar">
+          <small>Workspace</small>
+          <div className="editor-demo-line">
+            <FolderOpen />
+            <span>docs</span>
           </div>
-          <p>Launch Plan</p>
+          <div className="editor-demo-line active">
+            <Code2 />
+            <span>release-notes.md</span>
+          </div>
+          <div className="editor-demo-line">
+            <Code2 />
+            <span>roadmap.md</span>
+          </div>
+          <div className="editor-demo-line">
+            <Code2 />
+            <span>changelog.md</span>
+          </div>
         </div>
-        <div className="demo-tile">
-          <div>
-            <strong>Local Markdown</strong>
-            <span>Editable</span>
-          </div>
-          <code>Locality/notion/Launch Plan/page.md</code>
-        </div>
-        <div className="demo-tile">
-          <div>
-            <strong>Needs review</strong>
-            <span>Safe</span>
-          </div>
-          <p>Edited intro paragraph</p>
-          <p>Updated launch checklist</p>
-        </div>
-        <div className="demo-tile">
-          <div>
-            <strong>Notion</strong>
-            <span>Updated</span>
-          </div>
-          <p>Launch Plan reflects the approved Markdown edits.</p>
+        <div className="editor-demo-document">
+          <pre>{`# Release Notes - v2.4
+
+Synced from Notion - edited locally
+
+## Summary
+
+Added local file sync for connected sources
+and resolved review conflicts on large
+workspaces.
+
+## Changes
+
+- Notion pages now sync as Markdown
+- Review panel highlights agent edits
+- Fixed folder watch performance
+
+Reviewed by Alex - synced 2m ago`}</pre>
         </div>
       </div>
     </div>
