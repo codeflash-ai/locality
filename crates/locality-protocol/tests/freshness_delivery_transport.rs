@@ -6,19 +6,22 @@ use locality_protocol::freshness_delivery::{
     GENERATION_DELTA_RECEIPT_V1_GOLDEN_JSON, GenerationDeltaTerminalReceipt, GenerationFileIdentity,
 };
 use locality_protocol::freshness_delivery_transport::{
+    GENERATION_BODY_WINDOW_CONTENT_TYPE, GENERATION_BODY_WINDOW_FRAME_V1_GOLDEN_HEX,
     GENERATION_BODY_WINDOW_METADATA_V1_GOLDEN_JSON, GENERATION_BODY_WINDOW_REQUEST_V1_GOLDEN_JSON,
-    GENERATION_DELIVERY_ACKNOWLEDGMENT_V1_GOLDEN_JSON, GENERATION_DELIVERY_REQUEST_V1_GOLDEN_JSON,
-    GENERATION_PIN_LEASE_V1_GOLDEN_JSON, GENERATION_TRANSPORT_CAPABILITIES_V1_GOLDEN_JSON,
-    GENERATION_TRANSPORT_FORMAT_VERSION, GENERATION_TRANSPORT_READER_VERSION, GenerationBodyRange,
-    GenerationBodyWindowCapability, GenerationBodyWindowMetadata, GenerationBodyWindowRequest,
+    GENERATION_DELIVERY_ACKNOWLEDGMENT_V1_GOLDEN_JSON, GENERATION_DELIVERY_POLL_V1_GOLDEN_JSON,
+    GENERATION_DELIVERY_REQUEST_V1_GOLDEN_JSON, GENERATION_PIN_LEASE_V1_GOLDEN_JSON,
+    GENERATION_TRANSPORT_CAPABILITIES_V1_GOLDEN_JSON, GENERATION_TRANSPORT_FORMAT_VERSION,
+    GENERATION_TRANSPORT_READER_VERSION, GenerationBodyRange, GenerationBodyWindowCapability,
+    GenerationBodyWindowFrame, GenerationBodyWindowMetadata, GenerationBodyWindowRequest,
     GenerationDeliveryAcknowledgment, GenerationDeliveryAcknowledgmentRequest,
-    GenerationDeliveryRequest, GenerationPinFallbackPolicy, GenerationPinLeaseAcquireRequest,
-    GenerationPinLeaseAcquireResponse, GenerationPinLeaseCapability, GenerationPinLeaseRelease,
-    GenerationPinLeaseReleaseRequest, GenerationPinLeaseRenewRequest, GenerationPinLeaseRenewal,
-    GenerationTransportCapabilities, GenerationTransportContractError,
-    MAX_GENERATION_BODY_WINDOW_BYTES, MAX_GENERATION_PIN_LEASE_SECONDS,
-    MAX_GENERATION_PIN_LEASES_PER_DEVICE, MAX_GENERATION_PIN_OPERATION_ID_BYTES,
-    MAX_GENERATION_TRANSPORT_REQUEST_BYTES,
+    GenerationDeliveryPollResponse, GenerationDeliveryRequest, GenerationPinFallbackPolicy,
+    GenerationPinLeaseAcquireRequest, GenerationPinLeaseAcquireResponse,
+    GenerationPinLeaseCapability, GenerationPinLeaseRelease, GenerationPinLeaseReleaseRequest,
+    GenerationPinLeaseRenewRequest, GenerationPinLeaseRenewal, GenerationTransportCapabilities,
+    GenerationTransportContractError, MAX_GENERATION_BODY_WINDOW_BYTES,
+    MAX_GENERATION_BODY_WINDOW_METADATA_BYTES, MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES,
+    MAX_GENERATION_PIN_LEASE_SECONDS, MAX_GENERATION_PIN_LEASES_PER_DEVICE,
+    MAX_GENERATION_PIN_OPERATION_ID_BYTES, MAX_GENERATION_TRANSPORT_REQUEST_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -27,6 +30,22 @@ fn pretty_json(value: &impl Serialize) -> Vec<u8> {
     let mut bytes = serde_json::to_vec_pretty(value).expect("serialize JSON");
     bytes.push(b'\n');
     bytes
+}
+
+fn decode_hex_fixture(input: &[u8]) -> Vec<u8> {
+    let input = std::str::from_utf8(input).unwrap().trim().as_bytes();
+    assert_eq!(input.len() % 2, 0);
+    input
+        .chunks_exact(2)
+        .map(|pair| {
+            let digit = |byte| match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                _ => panic!("invalid fixture hex"),
+            };
+            digit(pair[0]) * 16 + digit(pair[1])
+        })
+        .collect()
 }
 
 fn capabilities() -> GenerationTransportCapabilities {
@@ -65,6 +84,13 @@ struct PinLeaseGolden {
     release_request: GenerationPinLeaseReleaseRequest,
     release: GenerationPinLeaseRelease,
     quota_unavailable: GenerationPinLeaseAcquireResponse,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DeliveryPollGolden {
+    delivery: GenerationDeliveryPollResponse,
+    no_delivery: GenerationDeliveryPollResponse,
+    error: GenerationDeliveryPollResponse,
 }
 
 #[test]
@@ -146,6 +172,186 @@ fn transport_contracts_match_exact_lf_json_goldens() {
         .validate_against(&pins.acquire_request, &pin_capability)
         .expect("quota unavailable");
     assert_eq!(pretty_json(&pins), GENERATION_PIN_LEASE_V1_GOLDEN_JSON);
+
+    let polls: DeliveryPollGolden =
+        serde_json::from_slice(GENERATION_DELIVERY_POLL_V1_GOLDEN_JSON).expect("poll fixture");
+    for poll in [&polls.delivery, &polls.no_delivery, &polls.error] {
+        poll.validate_against(&delivery_request)
+            .expect("poll response");
+        GenerationDeliveryPollResponse::decode_json(
+            &serde_json::to_vec(poll).unwrap(),
+            &delivery_request,
+        )
+        .expect("bounded poll response");
+    }
+    assert_eq!(pretty_json(&polls), GENERATION_DELIVERY_POLL_V1_GOLDEN_JSON);
+}
+
+#[test]
+fn poll_envelope_statuses_are_bounded_and_bound_to_the_request() {
+    let request =
+        GenerationDeliveryRequest::decode_json(GENERATION_DELIVERY_REQUEST_V1_GOLDEN_JSON).unwrap();
+    let polls: DeliveryPollGolden =
+        serde_json::from_slice(GENERATION_DELIVERY_POLL_V1_GOLDEN_JSON).unwrap();
+
+    let mut ambiguous = polls.no_delivery.clone();
+    ambiguous.delivery = polls.delivery.delivery.clone();
+    assert_eq!(
+        ambiguous.validate_against(&request),
+        Err(GenerationTransportContractError::AmbiguousPollResponse)
+    );
+
+    let mut crossed = polls.delivery.clone();
+    crossed.observed_generation_id = SourceGenerationId::new("generation-crossed").unwrap();
+    assert_eq!(
+        crossed.validate_against(&request),
+        Err(GenerationTransportContractError::PollResponseMismatch)
+    );
+
+    let mut invalid_receipt = polls.delivery.clone();
+    invalid_receipt
+        .delivery
+        .as_mut()
+        .unwrap()
+        .terminal_receipt
+        .delta_sha256 =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+    assert!(matches!(
+        invalid_receipt.validate_against(&request),
+        Err(GenerationTransportContractError::TerminalReceipt(_))
+    ));
+
+    let mut unknown = serde_json::to_value(&polls.no_delivery).unwrap();
+    unknown["status"] = json!("future_status");
+    let unknown = serde_json::from_value::<GenerationDeliveryPollResponse>(unknown).unwrap();
+    assert_eq!(
+        unknown.validate_against(&request),
+        Err(GenerationTransportContractError::UnknownPollStatus)
+    );
+
+    let mut additive = serde_json::to_value(&polls.no_delivery).unwrap();
+    additive["format_version"] = json!(2);
+    additive["future_additive_field"] = json!({"ignored": true});
+    GenerationDeliveryPollResponse::decode_json(&serde_json::to_vec(&additive).unwrap(), &request)
+        .expect("additive V1-compatible response");
+
+    additive["minimum_reader_version"] = json!(2);
+    assert_eq!(
+        GenerationDeliveryPollResponse::decode_json(
+            &serde_json::to_vec(&additive).unwrap(),
+            &request,
+        ),
+        Err(GenerationTransportContractError::UpdateRequired {
+            minimum: 2,
+            supported: 1,
+        })
+    );
+
+    assert!(matches!(
+        GenerationDeliveryPollResponse::decode_json(
+            &vec![b' '; MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES + 1],
+            &request,
+        ),
+        Err(GenerationTransportContractError::EncodingTooLarge { .. })
+    ));
+}
+
+#[test]
+fn body_window_http_frame_matches_exact_golden_and_rejects_crossed_wire_facts() {
+    let request = body_request();
+    let frame = GenerationBodyWindowFrame {
+        metadata: body_metadata(),
+        body: b"hello wo".to_vec(),
+    };
+    let encoded = frame.encode_http_body(&request).expect("encode body frame");
+    assert_eq!(
+        encoded,
+        decode_hex_fixture(GENERATION_BODY_WINDOW_FRAME_V1_GOLDEN_HEX)
+    );
+    assert_eq!(
+        GenerationBodyWindowFrame::decode_http_body(
+            &request,
+            GENERATION_BODY_WINDOW_CONTENT_TYPE,
+            encoded.len() as u64,
+            &encoded,
+        )
+        .unwrap(),
+        frame
+    );
+
+    assert_eq!(
+        GenerationBodyWindowFrame::decode_http_body(
+            &request,
+            "application/octet-stream",
+            encoded.len() as u64,
+            &encoded,
+        ),
+        Err(GenerationTransportContractError::InvalidBodyWindowContentType)
+    );
+    assert_eq!(
+        GenerationBodyWindowFrame::decode_http_body(
+            &request,
+            GENERATION_BODY_WINDOW_CONTENT_TYPE,
+            encoded.len() as u64 + 1,
+            &encoded,
+        ),
+        Err(GenerationTransportContractError::BodyContentLengthMismatch)
+    );
+
+    let mut crossed_auth = request.clone();
+    crossed_auth.terminal_receipt_sha256 =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+    assert_eq!(
+        GenerationBodyWindowFrame::decode_http_body(
+            &crossed_auth,
+            GENERATION_BODY_WINDOW_CONTENT_TYPE,
+            encoded.len() as u64,
+            &encoded,
+        ),
+        Err(GenerationTransportContractError::BodyWindowMismatch)
+    );
+
+    let mut crossed_range = request.clone();
+    crossed_range.offset = 1;
+    assert_eq!(
+        GenerationBodyWindowFrame::decode_http_body(
+            &crossed_range,
+            GENERATION_BODY_WINDOW_CONTENT_TYPE,
+            encoded.len() as u64,
+            &encoded,
+        ),
+        Err(GenerationTransportContractError::BodyWindowMismatch)
+    );
+
+    let mut changed_body = encoded.clone();
+    *changed_body.last_mut().unwrap() ^= 1;
+    assert_eq!(
+        GenerationBodyWindowFrame::decode_http_body(
+            &request,
+            GENERATION_BODY_WINDOW_CONTENT_TYPE,
+            changed_body.len() as u64,
+            &changed_body,
+        ),
+        Err(GenerationTransportContractError::BodyIntegrityMismatch)
+    );
+
+    let mut oversized_metadata =
+        Vec::with_capacity(4 + MAX_GENERATION_BODY_WINDOW_METADATA_BYTES + 1);
+    oversized_metadata.extend_from_slice(
+        &u32::try_from(MAX_GENERATION_BODY_WINDOW_METADATA_BYTES + 1)
+            .unwrap()
+            .to_be_bytes(),
+    );
+    oversized_metadata.resize(4 + MAX_GENERATION_BODY_WINDOW_METADATA_BYTES + 1, b' ');
+    assert_eq!(
+        GenerationBodyWindowFrame::decode_http_body(
+            &request,
+            GENERATION_BODY_WINDOW_CONTENT_TYPE,
+            oversized_metadata.len() as u64,
+            &oversized_metadata,
+        ),
+        Err(GenerationTransportContractError::InvalidBodyFrame)
+    );
 }
 
 #[test]
@@ -339,6 +545,19 @@ fn opaque_and_content_bearing_debug_output_is_redacted() {
     let values = [
         format!("{:?}", body_request()),
         format!("{:?}", body_metadata()),
+        format!(
+            "{:?}",
+            GenerationBodyWindowFrame {
+                metadata: body_metadata(),
+                body: b"hello wo".to_vec(),
+            }
+        ),
+        format!(
+            "{:?}",
+            serde_json::from_slice::<DeliveryPollGolden>(GENERATION_DELIVERY_POLL_V1_GOLDEN_JSON)
+                .unwrap()
+                .delivery
+        ),
         format!("{:?}", acknowledgment.request),
         format!("{:?}", acknowledgment.response),
         format!("{:?}", pins.acquire_request),
@@ -358,6 +577,8 @@ fn opaque_and_content_bearing_debug_output_is_redacted() {
             "pin-release-op-01",
             "Engineering/roadmap.md",
             "3ec8d4089470a2e4620d65c03a01635c028200982c94dfbc2e34eac95e2370b1",
+            "delta-poll-v1",
+            "hello wo",
         ] {
             assert!(!debug.contains(secret), "{debug}");
         }

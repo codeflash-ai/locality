@@ -14,15 +14,21 @@ use sha2::{Digest, Sha256};
 
 use crate::FreshnessEpoch;
 use crate::freshness_delivery::{
-    GenerationDeltaTerminalReceipt, GenerationFileIdentity, MAX_DELIVERY_ID_BYTES,
-    MAX_DELIVERY_TIMESTAMP_BYTES,
+    FreshnessReasonCode, FreshnessRetry, GenerationDelta, GenerationDeltaTerminalReceipt,
+    GenerationFileIdentity, MAX_DELIVERY_ID_BYTES, MAX_DELIVERY_TIMESTAMP_BYTES,
 };
 
 pub const GENERATION_TRANSPORT_FORMAT_VERSION: u16 = 1;
 pub const GENERATION_TRANSPORT_READER_VERSION: u16 = 1;
 pub const MAX_GENERATION_TRANSPORT_CAPABILITIES_BYTES: usize = 4 * 1024;
 pub const MAX_GENERATION_TRANSPORT_REQUEST_BYTES: usize = 16 * 1024;
+pub const MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_GENERATION_BODY_WINDOW_METADATA_BYTES: usize = 16 * 1024;
 pub const MAX_GENERATION_BODY_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
+pub const GENERATION_DELIVERY_POLL_CONTENT_TYPE: &str = "application/json";
+pub const GENERATION_BODY_WINDOW_CONTENT_TYPE: &str =
+    "application/vnd.locality.generation-body-window.v1";
+pub const GENERATION_BODY_WINDOW_METADATA_LENGTH_BYTES: usize = std::mem::size_of::<u32>();
 pub const MIN_GENERATION_PIN_LEASE_SECONDS: u64 = 60;
 pub const MAX_GENERATION_PIN_LEASE_SECONDS: u64 = 24 * 60 * 60;
 pub const MAX_GENERATION_PIN_LEASES_PER_DEVICE: u16 = 32;
@@ -35,10 +41,14 @@ pub const GENERATION_TRANSPORT_CAPABILITIES_V1_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/generation-transport-capabilities-v1.json");
 pub const GENERATION_DELIVERY_REQUEST_V1_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/generation-delivery-request-v1.json");
+pub const GENERATION_DELIVERY_POLL_V1_GOLDEN_JSON: &[u8] =
+    include_bytes!("../fixtures/generation-delivery-poll-v1.json");
 pub const GENERATION_BODY_WINDOW_REQUEST_V1_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/generation-body-window-request-v1.json");
 pub const GENERATION_BODY_WINDOW_METADATA_V1_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/generation-body-window-metadata-v1.json");
+pub const GENERATION_BODY_WINDOW_FRAME_V1_GOLDEN_HEX: &[u8] =
+    include_bytes!("../fixtures/generation-body-window-frame-v1.hex");
 pub const GENERATION_DELIVERY_ACKNOWLEDGMENT_V1_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/generation-delivery-acknowledgment-v1.json");
 pub const GENERATION_PIN_LEASE_V1_GOLDEN_JSON: &[u8] =
@@ -213,6 +223,156 @@ fn is_legacy_capabilities(capabilities: &GenerationTransportCapabilities) -> boo
     capabilities == &GenerationTransportCapabilities::legacy()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationDeliveryPollStatus {
+    Delivery,
+    NoDelivery,
+    Error,
+    #[serde(other)]
+    Unknown,
+}
+
+/// The portable delta and terminal receipt returned by a successful poll.
+/// Reader or stream values remain adapter concerns and never enter this wire
+/// contract.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationDeliveryPollDelivery {
+    pub delta: GenerationDelta,
+    pub terminal_receipt: GenerationDeltaTerminalReceipt,
+}
+
+impl Debug for GenerationDeliveryPollDelivery {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GenerationDeliveryPollDelivery")
+            .field("delta", &"<redacted>")
+            .field("terminal_receipt", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Bounded machine-readable failure. Human or provider error text is excluded
+/// from the public envelope so it cannot create an unbounded or secret-bearing
+/// wire field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationDeliveryPollError {
+    pub reason: FreshnessReasonCode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<FreshnessRetry>,
+}
+
+impl GenerationDeliveryPollError {
+    pub fn validate(&self) -> Result<(), GenerationTransportContractError> {
+        if self.reason == FreshnessReasonCode::Unknown {
+            return Err(GenerationTransportContractError::UnknownPollErrorReason);
+        }
+        if let Some(retry) = self.retry {
+            retry
+                .validate()
+                .map_err(|_| GenerationTransportContractError::InvalidPollRetry)?;
+        }
+        Ok(())
+    }
+}
+
+/// One authenticated poll response. Correlation fields are repeated on every
+/// status so a response cannot be replayed across mounts, sources, or observed
+/// generations. `selected_capabilities` is always a subset of the request
+/// offer, including for `no_delivery` and `error`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationDeliveryPollResponse {
+    #[serde(default = "v1")]
+    pub format_version: u16,
+    #[serde(default = "v1")]
+    pub minimum_reader_version: u16,
+    pub status: GenerationDeliveryPollStatus,
+    pub mount_id: PortableMountId,
+    pub source_connection_id: SourceConnectionId,
+    pub observed_generation_id: SourceGenerationId,
+    pub selected_capabilities: GenerationTransportCapabilities,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<GenerationDeliveryPollDelivery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<GenerationDeliveryPollError>,
+}
+
+impl Debug for GenerationDeliveryPollResponse {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GenerationDeliveryPollResponse")
+            .field("format_version", &self.format_version)
+            .field("minimum_reader_version", &self.minimum_reader_version)
+            .field("status", &self.status)
+            .field("mount_id", &self.mount_id)
+            .field("source_connection_id", &self.source_connection_id)
+            .field("observed_generation_id", &self.observed_generation_id)
+            .field("selected_capabilities", &self.selected_capabilities)
+            .field("delivery", &self.delivery.as_ref().map(|_| "<redacted>"))
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+impl GenerationDeliveryPollResponse {
+    pub fn decode_json(
+        input: &[u8],
+        request: &GenerationDeliveryRequest,
+    ) -> Result<Self, GenerationTransportContractError> {
+        validate_encoding_length_against(input.len(), MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES)?;
+        let response: Self = serde_json::from_slice(input)
+            .map_err(|error| GenerationTransportContractError::InvalidJson(error.to_string()))?;
+        response.validate_against(request)?;
+        Ok(response)
+    }
+
+    pub fn validate_against(
+        &self,
+        request: &GenerationDeliveryRequest,
+    ) -> Result<(), GenerationTransportContractError> {
+        request.validate()?;
+        validate_versions(self.format_version, self.minimum_reader_version)?;
+        if self.mount_id != request.mount_id
+            || self.source_connection_id != request.source_connection_id
+            || self.observed_generation_id != request.observed_generation_id
+        {
+            return Err(GenerationTransportContractError::PollResponseMismatch);
+        }
+        self.selected_capabilities
+            .validate_selection(&request.capabilities)?;
+
+        match (self.status, &self.delivery, &self.error) {
+            (GenerationDeliveryPollStatus::Delivery, Some(delivery), None) => {
+                delivery.delta.validate().map_err(|error| {
+                    GenerationTransportContractError::GenerationDelta(error.to_string())
+                })?;
+                delivery
+                    .terminal_receipt
+                    .validate_against(&delivery.delta)
+                    .map_err(|error| {
+                        GenerationTransportContractError::TerminalReceipt(error.to_string())
+                    })?;
+                if delivery.delta.mount_id != self.mount_id
+                    || delivery.delta.source_connection_id != self.source_connection_id
+                    || delivery.delta.base_generation_id != self.observed_generation_id
+                {
+                    return Err(GenerationTransportContractError::PollResponseMismatch);
+                }
+            }
+            (GenerationDeliveryPollStatus::NoDelivery, None, None) => {}
+            (GenerationDeliveryPollStatus::Error, None, Some(error)) => error.validate()?,
+            (GenerationDeliveryPollStatus::Unknown, _, _) => {
+                return Err(GenerationTransportContractError::UnknownPollStatus);
+            }
+            _ => return Err(GenerationTransportContractError::AmbiguousPollResponse),
+        }
+
+        let encoded = serde_json::to_vec(self)
+            .expect("serializing a typed generation delivery poll response cannot fail");
+        validate_encoding_length_against(encoded.len(), MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES)
+    }
+}
+
 /// Bounded request for one immutable content body window. The complete content
 /// identity is repeated so an authenticated adapter cannot accidentally reuse
 /// a range response for another projection or version.
@@ -297,26 +457,23 @@ pub struct GenerationBodyWindowMetadata {
 
 impl GenerationBodyWindowMetadata {
     pub fn decode_json(input: &[u8]) -> Result<Self, GenerationTransportContractError> {
-        validate_encoding_length(input.len())?;
-        serde_json::from_slice(input)
-            .map_err(|error| GenerationTransportContractError::InvalidJson(error.to_string()))
+        validate_encoding_length_against(input.len(), MAX_GENERATION_BODY_WINDOW_METADATA_BYTES)?;
+        let metadata: Self = serde_json::from_slice(input)
+            .map_err(|error| GenerationTransportContractError::InvalidJson(error.to_string()))?;
+        metadata.validate()?;
+        Ok(metadata)
     }
 
-    pub fn validate_against(
-        &self,
-        request: &GenerationBodyWindowRequest,
-    ) -> Result<(), GenerationTransportContractError> {
-        request.validate()?;
+    pub fn validate(&self) -> Result<(), GenerationTransportContractError> {
         validate_versions(self.format_version, self.minimum_reader_version)?;
+        validate_identifier("delta_id", &self.delta_id)?;
+        validate_sha256(&self.terminal_receipt_sha256)?;
         validate_sha256(&self.window_sha256)?;
-        if self.delta_id != request.delta_id
-            || self.terminal_receipt_sha256 != request.terminal_receipt_sha256
-            || self.content != request.content
-            || self.range.offset != request.offset
-            || self.range.length == 0
-            || self.range.length > request.max_bytes
-        {
-            return Err(GenerationTransportContractError::BodyWindowMismatch);
+        self.content.validate().map_err(|error| {
+            GenerationTransportContractError::ContentIdentity(error.to_string())
+        })?;
+        if !(1..=MAX_GENERATION_BODY_WINDOW_BYTES).contains(&self.range.length) {
+            return Err(GenerationTransportContractError::InvalidBodyRange);
         }
         let end = self
             .range
@@ -327,6 +484,24 @@ impl GenerationBodyWindowMetadata {
             || self.range.complete != (end == self.content.byte_length)
         {
             return Err(GenerationTransportContractError::InvalidBodyRange);
+        }
+        Ok(())
+    }
+
+    pub fn validate_against(
+        &self,
+        request: &GenerationBodyWindowRequest,
+    ) -> Result<(), GenerationTransportContractError> {
+        request.validate()?;
+        self.validate()?;
+        if self.delta_id != request.delta_id
+            || self.terminal_receipt_sha256 != request.terminal_receipt_sha256
+            || self.content != request.content
+            || self.range.offset != request.offset
+            || self.range.length == 0
+            || self.range.length > request.max_bytes
+        {
+            return Err(GenerationTransportContractError::BodyWindowMismatch);
         }
         Ok(())
     }
@@ -346,6 +521,96 @@ impl GenerationBodyWindowMetadata {
             return Err(GenerationTransportContractError::BodyIntegrityMismatch);
         }
         Ok(())
+    }
+}
+
+/// Canonical HTTP entity body for one body window. The wire bytes are exactly:
+/// a four-byte big-endian metadata JSON length, compact metadata JSON, and the
+/// raw body window. The HTTP `Content-Length` covers all three segments.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GenerationBodyWindowFrame {
+    pub metadata: GenerationBodyWindowMetadata,
+    pub body: Vec<u8>,
+}
+
+impl GenerationBodyWindowFrame {
+    pub fn encode_http_body(
+        &self,
+        request: &GenerationBodyWindowRequest,
+    ) -> Result<Vec<u8>, GenerationTransportContractError> {
+        self.metadata.validate_against(request)?;
+        self.metadata.validate_body(&self.body)?;
+        let metadata = serde_json::to_vec(&self.metadata)
+            .expect("serializing typed generation body window metadata cannot fail");
+        validate_encoding_length_against(
+            metadata.len(),
+            MAX_GENERATION_BODY_WINDOW_METADATA_BYTES,
+        )?;
+        let metadata_length = u32::try_from(metadata.len())
+            .map_err(|_| GenerationTransportContractError::InvalidBodyFrame)?;
+        let mut frame = Vec::with_capacity(
+            GENERATION_BODY_WINDOW_METADATA_LENGTH_BYTES + metadata.len() + self.body.len(),
+        );
+        frame.extend_from_slice(&metadata_length.to_be_bytes());
+        frame.extend_from_slice(&metadata);
+        frame.extend_from_slice(&self.body);
+        validate_body_frame_length(frame.len())?;
+        Ok(frame)
+    }
+
+    pub fn decode_http_body(
+        request: &GenerationBodyWindowRequest,
+        content_type: &str,
+        content_length: u64,
+        frame: &[u8],
+    ) -> Result<Self, GenerationTransportContractError> {
+        if content_type != GENERATION_BODY_WINDOW_CONTENT_TYPE {
+            return Err(GenerationTransportContractError::InvalidBodyWindowContentType);
+        }
+        validate_body_frame_length(frame.len())?;
+        let actual_length = u64::try_from(frame.len())
+            .map_err(|_| GenerationTransportContractError::InvalidBodyFrame)?;
+        if content_length != actual_length {
+            return Err(GenerationTransportContractError::BodyContentLengthMismatch);
+        }
+        let length_prefix: [u8; GENERATION_BODY_WINDOW_METADATA_LENGTH_BYTES] = frame
+            .get(..GENERATION_BODY_WINDOW_METADATA_LENGTH_BYTES)
+            .ok_or(GenerationTransportContractError::InvalidBodyFrame)?
+            .try_into()
+            .expect("slice length is checked");
+        let metadata_length = usize::try_from(u32::from_be_bytes(length_prefix))
+            .map_err(|_| GenerationTransportContractError::InvalidBodyFrame)?;
+        if metadata_length == 0 || metadata_length > MAX_GENERATION_BODY_WINDOW_METADATA_BYTES {
+            return Err(GenerationTransportContractError::InvalidBodyFrame);
+        }
+        let metadata_end = GENERATION_BODY_WINDOW_METADATA_LENGTH_BYTES
+            .checked_add(metadata_length)
+            .ok_or(GenerationTransportContractError::InvalidBodyFrame)?;
+        let metadata = GenerationBodyWindowMetadata::decode_json(
+            frame
+                .get(GENERATION_BODY_WINDOW_METADATA_LENGTH_BYTES..metadata_end)
+                .ok_or(GenerationTransportContractError::InvalidBodyFrame)?,
+        )?;
+        metadata.validate_against(request)?;
+        let body = frame
+            .get(metadata_end..)
+            .ok_or(GenerationTransportContractError::InvalidBodyFrame)?;
+        metadata.validate_body(body)?;
+        Ok(Self {
+            metadata,
+            body: body.to_vec(),
+        })
+    }
+}
+
+impl Debug for GenerationBodyWindowFrame {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GenerationBodyWindowFrame")
+            .field("metadata", &self.metadata)
+            .field("body", &"<redacted>")
+            .field("body_length", &self.body.len())
+            .finish()
     }
 }
 
@@ -1044,11 +1309,20 @@ pub enum GenerationTransportContractError {
     InvalidTimestamp,
     InvalidSha256,
     InvalidBodyWindowLimit { actual: u64 },
+    InvalidBodyWindowContentType,
+    BodyContentLengthMismatch,
+    InvalidBodyFrame,
     InvalidBodyRange,
     BodyWindowMismatch,
     BodyIntegrityMismatch,
     ContentIdentity(String),
     CapabilityNotOffered,
+    UnknownPollStatus,
+    AmbiguousPollResponse,
+    PollResponseMismatch,
+    UnknownPollErrorReason,
+    InvalidPollRetry,
+    GenerationDelta(String),
     InvalidPinCapability,
     InvalidPinLeaseDuration { actual: u64 },
     InvalidPinLeaseExpiry,
@@ -1090,6 +1364,14 @@ impl Display for GenerationTransportContractError {
                 formatter,
                 "body window limit {actual} is outside 1..={MAX_GENERATION_BODY_WINDOW_BYTES}"
             ),
+            Self::InvalidBodyWindowContentType => formatter
+                .write_str("generation body window response has the wrong HTTP content type"),
+            Self::BodyContentLengthMismatch => formatter.write_str(
+                "generation body window HTTP content length does not match the framed body",
+            ),
+            Self::InvalidBodyFrame => {
+                formatter.write_str("invalid bounded generation body window frame")
+            }
             Self::InvalidBodyRange => formatter.write_str("invalid generation body range"),
             Self::BodyWindowMismatch => {
                 formatter.write_str("body window metadata does not match request")
@@ -1101,6 +1383,22 @@ impl Display for GenerationTransportContractError {
             Self::CapabilityNotOffered => {
                 formatter.write_str("selected transport capability was not offered")
             }
+            Self::UnknownPollStatus => {
+                formatter.write_str("unknown generation delivery poll status")
+            }
+            Self::AmbiguousPollResponse => {
+                formatter.write_str("generation delivery poll status and payload disagree")
+            }
+            Self::PollResponseMismatch => {
+                formatter.write_str("generation delivery poll response does not match request")
+            }
+            Self::UnknownPollErrorReason => {
+                formatter.write_str("unknown generation delivery poll error reason")
+            }
+            Self::InvalidPollRetry => {
+                formatter.write_str("invalid generation delivery poll retry advice")
+            }
+            Self::GenerationDelta(error) => write!(formatter, "invalid generation delta: {error}"),
             Self::InvalidPinCapability => {
                 formatter.write_str("invalid generation pin capability limits")
             }
@@ -1149,14 +1447,26 @@ fn validate_versions(
 }
 
 fn validate_encoding_length(actual: usize) -> Result<(), GenerationTransportContractError> {
-    if actual > MAX_GENERATION_TRANSPORT_REQUEST_BYTES {
-        Err(GenerationTransportContractError::EncodingTooLarge {
-            actual,
-            maximum: MAX_GENERATION_TRANSPORT_REQUEST_BYTES,
-        })
+    validate_encoding_length_against(actual, MAX_GENERATION_TRANSPORT_REQUEST_BYTES)
+}
+
+fn validate_encoding_length_against(
+    actual: usize,
+    maximum: usize,
+) -> Result<(), GenerationTransportContractError> {
+    if actual > maximum {
+        Err(GenerationTransportContractError::EncodingTooLarge { actual, maximum })
     } else {
         Ok(())
     }
+}
+
+fn validate_body_frame_length(actual: usize) -> Result<(), GenerationTransportContractError> {
+    let maximum = GENERATION_BODY_WINDOW_METADATA_LENGTH_BYTES
+        + MAX_GENERATION_BODY_WINDOW_METADATA_BYTES
+        + usize::try_from(MAX_GENERATION_BODY_WINDOW_BYTES)
+            .expect("generation body window limit fits usize");
+    validate_encoding_length_against(actual, maximum)
 }
 
 fn decode_request<T>(input: &[u8]) -> Result<T, GenerationTransportContractError>

@@ -20,14 +20,33 @@ version fields decode as the legacy V1 whole-body transport.
 
 The client advertises `GenerationTransportCapabilities` with every next-delta
 request. That value remains a client offer across polls. The authenticated
-`AuthorizedGenerationDeliveryPoll` response carries a separate server
-selection, which may select only a subset with limits no larger than the offer;
-it must not replace or narrow a later client offer. The three V1 capabilities
-are bounded content body windows, idempotent terminal receipt acknowledgments,
-and device-scoped generation pin leases. Local sync validates the selected set
-immediately after the poll returns and before the returned delivery can cause
-journal, filesystem, or observed-generation mutations. Startup recovery and
-reconciliation still run before polling.
+wire response is the serde `GenerationDeliveryPollResponse`. It carries a
+separate server selection, which may select only a subset with limits no larger
+than the offer; it must not replace or narrow a later client offer. A private
+adapter maps that portable value to its local daemon result after authentication;
+the protocol value contains no reader or stream type.
+
+The poll response uses `Content-Type: application/json`, is capped at 64 MiB,
+and has exactly one of these status/payload combinations:
+
+- `delivery` has one delta and terminal receipt and no error.
+- `no_delivery` has neither a delivery nor an error.
+- `error` has no delivery and one bounded machine-readable freshness reason
+  with optional bounded retry advice. It never carries provider or human error
+  text.
+
+Every status repeats the mount, source connection, observed generation, and
+selected capabilities. The client rejects crossed request correlation, a
+selection outside its offer, ambiguous or unknown statuses, an invalid delta,
+or a receipt that does not bind that exact delta. Unknown additive object fields
+remain ignorable when `minimum_reader_version` remains 1; a higher minimum
+reader fails with `UpdateRequired`.
+
+The three V1 capabilities are bounded content body windows, idempotent terminal
+receipt acknowledgments, and device-scoped generation pin leases. Local sync
+validates the selected set immediately after the poll returns and before the
+returned delivery can cause journal, filesystem, or observed-generation
+mutations. Startup recovery and reconciliation still run before polling.
 
 For a returned delivery, SQLite durably stores the complete authenticated
 selection alongside the apply journal, including body-window bounds,
@@ -50,23 +69,65 @@ An existing adapter can continue implementing the original
 `GenerationDeliveryTransport` trait and `GenerationDeliveryRequest` without
 source changes. `next_delta_versioned` and `next_delta_poll` are additive
 default adapter methods, and `GenerationTransport` is a compatibility alias.
-The compatibility response selects the legacy transport. The default client
-offer is legacy, and the existing `open_content` stream remains the fallback.
-Selecting a capability and then omitting its response is a contract error;
-selection never silently falls back.
+The portable poll serde envelope and HTTP body frame are additive; they do not
+change any released V1 request or metadata JSON. The compatibility response
+selects the legacy transport. The default client offer is legacy, and the
+existing `open_content` stream remains the fallback. Selecting a capability and
+then omitting its response is a contract error; selection never silently falls
+back.
+
+## Target inventory commitment
+
+`target_inventory_sha256` commits to the complete authoritative file inventory
+of the resulting target generation, including files unchanged by the delta. The
+inventory is ordered by ascending bytewise `projection_id`; duplicate or
+portable-colliding logical paths are invalid. Its canonical preimage is:
+
+1. the ASCII domain `locality.generation-target-inventory.v1` followed by NUL;
+2. the inventory entry count as a big-endian `u64`;
+3. for every file, its `projection_id`, logical path, content version ID, and
+   `sha256:` content digest as UTF-8 byte strings, each prefixed by its
+   big-endian `u64` byte length, followed by its byte length as a big-endian
+   `u64`.
+
+The commitment is lowercase `sha256:` plus SHA-256 of that preimage. The
+protocol fixture includes empty, ASCII, Unicode, and framing-boundary vectors
+for implementations in other languages. Local sync derives the resulting
+inventory from its authoritative generation-path state plus the delta and
+compares the commitment before reserving a journal, downloading content,
+publishing filesystem changes, or committing the observed generation. A
+mismatch fails closed. This adds validation to the existing V1 field without
+changing its wire representation.
 
 ## Body windows
 
 A body-window request repeats the delta ID, terminal receipt digest, complete
 `GenerationFileIdentity`, offset, and requested maximum bytes. Authenticated
 response metadata repeats those bindings and supplies the exact range, terminal
-flag, and per-window SHA-256. Raw body bytes are transported separately from
-the JSON metadata.
+flag, and per-window SHA-256.
 
-The local daemon accepts a window only when its metadata matches the request,
-its range is contiguous and bounded, the terminal flag exactly matches the
-declared content end, the streamed window length and SHA-256 match, and the
-assembled file matches `GenerationFileIdentity`.
+A successful HTTP response has the exact media type
+`application/vnd.locality.generation-body-window.v1` and a required
+`Content-Length`. Its entity body has one canonical framing:
+
+1. four-byte unsigned big-endian metadata length;
+2. that many bytes of compact UTF-8 JSON `GenerationBodyWindowMetadata`, capped
+   at 16 KiB; then
+3. exactly `range.length` raw body bytes.
+
+There is no JSON body embedding, metadata header, multipart boundary, trailing
+data, or content-type sniffing. `Content-Length` covers the prefix, metadata,
+and raw bytes and must equal the bytes received. A non-success HTTP response is
+not a body-window frame; the private adapter owns its authenticated error
+mapping.
+
+The private adapter must authenticate the complete HTTP response before exposing
+the frame. The public decoder then accepts a window only when the metadata's
+delta and terminal receipt digest bind it to the authenticated delivery, its
+complete content identity and offset match the request, its range is contiguous
+and bounded by the requested maximum, the terminal flag exactly matches the
+declared content end, and the raw byte length and SHA-256 match. The assembled
+file must still match `GenerationFileIdentity`.
 
 Window size is capped at 4 MiB. A generation file remains capped at 64 MiB and
 a delta at 512 MiB by the underlying freshness contract. Empty files are
@@ -126,7 +187,9 @@ is integrated with generation selection.
 | --- | ---: |
 | Capability JSON | 4 KiB |
 | Request/metadata JSON | 16 KiB |
+| Poll response JSON | 64 MiB |
 | Body window | 4 MiB |
+| Body-window frame | 4-byte prefix + 16 KiB metadata + 4 MiB body |
 | Device scope ID | 128 bytes |
 | Pin operation ID | 128 bytes |
 | Lease ID | 256 bytes |
