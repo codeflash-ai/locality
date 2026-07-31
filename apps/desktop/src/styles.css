@@ -4587,12 +4587,17 @@ button.home-stat:hover {
 :root[data-theme="dark"] .connector-option.available,
 :root[data-theme="dark"] .connector-option.selectable:hover:not(:disabled),
 :root[data-theme="dark"] .connector-option.selectable.selected,
-:root[data-theme="dark"] .source-ready-card,
-:root[data-theme="dark"] .connector-choice-card.active,
-:root[data-theme="dark"] .mount-card.active,
 :root[data-theme="dark"] .file-row.expanded {
   border-color: var(--control-border-hover);
   background: var(--surface-active);
+  color: var(--ink);
+}
+
+:root[data-theme="dark"] .source-ready-card,
+:root[data-theme="dark"] .connector-choice-card.active,
+:root[data-theme="dark"] .mount-card.active {
+  border-color: var(--control-border-hover);
+  background: var(--surface-muted);
   color: var(--ink);
 }
 

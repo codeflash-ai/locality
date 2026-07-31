@@ -159,6 +159,9 @@ describe("desktop component theme contract", () => {
     const darkSharedActive = cssBlock(
       ':root[data-theme="dark"] .source-view-toggle button.active,\n:root[data-theme="dark"] .file-filter-bar button.active,\n:root[data-theme="dark"] .file-filter-bar button:hover,\n:root[data-theme="dark"] .activity-tabs button.active,\n:root[data-theme="dark"] .settings-nav button:hover,\n:root[data-theme="dark"] .settings-nav button.active,\n:root[data-theme="dark"] .theme-segmented button.active,\n:root[data-theme="dark"] .option-row:hover',
     );
+    const darkSourceCards = cssBlock(
+      ':root[data-theme="dark"] .source-ready-card,\n:root[data-theme="dark"] .connector-choice-card.active,\n:root[data-theme="dark"] .mount-card.active',
+    );
     const primaryButton = cssBlock(".primary-button");
     const primaryButtonHover = cssBlock(".primary-button:hover:not(:disabled)");
     const secondaryButtonHover = cssBlock(".secondary-button:hover:not(:disabled)");
@@ -190,6 +193,9 @@ describe("desktop component theme contract", () => {
     expectToken(settingsNavState, "color", "--control-selected-text");
     expectToken(darkSettingsNavSmall, "color", "--control-muted");
     expectToken(darkSharedActive, "box-shadow", "--surface-shadow");
+    expectToken(darkSourceCards, "border-color", "--control-border-hover");
+    expectToken(darkSourceCards, "background", "--surface-muted");
+    expectToken(darkSourceCards, "color", "--ink");
     expectToken(primaryButton, "box-shadow", "--surface-shadow");
     expectToken(primaryButtonHover, "box-shadow", "--surface-shadow");
     expectToken(secondaryButtonHover, "box-shadow", "--surface-shadow");
@@ -213,6 +219,7 @@ describe("desktop component theme contract", () => {
       settingsActivityHover,
       settingsNavState,
       darkSettingsNavSmall,
+      darkSourceCards,
       themeSegmentedActive,
     ]) {
       expectNoRawColorValues(block);
