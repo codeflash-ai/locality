@@ -1,9 +1,14 @@
 //! Staged, durable publication of validated generation-2 workspace archives.
 
 use std::fmt::{Display, Formatter};
-use std::fs::{self, OpenOptions};
+use std::fs;
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use rustix::fs::{AtFlags, Mode, OFlags};
 
 use hmac::{Hmac, Mac};
 use locality_protocol::workspace_api_v2::{WorkspaceExportOfferV2, WorkspaceProfileSessionV2};
@@ -15,8 +20,16 @@ use crate::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 use crate::replica_materializer::{
     ReplicaMaterializationError, StagingDirectory, WorkspaceGenerationFileBinding,
     WorkspaceGenerationIdentity, WorkspacePublicationLock, acquire_workspace_publication_lock,
+};
+#[cfg(not(unix))]
+use crate::replica_materializer::{
     remove_workspace_generation, repair_workspace_generation, workspace_generation_file_binding,
     workspace_generation_identity_if_exists,
+};
+#[cfg(unix)]
+use crate::replica_materializer::{
+    remove_workspace_generation_at, repair_workspace_generation_at,
+    workspace_generation_file_binding_at, workspace_generation_identity_if_exists_at,
 };
 use crate::workspace_archive::{
     ValidatedWorkspaceArchive, WorkspaceArchiveError, WorkspaceArchiveLimits, WorkspaceArchiveSink,
@@ -151,17 +164,20 @@ impl StagedWorkspaceMaterialization {
         destination: &Path,
     ) -> Result<PublishedWorkspace, WorkspaceMaterializationError> {
         let paths = PublicationPaths::new(destination)?;
-        let _lock = paths.acquire_lock()?;
+        let lock = paths.acquire_lock()?;
+        self.staging.verify_publication_parent(&lock)?;
         let expected_staging = self.staging.identity()?;
-        self.publish_initial_expected(destination, expected_staging)
+        self.publish_initial_expected(destination, expected_staging, &lock, &paths)
     }
 
     fn publish_initial_expected(
         mut self,
         destination: &Path,
         expected_staging: WorkspaceGenerationIdentity,
+        lock: &WorkspacePublicationLock,
+        paths: &PublicationPaths,
     ) -> Result<PublishedWorkspace, WorkspaceMaterializationError> {
-        if fs::symlink_metadata(destination).is_ok() {
+        if generation_identity_if_exists_locked(lock, paths, &paths.destination_name)?.is_some() {
             return Err(WorkspaceMaterializationError::DestinationExists(
                 destination.to_path_buf(),
             ));
@@ -185,12 +201,16 @@ impl StagedWorkspaceMaterialization {
         destination: &Path,
     ) -> Result<PublishedWorkspace, WorkspaceMaterializationError> {
         let paths = PublicationPaths::new(destination)?;
-        let _lock = paths.acquire_lock()?;
+        let lock = paths.acquire_lock()?;
+        self.staging.verify_publication_parent(&lock)?;
         let expected_staging = self.staging.identity()?;
-        let expected_destination = generation_identity(destination)?
-            .ok_or_else(|| WorkspaceMaterializationError::DestinationExists(destination.into()))?
-            .into();
-        self.publish_exchange_expected(destination, expected_staging, expected_destination)
+        let expected_destination =
+            generation_identity_locked(&lock, &paths, &paths.destination_name)?
+                .ok_or_else(|| {
+                    WorkspaceMaterializationError::DestinationExists(destination.into())
+                })?
+                .into();
+        self.publish_exchange_expected(destination, expected_staging, expected_destination, &lock)
     }
 
     fn publish_exchange_expected(
@@ -198,7 +218,9 @@ impl StagedWorkspaceMaterialization {
         destination: &Path,
         expected_staging: WorkspaceGenerationIdentity,
         expected_destination: WorkspaceGenerationIdentity,
+        lock: &WorkspacePublicationLock,
     ) -> Result<PublishedWorkspace, WorkspaceMaterializationError> {
+        self.staging.verify_publication_parent(lock)?;
         let old_generation =
             self.staging
                 .exchange(destination, expected_staging, expected_destination)?;
@@ -338,10 +360,11 @@ pub fn materialize_workspace_archive_durable<Body: Read>(
     ownership: &WorkspaceOwnershipCapability,
 ) -> Result<PublishedWorkspace, WorkspaceMaterializationError> {
     let paths = PublicationPaths::new(destination)?;
-    let _lock = paths.acquire_lock()?;
-    recover_workspace_publication_locked(destination, ownership, &paths)?;
-    let staged = stage_workspace_archive(archive, destination, limits, session, offer)?;
-    publish_staged_workspace_locked(staged, destination, ownership, &mut (), &paths)
+    let lock = paths.acquire_lock()?;
+    recover_workspace_publication_locked(destination, ownership, &paths, &lock)?;
+    let staged =
+        stage_workspace_archive_locked(archive, destination, limits, session, offer, Some(&lock))?;
+    publish_staged_workspace_locked(staged, destination, ownership, &mut (), &paths, &lock)
 }
 
 pub fn publish_staged_workspace(
@@ -359,8 +382,9 @@ pub fn publish_staged_workspace_with_hooks<H: WorkspacePublicationHooks>(
     hooks: &mut H,
 ) -> Result<PublishedWorkspace, WorkspaceMaterializationError> {
     let paths = PublicationPaths::new(destination)?;
-    let _lock = paths.acquire_lock()?;
-    publish_staged_workspace_locked(staged, destination, ownership, hooks, &paths)
+    let lock = paths.acquire_lock()?;
+    staged.staging.verify_publication_parent(&lock)?;
+    publish_staged_workspace_locked(staged, destination, ownership, hooks, &paths, &lock)
 }
 
 fn publish_staged_workspace_locked<H: WorkspacePublicationHooks>(
@@ -369,13 +393,15 @@ fn publish_staged_workspace_locked<H: WorkspacePublicationHooks>(
     ownership: &WorkspaceOwnershipCapability,
     hooks: &mut H,
     paths: &PublicationPaths,
+    lock: &WorkspacePublicationLock,
 ) -> Result<PublishedWorkspace, WorkspaceMaterializationError> {
-    if paths.journal.exists() {
+    if publication_entry_exists(lock, paths, &paths.journal_name, &paths.journal)? {
         return Err(WorkspaceMaterializationError::RecoveryRequired(
             paths.journal.clone(),
         ));
     }
-    let destination_exists = ordinary_directory_exists(destination)?;
+    let destination_exists =
+        generation_identity_if_exists_locked(lock, paths, &paths.destination_name)?.is_some();
     let new_identity: GenerationIdentity = staged.staging.identity()?.into();
     let new_marker = marker_binding_from_file(
         staged
@@ -383,12 +409,12 @@ fn publish_staged_workspace_locked<H: WorkspacePublicationHooks>(
             .file_binding(WORKSPACE_OWNERSHIP_MARKER, WORKSPACE_OWNERSHIP_NONCE_BYTES)?,
     )?;
     let old_identity = if destination_exists {
-        generation_identity(destination)?
+        generation_identity_locked(lock, paths, &paths.destination_name)?
     } else {
         None
     };
     let old_receipt = if let Some(identity) = old_identity {
-        let receipt = load_workspace_publication_receipt_locked(paths)?.ok_or_else(|| {
+        let receipt = load_workspace_publication_receipt_locked(paths, lock)?.ok_or_else(|| {
             WorkspaceMaterializationError::RecoveryConflict(
                 "an existing workspace root has no durable active receipt".to_string(),
             )
@@ -396,7 +422,7 @@ fn publish_staged_workspace_locked<H: WorkspacePublicationHooks>(
         validate_receipt_binding(
             &receipt,
             identity,
-            &generation_marker_binding(destination)?,
+            &generation_marker_binding_locked(lock, paths, &paths.destination_name)?,
             &paths.destination_name,
             ownership,
             "active workspace receipt",
@@ -429,7 +455,7 @@ fn publish_staged_workspace_locked<H: WorkspacePublicationHooks>(
     };
     journal.ownership_tag = journal_ownership_tag(&journal, ownership)?;
     validate_journal_receipt_bindings(&journal, ownership)?;
-    create_durable_journal(paths, &journal)?;
+    create_durable_journal(paths, lock, &journal)?;
     if let Err(source) = hooks.checkpoint(WorkspacePublicationCheckpoint::JournalDurable) {
         return Err(WorkspaceMaterializationError::Journal {
             path: paths.journal.clone(),
@@ -440,7 +466,7 @@ fn publish_staged_workspace_locked<H: WorkspacePublicationHooks>(
     validate_receipt_binding(
         &journal.new_receipt,
         required_identity(journal.new_identity, "new journal generation")?,
-        &generation_marker_binding(staged.staging.path())?,
+        &staging_marker_binding(&staged.staging)?,
         &paths.destination_name,
         ownership,
         "staged generation immediately before publication",
@@ -453,7 +479,7 @@ fn publish_staged_workspace_locked<H: WorkspacePublicationHooks>(
                 )
             })?,
             required_identity(journal.old_identity, "old journal generation")?,
-            &generation_marker_binding(destination)?,
+            &generation_marker_binding_locked(lock, paths, &paths.destination_name)?,
             &paths.destination_name,
             ownership,
             "active generation immediately before exchange",
@@ -466,11 +492,14 @@ fn publish_staged_workspace_locked<H: WorkspacePublicationHooks>(
             destination,
             required_identity(journal.new_identity, "new journal generation")?.into(),
             required_identity(journal.old_identity, "old journal generation")?.into(),
+            lock,
         )
     } else {
         staged.publish_initial_expected(
             destination,
             required_identity(journal.new_identity, "new journal generation")?.into(),
+            lock,
+            paths,
         )
     };
     let published = match publication {
@@ -479,7 +508,7 @@ fn publish_staged_workspace_locked<H: WorkspacePublicationHooks>(
             // Publication primitives can fail after an exchange has committed
             // (for example while syncing the parent). Let identity-based
             // recovery distinguish that state from a pre-exchange failure.
-            recover_workspace_publication_locked(destination, ownership, paths)?;
+            recover_workspace_publication_locked(destination, ownership, paths, lock)?;
             return Err(error);
         }
     };
@@ -489,7 +518,7 @@ fn publish_staged_workspace_locked<H: WorkspacePublicationHooks>(
             source,
         });
     }
-    replace_durable_receipt(paths, destination, &journal.new_receipt, ownership)?;
+    replace_durable_receipt(paths, lock, &journal.new_receipt, ownership)?;
     if let Err(source) = hooks.checkpoint(WorkspacePublicationCheckpoint::ReceiptDurable) {
         return Err(WorkspaceMaterializationError::Journal {
             path: paths.journal.clone(),
@@ -504,13 +533,19 @@ fn publish_staged_workspace_locked<H: WorkspacePublicationHooks>(
                 )
             })?,
             required_identity(journal.old_identity, "old journal generation")?,
-            &generation_marker_binding(old_generation)?,
+            &generation_marker_binding_locked(
+                lock,
+                paths,
+                path_file_name(old_generation)?.as_str(),
+            )?,
             &paths.destination_name,
             ownership,
             "old-generation cleanup receipt",
         )?;
-        remove_generation(
-            old_generation,
+        remove_generation_locked(
+            lock,
+            paths,
+            path_file_name(old_generation)?.as_str(),
             required_identity(journal.old_identity, "old journal generation")?,
             journal.old_receipt.as_ref().expect("validated old receipt"),
         )?;
@@ -521,7 +556,7 @@ fn publish_staged_workspace_locked<H: WorkspacePublicationHooks>(
             source,
         });
     }
-    remove_journal_if_present(paths)?;
+    remove_journal_if_present(paths, lock)?;
     Ok(published)
 }
 
@@ -533,19 +568,21 @@ pub fn recover_workspace_publication(
     ownership: &WorkspaceOwnershipCapability,
 ) -> Result<(), WorkspaceMaterializationError> {
     let paths = PublicationPaths::new(destination)?;
-    let _lock = paths.acquire_lock()?;
-    recover_workspace_publication_locked(destination, ownership, &paths)
+    let lock = paths.acquire_lock()?;
+    recover_workspace_publication_locked(destination, ownership, &paths, &lock)
 }
 
 fn recover_workspace_publication_locked(
     destination: &Path,
     ownership: &WorkspaceOwnershipCapability,
     paths: &PublicationPaths,
+    lock: &WorkspacePublicationLock,
 ) -> Result<(), WorkspaceMaterializationError> {
-    if !paths.journal.exists() {
+    if !publication_entry_exists(lock, paths, &paths.journal_name, &paths.journal)? {
         return Ok(());
     }
-    let journal: PublicationJournal = read_json(&paths.journal)?;
+    let journal: PublicationJournal =
+        read_json_locked(lock, paths, &paths.journal_name, &paths.journal)?;
     if journal.version != PUBLICATION_STATE_VERSION
         || journal.destination_name != path_file_name(destination)?
     {
@@ -561,17 +598,18 @@ fn recover_workspace_publication_locked(
             "journal staging name is invalid".to_string(),
         ));
     }
-    let staging = paths.parent.join(&journal.staging_name);
-    let destination_identity = generation_identity_if_exists(destination)?;
-    let staging_identity = generation_identity_if_exists(&staging)?;
-    let active_receipt = load_workspace_publication_receipt_locked(paths)?;
+    let destination_identity =
+        generation_identity_if_exists_locked(lock, paths, &paths.destination_name)?;
+    let staging_identity =
+        generation_identity_if_exists_locked(lock, paths, &journal.staging_name)?;
+    let active_receipt = load_workspace_publication_receipt_locked(paths, lock)?;
 
     if journal.old_identity.is_none() {
         if identity_matches(destination_identity, journal.new_identity) {
             validate_receipt_binding(
                 &journal.new_receipt,
                 required_identity(journal.new_identity, "new generation")?,
-                &generation_marker_binding(destination)?,
+                &generation_marker_binding_locked(lock, paths, &paths.destination_name)?,
                 &paths.destination_name,
                 ownership,
                 "initial publication generation",
@@ -588,11 +626,13 @@ fn recover_workspace_publication_locked(
                     "initial publication receipt",
                 )?;
             }
-            repair_generation(
-                destination,
+            repair_generation_locked(
+                lock,
+                paths,
+                &paths.destination_name,
                 required_identity(journal.new_identity, "new generation")?,
             )?;
-            replace_durable_receipt(paths, destination, &journal.new_receipt, ownership)?;
+            replace_durable_receipt(paths, lock, &journal.new_receipt, ownership)?;
             if staging_identity.is_some() {
                 return Err(WorkspaceMaterializationError::RecoveryConflict(
                     "initial publication left an unexpected staging generation".to_string(),
@@ -609,13 +649,15 @@ fn recover_workspace_publication_locked(
             validate_receipt_binding(
                 &journal.new_receipt,
                 required_identity(journal.new_identity, "new generation")?,
-                &generation_marker_binding(&staging)?,
+                &generation_marker_binding_locked(lock, paths, &journal.staging_name)?,
                 &paths.destination_name,
                 ownership,
                 "unpublished initial generation",
             )?;
-            remove_generation(
-                &staging,
+            remove_generation_locked(
+                lock,
+                paths,
+                &journal.staging_name,
                 required_identity(journal.new_identity, "new generation")?,
                 &journal.new_receipt,
             )?;
@@ -627,7 +669,7 @@ fn recover_workspace_publication_locked(
                 "initial publication paths do not match the durable journal".to_string(),
             ));
         }
-        remove_journal_if_present(paths)?;
+        remove_journal_if_present(paths, lock)?;
         return Ok(());
     }
 
@@ -637,7 +679,7 @@ fn recover_workspace_publication_locked(
         validate_receipt_binding(
             &journal.new_receipt,
             required_identity(journal.new_identity, "new generation")?,
-            &generation_marker_binding(destination)?,
+            &generation_marker_binding_locked(lock, paths, &paths.destination_name)?,
             &paths.destination_name,
             ownership,
             "exchanged new generation",
@@ -645,7 +687,7 @@ fn recover_workspace_publication_locked(
         validate_receipt_binding(
             journal.old_receipt.as_ref().expect("validated old receipt"),
             required_identity(journal.old_identity, "old generation")?,
-            &generation_marker_binding(&staging)?,
+            &generation_marker_binding_locked(lock, paths, &journal.staging_name)?,
             &paths.destination_name,
             ownership,
             "exchanged old generation",
@@ -670,25 +712,29 @@ fn recover_workspace_publication_locked(
             ownership,
             "exchanged workspace receipt",
         )?;
-        repair_generation(
-            destination,
+        repair_generation_locked(
+            lock,
+            paths,
+            &paths.destination_name,
             required_identity(journal.new_identity, "new generation")?,
         )?;
-        replace_durable_receipt(paths, destination, &journal.new_receipt, ownership)?;
+        replace_durable_receipt(paths, lock, &journal.new_receipt, ownership)?;
         validate_receipt_binding(
             journal.old_receipt.as_ref().expect("validated old receipt"),
             required_identity(journal.old_identity, "old generation")?,
-            &generation_marker_binding(&staging)?,
+            &generation_marker_binding_locked(lock, paths, &journal.staging_name)?,
             &paths.destination_name,
             ownership,
             "recovery cleanup receipt",
         )?;
-        remove_generation(
-            &staging,
+        remove_generation_locked(
+            lock,
+            paths,
+            &journal.staging_name,
             required_identity(journal.old_identity, "old generation")?,
             journal.old_receipt.as_ref().expect("validated old receipt"),
         )?;
-        remove_journal_if_present(paths)?;
+        remove_journal_if_present(paths, lock)?;
         return Ok(());
     }
     if identity_matches(destination_identity, journal.old_identity)
@@ -697,7 +743,7 @@ fn recover_workspace_publication_locked(
         validate_receipt_binding(
             journal.old_receipt.as_ref().expect("validated old receipt"),
             required_identity(journal.old_identity, "old generation")?,
-            &generation_marker_binding(destination)?,
+            &generation_marker_binding_locked(lock, paths, &paths.destination_name)?,
             &paths.destination_name,
             ownership,
             "pre-exchange old generation",
@@ -705,7 +751,7 @@ fn recover_workspace_publication_locked(
         validate_receipt_binding(
             &journal.new_receipt,
             required_identity(journal.new_identity, "new generation")?,
-            &generation_marker_binding(&staging)?,
+            &generation_marker_binding_locked(lock, paths, &journal.staging_name)?,
             &paths.destination_name,
             ownership,
             "pre-exchange new generation",
@@ -724,23 +770,27 @@ fn recover_workspace_publication_locked(
             ownership,
             "pre-exchange workspace receipt",
         )?;
-        repair_generation(
-            destination,
+        repair_generation_locked(
+            lock,
+            paths,
+            &paths.destination_name,
             required_identity(journal.old_identity, "old generation")?,
         )?;
-        remove_generation(
-            &staging,
+        remove_generation_locked(
+            lock,
+            paths,
+            &journal.staging_name,
             required_identity(journal.new_identity, "new generation")?,
             &journal.new_receipt,
         )?;
-        remove_journal_if_present(paths)?;
+        remove_journal_if_present(paths, lock)?;
         return Ok(());
     }
     if identity_matches(destination_identity, journal.old_identity) && staging_identity.is_none() {
         validate_receipt_binding(
             journal.old_receipt.as_ref().expect("validated old receipt"),
             required_identity(journal.old_identity, "old generation")?,
-            &generation_marker_binding(destination)?,
+            &generation_marker_binding_locked(lock, paths, &paths.destination_name)?,
             &paths.destination_name,
             ownership,
             "rolled-back generation",
@@ -759,18 +809,20 @@ fn recover_workspace_publication_locked(
             ownership,
             "rolled-back workspace receipt",
         )?;
-        repair_generation(
-            destination,
+        repair_generation_locked(
+            lock,
+            paths,
+            &paths.destination_name,
             required_identity(journal.old_identity, "old generation")?,
         )?;
-        remove_journal_if_present(paths)?;
+        remove_journal_if_present(paths, lock)?;
         return Ok(());
     }
     if identity_matches(destination_identity, journal.new_identity) && staging_identity.is_none() {
         validate_receipt_binding(
             &journal.new_receipt,
             required_identity(journal.new_identity, "new generation")?,
-            &generation_marker_binding(destination)?,
+            &generation_marker_binding_locked(lock, paths, &paths.destination_name)?,
             &paths.destination_name,
             ownership,
             "post-cleanup generation",
@@ -789,11 +841,13 @@ fn recover_workspace_publication_locked(
             ownership,
             "post-cleanup workspace receipt",
         )?;
-        repair_generation(
-            destination,
+        repair_generation_locked(
+            lock,
+            paths,
+            &paths.destination_name,
             required_identity(journal.new_identity, "new generation")?,
         )?;
-        remove_journal_if_present(paths)?;
+        remove_journal_if_present(paths, lock)?;
         return Ok(());
     }
     Err(WorkspaceMaterializationError::RecoveryConflict(
@@ -805,17 +859,18 @@ pub fn load_workspace_publication_receipt(
     destination: &Path,
 ) -> Result<Option<WorkspacePublicationReceipt>, WorkspaceMaterializationError> {
     let paths = PublicationPaths::new(destination)?;
-    let _lock = paths.acquire_lock()?;
-    load_workspace_publication_receipt_locked(&paths)
+    let lock = paths.acquire_lock()?;
+    load_workspace_publication_receipt_locked(&paths, &lock)
 }
 
 fn load_workspace_publication_receipt_locked(
     paths: &PublicationPaths,
+    lock: &WorkspacePublicationLock,
 ) -> Result<Option<WorkspacePublicationReceipt>, WorkspaceMaterializationError> {
-    if !paths.receipt.exists() {
+    if !publication_entry_exists(lock, paths, &paths.receipt_name, &paths.receipt)? {
         return Ok(None);
     }
-    read_json(&paths.receipt).map(Some)
+    read_json_locked(lock, paths, &paths.receipt_name, &paths.receipt).map(Some)
 }
 
 /// Recovers any local publication journal and confirms that an existing root
@@ -825,25 +880,27 @@ pub fn recover_and_verify_workspace_publication_state(
     ownership: &WorkspaceOwnershipCapability,
 ) -> Result<bool, WorkspaceMaterializationError> {
     let paths = PublicationPaths::new(destination)?;
-    let _lock = paths.acquire_lock()?;
-    if paths.journal.exists() {
-        recover_workspace_publication_locked(destination, ownership, &paths)?;
+    let lock = paths.acquire_lock()?;
+    if publication_entry_exists(&lock, &paths, &paths.journal_name, &paths.journal)? {
+        recover_workspace_publication_locked(destination, ownership, &paths, &lock)?;
     }
-    let Some(identity) = generation_identity_if_exists(destination)? else {
-        if paths.receipt.exists() {
+    let Some(identity) =
+        generation_identity_if_exists_locked(&lock, &paths, &paths.destination_name)?
+    else {
+        if publication_entry_exists(&lock, &paths, &paths.receipt_name, &paths.receipt)? {
             return Err(WorkspaceMaterializationError::RecoveryConflict(
                 "workspace receipt exists without its published generation".to_string(),
             ));
         }
         return Ok(false);
     };
-    let Some(receipt) = load_workspace_publication_receipt_locked(&paths)? else {
+    let Some(receipt) = load_workspace_publication_receipt_locked(&paths, &lock)? else {
         return Ok(false);
     };
     validate_receipt_binding(
         &receipt,
         identity,
-        &generation_marker_binding(destination)?,
+        &generation_marker_binding_locked(&lock, &paths, &paths.destination_name)?,
         &paths.destination_name,
         ownership,
         "active workspace receipt",
@@ -854,7 +911,9 @@ pub fn recover_and_verify_workspace_publication_state(
 struct PublicationPaths {
     parent: PathBuf,
     destination_name: String,
+    journal_name: String,
     journal: PathBuf,
+    receipt_name: String,
     receipt: PathBuf,
     lock_name: String,
 }
@@ -867,9 +926,13 @@ impl PublicationPaths {
             .ok_or(WorkspaceMaterializationError::InvalidDestination)?
             .to_path_buf();
         let destination_name = path_file_name(destination)?;
+        let journal_name = format!(".locality-{destination_name}.publication.json");
+        let receipt_name = format!(".locality-{destination_name}.receipt.json");
         Ok(Self {
-            journal: parent.join(format!(".locality-{destination_name}.publication.json")),
-            receipt: parent.join(format!(".locality-{destination_name}.receipt.json")),
+            journal: parent.join(&journal_name),
+            journal_name,
+            receipt: parent.join(&receipt_name),
+            receipt_name,
             lock_name: format!(".locality-{destination_name}.publication.lock"),
             destination_name,
             parent,
@@ -888,55 +951,81 @@ impl PublicationPaths {
 
 fn create_durable_journal(
     paths: &PublicationPaths,
+    lock: &WorkspacePublicationLock,
     journal: &PublicationJournal,
 ) -> Result<(), WorkspaceMaterializationError> {
     let bytes = serde_json::to_vec(journal)
         .map_err(|error| WorkspaceMaterializationError::RecoveryConflict(error.to_string()))?;
-    let temporary = write_durable_temporary(paths, "journal", &bytes)?;
-    let link_result = fs::hard_link(&temporary, &paths.journal);
-    let _ = fs::remove_file(&temporary);
+    let temporary = write_durable_temporary(paths, lock, "journal", &bytes)?;
+    #[cfg(unix)]
+    let link_result = rustix::fs::linkat(
+        lock.parent_directory(),
+        &temporary.name,
+        lock.parent_directory(),
+        &paths.journal_name,
+        AtFlags::empty(),
+    )
+    .map_err(io::Error::from);
+    #[cfg(not(unix))]
+    let link_result = fs::hard_link(&temporary.path, &paths.journal);
+    remove_temporary(lock, &temporary);
     link_result.map_err(|source| WorkspaceMaterializationError::Journal {
         path: paths.journal.clone(),
         source,
     })?;
-    sync_parent_directory(&paths.parent).map_err(|source| WorkspaceMaterializationError::Journal {
-        path: paths.parent.clone(),
-        source,
+    sync_publication_parent(lock, &paths.parent).map_err(|source| {
+        WorkspaceMaterializationError::Journal {
+            path: paths.parent.clone(),
+            source,
+        }
     })
 }
 
 fn replace_durable_receipt(
     paths: &PublicationPaths,
-    destination: &Path,
+    lock: &WorkspacePublicationLock,
     receipt: &WorkspacePublicationReceipt,
     ownership: &WorkspaceOwnershipCapability,
 ) -> Result<(), WorkspaceMaterializationError> {
-    let identity = generation_identity_if_exists(destination)?.ok_or_else(|| {
-        WorkspaceMaterializationError::RecoveryConflict(
-            "cannot publish a receipt without its workspace generation".to_string(),
-        )
-    })?;
+    let identity = generation_identity_if_exists_locked(lock, paths, &paths.destination_name)?
+        .ok_or_else(|| {
+            WorkspaceMaterializationError::RecoveryConflict(
+                "cannot publish a receipt without its workspace generation".to_string(),
+            )
+        })?;
     validate_receipt_binding(
         receipt,
         identity,
-        &generation_marker_binding(destination)?,
+        &generation_marker_binding_locked(lock, paths, &paths.destination_name)?,
         &paths.destination_name,
         ownership,
         "durable workspace receipt",
     )?;
     let bytes = serde_json::to_vec(receipt)
         .map_err(|error| WorkspaceMaterializationError::RecoveryConflict(error.to_string()))?;
-    let temporary = write_durable_temporary(paths, "receipt", &bytes)?;
-    if let Err(source) = fs::rename(&temporary, &paths.receipt) {
-        let _ = fs::remove_file(&temporary);
+    let temporary = write_durable_temporary(paths, lock, "receipt", &bytes)?;
+    #[cfg(unix)]
+    let rename_result = rustix::fs::renameat(
+        lock.parent_directory(),
+        &temporary.name,
+        lock.parent_directory(),
+        &paths.receipt_name,
+    )
+    .map_err(io::Error::from);
+    #[cfg(not(unix))]
+    let rename_result = fs::rename(&temporary.path, &paths.receipt);
+    if let Err(source) = rename_result {
+        remove_temporary(lock, &temporary);
         return Err(WorkspaceMaterializationError::Journal {
             path: paths.receipt.clone(),
             source,
         });
     }
-    sync_parent_directory(&paths.parent).map_err(|source| WorkspaceMaterializationError::Journal {
-        path: paths.parent.clone(),
-        source,
+    sync_publication_parent(lock, &paths.parent).map_err(|source| {
+        WorkspaceMaterializationError::Journal {
+            path: paths.parent.clone(),
+            source,
+        }
     })
 }
 
@@ -1163,11 +1252,18 @@ fn authentication_tag_matches(
     })
 }
 
+struct DurableTemporary {
+    name: String,
+    #[cfg_attr(unix, allow(dead_code))]
+    path: PathBuf,
+}
+
 fn write_durable_temporary(
     paths: &PublicationPaths,
+    lock: &WorkspacePublicationLock,
     label: &str,
     bytes: &[u8],
-) -> Result<PathBuf, WorkspaceMaterializationError> {
+) -> Result<DurableTemporary, WorkspaceMaterializationError> {
     for _ in 0..16 {
         let mut random = [0_u8; 16];
         getrandom::fill(&mut random)
@@ -1176,15 +1272,33 @@ fn write_durable_temporary(
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        let path = paths.parent.join(format!(".locality-{label}-{suffix}.tmp"));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        let name = format!(".locality-{label}-{suffix}.tmp");
+        let path = paths.parent.join(&name);
+        #[cfg(unix)]
+        let opened = rustix::fs::openat(
+            lock.parent_directory(),
+            &name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map(std::fs::File::from)
+        .map_err(io::Error::from);
+        #[cfg(not(unix))]
+        let opened = OpenOptions::new().write(true).create_new(true).open(&path);
+        match opened {
             Ok(mut file) => {
                 let result = file.write_all(bytes).and_then(|()| file.sync_all());
                 if let Err(source) = result {
-                    let _ = fs::remove_file(&path);
+                    remove_temporary(
+                        lock,
+                        &DurableTemporary {
+                            name,
+                            path: path.clone(),
+                        },
+                    );
                     return Err(WorkspaceMaterializationError::Journal { path, source });
                 }
-                return Ok(path);
+                return Ok(DurableTemporary { name, path });
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(source) => {
@@ -1197,10 +1311,64 @@ fn write_durable_temporary(
     ))
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(
+fn remove_temporary(lock: &WorkspacePublicationLock, temporary: &DurableTemporary) {
+    #[cfg(unix)]
+    let _ = rustix::fs::unlinkat(lock.parent_directory(), &temporary.name, AtFlags::empty());
+    #[cfg(not(unix))]
+    let _ = fs::remove_file(&temporary.path);
+}
+
+fn publication_entry_exists(
+    lock: &WorkspacePublicationLock,
+    _paths: &PublicationPaths,
+    name: &str,
+    path: &Path,
+) -> Result<bool, WorkspaceMaterializationError> {
+    #[cfg(unix)]
+    let result = rustix::fs::statat(lock.parent_directory(), name, AtFlags::SYMLINK_NOFOLLOW)
+        .map(|_| true)
+        .or_else(|error| {
+            if error == rustix::io::Errno::NOENT {
+                Ok(false)
+            } else {
+                Err(io::Error::from(error))
+            }
+        });
+    #[cfg(not(unix))]
+    let result = match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    };
+    result.map_err(|source| WorkspaceMaterializationError::Journal {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn read_json_locked<T: for<'de> Deserialize<'de>>(
+    lock: &WorkspacePublicationLock,
+    _paths: &PublicationPaths,
+    name: &str,
     path: &Path,
 ) -> Result<T, WorkspaceMaterializationError> {
-    let bytes = fs::read(path).map_err(|source| WorkspaceMaterializationError::Journal {
+    #[cfg(unix)]
+    let bytes = rustix::fs::openat(
+        lock.parent_directory(),
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(std::fs::File::from)
+    .map_err(io::Error::from)
+    .and_then(|mut file| {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    });
+    #[cfg(not(unix))]
+    let bytes = fs::read(path);
+    let bytes = bytes.map_err(|source| WorkspaceMaterializationError::Journal {
         path: path.to_path_buf(),
         source,
     })?;
@@ -1214,9 +1382,19 @@ fn read_json<T: for<'de> Deserialize<'de>>(
 
 fn remove_journal_if_present(
     paths: &PublicationPaths,
+    lock: &WorkspacePublicationLock,
 ) -> Result<(), WorkspaceMaterializationError> {
-    match fs::remove_file(&paths.journal) {
-        Ok(()) => sync_parent_directory(&paths.parent).map_err(|source| {
+    #[cfg(unix)]
+    let result = rustix::fs::unlinkat(
+        lock.parent_directory(),
+        &paths.journal_name,
+        AtFlags::empty(),
+    )
+    .map_err(io::Error::from);
+    #[cfg(not(unix))]
+    let result = fs::remove_file(&paths.journal);
+    match result {
+        Ok(()) => sync_publication_parent(lock, &paths.parent).map_err(|source| {
             WorkspaceMaterializationError::Journal {
                 path: paths.parent.clone(),
                 source,
@@ -1230,14 +1408,14 @@ fn remove_journal_if_present(
     }
 }
 
-fn sync_parent_directory(path: &Path) -> io::Result<()> {
+fn sync_publication_parent(lock: &WorkspacePublicationLock, _path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        fs::File::open(path)?.sync_all()
+        rustix::fs::fsync(lock.parent_directory()).map_err(Into::into)
     }
     #[cfg(not(unix))]
     {
-        match fs::File::open(path).and_then(|directory| directory.sync_all()) {
+        match fs::File::open(_path).and_then(|directory| directory.sync_all()) {
             Ok(()) => Ok(()),
             Err(error)
                 if matches!(
@@ -1260,52 +1438,73 @@ fn path_file_name(path: &Path) -> Result<String, WorkspaceMaterializationError> 
         .ok_or(WorkspaceMaterializationError::InvalidDestination)
 }
 
-fn ordinary_directory_exists(path: &Path) -> Result<bool, WorkspaceMaterializationError> {
-    workspace_generation_identity_if_exists(path)
-        .map(|identity| identity.is_some())
-        .map_err(|source| WorkspaceMaterializationError::Journal {
-            path: path.to_path_buf(),
-            source,
-        })
-}
-
-fn generation_identity_if_exists(
-    path: &Path,
+fn generation_identity_if_exists_locked(
+    lock: &WorkspacePublicationLock,
+    paths: &PublicationPaths,
+    name: &str,
 ) -> Result<Option<GenerationIdentity>, WorkspaceMaterializationError> {
-    workspace_generation_identity_if_exists(path)
+    #[cfg(unix)]
+    let result = workspace_generation_identity_if_exists_at(
+        lock.parent_directory(),
+        std::ffi::OsStr::new(name),
+    );
+    #[cfg(not(unix))]
+    let result = workspace_generation_identity_if_exists(&paths.parent.join(name));
+    result
         .map(|identity| identity.map(Into::into))
         .map_err(|source| WorkspaceMaterializationError::Journal {
-            path: path.to_path_buf(),
+            path: paths.parent.join(name),
             source,
         })
 }
 
-fn generation_identity(
-    path: &Path,
+fn generation_identity_locked(
+    lock: &WorkspacePublicationLock,
+    paths: &PublicationPaths,
+    name: &str,
 ) -> Result<Option<GenerationIdentity>, WorkspaceMaterializationError> {
-    generation_identity_if_exists(path)?
+    generation_identity_if_exists_locked(lock, paths, name)?
         .ok_or_else(|| {
             WorkspaceMaterializationError::RecoveryConflict(format!(
                 "publication path `{}` disappeared",
-                path.display()
+                paths.parent.join(name).display()
             ))
         })
         .map(Some)
 }
 
-fn generation_marker_binding(
-    path: &Path,
+fn generation_marker_binding_locked(
+    lock: &WorkspacePublicationLock,
+    paths: &PublicationPaths,
+    name: &str,
 ) -> Result<GenerationMarkerBinding, WorkspaceMaterializationError> {
-    workspace_generation_file_binding(
-        path,
+    #[cfg(unix)]
+    let result = workspace_generation_file_binding_at(
+        lock.parent_directory(),
+        std::ffi::OsStr::new(name),
         WORKSPACE_OWNERSHIP_MARKER,
         WORKSPACE_OWNERSHIP_NONCE_BYTES,
+    );
+    #[cfg(not(unix))]
+    let result = workspace_generation_file_binding(
+        &paths.parent.join(name),
+        WORKSPACE_OWNERSHIP_MARKER,
+        WORKSPACE_OWNERSHIP_NONCE_BYTES,
+    );
+    result
+        .map_err(|source| WorkspaceMaterializationError::Journal {
+            path: paths.parent.join(name).join(WORKSPACE_OWNERSHIP_MARKER),
+            source,
+        })
+        .and_then(marker_binding_from_file)
+}
+
+fn staging_marker_binding(
+    staging: &StagingDirectory,
+) -> Result<GenerationMarkerBinding, WorkspaceMaterializationError> {
+    marker_binding_from_file(
+        staging.file_binding(WORKSPACE_OWNERSHIP_MARKER, WORKSPACE_OWNERSHIP_NONCE_BYTES)?,
     )
-    .map_err(|source| WorkspaceMaterializationError::Journal {
-        path: path.join(WORKSPACE_OWNERSHIP_MARKER),
-        source,
-    })
-    .and_then(marker_binding_from_file)
 }
 
 fn marker_binding_from_file(
@@ -1373,34 +1572,54 @@ fn required_identity(
     })
 }
 
-fn remove_generation(
-    path: &Path,
+fn remove_generation_locked(
+    lock: &WorkspacePublicationLock,
+    paths: &PublicationPaths,
+    name: &str,
     expected: GenerationIdentity,
     receipt: &WorkspacePublicationReceipt,
 ) -> Result<(), WorkspaceMaterializationError> {
     let marker_content = marker_nonce_bytes(&receipt.ownership_marker_nonce)?;
-    remove_workspace_generation(
-        path,
+    #[cfg(unix)]
+    let result = remove_workspace_generation_at(
+        lock.parent_directory(),
+        std::ffi::OsStr::new(name),
         expected.into(),
         WORKSPACE_OWNERSHIP_MARKER,
         receipt.ownership_marker_identity.into(),
         &marker_content,
-    )
-    .map_err(|source| WorkspaceMaterializationError::Journal {
-        path: path.to_path_buf(),
+    );
+    #[cfg(not(unix))]
+    let result = remove_workspace_generation(
+        &paths.parent.join(name),
+        expected.into(),
+        WORKSPACE_OWNERSHIP_MARKER,
+        receipt.ownership_marker_identity.into(),
+        &marker_content,
+    );
+    result.map_err(|source| WorkspaceMaterializationError::Journal {
+        path: paths.parent.join(name),
         source,
     })
 }
 
-fn repair_generation(
-    path: &Path,
+fn repair_generation_locked(
+    lock: &WorkspacePublicationLock,
+    paths: &PublicationPaths,
+    name: &str,
     expected: GenerationIdentity,
 ) -> Result<(), WorkspaceMaterializationError> {
-    repair_workspace_generation(path, expected.into()).map_err(|source| {
-        WorkspaceMaterializationError::Journal {
-            path: path.to_path_buf(),
-            source,
-        }
+    #[cfg(unix)]
+    let result = repair_workspace_generation_at(
+        lock.parent_directory(),
+        std::ffi::OsStr::new(name),
+        expected.into(),
+    );
+    #[cfg(not(unix))]
+    let result = repair_workspace_generation(&paths.parent.join(name), expected.into());
+    result.map_err(|source| WorkspaceMaterializationError::Journal {
+        path: paths.parent.join(name),
+        source,
     })
 }
 
@@ -1413,6 +1632,17 @@ pub fn stage_workspace_archive<Body: Read>(
     session: &WorkspaceProfileSessionV2,
     offer: &WorkspaceExportOfferV2,
 ) -> Result<StagedWorkspaceMaterialization, WorkspaceMaterializationError> {
+    stage_workspace_archive_locked(archive, destination, limits, session, offer, None)
+}
+
+fn stage_workspace_archive_locked<Body: Read>(
+    archive: ReplicaArchive<Body>,
+    destination: &Path,
+    limits: WorkspaceMaterializationLimits,
+    session: &WorkspaceProfileSessionV2,
+    offer: &WorkspaceExportOfferV2,
+    lock: Option<&WorkspacePublicationLock>,
+) -> Result<StagedWorkspaceMaterialization, WorkspaceMaterializationError> {
     let parent = destination
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1420,16 +1650,21 @@ pub fn stage_workspace_archive<Body: Read>(
     if destination.file_name().is_none() {
         return Err(WorkspaceMaterializationError::InvalidDestination);
     }
-    match fs::symlink_metadata(parent) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-        Ok(_) | Err(_) => {
-            return Err(WorkspaceMaterializationError::DestinationParentMissing(
-                parent.to_path_buf(),
-            ));
+    if lock.is_none() {
+        match fs::symlink_metadata(parent) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) | Err(_) => {
+                return Err(WorkspaceMaterializationError::DestinationParentMissing(
+                    parent.to_path_buf(),
+                ));
+            }
         }
     }
 
-    let staging = StagingDirectory::create(parent)?;
+    let staging = match lock {
+        Some(lock) => StagingDirectory::create_for_publication(parent, lock)?,
+        None => StagingDirectory::create(parent)?,
+    };
     let mut sink = StagingSink { staging: &staging };
     let (validated, decoded_bytes) = match archive.encoding {
         ReplicaArchiveEncoding::Identity => {

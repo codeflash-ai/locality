@@ -1001,6 +1001,80 @@ fn concurrent_publication_waits_for_the_exclusive_publication_lock() {
     verifier.join().expect("verifier thread");
 }
 
+#[cfg(unix)]
+#[test]
+fn publication_remains_anchored_when_parent_is_renamed_and_replaced() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("renamed-publication-parent");
+    let root = directory.root();
+    let staged = stage_workspace_archive(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &root,
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("stage publication");
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let publisher_root = root.clone();
+    let publisher = std::thread::spawn(move || {
+        let mut pause = PauseAtJournal {
+            reached: reached_tx,
+            resume: resume_rx,
+        };
+        publish_staged_workspace_with_hooks_secure(
+            staged,
+            &publisher_root,
+            &test_ownership(),
+            &mut pause,
+        )
+    });
+    reached_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("publisher reached durable journal");
+
+    let retained = directory.0.with_extension("retained-parent");
+    fs::rename(&directory.0, &retained).expect("rename locked parent");
+    fs::create_dir(&directory.0).expect("create replacement parent");
+    fs::write(directory.0.join("substitute.txt"), b"must survive\n")
+        .expect("write replacement sentinel");
+    resume_tx.send(()).expect("resume anchored publication");
+    publisher
+        .join()
+        .expect("publisher thread")
+        .expect("publication stays on retained parent descriptor");
+
+    assert_eq!(
+        fs::read(directory.0.join("substitute.txt")).expect("replacement survives"),
+        b"must survive\n"
+    );
+    assert!(!directory.root().exists());
+    assert!(retained.join("Locality/Sales/README.md").exists());
+    assert!(retained.join(".locality-Locality.receipt.json").exists());
+    assert!(
+        !retained
+            .join(".locality-Locality.publication.json")
+            .exists()
+    );
+    assert!(
+        fs::read_dir(&retained)
+            .expect("read retained parent")
+            .all(|entry| !entry
+                .expect("retained entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".locality-stage-"))
+    );
+
+    make_removable(&retained);
+    fs::remove_dir_all(&retained).expect("remove retained parent");
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_verifies_the_sealed_marker_through_read_only_handles() {

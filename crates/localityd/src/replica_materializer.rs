@@ -77,6 +77,13 @@ pub(crate) struct WorkspacePublicationLock {
     _file: fs::File,
 }
 
+impl WorkspacePublicationLock {
+    #[cfg(unix)]
+    pub(crate) fn parent_directory(&self) -> &OwnedFd {
+        &self._parent
+    }
+}
+
 pub(crate) fn acquire_workspace_publication_lock(
     parent_path: &Path,
     lock_name: &str,
@@ -1527,43 +1534,6 @@ fn named_entry_matches(directory: &OwnedFd, name: &OsStr, expected: &Stat) -> io
 }
 
 #[cfg(unix)]
-fn open_anchored_parent(path: &Path) -> io::Result<(OwnedFd, OsString)> {
-    let parent_path = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| io::Error::other("workspace generation has no parent"))?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| io::Error::other("workspace generation has no file name"))?
-        .to_os_string();
-    let parent = rustix::fs::open(
-        parent_path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
-    let opened_parent = rustix::fs::fstat(&parent)?;
-    let named_parent = rustix::fs::stat(parent_path)?;
-    if !same_file_identity(&opened_parent, &named_parent) {
-        return Err(io::Error::other(
-            "workspace generation parent changed while it was opened",
-        ));
-    }
-    Ok((parent, name))
-}
-
-#[cfg(unix)]
-fn verify_anchored_parent(parent: &OwnedFd, parent_path: &Path) -> io::Result<Stat> {
-    let opened = rustix::fs::fstat(parent)?;
-    let named = rustix::fs::stat(parent_path)?;
-    if !same_file_identity(&opened, &named) {
-        return Err(io::Error::other(
-            "workspace destination parent identity changed",
-        ));
-    }
-    Ok(opened)
-}
-
-#[cfg(unix)]
 fn preflight_existing_destination_spelling(
     parent: &OwnedFd,
     destination_name: &OsStr,
@@ -1640,11 +1610,11 @@ fn preflight_new_destination_spelling(
 }
 
 #[cfg(unix)]
-pub(crate) fn workspace_generation_identity_if_exists(
-    path: &Path,
+pub(crate) fn workspace_generation_identity_if_exists_at(
+    parent: &OwnedFd,
+    name: &OsStr,
 ) -> io::Result<Option<WorkspaceGenerationIdentity>> {
-    let (parent, name) = open_anchored_parent(path)?;
-    let stat = match rustix::fs::statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW) {
+    let stat = match rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat) => stat,
         Err(rustix::io::Errno::NOENT) => return Ok(None),
         Err(error) => return Err(error.into()),
@@ -1654,7 +1624,7 @@ pub(crate) fn workspace_generation_identity_if_exists(
             "workspace generation is not an ordinary directory",
         ));
     }
-    let parent_stat = rustix::fs::fstat(&parent)?;
+    let parent_stat = rustix::fs::fstat(parent)?;
     if stat.st_dev != parent_stat.st_dev {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -1712,15 +1682,15 @@ fn verify_open_generation_file(
 }
 
 #[cfg(unix)]
-pub(crate) fn workspace_generation_file_binding(
-    root: &Path,
+pub(crate) fn workspace_generation_file_binding_at(
+    parent: &OwnedFd,
+    root_name: &OsStr,
     name: &str,
     max_content_bytes: usize,
 ) -> io::Result<WorkspaceGenerationFileBinding> {
-    let (parent, root_name) = open_anchored_parent(root)?;
     let root = rustix::fs::openat(
-        &parent,
-        &root_name,
+        parent,
+        root_name,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
@@ -1824,28 +1794,26 @@ fn rename_directory_noreplace(
 }
 
 #[cfg(target_os = "linux")]
-fn workspace_root_is_mount_point(path: &Path) -> Result<bool, ReplicaMaterializationError> {
-    let canonical = fs::canonicalize(path).map_err(ReplicaMaterializationError::Publish)?;
-    let mountinfo =
-        fs::read("/proc/self/mountinfo").map_err(ReplicaMaterializationError::Publish)?;
-    for line in mountinfo.split(|byte| *byte == b'\n') {
-        let Some(separator) = line.windows(3).position(|window| window == b" - ") else {
-            continue;
-        };
-        let Some(encoded_mount_point) = line[..separator].split(|byte| *byte == b' ').nth(4) else {
-            continue;
-        };
-        let mount_point = PathBuf::from(OsString::from_vec(decode_mountinfo_path(
-            encoded_mount_point,
-        )?));
-        if mount_point == canonical {
-            return Ok(true);
-        }
+fn anchored_workspace_root_crosses_mount(
+    parent: &OwnedFd,
+    name: &OsStr,
+) -> Result<bool, ReplicaMaterializationError> {
+    match open_cleanup_directory_at(parent, name) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::CrossesDevices => Ok(true),
+        Err(error) => Err(ReplicaMaterializationError::Publish(error)),
     }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn anchored_workspace_root_crosses_mount(
+    _parent: &OwnedFd,
+    _name: &OsStr,
+) -> Result<bool, ReplicaMaterializationError> {
     Ok(false)
 }
 
-#[cfg(target_vendor = "apple")]
+#[cfg(all(test, target_vendor = "apple"))]
 fn workspace_root_is_mount_point(path: &Path) -> Result<bool, ReplicaMaterializationError> {
     use std::ffi::CString;
     use std::mem::MaybeUninit;
@@ -1871,11 +1839,6 @@ fn workspace_root_is_mount_point(path: &Path) -> Result<bool, ReplicaMaterializa
         .map(|byte| *byte as u8)
         .collect::<Vec<_>>();
     Ok(canonical.as_os_str().as_bytes() == mount_name_bytes)
-}
-
-#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
-fn workspace_root_is_mount_point(_path: &Path) -> Result<bool, ReplicaMaterializationError> {
-    Ok(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -1923,23 +1886,6 @@ fn mountinfo_has_workspace_mount(root: &Path, mountinfo: &[u8]) -> io::Result<bo
     Ok(false)
 }
 
-#[cfg(target_os = "linux")]
-fn ensure_no_nested_workspace_mounts(path: &Path) -> io::Result<()> {
-    let canonical = fs::canonicalize(path)?;
-    let mountinfo = fs::read("/proc/self/mountinfo")?;
-    if mountinfo_has_workspace_mount(&canonical, &mountinfo)? {
-        return Err(io::Error::other(
-            "workspace cleanup refuses to traverse a nested mount",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn ensure_no_nested_workspace_mounts(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
 #[cfg(all(
     unix,
     not(any(target_vendor = "apple", target_os = "linux", target_os = "android"))
@@ -1966,9 +1912,7 @@ fn remove_open_staging_directory(
         return;
     };
     let expected_device = root_identity.st_dev as u64;
-    if ensure_no_nested_workspace_mounts(path).is_err()
-        || preflight_directory_contents(root, expected_device).is_err()
-        || ensure_no_nested_workspace_mounts(path).is_err()
+    if preflight_directory_contents(root, expected_device).is_err()
         || remove_directory_contents(root, expected_device).is_err()
     {
         return;
@@ -1991,8 +1935,48 @@ fn remove_open_staging_directory(
         let _ = rustix::fs::unlinkat(parent, &name, AtFlags::REMOVEDIR);
     }
     let _ = hinted_name;
+    let _ = path;
 }
 
+#[cfg(unix)]
+pub(crate) fn remove_workspace_generation_at(
+    parent: &OwnedFd,
+    name: &OsStr,
+    expected: WorkspaceGenerationIdentity,
+    marker_name: &str,
+    expected_marker: WorkspaceGenerationIdentity,
+    expected_marker_content: &[u8],
+) -> io::Result<()> {
+    let root = open_cleanup_directory_at(parent, name)?;
+    let opened = rustix::fs::fstat(&root)?;
+    if !stat_matches_workspace_identity(&opened, expected)
+        || !named_entry_matches(parent, name, &opened).unwrap_or(false)
+    {
+        return Err(io::Error::other(
+            "workspace generation identity changed before cleanup",
+        ));
+    }
+    verify_open_generation_file(&root, marker_name, expected_marker, expected_marker_content)?;
+    let parent_identity = rustix::fs::fstat(parent)?;
+    if opened.st_dev != parent_identity.st_dev {
+        return Err(io::Error::other(
+            "workspace cleanup refuses a cross-filesystem generation",
+        ));
+    }
+    preflight_directory_contents(&root, expected.device)?;
+    verify_open_generation_file(&root, marker_name, expected_marker, expected_marker_content)?;
+    remove_directory_contents(&root, expected.device)?;
+    if !named_entry_matches(parent, name, &opened).unwrap_or(false) {
+        return Err(io::Error::other(
+            "workspace generation identity changed before removal",
+        ));
+    }
+    rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR)?;
+    rustix::fs::fsync(parent)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
 pub(crate) fn remove_workspace_generation(
     path: &Path,
     expected: WorkspaceGenerationIdentity,
@@ -2008,42 +1992,6 @@ pub(crate) fn remove_workspace_generation(
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::other("workspace generation has no file name"))?;
-    #[cfg(unix)]
-    {
-        let (parent, anchored_name) = open_anchored_parent(path)?;
-        if anchored_name != name {
-            return Err(io::Error::other("workspace cleanup name changed"));
-        }
-        let root = open_cleanup_directory_at(&parent, name)?;
-        let opened = rustix::fs::fstat(&root)?;
-        if !stat_matches_workspace_identity(&opened, expected)
-            || !named_entry_matches(&parent, name, &opened).unwrap_or(false)
-        {
-            return Err(io::Error::other(
-                "workspace generation identity changed before cleanup",
-            ));
-        }
-        verify_open_generation_file(&root, marker_name, expected_marker, expected_marker_content)?;
-        let parent_identity = rustix::fs::fstat(&parent)?;
-        if opened.st_dev != parent_identity.st_dev {
-            return Err(io::Error::other(
-                "workspace cleanup refuses a cross-filesystem generation",
-            ));
-        }
-        ensure_no_nested_workspace_mounts(path)?;
-        preflight_directory_contents(&root, expected.device)?;
-        ensure_no_nested_workspace_mounts(path)?;
-        verify_open_generation_file(&root, marker_name, expected_marker, expected_marker_content)?;
-        remove_directory_contents(&root, expected.device)?;
-        if !named_entry_matches(&parent, name, &opened).unwrap_or(false) {
-            return Err(io::Error::other(
-                "workspace generation identity changed before removal",
-            ));
-        }
-        rustix::fs::unlinkat(&parent, name, AtFlags::REMOVEDIR)?;
-        rustix::fs::fsync(&parent)?;
-        Ok(())
-    }
     #[cfg(windows)]
     {
         let parent = WindowsDirectory::open_absolute(parent_path)?;
@@ -2097,37 +2045,42 @@ pub(crate) fn remove_workspace_generation(
     }
 }
 
+#[cfg(unix)]
+pub(crate) fn repair_workspace_generation_at(
+    parent: &OwnedFd,
+    name: &OsStr,
+    expected: WorkspaceGenerationIdentity,
+) -> io::Result<()> {
+    let root = rustix::fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let opened = rustix::fs::fstat(&root)?;
+    if !stat_matches_workspace_identity(&opened, expected)
+        || !named_entry_matches(parent, name, &opened).unwrap_or(false)
+    {
+        return Err(io::Error::other(
+            "workspace generation identity changed before mode repair",
+        ));
+    }
+    rustix::fs::fchmod(&root, Mode::from_raw_mode(0o555))?;
+    rustix::fs::fsync(&root)?;
+    if !named_entry_matches(parent, name, &opened).unwrap_or(false) {
+        return Err(io::Error::other(
+            "workspace generation identity changed while mode was repaired",
+        ));
+    }
+    rustix::fs::fsync(parent)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
 pub(crate) fn repair_workspace_generation(
     path: &Path,
     expected: WorkspaceGenerationIdentity,
 ) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        let (parent, name) = open_anchored_parent(path)?;
-        let root = rustix::fs::openat(
-            &parent,
-            &name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
-        let opened = rustix::fs::fstat(&root)?;
-        if !stat_matches_workspace_identity(&opened, expected)
-            || !named_entry_matches(&parent, &name, &opened).unwrap_or(false)
-        {
-            return Err(io::Error::other(
-                "workspace generation identity changed before mode repair",
-            ));
-        }
-        rustix::fs::fchmod(&root, Mode::from_raw_mode(0o555))?;
-        rustix::fs::fsync(&root)?;
-        if !named_entry_matches(&parent, &name, &opened).unwrap_or(false) {
-            return Err(io::Error::other(
-                "workspace generation identity changed while mode was repaired",
-            ));
-        }
-        rustix::fs::fsync(&parent)?;
-        Ok(())
-    }
     #[cfg(windows)]
     {
         let parent_path = path
@@ -2186,6 +2139,99 @@ pub(crate) struct StagingDirectory {
 }
 
 impl StagingDirectory {
+    pub(crate) fn create_for_publication(
+        parent: &Path,
+        lock: &WorkspacePublicationLock,
+    ) -> Result<Self, ReplicaMaterializationError> {
+        #[cfg(unix)]
+        {
+            let parent_descriptor = lock
+                ._parent
+                .try_clone()
+                .map_err(ReplicaMaterializationError::Staging)?;
+            Self::create_in_open_unix_parent(parent, parent_descriptor)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = lock;
+            Self::create(parent)
+        }
+    }
+
+    #[cfg(unix)]
+    fn create_in_open_unix_parent(
+        parent: &Path,
+        parent_descriptor: OwnedFd,
+    ) -> Result<Self, ReplicaMaterializationError> {
+        for _ in 0..16 {
+            let mut random = [0_u8; 16];
+            getrandom::fill(&mut random).map_err(|error| {
+                ReplicaMaterializationError::Staging(io::Error::other(error.to_string()))
+            })?;
+            let suffix = random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let name = OsString::from(format!(".locality-stage-{suffix}"));
+            let path = parent.join(&name);
+            match rustix::fs::mkdirat(&parent_descriptor, &name, Mode::from_raw_mode(0o700)) {
+                Ok(()) => {
+                    let root = match rustix::fs::openat(
+                        &parent_descriptor,
+                        &name,
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    ) {
+                        Ok(root) => root,
+                        Err(error) => {
+                            let _ =
+                                rustix::fs::unlinkat(&parent_descriptor, &name, AtFlags::REMOVEDIR);
+                            return Err(ReplicaMaterializationError::Staging(error.into()));
+                        }
+                    };
+                    if let Err(error) = rustix::fs::fchmod(&root, Mode::from_raw_mode(0o700)) {
+                        let _ = rustix::fs::unlinkat(&parent_descriptor, &name, AtFlags::REMOVEDIR);
+                        return Err(ReplicaMaterializationError::Staging(error.into()));
+                    }
+                    return Ok(Self {
+                        path,
+                        parent: parent_descriptor,
+                        root,
+                        name,
+                        published: false,
+                    });
+                }
+                Err(rustix::io::Errno::EXIST) => continue,
+                Err(error) => return Err(ReplicaMaterializationError::Staging(error.into())),
+            }
+        }
+        Err(ReplicaMaterializationError::Staging(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique staging directory",
+        )))
+    }
+
+    pub(crate) fn verify_publication_parent(
+        &self,
+        lock: &WorkspacePublicationLock,
+    ) -> Result<(), ReplicaMaterializationError> {
+        #[cfg(unix)]
+        {
+            let staging_parent = rustix::fs::fstat(&self.parent)
+                .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+            let locked_parent = rustix::fs::fstat(&lock._parent)
+                .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+            if !same_file_identity(&staging_parent, &locked_parent) {
+                return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                    "workspace staging directory is outside the locked parent namespace",
+                )));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = lock;
+        Ok(())
+    }
+
     pub(crate) fn create(parent: &Path) -> Result<Self, ReplicaMaterializationError> {
         // The pre-open metadata check alone is not enough: the path can be
         // replaced with a symlink before `open`. Keep the descriptor anchored
@@ -2456,15 +2502,13 @@ impl StagingDirectory {
         let parent_identity = rustix::fs::fstat(&self.parent)
             .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
         if old_identity.st_dev != parent_identity.st_dev
-            || workspace_root_is_mount_point(destination)?
+            || anchored_workspace_root_crosses_mount(&self.parent, destination_name)?
         {
             return Err(ReplicaMaterializationError::Publish(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "workspace publication root is a mount point or different filesystem",
             )));
         }
-        let parent_identity = verify_anchored_parent(&self.parent, &parent_path)
-            .map_err(ReplicaMaterializationError::Publish)?;
         let immediate_old =
             rustix::fs::statat(&self.parent, destination_name, AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
@@ -2779,13 +2823,7 @@ impl StagingDirectory {
                 "workspace staging root identity changed before publication",
             )));
         }
-        let parent_identity = rustix::fs::fstat(&self.parent)
-            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
-        let named_parent = rustix::fs::stat(&parent_path)
-            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
-        if !same_file_identity(&parent_identity, &named_parent)
-            || !named_entry_matches(&self.parent, &self.name, &root_identity).unwrap_or(false)
-        {
+        if !named_entry_matches(&self.parent, &self.name, &root_identity).unwrap_or(false) {
             return Err(ReplicaMaterializationError::Publish(io::Error::other(
                 "replica staging root identity changed before publication",
             )));
@@ -2802,12 +2840,9 @@ impl StagingDirectory {
                 },
             )?;
         }
-        let immediate_parent = verify_anchored_parent(&self.parent, &parent_path)
-            .map_err(ReplicaMaterializationError::Publish)?;
         let immediate_root = rustix::fs::fstat(&self.root)
             .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
-        if !same_file_identity(&parent_identity, &immediate_parent)
-            || !stat_matches_workspace_identity(&immediate_root, expected_staging)
+        if !stat_matches_workspace_identity(&immediate_root, expected_staging)
             || !named_entry_matches(&self.parent, &self.name, &immediate_root).unwrap_or(false)
         {
             return Err(ReplicaMaterializationError::Publish(io::Error::other(
@@ -2835,11 +2870,7 @@ impl StagingDirectory {
             .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
         rustix::fs::fsync(&self.root)
             .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
-        let named_parent = rustix::fs::stat(&parent_path)
-            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
-        if !same_file_identity(&parent_identity, &named_parent)
-            || !named_entry_matches(&self.parent, &self.name, &root_identity).unwrap_or(false)
-        {
+        if !named_entry_matches(&self.parent, &self.name, &root_identity).unwrap_or(false) {
             return Err(ReplicaMaterializationError::Publish(io::Error::other(
                 "replica staging root identity changed while publication was finalized",
             )));

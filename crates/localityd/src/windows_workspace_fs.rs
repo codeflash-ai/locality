@@ -49,6 +49,7 @@ const MUTABLE_FILE_ACCESS: u32 = FILE_READ_DATA
     | DELETE
     | SYNCHRONIZE;
 const READ_FILE_ACCESS: u32 = FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+const LOCK_FILE_ACCESS: u32 = FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const SHARING: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 const LOCK_SHARING: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
 
@@ -165,7 +166,7 @@ impl WindowsDirectory {
         let handle = nt_open_relative(
             &self.handle,
             name,
-            MUTABLE_FILE_ACCESS,
+            LOCK_FILE_ACCESS,
             FILE_OPEN_IF,
             FILE_NON_DIRECTORY_FILE,
             LOCK_SHARING,
@@ -588,6 +589,70 @@ fn query_raw_handle(
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn publication_lock_access_allows_contenders_but_denies_delete_sharing() {
+        assert_eq!(LOCK_FILE_ACCESS & DELETE, 0);
+        assert_eq!(LOCK_SHARING & FILE_SHARE_DELETE, 0);
+        assert_ne!(LOCK_FILE_ACCESS & (FILE_READ_DATA | FILE_WRITE_DATA), 0);
+        assert_eq!(
+            LOCK_SHARING & (FILE_SHARE_READ | FILE_SHARE_WRITE),
+            LOCK_SHARING
+        );
+    }
+
+    #[test]
+    fn publication_lock_contender_opens_same_object_then_waits_in_lock_file_ex() {
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).expect("random test directory suffix");
+        let suffix = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let path = std::env::temp_dir().join(format!("locality-windows-lock-{suffix}"));
+        std::fs::create_dir(&path).expect("create lock test directory");
+        let parent = WindowsDirectory::open_absolute(&path).expect("open lock test directory");
+        let first = parent
+            .open_or_create_lock_file(OsStr::new("publication.lock"))
+            .expect("create first lock handle");
+        lock_file_exclusive(&first).expect("acquire first lock");
+
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let contender_path = path.clone();
+        let contender = std::thread::spawn(move || {
+            let parent =
+                WindowsDirectory::open_absolute(&contender_path).expect("open contender parent");
+            let file = parent
+                .open_or_create_lock_file(OsStr::new("publication.lock"))
+                .expect("contender opens the existing lock object");
+            opened_tx.send(()).expect("report contender open");
+            lock_file_exclusive(&file).expect("contender acquires after release");
+            locked_tx.send(()).expect("report contender lock");
+        });
+
+        opened_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("contender must open despite no delete sharing");
+        assert!(
+            locked_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "contender must wait in LockFileEx"
+        );
+        drop(first);
+        locked_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("contender acquires after first handle closes");
+        contender.join().expect("contender thread");
+        drop(parent);
+        std::fs::remove_dir_all(path).expect("remove lock test directory");
+    }
 }
 
 fn raw_handle(handle: &OwnedHandle) -> HANDLE {
