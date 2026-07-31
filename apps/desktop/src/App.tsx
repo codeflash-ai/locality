@@ -1164,6 +1164,14 @@ function writeOnboardingCompleted() {
   }
 }
 
+function clearOnboardingCompleted() {
+  try {
+    window.localStorage.removeItem(ONBOARDING_COMPLETED_STORAGE_KEY);
+  } catch {
+    // Reset still proceeds; this only affects the next desktop onboarding launch.
+  }
+}
+
 function resolvedAppTheme(theme: AppTheme): "light" | "dark" {
   if (theme !== "system") {
     return theme;
@@ -1660,6 +1668,8 @@ export default function App() {
       onInstallUpdate={installAppUpdate}
       appStoreDistribution={appStoreDistribution}
       onResetComplete={() => {
+        clearOnboardingCompleted();
+        setOnboardingCompleted(false);
         setOnboardingInitialStep(1);
         setOnboardingKey((key) => key + 1);
         setView("home");
@@ -6103,6 +6113,7 @@ function SettingsView({
       if (report.ok) {
         setDestructiveAction(null);
         setDestructiveConfirmation("");
+        onResetComplete();
         await callCommand<ActionReport>(
           "quit_completely",
           undefined,
@@ -6587,7 +6598,7 @@ function DestructiveSettingsDialog({
     ? [
         "Your files in the Locality folder are kept.",
         "Your Notion workspace is not changed.",
-        "You will need to reconnect and re-verify the local folder.",
+        "Locality opens onboarding again after cleanup.",
       ]
     : [
         "Your files in the Locality folder are kept.",
