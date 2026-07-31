@@ -448,6 +448,73 @@ fn current_v21_save_of_existing_mount_does_not_reconstruct_missing_binding() {
 }
 
 #[test]
+fn save_mount_atomically_creates_binding_or_rolls_back_mount() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let mount_id = MountId::new("google-docs-main");
+    let mount = MountConfig::new(
+        mount_id.clone(),
+        "google-docs",
+        fixture.root.join("Locality/google-docs-main"),
+    )
+    .projection(ProjectionMode::LinuxFuse);
+    let connection = Connection::open(&store.db_path).expect("raw failpoint connection");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_google_docs_binding
+             BEFORE INSERT ON workspace_bindings
+             WHEN NEW.mount_id = 'google-docs-main'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected binding insert failure');
+             END;",
+        )
+        .expect("install binding failpoint");
+    drop(connection);
+
+    assert!(store.save_mount(mount.clone()).is_err());
+    let connection = Connection::open(&store.db_path).expect("raw rolled-back mount state");
+    let partial_rows: (i64, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM mounts WHERE mount_id = 'google-docs-main'),
+                (SELECT COUNT(*) FROM workspace_bindings
+                 WHERE mount_id = 'google-docs-main')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("partial mount and binding rows");
+    assert_eq!(partial_rows, (0, 0));
+    connection
+        .execute_batch("DROP TRIGGER fail_google_docs_binding;")
+        .expect("remove binding failpoint");
+    drop(connection);
+
+    store.save_mount(mount.clone()).expect("save mount");
+    assert_eq!(
+        store
+            .get_workspace_binding(&mount_id)
+            .expect("read binding")
+            .expect("binding exists")
+            .mount_target()
+            .as_str(),
+        "google-docs-main"
+    );
+    drop(store);
+
+    let restarted = fixture.open();
+    assert_eq!(
+        restarted.get_mount(&mount_id).expect("read mount"),
+        Some(mount)
+    );
+    assert!(
+        restarted
+            .get_workspace_binding(&mount_id)
+            .expect("read restarted binding")
+            .is_some()
+    );
+}
+
+#[test]
 fn current_v21_open_rejects_missing_non_rebuildable_binding_component() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
