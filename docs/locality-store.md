@@ -163,6 +163,16 @@ authenticated payloads for current live conflicts, removes successful,
 superseded, or orphan payloads, and enforces bounded per-mount and global
 retained-conflict quotas including tombstones.
 
+An apply that could displace another inode first opens every resolved tombstone
+mount under the generation state/mount locks, double-fingerprints both retained
+names, atomically refreshes both stored hashes and lengths, and rechecks them.
+Quota admission then includes those current lengths plus the prospective local
+preimages before staging or filesystem mutation. A missing, unavailable, or
+continuously changing tombstone fails that evidence-producing admission without
+unlinking data. Global crash reconciliation is separate: it selects only mounts
+with unresolved evidence before any mount-root access, so an unavailable mount
+containing only tombstones cannot block unrelated polling or recovery.
+
 V1 deltas are mount-scoped. Empty entry lists are valid when a complete target
 generation changes no projected bytes. A logical path may occur in only one
 entry, preventing order-dependent delete/create replacement. Per-file and

@@ -207,6 +207,14 @@ pub struct GenerationInodeEvidenceResolution {
     pub updated_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenerationInodeEvidenceTombstoneRefresh {
+    pub expected_sha256: String,
+    pub byte_length: u64,
+    pub visible_expected_sha256: String,
+    pub visible_byte_length: u64,
+}
+
 pub trait GenerationDeliveryRepository {
     /// Seeds or exactly replays a complete local base. Replacing a different
     /// observed head is intentionally not part of this operation.
@@ -279,6 +287,15 @@ pub trait GenerationDeliveryRepository {
         delta_id: &str,
         entry_index: u64,
         resolution: GenerationInodeEvidenceResolution,
+    ) -> StoreResult<()>;
+
+    /// Atomically refreshes both fingerprints of an already-resolved dual
+    /// inode tombstone. This never changes path/apply state or retires files.
+    fn refresh_generation_inode_evidence_tombstone(
+        &mut self,
+        delta_id: &str,
+        entry_index: u64,
+        refresh: GenerationInodeEvidenceTombstoneRefresh,
     ) -> StoreResult<()>;
 
     fn remove_generation_inode_evidence(

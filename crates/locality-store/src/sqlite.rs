@@ -42,9 +42,9 @@ use crate::error::{StoreError, StoreResult};
 use crate::generation_delivery::{
     GENERATION_DELIVERY_COMPONENT_VERSION, GenerationApplyJournalRecord, GenerationApplyOutcome,
     GenerationApplyStatus, GenerationDeliveryRepository, GenerationInodeEvidenceConflictUpdate,
-    GenerationInodeEvidenceRecord, GenerationInodeEvidenceResolution, GenerationPathRecord,
-    GenerationPathState, GenerationRetainedInodeRecord, ObservedGenerationRecord,
-    PreparedGenerationApply,
+    GenerationInodeEvidenceRecord, GenerationInodeEvidenceResolution,
+    GenerationInodeEvidenceTombstoneRefresh, GenerationPathRecord, GenerationPathState,
+    GenerationRetainedInodeRecord, ObservedGenerationRecord, PreparedGenerationApply,
 };
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
@@ -1391,6 +1391,45 @@ impl GenerationDeliveryRepository for SqliteStateStore {
             params![delta_id, index, resolution.updated_at.as_str()],
         )?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    fn refresh_generation_inode_evidence_tombstone(
+        &mut self,
+        delta_id: &str,
+        entry_index: u64,
+        refresh: GenerationInodeEvidenceTombstoneRefresh,
+    ) -> StoreResult<()> {
+        let byte_length = i64::try_from(refresh.byte_length).map_err(|_| {
+            StoreError::InvalidState("generation evidence length is too large".to_string())
+        })?;
+        let visible_byte_length = i64::try_from(refresh.visible_byte_length).map_err(|_| {
+            StoreError::InvalidState("visible generation evidence length is too large".to_string())
+        })?;
+        let changed = self.connection()?.execute(
+            "UPDATE generation_inode_evidence
+             SET expected_sha256 = ?3, byte_length = ?4,
+                 visible_expected_sha256 = ?5, visible_byte_length = ?6
+             WHERE delta_id = ?1 AND entry_index = ?2
+               AND resolved_at IS NOT NULL
+               AND visible_evidence_name IS NOT NULL",
+            params![
+                delta_id,
+                i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
+                    "generation evidence index is too large".to_string()
+                ))?,
+                refresh.expected_sha256.as_str(),
+                byte_length,
+                refresh.visible_expected_sha256.as_str(),
+                visible_byte_length,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidState(
+                "generation inode tombstone disappeared or became unresolved during refresh"
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 
