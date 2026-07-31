@@ -826,6 +826,22 @@ struct PauseAtJournal {
     resume: mpsc::Receiver<()>,
 }
 
+#[cfg(unix)]
+struct ReplaceLockAtJournal {
+    lock: PathBuf,
+}
+
+#[cfg(unix)]
+impl WorkspacePublicationHooks for ReplaceLockAtJournal {
+    fn checkpoint(&mut self, checkpoint: WorkspacePublicationCheckpoint) -> io::Result<()> {
+        if checkpoint == WorkspacePublicationCheckpoint::JournalDurable {
+            fs::remove_file(&self.lock)?;
+            fs::write(&self.lock, b"replacement lock\n")?;
+        }
+        Ok(())
+    }
+}
+
 struct ForgeMarkerAt {
     checkpoint: WorkspacePublicationCheckpoint,
     generation: PathBuf,
@@ -1003,6 +1019,46 @@ fn concurrent_publication_waits_for_the_exclusive_publication_lock() {
 
 #[cfg(unix)]
 #[test]
+fn publication_fails_closed_when_named_lock_is_unlinked_and_replaced() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("replaced-publication-lock");
+    let root = directory.root();
+    let staged = stage_workspace_archive(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &root,
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("stage publication");
+    let lock = directory.0.join(".locality-Locality.publication.lock");
+    let mut replace = ReplaceLockAtJournal { lock: lock.clone() };
+
+    let error = publish_staged_workspace_with_hooks(staged, &root, &mut replace)
+        .expect_err("replacement lock must detach the held lock identity");
+    assert!(error.to_string().contains("lock detached"));
+    assert!(!root.exists());
+    assert_eq!(
+        fs::read(lock).expect("replacement lock survives"),
+        b"replacement lock\n"
+    );
+    assert!(
+        fs::read_dir(&directory.0)
+            .expect("read publication parent")
+            .all(|entry| !entry
+                .expect("publication entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".locality-stage-"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn publication_fails_closed_when_parent_is_renamed_and_replaced() {
     let fixture = fixture();
     let contract = contract(&fixture);
@@ -1164,12 +1220,12 @@ fn windows_reparse_publication_state_is_rejected_without_following() {
     let target = directory.0.join("attacker-state.json");
     fs::write(&target, b"{}\r\n").expect("write reparse target");
     let receipt = directory.0.join(".locality-Locality.receipt.json");
-    if let Err(error) = symlink_file(&target, &receipt) {
-        if error.kind() == io::ErrorKind::PermissionDenied {
-            return;
-        }
-        panic!("create state reparse point: {error}");
-    }
+    symlink_file(&target, &receipt).unwrap_or_else(|error| {
+        panic!(
+            "create state reparse point (Windows CI must enable symlink privilege for this \
+             security regression): {error}"
+        )
+    });
 
     let error = load_workspace_publication_receipt(&directory.root())
         .expect_err("publication state reparse point must not be followed");

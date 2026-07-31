@@ -403,7 +403,7 @@ pub(crate) fn read_regular_file_no_follow(path: &Path, max_bytes: usize) -> io::
     let file = OpenOptions::new()
         .read(true)
         .share_mode(SHARING)
-        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+        .custom_flags(PUBLICATION_STATE_OPEN_FLAGS)
         .open(path)?;
     let metadata = file.metadata()?;
     let handle: OwnedHandle = file.into();
@@ -429,6 +429,9 @@ pub(crate) fn read_regular_file_no_follow(path: &Path, max_bytes: usize) -> io::
     }
     Ok(bytes)
 }
+
+const PUBLICATION_STATE_OPEN_FLAGS: u32 =
+    windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 
 fn set_handle_read_only(handle: &OwnedHandle, read_only: bool) -> io::Result<()> {
     let mut basic = FILE_BASIC_INFO::default();
@@ -647,6 +650,15 @@ mod lock_tests {
         assert_eq!(
             LOCK_SHARING & (FILE_SHARE_READ | FILE_SHARE_WRITE),
             LOCK_SHARING
+        );
+    }
+
+    #[test]
+    fn publication_state_open_contract_does_not_follow_reparse_points() {
+        assert_ne!(
+            PUBLICATION_STATE_OPEN_FLAGS
+                & windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            0
         );
     }
 
