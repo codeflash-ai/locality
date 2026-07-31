@@ -11,22 +11,24 @@ use std::ptr;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF,
-    FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+    FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
+    FileRenameInformation, NtCreateFile, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
-    HANDLE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, STATUS_OBJECT_NAME_COLLISION,
-    STATUS_OBJECT_NAME_NOT_FOUND, UNICODE_STRING,
+    HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, STATUS_NO_SUCH_FILE,
+    STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_EXISTS, STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
     FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
     FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FILE_ID_INFO,
-    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_RENAME_INFO, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
-    FileAttributeTagInfo, FileBasicInfo, FileDispositionInfoEx, FileIdInfo, FileRenameInfo,
-    FlushFileBuffers, GetFileInformationByHandleEx, LOCKFILE_EXCLUSIVE_LOCK, LockFileEx,
-    SYNCHRONIZE, SetFileInformationByHandle,
+    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FileAttributeTagInfo,
+    FileBasicInfo, FileDispositionInfoEx, FileIdInfo, FlushFileBuffers,
+    GetFileInformationByHandleEx, LOCKFILE_EXCLUSIVE_LOCK, LockFileEx, SYNCHRONIZE,
+    SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::{IO_STATUS_BLOCK, OVERLAPPED};
 
@@ -380,24 +382,29 @@ impl WindowsDirectory {
             .and_then(|length| u32::try_from(length).ok())
             .ok_or_else(|| io::Error::other("workspace destination name is too long"))?;
         let total = rename_information_buffer_size(name.len())?;
+        let total_u32 = u32::try_from(total)
+            .map_err(|_| io::Error::other("workspace rename buffer is too large"))?;
         let words = total.div_ceil(size_of::<usize>());
         let mut storage = vec![0_usize; words];
-        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
         // SAFETY: `storage` is suitably aligned and large enough for the fixed
-        // header plus the exact UTF-16 name payload.
+        // header plus the exact UTF-16 name payload. Both source and parent
+        // handles remain owned for the synchronous native rename call.
         unsafe {
             (*info).Anonymous.ReplaceIfExists = false;
             (*info).RootDirectory = raw_handle(&destination_parent.handle);
             (*info).FileNameLength = byte_len;
             ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
-            if SetFileInformationByHandle(
+            let mut status_block: IO_STATUS_BLOCK = zeroed();
+            let status = NtSetInformationFile(
                 raw_handle(&self.handle),
-                FileRenameInfo,
+                &mut status_block,
                 info.cast(),
-                total as u32,
-            ) == 0
-            {
-                return Err(io::Error::last_os_error());
+                total_u32,
+                FileRenameInformation,
+            );
+            if status < 0 || status == STATUS_OBJECT_NAME_EXISTS {
+                return Err(rename_status_error(status));
             }
         }
         Ok(())
@@ -411,12 +418,26 @@ fn rename_information_buffer_size(name_units: usize) -> io::Result<usize> {
     let trailing_bytes = trailing_units
         .checked_mul(size_of::<u16>())
         .ok_or_else(|| io::Error::other("workspace rename buffer overflow"))?;
-    // `FILE_RENAME_INFO` already contains one UTF-16 code unit plus tail
+    // `FILE_RENAME_INFORMATION` already contains one UTF-16 code unit plus tail
     // padding. Starting at `FileName` omits that padding and Windows rejects
     // the otherwise valid rename buffer with ERROR_INVALID_PARAMETER.
-    size_of::<FILE_RENAME_INFO>()
+    size_of::<FILE_RENAME_INFORMATION>()
         .checked_add(trailing_bytes)
         .ok_or_else(|| io::Error::other("workspace rename buffer overflow"))
+}
+
+fn rename_status_error(status: NTSTATUS) -> io::Error {
+    let kind = match status {
+        STATUS_OBJECT_NAME_COLLISION | STATUS_OBJECT_NAME_EXISTS => io::ErrorKind::AlreadyExists,
+        STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND | STATUS_NO_SUCH_FILE => {
+            io::ErrorKind::NotFound
+        }
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(
+        kind,
+        io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32),
+    )
 }
 
 pub(crate) fn lock_file_exclusive(file: &File) -> io::Result<()> {
@@ -718,16 +739,28 @@ mod lock_tests {
     fn rename_buffer_includes_the_struct_tail_and_alignment() {
         assert_eq!(
             rename_information_buffer_size(1).expect("one-unit rename buffer"),
-            size_of::<FILE_RENAME_INFO>()
+            size_of::<FILE_RENAME_INFORMATION>()
         );
         assert_eq!(
             rename_information_buffer_size(8).expect("eight-unit rename buffer"),
-            size_of::<FILE_RENAME_INFO>() + 7 * size_of::<u16>()
+            size_of::<FILE_RENAME_INFORMATION>() + 7 * size_of::<u16>()
         );
         assert!(rename_information_buffer_size(0).is_err());
         assert!(
             rename_information_buffer_size(8).expect("aligned rename buffer")
-                > std::mem::offset_of!(FILE_RENAME_INFO, FileName) + 8 * size_of::<u16>()
+                > std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName) + 8 * size_of::<u16>()
+        );
+        assert_eq!(
+            rename_status_error(STATUS_OBJECT_NAME_COLLISION).kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            rename_status_error(STATUS_OBJECT_NAME_NOT_FOUND).kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            rename_status_error(STATUS_OBJECT_PATH_NOT_FOUND).kind(),
+            io::ErrorKind::NotFound
         );
     }
 
@@ -753,6 +786,39 @@ mod lock_tests {
             expected
         );
 
+        let collision_source = parent
+            .create_directory(OsStr::new("collision-source"))
+            .expect("create collision source");
+        let collision_source_identity = collision_source.identity().expect("collision source id");
+        let collision_destination = parent
+            .create_directory(OsStr::new("collision-destination"))
+            .expect("create collision destination");
+        let collision_destination_identity = collision_destination
+            .identity()
+            .expect("collision destination id");
+        let error = collision_source
+            .rename_no_replace(&parent, OsStr::new("collision-destination"))
+            .expect_err("native relative rename must not replace an existing destination");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            parent
+                .open_directory_read_only(OsStr::new("collision-source"))
+                .expect("collision source remains")
+                .identity()
+                .expect("remaining collision source id"),
+            collision_source_identity
+        );
+        assert_eq!(
+            parent
+                .open_directory_read_only(OsStr::new("collision-destination"))
+                .expect("collision destination remains")
+                .identity()
+                .expect("remaining collision destination id"),
+            collision_destination_identity
+        );
+
+        drop(collision_destination);
+        drop(collision_source);
         drop(source);
         drop(parent);
         std::fs::remove_dir_all(path).expect("remove rename test directory");
