@@ -1595,6 +1595,10 @@ fn validate_resulting_inventory(
             .map(|identity| &identity.logical_path),
     )?;
     validate_inventory_path_set(local_inventory.values())?;
+    let target_inventory = remote_inventory.into_values().collect::<Vec<_>>();
+    delta
+        .validate_target_inventory(&target_inventory)
+        .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
     Ok(paths)
 }
 
@@ -2721,6 +2725,7 @@ mod tests {
     use locality_protocol::FreshnessEpoch;
     use locality_protocol::freshness_delivery::{
         FRESHNESS_DELIVERY_READER_VERSION, GENERATION_DELTA_FORMAT_VERSION,
+        canonical_target_inventory_sha256,
     };
     use locality_protocol::workspace_layout::LayoutDigest;
     use locality_store::{
@@ -2913,6 +2918,10 @@ mod tests {
     }
 
     fn delivery(id: &str, entries: Vec<GenerationDeltaEntry>) -> AuthorizedGenerationDelivery {
+        let target_inventory = entries
+            .iter()
+            .filter_map(|entry| entry.new.clone())
+            .collect::<Vec<_>>();
         let delta = GenerationDelta {
             format_version: GENERATION_DELTA_FORMAT_VERSION,
             minimum_reader_version: FRESHNESS_DELIVERY_READER_VERSION,
@@ -2922,7 +2931,7 @@ mod tests {
             base_generation_id: SourceGenerationId::new("generation-1").unwrap(),
             target_generation_id: SourceGenerationId::new("generation-2").unwrap(),
             target_complete: true,
-            target_inventory_sha256: sha256_label(b"target-inventory"),
+            target_inventory_sha256: canonical_target_inventory_sha256(&target_inventory).unwrap(),
             workspace_layout_version: 1,
             workspace_layout_digest: LayoutDigest::new(sha256_label(b"layout")).unwrap(),
             entries,
@@ -2953,8 +2962,6 @@ mod tests {
     fn retarget_delivery(delivery: &mut AuthorizedGenerationDelivery, base: &str, target: &str) {
         delivery.delta.base_generation_id = SourceGenerationId::new(base).unwrap();
         delivery.delta.target_generation_id = SourceGenerationId::new(target).unwrap();
-        delivery.delta.target_inventory_sha256 =
-            sha256_label(format!("inventory-{target}").as_bytes());
         delivery.terminal_receipt.base_generation_id = delivery.delta.base_generation_id.clone();
         delivery.terminal_receipt.target_generation_id =
             delivery.delta.target_generation_id.clone();
@@ -2963,6 +2970,37 @@ mod tests {
         delivery.terminal_receipt.delta_sha256 = delivery.delta.canonical_sha256().unwrap();
         delivery.terminal_receipt.changed_content_bytes =
             delivery.delta.changed_content_bytes().unwrap();
+    }
+
+    fn reseal_target_inventory(
+        delivery: &mut AuthorizedGenerationDelivery,
+        inventory: &[GenerationFileIdentity],
+    ) {
+        delivery.delta.target_inventory_sha256 =
+            canonical_target_inventory_sha256(inventory).unwrap();
+        delivery.terminal_receipt.target_inventory_sha256 =
+            delivery.delta.target_inventory_sha256.clone();
+        delivery.terminal_receipt.delta_sha256 = delivery.delta.canonical_sha256().unwrap();
+    }
+
+    fn authoritative_target_inventory(
+        store: &SqliteStateStore,
+        mount_id: &MountId,
+    ) -> Vec<GenerationFileIdentity> {
+        let mut inventory = store
+            .list_generation_paths(mount_id)
+            .unwrap()
+            .into_iter()
+            .filter_map(|path| {
+                if path.state == GenerationPathState::Conflicted {
+                    path.incoming_identity
+                } else {
+                    path.base_identity
+                }
+            })
+            .collect::<Vec<_>>();
+        inventory.sort_by(|left, right| left.projection_id.cmp(&right.projection_id));
+        inventory
     }
 
     #[cfg(unix)]
@@ -3492,6 +3530,57 @@ mod tests {
     }
 
     #[test]
+    fn target_inventory_mismatch_fails_before_journal_download_or_publication() {
+        let fixture = Fixture::new("target-inventory-mismatch");
+        let old = identity("projection-a", "Roadmap.md", "content-old", b"old");
+        let new = identity("projection-a", "Roadmap.md", "content-new", b"new");
+        fs::write(fixture.mount_root.join("Roadmap.md"), b"old").unwrap();
+        let mut store = seed(&fixture, vec![old.clone()]);
+        let mut delivery = delivery(
+            "delta-target-inventory-mismatch",
+            vec![GenerationDeltaEntry {
+                old: Some(old),
+                new: Some(new),
+            }],
+        );
+        delivery.delta.target_inventory_sha256 = sha256_label(b"substituted-inventory");
+        delivery.terminal_receipt.target_inventory_sha256 =
+            delivery.delta.target_inventory_sha256.clone();
+        delivery.terminal_receipt.delta_sha256 = delivery.delta.canonical_sha256().unwrap();
+        let mut transport = FakeTransport::default();
+        transport
+            .contents
+            .insert("content-new".to_string(), b"new".to_vec());
+
+        let error = apply_authorized_delivery(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            delivery,
+            &mut transport,
+        )
+        .expect_err("mismatched target inventory must fail closed");
+
+        assert!(matches!(error, GenerationSyncError::Contract(_)));
+        assert!(error.to_string().contains("target inventory digest"));
+        assert_eq!(transport.content_fetches, 0);
+        assert!(store.list_generation_applies().unwrap().is_empty());
+        assert_eq!(
+            store
+                .get_observed_generation(&fixture.mount_id)
+                .unwrap()
+                .unwrap()
+                .generation_id
+                .as_str(),
+            "generation-1"
+        );
+        assert_eq!(
+            fs::read(fixture.mount_root.join("Roadmap.md")).unwrap(),
+            b"old"
+        );
+    }
+
+    #[test]
     fn resulting_inventory_retains_conflicted_local_path_occupancy() {
         let fixture = Fixture::new("conflicted-local-occupancy");
         let base = identity("projection-a", "Local.md", "base", b"base");
@@ -3641,14 +3730,7 @@ mod tests {
                 new: Some(incoming_three.clone()),
             }],
         );
-        second.delta.base_generation_id = SourceGenerationId::new("generation-2").unwrap();
-        second.delta.target_generation_id = SourceGenerationId::new("generation-3").unwrap();
-        second.delta.target_inventory_sha256 = sha256_label(b"target-inventory-3");
-        second.terminal_receipt.base_generation_id = second.delta.base_generation_id.clone();
-        second.terminal_receipt.target_generation_id = second.delta.target_generation_id.clone();
-        second.terminal_receipt.target_inventory_sha256 =
-            second.delta.target_inventory_sha256.clone();
-        second.terminal_receipt.delta_sha256 = second.delta.canonical_sha256().unwrap();
+        retarget_delivery(&mut second, "generation-2", "generation-3");
         let mut second_transport = FakeTransport::default();
         second_transport
             .contents
@@ -3784,14 +3866,7 @@ mod tests {
                 new: Some(remote),
             }],
         );
-        second.delta.base_generation_id = SourceGenerationId::new("generation-2").unwrap();
-        second.delta.target_generation_id = SourceGenerationId::new("generation-3").unwrap();
-        second.delta.target_inventory_sha256 = sha256_label(b"target-inventory-3");
-        second.terminal_receipt.base_generation_id = second.delta.base_generation_id.clone();
-        second.terminal_receipt.target_generation_id = second.delta.target_generation_id.clone();
-        second.terminal_receipt.target_inventory_sha256 =
-            second.delta.target_inventory_sha256.clone();
-        second.terminal_receipt.delta_sha256 = second.delta.canonical_sha256().unwrap();
+        retarget_delivery(&mut second, "generation-2", "generation-3");
         let mut second_transport = FakeTransport::default();
         second_transport.contents.insert(
             "content-remote".to_string(),
@@ -4045,6 +4120,10 @@ mod tests {
 
         let mut next = delivery(&format!("{delta_id}-next"), Vec::new());
         retarget_delivery(&mut next, "generation-3", "generation-4");
+        reseal_target_inventory(
+            &mut next,
+            &authoritative_target_inventory(&store, &fixture.mount_id),
+        );
         let next_summary = apply_authorized_delivery(
             &mut store,
             &fixture.mount_id,
@@ -4474,6 +4553,10 @@ mod tests {
 
         let mut next = delivery("delta-after-post-commit-held-fd-race", Vec::new());
         retarget_delivery(&mut next, "generation-3", "generation-4");
+        reseal_target_inventory(
+            &mut next,
+            &authoritative_target_inventory(&store, &fixture.mount_id),
+        );
         let next_summary = apply_authorized_delivery(
             &mut store,
             &fixture.mount_id,

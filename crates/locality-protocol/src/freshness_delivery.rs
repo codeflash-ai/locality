@@ -35,6 +35,8 @@ pub const GENERATION_DELTA_RECEIPT_V1_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/generation-delta-receipt-v1.json");
 pub const GENERATION_DELTA_PREIMAGE_V1_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/generation-delta-preimage-v1.json");
+pub const GENERATION_TARGET_INVENTORY_V1_VECTORS_JSON: &[u8] =
+    include_bytes!("../fixtures/generation-target-inventory-v1.json");
 
 /// Stable, redaction-safe explanation shared by API, CLI, Desktop, and logs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,6 +300,47 @@ impl GenerationFileIdentity {
     }
 }
 
+/// Exact domain-separated, length-framed preimage for the complete target
+/// generation inventory. Identities must contain every authoritative target
+/// file exactly once in ascending bytewise projection-ID order.
+pub fn canonical_target_inventory_preimage(
+    inventory: &[GenerationFileIdentity],
+) -> Result<Vec<u8>, FreshnessDeliveryError> {
+    let mut output = b"locality.generation-target-inventory.v1\0".to_vec();
+    append_u64(
+        &mut output,
+        u64::try_from(inventory.len())
+            .map_err(|_| FreshnessDeliveryError::CanonicalValueTooLarge)?,
+    );
+    let mut previous_projection: Option<&str> = None;
+    let mut claimed_paths = BTreeSet::new();
+    for identity in inventory {
+        identity.validate()?;
+        let projection_id = identity.projection_id.as_str();
+        if previous_projection.is_some_and(|previous| previous >= projection_id) {
+            return Err(FreshnessDeliveryError::NonCanonicalTargetInventoryOrder);
+        }
+        previous_projection = Some(projection_id);
+        if !claimed_paths.insert(identity.logical_path.portable_collision_key()) {
+            return Err(FreshnessDeliveryError::TargetInventoryPathReuse);
+        }
+        append_text(&mut output, projection_id)?;
+        append_text(&mut output, identity.logical_path.as_str())?;
+        append_text(&mut output, identity.content_version_id.as_str())?;
+        append_text(&mut output, &identity.content_sha256)?;
+        append_u64(&mut output, identity.byte_length);
+    }
+    Ok(output)
+}
+
+pub fn canonical_target_inventory_sha256(
+    inventory: &[GenerationFileIdentity],
+) -> Result<String, FreshnessDeliveryError> {
+    Ok(sha256_label(&canonical_target_inventory_preimage(
+        inventory,
+    )?))
+}
+
 /// One create, update, rename, or deletion. Content bytes are obtained through
 /// the authenticated delivery transport and verified against `new`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -452,6 +495,17 @@ impl GenerationDelta {
         Ok(sha256_label(&self.canonical_preimage()?))
     }
 
+    pub fn validate_target_inventory(
+        &self,
+        inventory: &[GenerationFileIdentity],
+    ) -> Result<(), FreshnessDeliveryError> {
+        self.validate()?;
+        if canonical_target_inventory_sha256(inventory)? != self.target_inventory_sha256 {
+            return Err(FreshnessDeliveryError::TargetInventoryMismatch);
+        }
+        Ok(())
+    }
+
     pub fn changed_content_bytes(&self) -> Result<u64, FreshnessDeliveryError> {
         self.entries.iter().try_fold(0_u64, |total, entry| {
             total
@@ -582,10 +636,13 @@ pub enum FreshnessDeliveryError {
     FileContentTooLarge { actual: u64 },
     DeltaContentTooLarge { actual: u64 },
     NonCanonicalDeltaOrder,
+    NonCanonicalTargetInventoryOrder,
     CrossEntryPathReuse,
+    TargetInventoryPathReuse,
     ContentLengthOverflow,
     CanonicalValueTooLarge,
     ReceiptMismatch,
+    TargetInventoryMismatch,
 }
 
 impl Display for FreshnessDeliveryError {
@@ -648,14 +705,23 @@ impl Display for FreshnessDeliveryError {
             Self::NonCanonicalDeltaOrder => {
                 formatter.write_str("delta entries are not in canonical order")
             }
+            Self::NonCanonicalTargetInventoryOrder => {
+                formatter.write_str("target inventory is not in canonical projection order")
+            }
             Self::CrossEntryPathReuse => {
                 formatter.write_str("delta reuses a logical path across entries")
+            }
+            Self::TargetInventoryPathReuse => {
+                formatter.write_str("target inventory reuses a logical path")
             }
             Self::ContentLengthOverflow => formatter.write_str("delta content length overflow"),
             Self::CanonicalValueTooLarge => {
                 formatter.write_str("value is too large for canonical encoding")
             }
             Self::ReceiptMismatch => formatter.write_str("terminal receipt does not match delta"),
+            Self::TargetInventoryMismatch => {
+                formatter.write_str("target inventory digest does not match delta")
+            }
         }
     }
 }
