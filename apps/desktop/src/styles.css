@@ -77,6 +77,14 @@
   --chip-bg: rgba(247, 249, 248, 0.92);
   --chip-text: #53615b;
   --chip-border: rgba(25, 36, 31, 0.12);
+  --onboarding-progress-bg: rgba(25, 36, 31, 0.14);
+  --onboarding-ambient-bg: radial-gradient(circle at 73% 48%, rgba(15, 143, 98, 0.2) 0%, rgba(15, 143, 98, 0.12) 28%, transparent 64%);
+  --onboarding-demo-bg: #17201d;
+  --onboarding-demo-panel-bg: rgba(255, 255, 255, 0.06);
+  --onboarding-demo-line: rgba(255, 255, 255, 0.1);
+  --onboarding-card-bg: var(--surface-raised);
+  --onboarding-card-selected-bg: rgba(15, 143, 98, 0.14);
+  --onboarding-ready-mark-bg: rgba(15, 143, 98, 0.12);
   --tooltip-bg: #ffffff;
   --tooltip-text: var(--ink);
   --modal-backdrop: rgba(21, 28, 25, 0.28);
@@ -182,6 +190,14 @@
   --chip-bg: #2a2d2b;
   --chip-text: #c3c9c1;
   --chip-border: rgba(255, 255, 255, 0.1);
+  --onboarding-progress-bg: #343735;
+  --onboarding-ambient-bg: radial-gradient(circle at 73% 48%, rgba(0, 215, 124, 0.5) 0%, rgba(0, 120, 72, 0.34) 32%, rgba(0, 120, 72, 0.16) 48%, transparent 70%);
+  --onboarding-demo-bg: #171817;
+  --onboarding-demo-panel-bg: #242625;
+  --onboarding-demo-line: rgba(255, 255, 255, 0.08);
+  --onboarding-card-bg: #242625;
+  --onboarding-card-selected-bg: #043f24;
+  --onboarding-ready-mark-bg: #203228;
   --tooltip-bg: #2a2d2b;
   --tooltip-text: var(--ink);
   --modal-backdrop: rgba(0, 0, 0, 0.42);
@@ -290,6 +306,48 @@ p {
 .setup-window {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
+}
+
+.onboarding-window {
+  position: relative;
+  isolation: isolate;
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+
+.onboarding-window::before {
+  position: absolute;
+  inset: 40px 0 0;
+  z-index: 0;
+  background: var(--onboarding-ambient-bg);
+  content: "";
+  pointer-events: none;
+}
+
+.onboarding-window > .window-chrome,
+.onboarding-window > .setup-progress-rail,
+.onboarding-window > .setup-scrollport {
+  position: relative;
+  z-index: 1;
+}
+
+.setup-progress-rail {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  padding: 8px 16px 0;
+  background: transparent;
+}
+
+.setup-progress-rail span {
+  display: block;
+  width: 100%;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--onboarding-progress-bg);
+}
+
+.setup-progress-rail span.complete {
+  background: var(--accent);
 }
 
 .window-chrome {

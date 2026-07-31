@@ -62,6 +62,7 @@ import { connectionMissing, connectionReady } from "./connection-state";
 import { copyLoginLinkDisabled, loginLinkFlowMode } from "./onboarding-connect";
 import { mountRecoveryEnabled, shouldAutoCreateMount } from "./onboarding-flow";
 import { classifyMountSetupError } from "./onboarding-errors";
+import { onboardingProgressSegments, onboardingProgressStep, onboardingStepMeta, type OnboardingStep } from "./onboarding-steps";
 import {
   createFileProviderEnablementPoller,
   fileProviderEnablementHeadline,
@@ -133,7 +134,6 @@ const onboardingDemoVideoUrl = import.meta.env.VITE_LOCALITY_ONBOARDING_DEMO_VID
 
 type AppView = "home" | "files" | "mount" | "pending" | "review" | "activity" | "settings";
 type LocateState = "idle" | "preparing" | "ready" | "error";
-type OnboardingStep = 1 | 2 | 3 | 4 | 5;
 type OnboardingConnectorId = SourceConnectorId;
 type ReviewFilter = "all" | "approvals" | "problems";
 type FileStatusFilter = "all" | "review" | "conflict" | "synced";
@@ -1050,22 +1050,6 @@ function itemMatchesFileStatusFilter(item: LocatedItem, filter: FileStatusFilter
     return item.state === "conflict";
   }
   return item.state === "ready";
-}
-
-function onboardingStepMeta(step: OnboardingStep) {
-  if (step === 2) {
-    return "Optional guide";
-  }
-  if (step === 3) {
-    return "2 of 4";
-  }
-  if (step === 4) {
-    return "3 of 4";
-  }
-  if (step === 5) {
-    return "4 of 4";
-  }
-  return "1 of 4";
 }
 
 function useMountLiveModeController(
@@ -2427,9 +2411,7 @@ function Onboarding({
         });
 
   return (
-    <main className="setup-shell">
-      <section className="setup-window">
-        <WindowChrome title="Locality Setup" meta={onboardingStepMeta(step)} />
+    <OnboardingFrame step={step} optionalGuideReturnStep={optionalGuideReturnStep}>
         {step === 1 && (
           <SetupContent variant="hero" side={<ProductLoopDemo />}>
             <div>
@@ -2739,8 +2721,7 @@ function Onboarding({
             </div>
           </SetupContent>
         )}
-      </section>
-    </main>
+    </OnboardingFrame>
   );
 }
 
@@ -7842,6 +7823,42 @@ function ConnectorOptions({
         </div>
         <span>{connectedConnector === "slack" ? "Connected" : "OAuth"}</span>
       </button>
+    </div>
+  );
+}
+
+function OnboardingFrame({
+  step,
+  optionalGuideReturnStep,
+  children,
+}: {
+  step: OnboardingStep;
+  optionalGuideReturnStep: OnboardingStep | null;
+  children: React.ReactNode;
+}) {
+  const currentStep = onboardingProgressStep(step, optionalGuideReturnStep);
+
+  return (
+    <main className="setup-shell">
+      <section className="setup-window onboarding-window">
+        <WindowChrome title="Locality" meta={onboardingStepMeta(step, optionalGuideReturnStep)} />
+        <OnboardingProgressRail currentStep={currentStep} />
+        {children}
+      </section>
+    </main>
+  );
+}
+
+function OnboardingProgressRail({ currentStep }: { currentStep: 1 | 2 | 3 | 4 }) {
+  return (
+    <div className="setup-progress-rail" aria-label={`Onboarding progress ${currentStep} of 4`}>
+      {onboardingProgressSegments(currentStep).map((segment) => (
+        <span
+          aria-hidden="true"
+          className={segment.state === "complete" ? "complete" : ""}
+          key={segment.step}
+        />
+      ))}
     </div>
   );
 }
