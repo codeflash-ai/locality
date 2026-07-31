@@ -43,6 +43,13 @@ the observed generation advances only after every entry has a terminal local
 outcome. The transport remains behind an authenticated adapter trait. Until the
 private endpoint exists, this path has a fake transport and no CLI/API route.
 
+The public adapter contract supports explicit capability negotiation, bounded
+receipt-bound content windows, terminal receipt acknowledgments, and opaque
+device-scoped generation pin lease operations while preserving the legacy
+whole-body reader. Hosted routes, credentials, tenant binding, and lease
+persistence remain private. See
+[`freshness-delivery-transport.md`](freshness-delivery-transport.md).
+
 The V1 delivery unit is exactly one mount, including empty no-content
 advancements. Incoming files are streamed under bounded per-file and aggregate
 limits. Clean local mutations use a mount coordinator plus handle-relative,
