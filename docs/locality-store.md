@@ -57,6 +57,9 @@
   base, terminal receipt, and resumable differential-apply journal tables. The
   additive migration does not rewrite or discard pending push journals, virtual
   mutations, shadows, or local files.
+- SQLite migrates v21 rows to v22 by relating each differential-apply journal
+  to its mount. Connection, remote-root, and settings changes fail closed while
+  that mount has an active journal, preventing source resets from orphaning it.
 - SQLite records component versions for durable subsystems so compatibility is
   decided from persisted state contracts instead of desktop build IDs.
 - SQLite enables WAL mode, a busy timeout, foreign keys, and `PRAGMA user_version` schema versioning.
@@ -125,20 +128,29 @@ facts. Changed retries, newer required readers, incomplete targets, layout
 changes, generation gaps, and old-identity mismatches fail before the local tree
 is changed.
 
-`generation_apply_journals` stores the canonical delta and terminal receipt,
-staging root, lifecycle, and per-entry outcomes. The daemon stages and verifies
+`generation_apply_journals` stores the owning mount, canonical delta and
+terminal receipt, staging root, lifecycle, and per-entry outcomes. Source
+identity/settings resets are transactionally blocked while that mount has an
+active apply. The daemon stages and verifies
 incoming bytes before applying clean creates/updates/deletions. Each filesystem
 operation is idempotently recognizable after a crash, so recovery can record
 the missing outcome and continue. Only after every entry has an applied,
 deleted, or conflict outcome does one SQLite transaction advance affected mount
 heads and clean path bases. Dirty local bytes stay in place and become explicit
-conflicts; staged incoming bytes are retained while a conflict remains.
+conflicts. Reconciliation retains only authenticated payloads for current live
+conflicts, removes successful/superseded/orphan payloads, and enforces bounded
+per-mount and global retained-conflict quotas.
 
 V1 deltas are mount-scoped. Empty entry lists are valid when a complete target
 generation changes no projected bytes. A logical path may occur in only one
 entry, preventing order-dependent delete/create replacement. Per-file and
 aggregate content limits are validated before reservation; the journal is
 reserved before bounded streaming downloads begin.
+
+Apply mutations are handle-relative beneath a no-follow root and coordinated by
+an inter-process mount lock. Unix uses no-follow directory descriptors; Windows
+opens and validates a non-reparse root handle and locks a stable root lock file.
+Other non-Unix platforms fail closed until equivalent primitives exist.
 
 The public daemon exposes an authenticated transport trait and a deterministic
 fake, not a network route. An authenticated private endpoint adapter and the

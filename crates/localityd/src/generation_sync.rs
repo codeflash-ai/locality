@@ -6,10 +6,10 @@
 //! `loc pull` and Live Mode integration.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -24,10 +24,22 @@ use locality_store::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::durable_fs::{
-    create_dir_all_durable, remove_dir_all_durable, remove_path_durable, rename_noreplace_durable,
+use crate::durable_fs::{create_dir_all_durable, remove_path_durable, rename_noreplace_durable};
+use crate::generation_mount::{GENERATION_MOUNT_LOCK_FILE, SecureMount, SecureTarget};
+
+const DEFAULT_PER_MOUNT_CONFLICT_BYTES: u64 = 1024 * 1024 * 1024;
+const DEFAULT_GLOBAL_CONFLICT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct ConflictRetentionLimits {
+    per_mount_bytes: u64,
+    global_bytes: u64,
+}
+
+const DEFAULT_CONFLICT_RETENTION_LIMITS: ConflictRetentionLimits = ConflictRetentionLimits {
+    per_mount_bytes: DEFAULT_PER_MOUNT_CONFLICT_BYTES,
+    global_bytes: DEFAULT_GLOBAL_CONFLICT_BYTES,
 };
-use crate::generation_mount::{SecureMount, SecureTarget};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GenerationDeliveryRequest {
@@ -91,6 +103,7 @@ where
         mount_id: &MountId,
         mount_root: &Path,
     ) -> Result<GenerationSyncSummary, GenerationSyncError> {
+        recover_generation_delivery_staging(store)?;
         let observed = store
             .get_observed_generation(mount_id)?
             .ok_or_else(|| GenerationSyncError::MissingObservedGeneration(mount_id.clone()))?;
@@ -108,6 +121,16 @@ where
         };
         apply_authorized_delivery(store, mount_id, mount_root, delivery, &mut self.transport)
     }
+}
+
+/// Reconciles crash leftovers at daemon/client startup without contacting a
+/// backend. Authenticated payloads for live conflicts survive; successful,
+/// superseded, terminal partial, and orphan payloads do not. A partial for an
+/// active pending entry is left for the staging retry to authenticate or remove.
+pub fn recover_generation_delivery_staging(
+    store: &SqliteStateStore,
+) -> Result<(), GenerationSyncError> {
+    reconcile_generation_staging(store).map(|_| ())
 }
 
 pub fn apply_authorized_delivery<T: GenerationDeliveryTransport>(
@@ -132,6 +155,7 @@ pub fn apply_authorized_delivery<T: GenerationDeliveryTransport>(
 struct ApplyHooks<'a> {
     after_target_open: Option<&'a mut dyn FnMut()>,
     after_preimage_move: Option<&'a mut dyn FnMut()>,
+    after_preimage_verified: Option<&'a mut dyn FnMut()>,
 }
 
 fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
@@ -149,13 +173,21 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
         .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
     validate_mount_delta(&delivery.delta, mount_id)?;
 
-    if let Some(existing) = store.get_generation_apply(&delivery.delta.delta_id)?
-        && existing.status == GenerationApplyStatus::Completed
-    {
+    let retained = reconcile_generation_staging(store)?;
+    let existing = store.get_generation_apply(&delivery.delta.delta_id)?;
+    if let Some(existing) = &existing {
         if existing.delta != delivery.delta || existing.receipt != delivery.terminal_receipt {
             return Err(GenerationSyncError::JournalMismatch);
         }
-        return Ok(summary(&existing, true));
+        if existing.status == GenerationApplyStatus::Completed {
+            return Ok(summary(existing, true));
+        }
+    } else {
+        enforce_conflict_retention_quota(
+            &retained,
+            &delivery.delta,
+            DEFAULT_CONFLICT_RETENTION_LIMITS,
+        )?;
     }
     validate_local_base(store, mount_id, &delivery.delta)?;
     let _mount_guard = MountApplyGuard::acquire(mount_root)?;
@@ -175,13 +207,13 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
         stage_root: path_to_portable_text(&stage_relative)?,
         created_at: created_at.clone(),
     })?;
-    stage_contents(&stage_root, &journal.delta, transport)?;
-    store.mark_generation_apply_started(&journal.delta.delta_id, &created_at)?;
     let already_recorded = journal
         .outcomes
         .iter()
         .map(|(index, _)| *index)
         .collect::<BTreeSet<_>>();
+    stage_contents(&stage_root, &journal.delta, &already_recorded, transport)?;
+    store.mark_generation_apply_started(&journal.delta.delta_id, &created_at)?;
     let mut filesystem_mutations = 0_usize;
 
     for (index, entry) in journal.delta.entries.iter().enumerate() {
@@ -206,17 +238,213 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
         store.record_generation_apply_outcome(
             &journal.delta.delta_id,
             index,
-            outcome,
+            outcome.clone(),
             &created_at,
         )?;
+        cleanup_terminal_payload(&stage_root, index, &outcome)?;
     }
 
     let completed = store.complete_generation_apply(&journal.delta.delta_id, &created_at)?;
     let completed_summary = summary(&completed, false);
-    if completed_summary.conflicted_paths == 0 && stage_root.exists() {
-        remove_dir_all_durable(&stage_root)?;
-    }
+    reconcile_generation_staging(store)?;
     Ok(completed_summary)
+}
+
+#[derive(Default)]
+struct RetainedConflictUsage {
+    global_bytes: u64,
+    by_mount: BTreeMap<String, u64>,
+}
+
+static GENERATION_STAGE_RECONCILE: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn reconcile_generation_staging(
+    store: &SqliteStateStore,
+) -> Result<RetainedConflictUsage, GenerationSyncError> {
+    let _guard = GENERATION_STAGE_RECONCILE
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| GenerationSyncError::MountCoordinatorPoisoned)?;
+    let journals = store.list_generation_applies()?;
+    let mut usage = RetainedConflictUsage::default();
+    let mut live_stages = BTreeSet::new();
+    let mut current_conflicts = BTreeMap::new();
+    for mount_id in journals
+        .iter()
+        .map(|journal| journal.delta.mount_id.as_str())
+        .collect::<BTreeSet<_>>()
+    {
+        for path in store.list_generation_paths(&MountId::new(mount_id))? {
+            if path.state == GenerationPathState::Conflicted
+                && let Some(incoming) = path.incoming_identity
+            {
+                current_conflicts
+                    .insert((mount_id.to_string(), path.projection_id.clone()), incoming);
+            }
+        }
+    }
+
+    for journal in &journals {
+        let expected_relative = stage_relative_path(&journal.delta)?;
+        if journal.stage_root != path_to_portable_text(&expected_relative)? {
+            return Err(GenerationSyncError::JournalMismatch);
+        }
+        live_stages.insert(expected_relative.clone());
+        let stage_root = store.root.join(&expected_relative);
+        let payload_root = stage_root.join("payloads");
+        let outcomes = journal
+            .outcomes
+            .iter()
+            .map(|(index, outcome)| (*index, outcome))
+            .collect::<BTreeMap<_, _>>();
+        let mut keep = BTreeSet::new();
+        let mut conflict = BTreeSet::new();
+        let mut pending = BTreeSet::new();
+        for (index, entry) in journal.delta.entries.iter().enumerate() {
+            let index = index as u64;
+            let Some(identity) = &entry.new else {
+                continue;
+            };
+            match outcomes.get(&index) {
+                Some(GenerationApplyOutcome::Conflict {
+                    incoming_identity: Some(incoming),
+                    ..
+                }) if incoming == identity
+                    && (journal.status.is_active()
+                        || current_conflicts.get(&(
+                            journal.delta.mount_id.as_str().to_string(),
+                            identity.projection_id.clone(),
+                        )) == Some(identity)) =>
+                {
+                    keep.insert(index);
+                    conflict.insert(index);
+                }
+                None if journal.status.is_active() => {
+                    keep.insert(index);
+                    pending.insert(index);
+                }
+                _ => {}
+            }
+        }
+
+        if payload_root.exists() {
+            for entry in std::fs::read_dir(&payload_root)? {
+                let entry = entry?;
+                let path = entry.path();
+                let index = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse::<u64>().ok());
+                let partial_index = entry.file_name().to_str().and_then(|name| {
+                    name.strip_prefix('.')
+                        .and_then(|name| name.strip_suffix(".partial"))
+                        .and_then(|name| name.parse::<u64>().ok())
+                });
+                if !index.is_some_and(|index| keep.contains(&index))
+                    && !partial_index.is_some_and(|index| pending.contains(&index))
+                {
+                    remove_path_durable(&path)?;
+                }
+            }
+        }
+
+        for index in keep {
+            let identity = journal.delta.entries[index as usize]
+                .new
+                .as_ref()
+                .expect("retained payload has incoming identity");
+            let payload = payload_root.join(index.to_string());
+            if payload.exists() {
+                verify_file(&payload, identity)?;
+            } else if conflict.contains(&index) {
+                return Err(GenerationSyncError::MissingConflictEvidence(
+                    identity.content_version_id.as_str().to_string(),
+                ));
+            }
+            if conflict.contains(&index) {
+                usage.global_bytes = usage
+                    .global_bytes
+                    .checked_add(identity.byte_length)
+                    .ok_or(GenerationSyncError::ConflictRetentionQuotaExceeded)?;
+                let mount_bytes = usage
+                    .by_mount
+                    .entry(journal.delta.mount_id.as_str().to_string())
+                    .or_default();
+                *mount_bytes = mount_bytes
+                    .checked_add(identity.byte_length)
+                    .ok_or(GenerationSyncError::ConflictRetentionQuotaExceeded)?;
+            }
+        }
+
+        if !journal.status.is_active() && conflict.is_empty() && stage_root.exists() {
+            remove_path_durable(&stage_root)?;
+            live_stages.remove(&expected_relative);
+        }
+    }
+
+    let delivery_root = store.root.join("generation-delivery");
+    if delivery_root.exists() {
+        for entry in std::fs::read_dir(&delivery_root)? {
+            let path = entry?.path();
+            let relative = path
+                .strip_prefix(&store.root)
+                .map_err(|_| GenerationSyncError::InvalidStagePath)?;
+            if !live_stages.contains(relative) {
+                remove_path_durable(&path)?;
+            }
+        }
+    }
+    if usage.global_bytes > DEFAULT_CONFLICT_RETENTION_LIMITS.global_bytes
+        || usage
+            .by_mount
+            .values()
+            .any(|bytes| *bytes > DEFAULT_CONFLICT_RETENTION_LIMITS.per_mount_bytes)
+    {
+        return Err(GenerationSyncError::ConflictRetentionQuotaExceeded);
+    }
+    Ok(usage)
+}
+
+fn enforce_conflict_retention_quota(
+    retained: &RetainedConflictUsage,
+    delta: &GenerationDelta,
+    limits: ConflictRetentionLimits,
+) -> Result<(), GenerationSyncError> {
+    let incoming = delta
+        .changed_content_bytes()
+        .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
+    let mount_retained = retained
+        .by_mount
+        .get(delta.mount_id.as_str())
+        .copied()
+        .unwrap_or(0);
+    if mount_retained.saturating_add(incoming) > limits.per_mount_bytes
+        || retained.global_bytes.saturating_add(incoming) > limits.global_bytes
+    {
+        return Err(GenerationSyncError::ConflictRetentionQuotaExceeded);
+    }
+    Ok(())
+}
+
+fn cleanup_terminal_payload(
+    stage_root: &Path,
+    index: u64,
+    outcome: &GenerationApplyOutcome,
+) -> Result<(), GenerationSyncError> {
+    if matches!(
+        outcome,
+        GenerationApplyOutcome::Conflict {
+            incoming_identity: Some(_),
+            ..
+        }
+    ) {
+        return Ok(());
+    }
+    let payload = stage_root.join("payloads").join(index.to_string());
+    if payload.exists() {
+        remove_path_durable(&payload)?;
+    }
+    Ok(())
 }
 
 static ACTIVE_MOUNT_APPLIES: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
@@ -298,6 +526,17 @@ fn validate_mount_delta(
     if delta.mount_id.as_str() != mount_id.as_str() {
         return Err(GenerationSyncError::UnexpectedMount);
     }
+    if delta.entries.iter().any(|entry| {
+        entry
+            .old
+            .iter()
+            .chain(entry.new.iter())
+            .any(|identity| identity.logical_path.as_str() == GENERATION_MOUNT_LOCK_FILE)
+    }) {
+        return Err(GenerationSyncError::Contract(
+            "generation delta targets the reserved mount lock path".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -311,11 +550,15 @@ fn stage_relative_path(delta: &GenerationDelta) -> Result<PathBuf, GenerationSyn
 fn stage_contents<T: GenerationDeliveryTransport>(
     stage_root: &Path,
     delta: &GenerationDelta,
+    already_recorded: &BTreeSet<u64>,
     transport: &mut T,
 ) -> Result<(), GenerationSyncError> {
     let payload_root = stage_root.join("payloads");
     create_dir_all_durable(&payload_root)?;
     for (index, entry) in delta.entries.iter().enumerate() {
+        if already_recorded.contains(&(index as u64)) {
+            continue;
+        }
         let Some(identity) = &entry.new else {
             continue;
         };
@@ -421,9 +664,10 @@ fn apply_fenced_update(
         return Err(GenerationSyncError::ConcurrentMutation);
     }
     let preimage = preimage_name(delta_id, index);
-    if let Some(preimage_digest) = digest_named(target, &preimage)? {
-        let current = digest_target(target)?;
+    if let Some(mut preimage_file) = target.open_named(&preimage)? {
+        let preimage_digest = digest_open_file_handle(&mut preimage_file)?;
         if preimage_digest != old.content_sha256 {
+            let current = digest_target(target)?;
             if current.is_none() {
                 target.restore_named(&preimage)?;
                 return Ok((
@@ -436,6 +680,25 @@ fn apply_fenced_update(
             }
             return Err(GenerationSyncError::ConcurrentMutation);
         }
+        call_hook(&mut hooks.after_preimage_verified);
+        let verified_digest = digest_open_file_handle(&mut preimage_file)?;
+        if verified_digest != old.content_sha256 {
+            let current = digest_target(target)?;
+            if current.as_deref() == Some(new.content_sha256.as_str()) {
+                target.remove_current()?;
+            } else if current.is_some() {
+                return Err(GenerationSyncError::ConcurrentMutation);
+            }
+            target.restore_named(&preimage)?;
+            return Ok((
+                GenerationApplyOutcome::Conflict {
+                    local_sha256: Some(verified_digest),
+                    incoming_identity: Some(new.clone()),
+                },
+                true,
+            ));
+        }
+        let current = digest_target(target)?;
         match current {
             Some(actual) if actual == new.content_sha256 => {
                 target.remove_named(&preimage)?;
@@ -524,9 +787,10 @@ fn apply_fenced_delete(
         return Err(GenerationSyncError::ConcurrentMutation);
     }
     let preimage = preimage_name(delta_id, index);
-    if let Some(preimage_digest) = digest_named(target, &preimage)? {
-        let current = digest_target(target)?;
+    if let Some(mut preimage_file) = target.open_named(&preimage)? {
+        let preimage_digest = digest_open_file_handle(&mut preimage_file)?;
         if preimage_digest != old.content_sha256 {
+            let current = digest_target(target)?;
             if current.is_none() {
                 target.restore_named(&preimage)?;
                 return Ok((
@@ -539,6 +803,23 @@ fn apply_fenced_delete(
             }
             return Err(GenerationSyncError::ConcurrentMutation);
         }
+        call_hook(&mut hooks.after_preimage_verified);
+        let verified_digest = digest_open_file_handle(&mut preimage_file)?;
+        if verified_digest != old.content_sha256 {
+            let current = digest_target(target)?;
+            if current.is_some() {
+                return Err(GenerationSyncError::ConcurrentMutation);
+            }
+            target.restore_named(&preimage)?;
+            return Ok((
+                GenerationApplyOutcome::Conflict {
+                    local_sha256: Some(verified_digest),
+                    incoming_identity: None,
+                },
+                true,
+            ));
+        }
+        let current = digest_target(target)?;
         target.remove_named(&preimage)?;
         return match current {
             None => Ok((GenerationApplyOutcome::Deleted, true)),
@@ -632,14 +913,12 @@ fn digest_target(target: &SecureTarget) -> Result<Option<String>, GenerationSync
     target.open_current()?.map(digest_open_file).transpose()
 }
 
-fn digest_named(
-    target: &SecureTarget,
-    name: &OsStr,
-) -> Result<Option<String>, GenerationSyncError> {
-    target.open_named(name)?.map(digest_open_file).transpose()
+fn digest_open_file(mut file: File) -> Result<String, GenerationSyncError> {
+    digest_open_file_handle(&mut file)
 }
 
-fn digest_open_file(mut file: File) -> Result<String, GenerationSyncError> {
+fn digest_open_file_handle(file: &mut File) -> Result<String, GenerationSyncError> {
+    file.seek(SeekFrom::Start(0))?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -792,6 +1071,8 @@ pub enum GenerationSyncError {
     LocalBaseMismatch,
     JournalMismatch,
     ConcurrentMutation,
+    MissingConflictEvidence(String),
+    ConflictRetentionQuotaExceeded,
     InjectedInterruption,
 }
 
@@ -828,6 +1109,12 @@ impl Display for GenerationSyncError {
             Self::ConcurrentMutation => formatter.write_str(
                 "local file changed concurrently while generation apply held its preimage",
             ),
+            Self::MissingConflictEvidence(id) => {
+                write!(formatter, "retained conflict content `{id}` is missing")
+            }
+            Self::ConflictRetentionQuotaExceeded => {
+                formatter.write_str("generation conflict-retention quota would be exceeded")
+            }
             Self::InjectedInterruption => {
                 formatter.write_str("injected generation apply interruption")
             }
@@ -853,7 +1140,8 @@ impl From<std::io::Error> for GenerationSyncError {
 mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
-    use std::io::{Seek, SeekFrom};
+    use std::io::{BufRead, Seek, SeekFrom};
+    use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -1125,11 +1413,17 @@ mod tests {
     fn clean_deletion_applies_while_dirty_update_is_preserved_as_conflict() {
         let fixture = Fixture::new("delete-dirty");
         let delete_old = identity("projection-a", "Delete.md", "delete-old", b"delete me");
+        let clean_old = identity("projection-c", "Clean.md", "clean-old", b"base clean");
+        let clean_new = identity("projection-c", "Clean.md", "clean-new", b"remote clean");
         let dirty_old = identity("projection-b", "Dirty.md", "dirty-old", b"base");
         let dirty_new = identity("projection-b", "Dirty.md", "dirty-new", b"remote");
         fs::write(fixture.mount_root.join("Delete.md"), b"delete me").unwrap();
+        fs::write(fixture.mount_root.join("Clean.md"), b"base clean").unwrap();
         fs::write(fixture.mount_root.join("Dirty.md"), b"local edit").unwrap();
-        let mut store = seed(&fixture, vec![delete_old.clone(), dirty_old.clone()]);
+        let mut store = seed(
+            &fixture,
+            vec![delete_old.clone(), clean_old.clone(), dirty_old.clone()],
+        );
         let delivery = delivery(
             "delta-delete-dirty",
             vec![
@@ -1141,42 +1435,83 @@ mod tests {
                     old: Some(dirty_old),
                     new: Some(dirty_new.clone()),
                 },
+                GenerationDeltaEntry {
+                    old: Some(clean_old),
+                    new: Some(clean_new.clone()),
+                },
             ],
         );
         let mut transport = FakeTransport::default();
         transport
             .contents
             .insert("dirty-new".to_string(), b"remote".to_vec());
+        transport
+            .contents
+            .insert("clean-new".to_string(), b"remote clean".to_vec());
 
         let summary = apply_authorized_delivery(
             &mut store,
             &fixture.mount_id,
             &fixture.mount_root,
-            delivery,
+            delivery.clone(),
             &mut transport,
         )
         .unwrap();
 
         assert_eq!(summary.deleted_paths, 1);
+        assert_eq!(summary.applied_paths, 1);
         assert_eq!(summary.conflicted_paths, 1);
         assert!(!fixture.mount_root.join("Delete.md").exists());
+        assert_eq!(
+            fs::read(fixture.mount_root.join("Clean.md")).unwrap(),
+            b"remote clean"
+        );
         assert_eq!(
             fs::read(fixture.mount_root.join("Dirty.md")).unwrap(),
             b"local edit"
         );
         let paths = store.list_generation_paths(&fixture.mount_id).unwrap();
-        assert_eq!(paths.len(), 1);
-        assert_eq!(paths[0].state, GenerationPathState::Conflicted);
-        assert_eq!(paths[0].incoming_identity, Some(dirty_new));
-        assert_eq!(paths[0].base_generation_id.as_str(), "generation-1");
+        assert_eq!(paths.len(), 2);
+        let dirty_path = paths
+            .iter()
+            .find(|path| path.projection_id.as_str() == "projection-b")
+            .unwrap();
+        assert_eq!(dirty_path.state, GenerationPathState::Conflicted);
+        assert_eq!(dirty_path.incoming_identity, Some(dirty_new));
+        assert_eq!(dirty_path.base_generation_id.as_str(), "generation-1");
         let journal = store
             .get_generation_apply("delta-delete-dirty")
             .unwrap()
             .unwrap();
         assert!(
-            store.root.join(journal.stage_root).exists(),
+            store.root.join(&journal.stage_root).exists(),
             "conflict retains staged incoming bytes"
         );
+        let payload_root = store.root.join(&journal.stage_root).join("payloads");
+        assert!(!payload_root.join("2").exists());
+        assert_eq!(fs::read(payload_root.join("1")).unwrap(), b"remote");
+
+        fs::write(payload_root.join("2"), b"remote clean").unwrap();
+        let orphan = store.root.join("generation-delivery/orphan/payloads");
+        fs::create_dir_all(&orphan).unwrap();
+        fs::write(orphan.join("0"), b"orphan").unwrap();
+        recover_generation_delivery_staging(&store).unwrap();
+        assert!(!payload_root.join("2").exists());
+        assert_eq!(fs::read(payload_root.join("1")).unwrap(), b"remote");
+        assert!(!store.root.join("generation-delivery/orphan").exists());
+
+        fs::write(payload_root.join("2"), b"remote clean").unwrap();
+        let replay = apply_authorized_delivery(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            delivery,
+            &mut FakeTransport::default(),
+        )
+        .unwrap();
+        assert!(replay.replayed);
+        assert!(!payload_root.join("2").exists());
+        assert_eq!(fs::read(payload_root.join("1")).unwrap(), b"remote");
         assert_eq!(
             store
                 .get_observed_generation(&fixture.mount_id)
@@ -1186,6 +1521,134 @@ mod tests {
                 .as_str(),
             "generation-2"
         );
+    }
+
+    #[test]
+    fn conflict_retention_enforces_mount_and_global_quotas() {
+        let incoming = identity("projection-a", "Roadmap.md", "incoming", b"123456");
+        let delta = delivery(
+            "delta-quota",
+            vec![GenerationDeltaEntry {
+                old: None,
+                new: Some(incoming),
+            }],
+        )
+        .delta;
+
+        let mount_usage = RetainedConflictUsage {
+            global_bytes: 6,
+            by_mount: BTreeMap::from([("mount-main".to_string(), 6)]),
+        };
+        assert!(matches!(
+            enforce_conflict_retention_quota(
+                &mount_usage,
+                &delta,
+                ConflictRetentionLimits {
+                    per_mount_bytes: 10,
+                    global_bytes: 100,
+                },
+            ),
+            Err(GenerationSyncError::ConflictRetentionQuotaExceeded)
+        ));
+
+        let global_usage = RetainedConflictUsage {
+            global_bytes: 6,
+            ..RetainedConflictUsage::default()
+        };
+        assert!(matches!(
+            enforce_conflict_retention_quota(
+                &global_usage,
+                &delta,
+                ConflictRetentionLimits {
+                    per_mount_bytes: 100,
+                    global_bytes: 10,
+                },
+            ),
+            Err(GenerationSyncError::ConflictRetentionQuotaExceeded)
+        ));
+    }
+
+    #[test]
+    fn newer_conflict_generation_garbage_collects_superseded_evidence() {
+        let fixture = Fixture::new("superseded-conflict");
+        let base = identity("projection-a", "Roadmap.md", "base", b"base");
+        let incoming_two = identity("projection-a", "Roadmap.md", "incoming-2", b"remote two");
+        fs::write(fixture.mount_root.join("Roadmap.md"), b"local edit").unwrap();
+        let mut store = seed(&fixture, vec![base.clone()]);
+        let first = delivery(
+            "delta-conflict-2",
+            vec![GenerationDeltaEntry {
+                old: Some(base),
+                new: Some(incoming_two.clone()),
+            }],
+        );
+        let mut first_transport = FakeTransport::default();
+        first_transport
+            .contents
+            .insert("incoming-2".to_string(), b"remote two".to_vec());
+        apply_authorized_delivery(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            first,
+            &mut first_transport,
+        )
+        .unwrap();
+        let first_stage = store.root.join(
+            store
+                .get_generation_apply("delta-conflict-2")
+                .unwrap()
+                .unwrap()
+                .stage_root,
+        );
+        assert!(first_stage.join("payloads/0").exists());
+
+        let incoming_three = identity("projection-a", "Roadmap.md", "incoming-3", b"remote three");
+        let mut second = delivery(
+            "delta-conflict-3",
+            vec![GenerationDeltaEntry {
+                old: Some(incoming_two),
+                new: Some(incoming_three.clone()),
+            }],
+        );
+        second.delta.base_generation_id = SourceGenerationId::new("generation-2").unwrap();
+        second.delta.target_generation_id = SourceGenerationId::new("generation-3").unwrap();
+        second.delta.target_inventory_sha256 = sha256_label(b"target-inventory-3");
+        second.terminal_receipt.base_generation_id = second.delta.base_generation_id.clone();
+        second.terminal_receipt.target_generation_id = second.delta.target_generation_id.clone();
+        second.terminal_receipt.target_inventory_sha256 =
+            second.delta.target_inventory_sha256.clone();
+        second.terminal_receipt.delta_sha256 = second.delta.canonical_sha256().unwrap();
+        let mut second_transport = FakeTransport::default();
+        second_transport
+            .contents
+            .insert("incoming-3".to_string(), b"remote three".to_vec());
+        apply_authorized_delivery(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            second,
+            &mut second_transport,
+        )
+        .unwrap();
+
+        assert!(!first_stage.exists());
+        let second_stage = store.root.join(
+            store
+                .get_generation_apply("delta-conflict-3")
+                .unwrap()
+                .unwrap()
+                .stage_root,
+        );
+        assert_eq!(
+            fs::read(second_stage.join("payloads/0")).unwrap(),
+            b"remote three"
+        );
+        let path = store
+            .list_generation_paths(&fixture.mount_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(path.incoming_identity, Some(incoming_three));
     }
 
     #[test]
@@ -1257,6 +1720,35 @@ mod tests {
                 .as_str(),
             "generation-2"
         );
+    }
+
+    #[test]
+    fn reserved_mount_lock_path_is_rejected_before_staging() {
+        let fixture = Fixture::new("reserved-lock-path");
+        let mut store = seed(&fixture, Vec::new());
+        let incoming = identity(
+            "projection-lock",
+            GENERATION_MOUNT_LOCK_FILE,
+            "lock-content",
+            b"remote",
+        );
+        let delivery = delivery(
+            "delta-lock-path",
+            vec![GenerationDeltaEntry {
+                old: None,
+                new: Some(incoming),
+            }],
+        );
+        let error = apply_authorized_delivery(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            delivery,
+            &mut FakeTransport::default(),
+        )
+        .expect_err("lock path is local apply metadata");
+        assert!(matches!(error, GenerationSyncError::Contract(_)));
+        assert!(store.list_active_generation_applies().unwrap().is_empty());
     }
 
     #[test]
@@ -1352,7 +1844,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn concurrent_old_handle_write_is_restored_as_update_conflict() {
+    fn old_inode_write_after_preimage_verification_is_restored_as_update_conflict() {
         let fixture = Fixture::new("concurrent-update");
         let old = identity("projection-a", "Roadmap.md", "content-old", b"old");
         let new = identity("projection-a", "Roadmap.md", "content-new", b"remote");
@@ -1393,7 +1885,7 @@ mod tests {
             finished.wait();
         };
         let mut hooks = ApplyHooks {
-            after_preimage_move: Some(&mut interleave),
+            after_preimage_verified: Some(&mut interleave),
             ..ApplyHooks::default()
         };
 
@@ -1415,7 +1907,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn concurrent_old_handle_write_is_restored_instead_of_deleted() {
+    fn old_inode_write_after_preimage_verification_is_restored_instead_of_deleted() {
         let fixture = Fixture::new("concurrent-delete");
         let old = identity("projection-a", "Delete.md", "content-old", b"old");
         let path = fixture.mount_root.join("Delete.md");
@@ -1451,7 +1943,7 @@ mod tests {
             finished.wait();
         };
         let mut hooks = ApplyHooks {
-            after_preimage_move: Some(&mut interleave),
+            after_preimage_verified: Some(&mut interleave),
             ..ApplyHooks::default()
         };
 
@@ -1529,10 +2021,26 @@ mod tests {
     }
 
     #[test]
-    fn mount_lock_rejects_a_second_apply_coordinator() {
+    fn mount_lock_rejects_another_process() {
         let fixture = Fixture::new("mount-lock");
         let mut store = seed(&fixture, Vec::new());
-        let _held = SecureMount::open(&fixture.mount_root).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("generation_sync::tests::mount_lock_child_process")
+            .arg("--nocapture")
+            .env("LOCALITY_TEST_GENERATION_LOCK_ROOT", &fixture.mount_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        loop {
+            let mut ready = String::new();
+            assert_ne!(output.read_line(&mut ready).unwrap(), 0);
+            if ready.contains("generation-lock-held") {
+                break;
+            }
+        }
 
         let error = apply_authorized_delivery(
             &mut store,
@@ -1543,6 +2051,20 @@ mod tests {
         )
         .expect_err("second mount coordinator must fail closed");
         assert!(matches!(error, GenerationSyncError::MountAccess(_)));
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn mount_lock_child_process() {
+        let Some(root) = std::env::var_os("LOCALITY_TEST_GENERATION_LOCK_ROOT") else {
+            return;
+        };
+        let _held = SecureMount::open(Path::new(&root)).unwrap();
+        println!("generation-lock-held");
+        std::io::stdout().flush().unwrap();
+        let mut release = String::new();
+        std::io::stdin().read_line(&mut release).unwrap();
     }
 
     struct Fixture {
