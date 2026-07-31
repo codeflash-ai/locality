@@ -349,6 +349,12 @@ impl HostedSlackPollCheckpointV1 {
         Ok(checkpoint)
     }
 
+    /// Starts a bounded incremental poll from one fully applied checkpoint.
+    ///
+    /// Catch-up history remains windowed, while the reply phase reconciles
+    /// every retained thread root. The normal page/request budgets make that
+    /// sweep resumable and prevent an incomplete sweep from reporting a
+    /// complete, fresh output.
     pub fn incremental_from_applied(
         applied: &Self,
         channel: RawHostedSlackChannel,

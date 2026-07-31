@@ -5,11 +5,11 @@ use locality_slack::portable::hosted::{
     HostedSlackPageApplyOutcomeV1, HostedSlackPollCheckpointV1, HostedSlackPollError,
     HostedSlackPollEvidenceV1, HostedSlackPollKindV1, HostedSlackPollKindV2,
     HostedSlackPollOutputV1, HostedSlackPollPhaseV1, HostedSlackRepliesPageV1,
-    MAX_HOSTED_SLACK_CHECKPOINT_BYTES_V1, MAX_HOSTED_SLACK_CURSOR_BYTES_V1,
-    MAX_HOSTED_SLACK_POLL_PAGE_BYTES_V1, MAX_HOSTED_SLACK_POLL_PAGE_MESSAGES_V1,
-    RawHostedSlackMessage, RawHostedSlackNativeSnapshot, decode_hosted_slack_history_page_v1,
-    decode_hosted_slack_poll_checkpoint_v1, decode_hosted_slack_poll_checkpoint_v2,
-    decode_hosted_slack_replies_page_v1,
+    HostedSlackRepliesPageV2, MAX_HOSTED_SLACK_CHECKPOINT_BYTES_V1,
+    MAX_HOSTED_SLACK_CURSOR_BYTES_V1, MAX_HOSTED_SLACK_POLL_PAGE_BYTES_V1,
+    MAX_HOSTED_SLACK_POLL_PAGE_MESSAGES_V1, RawHostedSlackMessage, RawHostedSlackNativeSnapshot,
+    decode_hosted_slack_history_page_v1, decode_hosted_slack_poll_checkpoint_v1,
+    decode_hosted_slack_poll_checkpoint_v2, decode_hosted_slack_replies_page_v1,
 };
 use serde::Serialize;
 
@@ -1145,7 +1145,7 @@ fn full_repair_and_poll_only_bootstrap_converge_without_events() {
 }
 
 #[test]
-fn incremental_poll_starts_from_applied_candidate_and_skips_historical_and_untouched_replies() {
+fn incremental_poll_starts_from_applied_candidate_and_reconciles_late_old_root_replies() {
     let applied = completed_checkpoint(checkpoint());
     let mut wrong_non_incremental_version = serde_json::to_value(&applied).unwrap();
     wrong_non_incremental_version["checkpoint_format_version"] = 3.into();
@@ -1212,12 +1212,38 @@ fn incremental_poll_starts_from_applied_candidate_and_skips_historical_and_untou
     incremental.apply_history_page_v2(&page).unwrap();
     assert_eq!(
         incremental.phase(),
-        HostedSlackPollPhaseV1::CompleteCandidate,
-        "an empty incremental window must retain untouched applied roots without a reply sweep"
+        HostedSlackPollPhaseV1::CatchUpReplies,
+        "an empty incremental history window must still reconcile retained roots"
     );
     assert_eq!(
-        incremental.completed_output().unwrap().snapshot,
-        applied_snapshot
+        incremental.current_root_message_id(),
+        Some("1780000000.000100")
+    );
+
+    let mut replies: HostedSlackRepliesPageV2 = old_root_late_replies_page().into();
+    replies.page_format_version = HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3;
+    replies.minimum_reader_version = HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3;
+    replies.poll_kind = HostedSlackPollKindV2::Incremental;
+    replies.backfill_cut_at = "2026-06-02T00:00:00Z".to_string();
+    replies.poll_overlap_watermark = "2026-06-01T23:55:00Z".to_string();
+    replies.poll_cut_at = Some("2026-06-02T00:05:00Z".to_string());
+    replies.observed_at = "2026-06-02T00:05:02Z".to_string();
+    incremental.apply_replies_page_v2(&replies).unwrap();
+
+    let output = incremental.completed_output().unwrap();
+    assert_ne!(output.snapshot, applied_snapshot);
+    assert_eq!(output.snapshot.threads()[0].reply_message_ids().len(), 3);
+    assert!(
+        output
+            .snapshot
+            .messages()
+            .iter()
+            .any(|message| message.text() == "Late non-broadcast reply")
+    );
+    assert!(output.operational_status.coverage_complete);
+    assert_eq!(
+        output.operational_status.freshness_state,
+        locality_protocol::ReplicaFreshnessState::Fresh
     );
 }
 

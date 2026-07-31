@@ -480,13 +480,16 @@ impl HostedSlackRepliesPageV2 {
                 minimum_reader_version: self.minimum_reader_version,
             });
         }
+        let deletion_reconciliation = is_deleted_root_reconciliation_page(self);
+        let legacy_format_version = if deletion_reconciliation {
+            self.page_format_version
+                .min(HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2)
+        } else {
+            HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1
+        };
         let legacy = HostedSlackRepliesPageV1 {
-            page_format_version: self
-                .page_format_version
-                .min(HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2),
-            minimum_reader_version: self
-                .minimum_reader_version
-                .min(HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2),
+            page_format_version: legacy_format_version,
+            minimum_reader_version: legacy_format_version,
             poll_kind: self
                 .poll_kind
                 .try_into()
@@ -1342,9 +1345,7 @@ fn prepare_reply_phase(
             return Err(HostedSlackPollError::MissingRoot(root.clone()));
         }
     }
-    let pending = if history_phase == HostedSlackPollPhaseV1::HistoricalHistory
-        || checkpoint.poll_kind == HostedSlackPollKindV2::Incremental
-    {
+    let pending = if history_phase == HostedSlackPollPhaseV1::HistoricalHistory {
         checkpoint
             .completed_roots
             .retain(|root| !touched.contains(&root.root_message_id));
