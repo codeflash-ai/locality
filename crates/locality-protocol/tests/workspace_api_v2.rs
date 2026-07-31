@@ -108,6 +108,12 @@ fn status() -> WorkspaceSessionStatusV2 {
 fn sealed_offer() -> SealedExportOffer {
     let mut offer: SealedExportOffer = serde_json::from_slice(SEALED_EXPORT_OFFER_GOLDEN_JSON)
         .expect("existing sealed offer fixture must decode");
+    offer.directory_count = 4;
+    offer.archive_entry_count = 7;
+    offer.inventory_sha256 =
+        "sha256:3282a9e3a380a97d53bead78c1e025e2ed428b6627b3446ddb4266bd6d06b0c4".to_string();
+    offer.writable_metadata_sha256 =
+        "sha256:07fc6fceeff5dfc7e04362aa09fb29df8f76876856f90a1e645330644b746642".to_string();
     offer.source_generations[0].ordinal = 1;
     offer.source_generations.insert(
         0,

@@ -1,0 +1,25 @@
+{
+  "ok": true,
+  "channels": [
+    {
+      "id": "C08ENGINEER1",
+      "context_team_id": "T08LOCALITY1",
+      "team_id": "T08LOCALITY1",
+      "name": "engineering",
+      "created": 1780000000,
+      "updated": "malformed-timestamp-secret",
+      "is_archived": false,
+      "is_private": true,
+      "is_shared": false,
+      "is_ext_shared": false,
+      "is_org_shared": false,
+      "is_member": true,
+      "shared_team_ids": [
+        "T08LOCALITY1"
+      ]
+    }
+  ],
+  "response_metadata": {
+    "next_cursor": ""
+  }
+}

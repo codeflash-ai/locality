@@ -11,11 +11,27 @@ use locality_core::LocalityError;
 use locality_core::journal::PushId;
 use locality_core::model::{MountId, RemoteId};
 
+use crate::workspace_binding::WorkspaceRebindBlocker;
+
 pub type StoreResult<T> = Result<T, StoreError>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreError {
     MountMissing(MountId),
+    WorkspaceBindingMissing(MountId),
+    WorkspaceMountTargetCollision {
+        target: String,
+        existing_mount_id: MountId,
+    },
+    WorkspaceBindingTargetImmutable {
+        mount_id: MountId,
+        existing_target: String,
+        requested_target: String,
+    },
+    WorkspaceRebindBlocked {
+        mount_id: MountId,
+        blocker: WorkspaceRebindBlocker,
+    },
     EntityMissing {
         mount_id: MountId,
         remote_id: RemoteId,
@@ -50,6 +66,37 @@ impl Display for StoreError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MountMissing(mount_id) => write!(f, "mount `{}` was not found", mount_id.0),
+            Self::WorkspaceBindingMissing(mount_id) => {
+                write!(
+                    f,
+                    "workspace binding for mount `{}` was not found",
+                    mount_id.0
+                )
+            }
+            Self::WorkspaceMountTargetCollision {
+                target,
+                existing_mount_id,
+            } => write!(
+                f,
+                "workspace mount target `{target}` collides with mount `{}`",
+                existing_mount_id.0
+            ),
+            Self::WorkspaceBindingTargetImmutable {
+                mount_id,
+                existing_target,
+                requested_target,
+            } => write!(
+                f,
+                "workspace binding target for mount `{}` is immutable outside the owning coordinator: `{existing_target}` cannot be changed to `{requested_target}`",
+                mount_id.0
+            ),
+            Self::WorkspaceRebindBlocked { mount_id, blocker } => {
+                write!(
+                    f,
+                    "workspace move for mount `{}` is blocked: {blocker}",
+                    mount_id.0
+                )
+            }
             Self::EntityMissing {
                 mount_id,
                 remote_id,

@@ -1,0 +1,41 @@
+[
+  {
+    "message": {
+      "channel_id": "C08ENGINEER1",
+      "ts": "1780000000.000100",
+      "thread_ts": null,
+      "user_id": "U08ADA00001",
+      "text": "[Slack system event: channel_join] <@U08ADA00001> joined the channel",
+      "edited_ts": null,
+      "deleted": false,
+      "file_ids": []
+    },
+    "reply_count": null
+  },
+  {
+    "message": {
+      "channel_id": "C08ENGINEER1",
+      "ts": "1780000001.000100",
+      "thread_ts": null,
+      "user_id": "U08GRACE001",
+      "text": "[Slack system event: channel_topic] set the channel topic",
+      "edited_ts": null,
+      "deleted": false,
+      "file_ids": []
+    },
+    "reply_count": null
+  },
+  {
+    "message": {
+      "channel_id": "C08ENGINEER1",
+      "ts": "1780000002.000100",
+      "thread_ts": null,
+      "user_id": null,
+      "text": "[Slack system event: huddle_thread]",
+      "edited_ts": null,
+      "deleted": false,
+      "file_ids": []
+    },
+    "reply_count": null
+  }
+]

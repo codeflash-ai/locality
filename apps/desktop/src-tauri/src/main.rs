@@ -47,6 +47,10 @@ use loc_cli::push::{
     PushOptions, PushReport, push_report_exit_code, run_push_with_daemon_at_state_root,
 };
 use loc_cli::restore::{RestoreOptions, run_restore};
+use loc_cli::sandbox::{
+    SandboxContentEncodingPreference, SandboxInitOptions, SandboxInitReport, SandboxProfileKey,
+    run_sandbox_init_with_profile_key, validate_sandbox_api_url,
+};
 use loc_cli::search::{
     SearchOptions, SearchResult, is_notion_url_host, notion_id_from_url,
     run_search_with_access_roots, source_url_host,
@@ -451,6 +455,14 @@ struct CreateDesktopMountRequest {
 struct WorkspaceMountOnboardingRequest {
     path: String,
     action: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PortableWorkspaceMaterializationRequest {
+    api_url: String,
+    root: String,
+    profile_key: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1427,6 +1439,43 @@ async fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
         },
     )
     .await
+}
+
+#[tauri::command]
+async fn materialize_portable_workspace(
+    request: PortableWorkspaceMaterializationRequest,
+) -> Result<SandboxInitReport, String> {
+    let (options, profile_key) = portable_workspace_options(request)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        run_sandbox_init_with_profile_key(
+            options,
+            profile_key,
+            SandboxContentEncodingPreference::Automatic,
+        )
+        .map_err(|error| format!("Portable workspace materialization failed: {error}"))
+    })
+    .await
+    .map_err(|error| format!("Portable workspace worker failed: {error}"))?
+}
+
+fn portable_workspace_options(
+    request: PortableWorkspaceMaterializationRequest,
+) -> Result<(SandboxInitOptions, SandboxProfileKey), String> {
+    validate_sandbox_api_url(&request.api_url)
+        .map_err(|error| format!("Portable workspace API URL is invalid: {error}"))?;
+    let root = PathBuf::from(request.root);
+    if !root.is_absolute() {
+        return Err("Portable workspace root must be an absolute path".to_string());
+    }
+    let profile_key = SandboxProfileKey::new(request.profile_key)
+        .map_err(|error| format!("Portable workspace credential is invalid: {error}"))?;
+    Ok((
+        SandboxInitOptions {
+            api_url: request.api_url,
+            root,
+        },
+        profile_key,
+    ))
 }
 
 #[tauri::command]
@@ -12083,6 +12132,54 @@ mod tests {
         assert!(super::absolute_state_root(PathBuf::from(".loc")).is_absolute());
     }
 
+    #[test]
+    fn portable_workspace_invoke_boundary_rejects_invalid_urls_and_relative_roots() {
+        for api_url in [
+            "https://workspace.example.test/api",
+            "https://user@workspace.example.test",
+            "https://workspace.example.test?tenant=7",
+            "https://workspace.example.test#fragment",
+            "http://workspace.example.test",
+        ] {
+            let error =
+                super::portable_workspace_options(super::PortableWorkspaceMaterializationRequest {
+                    api_url: api_url.to_string(),
+                    root: std::env::temp_dir().join("Locality").display().to_string(),
+                    profile_key: "a".repeat(64),
+                })
+                .expect_err("invalid Desktop API URL must fail before invocation");
+            assert!(error.contains("API URL is invalid"), "{api_url}: {error}");
+        }
+
+        let error =
+            super::portable_workspace_options(super::PortableWorkspaceMaterializationRequest {
+                api_url: "https://workspace.example.test".to_string(),
+                root: "relative/Locality".to_string(),
+                profile_key: "a".repeat(64),
+            })
+            .expect_err("relative Desktop root must fail before invocation");
+        assert!(error.contains("absolute path"));
+    }
+
+    #[test]
+    fn portable_workspace_invoke_boundary_accepts_https_and_loopback_http() {
+        for api_url in [
+            "https://workspace.example.test",
+            "http://127.0.0.1:8080",
+            "http://127.1:8080",
+        ] {
+            let (options, _) =
+                super::portable_workspace_options(super::PortableWorkspaceMaterializationRequest {
+                    api_url: api_url.to_string(),
+                    root: std::env::temp_dir().join("Locality").display().to_string(),
+                    profile_key: "a".repeat(64),
+                })
+                .expect("valid Desktop workspace request");
+            assert_eq!(options.api_url, api_url);
+            assert!(options.root.is_absolute());
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn write_file_atomic_falls_back_to_existing_file_overwrite() {
@@ -18106,6 +18203,7 @@ fn main() {
             ensure_runtime_ready,
             ensure_terminal_cli_available,
             create_workspace_mount,
+            materialize_portable_workspace,
             create_desktop_mount,
             connect_granola,
             connect_linear,

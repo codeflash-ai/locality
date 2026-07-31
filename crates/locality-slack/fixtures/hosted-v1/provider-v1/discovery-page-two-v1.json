@@ -1,0 +1,28 @@
+{
+  "ok": true,
+  "channels": [
+    {
+      "id": "C08GENERAL01",
+      "context_team_id": "T08LOCALITY1",
+      "team_id": "T08LOCALITY1",
+      "name": "general",
+      "topic": {
+        "value": ""
+      },
+      "purpose": {
+        "value": ""
+      },
+      "created": 1780000020,
+      "is_archived": true,
+      "is_private": false,
+      "is_shared": false,
+      "is_ext_shared": false,
+      "is_org_shared": false,
+      "is_member": false,
+      "shared_team_ids": []
+    }
+  ],
+  "response_metadata": {
+    "next_cursor": ""
+  }
+}

@@ -21,6 +21,7 @@ use locality_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorProfileRepository, CredentialStore, FileCredentialStore,
     InMemoryStateStore, MountRepository, ProjectionMode, SqliteStateStore,
+    WorkspaceBindingRepository,
 };
 use serde_json::Value;
 
@@ -214,6 +215,57 @@ fn linux_fuse_mount_keeps_mount_point_virtual() {
         .expect("mount exists");
     assert_eq!(mount.root, fixture.root);
     assert_eq!(mount.projection, ProjectionMode::LinuxFuse);
+}
+
+#[test]
+fn linux_fuse_cli_mounts_persist_bindings_before_daemon_reopen() {
+    let projection = match std::env::consts::OS {
+        "linux" => "linux-fuse",
+        "macos" => "macos-file-provider",
+        _ => return,
+    };
+    let fixture = MountFixture::new("loc-cli-linux-fuse-binding-handoff");
+    let state_root = fixture.root.join("state");
+    let locality_root = fixture.root.join("Locality");
+    seed_cli_notion_connection(&state_root, "notion-work", "Work");
+    let loc = env!("CARGO_BIN_EXE_loc");
+
+    for (mount_id, mount_target) in [
+        ("notion-main", "notion-main"),
+        ("google-docs-main", "google-docs-main"),
+    ] {
+        let mount_root = locality_root.join(mount_target).display().to_string();
+        let report = loc_json_ok(loc_command(loc, &state_root).args([
+            "mount",
+            "notion",
+            mount_root.as_str(),
+            "--connection",
+            "notion-work",
+            "--workspace",
+            "--mount-id",
+            mount_id,
+            "--projection",
+            projection,
+            "--json",
+        ]));
+        assert_eq!(report["mount_id"], mount_id, "{report:#?}");
+    }
+
+    let store = SqliteStateStore::open(state_root.clone()).expect("daemon-style store open");
+    let bindings = store
+        .load_workspace_bindings()
+        .expect("load CLI-created bindings");
+    assert_eq!(bindings.len(), 2);
+    assert_eq!(bindings[0].mount_id, MountId::new("google-docs-main"));
+    assert_eq!(
+        bindings[0].binding.mount_target().as_str(),
+        "google-docs-main"
+    );
+    assert_eq!(bindings[1].mount_id, MountId::new("notion-main"));
+    assert_eq!(bindings[1].binding.mount_target().as_str(), "notion-main");
+    drop(store);
+
+    SqliteStateStore::open(state_root).expect("daemon process transition remains readable");
 }
 
 #[test]

@@ -6,6 +6,7 @@
 
 pub mod freshness_delivery;
 pub mod workspace_api_v2;
+pub mod workspace_export_v2;
 pub mod workspace_layout;
 
 use std::collections::{BTreeMap, BTreeSet};

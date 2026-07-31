@@ -204,6 +204,48 @@ fn identity_archive_publishes_only_read_only_files_and_directories() {
     assert_modes(&root.destination().join("top.txt"), 0o444);
 }
 
+#[cfg(unix)]
+#[test]
+fn generation1_accepts_case_folded_destination_sibling_on_case_sensitive_unix() {
+    let root = TestDirectory::new("v1-casefold-destination");
+    fs::create_dir(root.0.join("REPLICA")).expect("create distinct case-fold sibling");
+    if root.destination().exists() {
+        return;
+    }
+
+    materialize_identity(
+        tar_archive(&[TestMember::file("readme.md", b"generation 1\n")]),
+        &root.destination(),
+        ReplicaMaterializationLimits::default(),
+    )
+    .expect("generation 1 keeps Linux case-sensitive destination behavior");
+
+    assert_eq!(
+        fs::read(root.destination().join("readme.md")).expect("read V1 publication"),
+        b"generation 1\n"
+    );
+    assert!(root.0.join("REPLICA").is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn generation1_accepts_non_nfc_destination_spelling_on_unix() {
+    let root = TestDirectory::new("v1-non-nfc-destination");
+    let destination = root.0.join("re\u{301}plica");
+
+    materialize_identity(
+        tar_archive(&[TestMember::file("readme.md", b"generation 1\n")]),
+        &destination,
+        ReplicaMaterializationLimits::default(),
+    )
+    .expect("generation 1 keeps exact non-NFC Linux destination behavior");
+
+    assert_eq!(
+        fs::read(destination.join("readme.md")).expect("read V1 publication"),
+        b"generation 1\n"
+    );
+}
+
 #[test]
 fn exact_receipt_identity_archive_publishes_after_decoded_tar_verification() {
     let root = TestDirectory::new("identity-receipt");
@@ -1099,7 +1141,22 @@ fn rejects_staging_root_replaced_by_symlink_before_publication() {
             .contains("staging root identity changed before publication"),
         "rejection identifies the root publication race: {error}"
     );
-    root.assert_no_staging_or_destination();
+    assert!(!root.destination().exists());
+    let substituted = fs::read_dir(&root.0)
+        .expect("read staging parent")
+        .map(|entry| entry.expect("read staging entry").path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".locality-stage-"))
+        })
+        .expect("substituted staging name is deliberately preserved");
+    assert!(
+        fs::symlink_metadata(&substituted)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(
         fs::read(outside.0.join("sentinel.txt")).expect("read untouched sentinel"),
         b"outside\n"

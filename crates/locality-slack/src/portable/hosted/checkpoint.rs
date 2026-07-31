@@ -17,6 +17,8 @@ use super::native::{
 
 pub const HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V1: u16 = 1;
 pub const HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V1: u16 = 1;
+pub const HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V2: u16 = 2;
+pub const HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V2: u16 = 2;
 pub const MAX_HOSTED_SLACK_CURSOR_BYTES_V1: usize = 1024;
 pub const MAX_HOSTED_SLACK_APPLIED_PAGES_V1: usize = 256;
 pub const MAX_HOSTED_SLACK_REPLAY_BYTES_V1: usize = 512 * 1024;
@@ -137,6 +139,12 @@ struct HostedSlackPollCheckpointWireV1 {
     evidence: Vec<HostedSlackPollEvidenceV1>,
 }
 
+#[derive(Deserialize)]
+struct HostedSlackPollCheckpointVersionHeader {
+    checkpoint_format_version: u16,
+    minimum_reader_version: u16,
+}
+
 impl From<HostedSlackPollCheckpointWireV1> for HostedSlackPollCheckpointV1 {
     fn from(wire: HostedSlackPollCheckpointWireV1) -> Self {
         Self {
@@ -247,6 +255,14 @@ impl HostedSlackPollCheckpointV1 {
         &self.candidate
     }
 
+    pub fn root_expected_reply_count(&self, root_message_id: &str) -> Option<u32> {
+        self.candidate
+            .root_expectations
+            .iter()
+            .find(|expectation| expectation.root_message_id == root_message_id)
+            .map(|expectation| expectation.expected_reply_count)
+    }
+
     pub fn new(
         selector: &HostedSlackChannelSelector,
         channel: RawHostedSlackChannel,
@@ -318,15 +334,12 @@ impl HostedSlackPollCheckpointV1 {
     }
 
     pub(super) fn validate_internal(&self) -> Result<(), HostedSlackPollError> {
-        if self.checkpoint_format_version != HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V1
-            || self.minimum_reader_version == 0
-            || self.minimum_reader_version > HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V1
-        {
-            return Err(HostedSlackPollError::UnsupportedVersion {
-                format_version: self.checkpoint_format_version,
-                minimum_reader_version: self.minimum_reader_version,
-            });
-        }
+        validate_checkpoint_versions_for_reader(
+            self.checkpoint_format_version,
+            self.minimum_reader_version,
+            HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V2,
+            HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V2,
+        )?;
         let selector = self.selector();
         selector
             .validate()
@@ -389,9 +402,6 @@ impl HostedSlackPollCheckpointV1 {
             self.backfill_cut_at.clone(),
             self.poll_overlap_watermark.clone(),
         );
-        rebuilt.checkpoint_format_version = self.checkpoint_format_version;
-        rebuilt.minimum_reader_version = self.minimum_reader_version;
-
         for evidence in self.evidence.clone() {
             match evidence {
                 HostedSlackPollEvidenceV1::AppliedPage { page } => {
@@ -446,6 +456,18 @@ impl HostedSlackPollCheckpointV1 {
 pub fn decode_hosted_slack_poll_checkpoint_v1(
     bytes: &[u8],
 ) -> Result<HostedSlackPollCheckpointV1, HostedSlackPollError> {
+    decode_hosted_slack_poll_checkpoint_for_reader(
+        bytes,
+        HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V2,
+        HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V2,
+    )
+}
+
+fn decode_hosted_slack_poll_checkpoint_for_reader(
+    bytes: &[u8],
+    supported_format_version: u16,
+    supported_reader_version: u16,
+) -> Result<HostedSlackPollCheckpointV1, HostedSlackPollError> {
     if bytes.len() > MAX_HOSTED_SLACK_CHECKPOINT_BYTES_V1 {
         return Err(HostedSlackPollError::InputTooLarge {
             input: "checkpoint",
@@ -453,6 +475,14 @@ pub fn decode_hosted_slack_poll_checkpoint_v1(
             actual_bytes: bytes.len(),
         });
     }
+    let header = serde_json::from_slice::<HostedSlackPollCheckpointVersionHeader>(bytes)
+        .map_err(|_| HostedSlackPollError::InvalidJson("checkpoint"))?;
+    validate_checkpoint_versions_for_reader(
+        header.checkpoint_format_version,
+        header.minimum_reader_version,
+        supported_format_version,
+        supported_reader_version,
+    )?;
     let checkpoint = serde_json::from_slice::<HostedSlackPollCheckpointV1>(bytes)
         .map_err(|_| HostedSlackPollError::InvalidJson("checkpoint"))?;
     checkpoint.validate()?;
@@ -470,6 +500,11 @@ pub enum HostedSlackPollError {
     UnsupportedVersion {
         format_version: u16,
         minimum_reader_version: u16,
+    },
+    ReaderUpdateRequired {
+        format_version: u16,
+        minimum_reader_version: u16,
+        supported_reader_version: u16,
     },
     InvalidIdentity(&'static str),
     InvalidCanonicalUtcTimestamp(&'static str),
@@ -518,6 +553,14 @@ impl Display for HostedSlackPollError {
             } => write!(
                 formatter,
                 "unsupported hosted Slack format {format_version} / reader {minimum_reader_version}"
+            ),
+            Self::ReaderUpdateRequired {
+                format_version,
+                minimum_reader_version,
+                supported_reader_version,
+            } => write!(
+                formatter,
+                "hosted Slack reader update required for format {format_version} / reader {minimum_reader_version}; supported reader is {supported_reader_version}"
             ),
             Self::InvalidIdentity(field) => write!(formatter, "invalid hosted Slack {field}"),
             Self::InvalidCanonicalUtcTimestamp(field) => {
@@ -570,6 +613,39 @@ impl Display for HostedSlackPollError {
 }
 
 impl std::error::Error for HostedSlackPollError {}
+
+pub(crate) fn validate_checkpoint_versions_for_reader(
+    format_version: u16,
+    minimum_reader_version: u16,
+    supported_format_version: u16,
+    supported_reader_version: u16,
+) -> Result<(), HostedSlackPollError> {
+    if !matches!(
+        (format_version, minimum_reader_version),
+        (
+            HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V1,
+            HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V1
+        ) | (
+            HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V2,
+            HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V2
+        )
+    ) {
+        return Err(HostedSlackPollError::UnsupportedVersion {
+            format_version,
+            minimum_reader_version,
+        });
+    }
+    if format_version > supported_format_version
+        || minimum_reader_version > supported_reader_version
+    {
+        return Err(HostedSlackPollError::ReaderUpdateRequired {
+            format_version,
+            minimum_reader_version,
+            supported_reader_version,
+        });
+    }
+    Ok(())
+}
 
 pub(crate) fn parse_canonical_utc_timestamp(
     field: &'static str,
@@ -961,4 +1037,104 @@ pub(crate) fn compare_slack_timestamps(left: &str, right: &str) -> Ordering {
         .len()
         .cmp(&right_seconds.len())
         .then_with(|| left.cmp(right))
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+    use crate::portable::hosted::{
+        HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2, HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2,
+        HostedSlackRepliesPageV1,
+    };
+
+    const PRE_CHANGE_READER_GOLDEN: &[u8] =
+        include_bytes!("../../../fixtures/hosted-v1/poll-v1/checkpoint-reply-pagination-v1.json");
+
+    fn decode_with_pre_change_reader_semantics(
+        bytes: &[u8],
+    ) -> Result<HostedSlackPollCheckpointV1, HostedSlackPollError> {
+        decode_hosted_slack_poll_checkpoint_for_reader(
+            bytes,
+            HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V1,
+            HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V1,
+        )
+    }
+
+    fn valid_v2_continuation_deletion_checkpoint() -> HostedSlackPollCheckpointV1 {
+        let mut checkpoint = decode_hosted_slack_poll_checkpoint_v1(PRE_CHANGE_READER_GOLDEN)
+            .expect("V1 continuation golden");
+        let root_message_id = checkpoint
+            .current_root_message_id
+            .clone()
+            .expect("continuation root");
+        let mut root = checkpoint
+            .candidate
+            .messages
+            .iter()
+            .find(|message| message.ts == root_message_id)
+            .cloned()
+            .expect("root message");
+        root.text.clear();
+        root.edited_ts = None;
+        root.deleted = true;
+        root.file_ids.clear();
+        let page = HostedSlackRepliesPageV1 {
+            page_format_version: HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2,
+            minimum_reader_version: HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2,
+            poll_kind: checkpoint.poll_kind,
+            phase: checkpoint.phase,
+            installation_id: checkpoint.installation_id.clone(),
+            team_id: checkpoint.team_id.clone(),
+            channel_id: checkpoint.channel_id.clone(),
+            sharing: checkpoint.sharing,
+            authorized_history_start_at: checkpoint.authorized_history_start_at.clone(),
+            backfill_cut_at: checkpoint.backfill_cut_at.clone(),
+            poll_cut_at: checkpoint.poll_cut_at.clone(),
+            poll_overlap_watermark: checkpoint.poll_overlap_watermark.clone(),
+            root_message_id,
+            root_reply_count: 0,
+            request_cursor: checkpoint.reply_cursor.clone(),
+            next_cursor: None,
+            observed_at: "2026-06-01T00:00:05Z".to_string(),
+            messages: vec![root],
+            users: Vec::new(),
+            files: Vec::new(),
+        };
+        checkpoint
+            .apply_replies_page(&page)
+            .expect("V2 continuation deletion");
+        checkpoint
+    }
+
+    #[test]
+    fn pre_change_reader_accepts_v1_golden_and_rejects_v2_before_replay() {
+        assert!(decode_with_pre_change_reader_semantics(PRE_CHANGE_READER_GOLDEN).is_ok());
+
+        let v2 = valid_v2_continuation_deletion_checkpoint();
+        let v2_bytes = serde_json::to_vec(&v2).unwrap();
+        assert_eq!(decode_hosted_slack_poll_checkpoint_v1(&v2_bytes), Ok(v2));
+        assert_eq!(
+            decode_with_pre_change_reader_semantics(&v2_bytes),
+            Err(HostedSlackPollError::ReaderUpdateRequired {
+                format_version: HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V2,
+                minimum_reader_version: HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V2,
+                supported_reader_version: HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V1,
+            })
+        );
+
+        let mut malformed_after_header =
+            serde_json::from_slice::<serde_json::Value>(&v2_bytes).unwrap();
+        malformed_after_header["evidence"][0]["page"]["canonical_page_json"] =
+            serde_json::json!("would fail if replayed");
+        assert_eq!(
+            decode_with_pre_change_reader_semantics(
+                &serde_json::to_vec(&malformed_after_header).unwrap()
+            ),
+            Err(HostedSlackPollError::ReaderUpdateRequired {
+                format_version: HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V2,
+                minimum_reader_version: HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V2,
+                supported_reader_version: HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V1,
+            })
+        );
+    }
 }

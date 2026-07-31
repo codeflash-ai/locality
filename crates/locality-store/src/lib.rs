@@ -16,6 +16,7 @@ pub mod records;
 pub mod repository;
 pub mod reset;
 pub mod sqlite;
+pub mod workspace_binding;
 
 pub use compatibility::{
     StateCompatibilityIssue, StateCompatibilityReport, StateCompatibilityStatus,
@@ -56,10 +57,14 @@ pub use repository::{
     FreshnessStateRepository, HydrationJobRepository, JournalRepository,
     MetadataDiscoveryJobRepository, MountLiveModeRepository, MountRepository,
     RemoteObservationRepository, ShadowRepository, VirtualMoveRepository, VirtualMoveTransition,
-    VirtualMutationRepository,
+    VirtualMutationRepository, WorkspaceBindingRepository,
 };
 pub use reset::{
     LocalStateResetCredentialError, LocalStateResetError, LocalStateResetStorageReport,
     connection_secret_refs, reset_locality_state_storage,
 };
 pub use sqlite::SqliteStateStore;
+pub use workspace_binding::{
+    WORKSPACE_BINDING_LAYOUT_VERSION, WORKSPACE_BINDING_VERSION, WorkspaceBinding,
+    WorkspaceBindingError, WorkspaceBindingRecord, WorkspaceRebindBlocker,
+};

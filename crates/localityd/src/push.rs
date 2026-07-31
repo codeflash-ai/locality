@@ -39,7 +39,7 @@ use locality_core::push::{
 };
 use locality_core::shadow::{
     MarkdownBlockKind, ShadowBlock, ShadowDocument, rendered_bodies_equivalent,
-    segment_markdown_body,
+    segment_markdown_body, stable_hash,
 };
 use locality_core::validation::{ValidationIssue, ValidationReport};
 use locality_core::{LocalityError, LocalityResult};
@@ -81,6 +81,9 @@ use crate::virtual_fs::{
     repair_legacy_macos_content_root, virtual_fs_content_path, virtual_fs_content_root,
     virtual_mutation_content_path_for_read,
 };
+
+const CREATED_ENTITY_FILENAME_SLUG_MAX_LEN: usize = 96;
+const CREATED_ENTITY_FILENAME_HASH_LEN: usize = 16;
 
 pub fn execute_push_job<S, Source>(
     store: &mut S,
@@ -4244,7 +4247,23 @@ fn created_entity_safe_slug(value: &str) -> String {
     if slug.is_empty() {
         "untitled".to_string()
     } else {
-        slug.to_string()
+        bound_created_entity_slug(slug, value)
+    }
+}
+
+fn bound_created_entity_slug(slug: &str, source: &str) -> String {
+    if slug.len() <= CREATED_ENTITY_FILENAME_SLUG_MAX_LEN {
+        return slug.to_string();
+    }
+
+    let hash = stable_hash(source);
+    let hash = &hash[..CREATED_ENTITY_FILENAME_HASH_LEN];
+    let prefix_len = CREATED_ENTITY_FILENAME_SLUG_MAX_LEN.saturating_sub(hash.len() + 1);
+    let prefix = slug[..prefix_len].trim_matches('-');
+    if prefix.is_empty() {
+        hash.to_string()
+    } else {
+        format!("{prefix}-{hash}")
     }
 }
 
