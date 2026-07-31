@@ -26,6 +26,23 @@ Locality uses the same high-level Nucleus vocabulary throughout the sync engine:
 - **Planner**: deterministic decision code that compares those three trees and
   chooses no-op, pull, push, auto-merge, or conflict.
 
+### Backend Generation Delivery
+
+Persistent backend-mode mounts consume complete-generation deltas through the
+same three-tree safety rule. Portable protocol values keep provider health,
+publication-generation health, and machine-local delivered-tree state separate.
+A terminal receipt binds the exact base generation, target complete generation,
+inventory, workspace layout, canonical delta digest, entry count, byte count,
+and authorization epoch.
+
+The local daemon applies only a delta matching its persisted observed generation
+and layout. Clean files fast-forward, clean deletions disappear, and dirty files
+remain byte-for-byte unchanged with an explicit incoming conflict identity.
+Staging and per-entry journals make retries and crash recovery deterministic;
+the observed generation advances only after every entry has a terminal local
+outcome. The transport remains behind an authenticated adapter trait. Until the
+private endpoint exists, this path has a fake transport and no CLI/API route.
+
 ### Entity
 
 An `Entity` is any remote object Locality knows about. Examples include a Notion page,

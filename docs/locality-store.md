@@ -17,6 +17,7 @@
 | `records` | Durable connector profile, connection, mount, entity, shadow snapshot, and shadow block record shapes. |
 | `repository` | Split repository traits for connector profiles, connections, mounts, entities, shadows, hydration jobs, and journals. |
 | `discovery` | Connector-neutral atomic batch-discovery commit, validation, and conservative pending-work guards. |
+| `generation_delivery` | Observed backend generations, per-path merge bases, and resumable generation-apply journal contracts. |
 | `memory` | Deterministic in-memory implementation for tests and early orchestration. |
 | `sqlite` | SQLite-backed durable implementation of the repository traits. |
 | `error` | Store-specific structured errors and conversion to `locality-core` errors. |
@@ -52,6 +53,10 @@
 - SQLite migrates v19 rows to v20 by creating and rebuilding
   `search_documents_fts`, a connector-neutral search cache over entity metadata
   plus connector search metadata and hydrated shadow frontmatter/body.
+- SQLite migrates v20 rows to v21 by adding observed generation, per-path merge
+  base, terminal receipt, and resumable differential-apply journal tables. The
+  additive migration does not rewrite or discard pending push journals, virtual
+  mutations, shadows, or local files.
 - SQLite records component versions for durable subsystems so compatibility is
   decided from persisted state contracts instead of desktop build IDs.
 - SQLite enables WAL mode, a busy timeout, foreign keys, and `PRAGMA user_version` schema versioning.
@@ -109,6 +114,30 @@ These are executor APIs, not a claim about a daemon startup call site. Ambiguous
 filesystem state returns `needs_review`; repository and I/O failures propagate.
 Raw projection and version fields are checked before typed decoding so future
 layouts fail update-required without mutating durable state.
+
+## Generation Delivery Transactions
+
+Backend generation delivery is separate from direct-provider discovery. A mount
+records its latest fully observed source generation, inventory digest, exact
+workspace layout version/digest, terminal receipt digest, and one merge-base
+record per projected path. A delta reservation must match all of those base
+facts. Changed retries, newer required readers, incomplete targets, layout
+changes, generation gaps, and old-identity mismatches fail before the local tree
+is changed.
+
+`generation_apply_journals` stores the canonical delta and terminal receipt,
+staging root, lifecycle, and per-entry outcomes. The daemon stages and verifies
+incoming bytes before applying clean creates/updates/deletions. Each filesystem
+operation is idempotently recognizable after a crash, so recovery can record
+the missing outcome and continue. Only after every entry has an applied,
+deleted, or conflict outcome does one SQLite transaction advance affected mount
+heads and clean path bases. Dirty local bytes stay in place and become explicit
+conflicts; staged incoming bytes are retained while a conflict remains.
+
+The public daemon exposes an authenticated transport trait and a deterministic
+fake, not a network route. An authenticated private endpoint adapter and the
+existing `loc pull`/Live Mode call-site integration remain follow-up work. No
+unauthenticated API or new routine sync command is implied by these tables.
 
 `commit_discovery_transaction` loads the stored commit rather than accepting a
 caller replacement. One SQLite transaction revalidates the reservation and
@@ -172,6 +201,12 @@ The first schema keeps high-value lookup fields relational and stores complex co
 - `discovery_projection_transactions`: immutable discovery plans, commits, and
   reservations plus durable execution effects, status, recovery error, and
   commit/finalization timestamps;
+- `observed_generations`: per-mount source generation, inventory and layout
+  fence, latest terminal receipt, and update time;
+- `generation_paths`: per-projection local merge base, clean/dirty/conflicted
+  state, and newest incoming identity;
+- `generation_apply_journals` and `generation_apply_outcomes`: immutable delta
+  and receipt payloads plus crash-recoverable per-entry apply results;
 - `projection_state`: projection-owned state such as File Provider/FUSE layout
   versions and repair generations.
 
