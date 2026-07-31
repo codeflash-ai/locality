@@ -7,6 +7,7 @@ use locality_protocol::{
 use serde::{Deserialize, Serialize};
 
 use super::checkpoint::{
+    HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V2, HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V2,
     HostedSlackAppliedPageV1, HostedSlackCompletedRootV1, HostedSlackPollCheckpointV1,
     HostedSlackPollError, HostedSlackPollEvidenceV1, HostedSlackPollKindV1, HostedSlackPollPhaseV1,
     HostedSlackRootExpectationV1, MAX_HOSTED_SLACK_APPLIED_PAGES_V1, compare_slack_timestamps,
@@ -23,6 +24,8 @@ use super::render::{
 
 pub const HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1: u16 = 1;
 pub const HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V1: u16 = 1;
+pub const HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2: u16 = 2;
+pub const HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2: u16 = 2;
 pub const MAX_HOSTED_SLACK_POLL_PAGE_BYTES_V1: usize = 512 * 1024;
 pub const MAX_HOSTED_SLACK_POLL_PAGE_MESSAGES_V1: usize = 512;
 pub const MAX_HOSTED_SLACK_POLL_PAGE_USERS_V1: usize = 512;
@@ -125,6 +128,12 @@ pub fn hosted_slack_replies_page_reference_closure_v1(
 impl HostedSlackHistoryPageV1 {
     pub fn validate(&self) -> Result<(), HostedSlackPollError> {
         validate_page_versions(self.page_format_version, self.minimum_reader_version)?;
+        if self.page_format_version != HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1 {
+            return Err(HostedSlackPollError::UnsupportedVersion {
+                format_version: self.page_format_version,
+                minimum_reader_version: self.minimum_reader_version,
+            });
+        }
         if !matches!(
             self.phase,
             HostedSlackPollPhaseV1::HistoricalHistory | HostedSlackPollPhaseV1::CatchUpHistory
@@ -247,6 +256,13 @@ impl HostedSlackRepliesPageV1 {
             ));
         }
         let deleted_root_reconciliation = is_deleted_root_reconciliation_page(self);
+        if self.page_format_version == HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2
+            && !deleted_root_reconciliation
+        {
+            return Err(HostedSlackPollError::IncompleteCandidate(
+                "V2 replies deletion reconciliation",
+            ));
+        }
         if self.request_cursor.is_none() {
             let first = &self.messages[0];
             if first.ts != self.root_message_id {
@@ -454,6 +470,10 @@ impl HostedSlackPollCheckpointV1 {
         }
         let first_page = page.request_cursor.is_none();
         let deleted_root_reconciliation = is_deleted_root_reconciliation_page(page);
+        if deleted_root_reconciliation {
+            next.checkpoint_format_version = HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V2;
+            next.minimum_reader_version = HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V2;
+        }
         let expectation_is_from_this_catch_up = page.phase
             != HostedSlackPollPhaseV1::CatchUpReplies
             || catch_up_history_contains_root(&next, &page.root_message_id)?
@@ -650,10 +670,16 @@ fn validate_page_versions(
     format_version: u16,
     minimum_reader_version: u16,
 ) -> Result<(), HostedSlackPollError> {
-    if format_version != HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1
-        || minimum_reader_version == 0
-        || minimum_reader_version > HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V1
-    {
+    if !matches!(
+        (format_version, minimum_reader_version),
+        (
+            HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1,
+            HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V1
+        ) | (
+            HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2,
+            HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2
+        )
+    ) {
         return Err(HostedSlackPollError::UnsupportedVersion {
             format_version,
             minimum_reader_version,
@@ -1624,11 +1650,13 @@ fn normalized_root_id(message: &RawHostedSlackMessage) -> Option<&str> {
         .filter(|thread_ts| *thread_ts != message.ts)
 }
 
-// V1 reconciliation deliberately uses only the existing replies-page schema so
-// deny-unknown V1 readers never receive an unversioned field. The exact terminal
-// tombstone shape is reserved for a root Slack reports as thread_not_found.
+// V2 deliberately adds no fields to the deny-unknown V1 schema. Its explicit
+// format/minimum-reader pair reserves this terminal tombstone shape for a root
+// Slack reports as thread_not_found, including after continuation pages.
 fn is_deleted_root_reconciliation_page(page: &HostedSlackRepliesPageV1) -> bool {
-    page.next_cursor.is_none()
+    page.page_format_version == HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2
+        && page.minimum_reader_version == HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2
+        && page.next_cursor.is_none()
         && page.root_reply_count == 0
         && page.messages.len() == 1
         && page.messages[0].ts == page.root_message_id

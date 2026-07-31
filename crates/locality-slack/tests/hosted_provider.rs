@@ -6,6 +6,8 @@ use locality_protocol::{
     HostedSlackChannelSelector, ProviderSourceScopeSelector, SlackChannelSharingClassification,
 };
 use locality_slack::portable::hosted::{
+    HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V2, HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V2,
+    HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2, HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2,
     HostedSlackCancellationToken, HostedSlackDriveControlV1, HostedSlackDriveOutcomeV1,
     HostedSlackDrivePendingReasonV1, HostedSlackHistoryPageV1, HostedSlackInstallationBinding,
     HostedSlackObservedChannelAuthorityV1, HostedSlackObservedInstallationIdentity,
@@ -982,6 +984,14 @@ async fn thread_not_found_reconciles_deleted_root_and_replays_without_stale_file
     );
     assert!(checkpoint.candidate().files().is_empty());
     assert_eq!(checkpoint.completed_roots()[0].expected_reply_count, 0);
+    assert_eq!(
+        checkpoint.checkpoint_format_version(),
+        HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V2
+    );
+    assert_eq!(
+        checkpoint.minimum_reader_version(),
+        HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V2
+    );
     let encoded = serde_json::to_vec(&checkpoint).unwrap();
     let encoded_value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
     assert!(!String::from_utf8_lossy(&encoded).contains("reconciliation"));
@@ -995,7 +1005,10 @@ async fn thread_not_found_reconciles_deleted_root_and_replays_without_stale_file
                     .as_str()
                     .and_then(|page| serde_json::from_str::<serde_json::Value>(page).ok())
                     .is_some_and(|page| {
-                        page["request_cursor"] == "reply-page-2"
+                        page["page_format_version"] == HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2
+                            && page["minimum_reader_version"]
+                                == HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2
+                            && page["request_cursor"] == "reply-page-2"
                             && page["next_cursor"].is_null()
                             && page["root_reply_count"] == 0
                             && page["messages"][0]["deleted"] == true

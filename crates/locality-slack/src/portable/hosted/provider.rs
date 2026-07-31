@@ -28,10 +28,11 @@ use super::native::{
     RawHostedSlackMessage, RawHostedSlackUser,
 };
 use super::poll::{
-    HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1, HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V1,
-    HostedSlackHistoryMessageV1, HostedSlackHistoryPageV1, HostedSlackPollOutputV1,
-    HostedSlackRepliesPageV1, hosted_slack_history_page_reference_closure_v1,
-    hosted_slack_replies_page_reference_closure_v1,
+    HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1, HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2,
+    HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V1,
+    HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2, HostedSlackHistoryMessageV1,
+    HostedSlackHistoryPageV1, HostedSlackPollOutputV1, HostedSlackRepliesPageV1,
+    hosted_slack_history_page_reference_closure_v1, hosted_slack_replies_page_reference_closure_v1,
 };
 
 pub const HOSTED_SLACK_PROVIDER_PAGE_LIMIT_V1: u32 = 15;
@@ -1009,8 +1010,8 @@ fn deleted_root_reconciliation_page(
     root.file_ids.clear();
     let selector = checkpoint.selector();
     let page = HostedSlackRepliesPageV1 {
-        page_format_version: HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1,
-        minimum_reader_version: HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V1,
+        page_format_version: HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2,
+        minimum_reader_version: HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2,
         poll_kind: checkpoint.poll_kind(),
         phase: request.phase,
         installation_id: selector.installation_id,
