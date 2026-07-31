@@ -343,7 +343,7 @@ fn delete_create_path_reuse_is_rejected_in_both_canonical_orders() {
 fn portable_casefold_and_unicode_path_collisions_are_rejected() {
     for (first, second) in [
         ("Docs/Roadmap.md", "docs/roadmap.MD"),
-        ("Docs/é.md", "Docs/e\u{301}.md"),
+        ("Docs/é.md", "docs/É.md"),
         ("Docs/ß.md", "docs/ss.md"),
     ] {
         let mut candidate = delta();

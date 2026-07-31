@@ -62,7 +62,7 @@ use crate::repository::{
 };
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 23;
+const SCHEMA_VERSION: i64 = 24;
 const ENTITY_SEARCH_COMPONENT_VERSION: i64 = 2;
 const JOURNALS_COMPONENT_VERSION: i64 = 3;
 const LINUX_FUSE_PROJECTION_LAYOUT_VERSION: i64 = 2;
@@ -353,7 +353,10 @@ fn generation_path_from_row(
         String,
         String,
         String,
+        String,
         Option<String>,
+        Option<String>,
+        Option<i64>,
         Option<String>,
         Option<i64>,
         String,
@@ -365,21 +368,33 @@ fn generation_path_from_row(
         mount_id: MountId::new(row.0),
         projection_id: locality_core::portable::ProjectionId::new(row.1),
         logical_path: row.2,
-        base_generation_id: locality_core::portable::SourceGenerationId::new(row.3)
+        local_logical_path: row.3,
+        base_generation_id: locality_core::portable::SourceGenerationId::new(row.4)
             .map_err(|error| StoreError::InvalidState(error.to_string()))?,
-        base_identity: row.4.map(|value| from_json(&value)).transpose()?,
-        base_payload_delta_id: row.5,
+        base_identity: row.5.map(|value| from_json(&value)).transpose()?,
+        base_payload_delta_id: row.6,
         base_payload_entry_index: row
-            .6
+            .7
             .map(|value| {
                 u64::try_from(value).map_err(|_| {
                     StoreError::InvalidState("negative generation base payload index".to_string())
                 })
             })
             .transpose()?,
-        state: parse_generation_path_state(&row.7)?,
-        incoming_identity: row.8.map(|value| from_json(&value)).transpose()?,
-        updated_at: row.9,
+        conflict_payload_delta_id: row.8,
+        conflict_payload_entry_index: row
+            .9
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    StoreError::InvalidState(
+                        "negative generation conflict payload index".to_string(),
+                    )
+                })
+            })
+            .transpose()?,
+        state: parse_generation_path_state(&row.10)?,
+        incoming_identity: row.11.map(|value| from_json(&value)).transpose()?,
+        updated_at: row.12,
     })
 }
 
@@ -390,8 +405,9 @@ fn select_generation_path(
 ) -> StoreResult<Option<GenerationPathRecord>> {
     connection
         .query_row(
-            "SELECT mount_id, projection_id, logical_path, base_generation_id,
+            "SELECT mount_id, projection_id, logical_path, local_logical_path, base_generation_id,
                     base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                    conflict_payload_delta_id, conflict_payload_entry_index,
                     state, incoming_identity_json, updated_at
              FROM generation_paths WHERE mount_id = ?1 AND projection_id = ?2",
             params![mount_id.0.as_str(), projection_id.as_str()],
@@ -407,6 +423,9 @@ fn select_generation_path(
                     row.get(7)?,
                     row.get(8)?,
                     row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
                 ))
             },
         )
@@ -420,8 +439,9 @@ fn list_generation_paths_from_connection(
     mount_id: &MountId,
 ) -> StoreResult<Vec<GenerationPathRecord>> {
     let mut statement = connection.prepare(
-        "SELECT mount_id, projection_id, logical_path, base_generation_id,
+        "SELECT mount_id, projection_id, logical_path, local_logical_path, base_generation_id,
                 base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                conflict_payload_delta_id, conflict_payload_entry_index,
                 state, incoming_identity_json, updated_at
          FROM generation_paths WHERE mount_id = ?1 ORDER BY projection_id",
     )?;
@@ -437,6 +457,9 @@ fn list_generation_paths_from_connection(
             row.get(7)?,
             row.get(8)?,
             row.get(9)?,
+            row.get(10)?,
+            row.get(11)?,
+            row.get(12)?,
         ))
     })?;
     rows.map(|row| generation_path_from_row(row?)).collect()
@@ -521,13 +544,18 @@ fn validate_seed_generation(
     }
     let mut projections = BTreeSet::new();
     let mut logical_paths = BTreeSet::new();
+    let mut local_paths = BTreeSet::new();
     for path in paths {
+        let logical_path = locality_core::portable::LogicalPath::new(path.logical_path.clone())
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+        let local_path = locality_core::portable::LogicalPath::new(path.local_logical_path.clone())
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?;
         if path.mount_id != observed.mount_id
             || path.base_generation_id != observed.generation_id
-            || path.logical_path.is_empty()
             || path.updated_at.is_empty()
             || !projections.insert(path.projection_id.clone())
-            || !logical_paths.insert(path.logical_path.clone())
+            || !logical_paths.insert(logical_path.portable_collision_key())
+            || !local_paths.insert(local_path.portable_collision_key())
         {
             return Err(StoreError::InvalidState(
                 "generation path seed does not match its observed generation".to_string(),
@@ -539,6 +567,12 @@ fn validate_seed_generation(
         {
             return Err(StoreError::InvalidState(
                 "generation path base identity does not match its row".to_string(),
+            ));
+        }
+        if path.state == GenerationPathState::Clean && path.local_logical_path != path.logical_path
+        {
+            return Err(StoreError::InvalidState(
+                "clean generation path has a different local working path".to_string(),
             ));
         }
     }
@@ -594,14 +628,16 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         for path in paths {
             transaction.execute(
                 "INSERT INTO generation_paths (
-                    mount_id, projection_id, logical_path, base_generation_id,
+                    mount_id, projection_id, logical_path, local_logical_path, base_generation_id,
                     base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                    conflict_payload_delta_id, conflict_payload_entry_index,
                     state, incoming_identity_json, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     path.mount_id.0.as_str(),
                     path.projection_id.as_str(),
                     path.logical_path.as_str(),
+                    path.local_logical_path.as_str(),
                     path.base_generation_id.as_str(),
                     path.base_identity.as_ref().map(to_json).transpose()?,
                     path.base_payload_delta_id.as_deref(),
@@ -610,6 +646,13 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                         .transpose()
                         .map_err(|_| StoreError::InvalidState(
                             "generation base payload index is too large".to_string()
+                        ))?,
+                    path.conflict_payload_delta_id.as_deref(),
+                    path.conflict_payload_entry_index
+                        .map(i64::try_from)
+                        .transpose()
+                        .map_err(|_| StoreError::InvalidState(
+                            "generation conflict payload index is too large".to_string()
                         ))?,
                     generation_path_state_label(path.state),
                     path.incoming_identity.as_ref().map(to_json).transpose()?,
@@ -889,8 +932,9 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         let changed = connection.execute(
             "INSERT INTO generation_inode_evidence (
                 delta_id, entry_index, mount_id, logical_path, evidence_name,
-                expected_sha256, byte_length, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                expected_sha256, byte_length, base_payload_delta_id,
+                base_payload_entry_index, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(delta_id, entry_index) DO NOTHING",
             params![
                 evidence.delta_id.as_str(),
@@ -900,13 +944,23 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 evidence.evidence_name.as_str(),
                 evidence.expected_sha256.as_str(),
                 byte_length,
+                evidence.base_payload_delta_id.as_deref(),
+                evidence
+                    .base_payload_entry_index
+                    .map(i64::try_from)
+                    .transpose()
+                    .map_err(|_| StoreError::InvalidState(
+                        "generation evidence base payload index is too large".to_string()
+                    ))?,
                 evidence.created_at.as_str(),
             ],
         )?;
         if changed == 0 {
             let exact: bool = connection.query_row(
                 "SELECT mount_id = ?3 AND logical_path = ?4 AND evidence_name = ?5
-                        AND expected_sha256 = ?6 AND byte_length = ?7 AND created_at = ?8
+                        AND expected_sha256 = ?6 AND byte_length = ?7
+                        AND base_payload_delta_id IS ?8 AND base_payload_entry_index IS ?9
+                        AND created_at = ?10
                  FROM generation_inode_evidence WHERE delta_id = ?1 AND entry_index = ?2",
                 params![
                     evidence.delta_id.as_str(),
@@ -916,6 +970,14 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                     evidence.evidence_name.as_str(),
                     evidence.expected_sha256.as_str(),
                     byte_length,
+                    evidence.base_payload_delta_id.as_deref(),
+                    evidence
+                        .base_payload_entry_index
+                        .map(i64::try_from)
+                        .transpose()
+                        .map_err(|_| StoreError::InvalidState(
+                            "generation evidence base payload index is too large".to_string()
+                        ))?,
                     evidence.created_at.as_str(),
                 ],
                 |row| row.get(0),
@@ -933,7 +995,8 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT delta_id, entry_index, mount_id, logical_path, evidence_name,
-                    expected_sha256, byte_length, created_at
+                    expected_sha256, byte_length, base_payload_delta_id,
+                    base_payload_entry_index, created_at
              FROM generation_inode_evidence ORDER BY created_at, delta_id, entry_index",
         )?;
         let rows = statement.query_map([], |row| {
@@ -945,7 +1008,9 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, i64>(6)?,
-                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, String>(9)?,
             ))
         })?;
         rows.map(|row| {
@@ -962,7 +1027,18 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 byte_length: u64::try_from(row.6).map_err(|_| {
                     StoreError::InvalidState("negative generation evidence length".to_string())
                 })?,
-                created_at: row.7,
+                base_payload_delta_id: row.7,
+                base_payload_entry_index: row
+                    .8
+                    .map(|value| {
+                        u64::try_from(value).map_err(|_| {
+                            StoreError::InvalidState(
+                                "negative generation evidence base payload index".to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?,
+                created_at: row.9,
             })
         })
         .collect()
@@ -996,26 +1072,106 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         let old = entry.old.as_ref().ok_or_else(|| {
             StoreError::InvalidState("generation evidence entry has no old identity".to_string())
         })?;
-        let incoming = entry.new.as_ref().map(to_json).transpose()?;
+        let was_over_quota = journal
+            .outcomes
+            .iter()
+            .find(|(index, _)| *index == entry_index)
+            .is_some_and(|(_, outcome)| {
+                matches!(outcome, GenerationApplyOutcome::ConflictOverQuota { .. })
+            });
+        let incoming = entry.new.as_ref();
+        let existing = select_generation_path(
+            &transaction,
+            &MountId::new(journal.delta.mount_id.as_str()),
+            &old.projection_id,
+        )?;
+        let (evidence_base_delta_id, evidence_base_entry_index): (Option<String>, Option<i64>) =
+            transaction
+                .query_row(
+                    "SELECT base_payload_delta_id, base_payload_entry_index
+                     FROM generation_inode_evidence
+                     WHERE delta_id = ?1 AND entry_index = ?2",
+                    params![
+                        delta_id,
+                        i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
+                            "generation evidence index is too large".to_string()
+                        ))?
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    StoreError::InvalidState(
+                        "generation inode evidence disappeared during conflict conversion"
+                            .to_string(),
+                    )
+                })?;
+        let remote_logical_path =
+            incoming.map_or(&old.logical_path, |identity| &identity.logical_path);
+        let local_logical_path = existing.as_ref().map_or(old.logical_path.as_str(), |path| {
+            path.local_logical_path.as_str()
+        });
+        let conflict_payload_delta_id = incoming.filter(|_| !was_over_quota).map(|_| delta_id);
+        let conflict_payload_entry_index = incoming
+            .filter(|_| !was_over_quota)
+            .map(|_| i64::try_from(entry_index))
+            .transpose()
+            .map_err(|_| {
+                StoreError::InvalidState("generation evidence index is too large".to_string())
+            })?;
         transaction.execute(
             "INSERT INTO generation_paths (
-                mount_id, projection_id, logical_path, base_generation_id,
+                mount_id, projection_id, logical_path, local_logical_path, base_generation_id,
                 base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                conflict_payload_delta_id, conflict_payload_entry_index,
                 state, incoming_identity_json, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, 'conflicted', ?6, ?7)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'conflicted', ?11, ?12)
              ON CONFLICT(mount_id, projection_id) DO UPDATE SET
                 logical_path = excluded.logical_path,
+                local_logical_path = excluded.local_logical_path,
                 base_generation_id = excluded.base_generation_id,
                 base_identity_json = excluded.base_identity_json,
+                base_payload_delta_id = excluded.base_payload_delta_id,
+                base_payload_entry_index = excluded.base_payload_entry_index,
+                conflict_payload_delta_id = excluded.conflict_payload_delta_id,
+                conflict_payload_entry_index = excluded.conflict_payload_entry_index,
                 state = 'conflicted', incoming_identity_json = excluded.incoming_identity_json,
                 updated_at = excluded.updated_at",
             params![
                 journal.delta.mount_id.as_str(),
                 old.projection_id.as_str(),
-                old.logical_path.as_str(),
+                remote_logical_path.as_str(),
+                local_logical_path,
                 journal.delta.base_generation_id.as_str(),
                 to_json(old)?,
-                incoming,
+                evidence_base_delta_id,
+                evidence_base_entry_index,
+                conflict_payload_delta_id,
+                conflict_payload_entry_index,
+                incoming.map(to_json).transpose()?,
+                updated_at,
+            ],
+        )?;
+        let converted_outcome = if was_over_quota {
+            GenerationApplyOutcome::ConflictOverQuota {
+                local_sha256: Some(local_sha256.to_string()),
+                incoming_identity: incoming.cloned(),
+            }
+        } else {
+            GenerationApplyOutcome::Conflict {
+                local_sha256: Some(local_sha256.to_string()),
+                incoming_identity: incoming.cloned(),
+            }
+        };
+        transaction.execute(
+            "UPDATE generation_apply_outcomes SET outcome_json = ?3, updated_at = ?4
+             WHERE delta_id = ?1 AND entry_index = ?2",
+            params![
+                delta_id,
+                i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
+                    "generation evidence index is too large".to_string()
+                ))?,
+                to_json(&converted_outcome)?,
                 updated_at,
             ],
         )?;
@@ -1093,16 +1249,21 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                     })?;
                     transaction.execute(
                         "INSERT INTO generation_paths (
-                            mount_id, projection_id, logical_path, base_generation_id,
+                            mount_id, projection_id, logical_path, local_logical_path,
+                            base_generation_id,
                             base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                            conflict_payload_delta_id, conflict_payload_entry_index,
                             state, incoming_identity_json, updated_at
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'clean', NULL, ?8)
+                         ) VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, NULL, NULL, 'clean', NULL, ?8)
                          ON CONFLICT(mount_id, projection_id) DO UPDATE SET
                             logical_path = excluded.logical_path,
+                            local_logical_path = excluded.local_logical_path,
                             base_generation_id = excluded.base_generation_id,
                             base_identity_json = excluded.base_identity_json,
                             base_payload_delta_id = excluded.base_payload_delta_id,
                             base_payload_entry_index = excluded.base_payload_entry_index,
+                            conflict_payload_delta_id = NULL,
+                            conflict_payload_entry_index = NULL,
                             state = 'clean', incoming_identity_json = NULL,
                             updated_at = excluded.updated_at",
                         params![
@@ -1125,16 +1286,21 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                     })?;
                     transaction.execute(
                         "INSERT INTO generation_paths (
-                            mount_id, projection_id, logical_path, base_generation_id,
+                            mount_id, projection_id, logical_path, local_logical_path,
+                            base_generation_id,
                             base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                            conflict_payload_delta_id, conflict_payload_entry_index,
                             state, incoming_identity_json, updated_at
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'dirty', NULL, ?8)
+                         ) VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, NULL, NULL, 'dirty', NULL, ?8)
                          ON CONFLICT(mount_id, projection_id) DO UPDATE SET
                             logical_path = excluded.logical_path,
+                            local_logical_path = excluded.local_logical_path,
                             base_generation_id = excluded.base_generation_id,
                             base_identity_json = excluded.base_identity_json,
                             base_payload_delta_id = excluded.base_payload_delta_id,
                             base_payload_entry_index = excluded.base_payload_entry_index,
+                            conflict_payload_delta_id = NULL,
+                            conflict_payload_entry_index = NULL,
                             state = 'dirty', incoming_identity_json = NULL,
                             updated_at = excluded.updated_at",
                         params![
@@ -1168,18 +1334,25 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 GenerationApplyOutcome::Conflict {
                     local_sha256: _,
                     incoming_identity,
+                }
+                | GenerationApplyOutcome::ConflictOverQuota {
+                    local_sha256: _,
+                    incoming_identity,
                 } => {
                     let projection_id = entry
                         .projection_id()
                         .expect("validated delta entry has projection identity");
                     let existing = select_generation_path(&transaction, &mount_id, projection_id)?;
                     let logical_path = entry
-                        .old
+                        .new
                         .as_ref()
-                        .or(entry.new.as_ref())
+                        .or(entry.old.as_ref())
                         .expect("validated delta entry has identity")
                         .logical_path
                         .as_str();
+                    let local_logical_path = existing
+                        .as_ref()
+                        .map_or(logical_path, |path| path.local_logical_path.as_str());
                     let base_generation_id = existing
                         .as_ref()
                         .map_or(&journal.delta.base_generation_id, |path| {
@@ -1189,13 +1362,38 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                         .as_ref()
                         .and_then(|path| path.base_identity.as_ref())
                         .or(entry.old.as_ref());
+                    let base_payload_delta_id = existing
+                        .as_ref()
+                        .and_then(|path| path.base_payload_delta_id.as_deref());
+                    let base_payload_entry_index = existing
+                        .as_ref()
+                        .and_then(|path| path.base_payload_entry_index)
+                        .map(i64::try_from)
+                        .transpose()
+                        .map_err(|_| {
+                            StoreError::InvalidState(
+                                "generation base payload index is too large".to_string(),
+                            )
+                        })?;
+                    let retains_conflict_payload =
+                        matches!(outcome, GenerationApplyOutcome::Conflict { .. })
+                            && entry.new.is_some();
                     transaction.execute(
                         "INSERT INTO generation_paths (
-                            mount_id, projection_id, logical_path, base_generation_id,
-                            base_identity_json, state, incoming_identity_json, updated_at
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, 'conflicted', ?6, ?7)
+                            mount_id, projection_id, logical_path, local_logical_path,
+                            base_generation_id, base_identity_json,
+                            base_payload_delta_id, base_payload_entry_index,
+                            conflict_payload_delta_id, conflict_payload_entry_index,
+                            state, incoming_identity_json, updated_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                                   'conflicted', ?11, ?12)
                          ON CONFLICT(mount_id, projection_id) DO UPDATE SET
                             logical_path = excluded.logical_path,
+                            local_logical_path = excluded.local_logical_path,
+                            base_payload_delta_id = excluded.base_payload_delta_id,
+                            base_payload_entry_index = excluded.base_payload_entry_index,
+                            conflict_payload_delta_id = excluded.conflict_payload_delta_id,
+                            conflict_payload_entry_index = excluded.conflict_payload_entry_index,
                             state = 'conflicted',
                             incoming_identity_json = excluded.incoming_identity_json,
                             updated_at = excluded.updated_at",
@@ -1203,8 +1401,20 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                             mount_id.0.as_str(),
                             projection_id.as_str(),
                             logical_path,
+                            local_logical_path,
                             base_generation_id.as_str(),
                             base_identity.map(to_json).transpose()?,
+                            base_payload_delta_id,
+                            base_payload_entry_index,
+                            retains_conflict_payload.then_some(journal.delta.delta_id.as_str()),
+                            retains_conflict_payload.then_some(
+                                i64::try_from(entry_index).map_err(
+                                    |_| StoreError::InvalidState(
+                                        "generation conflict payload index is too large"
+                                            .to_string()
+                                    )
+                                )?
+                            ),
                             incoming_identity.as_ref().map(to_json).transpose()?,
                             completed_at,
                         ],
@@ -3526,6 +3736,43 @@ fn mount_source_identity_changed(existing: &MountConfig, next: &MountConfig) -> 
 }
 
 fn clear_mount_source_state(connection: &Connection, mount_id: &MountId) -> StoreResult<()> {
+    let pending_virtual_mutation: Option<String> = connection
+        .query_row(
+            "SELECT local_id FROM virtual_mutations WHERE mount_id = ?1 LIMIT 1",
+            params![&mount_id.0],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(local_id) = pending_virtual_mutation {
+        return Err(StoreError::InvalidState(format!(
+            "mount `{}` cannot change source while virtual mutation `{local_id}` is pending",
+            mount_id.0
+        )));
+    }
+    let unsettled_push = {
+        let mut statement = connection.prepare(
+            "SELECT push_id, status_json FROM journals WHERE mount_id = ?1 ORDER BY push_id",
+        )?;
+        let rows = statement.query_map(params![&mount_id.0], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut unsettled = None;
+        for row in rows {
+            let (push_id, status_json) = row?;
+            let status: JournalStatus = from_json(&status_json)?;
+            if status.is_unsettled() {
+                unsettled = Some(push_id);
+                break;
+            }
+        }
+        unsettled
+    };
+    if let Some(push_id) = unsettled_push {
+        return Err(StoreError::InvalidState(format!(
+            "mount `{}` cannot change source while push journal `{push_id}` is unsettled",
+            mount_id.0
+        )));
+    }
     let active_delta: Option<String> = connection
         .query_row(
             "SELECT delta_id FROM generation_apply_journals
@@ -3796,7 +4043,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         migrate_journals_component_to_v3(connection)?;
         migrate_virtual_mutations_component_to_v3(connection)?;
         migrate_entity_search_component_to_v2(connection)?;
-        migrate_generation_delivery_component_to_v2(connection)?;
+        migrate_generation_delivery_component_to_v3(connection)?;
         return Ok(());
     }
 
@@ -4080,8 +4327,13 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             mount_id TEXT NOT NULL,
             projection_id TEXT NOT NULL,
             logical_path TEXT NOT NULL,
+            local_logical_path TEXT NOT NULL,
             base_generation_id TEXT NOT NULL,
             base_identity_json TEXT,
+            base_payload_delta_id TEXT,
+            base_payload_entry_index INTEGER CHECK (base_payload_entry_index >= 0),
+            conflict_payload_delta_id TEXT,
+            conflict_payload_entry_index INTEGER CHECK (conflict_payload_entry_index >= 0),
             state TEXT NOT NULL CHECK (state IN ('clean', 'dirty', 'conflicted')),
             incoming_identity_json TEXT,
             updated_at TEXT NOT NULL,
@@ -4405,7 +4657,14 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
     if user_version < 23 {
         migrate_generation_delivery_storage_to_v2(connection)?;
         if user_version >= 21 {
-            migrate_generation_delivery_component_to_v2(connection)?;
+            record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
+        }
+    }
+
+    if user_version < 24 {
+        migrate_generation_delivery_storage_to_v3(connection)?;
+        if user_version >= 21 {
+            migrate_generation_delivery_component_to_v3(connection)?;
             record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
         }
     }
@@ -4481,9 +4740,9 @@ fn state_component_issue_allows_schema_migration(
         issue,
         StateCompatibilityIssue::OlderComponent {
             component_id,
-            found: 1,
+            found,
             current: GENERATION_DELIVERY_COMPONENT_VERSION,
-        } if component_id == "durable:generation_delivery"
+        } if component_id == "durable:generation_delivery" && matches!(*found, 1 | 2)
     ) || matches!(
         issue,
         StateCompatibilityIssue::OlderComponent {
@@ -5328,10 +5587,13 @@ fn create_generation_delivery_tables(connection: &Connection) -> StoreResult<()>
             mount_id TEXT NOT NULL,
             projection_id TEXT NOT NULL,
             logical_path TEXT NOT NULL,
+            local_logical_path TEXT NOT NULL,
             base_generation_id TEXT NOT NULL,
             base_identity_json TEXT,
             base_payload_delta_id TEXT,
             base_payload_entry_index INTEGER CHECK (base_payload_entry_index >= 0),
+            conflict_payload_delta_id TEXT,
+            conflict_payload_entry_index INTEGER CHECK (conflict_payload_entry_index >= 0),
             state TEXT NOT NULL CHECK (state IN ('clean', 'dirty', 'conflicted')),
             incoming_identity_json TEXT,
             updated_at TEXT NOT NULL,
@@ -5383,6 +5645,8 @@ fn create_generation_delivery_tables(connection: &Connection) -> StoreResult<()>
             evidence_name TEXT NOT NULL,
             expected_sha256 TEXT NOT NULL,
             byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+            base_payload_delta_id TEXT,
+            base_payload_entry_index INTEGER CHECK (base_payload_entry_index >= 0),
             created_at TEXT NOT NULL,
             PRIMARY KEY (delta_id, entry_index),
             FOREIGN KEY (delta_id) REFERENCES generation_apply_journals(delta_id) ON DELETE CASCADE,
@@ -5425,7 +5689,7 @@ fn migrate_virtual_mutations_component_to_v3(connection: &Connection) -> StoreRe
     migrate_state_component_to_current(connection, "durable:virtual_mutations")
 }
 
-fn migrate_generation_delivery_component_to_v2(connection: &Connection) -> StoreResult<()> {
+fn migrate_generation_delivery_component_to_v3(connection: &Connection) -> StoreResult<()> {
     migrate_state_component_to_current(connection, "durable:generation_delivery")
 }
 
@@ -5452,6 +5716,31 @@ fn migrate_generation_delivery_storage_to_v2(connection: &Connection) -> StoreRe
             FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
          );",
     )?;
+    Ok(())
+}
+
+fn migrate_generation_delivery_storage_to_v3(connection: &Connection) -> StoreResult<()> {
+    if !column_exists(connection, "generation_paths", "local_logical_path")? {
+        connection.execute_batch(
+            "ALTER TABLE generation_paths ADD COLUMN local_logical_path TEXT;
+             UPDATE generation_paths SET local_logical_path = logical_path
+             WHERE local_logical_path IS NULL;
+             ALTER TABLE generation_paths ADD COLUMN conflict_payload_delta_id TEXT;
+             ALTER TABLE generation_paths ADD COLUMN conflict_payload_entry_index INTEGER
+                 CHECK (conflict_payload_entry_index >= 0);",
+        )?;
+    }
+    if !column_exists(
+        connection,
+        "generation_inode_evidence",
+        "base_payload_delta_id",
+    )? {
+        connection.execute_batch(
+            "ALTER TABLE generation_inode_evidence ADD COLUMN base_payload_delta_id TEXT;
+             ALTER TABLE generation_inode_evidence ADD COLUMN base_payload_entry_index INTEGER
+                 CHECK (base_payload_entry_index >= 0);",
+        )?;
+    }
     Ok(())
 }
 

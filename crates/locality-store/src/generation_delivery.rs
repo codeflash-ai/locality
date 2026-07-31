@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{StoreError, StoreResult};
 
-pub const GENERATION_DELIVERY_COMPONENT_VERSION: i64 = 2;
+pub const GENERATION_DELIVERY_COMPONENT_VERSION: i64 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservedGenerationRecord {
@@ -40,11 +40,17 @@ pub struct GenerationPathRecord {
     pub mount_id: MountId,
     pub projection_id: ProjectionId,
     pub logical_path: String,
+    /// Actual local working path. This may differ from the remote logical path
+    /// while a rename is conflicted and must survive subsequent generations.
+    pub local_logical_path: String,
     pub base_generation_id: SourceGenerationId,
     pub base_identity: Option<GenerationFileIdentity>,
     /// Authenticated staged payload that contains the exact merge-base bytes.
     pub base_payload_delta_id: Option<String>,
     pub base_payload_entry_index: Option<u64>,
+    /// Exact retained incoming payload for a conflict, when quota admitted it.
+    pub conflict_payload_delta_id: Option<String>,
+    pub conflict_payload_entry_index: Option<u64>,
     pub state: GenerationPathState,
     pub incoming_identity: Option<GenerationFileIdentity>,
     pub updated_at: String,
@@ -91,6 +97,13 @@ pub enum GenerationApplyOutcome {
     Merged,
     Deleted,
     Conflict {
+        local_sha256: Option<String>,
+        incoming_identity: Option<GenerationFileIdentity>,
+    },
+    /// The local conflict is durable, but its incoming bytes could not be
+    /// retained within the configured evidence quota. The metadata remains
+    /// terminal so unrelated entries and the generation can advance.
+    ConflictOverQuota {
         local_sha256: Option<String>,
         incoming_identity: Option<GenerationFileIdentity>,
     },
@@ -151,6 +164,10 @@ pub struct GenerationInodeEvidenceRecord {
     pub evidence_name: String,
     pub expected_sha256: String,
     pub byte_length: u64,
+    /// Merge-base payload lineage that must be restored if a late writer turns
+    /// this completed apply into a local conflict.
+    pub base_payload_delta_id: Option<String>,
+    pub base_payload_entry_index: Option<u64>,
     pub created_at: String,
 }
 

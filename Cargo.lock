@@ -2430,6 +2430,7 @@ dependencies = [
  "locality-slack",
  "locality-store",
  "notify",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",

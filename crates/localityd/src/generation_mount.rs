@@ -237,13 +237,7 @@ impl SecureTarget {
         }
         #[cfg(windows)]
         {
-            if self.open_named(name)?.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "generation preimage already exists",
-                ));
-            }
-            self.parent.rename(&self.name, &self.parent, name)?;
+            rename_windows_noreplace(&self.parent, &self.name, name)?;
             sync_cap_dir(&self.parent)
         }
         #[cfg(not(any(unix, windows)))]
@@ -453,6 +447,77 @@ fn open_windows_regular_file(
     }
 }
 
+/// Renames through an already-open parent and asks NTFS/ReFS to reject an
+/// existing destination in the same kernel operation. A path preflight plus
+/// `rename` is not sufficient because another process can create the evidence
+/// leaf between those calls.
+#[cfg(windows)]
+fn rename_windows_noreplace(
+    parent: &cap_std::fs::Dir,
+    source_name: &OsStr,
+    destination_name: &OsStr,
+) -> io::Result<()> {
+    use cap_std::fs::OpenOptionsExt;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FileRenameInfo, SYNCHRONIZE, SetFileInformationByHandle,
+    };
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let source = parent.open_with(source_name, &options)?.into_std();
+    validate_windows_regular_handle(&source)?;
+    let destination = destination_name.encode_wide().collect::<Vec<_>>();
+    let header_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let byte_length = header_bytes
+        .checked_add(destination.len() * std::mem::size_of::<u16>())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename leaf is too long"))?;
+    let mut buffer = vec![0_usize; byte_length.div_ceil(std::mem::size_of::<usize>())];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let root = parent.try_clone()?.into_std_file();
+    unsafe {
+        (*info).Anonymous.ReplaceIfExists = false;
+        (*info).RootDirectory = root.as_raw_handle() as _;
+        (*info).FileNameLength = u32::try_from(destination.len() * 2)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename leaf is too long"))?;
+        std::ptr::copy_nonoverlapping(
+            destination.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            destination.len(),
+        );
+    }
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            source.as_raw_handle() as _,
+            FileRenameInfo,
+            info.cast(),
+            u32::try_from(byte_length).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "rename buffer is too large")
+            })?,
+        )
+    };
+    if ok == 0 {
+        let error = io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error().map(|code| code as u32),
+            Some(code) if code == ERROR_ALREADY_EXISTS || code == ERROR_FILE_EXISTS
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "generation preimage already exists",
+            ));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn validate_windows_regular_handle(file: &File) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
@@ -556,4 +621,84 @@ fn not_regular_file() -> io::Error {
         io::ErrorKind::InvalidInput,
         "generation path is not a regular file",
     )
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::fs;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(label: &str) -> std::path::PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "locality-generation-mount-{label}-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn native_displacement_never_replaces_an_existing_leaf() {
+        let root = temp_root("noreplace-existing");
+        fs::write(root.join("source"), b"source").unwrap();
+        fs::write(root.join("evidence"), b"evidence").unwrap();
+        let directory = open_windows_root(&root).unwrap();
+        let error =
+            rename_windows_noreplace(&directory, OsStr::new("source"), OsStr::new("evidence"))
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(root.join("source")).unwrap(), b"source");
+        assert_eq!(fs::read(root.join("evidence")).unwrap(), b"evidence");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_displacement_race_has_exactly_one_winner() {
+        let root = temp_root("noreplace-race");
+        fs::write(root.join("source-a"), b"a").unwrap();
+        fs::write(root.join("source-b"), b"b").unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for source in ["source-a", "source-b"] {
+            let root = root.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                let directory = open_windows_root(&root).unwrap();
+                barrier.wait();
+                rename_windows_noreplace(&directory, OsStr::new(source), OsStr::new("evidence"))
+            }));
+        }
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result
+                    .as_ref()
+                    .is_err_and(|error| { error.kind() == io::ErrorKind::AlreadyExists }))
+                .count(),
+            1
+        );
+        let evidence = fs::read(root.join("evidence")).unwrap();
+        assert!(evidence == b"a" || evidence == b"b");
+        assert_eq!(
+            [root.join("source-a"), root.join("source-b")]
+                .into_iter()
+                .filter(|path| path.exists())
+                .count(),
+            1
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 }

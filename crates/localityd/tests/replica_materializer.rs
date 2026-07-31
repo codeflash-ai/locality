@@ -1458,7 +1458,7 @@ fn rejects_duplicate_case_unicode_and_file_directory_collisions_exactly() {
     );
     assert_eq!(
         unicode,
-        "replica paths collide after Unicode normalization: `caf\u{e9}.md` and `cafe\u{301}.md`"
+        "invalid replica path `cafe\u{301}.md`: logical path component is not NFC: `cafe\u{301}.md`"
     );
 
     let type_collision = rejected_identity(

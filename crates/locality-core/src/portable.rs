@@ -13,6 +13,13 @@ use caseless::Caseless;
 use serde::{Deserialize, Deserializer, Serialize};
 use unicode_normalization_v16::UnicodeNormalization;
 
+/// Frozen ADR0005 portable filesystem ceilings. Both encodings are bounded so
+/// an accepted logical path is materializable on every supported host.
+pub const MAX_LOGICAL_PATH_COMPONENT_UTF8_BYTES: usize = 255;
+pub const MAX_LOGICAL_PATH_COMPONENT_UTF16_UNITS: usize = 255;
+pub const MAX_LOGICAL_PATH_UTF8_BYTES: usize = 1024;
+pub const MAX_LOGICAL_PATH_UTF16_UNITS: usize = 1024;
+
 use crate::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
 use crate::planner::{
     PlanDegradation, PlanSummary, PropertyValue, PushOperation, PushOperationKind, PushPlan,
@@ -202,6 +209,9 @@ pub enum LogicalPathError {
     ReservedMetadata,
     ReservedName(String),
     UnsafeCharacter,
+    NotNfc(String),
+    ComponentTooLong(String),
+    PathTooLong,
 }
 
 impl Display for LogicalPathError {
@@ -227,6 +237,19 @@ impl Display for LogicalPathError {
             Self::UnsafeCharacter => {
                 formatter.write_str("logical path contains an unsafe character")
             }
+            Self::NotNfc(component) => {
+                write!(
+                    formatter,
+                    "logical path component is not NFC: `{component}`"
+                )
+            }
+            Self::ComponentTooLong(component) => {
+                write!(
+                    formatter,
+                    "logical path component exceeds ADR0005 limits: `{component}`"
+                )
+            }
+            Self::PathTooLong => formatter.write_str("logical path exceeds ADR0005 limits"),
         }
     }
 }
@@ -246,6 +269,11 @@ fn validate_logical_path(value: &str) -> Result<(), LogicalPathError> {
     if value.eq_ignore_ascii_case(RESERVED_EXPORT_METADATA_PATH) {
         return Err(LogicalPathError::ReservedMetadata);
     }
+    if value.len() > MAX_LOGICAL_PATH_UTF8_BYTES
+        || value.encode_utf16().count() > MAX_LOGICAL_PATH_UTF16_UNITS
+    {
+        return Err(LogicalPathError::PathTooLong);
+    }
 
     for (index, component) in value.split('/').enumerate() {
         if component.is_empty() || matches!(component, "." | "..") {
@@ -253,7 +281,19 @@ fn validate_logical_path(value: &str) -> Result<(), LogicalPathError> {
                 component.to_string(),
             ));
         }
-        if component.chars().any(char::is_control) || component.contains(':') {
+        if component.nfc().ne(component.chars()) {
+            return Err(LogicalPathError::NotNfc(component.to_string()));
+        }
+        if component.len() > MAX_LOGICAL_PATH_COMPONENT_UTF8_BYTES
+            || component.encode_utf16().count() > MAX_LOGICAL_PATH_COMPONENT_UTF16_UNITS
+        {
+            return Err(LogicalPathError::ComponentTooLong(component.to_string()));
+        }
+        if component.chars().any(char::is_control)
+            || component
+                .chars()
+                .any(|character| matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+        {
             if index == 0
                 && component.as_bytes().get(1) == Some(&b':')
                 && component.as_bytes()[0].is_ascii_alphabetic()
@@ -271,14 +311,20 @@ fn validate_logical_path(value: &str) -> Result<(), LogicalPathError> {
             .split_once('.')
             .map_or(component, |(stem, _)| stem)
             .to_ascii_lowercase();
-        if matches!(device_name.as_str(), "con" | "prn" | "aux" | "nul")
-            || device_name.strip_prefix("com").is_some_and(|suffix| {
-                matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
-            })
-            || device_name.strip_prefix("lpt").is_some_and(|suffix| {
-                matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
-            })
-        {
+        if matches!(
+            device_name.as_str(),
+            "con" | "prn" | "aux" | "nul" | "clock$" | "conin$" | "conout$"
+        ) || device_name.strip_prefix("com").is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        }) || device_name.strip_prefix("lpt").is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        }) {
             return Err(LogicalPathError::ReservedName(component.to_string()));
         }
     }
@@ -699,6 +745,11 @@ mod tests {
             ".loc/session.json",
             ".LOC/SESSION.JSON",
             "safe/NUL.txt",
+            "safe/COM¹.txt",
+            "safe/CONOUT$.log",
+            "safe/bad?.md",
+            "safe/bad|name.md",
+            "safe/e\u{301}.md",
         ];
 
         for value in cases {
@@ -707,6 +758,24 @@ mod tests {
                 "hostile logical path unexpectedly accepted: {value:?}"
             );
         }
+    }
+
+    #[test]
+    fn logical_path_enforces_utf8_and_utf16_adr0005_ceilings() {
+        assert!(LogicalPath::new("a".repeat(255)).is_ok());
+        assert!(matches!(
+            LogicalPath::new("a".repeat(256)),
+            Err(LogicalPathError::ComponentTooLong(_))
+        ));
+        assert!(matches!(
+            LogicalPath::new("😀".repeat(128)),
+            Err(LogicalPathError::ComponentTooLong(_))
+        ));
+        let long_path = vec!["a".repeat(255); 5].join("/");
+        assert_eq!(
+            LogicalPath::new(long_path),
+            Err(LogicalPathError::PathTooLong)
+        );
     }
 
     #[test]

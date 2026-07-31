@@ -102,10 +102,13 @@ fn seed(store: &mut SqliteStateStore, fixture: &Fixture) {
                 mount_id: fixture.mount_id.clone(),
                 projection_id: ProjectionId::new("projection-roadmap"),
                 logical_path: "Roadmap.md".to_string(),
+                local_logical_path: "Roadmap.md".to_string(),
                 base_generation_id: generation("generation-1"),
                 base_identity: Some(identity("content-1", '1', 3)),
                 base_payload_delta_id: None,
                 base_payload_entry_index: None,
+                conflict_payload_delta_id: None,
+                conflict_payload_entry_index: None,
                 state: GenerationPathState::Clean,
                 incoming_identity: None,
                 updated_at: "2026-07-31T11:00:00Z".to_string(),
@@ -387,6 +390,79 @@ fn source_reset_retires_clean_completed_lineage_but_preserves_conflicts() {
 }
 
 #[test]
+fn source_reset_preserves_pending_virtual_mutations_and_unsettled_push_journals() {
+    use locality_core::journal::{JournalEntry, JournalStatus, PushId};
+    use locality_core::planner::PushPlan;
+    use locality_store::{
+        JournalRepository, VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
+    };
+
+    let virtual_fixture = Fixture::new("reset-pending-virtual");
+    let mut virtual_store = SqliteStateStore::open(virtual_fixture.state_root.clone()).unwrap();
+    seed(&mut virtual_store, &virtual_fixture);
+    let mutation = VirtualMutationRecord {
+        mount_id: virtual_fixture.mount_id.clone(),
+        local_id: "local-rename".to_string(),
+        mutation_kind: VirtualMutationKind::Rename,
+        target_remote_id: Some(RemoteId::new("page-1")),
+        parent_remote_id: None,
+        original_path: Some(PathBuf::from("Roadmap.md")),
+        projected_path: PathBuf::from("Roadmap-local.md"),
+        title: "Roadmap local".to_string(),
+        content_path: Some(virtual_fixture.mount_root.join("Roadmap-local.md")),
+        created_at: "2026-07-31T12:00:00Z".to_string(),
+        updated_at: "2026-07-31T12:00:00Z".to_string(),
+    };
+    virtual_store
+        .save_virtual_mutation(mutation.clone())
+        .unwrap();
+    let error = virtual_store
+        .save_mount(
+            MountConfig::new(
+                virtual_fixture.mount_id.clone(),
+                "backend",
+                &virtual_fixture.mount_root,
+            )
+            .with_settings_json(r#"{"view":"replacement"}"#),
+        )
+        .expect_err("pending virtual mutation must fence source reset");
+    assert!(matches!(error, StoreError::InvalidState(_)));
+    assert_eq!(
+        virtual_store
+            .get_virtual_mutation(&virtual_fixture.mount_id, &mutation.local_id)
+            .unwrap(),
+        Some(mutation)
+    );
+
+    let push_fixture = Fixture::new("reset-unsettled-push");
+    let mut push_store = SqliteStateStore::open(push_fixture.state_root.clone()).unwrap();
+    seed(&mut push_store, &push_fixture);
+    let journal = JournalEntry::new(
+        PushId("push-pending-reset".to_string()),
+        push_fixture.mount_id.clone(),
+        vec![RemoteId::new("page-1")],
+        PushPlan::default(),
+        JournalStatus::Applied,
+    );
+    push_store.append_journal(journal.clone()).unwrap();
+    let error = push_store
+        .save_mount(
+            MountConfig::new(
+                push_fixture.mount_id.clone(),
+                "backend",
+                &push_fixture.mount_root,
+            )
+            .with_connection_id(ConnectionId::new("replacement")),
+        )
+        .expect_err("unsettled push journal must fence source reset");
+    assert!(matches!(error, StoreError::InvalidState(_)));
+    assert_eq!(
+        push_store.get_journal(&journal.push_id).unwrap(),
+        Some(journal)
+    );
+}
+
+#[test]
 fn schema_20_migration_preserves_pending_local_state_and_adds_delivery_tables() {
     use locality_core::journal::{JournalEntry, JournalStatus, PushId};
     use locality_core::planner::PushPlan;
@@ -460,7 +536,7 @@ fn schema_20_migration_preserves_pending_local_state_and_adds_delivery_tables() 
         fs::read(fixture.mount_root.join("dirty.md")).unwrap(),
         b"local pending bytes"
     );
-    assert_eq!(SqliteStateStore::current_schema_version(), 23);
+    assert_eq!(SqliteStateStore::current_schema_version(), 24);
     assert!(
         reopened
             .get_observed_generation(&fixture.mount_id)
@@ -470,7 +546,7 @@ fn schema_20_migration_preserves_pending_local_state_and_adds_delivery_tables() 
 }
 
 #[test]
-fn schema_21_migration_relates_active_journal_to_mount_and_preserves_it() {
+fn genuine_schema_21_component_v1_fixture_migrates_without_losing_active_state() {
     use rusqlite::Connection;
 
     let fixture = Fixture::new("migration-v21-journal-mount");
@@ -492,49 +568,9 @@ fn schema_21_migration_relates_active_journal_to_mount_and_preserves_it() {
 
     let connection = Connection::open(&db_path).unwrap();
     connection
-        .execute_batch(
-            "PRAGMA foreign_keys = OFF;
-             BEGIN IMMEDIATE;
-             ALTER TABLE generation_apply_outcomes RENAME TO generation_apply_outcomes_v22;
-             ALTER TABLE generation_apply_journals RENAME TO generation_apply_journals_v22;
-             DROP INDEX generation_apply_one_active_per_source;
-             CREATE TABLE generation_apply_journals (
-                delta_id TEXT PRIMARY KEY,
-                source_connection_id TEXT NOT NULL,
-                base_generation_id TEXT NOT NULL,
-                target_generation_id TEXT NOT NULL,
-                delta_json TEXT NOT NULL,
-                receipt_json TEXT NOT NULL,
-                receipt_sha256 TEXT NOT NULL,
-                stage_root TEXT NOT NULL,
-                status TEXT NOT NULL CHECK (status IN ('staged', 'applying', 'completed')),
-                active INTEGER NOT NULL CHECK (active IN (0, 1)),
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                completed_at TEXT
-             );
-             INSERT INTO generation_apply_journals
-             SELECT delta_id, source_connection_id, base_generation_id,
-                    target_generation_id, delta_json, receipt_json, receipt_sha256,
-                    stage_root, status, active, created_at, updated_at, completed_at
-             FROM generation_apply_journals_v22;
-             CREATE UNIQUE INDEX generation_apply_one_active_per_source
-             ON generation_apply_journals(source_connection_id) WHERE active = 1;
-             CREATE TABLE generation_apply_outcomes (
-                delta_id TEXT NOT NULL,
-                entry_index INTEGER NOT NULL,
-                outcome_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (delta_id, entry_index)
-             );
-             INSERT INTO generation_apply_outcomes
-             SELECT * FROM generation_apply_outcomes_v22;
-             DROP TABLE generation_apply_outcomes_v22;
-             DROP TABLE generation_apply_journals_v22;
-             UPDATE state_components SET version = 21 WHERE component_id = 'core:schema';
-             PRAGMA user_version = 21;
-             COMMIT;",
-        )
+        .execute_batch(include_str!(
+            "fixtures/generation-delivery-v21-component-v1.sql"
+        ))
         .unwrap();
     drop(connection);
 
@@ -542,6 +578,21 @@ fn schema_21_migration_relates_active_journal_to_mount_and_preserves_it() {
     let active = reopened.list_active_generation_applies().unwrap();
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].delta.mount_id.as_str(), fixture.mount_id.as_str());
+    let migrated_path = reopened
+        .list_generation_paths(&fixture.mount_id)
+        .unwrap()
+        .remove(0);
+    assert_eq!(migrated_path.local_logical_path, migrated_path.logical_path);
+    let connection = Connection::open(&db_path).unwrap();
+    let component: (i64, i64) = connection
+        .query_row(
+            "SELECT version, min_reader_version FROM state_components
+             WHERE component_id = 'durable:generation_delivery'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(component, (3, 3));
     let error = reopened
         .clear_mount_source_state(&fixture.mount_id)
         .expect_err("migrated active journal must fence source reset");
