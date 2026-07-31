@@ -27,8 +27,17 @@ Core rules:
 
 - Native desktop density: compact spacing, clear hierarchy, no oversized hero
   sections.
-- Neutral base palette with purposeful status color only.
-- Avoid decorative gradients, floating card stacks, and marketing layout.
+- Light mode uses a calm neutral/off-white canvas, white or raised panels,
+  restrained borders, and a dark green accent.
+- Dark mode matches the reference charcoal system: charcoal canvas and panels,
+  low-contrast hairline borders, off-white primary text, muted gray secondary
+  text, and emerald accent for primary actions, active navigation, ready states,
+  and live controls.
+- Components should use the semantic role tokens in
+  `apps/desktop/src/styles.css`; avoid one-off hex, rgba, or gradient color
+  literals in new desktop UI.
+- Avoid decorative gradients, color washes, floating card stacks, and marketing
+  layout.
 - Use familiar icon buttons for repeated actions such as copy, reveal, settings,
   reconnect, review, and undo.
 
