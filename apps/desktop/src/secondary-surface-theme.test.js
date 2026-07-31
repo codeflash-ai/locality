@@ -109,12 +109,13 @@ describe("desktop secondary surface theme contract", () => {
       "color: var(--chip-text);",
     ]);
     expectCssBlock(':root[data-theme="dark"] .connector-option.available', [
+      "border-color: var(--line);",
       "background: var(--onboarding-card-bg);",
     ]);
     expectCssBlock(':root[data-theme="dark"] .connector-option.selectable:hover:not(:disabled),\n:root[data-theme="dark"] .connector-option.selectable.selected', [
       "border-color: var(--control-border-hover);",
       "background: var(--onboarding-card-selected-bg);",
-      "box-shadow: var(--surface-shadow);",
+      "color: var(--ink);",
     ]);
     expectCssBlock(".agent-guidance-card", [
       "border: 1px solid var(--control-border-hover);",
