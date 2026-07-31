@@ -1,0 +1,14 @@
+{
+  "channel": {
+    "team_id": "T08LOCALITY1",
+    "id": "C08ENGINEER1",
+    "name": "engineering",
+    "topic": "Build safely",
+    "purpose": "Engineering",
+    "created_ts": "1780000000.000000",
+    "updated_ts": "1780000010.123000",
+    "sharing": "private"
+  },
+  "is_member": true,
+  "is_archived": false
+}

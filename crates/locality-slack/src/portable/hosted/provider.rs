@@ -2159,7 +2159,7 @@ fn provider_discovered_channel(
         topic,
         purpose,
         created_ts: epoch_seconds_timestamp(created),
-        updated_ts: updated.map(epoch_seconds_timestamp),
+        updated_ts: updated.map(epoch_milliseconds_timestamp),
         sharing,
     };
     super::native::HostedSlackChannel::try_from(raw.clone())?;
@@ -2505,6 +2505,14 @@ fn epoch_seconds_timestamp(seconds: u64) -> String {
     format!("{seconds}.000000")
 }
 
+fn epoch_milliseconds_timestamp(milliseconds: u64) -> String {
+    format!(
+        "{}.{:06}",
+        milliseconds / 1_000,
+        (milliseconds % 1_000) * 1_000
+    )
+}
+
 fn ensure_crypto_provider() {
     HOSTED_SLACK_CRYPTO_PROVIDER.get_or_init(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -2537,6 +2545,7 @@ fn operation_network_config(operation: HostedSlackProviderOperationV1) -> Connec
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc::{self, Receiver};
@@ -2548,6 +2557,85 @@ mod tests {
         status: &'static str,
         headers: Vec<(&'static str, &'static str)>,
         body: &'static str,
+    }
+
+    #[derive(Debug)]
+    struct StubDiscoveryProvider {
+        pages: Mutex<VecDeque<Result<HostedSlackChannelDiscoveryPageV1, HostedSlackProviderError>>>,
+        requests: Mutex<Vec<HostedSlackChannelDiscoveryRequestV1>>,
+    }
+
+    impl StubDiscoveryProvider {
+        fn new(
+            pages: impl IntoIterator<
+                Item = Result<HostedSlackChannelDiscoveryPageV1, HostedSlackProviderError>,
+            >,
+        ) -> Self {
+            Self {
+                pages: Mutex::new(pages.into_iter().collect()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl HostedSlackProviderPort for StubDiscoveryProvider {
+        fn verify_installation(
+            &self,
+        ) -> HostedSlackProviderFuture<'_, HostedSlackObservedInstallationIdentity> {
+            Box::pin(async { Ok(observed_identity()) })
+        }
+
+        fn conversations_info(
+            &self,
+            _channel_id: String,
+        ) -> HostedSlackProviderFuture<'_, HostedSlackObservedChannelAuthorityV1> {
+            Box::pin(async { Err(HostedSlackProviderError::InvalidResponse("unexpected call")) })
+        }
+
+        fn conversations_history(
+            &self,
+            _request: HostedSlackHistoryRequestV1,
+        ) -> HostedSlackProviderFuture<'_, HostedSlackProviderMessagePageV1> {
+            Box::pin(async { Err(HostedSlackProviderError::InvalidResponse("unexpected call")) })
+        }
+
+        fn conversations_replies(
+            &self,
+            _request: HostedSlackRepliesRequestV1,
+        ) -> HostedSlackProviderFuture<'_, HostedSlackProviderMessagePageV1> {
+            Box::pin(async { Err(HostedSlackProviderError::InvalidResponse("unexpected call")) })
+        }
+
+        fn users_info(
+            &self,
+            _user_id: String,
+        ) -> HostedSlackProviderFuture<'_, RawHostedSlackUser> {
+            Box::pin(async { Err(HostedSlackProviderError::InvalidResponse("unexpected call")) })
+        }
+
+        fn files_info(
+            &self,
+            _file_id: String,
+            _channel_id: String,
+        ) -> HostedSlackProviderFuture<'_, RawHostedSlackFileMetadata> {
+            Box::pin(async { Err(HostedSlackProviderError::InvalidResponse("unexpected call")) })
+        }
+    }
+
+    impl HostedSlackDiscoveryProviderPort for StubDiscoveryProvider {
+        fn conversations_list(
+            &self,
+            request: HostedSlackChannelDiscoveryRequestV1,
+        ) -> HostedSlackProviderFuture<'_, HostedSlackChannelDiscoveryPageV1> {
+            Box::pin(async move {
+                self.requests.lock().unwrap().push(request);
+                self.pages
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("missing discovery page")
+            })
+        }
     }
 
     fn observed_identity() -> HostedSlackObservedInstallationIdentity {
@@ -2592,6 +2680,34 @@ mod tests {
             },
             is_member,
             is_archived,
+        }
+    }
+
+    fn indexed_discovered_channel(index: usize) -> HostedSlackDiscoveredChannelV1 {
+        HostedSlackDiscoveredChannelV1 {
+            channel: RawHostedSlackChannel {
+                team_id: "T08LOCALITY1".to_string(),
+                id: format!("C{index:011}"),
+                name: format!("channel-{index}"),
+                topic: None,
+                purpose: None,
+                created_ts: "1780000000.000000".to_string(),
+                updated_ts: Some("1780000010.123000".to_string()),
+                sharing: SlackChannelSharingClassification::Public,
+            },
+            is_member: true,
+            is_archived: false,
+        }
+    }
+
+    fn discovery_page(
+        channels: Vec<HostedSlackDiscoveredChannelV1>,
+        next_cursor: Option<String>,
+    ) -> HostedSlackChannelDiscoveryPageV1 {
+        HostedSlackChannelDiscoveryPageV1 {
+            observed_at: "2026-06-01T00:00:00Z".to_string(),
+            next_cursor,
+            channels,
         }
     }
 
@@ -2761,6 +2877,16 @@ mod tests {
         }
     }"#;
 
+    const DISCOVERY_PAGE_ONE: &str =
+        include_str!("../../../fixtures/hosted-v1/provider-v1/discovery-page-one-v1.json");
+    const DISCOVERY_PAGE_TWO: &str =
+        include_str!("../../../fixtures/hosted-v1/provider-v1/discovery-page-two-v1.json");
+    const DISCOVERY_MALFORMED_UPDATED: &str =
+        include_str!("../../../fixtures/hosted-v1/provider-v1/discovery-malformed-updated-v1.json");
+    const DISCOVERY_SANITIZED_CHANNEL: &[u8] = include_bytes!(
+        "../../../fixtures/hosted-v1/provider-v1/discovery-sanitized-channel-v1.json"
+    );
+
     #[test]
     fn production_wire_boundary_discards_private_urls_email_headers_cookies_and_raw_content() {
         let history = serde_json::from_slice::<HistoryResponse>(HOSTILE_HISTORY).unwrap();
@@ -2776,9 +2902,23 @@ mod tests {
             "C08ENGINEER1".to_string(),
         )
         .unwrap();
-        let sanitized =
-            serde_json::to_string(&(provider_page(history, "C08ENGINEER1").unwrap(), user, file))
-                .unwrap();
+        let mut discovery_response =
+            serde_json::from_str::<ConversationsListResponse>(DISCOVERY_PAGE_ONE).unwrap();
+        let discovered = provider_discovered_channel(
+            discovery_response.channels.take().unwrap().remove(0),
+            "T08LOCALITY1",
+        )
+        .unwrap();
+        let mut exact_discovered = serde_json::to_vec_pretty(&discovered).unwrap();
+        exact_discovered.push(b'\n');
+        assert_eq!(exact_discovered, DISCOVERY_SANITIZED_CHANNEL);
+        let sanitized = serde_json::to_string(&(
+            provider_page(history, "C08ENGINEER1").unwrap(),
+            user,
+            file,
+            discovered,
+        ))
+        .unwrap();
         for forbidden in [
             "authorization",
             "cookie",
@@ -2790,6 +2930,11 @@ mod tests {
             "user-secret",
             "raw-file-secret",
             "secret@example.invalid",
+            "discovery-secret",
+            "discovery-cookie",
+            "private-message-secret",
+            "discovery-file-secret",
+            "discovery-secret@example.invalid",
         ] {
             assert!(!sanitized.to_ascii_lowercase().contains(forbidden));
         }
@@ -2881,47 +3026,6 @@ mod tests {
             "enterprise_id": "E08LOCALITY1",
             "is_enterprise_install": false
         }"#;
-        let first_page = r#"{
-            "ok": true,
-            "channels": [{
-                "id": "C08ENGINEER1",
-                "context_team_id": "T08LOCALITY1",
-                "team_id": "T08LOCALITY1",
-                "name": "engineering",
-                "topic": {"value": "Build safely"},
-                "purpose": {"value": "Engineering"},
-                "created": 1780000000,
-                "updated": 1780000010,
-                "is_archived": false,
-                "is_private": true,
-                "is_shared": false,
-                "is_ext_shared": false,
-                "is_org_shared": false,
-                "is_member": true,
-                "shared_team_ids": ["T08LOCALITY1"]
-            }],
-            "response_metadata": {"next_cursor": "page-two"}
-        }"#;
-        let second_page = r#"{
-            "ok": true,
-            "channels": [{
-                "id": "C08GENERAL01",
-                "context_team_id": "T08LOCALITY1",
-                "team_id": "T08LOCALITY1",
-                "name": "general",
-                "topic": {"value": ""},
-                "purpose": {"value": ""},
-                "created": 1780000020,
-                "is_archived": true,
-                "is_private": false,
-                "is_shared": false,
-                "is_ext_shared": false,
-                "is_org_shared": false,
-                "is_member": false,
-                "shared_team_ids": []
-            }],
-            "response_metadata": {"next_cursor": ""}
-        }"#;
         let (base_url, requests, server) = spawn_stub_server(vec![
             StubResponse {
                 status: "200 OK",
@@ -2931,12 +3035,12 @@ mod tests {
             StubResponse {
                 status: "200 OK",
                 headers: Vec::new(),
-                body: first_page,
+                body: DISCOVERY_PAGE_ONE,
             },
             StubResponse {
                 status: "200 OK",
                 headers: Vec::new(),
-                body: second_page,
+                body: DISCOVERY_PAGE_TWO,
             },
         ]);
         let provider = test_provider(base_url);
@@ -2956,6 +3060,10 @@ mod tests {
         assert!(discovery.channels[0].is_member);
         assert!(discovery.channels[1].is_archived);
         assert_eq!(
+            discovery.channels[0].channel.updated_ts.as_deref(),
+            Some("1780000010.123000")
+        );
+        assert_eq!(
             requests.recv().unwrap().lines().next(),
             Some("POST /auth.test HTTP/1.1")
         );
@@ -2972,6 +3080,177 @@ mod tests {
             )
         );
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovery_accepts_exact_bounds_and_rejects_oversize_pages_cursors_and_cycles() {
+        let pages = (0..MAX_HOSTED_SLACK_DISCOVERY_PAGES_V1)
+            .map(|page_index| {
+                let start = page_index * HOSTED_SLACK_DISCOVERY_PAGE_LIMIT_V1 as usize;
+                let channels = (start..start + HOSTED_SLACK_DISCOVERY_PAGE_LIMIT_V1 as usize)
+                    .map(indexed_discovered_channel)
+                    .collect();
+                let next_cursor = (page_index + 1 < MAX_HOSTED_SLACK_DISCOVERY_PAGES_V1)
+                    .then(|| format!("page-{}", page_index + 2));
+                Ok(discovery_page(channels, next_cursor))
+            })
+            .collect::<Vec<_>>();
+        let exact = StubDiscoveryProvider::new(pages);
+        let discovery = discover_hosted_slack_channels_v1(
+            &exact,
+            &installation_binding(),
+            &HostedSlackDriveControlV1::new(
+                Instant::now() + Duration::from_secs(10),
+                HostedSlackCancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            discovery.channels.len(),
+            MAX_HOSTED_SLACK_DISCOVERY_CHANNELS_V1
+        );
+        assert_eq!(
+            exact.requests.lock().unwrap().len(),
+            MAX_HOSTED_SLACK_DISCOVERY_PAGES_V1
+        );
+
+        let oversized_page = StubDiscoveryProvider::new([Ok(discovery_page(
+            (0..=HOSTED_SLACK_DISCOVERY_PAGE_LIMIT_V1 as usize)
+                .map(indexed_discovered_channel)
+                .collect(),
+            None,
+        ))]);
+        assert_eq!(
+            discover_hosted_slack_channels_v1(
+                &oversized_page,
+                &installation_binding(),
+                &HostedSlackDriveControlV1::new(
+                    Instant::now() + Duration::from_secs(10),
+                    HostedSlackCancellationToken::new(),
+                    None,
+                ),
+            )
+            .await,
+            Err(HostedSlackProviderError::LimitExceeded(
+                "discovery page channels"
+            ))
+        );
+
+        let oversized_cursor = StubDiscoveryProvider::new([Ok(discovery_page(
+            Vec::new(),
+            Some("x".repeat(MAX_HOSTED_SLACK_DISCOVERY_CURSOR_BYTES_V1 + 1)),
+        ))]);
+        assert_eq!(
+            discover_hosted_slack_channels_v1(
+                &oversized_cursor,
+                &installation_binding(),
+                &HostedSlackDriveControlV1::new(
+                    Instant::now() + Duration::from_secs(10),
+                    HostedSlackCancellationToken::new(),
+                    None,
+                ),
+            )
+            .await,
+            Err(HostedSlackProviderError::LimitExceeded("discovery cursor"))
+        );
+
+        let never_ending = StubDiscoveryProvider::new(
+            (0..MAX_HOSTED_SLACK_DISCOVERY_PAGES_V1).map(|page_index| {
+                Ok(discovery_page(
+                    Vec::new(),
+                    Some(format!("page-{}", page_index + 2)),
+                ))
+            }),
+        );
+        assert_eq!(
+            discover_hosted_slack_channels_v1(
+                &never_ending,
+                &installation_binding(),
+                &HostedSlackDriveControlV1::new(
+                    Instant::now() + Duration::from_secs(10),
+                    HostedSlackCancellationToken::new(),
+                    None,
+                ),
+            )
+            .await,
+            Err(HostedSlackProviderError::LimitExceeded("discovery pages"))
+        );
+        assert_eq!(
+            never_ending.requests.lock().unwrap().len(),
+            MAX_HOSTED_SLACK_DISCOVERY_PAGES_V1
+        );
+
+        let repeated_cursor = StubDiscoveryProvider::new([
+            Ok(discovery_page(
+                vec![indexed_discovered_channel(1)],
+                Some("same-cursor".to_string()),
+            )),
+            Ok(discovery_page(
+                vec![indexed_discovered_channel(2)],
+                Some("same-cursor".to_string()),
+            )),
+        ]);
+        assert_eq!(
+            discover_hosted_slack_channels_v1(
+                &repeated_cursor,
+                &installation_binding(),
+                &HostedSlackDriveControlV1::new(
+                    Instant::now() + Duration::from_secs(10),
+                    HostedSlackCancellationToken::new(),
+                    None,
+                ),
+            )
+            .await,
+            Err(HostedSlackProviderError::InvalidResponse(
+                "repeated discovery cursor"
+            ))
+        );
+        assert_eq!(
+            repeated_cursor.requests.lock().unwrap().as_slice(),
+            [
+                HostedSlackChannelDiscoveryRequestV1 {
+                    cursor: None,
+                    limit: HOSTED_SLACK_DISCOVERY_PAGE_LIMIT_V1,
+                },
+                HostedSlackChannelDiscoveryRequestV1 {
+                    cursor: Some("same-cursor".to_string()),
+                    limit: HOSTED_SLACK_DISCOVERY_PAGE_LIMIT_V1,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_rejects_malformed_and_out_of_range_updated_timestamps_without_leaking() {
+        let (base_url, _requests, server) = spawn_stub_server(vec![StubResponse {
+            status: "200 OK",
+            headers: Vec::new(),
+            body: DISCOVERY_MALFORMED_UPDATED,
+        }]);
+        let provider = test_provider(base_url);
+        let error = provider
+            .conversations_list(HostedSlackChannelDiscoveryRequestV1 {
+                cursor: None,
+                limit: HOSTED_SLACK_DISCOVERY_PAGE_LIMIT_V1,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error, HostedSlackProviderError::InvalidResponse("JSON"));
+        assert!(!error.to_string().contains("malformed-timestamp-secret"));
+        server.join().unwrap();
+
+        let mut response =
+            serde_json::from_str::<ConversationsListResponse>(DISCOVERY_PAGE_ONE).unwrap();
+        let mut channel = response.channels.take().unwrap().remove(0);
+        channel.updated = Some(u64::MAX);
+        assert_eq!(
+            provider_discovered_channel(channel, "T08LOCALITY1"),
+            Err(HostedSlackProviderError::Portable(
+                HostedSlackPortableError::InvalidTimestamp("channel.updated_ts")
+            ))
+        );
     }
 
     #[test]
