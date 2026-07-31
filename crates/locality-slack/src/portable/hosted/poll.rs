@@ -26,6 +26,8 @@ pub const HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1: u16 = 1;
 pub const HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V1: u16 = 1;
 pub const HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2: u16 = 2;
 pub const HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2: u16 = 2;
+pub const HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3: u16 = 3;
+pub const HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3: u16 = 3;
 pub const MAX_HOSTED_SLACK_POLL_PAGE_BYTES_V1: usize = 512 * 1024;
 pub const MAX_HOSTED_SLACK_POLL_PAGE_MESSAGES_V1: usize = 512;
 pub const MAX_HOSTED_SLACK_POLL_PAGE_USERS_V1: usize = 512;
@@ -128,7 +130,9 @@ pub fn hosted_slack_replies_page_reference_closure_v1(
 impl HostedSlackHistoryPageV1 {
     pub fn validate(&self) -> Result<(), HostedSlackPollError> {
         validate_page_versions(self.page_format_version, self.minimum_reader_version)?;
-        if self.page_format_version != HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1 {
+        if (self.poll_kind == HostedSlackPollKindV1::Incremental)
+            != (self.page_format_version == HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3)
+        {
             return Err(HostedSlackPollError::UnsupportedVersion {
                 format_version: self.page_format_version,
                 minimum_reader_version: self.minimum_reader_version,
@@ -198,6 +202,14 @@ impl HostedSlackHistoryPageV1 {
 impl HostedSlackRepliesPageV1 {
     pub fn validate(&self) -> Result<(), HostedSlackPollError> {
         validate_page_versions(self.page_format_version, self.minimum_reader_version)?;
+        if (self.poll_kind == HostedSlackPollKindV1::Incremental)
+            != (self.page_format_version == HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3)
+        {
+            return Err(HostedSlackPollError::UnsupportedVersion {
+                format_version: self.page_format_version,
+                minimum_reader_version: self.minimum_reader_version,
+            });
+        }
         if !matches!(
             self.phase,
             HostedSlackPollPhaseV1::HistoricalReplies | HostedSlackPollPhaseV1::CatchUpReplies
@@ -306,7 +318,20 @@ impl HostedSlackRepliesPageV1 {
 pub fn decode_hosted_slack_history_page_v1(
     bytes: &[u8],
 ) -> Result<HostedSlackHistoryPageV1, HostedSlackPollError> {
+    decode_hosted_slack_history_page_for_reader(
+        bytes,
+        HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3,
+        HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3,
+    )
+}
+
+fn decode_hosted_slack_history_page_for_reader(
+    bytes: &[u8],
+    supported_format_version: u16,
+    supported_reader_version: u16,
+) -> Result<HostedSlackHistoryPageV1, HostedSlackPollError> {
     validate_page_bytes("history page", bytes)?;
+    validate_page_header_for_reader(bytes, supported_format_version, supported_reader_version)?;
     let page = serde_json::from_slice::<HostedSlackHistoryPageV1>(bytes)
         .map_err(|_| HostedSlackPollError::InvalidJson("history page"))?;
     page.validate()?;
@@ -316,7 +341,20 @@ pub fn decode_hosted_slack_history_page_v1(
 pub fn decode_hosted_slack_replies_page_v1(
     bytes: &[u8],
 ) -> Result<HostedSlackRepliesPageV1, HostedSlackPollError> {
+    decode_hosted_slack_replies_page_for_reader(
+        bytes,
+        HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3,
+        HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3,
+    )
+}
+
+fn decode_hosted_slack_replies_page_for_reader(
+    bytes: &[u8],
+    supported_format_version: u16,
+    supported_reader_version: u16,
+) -> Result<HostedSlackRepliesPageV1, HostedSlackPollError> {
     validate_page_bytes("replies page", bytes)?;
+    validate_page_header_for_reader(bytes, supported_format_version, supported_reader_version)?;
     let page = serde_json::from_slice::<HostedSlackRepliesPageV1>(bytes)
         .map_err(|_| HostedSlackPollError::InvalidJson("replies page"))?;
     page.validate()?;
@@ -680,11 +718,40 @@ fn validate_page_versions(
         ) | (
             HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2,
             HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2
+        ) | (
+            HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3,
+            HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3
         )
     ) {
         return Err(HostedSlackPollError::UnsupportedVersion {
             format_version,
             minimum_reader_version,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct HostedSlackPollPageVersionHeader {
+    page_format_version: u16,
+    minimum_reader_version: u16,
+}
+
+fn validate_page_header_for_reader(
+    bytes: &[u8],
+    supported_format_version: u16,
+    supported_reader_version: u16,
+) -> Result<(), HostedSlackPollError> {
+    let header = serde_json::from_slice::<HostedSlackPollPageVersionHeader>(bytes)
+        .map_err(|_| HostedSlackPollError::InvalidJson("poll page"))?;
+    validate_page_versions(header.page_format_version, header.minimum_reader_version)?;
+    if header.page_format_version > supported_format_version
+        || header.minimum_reader_version > supported_reader_version
+    {
+        return Err(HostedSlackPollError::ReaderUpdateRequired {
+            format_version: header.page_format_version,
+            minimum_reader_version: header.minimum_reader_version,
+            supported_reader_version,
         });
     }
     Ok(())
@@ -1390,12 +1457,20 @@ fn rebuild_candidate_reference_metadata(
         .iter()
         .flat_map(|message| message.file_ids.iter().cloned())
         .collect::<BTreeSet<_>>();
-    let mut files = Vec::new();
+    let mut files = if checkpoint.poll_kind == HostedSlackPollKindV1::Incremental {
+        checkpoint
+            .candidate
+            .files
+            .iter()
+            .filter(|file| referenced_file_ids.contains(&file.id))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
     for evidence in &checkpoint.evidence {
         let page_files = match evidence {
-            HostedSlackPollEvidenceV1::IncrementalBaseline { candidate, .. } => {
-                candidate.files.clone()
-            }
+            HostedSlackPollEvidenceV1::IncrementalBaseline { .. } => continue,
             HostedSlackPollEvidenceV1::AppliedPage { page } => page_reference_metadata(page)?.1,
             HostedSlackPollEvidenceV1::BeginCatchUp { .. } => continue,
         };
@@ -1413,12 +1488,20 @@ fn rebuild_candidate_reference_metadata(
         .filter_map(|message| message.user_id.clone())
         .collect::<BTreeSet<_>>();
     referenced_user_ids.extend(files.iter().filter_map(|file| file.user_id.clone()));
-    let mut users = Vec::new();
+    let mut users = if checkpoint.poll_kind == HostedSlackPollKindV1::Incremental {
+        checkpoint
+            .candidate
+            .users
+            .iter()
+            .filter(|user| referenced_user_ids.contains(&user.id))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
     for evidence in &checkpoint.evidence {
         let page_users = match evidence {
-            HostedSlackPollEvidenceV1::IncrementalBaseline { candidate, .. } => {
-                candidate.users.clone()
-            }
+            HostedSlackPollEvidenceV1::IncrementalBaseline { .. } => continue,
             HostedSlackPollEvidenceV1::AppliedPage { page } => page_reference_metadata(page)?.0,
             HostedSlackPollEvidenceV1::BeginCatchUp { .. } => continue,
         };
@@ -1665,9 +1748,16 @@ fn normalized_root_id(message: &RawHostedSlackMessage) -> Option<&str> {
 // format/minimum-reader pair reserves this terminal tombstone shape for a root
 // Slack reports as thread_not_found, including after continuation pages.
 fn is_deleted_root_reconciliation_page(page: &HostedSlackRepliesPageV1) -> bool {
-    page.page_format_version == HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2
-        && page.minimum_reader_version == HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2
-        && page.next_cursor.is_none()
+    matches!(
+        (page.page_format_version, page.minimum_reader_version),
+        (
+            HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2,
+            HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2
+        ) | (
+            HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3,
+            HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3
+        )
+    ) && page.next_cursor.is_none()
         && page.root_reply_count == 0
         && page.messages.len() == 1
         && page.messages[0].ts == page.root_message_id
@@ -1710,4 +1800,48 @@ fn ensure_unique_page_values<'a>(
         return Err(HostedSlackPollError::DuplicateValue(field));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod wire_compatibility_tests {
+    use super::*;
+
+    const MALFORMED_V3_INCREMENTAL_PAGE: &[u8] = br#"{
+        "page_format_version":3,
+        "minimum_reader_version":3,
+        "poll_kind":"incremental",
+        "would_fail_if_parsed":true
+    }"#;
+
+    #[test]
+    fn v2_reader_rejects_incremental_history_page_before_body_decode() {
+        assert_eq!(
+            decode_hosted_slack_history_page_for_reader(
+                MALFORMED_V3_INCREMENTAL_PAGE,
+                HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2,
+                HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2,
+            ),
+            Err(HostedSlackPollError::ReaderUpdateRequired {
+                format_version: HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3,
+                minimum_reader_version: HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3,
+                supported_reader_version: HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2,
+            })
+        );
+    }
+
+    #[test]
+    fn v2_reader_rejects_incremental_replies_page_before_body_decode() {
+        assert_eq!(
+            decode_hosted_slack_replies_page_for_reader(
+                MALFORMED_V3_INCREMENTAL_PAGE,
+                HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2,
+                HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2,
+            ),
+            Err(HostedSlackPollError::ReaderUpdateRequired {
+                format_version: HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3,
+                minimum_reader_version: HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3,
+                supported_reader_version: HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2,
+            })
+        );
+    }
 }

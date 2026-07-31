@@ -1,5 +1,6 @@
 use locality_protocol::{HostedSlackChannelSelector, ProviderSourceScopeSelector};
 use locality_slack::portable::hosted::{
+    HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3, HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3,
     HostedSlackHistoryMessageV1, HostedSlackHistoryPageV1, HostedSlackPageApplyOutcomeV1,
     HostedSlackPollCheckpointV1, HostedSlackPollError, HostedSlackPollKindV1,
     HostedSlackPollOutputV1, HostedSlackPollPhaseV1, HostedSlackRepliesPageV1,
@@ -1158,6 +1159,16 @@ fn incremental_poll_starts_from_applied_candidate_and_skips_historical_and_untou
     );
     assert_eq!(incremental.backfill_cut_at(), "2026-06-02T00:00:00Z");
     let encoded = serde_json::to_vec(&incremental).unwrap();
+    let encoded_value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(encoded_value["evidence"][0]["kind"], "incremental_baseline");
+    assert!(encoded_value["evidence"][0].get("candidate").is_none());
+    assert!(
+        serde_json::to_vec(&encoded_value["evidence"][0])
+            .unwrap()
+            .len()
+            < 256,
+        "the applied candidate must not be duplicated into replay evidence"
+    );
     assert_eq!(
         decode_hosted_slack_poll_checkpoint_v1(&encoded).unwrap(),
         incremental
@@ -1167,6 +1178,8 @@ fn incremental_poll_starts_from_applied_candidate_and_skips_historical_and_untou
         .begin_catch_up("2026-06-02T00:05:00Z".to_string())
         .unwrap();
     let mut page = catch_up_page();
+    page.page_format_version = HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3;
+    page.minimum_reader_version = HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3;
     page.poll_kind = HostedSlackPollKindV1::Incremental;
     page.backfill_cut_at = "2026-06-02T00:00:00Z".to_string();
     page.poll_overlap_watermark = "2026-06-01T23:55:00Z".to_string();

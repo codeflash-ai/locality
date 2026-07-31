@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use super::checkpoint::{
-    HostedSlackPollCheckpointV1, HostedSlackPollError, HostedSlackPollPhaseV1,
+    HostedSlackPollCheckpointV1, HostedSlackPollError, HostedSlackPollKindV1,
+    HostedSlackPollPhaseV1,
 };
 use super::identity::{
     HostedSlackInstallationBinding, HostedSlackObservedInstallationIdentity,
@@ -29,8 +30,9 @@ use super::native::{
 };
 use super::poll::{
     HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1, HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2,
-    HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V1,
-    HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2, HostedSlackHistoryMessageV1,
+    HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3, HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V1,
+    HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2,
+    HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3, HostedSlackHistoryMessageV1,
     HostedSlackHistoryPageV1, HostedSlackPollOutputV1, HostedSlackRepliesPageV1,
     hosted_slack_history_page_reference_closure_v1, hosted_slack_replies_page_reference_closure_v1,
 };
@@ -876,6 +878,20 @@ fn replies_request(
     })
 }
 
+fn poll_page_version(checkpoint: &HostedSlackPollCheckpointV1) -> (u16, u16) {
+    if checkpoint.poll_kind() == HostedSlackPollKindV1::Incremental {
+        (
+            HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3,
+            HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3,
+        )
+    } else {
+        (
+            HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1,
+            HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V1,
+        )
+    }
+}
+
 fn history_poll_page(
     checkpoint: &HostedSlackPollCheckpointV1,
     request: &HostedSlackHistoryRequestV1,
@@ -904,9 +920,10 @@ fn history_poll_page(
         })
         .collect::<Result<Vec<_>, HostedSlackProviderError>>()?;
     let selector = checkpoint.selector();
+    let (page_format_version, minimum_reader_version) = poll_page_version(checkpoint);
     let page = HostedSlackHistoryPageV1 {
-        page_format_version: HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1,
-        minimum_reader_version: HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V1,
+        page_format_version,
+        minimum_reader_version,
         poll_kind: checkpoint.poll_kind(),
         phase: request.phase,
         installation_id: selector.installation_id,
@@ -961,9 +978,10 @@ fn replies_poll_page(
             ))?
     };
     let selector = checkpoint.selector();
+    let (page_format_version, minimum_reader_version) = poll_page_version(checkpoint);
     let page = HostedSlackRepliesPageV1 {
-        page_format_version: HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1,
-        minimum_reader_version: HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V1,
+        page_format_version,
+        minimum_reader_version,
         poll_kind: checkpoint.poll_kind(),
         phase: request.phase,
         installation_id: selector.installation_id,
@@ -1009,9 +1027,21 @@ fn deleted_root_reconciliation_page(
     root.deleted = true;
     root.file_ids.clear();
     let selector = checkpoint.selector();
+    let (page_format_version, minimum_reader_version) =
+        if checkpoint.poll_kind() == HostedSlackPollKindV1::Incremental {
+            (
+                HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3,
+                HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3,
+            )
+        } else {
+            (
+                HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2,
+                HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2,
+            )
+        };
     let page = HostedSlackRepliesPageV1 {
-        page_format_version: HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2,
-        minimum_reader_version: HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2,
+        page_format_version,
+        minimum_reader_version,
         poll_kind: checkpoint.poll_kind(),
         phase: request.phase,
         installation_id: selector.installation_id,
