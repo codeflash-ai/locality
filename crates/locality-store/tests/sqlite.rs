@@ -116,8 +116,8 @@ fn sqlite_store_seeds_state_compatibility_components() {
             (
                 "durable:generation_delivery".to_string(),
                 "durable_transaction".to_string(),
-                5,
-                5,
+                6,
+                6,
                 1,
                 0
             ),
@@ -423,7 +423,7 @@ discovery_projection_transactions: transaction_id, mount_id, projection_json, st
 entities: mount_id, remote_id, kind_json, title, path, hydration_json, content_hash, remote_edited_at
 entity_search_fts: mount_id, remote_id, title, path, observed_title, observed_path
 freshness_states: mount_id, remote_id, tier_json, last_checked_at, next_check_at, last_opened_at, last_local_change_at, remote_hint_pending
-generation_apply_journals: delta_id, mount_id, source_connection_id, base_generation_id, target_generation_id, delta_json, receipt_json, receipt_sha256, selected_capabilities_json, acknowledgment_required, acknowledged_at, stage_root, status, active, created_at, updated_at, completed_at
+generation_apply_journals: delta_id, mount_id, source_connection_id, base_generation_id, target_generation_id, delta_json, receipt_json, receipt_sha256, selected_capabilities_json, selection_binding, acknowledgment_required, acknowledged_at, stage_root, status, active, created_at, updated_at, completed_at
 generation_apply_outcomes: delta_id, entry_index, outcome_json, updated_at
 generation_inode_evidence: delta_id, entry_index, mount_id, logical_path, evidence_name, expected_sha256, byte_length, base_payload_delta_id, base_payload_entry_index, created_at
 generation_paths: mount_id, projection_id, logical_path, local_logical_path, base_generation_id, base_identity_json, base_payload_delta_id, base_payload_entry_index, conflict_payload_delta_id, conflict_payload_entry_index, state, incoming_identity_json, updated_at

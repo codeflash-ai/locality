@@ -250,7 +250,12 @@ where
             &mut self.transport,
             &poll.selected_capabilities,
         )?;
-        if poll.selected_capabilities.terminal_receipt_acknowledgments {
+        let acknowledgment_required = store
+            .get_generation_apply_v2(&acknowledgment.delta_id)?
+            .ok_or(GenerationSyncError::JournalMismatch)?
+            .selection_binding
+            .terminal_receipt_acknowledgments();
+        if acknowledgment_required {
             acknowledge_terminal_receipt(store, &mut self.transport, &acknowledgment)?;
         }
         Ok(summary)
@@ -418,7 +423,12 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
     if let Some(existing) = &existing {
         if existing.apply.delta != delivery.delta
             || existing.apply.receipt != delivery.terminal_receipt
-            || existing.selected_capabilities != capabilities
+            || existing
+                .selection_binding
+                .selected_capabilities()
+                .is_some_and(|bound| bound != &capabilities)
+            || (existing.selection_binding.selected_capabilities().is_none()
+                && existing.apply.status != GenerationApplyStatus::Completed)
         {
             return Err(GenerationSyncError::JournalMismatch);
         }
@@ -454,7 +464,11 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
         },
         capabilities.clone(),
     ))?;
-    let capabilities = negotiated_journal.selected_capabilities;
+    let capabilities = negotiated_journal
+        .selection_binding
+        .selected_capabilities()
+        .cloned()
+        .ok_or(GenerationSyncError::JournalMismatch)?;
     let journal = negotiated_journal.apply;
     let already_recorded = journal
         .outcomes
@@ -3343,8 +3357,9 @@ mod tests {
                 .get_generation_apply_v2("delta-windowed-content")
                 .unwrap()
                 .unwrap()
-                .selected_capabilities,
-            client.transport().capabilities
+                .selection_binding
+                .selected_capabilities(),
+            Some(&client.transport().capabilities)
         );
         assert_eq!(
             client.transport().versioned_requests[0].capabilities,
@@ -3355,6 +3370,64 @@ mod tests {
             client.transport().capabilities,
             "authenticated selection must not mutate the next client offer"
         );
+    }
+
+    #[test]
+    fn completed_pre_binding_journal_replays_without_selection_mismatch() {
+        let fixture = Fixture::new("completed-pre-binding-replay");
+        let mut store = seed(&fixture, Vec::new());
+        let delivery = delivery("delta-pre-binding-replay", Vec::new());
+        let selected = GenerationTransportCapabilities {
+            body_windows: Some(
+                locality_protocol::freshness_delivery_transport::GenerationBodyWindowCapability {
+                    max_window_bytes: 64 * 1024,
+                },
+            ),
+            terminal_receipt_acknowledgments: true,
+            generation_pin_leases: Some(
+                locality_protocol::freshness_delivery_transport::GenerationPinLeaseCapability {
+                    min_lease_seconds: 60,
+                    max_lease_seconds: 600,
+                    max_active_leases_per_device: 4,
+                    fallback_policies: vec![
+                        locality_protocol::freshness_delivery_transport::GenerationPinFallbackPolicy::RequireExact,
+                    ],
+                },
+            ),
+            ..GenerationTransportCapabilities::legacy()
+        };
+        apply_authorized_delivery_with_capabilities(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            delivery.clone(),
+            &mut FakeTransport::default(),
+            &selected,
+        )
+        .unwrap();
+
+        let connection = rusqlite::Connection::open(&store.db_path).unwrap();
+        connection
+            .execute(
+                "UPDATE generation_apply_journals
+                 SET selection_binding = 'pre_binding_completed',
+                     selected_capabilities_json = '{}'
+                 WHERE delta_id = ?1",
+                [&delivery.delta.delta_id],
+            )
+            .unwrap();
+        drop(connection);
+
+        let replay = apply_authorized_delivery_with_capabilities(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            delivery,
+            &mut FakeTransport::default(),
+            &GenerationTransportCapabilities::legacy(),
+        )
+        .expect("completed pre-binding state must be an exact no-op replay");
+        assert!(replay.replayed);
     }
 
     #[test]

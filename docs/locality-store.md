@@ -66,6 +66,11 @@
   authenticated transport selection to each apply journal. Exact retries and
   recovery therefore preserve body-window bounds, acknowledgment state, and
   selected pin-lease policy without renegotiating an in-flight apply.
+- Generation-delivery component v6 marks whether that selection is fully bound.
+  Ambiguous active v25 journals fail migration atomically; completed pre-binding
+  journals permit only exact terminal replay and preserve only their recorded
+  acknowledgment requirement. Prerelease v26 rows are bound only when their
+  stored body-window or pin data proves the complete selection.
 - SQLite records component versions for durable subsystems so compatibility is
   decided from persisted state contracts instead of desktop build IDs.
 - SQLite enables WAL mode, a busy timeout, foreign keys, and `PRAGMA user_version` schema versioning.

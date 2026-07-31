@@ -35,6 +35,17 @@ acknowledgment selection, and pin-lease policy. An exact reservation replay must
 match that complete selection. Recovery uses the stored selection, so adapter
 configuration changes cannot renegotiate an in-flight apply.
 
+Prerelease schema-v25 journals predate that complete binding. Migration fails
+atomically when such a journal is still active because its acknowledgment bit
+cannot prove whether body windows or pins were selected; the prerelease reader
+must finish that apply before migration is retried. A completed pre-binding
+journal may migrate because it can no longer fetch content or exercise pin
+policy. Its only legal replay is an exact delta/receipt no-op, and only its
+recorded acknowledgment bit remains operative. No capability selection is
+inferred for that terminal state. Older component-v3 active journals are known
+legacy transport and can be bound faithfully. Prerelease component-v5 journals
+with persisted body-window or pin data also retain that exact selection.
+
 An existing adapter can continue implementing the original
 `GenerationDeliveryTransport` trait and `GenerationDeliveryRequest` without
 source changes. `next_delta_versioned` and `next_delta_poll` are additive

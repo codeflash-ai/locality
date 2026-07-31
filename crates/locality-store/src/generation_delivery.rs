@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{StoreError, StoreResult};
 
-pub const GENERATION_DELIVERY_COMPONENT_VERSION: i64 = 5;
+pub const GENERATION_DELIVERY_COMPONENT_VERSION: i64 = 6;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservedGenerationRecord {
@@ -193,12 +193,41 @@ pub struct GenerationApplyJournalRecord {
     pub completed_at: Option<String>,
 }
 
-/// Additive journal view containing the immutable negotiated transport
-/// selection without changing the original public journal struct.
+/// Additive journal view containing either the immutable negotiated transport
+/// selection or the explicit terminal-only compatibility state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NegotiatedGenerationApplyJournalRecord {
     pub apply: GenerationApplyJournalRecord,
-    pub selected_capabilities: GenerationTransportCapabilities,
+    pub selection_binding: GenerationTransportSelectionBinding,
+}
+
+/// Whether a journal has a complete authenticated transport selection. A
+/// pre-binding journal is legal only after completion: replay is an exact
+/// delta/receipt no-op and only its recorded acknowledgment bit remains live.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GenerationTransportSelectionBinding {
+    Bound(GenerationTransportCapabilities),
+    PreBindingCompleted {
+        terminal_receipt_acknowledgments: bool,
+    },
+}
+
+impl GenerationTransportSelectionBinding {
+    pub fn selected_capabilities(&self) -> Option<&GenerationTransportCapabilities> {
+        match self {
+            Self::Bound(capabilities) => Some(capabilities),
+            Self::PreBindingCompleted { .. } => None,
+        }
+    }
+
+    pub const fn terminal_receipt_acknowledgments(&self) -> bool {
+        match self {
+            Self::Bound(capabilities) => capabilities.terminal_receipt_acknowledgments,
+            Self::PreBindingCompleted {
+                terminal_receipt_acknowledgments,
+            } => *terminal_receipt_acknowledgments,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -269,7 +298,9 @@ pub trait GenerationDeliveryRepository {
         self.reserve_generation_apply(prepared.apply).map(|apply| {
             NegotiatedGenerationApplyJournalRecord {
                 apply,
-                selected_capabilities: GenerationTransportCapabilities::legacy(),
+                selection_binding: GenerationTransportSelectionBinding::Bound(
+                    GenerationTransportCapabilities::legacy(),
+                ),
             }
         })
     }
@@ -300,7 +331,9 @@ pub trait GenerationDeliveryRepository {
         self.get_generation_apply(delta_id).map(|journal| {
             journal.map(|apply| NegotiatedGenerationApplyJournalRecord {
                 apply,
-                selected_capabilities: GenerationTransportCapabilities::legacy(),
+                selection_binding: GenerationTransportSelectionBinding::Bound(
+                    GenerationTransportCapabilities::legacy(),
+                ),
             })
         })
     }

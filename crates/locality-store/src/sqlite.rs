@@ -43,9 +43,9 @@ use crate::error::{StoreError, StoreResult};
 use crate::generation_delivery::{
     GENERATION_DELIVERY_COMPONENT_VERSION, GenerationApplyJournalRecord, GenerationApplyOutcome,
     GenerationApplyStatus, GenerationDeliveryRepository, GenerationInodeEvidenceRecord,
-    GenerationPathRecord, GenerationPathState, NegotiatedGenerationApplyJournalRecord,
-    ObservedGenerationRecord, PreparedGenerationApply, PreparedGenerationApplyV2,
-    PreparedGenerationApplyV3,
+    GenerationPathRecord, GenerationPathState, GenerationTransportSelectionBinding,
+    NegotiatedGenerationApplyJournalRecord, ObservedGenerationRecord, PreparedGenerationApply,
+    PreparedGenerationApplyV2, PreparedGenerationApplyV3,
 };
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
@@ -471,7 +471,7 @@ fn list_generation_paths_from_connection(
 
 struct StoredGenerationApply {
     journal: GenerationApplyJournalRecord,
-    selected_capabilities: GenerationTransportCapabilities,
+    selection_binding: GenerationTransportSelectionBinding,
     acknowledgment_required: bool,
     acknowledged_at: Option<String>,
 }
@@ -491,8 +491,8 @@ fn generation_apply_from_connection(
     let row = connection
         .query_row(
             "SELECT mount_id, delta_json, receipt_json, receipt_sha256,
-                    selected_capabilities_json, acknowledgment_required, acknowledged_at, stage_root, status,
-                    created_at, updated_at, completed_at
+                    selected_capabilities_json, selection_binding, acknowledgment_required,
+                    acknowledged_at, stage_root, status, active, created_at, updated_at, completed_at
              FROM generation_apply_journals WHERE delta_id = ?1",
             params![delta_id],
             |row| {
@@ -502,13 +502,15 @@ fn generation_apply_from_connection(
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, bool>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, bool>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                     row.get::<_, String>(8)?,
                     row.get::<_, String>(9)?,
-                    row.get::<_, String>(10)?,
-                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, bool>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, Option<String>>(13)?,
                 ))
             },
         )
@@ -539,29 +541,45 @@ fn generation_apply_from_connection(
             "generation apply `{delta_id}` mount relation does not match its delta"
         )));
     }
-    let selected_capabilities: GenerationTransportCapabilities = from_json(&row.4)?;
-    selected_capabilities
-        .validate()
-        .map_err(|error| StoreError::InvalidState(error.to_string()))?;
-    if selected_capabilities.terminal_receipt_acknowledgments != row.5 {
-        return Err(StoreError::InvalidState(format!(
-            "generation apply `{delta_id}` acknowledgment selection does not match its journal"
-        )));
-    }
+    let status = GenerationApplyStatus::parse(&row.9)?;
+    let selection_binding = match row.5.as_str() {
+        "bound" => {
+            let selected_capabilities: GenerationTransportCapabilities = from_json(&row.4)?;
+            selected_capabilities
+                .validate()
+                .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+            if selected_capabilities.terminal_receipt_acknowledgments != row.6 {
+                return Err(StoreError::InvalidState(format!(
+                    "generation apply `{delta_id}` acknowledgment selection does not match its journal"
+                )));
+            }
+            GenerationTransportSelectionBinding::Bound(selected_capabilities)
+        }
+        "pre_binding_completed" if status == GenerationApplyStatus::Completed && !row.10 => {
+            GenerationTransportSelectionBinding::PreBindingCompleted {
+                terminal_receipt_acknowledgments: row.6,
+            }
+        }
+        binding => {
+            return Err(StoreError::InvalidState(format!(
+                "generation apply `{delta_id}` has invalid transport selection binding `{binding}`"
+            )));
+        }
+    };
     Ok(Some(StoredGenerationApply {
-        selected_capabilities,
-        acknowledgment_required: row.5,
-        acknowledged_at: row.6,
+        selection_binding,
+        acknowledgment_required: row.6,
+        acknowledged_at: row.7,
         journal: GenerationApplyJournalRecord {
             delta,
             receipt: from_json(&row.2)?,
             receipt_sha256: row.3,
-            stage_root: row.7,
-            status: GenerationApplyStatus::parse(&row.8)?,
+            stage_root: row.8,
+            status,
             outcomes,
-            created_at: row.9,
-            updated_at: row.10,
-            completed_at: row.11,
+            created_at: row.11,
+            updated_at: row.12,
+            completed_at: row.13,
         },
     }))
 }
@@ -749,18 +767,25 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         if let Some(existing) =
             generation_apply_from_connection(&transaction, &prepared.delta.delta_id)?
         {
-            if existing.delta == prepared.delta
+            let immutable_apply_matches = existing.delta == prepared.delta
                 && existing.receipt == prepared.receipt
                 && existing.receipt_sha256 == prepared.receipt_sha256
-                && existing.selected_capabilities == selected_capabilities
-                && existing.acknowledgment_required == acknowledgment_required
                 && existing.stage_root == prepared.stage_root
-                && existing.created_at == prepared.created_at
-            {
+                && existing.created_at == prepared.created_at;
+            let selection_matches = match &existing.selection_binding {
+                GenerationTransportSelectionBinding::Bound(bound) => {
+                    bound == &selected_capabilities
+                        && existing.acknowledgment_required == acknowledgment_required
+                }
+                GenerationTransportSelectionBinding::PreBindingCompleted { .. } => {
+                    existing.status == GenerationApplyStatus::Completed
+                }
+            };
+            if immutable_apply_matches && selection_matches {
                 transaction.commit()?;
                 return Ok(NegotiatedGenerationApplyJournalRecord {
                     apply: existing.journal,
-                    selected_capabilities: existing.selected_capabilities,
+                    selection_binding: existing.selection_binding,
                 });
             }
             return Err(StoreError::InvalidState(format!(
@@ -825,9 +850,9 @@ impl GenerationDeliveryRepository for SqliteStateStore {
             "INSERT INTO generation_apply_journals (
                 delta_id, mount_id, source_connection_id, base_generation_id,
                 target_generation_id, delta_json, receipt_json, receipt_sha256,
-                selected_capabilities_json, acknowledgment_required, acknowledged_at,
+                selected_capabilities_json, selection_binding, acknowledgment_required, acknowledged_at,
                 stage_root, status, active, created_at, updated_at, completed_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, 'staged', 1, ?12, ?12, NULL)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'bound', ?10, NULL, ?11, 'staged', 1, ?12, ?12, NULL)",
             params![
                 prepared.delta.delta_id.as_str(),
                 prepared.delta.mount_id.as_str(),
@@ -848,7 +873,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         transaction.commit()?;
         Ok(NegotiatedGenerationApplyJournalRecord {
             apply: record.journal,
-            selected_capabilities: record.selected_capabilities,
+            selection_binding: record.selection_binding,
         })
     }
 
@@ -964,7 +989,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
             generation_apply_from_connection(&self.connection()?, delta_id)?.map(|stored| {
                 NegotiatedGenerationApplyJournalRecord {
                     apply: stored.journal,
-                    selected_capabilities: stored.selected_capabilities,
+                    selection_binding: stored.selection_binding,
                 }
             }),
         )
@@ -4238,7 +4263,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         migrate_journals_component_to_v3(connection)?;
         migrate_virtual_mutations_component_to_v3(connection)?;
         migrate_entity_search_component_to_v2(connection)?;
-        migrate_generation_delivery_to_v5(connection, None, true)?;
+        migrate_generation_delivery_to_v6(connection, None, true)?;
         return Ok(());
     }
 
@@ -4547,6 +4572,8 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             receipt_json TEXT NOT NULL,
             receipt_sha256 TEXT NOT NULL,
             selected_capabilities_json TEXT NOT NULL DEFAULT '{}',
+            selection_binding TEXT NOT NULL DEFAULT 'bound'
+                CHECK (selection_binding IN ('bound', 'pre_binding_unknown', 'pre_binding_completed')),
             acknowledgment_required INTEGER NOT NULL DEFAULT 0
                 CHECK (acknowledgment_required IN (0, 1)),
             acknowledged_at TEXT,
@@ -4854,7 +4881,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
     }
 
     if user_version < SCHEMA_VERSION {
-        migrate_generation_delivery_to_v5(
+        migrate_generation_delivery_to_v6(
             connection,
             (user_version >= 21).then_some(user_version),
             user_version >= 21,
@@ -4934,7 +4961,7 @@ fn state_component_issue_allows_schema_migration(
             component_id,
             found,
             current: GENERATION_DELIVERY_COMPONENT_VERSION,
-        } if component_id == "durable:generation_delivery" && matches!(*found, 1..=4)
+        } if component_id == "durable:generation_delivery" && matches!(*found, 1..=5)
     ) || matches!(
         issue,
         StateCompatibilityIssue::OlderComponent {
@@ -5714,6 +5741,8 @@ fn migrate_generation_delivery_journals_to_mount_relation(
             receipt_json TEXT NOT NULL,
             receipt_sha256 TEXT NOT NULL,
             selected_capabilities_json TEXT NOT NULL DEFAULT '{}',
+            selection_binding TEXT NOT NULL DEFAULT 'pre_binding_unknown'
+                CHECK (selection_binding IN ('bound', 'pre_binding_unknown', 'pre_binding_completed')),
             acknowledgment_required INTEGER NOT NULL DEFAULT 0
                 CHECK (acknowledgment_required IN (0, 1)),
             acknowledged_at TEXT,
@@ -5808,6 +5837,8 @@ fn create_generation_delivery_tables(connection: &Connection) -> StoreResult<()>
             receipt_json TEXT NOT NULL,
             receipt_sha256 TEXT NOT NULL,
             selected_capabilities_json TEXT NOT NULL DEFAULT '{}',
+            selection_binding TEXT NOT NULL DEFAULT 'bound'
+                CHECK (selection_binding IN ('bound', 'pre_binding_unknown', 'pre_binding_completed')),
             acknowledgment_required INTEGER NOT NULL DEFAULT 0
                 CHECK (acknowledgment_required IN (0, 1)),
             acknowledged_at TEXT,
@@ -5889,17 +5920,17 @@ fn migrate_virtual_mutations_component_to_v3(connection: &Connection) -> StoreRe
     migrate_state_component_to_current(connection, "durable:virtual_mutations")
 }
 
-fn migrate_generation_delivery_component_to_v5(connection: &Connection) -> StoreResult<()> {
+fn migrate_generation_delivery_component_to_v6(connection: &Connection) -> StoreResult<()> {
     migrate_state_component_to_current(connection, "durable:generation_delivery")
 }
 
-fn migrate_generation_delivery_to_v5(
+fn migrate_generation_delivery_to_v6(
     connection: &Connection,
     record_from_schema: Option<i64>,
     update_component: bool,
 ) -> StoreResult<()> {
     if record_from_schema.is_none()
-        && generation_delivery_storage_v5_is_complete(connection)?
+        && generation_delivery_storage_v6_is_complete(connection)?
         && (!update_component || generation_delivery_component_is_current(connection)?)
     {
         return Ok(());
@@ -5909,9 +5940,10 @@ fn migrate_generation_delivery_to_v5(
     migrate_generation_delivery_storage_to_v3(&transaction)?;
     migrate_generation_delivery_storage_to_v4(&transaction)?;
     migrate_generation_delivery_storage_to_v5(&transaction)?;
-    verify_generation_delivery_storage_v5(&transaction)?;
+    migrate_generation_delivery_storage_to_v6(&transaction)?;
+    verify_generation_delivery_storage_v6(&transaction)?;
     if update_component {
-        migrate_generation_delivery_component_to_v5(&transaction)?;
+        migrate_generation_delivery_component_to_v6(&transaction)?;
     }
     if let Some(from) = record_from_schema {
         record_schema_migration(&transaction, from, SCHEMA_VERSION)?;
@@ -6048,8 +6080,93 @@ fn migrate_generation_delivery_storage_to_v5(connection: &Connection) -> StoreRe
     Ok(())
 }
 
-fn verify_generation_delivery_storage_v5(connection: &Connection) -> StoreResult<()> {
-    if generation_delivery_storage_v5_is_complete(connection)? {
+fn migrate_generation_delivery_storage_to_v6(connection: &Connection) -> StoreResult<()> {
+    let prior_component_version = if table_exists(connection, "state_components")? {
+        connection
+            .query_row(
+                "SELECT version FROM state_components
+                 WHERE component_id = 'durable:generation_delivery'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+    } else {
+        None
+    };
+    let selected_capabilities_preexisted = column_exists(
+        connection,
+        "generation_apply_journals",
+        "selected_capabilities_json",
+    )? && prior_component_version
+        .is_some_and(|version| version >= 5);
+    add_column_if_missing(
+        connection,
+        "generation_apply_journals",
+        "selection_binding",
+        "TEXT NOT NULL DEFAULT 'pre_binding_unknown' CHECK (selection_binding IN ('bound', 'pre_binding_unknown', 'pre_binding_completed'))",
+    )?;
+
+    let candidates = {
+        let mut statement = connection.prepare(
+            "SELECT delta_id, status, active, selected_capabilities_json,
+                    acknowledgment_required
+             FROM generation_apply_journals
+             WHERE selection_binding = 'pre_binding_unknown'
+             ORDER BY delta_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, bool>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    for (delta_id, status, active, selected_json, acknowledgment_required) in candidates {
+        let known_legacy_binding =
+            prior_component_version.is_some_and(|version| version <= 3) && !acknowledgment_required;
+        let recoverable_persisted_binding = selected_capabilities_preexisted
+            && from_json::<GenerationTransportCapabilities>(&selected_json)
+                .ok()
+                .filter(|selected| {
+                    (selected.body_windows.is_some() || selected.generation_pin_leases.is_some())
+                        && selected.terminal_receipt_acknowledgments == acknowledgment_required
+                        && selected.validate().is_ok()
+                })
+                .is_some();
+        let recoverable_binding = known_legacy_binding || recoverable_persisted_binding;
+        if recoverable_binding {
+            connection.execute(
+                "UPDATE generation_apply_journals
+                 SET selected_capabilities_json = CASE
+                         WHEN ?2 THEN '{}' ELSE selected_capabilities_json END,
+                     selection_binding = 'bound'
+                 WHERE delta_id = ?1",
+                params![delta_id, known_legacy_binding],
+            )?;
+        } else if status == "completed" && !active {
+            connection.execute(
+                "UPDATE generation_apply_journals
+                 SET selection_binding = 'pre_binding_completed'
+                 WHERE delta_id = ?1",
+                params![delta_id],
+            )?;
+        } else {
+            return Err(StoreError::InvalidState(format!(
+                "active generation apply `{delta_id}` has no complete immutable transport selection; complete it with the prerelease database reader before retrying this migration"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_generation_delivery_storage_v6(connection: &Connection) -> StoreResult<()> {
+    if generation_delivery_storage_v6_is_complete(connection)? {
         return Ok(());
     }
     for (table, columns) in [
@@ -6073,6 +6190,7 @@ fn verify_generation_delivery_storage_v5(connection: &Connection) -> StoreResult
                 "acknowledgment_required",
                 "acknowledged_at",
                 "selected_capabilities_json",
+                "selection_binding",
             ][..],
         ),
     ] {
@@ -6096,10 +6214,15 @@ fn verify_generation_delivery_storage_v5(connection: &Connection) -> StoreResult
             "generation delivery migration left a null local logical path".to_string(),
         ));
     }
+    if !generation_delivery_storage_v6_is_complete(connection)? {
+        return Err(StoreError::InvalidState(
+            "generation delivery migration left an unsafe transport selection binding".to_string(),
+        ));
+    }
     Ok(())
 }
 
-fn generation_delivery_storage_v5_is_complete(connection: &Connection) -> StoreResult<bool> {
+fn generation_delivery_storage_v6_is_complete(connection: &Connection) -> StoreResult<bool> {
     for (table, columns) in [
         (
             "generation_paths",
@@ -6121,6 +6244,7 @@ fn generation_delivery_storage_v5_is_complete(connection: &Connection) -> StoreR
                 "acknowledgment_required",
                 "acknowledged_at",
                 "selected_capabilities_json",
+                "selection_binding",
             ][..],
         ),
     ] {
@@ -6137,7 +6261,20 @@ fn generation_delivery_storage_v5_is_complete(connection: &Connection) -> StoreR
         [],
         |row| row.get(0),
     )?;
-    Ok(!null_local_path)
+    if null_local_path {
+        return Ok(false);
+    }
+    let invalid_binding: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_apply_journals
+            WHERE selection_binding NOT IN ('bound', 'pre_binding_completed')
+               OR (selection_binding = 'pre_binding_completed'
+                   AND (status != 'completed' OR active != 0))
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(!invalid_binding)
 }
 
 fn migrate_journals_component_to_v3(connection: &Connection) -> StoreResult<()> {
