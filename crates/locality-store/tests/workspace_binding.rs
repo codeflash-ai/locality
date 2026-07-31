@@ -515,6 +515,18 @@ fn v21_transition_rolls_back_table_roots_components_and_version_on_failure() {
                  'Workspace', 'Workspace', '\"virtual\"', NULL, NULL),
                 ('notion-main', 'legacy-child', '\"page\"',
                  'Legacy child', 'Workspace/Legacy/page.md', '\"hydrated\"', NULL, NULL);
+             INSERT INTO entity_search_fts (
+                mount_id, remote_id, title, path, observed_title, observed_path
+             ) VALUES (
+                'notion-main', 'legacy-child', 'Rollback sentinel',
+                'Workspace/Legacy/page.md', NULL, NULL
+             );
+             INSERT INTO search_documents_fts (
+                mount_id, remote_id, connector, kind, title, path
+             ) VALUES (
+                'notion-main', 'legacy-child', 'notion', '\"page\"',
+                'Rollback sentinel', 'Workspace/Legacy/page.md'
+             );
              CREATE TRIGGER fail_workspace_binding_component
              BEFORE INSERT ON state_components
              WHEN NEW.component_id = 'durable:workspace_bindings'
@@ -578,6 +590,33 @@ fn v21_transition_rolls_back_table_roots_components_and_version_on_failure() {
             |row| row.get(0),
         )
         .expect("rolled-back legacy child path");
+    let legacy_fts_row: (String, String) = connection
+        .query_row(
+            "SELECT title, path FROM entity_search_fts
+             WHERE mount_id = 'notion-main' AND remote_id = 'legacy-child'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("rolled-back legacy FTS row");
+    let current_fts_row: (String, String) = connection
+        .query_row(
+            "SELECT title, path FROM search_documents_fts
+             WHERE mount_id = 'notion-main' AND remote_id = 'legacy-child'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("rolled-back current FTS row");
+    let partial_flattened_fts_rows: i64 = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM entity_search_fts
+                 WHERE remote_id = 'legacy-child' AND path = 'Legacy/page.md')
+              + (SELECT COUNT(*) FROM search_documents_fts
+                 WHERE remote_id = 'legacy-child' AND path = 'Legacy/page.md')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("partial flattened FTS rows");
     assert_eq!(user_version, 20);
     assert_eq!(binding_table_count, 0);
     assert_eq!(stored_root, shared_root.to_string_lossy());
@@ -585,6 +624,15 @@ fn v21_transition_rolls_back_table_roots_components_and_version_on_failure() {
     assert_eq!(retired_component_count, 1);
     assert_eq!(retired_root_count, 1);
     assert_eq!(legacy_child_path, "Workspace/Legacy/page.md");
+    assert_eq!(
+        legacy_fts_row,
+        (
+            "Rollback sentinel".to_string(),
+            "Workspace/Legacy/page.md".to_string(),
+        )
+    );
+    assert_eq!(current_fts_row, legacy_fts_row);
+    assert_eq!(partial_flattened_fts_rows, 0);
     connection
         .execute_batch("DROP TRIGGER fail_workspace_binding_component;")
         .expect("remove failpoint");
@@ -622,6 +670,31 @@ fn v21_transition_rolls_back_table_roots_components_and_version_on_failure() {
         )
         .expect("retired state after successful restart");
     assert_eq!(retired_state, (0, 0, "Legacy/page.md".to_string()));
+    let rebuilt_fts_rows: ((String, String), (String, String)) = (
+        connection
+            .query_row(
+                "SELECT title, path FROM entity_search_fts
+                 WHERE mount_id = 'notion-main' AND remote_id = 'legacy-child'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("rebuilt legacy FTS row"),
+        connection
+            .query_row(
+                "SELECT title, path FROM search_documents_fts
+                 WHERE mount_id = 'notion-main' AND remote_id = 'legacy-child'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("rebuilt current FTS row"),
+    );
+    assert_eq!(
+        rebuilt_fts_rows,
+        (
+            ("Legacy child".to_string(), "Legacy/page.md".to_string()),
+            ("Legacy child".to_string(), "Legacy/page.md".to_string()),
+        )
+    );
 }
 
 #[test]
