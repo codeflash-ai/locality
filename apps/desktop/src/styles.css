@@ -958,7 +958,6 @@ p {
 
 .onboarding-pill-row span,
 .onboarding-pill,
-.connector-option > span,
 .demo-tile span,
 .review-strip span {
   display: inline-flex;
@@ -1622,16 +1621,20 @@ p {
   gap: 12px;
 }
 
+.onboarding-source-list {
+  gap: 10px;
+}
+
 .connector-option {
   display: grid;
-  grid-template-columns: 34px minmax(0, 1fr) auto;
-  min-height: 72px;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  min-height: 90px;
   align-items: center;
   gap: 14px;
   width: 100%;
-  padding: 14px;
+  padding: 16px 18px;
   border: 1px solid var(--line);
-  border-radius: 15px;
+  border-radius: 14px;
   background: var(--surface-raised);
   color: var(--ink);
   font: inherit;
@@ -1643,8 +1646,7 @@ p {
 }
 
 .connector-option.available {
-  border-color: var(--control-border-hover);
-  background: var(--control-selected-bg);
+  background: var(--onboarding-card-bg);
 }
 
 .connector-option.selectable {
@@ -1654,7 +1656,7 @@ p {
 .connector-option.selectable:hover:not(:disabled),
 .connector-option.selectable.selected {
   border-color: var(--control-border-hover);
-  background: var(--control-selected-bg);
+  background: var(--onboarding-card-selected-bg);
   box-shadow: var(--surface-shadow);
 }
 
@@ -1671,10 +1673,42 @@ p {
   display: block;
 }
 
+.connector-option strong {
+  font-size: 15px;
+}
+
 .connector-option small {
-  margin-top: 4px;
+  margin-top: 7px;
   color: var(--muted);
   line-height: 1.35;
+}
+
+.connector-card-accessory {
+  display: inline-flex;
+  min-height: 28px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.connector-option.connected .connector-card-accessory {
+  width: auto;
+  padding: 0 9px;
+  border: 1px solid var(--chip-border);
+  background: var(--chip-bg);
+  color: var(--chip-text);
+}
+
+.connector-card-accessory svg {
+  width: 16px;
+  height: 16px;
 }
 
 .connector-option .connector-icon {
@@ -4814,13 +4848,21 @@ button.home-stat:hover {
 }
 
 :root[data-theme="dark"] .live-mode-control.active,
-:root[data-theme="dark"] .connector-option.available,
-:root[data-theme="dark"] .connector-option.selectable:hover:not(:disabled),
-:root[data-theme="dark"] .connector-option.selectable.selected,
 :root[data-theme="dark"] .file-row.expanded {
   border-color: var(--control-border-hover);
   background: var(--surface-active);
   color: var(--ink);
+}
+
+:root[data-theme="dark"] .connector-option.available {
+  background: var(--onboarding-card-bg);
+}
+
+:root[data-theme="dark"] .connector-option.selectable:hover:not(:disabled),
+:root[data-theme="dark"] .connector-option.selectable.selected {
+  border-color: var(--control-border-hover);
+  background: var(--onboarding-card-selected-bg);
+  box-shadow: var(--surface-shadow);
 }
 
 :root[data-theme="dark"] .source-ready-card,

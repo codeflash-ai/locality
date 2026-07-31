@@ -56,9 +56,9 @@ describe("desktop secondary surface theme contract", () => {
     expect(cssBlock(".sync-note.warning")).toContain("background: var(--status-warn-bg);");
     expect(cssBlock(".sync-note.warning")).toContain("color: var(--status-warn-text);");
     expect(cssBlock(".sync-note svg")).toContain("color: currentColor;");
-    expect(cssBlock(".onboarding-pill-row span,\n.onboarding-pill,\n.connector-option > span,\n.demo-tile span,\n.review-strip span")).toContain("border: 1px solid var(--chip-border);");
-    expect(cssBlock(".onboarding-pill-row span,\n.onboarding-pill,\n.connector-option > span,\n.demo-tile span,\n.review-strip span")).toContain("background: var(--chip-bg);");
-    expect(cssBlock(".onboarding-pill-row span,\n.onboarding-pill,\n.connector-option > span,\n.demo-tile span,\n.review-strip span")).toContain("color: var(--chip-text);");
+    expect(cssBlock(".onboarding-pill-row span,\n.onboarding-pill,\n.demo-tile span,\n.review-strip span")).toContain("border: 1px solid var(--chip-border);");
+    expect(cssBlock(".onboarding-pill-row span,\n.onboarding-pill,\n.demo-tile span,\n.review-strip span")).toContain("background: var(--chip-bg);");
+    expect(cssBlock(".onboarding-pill-row span,\n.onboarding-pill,\n.demo-tile span,\n.review-strip span")).toContain("color: var(--chip-text);");
     expectCssBlock(".onboarding-editor-demo", [
       "border: 1px solid var(--onboarding-demo-line);",
       "background: var(--onboarding-demo-bg);",
@@ -91,9 +91,29 @@ describe("desktop secondary surface theme contract", () => {
     expectCssBlock(".path-field", ["background: var(--field-bg);"]);
     expectCssBlock(".agent-demo", ["background: var(--surface-active);"]);
     expectCssBlock(".agent-demo-command", ["background: var(--code-bg);"]);
+    expectCssBlock(".connector-option.available", [
+      "background: var(--onboarding-card-bg);",
+    ]);
     expectCssBlock(".connector-option.selectable:hover:not(:disabled),\n.connector-option.selectable.selected", [
       "border-color: var(--control-border-hover);",
-      "background: var(--control-selected-bg);",
+      "background: var(--onboarding-card-selected-bg);",
+      "box-shadow: var(--surface-shadow);",
+    ]);
+    expectCssBlock(".connector-card-accessory", [
+      "background: transparent;",
+      "color: var(--muted);",
+    ]);
+    expectCssBlock(".connector-option.connected .connector-card-accessory", [
+      "border: 1px solid var(--chip-border);",
+      "background: var(--chip-bg);",
+      "color: var(--chip-text);",
+    ]);
+    expectCssBlock(':root[data-theme="dark"] .connector-option.available', [
+      "background: var(--onboarding-card-bg);",
+    ]);
+    expectCssBlock(':root[data-theme="dark"] .connector-option.selectable:hover:not(:disabled),\n:root[data-theme="dark"] .connector-option.selectable.selected', [
+      "border-color: var(--control-border-hover);",
+      "background: var(--onboarding-card-selected-bg);",
       "box-shadow: var(--surface-shadow);",
     ]);
     expectCssBlock(".agent-guidance-card", [
@@ -138,10 +158,15 @@ describe("desktop secondary surface theme contract", () => {
     expectNoRawSurfaceColors(cssBlock(".sync-note.connected"));
     expectNoRawSurfaceColors(cssBlock(".sync-note.warning"));
     expectNoRawSurfaceColors(cssBlock(".sync-note svg"));
-    expectNoRawSurfaceColors(cssBlock(".onboarding-pill-row span,\n.onboarding-pill,\n.connector-option > span,\n.demo-tile span,\n.review-strip span"));
+    expectNoRawSurfaceColors(cssBlock(".onboarding-pill-row span,\n.onboarding-pill,\n.demo-tile span,\n.review-strip span"));
     expectNoRawSurfaceColors(cssBlock(".demo-tile"));
     expectNoRawSurfaceColors(cssBlock(".demo-tile p,\n.demo-tile code"));
+    expectNoRawSurfaceColors(cssBlock(".connector-option.available"));
     expectNoRawSurfaceColors(cssBlock(".connector-option.selectable:hover:not(:disabled),\n.connector-option.selectable.selected"));
+    expectNoRawSurfaceColors(cssBlock(".connector-card-accessory"));
+    expectNoRawSurfaceColors(cssBlock(".connector-option.connected .connector-card-accessory"));
+    expectNoRawSurfaceColors(cssBlock(':root[data-theme="dark"] .connector-option.available'));
+    expectNoRawSurfaceColors(cssBlock(':root[data-theme="dark"] .connector-option.selectable:hover:not(:disabled),\n:root[data-theme="dark"] .connector-option.selectable.selected'));
     expectNoRawSurfaceColors(cssBlock(".agent-guidance-card"));
     expectNoRawSurfaceColors(cssBlock(".agent-guidance-card.warning"));
   });

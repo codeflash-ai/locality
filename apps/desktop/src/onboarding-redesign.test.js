@@ -123,4 +123,48 @@ describe("onboarding redesign structure", () => {
     expectNoRawSurfaceColors(cssBlock(".editor-demo-line.active"));
     expectNoRawSurfaceColors(cssBlock(".editor-demo-document pre"));
   });
+
+  it("renders the reference source list as five vertical cards", () => {
+    expect(appSource).toContain("type OnboardingConnectorCard = {");
+    expect(appSource).toContain("const onboardingConnectorCards: OnboardingConnectorCard[] = [");
+    expect(appSource).toContain('connector: "notion",');
+    expect(appSource).toContain('connector: "google-docs",');
+    expect(appSource).toContain('connector: "google-calendar",');
+    expect(appSource).toContain('connector: "gmail",');
+    expect(appSource).toContain('connector: "granola",');
+    expect(appSource).not.toContain('connector: "linear", title: "Linear"');
+    expect(appSource).not.toContain('connector: "slack", title: "Slack"');
+    expect(appSource).toContain('className="connector-options onboarding-source-list"');
+    expect(appSource).toContain('className="connector-card-accessory"');
+    expect(appSource).toContain('<ChevronRight />');
+    expect(appSource).toContain('<PrimaryButton icon={<ConnectorIcon connector={selectedOnboardingConnector} />}');
+    expect(appSource).toContain('<SecondaryButton icon={<Clipboard />}');
+
+    expectDeclarations(".onboarding-source-list", [
+      "gap: 10px;",
+    ]);
+    expectDeclarations(".connector-option", [
+      "grid-template-columns: 38px minmax(0, 1fr) auto;",
+    ]);
+    expectDeclarations(".connector-option.available", [
+      "background: var(--onboarding-card-bg);",
+    ]);
+    expectDeclarations(".connector-option.selectable:hover:not(:disabled),\n.connector-option.selectable.selected", [
+      "background: var(--onboarding-card-selected-bg);",
+    ]);
+    expectDeclarations(".connector-card-accessory", [
+      "background: transparent;",
+      "color: var(--muted);",
+    ]);
+    expectDeclarations(".connector-option.connected .connector-card-accessory", [
+      "border: 1px solid var(--chip-border);",
+      "background: var(--chip-bg);",
+      "color: var(--chip-text);",
+    ]);
+
+    expectNoRawSurfaceColors(cssBlock(".connector-option.available"));
+    expectNoRawSurfaceColors(cssBlock(".connector-option.selectable:hover:not(:disabled),\n.connector-option.selectable.selected"));
+    expectNoRawSurfaceColors(cssBlock(".connector-card-accessory"));
+    expectNoRawSurfaceColors(cssBlock(".connector-option.connected .connector-card-accessory"));
+  });
 });
