@@ -388,6 +388,48 @@ pub(crate) fn lock_file_exclusive(file: &File) -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn read_regular_file_no_follow(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    let named = std::fs::symlink_metadata(path)?;
+    if !named.is_file() || named.file_type().is_symlink() {
+        return Err(io::Error::other(
+            "workspace publication state is not an ordinary file or is a reparse point",
+        ));
+    }
+    if named.len() > max_bytes as u64 {
+        return Err(io::Error::other(
+            "workspace publication state exceeds its fixed size limit",
+        ));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(SHARING)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    let handle: OwnedHandle = file.into();
+    reject_reparse(&handle)?;
+    if !metadata.is_file() {
+        return Err(io::Error::other(
+            "workspace publication state is not an ordinary file",
+        ));
+    }
+    if metadata.len() > max_bytes as u64 {
+        return Err(io::Error::other(
+            "workspace publication state exceeds its fixed size limit",
+        ));
+    }
+    let mut bytes = Vec::new();
+    File::from(handle)
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(io::Error::other(
+            "workspace publication state exceeds its fixed size limit",
+        ));
+    }
+    Ok(bytes)
+}
+
 fn set_handle_read_only(handle: &OwnedHandle, read_only: bool) -> io::Result<()> {
     let mut basic = FILE_BASIC_INFO::default();
     query_handle(

@@ -43,6 +43,8 @@ use crate::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 #[path = "windows_workspace_fs.rs"]
 mod windows_workspace_fs;
 #[cfg(windows)]
+pub(crate) use windows_workspace_fs::read_regular_file_no_follow as read_windows_publication_state_file;
+#[cfg(windows)]
 use windows_workspace_fs::{
     WindowsDirectory, lock_file_exclusive as lock_windows_file_exclusive,
     set_file_read_only as set_windows_file_read_only,
@@ -73,6 +75,8 @@ pub(crate) struct WorkspacePublicationLock {
     _file: OwnedFd,
     #[cfg(unix)]
     _parent: OwnedFd,
+    #[cfg(unix)]
+    _lock_name: OsString,
     #[cfg(windows)]
     _file: fs::File,
 }
@@ -81,6 +85,35 @@ impl WorkspacePublicationLock {
     #[cfg(unix)]
     pub(crate) fn parent_directory(&self) -> &OwnedFd {
         &self._parent
+    }
+
+    pub(crate) fn verify_visible_parent(&self, parent_path: &Path) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            let visible = rustix::fs::open(
+                parent_path,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
+            let visible_identity = rustix::fs::fstat(&visible)?;
+            let retained_identity = rustix::fs::fstat(&self._parent)?;
+            if !same_file_identity(&visible_identity, &retained_identity) {
+                return Err(io::Error::other(
+                    "workspace publication parent detached from its visible path",
+                ));
+            }
+            let lock_identity = rustix::fs::fstat(&self._file)?;
+            if !named_entry_matches(&self._parent, &self._lock_name, &lock_identity)
+                .unwrap_or(false)
+            {
+                return Err(io::Error::other(
+                    "workspace publication lock detached from its parent namespace",
+                ));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = parent_path;
+        Ok(())
     }
 }
 
@@ -145,6 +178,7 @@ pub(crate) fn acquire_workspace_publication_lock(
         Ok(WorkspacePublicationLock {
             _file: file,
             _parent: parent,
+            _lock_name: lock_name.into(),
         })
     }
     #[cfg(windows)]

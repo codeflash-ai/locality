@@ -8,7 +8,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-use rustix::fs::{AtFlags, Mode, OFlags};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 
 use hmac::{Hmac, Mac};
 use locality_protocol::workspace_api_v2::{WorkspaceExportOfferV2, WorkspaceProfileSessionV2};
@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 use crate::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
+#[cfg(windows)]
+use crate::replica_materializer::read_windows_publication_state_file;
 use crate::replica_materializer::{
     ReplicaMaterializationError, StagingDirectory, WorkspaceGenerationFileBinding,
     WorkspaceGenerationIdentity, WorkspacePublicationLock, acquire_workspace_publication_lock,
@@ -167,7 +169,10 @@ impl StagedWorkspaceMaterialization {
         let lock = paths.acquire_lock()?;
         self.staging.verify_publication_parent(&lock)?;
         let expected_staging = self.staging.identity()?;
-        self.publish_initial_expected(destination, expected_staging, &lock, &paths)
+        let published =
+            self.publish_initial_expected(destination, expected_staging, &lock, &paths)?;
+        paths.verify_visible_parent(&lock)?;
+        Ok(published)
     }
 
     fn publish_initial_expected(
@@ -210,7 +215,14 @@ impl StagedWorkspaceMaterialization {
                     WorkspaceMaterializationError::DestinationExists(destination.into())
                 })?
                 .into();
-        self.publish_exchange_expected(destination, expected_staging, expected_destination, &lock)
+        let published = self.publish_exchange_expected(
+            destination,
+            expected_staging,
+            expected_destination,
+            &lock,
+        )?;
+        paths.verify_visible_parent(&lock)?;
+        Ok(published)
     }
 
     fn publish_exchange_expected(
@@ -317,6 +329,7 @@ struct GenerationIdentity {
 }
 
 const PUBLICATION_STATE_VERSION: u16 = 4;
+const PUBLICATION_STATE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const WORKSPACE_OWNERSHIP_MARKER: &str = ".locality-ownership-v4";
 const WORKSPACE_OWNERSHIP_NONCE_BYTES: usize = 32;
 const RECEIPT_AUTH_DOMAIN: &str = "locality.workspace-publication-receipt.v4";
@@ -364,7 +377,10 @@ pub fn materialize_workspace_archive_durable<Body: Read>(
     recover_workspace_publication_locked(destination, ownership, &paths, &lock)?;
     let staged =
         stage_workspace_archive_locked(archive, destination, limits, session, offer, Some(&lock))?;
-    publish_staged_workspace_locked(staged, destination, ownership, &mut (), &paths, &lock)
+    let published =
+        publish_staged_workspace_locked(staged, destination, ownership, &mut (), &paths, &lock)?;
+    paths.verify_visible_parent(&lock)?;
+    Ok(published)
 }
 
 pub fn publish_staged_workspace(
@@ -384,7 +400,10 @@ pub fn publish_staged_workspace_with_hooks<H: WorkspacePublicationHooks>(
     let paths = PublicationPaths::new(destination)?;
     let lock = paths.acquire_lock()?;
     staged.staging.verify_publication_parent(&lock)?;
-    publish_staged_workspace_locked(staged, destination, ownership, hooks, &paths, &lock)
+    let published =
+        publish_staged_workspace_locked(staged, destination, ownership, hooks, &paths, &lock)?;
+    paths.verify_visible_parent(&lock)?;
+    Ok(published)
 }
 
 fn publish_staged_workspace_locked<H: WorkspacePublicationHooks>(
@@ -395,6 +414,7 @@ fn publish_staged_workspace_locked<H: WorkspacePublicationHooks>(
     paths: &PublicationPaths,
     lock: &WorkspacePublicationLock,
 ) -> Result<PublishedWorkspace, WorkspaceMaterializationError> {
+    paths.verify_visible_parent(lock)?;
     if publication_entry_exists(lock, paths, &paths.journal_name, &paths.journal)? {
         return Err(WorkspaceMaterializationError::RecoveryRequired(
             paths.journal.clone(),
@@ -462,6 +482,7 @@ fn publish_staged_workspace_locked<H: WorkspacePublicationHooks>(
             source,
         });
     }
+    paths.verify_visible_parent(lock)?;
 
     validate_receipt_binding(
         &journal.new_receipt,
@@ -518,6 +539,7 @@ fn publish_staged_workspace_locked<H: WorkspacePublicationHooks>(
             source,
         });
     }
+    paths.verify_visible_parent(lock)?;
     replace_durable_receipt(paths, lock, &journal.new_receipt, ownership)?;
     if let Err(source) = hooks.checkpoint(WorkspacePublicationCheckpoint::ReceiptDurable) {
         return Err(WorkspaceMaterializationError::Journal {
@@ -525,6 +547,7 @@ fn publish_staged_workspace_locked<H: WorkspacePublicationHooks>(
             source,
         });
     }
+    paths.verify_visible_parent(lock)?;
     if let Some(old_generation) = &published.old_generation {
         validate_receipt_binding(
             journal.old_receipt.as_ref().ok_or_else(|| {
@@ -556,7 +579,9 @@ fn publish_staged_workspace_locked<H: WorkspacePublicationHooks>(
             source,
         });
     }
+    paths.verify_visible_parent(lock)?;
     remove_journal_if_present(paths, lock)?;
+    paths.verify_visible_parent(lock)?;
     Ok(published)
 }
 
@@ -569,7 +594,8 @@ pub fn recover_workspace_publication(
 ) -> Result<(), WorkspaceMaterializationError> {
     let paths = PublicationPaths::new(destination)?;
     let lock = paths.acquire_lock()?;
-    recover_workspace_publication_locked(destination, ownership, &paths, &lock)
+    recover_workspace_publication_locked(destination, ownership, &paths, &lock)?;
+    paths.verify_visible_parent(&lock)
 }
 
 fn recover_workspace_publication_locked(
@@ -860,7 +886,9 @@ pub fn load_workspace_publication_receipt(
 ) -> Result<Option<WorkspacePublicationReceipt>, WorkspaceMaterializationError> {
     let paths = PublicationPaths::new(destination)?;
     let lock = paths.acquire_lock()?;
-    load_workspace_publication_receipt_locked(&paths, &lock)
+    let receipt = load_workspace_publication_receipt_locked(&paths, &lock)?;
+    paths.verify_visible_parent(&lock)?;
+    Ok(receipt)
 }
 
 fn load_workspace_publication_receipt_locked(
@@ -892,9 +920,11 @@ pub fn recover_and_verify_workspace_publication_state(
                 "workspace receipt exists without its published generation".to_string(),
             ));
         }
+        paths.verify_visible_parent(&lock)?;
         return Ok(false);
     };
     let Some(receipt) = load_workspace_publication_receipt_locked(&paths, &lock)? else {
+        paths.verify_visible_parent(&lock)?;
         return Ok(false);
     };
     validate_receipt_binding(
@@ -905,6 +935,7 @@ pub fn recover_and_verify_workspace_publication_state(
         ownership,
         "active workspace receipt",
     )?;
+    paths.verify_visible_parent(&lock)?;
     Ok(true)
 }
 
@@ -947,6 +978,18 @@ impl PublicationPaths {
             }
         })
     }
+
+    fn verify_visible_parent(
+        &self,
+        lock: &WorkspacePublicationLock,
+    ) -> Result<(), WorkspaceMaterializationError> {
+        lock.verify_visible_parent(&self.parent).map_err(|source| {
+            WorkspaceMaterializationError::Journal {
+                path: self.parent.clone(),
+                source,
+            }
+        })
+    }
 }
 
 fn create_durable_journal(
@@ -956,6 +999,11 @@ fn create_durable_journal(
 ) -> Result<(), WorkspaceMaterializationError> {
     let bytes = serde_json::to_vec(journal)
         .map_err(|error| WorkspaceMaterializationError::RecoveryConflict(error.to_string()))?;
+    if bytes.len() > PUBLICATION_STATE_MAX_BYTES {
+        return Err(WorkspaceMaterializationError::RecoveryConflict(
+            "publication journal exceeds its fixed size limit".to_string(),
+        ));
+    }
     let temporary = write_durable_temporary(paths, lock, "journal", &bytes)?;
     #[cfg(unix)]
     let link_result = rustix::fs::linkat(
@@ -1003,6 +1051,11 @@ fn replace_durable_receipt(
     )?;
     let bytes = serde_json::to_vec(receipt)
         .map_err(|error| WorkspaceMaterializationError::RecoveryConflict(error.to_string()))?;
+    if bytes.len() > PUBLICATION_STATE_MAX_BYTES {
+        return Err(WorkspaceMaterializationError::RecoveryConflict(
+            "publication receipt exceeds its fixed size limit".to_string(),
+        ));
+    }
     let temporary = write_durable_temporary(paths, lock, "receipt", &bytes)?;
     #[cfg(unix)]
     let rename_result = rustix::fs::renameat(
@@ -1353,21 +1406,72 @@ fn read_json_locked<T: for<'de> Deserialize<'de>>(
     path: &Path,
 ) -> Result<T, WorkspaceMaterializationError> {
     #[cfg(unix)]
-    let bytes = rustix::fs::openat(
-        lock.parent_directory(),
-        name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map(std::fs::File::from)
-    .map_err(io::Error::from)
-    .and_then(|mut file| {
+    let bytes = (|| -> io::Result<Vec<u8>> {
+        let named = rustix::fs::statat(lock.parent_directory(), name, AtFlags::SYMLINK_NOFOLLOW)?;
+        if FileType::from_raw_mode(named.st_mode) != FileType::RegularFile {
+            return Err(io::Error::other(
+                "workspace publication state is not an ordinary file",
+            ));
+        }
+        if named.st_size < 0 || named.st_size as u64 > PUBLICATION_STATE_MAX_BYTES as u64 {
+            return Err(io::Error::other(
+                "workspace publication state exceeds its fixed size limit",
+            ));
+        }
+        let descriptor = rustix::fs::openat(
+            lock.parent_directory(),
+            name,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let metadata = rustix::fs::fstat(&descriptor)?;
+        if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile {
+            return Err(io::Error::other(
+                "workspace publication state is not an ordinary file",
+            ));
+        }
+        if metadata.st_size < 0 || metadata.st_size as u64 > PUBLICATION_STATE_MAX_BYTES as u64 {
+            return Err(io::Error::other(
+                "workspace publication state exceeds its fixed size limit",
+            ));
+        }
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        std::fs::File::from(descriptor)
+            .take(PUBLICATION_STATE_MAX_BYTES.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > PUBLICATION_STATE_MAX_BYTES {
+            return Err(io::Error::other(
+                "workspace publication state exceeds its fixed size limit",
+            ));
+        }
         Ok(bytes)
-    });
-    #[cfg(not(unix))]
-    let bytes = fs::read(path);
+    })();
+    #[cfg(windows)]
+    let bytes = read_windows_publication_state_file(path, PUBLICATION_STATE_MAX_BYTES);
+    #[cfg(not(any(unix, windows)))]
+    let bytes = (|| -> io::Result<Vec<u8>> {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(io::Error::other(
+                "workspace publication state is not an ordinary file",
+            ));
+        }
+        if metadata.len() > PUBLICATION_STATE_MAX_BYTES as u64 {
+            return Err(io::Error::other(
+                "workspace publication state exceeds its fixed size limit",
+            ));
+        }
+        let mut bytes = Vec::new();
+        fs::File::open(path)?
+            .take(PUBLICATION_STATE_MAX_BYTES.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > PUBLICATION_STATE_MAX_BYTES {
+            return Err(io::Error::other(
+                "workspace publication state exceeds its fixed size limit",
+            ));
+        }
+        Ok(bytes)
+    })();
     let bytes = bytes.map_err(|source| WorkspaceMaterializationError::Journal {
         path: path.to_path_buf(),
         source,

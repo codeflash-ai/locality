@@ -1003,7 +1003,7 @@ fn concurrent_publication_waits_for_the_exclusive_publication_lock() {
 
 #[cfg(unix)]
 #[test]
-fn publication_remains_anchored_when_parent_is_renamed_and_replaced() {
+fn publication_fails_closed_when_parent_is_renamed_and_replaced() {
     let fixture = fixture();
     let contract = contract(&fixture);
     let directory = TestDirectory::new("renamed-publication-parent");
@@ -1044,20 +1044,21 @@ fn publication_remains_anchored_when_parent_is_renamed_and_replaced() {
     fs::write(directory.0.join("substitute.txt"), b"must survive\n")
         .expect("write replacement sentinel");
     resume_tx.send(()).expect("resume anchored publication");
-    publisher
+    let error = publisher
         .join()
         .expect("publisher thread")
-        .expect("publication stays on retained parent descriptor");
+        .expect_err("detached visible parent must not report publication success");
+    assert!(error.to_string().contains("parent detached"));
 
     assert_eq!(
         fs::read(directory.0.join("substitute.txt")).expect("replacement survives"),
         b"must survive\n"
     );
     assert!(!directory.root().exists());
-    assert!(retained.join("Locality/Sales/README.md").exists());
-    assert!(retained.join(".locality-Locality.receipt.json").exists());
+    assert!(!retained.join("Locality").exists());
+    assert!(!retained.join(".locality-Locality.receipt.json").exists());
     assert!(
-        !retained
+        retained
             .join(".locality-Locality.publication.json")
             .exists()
     );
@@ -1073,6 +1074,107 @@ fn publication_remains_anchored_when_parent_is_renamed_and_replaced() {
 
     make_removable(&retained);
     fs::remove_dir_all(&retained).expect("remove retained parent");
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_publication_state_is_rejected_without_blocking() {
+    let directory = TestDirectory::new("fifo-publication-state");
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let receipt_path = directory.0.join(".locality-Locality.receipt.json");
+        let receipt = CString::new(receipt_path.as_os_str().as_bytes()).expect("FIFO path CString");
+        // SAFETY: the path is a live NUL-terminated C string and the mode is valid.
+        assert_eq!(unsafe { libc::mkfifo(receipt.as_ptr(), 0o600) }, 0);
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        use rustix::fs::{Mode, OFlags};
+
+        let parent = rustix::fs::open(
+            &directory.0,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open test parent");
+        rustix::fs::mkfifoat(
+            &parent,
+            ".locality-Locality.receipt.json",
+            Mode::from_raw_mode(0o600),
+        )
+        .expect("create publication-state fifo");
+    }
+    let root = directory.root();
+    let (result_tx, result_rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        result_tx
+            .send(load_workspace_publication_receipt(&root))
+            .expect("report fifo read result");
+    });
+    let error = result_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("FIFO state read must not block")
+        .expect_err("FIFO must not be accepted as publication state");
+    assert!(error.to_string().contains("not an ordinary file"));
+    reader.join().expect("FIFO reader thread");
+}
+
+#[test]
+fn oversized_publication_state_is_rejected_before_reading() {
+    let directory = TestDirectory::new("oversized-publication-state");
+    let receipt = directory.0.join(".locality-Locality.receipt.json");
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&receipt)
+        .expect("create oversized receipt");
+    file.set_len(8 * 1024 * 1024 + 1)
+        .expect("size oversized receipt");
+
+    let error = load_workspace_publication_receipt(&directory.root())
+        .expect_err("oversized publication state must fail closed");
+    assert!(error.to_string().contains("fixed size limit"));
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_publication_state_is_rejected_without_following() {
+    use std::os::unix::fs::symlink;
+
+    let directory = TestDirectory::new("symlink-publication-state");
+    let target = directory.0.join("attacker-state.json");
+    fs::write(&target, b"{}\n").expect("write symlink target");
+    symlink(&target, directory.0.join(".locality-Locality.receipt.json"))
+        .expect("create state symlink");
+
+    load_workspace_publication_receipt(&directory.root())
+        .expect_err("publication state symlink must not be followed");
+    assert_eq!(fs::read(target).expect("target survives"), b"{}\n");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_reparse_publication_state_is_rejected_without_following() {
+    use std::os::windows::fs::symlink_file;
+
+    let directory = TestDirectory::new("reparse-publication-state");
+    let target = directory.0.join("attacker-state.json");
+    fs::write(&target, b"{}\r\n").expect("write reparse target");
+    let receipt = directory.0.join(".locality-Locality.receipt.json");
+    if let Err(error) = symlink_file(&target, &receipt) {
+        if error.kind() == io::ErrorKind::PermissionDenied {
+            return;
+        }
+        panic!("create state reparse point: {error}");
+    }
+
+    let error = load_workspace_publication_receipt(&directory.root())
+        .expect_err("publication state reparse point must not be followed");
+    assert!(error.to_string().contains("reparse point"));
+    assert_eq!(fs::read(target).expect("target survives"), b"{}\r\n");
 }
 
 #[cfg(windows)]
