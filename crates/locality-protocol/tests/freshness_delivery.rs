@@ -8,8 +8,9 @@ use locality_protocol::freshness_delivery::{
     FreshnessRetry, FreshnessRetryClass, GENERATION_DELTA_FORMAT_VERSION,
     GENERATION_DELTA_PREIMAGE_V1_GOLDEN_JSON, GENERATION_DELTA_RECEIPT_V1_GOLDEN_JSON,
     GENERATION_DELTA_V1_GOLDEN_JSON, GenerationDelta, GenerationDeltaEntry,
-    GenerationDeltaTerminalReceipt, GenerationFileIdentity, ProviderHealth, ProviderHealthState,
-    ProviderWorkerProgress, PublicationGenerationHealth, PublicationGenerationState,
+    GenerationDeltaTerminalReceipt, GenerationFileIdentity, MAX_GENERATION_DELTA_CONTENT_BYTES,
+    MAX_GENERATION_FILE_BYTES, ProviderHealth, ProviderHealthState, ProviderWorkerProgress,
+    PublicationGenerationHealth, PublicationGenerationState,
 };
 use locality_protocol::workspace_layout::LayoutDigest;
 use locality_protocol::{FreshnessEpoch, ScopeFreshnessEpochs};
@@ -48,6 +49,7 @@ fn delta() -> GenerationDelta {
         format_version: GENERATION_DELTA_FORMAT_VERSION,
         minimum_reader_version: FRESHNESS_DELIVERY_READER_VERSION,
         delta_id: "delta-018f4f6e".to_string(),
+        mount_id: PortableMountId::new("mount-alpha").unwrap(),
         source_connection_id: SourceConnectionId::new("source-018f4f6e"),
         base_generation_id: SourceGenerationId::new("generation-0007").unwrap(),
         target_generation_id: SourceGenerationId::new("generation-0008").unwrap(),
@@ -57,7 +59,6 @@ fn delta() -> GenerationDelta {
         workspace_layout_digest: layout_digest(),
         entries: vec![
             GenerationDeltaEntry {
-                mount_id: PortableMountId::new("mount-alpha").unwrap(),
                 old: None,
                 new: Some(identity(
                     "projection-1",
@@ -68,7 +69,6 @@ fn delta() -> GenerationDelta {
                 )),
             },
             GenerationDeltaEntry {
-                mount_id: PortableMountId::new("mount-alpha").unwrap(),
                 old: Some(identity(
                     "projection-2",
                     "Engineering/roadmap.md",
@@ -85,7 +85,6 @@ fn delta() -> GenerationDelta {
                 )),
             },
             GenerationDeltaEntry {
-                mount_id: PortableMountId::new("mount-zeta").unwrap(),
                 old: Some(identity(
                     "projection-9",
                     "Sales/old.md",
@@ -104,6 +103,7 @@ fn receipt(delta: &GenerationDelta) -> GenerationDeltaTerminalReceipt {
         format_version: delta.format_version,
         minimum_reader_version: delta.minimum_reader_version,
         delta_id: delta.delta_id.clone(),
+        mount_id: delta.mount_id.clone(),
         source_connection_id: delta.source_connection_id.clone(),
         base_generation_id: delta.base_generation_id.clone(),
         target_generation_id: delta.target_generation_id.clone(),
@@ -265,7 +265,7 @@ fn unknown_taxonomy_decodes_but_fails_closed_when_used() {
 }
 
 #[test]
-fn delta_validation_rejects_reorder_collision_incomplete_and_receipt_substitution() {
+fn delta_validation_rejects_reorder_path_reuse_incomplete_and_receipt_substitution() {
     let mut reordered = delta();
     reordered.entries.swap(0, 1);
     assert_eq!(
@@ -278,7 +278,7 @@ fn delta_validation_rejects_reorder_collision_incomplete_and_receipt_substitutio
         LogicalPath::new("Engineering/new.md").unwrap();
     assert_eq!(
         collision.validate(),
-        Err(FreshnessDeliveryError::DuplicateNewPath)
+        Err(FreshnessDeliveryError::CrossEntryPathReuse)
     );
 
     let mut incomplete = delta();
@@ -295,4 +295,85 @@ fn delta_validation_rejects_reorder_collision_incomplete_and_receipt_substitutio
         substituted.validate_against(&delta),
         Err(FreshnessDeliveryError::ReceiptMismatch)
     );
+}
+
+#[test]
+fn delete_create_path_reuse_is_rejected_in_both_canonical_orders() {
+    for (deleted_projection, created_projection) in [
+        ("projection-1", "projection-2"),
+        ("projection-2", "projection-1"),
+    ] {
+        let mut delta = delta();
+        delta.entries = vec![
+            GenerationDeltaEntry {
+                old: Some(identity(
+                    deleted_projection,
+                    "Shared.md",
+                    "content-old",
+                    '1',
+                    1,
+                )),
+                new: None,
+            },
+            GenerationDeltaEntry {
+                old: None,
+                new: Some(identity(
+                    created_projection,
+                    "Shared.md",
+                    "content-new",
+                    '2',
+                    1,
+                )),
+            },
+        ];
+        delta.entries.sort_by(|left, right| {
+            left.projection_id()
+                .unwrap()
+                .as_str()
+                .cmp(right.projection_id().unwrap().as_str())
+        });
+        assert_eq!(
+            delta.validate(),
+            Err(FreshnessDeliveryError::CrossEntryPathReuse)
+        );
+    }
+}
+
+#[test]
+fn empty_delta_advances_generation_and_content_limits_are_bounded() {
+    let mut empty = delta();
+    empty.entries.clear();
+    empty.validate().expect("empty generation advancement");
+    assert_eq!(empty.changed_content_bytes().unwrap(), 0);
+    receipt(&empty)
+        .validate_against(&empty)
+        .expect("empty terminal receipt");
+
+    let mut oversized_file = delta();
+    oversized_file.entries.truncate(1);
+    oversized_file.entries[0].new.as_mut().unwrap().byte_length = MAX_GENERATION_FILE_BYTES + 1;
+    assert_eq!(
+        oversized_file.validate(),
+        Err(FreshnessDeliveryError::FileContentTooLarge {
+            actual: MAX_GENERATION_FILE_BYTES + 1,
+        })
+    );
+
+    let mut oversized_delta = delta();
+    oversized_delta.entries = (0..=MAX_GENERATION_DELTA_CONTENT_BYTES / MAX_GENERATION_FILE_BYTES)
+        .map(|index| GenerationDeltaEntry {
+            old: None,
+            new: Some(identity(
+                &format!("projection-{index:03}"),
+                &format!("file-{index:03}.md"),
+                &format!("content-{index:03}"),
+                '3',
+                MAX_GENERATION_FILE_BYTES,
+            )),
+        })
+        .collect();
+    assert!(matches!(
+        oversized_delta.validate(),
+        Err(FreshnessDeliveryError::DeltaContentTooLarge { .. })
+    ));
 }

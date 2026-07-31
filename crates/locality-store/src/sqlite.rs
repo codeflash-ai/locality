@@ -601,11 +601,6 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         prepared: PreparedGenerationApply,
     ) -> StoreResult<GenerationApplyJournalRecord> {
         prepared.validate()?;
-        if prepared.delta.entries.is_empty() {
-            return Err(StoreError::InvalidState(
-                "generation apply delta has no entries".to_string(),
-            ));
-        }
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(existing) =
@@ -626,40 +621,32 @@ impl GenerationDeliveryRepository for SqliteStateStore {
             )));
         }
 
-        let mut mount_ids = BTreeSet::new();
+        let mount_id = MountId::new(prepared.delta.mount_id.as_str());
+        let observed = select_observed_generation(&transaction, &mount_id)?.ok_or_else(|| {
+            StoreError::InvalidState(format!(
+                "mount `{}` has no observed generation",
+                prepared.delta.mount_id
+            ))
+        })?;
+        if observed.source_connection_id != prepared.delta.source_connection_id
+            || observed.generation_id != prepared.delta.base_generation_id
+            || observed.workspace_layout_version != prepared.delta.workspace_layout_version
+            || observed.workspace_layout_digest != prepared.delta.workspace_layout_digest.as_str()
+        {
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` generation or layout does not match delta base",
+                prepared.delta.mount_id
+            )));
+        }
         for entry in &prepared.delta.entries {
-            mount_ids.insert(MountId::new(entry.mount_id.as_str()));
-            let observed =
-                select_observed_generation(&transaction, &MountId::new(entry.mount_id.as_str()))?
-                    .ok_or_else(|| {
-                    StoreError::InvalidState(format!(
-                        "mount `{}` has no observed generation",
-                        entry.mount_id
-                    ))
-                })?;
-            if observed.source_connection_id != prepared.delta.source_connection_id
-                || observed.generation_id != prepared.delta.base_generation_id
-                || observed.workspace_layout_version != prepared.delta.workspace_layout_version
-                || observed.workspace_layout_digest
-                    != prepared.delta.workspace_layout_digest.as_str()
-            {
-                return Err(StoreError::InvalidState(format!(
-                    "mount `{}` generation or layout does not match delta base",
-                    entry.mount_id
-                )));
-            }
             if let Some(old) = &entry.old {
-                let path = select_generation_path(
-                    &transaction,
-                    &MountId::new(entry.mount_id.as_str()),
-                    &old.projection_id,
-                )?
-                .ok_or_else(|| {
-                    StoreError::InvalidState(format!(
-                        "delta old projection `{}` has no local merge base",
-                        old.projection_id.as_str()
-                    ))
-                })?;
+                let path = select_generation_path(&transaction, &mount_id, &old.projection_id)?
+                    .ok_or_else(|| {
+                        StoreError::InvalidState(format!(
+                            "delta old projection `{}` has no local merge base",
+                            old.projection_id.as_str()
+                        ))
+                    })?;
                 let expected = if path.state == GenerationPathState::Conflicted {
                     path.incoming_identity.as_ref()
                 } else {
@@ -858,10 +845,8 @@ impl GenerationDeliveryRepository for SqliteStateStore {
             )));
         }
 
-        let mut mount_ids = BTreeSet::new();
+        let mount_id = MountId::new(journal.delta.mount_id.as_str());
         for (entry, (_, outcome)) in journal.delta.entries.iter().zip(&journal.outcomes) {
-            let mount_id = MountId::new(entry.mount_id.as_str());
-            mount_ids.insert(mount_id.clone());
             match outcome {
                 GenerationApplyOutcome::Applied => {
                     let new = entry.new.as_ref().ok_or_else(|| {
@@ -949,31 +934,29 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 }
             }
         }
-        for mount_id in mount_ids {
-            let changed = transaction.execute(
-                "UPDATE observed_generations
-                 SET generation_id = ?2, inventory_sha256 = ?3,
-                     workspace_layout_version = ?4, workspace_layout_digest = ?5,
-                     last_receipt_sha256 = ?6, updated_at = ?7
-                 WHERE mount_id = ?1 AND source_connection_id = ?8 AND generation_id = ?9",
-                params![
-                    mount_id.0.as_str(),
-                    journal.delta.target_generation_id.as_str(),
-                    journal.delta.target_inventory_sha256.as_str(),
-                    journal.delta.workspace_layout_version,
-                    journal.delta.workspace_layout_digest.as_str(),
-                    journal.receipt_sha256.as_str(),
-                    completed_at,
-                    journal.delta.source_connection_id.as_str(),
-                    journal.delta.base_generation_id.as_str(),
-                ],
-            )?;
-            if changed != 1 {
-                return Err(StoreError::InvalidState(format!(
-                    "mount `{}` observed generation changed during apply",
-                    mount_id.0
-                )));
-            }
+        let changed = transaction.execute(
+            "UPDATE observed_generations
+             SET generation_id = ?2, inventory_sha256 = ?3,
+                 workspace_layout_version = ?4, workspace_layout_digest = ?5,
+                 last_receipt_sha256 = ?6, updated_at = ?7
+             WHERE mount_id = ?1 AND source_connection_id = ?8 AND generation_id = ?9",
+            params![
+                mount_id.0.as_str(),
+                journal.delta.target_generation_id.as_str(),
+                journal.delta.target_inventory_sha256.as_str(),
+                journal.delta.workspace_layout_version,
+                journal.delta.workspace_layout_digest.as_str(),
+                journal.receipt_sha256.as_str(),
+                completed_at,
+                journal.delta.source_connection_id.as_str(),
+                journal.delta.base_generation_id.as_str(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` observed generation changed during apply",
+                mount_id.0
+            )));
         }
         transaction.execute(
             "UPDATE generation_apply_journals

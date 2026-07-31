@@ -77,27 +77,6 @@ pub(crate) fn rename_noreplace_durable(source: &Path, destination: &Path) -> io:
     rename_noreplace_durable_with_sync(source, destination, sync_directory)
 }
 
-pub(crate) fn rename_replace_durable(source: &Path, destination: &Path) -> io::Result<()> {
-    rename_replace(source, destination)?;
-    let source_parent = source.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("source `{}` has no parent", source.display()),
-        )
-    })?;
-    let destination_parent = destination.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("destination `{}` has no parent", destination.display()),
-        )
-    })?;
-    sync_directory(destination_parent)?;
-    if source_parent != destination_parent {
-        sync_directory(source_parent)?;
-    }
-    Ok(())
-}
-
 pub(crate) fn rename_noreplace_durable_with_sync(
     source: &Path,
     destination: &Path,
@@ -260,41 +239,6 @@ fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
         rustix::fs::RenameFlags::NOREPLACE,
     )
     .map_err(io::Error::from)
-}
-
-#[cfg(not(windows))]
-fn rename_replace(source: &Path, destination: &Path) -> io::Result<()> {
-    fs::rename(source, destination)
-}
-
-#[cfg(windows)]
-fn rename_replace(source: &Path, destination: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-
-    let source = source
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let destination = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let moved = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 #[cfg(all(

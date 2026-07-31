@@ -21,6 +21,8 @@ use crate::workspace_layout::LayoutDigest;
 pub const FRESHNESS_DELIVERY_READER_VERSION: u16 = 1;
 pub const GENERATION_DELTA_FORMAT_VERSION: u16 = 1;
 pub const MAX_GENERATION_DELTA_ENTRIES: usize = 100_000;
+pub const MAX_GENERATION_FILE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_GENERATION_DELTA_CONTENT_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_DELIVERY_ID_BYTES: usize = 128;
 pub const MAX_DELIVERY_TIMESTAMP_BYTES: usize = 64;
 pub const MAX_RETRY_AFTER_SECONDS: u64 = 24 * 60 * 60;
@@ -286,7 +288,13 @@ impl GenerationFileIdentity {
     pub fn validate(&self) -> Result<(), FreshnessDeliveryError> {
         validate_identifier("projection_id", self.projection_id.as_str())?;
         validate_identifier("content_version_id", self.content_version_id.as_str())?;
-        validate_sha256(&self.content_sha256)
+        validate_sha256(&self.content_sha256)?;
+        if self.byte_length > MAX_GENERATION_FILE_BYTES {
+            return Err(FreshnessDeliveryError::FileContentTooLarge {
+                actual: self.byte_length,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -294,7 +302,6 @@ impl GenerationFileIdentity {
 /// the authenticated delivery transport and verified against `new`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationDeltaEntry {
-    pub mount_id: PortableMountId,
     pub old: Option<GenerationFileIdentity>,
     pub new: Option<GenerationFileIdentity>,
 }
@@ -330,12 +337,15 @@ impl GenerationDeltaEntry {
 }
 
 /// Complete metadata for an authorized delta between two immutable source
-/// generations. Entries are canonical bytewise by `(mount_id, projection_id)`.
+/// generations for one mount. Entries are canonical bytewise by stable
+/// projection identity. An empty entry list is a valid no-content generation
+/// advancement.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationDelta {
     pub format_version: u16,
     pub minimum_reader_version: u16,
     pub delta_id: String,
+    pub mount_id: PortableMountId,
     pub source_connection_id: SourceConnectionId,
     pub base_generation_id: SourceGenerationId,
     pub target_generation_id: SourceGenerationId,
@@ -350,6 +360,7 @@ impl GenerationDelta {
     pub fn validate(&self) -> Result<(), FreshnessDeliveryError> {
         validate_versions(self.format_version, self.minimum_reader_version)?;
         validate_identifier("delta_id", &self.delta_id)?;
+        validate_identifier("mount_id", self.mount_id.as_str())?;
         validate_identifier("source_connection_id", self.source_connection_id.as_str())?;
         validate_identifier("base_generation_id", self.base_generation_id.as_str())?;
         validate_identifier("target_generation_id", self.target_generation_id.as_str())?;
@@ -369,30 +380,37 @@ impl GenerationDelta {
             });
         }
 
-        let mut previous_key: Option<(&str, &str)> = None;
-        let mut old_paths = BTreeSet::new();
-        let mut new_paths = BTreeSet::new();
+        let mut previous_projection: Option<&str> = None;
+        let mut claimed_paths = BTreeSet::new();
         for entry in &self.entries {
             entry.validate()?;
             let projection_id = entry
                 .projection_id()
                 .expect("validated entry has an identity")
                 .as_str();
-            let key = (entry.mount_id.as_str(), projection_id);
-            if previous_key.is_some_and(|previous| previous >= key) {
+            if previous_projection.is_some_and(|previous| previous >= projection_id) {
                 return Err(FreshnessDeliveryError::NonCanonicalDeltaOrder);
             }
-            previous_key = Some(key);
-            if let Some(old) = &entry.old
-                && !old_paths.insert((entry.mount_id.as_str(), old.logical_path.as_str()))
-            {
-                return Err(FreshnessDeliveryError::DuplicateOldPath);
+            previous_projection = Some(projection_id);
+
+            let mut entry_paths = BTreeSet::new();
+            if let Some(old) = &entry.old {
+                entry_paths.insert(old.logical_path.as_str());
             }
-            if let Some(new) = &entry.new
-                && !new_paths.insert((entry.mount_id.as_str(), new.logical_path.as_str()))
-            {
-                return Err(FreshnessDeliveryError::DuplicateNewPath);
+            if let Some(new) = &entry.new {
+                entry_paths.insert(new.logical_path.as_str());
             }
+            for path in entry_paths {
+                if !claimed_paths.insert(path) {
+                    return Err(FreshnessDeliveryError::CrossEntryPathReuse);
+                }
+            }
+        }
+        let changed_content_bytes = self.changed_content_bytes()?;
+        if changed_content_bytes > MAX_GENERATION_DELTA_CONTENT_BYTES {
+            return Err(FreshnessDeliveryError::DeltaContentTooLarge {
+                actual: changed_content_bytes,
+            });
         }
         Ok(())
     }
@@ -403,6 +421,7 @@ impl GenerationDelta {
         append_u64(&mut output, u64::from(self.format_version));
         append_u64(&mut output, u64::from(self.minimum_reader_version));
         append_text(&mut output, &self.delta_id)?;
+        append_text(&mut output, self.mount_id.as_str())?;
         append_text(&mut output, self.source_connection_id.as_str())?;
         append_text(&mut output, self.base_generation_id.as_str())?;
         append_text(&mut output, self.target_generation_id.as_str())?;
@@ -423,7 +442,6 @@ impl GenerationDelta {
                 .map_err(|_| FreshnessDeliveryError::CanonicalValueTooLarge)?,
         );
         for entry in &self.entries {
-            append_text(&mut output, entry.mount_id.as_str())?;
             append_identity(&mut output, entry.old.as_ref())?;
             append_identity(&mut output, entry.new.as_ref())?;
         }
@@ -456,6 +474,7 @@ pub struct GenerationDeltaTerminalReceipt {
     pub format_version: u16,
     pub minimum_reader_version: u16,
     pub delta_id: String,
+    pub mount_id: PortableMountId,
     pub source_connection_id: SourceConnectionId,
     pub base_generation_id: SourceGenerationId,
     pub target_generation_id: SourceGenerationId,
@@ -473,6 +492,7 @@ impl GenerationDeltaTerminalReceipt {
     pub fn validate(&self) -> Result<(), FreshnessDeliveryError> {
         validate_versions(self.format_version, self.minimum_reader_version)?;
         validate_identifier("delta_id", &self.delta_id)?;
+        validate_identifier("mount_id", self.mount_id.as_str())?;
         validate_identifier("source_connection_id", self.source_connection_id.as_str())?;
         validate_identifier("base_generation_id", self.base_generation_id.as_str())?;
         validate_identifier("target_generation_id", self.target_generation_id.as_str())?;
@@ -492,6 +512,7 @@ impl GenerationDeltaTerminalReceipt {
         if self.format_version != delta.format_version
             || self.minimum_reader_version != delta.minimum_reader_version
             || self.delta_id != delta.delta_id
+            || self.mount_id != delta.mount_id
             || self.source_connection_id != delta.source_connection_id
             || self.base_generation_id != delta.base_generation_id
             || self.target_generation_id != delta.target_generation_id
@@ -513,6 +534,7 @@ impl GenerationDeltaTerminalReceipt {
         append_u64(&mut output, u64::from(self.format_version));
         append_u64(&mut output, u64::from(self.minimum_reader_version));
         append_text(&mut output, &self.delta_id)?;
+        append_text(&mut output, self.mount_id.as_str())?;
         append_text(&mut output, self.source_connection_id.as_str())?;
         append_text(&mut output, self.base_generation_id.as_str())?;
         append_text(&mut output, self.target_generation_id.as_str())?;
@@ -557,9 +579,10 @@ pub enum FreshnessDeliveryError {
     IncompleteTargetGeneration,
     InvalidLayoutVersion,
     TooManyDeltaEntries { actual: usize },
+    FileContentTooLarge { actual: u64 },
+    DeltaContentTooLarge { actual: u64 },
     NonCanonicalDeltaOrder,
-    DuplicateOldPath,
-    DuplicateNewPath,
+    CrossEntryPathReuse,
     ContentLengthOverflow,
     CanonicalValueTooLarge,
     ReceiptMismatch,
@@ -614,11 +637,20 @@ impl Display for FreshnessDeliveryError {
                 formatter,
                 "delta contains {actual} entries, exceeding {MAX_GENERATION_DELTA_ENTRIES}"
             ),
+            Self::FileContentTooLarge { actual } => write!(
+                formatter,
+                "generation file contains {actual} bytes, exceeding {MAX_GENERATION_FILE_BYTES}"
+            ),
+            Self::DeltaContentTooLarge { actual } => write!(
+                formatter,
+                "delta contains {actual} content bytes, exceeding {MAX_GENERATION_DELTA_CONTENT_BYTES}"
+            ),
             Self::NonCanonicalDeltaOrder => {
                 formatter.write_str("delta entries are not in canonical order")
             }
-            Self::DuplicateOldPath => formatter.write_str("delta repeats an old path"),
-            Self::DuplicateNewPath => formatter.write_str("delta repeats a new path"),
+            Self::CrossEntryPathReuse => {
+                formatter.write_str("delta reuses a logical path across entries")
+            }
             Self::ContentLengthOverflow => formatter.write_str("delta content length overflow"),
             Self::CanonicalValueTooLarge => {
                 formatter.write_str("value is too large for canonical encoding")

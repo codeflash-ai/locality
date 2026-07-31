@@ -2,6 +2,7 @@
   "format_version": 1,
   "minimum_reader_version": 1,
   "delta_id": "delta-018f4f6e",
+  "mount_id": "mount-alpha",
   "source_connection_id": "source-018f4f6e",
   "base_generation_id": "generation-0007",
   "target_generation_id": "generation-0008",
@@ -11,7 +12,6 @@
   "workspace_layout_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "entries": [
     {
-      "mount_id": "mount-alpha",
       "old": null,
       "new": {
         "projection_id": "projection-1",
@@ -22,7 +22,6 @@
       }
     },
     {
-      "mount_id": "mount-alpha",
       "old": {
         "projection_id": "projection-2",
         "logical_path": "Engineering/roadmap.md",
@@ -39,7 +38,6 @@
       }
     },
     {
-      "mount_id": "mount-zeta",
       "old": {
         "projection_id": "projection-9",
         "logical_path": "Sales/old.md",

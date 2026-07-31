@@ -134,6 +134,12 @@ deleted, or conflict outcome does one SQLite transaction advance affected mount
 heads and clean path bases. Dirty local bytes stay in place and become explicit
 conflicts; staged incoming bytes are retained while a conflict remains.
 
+V1 deltas are mount-scoped. Empty entry lists are valid when a complete target
+generation changes no projected bytes. A logical path may occur in only one
+entry, preventing order-dependent delete/create replacement. Per-file and
+aggregate content limits are validated before reservation; the journal is
+reserved before bounded streaming downloads begin.
+
 The public daemon exposes an authenticated transport trait and a deterministic
 fake, not a network route. An authenticated private endpoint adapter and the
 existing `loc pull`/Live Mode call-site integration remain follow-up work. No

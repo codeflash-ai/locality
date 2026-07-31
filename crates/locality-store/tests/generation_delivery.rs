@@ -43,6 +43,7 @@ fn delta() -> GenerationDelta {
         format_version: GENERATION_DELTA_FORMAT_VERSION,
         minimum_reader_version: FRESHNESS_DELIVERY_READER_VERSION,
         delta_id: "delta-2".to_string(),
+        mount_id: PortableMountId::new("mount-main").unwrap(),
         source_connection_id: SourceConnectionId::new("source-main"),
         base_generation_id: generation("generation-1"),
         target_generation_id: generation("generation-2"),
@@ -51,7 +52,6 @@ fn delta() -> GenerationDelta {
         workspace_layout_version: 1,
         workspace_layout_digest: LayoutDigest::new(digest('a')).unwrap(),
         entries: vec![GenerationDeltaEntry {
-            mount_id: PortableMountId::new("mount-main").unwrap(),
             old: Some(identity("content-1", '1', 3)),
             new: Some(identity("content-2", '2', 4)),
         }],
@@ -63,6 +63,7 @@ fn receipt(delta: &GenerationDelta) -> GenerationDeltaTerminalReceipt {
         format_version: delta.format_version,
         minimum_reader_version: delta.minimum_reader_version,
         delta_id: delta.delta_id.clone(),
+        mount_id: delta.mount_id.clone(),
         source_connection_id: delta.source_connection_id.clone(),
         base_generation_id: delta.base_generation_id.clone(),
         target_generation_id: delta.target_generation_id.clone(),
@@ -70,8 +71,8 @@ fn receipt(delta: &GenerationDelta) -> GenerationDeltaTerminalReceipt {
         workspace_layout_version: delta.workspace_layout_version,
         workspace_layout_digest: delta.workspace_layout_digest.clone(),
         delta_sha256: delta.canonical_sha256().unwrap(),
-        entry_count: 1,
-        changed_content_bytes: 4,
+        entry_count: delta.entries.len() as u64,
+        changed_content_bytes: delta.changed_content_bytes().unwrap(),
         authorization_epoch: FreshnessEpoch::new(7).unwrap(),
         completed_at: "2026-07-31T12:00:00Z".to_string(),
     }
@@ -204,6 +205,40 @@ fn reservation_fails_closed_on_generation_layout_and_old_identity_mismatch() {
         assert!(matches!(error, StoreError::InvalidState(_)));
     }
     assert!(store.list_active_generation_applies().unwrap().is_empty());
+}
+
+#[test]
+fn empty_mount_delta_completes_and_advances_observed_generation() {
+    let fixture = Fixture::new("empty-advance");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let mut delta = delta();
+    delta.delta_id = "delta-empty".to_string();
+    delta.entries.clear();
+    let receipt = receipt(&delta);
+    store
+        .reserve_generation_apply(PreparedGenerationApply {
+            receipt_sha256: receipt.canonical_sha256().unwrap(),
+            receipt,
+            delta,
+            stage_root: "generation-delivery/delta-empty".to_string(),
+            created_at: "2026-07-31T12:01:00Z".to_string(),
+        })
+        .unwrap();
+
+    let completed = store
+        .complete_generation_apply("delta-empty", "2026-07-31T12:02:00Z")
+        .unwrap();
+
+    assert!(completed.outcomes.is_empty());
+    assert_eq!(
+        store
+            .get_observed_generation(&fixture.mount_id)
+            .unwrap()
+            .unwrap()
+            .generation_id,
+        generation("generation-2")
+    );
 }
 
 #[test]

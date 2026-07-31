@@ -43,6 +43,13 @@ the observed generation advances only after every entry has a terminal local
 outcome. The transport remains behind an authenticated adapter trait. Until the
 private endpoint exists, this path has a fake transport and no CLI/API route.
 
+The V1 delivery unit is exactly one mount, including empty no-content
+advancements. Incoming files are streamed under bounded per-file and aggregate
+limits. Clean local mutations use a mount coordinator plus handle-relative,
+no-follow/beneath operations and recoverable preimages, so a concurrent local
+writer or parent-directory replacement cannot turn a stale digest into an
+overwrite, deletion, or write outside the opened mount tree.
+
 ### Entity
 
 An `Entity` is any remote object Locality knows about. Examples include a Notion page,
