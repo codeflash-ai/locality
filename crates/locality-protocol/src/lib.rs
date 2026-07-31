@@ -4,6 +4,7 @@
 //! This crate owns envelopes, not transport or persistence. In particular it
 //! contains no HTTP client, database repository, cloud SDK, or host path.
 
+pub mod freshness_delivery;
 pub mod workspace_api_v2;
 pub mod workspace_layout;
 
