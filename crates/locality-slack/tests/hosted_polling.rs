@@ -1036,6 +1036,16 @@ fn page_and_checkpoint_decoders_enforce_bounds_unknown_fields_and_scope() {
         Err(HostedSlackPollError::InvalidJson("history page"))
     );
 
+    let mut unversioned_reconciliation =
+        serde_json::from_slice::<serde_json::Value>(REPLIES_PAGE).unwrap();
+    unversioned_reconciliation["reconciliation"] = serde_json::json!("thread_not_found");
+    assert_eq!(
+        decode_hosted_slack_replies_page_v1(
+            &serde_json::to_vec(&unversioned_reconciliation).unwrap()
+        ),
+        Err(HostedSlackPollError::InvalidJson("replies page"))
+    );
+
     let mut too_many = history_page();
     too_many.messages =
         vec![too_many.messages[0].clone(); MAX_HOSTED_SLACK_POLL_PAGE_MESSAGES_V1 + 1];
