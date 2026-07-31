@@ -610,6 +610,16 @@ pub fn decode_hosted_slack_poll_checkpoint_v1(
 ) -> Result<HostedSlackPollCheckpointV1, HostedSlackPollError> {
     decode_hosted_slack_poll_checkpoint_for_reader(
         bytes,
+        HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V2,
+        HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V2,
+    )
+}
+
+pub fn decode_hosted_slack_poll_checkpoint_v2(
+    bytes: &[u8],
+) -> Result<HostedSlackPollCheckpointV1, HostedSlackPollError> {
+    decode_hosted_slack_poll_checkpoint_for_reader(
+        bytes,
         HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V3,
         HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V3,
     )

@@ -8,7 +8,8 @@ use locality_slack::portable::hosted::{
     MAX_HOSTED_SLACK_CHECKPOINT_BYTES_V1, MAX_HOSTED_SLACK_CURSOR_BYTES_V1,
     MAX_HOSTED_SLACK_POLL_PAGE_BYTES_V1, MAX_HOSTED_SLACK_POLL_PAGE_MESSAGES_V1,
     RawHostedSlackMessage, RawHostedSlackNativeSnapshot, decode_hosted_slack_history_page_v1,
-    decode_hosted_slack_poll_checkpoint_v1, decode_hosted_slack_replies_page_v1,
+    decode_hosted_slack_poll_checkpoint_v1, decode_hosted_slack_poll_checkpoint_v2,
+    decode_hosted_slack_replies_page_v1,
 };
 use serde::Serialize;
 
@@ -1150,7 +1151,7 @@ fn incremental_poll_starts_from_applied_candidate_and_skips_historical_and_untou
     wrong_non_incremental_version["checkpoint_format_version"] = 3.into();
     wrong_non_incremental_version["minimum_reader_version"] = 3.into();
     assert!(
-        decode_hosted_slack_poll_checkpoint_v1(
+        decode_hosted_slack_poll_checkpoint_v2(
             &serde_json::to_vec(&wrong_non_incremental_version).unwrap()
         )
         .is_err()
@@ -1183,14 +1184,15 @@ fn incremental_poll_starts_from_applied_candidate_and_skips_historical_and_untou
         "the applied candidate must not be duplicated into replay evidence"
     );
     assert_eq!(
-        decode_hosted_slack_poll_checkpoint_v1(&encoded).unwrap(),
+        decode_hosted_slack_poll_checkpoint_v2(&encoded).unwrap(),
         incremental
     );
+    assert!(decode_hosted_slack_poll_checkpoint_v1(&encoded).is_err());
     let mut wrong_incremental_version = encoded_value.clone();
     wrong_incremental_version["checkpoint_format_version"] = 2.into();
     wrong_incremental_version["minimum_reader_version"] = 2.into();
     assert!(
-        decode_hosted_slack_poll_checkpoint_v1(
+        decode_hosted_slack_poll_checkpoint_v2(
             &serde_json::to_vec(&wrong_incremental_version).unwrap()
         )
         .is_err()
