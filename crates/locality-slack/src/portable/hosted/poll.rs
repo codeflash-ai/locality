@@ -75,20 +75,12 @@ pub struct HostedSlackRepliesPageV1 {
     pub poll_overlap_watermark: String,
     pub root_message_id: String,
     pub root_reply_count: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reconciliation: Option<HostedSlackRepliesReconciliationV1>,
     pub request_cursor: Option<String>,
     pub next_cursor: Option<String>,
     pub observed_at: String,
     pub messages: Vec<RawHostedSlackMessage>,
     pub users: Vec<RawHostedSlackUser>,
     pub files: Vec<RawHostedSlackFileMetadata>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HostedSlackRepliesReconciliationV1 {
-    ThreadNotFound,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,6 +246,7 @@ impl HostedSlackRepliesPageV1 {
                 "replies page messages",
             ));
         }
+        let deleted_root_reconciliation = is_deleted_root_reconciliation_page(self);
         if self.request_cursor.is_none() {
             let first = &self.messages[0];
             if first.ts != self.root_message_id {
@@ -266,10 +259,11 @@ impl HostedSlackRepliesPageV1 {
                     first.ts.clone(),
                 ));
             }
-        } else if self
-            .messages
-            .iter()
-            .any(|message| message.ts == self.root_message_id)
+        } else if !deleted_root_reconciliation
+            && self
+                .messages
+                .iter()
+                .any(|message| message.ts == self.root_message_id)
         {
             return Err(HostedSlackPollError::InvalidMessageRelationship(
                 self.root_message_id.clone(),
@@ -287,20 +281,6 @@ impl HostedSlackRepliesPageV1 {
                     message.ts.clone(),
                 ));
             }
-        }
-        if self.reconciliation == Some(HostedSlackRepliesReconciliationV1::ThreadNotFound)
-            && (self.request_cursor.is_some()
-                || self.next_cursor.is_some()
-                || self.root_reply_count != 0
-                || self.messages.len() != 1
-                || self.messages[0].ts != self.root_message_id
-                || !self.messages[0].deleted
-                || !self.messages[0].text.is_empty()
-                || !self.messages[0].file_ids.is_empty())
-        {
-            return Err(HostedSlackPollError::IncompleteCandidate(
-                "thread-not-found reconciliation",
-            ));
         }
         validate_serialized_page_size(self, "replies page")?;
         Ok(())
@@ -473,8 +453,7 @@ impl HostedSlackPollCheckpointV1 {
             return Err(HostedSlackPollError::PageWindowMismatch);
         }
         let first_page = page.request_cursor.is_none();
-        let deleted_root_reconciliation =
-            page.reconciliation == Some(HostedSlackRepliesReconciliationV1::ThreadNotFound);
+        let deleted_root_reconciliation = is_deleted_root_reconciliation_page(page);
         let expectation_is_from_this_catch_up = page.phase
             != HostedSlackPollPhaseV1::CatchUpReplies
             || catch_up_history_contains_root(&next, &page.root_message_id)?
@@ -505,7 +484,7 @@ impl HostedSlackPollCheckpointV1 {
                 },
             );
         }
-        if first_page {
+        if first_page || deleted_root_reconciliation {
             next.candidate.messages.retain(|message| {
                 normalized_root_id(message) != Some(page.root_message_id.as_str())
             });
@@ -1643,6 +1622,23 @@ fn normalized_root_id(message: &RawHostedSlackMessage) -> Option<&str> {
         .thread_ts
         .as_deref()
         .filter(|thread_ts| *thread_ts != message.ts)
+}
+
+// V1 reconciliation deliberately uses only the existing replies-page schema so
+// deny-unknown V1 readers never receive an unversioned field. The exact terminal
+// tombstone shape is reserved for a root Slack reports as thread_not_found.
+fn is_deleted_root_reconciliation_page(page: &HostedSlackRepliesPageV1) -> bool {
+    page.next_cursor.is_none()
+        && page.root_reply_count == 0
+        && page.messages.len() == 1
+        && page.messages[0].ts == page.root_message_id
+        && normalized_root_id(&page.messages[0]).is_none()
+        && page.messages[0].deleted
+        && page.messages[0].text.is_empty()
+        && page.messages[0].edited_ts.is_none()
+        && page.messages[0].file_ids.is_empty()
+        && page.users.is_empty()
+        && page.files.is_empty()
 }
 
 fn record_page(

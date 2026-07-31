@@ -30,8 +30,8 @@ use super::native::{
 use super::poll::{
     HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1, HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V1,
     HostedSlackHistoryMessageV1, HostedSlackHistoryPageV1, HostedSlackPollOutputV1,
-    HostedSlackRepliesPageV1, HostedSlackRepliesReconciliationV1,
-    hosted_slack_history_page_reference_closure_v1, hosted_slack_replies_page_reference_closure_v1,
+    HostedSlackRepliesPageV1, hosted_slack_history_page_reference_closure_v1,
+    hosted_slack_replies_page_reference_closure_v1,
 };
 
 pub const HOSTED_SLACK_PROVIDER_PAGE_LIMIT_V1: u32 = 15;
@@ -666,7 +666,7 @@ pub async fn drive_hosted_slack_poll_v1<P: HostedSlackProviderPort>(
                 .await
                 {
                     Ok(response) => response,
-                    Err(HostedSlackProviderError::ThreadNotFound) if request.cursor.is_none() => {
+                    Err(HostedSlackProviderError::ThreadNotFound) => {
                         let page = deleted_root_reconciliation_page(checkpoint, &request)?;
                         ensure_active(control)?;
                         checkpoint.apply_replies_page(&page)?;
@@ -887,11 +887,7 @@ fn history_poll_page(
         .map(|provided| {
             let is_root = normalized_root_id(&provided.message).is_none();
             let reply_count = if is_root {
-                provided
-                    .reply_count
-                    .ok_or(HostedSlackProviderError::InvalidResponse(
-                        "root reply_count",
-                    ))?
+                provided.reply_count.unwrap_or(0)
             } else {
                 if provided.reply_count.is_some_and(|count| count != 0) {
                     return Err(HostedSlackProviderError::InvalidResponse(
@@ -979,7 +975,6 @@ fn replies_poll_page(
         poll_overlap_watermark: checkpoint.poll_overlap_watermark().to_string(),
         root_message_id: request.root_message_id.clone(),
         root_reply_count,
-        reconciliation: None,
         request_cursor: request.cursor.clone(),
         next_cursor,
         observed_at: response.observed_at,
@@ -1028,8 +1023,7 @@ fn deleted_root_reconciliation_page(
         poll_overlap_watermark: checkpoint.poll_overlap_watermark().to_string(),
         root_message_id: request.root_message_id.clone(),
         root_reply_count: 0,
-        reconciliation: Some(HostedSlackRepliesReconciliationV1::ThreadNotFound),
-        request_cursor: None,
+        request_cursor: request.cursor.clone(),
         next_cursor: None,
         observed_at: current_canonical_utc(),
         messages: vec![root],
@@ -1231,11 +1225,17 @@ where
                 if attempt == retry.max_retries {
                     return Err(error);
                 }
-                if delay > MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1 {
-                    wait_for_retry(control, MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1).await?;
+                let in_drive_wait = delay.min(MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1);
+                if control
+                    .remaining()
+                    .is_none_or(|remaining| in_drive_wait >= remaining)
+                {
                     return Err(error);
                 }
-                wait_for_retry(control, delay).await?;
+                wait_for_retry(control, in_drive_wait).await?;
+                if delay > in_drive_wait {
+                    return Err(error);
+                }
             }
         }
     }
@@ -1368,15 +1368,43 @@ struct HostedSlackMethodGateState {
     in_flight: usize,
     tokens: f64,
     last_refill: Instant,
-    cooldown_until: Option<Instant>,
+    cooldown: Option<HostedSlackMethodCooldown>,
+}
+
+struct HostedSlackMethodCooldown {
+    started_at: Instant,
+    duration: Duration,
+    checked_until: Option<Instant>,
+}
+
+impl HostedSlackMethodCooldown {
+    fn new(started_at: Instant, duration: Duration) -> Self {
+        Self {
+            started_at,
+            duration,
+            checked_until: started_at.checked_add(duration),
+        }
+    }
+
+    fn remaining(&self, now: Instant) -> Duration {
+        self.checked_until.map_or_else(
+            || {
+                self.duration
+                    .saturating_sub(now.saturating_duration_since(self.started_at))
+            },
+            |until| until.saturating_duration_since(now),
+        )
+    }
 }
 
 impl HostedSlackMethodGateState {
     fn refill(&mut self, config: &ConnectorNetworkConfig, now: Instant) {
-        if self.cooldown_until.is_some_and(|until| until > now) {
+        if let Some(cooldown) = &self.cooldown
+            && !cooldown.remaining(now).is_zero()
+        {
             return;
         }
-        self.cooldown_until = None;
+        self.cooldown = None;
         let elapsed = now.saturating_duration_since(self.last_refill);
         self.tokens =
             (self.tokens + elapsed.as_secs_f64() * config.requests_per_second).min(config.burst);
@@ -1401,7 +1429,7 @@ impl HostedSlackMethodGate {
                     in_flight: 0,
                     tokens,
                     last_refill: Instant::now(),
-                    cooldown_until: None,
+                    cooldown: None,
                 }),
                 changed,
             }),
@@ -1425,8 +1453,12 @@ impl HostedSlackMethodGate {
                         inner: self.inner.clone(),
                     };
                 }
-                if let Some(until) = state.cooldown_until.filter(|until| *until > now) {
-                    Some(until.saturating_duration_since(now))
+                if let Some(cooldown) = &state.cooldown {
+                    Some(
+                        cooldown
+                            .remaining(now)
+                            .min(MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1),
+                    )
                 } else if state.in_flight < self.inner.config.max_in_flight {
                     let missing = (1.0 - state.tokens).max(0.0);
                     Some(Duration::from_secs_f64(
@@ -1455,14 +1487,16 @@ impl HostedSlackMethodGate {
 
     fn record_cooldown(&self, delay: Duration) {
         let now = Instant::now();
-        let until = now + delay;
+        let candidate = HostedSlackMethodCooldown::new(now, delay);
         {
             let mut state = self.inner.state.lock().expect("hosted Slack gate lock");
-            state.cooldown_until = Some(
-                state
-                    .cooldown_until
-                    .map_or(until, |current| current.max(until)),
-            );
+            if state
+                .cooldown
+                .as_ref()
+                .is_none_or(|current| candidate.remaining(now) > current.remaining(now))
+            {
+                state.cooldown = Some(candidate);
+            }
             state.tokens = 0.0;
             state.last_refill = now;
         }
@@ -1479,9 +1513,10 @@ impl HostedSlackMethodGate {
             in_flight: state.in_flight,
             tokens: state.tokens,
             cooldown_remaining: state
-                .cooldown_until
-                .filter(|until| *until > now)
-                .map(|until| until.saturating_duration_since(now)),
+                .cooldown
+                .as_ref()
+                .map(|cooldown| cooldown.remaining(now))
+                .filter(|remaining| !remaining.is_zero()),
         }
     }
 }
@@ -2441,7 +2476,6 @@ fn provider_message(
             body.text = bounded_system_event_text(subtype, &body.text);
             body.edited = None;
             body.files.clear();
-            body.reply_count = Some(0);
             (body, false)
         }
         Some(_) => {
@@ -3138,8 +3172,19 @@ mod tests {
         assert!(bounded.message.text.ends_with(" …[truncated]"));
         assert!(std::str::from_utf8(bounded.message.text.as_bytes()).is_ok());
 
+        let threaded = serde_json::from_str::<MessageWire>(
+            r#"{"ts":"1780000004.000100","subtype":"channel_topic","text":"topic","reply_count":2}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            provider_message(threaded, "C08ENGINEER1")
+                .unwrap()
+                .reply_count,
+            Some(2)
+        );
+
         let unknown = serde_json::from_str::<MessageWire>(
-            r#"{"ts":"1780000004.000100","subtype":"unknown_provider_secret","text":"secret"}"#,
+            r#"{"ts":"1780000005.000100","subtype":"unknown_provider_secret","text":"secret"}"#,
         )
         .unwrap();
         assert_eq!(
@@ -3810,6 +3855,14 @@ mod tests {
                 },
                 MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1,
                 Duration::from_secs(301),
+            ),
+            (
+                vec![("Retry-After", "18446744073709551615")],
+                HostedSlackProviderError::RateLimited {
+                    retry_after: Duration::from_secs(u64::MAX),
+                },
+                Duration::from_secs(u64::MAX - 1),
+                Duration::from_secs(u64::MAX),
             ),
         ];
 

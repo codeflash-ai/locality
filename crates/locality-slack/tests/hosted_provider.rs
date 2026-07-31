@@ -642,6 +642,41 @@ async fn long_retry_after_is_retained_while_current_drive_wait_is_capped() {
     assert_eq!(provider.transcript().len(), 3);
 }
 
+#[tokio::test(start_paused = true)]
+async fn retry_wait_returns_full_cooldown_immediately_when_deadline_cannot_cover_it() {
+    let provider = FakeProvider::new([
+        ScriptedResponse::Identity(Ok(observed())),
+        ScriptedResponse::Authority(Ok(authority())),
+        ScriptedResponse::History(Err(HostedSlackProviderError::RateLimited {
+            retry_after: Duration::from_secs(601),
+        })),
+    ]);
+    let mut checkpoint = new_checkpoint("2026-05-28T20:00:00Z");
+    let before = checkpoint.clone();
+    let started = tokio::time::Instant::now();
+    let drive_control = HostedSlackDriveControlV1::new(
+        Instant::now() + Duration::from_secs(299),
+        HostedSlackCancellationToken::new(),
+        None,
+    );
+    assert_eq!(
+        drive_hosted_slack_poll_v1(
+            &provider,
+            &binding(),
+            &selector(),
+            &mut checkpoint,
+            &drive_control,
+        )
+        .await,
+        Err(HostedSlackProviderError::RateLimited {
+            retry_after: Duration::from_secs(601),
+        })
+    );
+    assert_eq!(tokio::time::Instant::now(), started);
+    assert_eq!(checkpoint, before);
+    provider.assert_exhausted();
+}
+
 #[tokio::test]
 async fn identity_swap_and_revocation_fail_before_content_calls() {
     let mut swapped = observed();
@@ -788,7 +823,7 @@ async fn channel_authority_drift_and_access_revocation_fail_before_history() {
 }
 
 #[tokio::test]
-async fn exact_history_boundaries_include_start_exclude_cut_and_require_root_count() {
+async fn exact_history_boundaries_include_start_exclude_cut_and_default_absent_root_count() {
     let mut start = zero_root_response(None, "2026-06-01T00:00:01Z");
     start.messages[0].message.ts = "1767225600.000000".to_string();
     start.messages[0].reply_count = None;
@@ -806,11 +841,15 @@ async fn exact_history_boundaries_include_start_exclude_cut_and_require_root_cou
             &mut checkpoint,
             &control(None),
         )
-        .await,
-        Err(HostedSlackProviderError::InvalidResponse(
-            "root reply_count"
-        ))
+        .await
+        .unwrap(),
+        HostedSlackDriveOutcomeV1::Pending {
+            phase: HostedSlackPollPhaseV1::AwaitingCatchUpCut,
+            reason: HostedSlackDrivePendingReasonV1::AwaitingCatchUpCut,
+        }
     );
+    provider.assert_exhausted();
+    assert_eq!(checkpoint.completed_roots()[0].expected_reply_count, 0);
 
     let mut cut = zero_root_response(None, "2026-06-01T00:00:01Z");
     cut.messages[0].message.ts = "1780272000.000000".to_string();
@@ -900,6 +939,9 @@ async fn thread_not_found_reconciles_deleted_root_and_replays_without_stale_file
     terminal.poll_kind = HostedSlackPollKindV1::FullRepair;
     checkpoint.apply_history_page(&first).unwrap();
     checkpoint.apply_history_page(&terminal).unwrap();
+    let mut partial_replies = replies_page();
+    partial_replies.poll_kind = HostedSlackPollKindV1::FullRepair;
+    checkpoint.apply_replies_page(&partial_replies).unwrap();
     let provider = FakeProvider::new([
         ScriptedResponse::Identity(Ok(observed())),
         ScriptedResponse::Authority(Ok(authority())),
@@ -931,10 +973,18 @@ async fn thread_not_found_reconciles_deleted_root_and_replays_without_stale_file
     assert!(root.deleted);
     assert!(root.text.is_empty());
     assert!(root.file_ids.is_empty());
+    assert!(
+        checkpoint
+            .candidate()
+            .messages()
+            .iter()
+            .all(|message| message.thread_ts.as_deref() != Some("1780000000.000100"))
+    );
     assert!(checkpoint.candidate().files().is_empty());
     assert_eq!(checkpoint.completed_roots()[0].expected_reply_count, 0);
     let encoded = serde_json::to_vec(&checkpoint).unwrap();
     let encoded_value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    assert!(!String::from_utf8_lossy(&encoded).contains("reconciliation"));
     assert!(
         encoded_value["evidence"]
             .as_array()
@@ -943,7 +993,14 @@ async fn thread_not_found_reconciles_deleted_root_and_replays_without_stale_file
             .any(|item| {
                 item["page"]["canonical_page_json"]
                     .as_str()
-                    .is_some_and(|page| page.contains(r#""reconciliation":"thread_not_found""#))
+                    .and_then(|page| serde_json::from_str::<serde_json::Value>(page).ok())
+                    .is_some_and(|page| {
+                        page["request_cursor"] == "reply-page-2"
+                            && page["next_cursor"].is_null()
+                            && page["root_reply_count"] == 0
+                            && page["messages"][0]["deleted"] == true
+                            && page["messages"][0]["file_ids"] == serde_json::json!([])
+                    })
             })
     );
     assert_eq!(

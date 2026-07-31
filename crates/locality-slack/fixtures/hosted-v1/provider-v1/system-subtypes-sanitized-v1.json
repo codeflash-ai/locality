@@ -10,7 +10,7 @@
       "deleted": false,
       "file_ids": []
     },
-    "reply_count": 0
+    "reply_count": null
   },
   {
     "message": {
@@ -23,7 +23,7 @@
       "deleted": false,
       "file_ids": []
     },
-    "reply_count": 0
+    "reply_count": null
   },
   {
     "message": {
@@ -36,6 +36,6 @@
       "deleted": false,
       "file_ids": []
     },
-    "reply_count": 0
+    "reply_count": null
   }
 ]
