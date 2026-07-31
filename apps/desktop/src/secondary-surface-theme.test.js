@@ -65,6 +65,14 @@ describe("desktop secondary surface theme contract", () => {
       "color: var(--onboarding-demo-text);",
       "box-shadow: var(--modal-shadow);",
     ]);
+    expectCssBlock(".onboarding-video-demo", [
+      "border: 1px solid var(--onboarding-demo-line);",
+      "background: var(--onboarding-demo-bg);",
+      "box-shadow: var(--modal-shadow);",
+    ]);
+    expectCssBlock(".onboarding-video-demo video", [
+      "background: var(--onboarding-demo-bg);",
+    ]);
     expectCssBlock(".editor-demo-toolbar", [
       "border-bottom: 1px solid var(--onboarding-demo-line);",
       "background: var(--onboarding-demo-panel-bg);",
@@ -143,6 +151,8 @@ describe("desktop secondary surface theme contract", () => {
     expect(cssBlock(".progress-list li.active span")).toContain("background: transparent;");
 
     expectNoRawSurfaceColors(cssBlock(".onboarding-editor-demo"));
+    expectNoRawSurfaceColors(cssBlock(".onboarding-video-demo"));
+    expectNoRawSurfaceColors(cssBlock(".onboarding-video-demo video"));
     expectNoRawSurfaceColors(cssBlock(".editor-demo-toolbar"));
     expectNoRawSurfaceColors(cssBlock(".editor-demo-toolbar span"));
     expectNoRawSurfaceColors(cssBlock(".editor-demo-sidebar"));

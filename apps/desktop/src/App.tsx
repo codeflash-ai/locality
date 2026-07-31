@@ -130,6 +130,7 @@ import localityShortLightUrl from "./assets/brand/locality-short-light.svg";
 
 const distributionChannel = (import.meta.env.VITE_LOCALITY_DISTRIBUTION_CHANNEL || "direct").toLowerCase();
 const appStoreDistribution = distributionChannel === "mas";
+const onboardingDemoVideoUrl = import.meta.env.VITE_LOCALITY_ONBOARDING_DEMO_VIDEO_URL?.trim() || "";
 
 type AppView = "home" | "files" | "mount" | "pending" | "review" | "activity" | "settings";
 type LocateState = "idle" | "preparing" | "ready" | "error";
@@ -142,6 +143,7 @@ type SourceListViewMode = "list" | "tiles";
 type AppTheme = "system" | "light" | "dark";
 
 const APP_THEME_STORAGE_KEY = "locality.desktop.theme";
+const ONBOARDING_COMPLETED_STORAGE_KEY = "locality.desktop.onboarding.completed";
 
 type ConnectorOption = {
   id: SourceConnectorId;
@@ -925,11 +927,11 @@ function snapshotNeedsOnboarding(snapshot: DesktopSnapshot) {
   return snapshot.needsOnboarding || connectionMissing(snapshot) || mountMissing(snapshot);
 }
 
-function routeShouldShowOnboarding(route: string, snapshot: DesktopSnapshot) {
+function routeShouldShowOnboarding(route: string, snapshot: DesktopSnapshot, onboardingCompleted: boolean) {
   if (route === "#tray" || routeForcesMainApp(route)) {
     return false;
   }
-  return routeForcesOnboarding(route) || previewRouteStartsOnboarding(route) || snapshotNeedsOnboarding(snapshot);
+  return routeForcesOnboarding(route) || (!onboardingCompleted && (previewRouteStartsOnboarding(route) || snapshotNeedsOnboarding(snapshot)));
 }
 
 async function callCommand<T>(command: string, args?: Record<string, unknown>, fallback?: T) {
@@ -1146,6 +1148,22 @@ function initialAppTheme(): AppTheme {
   }
 }
 
+function readOnboardingCompleted() {
+  try {
+    return window.localStorage.getItem(ONBOARDING_COMPLETED_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function writeOnboardingCompleted() {
+  try {
+    window.localStorage.setItem(ONBOARDING_COMPLETED_STORAGE_KEY, "true");
+  } catch {
+    // The in-memory state still lets the current session leave onboarding.
+  }
+}
+
 function resolvedAppTheme(theme: AppTheme): "light" | "dark" {
   if (theme !== "system") {
     return theme;
@@ -1162,6 +1180,7 @@ function applyAppTheme(theme: AppTheme) {
 
 export default function App() {
   const initialRoute = window.location.hash;
+  const initialOnboardingCompleted = readOnboardingCompleted();
   const [snapshot, setSnapshot] = useState<DesktopSnapshot>(() =>
     isTauriRuntime() ? loadingSnapshot : sampleSnapshot,
   );
@@ -1170,8 +1189,9 @@ export default function App() {
   const [reviewInitialFilter, setReviewInitialFilter] = useState<ReviewFilter>("all");
   const [theme, setTheme] = useState<AppTheme>(() => initialAppTheme());
   const [route, setRoute] = useState(initialRoute);
+  const [onboardingCompleted, setOnboardingCompleted] = useState(initialOnboardingCompleted);
   const [showOnboarding, setShowOnboarding] = useState(() =>
-    routeForcesOnboarding(initialRoute) || previewRouteStartsOnboarding(initialRoute),
+    routeForcesOnboarding(initialRoute) || (!initialOnboardingCompleted && previewRouteStartsOnboarding(initialRoute)),
   );
   const [onboardingKey, setOnboardingKey] = useState(0);
   const [onboardingInitialStep, setOnboardingInitialStep] = useState<OnboardingStep>(() =>
@@ -1518,7 +1538,7 @@ export default function App() {
       return;
     }
 
-    if (routeShouldShowOnboarding(route, snapshot)) {
+    if (routeShouldShowOnboarding(route, snapshot, onboardingCompleted)) {
       setOnboardingInitialStep(1);
       setShowOnboarding(true);
       return;
@@ -1531,6 +1551,7 @@ export default function App() {
     setShowOnboarding(false);
   }, [
     route,
+    onboardingCompleted,
     snapshot.connection.status,
     snapshot.mount.status,
     snapshot.needsOnboarding,
@@ -1593,7 +1614,7 @@ export default function App() {
   }
 
   const shouldRenderOnboarding =
-    showOnboarding || (snapshotLoaded && routeShouldShowOnboarding(route, snapshot));
+    showOnboarding || (snapshotLoaded && routeShouldShowOnboarding(route, snapshot, onboardingCompleted));
 
   if (shouldRenderOnboarding) {
     return (
@@ -1603,7 +1624,13 @@ export default function App() {
         snapshotLoaded={snapshotLoaded}
         initialStep={onboardingInitialStep}
         onComplete={() => {
+          writeOnboardingCompleted();
+          setOnboardingCompleted(true);
           void refreshSnapshot().catch(() => undefined);
+          if (window.location.hash !== "#app") {
+            window.history.replaceState(null, "", "#app");
+            setRoute("#app");
+          }
           setShowOnboarding(false);
           setView("home");
         }}
@@ -2387,6 +2414,12 @@ function Onboarding({
   const fileProviderGuideVisible =
     mountOnboarding?.state === "needs_finder_enable" ||
     mountOnboarding?.state === "waiting_for_cloudstorage_root";
+  const localFolderReadyNow =
+    connectionReadyNow &&
+    !connectorSkipsMountStep(selectedOnboardingConnector) &&
+    !mountMissing(snapshot);
+  const canLeaveConnectorStep = !selectedConnectorBusy;
+  const canLeaveMountStep = !mounting && !fileProviderGuideVisible;
   const displayedFileProviderEnablement = fileProviderEnablement ??
     (mountOnboarding?.state === "waiting_for_cloudstorage_root"
       ? {
@@ -2399,6 +2432,33 @@ function Onboarding({
           message: "In Finder, click Enable for Locality.",
           path: mountPath,
         });
+
+  function goBackFromOnboarding() {
+    if (step === 5) {
+      setStep(connectorSkipsMountStep(selectedOnboardingConnector) ? 3 : 4);
+      return;
+    }
+    if (step === 4) {
+      if (!canLeaveMountStep) {
+        return;
+      }
+      setStep(3);
+      return;
+    }
+    if (step === 3) {
+      if (!canLeaveConnectorStep) {
+        return;
+      }
+      setStep(1);
+    }
+  }
+
+  function skipSourceOnboarding() {
+    if (!canLeaveConnectorStep) {
+      return;
+    }
+    finishOnboarding();
+  }
 
   return (
     <OnboardingFrame step={step} optionalGuideReturnStep={optionalGuideReturnStep}>
@@ -2448,16 +2508,17 @@ function Onboarding({
         )}
 
         {step === 3 && (
-          <SetupContent
-            side={
-              <ConnectorOptions
-                selected={selectedOnboardingConnector}
-                connectedConnector={connectionReadyNow ? selectedOnboardingConnector : null}
-                busy={selectedConnectorBusy}
-                onSelect={selectOnboardingConnector}
-              />
-            }
-          >
+          <>
+            <SetupContent
+              side={
+                <ConnectorOptions
+                  selected={selectedOnboardingConnector}
+                  connectedConnector={connectionReadyNow ? selectedOnboardingConnector : null}
+                  busy={selectedConnectorBusy}
+                  onSelect={selectOnboardingConnector}
+                />
+              }
+            >
             <div>
               <div className="eyebrow">Connect source</div>
               {(selectedConnectorBusy || connectionReadyNow) && (
@@ -2521,7 +2582,10 @@ function Onboarding({
                 />
               </label>
             )}
-            <div className="button-row">
+            <div className="button-row onboarding-nav-actions">
+              <SecondaryButton disabled={!canLeaveConnectorStep} onClick={goBackFromOnboarding}>
+                Back
+              </SecondaryButton>
               <PrimaryButton icon={<ConnectorIcon connector={selectedOnboardingConnector} />}
                 busy={selectedConnectorBusy && !connectionReadyNow}
                 disabled={
@@ -2562,7 +2626,15 @@ function Onboarding({
             </div>
             {loginCopyMessage && <p className="quiet-note inline-note">{loginCopyMessage}</p>}
             {oauthError && <p className="field-error">{oauthError}</p>}
-          </SetupContent>
+            </SetupContent>
+            {!connectionReadyNow && (
+              <div className="onboarding-skip-corner">
+                <SecondaryButton compact disabled={!canLeaveConnectorStep} onClick={skipSourceOnboarding}>
+                  Skip
+                </SecondaryButton>
+              </div>
+            )}
+          </>
         )}
 
         {step === 4 && (
@@ -2631,6 +2703,10 @@ function Onboarding({
                 )}
                 {finderRevealError && <p className="field-error">{finderRevealError}</p>}
               </>
+            ) : localFolderReadyNow ? (
+              <PrimaryButton onClick={() => setStep(5)}>
+                Continue
+              </PrimaryButton>
             ) : showRecoveryChooser ? (
               <div className="button-row">
                 <PrimaryButton
@@ -2653,6 +2729,11 @@ function Onboarding({
                 {mountOnboardingPrimaryLabel(mountOnboarding, mounting)}
               </PrimaryButton>
             )}
+            <div className="button-row onboarding-nav-actions">
+              <SecondaryButton disabled={!canLeaveMountStep} onClick={goBackFromOnboarding}>
+                Back
+              </SecondaryButton>
+            </div>
             {!fileProviderGuideVisible && mountOnboardingNeedsInstructions(mountOnboarding) && (
               <p className="quiet-note">{mountOnboardingInstructions(mountOnboarding)}</p>
             )}
@@ -2677,6 +2758,9 @@ function Onboarding({
             </div>
             {mountOnboarding && <p className="field-error">{mountOnboarding.message}</p>}
             <div className="final-actions">
+              <SecondaryButton onClick={goBackFromOnboarding}>
+                Back
+              </SecondaryButton>
               <PrimaryButton onClick={finishOnboarding}>
                 Open Locality
               </PrimaryButton>
@@ -3688,18 +3772,14 @@ function MountsView({
       </ViewHeader>
 
       {!hasVisibleSources ? (
-        <section className="empty-action-panel">
+        <section className="empty-action-panel sources-empty-panel">
           <BrandTile variant="folder" />
           <div>
-            <h2>Add a Notion source</h2>
-            <p>Connect a source once, then use its local folder from Files or your editor.</p>
+            <h2>No sources connected yet</h2>
+            <p>Connect a source when you're ready. Locality will create a local folder after the connection is set up.</p>
           </div>
-          <PrimaryButton
-            busy={creating}
-            icon={<FolderOpen />}
-            onClick={openAddSourceDialog}
-          >
-            Add Notion Source
+          <PrimaryButton busy={creating} icon={<Plus />} onClick={openAddSourceDialog}>
+            Add Source
           </PrimaryButton>
         </section>
       ) : (
@@ -7594,6 +7674,24 @@ function ViewHeader({
 }
 
 function ProductLoopDemo() {
+  const [videoAvailable, setVideoAvailable] = useState(Boolean(onboardingDemoVideoUrl));
+
+  if (onboardingDemoVideoUrl && videoAvailable) {
+    return (
+      <div className="onboarding-video-demo" aria-label="Locality onboarding video">
+        <video
+          autoPlay
+          loop
+          muted
+          playsInline
+          onError={() => setVideoAvailable(false)}
+        >
+          <source src={onboardingDemoVideoUrl} type="video/mp4" />
+        </video>
+      </div>
+    );
+  }
+
   return (
     <div className="onboarding-editor-demo" aria-label="Local Markdown preview">
       <div className="editor-demo-toolbar">
@@ -7725,6 +7823,16 @@ const onboardingConnectorCards: OnboardingConnectorCard[] = [
     connector: "granola",
     title: "Granola",
     description: "Meeting summaries and transcripts as read-only files.",
+  },
+  {
+    connector: "linear",
+    title: "Linear",
+    description: "Issues by team with local Markdown edits and review.",
+  },
+  {
+    connector: "slack",
+    title: "Slack",
+    description: "Recent accessible conversations as read-only files.",
   },
 ];
 

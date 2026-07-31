@@ -33,7 +33,9 @@ describe("onboarding layout styles", () => {
     expect(styles).toMatch(/\.agent-demo-command\s*\{[\s\S]*?overflow-wrap:\s*anywhere;/s);
   });
 
-  it("keeps the onboarding editor mock in a stable native-looking frame", () => {
+  it("keeps the onboarding video and editor mock in stable native-looking frames", () => {
+    expect(styles).toMatch(/\.onboarding-video-demo\s*\{[\s\S]*?aspect-ratio:\s*143 \/ 90;/s);
+    expect(styles).toMatch(/\.onboarding-video-demo video\s*\{[\s\S]*?object-fit:\s*cover;/s);
     expect(styles).toMatch(/\.onboarding-editor-demo\s*\{[\s\S]*?min-height:\s*440px;/s);
     expect(styles).toMatch(/\.editor-demo-body\s*\{[\s\S]*?grid-template-columns:\s*140px minmax\(0, 1fr\);/s);
     expect(styles).toMatch(/\.editor-demo-document pre\s*\{[\s\S]*?white-space:\s*pre-wrap;/s);
@@ -58,6 +60,8 @@ describe("onboarding layout styles", () => {
       /\.setup-content\.split-setup \.setup-copy h1,\s*\.setup-content\.split-setup \.setup-copy p\s*\{[\s\S]*?max-width:\s*100%;/s,
     );
     expect(styles).toMatch(/\.onboarding-pill-row\s*\{[\s\S]*?flex-wrap:\s*wrap;/s);
+    expect(styles).toMatch(/\.onboarding-source-list \.connector-option\s*\{[\s\S]*?min-height:\s*76px;/s);
+    expect(styles).toMatch(/\.onboarding-source-list \.connector-option small\s*\{[\s\S]*?line-height:\s*1\.3;/s);
   });
 
   it("stacks onboarding content cleanly on narrow desktop windows", () => {

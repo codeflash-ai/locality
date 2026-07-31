@@ -73,7 +73,7 @@ describe("onboarding redesign structure", () => {
     ]);
   });
 
-  it("uses the reference step one copy, actions, chips, and static editor mock", () => {
+  it("uses the reference step one copy, actions, chips, video, and editor fallback", () => {
     expect(appSource).toContain('<div className="eyebrow"><span />Meet Locality</div>');
     expect(appSource).toContain("<h1>Turn work apps into agent-ready files.</h1>");
     expect(appSource).toContain('<PrimaryButton icon={<ChevronRight />} onClick={() => setStep(3)}>Get Started</PrimaryButton>');
@@ -84,10 +84,25 @@ describe("onboarding redesign structure", () => {
     expect(appSource).toContain("Markdown edits");
     expect(appSource).toContain('<Check />');
     expect(appSource).toContain("Review before sync");
+    expect(appSource).toContain("const onboardingDemoVideoUrl = import.meta.env.VITE_LOCALITY_ONBOARDING_DEMO_VIDEO_URL?.trim() || \"\";");
+    expect(appSource).toContain("const [videoAvailable, setVideoAvailable] = useState(Boolean(onboardingDemoVideoUrl));");
+    expect(appSource).toContain('className="onboarding-video-demo" aria-label="Locality onboarding video"');
+    expect(appSource).toContain('<source src={onboardingDemoVideoUrl} type="video/mp4" />');
+    expect(appSource).toContain("onError={() => setVideoAvailable(false)}");
     expect(appSource).toContain('aria-label="Local Markdown preview"');
     expect(appSource).toContain("Release Notes - v2.4");
-    expect(appSource).not.toContain("onboardingDemoVideoUrl");
 
+    expectDeclarations(".onboarding-video-demo", [
+      "overflow: hidden;",
+      "border: 1px solid var(--onboarding-demo-line);",
+      "background: var(--onboarding-demo-bg);",
+      "box-shadow: var(--modal-shadow);",
+    ]);
+    expectDeclarations(".onboarding-video-demo video", [
+      "width: 100%;",
+      "height: 100%;",
+      "object-fit: cover;",
+    ]);
     expectDeclarations(".onboarding-editor-demo", [
       "background: var(--onboarding-demo-bg);",
       "color: var(--onboarding-demo-text);",
@@ -122,18 +137,25 @@ describe("onboarding redesign structure", () => {
     expectNoRawSurfaceColors(cssBlock(".editor-demo-line"));
     expectNoRawSurfaceColors(cssBlock(".editor-demo-line.active"));
     expectNoRawSurfaceColors(cssBlock(".editor-demo-document pre"));
+    expectNoRawSurfaceColors(cssBlock(".onboarding-video-demo"));
+    expectNoRawSurfaceColors(cssBlock(".onboarding-video-demo video"));
   });
 
-  it("renders the reference source list as five vertical cards", () => {
+  it("renders every onboarding connector as vertical cards", () => {
+    const connectorCardsStart = appSource.indexOf("const onboardingConnectorCards: OnboardingConnectorCard[] = [");
+    const connectorCardsEnd = appSource.indexOf("function ConnectorOptions");
+    expect(connectorCardsStart).toBeGreaterThanOrEqual(0);
+    expect(connectorCardsEnd).toBeGreaterThan(connectorCardsStart);
+    const connectorCardsSource = appSource.slice(connectorCardsStart, connectorCardsEnd);
+
     expect(appSource).toContain("type OnboardingConnectorCard = {");
     expect(appSource).toContain("const onboardingConnectorCards: OnboardingConnectorCard[] = [");
-    expect(appSource).toContain('connector: "notion",');
-    expect(appSource).toContain('connector: "google-docs",');
-    expect(appSource).toContain('connector: "google-calendar",');
-    expect(appSource).toContain('connector: "gmail",');
-    expect(appSource).toContain('connector: "granola",');
-    expect(appSource).not.toContain('connector: "linear", title: "Linear"');
-    expect(appSource).not.toContain('connector: "slack", title: "Slack"');
+    expect([...connectorCardsSource.matchAll(/connector: "/g)]).toHaveLength(7);
+    for (const connector of ["notion", "google-docs", "google-calendar", "gmail", "granola", "linear", "slack"]) {
+      expect(connectorCardsSource).toContain(`connector: "${connector}",`);
+    }
+    expect(connectorCardsSource).toContain('title: "Linear"');
+    expect(connectorCardsSource).toContain('title: "Slack"');
     expect(appSource).toContain('className="connector-options onboarding-source-list"');
     expect(appSource).toContain('className="connector-card-accessory"');
     expect(appSource).toContain('<ChevronRight />');
@@ -145,6 +167,10 @@ describe("onboarding redesign structure", () => {
     ]);
     expectDeclarations(".connector-option", [
       "grid-template-columns: 38px minmax(0, 1fr) auto;",
+    ]);
+    expectDeclarations(".onboarding-source-list .connector-option", [
+      "min-height: 76px;",
+      "padding: 12px 14px;",
     ]);
     expectDeclarations(".connector-option.available", [
       "background: var(--onboarding-card-bg);",
@@ -166,6 +192,43 @@ describe("onboarding redesign structure", () => {
     expectNoRawSurfaceColors(cssBlock(".connector-option.selectable:hover:not(:disabled),\n.connector-option.selectable.selected"));
     expectNoRawSurfaceColors(cssBlock(".connector-card-accessory"));
     expectNoRawSurfaceColors(cssBlock(".connector-option.connected .connector-card-accessory"));
+  });
+
+  it("keeps onboarding navigation guarded while allowing source skip", () => {
+    expect(appSource).toContain('const ONBOARDING_COMPLETED_STORAGE_KEY = "locality.desktop.onboarding.completed";');
+    expect(appSource).toContain("function readOnboardingCompleted()");
+    expect(appSource).toContain("function writeOnboardingCompleted()");
+    expect(appSource).toContain("function routeShouldShowOnboarding(route: string, snapshot: DesktopSnapshot, onboardingCompleted: boolean)");
+    expect(appSource).toContain("return routeForcesOnboarding(route) || (!onboardingCompleted && (previewRouteStartsOnboarding(route) || snapshotNeedsOnboarding(snapshot)));");
+    expect(appSource).toContain("writeOnboardingCompleted();");
+    expect(appSource).toContain("setOnboardingCompleted(true);");
+    expect(appSource).toContain('window.history.replaceState(null, "", "#app");');
+    expect(appSource).toContain('setRoute("#app");');
+    expect(appSource).toContain("const localFolderReadyNow =");
+    expect(appSource).toContain("const canLeaveConnectorStep = !selectedConnectorBusy;");
+    expect(appSource).toContain("const canLeaveMountStep = !mounting && !fileProviderGuideVisible;");
+    expect(appSource).toContain("function goBackFromOnboarding()");
+    expect(appSource).toContain("function skipSourceOnboarding()");
+    expect(appSource).toContain("finishOnboarding();");
+    expect(appSource).toContain('className="button-row onboarding-nav-actions"');
+    expect(appSource).toContain('className="onboarding-skip-corner"');
+    expect(appSource).toContain('<SecondaryButton disabled={!canLeaveConnectorStep} onClick={goBackFromOnboarding}>');
+    expect(appSource).toContain('<SecondaryButton compact disabled={!canLeaveConnectorStep} onClick={skipSourceOnboarding}>');
+    expect(appSource).toContain("Skip");
+    expect(appSource).not.toContain("Skip Source");
+    expect(appSource).toContain("localFolderReadyNow ? (");
+    expect(appSource).toContain('<PrimaryButton onClick={() => setStep(5)}>');
+    expect(appSource).toContain('<SecondaryButton disabled={!canLeaveMountStep} onClick={goBackFromOnboarding}>');
+    expect(appSource).toContain('<SecondaryButton onClick={goBackFromOnboarding}>');
+
+    expectDeclarations(".onboarding-nav-actions", [
+      "flex-wrap: wrap;",
+    ]);
+    expectDeclarations(".onboarding-skip-corner", [
+      "position: absolute;",
+      "left: 24px;",
+      "bottom: 24px;",
+    ]);
   });
 
   it("renders the ready screen as a centered success state with one folder card", () => {

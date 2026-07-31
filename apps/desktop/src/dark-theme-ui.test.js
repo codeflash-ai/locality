@@ -188,4 +188,18 @@ describe("desktop dark theme UI", () => {
       /:root\[data-theme="dark"\] \.secondary-button:disabled,[\s\S]*?background:\s*var\(--control-disabled-bg\);[\s\S]*?color:\s*var\(--control-disabled-text\);/s,
     );
   });
+
+  it("shows a neutral empty state when the Sources page has no connected sources", () => {
+    expect(appSource).toContain('className="empty-action-panel sources-empty-panel"');
+    expect(appSource).toContain("<h2>No sources connected yet</h2>");
+    expect(appSource).toContain("Connect a source when you're ready. Locality will create a local folder after the connection is set up.");
+    expect(appSource).toContain('<PrimaryButton busy={creating} icon={<Plus />} onClick={openAddSourceDialog}>');
+    expect(appSource).not.toContain("<h2>Add a Notion source</h2>");
+    expect(appSource).not.toContain("Add Notion Source");
+
+    expect(cssBlock(".sources-empty-panel")).toContain("justify-content: center;");
+    expect(cssBlock(".sources-empty-panel")).toContain("text-align: center;");
+    expect(cssBlock(".sources-empty-panel .brand-tile")).toContain("background: var(--surface-muted);");
+    expect(cssBlock(".sources-empty-panel .primary-button")).toContain("margin-left: 0;");
+  });
 });
