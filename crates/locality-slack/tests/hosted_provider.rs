@@ -2,7 +2,9 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use locality_protocol::{HostedSlackChannelSelector, ProviderSourceScopeSelector};
+use locality_protocol::{
+    HostedSlackChannelSelector, ProviderSourceScopeSelector, SlackChannelSharingClassification,
+};
 use locality_slack::portable::hosted::{
     HostedSlackCancellationToken, HostedSlackDriveControlV1, HostedSlackDriveOutcomeV1,
     HostedSlackDrivePendingReasonV1, HostedSlackHistoryPageV1, HostedSlackInstallationBinding,
@@ -194,7 +196,10 @@ impl HostedSlackProviderPort for FakeProvider {
 
 fn selector() -> HostedSlackChannelSelector {
     match serde_json::from_slice::<ProviderSourceScopeSelector>(SELECTOR).unwrap() {
-        ProviderSourceScopeSelector::HostedSlackChannel(selector) => selector,
+        ProviderSourceScopeSelector::HostedSlackChannel(mut selector) => {
+            selector.sharing = SlackChannelSharingClassification::Private;
+            selector
+        }
         other => panic!("unexpected selector: {other:?}"),
     }
 }
@@ -220,16 +225,18 @@ fn authority() -> HostedSlackObservedChannelAuthorityV1 {
         team_id: "T08LOCALITY1".to_string(),
         channel_id: "C08ENGINEER1".to_string(),
         is_private: true,
-        is_shared: true,
-        is_externally_shared: true,
+        is_shared: false,
+        is_externally_shared: false,
         is_org_shared: false,
         is_member: true,
-        shared_team_ids: vec!["T08EXTERNAL1".to_string(), "T08LOCALITY1".to_string()],
+        shared_team_ids: vec!["T08LOCALITY1".to_string()],
     }
 }
 
 fn raw_snapshot() -> RawHostedSlackNativeSnapshot {
-    serde_json::from_slice(NATIVE_RAW).unwrap()
+    let mut snapshot: RawHostedSlackNativeSnapshot = serde_json::from_slice(NATIVE_RAW).unwrap();
+    snapshot.channel.sharing = SlackChannelSharingClassification::Private;
+    snapshot
 }
 
 fn new_checkpoint(overlap: &str) -> HostedSlackPollCheckpointV1 {
@@ -244,7 +251,9 @@ fn new_checkpoint(overlap: &str) -> HostedSlackPollCheckpointV1 {
 }
 
 fn history_page() -> HostedSlackHistoryPageV1 {
-    decode_hosted_slack_history_page_v1(HISTORY_PAGE).unwrap()
+    let mut page = decode_hosted_slack_history_page_v1(HISTORY_PAGE).unwrap();
+    page.sharing = SlackChannelSharingClassification::Private;
+    page
 }
 
 fn history_terminal_page() -> HostedSlackHistoryPageV1 {
@@ -258,7 +267,9 @@ fn history_terminal_page() -> HostedSlackHistoryPageV1 {
 }
 
 fn replies_page() -> HostedSlackRepliesPageV1 {
-    decode_hosted_slack_replies_page_v1(REPLIES_PAGE).unwrap()
+    let mut page = decode_hosted_slack_replies_page_v1(REPLIES_PAGE).unwrap();
+    page.sharing = SlackChannelSharingClassification::Private;
+    page
 }
 
 fn replies_terminal_page() -> HostedSlackRepliesPageV1 {
@@ -497,7 +508,8 @@ async fn catch_up_sweeps_every_old_root_and_retains_late_non_broadcast_reply() {
     let overlap = "2026-05-29T00:00:00Z";
     let mut checkpoint = awaiting_checkpoint_with_overlap(overlap);
     let catch_up = catch_up_history_page(overlap);
-    let late_page = decode_hosted_slack_replies_page_v1(LATE_REPLIES_PAGE).unwrap();
+    let mut late_page = decode_hosted_slack_replies_page_v1(LATE_REPLIES_PAGE).unwrap();
+    late_page.sharing = SlackChannelSharingClassification::Private;
     let provider = FakeProvider::new([
         ScriptedResponse::Identity(Ok(observed())),
         ScriptedResponse::Authority(Ok(authority())),
@@ -585,6 +597,51 @@ async fn rate_limit_retry_after_is_respected_without_losing_progress() {
     assert_eq!(exact_json(&provider.transcript()), RATE_TRANSCRIPT);
 }
 
+#[tokio::test(start_paused = true)]
+async fn long_retry_after_is_retained_while_current_drive_wait_is_capped() {
+    let provider = FakeProvider::new([
+        ScriptedResponse::Identity(Ok(observed())),
+        ScriptedResponse::Authority(Ok(authority())),
+        ScriptedResponse::History(Err(HostedSlackProviderError::RateLimited {
+            retry_after: Duration::from_secs(601),
+        })),
+    ]);
+    let mut checkpoint = new_checkpoint("2026-05-28T20:00:00Z");
+    let before = checkpoint.clone();
+    let installation_binding = binding();
+    let channel_selector = selector();
+    let drive_control = control(None);
+    let result = {
+        let drive = drive_hosted_slack_poll_v1(
+            &provider,
+            &installation_binding,
+            &channel_selector,
+            &mut checkpoint,
+            &drive_control,
+        );
+        tokio::pin!(drive);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(299)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(Duration::ZERO, drive.as_mut())
+                .await
+                .is_err()
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        drive.await
+    };
+    assert_eq!(
+        result,
+        Err(HostedSlackProviderError::RateLimited {
+            retry_after: Duration::from_secs(601),
+        })
+    );
+    assert_eq!(checkpoint, before);
+    provider.assert_exhausted();
+    assert_eq!(provider.transcript().len(), 3);
+}
+
 #[tokio::test]
 async fn identity_swap_and_revocation_fail_before_content_calls() {
     let mut swapped = observed();
@@ -658,12 +715,12 @@ async fn channel_authority_drift_and_access_revocation_fail_before_history() {
             value.shared_team_ids = vec!["T08EXTERNAL1".to_string()];
             (
                 value,
-                HostedSlackProviderError::IdentityMismatch("channel shared team_id"),
+                HostedSlackProviderError::InvalidResponse("channel sharing facts"),
             )
         },
         {
             let mut value = authority();
-            value.shared_team_ids = vec!["T08LOCALITY1".to_string()];
+            value.is_shared = true;
             (
                 value,
                 HostedSlackProviderError::InvalidResponse("channel sharing facts"),
@@ -679,18 +736,12 @@ async fn channel_authority_drift_and_access_revocation_fail_before_history() {
         },
         {
             let mut value = authority();
-            value.is_externally_shared = false;
+            value.is_shared = true;
+            value.is_externally_shared = true;
+            value.shared_team_ids = vec!["T08EXTERNAL1".to_string(), "T08LOCALITY1".to_string()];
             (
                 value,
-                HostedSlackProviderError::InvalidResponse("channel sharing facts"),
-            )
-        },
-        {
-            let mut value = authority();
-            value.is_shared = false;
-            (
-                value,
-                HostedSlackProviderError::InvalidResponse("channel sharing facts"),
+                HostedSlackProviderError::Unsupported("Slack Connect channel identity in V1"),
             )
         },
     ];
@@ -737,7 +788,7 @@ async fn channel_authority_drift_and_access_revocation_fail_before_history() {
 }
 
 #[tokio::test]
-async fn exact_history_boundaries_include_start_exclude_cut_and_missing_root_count_is_zero() {
+async fn exact_history_boundaries_include_start_exclude_cut_and_require_root_count() {
     let mut start = zero_root_response(None, "2026-06-01T00:00:01Z");
     start.messages[0].message.ts = "1767225600.000000".to_string();
     start.messages[0].reply_count = None;
@@ -747,7 +798,7 @@ async fn exact_history_boundaries_include_start_exclude_cut_and_missing_root_cou
         ScriptedResponse::History(Ok(start)),
     ]);
     let mut checkpoint = new_checkpoint("2026-05-28T20:00:00Z");
-    assert!(matches!(
+    assert_eq!(
         drive_hosted_slack_poll_v1(
             &provider,
             &binding(),
@@ -755,19 +806,10 @@ async fn exact_history_boundaries_include_start_exclude_cut_and_missing_root_cou
             &mut checkpoint,
             &control(None),
         )
-        .await
-        .unwrap(),
-        HostedSlackDriveOutcomeV1::Pending {
-            phase: HostedSlackPollPhaseV1::AwaitingCatchUpCut,
-            ..
-        }
-    ));
-    assert!(
-        checkpoint
-            .candidate()
-            .messages()
-            .iter()
-            .any(|message| message.ts == "1767225600.000000")
+        .await,
+        Err(HostedSlackProviderError::InvalidResponse(
+            "root reply_count"
+        ))
     );
 
     let mut cut = zero_root_response(None, "2026-06-01T00:00:01Z");
@@ -790,6 +832,123 @@ async fn exact_history_boundaries_include_start_exclude_cut_and_missing_root_cou
         Err(HostedSlackProviderError::Poll(
             HostedSlackPollError::PageWindowMismatch
         ))
+    );
+}
+
+#[tokio::test]
+async fn exact_zero_reply_count_skips_replies_at_history_and_catch_up_boundaries() {
+    let historical = FakeProvider::new([
+        ScriptedResponse::Identity(Ok(observed())),
+        ScriptedResponse::Authority(Ok(authority())),
+        ScriptedResponse::History(Ok(zero_root_response(None, "2026-06-01T00:00:01Z"))),
+    ]);
+    let mut zero = new_checkpoint("2026-05-28T20:00:00Z");
+    assert_eq!(
+        drive_hosted_slack_poll_v1(
+            &historical,
+            &binding(),
+            &selector(),
+            &mut zero,
+            &control(None),
+        )
+        .await
+        .unwrap(),
+        HostedSlackDriveOutcomeV1::Pending {
+            phase: HostedSlackPollPhaseV1::AwaitingCatchUpCut,
+            reason: HostedSlackDrivePendingReasonV1::AwaitingCatchUpCut,
+        }
+    );
+    historical.assert_exhausted();
+    assert_eq!(historical.transcript().len(), 3);
+
+    let overlap = "2026-05-28T20:00:00Z";
+    let mut checkpoint = awaiting_checkpoint_with_overlap(overlap);
+    let mut zero_catch_up = as_history_response(&history_page());
+    zero_catch_up.observed_at = "2026-06-02T00:00:01Z".to_string();
+    zero_catch_up.has_more = Some(false);
+    zero_catch_up.next_cursor = None;
+    zero_catch_up.messages.truncate(1);
+    zero_catch_up.messages[0].reply_count = Some(0);
+    let catch_up = FakeProvider::new([
+        ScriptedResponse::Identity(Ok(observed())),
+        ScriptedResponse::Authority(Ok(authority())),
+        ScriptedResponse::History(Ok(zero_catch_up)),
+    ]);
+    let outcome = drive_hosted_slack_poll_v1(
+        &catch_up,
+        &binding(),
+        &selector(),
+        &mut checkpoint,
+        &control(Some("2026-06-02T00:00:00Z")),
+    )
+    .await
+    .unwrap();
+    let HostedSlackDriveOutcomeV1::Complete(output) = outcome else {
+        panic!("zero-reply catch-up did not complete");
+    };
+    catch_up.assert_exhausted();
+    assert_eq!(catch_up.transcript().len(), 3);
+    assert!(output.snapshot.threads()[0].reply_message_ids().is_empty());
+}
+
+#[tokio::test]
+async fn thread_not_found_reconciles_deleted_root_and_replays_without_stale_files() {
+    let mut checkpoint = new_checkpoint("2026-05-28T20:00:00Z");
+    let mut first = history_page();
+    first.poll_kind = HostedSlackPollKindV1::FullRepair;
+    let mut terminal = history_terminal_page();
+    terminal.poll_kind = HostedSlackPollKindV1::FullRepair;
+    checkpoint.apply_history_page(&first).unwrap();
+    checkpoint.apply_history_page(&terminal).unwrap();
+    let provider = FakeProvider::new([
+        ScriptedResponse::Identity(Ok(observed())),
+        ScriptedResponse::Authority(Ok(authority())),
+        ScriptedResponse::Replies(Err(HostedSlackProviderError::ThreadNotFound)),
+    ]);
+
+    assert_eq!(
+        drive_hosted_slack_poll_v1(
+            &provider,
+            &binding(),
+            &selector(),
+            &mut checkpoint,
+            &control(None),
+        )
+        .await
+        .unwrap(),
+        HostedSlackDriveOutcomeV1::Pending {
+            phase: HostedSlackPollPhaseV1::AwaitingCatchUpCut,
+            reason: HostedSlackDrivePendingReasonV1::AwaitingCatchUpCut,
+        }
+    );
+    provider.assert_exhausted();
+    let root = checkpoint
+        .candidate()
+        .messages()
+        .iter()
+        .find(|message| message.ts == "1780000000.000100")
+        .unwrap();
+    assert!(root.deleted);
+    assert!(root.text.is_empty());
+    assert!(root.file_ids.is_empty());
+    assert!(checkpoint.candidate().files().is_empty());
+    assert_eq!(checkpoint.completed_roots()[0].expected_reply_count, 0);
+    let encoded = serde_json::to_vec(&checkpoint).unwrap();
+    let encoded_value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    assert!(
+        encoded_value["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| {
+                item["page"]["canonical_page_json"]
+                    .as_str()
+                    .is_some_and(|page| page.contains(r#""reconciliation":"thread_not_found""#))
+            })
+    );
+    assert_eq!(
+        decode_hosted_slack_poll_checkpoint_v1(&encoded).unwrap(),
+        checkpoint
     );
 }
 
@@ -843,7 +1002,7 @@ async fn contradictory_or_missing_reply_metadata_fails_closed() {
             }],
         })),
     ]);
-    assert!(matches!(
+    assert_eq!(
         drive_hosted_slack_poll_v1(
             &provider,
             &binding(),
@@ -852,14 +1011,10 @@ async fn contradictory_or_missing_reply_metadata_fails_closed() {
             &control(None),
         )
         .await,
-        Err(HostedSlackProviderError::Poll(
-            HostedSlackPollError::ReplyCountMismatch {
-                expected: 2,
-                actual: 0,
-                ..
-            }
+        Err(HostedSlackProviderError::InvalidResponse(
+            "initial replies root reply_count"
         ))
-    ));
+    );
 }
 
 #[tokio::test]

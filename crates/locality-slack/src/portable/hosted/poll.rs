@@ -75,12 +75,20 @@ pub struct HostedSlackRepliesPageV1 {
     pub poll_overlap_watermark: String,
     pub root_message_id: String,
     pub root_reply_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciliation: Option<HostedSlackRepliesReconciliationV1>,
     pub request_cursor: Option<String>,
     pub next_cursor: Option<String>,
     pub observed_at: String,
     pub messages: Vec<RawHostedSlackMessage>,
     pub users: Vec<RawHostedSlackUser>,
     pub files: Vec<RawHostedSlackFileMetadata>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostedSlackRepliesReconciliationV1 {
+    ThreadNotFound,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,6 +288,20 @@ impl HostedSlackRepliesPageV1 {
                 ));
             }
         }
+        if self.reconciliation == Some(HostedSlackRepliesReconciliationV1::ThreadNotFound)
+            && (self.request_cursor.is_some()
+                || self.next_cursor.is_some()
+                || self.root_reply_count != 0
+                || self.messages.len() != 1
+                || self.messages[0].ts != self.root_message_id
+                || !self.messages[0].deleted
+                || !self.messages[0].text.is_empty()
+                || !self.messages[0].file_ids.is_empty())
+        {
+            return Err(HostedSlackPollError::IncompleteCandidate(
+                "thread-not-found reconciliation",
+            ));
+        }
         validate_serialized_page_size(self, "replies page")?;
         Ok(())
     }
@@ -451,11 +473,21 @@ impl HostedSlackPollCheckpointV1 {
             return Err(HostedSlackPollError::PageWindowMismatch);
         }
         let first_page = page.request_cursor.is_none();
+        let deleted_root_reconciliation =
+            page.reconciliation == Some(HostedSlackRepliesReconciliationV1::ThreadNotFound);
         let expectation_is_from_this_catch_up = page.phase
             != HostedSlackPollPhaseV1::CatchUpReplies
             || catch_up_history_contains_root(&next, &page.root_message_id)?
             || !first_page;
-        if expectation_is_from_this_catch_up {
+        if deleted_root_reconciliation {
+            upsert_root_expectation(
+                &mut next.candidate.root_expectations,
+                HostedSlackRootExpectationV1 {
+                    root_message_id: page.root_message_id.clone(),
+                    expected_reply_count: 0,
+                },
+            );
+        } else if expectation_is_from_this_catch_up {
             let expected = expected_reply_count(&next, &page.root_message_id)?;
             if expected != page.root_reply_count {
                 return Err(HostedSlackPollError::ReplyCountMismatch {
@@ -483,6 +515,21 @@ impl HostedSlackPollCheckpointV1 {
         for message in &accepted_page.messages {
             let message_time = parse_slack_timestamp("page.message.ts", &message.ts)?;
             if message.ts == page.root_message_id {
+                if deleted_root_reconciliation {
+                    let root = next
+                        .candidate
+                        .messages
+                        .iter_mut()
+                        .find(|candidate| candidate.ts == message.ts)
+                        .ok_or_else(|| HostedSlackPollError::MissingRoot(message.ts.clone()))?;
+                    if normalized_root_id(root).is_some() {
+                        return Err(HostedSlackPollError::InvalidMessageRelationship(
+                            message.ts.clone(),
+                        ));
+                    }
+                    *root = message.clone();
+                    continue;
+                }
                 apply_message_current_state(
                     &mut next.candidate.messages,
                     message.clone(),
@@ -1014,19 +1061,45 @@ fn prepare_reply_phase(
             .filter(|message| normalized_root_id(message).is_none())
             .map(|message| message.ts.clone())
             .collect::<Vec<_>>();
+        let yielded = checkpoint
+            .candidate
+            .stage_yielded_reply_root_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        checkpoint.completed_roots.clear();
+        let mut pending = Vec::new();
+        for root in roots {
+            let exact_zero_from_history = touched.contains(&root)
+                && !yielded.contains(&root)
+                && expected_reply_count(checkpoint, &root)? == 0;
+            if exact_zero_from_history {
+                checkpoint
+                    .candidate
+                    .messages
+                    .retain(|message| normalized_root_id(message) != Some(root.as_str()));
+                checkpoint.completed_roots.push(HostedSlackCompletedRootV1 {
+                    root_message_id: root,
+                    expected_reply_count: 0,
+                    observed_reply_count: 0,
+                    completed_phase: reply_phase,
+                });
+            } else {
+                pending.push(root);
+            }
+        }
         let applied_pages = checkpoint
             .evidence
             .iter()
             .filter(|evidence| matches!(evidence, HostedSlackPollEvidenceV1::AppliedPage { .. }))
             .count();
-        let minimum_required_pages = applied_pages.saturating_add(roots.len());
+        let minimum_required_pages = applied_pages.saturating_add(pending.len());
         if minimum_required_pages > MAX_HOSTED_SLACK_APPLIED_PAGES_V1 {
             return Err(HostedSlackPollError::CollectionTooLarge(
                 "catch-up root sweep",
             ));
         }
-        checkpoint.completed_roots.clear();
-        roots
+        pending
     };
     checkpoint
         .completed_roots

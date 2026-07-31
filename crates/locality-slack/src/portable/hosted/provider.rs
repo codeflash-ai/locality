@@ -24,13 +24,14 @@ use super::identity::{
 };
 use super::native::{
     HostedSlackFileMetadata, HostedSlackUser, MAX_HOSTED_SLACK_MESSAGE_FILES,
-    RawHostedSlackChannel, RawHostedSlackFileMetadata, RawHostedSlackMessage, RawHostedSlackUser,
+    MAX_HOSTED_SLACK_MESSAGE_TEXT_BYTES, RawHostedSlackChannel, RawHostedSlackFileMetadata,
+    RawHostedSlackMessage, RawHostedSlackUser,
 };
 use super::poll::{
     HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1, HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V1,
     HostedSlackHistoryMessageV1, HostedSlackHistoryPageV1, HostedSlackPollOutputV1,
-    HostedSlackRepliesPageV1, hosted_slack_history_page_reference_closure_v1,
-    hosted_slack_replies_page_reference_closure_v1,
+    HostedSlackRepliesPageV1, HostedSlackRepliesReconciliationV1,
+    hosted_slack_history_page_reference_closure_v1, hosted_slack_replies_page_reference_closure_v1,
 };
 
 pub const HOSTED_SLACK_PROVIDER_PAGE_LIMIT_V1: u32 = 15;
@@ -48,12 +49,13 @@ const HOSTED_SLACK_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const HOSTED_SLACK_MAX_RETRIES: usize = 4;
 
 static HOSTED_SLACK_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
-static HOSTED_SLACK_PROVIDER_GATES: OnceLock<HostedSlackProviderGates> = OnceLock::new();
+static HOSTED_SLACK_PROVIDER_GATES: OnceLock<Mutex<BTreeMap<String, HostedSlackProviderGates>>> =
+    OnceLock::new();
 
 pub type HostedSlackProviderFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, HostedSlackProviderError>> + Send + 'a>>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostedSlackProviderOperationV1 {
     VerifyInstallation,
@@ -63,6 +65,17 @@ pub enum HostedSlackProviderOperationV1 {
     ConversationsReplies,
     UsersInfo,
     FilesInfo,
+}
+
+/// Stable team-and-method key for durable hosted request coordination.
+///
+/// The HTTP provider's built-in gate is process-local only. A hosted backend can
+/// persist and coordinate this serializable scope outside the public provider.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedSlackProviderCoordinationScopeV1 {
+    pub team_id: String,
+    pub operation: HostedSlackProviderOperationV1,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -342,6 +355,7 @@ impl HostedSlackInitialChannelDescriptorV1 {
             return Err(HostedSlackProviderError::NotFound("channel membership"));
         }
         let channel = super::native::HostedSlackChannel::try_from(discovered.channel.clone())?;
+        ensure_v1_channel_identity_supported(channel.sharing())?;
         if channel.team_id() != binding.team_id {
             return Err(HostedSlackProviderError::IdentityMismatch(
                 "channel team_id",
@@ -417,6 +431,7 @@ where
         observed_at.get_or_insert(page.observed_at.clone());
         for discovered in page.channels {
             let channel = super::native::HostedSlackChannel::try_from(discovered.channel.clone())?;
+            ensure_v1_channel_identity_supported(channel.sharing())?;
             if channel.team_id() != binding.team_id {
                 return Err(HostedSlackProviderError::IdentityMismatch(
                     "channel team_id",
@@ -466,6 +481,8 @@ pub enum HostedSlackProviderError {
     Transient,
     InvalidResponse(&'static str),
     IdentityMismatch(&'static str),
+    Unsupported(&'static str),
+    ThreadNotFound,
     Cancelled,
     DeadlineExceeded,
     Poll(HostedSlackPollError),
@@ -508,6 +525,8 @@ impl Display for HostedSlackProviderError {
             Self::IdentityMismatch(field) => {
                 write!(formatter, "Slack installation identity mismatch: {field}")
             }
+            Self::Unsupported(feature) => write!(formatter, "unsupported hosted Slack {feature}"),
+            Self::ThreadNotFound => formatter.write_str("Slack thread root was not found"),
             Self::Cancelled => formatter.write_str("hosted Slack polling was cancelled"),
             Self::DeadlineExceeded => {
                 formatter.write_str("hosted Slack polling deadline was exceeded")
@@ -638,13 +657,24 @@ pub async fn drive_hosted_slack_poll_v1<P: HostedSlackProviderPort>(
                     });
                 }
                 let request = replies_request(checkpoint)?;
-                let response = call_with_retry(
+                let response = match call_with_retry(
                     control,
                     &mut request_count,
                     HostedSlackProviderOperationV1::ConversationsReplies,
                     || provider.conversations_replies(request.clone()),
                 )
-                .await?;
+                .await
+                {
+                    Ok(response) => response,
+                    Err(HostedSlackProviderError::ThreadNotFound) if request.cursor.is_none() => {
+                        let page = deleted_root_reconciliation_page(checkpoint, &request)?;
+                        ensure_active(control)?;
+                        checkpoint.apply_replies_page(&page)?;
+                        applied_pages += 1;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let mut page = replies_poll_page(checkpoint, &request, response)?;
                 enrich_replies_page(provider, checkpoint, control, &mut request_count, &mut page)
                     .await?;
@@ -694,6 +724,11 @@ fn verify_channel_authority(
     if authority.is_org_shared || authority.is_shared != authority.is_externally_shared {
         return Err(HostedSlackProviderError::InvalidResponse(
             "channel sharing facts",
+        ));
+    }
+    if authority.is_externally_shared {
+        return Err(HostedSlackProviderError::Unsupported(
+            "Slack Connect channel identity in V1",
         ));
     }
     if authority.is_shared
@@ -852,7 +887,11 @@ fn history_poll_page(
         .map(|provided| {
             let is_root = normalized_root_id(&provided.message).is_none();
             let reply_count = if is_root {
-                provided.reply_count.unwrap_or(0)
+                provided
+                    .reply_count
+                    .ok_or(HostedSlackProviderError::InvalidResponse(
+                        "root reply_count",
+                    ))?
             } else {
                 if provided.reply_count.is_some_and(|count| count != 0) {
                     return Err(HostedSlackProviderError::InvalidResponse(
@@ -906,7 +945,14 @@ fn replies_poll_page(
                 provided.message.ts == request.root_message_id
                     && normalized_root_id(&provided.message).is_none()
             })
-            .map(|provided| provided.reply_count.unwrap_or(0))
+            .map(|provided| {
+                provided
+                    .reply_count
+                    .ok_or(HostedSlackProviderError::InvalidResponse(
+                        "initial replies root reply_count",
+                    ))
+            })
+            .transpose()?
             .ok_or(HostedSlackProviderError::InvalidResponse(
                 "initial replies root reply_count",
             ))?
@@ -933,6 +979,7 @@ fn replies_poll_page(
         poll_overlap_watermark: checkpoint.poll_overlap_watermark().to_string(),
         root_message_id: request.root_message_id.clone(),
         root_reply_count,
+        reconciliation: None,
         request_cursor: request.cursor.clone(),
         next_cursor,
         observed_at: response.observed_at,
@@ -941,6 +988,51 @@ fn replies_poll_page(
             .into_iter()
             .map(|provided| provided.message)
             .collect(),
+        users: Vec::new(),
+        files: Vec::new(),
+    };
+    page.validate()?;
+    Ok(page)
+}
+
+fn deleted_root_reconciliation_page(
+    checkpoint: &HostedSlackPollCheckpointV1,
+    request: &HostedSlackRepliesRequestV1,
+) -> Result<HostedSlackRepliesPageV1, HostedSlackProviderError> {
+    let mut root = checkpoint
+        .candidate()
+        .messages()
+        .iter()
+        .find(|message| {
+            message.ts == request.root_message_id && normalized_root_id(message).is_none()
+        })
+        .cloned()
+        .ok_or_else(|| HostedSlackPollError::MissingRoot(request.root_message_id.clone()))?;
+    root.text.clear();
+    root.edited_ts = None;
+    root.deleted = true;
+    root.file_ids.clear();
+    let selector = checkpoint.selector();
+    let page = HostedSlackRepliesPageV1 {
+        page_format_version: HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V1,
+        minimum_reader_version: HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V1,
+        poll_kind: checkpoint.poll_kind(),
+        phase: request.phase,
+        installation_id: selector.installation_id,
+        team_id: selector.team_id,
+        channel_id: selector.channel_id,
+        sharing: selector.sharing,
+        authorized_history_start_at: selector.authorized_history_start_at,
+        backfill_cut_at: checkpoint.backfill_cut_at().to_string(),
+        poll_cut_at: checkpoint.poll_cut_at().map(str::to_string),
+        poll_overlap_watermark: checkpoint.poll_overlap_watermark().to_string(),
+        root_message_id: request.root_message_id.clone(),
+        root_reply_count: 0,
+        reconciliation: Some(HostedSlackRepliesReconciliationV1::ThreadNotFound),
+        request_cursor: None,
+        next_cursor: None,
+        observed_at: current_canonical_utc(),
+        messages: vec![root],
         users: Vec::new(),
         files: Vec::new(),
     };
@@ -1140,7 +1232,8 @@ where
                     return Err(error);
                 }
                 if delay > MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1 {
-                    return Err(HostedSlackProviderError::LimitExceeded("retry delay"));
+                    wait_for_retry(control, MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1).await?;
+                    return Err(error);
                 }
                 wait_for_retry(control, delay).await?;
             }
@@ -1214,9 +1307,13 @@ struct HostedSlackProviderGates {
 }
 
 impl HostedSlackProviderGates {
-    fn global() -> Self {
+    fn global(team_id: &str) -> Self {
         HOSTED_SLACK_PROVIDER_GATES
-            .get_or_init(|| Self {
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("hosted Slack gate registry lock")
+            .entry(team_id.to_string())
+            .or_insert_with(|| Self {
                 verify_installation: HostedSlackMethodGate::new(operation_network_config(
                     HostedSlackProviderOperationV1::VerifyInstallation,
                 )),
@@ -1357,7 +1454,6 @@ impl HostedSlackMethodGate {
     }
 
     fn record_cooldown(&self, delay: Duration) {
-        let delay = delay.min(MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1);
         let now = Instant::now();
         let until = now + delay;
         {
@@ -1494,13 +1590,24 @@ impl HttpHostedSlackProvider {
             .timeout(HOSTED_SLACK_HTTP_TIMEOUT)
             .build()
             .map_err(|_| HostedSlackProviderError::Transient)?;
+        let gates = HostedSlackProviderGates::global(&credential_identity.team_id);
         Ok(Self {
             access_token: access_token.into(),
             credential_identity,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             client,
-            gates: HostedSlackProviderGates::global(),
+            gates,
         })
+    }
+
+    pub fn coordination_scope(
+        &self,
+        operation: HostedSlackProviderOperationV1,
+    ) -> HostedSlackProviderCoordinationScopeV1 {
+        HostedSlackProviderCoordinationScopeV1 {
+            team_id: self.credential_identity.team_id.clone(),
+            operation,
+        }
     }
 
     async fn request<T: DeserializeOwned + SlackProviderEnvelope>(
@@ -2193,6 +2300,11 @@ fn validate_discovered_channel_authority(
             "channel sharing facts",
         ));
     }
+    if authority.is_externally_shared {
+        return Err(HostedSlackProviderError::Unsupported(
+            "Slack Connect channel identity in V1",
+        ));
+    }
     if authority.is_shared
         && (authority
             .shared_team_ids
@@ -2215,6 +2327,21 @@ fn validate_discovered_channel_authority(
     {
         return Err(HostedSlackProviderError::InvalidResponse(
             "channel sharing facts",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_v1_channel_identity_supported(
+    sharing: SlackChannelSharingClassification,
+) -> Result<(), HostedSlackProviderError> {
+    if matches!(
+        sharing,
+        SlackChannelSharingClassification::ExternallySharedPublic
+            | SlackChannelSharingClassification::ExternallySharedPrivate
+    ) {
+        return Err(HostedSlackProviderError::Unsupported(
+            "Slack Connect channel identity in V1",
         ));
     }
     Ok(())
@@ -2305,7 +2432,17 @@ fn provider_message(
                     "deleted message timestamp",
                 ))?;
             previous.text.clear();
+            previous.files.clear();
+            previous.reply_count = Some(0);
             (previous, true)
+        }
+        Some(subtype) if is_evidence_system_subtype(subtype) => {
+            let mut body = wire.body;
+            body.text = bounded_system_event_text(subtype, &body.text);
+            body.edited = None;
+            body.files.clear();
+            body.reply_count = Some(0);
+            (body, false)
         }
         Some(_) => {
             return Err(HostedSlackProviderError::InvalidResponse(
@@ -2342,6 +2479,65 @@ fn provider_message(
             file_ids,
         },
     })
+}
+
+fn is_evidence_system_subtype(subtype: &str) -> bool {
+    matches!(
+        subtype,
+        "bot_add"
+            | "bot_remove"
+            | "channel_archive"
+            | "channel_convert_to_private"
+            | "channel_convert_to_public"
+            | "channel_join"
+            | "channel_leave"
+            | "channel_name"
+            | "channel_posting_permissions"
+            | "channel_purpose"
+            | "channel_topic"
+            | "channel_unarchive"
+            | "ekm_access_denied"
+            | "file_comment"
+            | "file_mention"
+            | "group_archive"
+            | "group_join"
+            | "group_leave"
+            | "group_name"
+            | "group_purpose"
+            | "group_topic"
+            | "group_unarchive"
+            | "huddle_thread"
+            | "me_message"
+            | "pinned_item"
+            | "reminder_add"
+            | "sh_room_created"
+            | "slackbot_response"
+            | "tombstone"
+            | "unpinned_item"
+    )
+}
+
+fn bounded_system_event_text(subtype: &str, source: &str) -> String {
+    let prefix = format!("[Slack system event: {subtype}]");
+    if source.is_empty() {
+        return prefix;
+    }
+    let separator = " ";
+    let truncation_marker = " …[truncated]";
+    let available =
+        MAX_HOSTED_SLACK_MESSAGE_TEXT_BYTES.saturating_sub(prefix.len() + separator.len());
+    if source.len() <= available {
+        return format!("{prefix}{separator}{source}");
+    }
+    let content_limit = available.saturating_sub(truncation_marker.len());
+    let mut boundary = content_limit.min(source.len());
+    while !source.is_char_boundary(boundary) {
+        boundary = boundary.saturating_sub(1);
+    }
+    format!(
+        "{prefix}{separator}{}{truncation_marker}",
+        &source[..boundary]
+    )
 }
 
 async fn bounded_response_bytes(
@@ -2386,18 +2582,9 @@ fn rate_limit_error_and_cooldown(
     retry_after: Option<Duration>,
 ) -> (HostedSlackProviderError, Duration) {
     match retry_after {
-        Some(retry_after)
-            if !retry_after.is_zero()
-                && retry_after <= MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1 =>
-        {
-            (
-                HostedSlackProviderError::RateLimited { retry_after },
-                retry_after,
-            )
-        }
-        Some(retry_after) if retry_after > MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1 => (
-            HostedSlackProviderError::LimitExceeded("retry delay"),
-            MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1,
+        Some(retry_after) if !retry_after.is_zero() => (
+            HostedSlackProviderError::RateLimited { retry_after },
+            retry_after,
         ),
         Some(_) | None => (
             HostedSlackProviderError::InvalidResponse("Retry-After"),
@@ -2445,6 +2632,11 @@ fn logical_slack_error(
             HostedSlackProviderError::Revoked
         }
         Some("not_in_channel") => HostedSlackProviderError::Authentication,
+        Some("thread_not_found")
+            if operation == HostedSlackProviderOperationV1::ConversationsReplies =>
+        {
+            HostedSlackProviderError::ThreadNotFound
+        }
         Some(
             "channel_not_found" | "file_not_found" | "message_not_found" | "team_not_found"
             | "thread_not_found" | "user_not_found",
@@ -2552,6 +2744,7 @@ mod tests {
     use std::thread::{self, JoinHandle};
 
     use super::*;
+    use crate::portable::hosted::HostedSlackPollKindV1;
 
     struct StubResponse {
         status: &'static str,
@@ -2886,6 +3079,100 @@ mod tests {
     const DISCOVERY_SANITIZED_CHANNEL: &[u8] = include_bytes!(
         "../../../fixtures/hosted-v1/provider-v1/discovery-sanitized-channel-v1.json"
     );
+    const DISCOVERY_SLACK_CONNECT: &str =
+        include_str!("../../../fixtures/hosted-v1/provider-v1/discovery-slack-connect-v1.json");
+    const SYSTEM_SUBTYPES_RESPONSE: &[u8] =
+        include_bytes!("../../../fixtures/hosted-v1/provider-v1/system-subtypes-response-v1.json");
+    const SYSTEM_SUBTYPES_SANITIZED: &[u8] =
+        include_bytes!("../../../fixtures/hosted-v1/provider-v1/system-subtypes-sanitized-v1.json");
+
+    #[test]
+    fn system_subtypes_preserve_bounded_evidence_without_private_payloads() {
+        let response = serde_json::from_slice::<HistoryResponse>(SYSTEM_SUBTYPES_RESPONSE).unwrap();
+        let provider_page = provider_page(response, "C08ENGINEER1").unwrap();
+        let messages = provider_page.messages.clone();
+        let mut exact = serde_json::to_vec_pretty(&messages).unwrap();
+        exact.push(b'\n');
+        assert_eq!(exact, SYSTEM_SUBTYPES_SANITIZED);
+        let sanitized = String::from_utf8(exact).unwrap();
+        for forbidden in ["url_private", "system-file-secret", "system-room-secret"] {
+            assert!(!sanitized.contains(forbidden));
+        }
+        let binding = installation_binding();
+        let descriptor = HostedSlackInitialChannelDescriptorV1::new(
+            &binding,
+            &discovered_channel("T08LOCALITY1", true, false),
+            "2026-06-01T00:00:00Z".to_string(),
+            "2026-01-01T00:00:00Z".to_string(),
+        )
+        .unwrap();
+        let mut checkpoint = HostedSlackPollCheckpointV1::new(
+            &descriptor.selector,
+            descriptor.channel,
+            HostedSlackPollKindV1::FullRepair,
+            "2026-06-01T00:00:00Z".to_string(),
+            "2026-05-28T20:00:00Z".to_string(),
+        )
+        .unwrap();
+        let request = history_request(&checkpoint).unwrap();
+        let history = history_poll_page(&checkpoint, &request, provider_page).unwrap();
+        checkpoint.apply_history_page(&history).unwrap();
+        assert_eq!(
+            checkpoint.phase(),
+            HostedSlackPollPhaseV1::AwaitingCatchUpCut
+        );
+        assert_eq!(checkpoint.completed_roots().len(), 3);
+
+        let oversized = serde_json::json!({
+            "ts": "1780000003.000100",
+            "subtype": "channel_topic",
+            "text": "é".repeat(MAX_HOSTED_SLACK_MESSAGE_TEXT_BYTES),
+            "reply_count": 0
+        });
+        let bounded = provider_message(
+            serde_json::from_value::<MessageWire>(oversized).unwrap(),
+            "C08ENGINEER1",
+        )
+        .unwrap();
+        assert!(bounded.message.text.len() <= MAX_HOSTED_SLACK_MESSAGE_TEXT_BYTES);
+        assert!(bounded.message.text.ends_with(" …[truncated]"));
+        assert!(std::str::from_utf8(bounded.message.text.as_bytes()).is_ok());
+
+        let unknown = serde_json::from_str::<MessageWire>(
+            r#"{"ts":"1780000004.000100","subtype":"unknown_provider_secret","text":"secret"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            provider_message(unknown, "C08ENGINEER1"),
+            Err(HostedSlackProviderError::InvalidResponse(
+                "unsupported message subtype"
+            ))
+        );
+    }
+
+    #[test]
+    fn deleted_message_tombstones_clear_stale_file_references() {
+        let wire = serde_json::from_str::<MessageWire>(
+            r#"{
+                "ts": "1780000010.000100",
+                "subtype": "message_deleted",
+                "deleted_ts": "1780000000.000100",
+                "previous_message": {
+                    "ts": "1780000000.000100",
+                    "user": "U08ADA00001",
+                    "text": "deleted body",
+                    "files": [{"id": "F08PLAN0001"}],
+                    "reply_count": 2
+                }
+            }"#,
+        )
+        .unwrap();
+        let tombstone = provider_message(wire, "C08ENGINEER1").unwrap();
+        assert!(tombstone.message.deleted);
+        assert!(tombstone.message.text.is_empty());
+        assert!(tombstone.message.file_ids.is_empty());
+        assert_eq!(tombstone.reply_count, Some(0));
+    }
 
     #[test]
     fn production_wire_boundary_discards_private_urls_email_headers_cookies_and_raw_content() {
@@ -3014,6 +3301,90 @@ mod tests {
                 "2026-01-01T00:00:00Z".to_string(),
             ),
             Err(HostedSlackProviderError::Revoked)
+        );
+        let mut slack_connect = discovered_channel("T08LOCALITY1", true, false);
+        slack_connect.channel.sharing = SlackChannelSharingClassification::ExternallySharedPrivate;
+        assert_eq!(
+            HostedSlackInitialChannelDescriptorV1::new(
+                &binding,
+                &slack_connect,
+                "2026-05-28T20:26:40Z".to_string(),
+                "2026-01-01T00:00:00Z".to_string(),
+            ),
+            Err(HostedSlackProviderError::Unsupported(
+                "Slack Connect channel identity in V1"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_and_readiness_reject_slack_connect_without_composite_identity() {
+        let (base_url, _requests, server) = spawn_stub_server(vec![StubResponse {
+            status: "200 OK",
+            headers: Vec::new(),
+            body: DISCOVERY_SLACK_CONNECT,
+        }]);
+        let provider = test_provider(base_url);
+        assert_eq!(
+            provider
+                .conversations_list(HostedSlackChannelDiscoveryRequestV1 {
+                    cursor: None,
+                    limit: HOSTED_SLACK_DISCOVERY_PAGE_LIMIT_V1,
+                })
+                .await,
+            Err(HostedSlackProviderError::Unsupported(
+                "Slack Connect channel identity in V1"
+            ))
+        );
+        server.join().unwrap();
+
+        let mut channel = indexed_discovered_channel(1);
+        channel.channel.sharing = SlackChannelSharingClassification::ExternallySharedPublic;
+        let fake = StubDiscoveryProvider::new([Ok(discovery_page(vec![channel], None))]);
+        assert_eq!(
+            discover_hosted_slack_channels_v1(
+                &fake,
+                &installation_binding(),
+                &HostedSlackDriveControlV1::new(
+                    Instant::now() + Duration::from_secs(10),
+                    HostedSlackCancellationToken::new(),
+                    None,
+                ),
+            )
+            .await,
+            Err(HostedSlackProviderError::Unsupported(
+                "Slack Connect channel identity in V1"
+            ))
+        );
+
+        assert_eq!(
+            verify_channel_authority(
+                &HostedSlackChannelSelector {
+                    sharing: SlackChannelSharingClassification::ExternallySharedPrivate,
+                    ..HostedSlackInitialChannelDescriptorV1::new(
+                        &installation_binding(),
+                        &discovered_channel("T08LOCALITY1", true, false),
+                        "2026-05-28T20:26:40Z".to_string(),
+                        "2026-01-01T00:00:00Z".to_string(),
+                    )
+                    .unwrap()
+                    .selector
+                },
+                &observed_identity(),
+                &HostedSlackObservedChannelAuthorityV1 {
+                    team_id: "T08LOCALITY1".to_string(),
+                    channel_id: "C08ENGINEER1".to_string(),
+                    is_private: true,
+                    is_shared: true,
+                    is_externally_shared: true,
+                    is_org_shared: false,
+                    is_member: true,
+                    shared_team_ids: vec!["T08EXTERNAL1".to_string(), "T08LOCALITY1".to_string(),],
+                },
+            ),
+            Err(HostedSlackProviderError::Unsupported(
+                "Slack Connect channel identity in V1"
+            ))
         );
     }
 
@@ -3412,27 +3783,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_invalid_429_installs_a_conservative_shared_cooldown() {
+    async fn invalid_and_long_429s_install_the_required_shared_cooldown() {
         let cases = [
             (
                 Vec::new(),
                 HostedSlackProviderError::InvalidResponse("Retry-After"),
+                Duration::from_secs(299),
+                MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1,
             ),
             (
                 vec![("Retry-After", "not-a-delay")],
                 HostedSlackProviderError::InvalidResponse("Retry-After"),
+                Duration::from_secs(299),
+                MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1,
             ),
             (
                 vec![("Retry-After", "0")],
                 HostedSlackProviderError::InvalidResponse("Retry-After"),
+                Duration::from_secs(299),
+                MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1,
             ),
             (
                 vec![("Retry-After", "301")],
-                HostedSlackProviderError::LimitExceeded("retry delay"),
+                HostedSlackProviderError::RateLimited {
+                    retry_after: Duration::from_secs(301),
+                },
+                MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1,
+                Duration::from_secs(301),
             ),
         ];
 
-        for (headers, expected) in cases {
+        for (headers, expected, minimum_cooldown, maximum_cooldown) in cases {
             let (base_url, _requests, server) = spawn_stub_server(vec![StubResponse {
                 status: "429 Too Many Requests",
                 headers,
@@ -3451,8 +3832,8 @@ mod tests {
                 .gates
                 .gate(HostedSlackProviderOperationV1::ConversationsInfo);
             let cooldown = gate.status().cooldown_remaining.unwrap();
-            assert!(cooldown > Duration::from_secs(299));
-            assert!(cooldown <= MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1);
+            assert!(cooldown > minimum_cooldown);
+            assert!(cooldown <= maximum_cooldown);
 
             let concurrent_provider = provider.clone();
             let concurrent = tokio::spawn(async move {
@@ -3600,6 +3981,46 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[test]
+    fn in_process_gates_are_team_and_method_scoped_with_a_durable_public_key() {
+        let first = HostedSlackProviderGates::global("T08SCOPE001");
+        let same_team = HostedSlackProviderGates::global("T08SCOPE001");
+        let other_team = HostedSlackProviderGates::global("T08SCOPE002");
+        assert!(Arc::ptr_eq(
+            &first.conversations_history.inner,
+            &same_team.conversations_history.inner,
+        ));
+        assert!(!Arc::ptr_eq(
+            &first.conversations_history.inner,
+            &first.conversations_replies.inner,
+        ));
+        assert!(!Arc::ptr_eq(
+            &first.conversations_history.inner,
+            &other_team.conversations_history.inner,
+        ));
+
+        let provider = HttpHostedSlackProvider::with_base_url(
+            "xoxb-scope-test",
+            HostedSlackObservedInstallationIdentity {
+                api_app_id: "A08LOCALITY1".to_string(),
+                team_id: "T08SCOPE001".to_string(),
+                enterprise_id: None,
+                enterprise_install: false,
+                bot_user_id: "U08LOCALBOT1".to_string(),
+                oauth_subject_id: "U08INSTALLER1".to_string(),
+            },
+            "https://scope.invalid",
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(
+                &provider.coordination_scope(HostedSlackProviderOperationV1::ConversationsHistory,)
+            )
+            .unwrap(),
+            r#"{"team_id":"T08SCOPE001","operation":"conversations_history"}"#
+        );
+    }
+
     #[tokio::test]
     async fn production_http_calls_obey_orchestrator_cancellation_and_deadline() {
         let request = || HostedSlackHistoryRequestV1 {
@@ -3709,7 +4130,9 @@ mod tests {
                 StatusCode::TOO_MANY_REQUESTS,
                 Some(MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1 + Duration::from_secs(1)),
             ),
-            HostedSlackProviderError::LimitExceeded("retry delay")
+            HostedSlackProviderError::RateLimited {
+                retry_after: MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1 + Duration::from_secs(1)
+            }
         );
         assert_eq!(
             logical_slack_error(
@@ -3717,6 +4140,13 @@ mod tests {
                 HostedSlackProviderOperationV1::VerifyInstallation,
             ),
             HostedSlackProviderError::Revoked
+        );
+        assert_eq!(
+            logical_slack_error(
+                Some("thread_not_found"),
+                HostedSlackProviderOperationV1::ConversationsReplies,
+            ),
+            HostedSlackProviderError::ThreadNotFound
         );
         assert_eq!(
             logical_slack_error(
