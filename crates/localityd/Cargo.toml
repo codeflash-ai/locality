@@ -48,6 +48,7 @@ rustix = { version = "1.1.4", features = ["fs"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+cap-std = "4.0.2"
 windows-sys = { version = "0.61", features = [
   "Wdk_Foundation",
   "Wdk_Storage_FileSystem",
@@ -56,3 +57,6 @@ windows-sys = { version = "0.61", features = [
   "Win32_Storage_FileSystem",
   "Win32_System_IO",
 ] }
+
+[dev-dependencies]
+rusqlite = { version = "0.39.0", features = ["bundled"] }

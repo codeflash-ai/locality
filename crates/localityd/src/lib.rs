@@ -5,6 +5,8 @@ mod durable_fs;
 pub mod execution;
 pub mod file_provider;
 pub mod freshness;
+mod generation_mount;
+pub mod generation_sync;
 pub mod gmail;
 pub mod google_calendar;
 pub mod google_docs;

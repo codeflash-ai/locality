@@ -17,6 +17,7 @@
 | `records` | Durable connector profile, connection, mount, entity, shadow snapshot, and shadow block record shapes. |
 | `repository` | Split repository traits for connector profiles, connections, mounts, entities, shadows, hydration jobs, and journals. |
 | `discovery` | Connector-neutral atomic batch-discovery commit, validation, and conservative pending-work guards. |
+| `generation_delivery` | Observed backend generations, per-path merge bases, and resumable generation-apply journal contracts. |
 | `memory` | Deterministic in-memory implementation for tests and early orchestration. |
 | `sqlite` | SQLite-backed durable implementation of the repository traits. |
 | `error` | Store-specific structured errors and conversion to `locality-core` errors. |
@@ -52,6 +53,13 @@
 - SQLite migrates v19 rows to v20 by creating and rebuilding
   `search_documents_fts`, a connector-neutral search cache over entity metadata
   plus connector search metadata and hydrated shadow frontmatter/body.
+- SQLite migrates v20 rows to v21 by adding observed generation, per-path merge
+  base, terminal receipt, and resumable differential-apply journal tables. The
+  additive migration does not rewrite or discard pending push journals, virtual
+  mutations, shadows, or local files.
+- SQLite migrates v21 rows to v22 by relating each differential-apply journal
+  to its mount. Connection, remote-root, and settings changes fail closed while
+  that mount has an active journal, preventing source resets from orphaning it.
 - SQLite records component versions for durable subsystems so compatibility is
   decided from persisted state contracts instead of desktop build IDs.
 - SQLite enables WAL mode, a busy timeout, foreign keys, and `PRAGMA user_version` schema versioning.
@@ -109,6 +117,78 @@ These are executor APIs, not a claim about a daemon startup call site. Ambiguous
 filesystem state returns `needs_review`; repository and I/O failures propagate.
 Raw projection and version fields are checked before typed decoding so future
 layouts fail update-required without mutating durable state.
+
+## Generation Delivery Transactions
+
+Backend generation delivery is separate from direct-provider discovery. A mount
+records its latest fully observed source generation, inventory digest, exact
+workspace layout version/digest, terminal receipt digest, and one merge-base
+record per projected path. A delta reservation must match all of those base
+facts. Changed retries, newer required readers, incomplete targets, layout
+changes, generation gaps, and old-identity mismatches fail before the local tree
+is changed.
+
+`generation_apply_journals` stores the owning mount, canonical delta and
+terminal receipt, staging root, lifecycle, and per-entry outcomes. Source
+identity/settings resets are transactionally blocked while that mount has an
+active apply. The daemon stages and verifies
+incoming bytes before applying clean creates/updates/deletions. Each filesystem
+operation is idempotently recognizable after a crash, so recovery can record
+the missing outcome and continue. Only after every entry has an applied,
+deleted, or conflict outcome does one SQLite transaction advance affected mount
+heads and clean path bases. Dirty local bytes stay in place and become explicit
+conflicts. A write through a descriptor retained across a clean three-way merge
+renames the visible merged inode to a deterministic retained name while keeping
+the pre-merge inode retained too. The logical path contains only a small,
+deterministic manifest naming both resolvable versions, so two individually
+bounded files can never produce an inline conflict larger than the 64 MiB file
+limit. Both inode hashes and byte lengths advance atomically in SQLite after
+later writes, and both lengths count toward per-mount and global evidence
+quotas. Recovery recognizes the visible-inode rename as a durable checkpoint,
+including a crash before manifest publication, and idempotently finishes the
+manifest and fences without unlinking either inode. Recovery also reconstructs
+the pre-merge fence when merged bytes were published before evidence was
+persisted. To resolve this conflict, the user closes writers, copies exactly one
+named retained file over the manifest, and syncs again. Reconciliation fsyncs
+and re-fences that exact choice, then atomically restores the path to `dirty`,
+records the apply as `merged`, and marks the dual-inode evidence row resolved.
+Both retained files remain as a tombstoned GC journal. Their `captured_sha256`
+and `captured_byte_length` values are frozen snapshots of bytes Locality managed
+at capture or resolution. Admission treats those captured lengths as a logical
+managed-evidence reservation; it is not an actual-disk quota. A foreign file
+descriptor opened earlier can grow either inode without Locality's involvement,
+so that reachable, user-owned recovery growth is deliberately outside the
+managed reservation. Apply, reconciliation, and ordinary startup never open,
+fingerprint, require, or unlink resolved tombstones. They account only frozen
+captured reservations plus the active update's prospective Locality-managed
+preimage. Consequently, an unavailable mount containing only resolved
+tombstones cannot block unrelated polling, recovery, or evidence-producing
+updates, including deltas with old-identity metadata.
+
+Cleanup is deferred to a future GC that must hold an explicit exclusive
+no-active-mount lifecycle gate and must define how external-descriptor growth is
+handled; no such GC runs today. Arbitrary custom replacement bytes are preserved
+but intentionally do not clear the conflict. Reconciliation retains only
+authenticated payloads for current live conflicts and removes successful,
+superseded, or orphan payloads. Per-mount and global limits bound Locality's
+captured managed-evidence reservations and current conflict payloads, not later
+user-owned writes to retained inodes.
+
+V1 deltas are mount-scoped. Empty entry lists are valid when a complete target
+generation changes no projected bytes. A logical path may occur in only one
+entry, preventing order-dependent delete/create replacement. Per-file and
+aggregate content limits are validated before reservation; the journal is
+reserved before bounded streaming downloads begin.
+
+Apply mutations are handle-relative beneath a no-follow root and coordinated by
+an inter-process mount lock. Unix uses no-follow directory descriptors; Windows
+opens and validates a non-reparse root handle and locks a stable root lock file.
+Other non-Unix platforms fail closed until equivalent primitives exist.
+
+The public daemon exposes an authenticated transport trait and a deterministic
+fake, not a network route. An authenticated private endpoint adapter and the
+existing `loc pull`/Live Mode call-site integration remain follow-up work. No
+unauthenticated API or new routine sync command is implied by these tables.
 
 `commit_discovery_transaction` loads the stored commit rather than accepting a
 caller replacement. One SQLite transaction revalidates the reservation and
@@ -172,6 +252,12 @@ The first schema keeps high-value lookup fields relational and stores complex co
 - `discovery_projection_transactions`: immutable discovery plans, commits, and
   reservations plus durable execution effects, status, recovery error, and
   commit/finalization timestamps;
+- `observed_generations`: per-mount source generation, inventory and layout
+  fence, latest terminal receipt, and update time;
+- `generation_paths`: per-projection local merge base, clean/dirty/conflicted
+  state, and newest incoming identity;
+- `generation_apply_journals` and `generation_apply_outcomes`: immutable delta
+  and receipt payloads plus crash-recoverable per-entry apply results;
 - `projection_state`: projection-owned state such as File Provider/FUSE layout
   versions and repair generations.
 

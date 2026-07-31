@@ -1295,11 +1295,11 @@ fn append_u64(output: &mut Vec<u8>, value: u64) -> Result<(), WorkspaceExportV2E
 }
 
 fn validate_connector_path(value: &str) -> Result<LogicalPath, WorkspaceExportV2Error> {
+    validate_regular_path(value)?;
     let logical_path =
         LogicalPath::new(value).map_err(|_| WorkspaceExportV2Error::InvalidLogicalPath {
             path: value.to_string(),
         })?;
-    validate_regular_path(value)?;
     Ok(logical_path)
 }
 

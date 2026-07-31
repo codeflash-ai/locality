@@ -9,6 +9,7 @@ pub mod compatibility;
 pub mod credentials;
 pub mod discovery;
 pub mod error;
+pub mod generation_delivery;
 pub mod live_mode;
 pub mod memory;
 pub mod records;
@@ -31,6 +32,13 @@ pub use discovery::{
     PreparedDiscoveryTransaction, TransactionalDiscoveryCommit, discovery_auto_save_candidate,
 };
 pub use error::{StoreError, StoreResult};
+pub use generation_delivery::{
+    GenerationApplyJournalRecord, GenerationApplyOutcome, GenerationApplyStatus,
+    GenerationDeliveryRepository, GenerationInodeEvidenceConflictUpdate,
+    GenerationInodeEvidenceRecord, GenerationInodeEvidenceResolution, GenerationPathRecord,
+    GenerationPathState, GenerationRetainedInodeRecord, ObservedGenerationRecord,
+    PreparedGenerationApply,
+};
 pub use live_mode::{
     LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountLiveModeStateChangeError,
     is_live_mode_state_change_signal_path, live_mode_state_change_signal_path,

@@ -569,6 +569,17 @@ fn scheduled_pull_fetch_does_not_occupy_the_local_mutation_slot() {
             .expect("event ran while fetch blocked"),
         event
     );
+    // The runner signals `event_rx` before its job thread enqueues completion.
+    // Wait until the runtime has consumed that completion so the exact status
+    // assertion cannot race the still-active file-event bookkeeping.
+    wait_until(ASYNC_EVENT_TIMEOUT, || {
+        runtime
+            .handle()
+            .status()
+            .ok()
+            .and_then(|status| status.active_job_detail)
+            .is_some_and(|job| job.kind == "scheduled_pull_fetch")
+    });
     let status = runtime.handle().status().expect("runtime status");
     assert_eq!(
         status.active_job_detail.expect("fetch activity").kind,

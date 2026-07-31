@@ -1,0 +1,47 @@
+{
+  "provider": {
+    "source_connection_id": "source-018f4f6e",
+    "state": "degraded",
+    "reason": "provider_cooldown",
+    "retry": {
+      "class": "after_delay",
+      "retry_after_seconds": 30
+    },
+    "epochs": {
+      "demand_epoch": "12",
+      "received_epoch": "12",
+      "processed_epoch": "11",
+      "applied_epoch": "11"
+    },
+    "worker_progress": "fetching",
+    "latest_observation_at": "2026-07-31T12:30:00Z",
+    "provider_cooldown_until": "2026-07-31T12:35:00Z"
+  },
+  "publication": {
+    "source_connection_id": "source-018f4f6e",
+    "generation_id": "generation-0008",
+    "state": "complete",
+    "verified": true,
+    "retained": true,
+    "selectable": true,
+    "applied_receipt_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "reason": null,
+    "retry": null
+  },
+  "local_delivery": {
+    "mount_id": "mount-alpha",
+    "state": "conflicted",
+    "observed_generation_id": "generation-0008",
+    "available_generation_id": "generation-0008",
+    "clean_path_count": 8,
+    "dirty_path_count": 2,
+    "pending_path_count": 1,
+    "conflicted_path_count": 1,
+    "last_delta_receipt_sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "reason": "merge_conflict",
+    "retry": {
+      "class": "after_user_action",
+      "retry_after_seconds": null
+    }
+  }
+}

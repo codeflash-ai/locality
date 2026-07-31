@@ -49,7 +49,7 @@ fn legacy_v20_upgrade_preserves_dirty_shadow_apply_journal_and_mount_identity() 
         before.issues,
         vec![StateCompatibilityIssue::OlderSchema {
             found: 20,
-            current: 21,
+            current: 25,
         }]
     );
 
@@ -386,7 +386,7 @@ fn assert_legacy_virtual_binding_uses_final_mount_point(projection: ProjectionMo
 }
 
 #[test]
-fn current_v21_open_rejects_missing_binding_without_reconstructing_it() {
+fn current_v25_open_rejects_missing_binding_without_reconstructing_it() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
     store
@@ -418,7 +418,7 @@ fn current_v21_open_rejects_missing_binding_without_reconstructing_it() {
 }
 
 #[test]
-fn current_v21_save_of_existing_mount_does_not_reconstruct_missing_binding() {
+fn current_v25_save_of_existing_mount_does_not_reconstruct_missing_binding() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
     let mount = fixture.mount_config(ProjectionMode::PlainFiles);
@@ -515,7 +515,7 @@ fn save_mount_atomically_creates_binding_or_rolls_back_mount() {
 }
 
 #[test]
-fn current_v21_open_rejects_missing_non_rebuildable_binding_component() {
+fn current_v25_open_rejects_missing_non_rebuildable_binding_component() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
     store
@@ -551,7 +551,7 @@ fn current_v21_open_rejects_missing_non_rebuildable_binding_component() {
 }
 
 #[test]
-fn v21_transition_rolls_back_table_roots_components_and_version_on_failure() {
+fn v25_transition_rolls_back_table_roots_components_and_version_on_failure() {
     let fixture = Fixture::new();
     let shared_root = fixture.root.join("LegacyLocality");
     fs::create_dir_all(&shared_root).expect("shared root");

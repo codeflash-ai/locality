@@ -20,6 +20,7 @@ use locality_core::planner::{PlanSummary, PushOperation, PushPlan};
 use locality_core::readable_diff::ReadableDiffOutput;
 use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::shadow::ShadowDocument;
+use locality_protocol::freshness_delivery::GenerationDelta;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -38,6 +39,13 @@ use crate::discovery::{
     reservation_changed, transaction_missing, validate_envelope_version,
 };
 use crate::error::{StoreError, StoreResult};
+use crate::generation_delivery::{
+    GENERATION_DELIVERY_COMPONENT_VERSION, GenerationApplyJournalRecord, GenerationApplyOutcome,
+    GenerationApplyStatus, GenerationDeliveryRepository, GenerationInodeEvidenceConflictUpdate,
+    GenerationInodeEvidenceRecord, GenerationInodeEvidenceResolution, GenerationPathRecord,
+    GenerationPathState, GenerationRetainedInodeRecord, ObservedGenerationRecord,
+    PreparedGenerationApply,
+};
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorStateRecord, EntityRecord, FreshnessStateRecord,
@@ -60,7 +68,7 @@ use crate::workspace_binding::{
 };
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 21;
+const SCHEMA_VERSION: i64 = 25;
 const ENTITY_SEARCH_COMPONENT_VERSION: i64 = 2;
 const JOURNALS_COMPONENT_VERSION: i64 = 3;
 const LINUX_FUSE_PROJECTION_LAYOUT_VERSION: i64 = 2;
@@ -201,6 +209,15 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
         data_json: "{}",
     },
     StateComponentDefinition {
+        component_id: "durable:generation_delivery",
+        component_kind: "durable_transaction",
+        current_version: GENERATION_DELIVERY_COMPONENT_VERSION,
+        min_reader_version: GENERATION_DELIVERY_COMPONENT_VERSION,
+        required: true,
+        rebuildable: false,
+        data_json: "{}",
+    },
+    StateComponentDefinition {
         component_id: "auth:connections",
         component_kind: "secret_binding",
         current_version: 1,
@@ -250,8 +267,11 @@ impl SqliteStateStore {
     }
 
     pub fn clear_mount_source_state(&mut self, mount_id: &MountId) -> StoreResult<()> {
-        let connection = self.connection()?;
-        clear_mount_source_state(&connection, mount_id)
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        clear_mount_source_state(&transaction, mount_id)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     fn connection(&self) -> StoreResult<Connection> {
@@ -267,10 +287,1394 @@ impl SqliteStateStore {
     }
 }
 
+fn generation_path_state_label(state: GenerationPathState) -> &'static str {
+    match state {
+        GenerationPathState::Clean => "clean",
+        GenerationPathState::Dirty => "dirty",
+        GenerationPathState::Conflicted => "conflicted",
+    }
+}
+
+fn parse_generation_path_state(value: &str) -> StoreResult<GenerationPathState> {
+    match value {
+        "clean" => Ok(GenerationPathState::Clean),
+        "dirty" => Ok(GenerationPathState::Dirty),
+        "conflicted" => Ok(GenerationPathState::Conflicted),
+        _ => Err(StoreError::InvalidState(format!(
+            "unknown generation path state `{value}`"
+        ))),
+    }
+}
+
+fn observed_generation_from_row(
+    row: (
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        Option<String>,
+        String,
+    ),
+) -> StoreResult<ObservedGenerationRecord> {
+    Ok(ObservedGenerationRecord {
+        mount_id: MountId::new(row.0),
+        source_connection_id: locality_core::portable::SourceConnectionId::new(row.1),
+        generation_id: locality_core::portable::SourceGenerationId::new(row.2)
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?,
+        inventory_sha256: row.3,
+        workspace_layout_version: u16::try_from(row.4).map_err(|_| {
+            StoreError::InvalidState("invalid stored workspace layout version".to_string())
+        })?,
+        workspace_layout_digest: row.5,
+        last_receipt_sha256: row.6,
+        updated_at: row.7,
+    })
+}
+
+fn select_observed_generation(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<Option<ObservedGenerationRecord>> {
+    connection
+        .query_row(
+            "SELECT mount_id, source_connection_id, generation_id, inventory_sha256,
+                    workspace_layout_version, workspace_layout_digest,
+                    last_receipt_sha256, updated_at
+             FROM observed_generations WHERE mount_id = ?1",
+            params![mount_id.0.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(observed_generation_from_row)
+        .transpose()
+}
+
+fn generation_path_from_row(
+    row: (
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+        String,
+        Option<String>,
+        String,
+    ),
+) -> StoreResult<GenerationPathRecord> {
+    Ok(GenerationPathRecord {
+        mount_id: MountId::new(row.0),
+        projection_id: locality_core::portable::ProjectionId::new(row.1),
+        logical_path: row.2,
+        local_logical_path: row.3,
+        base_generation_id: locality_core::portable::SourceGenerationId::new(row.4)
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?,
+        base_identity: row.5.map(|value| from_json(&value)).transpose()?,
+        base_payload_delta_id: row.6,
+        base_payload_entry_index: row
+            .7
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    StoreError::InvalidState("negative generation base payload index".to_string())
+                })
+            })
+            .transpose()?,
+        conflict_payload_delta_id: row.8,
+        conflict_payload_entry_index: row
+            .9
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    StoreError::InvalidState(
+                        "negative generation conflict payload index".to_string(),
+                    )
+                })
+            })
+            .transpose()?,
+        state: parse_generation_path_state(&row.10)?,
+        incoming_identity: row.11.map(|value| from_json(&value)).transpose()?,
+        updated_at: row.12,
+    })
+}
+
+fn select_generation_path(
+    connection: &Connection,
+    mount_id: &MountId,
+    projection_id: &locality_core::portable::ProjectionId,
+) -> StoreResult<Option<GenerationPathRecord>> {
+    connection
+        .query_row(
+            "SELECT mount_id, projection_id, logical_path, local_logical_path, base_generation_id,
+                    base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                    conflict_payload_delta_id, conflict_payload_entry_index,
+                    state, incoming_identity_json, updated_at
+             FROM generation_paths WHERE mount_id = ?1 AND projection_id = ?2",
+            params![mount_id.0.as_str(), projection_id.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(generation_path_from_row)
+        .transpose()
+}
+
+fn list_generation_paths_from_connection(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<Vec<GenerationPathRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT mount_id, projection_id, logical_path, local_logical_path, base_generation_id,
+                base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                conflict_payload_delta_id, conflict_payload_entry_index,
+                state, incoming_identity_json, updated_at
+         FROM generation_paths WHERE mount_id = ?1 ORDER BY projection_id",
+    )?;
+    let rows = statement.query_map(params![mount_id.0.as_str()], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+            row.get(8)?,
+            row.get(9)?,
+            row.get(10)?,
+            row.get(11)?,
+            row.get(12)?,
+        ))
+    })?;
+    rows.map(|row| generation_path_from_row(row?)).collect()
+}
+
+fn generation_apply_from_connection(
+    connection: &Connection,
+    delta_id: &str,
+) -> StoreResult<Option<GenerationApplyJournalRecord>> {
+    let row = connection
+        .query_row(
+            "SELECT mount_id, delta_json, receipt_json, receipt_sha256, stage_root, status,
+                    created_at, updated_at, completed_at
+             FROM generation_apply_journals WHERE delta_id = ?1",
+            params![delta_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let mut outcomes = Vec::new();
+    let mut statement = connection.prepare(
+        "SELECT entry_index, outcome_json
+         FROM generation_apply_outcomes WHERE delta_id = ?1 ORDER BY entry_index",
+    )?;
+    let rows = statement.query_map(params![delta_id], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (entry_index, outcome_json) = row?;
+        outcomes.push((
+            u64::try_from(entry_index).map_err(|_| {
+                StoreError::InvalidState("negative generation outcome index".to_string())
+            })?,
+            from_json(&outcome_json)?,
+        ));
+    }
+    let delta: GenerationDelta = from_json(&row.1)?;
+    if delta.mount_id.as_str() != row.0 {
+        return Err(StoreError::InvalidState(format!(
+            "generation apply `{delta_id}` mount relation does not match its delta"
+        )));
+    }
+    Ok(Some(GenerationApplyJournalRecord {
+        delta,
+        receipt: from_json(&row.2)?,
+        receipt_sha256: row.3,
+        stage_root: row.4,
+        status: GenerationApplyStatus::parse(&row.5)?,
+        outcomes,
+        created_at: row.6,
+        updated_at: row.7,
+        completed_at: row.8,
+    }))
+}
+
+fn validate_seed_generation(
+    observed: &ObservedGenerationRecord,
+    paths: &[GenerationPathRecord],
+) -> StoreResult<()> {
+    if observed.workspace_layout_version == 0
+        || observed.workspace_layout_digest.is_empty()
+        || observed.inventory_sha256.is_empty()
+        || observed.updated_at.is_empty()
+    {
+        return Err(StoreError::InvalidState(
+            "observed generation has incomplete metadata".to_string(),
+        ));
+    }
+    let mut projections = BTreeSet::new();
+    let mut logical_paths = BTreeSet::new();
+    let mut local_paths = BTreeSet::new();
+    for path in paths {
+        let logical_path = locality_core::portable::LogicalPath::new(path.logical_path.clone())
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+        let local_path = locality_core::portable::LogicalPath::new(path.local_logical_path.clone())
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+        if path.mount_id != observed.mount_id
+            || path.base_generation_id != observed.generation_id
+            || path.updated_at.is_empty()
+            || !projections.insert(path.projection_id.clone())
+            || !logical_paths.insert(logical_path.portable_collision_key())
+            || !local_paths.insert(local_path.portable_collision_key())
+        {
+            return Err(StoreError::InvalidState(
+                "generation path seed does not match its observed generation".to_string(),
+            ));
+        }
+        if let Some(identity) = &path.base_identity
+            && (identity.projection_id != path.projection_id
+                || identity.logical_path.as_str() != path.logical_path)
+        {
+            return Err(StoreError::InvalidState(
+                "generation path base identity does not match its row".to_string(),
+            ));
+        }
+        if path.state == GenerationPathState::Clean && path.local_logical_path != path.logical_path
+        {
+            return Err(StoreError::InvalidState(
+                "clean generation path has a different local working path".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl GenerationDeliveryRepository for SqliteStateStore {
+    fn seed_observed_generation(
+        &mut self,
+        observed: ObservedGenerationRecord,
+        mut paths: Vec<GenerationPathRecord>,
+    ) -> StoreResult<()> {
+        validate_seed_generation(&observed, &paths)?;
+        paths.sort_by(|left, right| left.projection_id.cmp(&right.projection_id));
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mount_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mounts WHERE mount_id = ?1)",
+            params![observed.mount_id.0.as_str()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !mount_exists {
+            return Err(StoreError::MountMissing(observed.mount_id));
+        }
+        if let Some(existing) = select_observed_generation(&transaction, &observed.mount_id)? {
+            let existing_paths =
+                list_generation_paths_from_connection(&transaction, &observed.mount_id)?;
+            if existing == observed && existing_paths == paths {
+                transaction.commit()?;
+                return Ok(());
+            }
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` already has a different observed generation",
+                observed.mount_id.0
+            )));
+        }
+        transaction.execute(
+            "INSERT INTO observed_generations (
+                mount_id, source_connection_id, generation_id, inventory_sha256,
+                workspace_layout_version, workspace_layout_digest,
+                last_receipt_sha256, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                observed.mount_id.0.as_str(),
+                observed.source_connection_id.as_str(),
+                observed.generation_id.as_str(),
+                observed.inventory_sha256.as_str(),
+                observed.workspace_layout_version,
+                observed.workspace_layout_digest.as_str(),
+                observed.last_receipt_sha256.as_deref(),
+                observed.updated_at.as_str(),
+            ],
+        )?;
+        for path in paths {
+            transaction.execute(
+                "INSERT INTO generation_paths (
+                    mount_id, projection_id, logical_path, local_logical_path, base_generation_id,
+                    base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                    conflict_payload_delta_id, conflict_payload_entry_index,
+                    state, incoming_identity_json, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    path.mount_id.0.as_str(),
+                    path.projection_id.as_str(),
+                    path.logical_path.as_str(),
+                    path.local_logical_path.as_str(),
+                    path.base_generation_id.as_str(),
+                    path.base_identity.as_ref().map(to_json).transpose()?,
+                    path.base_payload_delta_id.as_deref(),
+                    path.base_payload_entry_index
+                        .map(i64::try_from)
+                        .transpose()
+                        .map_err(|_| StoreError::InvalidState(
+                            "generation base payload index is too large".to_string()
+                        ))?,
+                    path.conflict_payload_delta_id.as_deref(),
+                    path.conflict_payload_entry_index
+                        .map(i64::try_from)
+                        .transpose()
+                        .map_err(|_| StoreError::InvalidState(
+                            "generation conflict payload index is too large".to_string()
+                        ))?,
+                    generation_path_state_label(path.state),
+                    path.incoming_identity.as_ref().map(to_json).transpose()?,
+                    path.updated_at.as_str(),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn get_observed_generation(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Option<ObservedGenerationRecord>> {
+        select_observed_generation(&self.connection()?, mount_id)
+    }
+
+    fn list_generation_paths(&self, mount_id: &MountId) -> StoreResult<Vec<GenerationPathRecord>> {
+        list_generation_paths_from_connection(&self.connection()?, mount_id)
+    }
+
+    fn reserve_generation_apply(
+        &mut self,
+        prepared: PreparedGenerationApply,
+    ) -> StoreResult<GenerationApplyJournalRecord> {
+        prepared.validate()?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) =
+            generation_apply_from_connection(&transaction, &prepared.delta.delta_id)?
+        {
+            if existing.delta == prepared.delta
+                && existing.receipt == prepared.receipt
+                && existing.receipt_sha256 == prepared.receipt_sha256
+                && existing.stage_root == prepared.stage_root
+                && existing.created_at == prepared.created_at
+            {
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            return Err(StoreError::InvalidState(format!(
+                "generation apply `{}` replay changed its immutable payload",
+                prepared.delta.delta_id
+            )));
+        }
+
+        let mount_id = MountId::new(prepared.delta.mount_id.as_str());
+        let observed = select_observed_generation(&transaction, &mount_id)?.ok_or_else(|| {
+            StoreError::InvalidState(format!(
+                "mount `{}` has no observed generation",
+                prepared.delta.mount_id
+            ))
+        })?;
+        if observed.source_connection_id != prepared.delta.source_connection_id
+            || observed.generation_id != prepared.delta.base_generation_id
+            || observed.workspace_layout_version != prepared.delta.workspace_layout_version
+            || observed.workspace_layout_digest != prepared.delta.workspace_layout_digest.as_str()
+        {
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` generation or layout does not match delta base",
+                prepared.delta.mount_id
+            )));
+        }
+        for entry in &prepared.delta.entries {
+            if let Some(old) = &entry.old {
+                let path = select_generation_path(&transaction, &mount_id, &old.projection_id)?
+                    .ok_or_else(|| {
+                        StoreError::InvalidState(format!(
+                            "delta old projection `{}` has no local merge base",
+                            old.projection_id.as_str()
+                        ))
+                    })?;
+                let expected = if path.state == GenerationPathState::Conflicted {
+                    path.incoming_identity.as_ref()
+                } else {
+                    path.base_identity.as_ref()
+                };
+                if expected != Some(old) {
+                    return Err(StoreError::InvalidState(format!(
+                        "delta old projection `{}` does not match local merge state",
+                        old.projection_id.as_str()
+                    )));
+                }
+            }
+        }
+        let active: Option<String> = transaction
+            .query_row(
+                "SELECT delta_id FROM generation_apply_journals
+                 WHERE source_connection_id = ?1 AND active = 1",
+                params![prepared.delta.source_connection_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(active) = active {
+            return Err(StoreError::InvalidState(format!(
+                "source already has active generation apply `{active}`"
+            )));
+        }
+        transaction.execute(
+            "INSERT INTO generation_apply_journals (
+                delta_id, mount_id, source_connection_id, base_generation_id,
+                target_generation_id, delta_json, receipt_json, receipt_sha256,
+                stage_root, status, active, created_at, updated_at, completed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'staged', 1, ?10, ?10, NULL)",
+            params![
+                prepared.delta.delta_id.as_str(),
+                prepared.delta.mount_id.as_str(),
+                prepared.delta.source_connection_id.as_str(),
+                prepared.delta.base_generation_id.as_str(),
+                prepared.delta.target_generation_id.as_str(),
+                to_json(&prepared.delta)?,
+                to_json(&prepared.receipt)?,
+                prepared.receipt_sha256.as_str(),
+                prepared.stage_root.as_str(),
+                prepared.created_at.as_str(),
+            ],
+        )?;
+        let record = generation_apply_from_connection(&transaction, &prepared.delta.delta_id)?
+            .expect("inserted generation journal exists");
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    fn mark_generation_apply_started(
+        &mut self,
+        delta_id: &str,
+        updated_at: &str,
+    ) -> StoreResult<GenerationApplyJournalRecord> {
+        let connection = self.connection()?;
+        let existing =
+            generation_apply_from_connection(&connection, delta_id)?.ok_or_else(|| {
+                StoreError::InvalidState(format!("generation apply `{delta_id}` is missing"))
+            })?;
+        if existing.status == GenerationApplyStatus::Completed {
+            return Ok(existing);
+        }
+        connection.execute(
+            "UPDATE generation_apply_journals
+             SET status = 'applying', updated_at = ?2
+             WHERE delta_id = ?1 AND active = 1",
+            params![delta_id, updated_at],
+        )?;
+        generation_apply_from_connection(&connection, delta_id)?.ok_or_else(|| {
+            StoreError::InvalidState(format!("generation apply `{delta_id}` disappeared"))
+        })
+    }
+
+    fn record_generation_apply_outcome(
+        &mut self,
+        delta_id: &str,
+        entry_index: u64,
+        outcome: GenerationApplyOutcome,
+        updated_at: &str,
+    ) -> StoreResult<GenerationApplyJournalRecord> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let journal =
+            generation_apply_from_connection(&transaction, delta_id)?.ok_or_else(|| {
+                StoreError::InvalidState(format!("generation apply `{delta_id}` is missing"))
+            })?;
+        if journal.status == GenerationApplyStatus::Completed {
+            let exact = journal
+                .outcomes
+                .iter()
+                .find(|(index, _)| *index == entry_index)
+                .is_some_and(|(_, existing)| existing == &outcome);
+            return if exact {
+                Ok(journal)
+            } else {
+                Err(StoreError::InvalidState(format!(
+                    "completed generation apply `{delta_id}` outcome changed"
+                )))
+            };
+        }
+        if entry_index >= journal.delta.entries.len() as u64 {
+            return Err(StoreError::InvalidState(format!(
+                "generation apply `{delta_id}` outcome index is out of bounds"
+            )));
+        }
+        if let Some((_, existing)) = journal
+            .outcomes
+            .iter()
+            .find(|(index, _)| *index == entry_index)
+        {
+            return if existing == &outcome {
+                Ok(journal)
+            } else {
+                Err(StoreError::InvalidState(format!(
+                    "generation apply `{delta_id}` outcome replay changed"
+                )))
+            };
+        }
+        transaction.execute(
+            "INSERT INTO generation_apply_outcomes (delta_id, entry_index, outcome_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                delta_id,
+                i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
+                    "generation apply outcome index is too large".to_string()
+                ))?,
+                to_json(&outcome)?,
+                updated_at
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE generation_apply_journals SET status = 'applying', updated_at = ?2
+             WHERE delta_id = ?1 AND active = 1",
+            params![delta_id, updated_at],
+        )?;
+        let updated = generation_apply_from_connection(&transaction, delta_id)?
+            .expect("generation journal remains present");
+        transaction.commit()?;
+        Ok(updated)
+    }
+
+    fn get_generation_apply(
+        &self,
+        delta_id: &str,
+    ) -> StoreResult<Option<GenerationApplyJournalRecord>> {
+        generation_apply_from_connection(&self.connection()?, delta_id)
+    }
+
+    fn list_active_generation_applies(&self) -> StoreResult<Vec<GenerationApplyJournalRecord>> {
+        let connection = self.connection()?;
+        let delta_ids = {
+            let mut statement = connection.prepare(
+                "SELECT delta_id FROM generation_apply_journals WHERE active = 1 ORDER BY delta_id",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        delta_ids
+            .iter()
+            .map(|delta_id| {
+                generation_apply_from_connection(&connection, delta_id)?.ok_or_else(|| {
+                    StoreError::InvalidState(format!(
+                        "active generation apply `{delta_id}` disappeared"
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    fn list_generation_applies(&self) -> StoreResult<Vec<GenerationApplyJournalRecord>> {
+        let connection = self.connection()?;
+        let delta_ids = {
+            let mut statement = connection.prepare(
+                "SELECT delta_id FROM generation_apply_journals ORDER BY created_at, delta_id",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        delta_ids
+            .iter()
+            .map(|delta_id| {
+                generation_apply_from_connection(&connection, delta_id)?.ok_or_else(|| {
+                    StoreError::InvalidState(format!("generation apply `{delta_id}` disappeared"))
+                })
+            })
+            .collect()
+    }
+
+    fn record_generation_inode_evidence(
+        &mut self,
+        evidence: GenerationInodeEvidenceRecord,
+    ) -> StoreResult<()> {
+        // The SQL column names predate the captured-reservation model and stay
+        // stable for schema compatibility. They store captured snapshots, not
+        // live post-resolution filesystem fingerprints or disk usage.
+        if evidence.resolved_at.is_some() {
+            return Err(StoreError::InvalidState(
+                "new generation inode evidence cannot start resolved".to_string(),
+            ));
+        }
+        let connection = self.connection()?;
+        let entry_index = i64::try_from(evidence.entry_index).map_err(|_| {
+            StoreError::InvalidState("generation evidence index is too large".to_string())
+        })?;
+        let byte_length = i64::try_from(evidence.captured_byte_length).map_err(|_| {
+            StoreError::InvalidState("generation evidence length is too large".to_string())
+        })?;
+        let changed = connection.execute(
+            "INSERT INTO generation_inode_evidence (
+                delta_id, entry_index, mount_id, logical_path, evidence_name,
+                expected_sha256, byte_length, base_payload_delta_id,
+                base_payload_entry_index, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(delta_id, entry_index) DO NOTHING",
+            params![
+                evidence.delta_id.as_str(),
+                entry_index,
+                evidence.mount_id.0.as_str(),
+                evidence.logical_path.as_str(),
+                evidence.evidence_name.as_str(),
+                evidence.captured_sha256.as_str(),
+                byte_length,
+                evidence.base_payload_delta_id.as_deref(),
+                evidence
+                    .base_payload_entry_index
+                    .map(i64::try_from)
+                    .transpose()
+                    .map_err(|_| StoreError::InvalidState(
+                        "generation evidence base payload index is too large".to_string()
+                    ))?,
+                evidence.created_at.as_str(),
+            ],
+        )?;
+        if changed == 0 {
+            let exact: bool = connection.query_row(
+                "SELECT mount_id = ?3 AND logical_path = ?4 AND evidence_name = ?5
+                        AND expected_sha256 = ?6 AND byte_length = ?7
+                        AND base_payload_delta_id IS ?8 AND base_payload_entry_index IS ?9
+                        AND created_at = ?10
+                        AND visible_evidence_name IS NULL
+                        AND visible_expected_sha256 IS NULL
+                        AND visible_byte_length IS NULL
+                        AND resolved_at IS NULL
+                 FROM generation_inode_evidence WHERE delta_id = ?1 AND entry_index = ?2",
+                params![
+                    evidence.delta_id.as_str(),
+                    entry_index,
+                    evidence.mount_id.0.as_str(),
+                    evidence.logical_path.as_str(),
+                    evidence.evidence_name.as_str(),
+                    evidence.captured_sha256.as_str(),
+                    byte_length,
+                    evidence.base_payload_delta_id.as_deref(),
+                    evidence
+                        .base_payload_entry_index
+                        .map(i64::try_from)
+                        .transpose()
+                        .map_err(|_| StoreError::InvalidState(
+                            "generation evidence base payload index is too large".to_string()
+                        ))?,
+                    evidence.created_at.as_str(),
+                ],
+                |row| row.get(0),
+            )?;
+            if !exact {
+                return Err(StoreError::InvalidState(
+                    "generation inode evidence replay changed".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn list_generation_inode_evidence(&self) -> StoreResult<Vec<GenerationInodeEvidenceRecord>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT delta_id, entry_index, mount_id, logical_path, evidence_name,
+                    expected_sha256, byte_length, visible_evidence_name,
+                    visible_expected_sha256, visible_byte_length,
+                    base_payload_delta_id, base_payload_entry_index, resolved_at, created_at
+             FROM generation_inode_evidence ORDER BY created_at, delta_id, entry_index",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<i64>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, String>(13)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let row = row?;
+            Ok(GenerationInodeEvidenceRecord {
+                delta_id: row.0,
+                entry_index: u64::try_from(row.1).map_err(|_| {
+                    StoreError::InvalidState("negative generation evidence index".to_string())
+                })?,
+                mount_id: MountId::new(row.2),
+                logical_path: row.3,
+                evidence_name: row.4,
+                captured_sha256: row.5,
+                captured_byte_length: u64::try_from(row.6).map_err(|_| {
+                    StoreError::InvalidState("negative generation evidence length".to_string())
+                })?,
+                visible_evidence: match (row.7, row.8, row.9) {
+                    (Some(evidence_name), Some(captured_sha256), Some(captured_byte_length)) => {
+                        Some(GenerationRetainedInodeRecord {
+                            evidence_name,
+                            captured_sha256,
+                            captured_byte_length: u64::try_from(captured_byte_length).map_err(
+                                |_| {
+                                    StoreError::InvalidState(
+                                        "negative visible generation evidence length".to_string(),
+                                    )
+                                },
+                            )?,
+                        })
+                    }
+                    (None, None, None) => None,
+                    _ => {
+                        return Err(StoreError::InvalidState(
+                            "partial visible generation inode evidence".to_string(),
+                        ));
+                    }
+                },
+                base_payload_delta_id: row.10,
+                base_payload_entry_index: row
+                    .11
+                    .map(|value| {
+                        u64::try_from(value).map_err(|_| {
+                            StoreError::InvalidState(
+                                "negative generation evidence base payload index".to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?,
+                resolved_at: row.12,
+                created_at: row.13,
+            })
+        })
+        .collect()
+    }
+
+    fn mark_generation_inode_evidence_conflict(
+        &mut self,
+        delta_id: &str,
+        entry_index: u64,
+        update: GenerationInodeEvidenceConflictUpdate,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let journal =
+            generation_apply_from_connection(&transaction, delta_id)?.ok_or_else(|| {
+                StoreError::InvalidState(format!("generation apply `{delta_id}` is missing"))
+            })?;
+        if journal.status != GenerationApplyStatus::Completed {
+            return Err(StoreError::InvalidState(
+                "late inode conflict requires a completed generation apply".to_string(),
+            ));
+        }
+        let entry = journal
+            .delta
+            .entries
+            .get(entry_index as usize)
+            .ok_or_else(|| {
+                StoreError::InvalidState("generation evidence index is out of bounds".to_string())
+            })?;
+        let old = entry.old.as_ref().ok_or_else(|| {
+            StoreError::InvalidState("generation evidence entry has no old identity".to_string())
+        })?;
+        let was_over_quota = journal
+            .outcomes
+            .iter()
+            .find(|(index, _)| *index == entry_index)
+            .is_some_and(|(_, outcome)| {
+                matches!(outcome, GenerationApplyOutcome::ConflictOverQuota { .. })
+            });
+        let incoming = entry.new.as_ref();
+        let existing = select_generation_path(
+            &transaction,
+            &MountId::new(journal.delta.mount_id.as_str()),
+            &old.projection_id,
+        )?;
+        let (evidence_base_delta_id, evidence_base_entry_index): (Option<String>, Option<i64>) =
+            transaction
+                .query_row(
+                    "SELECT base_payload_delta_id, base_payload_entry_index
+                     FROM generation_inode_evidence
+                     WHERE delta_id = ?1 AND entry_index = ?2",
+                    params![
+                        delta_id,
+                        i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
+                            "generation evidence index is too large".to_string()
+                        ))?
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    StoreError::InvalidState(
+                        "generation inode evidence disappeared during conflict conversion"
+                            .to_string(),
+                    )
+                })?;
+        let remote_logical_path =
+            incoming.map_or(&old.logical_path, |identity| &identity.logical_path);
+        let local_logical_path = existing.as_ref().map_or(old.logical_path.as_str(), |path| {
+            path.local_logical_path.as_str()
+        });
+        let conflict_payload_delta_id = incoming.filter(|_| !was_over_quota).map(|_| delta_id);
+        let conflict_payload_entry_index = incoming
+            .filter(|_| !was_over_quota)
+            .map(|_| i64::try_from(entry_index))
+            .transpose()
+            .map_err(|_| {
+                StoreError::InvalidState("generation evidence index is too large".to_string())
+            })?;
+        transaction.execute(
+            "INSERT INTO generation_paths (
+                mount_id, projection_id, logical_path, local_logical_path, base_generation_id,
+                base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                conflict_payload_delta_id, conflict_payload_entry_index,
+                state, incoming_identity_json, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'conflicted', ?11, ?12)
+             ON CONFLICT(mount_id, projection_id) DO UPDATE SET
+                logical_path = excluded.logical_path,
+                local_logical_path = excluded.local_logical_path,
+                base_generation_id = excluded.base_generation_id,
+                base_identity_json = excluded.base_identity_json,
+                base_payload_delta_id = excluded.base_payload_delta_id,
+                base_payload_entry_index = excluded.base_payload_entry_index,
+                conflict_payload_delta_id = excluded.conflict_payload_delta_id,
+                conflict_payload_entry_index = excluded.conflict_payload_entry_index,
+                state = 'conflicted', incoming_identity_json = excluded.incoming_identity_json,
+                updated_at = excluded.updated_at",
+            params![
+                journal.delta.mount_id.as_str(),
+                old.projection_id.as_str(),
+                remote_logical_path.as_str(),
+                local_logical_path,
+                journal.delta.base_generation_id.as_str(),
+                to_json(old)?,
+                evidence_base_delta_id,
+                evidence_base_entry_index,
+                conflict_payload_delta_id,
+                conflict_payload_entry_index,
+                incoming.map(to_json).transpose()?,
+                update.updated_at.as_str(),
+            ],
+        )?;
+        let converted_outcome = if was_over_quota {
+            GenerationApplyOutcome::ConflictOverQuota {
+                local_sha256: Some(update.local_sha256.clone()),
+                incoming_identity: incoming.cloned(),
+            }
+        } else {
+            GenerationApplyOutcome::Conflict {
+                local_sha256: Some(update.local_sha256.clone()),
+                incoming_identity: incoming.cloned(),
+            }
+        };
+        transaction.execute(
+            "UPDATE generation_apply_outcomes SET outcome_json = ?3, updated_at = ?4
+             WHERE delta_id = ?1 AND entry_index = ?2",
+            params![
+                delta_id,
+                i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
+                    "generation evidence index is too large".to_string()
+                ))?,
+                to_json(&converted_outcome)?,
+                update.updated_at.as_str(),
+            ],
+        )?;
+        let byte_length = i64::try_from(update.captured_byte_length).map_err(|_| {
+            StoreError::InvalidState("generation evidence length is too large".to_string())
+        })?;
+        let visible_byte_length = update
+            .visible_evidence
+            .as_ref()
+            .map(|visible| i64::try_from(visible.captured_byte_length))
+            .transpose()
+            .map_err(|_| {
+                StoreError::InvalidState(
+                    "visible generation evidence length is too large".to_string(),
+                )
+            })?;
+        transaction.execute(
+            "UPDATE generation_inode_evidence
+             SET expected_sha256 = ?3, byte_length = ?4,
+                 visible_evidence_name = ?5, visible_expected_sha256 = ?6,
+                 visible_byte_length = ?7, resolved_at = NULL
+             WHERE delta_id = ?1 AND entry_index = ?2",
+            params![
+                delta_id,
+                i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
+                    "generation evidence index is too large".to_string()
+                ))?,
+                update.captured_sha256.as_str(),
+                byte_length,
+                update
+                    .visible_evidence
+                    .as_ref()
+                    .map(|visible| visible.evidence_name.as_str()),
+                update
+                    .visible_evidence
+                    .as_ref()
+                    .map(|visible| visible.captured_sha256.as_str()),
+                visible_byte_length,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn mark_generation_inode_evidence_resolved(
+        &mut self,
+        delta_id: &str,
+        entry_index: u64,
+        resolution: GenerationInodeEvidenceResolution,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let journal =
+            generation_apply_from_connection(&transaction, delta_id)?.ok_or_else(|| {
+                StoreError::InvalidState(format!("generation apply `{delta_id}` is missing"))
+            })?;
+        if journal.status != GenerationApplyStatus::Completed {
+            return Err(StoreError::InvalidState(
+                "inode evidence resolution requires a completed generation apply".to_string(),
+            ));
+        }
+        let entry = journal
+            .delta
+            .entries
+            .get(entry_index as usize)
+            .ok_or_else(|| {
+                StoreError::InvalidState("generation evidence index is out of bounds".to_string())
+            })?;
+        let new = entry.new.as_ref().ok_or_else(|| {
+            StoreError::InvalidState(
+                "retained inode resolution requires an incoming identity".to_string(),
+            )
+        })?;
+        let index = i64::try_from(entry_index).map_err(|_| {
+            StoreError::InvalidState("generation evidence index is too large".to_string())
+        })?;
+        let byte_length = i64::try_from(resolution.captured_byte_length).map_err(|_| {
+            StoreError::InvalidState("generation evidence length is too large".to_string())
+        })?;
+        let visible_byte_length =
+            i64::try_from(resolution.visible_captured_byte_length).map_err(|_| {
+                StoreError::InvalidState(
+                    "visible generation evidence length is too large".to_string(),
+                )
+            })?;
+        let exact_evidence: bool = transaction
+            .query_row(
+                "SELECT expected_sha256 = ?3 AND byte_length = ?4
+                        AND visible_expected_sha256 = ?5
+                        AND visible_byte_length = ?6
+                 FROM generation_inode_evidence
+                 WHERE delta_id = ?1 AND entry_index = ?2
+                       AND visible_evidence_name IS NOT NULL
+                       AND resolved_at IS NULL",
+                params![
+                    delta_id,
+                    index,
+                    resolution.captured_sha256.as_str(),
+                    byte_length,
+                    resolution.visible_captured_sha256.as_str(),
+                    visible_byte_length,
+                ],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::InvalidState(
+                    "generation inode evidence disappeared during resolution".to_string(),
+                )
+            })?;
+        if !exact_evidence {
+            return Err(StoreError::InvalidState(
+                "generation inode evidence changed during resolution".to_string(),
+            ));
+        }
+        let existing = select_generation_path(
+            &transaction,
+            &MountId::new(journal.delta.mount_id.as_str()),
+            &new.projection_id,
+        )?;
+        let local_logical_path = existing.as_ref().map_or(new.logical_path.as_str(), |path| {
+            path.local_logical_path.as_str()
+        });
+        transaction.execute(
+            "INSERT INTO generation_paths (
+                mount_id, projection_id, logical_path, local_logical_path,
+                base_generation_id, base_identity_json,
+                base_payload_delta_id, base_payload_entry_index,
+                conflict_payload_delta_id, conflict_payload_entry_index,
+                state, incoming_identity_json, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL,
+                       'dirty', NULL, ?9)
+             ON CONFLICT(mount_id, projection_id) DO UPDATE SET
+                logical_path = excluded.logical_path,
+                local_logical_path = excluded.local_logical_path,
+                base_generation_id = excluded.base_generation_id,
+                base_identity_json = excluded.base_identity_json,
+                base_payload_delta_id = excluded.base_payload_delta_id,
+                base_payload_entry_index = excluded.base_payload_entry_index,
+                conflict_payload_delta_id = NULL,
+                conflict_payload_entry_index = NULL,
+                state = 'dirty', incoming_identity_json = NULL,
+                updated_at = excluded.updated_at",
+            params![
+                journal.delta.mount_id.as_str(),
+                new.projection_id.as_str(),
+                new.logical_path.as_str(),
+                local_logical_path,
+                journal.delta.target_generation_id.as_str(),
+                to_json(new)?,
+                delta_id,
+                index,
+                resolution.updated_at.as_str(),
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE generation_apply_outcomes
+             SET outcome_json = ?3, updated_at = ?4
+             WHERE delta_id = ?1 AND entry_index = ?2",
+            params![
+                delta_id,
+                index,
+                to_json(&GenerationApplyOutcome::Merged)?,
+                resolution.updated_at.as_str(),
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE generation_inode_evidence
+             SET resolved_at = ?3
+             WHERE delta_id = ?1 AND entry_index = ?2",
+            params![delta_id, index, resolution.updated_at.as_str()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn remove_generation_inode_evidence(
+        &mut self,
+        delta_id: &str,
+        entry_index: u64,
+    ) -> StoreResult<()> {
+        self.connection()?.execute(
+            "DELETE FROM generation_inode_evidence WHERE delta_id = ?1 AND entry_index = ?2",
+            params![
+                delta_id,
+                i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
+                    "generation evidence index is too large".to_string()
+                ))?
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn complete_generation_apply(
+        &mut self,
+        delta_id: &str,
+        completed_at: &str,
+    ) -> StoreResult<GenerationApplyJournalRecord> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let journal =
+            generation_apply_from_connection(&transaction, delta_id)?.ok_or_else(|| {
+                StoreError::InvalidState(format!("generation apply `{delta_id}` is missing"))
+            })?;
+        if journal.status == GenerationApplyStatus::Completed {
+            transaction.commit()?;
+            return Ok(journal);
+        }
+        if journal.outcomes.len() != journal.delta.entries.len()
+            || journal
+                .outcomes
+                .iter()
+                .enumerate()
+                .any(|(expected, (actual, _))| *actual != expected as u64)
+        {
+            return Err(StoreError::InvalidState(format!(
+                "generation apply `{delta_id}` does not have one outcome per entry"
+            )));
+        }
+
+        let mount_id = MountId::new(journal.delta.mount_id.as_str());
+        for (entry_index, (entry, (_, outcome))) in journal
+            .delta
+            .entries
+            .iter()
+            .zip(&journal.outcomes)
+            .enumerate()
+        {
+            match outcome {
+                GenerationApplyOutcome::Applied => {
+                    let new = entry.new.as_ref().ok_or_else(|| {
+                        StoreError::InvalidState("applied outcome has no new identity".to_string())
+                    })?;
+                    transaction.execute(
+                        "INSERT INTO generation_paths (
+                            mount_id, projection_id, logical_path, local_logical_path,
+                            base_generation_id,
+                            base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                            conflict_payload_delta_id, conflict_payload_entry_index,
+                            state, incoming_identity_json, updated_at
+                         ) VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, NULL, NULL, 'clean', NULL, ?8)
+                         ON CONFLICT(mount_id, projection_id) DO UPDATE SET
+                            logical_path = excluded.logical_path,
+                            local_logical_path = excluded.local_logical_path,
+                            base_generation_id = excluded.base_generation_id,
+                            base_identity_json = excluded.base_identity_json,
+                            base_payload_delta_id = excluded.base_payload_delta_id,
+                            base_payload_entry_index = excluded.base_payload_entry_index,
+                            conflict_payload_delta_id = NULL,
+                            conflict_payload_entry_index = NULL,
+                            state = 'clean', incoming_identity_json = NULL,
+                            updated_at = excluded.updated_at",
+                        params![
+                            mount_id.0.as_str(),
+                            new.projection_id.as_str(),
+                            new.logical_path.as_str(),
+                            journal.delta.target_generation_id.as_str(),
+                            to_json(new)?,
+                            journal.delta.delta_id.as_str(),
+                            i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
+                                "generation entry index is too large".to_string()
+                            ))?,
+                            completed_at,
+                        ],
+                    )?;
+                }
+                GenerationApplyOutcome::Merged => {
+                    let new = entry.new.as_ref().ok_or_else(|| {
+                        StoreError::InvalidState("merged outcome has no new identity".to_string())
+                    })?;
+                    transaction.execute(
+                        "INSERT INTO generation_paths (
+                            mount_id, projection_id, logical_path, local_logical_path,
+                            base_generation_id,
+                            base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                            conflict_payload_delta_id, conflict_payload_entry_index,
+                            state, incoming_identity_json, updated_at
+                         ) VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, NULL, NULL, 'dirty', NULL, ?8)
+                         ON CONFLICT(mount_id, projection_id) DO UPDATE SET
+                            logical_path = excluded.logical_path,
+                            local_logical_path = excluded.local_logical_path,
+                            base_generation_id = excluded.base_generation_id,
+                            base_identity_json = excluded.base_identity_json,
+                            base_payload_delta_id = excluded.base_payload_delta_id,
+                            base_payload_entry_index = excluded.base_payload_entry_index,
+                            conflict_payload_delta_id = NULL,
+                            conflict_payload_entry_index = NULL,
+                            state = 'dirty', incoming_identity_json = NULL,
+                            updated_at = excluded.updated_at",
+                        params![
+                            mount_id.0.as_str(),
+                            new.projection_id.as_str(),
+                            new.logical_path.as_str(),
+                            journal.delta.target_generation_id.as_str(),
+                            to_json(new)?,
+                            journal.delta.delta_id.as_str(),
+                            i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
+                                "generation entry index is too large".to_string()
+                            ))?,
+                            completed_at,
+                        ],
+                    )?;
+                }
+                GenerationApplyOutcome::Deleted => {
+                    let old = entry.old.as_ref().ok_or_else(|| {
+                        StoreError::InvalidState("deleted outcome has no old identity".to_string())
+                    })?;
+                    if entry.new.is_some() {
+                        return Err(StoreError::InvalidState(
+                            "deleted outcome names a non-deletion entry".to_string(),
+                        ));
+                    }
+                    transaction.execute(
+                        "DELETE FROM generation_paths WHERE mount_id = ?1 AND projection_id = ?2",
+                        params![mount_id.0.as_str(), old.projection_id.as_str()],
+                    )?;
+                }
+                GenerationApplyOutcome::Conflict {
+                    local_sha256: _,
+                    incoming_identity,
+                }
+                | GenerationApplyOutcome::ConflictOverQuota {
+                    local_sha256: _,
+                    incoming_identity,
+                } => {
+                    let projection_id = entry
+                        .projection_id()
+                        .expect("validated delta entry has projection identity");
+                    let existing = select_generation_path(&transaction, &mount_id, projection_id)?;
+                    let logical_path = entry
+                        .new
+                        .as_ref()
+                        .or(entry.old.as_ref())
+                        .expect("validated delta entry has identity")
+                        .logical_path
+                        .as_str();
+                    let local_logical_path = existing
+                        .as_ref()
+                        .map_or(logical_path, |path| path.local_logical_path.as_str());
+                    let base_generation_id = existing
+                        .as_ref()
+                        .map_or(&journal.delta.base_generation_id, |path| {
+                            &path.base_generation_id
+                        });
+                    let base_identity = existing
+                        .as_ref()
+                        .and_then(|path| path.base_identity.as_ref())
+                        .or(entry.old.as_ref());
+                    let base_payload_delta_id = existing
+                        .as_ref()
+                        .and_then(|path| path.base_payload_delta_id.as_deref());
+                    let base_payload_entry_index = existing
+                        .as_ref()
+                        .and_then(|path| path.base_payload_entry_index)
+                        .map(i64::try_from)
+                        .transpose()
+                        .map_err(|_| {
+                            StoreError::InvalidState(
+                                "generation base payload index is too large".to_string(),
+                            )
+                        })?;
+                    let retains_conflict_payload =
+                        matches!(outcome, GenerationApplyOutcome::Conflict { .. })
+                            && entry.new.is_some();
+                    transaction.execute(
+                        "INSERT INTO generation_paths (
+                            mount_id, projection_id, logical_path, local_logical_path,
+                            base_generation_id, base_identity_json,
+                            base_payload_delta_id, base_payload_entry_index,
+                            conflict_payload_delta_id, conflict_payload_entry_index,
+                            state, incoming_identity_json, updated_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                                   'conflicted', ?11, ?12)
+                         ON CONFLICT(mount_id, projection_id) DO UPDATE SET
+                            logical_path = excluded.logical_path,
+                            local_logical_path = excluded.local_logical_path,
+                            base_payload_delta_id = excluded.base_payload_delta_id,
+                            base_payload_entry_index = excluded.base_payload_entry_index,
+                            conflict_payload_delta_id = excluded.conflict_payload_delta_id,
+                            conflict_payload_entry_index = excluded.conflict_payload_entry_index,
+                            state = 'conflicted',
+                            incoming_identity_json = excluded.incoming_identity_json,
+                            updated_at = excluded.updated_at",
+                        params![
+                            mount_id.0.as_str(),
+                            projection_id.as_str(),
+                            logical_path,
+                            local_logical_path,
+                            base_generation_id.as_str(),
+                            base_identity.map(to_json).transpose()?,
+                            base_payload_delta_id,
+                            base_payload_entry_index,
+                            retains_conflict_payload.then_some(journal.delta.delta_id.as_str()),
+                            retains_conflict_payload.then_some(
+                                i64::try_from(entry_index).map_err(
+                                    |_| StoreError::InvalidState(
+                                        "generation conflict payload index is too large"
+                                            .to_string()
+                                    )
+                                )?
+                            ),
+                            incoming_identity.as_ref().map(to_json).transpose()?,
+                            completed_at,
+                        ],
+                    )?;
+                }
+            }
+        }
+        let changed = transaction.execute(
+            "UPDATE observed_generations
+             SET generation_id = ?2, inventory_sha256 = ?3,
+                 workspace_layout_version = ?4, workspace_layout_digest = ?5,
+                 last_receipt_sha256 = ?6, updated_at = ?7
+             WHERE mount_id = ?1 AND source_connection_id = ?8 AND generation_id = ?9",
+            params![
+                mount_id.0.as_str(),
+                journal.delta.target_generation_id.as_str(),
+                journal.delta.target_inventory_sha256.as_str(),
+                journal.delta.workspace_layout_version,
+                journal.delta.workspace_layout_digest.as_str(),
+                journal.receipt_sha256.as_str(),
+                completed_at,
+                journal.delta.source_connection_id.as_str(),
+                journal.delta.base_generation_id.as_str(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` observed generation changed during apply",
+                mount_id.0
+            )));
+        }
+        transaction.execute(
+            "UPDATE generation_apply_journals
+             SET status = 'completed', active = 0, updated_at = ?2, completed_at = ?2
+             WHERE delta_id = ?1 AND active = 1",
+            params![delta_id, completed_at],
+        )?;
+        let completed = generation_apply_from_connection(&transaction, delta_id)?
+            .expect("completed generation journal remains present");
+        transaction.commit()?;
+        Ok(completed)
+    }
+}
+
 impl MountRepository for SqliteStateStore {
     fn save_mount(&mut self, mount: MountConfig) -> StoreResult<()> {
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = transaction
             .query_row(
                 "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, settings_json
@@ -2689,7 +4093,95 @@ fn mount_source_identity_changed(existing: &MountConfig, next: &MountConfig) -> 
 }
 
 fn clear_mount_source_state(connection: &Connection, mount_id: &MountId) -> StoreResult<()> {
+    let pending_virtual_mutation: Option<String> = connection
+        .query_row(
+            "SELECT local_id FROM virtual_mutations WHERE mount_id = ?1 LIMIT 1",
+            params![&mount_id.0],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(local_id) = pending_virtual_mutation {
+        return Err(StoreError::InvalidState(format!(
+            "mount `{}` cannot change source while virtual mutation `{local_id}` is pending",
+            mount_id.0
+        )));
+    }
+    let unsettled_push = {
+        let mut statement = connection.prepare(
+            "SELECT push_id, status_json FROM journals WHERE mount_id = ?1 ORDER BY push_id",
+        )?;
+        let rows = statement.query_map(params![&mount_id.0], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut unsettled = None;
+        for row in rows {
+            let (push_id, status_json) = row?;
+            let status: JournalStatus = from_json(&status_json)?;
+            if status.is_unsettled() {
+                unsettled = Some(push_id);
+                break;
+            }
+        }
+        unsettled
+    };
+    if let Some(push_id) = unsettled_push {
+        return Err(StoreError::InvalidState(format!(
+            "mount `{}` cannot change source while push journal `{push_id}` is unsettled",
+            mount_id.0
+        )));
+    }
+    let active_delta: Option<String> = connection
+        .query_row(
+            "SELECT delta_id FROM generation_apply_journals
+             WHERE mount_id = ?1 AND active = 1 LIMIT 1",
+            params![&mount_id.0],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(delta_id) = active_delta {
+        return Err(StoreError::InvalidState(format!(
+            "mount `{}` has active generation apply `{delta_id}`",
+            mount_id.0
+        )));
+    }
+    let preserved_path: Option<(String, String)> = connection
+        .query_row(
+            "SELECT projection_id, state FROM generation_paths
+             WHERE mount_id = ?1 AND state IN ('dirty', 'conflicted') LIMIT 1",
+            params![&mount_id.0],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((projection_id, state)) = preserved_path {
+        return Err(StoreError::InvalidState(format!(
+            "mount `{}` cannot change source while generation path `{projection_id}` is {state}",
+            mount_id.0
+        )));
+    }
+    let retained_inode: Option<String> = connection
+        .query_row(
+            "SELECT evidence.logical_path
+             FROM generation_inode_evidence AS evidence
+             WHERE evidence.mount_id = ?1 LIMIT 1",
+            params![&mount_id.0],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(logical_path) = retained_inode {
+        return Err(StoreError::InvalidState(format!(
+            "mount `{}` cannot change source while displaced inode evidence for `{logical_path}` is retained",
+            mount_id.0
+        )));
+    }
+    // Retire only completed clean lineage in the same transaction as the
+    // source reset. Active, dirty, and conflicted lineage is preserved above.
+    connection.execute(
+        "DELETE FROM generation_apply_journals WHERE mount_id = ?1 AND active = 0",
+        params![&mount_id.0],
+    )?;
     for table in [
+        "generation_paths",
+        "observed_generations",
         "entities",
         "shadows",
         "hydration_jobs",
@@ -2909,6 +4401,7 @@ fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
         migrate_journals_component_to_v3(connection)?;
         migrate_virtual_mutations_component_to_v3(connection)?;
         migrate_entity_search_component_to_v2(connection)?;
+        migrate_generation_delivery_to_v5(connection, None, true)?;
         return Ok(());
     }
 
@@ -3173,6 +4666,72 @@ fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
             metadata_json TEXT NOT NULL DEFAULT '{\"author\":{\"kind\":\"anonymous\",\"display_name\":\"anonymous\"}}',
             readable_diff_json TEXT,
             FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS observed_generations (
+            mount_id TEXT PRIMARY KEY,
+            source_connection_id TEXT NOT NULL,
+            generation_id TEXT NOT NULL,
+            inventory_sha256 TEXT NOT NULL,
+            workspace_layout_version INTEGER NOT NULL CHECK (workspace_layout_version > 0),
+            workspace_layout_digest TEXT NOT NULL,
+            last_receipt_sha256 TEXT,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS generation_paths (
+            mount_id TEXT NOT NULL,
+            projection_id TEXT NOT NULL,
+            logical_path TEXT NOT NULL,
+            local_logical_path TEXT NOT NULL,
+            base_generation_id TEXT NOT NULL,
+            base_identity_json TEXT,
+            base_payload_delta_id TEXT,
+            base_payload_entry_index INTEGER CHECK (base_payload_entry_index >= 0),
+            conflict_payload_delta_id TEXT,
+            conflict_payload_entry_index INTEGER CHECK (conflict_payload_entry_index >= 0),
+            state TEXT NOT NULL CHECK (state IN ('clean', 'dirty', 'conflicted')),
+            incoming_identity_json TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (mount_id, projection_id),
+            UNIQUE (mount_id, logical_path),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS generation_apply_journals (
+            delta_id TEXT PRIMARY KEY,
+            mount_id TEXT NOT NULL,
+            source_connection_id TEXT NOT NULL,
+            base_generation_id TEXT NOT NULL,
+            target_generation_id TEXT NOT NULL,
+            delta_json TEXT NOT NULL,
+            receipt_json TEXT NOT NULL,
+            receipt_sha256 TEXT NOT NULL,
+            stage_root TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('staged', 'applying', 'completed')),
+            active INTEGER NOT NULL CHECK (active IN (0, 1)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            CHECK (
+                (active = 0 AND status = 'completed' AND completed_at IS NOT NULL)
+                OR (active = 1 AND status IN ('staged', 'applying') AND completed_at IS NULL)
+            ),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS generation_apply_one_active_per_source
+        ON generation_apply_journals(source_connection_id)
+        WHERE active = 1;
+
+        CREATE TABLE IF NOT EXISTS generation_apply_outcomes (
+            delta_id TEXT NOT NULL,
+            entry_index INTEGER NOT NULL CHECK (entry_index >= 0),
+            outcome_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (delta_id, entry_index),
+            FOREIGN KEY (delta_id) REFERENCES generation_apply_journals(delta_id) ON DELETE CASCADE
         );
         ",
     )?;
@@ -3440,6 +4999,26 @@ fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
         }
     }
 
+    if user_version < 21 {
+        create_generation_delivery_tables(connection)?;
+        if user_version >= 13 {
+            record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
+        }
+    }
+
+    if user_version == 21 && !column_exists(connection, "generation_apply_journals", "mount_id")? {
+        migrate_generation_delivery_journals_to_mount_relation(connection)?;
+        record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
+    }
+
+    if user_version < SCHEMA_VERSION {
+        migrate_generation_delivery_to_v5(
+            connection,
+            (user_version >= 21).then_some(user_version),
+            user_version >= 21,
+        )?;
+    }
+
     if user_version < SCHEMA_VERSION {
         seed_default_notion_profile(connection)?;
         migrate_workspace_bindings_schema_v21(connection, user_version)?;
@@ -3508,6 +5087,13 @@ fn state_component_issue_allows_schema_migration(
         issue,
         StateCompatibilityIssue::OlderComponent {
             component_id,
+            found,
+            current: GENERATION_DELIVERY_COMPONENT_VERSION,
+        } if component_id == "durable:generation_delivery" && matches!(*found, 1..=4)
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::OlderComponent {
+            component_id,
             found: 1,
             current: LINUX_FUSE_PROJECTION_LAYOUT_VERSION,
         } if component_id == "projection:linux_fuse"
@@ -3562,7 +5148,11 @@ fn state_component_issue_allows_schema_migration(
     ) || matches!(
         issue,
         StateCompatibilityIssue::MissingComponent { component_id }
-            if user_version < 21 && component_id == "durable:workspace_bindings"
+            if user_version < 22 && component_id == "durable:generation_delivery"
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::MissingComponent { component_id }
+            if user_version < SCHEMA_VERSION && component_id == "durable:workspace_bindings"
     )
 }
 
@@ -4437,6 +6027,164 @@ fn create_state_management_tables(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+fn migrate_generation_delivery_journals_to_mount_relation(
+    connection: &Connection,
+) -> StoreResult<()> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         ALTER TABLE generation_apply_outcomes RENAME TO generation_apply_outcomes_v21;
+         ALTER TABLE generation_apply_journals RENAME TO generation_apply_journals_v21;
+         DROP INDEX generation_apply_one_active_per_source;
+
+         CREATE TABLE generation_apply_journals (
+            delta_id TEXT PRIMARY KEY,
+            mount_id TEXT NOT NULL,
+            source_connection_id TEXT NOT NULL,
+            base_generation_id TEXT NOT NULL,
+            target_generation_id TEXT NOT NULL,
+            delta_json TEXT NOT NULL,
+            receipt_json TEXT NOT NULL,
+            receipt_sha256 TEXT NOT NULL,
+            stage_root TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('staged', 'applying', 'completed')),
+            active INTEGER NOT NULL CHECK (active IN (0, 1)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            CHECK (
+                (active = 0 AND status = 'completed' AND completed_at IS NOT NULL)
+                OR (active = 1 AND status IN ('staged', 'applying') AND completed_at IS NULL)
+            ),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+         );
+
+         INSERT INTO generation_apply_journals (
+            delta_id, mount_id, source_connection_id, base_generation_id,
+            target_generation_id, delta_json, receipt_json, receipt_sha256,
+            stage_root, status, active, created_at, updated_at, completed_at
+         )
+         SELECT delta_id, json_extract(delta_json, '$.mount_id'), source_connection_id,
+                base_generation_id, target_generation_id, delta_json, receipt_json,
+                receipt_sha256, stage_root, status, active, created_at, updated_at,
+                completed_at
+         FROM generation_apply_journals_v21;
+
+         CREATE UNIQUE INDEX generation_apply_one_active_per_source
+         ON generation_apply_journals(source_connection_id)
+         WHERE active = 1;
+
+         CREATE TABLE generation_apply_outcomes (
+            delta_id TEXT NOT NULL,
+            entry_index INTEGER NOT NULL CHECK (entry_index >= 0),
+            outcome_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (delta_id, entry_index),
+            FOREIGN KEY (delta_id) REFERENCES generation_apply_journals(delta_id) ON DELETE CASCADE
+         );
+         INSERT INTO generation_apply_outcomes
+         SELECT delta_id, entry_index, outcome_json, updated_at
+         FROM generation_apply_outcomes_v21;
+
+         DROP TABLE generation_apply_outcomes_v21;
+         DROP TABLE generation_apply_journals_v21;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+fn create_generation_delivery_tables(connection: &Connection) -> StoreResult<()> {
+    connection.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS observed_generations (
+            mount_id TEXT PRIMARY KEY,
+            source_connection_id TEXT NOT NULL,
+            generation_id TEXT NOT NULL,
+            inventory_sha256 TEXT NOT NULL,
+            workspace_layout_version INTEGER NOT NULL CHECK (workspace_layout_version > 0),
+            workspace_layout_digest TEXT NOT NULL,
+            last_receipt_sha256 TEXT,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS generation_paths (
+            mount_id TEXT NOT NULL,
+            projection_id TEXT NOT NULL,
+            logical_path TEXT NOT NULL,
+            local_logical_path TEXT NOT NULL,
+            base_generation_id TEXT NOT NULL,
+            base_identity_json TEXT,
+            base_payload_delta_id TEXT,
+            base_payload_entry_index INTEGER CHECK (base_payload_entry_index >= 0),
+            conflict_payload_delta_id TEXT,
+            conflict_payload_entry_index INTEGER CHECK (conflict_payload_entry_index >= 0),
+            state TEXT NOT NULL CHECK (state IN ('clean', 'dirty', 'conflicted')),
+            incoming_identity_json TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (mount_id, projection_id),
+            UNIQUE (mount_id, logical_path),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS generation_apply_journals (
+            delta_id TEXT PRIMARY KEY,
+            mount_id TEXT NOT NULL,
+            source_connection_id TEXT NOT NULL,
+            base_generation_id TEXT NOT NULL,
+            target_generation_id TEXT NOT NULL,
+            delta_json TEXT NOT NULL,
+            receipt_json TEXT NOT NULL,
+            receipt_sha256 TEXT NOT NULL,
+            stage_root TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('staged', 'applying', 'completed')),
+            active INTEGER NOT NULL CHECK (active IN (0, 1)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            CHECK (
+                (active = 0 AND status = 'completed' AND completed_at IS NOT NULL)
+                OR (active = 1 AND status IN ('staged', 'applying') AND completed_at IS NULL)
+            ),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS generation_apply_one_active_per_source
+        ON generation_apply_journals(source_connection_id)
+        WHERE active = 1;
+
+        CREATE TABLE IF NOT EXISTS generation_apply_outcomes (
+            delta_id TEXT NOT NULL,
+            entry_index INTEGER NOT NULL CHECK (entry_index >= 0),
+            outcome_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (delta_id, entry_index),
+            FOREIGN KEY (delta_id) REFERENCES generation_apply_journals(delta_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS generation_inode_evidence (
+            delta_id TEXT NOT NULL,
+            entry_index INTEGER NOT NULL CHECK (entry_index >= 0),
+            mount_id TEXT NOT NULL,
+            logical_path TEXT NOT NULL,
+            evidence_name TEXT NOT NULL,
+            expected_sha256 TEXT NOT NULL,
+            byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+            visible_evidence_name TEXT,
+            visible_expected_sha256 TEXT,
+            visible_byte_length INTEGER CHECK (visible_byte_length >= 0),
+            base_payload_delta_id TEXT,
+            base_payload_entry_index INTEGER CHECK (base_payload_entry_index >= 0),
+            resolved_at TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (delta_id, entry_index),
+            FOREIGN KEY (delta_id) REFERENCES generation_apply_journals(delta_id) ON DELETE CASCADE,
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+        ",
+    )?;
+    Ok(())
+}
+
 fn migrate_linux_fuse_projection_layout_to_v2(
     connection: &Connection,
     pre_state_components_schema: bool,
@@ -4467,6 +6215,327 @@ fn migrate_windows_cloud_files_projection_layout_to_v2(
 
 fn migrate_virtual_mutations_component_to_v3(connection: &Connection) -> StoreResult<()> {
     migrate_state_component_to_current(connection, "durable:virtual_mutations")
+}
+
+fn migrate_generation_delivery_component_to_v5(connection: &Connection) -> StoreResult<()> {
+    migrate_state_component_to_current(connection, "durable:generation_delivery")
+}
+
+fn migrate_generation_delivery_to_v5(
+    connection: &Connection,
+    record_from_schema: Option<i64>,
+    update_component: bool,
+) -> StoreResult<()> {
+    if record_from_schema.is_none()
+        && generation_delivery_storage_v5_is_complete(connection)?
+        && (!update_component || generation_delivery_component_is_current(connection)?)
+    {
+        return Ok(());
+    }
+    let transaction = connection.unchecked_transaction()?;
+    migrate_generation_delivery_storage_to_v2(&transaction)?;
+    migrate_generation_delivery_storage_to_v3(&transaction)?;
+    migrate_generation_delivery_storage_to_v4(&transaction)?;
+    migrate_generation_delivery_storage_to_v5(&transaction)?;
+    verify_generation_delivery_storage_v5(&transaction)?;
+    if update_component {
+        migrate_generation_delivery_component_to_v5(&transaction)?;
+    }
+    if let Some(from) = record_from_schema {
+        record_schema_migration(&transaction, from, SCHEMA_VERSION)?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn generation_delivery_component_is_current(connection: &Connection) -> StoreResult<bool> {
+    connection
+        .query_row(
+            "SELECT version = ?2 AND min_reader_version = ?2
+             FROM state_components WHERE component_id = ?1",
+            params![
+                "durable:generation_delivery",
+                GENERATION_DELIVERY_COMPONENT_VERSION
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(|value| value.unwrap_or(false))
+        .map_err(Into::into)
+}
+
+fn add_column_if_missing(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> StoreResult<()> {
+    if !column_exists(connection, table, column)? {
+        connection.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition};"
+        ))?;
+    }
+    Ok(())
+}
+
+fn migrate_generation_delivery_storage_to_v2(connection: &Connection) -> StoreResult<()> {
+    add_column_if_missing(
+        connection,
+        "generation_paths",
+        "base_payload_delta_id",
+        "TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_paths",
+        "base_payload_entry_index",
+        "INTEGER CHECK (base_payload_entry_index >= 0)",
+    )?;
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS generation_inode_evidence (
+            delta_id TEXT NOT NULL,
+            entry_index INTEGER NOT NULL CHECK (entry_index >= 0),
+            mount_id TEXT NOT NULL,
+            logical_path TEXT NOT NULL,
+            evidence_name TEXT NOT NULL,
+            expected_sha256 TEXT NOT NULL,
+            byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+            visible_evidence_name TEXT,
+            visible_expected_sha256 TEXT,
+            visible_byte_length INTEGER CHECK (visible_byte_length >= 0),
+            resolved_at TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (delta_id, entry_index),
+            FOREIGN KEY (delta_id) REFERENCES generation_apply_journals(delta_id) ON DELETE CASCADE,
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+         );",
+    )?;
+    Ok(())
+}
+
+fn migrate_generation_delivery_storage_to_v3(connection: &Connection) -> StoreResult<()> {
+    add_column_if_missing(connection, "generation_paths", "local_logical_path", "TEXT")?;
+    connection.execute(
+        "UPDATE generation_paths SET local_logical_path = logical_path
+         WHERE local_logical_path IS NULL",
+        [],
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_paths",
+        "conflict_payload_delta_id",
+        "TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_paths",
+        "conflict_payload_entry_index",
+        "INTEGER CHECK (conflict_payload_entry_index >= 0)",
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_inode_evidence",
+        "base_payload_delta_id",
+        "TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_inode_evidence",
+        "base_payload_entry_index",
+        "INTEGER CHECK (base_payload_entry_index >= 0)",
+    )?;
+    Ok(())
+}
+
+fn migrate_generation_delivery_storage_to_v4(connection: &Connection) -> StoreResult<()> {
+    add_column_if_missing(
+        connection,
+        "generation_inode_evidence",
+        "visible_evidence_name",
+        "TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_inode_evidence",
+        "visible_expected_sha256",
+        "TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_inode_evidence",
+        "visible_byte_length",
+        "INTEGER CHECK (visible_byte_length >= 0)",
+    )?;
+    Ok(())
+}
+
+fn migrate_generation_delivery_storage_to_v5(connection: &Connection) -> StoreResult<()> {
+    add_column_if_missing(
+        connection,
+        "generation_inode_evidence",
+        "resolved_at",
+        "TEXT",
+    )?;
+    connection.execute(
+        "UPDATE generation_inode_evidence
+         SET resolved_at = (
+             SELECT outcomes.updated_at
+             FROM generation_apply_outcomes AS outcomes
+             WHERE outcomes.delta_id = generation_inode_evidence.delta_id
+               AND outcomes.entry_index = generation_inode_evidence.entry_index
+               AND json_extract(outcomes.outcome_json, '$.kind') = 'merged'
+         )
+         WHERE resolved_at IS NULL
+           AND visible_evidence_name IS NOT NULL
+           AND EXISTS (
+               SELECT 1 FROM generation_apply_outcomes AS outcomes
+               WHERE outcomes.delta_id = generation_inode_evidence.delta_id
+                 AND outcomes.entry_index = generation_inode_evidence.entry_index
+                 AND json_extract(outcomes.outcome_json, '$.kind') = 'merged'
+           )",
+        [],
+    )?;
+    Ok(())
+}
+
+fn verify_generation_delivery_storage_v5(connection: &Connection) -> StoreResult<()> {
+    if generation_delivery_storage_v5_is_complete(connection)? {
+        return Ok(());
+    }
+    for (table, columns) in [
+        (
+            "generation_paths",
+            &[
+                "base_payload_delta_id",
+                "base_payload_entry_index",
+                "local_logical_path",
+                "conflict_payload_delta_id",
+                "conflict_payload_entry_index",
+            ][..],
+        ),
+        (
+            "generation_inode_evidence",
+            &[
+                "base_payload_delta_id",
+                "base_payload_entry_index",
+                "visible_evidence_name",
+                "visible_expected_sha256",
+                "visible_byte_length",
+                "resolved_at",
+            ][..],
+        ),
+    ] {
+        for column in columns {
+            if !column_exists(connection, table, column)? {
+                return Err(StoreError::InvalidState(format!(
+                    "generation delivery migration left `{table}.{column}` incomplete"
+                )));
+            }
+        }
+    }
+    let null_local_path: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_paths WHERE local_logical_path IS NULL
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if null_local_path {
+        return Err(StoreError::InvalidState(
+            "generation delivery migration left a null local logical path".to_string(),
+        ));
+    }
+    let partial_visible_evidence: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_inode_evidence
+            WHERE (visible_evidence_name IS NULL)
+                != (visible_expected_sha256 IS NULL)
+               OR (visible_evidence_name IS NULL) != (visible_byte_length IS NULL)
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if partial_visible_evidence {
+        return Err(StoreError::InvalidState(
+            "generation delivery migration left partial visible inode evidence".to_string(),
+        ));
+    }
+    let invalid_tombstone: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_inode_evidence
+            WHERE resolved_at IS NOT NULL AND visible_evidence_name IS NULL
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_tombstone {
+        return Err(StoreError::InvalidState(
+            "generation delivery migration left a tombstone without both retained inodes"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn generation_delivery_storage_v5_is_complete(connection: &Connection) -> StoreResult<bool> {
+    for (table, columns) in [
+        (
+            "generation_paths",
+            &[
+                "base_payload_delta_id",
+                "base_payload_entry_index",
+                "local_logical_path",
+                "conflict_payload_delta_id",
+                "conflict_payload_entry_index",
+            ][..],
+        ),
+        (
+            "generation_inode_evidence",
+            &[
+                "base_payload_delta_id",
+                "base_payload_entry_index",
+                "visible_evidence_name",
+                "visible_expected_sha256",
+                "visible_byte_length",
+                "resolved_at",
+            ][..],
+        ),
+    ] {
+        for column in columns {
+            if !column_exists(connection, table, column)? {
+                return Ok(false);
+            }
+        }
+    }
+    let null_local_path: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_paths WHERE local_logical_path IS NULL
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if null_local_path {
+        return Ok(false);
+    }
+    let partial_visible_evidence: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_inode_evidence
+            WHERE (visible_evidence_name IS NULL)
+                != (visible_expected_sha256 IS NULL)
+               OR (visible_evidence_name IS NULL) != (visible_byte_length IS NULL)
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    let invalid_tombstone: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_inode_evidence
+            WHERE resolved_at IS NOT NULL AND visible_evidence_name IS NULL
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(!partial_visible_evidence && !invalid_tombstone)
 }
 
 fn migrate_journals_component_to_v3(connection: &Connection) -> StoreResult<()> {
