@@ -14,6 +14,12 @@ validation, conflict detection, and network admission mechanics to the host:
 
 First-party connectors compile in as Rust crates. A future third-party connector ABI should be possible if this trait remains narrow, explicit, and host-mediated.
 
+The versioned public connector catalog lives in `connectors/registry.json` and
+is validated by `locality-connector`. It is descriptive metadata, not executable
+authority: resolver, credential, path-write, validation, and apply behavior
+remain in trusted code. See [Connector Development](connector-development.md)
+for the exact registration and fixture contract.
+
 ## Network Policy
 
 Each connector supplies a `ConnectorNetworkConfig` for the quota scope enforced

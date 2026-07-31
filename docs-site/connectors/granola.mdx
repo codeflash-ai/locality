@@ -1,0 +1,54 @@
+---
+title: "Granola connector"
+description: "Mount Granola meeting summaries and transcripts as read-only Markdown."
+---
+
+The Granola connector uses Granola's supported public REST API and is strictly
+read-only. It does not inspect the desktop database, use private endpoints, or
+write meeting notes.
+
+## Connect
+
+Granola API keys are available on supported Business and Enterprise plans.
+
+```bash
+printf '%s' "$GRANOLA_API_KEY" | loc connect granola --api-key-stdin
+```
+
+## Mount
+
+```bash
+loc mount granola ~/Locality/granola-main
+loc pull ~/Locality/granola-main
+```
+
+## Projection
+
+```text
+granola-main/
+  Weekly product sync — 2026-07-14 17.30.00 UTC/
+    summary.md
+    transcript.md
+```
+
+- meeting directories use title-first names plus UTC creation time;
+- `summary.md` uses Granola's Markdown summary with a text fallback;
+- `transcript.md` preserves returned transcript chunks in order;
+- a stable transcript file explains when Granola returns no transcript.
+
+## Sync and safety
+
+Locality performs periodic incremental discovery with overlap so delayed
+updates are retained safely. Meeting content is untrusted input and can be
+sensitive.
+
+All Granola files are read-only. Locality rejects edits, creates, renames,
+moves, deletes, push, undo, and autosave operations for the mount.
+
+## Current limits
+
+- Granola's public API and MCP surface do not support meeting-note writes.
+- The API has no webhooks; changes arrive through periodic discovery, explicit
+  pull, or normal freshness work.
+- Transcript retention can remove a transcript while leaving the meeting
+  summary available.

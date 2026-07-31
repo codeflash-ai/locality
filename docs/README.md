@@ -13,6 +13,8 @@ Use this directory for repo-facing documentation that helps contributors underst
   and client architecture for cloud coding-agent sandboxes.
 - [`freshness-wait-transport.md`](freshness-wait-transport.md): public,
   capability-gated durable freshness wait-attempt wire contract.
+- [`connector-development.md`](connector-development.md): connector manifest,
+  host-hook, fixture, security-boundary, and add-a-connector contract.
 
 ## Static collaboration artifacts
 
