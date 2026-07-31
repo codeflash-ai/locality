@@ -22,9 +22,8 @@ use locality_protocol::freshness_delivery::{
 use locality_store::{
     GenerationApplyOutcome, GenerationApplyStatus, GenerationDeliveryRepository,
     GenerationInodeEvidenceConflictUpdate, GenerationInodeEvidenceRecord,
-    GenerationInodeEvidenceResolution, GenerationInodeEvidenceTombstoneRefresh,
-    GenerationPathRecord, GenerationPathState, GenerationRetainedInodeRecord, MountRepository,
-    PreparedGenerationApply, SqliteStateStore,
+    GenerationInodeEvidenceResolution, GenerationPathRecord, GenerationPathState,
+    GenerationRetainedInodeRecord, MountRepository, PreparedGenerationApply, SqliteStateStore,
 };
 use sha2::{Digest, Sha256};
 
@@ -39,7 +38,7 @@ const DEFAULT_GLOBAL_CONFLICT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 // A displaced inode may still be writable through an editor's old descriptor.
 // POSIX has no portable way to prove that descriptor is closed, so evidence is
 // never removed by apply, reconciliation, or ordinary startup. Tombstoned
-// evidence remains quota-accounted for a future GC that must prove an
+// evidence keeps its captured managed-byte reservation for a future GC that must prove an
 // exclusive no-active-mount lifecycle; source resets are likewise blocked
 // while evidence remains.
 
@@ -279,12 +278,13 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
         })
         .collect::<BTreeSet<_>>();
     if !pending_evidence_indexes.is_empty() {
-        refresh_resolved_inode_evidence_for_admission(store, mount_id, &secure_mount)?;
         let limits = hooks
             .evidence_retention_limits
             .unwrap_or(DEFAULT_CONFLICT_RETENTION_LIMITS);
-        let usage =
-            validate_inode_evidence_usage(&store.list_generation_inode_evidence()?, limits)?;
+        let usage = validate_captured_evidence_reservation(
+            &store.list_generation_inode_evidence()?,
+            limits,
+        )?;
         let prospective_bytes = prospective_inode_evidence_bytes(
             &secure_mount,
             &delivery.delta,
@@ -366,7 +366,7 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
                 || old.logical_path.as_str().to_string(),
                 |path| path.local_logical_path.clone(),
             );
-            let (expected_sha256, byte_length) = displaced_inode_fingerprint
+            let (captured_sha256, captured_byte_length) = displaced_inode_fingerprint
                 .unwrap_or_else(|| (old.content_sha256.clone(), old.byte_length));
             store.record_generation_inode_evidence(GenerationInodeEvidenceRecord {
                 delta_id: journal.delta.delta_id.clone(),
@@ -376,8 +376,8 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
                 evidence_name: evidence_name
                     .into_string()
                     .map_err(|_| GenerationSyncError::InvalidStagePath)?,
-                expected_sha256,
-                byte_length,
+                captured_sha256,
+                captured_byte_length,
                 visible_evidence: None,
                 base_payload_delta_id: previous_path
                     .and_then(|path| path.base_payload_delta_id.clone()),
@@ -532,10 +532,10 @@ fn reconcile_completed_mount_inode_evidence_inner(
             })?;
             let (visible_sha256, visible_length) = fingerprint_open_file_handle(&mut visible)?;
             let current = fingerprint_target(&target)?;
-            let evidence_changed = actual != evidence.expected_sha256
-                || actual_length != evidence.byte_length
-                || visible_sha256 != expected_visible.expected_sha256
-                || visible_length != expected_visible.byte_length;
+            let evidence_changed = actual != evidence.captured_sha256
+                || actual_length != evidence.captured_byte_length
+                || visible_sha256 != expected_visible.captured_sha256
+                || visible_length != expected_visible.captured_byte_length;
             if evidence_changed {
                 record_changed_dual_inode_evidence(
                     store,
@@ -610,10 +610,10 @@ fn reconcile_completed_mount_inode_evidence_inner(
                         &evidence.delta_id,
                         evidence.entry_index,
                         GenerationInodeEvidenceResolution {
-                            expected_sha256: actual,
-                            byte_length: actual_length,
-                            visible_expected_sha256: visible_sha256,
-                            visible_byte_length: visible_length,
+                            captured_sha256: actual,
+                            captured_byte_length: actual_length,
+                            visible_captured_sha256: visible_sha256,
+                            visible_captured_byte_length: visible_length,
                             updated_at: journal.receipt.completed_at.clone(),
                         },
                     )?;
@@ -629,8 +629,8 @@ fn reconcile_completed_mount_inode_evidence_inner(
         }
 
         let snapshot_exists = target.open_named(&visible_snapshot)?.is_some();
-        if actual == evidence.expected_sha256
-            && actual_length == evidence.byte_length
+        if actual == evidence.captured_sha256
+            && actual_length == evidence.captured_byte_length
             && !snapshot_exists
         {
             continue;
@@ -655,8 +655,8 @@ fn reconcile_completed_mount_inode_evidence_inner(
                 evidence.entry_index,
                 GenerationInodeEvidenceConflictUpdate {
                     local_sha256: actual.clone(),
-                    expected_sha256: actual,
-                    byte_length: actual_length,
+                    captured_sha256: actual,
+                    captured_byte_length: actual_length,
                     visible_evidence: None,
                     updated_at: journal.receipt.completed_at.clone(),
                 },
@@ -677,12 +677,12 @@ fn reconcile_completed_mount_inode_evidence_inner(
                 evidence.entry_index,
                 GenerationInodeEvidenceConflictUpdate {
                     local_sha256: manifest_sha256,
-                    expected_sha256: actual,
-                    byte_length: actual_length,
+                    captured_sha256: actual,
+                    captured_byte_length: actual_length,
                     visible_evidence: Some(GenerationRetainedInodeRecord {
                         evidence_name: visible_snapshot_text.to_string(),
-                        expected_sha256: visible.0,
-                        byte_length: visible.1,
+                        captured_sha256: visible.0,
+                        captured_byte_length: visible.1,
                     }),
                     updated_at: journal.receipt.completed_at.clone(),
                 },
@@ -690,7 +690,7 @@ fn reconcile_completed_mount_inode_evidence_inner(
         }
         conflicts += 1;
     }
-    validate_inode_evidence_usage(
+    validate_captured_evidence_reservation(
         &store.list_generation_inode_evidence()?,
         DEFAULT_CONFLICT_RETENTION_LIMITS,
     )?;
@@ -757,12 +757,12 @@ fn record_changed_dual_inode_evidence(
         evidence.entry_index,
         GenerationInodeEvidenceConflictUpdate {
             local_sha256,
-            expected_sha256: fingerprints.pre_merge.0.to_string(),
-            byte_length: fingerprints.pre_merge.1,
+            captured_sha256: fingerprints.pre_merge.0.to_string(),
+            captured_byte_length: fingerprints.pre_merge.1,
             visible_evidence: Some(GenerationRetainedInodeRecord {
                 evidence_name: visible_evidence.evidence_name.clone(),
-                expected_sha256: fingerprints.visible.0.to_string(),
-                byte_length: fingerprints.visible.1,
+                captured_sha256: fingerprints.visible.0.to_string(),
+                captured_byte_length: fingerprints.visible.1,
             }),
             updated_at: updated_at.to_string(),
         },
@@ -875,105 +875,6 @@ struct RetainedConflictUsage {
     by_mount: BTreeMap<String, u64>,
 }
 
-fn refresh_resolved_mount_inode_evidence(
-    store: &mut SqliteStateStore,
-    mount_id: &MountId,
-    mount: &SecureMount,
-) -> Result<(), GenerationSyncError> {
-    for evidence in store
-        .list_generation_inode_evidence()?
-        .into_iter()
-        .filter(|evidence| &evidence.mount_id == mount_id && evidence.resolved_at.is_some())
-    {
-        let evidence_path = LogicalPath::new(evidence.logical_path.clone())
-            .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
-        let target = mount.target(&evidence_path.to_relative_path_buf(), false)?;
-        let mut refreshed = false;
-        for _ in 0..8 {
-            let before = fingerprint_resolved_tombstone(&target, &evidence)?;
-            store.refresh_generation_inode_evidence_tombstone(
-                &evidence.delta_id,
-                evidence.entry_index,
-                GenerationInodeEvidenceTombstoneRefresh {
-                    expected_sha256: before.pre_merge.0.clone(),
-                    byte_length: before.pre_merge.1,
-                    visible_expected_sha256: before.visible.0.clone(),
-                    visible_byte_length: before.visible.1,
-                },
-            )?;
-            if fingerprint_resolved_tombstone(&target, &evidence)? == before {
-                refreshed = true;
-                break;
-            }
-        }
-        if !refreshed {
-            return Err(GenerationSyncError::ConcurrentMutation);
-        }
-    }
-    Ok(())
-}
-
-fn refresh_resolved_inode_evidence_for_admission(
-    store: &mut SqliteStateStore,
-    active_mount_id: &MountId,
-    active_mount: &SecureMount,
-) -> Result<(), GenerationSyncError> {
-    let resolved_mounts = store
-        .list_generation_inode_evidence()?
-        .into_iter()
-        .filter(|evidence| evidence.resolved_at.is_some())
-        .map(|evidence| evidence.mount_id)
-        .collect::<BTreeSet<_>>();
-    if resolved_mounts.is_empty() {
-        return Ok(());
-    }
-    let mounts = store
-        .load_mounts()?
-        .into_iter()
-        .map(|mount| (mount.mount_id.clone(), mount))
-        .collect::<BTreeMap<_, _>>();
-    for mount_id in resolved_mounts {
-        if &mount_id == active_mount_id {
-            refresh_resolved_mount_inode_evidence(store, &mount_id, active_mount)?;
-            continue;
-        }
-        let mount = mounts
-            .get(&mount_id)
-            .ok_or(GenerationSyncError::JournalMismatch)?;
-        let _mount_guard = MountApplyGuard::acquire(&mount.root)?;
-        let secure_mount =
-            SecureMount::open(&mount.root).map_err(GenerationSyncError::MountAccess)?;
-        refresh_resolved_mount_inode_evidence(store, &mount_id, &secure_mount)?;
-    }
-    Ok(())
-}
-
-#[derive(PartialEq, Eq)]
-struct ResolvedTombstoneFingerprints {
-    pre_merge: (String, u64),
-    visible: (String, u64),
-}
-
-fn fingerprint_resolved_tombstone(
-    target: &SecureTarget,
-    evidence: &GenerationInodeEvidenceRecord,
-) -> Result<ResolvedTombstoneFingerprints, GenerationSyncError> {
-    let visible = evidence
-        .visible_evidence
-        .as_ref()
-        .ok_or(GenerationSyncError::JournalMismatch)?;
-    let mut pre_merge = target
-        .open_named(OsStr::new(&evidence.evidence_name))?
-        .ok_or_else(|| GenerationSyncError::MissingInodeEvidence(evidence.logical_path.clone()))?;
-    let mut visible_file = target
-        .open_named(OsStr::new(&visible.evidence_name))?
-        .ok_or_else(|| GenerationSyncError::MissingInodeEvidence(evidence.logical_path.clone()))?;
-    Ok(ResolvedTombstoneFingerprints {
-        pre_merge: fingerprint_open_file_handle(&mut pre_merge)?,
-        visible: fingerprint_open_file_handle(&mut visible_file)?,
-    })
-}
-
 fn prospective_inode_evidence_bytes(
     mount: &SecureMount,
     delta: &GenerationDelta,
@@ -1000,7 +901,7 @@ fn prospective_inode_evidence_bytes(
         if let Some((_, byte_length)) = fingerprint_target(&target)? {
             bytes = bytes
                 .checked_add(byte_length)
-                .ok_or(GenerationSyncError::EvidenceRetentionQuotaExceeded)?;
+                .ok_or(GenerationSyncError::CapturedEvidenceReservationExceeded)?;
         }
     }
     Ok(bytes)
@@ -1021,12 +922,15 @@ fn validate_inode_evidence_admission(
             .checked_add(prospective_bytes)
             .is_none_or(|bytes| bytes > limits.per_mount_bytes)
     {
-        return Err(GenerationSyncError::EvidenceRetentionQuotaExceeded);
+        return Err(GenerationSyncError::CapturedEvidenceReservationExceeded);
     }
     Ok(())
 }
 
-fn validate_inode_evidence_usage(
+/// Validates Locality-managed bytes captured when evidence was created or
+/// fenced. Resolved tombstones are metadata-only during an active lifecycle;
+/// later writes through foreign descriptors are intentionally not measured.
+fn validate_captured_evidence_reservation(
     evidence: &[GenerationInodeEvidenceRecord],
     limits: ConflictRetentionLimits,
 ) -> Result<RetainedConflictUsage, GenerationSyncError> {
@@ -1035,21 +939,23 @@ fn validate_inode_evidence_usage(
         let retained_bytes = evidence
             .visible_evidence
             .as_ref()
-            .map_or(Some(evidence.byte_length), |visible| {
-                evidence.byte_length.checked_add(visible.byte_length)
+            .map_or(Some(evidence.captured_byte_length), |visible| {
+                evidence
+                    .captured_byte_length
+                    .checked_add(visible.captured_byte_length)
             })
-            .ok_or(GenerationSyncError::EvidenceRetentionQuotaExceeded)?;
+            .ok_or(GenerationSyncError::CapturedEvidenceReservationExceeded)?;
         usage.global_bytes = usage
             .global_bytes
             .checked_add(retained_bytes)
-            .ok_or(GenerationSyncError::EvidenceRetentionQuotaExceeded)?;
+            .ok_or(GenerationSyncError::CapturedEvidenceReservationExceeded)?;
         let mount_bytes = usage
             .by_mount
             .entry(evidence.mount_id.as_str().to_string())
             .or_default();
         *mount_bytes = mount_bytes
             .checked_add(retained_bytes)
-            .ok_or(GenerationSyncError::EvidenceRetentionQuotaExceeded)?;
+            .ok_or(GenerationSyncError::CapturedEvidenceReservationExceeded)?;
     }
     if usage.global_bytes > limits.global_bytes
         || usage
@@ -1057,7 +963,7 @@ fn validate_inode_evidence_usage(
             .values()
             .any(|bytes| *bytes > limits.per_mount_bytes)
     {
-        return Err(GenerationSyncError::EvidenceRetentionQuotaExceeded);
+        return Err(GenerationSyncError::CapturedEvidenceReservationExceeded);
     }
     Ok(usage)
 }
@@ -1077,7 +983,7 @@ fn reconcile_generation_staging_locked(
 ) -> Result<RetainedConflictUsage, GenerationSyncError> {
     let journals = store.list_generation_applies()?;
     let inode_evidence = store.list_generation_inode_evidence()?;
-    validate_inode_evidence_usage(&inode_evidence, DEFAULT_CONFLICT_RETENTION_LIMITS)?;
+    validate_captured_evidence_reservation(&inode_evidence, DEFAULT_CONFLICT_RETENTION_LIMITS)?;
     let mut usage = RetainedConflictUsage::default();
     let mut live_stages = BTreeSet::new();
     let mut current_conflicts = BTreeMap::new();
@@ -2230,7 +2136,7 @@ fn fingerprint_open_file_handle(file: &mut File) -> Result<(String, u64), Genera
         digest.update(&buffer[..read]);
         byte_length = byte_length
             .checked_add(read as u64)
-            .ok_or(GenerationSyncError::EvidenceRetentionQuotaExceeded)?;
+            .ok_or(GenerationSyncError::CapturedEvidenceReservationExceeded)?;
     }
     if file.metadata()?.len() != byte_length {
         return Err(GenerationSyncError::ConcurrentMutation);
@@ -2386,7 +2292,7 @@ pub enum GenerationSyncError {
     MissingMergeBaseEvidence(String),
     MissingInodeEvidence(String),
     ConflictRetentionQuotaExceeded,
-    EvidenceRetentionQuotaExceeded,
+    CapturedEvidenceReservationExceeded,
     BaseRetentionQuotaExceeded,
     InjectedInterruption,
 }
@@ -2445,8 +2351,8 @@ impl Display for GenerationSyncError {
             Self::ConflictRetentionQuotaExceeded => {
                 formatter.write_str("generation conflict-retention quota would be exceeded")
             }
-            Self::EvidenceRetentionQuotaExceeded => {
-                formatter.write_str("generation displaced-inode evidence quota is exceeded")
+            Self::CapturedEvidenceReservationExceeded => {
+                formatter.write_str("generation captured managed-evidence reservation is exceeded")
             }
             Self::BaseRetentionQuotaExceeded => {
                 formatter.write_str("generation merge-base retention quota is exceeded")
@@ -3507,10 +3413,13 @@ mod tests {
 
         let evidence = store.list_generation_inode_evidence().unwrap().remove(0);
         assert_eq!(
-            evidence.expected_sha256,
+            evidence.captured_sha256,
             sha256_label(b"local\nmiddle\ntwo\n")
         );
-        assert_eq!(evidence.byte_length, b"local\nmiddle\ntwo\n".len() as u64);
+        assert_eq!(
+            evidence.captured_byte_length,
+            b"local\nmiddle\ntwo\n".len() as u64
+        );
 
         reconcile_all_completed_inode_evidence(&mut store).unwrap();
         let reconciled = store
@@ -3565,11 +3474,11 @@ mod tests {
             GenerationPathState::Conflicted
         );
         let evidence = store.list_generation_inode_evidence().unwrap().remove(0);
-        assert_eq!(evidence.expected_sha256, sha256_label(late_local));
-        assert_eq!(evidence.byte_length, late_local.len() as u64);
+        assert_eq!(evidence.captured_sha256, sha256_label(late_local));
+        assert_eq!(evidence.captured_byte_length, late_local.len() as u64);
         let visible_evidence = evidence.visible_evidence.unwrap();
         assert_eq!(
-            visible_evidence.expected_sha256,
+            visible_evidence.captured_sha256,
             sha256_label(b"local\nmiddle\nremote\n")
         );
 
@@ -3598,16 +3507,19 @@ mod tests {
         );
         assert_eq!(fs::read(&path).unwrap(), manifest);
         let evidence = store.list_generation_inode_evidence().unwrap().remove(0);
-        assert_eq!(evidence.expected_sha256, sha256_label(later_pre_merge));
-        assert_eq!(evidence.byte_length, later_pre_merge.len() as u64);
+        assert_eq!(evidence.captured_sha256, sha256_label(later_pre_merge));
+        assert_eq!(evidence.captured_byte_length, later_pre_merge.len() as u64);
         let visible_evidence = evidence.visible_evidence.as_ref().unwrap();
         assert_eq!(
-            visible_evidence.expected_sha256,
+            visible_evidence.captured_sha256,
             sha256_label(later_visible)
         );
-        assert_eq!(visible_evidence.byte_length, later_visible.len() as u64);
+        assert_eq!(
+            visible_evidence.captured_byte_length,
+            later_visible.len() as u64
+        );
         let retained_bytes = later_pre_merge.len() as u64 + later_visible.len() as u64;
-        let usage = validate_inode_evidence_usage(
+        let usage = validate_captured_evidence_reservation(
             std::slice::from_ref(&evidence),
             ConflictRetentionLimits {
                 per_mount_bytes: retained_bytes,
@@ -3617,14 +3529,14 @@ mod tests {
         .unwrap();
         assert_eq!(usage.global_bytes, retained_bytes);
         assert!(matches!(
-            validate_inode_evidence_usage(
+            validate_captured_evidence_reservation(
                 &[evidence],
                 ConflictRetentionLimits {
                     per_mount_bytes: retained_bytes,
                     global_bytes: retained_bytes - 1,
                 },
             ),
-            Err(GenerationSyncError::EvidenceRetentionQuotaExceeded)
+            Err(GenerationSyncError::CapturedEvidenceReservationExceeded)
         ));
         let journal = store.get_generation_apply(delta_id).unwrap().unwrap();
         assert!(matches!(
@@ -3679,9 +3591,13 @@ mod tests {
         assert!(fixture.mount_root.join(&visible_name).exists());
         let evidence = store.list_generation_inode_evidence().unwrap().remove(0);
         assert!(evidence.resolved_at.is_some());
-        let retained_bytes =
-            evidence.byte_length + evidence.visible_evidence.as_ref().unwrap().byte_length;
-        let usage = validate_inode_evidence_usage(
+        let retained_bytes = evidence.captured_byte_length
+            + evidence
+                .visible_evidence
+                .as_ref()
+                .unwrap()
+                .captured_byte_length;
+        let usage = validate_captured_evidence_reservation(
             std::slice::from_ref(&evidence),
             ConflictRetentionLimits {
                 per_mount_bytes: retained_bytes,
@@ -3996,8 +3912,8 @@ mod tests {
         );
         assert!(fixture.mount_root.join(&visible_name).exists());
         let evidence = store.list_generation_inode_evidence().unwrap().remove(0);
-        assert_eq!(evidence.expected_sha256, sha256_label(raced_bytes));
-        assert_eq!(evidence.byte_length, raced_bytes.len() as u64);
+        assert_eq!(evidence.captured_sha256, sha256_label(raced_bytes));
+        assert_eq!(evidence.captured_byte_length, raced_bytes.len() as u64);
         assert_eq!(
             store.list_generation_paths(&fixture.mount_id).unwrap()[0].state,
             GenerationPathState::Conflicted
@@ -4072,10 +3988,14 @@ mod tests {
         );
         let evidence = store.list_generation_inode_evidence().unwrap().remove(0);
         assert!(evidence.resolved_at.is_some());
-        let retained_bytes =
-            evidence.byte_length + evidence.visible_evidence.as_ref().unwrap().byte_length;
+        let retained_bytes = evidence.captured_byte_length
+            + evidence
+                .visible_evidence
+                .as_ref()
+                .unwrap()
+                .captured_byte_length;
         assert_eq!(
-            validate_inode_evidence_usage(
+            validate_captured_evidence_reservation(
                 std::slice::from_ref(&evidence),
                 ConflictRetentionLimits {
                     per_mount_bytes: retained_bytes,
@@ -4163,9 +4083,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn tombstone_growth_refreshes_actual_quota_before_new_evidence_admission() {
-        let fixture = Fixture::new("tombstone-growth-quota-refresh");
-        let delta_id = "delta-tombstone-growth-quota-refresh";
+    fn resolved_tombstone_growth_keeps_frozen_captured_reservation() {
+        let fixture = Fixture::new("tombstone-growth-frozen-reservation");
+        let delta_id = "delta-tombstone-growth-frozen-reservation";
         let (mut store, merged, mut pre_merge_writer, mut visible_writer) =
             prepare_retained_version_conflict(&fixture, delta_id);
         let pre_merge_name = preimage_name(delta_id, 0);
@@ -4184,13 +4104,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolution.conflicted_paths, 0);
+        let captured = store.list_generation_inode_evidence().unwrap().remove(0);
+        assert!(captured.resolved_at.is_some());
+        let captured_visible = captured.visible_evidence.as_ref().unwrap();
+        let frozen_reservation =
+            captured.captured_byte_length + captured_visible.captured_byte_length;
+        let captured_pre_merge = (
+            captured.captured_sha256.clone(),
+            captured.captured_byte_length,
+        );
+        let captured_visible = (
+            captured_visible.captured_sha256.clone(),
+            captured_visible.captured_byte_length,
+        );
 
         let larger_pre_merge = vec![b'P'; 257];
         let larger_visible = vec![b'V'; 389];
         replace_held_file(&mut pre_merge_writer, &larger_pre_merge);
         replace_held_file(&mut visible_writer, &larger_visible);
         let current = fs::read(fixture.mount_root.join("Roadmap.md")).unwrap();
-        let actual_tombstone_bytes = (larger_pre_merge.len() + larger_visible.len()) as u64;
+        assert!(
+            (larger_pre_merge.len() + larger_visible.len()) as u64 > frozen_reservation,
+            "foreign-descriptor growth must exceed the frozen managed reservation"
+        );
 
         let old = identity(
             "projection-a",
@@ -4216,7 +4152,7 @@ mod tests {
         transport
             .contents
             .insert("content-next".to_string(), b"one\nmiddle\nnext\n".to_vec());
-        let rejected_limit = actual_tombstone_bytes + current.len() as u64 - 1;
+        let rejected_limit = frozen_reservation + current.len() as u64 - 1;
         let error = apply_authorized_delivery_inner(
             &mut store,
             &fixture.mount_id,
@@ -4232,10 +4168,10 @@ mod tests {
                 ..ApplyHooks::default()
             },
         )
-        .expect_err("refreshed tombstone plus new evidence must exceed quota");
+        .expect_err("frozen reservation plus prospective evidence must exceed the limit");
         assert!(matches!(
             error,
-            GenerationSyncError::EvidenceRetentionQuotaExceeded
+            GenerationSyncError::CapturedEvidenceReservationExceeded
         ));
         assert_eq!(transport.content_fetches, 0);
         assert!(
@@ -4244,16 +4180,22 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let refreshed = store.list_generation_inode_evidence().unwrap().remove(0);
-        assert!(refreshed.resolved_at.is_some());
-        assert_eq!(refreshed.expected_sha256, sha256_label(&larger_pre_merge));
-        assert_eq!(refreshed.byte_length, larger_pre_merge.len() as u64);
-        let refreshed_visible = refreshed.visible_evidence.unwrap();
+        let still_captured = store.list_generation_inode_evidence().unwrap().remove(0);
         assert_eq!(
-            refreshed_visible.expected_sha256,
-            sha256_label(&larger_visible)
+            (
+                still_captured.captured_sha256.clone(),
+                still_captured.captured_byte_length,
+            ),
+            captured_pre_merge
         );
-        assert_eq!(refreshed_visible.byte_length, larger_visible.len() as u64);
+        let still_captured_visible = still_captured.visible_evidence.as_ref().unwrap();
+        assert_eq!(
+            (
+                still_captured_visible.captured_sha256.clone(),
+                still_captured_visible.captured_byte_length,
+            ),
+            captured_visible
+        );
         assert_eq!(
             fs::read(fixture.mount_root.join(&pre_merge_name)).unwrap(),
             larger_pre_merge
@@ -4267,7 +4209,7 @@ mod tests {
             current
         );
 
-        let admitted_limit = actual_tombstone_bytes + current.len() as u64;
+        let admitted_limit = frozen_reservation + current.len() as u64;
         let summary = apply_authorized_delivery_inner(
             &mut store,
             &fixture.mount_id,
@@ -4287,6 +4229,24 @@ mod tests {
         assert_eq!(summary.applied_paths, 1);
         assert_eq!(transport.content_fetches, 1);
         assert_eq!(store.list_generation_inode_evidence().unwrap().len(), 2);
+        let tombstone = store
+            .list_generation_inode_evidence()
+            .unwrap()
+            .into_iter()
+            .find(|evidence| evidence.delta_id == delta_id)
+            .unwrap();
+        assert_eq!(
+            (tombstone.captured_sha256, tombstone.captured_byte_length),
+            captured_pre_merge
+        );
+        let tombstone_visible = tombstone.visible_evidence.unwrap();
+        assert_eq!(
+            (
+                tombstone_visible.captured_sha256,
+                tombstone_visible.captured_byte_length,
+            ),
+            captured_visible
+        );
         assert_eq!(
             fs::read(fixture.mount_root.join(&pre_merge_name)).unwrap(),
             larger_pre_merge
@@ -4355,14 +4315,17 @@ mod tests {
             late_local
         );
         let evidence = store.list_generation_inode_evidence().unwrap().remove(0);
-        assert_eq!(evidence.expected_sha256, sha256_label(late_local));
-        assert_eq!(evidence.byte_length, late_local.len() as u64);
+        assert_eq!(evidence.captured_sha256, sha256_label(late_local));
+        assert_eq!(evidence.captured_byte_length, late_local.len() as u64);
         let visible = evidence.visible_evidence.unwrap();
         assert_eq!(
-            visible.expected_sha256,
+            visible.captured_sha256,
             sha256_label(b"local\nmiddle\nremote\n")
         );
-        assert_eq!(visible.byte_length, b"local\nmiddle\nremote\n".len() as u64);
+        assert_eq!(
+            visible.captured_byte_length,
+            b"local\nmiddle\nremote\n".len() as u64
+        );
         drop((pre_merge, visible_merged));
     }
 
@@ -4403,9 +4366,9 @@ mod tests {
                 <= locality_protocol::freshness_delivery::MAX_GENERATION_FILE_BYTES
         );
         let evidence = store.list_generation_inode_evidence().unwrap().remove(0);
-        assert_eq!(evidence.byte_length, version_length);
+        assert_eq!(evidence.captured_byte_length, version_length);
         assert_eq!(
-            evidence.visible_evidence.unwrap().byte_length,
+            evidence.visible_evidence.unwrap().captured_byte_length,
             version_length
         );
         assert_eq!(
@@ -4450,12 +4413,12 @@ mod tests {
             mount_id: MountId::new("mount-main"),
             logical_path: "Roadmap.md".to_string(),
             evidence_name: ".preimage".to_string(),
-            expected_sha256: sha256_label(b"pre-merge"),
-            byte_length: limit,
+            captured_sha256: sha256_label(b"pre-merge"),
+            captured_byte_length: limit,
             visible_evidence: Some(GenerationRetainedInodeRecord {
                 evidence_name: ".visible-conflict".to_string(),
-                expected_sha256: sha256_label(b"visible"),
-                byte_length: limit,
+                captured_sha256: sha256_label(b"visible"),
+                captured_byte_length: limit,
             }),
             base_payload_delta_id: None,
             base_payload_entry_index: None,
@@ -4463,7 +4426,7 @@ mod tests {
             created_at: "2026-07-31T12:00:00Z".to_string(),
         };
         let retained = limit * 2;
-        let usage = validate_inode_evidence_usage(
+        let usage = validate_captured_evidence_reservation(
             std::slice::from_ref(&evidence),
             ConflictRetentionLimits {
                 per_mount_bytes: retained,
@@ -4473,18 +4436,26 @@ mod tests {
         .unwrap();
         assert_eq!(usage.global_bytes, retained);
         assert!(matches!(
-            validate_inode_evidence_usage(
+            validate_captured_evidence_reservation(
                 &[evidence],
                 ConflictRetentionLimits {
                     per_mount_bytes: retained - 1,
                     global_bytes: retained,
                 },
             ),
-            Err(GenerationSyncError::EvidenceRetentionQuotaExceeded)
+            Err(GenerationSyncError::CapturedEvidenceReservationExceeded)
         ));
         let manifest = retained_local_versions_manifest(".preimage", ".visible-conflict");
         assert!(manifest.len() < 512);
         assert!(manifest.len() as u64 <= limit);
+    }
+
+    #[test]
+    fn captured_evidence_limit_reports_a_managed_reservation() {
+        assert_eq!(
+            GenerationSyncError::CapturedEvidenceReservationExceeded.to_string(),
+            "generation captured managed-evidence reservation is exceeded"
+        );
     }
 
     #[test]
@@ -5107,7 +5078,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unavailable_resolved_only_mount_does_not_block_unrelated_mount_sync() {
+    fn unavailable_resolved_only_mount_does_not_block_unrelated_evidence_producing_sync() {
         let fixture = Fixture::new("unavailable-resolved-only-mount");
         let delta_id = "delta-unavailable-resolved-only-mount";
         let (mut store, merged, pre_merge_writer, visible_writer) =
@@ -5145,34 +5116,87 @@ mod tests {
                 &other_mount_root,
             ))
             .unwrap();
+        let other_old = identity(
+            "projection-other",
+            "Other.md",
+            "content-other-old",
+            b"other old bytes",
+        );
+        let other_new = identity(
+            "projection-other",
+            "Other.md",
+            "content-other-new",
+            b"other new bytes",
+        );
+        fs::write(other_mount_root.join("Other.md"), b"other old bytes").unwrap();
         store
             .seed_observed_generation(
                 ObservedGenerationRecord {
                     mount_id: other_mount_id.clone(),
-                    source_connection_id: SourceConnectionId::new("source-other"),
-                    generation_id: SourceGenerationId::new("generation-other").unwrap(),
+                    source_connection_id: SourceConnectionId::new("source-main"),
+                    generation_id: SourceGenerationId::new("generation-1").unwrap(),
                     inventory_sha256: sha256_label(b"other-inventory"),
                     workspace_layout_version: 1,
                     workspace_layout_digest: sha256_label(b"layout"),
                     last_receipt_sha256: None,
                     updated_at: "2026-07-31T13:00:00Z".to_string(),
                 },
-                Vec::new(),
+                vec![GenerationPathRecord {
+                    mount_id: other_mount_id.clone(),
+                    projection_id: other_old.projection_id.clone(),
+                    logical_path: other_old.logical_path.as_str().to_string(),
+                    local_logical_path: other_old.logical_path.as_str().to_string(),
+                    base_generation_id: SourceGenerationId::new("generation-1").unwrap(),
+                    base_identity: Some(other_old.clone()),
+                    base_payload_delta_id: None,
+                    base_payload_entry_index: None,
+                    conflict_payload_delta_id: None,
+                    conflict_payload_entry_index: None,
+                    state: GenerationPathState::Clean,
+                    incoming_identity: None,
+                    updated_at: "2026-07-31T13:00:00Z".to_string(),
+                }],
             )
             .unwrap();
 
+        let mut unrelated = delivery(
+            "delta-unrelated-with-old-identity",
+            vec![GenerationDeltaEntry {
+                old: Some(other_old),
+                new: Some(other_new),
+            }],
+        );
+        unrelated.delta.mount_id = PortableMountId::new("mount-other").unwrap();
+        unrelated.terminal_receipt.mount_id = unrelated.delta.mount_id.clone();
+        unrelated.terminal_receipt.delta_sha256 = unrelated.delta.canonical_sha256().unwrap();
+
         let parked_mount = fixture.root.join("parked-resolved-mount");
         fs::rename(&fixture.mount_root, &parked_mount).unwrap();
-        let mut client = GenerationSyncClient::new(FakeTransport::default());
+        let mut transport = FakeTransport::default();
+        transport.deliveries.push_back(unrelated);
+        transport
+            .contents
+            .insert("content-other-new".to_string(), b"other new bytes".to_vec());
+        let mut client = GenerationSyncClient::new(transport);
         let summary = client
             .sync_mount(&mut store, &other_mount_id, &other_mount_root)
             .unwrap();
 
-        assert_eq!(summary, GenerationSyncSummary::default());
+        assert_eq!(summary.applied_paths, 1);
         assert_eq!(client.transport().requests.len(), 1);
+        assert_eq!(client.transport().content_fetches, 1);
+        assert_eq!(
+            fs::read(other_mount_root.join("Other.md")).unwrap(),
+            b"other new bytes"
+        );
         assert!(parked_mount.join(pre_merge_name).exists());
         assert!(parked_mount.join(visible_name).exists());
-        assert_eq!(store.list_generation_inode_evidence().unwrap().len(), 1);
+        let evidence = store.list_generation_inode_evidence().unwrap();
+        assert_eq!(evidence.len(), 2);
+        assert!(evidence.iter().any(|evidence| {
+            evidence.delta_id == "delta-unrelated-with-old-identity"
+                && evidence.mount_id == other_mount_id
+        }));
     }
 
     #[test]

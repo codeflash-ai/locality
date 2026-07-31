@@ -233,7 +233,7 @@ fn observed_generation_apply_is_persisted_exact_replayable_and_atomic() {
 }
 
 #[test]
-fn retained_inode_hashes_and_lengths_advance_atomically() {
+fn captured_retained_inode_hashes_and_lengths_advance_atomically() {
     use rusqlite::Connection;
 
     let fixture = Fixture::new("atomic-inode-fingerprints");
@@ -257,8 +257,8 @@ fn retained_inode_hashes_and_lengths_advance_atomically() {
             mount_id: fixture.mount_id.clone(),
             logical_path: "Roadmap.md".to_string(),
             evidence_name: ".preimage".to_string(),
-            expected_sha256: digest('1'),
-            byte_length: 3,
+            captured_sha256: digest('1'),
+            captured_byte_length: 3,
             visible_evidence: None,
             base_payload_delta_id: None,
             base_payload_entry_index: None,
@@ -280,12 +280,12 @@ fn retained_inode_hashes_and_lengths_advance_atomically() {
 
     let first = GenerationInodeEvidenceConflictUpdate {
         local_sha256: digest('m'),
-        expected_sha256: digest('p'),
-        byte_length: 11,
+        captured_sha256: digest('p'),
+        captured_byte_length: 11,
         visible_evidence: Some(GenerationRetainedInodeRecord {
             evidence_name: ".visible".to_string(),
-            expected_sha256: digest('v'),
-            byte_length: 22,
+            captured_sha256: digest('v'),
+            captured_byte_length: 22,
         }),
         updated_at: "2026-07-31T12:04:00Z".to_string(),
     };
@@ -293,8 +293,8 @@ fn retained_inode_hashes_and_lengths_advance_atomically() {
         .mark_generation_inode_evidence_conflict("delta-2", 0, first.clone())
         .unwrap();
     let evidence = store.list_generation_inode_evidence().unwrap().remove(0);
-    assert_eq!(evidence.expected_sha256, first.expected_sha256);
-    assert_eq!(evidence.byte_length, first.byte_length);
+    assert_eq!(evidence.captured_sha256, first.captured_sha256);
+    assert_eq!(evidence.captured_byte_length, first.captured_byte_length);
     assert_eq!(evidence.visible_evidence, first.visible_evidence);
 
     let connection = Connection::open(&store.db_path).unwrap();
@@ -310,12 +310,12 @@ fn retained_inode_hashes_and_lengths_advance_atomically() {
     drop(connection);
     let second = GenerationInodeEvidenceConflictUpdate {
         local_sha256: digest('n'),
-        expected_sha256: digest('q'),
-        byte_length: 111,
+        captured_sha256: digest('q'),
+        captured_byte_length: 111,
         visible_evidence: Some(GenerationRetainedInodeRecord {
             evidence_name: ".visible".to_string(),
-            expected_sha256: digest('w'),
-            byte_length: 222,
+            captured_sha256: digest('w'),
+            captured_byte_length: 222,
         }),
         updated_at: "2026-07-31T12:05:00Z".to_string(),
     };
@@ -325,8 +325,8 @@ fn retained_inode_hashes_and_lengths_advance_atomically() {
             .is_err()
     );
     let evidence = store.list_generation_inode_evidence().unwrap().remove(0);
-    assert_eq!(evidence.expected_sha256, first.expected_sha256);
-    assert_eq!(evidence.byte_length, first.byte_length);
+    assert_eq!(evidence.captured_sha256, first.captured_sha256);
+    assert_eq!(evidence.captured_byte_length, first.captured_byte_length);
     assert_eq!(evidence.visible_evidence, first.visible_evidence);
     let outcome = store
         .get_generation_apply("delta-2")
@@ -369,8 +369,8 @@ fn generation_v4_migration_tombstones_already_resolved_dual_evidence() {
             mount_id: fixture.mount_id.clone(),
             logical_path: "Roadmap.md".to_string(),
             evidence_name: ".preimage".to_string(),
-            expected_sha256: digest('p'),
-            byte_length: 11,
+            captured_sha256: digest('p'),
+            captured_byte_length: 11,
             visible_evidence: None,
             base_payload_delta_id: None,
             base_payload_entry_index: None,
@@ -395,12 +395,12 @@ fn generation_v4_migration_tombstones_already_resolved_dual_evidence() {
             0,
             GenerationInodeEvidenceConflictUpdate {
                 local_sha256: digest('m'),
-                expected_sha256: digest('p'),
-                byte_length: 11,
+                captured_sha256: digest('p'),
+                captured_byte_length: 11,
                 visible_evidence: Some(GenerationRetainedInodeRecord {
                     evidence_name: ".visible".to_string(),
-                    expected_sha256: digest('v'),
-                    byte_length: 22,
+                    captured_sha256: digest('v'),
+                    captured_byte_length: 22,
                 }),
                 updated_at: "2026-07-31T12:04:00Z".to_string(),
             },
@@ -411,10 +411,10 @@ fn generation_v4_migration_tombstones_already_resolved_dual_evidence() {
             "delta-2",
             0,
             GenerationInodeEvidenceResolution {
-                expected_sha256: digest('p'),
-                byte_length: 11,
-                visible_expected_sha256: digest('v'),
-                visible_byte_length: 22,
+                captured_sha256: digest('p'),
+                captured_byte_length: 11,
+                visible_captured_sha256: digest('v'),
+                visible_captured_byte_length: 22,
                 updated_at: "2026-07-31T12:05:00Z".to_string(),
             },
         )

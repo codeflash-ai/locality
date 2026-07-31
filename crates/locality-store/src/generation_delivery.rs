@@ -162,8 +162,14 @@ pub struct GenerationInodeEvidenceRecord {
     pub mount_id: MountId,
     pub logical_path: String,
     pub evidence_name: String,
-    pub expected_sha256: String,
-    pub byte_length: u64,
+    /// Digest captured while Locality owned the evidence transition. This is
+    /// not a live fingerprint after resolution: a foreign descriptor may
+    /// subsequently write the retained inode.
+    pub captured_sha256: String,
+    /// Bytes captured and reserved as Locality-managed evidence. Later growth
+    /// through a foreign descriptor is reachable user recovery data, but is
+    /// outside this managed-evidence reservation.
+    pub captured_byte_length: u64,
     /// The second local inode retained when a late write races a published
     /// merge. Keeping this inode named means a descriptor opened on the
     /// published merge cannot become unreachable after conflict conversion.
@@ -174,7 +180,8 @@ pub struct GenerationInodeEvidenceRecord {
     pub base_payload_entry_index: Option<u64>,
     /// Set only after an exact retained version has been durably selected and
     /// the path was atomically advanced. Tombstoned evidence remains named and
-    /// quota-accounted until a future exclusive, no-active-mount GC gate.
+    /// reserved at its captured lengths until a future exclusive,
+    /// no-active-mount GC gate.
     pub resolved_at: Option<String>,
     pub created_at: String,
 }
@@ -182,37 +189,29 @@ pub struct GenerationInodeEvidenceRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GenerationRetainedInodeRecord {
     pub evidence_name: String,
-    pub expected_sha256: String,
-    pub byte_length: u64,
+    pub captured_sha256: String,
+    pub captured_byte_length: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GenerationInodeEvidenceConflictUpdate {
     /// Digest of the small conflict manifest at the logical path.
     pub local_sha256: String,
-    /// Current fingerprint of the pre-merge retained inode.
-    pub expected_sha256: String,
-    pub byte_length: u64,
-    /// Current fingerprint of the retained visible merged inode.
+    /// Fingerprint captured from the pre-merge retained inode.
+    pub captured_sha256: String,
+    pub captured_byte_length: u64,
+    /// Fingerprint captured from the retained visible merged inode.
     pub visible_evidence: Option<GenerationRetainedInodeRecord>,
     pub updated_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GenerationInodeEvidenceResolution {
-    pub expected_sha256: String,
-    pub byte_length: u64,
-    pub visible_expected_sha256: String,
-    pub visible_byte_length: u64,
+    pub captured_sha256: String,
+    pub captured_byte_length: u64,
+    pub visible_captured_sha256: String,
+    pub visible_captured_byte_length: u64,
     pub updated_at: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GenerationInodeEvidenceTombstoneRefresh {
-    pub expected_sha256: String,
-    pub byte_length: u64,
-    pub visible_expected_sha256: String,
-    pub visible_byte_length: u64,
 }
 
 pub trait GenerationDeliveryRepository {
@@ -271,7 +270,7 @@ pub trait GenerationDeliveryRepository {
     fn list_generation_inode_evidence(&self) -> StoreResult<Vec<GenerationInodeEvidenceRecord>>;
 
     /// Converts a completed apply to conflict and atomically advances both
-    /// retained-inode fences, including their quota-accounted lengths.
+    /// retained-inode fences, including their captured reservation lengths.
     fn mark_generation_inode_evidence_conflict(
         &mut self,
         delta_id: &str,
@@ -281,21 +280,13 @@ pub trait GenerationDeliveryRepository {
 
     /// Atomically clears the late-write conflict after the visible file was
     /// durably replaced by one exact retained version. Both retained inodes
-    /// and their evidence remain as a quota-accounted tombstoned GC journal.
+    /// and their evidence remain as a captured-reservation tombstoned GC
+    /// journal. Later foreign-descriptor growth is deliberately not measured.
     fn mark_generation_inode_evidence_resolved(
         &mut self,
         delta_id: &str,
         entry_index: u64,
         resolution: GenerationInodeEvidenceResolution,
-    ) -> StoreResult<()>;
-
-    /// Atomically refreshes both fingerprints of an already-resolved dual
-    /// inode tombstone. This never changes path/apply state or retires files.
-    fn refresh_generation_inode_evidence_tombstone(
-        &mut self,
-        delta_id: &str,
-        entry_index: u64,
-        refresh: GenerationInodeEvidenceTombstoneRefresh,
     ) -> StoreResult<()>;
 
     fn remove_generation_inode_evidence(

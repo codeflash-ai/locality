@@ -42,9 +42,9 @@ use crate::error::{StoreError, StoreResult};
 use crate::generation_delivery::{
     GENERATION_DELIVERY_COMPONENT_VERSION, GenerationApplyJournalRecord, GenerationApplyOutcome,
     GenerationApplyStatus, GenerationDeliveryRepository, GenerationInodeEvidenceConflictUpdate,
-    GenerationInodeEvidenceRecord, GenerationInodeEvidenceResolution,
-    GenerationInodeEvidenceTombstoneRefresh, GenerationPathRecord, GenerationPathState,
-    GenerationRetainedInodeRecord, ObservedGenerationRecord, PreparedGenerationApply,
+    GenerationInodeEvidenceRecord, GenerationInodeEvidenceResolution, GenerationPathRecord,
+    GenerationPathState, GenerationRetainedInodeRecord, ObservedGenerationRecord,
+    PreparedGenerationApply,
 };
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
@@ -938,6 +938,9 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         &mut self,
         evidence: GenerationInodeEvidenceRecord,
     ) -> StoreResult<()> {
+        // The SQL column names predate the captured-reservation model and stay
+        // stable for schema compatibility. They store captured snapshots, not
+        // live post-resolution filesystem fingerprints or disk usage.
         if evidence.resolved_at.is_some() {
             return Err(StoreError::InvalidState(
                 "new generation inode evidence cannot start resolved".to_string(),
@@ -947,7 +950,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         let entry_index = i64::try_from(evidence.entry_index).map_err(|_| {
             StoreError::InvalidState("generation evidence index is too large".to_string())
         })?;
-        let byte_length = i64::try_from(evidence.byte_length).map_err(|_| {
+        let byte_length = i64::try_from(evidence.captured_byte_length).map_err(|_| {
             StoreError::InvalidState("generation evidence length is too large".to_string())
         })?;
         let changed = connection.execute(
@@ -963,7 +966,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 evidence.mount_id.0.as_str(),
                 evidence.logical_path.as_str(),
                 evidence.evidence_name.as_str(),
-                evidence.expected_sha256.as_str(),
+                evidence.captured_sha256.as_str(),
                 byte_length,
                 evidence.base_payload_delta_id.as_deref(),
                 evidence
@@ -993,7 +996,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                     evidence.mount_id.0.as_str(),
                     evidence.logical_path.as_str(),
                     evidence.evidence_name.as_str(),
-                    evidence.expected_sha256.as_str(),
+                    evidence.captured_sha256.as_str(),
                     byte_length,
                     evidence.base_payload_delta_id.as_deref(),
                     evidence
@@ -1053,20 +1056,22 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 mount_id: MountId::new(row.2),
                 logical_path: row.3,
                 evidence_name: row.4,
-                expected_sha256: row.5,
-                byte_length: u64::try_from(row.6).map_err(|_| {
+                captured_sha256: row.5,
+                captured_byte_length: u64::try_from(row.6).map_err(|_| {
                     StoreError::InvalidState("negative generation evidence length".to_string())
                 })?,
                 visible_evidence: match (row.7, row.8, row.9) {
-                    (Some(evidence_name), Some(expected_sha256), Some(byte_length)) => {
+                    (Some(evidence_name), Some(captured_sha256), Some(captured_byte_length)) => {
                         Some(GenerationRetainedInodeRecord {
                             evidence_name,
-                            expected_sha256,
-                            byte_length: u64::try_from(byte_length).map_err(|_| {
-                                StoreError::InvalidState(
-                                    "negative visible generation evidence length".to_string(),
-                                )
-                            })?,
+                            captured_sha256,
+                            captured_byte_length: u64::try_from(captured_byte_length).map_err(
+                                |_| {
+                                    StoreError::InvalidState(
+                                        "negative visible generation evidence length".to_string(),
+                                    )
+                                },
+                            )?,
                         })
                     }
                     (None, None, None) => None,
@@ -1224,13 +1229,13 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 update.updated_at.as_str(),
             ],
         )?;
-        let byte_length = i64::try_from(update.byte_length).map_err(|_| {
+        let byte_length = i64::try_from(update.captured_byte_length).map_err(|_| {
             StoreError::InvalidState("generation evidence length is too large".to_string())
         })?;
         let visible_byte_length = update
             .visible_evidence
             .as_ref()
-            .map(|visible| i64::try_from(visible.byte_length))
+            .map(|visible| i64::try_from(visible.captured_byte_length))
             .transpose()
             .map_err(|_| {
                 StoreError::InvalidState(
@@ -1248,7 +1253,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
                     "generation evidence index is too large".to_string()
                 ))?,
-                update.expected_sha256.as_str(),
+                update.captured_sha256.as_str(),
                 byte_length,
                 update
                     .visible_evidence
@@ -1257,7 +1262,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 update
                     .visible_evidence
                     .as_ref()
-                    .map(|visible| visible.expected_sha256.as_str()),
+                    .map(|visible| visible.captured_sha256.as_str()),
                 visible_byte_length,
             ],
         )?;
@@ -1297,12 +1302,15 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         let index = i64::try_from(entry_index).map_err(|_| {
             StoreError::InvalidState("generation evidence index is too large".to_string())
         })?;
-        let byte_length = i64::try_from(resolution.byte_length).map_err(|_| {
+        let byte_length = i64::try_from(resolution.captured_byte_length).map_err(|_| {
             StoreError::InvalidState("generation evidence length is too large".to_string())
         })?;
-        let visible_byte_length = i64::try_from(resolution.visible_byte_length).map_err(|_| {
-            StoreError::InvalidState("visible generation evidence length is too large".to_string())
-        })?;
+        let visible_byte_length =
+            i64::try_from(resolution.visible_captured_byte_length).map_err(|_| {
+                StoreError::InvalidState(
+                    "visible generation evidence length is too large".to_string(),
+                )
+            })?;
         let exact_evidence: bool = transaction
             .query_row(
                 "SELECT expected_sha256 = ?3 AND byte_length = ?4
@@ -1315,9 +1323,9 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 params![
                     delta_id,
                     index,
-                    resolution.expected_sha256.as_str(),
+                    resolution.captured_sha256.as_str(),
                     byte_length,
-                    resolution.visible_expected_sha256.as_str(),
+                    resolution.visible_captured_sha256.as_str(),
                     visible_byte_length,
                 ],
                 |row| row.get(0),
@@ -1391,45 +1399,6 @@ impl GenerationDeliveryRepository for SqliteStateStore {
             params![delta_id, index, resolution.updated_at.as_str()],
         )?;
         transaction.commit()?;
-        Ok(())
-    }
-
-    fn refresh_generation_inode_evidence_tombstone(
-        &mut self,
-        delta_id: &str,
-        entry_index: u64,
-        refresh: GenerationInodeEvidenceTombstoneRefresh,
-    ) -> StoreResult<()> {
-        let byte_length = i64::try_from(refresh.byte_length).map_err(|_| {
-            StoreError::InvalidState("generation evidence length is too large".to_string())
-        })?;
-        let visible_byte_length = i64::try_from(refresh.visible_byte_length).map_err(|_| {
-            StoreError::InvalidState("visible generation evidence length is too large".to_string())
-        })?;
-        let changed = self.connection()?.execute(
-            "UPDATE generation_inode_evidence
-             SET expected_sha256 = ?3, byte_length = ?4,
-                 visible_expected_sha256 = ?5, visible_byte_length = ?6
-             WHERE delta_id = ?1 AND entry_index = ?2
-               AND resolved_at IS NOT NULL
-               AND visible_evidence_name IS NOT NULL",
-            params![
-                delta_id,
-                i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
-                    "generation evidence index is too large".to_string()
-                ))?,
-                refresh.expected_sha256.as_str(),
-                byte_length,
-                refresh.visible_expected_sha256.as_str(),
-                visible_byte_length,
-            ],
-        )?;
-        if changed != 1 {
-            return Err(StoreError::InvalidState(
-                "generation inode tombstone disappeared or became unresolved during refresh"
-                    .to_string(),
-            ));
-        }
         Ok(())
     }
 

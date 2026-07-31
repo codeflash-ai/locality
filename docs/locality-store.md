@@ -152,26 +152,27 @@ persisted. To resolve this conflict, the user closes writers, copies exactly one
 named retained file over the manifest, and syncs again. Reconciliation fsyncs
 and re-fences that exact choice, then atomically restores the path to `dirty`,
 records the apply as `merged`, and marks the dual-inode evidence row resolved.
-Both retained files, hashes, and lengths remain as a quota-accounted tombstoned
-GC journal. Apply, reconciliation, and ordinary startup neither require nor
-unlink tombstoned files, so writes through descriptors retained before or after
-resolution remain reachable while subsequent syncs proceed. Cleanup is deferred
-to a future GC that must hold an explicit exclusive no-active-mount lifecycle
-gate; no such GC runs today. Arbitrary custom replacement bytes are preserved
-but intentionally do not clear the conflict. Reconciliation retains only
-authenticated payloads for current live conflicts, removes successful,
-superseded, or orphan payloads, and enforces bounded per-mount and global
-retained-conflict quotas including tombstones.
+Both retained files remain as a tombstoned GC journal. Their `captured_sha256`
+and `captured_byte_length` values are frozen snapshots of bytes Locality managed
+at capture or resolution. Admission treats those captured lengths as a logical
+managed-evidence reservation; it is not an actual-disk quota. A foreign file
+descriptor opened earlier can grow either inode without Locality's involvement,
+so that reachable, user-owned recovery growth is deliberately outside the
+managed reservation. Apply, reconciliation, and ordinary startup never open,
+fingerprint, require, or unlink resolved tombstones. They account only frozen
+captured reservations plus the active update's prospective Locality-managed
+preimage. Consequently, an unavailable mount containing only resolved
+tombstones cannot block unrelated polling, recovery, or evidence-producing
+updates, including deltas with old-identity metadata.
 
-An apply that could displace another inode first opens every resolved tombstone
-mount under the generation state/mount locks, double-fingerprints both retained
-names, atomically refreshes both stored hashes and lengths, and rechecks them.
-Quota admission then includes those current lengths plus the prospective local
-preimages before staging or filesystem mutation. A missing, unavailable, or
-continuously changing tombstone fails that evidence-producing admission without
-unlinking data. Global crash reconciliation is separate: it selects only mounts
-with unresolved evidence before any mount-root access, so an unavailable mount
-containing only tombstones cannot block unrelated polling or recovery.
+Cleanup is deferred to a future GC that must hold an explicit exclusive
+no-active-mount lifecycle gate and must define how external-descriptor growth is
+handled; no such GC runs today. Arbitrary custom replacement bytes are preserved
+but intentionally do not clear the conflict. Reconciliation retains only
+authenticated payloads for current live conflicts and removes successful,
+superseded, or orphan payloads. Per-mount and global limits bound Locality's
+captured managed-evidence reservations and current conflict payloads, not later
+user-owned writes to retained inodes.
 
 V1 deltas are mount-scoped. Empty entry lists are valid when a complete target
 generation changes no projected bytes. A logical path may occur in only one
