@@ -191,6 +191,7 @@ type DesktopSnapshot = {
   activeMountId?: string | null;
   liveMode: MountLiveMode;
   needsOnboarding: boolean;
+  onboardingCompleted: boolean;
   settings: {
     launchAtLogin: boolean;
     showMenuBar: boolean;
@@ -469,6 +470,7 @@ const sampleSnapshot: DesktopSnapshot = {
     coveredCount: 2,
   },
   needsOnboarding: false,
+  onboardingCompleted: false,
   settings: {
     launchAtLogin: true,
     showMenuBar: true,
@@ -1263,6 +1265,8 @@ export default function App() {
     return promise;
   }
 
+  const effectiveOnboardingCompleted = isTauriRuntime() ? snapshot.onboardingCompleted : onboardingCompleted;
+
   async function checkForAppUpdate(options: AppUpdateCheckOptions = {}) {
     if (updateOperationRef.current) {
       return updateOperationRef.current;
@@ -1546,7 +1550,7 @@ export default function App() {
       return;
     }
 
-    if (routeShouldShowOnboarding(route, snapshot, onboardingCompleted)) {
+    if (routeShouldShowOnboarding(route, snapshot, effectiveOnboardingCompleted)) {
       setOnboardingInitialStep(1);
       setShowOnboarding(true);
       return;
@@ -1559,7 +1563,7 @@ export default function App() {
     setShowOnboarding(false);
   }, [
     route,
-    onboardingCompleted,
+    effectiveOnboardingCompleted,
     snapshot.connection.status,
     snapshot.mount.status,
     snapshot.needsOnboarding,
@@ -1622,7 +1626,7 @@ export default function App() {
   }
 
   const shouldRenderOnboarding =
-    showOnboarding || (snapshotLoaded && routeShouldShowOnboarding(route, snapshot, onboardingCompleted));
+    showOnboarding || (snapshotLoaded && routeShouldShowOnboarding(route, snapshot, effectiveOnboardingCompleted));
 
   if (shouldRenderOnboarding) {
     return (
@@ -1634,7 +1638,16 @@ export default function App() {
         onComplete={() => {
           writeOnboardingCompleted();
           setOnboardingCompleted(true);
-          void refreshSnapshot().catch(() => undefined);
+          if (isTauriRuntime()) {
+            void callCommand<ActionReport>("complete_onboarding", undefined, {
+              ok: true,
+              message: "Onboarding marked complete.",
+            })
+              .then(() => refreshSnapshot())
+              .catch(() => undefined);
+          } else {
+            void refreshSnapshot().catch(() => undefined);
+          }
           if (window.location.hash !== "#app") {
             window.history.replaceState(null, "", "#app");
             setRoute("#app");
