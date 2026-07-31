@@ -6,7 +6,8 @@ use locality_protocol::freshness_delivery::{
 use locality_protocol::freshness_delivery_transport::GenerationTransportCapabilities;
 use locality_store::{
     GenerationApplyJournalRecord, GenerationApplyOutcome, GenerationApplyStatus,
-    GenerationDeliveryRepository, GenerationInodeEvidenceRecord, GenerationPathRecord,
+    GenerationDeliveryRepository, GenerationInodeEvidenceConflictUpdate,
+    GenerationInodeEvidenceRecord, GenerationInodeEvidenceResolution, GenerationPathRecord,
     ObservedGenerationRecord, PreparedGenerationApply, PreparedGenerationApplyV2,
     PreparedGenerationApplyV3, StoreError, StoreResult,
 };
@@ -88,8 +89,16 @@ impl GenerationDeliveryRepository for LegacyGenerationRepository {
         &mut self,
         _delta_id: &str,
         _entry_index: u64,
-        _local_sha256: &str,
-        _updated_at: &str,
+        _update: GenerationInodeEvidenceConflictUpdate,
+    ) -> StoreResult<()> {
+        unimplemented!()
+    }
+
+    fn mark_generation_inode_evidence_resolved(
+        &mut self,
+        _delta_id: &str,
+        _entry_index: u64,
+        _resolution: GenerationInodeEvidenceResolution,
     ) -> StoreResult<()> {
         unimplemented!()
     }
