@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 use std::mem::{offset_of, size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
@@ -25,11 +25,12 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_RENAME_INFO, FILE_SHARE_DELETE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
     FileAttributeTagInfo, FileBasicInfo, FileDispositionInfoEx, FileIdInfo, FileRenameInfo,
-    FlushFileBuffers, GetFileInformationByHandleEx, SYNCHRONIZE, SetFileInformationByHandle,
+    FlushFileBuffers, GetFileInformationByHandleEx, LOCKFILE_EXCLUSIVE_LOCK, LockFileEx,
+    SYNCHRONIZE, SetFileInformationByHandle,
 };
-use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+use windows_sys::Win32::System::IO::{IO_STATUS_BLOCK, OVERLAPPED};
 
-use crate::replica_materializer::WorkspaceGenerationIdentity;
+use crate::replica_materializer::{WorkspaceGenerationFileBinding, WorkspaceGenerationIdentity};
 
 const DIRECTORY_ACCESS: u32 = FILE_LIST_DIRECTORY
     | FILE_TRAVERSE
@@ -125,6 +126,18 @@ impl WindowsDirectory {
         Ok(File::from(handle))
     }
 
+    pub(crate) fn open_or_create_file(&self, name: &OsStr) -> io::Result<File> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            FILE_ACCESS,
+            FILE_OPEN_IF,
+            FILE_NON_DIRECTORY_FILE,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(File::from(handle))
+    }
+
     fn open_file_handle(&self, name: &OsStr) -> io::Result<OwnedHandle> {
         let handle = nt_open_relative(
             &self.handle,
@@ -137,22 +150,89 @@ impl WindowsDirectory {
         Ok(handle)
     }
 
-    pub(crate) fn file_identity(&self, name: &OsStr) -> io::Result<WorkspaceGenerationIdentity> {
-        handle_identity(&self.open_file_handle(name)?)
+    pub(crate) fn file_binding(
+        &self,
+        name: &OsStr,
+        max_content_bytes: usize,
+    ) -> io::Result<WorkspaceGenerationFileBinding> {
+        let handle = self.open_file_handle(name)?;
+        let identity = handle_identity(&handle)?;
+        let mut content = Vec::new();
+        File::from(handle)
+            .take(max_content_bytes.saturating_add(1) as u64)
+            .read_to_end(&mut content)?;
+        if content.len() > max_content_bytes {
+            return Err(io::Error::other(
+                "workspace ownership marker exceeds its content bound",
+            ));
+        }
+        Ok(WorkspaceGenerationFileBinding { identity, content })
     }
 
-    pub(crate) fn remove_contents(&self, named_path: &Path) -> io::Result<()> {
+    pub(crate) fn preflight_contents(
+        &self,
+        named_path: &Path,
+        expected_device: u64,
+    ) -> io::Result<()> {
+        for entry in std::fs::read_dir(named_path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            match self.open_directory(&name) {
+                Ok(child) => {
+                    let identity = child.identity()?;
+                    if identity.device != expected_device {
+                        return Err(io::Error::other(
+                            "workspace cleanup refuses to cross a volume boundary",
+                        ));
+                    }
+                    child.preflight_contents(&entry.path(), expected_device)?;
+                }
+                Err(directory_error) => match self.open_file_handle(&name) {
+                    Ok(file) => {
+                        if handle_identity(&file)?.device != expected_device {
+                            return Err(io::Error::other(
+                                "workspace cleanup refuses to cross a volume boundary",
+                            ));
+                        }
+                    }
+                    Err(file_error)
+                        if directory_error.kind() == io::ErrorKind::NotFound
+                            && file_error.kind() == io::ErrorKind::NotFound => {}
+                    Err(file_error) => return Err(file_error),
+                },
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove_contents(
+        &self,
+        named_path: &Path,
+        expected_device: u64,
+    ) -> io::Result<()> {
         self.clear_read_only()?;
         for entry in std::fs::read_dir(named_path)? {
             let entry = entry?;
             let name = entry.file_name();
             match self.open_directory(&name) {
                 Ok(child) => {
-                    child.remove_contents(&entry.path())?;
+                    if child.identity()?.device != expected_device {
+                        return Err(io::Error::other(
+                            "workspace cleanup refuses to cross a volume boundary",
+                        ));
+                    }
+                    child.remove_contents(&entry.path(), expected_device)?;
                     child.mark_delete()?;
                 }
                 Err(directory_error) => match self.open_file_handle(&name) {
-                    Ok(file) => mark_handle_delete(&file)?,
+                    Ok(file) => {
+                        if handle_identity(&file)?.device != expected_device {
+                            return Err(io::Error::other(
+                                "workspace cleanup refuses to cross a volume boundary",
+                            ));
+                        }
+                        mark_handle_delete(&file)?;
+                    }
                     Err(file_error)
                         if directory_error.kind() == io::ErrorKind::NotFound
                             && file_error.kind() == io::ErrorKind::NotFound => {}
@@ -235,6 +315,26 @@ impl WindowsDirectory {
         }
         Ok(())
     }
+}
+
+pub(crate) fn lock_file_exclusive(file: &File) -> io::Result<()> {
+    let mut overlapped = OVERLAPPED::default();
+    // SAFETY: the file handle and overlapped structure are valid for this
+    // synchronous lock acquisition. Closing the retained file releases it.
+    if unsafe {
+        LockFileEx(
+            file.as_raw_handle().cast(),
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn set_handle_read_only(handle: &OwnedHandle, read_only: bool) -> io::Result<()> {

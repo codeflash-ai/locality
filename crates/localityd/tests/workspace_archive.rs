@@ -3,6 +3,8 @@ use std::fs;
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use locality_core::model::RemoteId;
 use locality_core::portable::{
@@ -33,6 +35,7 @@ use localityd::workspace_materializer::{
     WorkspacePublicationHooks, load_workspace_publication_receipt,
     materialize_workspace_archive_durable as materialize_workspace_archive_durable_secure,
     publish_staged_workspace_with_hooks as publish_staged_workspace_with_hooks_secure,
+    recover_and_verify_workspace_publication_state,
     recover_workspace_publication as recover_workspace_publication_secure, stage_workspace_archive,
 };
 use serde::Deserialize;
@@ -672,7 +675,7 @@ fn staged_identity_and_zstd_archives_publish_complete_read_only_roots() {
             b"Public\n"
         );
         assert!(directory.root().join("Engineering").is_dir());
-        directory.assert_only(&["Locality"]);
+        directory.assert_only(&[".locality-Locality.publication.lock", "Locality"]);
         assert_read_only(&directory.root());
         assert_read_only(&directory.root().join("Sales/README.md"));
     }
@@ -818,6 +821,43 @@ impl WorkspacePublicationHooks for FailAt {
     }
 }
 
+struct PauseAtJournal {
+    reached: mpsc::Sender<()>,
+    resume: mpsc::Receiver<()>,
+}
+
+struct ForgeMarkerAt {
+    checkpoint: WorkspacePublicationCheckpoint,
+    generation: PathBuf,
+}
+
+impl WorkspacePublicationHooks for ForgeMarkerAt {
+    fn checkpoint(&mut self, checkpoint: WorkspacePublicationCheckpoint) -> io::Result<()> {
+        if checkpoint == self.checkpoint {
+            make_removable(&self.generation);
+            fs::write(
+                self.generation.join(".locality-ownership-v4"),
+                [0x91_u8; 32],
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl WorkspacePublicationHooks for PauseAtJournal {
+    fn checkpoint(&mut self, checkpoint: WorkspacePublicationCheckpoint) -> io::Result<()> {
+        if checkpoint == WorkspacePublicationCheckpoint::JournalDurable {
+            self.reached
+                .send(())
+                .map_err(|_| io::Error::other("journal pause observer disappeared"))?;
+            self.resume
+                .recv()
+                .map_err(|_| io::Error::other("journal pause was not resumed"))?;
+        }
+        Ok(())
+    }
+}
+
 struct SubstituteAt {
     checkpoint: WorkspacePublicationCheckpoint,
     path: PathBuf,
@@ -863,10 +903,17 @@ fn durable_entry_point_persists_receipt_for_loc_and_desktop_callers() {
 
     assert_eq!(receipt.terminal_control, contract.control);
     assert_eq!(receipt.decoded_bytes, published.decoded_bytes);
-    assert_eq!(receipt.version, 3);
+    assert_eq!(receipt.version, 4);
     let receipt_json = serde_json::to_value(&receipt).expect("serialize receipt");
     assert!(receipt_json["generation_identity"]["inode"].is_u64());
     assert!(receipt_json["ownership_marker_identity"]["inode"].is_u64());
+    assert_eq!(
+        receipt_json["ownership_marker_nonce"]
+            .as_str()
+            .expect("marker nonce")
+            .len(),
+        64
+    );
     assert!(receipt_json["ownership_tag"].as_str().is_some());
     assert!(
         !directory
@@ -874,6 +921,75 @@ fn durable_entry_point_persists_receipt_for_loc_and_desktop_callers() {
             .join(".locality-Locality.publication.json")
             .exists()
     );
+}
+
+#[test]
+fn concurrent_publication_waits_for_the_exclusive_publication_lock() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("concurrent-publication-lock");
+    let root = directory.root();
+    let staged = stage_workspace_archive(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &root,
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("stage publication");
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let publisher_root = root.clone();
+    let publisher = std::thread::spawn(move || {
+        let mut pause = PauseAtJournal {
+            reached: reached_tx,
+            resume: resume_rx,
+        };
+        publish_staged_workspace_with_hooks_secure(
+            staged,
+            &publisher_root,
+            &test_ownership(),
+            &mut pause,
+        )
+    });
+    reached_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("publisher reached durable journal while holding lock");
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let (verified_tx, verified_rx) = mpsc::channel();
+    let verifier_root = root.clone();
+    let verifier = std::thread::spawn(move || {
+        started_tx.send(()).expect("announce verifier");
+        let result =
+            recover_and_verify_workspace_publication_state(&verifier_root, &test_ownership());
+        verified_tx.send(result).expect("report verifier result");
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("verifier started");
+    assert!(
+        verified_rx
+            .recv_timeout(Duration::from_millis(200))
+            .is_err(),
+        "concurrent verifier must wait for the publication lock"
+    );
+
+    resume_tx.send(()).expect("resume publication");
+    publisher
+        .join()
+        .expect("publisher thread")
+        .expect("publish under lock");
+    assert!(
+        verified_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("verifier completed after lock release")
+            .expect("verify published workspace")
+    );
+    verifier.join().expect("verifier thread");
 }
 
 #[test]
@@ -911,7 +1027,7 @@ fn stale_receipt_cannot_authorize_exchange_after_root_rename() {
     )
     .expect_err("stale sibling receipt must not authorize exchange");
 
-    assert!(error.to_string().contains(".locality-ownership-v3"));
+    assert!(error.to_string().contains(".locality-ownership-v4"));
     assert_eq!(
         fs::read(directory.root().join("unrelated.txt")).expect("replacement survives"),
         b"must survive\n"
@@ -953,7 +1069,7 @@ fn stale_receipt_cannot_authorize_exchange_after_root_delete_and_recreate() {
     )
     .expect_err("receipt for deleted generation must not authorize exchange");
 
-    assert!(error.to_string().contains(".locality-ownership-v3"));
+    assert!(error.to_string().contains(".locality-ownership-v4"));
     assert_eq!(
         fs::read(directory.root().join("unrelated.txt")).expect("replacement survives"),
         b"must survive\n"
@@ -1005,6 +1121,148 @@ fn forged_matching_receipt_cannot_authorize_exchange_or_cleanup() {
     assert!(error.to_string().contains("authenticated"));
     assert_eq!(
         fs::read(directory.root().join("Sales/README.md")).expect("old root survives"),
+        b"Public\n"
+    );
+}
+
+#[test]
+fn forged_marker_content_with_same_file_id_cannot_authorize_cleanup() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("forged-marker-content");
+    materialize_workspace_archive_durable(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("publish nonce-bound receipt");
+    make_removable(&directory.root());
+    let marker_path = directory.root().join(".locality-ownership-v4");
+    #[cfg(unix)]
+    let marker_inode = {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(&marker_path).expect("marker metadata").ino()
+    };
+    fs::write(&marker_path, [0x44_u8; 32]).expect("replace marker contents in place");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            fs::metadata(&marker_path)
+                .expect("forged marker metadata")
+                .ino(),
+            marker_inode,
+            "content forgery retains the marker inode"
+        );
+    }
+
+    let error = materialize_workspace_archive_durable(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect_err("forged marker content must not authorize refresh or cleanup");
+
+    assert!(error.to_string().contains("authenticated"));
+    assert_eq!(
+        fs::read(directory.root().join("Sales/README.md")).expect("owned root survives"),
+        b"Public\n"
+    );
+}
+
+#[test]
+fn marker_forged_after_journal_is_rejected_immediately_before_exchange() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("forged-marker-before-exchange");
+    materialize_workspace_archive_durable(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("publish old generation");
+    let staged = stage_workspace_archive(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("stage replacement");
+    let staging_path = staged.staging_path().to_path_buf();
+    let mut forge = ForgeMarkerAt {
+        checkpoint: WorkspacePublicationCheckpoint::JournalDurable,
+        generation: staging_path,
+    };
+
+    let error = publish_staged_workspace_with_hooks(staged, &directory.root(), &mut forge)
+        .expect_err("forged staged marker must stop exchange");
+
+    assert!(error.to_string().contains("authenticated"));
+    assert_eq!(
+        fs::read(directory.root().join("Sales/README.md")).expect("old root survives"),
+        b"Public\n"
+    );
+}
+
+#[test]
+fn marker_forged_after_exchange_is_rejected_before_cleanup() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("forged-marker-before-cleanup");
+    materialize_workspace_archive_durable(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("publish old generation");
+    let staged = stage_workspace_archive(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("stage replacement");
+    let old_generation = staged.staging_path().to_path_buf();
+    let mut forge = ForgeMarkerAt {
+        checkpoint: WorkspacePublicationCheckpoint::ReceiptDurable,
+        generation: old_generation.clone(),
+    };
+
+    let error = publish_staged_workspace_with_hooks(staged, &directory.root(), &mut forge)
+        .expect_err("forged old marker must stop cleanup");
+
+    assert!(error.to_string().contains("authenticated"));
+    assert!(old_generation.exists(), "old generation is retained");
+    assert_eq!(
+        fs::read(old_generation.join("Sales/README.md")).expect("old generation survives"),
         b"Public\n"
     );
 }

@@ -876,9 +876,12 @@ The managed-cell contract is:
   the tar response completes. A truncated response is discarded and restarted;
   resumable cursors are added only if measurements justify them. Local refresh
   receipts and crash journals are HMAC-authenticated with a capability derived
-  from the Workspace Profile key and bind both the root and a materializer-made
-  marker identity; writable sibling JSON or a reused directory inode is not
-  ownership authority; and
+  from the Workspace Profile key and bind the root plus a cryptographically
+  random materializer marker's exact content and filesystem identity; writable
+  sibling JSON, a forged marker, or a reused inode/file ID is not ownership
+  authority. Publication and recovery hold an exclusive sibling lock, and
+  cleanup preflights the complete generation without crossing filesystem,
+  mount, volume, or reparse boundaries; and
 - destroy plaintext task volumes with the sandbox. `grep` requires plaintext
   local files, so the sandbox filesystem and process boundary remain part of the
   trusted execution environment.
