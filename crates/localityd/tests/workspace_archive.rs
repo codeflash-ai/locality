@@ -958,6 +958,15 @@ fn concurrent_publication_waits_for_the_exclusive_publication_lock() {
     reached_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("publisher reached durable journal while holding lock");
+    #[cfg(windows)]
+    assert!(
+        fs::rename(
+            directory.0.join(".locality-Locality.publication.lock"),
+            directory.0.join("replaced-publication.lock"),
+        )
+        .is_err(),
+        "Windows lock object must deny rename/delete sharing while held"
+    );
 
     let (started_tx, started_rx) = mpsc::channel();
     let (verified_tx, verified_rx) = mpsc::channel();
@@ -990,6 +999,30 @@ fn concurrent_publication_waits_for_the_exclusive_publication_lock() {
             .expect("verify published workspace")
     );
     verifier.join().expect("verifier thread");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_verifies_the_sealed_marker_through_read_only_handles() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("windows-read-only-marker");
+    materialize_workspace_archive_durable(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("publish read-only workspace");
+    assert_read_only(&directory.root().join(".locality-ownership-v4"));
+    assert!(
+        recover_and_verify_workspace_publication_state(&directory.root(), &test_ownership())
+            .expect("verify read-only marker without create/delete access")
+    );
 }
 
 #[test]
@@ -1268,7 +1301,7 @@ fn marker_forged_after_exchange_is_rejected_before_cleanup() {
 }
 
 #[test]
-fn receipt_cannot_be_reused_with_another_profile_capability() {
+fn reissued_same_profile_secret_recovers_but_rotated_key_fails_closed() {
     let fixture = fixture();
     let contract = contract(&fixture);
     let directory = TestDirectory::new("receipt-capability-reuse");
@@ -1301,6 +1334,13 @@ fn receipt_cannot_be_reused_with_another_profile_capability() {
     assert_eq!(
         fs::read(directory.root().join("Sales/README.md")).expect("owned root survives"),
         b"Public\n"
+    );
+    assert!(
+        recover_and_verify_workspace_publication_state(
+            &directory.root(),
+            &WorkspaceOwnershipCapability::new([0x5a; 32]),
+        )
+        .expect("a reissued key with the same profile secret recovers ownership")
     );
 }
 

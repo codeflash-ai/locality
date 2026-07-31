@@ -881,10 +881,24 @@ The managed-cell contract is:
   sibling JSON, a forged marker, or a reused inode/file ID is not ownership
   authority. Publication and recovery hold an exclusive sibling lock, and
   cleanup preflights the complete generation without crossing filesystem,
-  mount, volume, or reparse boundaries; and
+  mount, volume, or reparse boundaries. Linux cleanup performs every directory
+  descent with descriptor-relative `openat2(RESOLVE_BENEATH | RESOLVE_NO_XDEV |
+  RESOLVE_NO_SYMLINKS)`, including best-effort staging cleanup. Unix retains an
+  exclusive lock on the anchored parent descriptor for the operation; Windows
+  denies delete sharing on the lock object and reads the sealed marker through
+  a read-only no-follow handle; and
 - destroy plaintext task volumes with the sandbox. `grep` requires plaintext
   local files, so the sandbox filesystem and process boundary remain part of the
   trusted execution environment.
+
+Local ownership continuity follows the Workspace Profile secret, not a display
+identifier or profile revision. Reissuing the exact same profile key preserves
+the ownership capability and can recover or refresh its existing replica. A
+rotated key with a new secret intentionally fails closed: it cannot adopt,
+clean, or re-sign the old replica. The operator must either materialize to a new
+destination, or explicitly decommission the old root and its sibling receipt,
+journal, and lock after independently confirming that the old replica is no
+longer needed. There is no automatic ownership-transfer path.
 
 An employee with only object-store console access cannot read PostgreSQL rows.
 An employee or service with sufficiently privileged database `SELECT` access can

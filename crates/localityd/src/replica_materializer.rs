@@ -23,6 +23,8 @@ use rustix::fd::{AsFd, OwnedFd};
     any(target_vendor = "apple", target_os = "linux", target_os = "android")
 ))]
 use rustix::fs::RenameFlags;
+#[cfg(target_os = "linux")]
+use rustix::fs::ResolveFlags;
 #[cfg(unix)]
 use rustix::fs::{AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, Stat};
 
@@ -69,6 +71,8 @@ pub(crate) struct WorkspaceGenerationFileBinding {
 pub(crate) struct WorkspacePublicationLock {
     #[cfg(unix)]
     _file: OwnedFd,
+    #[cfg(unix)]
+    _parent: OwnedFd,
     #[cfg(windows)]
     _file: fs::File,
 }
@@ -103,6 +107,13 @@ pub(crate) fn acquire_workspace_publication_lock(
                 "workspace publication lock parent changed while opening",
             ));
         }
+        rustix::fs::flock(&parent, FlockOperation::LockExclusive)?;
+        let named_parent = rustix::fs::stat(parent_path)?;
+        if !same_file_identity(&opened_parent, &named_parent) {
+            return Err(io::Error::other(
+                "workspace publication lock parent changed while locking",
+            ));
+        }
         let file = rustix::fs::openat(
             &parent,
             lock_name,
@@ -124,12 +135,15 @@ pub(crate) fn acquire_workspace_publication_lock(
                 "workspace publication lock changed while acquiring",
             ));
         }
-        Ok(WorkspacePublicationLock { _file: file })
+        Ok(WorkspacePublicationLock {
+            _file: file,
+            _parent: parent,
+        })
     }
     #[cfg(windows)]
     {
         let parent = WindowsDirectory::open_absolute(parent_path)?;
-        let file = parent.open_or_create_file(OsStr::new(lock_name))?;
+        let file = parent.open_or_create_lock_file(OsStr::new(lock_name))?;
         lock_windows_file_exclusive(&file)?;
         Ok(WorkspacePublicationLock { _file: file })
     }
@@ -1381,6 +1395,29 @@ fn open_directory_at<Fd: AsFd, P: rustix::path::Arg>(
     .map_err(Into::into)
 }
 
+#[cfg(target_os = "linux")]
+fn open_cleanup_directory_at<Fd: AsFd, P: rustix::path::Arg>(
+    directory: Fd,
+    path: P,
+) -> io::Result<OwnedFd> {
+    rustix::fs::openat2(
+        directory,
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_XDEV | ResolveFlags::NO_SYMLINKS | ResolveFlags::BENEATH,
+    )
+    .map_err(Into::into)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn open_cleanup_directory_at<Fd: AsFd, P: rustix::path::Arg>(
+    directory: Fd,
+    path: P,
+) -> io::Result<OwnedFd> {
+    open_directory_at(directory, path)
+}
+
 #[cfg(unix)]
 fn preflight_directory_contents(directory: &OwnedFd, expected_device: u64) -> io::Result<()> {
     let entries = Dir::read_from(directory)?;
@@ -1401,7 +1438,7 @@ fn preflight_directory_contents(directory: &OwnedFd, expected_device: u64) -> io
             ));
         }
         if FileType::from_raw_mode(metadata.st_mode) == FileType::Directory {
-            let child = open_directory_at(directory, name)?;
+            let child = open_cleanup_directory_at(directory, name)?;
             let opened = rustix::fs::fstat(&child)?;
             if !same_file_identity(&metadata, &opened) {
                 return Err(io::Error::other(
@@ -1436,7 +1473,7 @@ fn remove_directory_contents(directory: &OwnedFd, expected_device: u64) -> io::R
             ));
         }
         if FileType::from_raw_mode(metadata.st_mode) == FileType::Directory
-            && let Ok(child) = open_directory_at(directory, name)
+            && let Ok(child) = open_cleanup_directory_at(directory, name)
         {
             let opened = rustix::fs::fstat(&child)?;
             if !same_file_identity(&metadata, &opened)
@@ -1696,7 +1733,7 @@ pub(crate) fn workspace_generation_file_binding(
     name: &str,
     max_content_bytes: usize,
 ) -> io::Result<WorkspaceGenerationFileBinding> {
-    let root = WindowsDirectory::open_absolute(root)?;
+    let root = WindowsDirectory::open_absolute_read_only(root)?;
     root.file_binding(OsStr::new(name), max_content_bytes)
 }
 
@@ -1739,8 +1776,8 @@ pub(crate) fn workspace_generation_identity_if_exists(
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::other("workspace generation has no file name"))?;
-    let parent = WindowsDirectory::open_absolute(parent_path)?;
-    match parent.open_directory(name) {
+    let parent = WindowsDirectory::open_absolute_read_only(parent_path)?;
+    match parent.open_directory_read_only(name) {
         Ok(directory) => directory.identity().map(Some),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
@@ -1977,12 +2014,7 @@ pub(crate) fn remove_workspace_generation(
         if anchored_name != name {
             return Err(io::Error::other("workspace cleanup name changed"));
         }
-        let root = rustix::fs::openat(
-            &parent,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
+        let root = open_cleanup_directory_at(&parent, name)?;
         let opened = rustix::fs::fstat(&root)?;
         if !stat_matches_workspace_identity(&opened, expected)
             || !named_entry_matches(&parent, name, &opened).unwrap_or(false)
@@ -2981,6 +3013,21 @@ mod linux_cleanup_tests {
             !mountinfo_has_workspace_mount(Path::new("/tmp/other"), mountinfo)
                 .expect("parse unrelated mountinfo")
         );
+    }
+
+    #[test]
+    fn cleanup_open_refuses_to_cross_the_proc_mount() {
+        if !Path::new("/proc/self/mountinfo").exists() {
+            return;
+        }
+        let root = rustix::fs::open(
+            "/",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open filesystem root");
+        open_cleanup_directory_at(&root, "proc")
+            .expect_err("RESOLVE_NO_XDEV must reject the proc mount");
     }
 }
 

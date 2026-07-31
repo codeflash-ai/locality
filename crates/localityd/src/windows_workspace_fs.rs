@@ -40,13 +40,17 @@ const DIRECTORY_ACCESS: u32 = FILE_LIST_DIRECTORY
     | FILE_ADD_SUBDIRECTORY
     | DELETE
     | SYNCHRONIZE;
-const FILE_ACCESS: u32 = FILE_READ_DATA
+const READ_DIRECTORY_ACCESS: u32 =
+    FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+const MUTABLE_FILE_ACCESS: u32 = FILE_READ_DATA
     | FILE_WRITE_DATA
     | FILE_READ_ATTRIBUTES
     | FILE_WRITE_ATTRIBUTES
     | DELETE
     | SYNCHRONIZE;
+const READ_FILE_ACCESS: u32 = FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const SHARING: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+const LOCK_SHARING: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
 
 pub(crate) struct WindowsDirectory {
     handle: OwnedHandle,
@@ -68,6 +72,20 @@ impl WindowsDirectory {
         Ok(Self { handle })
     }
 
+    pub(crate) fn open_absolute_read_only(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .share_mode(SHARING)
+            .custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS
+                    | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+            .open(path)?;
+        let handle: OwnedHandle = file.into();
+        reject_reparse(&handle)?;
+        Ok(Self { handle })
+    }
+
     pub(crate) fn create_directory(&self, name: &OsStr) -> io::Result<Self> {
         let handle = nt_open_relative(
             &self.handle,
@@ -75,6 +93,7 @@ impl WindowsDirectory {
             DIRECTORY_ACCESS,
             FILE_CREATE,
             FILE_DIRECTORY_FILE,
+            SHARING,
         )?;
         reject_reparse(&handle)?;
         Ok(Self { handle })
@@ -87,6 +106,20 @@ impl WindowsDirectory {
             DIRECTORY_ACCESS,
             FILE_OPEN,
             FILE_DIRECTORY_FILE,
+            SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(Self { handle })
+    }
+
+    pub(crate) fn open_directory_read_only(&self, name: &OsStr) -> io::Result<Self> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            READ_DIRECTORY_ACCESS,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE,
+            SHARING,
         )?;
         reject_reparse(&handle)?;
         Ok(Self { handle })
@@ -102,6 +135,7 @@ impl WindowsDirectory {
                     DIRECTORY_ACCESS,
                     FILE_OPEN_IF,
                     FILE_DIRECTORY_FILE,
+                    SHARING,
                 ) {
                     Ok(handle) => {
                         reject_reparse(&handle)?;
@@ -118,21 +152,23 @@ impl WindowsDirectory {
         let handle = nt_open_relative(
             &self.handle,
             name,
-            FILE_ACCESS,
+            MUTABLE_FILE_ACCESS,
             FILE_CREATE,
             FILE_NON_DIRECTORY_FILE,
+            SHARING,
         )?;
         reject_reparse(&handle)?;
         Ok(File::from(handle))
     }
 
-    pub(crate) fn open_or_create_file(&self, name: &OsStr) -> io::Result<File> {
+    pub(crate) fn open_or_create_lock_file(&self, name: &OsStr) -> io::Result<File> {
         let handle = nt_open_relative(
             &self.handle,
             name,
-            FILE_ACCESS,
+            MUTABLE_FILE_ACCESS,
             FILE_OPEN_IF,
             FILE_NON_DIRECTORY_FILE,
+            LOCK_SHARING,
         )?;
         reject_reparse(&handle)?;
         Ok(File::from(handle))
@@ -142,9 +178,23 @@ impl WindowsDirectory {
         let handle = nt_open_relative(
             &self.handle,
             name,
-            FILE_ACCESS,
+            MUTABLE_FILE_ACCESS,
             FILE_OPEN,
             FILE_NON_DIRECTORY_FILE,
+            SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(handle)
+    }
+
+    fn open_file_read_handle(&self, name: &OsStr) -> io::Result<OwnedHandle> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            READ_FILE_ACCESS,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE,
+            SHARING,
         )?;
         reject_reparse(&handle)?;
         Ok(handle)
@@ -155,7 +205,7 @@ impl WindowsDirectory {
         name: &OsStr,
         max_content_bytes: usize,
     ) -> io::Result<WorkspaceGenerationFileBinding> {
-        let handle = self.open_file_handle(name)?;
+        let handle = self.open_file_read_handle(name)?;
         let identity = handle_identity(&handle)?;
         let mut content = Vec::new();
         File::from(handle)
@@ -187,7 +237,7 @@ impl WindowsDirectory {
                     }
                     child.preflight_contents(&entry.path(), expected_device)?;
                 }
-                Err(directory_error) => match self.open_file_handle(&name) {
+                Err(directory_error) => match self.open_file_read_handle(&name) {
                     Ok(file) => {
                         if handle_identity(&file)?.device != expected_device {
                             return Err(io::Error::other(
@@ -418,6 +468,7 @@ fn nt_open_relative(
     access: u32,
     disposition: u32,
     kind: u32,
+    sharing: u32,
 ) -> io::Result<OwnedHandle> {
     let mut name = wide_name(name)?;
     let length = name
@@ -450,7 +501,7 @@ fn nt_open_relative(
             &mut status_block,
             ptr::null(),
             FILE_ATTRIBUTE_NORMAL,
-            SHARING,
+            sharing,
             disposition,
             kind | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
             ptr::null(),
