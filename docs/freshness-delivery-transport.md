@@ -23,8 +23,10 @@ request. The authenticated response may select only a subset with limits no
 larger than the offer. The three V1 capabilities are bounded content body
 windows, idempotent terminal receipt acknowledgments, and device-scoped
 generation pin leases. Local sync validates the selected set immediately after
-the poll returns and before journal, filesystem, or observed-generation state
-can change. That immutable validated selection controls the complete apply.
+the poll returns and before the returned delivery can cause journal,
+filesystem, or observed-generation mutations. Startup recovery and
+reconciliation still run before polling. The immutable validated selection
+controls the complete returned-delivery apply.
 
 An existing adapter can continue implementing the original
 `GenerationDeliveryTransport` trait and `GenerationDeliveryRequest` without
@@ -83,7 +85,9 @@ most 32 active leases per device. Responses report the effective duration,
 trusted issue/server time, expiry, active count, and maximum count. The expiry
 must equal issue time plus the stated duration, and validation at authenticated
 server time rejects already-expired or not-yet-issued leases. Retry advice is
-capped at one hour.
+capped at one hour. Acquire and renewal validation also requires the exact
+selected pin capability and rejects durations, device quotas, or fallback
+policies outside that negotiated selection.
 
 Fallback is explicit:
 

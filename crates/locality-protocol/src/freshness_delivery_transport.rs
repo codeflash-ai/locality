@@ -732,8 +732,9 @@ impl GenerationPinLeaseAcquireResponse {
     pub fn validate_against(
         &self,
         request: &GenerationPinLeaseAcquireRequest,
+        selected_capability: &GenerationPinLeaseCapability,
     ) -> Result<(), GenerationTransportContractError> {
-        request.validate()?;
+        validate_pin_acquire_request_against_capability(request, selected_capability)?;
         match self {
             Self::Granted {
                 format_version,
@@ -760,6 +761,12 @@ impl GenerationPinLeaseAcquireResponse {
                     || lease.device_scope_id != request.device_scope_id
                     || lease.source_connection_id != request.source_connection_id
                     || lease.lease_seconds > request.requested_lease_seconds
+                    || lease.lease_seconds < selected_capability.min_lease_seconds
+                    || lease.lease_seconds > selected_capability.max_lease_seconds
+                    || lease.max_active_leases_per_device
+                        > selected_capability.max_active_leases_per_device
+                    || lease.active_leases_for_device
+                        > selected_capability.max_active_leases_per_device
                     || (*fallback_applied
                         && (request.fallback_policy
                             != GenerationPinFallbackPolicy::UseLatestRetained
@@ -887,8 +894,9 @@ impl GenerationPinLeaseRenewal {
     pub fn validate_against(
         &self,
         request: &GenerationPinLeaseRenewRequest,
+        selected_capability: &GenerationPinLeaseCapability,
     ) -> Result<(), GenerationTransportContractError> {
-        request.validate()?;
+        validate_pin_renew_request_against_capability(request, selected_capability)?;
         validate_versions(self.format_version, self.minimum_reader_version)?;
         validate_opaque(
             "operation_id",
@@ -904,6 +912,12 @@ impl GenerationPinLeaseRenewal {
             || self.lease.source_connection_id != request.source_connection_id
             || self.lease.generation_id != request.generation_id
             || self.lease.lease_seconds > request.requested_lease_seconds
+            || self.lease.lease_seconds < selected_capability.min_lease_seconds
+            || self.lease.lease_seconds > selected_capability.max_lease_seconds
+            || self.lease.max_active_leases_per_device
+                > selected_capability.max_active_leases_per_device
+            || self.lease.active_leases_for_device
+                > selected_capability.max_active_leases_per_device
         {
             return Err(GenerationTransportContractError::PinLeaseMismatch);
         }
@@ -1309,6 +1323,37 @@ fn validate_pin_capability(
             return Err(GenerationTransportContractError::InvalidPinCapability);
         }
         previous = Some(policy);
+    }
+    Ok(())
+}
+
+fn validate_pin_acquire_request_against_capability(
+    request: &GenerationPinLeaseAcquireRequest,
+    capability: &GenerationPinLeaseCapability,
+) -> Result<(), GenerationTransportContractError> {
+    request.validate()?;
+    validate_pin_capability(capability)?;
+    if !(capability.min_lease_seconds..=capability.max_lease_seconds)
+        .contains(&request.requested_lease_seconds)
+        || !capability
+            .fallback_policies
+            .contains(&request.fallback_policy)
+    {
+        return Err(GenerationTransportContractError::PinLeaseMismatch);
+    }
+    Ok(())
+}
+
+fn validate_pin_renew_request_against_capability(
+    request: &GenerationPinLeaseRenewRequest,
+    capability: &GenerationPinLeaseCapability,
+) -> Result<(), GenerationTransportContractError> {
+    request.validate()?;
+    validate_pin_capability(capability)?;
+    if !(capability.min_lease_seconds..=capability.max_lease_seconds)
+        .contains(&request.requested_lease_seconds)
+    {
+        return Err(GenerationTransportContractError::PinLeaseMismatch);
     }
     Ok(())
 }

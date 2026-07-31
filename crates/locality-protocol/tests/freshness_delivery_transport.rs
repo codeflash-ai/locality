@@ -34,6 +34,12 @@ fn capabilities() -> GenerationTransportCapabilities {
         .expect("capabilities fixture")
 }
 
+fn pin_capability() -> GenerationPinLeaseCapability {
+    capabilities()
+        .generation_pin_leases
+        .expect("pin capability fixture")
+}
+
 fn body_request() -> GenerationBodyWindowRequest {
     serde_json::from_slice(GENERATION_BODY_WINDOW_REQUEST_V1_GOLDEN_JSON)
         .expect("body request fixture")
@@ -116,6 +122,7 @@ fn transport_contracts_match_exact_lf_json_goldens() {
 
     let pins: PinLeaseGolden =
         serde_json::from_slice(GENERATION_PIN_LEASE_V1_GOLDEN_JSON).expect("pin fixture");
+    let pin_capability = pin_capability();
     GenerationPinLeaseAcquireRequest::decode_json(
         &serde_json::to_vec(&pins.acquire_request).unwrap(),
     )
@@ -127,16 +134,16 @@ fn transport_contracts_match_exact_lf_json_goldens() {
     )
     .expect("bounded release request");
     pins.acquire_response
-        .validate_against(&pins.acquire_request)
+        .validate_against(&pins.acquire_request, &pin_capability)
         .expect("acquire");
     pins.renewal
-        .validate_against(&pins.renew_request)
+        .validate_against(&pins.renew_request, &pin_capability)
         .expect("renew");
     pins.release
         .validate_against(&pins.release_request)
         .expect("release");
     pins.quota_unavailable
-        .validate_against(&pins.acquire_request)
+        .validate_against(&pins.acquire_request, &pin_capability)
         .expect("quota unavailable");
     assert_eq!(pretty_json(&pins), GENERATION_PIN_LEASE_V1_GOLDEN_JSON);
 }
@@ -360,6 +367,7 @@ fn opaque_and_content_bearing_debug_output_is_redacted() {
 #[test]
 fn pin_leases_enforce_expiry_quota_and_safe_fallback_semantics() {
     let pins: PinLeaseGolden = serde_json::from_slice(GENERATION_PIN_LEASE_V1_GOLDEN_JSON).unwrap();
+    let capability = pin_capability();
     let mut excessive = pins.acquire_request.clone();
     excessive.requested_lease_seconds = MAX_GENERATION_PIN_LEASE_SECONDS + 1;
     assert_eq!(
@@ -381,21 +389,21 @@ fn pin_leases_enforce_expiry_quota_and_safe_fallback_semantics() {
     let mut malformed_expiry = pins.renewal.clone();
     malformed_expiry.lease.expires_at = "2026-02-30T12:00:00Z".to_string();
     assert_eq!(
-        malformed_expiry.validate_against(&pins.renew_request),
+        malformed_expiry.validate_against(&pins.renew_request, &capability),
         Err(GenerationTransportContractError::InvalidTimestamp)
     );
 
     let mut inconsistent_expiry = pins.renewal.clone();
     inconsistent_expiry.lease.expires_at = "2026-07-31T13:04:59Z".to_string();
     assert_eq!(
-        inconsistent_expiry.validate_against(&pins.renew_request),
+        inconsistent_expiry.validate_against(&pins.renew_request, &capability),
         Err(GenerationTransportContractError::InvalidPinLeaseExpiry)
     );
 
     let mut expired = pins.renewal.clone();
     expired.server_time = expired.lease.expires_at.clone();
     assert_eq!(
-        expired.validate_against(&pins.renew_request),
+        expired.validate_against(&pins.renew_request, &capability),
         Err(GenerationTransportContractError::ExpiredPinLease)
     );
 
@@ -405,7 +413,7 @@ fn pin_leases_enforce_expiry_quota_and_safe_fallback_semantics() {
     };
     lease.device_scope_id = "another-device".to_string();
     assert_eq!(
-        wrong_device.validate_against(&pins.acquire_request),
+        wrong_device.validate_against(&pins.acquire_request, &capability),
         Err(GenerationTransportContractError::PinLeaseMismatch)
     );
 
@@ -417,11 +425,13 @@ fn pin_leases_enforce_expiry_quota_and_safe_fallback_semantics() {
         ..pins.acquire_request.clone()
     };
     assert_eq!(
-        pins.acquire_response.validate_against(&crossed_request),
+        pins.acquire_response
+            .validate_against(&crossed_request, &capability),
         Err(GenerationTransportContractError::PinLeaseMismatch)
     );
     assert_eq!(
-        pins.quota_unavailable.validate_against(&crossed_request),
+        pins.quota_unavailable
+            .validate_against(&crossed_request, &capability),
         Err(GenerationTransportContractError::PinLeaseMismatch)
     );
 
@@ -429,7 +439,7 @@ fn pin_leases_enforce_expiry_quota_and_safe_fallback_semantics() {
     renewal_retarget.lease.source_connection_id = SourceConnectionId::new("source-crossed");
     renewal_retarget.lease.generation_id = SourceGenerationId::new("generation-crossed").unwrap();
     assert_eq!(
-        renewal_retarget.validate_against(&pins.renew_request),
+        renewal_retarget.validate_against(&pins.renew_request, &capability),
         Err(GenerationTransportContractError::PinLeaseMismatch)
     );
 
@@ -451,7 +461,7 @@ fn pin_leases_enforce_expiry_quota_and_safe_fallback_semantics() {
     *fallback_policy = GenerationPinFallbackPolicy::UseLatestRetained;
     lease.generation_id = SourceGenerationId::new("generation-0009").unwrap();
     fallback_response
-        .validate_against(&fallback_request)
+        .validate_against(&fallback_request, &capability)
         .expect("newer retained generation remains pinned");
 
     let unsafe_fallback = GenerationPinLeaseAcquireRequest {
@@ -459,7 +469,97 @@ fn pin_leases_enforce_expiry_quota_and_safe_fallback_semantics() {
         ..fallback_request
     };
     assert_eq!(
-        fallback_response.validate_against(&unsafe_fallback),
+        fallback_response.validate_against(&unsafe_fallback, &capability),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+}
+
+#[test]
+fn pin_responses_are_bounded_by_the_exact_selected_capability() {
+    let pins: PinLeaseGolden = serde_json::from_slice(GENERATION_PIN_LEASE_V1_GOLDEN_JSON).unwrap();
+    let capability = pin_capability();
+
+    let duration_selection = GenerationPinLeaseCapability {
+        max_lease_seconds: 600,
+        ..capability.clone()
+    };
+    assert_eq!(
+        pins.acquire_response
+            .validate_against(&pins.acquire_request, &duration_selection),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+    assert_eq!(
+        pins.quota_unavailable
+            .validate_against(&pins.acquire_request, &duration_selection),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+    assert_eq!(
+        pins.renewal
+            .validate_against(&pins.renew_request, &duration_selection),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+
+    let quota_selection = GenerationPinLeaseCapability {
+        max_active_leases_per_device: 4,
+        ..capability.clone()
+    };
+    assert_eq!(
+        pins.acquire_response
+            .validate_against(&pins.acquire_request, &quota_selection),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+    assert_eq!(
+        pins.renewal
+            .validate_against(&pins.renew_request, &quota_selection),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+    let mut active_quota_overflow = pins.acquire_response.clone();
+    let GenerationPinLeaseAcquireResponse::Granted { lease, .. } = &mut active_quota_overflow
+    else {
+        panic!("granted fixture");
+    };
+    lease.active_leases_for_device = 5;
+    lease.max_active_leases_per_device = 5;
+    assert_eq!(
+        active_quota_overflow.validate_against(&pins.acquire_request, &quota_selection),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+
+    let fallback_request = GenerationPinLeaseAcquireRequest {
+        fallback_policy: GenerationPinFallbackPolicy::UseLatestRetained,
+        ..pins.acquire_request.clone()
+    };
+    let mut fallback_response = pins.acquire_response.clone();
+    let GenerationPinLeaseAcquireResponse::Granted {
+        fallback_applied,
+        fallback_policy,
+        lease,
+        ..
+    } = &mut fallback_response
+    else {
+        panic!("granted fixture");
+    };
+    *fallback_applied = true;
+    *fallback_policy = GenerationPinFallbackPolicy::UseLatestRetained;
+    lease.generation_id = SourceGenerationId::new("generation-0009").unwrap();
+    let exact_only_selection = GenerationPinLeaseCapability {
+        fallback_policies: vec![GenerationPinFallbackPolicy::RequireExact],
+        ..capability
+    };
+    assert_eq!(
+        fallback_response.validate_against(&fallback_request, &exact_only_selection),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+    let mut unavailable_fallback = pins.quota_unavailable.clone();
+    let GenerationPinLeaseAcquireResponse::Unavailable {
+        fallback_policy, ..
+    } = &mut unavailable_fallback
+    else {
+        panic!("unavailable fixture");
+    };
+    *fallback_policy = GenerationPinFallbackPolicy::UseLatestRetained;
+    assert_eq!(
+        unavailable_fallback.validate_against(&fallback_request, &exact_only_selection),
         Err(GenerationTransportContractError::PinLeaseMismatch)
     );
 }

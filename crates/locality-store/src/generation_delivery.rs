@@ -114,9 +114,6 @@ pub struct PreparedGenerationApply {
     pub delta: GenerationDelta,
     pub receipt: GenerationDeltaTerminalReceipt,
     pub receipt_sha256: String,
-    /// The authenticated capability selection requires a durable terminal
-    /// acknowledgment after this apply completes.
-    pub acknowledgment_required: bool,
     pub stage_root: String,
     pub created_at: String,
 }
@@ -145,13 +142,28 @@ impl PreparedGenerationApply {
     }
 }
 
+/// Additive reservation envelope for delivery capabilities that need durable
+/// state beyond the original generation-apply repository contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedGenerationApplyV2 {
+    pub apply: PreparedGenerationApply,
+    pub acknowledgment_required: bool,
+}
+
+impl PreparedGenerationApplyV2 {
+    pub const fn new(apply: PreparedGenerationApply, acknowledgment_required: bool) -> Self {
+        Self {
+            apply,
+            acknowledgment_required,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GenerationApplyJournalRecord {
     pub delta: GenerationDelta,
     pub receipt: GenerationDeltaTerminalReceipt,
     pub receipt_sha256: String,
-    pub acknowledgment_required: bool,
-    pub acknowledged_at: Option<String>,
     pub stage_root: String,
     pub status: GenerationApplyStatus,
     pub outcomes: Vec<(u64, GenerationApplyOutcome)>,
@@ -199,6 +211,21 @@ pub trait GenerationDeliveryRepository {
         prepared: PreparedGenerationApply,
     ) -> StoreResult<GenerationApplyJournalRecord>;
 
+    /// Additive V2 reservation. Legacy repositories safely support only
+    /// reservations that do not require a durable terminal acknowledgment.
+    fn reserve_generation_apply_v2(
+        &mut self,
+        prepared: PreparedGenerationApplyV2,
+    ) -> StoreResult<GenerationApplyJournalRecord> {
+        if prepared.acknowledgment_required {
+            return Err(StoreError::InvalidState(
+                "generation repository does not support durable terminal acknowledgments"
+                    .to_string(),
+            ));
+        }
+        self.reserve_generation_apply(prepared.apply)
+    }
+
     fn mark_generation_apply_started(
         &mut self,
         delta_id: &str,
@@ -227,15 +254,21 @@ pub trait GenerationDeliveryRepository {
     /// Completed acknowledgments are replayed before polling for another delta.
     fn list_pending_generation_acknowledgments(
         &self,
-        mount_id: &MountId,
-    ) -> StoreResult<Vec<GenerationApplyJournalRecord>>;
+        _mount_id: &MountId,
+    ) -> StoreResult<Vec<GenerationApplyJournalRecord>> {
+        Ok(Vec::new())
+    }
 
     fn mark_generation_acknowledged(
         &mut self,
-        delta_id: &str,
-        receipt_sha256: &str,
-        acknowledged_at: &str,
-    ) -> StoreResult<GenerationApplyJournalRecord>;
+        _delta_id: &str,
+        _receipt_sha256: &str,
+        _acknowledged_at: &str,
+    ) -> StoreResult<GenerationApplyJournalRecord> {
+        Err(StoreError::InvalidState(
+            "generation repository does not support durable terminal acknowledgments".to_string(),
+        ))
+    }
 
     fn record_generation_inode_evidence(
         &mut self,

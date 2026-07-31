@@ -17,7 +17,8 @@ use locality_protocol::workspace_layout::LayoutDigest;
 use locality_store::{
     ConnectionId, GenerationApplyOutcome, GenerationApplyStatus, GenerationDeliveryRepository,
     GenerationPathRecord, GenerationPathState, MountConfig, MountRepository,
-    ObservedGenerationRecord, PreparedGenerationApply, SqliteStateStore, StoreError,
+    ObservedGenerationRecord, PreparedGenerationApply, PreparedGenerationApplyV2, SqliteStateStore,
+    StoreError,
 };
 
 fn digest(character: char) -> String {
@@ -128,7 +129,6 @@ fn observed_generation_apply_is_persisted_exact_replayable_and_atomic() {
         delta: delta.clone(),
         receipt: receipt.clone(),
         receipt_sha256: receipt.canonical_sha256().unwrap(),
-        acknowledgment_required: false,
         stage_root: "generation-delivery/delta-2".to_string(),
         created_at: "2026-07-31T12:01:00Z".to_string(),
     };
@@ -187,14 +187,16 @@ fn completed_required_acknowledgment_is_durable_exact_and_idempotent() {
     let receipt = receipt(&delta);
     let receipt_sha256 = receipt.canonical_sha256().unwrap();
     store
-        .reserve_generation_apply(PreparedGenerationApply {
-            delta: delta.clone(),
-            receipt,
-            receipt_sha256: receipt_sha256.clone(),
-            acknowledgment_required: true,
-            stage_root: "generation-delivery/durable-ack".to_string(),
-            created_at: "2026-07-31T12:01:00Z".to_string(),
-        })
+        .reserve_generation_apply_v2(PreparedGenerationApplyV2::new(
+            PreparedGenerationApply {
+                delta: delta.clone(),
+                receipt,
+                receipt_sha256: receipt_sha256.clone(),
+                stage_root: "generation-delivery/durable-ack".to_string(),
+                created_at: "2026-07-31T12:01:00Z".to_string(),
+            },
+            true,
+        ))
         .unwrap();
     store
         .record_generation_apply_outcome(
@@ -214,8 +216,7 @@ fn completed_required_acknowledgment_is_durable_exact_and_idempotent() {
         .list_pending_generation_acknowledgments(&fixture.mount_id)
         .unwrap();
     assert_eq!(pending.len(), 1);
-    assert!(pending[0].acknowledgment_required);
-    assert_eq!(pending[0].acknowledged_at, None);
+    assert_eq!(pending[0].receipt_sha256, receipt_sha256);
     let reset_error = reopened
         .clear_mount_source_state(&fixture.mount_id)
         .expect_err("pending terminal acknowledgment must fence source reset");
@@ -228,10 +229,6 @@ fn completed_required_acknowledgment_is_durable_exact_and_idempotent() {
     let acknowledged = reopened
         .mark_generation_acknowledged(&delta.delta_id, &receipt_sha256, "2026-07-31T12:04:00Z")
         .unwrap();
-    assert_eq!(
-        acknowledged.acknowledged_at.as_deref(),
-        Some("2026-07-31T12:04:00Z")
-    );
     assert_eq!(
         reopened
             .mark_generation_acknowledged(&delta.delta_id, &receipt_sha256, "2026-07-31T12:05:00Z",)
@@ -263,7 +260,6 @@ fn schema_24_component_v3_migrates_existing_journals_without_pending_acknowledgm
             delta: delta.clone(),
             receipt: receipt.clone(),
             receipt_sha256: receipt.canonical_sha256().unwrap(),
-            acknowledgment_required: false,
             stage_root: "generation-delivery/prior-v3".to_string(),
             created_at: "2026-07-31T12:01:00Z".to_string(),
         })
@@ -302,8 +298,7 @@ fn schema_24_component_v3_migrates_existing_journals_without_pending_acknowledgm
         .get_generation_apply(&delta.delta_id)
         .unwrap()
         .unwrap();
-    assert!(!journal.acknowledgment_required);
-    assert_eq!(journal.acknowledged_at, None);
+    assert_eq!(journal.delta.delta_id, delta.delta_id);
     assert!(
         reopened
             .list_pending_generation_acknowledgments(&fixture.mount_id)
@@ -350,7 +345,6 @@ fn reservation_fails_closed_on_generation_layout_and_old_identity_mismatch() {
         let error = store
             .reserve_generation_apply(PreparedGenerationApply {
                 receipt_sha256: receipt.canonical_sha256().unwrap(),
-                acknowledgment_required: false,
                 receipt,
                 delta,
                 stage_root: format!("generation-delivery/{changed}"),
@@ -374,7 +368,6 @@ fn empty_mount_delta_completes_and_advances_observed_generation() {
     store
         .reserve_generation_apply(PreparedGenerationApply {
             receipt_sha256: receipt.canonical_sha256().unwrap(),
-            acknowledgment_required: false,
             receipt,
             delta,
             stage_root: "generation-delivery/delta-empty".to_string(),
@@ -407,7 +400,6 @@ fn active_apply_blocks_connection_and_settings_source_reset_transactionally() {
     store
         .reserve_generation_apply(PreparedGenerationApply {
             receipt_sha256: receipt.canonical_sha256().unwrap(),
-            acknowledgment_required: false,
             receipt,
             delta,
             stage_root: "generation-delivery/delta-2".to_string(),
@@ -455,7 +447,6 @@ fn source_reset_retires_clean_completed_lineage_but_preserves_conflicts() {
     clean_store
         .reserve_generation_apply(PreparedGenerationApply {
             receipt_sha256: clean_receipt.canonical_sha256().unwrap(),
-            acknowledgment_required: false,
             receipt: clean_receipt,
             delta: clean_delta,
             stage_root: "generation-delivery/clean-lineage".to_string(),
@@ -496,7 +487,6 @@ fn source_reset_retires_clean_completed_lineage_but_preserves_conflicts() {
     conflict_store
         .reserve_generation_apply(PreparedGenerationApply {
             receipt_sha256: conflict_receipt.canonical_sha256().unwrap(),
-            acknowledgment_required: false,
             receipt: conflict_receipt,
             delta: conflict_delta.clone(),
             stage_root: "generation-delivery/conflict-lineage".to_string(),
@@ -711,7 +701,6 @@ fn genuine_schema_21_component_v1_fixture_migrates_without_losing_active_state()
     store
         .reserve_generation_apply(PreparedGenerationApply {
             receipt_sha256: receipt.canonical_sha256().unwrap(),
-            acknowledgment_required: false,
             receipt,
             delta,
             stage_root: "generation-delivery/delta-2".to_string(),

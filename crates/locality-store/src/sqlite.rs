@@ -6,6 +6,7 @@
 //! until query needs justify normalization.
 
 use std::collections::BTreeSet;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -43,6 +44,7 @@ use crate::generation_delivery::{
     GENERATION_DELIVERY_COMPONENT_VERSION, GenerationApplyJournalRecord, GenerationApplyOutcome,
     GenerationApplyStatus, GenerationDeliveryRepository, GenerationInodeEvidenceRecord,
     GenerationPathRecord, GenerationPathState, ObservedGenerationRecord, PreparedGenerationApply,
+    PreparedGenerationApplyV2,
 };
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
@@ -465,10 +467,24 @@ fn list_generation_paths_from_connection(
     rows.map(|row| generation_path_from_row(row?)).collect()
 }
 
+struct StoredGenerationApply {
+    journal: GenerationApplyJournalRecord,
+    acknowledgment_required: bool,
+    acknowledged_at: Option<String>,
+}
+
+impl Deref for StoredGenerationApply {
+    type Target = GenerationApplyJournalRecord;
+
+    fn deref(&self) -> &Self::Target {
+        &self.journal
+    }
+}
+
 fn generation_apply_from_connection(
     connection: &Connection,
     delta_id: &str,
-) -> StoreResult<Option<GenerationApplyJournalRecord>> {
+) -> StoreResult<Option<StoredGenerationApply>> {
     let row = connection
         .query_row(
             "SELECT mount_id, delta_json, receipt_json, receipt_sha256,
@@ -519,18 +535,20 @@ fn generation_apply_from_connection(
             "generation apply `{delta_id}` mount relation does not match its delta"
         )));
     }
-    Ok(Some(GenerationApplyJournalRecord {
-        delta,
-        receipt: from_json(&row.2)?,
-        receipt_sha256: row.3,
+    Ok(Some(StoredGenerationApply {
         acknowledgment_required: row.4,
         acknowledged_at: row.5,
-        stage_root: row.6,
-        status: GenerationApplyStatus::parse(&row.7)?,
-        outcomes,
-        created_at: row.8,
-        updated_at: row.9,
-        completed_at: row.10,
+        journal: GenerationApplyJournalRecord {
+            delta,
+            receipt: from_json(&row.2)?,
+            receipt_sha256: row.3,
+            stage_root: row.6,
+            status: GenerationApplyStatus::parse(&row.7)?,
+            outcomes,
+            created_at: row.8,
+            updated_at: row.9,
+            completed_at: row.10,
+        },
     }))
 }
 
@@ -684,6 +702,15 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         &mut self,
         prepared: PreparedGenerationApply,
     ) -> StoreResult<GenerationApplyJournalRecord> {
+        self.reserve_generation_apply_v2(PreparedGenerationApplyV2::new(prepared, false))
+    }
+
+    fn reserve_generation_apply_v2(
+        &mut self,
+        prepared: PreparedGenerationApplyV2,
+    ) -> StoreResult<GenerationApplyJournalRecord> {
+        let acknowledgment_required = prepared.acknowledgment_required;
+        let prepared = prepared.apply;
         prepared.validate()?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -693,12 +720,12 @@ impl GenerationDeliveryRepository for SqliteStateStore {
             if existing.delta == prepared.delta
                 && existing.receipt == prepared.receipt
                 && existing.receipt_sha256 == prepared.receipt_sha256
-                && existing.acknowledgment_required == prepared.acknowledgment_required
+                && existing.acknowledgment_required == acknowledgment_required
                 && existing.stage_root == prepared.stage_root
                 && existing.created_at == prepared.created_at
             {
                 transaction.commit()?;
-                return Ok(existing);
+                return Ok(existing.journal);
             }
             return Err(StoreError::InvalidState(format!(
                 "generation apply `{}` replay changed its immutable payload",
@@ -774,7 +801,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 to_json(&prepared.delta)?,
                 to_json(&prepared.receipt)?,
                 prepared.receipt_sha256.as_str(),
-                prepared.acknowledgment_required,
+                acknowledgment_required,
                 prepared.stage_root.as_str(),
                 prepared.created_at.as_str(),
             ],
@@ -782,7 +809,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         let record = generation_apply_from_connection(&transaction, &prepared.delta.delta_id)?
             .expect("inserted generation journal exists");
         transaction.commit()?;
-        Ok(record)
+        Ok(record.journal)
     }
 
     fn mark_generation_apply_started(
@@ -796,7 +823,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 StoreError::InvalidState(format!("generation apply `{delta_id}` is missing"))
             })?;
         if existing.status == GenerationApplyStatus::Completed {
-            return Ok(existing);
+            return Ok(existing.journal);
         }
         connection.execute(
             "UPDATE generation_apply_journals
@@ -804,9 +831,11 @@ impl GenerationDeliveryRepository for SqliteStateStore {
              WHERE delta_id = ?1 AND active = 1",
             params![delta_id, updated_at],
         )?;
-        generation_apply_from_connection(&connection, delta_id)?.ok_or_else(|| {
-            StoreError::InvalidState(format!("generation apply `{delta_id}` disappeared"))
-        })
+        generation_apply_from_connection(&connection, delta_id)?
+            .map(|stored| stored.journal)
+            .ok_or_else(|| {
+                StoreError::InvalidState(format!("generation apply `{delta_id}` disappeared"))
+            })
     }
 
     fn record_generation_apply_outcome(
@@ -829,7 +858,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 .find(|(index, _)| *index == entry_index)
                 .is_some_and(|(_, existing)| existing == &outcome);
             return if exact {
-                Ok(journal)
+                Ok(journal.journal)
             } else {
                 Err(StoreError::InvalidState(format!(
                     "completed generation apply `{delta_id}` outcome changed"
@@ -847,7 +876,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
             .find(|(index, _)| *index == entry_index)
         {
             return if existing == &outcome {
-                Ok(journal)
+                Ok(journal.journal)
             } else {
                 Err(StoreError::InvalidState(format!(
                     "generation apply `{delta_id}` outcome replay changed"
@@ -874,14 +903,17 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         let updated = generation_apply_from_connection(&transaction, delta_id)?
             .expect("generation journal remains present");
         transaction.commit()?;
-        Ok(updated)
+        Ok(updated.journal)
     }
 
     fn get_generation_apply(
         &self,
         delta_id: &str,
     ) -> StoreResult<Option<GenerationApplyJournalRecord>> {
-        generation_apply_from_connection(&self.connection()?, delta_id)
+        Ok(
+            generation_apply_from_connection(&self.connection()?, delta_id)?
+                .map(|stored| stored.journal),
+        )
     }
 
     fn list_active_generation_applies(&self) -> StoreResult<Vec<GenerationApplyJournalRecord>> {
@@ -897,11 +929,13 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         delta_ids
             .iter()
             .map(|delta_id| {
-                generation_apply_from_connection(&connection, delta_id)?.ok_or_else(|| {
-                    StoreError::InvalidState(format!(
-                        "active generation apply `{delta_id}` disappeared"
-                    ))
-                })
+                generation_apply_from_connection(&connection, delta_id)?
+                    .map(|stored| stored.journal)
+                    .ok_or_else(|| {
+                        StoreError::InvalidState(format!(
+                            "active generation apply `{delta_id}` disappeared"
+                        ))
+                    })
             })
             .collect()
     }
@@ -919,9 +953,13 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         delta_ids
             .iter()
             .map(|delta_id| {
-                generation_apply_from_connection(&connection, delta_id)?.ok_or_else(|| {
-                    StoreError::InvalidState(format!("generation apply `{delta_id}` disappeared"))
-                })
+                generation_apply_from_connection(&connection, delta_id)?
+                    .map(|stored| stored.journal)
+                    .ok_or_else(|| {
+                        StoreError::InvalidState(format!(
+                            "generation apply `{delta_id}` disappeared"
+                        ))
+                    })
             })
             .collect()
     }
@@ -945,11 +983,13 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         delta_ids
             .iter()
             .map(|delta_id| {
-                generation_apply_from_connection(&connection, delta_id)?.ok_or_else(|| {
-                    StoreError::InvalidState(format!(
-                        "pending generation acknowledgment `{delta_id}` disappeared"
-                    ))
-                })
+                generation_apply_from_connection(&connection, delta_id)?
+                    .map(|stored| stored.journal)
+                    .ok_or_else(|| {
+                        StoreError::InvalidState(format!(
+                            "pending generation acknowledgment `{delta_id}` disappeared"
+                        ))
+                    })
             })
             .collect()
     }
@@ -979,7 +1019,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
             )));
         }
         if journal.acknowledged_at.is_some() {
-            return Ok(journal);
+            return Ok(journal.journal);
         }
         let changed = connection.execute(
             "UPDATE generation_apply_journals
@@ -994,11 +1034,13 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 "generation acknowledgment `{delta_id}` changed concurrently"
             )));
         }
-        generation_apply_from_connection(&connection, delta_id)?.ok_or_else(|| {
-            StoreError::InvalidState(format!(
-                "acknowledged generation apply `{delta_id}` disappeared"
-            ))
-        })
+        generation_apply_from_connection(&connection, delta_id)?
+            .map(|stored| stored.journal)
+            .ok_or_else(|| {
+                StoreError::InvalidState(format!(
+                    "acknowledged generation apply `{delta_id}` disappeared"
+                ))
+            })
     }
 
     fn record_generation_inode_evidence(
@@ -1303,7 +1345,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
             })?;
         if journal.status == GenerationApplyStatus::Completed {
             transaction.commit()?;
-            return Ok(journal);
+            return Ok(journal.journal);
         }
         if journal.outcomes.len() != journal.delta.entries.len()
             || journal
@@ -1538,7 +1580,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         let completed = generation_apply_from_connection(&transaction, delta_id)?
             .expect("completed generation journal remains present");
         transaction.commit()?;
-        Ok(completed)
+        Ok(completed.journal)
     }
 }
 

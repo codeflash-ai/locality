@@ -31,7 +31,7 @@ use locality_protocol::freshness_delivery_transport::{
 use locality_store::{
     GenerationApplyOutcome, GenerationApplyStatus, GenerationDeliveryRepository,
     GenerationInodeEvidenceRecord, GenerationPathRecord, GenerationPathState, MountRepository,
-    PreparedGenerationApply, SqliteStateStore,
+    PreparedGenerationApply, PreparedGenerationApplyV2, SqliteStateStore,
 };
 use sha2::{Digest, Sha256};
 
@@ -421,14 +421,16 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
         .canonical_sha256()
         .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
     let created_at = delivery.terminal_receipt.completed_at.clone();
-    let journal = store.reserve_generation_apply(PreparedGenerationApply {
-        delta: delivery.delta,
-        receipt: delivery.terminal_receipt,
-        receipt_sha256,
-        acknowledgment_required: capabilities.terminal_receipt_acknowledgments,
-        stage_root: path_to_portable_text(&stage_relative)?,
-        created_at: created_at.clone(),
-    })?;
+    let journal = store.reserve_generation_apply_v2(PreparedGenerationApplyV2::new(
+        PreparedGenerationApply {
+            delta: delivery.delta,
+            receipt: delivery.terminal_receipt,
+            receipt_sha256,
+            stage_root: path_to_portable_text(&stage_relative)?,
+            created_at: created_at.clone(),
+        },
+        capabilities.terminal_receipt_acknowledgments,
+    ))?;
     let already_recorded = journal
         .outcomes
         .iter()

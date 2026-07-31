@@ -145,6 +145,14 @@ conflicts. Reconciliation retains only authenticated payloads for current live
 conflicts, removes successful/superseded/orphan payloads, and enforces bounded
 per-mount and global retained-conflict quotas.
 
+The original public `PreparedGenerationApply`, `GenerationApplyJournalRecord`,
+and required `GenerationDeliveryRepository` methods remain source-compatible.
+Acknowledgment-aware reservation uses the additive
+`PreparedGenerationApplyV2`/`reserve_generation_apply_v2` surface. New
+acknowledgment methods have safe defaults: legacy repositories report no
+pending acknowledgments and reject an acknowledgment-required V2 reservation
+instead of silently losing retry state.
+
 V1 deltas are mount-scoped. Empty entry lists are valid when a complete target
 generation changes no projected bytes. A logical path may occur in only one
 entry, preventing order-dependent delete/create replacement. Per-file and
