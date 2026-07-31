@@ -150,14 +150,18 @@ manifest and fences without unlinking either inode. Recovery also reconstructs
 the pre-merge fence when merged bytes were published before evidence was
 persisted. To resolve this conflict, the user closes writers, copies exactly one
 named retained file over the manifest, and syncs again. Reconciliation fsyncs
-and re-fences that exact choice, atomically restores the path to `dirty`, keeps
-the evidence row as a crash-recoverable cleanup journal, and only then removes
-both retained files and the row. A concurrent held-descriptor write cancels the
-transition and keeps every version reachable. Arbitrary custom replacement
-bytes are preserved but intentionally do not clear the conflict. Reconciliation
-retains only authenticated payloads for current live conflicts, removes
-successful/superseded/orphan payloads, and enforces bounded per-mount and global
-retained-conflict quotas.
+and re-fences that exact choice, then atomically restores the path to `dirty`,
+records the apply as `merged`, and marks the dual-inode evidence row resolved.
+Both retained files, hashes, and lengths remain as a quota-accounted tombstoned
+GC journal. Apply, reconciliation, and ordinary startup neither require nor
+unlink tombstoned files, so writes through descriptors retained before or after
+resolution remain reachable while subsequent syncs proceed. Cleanup is deferred
+to a future GC that must hold an explicit exclusive no-active-mount lifecycle
+gate; no such GC runs today. Arbitrary custom replacement bytes are preserved
+but intentionally do not clear the conflict. Reconciliation retains only
+authenticated payloads for current live conflicts, removes successful,
+superseded, or orphan payloads, and enforces bounded per-mount and global
+retained-conflict quotas including tombstones.
 
 V1 deltas are mount-scoped. Empty entry lists are valid when a complete target
 generation changes no projected bytes. A logical path may occur in only one

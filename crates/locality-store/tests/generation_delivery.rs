@@ -16,9 +16,10 @@ use locality_protocol::freshness_delivery::{
 use locality_protocol::workspace_layout::LayoutDigest;
 use locality_store::{
     ConnectionId, GenerationApplyOutcome, GenerationApplyStatus, GenerationDeliveryRepository,
-    GenerationInodeEvidenceConflictUpdate, GenerationInodeEvidenceRecord, GenerationPathRecord,
-    GenerationPathState, GenerationRetainedInodeRecord, MountConfig, MountRepository,
-    ObservedGenerationRecord, PreparedGenerationApply, SqliteStateStore, StoreError,
+    GenerationInodeEvidenceConflictUpdate, GenerationInodeEvidenceRecord,
+    GenerationInodeEvidenceResolution, GenerationPathRecord, GenerationPathState,
+    GenerationRetainedInodeRecord, MountConfig, MountRepository, ObservedGenerationRecord,
+    PreparedGenerationApply, SqliteStateStore, StoreError,
 };
 
 fn digest(character: char) -> String {
@@ -261,6 +262,7 @@ fn retained_inode_hashes_and_lengths_advance_atomically() {
             visible_evidence: None,
             base_payload_delta_id: None,
             base_payload_entry_index: None,
+            resolved_at: None,
             created_at: "2026-07-31T12:01:00Z".to_string(),
         })
         .unwrap();
@@ -340,6 +342,108 @@ fn retained_inode_hashes_and_lengths_advance_atomically() {
             ..
         } if local_sha256 == first.local_sha256
     ));
+}
+
+#[test]
+fn generation_v4_migration_tombstones_already_resolved_dual_evidence() {
+    use rusqlite::Connection;
+
+    let fixture = Fixture::new("generation-v4-resolved-tombstone");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let delta = delta();
+    let receipt = receipt(&delta);
+    store
+        .reserve_generation_apply(PreparedGenerationApply {
+            receipt_sha256: receipt.canonical_sha256().unwrap(),
+            receipt,
+            delta,
+            stage_root: "generation-delivery/delta-2".to_string(),
+            created_at: "2026-07-31T12:01:00Z".to_string(),
+        })
+        .unwrap();
+    store
+        .record_generation_inode_evidence(GenerationInodeEvidenceRecord {
+            delta_id: "delta-2".to_string(),
+            entry_index: 0,
+            mount_id: fixture.mount_id.clone(),
+            logical_path: "Roadmap.md".to_string(),
+            evidence_name: ".preimage".to_string(),
+            expected_sha256: digest('p'),
+            byte_length: 11,
+            visible_evidence: None,
+            base_payload_delta_id: None,
+            base_payload_entry_index: None,
+            resolved_at: None,
+            created_at: "2026-07-31T12:01:00Z".to_string(),
+        })
+        .unwrap();
+    store
+        .record_generation_apply_outcome(
+            "delta-2",
+            0,
+            GenerationApplyOutcome::Merged,
+            "2026-07-31T12:02:00Z",
+        )
+        .unwrap();
+    store
+        .complete_generation_apply("delta-2", "2026-07-31T12:03:00Z")
+        .unwrap();
+    store
+        .mark_generation_inode_evidence_conflict(
+            "delta-2",
+            0,
+            GenerationInodeEvidenceConflictUpdate {
+                local_sha256: digest('m'),
+                expected_sha256: digest('p'),
+                byte_length: 11,
+                visible_evidence: Some(GenerationRetainedInodeRecord {
+                    evidence_name: ".visible".to_string(),
+                    expected_sha256: digest('v'),
+                    byte_length: 22,
+                }),
+                updated_at: "2026-07-31T12:04:00Z".to_string(),
+            },
+        )
+        .unwrap();
+    store
+        .mark_generation_inode_evidence_resolved(
+            "delta-2",
+            0,
+            GenerationInodeEvidenceResolution {
+                expected_sha256: digest('p'),
+                byte_length: 11,
+                visible_expected_sha256: digest('v'),
+                visible_byte_length: 22,
+                updated_at: "2026-07-31T12:05:00Z".to_string(),
+            },
+        )
+        .unwrap();
+    let db_path = store.db_path.clone();
+    drop(store);
+
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE generation_inode_evidence DROP COLUMN resolved_at;
+             UPDATE state_components
+             SET version = 4, min_reader_version = 4
+             WHERE component_id = 'durable:generation_delivery';",
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    let evidence = reopened.list_generation_inode_evidence().unwrap().remove(0);
+    assert_eq!(
+        evidence.resolved_at.as_deref(),
+        Some("2026-07-31T12:05:00Z")
+    );
+    assert!(evidence.visible_evidence.is_some());
+    assert_eq!(
+        reopened.list_generation_paths(&fixture.mount_id).unwrap()[0].state,
+        GenerationPathState::Dirty
+    );
 }
 
 #[test]
@@ -770,7 +874,7 @@ fn genuine_schema_21_component_v1_fixture_migrates_without_losing_active_state()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(component, (4, 4));
+    assert_eq!(component, (5, 5));
     let error = reopened
         .clear_mount_source_state(&fixture.mount_id)
         .expect_err("migrated active journal must fence source reset");
@@ -778,10 +882,10 @@ fn genuine_schema_21_component_v1_fixture_migrates_without_losing_active_state()
 }
 
 #[test]
-fn current_schema_generation_v3_migrates_dual_inode_evidence_columns() {
+fn current_schema_generation_v3_migrates_dual_inode_evidence_and_tombstone_columns() {
     use rusqlite::Connection;
 
-    let fixture = Fixture::new("generation-v3-to-v4");
+    let fixture = Fixture::new("generation-v3-to-v5");
     let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
     seed(&mut store, &fixture);
     let db_path = store.db_path.clone();
@@ -793,6 +897,7 @@ fn current_schema_generation_v3_migrates_dual_inode_evidence_columns() {
             "ALTER TABLE generation_inode_evidence DROP COLUMN visible_evidence_name;
              ALTER TABLE generation_inode_evidence DROP COLUMN visible_expected_sha256;
              ALTER TABLE generation_inode_evidence DROP COLUMN visible_byte_length;
+             ALTER TABLE generation_inode_evidence DROP COLUMN resolved_at;
              UPDATE state_components
              SET version = 3, min_reader_version = 3
              WHERE component_id = 'durable:generation_delivery';",
@@ -810,6 +915,7 @@ fn current_schema_generation_v3_migrates_dual_inode_evidence_columns() {
         "visible_evidence_name",
         "visible_expected_sha256",
         "visible_byte_length",
+        "resolved_at",
     ] {
         let present: bool = connection
             .query_row(
@@ -821,7 +927,7 @@ fn current_schema_generation_v3_migrates_dual_inode_evidence_columns() {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(present, "v4 migration did not add {column}");
+        assert!(present, "v5 migration did not add {column}");
     }
     let component: (i64, i64) = connection
         .query_row(
@@ -831,11 +937,11 @@ fn current_schema_generation_v3_migrates_dual_inode_evidence_columns() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(component, (4, 4));
+    assert_eq!(component, (5, 5));
 }
 
 #[test]
-fn partial_v2_v4_generation_migration_is_atomic_and_resumable_per_column() {
+fn partial_v2_v5_generation_migration_is_atomic_and_resumable_per_column() {
     use rusqlite::Connection;
 
     let fixture = Fixture::new("partial-v2-v3-migration");
@@ -854,6 +960,7 @@ fn partial_v2_v4_generation_migration_is_atomic_and_resumable_per_column() {
              ALTER TABLE generation_inode_evidence DROP COLUMN visible_evidence_name;
              ALTER TABLE generation_inode_evidence DROP COLUMN visible_expected_sha256;
              ALTER TABLE generation_inode_evidence DROP COLUMN visible_byte_length;
+             ALTER TABLE generation_inode_evidence DROP COLUMN resolved_at;
              CREATE TRIGGER fail_generation_path_backfill
              BEFORE UPDATE ON generation_paths
              BEGIN
@@ -879,6 +986,7 @@ fn partial_v2_v4_generation_migration_is_atomic_and_resumable_per_column() {
         ("generation_inode_evidence", "visible_evidence_name"),
         ("generation_inode_evidence", "visible_expected_sha256"),
         ("generation_inode_evidence", "visible_byte_length"),
+        ("generation_inode_evidence", "resolved_at"),
     ] {
         let present: bool = connection
             .query_row(
@@ -919,6 +1027,7 @@ fn partial_v2_v4_generation_migration_is_atomic_and_resumable_per_column() {
         ("generation_inode_evidence", "visible_evidence_name"),
         ("generation_inode_evidence", "visible_expected_sha256"),
         ("generation_inode_evidence", "visible_byte_length"),
+        ("generation_inode_evidence", "resolved_at"),
     ] {
         let present: bool = connection
             .query_row(
@@ -942,7 +1051,7 @@ fn partial_v2_v4_generation_migration_is_atomic_and_resumable_per_column() {
     let user_version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(component, (4, 4));
+    assert_eq!(component, (5, 5));
     assert_eq!(user_version, 25);
     assert_eq!(
         reopened.list_generation_paths(&fixture.mount_id).unwrap()[0].local_logical_path,

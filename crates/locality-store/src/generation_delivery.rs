@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{StoreError, StoreResult};
 
-pub const GENERATION_DELIVERY_COMPONENT_VERSION: i64 = 4;
+pub const GENERATION_DELIVERY_COMPONENT_VERSION: i64 = 5;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservedGenerationRecord {
@@ -172,6 +172,10 @@ pub struct GenerationInodeEvidenceRecord {
     /// this completed apply into a local conflict.
     pub base_payload_delta_id: Option<String>,
     pub base_payload_entry_index: Option<u64>,
+    /// Set only after an exact retained version has been durably selected and
+    /// the path was atomically advanced. Tombstoned evidence remains named and
+    /// quota-accounted until a future exclusive, no-active-mount GC gate.
+    pub resolved_at: Option<String>,
     pub created_at: String,
 }
 
@@ -268,8 +272,8 @@ pub trait GenerationDeliveryRepository {
     ) -> StoreResult<()>;
 
     /// Atomically clears the late-write conflict after the visible file was
-    /// durably replaced by one exact retained version. The evidence row stays
-    /// live as a crash-recoverable filesystem-cleanup journal.
+    /// durably replaced by one exact retained version. Both retained inodes
+    /// and their evidence remain as a quota-accounted tombstoned GC journal.
     fn mark_generation_inode_evidence_resolved(
         &mut self,
         delta_id: &str,

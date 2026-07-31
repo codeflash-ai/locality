@@ -938,6 +938,11 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         &mut self,
         evidence: GenerationInodeEvidenceRecord,
     ) -> StoreResult<()> {
+        if evidence.resolved_at.is_some() {
+            return Err(StoreError::InvalidState(
+                "new generation inode evidence cannot start resolved".to_string(),
+            ));
+        }
         let connection = self.connection()?;
         let entry_index = i64::try_from(evidence.entry_index).map_err(|_| {
             StoreError::InvalidState("generation evidence index is too large".to_string())
@@ -980,6 +985,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                         AND visible_evidence_name IS NULL
                         AND visible_expected_sha256 IS NULL
                         AND visible_byte_length IS NULL
+                        AND resolved_at IS NULL
                  FROM generation_inode_evidence WHERE delta_id = ?1 AND entry_index = ?2",
                 params![
                     evidence.delta_id.as_str(),
@@ -1016,7 +1022,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
             "SELECT delta_id, entry_index, mount_id, logical_path, evidence_name,
                     expected_sha256, byte_length, visible_evidence_name,
                     visible_expected_sha256, visible_byte_length,
-                    base_payload_delta_id, base_payload_entry_index, created_at
+                    base_payload_delta_id, base_payload_entry_index, resolved_at, created_at
              FROM generation_inode_evidence ORDER BY created_at, delta_id, entry_index",
         )?;
         let rows = statement.query_map([], |row| {
@@ -1033,7 +1039,8 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 row.get::<_, Option<i64>>(9)?,
                 row.get::<_, Option<String>>(10)?,
                 row.get::<_, Option<i64>>(11)?,
-                row.get::<_, String>(12)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, String>(13)?,
             ))
         })?;
         rows.map(|row| {
@@ -1080,7 +1087,8 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                         })
                     })
                     .transpose()?,
-                created_at: row.12,
+                resolved_at: row.12,
+                created_at: row.13,
             })
         })
         .collect()
@@ -1233,7 +1241,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
             "UPDATE generation_inode_evidence
              SET expected_sha256 = ?3, byte_length = ?4,
                  visible_evidence_name = ?5, visible_expected_sha256 = ?6,
-                 visible_byte_length = ?7
+                 visible_byte_length = ?7, resolved_at = NULL
              WHERE delta_id = ?1 AND entry_index = ?2",
             params![
                 delta_id,
@@ -1302,7 +1310,8 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                         AND visible_byte_length = ?6
                  FROM generation_inode_evidence
                  WHERE delta_id = ?1 AND entry_index = ?2
-                       AND visible_evidence_name IS NOT NULL",
+                       AND visible_evidence_name IS NOT NULL
+                       AND resolved_at IS NULL",
                 params![
                     delta_id,
                     index,
@@ -1374,6 +1383,12 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 to_json(&GenerationApplyOutcome::Merged)?,
                 resolution.updated_at.as_str(),
             ],
+        )?;
+        transaction.execute(
+            "UPDATE generation_inode_evidence
+             SET resolved_at = ?3
+             WHERE delta_id = ?1 AND entry_index = ?2",
+            params![delta_id, index, resolution.updated_at.as_str()],
         )?;
         transaction.commit()?;
         Ok(())
@@ -4378,7 +4393,7 @@ fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
         migrate_journals_component_to_v3(connection)?;
         migrate_virtual_mutations_component_to_v3(connection)?;
         migrate_entity_search_component_to_v2(connection)?;
-        migrate_generation_delivery_to_v4(connection, None, true)?;
+        migrate_generation_delivery_to_v5(connection, None, true)?;
         return Ok(());
     }
 
@@ -4989,7 +5004,7 @@ fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
     }
 
     if user_version < SCHEMA_VERSION {
-        migrate_generation_delivery_to_v4(
+        migrate_generation_delivery_to_v5(
             connection,
             (user_version >= 21).then_some(user_version),
             user_version >= 21,
@@ -5066,7 +5081,7 @@ fn state_component_issue_allows_schema_migration(
             component_id,
             found,
             current: GENERATION_DELIVERY_COMPONENT_VERSION,
-        } if component_id == "durable:generation_delivery" && matches!(*found, 1..=3)
+        } if component_id == "durable:generation_delivery" && matches!(*found, 1..=4)
     ) || matches!(
         issue,
         StateCompatibilityIssue::OlderComponent {
@@ -6151,6 +6166,7 @@ fn create_generation_delivery_tables(connection: &Connection) -> StoreResult<()>
             visible_byte_length INTEGER CHECK (visible_byte_length >= 0),
             base_payload_delta_id TEXT,
             base_payload_entry_index INTEGER CHECK (base_payload_entry_index >= 0),
+            resolved_at TEXT,
             created_at TEXT NOT NULL,
             PRIMARY KEY (delta_id, entry_index),
             FOREIGN KEY (delta_id) REFERENCES generation_apply_journals(delta_id) ON DELETE CASCADE,
@@ -6193,17 +6209,17 @@ fn migrate_virtual_mutations_component_to_v3(connection: &Connection) -> StoreRe
     migrate_state_component_to_current(connection, "durable:virtual_mutations")
 }
 
-fn migrate_generation_delivery_component_to_v4(connection: &Connection) -> StoreResult<()> {
+fn migrate_generation_delivery_component_to_v5(connection: &Connection) -> StoreResult<()> {
     migrate_state_component_to_current(connection, "durable:generation_delivery")
 }
 
-fn migrate_generation_delivery_to_v4(
+fn migrate_generation_delivery_to_v5(
     connection: &Connection,
     record_from_schema: Option<i64>,
     update_component: bool,
 ) -> StoreResult<()> {
     if record_from_schema.is_none()
-        && generation_delivery_storage_v4_is_complete(connection)?
+        && generation_delivery_storage_v5_is_complete(connection)?
         && (!update_component || generation_delivery_component_is_current(connection)?)
     {
         return Ok(());
@@ -6212,9 +6228,10 @@ fn migrate_generation_delivery_to_v4(
     migrate_generation_delivery_storage_to_v2(&transaction)?;
     migrate_generation_delivery_storage_to_v3(&transaction)?;
     migrate_generation_delivery_storage_to_v4(&transaction)?;
-    verify_generation_delivery_storage_v4(&transaction)?;
+    migrate_generation_delivery_storage_to_v5(&transaction)?;
+    verify_generation_delivery_storage_v5(&transaction)?;
     if update_component {
-        migrate_generation_delivery_component_to_v4(&transaction)?;
+        migrate_generation_delivery_component_to_v5(&transaction)?;
     }
     if let Some(from) = record_from_schema {
         record_schema_migration(&transaction, from, SCHEMA_VERSION)?;
@@ -6278,6 +6295,7 @@ fn migrate_generation_delivery_storage_to_v2(connection: &Connection) -> StoreRe
             visible_evidence_name TEXT,
             visible_expected_sha256 TEXT,
             visible_byte_length INTEGER CHECK (visible_byte_length >= 0),
+            resolved_at TEXT,
             created_at TEXT NOT NULL,
             PRIMARY KEY (delta_id, entry_index),
             FOREIGN KEY (delta_id) REFERENCES generation_apply_journals(delta_id) ON DELETE CASCADE,
@@ -6343,8 +6361,37 @@ fn migrate_generation_delivery_storage_to_v4(connection: &Connection) -> StoreRe
     Ok(())
 }
 
-fn verify_generation_delivery_storage_v4(connection: &Connection) -> StoreResult<()> {
-    if generation_delivery_storage_v4_is_complete(connection)? {
+fn migrate_generation_delivery_storage_to_v5(connection: &Connection) -> StoreResult<()> {
+    add_column_if_missing(
+        connection,
+        "generation_inode_evidence",
+        "resolved_at",
+        "TEXT",
+    )?;
+    connection.execute(
+        "UPDATE generation_inode_evidence
+         SET resolved_at = (
+             SELECT outcomes.updated_at
+             FROM generation_apply_outcomes AS outcomes
+             WHERE outcomes.delta_id = generation_inode_evidence.delta_id
+               AND outcomes.entry_index = generation_inode_evidence.entry_index
+               AND json_extract(outcomes.outcome_json, '$.kind') = 'merged'
+         )
+         WHERE resolved_at IS NULL
+           AND visible_evidence_name IS NOT NULL
+           AND EXISTS (
+               SELECT 1 FROM generation_apply_outcomes AS outcomes
+               WHERE outcomes.delta_id = generation_inode_evidence.delta_id
+                 AND outcomes.entry_index = generation_inode_evidence.entry_index
+                 AND json_extract(outcomes.outcome_json, '$.kind') = 'merged'
+           )",
+        [],
+    )?;
+    Ok(())
+}
+
+fn verify_generation_delivery_storage_v5(connection: &Connection) -> StoreResult<()> {
+    if generation_delivery_storage_v5_is_complete(connection)? {
         return Ok(());
     }
     for (table, columns) in [
@@ -6366,6 +6413,7 @@ fn verify_generation_delivery_storage_v4(connection: &Connection) -> StoreResult
                 "visible_evidence_name",
                 "visible_expected_sha256",
                 "visible_byte_length",
+                "resolved_at",
             ][..],
         ),
     ] {
@@ -6404,10 +6452,24 @@ fn verify_generation_delivery_storage_v4(connection: &Connection) -> StoreResult
             "generation delivery migration left partial visible inode evidence".to_string(),
         ));
     }
+    let invalid_tombstone: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_inode_evidence
+            WHERE resolved_at IS NOT NULL AND visible_evidence_name IS NULL
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_tombstone {
+        return Err(StoreError::InvalidState(
+            "generation delivery migration left a tombstone without both retained inodes"
+                .to_string(),
+        ));
+    }
     Ok(())
 }
 
-fn generation_delivery_storage_v4_is_complete(connection: &Connection) -> StoreResult<bool> {
+fn generation_delivery_storage_v5_is_complete(connection: &Connection) -> StoreResult<bool> {
     for (table, columns) in [
         (
             "generation_paths",
@@ -6427,6 +6489,7 @@ fn generation_delivery_storage_v4_is_complete(connection: &Connection) -> StoreR
                 "visible_evidence_name",
                 "visible_expected_sha256",
                 "visible_byte_length",
+                "resolved_at",
             ][..],
         ),
     ] {
@@ -6456,7 +6519,15 @@ fn generation_delivery_storage_v4_is_complete(connection: &Connection) -> StoreR
         [],
         |row| row.get(0),
     )?;
-    Ok(!partial_visible_evidence)
+    let invalid_tombstone: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_inode_evidence
+            WHERE resolved_at IS NOT NULL AND visible_evidence_name IS NULL
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(!partial_visible_evidence && !invalid_tombstone)
 }
 
 fn migrate_journals_component_to_v3(connection: &Connection) -> StoreResult<()> {
