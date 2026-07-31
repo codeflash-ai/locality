@@ -1,3 +1,4 @@
+use std::fmt;
 use std::sync::OnceLock;
 
 use locality_connector::ConnectorCapabilities;
@@ -28,7 +29,7 @@ pub const GOOGLE_DOCS_OAUTH_SCOPES: &[&str] = &[
 
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredGoogleDocsCredential {
     pub kind: String,
     pub connector: String,
@@ -44,6 +45,31 @@ pub struct StoredGoogleDocsCredential {
     pub refresh_token_handle: Option<String>,
     pub acquired_at: u64,
     pub expires_at: Option<u64>,
+}
+
+impl fmt::Debug for StoredGoogleDocsCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StoredGoogleDocsCredential")
+            .field("kind", &self.kind)
+            .field("connector", &self.connector)
+            .field("access_token", &"<redacted>")
+            .field("token_type", &self.token_type)
+            .field("oauth_client_id", &self.oauth_client_id)
+            .field("oauth_broker_url", &self.oauth_broker_url)
+            .field("account_id", &self.account_id)
+            .field("account_label", &self.account_label)
+            .field("workspace_id", &self.workspace_id)
+            .field("workspace_name", &self.workspace_name)
+            .field("scopes", &self.scopes)
+            .field(
+                "refresh_token_handle",
+                &self.refresh_token_handle.as_ref().map(|_| "<redacted>"),
+            )
+            .field("acquired_at", &self.acquired_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 impl StoredGoogleDocsCredential {

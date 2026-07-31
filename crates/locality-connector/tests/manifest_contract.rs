@@ -1,0 +1,137 @@
+use locality_connector::manifest::{
+    CONNECTOR_REGISTRY_JSON, CONNECTOR_REGISTRY_SCHEMA_JSON, ConnectorRegistry, ManifestError,
+    bundled_connector_registry,
+};
+use serde_json::{Value, json};
+
+fn registry_value() -> Value {
+    serde_json::from_str(CONNECTOR_REGISTRY_JSON).expect("registry JSON")
+}
+
+fn validation_messages(error: ManifestError) -> String {
+    match error {
+        ManifestError::Json(message) => message,
+        ManifestError::Validation(violations) => violations
+            .into_iter()
+            .map(|violation| format!("{}: {}", violation.path, violation.message))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+#[test]
+fn bundled_registry_is_strict_valid_v1() {
+    let registry = bundled_connector_registry().expect("bundled registry");
+    assert_eq!(registry.schema_version, 1);
+    assert_eq!(
+        registry
+            .connectors
+            .iter()
+            .map(|connector| connector.id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "notion",
+            "google-docs",
+            "google-calendar",
+            "gmail",
+            "granola",
+            "linear",
+            "slack",
+        ]
+    );
+}
+
+#[test]
+fn registry_matches_the_published_json_schema() {
+    let schema = serde_json::from_str::<Value>(CONNECTOR_REGISTRY_SCHEMA_JSON)
+        .expect("registry schema JSON");
+    let instance = registry_value();
+    let validator = jsonschema::validator_for(&schema).expect("compile registry schema");
+    let errors = validator
+        .iter_errors(&instance)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    assert!(errors.is_empty(), "schema errors: {errors:#?}");
+}
+
+#[test]
+fn every_default_mount_setting_matches_its_connector_schema() {
+    for connector in &bundled_connector_registry().expect("registry").connectors {
+        let validator = jsonschema::validator_for(&connector.mount.settings_schema)
+            .unwrap_or_else(|error| panic!("{} settings schema: {error}", connector.id));
+        let errors = validator
+            .iter_errors(&connector.mount.default_settings)
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            errors.is_empty(),
+            "{} default settings do not match schema: {errors:#?}",
+            connector.id
+        );
+    }
+}
+
+#[test]
+fn strict_parser_rejects_unknown_fields_and_enums() {
+    let mut unknown_field = registry_value();
+    unknown_field["connectors"][0]["executable"] = json!("/tmp/plugin");
+    assert!(
+        ConnectorRegistry::parse(&unknown_field.to_string())
+            .expect_err("unknown field")
+            .to_string()
+            .contains("unknown field")
+    );
+
+    let mut unknown_enum = registry_value();
+    unknown_enum["connectors"][0]["profiles"][0]["auth_kind"] = json!("shell");
+    assert!(
+        ConnectorRegistry::parse(&unknown_enum.to_string())
+            .expect_err("unknown enum")
+            .to_string()
+            .contains("unknown variant")
+    );
+}
+
+#[test]
+fn validation_rejects_duplicate_defaults_and_missing_default_profile() {
+    let mut duplicate = registry_value();
+    duplicate["connectors"][1]["default_connection_id"] = json!("notion-default");
+    duplicate["connectors"][1]["mount"]["default_id"] = json!("notion-main");
+    duplicate["connectors"][1]["default_profile_id"] = json!("missing-profile");
+
+    let messages = validation_messages(
+        ConnectorRegistry::parse(&duplicate.to_string()).expect_err("duplicates must fail"),
+    );
+    assert!(messages.contains("duplicate default connection id"));
+    assert!(messages.contains("duplicate default mount id"));
+    assert!(messages.contains("must name exactly one profile"));
+}
+
+#[test]
+fn validation_rejects_unsafe_assets_credentials_and_inconsistent_capabilities() {
+    let mut invalid = registry_value();
+    invalid["connectors"][0]["ui"]["icon"] = json!("../notion.svg");
+    invalid["connectors"][0]["ui"]["docs_slug"] = json!("https://example.test");
+    invalid["connectors"][0]["mount"]["default_settings"] =
+        json!({"access_token": "must-never-live-here"});
+    invalid["connectors"][0]["capabilities"]["supports_block_updates"] = json!(false);
+
+    let messages = validation_messages(
+        ConnectorRegistry::parse(&invalid.to_string()).expect_err("invalid contract must fail"),
+    );
+    assert!(messages.contains("safe relative kebab-case .svg filename"));
+    assert!(messages.contains("safe kebab-case identifier"));
+    assert!(messages.contains("cannot contain credential-bearing settings"));
+    assert!(messages.contains("must agree with declared block push operations"));
+}
+
+#[test]
+fn debug_omits_settings_and_scope_values() {
+    let registry = bundled_connector_registry().expect("registry");
+    let gmail = registry.connector("gmail").expect("gmail manifest");
+    let debug = format!("{gmail:?}");
+
+    assert!(debug.contains("<descriptive settings>"));
+    assert!(debug.contains("<5 descriptive scopes>"));
+    assert!(!debug.contains("gmail.compose"));
+}
