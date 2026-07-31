@@ -26,6 +26,7 @@ pub const HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V4: u16 = 4;
 pub const MAX_HOSTED_SLACK_CURSOR_BYTES_V1: usize = 1024;
 pub const MAX_HOSTED_SLACK_APPLIED_PAGES_V1: usize = 256;
 pub const MAX_HOSTED_SLACK_REPLAY_BYTES_V1: usize = 512 * 1024;
+pub const MAX_HOSTED_SLACK_COMPACT_REPLAY_BYTES_V4: usize = 1024 * 1024;
 pub const MAX_HOSTED_SLACK_CHECKPOINT_BYTES_V1: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +105,25 @@ pub struct HostedSlackAppliedPageV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedSlackAppliedPageFingerprintV4 {
+    pub phase: HostedSlackPollPhaseV1,
+    pub root_message_id: Option<String>,
+    pub request_cursor: Option<String>,
+    pub next_cursor: Option<String>,
+    pub canonical_page_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedSlackObservedMessageFingerprintV4 {
+    pub message_id: String,
+    pub thread_root_message_id: Option<String>,
+    pub canonical_message_sha256: String,
+    pub history_reply_count: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HostedSlackPollEvidenceV1 {
     AppliedPage { page: HostedSlackAppliedPageV1 },
@@ -119,6 +139,12 @@ pub enum HostedSlackPollEvidenceV2 {
     },
     AppliedPage {
         page: HostedSlackAppliedPageV1,
+    },
+    AppliedPageFingerprint {
+        page: HostedSlackAppliedPageFingerprintV4,
+    },
+    ObservedMessageFingerprint {
+        message: HostedSlackObservedMessageFingerprintV4,
     },
     BeginCatchUp {
         poll_cut_at: String,
@@ -537,6 +563,12 @@ impl HostedSlackPollCheckpointV1 {
                 }
                 HostedSlackPollEvidenceV2::AppliedPage { page } => {
                     super::poll::replay_applied_page_evidence(&mut rebuilt, &page)?;
+                }
+                HostedSlackPollEvidenceV2::AppliedPageFingerprint { .. }
+                | HostedSlackPollEvidenceV2::ObservedMessageFingerprint { .. } => {
+                    return Err(HostedSlackPollError::IncompleteCandidate(
+                        "compact incremental replay evidence",
+                    ));
                 }
                 HostedSlackPollEvidenceV2::BeginCatchUp { poll_cut_at } => {
                     rebuilt.begin_catch_up(poll_cut_at)?;
@@ -1136,14 +1168,19 @@ fn validate_candidate(
 }
 
 fn validate_evidence(checkpoint: &HostedSlackPollCheckpointV1) -> Result<(), HostedSlackPollError> {
-    if checkpoint.evidence.len() > MAX_HOSTED_SLACK_APPLIED_PAGES_V1 + 2 {
+    if checkpoint.evidence.len()
+        > MAX_HOSTED_SLACK_COLLECTION_ENTRIES * 2 + MAX_HOSTED_SLACK_APPLIED_PAGES_V1 + 2
+    {
         return Err(HostedSlackPollError::CollectionTooLarge("evidence"));
     }
     let mut keys = BTreeSet::new();
+    let mut observed_message_keys = BTreeSet::new();
     let mut replay_bytes = 0usize;
     let mut transitions = 0usize;
     let mut baselines = 0usize;
     let mut applied_pages = 0usize;
+    let mut compact_pages = 0usize;
+    let mut observed_messages = 0usize;
     for evidence in &checkpoint.evidence {
         match evidence {
             HostedSlackPollEvidenceV2::IncrementalBaseline {
@@ -1193,6 +1230,88 @@ fn validate_evidence(checkpoint: &HostedSlackPollCheckpointV1) -> Result<(), Hos
                 }
                 replay_bytes = replay_bytes.saturating_add(page.canonical_page_json.len());
             }
+            HostedSlackPollEvidenceV2::AppliedPageFingerprint { page } => {
+                if checkpoint.checkpoint_format_version
+                    < HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4
+                    || checkpoint.poll_kind != HostedSlackPollKindV2::Incremental
+                {
+                    return Err(HostedSlackPollError::IncompleteCandidate(
+                        "compact page evidence version",
+                    ));
+                }
+                compact_pages += 1;
+                if compact_pages
+                    > MAX_HOSTED_SLACK_COLLECTION_ENTRIES + MAX_HOSTED_SLACK_APPLIED_PAGES_V1
+                {
+                    return Err(HostedSlackPollError::CollectionTooLarge(
+                        "compact page evidence",
+                    ));
+                }
+                validate_cursor(
+                    "compact page request_cursor",
+                    page.request_cursor.as_deref(),
+                )?;
+                validate_cursor("compact page next_cursor", page.next_cursor.as_deref())?;
+                if let Some(root) = &page.root_message_id {
+                    parse_slack_timestamp("compact page root_message_id", root)?;
+                }
+                validate_sha256("compact page sha256", &page.canonical_page_sha256)?;
+                if !keys.insert((
+                    page.phase,
+                    page.root_message_id.as_deref(),
+                    page.request_cursor.as_deref(),
+                )) {
+                    return Err(HostedSlackPollError::DuplicateValue("applied page key"));
+                }
+                replay_bytes = replay_bytes
+                    .saturating_add(page.canonical_page_sha256.len())
+                    .saturating_add(page.root_message_id.as_ref().map_or(0, String::len))
+                    .saturating_add(page.request_cursor.as_ref().map_or(0, String::len))
+                    .saturating_add(page.next_cursor.as_ref().map_or(0, String::len));
+            }
+            HostedSlackPollEvidenceV2::ObservedMessageFingerprint { message } => {
+                if checkpoint.checkpoint_format_version
+                    < HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4
+                    || checkpoint.poll_kind != HostedSlackPollKindV2::Incremental
+                {
+                    return Err(HostedSlackPollError::IncompleteCandidate(
+                        "observed message evidence version",
+                    ));
+                }
+                observed_messages += 1;
+                if observed_messages > MAX_HOSTED_SLACK_COLLECTION_ENTRIES {
+                    return Err(HostedSlackPollError::CollectionTooLarge(
+                        "observed message evidence",
+                    ));
+                }
+                parse_slack_timestamp("observed message id", &message.message_id)?;
+                if !observed_message_keys.insert(message.message_id.as_str()) {
+                    return Err(HostedSlackPollError::DuplicateValue(
+                        "observed message evidence",
+                    ));
+                }
+                if let Some(root) = &message.thread_root_message_id {
+                    parse_slack_timestamp("observed message root", root)?;
+                }
+                if message
+                    .history_reply_count
+                    .is_some_and(|count| count as usize > MAX_HOSTED_SLACK_THREAD_REPLIES)
+                {
+                    return Err(HostedSlackPollError::CollectionTooLarge(
+                        "observed history reply count",
+                    ));
+                }
+                validate_sha256("observed message sha256", &message.canonical_message_sha256)?;
+                replay_bytes = replay_bytes
+                    .saturating_add(message.message_id.len())
+                    .saturating_add(
+                        message
+                            .thread_root_message_id
+                            .as_ref()
+                            .map_or(0, String::len),
+                    )
+                    .saturating_add(message.canonical_message_sha256.len());
+            }
             HostedSlackPollEvidenceV2::BeginCatchUp { poll_cut_at } => {
                 parse_canonical_utc_timestamp("evidence.poll_cut_at", poll_cut_at)?;
                 transitions += 1;
@@ -1210,12 +1329,29 @@ fn validate_evidence(checkpoint: &HostedSlackPollCheckpointV1) -> Result<(), Hos
             "incremental baseline evidence",
         ));
     }
-    if replay_bytes > MAX_HOSTED_SLACK_REPLAY_BYTES_V1 {
+    let maximum_replay_bytes =
+        if checkpoint.checkpoint_format_version >= HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4 {
+            MAX_HOSTED_SLACK_COMPACT_REPLAY_BYTES_V4
+        } else {
+            MAX_HOSTED_SLACK_REPLAY_BYTES_V1
+        };
+    if replay_bytes > maximum_replay_bytes {
         return Err(HostedSlackPollError::InputTooLarge {
             input: "checkpoint replay evidence",
-            maximum_bytes: MAX_HOSTED_SLACK_REPLAY_BYTES_V1,
+            maximum_bytes: maximum_replay_bytes,
             actual_bytes: replay_bytes,
         });
+    }
+    Ok(())
+}
+
+fn validate_sha256(field: &'static str, value: &str) -> Result<(), HostedSlackPollError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(HostedSlackPollError::IncompleteCandidate(field));
     }
     Ok(())
 }
