@@ -1308,6 +1308,7 @@ fn publish_local_bytes(
         let _ = target.remove_named(&temporary);
         return Err(error.into());
     }
+    drop(file);
     target.publish_named(&temporary)?;
     Ok(())
 }

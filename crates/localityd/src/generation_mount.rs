@@ -60,6 +60,7 @@ impl SecureMount {
                 true,
                 true,
                 false,
+                false,
             )?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "mount lock disappeared"))?;
             lock_windows_file(&lock)?;
@@ -155,6 +156,7 @@ impl GenerationStateLock {
                 true,
                 true,
                 false,
+                false,
             )?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "state lock disappeared"))?;
             lock_windows_file(&file)?;
@@ -213,7 +215,7 @@ impl SecureTarget {
         }
         #[cfg(windows)]
         {
-            open_windows_regular_file(&self.parent, name, false, false, false)
+            open_windows_regular_file(&self.parent, name, false, false, false, true)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -262,8 +264,7 @@ impl SecureTarget {
         }
         #[cfg(windows)]
         {
-            self.parent.hard_link(name, &self.parent, &self.name)?;
-            self.parent.remove_file(name)?;
+            rename_windows_noreplace(&self.parent, name, &self.name)?;
             sync_cap_dir(&self.parent)
         }
         #[cfg(not(any(unix, windows)))]
@@ -289,7 +290,7 @@ impl SecureTarget {
         }
         #[cfg(windows)]
         {
-            open_windows_regular_file(&self.parent, name, true, true, true)?
+            open_windows_regular_file(&self.parent, name, true, true, true, true)?
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "created file disappeared"))
         }
         #[cfg(not(any(unix, windows)))]
@@ -315,8 +316,7 @@ impl SecureTarget {
         }
         #[cfg(windows)]
         {
-            self.parent.hard_link(temporary, &self.parent, &self.name)?;
-            self.parent.remove_file(temporary)?;
+            rename_windows_noreplace(&self.parent, temporary, &self.name)?;
             sync_cap_dir(&self.parent)
         }
         #[cfg(not(any(unix, windows)))]
@@ -352,7 +352,22 @@ impl SecureTarget {
 
 #[cfg(windows)]
 fn sync_cap_dir(directory: &cap_std::fs::Dir) -> io::Result<()> {
-    directory.try_clone()?.into_std_file().sync_all()
+    match directory.try_clone()?.into_std_file().sync_all() {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::InvalidInput
+                    | io::ErrorKind::Unsupported
+            ) =>
+        {
+            // Windows does not guarantee FlushFileBuffers support for
+            // directory handles. File bodies are flushed before publication.
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(windows)]
@@ -417,17 +432,20 @@ fn open_windows_regular_file(
     write: bool,
     create: bool,
     exclusive: bool,
+    share_delete: bool,
 ) -> io::Result<Option<File>> {
     use cap_std::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
     let mut options = cap_std::fs::OpenOptions::new();
+    let share_mode =
+        FILE_SHARE_READ | FILE_SHARE_WRITE | if share_delete { FILE_SHARE_DELETE } else { 0 };
     options
         .read(true)
         .write(write)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .share_mode(share_mode)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     if create {
         if exclusive {
@@ -458,64 +476,115 @@ fn rename_windows_noreplace(
     destination_name: &OsStr,
 ) -> io::Result<()> {
     use cap_std::fs::OpenOptionsExt;
-    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
-    use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, FileRenameInfo, SYNCHRONIZE, SetFileInformationByHandle,
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
     };
+    use windows_sys::Win32::Foundation::STATUS_OBJECT_NAME_EXISTS;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     let mut options = cap_std::fs::OpenOptions::new();
     options
         .access_mode(DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    validate_windows_leaf_name(source_name)?;
     let source = parent.open_with(source_name, &options)?.into_std();
     validate_windows_regular_handle(&source)?;
-    let destination = destination_name.encode_wide().collect::<Vec<_>>();
-    let header_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-    let byte_length = header_bytes
-        .checked_add(destination.len() * std::mem::size_of::<u16>())
+    let destination = validate_windows_leaf_name(destination_name)?;
+    let byte_length = rename_information_buffer_size(destination.len())?;
+    let byte_length_u32 = u32::try_from(byte_length)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename buffer is too large"))?;
+    let name_byte_length = destination
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .and_then(|length| u32::try_from(length).ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename leaf is too long"))?;
     let mut buffer = vec![0_usize; byte_length.div_ceil(std::mem::size_of::<usize>())];
-    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
     let root = parent.try_clone()?.into_std_file();
     unsafe {
         (*info).Anonymous.ReplaceIfExists = false;
         (*info).RootDirectory = root.as_raw_handle() as _;
-        (*info).FileNameLength = u32::try_from(destination.len() * 2)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename leaf is too long"))?;
+        (*info).FileNameLength = name_byte_length;
         std::ptr::copy_nonoverlapping(
             destination.as_ptr(),
-            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            (*info).FileName.as_mut_ptr(),
             destination.len(),
         );
     }
-    let ok = unsafe {
-        SetFileInformationByHandle(
+    let mut status_block = unsafe { std::mem::zeroed::<IO_STATUS_BLOCK>() };
+    let status = unsafe {
+        NtSetInformationFile(
             source.as_raw_handle() as _,
-            FileRenameInfo,
+            &mut status_block,
             info.cast(),
-            u32::try_from(byte_length).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "rename buffer is too large")
-            })?,
+            byte_length_u32,
+            FileRenameInformation,
         )
     };
-    if ok == 0 {
-        let error = io::Error::last_os_error();
-        if matches!(
-            error.raw_os_error().map(|code| code as u32),
-            Some(code) if code == ERROR_ALREADY_EXISTS || code == ERROR_FILE_EXISTS
-        ) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "generation preimage already exists",
-            ));
-        }
-        return Err(error);
+    if status < 0 || status == STATUS_OBJECT_NAME_EXISTS {
+        return Err(rename_status_error(status));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn rename_status_error(status: windows_sys::Win32::Foundation::NTSTATUS) -> io::Error {
+    use windows_sys::Win32::Foundation::{
+        RtlNtStatusToDosError, STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_COLLISION,
+        STATUS_OBJECT_NAME_EXISTS, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+    };
+
+    let source = io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32);
+    let kind = match status {
+        STATUS_OBJECT_NAME_COLLISION | STATUS_OBJECT_NAME_EXISTS => io::ErrorKind::AlreadyExists,
+        STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND | STATUS_NO_SUCH_FILE => {
+            io::ErrorKind::NotFound
+        }
+        _ => source.kind(),
+    };
+    io::Error::new(kind, source)
+}
+
+#[cfg(windows)]
+fn validate_windows_leaf_name(name: &OsStr) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let name = name.encode_wide().collect::<Vec<_>>();
+    if name.is_empty()
+        || name
+            .iter()
+            .any(|unit| *unit == 0 || *unit == b'\\' as u16 || *unit == b'/' as u16)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "generation rename name is not a leaf",
+        ));
+    }
+    Ok(name)
+}
+
+#[cfg(windows)]
+fn rename_information_buffer_size(name_units: usize) -> io::Result<usize> {
+    use windows_sys::Wdk::Storage::FileSystem::FILE_RENAME_INFORMATION;
+
+    let trailing_units = name_units
+        .checked_sub(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename leaf is empty"))?;
+    let trailing_bytes = trailing_units
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename buffer overflow"))?;
+    // FILE_RENAME_INFORMATION already includes one UTF-16 code unit plus tail
+    // padding. Using offset_of(FileName) omits that padding and Windows rejects
+    // the otherwise valid request with ERROR_INVALID_PARAMETER.
+    std::mem::size_of::<FILE_RENAME_INFORMATION>()
+        .checked_add(trailing_bytes)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename buffer overflow"))
 }
 
 #[cfg(windows)]
@@ -627,6 +696,8 @@ fn not_regular_file() -> io::Error {
 mod windows_tests {
     use super::*;
     use std::fs;
+    use std::io::Read;
+    use std::mem::size_of;
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -656,6 +727,107 @@ mod windows_tests {
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(root.join("source")).unwrap(), b"source");
         assert_eq!(fs::read(root.join("evidence")).unwrap(), b"evidence");
+        drop(directory);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_rename_buffer_includes_struct_tail_and_maps_statuses() {
+        use windows_sys::Wdk::Storage::FileSystem::FILE_RENAME_INFORMATION;
+        use windows_sys::Win32::Foundation::{
+            STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
+            STATUS_OBJECT_PATH_NOT_FOUND,
+        };
+
+        assert_eq!(
+            rename_information_buffer_size(1).unwrap(),
+            size_of::<FILE_RENAME_INFORMATION>()
+        );
+        assert_eq!(
+            rename_information_buffer_size(8).unwrap(),
+            size_of::<FILE_RENAME_INFORMATION>() + 7 * size_of::<u16>()
+        );
+        assert!(rename_information_buffer_size(0).is_err());
+        assert!(
+            rename_information_buffer_size(8).unwrap()
+                > std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName) + 8 * size_of::<u16>()
+        );
+        assert_eq!(
+            rename_status_error(STATUS_OBJECT_NAME_COLLISION).kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            rename_status_error(STATUS_OBJECT_NAME_NOT_FOUND).kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            rename_status_error(STATUS_OBJECT_PATH_NOT_FOUND).kind(),
+            io::ErrorKind::NotFound
+        );
+        for invalid in ["", "../escape", "child/name", "child\\name"] {
+            assert_eq!(
+                validate_windows_leaf_name(OsStr::new(invalid))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[test]
+    fn native_displacement_moves_to_the_anchored_leaf() {
+        let root = temp_root("rename-success");
+        fs::write(root.join("source"), b"preserved bytes").unwrap();
+        let directory = open_windows_root(&root).unwrap();
+
+        rename_windows_noreplace(&directory, OsStr::new("source"), OsStr::new("evidence")).unwrap();
+
+        assert!(!root.join("source").exists());
+        assert_eq!(fs::read(root.join("evidence")).unwrap(), b"preserved bytes");
+        drop(directory);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retained_ordinary_handle_does_not_block_displacement() {
+        let root = temp_root("retained-handle");
+        fs::write(root.join("source"), b"retained bytes").unwrap();
+        let directory = open_windows_root(&root).unwrap();
+        let mut retained =
+            open_windows_regular_file(&directory, OsStr::new("source"), false, false, false, true)
+                .unwrap()
+                .unwrap();
+
+        rename_windows_noreplace(&directory, OsStr::new("source"), OsStr::new("evidence")).unwrap();
+
+        let mut bytes = Vec::new();
+        retained.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"retained bytes");
+        assert!(!root.join("source").exists());
+        assert_eq!(fs::read(root.join("evidence")).unwrap(), b"retained bytes");
+        drop(retained);
+        drop(directory);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lock_handle_cannot_be_displaced() {
+        let root = temp_root("lock-nonreplaceable");
+        fs::write(root.join("lock"), b"lock bytes").unwrap();
+        let directory = open_windows_root(&root).unwrap();
+        let lock =
+            open_windows_regular_file(&directory, OsStr::new("lock"), true, false, false, false)
+                .unwrap()
+                .unwrap();
+        lock_windows_file(&lock).unwrap();
+
+        rename_windows_noreplace(&directory, OsStr::new("lock"), OsStr::new("displaced"))
+            .unwrap_err();
+
+        assert_eq!(fs::read(root.join("lock")).unwrap(), b"lock bytes");
+        assert!(!root.join("displaced").exists());
+        drop(lock);
+        drop(directory);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -690,6 +862,7 @@ mod windows_tests {
                 .count(),
             1
         );
+        drop(results);
         let evidence = fs::read(root.join("evidence")).unwrap();
         assert!(evidence == b"a" || evidence == b"b");
         assert_eq!(
