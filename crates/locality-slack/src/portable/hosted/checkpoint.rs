@@ -21,6 +21,8 @@ pub const HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V2: u16 = 2;
 pub const HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V2: u16 = 2;
 pub const HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V3: u16 = 3;
 pub const HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V3: u16 = 3;
+pub const HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4: u16 = 4;
+pub const HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V4: u16 = 4;
 pub const MAX_HOSTED_SLACK_CURSOR_BYTES_V1: usize = 1024;
 pub const MAX_HOSTED_SLACK_APPLIED_PAGES_V1: usize = 256;
 pub const MAX_HOSTED_SLACK_REPLAY_BYTES_V1: usize = 512 * 1024;
@@ -380,8 +382,8 @@ impl HostedSlackPollCheckpointV1 {
             backfill_cut_at.clone(),
             poll_overlap_watermark,
         );
-        checkpoint.checkpoint_format_version = HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V3;
-        checkpoint.minimum_reader_version = HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V3;
+        checkpoint.checkpoint_format_version = HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4;
+        checkpoint.minimum_reader_version = HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V4;
         checkpoint.install_incremental_baseline(
             applied.candidate.clone(),
             applied.completed_roots.clone(),
@@ -436,7 +438,11 @@ impl HostedSlackPollCheckpointV1 {
     pub fn validate(&self) -> Result<(), HostedSlackPollError> {
         self.validate_internal()?;
         if (self.poll_kind == HostedSlackPollKindV2::Incremental)
-            != (self.checkpoint_format_version == HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V3)
+            != matches!(
+                self.checkpoint_format_version,
+                HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V3
+                    | HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4
+            )
         {
             return Err(HostedSlackPollError::UnsupportedVersion {
                 format_version: self.checkpoint_format_version,
@@ -457,8 +463,8 @@ impl HostedSlackPollCheckpointV1 {
         validate_checkpoint_versions_for_reader(
             self.checkpoint_format_version,
             self.minimum_reader_version,
-            HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V3,
-            HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V3,
+            HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4,
+            HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V4,
         )?;
         let selector = self.selector();
         selector
@@ -558,8 +564,8 @@ impl HostedSlackPollCheckpointV1 {
             ));
         }
         let mut next = self.clone();
-        next.checkpoint_format_version = HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V3;
-        next.minimum_reader_version = HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V3;
+        next.checkpoint_format_version = self.checkpoint_format_version;
+        next.minimum_reader_version = self.minimum_reader_version;
         next.candidate = candidate.clone();
         next.completed_roots = completed_roots.clone();
         next.latest_observed_message_timestamp = latest_observed_message_timestamp.clone();
@@ -628,6 +634,17 @@ pub fn decode_hosted_slack_poll_checkpoint_v2(
         bytes,
         HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V3,
         HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V3,
+    )
+}
+
+/// Reads the resumable V4 incremental checkpoint while older readers reject it.
+pub fn decode_hosted_slack_poll_checkpoint_v3(
+    bytes: &[u8],
+) -> Result<HostedSlackPollCheckpointV1, HostedSlackPollError> {
+    decode_hosted_slack_poll_checkpoint_for_reader(
+        bytes,
+        HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4,
+        HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V4,
     )
 }
 
@@ -799,6 +816,9 @@ pub(crate) fn validate_checkpoint_versions_for_reader(
         ) | (
             HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V3,
             HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V3
+        ) | (
+            HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4,
+            HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V4
         )
     ) {
         return Err(HostedSlackPollError::UnsupportedVersion {
@@ -1138,7 +1158,7 @@ fn validate_evidence(checkpoint: &HostedSlackPollCheckpointV1) -> Result<(), Hos
                 }
                 if *applied_checkpoint_format_version == 0
                     || *applied_checkpoint_format_version
-                        > HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V3
+                        > HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V4
                     || applied_poll_cut_at != &checkpoint.backfill_cut_at
                 {
                     return Err(HostedSlackPollError::IncompleteCandidate(

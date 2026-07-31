@@ -9,7 +9,8 @@ use locality_slack::portable::hosted::{
     MAX_HOSTED_SLACK_CURSOR_BYTES_V1, MAX_HOSTED_SLACK_POLL_PAGE_BYTES_V1,
     MAX_HOSTED_SLACK_POLL_PAGE_MESSAGES_V1, RawHostedSlackMessage, RawHostedSlackNativeSnapshot,
     decode_hosted_slack_history_page_v1, decode_hosted_slack_poll_checkpoint_v1,
-    decode_hosted_slack_poll_checkpoint_v2, decode_hosted_slack_replies_page_v1,
+    decode_hosted_slack_poll_checkpoint_v2, decode_hosted_slack_poll_checkpoint_v3,
+    decode_hosted_slack_replies_page_v1,
 };
 use serde::Serialize;
 
@@ -1184,9 +1185,10 @@ fn incremental_poll_starts_from_applied_candidate_and_reconciles_late_old_root_r
         "the applied candidate must not be duplicated into replay evidence"
     );
     assert_eq!(
-        decode_hosted_slack_poll_checkpoint_v2(&encoded).unwrap(),
+        decode_hosted_slack_poll_checkpoint_v3(&encoded).unwrap(),
         incremental
     );
+    assert!(decode_hosted_slack_poll_checkpoint_v2(&encoded).is_err());
     assert!(decode_hosted_slack_poll_checkpoint_v1(&encoded).is_err());
     let mut wrong_incremental_version = encoded_value.clone();
     wrong_incremental_version["checkpoint_format_version"] = 2.into();
@@ -1244,6 +1246,117 @@ fn incremental_poll_starts_from_applied_candidate_and_reconciles_late_old_root_r
     assert_eq!(
         output.operational_status.freshness_state,
         locality_protocol::ReplicaFreshnessState::Fresh
+    );
+}
+
+#[test]
+fn incremental_old_root_sweep_resumes_beyond_evidence_page_bound() {
+    let mut applied = checkpoint();
+    let mut empty_history = history_page();
+    empty_history.next_cursor = None;
+    empty_history.messages.clear();
+    empty_history.users.clear();
+    empty_history.files.clear();
+    applied.apply_history_page(&empty_history).unwrap();
+    applied
+        .begin_catch_up("2026-06-02T00:00:00Z".to_string())
+        .unwrap();
+
+    let template = history_page().messages[0].clone();
+    let roots = (0..300)
+        .map(|offset| {
+            let mut root = template.clone();
+            root.message.ts = format!("1780272000.{offset:06}");
+            root.message.thread_ts = None;
+            root.message.user_id = None;
+            root.message.file_ids.clear();
+            root.reply_count = 0;
+            root
+        })
+        .collect::<Vec<_>>();
+    let mut seed = catch_up_page();
+    seed.messages.clone_from(&roots);
+    applied.apply_history_page(&seed).unwrap();
+    assert!(applied.completed_output().is_ok());
+
+    let mut sweep = HostedSlackPollCheckpointV1::incremental_from_applied(
+        &applied,
+        raw_snapshot().channel,
+        "2026-06-01T23:55:00Z".to_string(),
+    )
+    .unwrap();
+    sweep
+        .begin_catch_up("2026-06-02T00:05:00Z".to_string())
+        .unwrap();
+    let mut empty_incremental: HostedSlackHistoryPageV2 = catch_up_page().into();
+    empty_incremental.page_format_version = HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3;
+    empty_incremental.minimum_reader_version = HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3;
+    empty_incremental.poll_kind = HostedSlackPollKindV2::Incremental;
+    empty_incremental.backfill_cut_at = "2026-06-02T00:00:00Z".to_string();
+    empty_incremental.poll_overlap_watermark = "2026-06-01T23:55:00Z".to_string();
+    empty_incremental.poll_cut_at = Some("2026-06-02T00:05:00Z".to_string());
+    empty_incremental.observed_at = "2026-06-02T00:05:01Z".to_string();
+    sweep.apply_history_page_v2(&empty_incremental).unwrap();
+
+    for (offset, root) in roots.iter().enumerate() {
+        assert!(
+            sweep.completed_output().is_err(),
+            "no false Fresh at {offset}"
+        );
+        let mut page: HostedSlackRepliesPageV2 = catch_up_replies_page(replies_page()).into();
+        page.page_format_version = HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3;
+        page.minimum_reader_version = HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3;
+        page.poll_kind = HostedSlackPollKindV2::Incremental;
+        page.backfill_cut_at = "2026-06-02T00:00:00Z".to_string();
+        page.poll_overlap_watermark = "2026-06-01T23:55:00Z".to_string();
+        page.poll_cut_at = Some("2026-06-02T00:05:00Z".to_string());
+        page.request_cursor = None;
+        page.next_cursor = None;
+        page.root_message_id.clone_from(&root.message.ts);
+        page.root_reply_count = u32::from(offset == 298);
+        page.observed_at = "2026-06-02T00:05:02Z".to_string();
+        page.messages = vec![root.message.clone()];
+        page.users.clear();
+        page.files.clear();
+        if offset == 298 {
+            let mut late = root.message.clone();
+            late.ts = "1780272200.000001".to_string();
+            late.thread_ts = Some(root.message.ts.clone());
+            late.text = "late near sweep end".to_string();
+            page.messages.push(late);
+        }
+
+        if offset == 150 {
+            let encoded = serde_json::to_vec(&sweep).unwrap();
+            assert!(encoded.len() <= MAX_HOSTED_SLACK_CHECKPOINT_BYTES_V1);
+            let mut replay = decode_hosted_slack_poll_checkpoint_v3(&encoded).unwrap();
+            sweep.apply_replies_page_v2(&page).unwrap();
+            replay.apply_replies_page_v2(&page).unwrap();
+            assert_eq!(sweep, replay, "interruption/replay must be exact");
+        } else {
+            sweep
+                .apply_replies_page_v2(&page)
+                .unwrap_or_else(|error| panic!("root {offset}: {error:?}"));
+        }
+    }
+
+    let encoded = serde_json::to_vec(&sweep).unwrap();
+    assert!(encoded.len() <= MAX_HOSTED_SLACK_CHECKPOINT_BYTES_V1);
+    assert!(decode_hosted_slack_poll_checkpoint_v2(&encoded).is_err());
+    let output = sweep.completed_output().unwrap();
+    assert!(output.operational_status.coverage_complete);
+    assert_eq!(
+        output.operational_status.freshness_state,
+        locality_protocol::ReplicaFreshnessState::Fresh
+    );
+    assert_eq!(
+        output
+            .snapshot
+            .messages()
+            .iter()
+            .filter(|message| message.text() == "late near sweep end")
+            .count(),
+        1
     );
 }
 
