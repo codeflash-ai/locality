@@ -348,6 +348,28 @@ impl SecureTarget {
     pub(crate) fn remove_current(&self) -> io::Result<()> {
         self.remove_named(&self.name)
     }
+
+    pub(crate) fn sync_current(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.open_current()?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "target file disappeared"))?
+                .sync_all()?;
+            rustix::fs::fsync(&self.parent)?;
+            Ok(())
+        }
+        #[cfg(windows)]
+        {
+            open_windows_regular_file(&self.parent, &self.name, true, false, false, true)?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "target file disappeared"))?
+                .sync_all()?;
+            sync_cap_dir(&self.parent)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(unsupported_platform())
+        }
+    }
 }
 
 #[cfg(windows)]

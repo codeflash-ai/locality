@@ -1,0 +1,38 @@
+{
+  "ok": true,
+  "has_more": false,
+  "messages": [
+    {
+      "type": "message",
+      "subtype": "channel_join",
+      "ts": "1780000000.000100",
+      "user": "U08ADA00001",
+      "text": "<@U08ADA00001> joined the channel"
+    },
+    {
+      "type": "message",
+      "subtype": "channel_topic",
+      "ts": "1780000001.000100",
+      "user": "U08GRACE001",
+      "text": "set the channel topic",
+      "files": [
+        {
+          "id": "F08SYSTEM01",
+          "url_private": "https://provider.invalid/system-file-secret"
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "subtype": "huddle_thread",
+      "ts": "1780000002.000100",
+      "text": "",
+      "room": {
+        "secret": "system-room-secret"
+      }
+    }
+  ],
+  "response_metadata": {
+    "next_cursor": ""
+  }
+}

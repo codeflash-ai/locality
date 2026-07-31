@@ -1,0 +1,47 @@
+{
+  "ok": true,
+  "headers": {
+    "Authorization": "Bearer discovery-secret"
+  },
+  "cookies": "discovery-cookie",
+  "channels": [
+    {
+      "id": "C08ENGINEER1",
+      "context_team_id": "T08LOCALITY1",
+      "team_id": "T08LOCALITY1",
+      "name": "engineering",
+      "topic": {
+        "value": "Build safely",
+        "creator": "U08TOPIC001"
+      },
+      "purpose": {
+        "value": "Engineering"
+      },
+      "created": 1780000000,
+      "updated": 1780000010123,
+      "is_archived": false,
+      "is_private": true,
+      "is_shared": false,
+      "is_ext_shared": false,
+      "is_org_shared": false,
+      "is_member": true,
+      "shared_team_ids": [
+        "T08LOCALITY1"
+      ],
+      "latest": {
+        "text": "private-message-secret",
+        "files": [
+          {
+            "url_private": "https://provider.invalid/discovery-file-secret"
+          }
+        ]
+      },
+      "creator_profile": {
+        "email": "discovery-secret@example.invalid"
+      }
+    }
+  ],
+  "response_metadata": {
+    "next_cursor": "page-two"
+  }
+}

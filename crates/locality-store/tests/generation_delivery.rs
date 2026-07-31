@@ -20,7 +20,9 @@ use locality_protocol::freshness_delivery_transport::{
 use locality_protocol::workspace_layout::LayoutDigest;
 use locality_store::{
     ConnectionId, GenerationApplyOutcome, GenerationApplyStatus, GenerationDeliveryRepository,
-    GenerationPathRecord, GenerationPathState, GenerationTransportSelectionBinding, MountConfig,
+    GenerationInodeEvidenceConflictUpdate, GenerationInodeEvidenceRecord,
+    GenerationInodeEvidenceResolution, GenerationPathRecord, GenerationPathState,
+    GenerationRetainedInodeRecord, GenerationTransportSelectionBinding, MountConfig,
     MountRepository, ObservedGenerationRecord, PreparedGenerationApply, PreparedGenerationApplyV2,
     PreparedGenerationApplyV3, SqliteStateStore, StoreError,
 };
@@ -120,6 +122,59 @@ fn seed(store: &mut SqliteStateStore, fixture: &Fixture) {
             }],
         )
         .unwrap();
+}
+
+#[test]
+fn observed_generation_seed_exact_replay_is_path_order_independent() {
+    let fixture = Fixture::new("seed-replay-path-order");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "backend",
+            &fixture.mount_root,
+        ))
+        .unwrap();
+    let observed = ObservedGenerationRecord {
+        mount_id: fixture.mount_id.clone(),
+        source_connection_id: SourceConnectionId::new("source-main"),
+        generation_id: generation("generation-1"),
+        inventory_sha256: digest('1'),
+        workspace_layout_version: 1,
+        workspace_layout_digest: digest('a'),
+        last_receipt_sha256: None,
+        updated_at: "2026-07-31T11:00:00Z".to_string(),
+    };
+    let path = |projection: &str, logical_path: &str| GenerationPathRecord {
+        mount_id: fixture.mount_id.clone(),
+        projection_id: ProjectionId::new(projection),
+        logical_path: logical_path.to_string(),
+        local_logical_path: logical_path.to_string(),
+        base_generation_id: generation("generation-1"),
+        base_identity: None,
+        base_payload_delta_id: None,
+        base_payload_entry_index: None,
+        conflict_payload_delta_id: None,
+        conflict_payload_entry_index: None,
+        state: GenerationPathState::Clean,
+        incoming_identity: None,
+        updated_at: "2026-07-31T11:00:00Z".to_string(),
+    };
+    let first = path("projection-a", "A.md");
+    let second = path("projection-b", "B.md");
+    let expected = vec![first.clone(), second.clone()];
+
+    store
+        .seed_observed_generation(observed.clone(), expected.clone())
+        .unwrap();
+    store
+        .seed_observed_generation(observed, vec![second, first])
+        .unwrap();
+
+    assert_eq!(
+        store.list_generation_paths(&fixture.mount_id).unwrap(),
+        expected
+    );
 }
 
 #[test]
@@ -682,6 +737,220 @@ fn prerelease_v26_active_nonlegacy_selection_is_faithfully_recovered() {
 }
 
 #[test]
+fn captured_retained_inode_hashes_and_lengths_advance_atomically() {
+    use rusqlite::Connection;
+
+    let fixture = Fixture::new("atomic-inode-fingerprints");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let delta = delta();
+    let receipt = receipt(&delta);
+    store
+        .reserve_generation_apply(PreparedGenerationApply {
+            receipt_sha256: receipt.canonical_sha256().unwrap(),
+            receipt,
+            delta,
+            stage_root: "generation-delivery/delta-2".to_string(),
+            created_at: "2026-07-31T12:01:00Z".to_string(),
+        })
+        .unwrap();
+    store
+        .record_generation_inode_evidence(GenerationInodeEvidenceRecord {
+            delta_id: "delta-2".to_string(),
+            entry_index: 0,
+            mount_id: fixture.mount_id.clone(),
+            logical_path: "Roadmap.md".to_string(),
+            evidence_name: ".preimage".to_string(),
+            captured_sha256: digest('1'),
+            captured_byte_length: 3,
+            visible_evidence: None,
+            base_payload_delta_id: None,
+            base_payload_entry_index: None,
+            resolved_at: None,
+            created_at: "2026-07-31T12:01:00Z".to_string(),
+        })
+        .unwrap();
+    store
+        .record_generation_apply_outcome(
+            "delta-2",
+            0,
+            GenerationApplyOutcome::Merged,
+            "2026-07-31T12:02:00Z",
+        )
+        .unwrap();
+    store
+        .complete_generation_apply("delta-2", "2026-07-31T12:03:00Z")
+        .unwrap();
+
+    let first = GenerationInodeEvidenceConflictUpdate {
+        local_sha256: digest('m'),
+        captured_sha256: digest('p'),
+        captured_byte_length: 11,
+        visible_evidence: Some(GenerationRetainedInodeRecord {
+            evidence_name: ".visible".to_string(),
+            captured_sha256: digest('v'),
+            captured_byte_length: 22,
+        }),
+        updated_at: "2026-07-31T12:04:00Z".to_string(),
+    };
+    store
+        .mark_generation_inode_evidence_conflict("delta-2", 0, first.clone())
+        .unwrap();
+    let evidence = store.list_generation_inode_evidence().unwrap().remove(0);
+    assert_eq!(evidence.captured_sha256, first.captured_sha256);
+    assert_eq!(evidence.captured_byte_length, first.captured_byte_length);
+    assert_eq!(evidence.visible_evidence, first.visible_evidence);
+
+    let connection = Connection::open(&store.db_path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_inode_fingerprint_update
+             BEFORE UPDATE ON generation_inode_evidence
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected evidence update failure');
+             END;",
+        )
+        .unwrap();
+    drop(connection);
+    let second = GenerationInodeEvidenceConflictUpdate {
+        local_sha256: digest('n'),
+        captured_sha256: digest('q'),
+        captured_byte_length: 111,
+        visible_evidence: Some(GenerationRetainedInodeRecord {
+            evidence_name: ".visible".to_string(),
+            captured_sha256: digest('w'),
+            captured_byte_length: 222,
+        }),
+        updated_at: "2026-07-31T12:05:00Z".to_string(),
+    };
+    assert!(
+        store
+            .mark_generation_inode_evidence_conflict("delta-2", 0, second)
+            .is_err()
+    );
+    let evidence = store.list_generation_inode_evidence().unwrap().remove(0);
+    assert_eq!(evidence.captured_sha256, first.captured_sha256);
+    assert_eq!(evidence.captured_byte_length, first.captured_byte_length);
+    assert_eq!(evidence.visible_evidence, first.visible_evidence);
+    let outcome = store
+        .get_generation_apply("delta-2")
+        .unwrap()
+        .unwrap()
+        .outcomes[0]
+        .1
+        .clone();
+    assert!(matches!(
+        outcome,
+        GenerationApplyOutcome::Conflict {
+            local_sha256: Some(local_sha256),
+            ..
+        } if local_sha256 == first.local_sha256
+    ));
+}
+
+#[test]
+fn generation_v4_migration_tombstones_already_resolved_dual_evidence() {
+    use rusqlite::Connection;
+
+    let fixture = Fixture::new("generation-v4-resolved-tombstone");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let delta = delta();
+    let receipt = receipt(&delta);
+    store
+        .reserve_generation_apply(PreparedGenerationApply {
+            receipt_sha256: receipt.canonical_sha256().unwrap(),
+            receipt,
+            delta,
+            stage_root: "generation-delivery/delta-2".to_string(),
+            created_at: "2026-07-31T12:01:00Z".to_string(),
+        })
+        .unwrap();
+    store
+        .record_generation_inode_evidence(GenerationInodeEvidenceRecord {
+            delta_id: "delta-2".to_string(),
+            entry_index: 0,
+            mount_id: fixture.mount_id.clone(),
+            logical_path: "Roadmap.md".to_string(),
+            evidence_name: ".preimage".to_string(),
+            captured_sha256: digest('p'),
+            captured_byte_length: 11,
+            visible_evidence: None,
+            base_payload_delta_id: None,
+            base_payload_entry_index: None,
+            resolved_at: None,
+            created_at: "2026-07-31T12:01:00Z".to_string(),
+        })
+        .unwrap();
+    store
+        .record_generation_apply_outcome(
+            "delta-2",
+            0,
+            GenerationApplyOutcome::Merged,
+            "2026-07-31T12:02:00Z",
+        )
+        .unwrap();
+    store
+        .complete_generation_apply("delta-2", "2026-07-31T12:03:00Z")
+        .unwrap();
+    store
+        .mark_generation_inode_evidence_conflict(
+            "delta-2",
+            0,
+            GenerationInodeEvidenceConflictUpdate {
+                local_sha256: digest('m'),
+                captured_sha256: digest('p'),
+                captured_byte_length: 11,
+                visible_evidence: Some(GenerationRetainedInodeRecord {
+                    evidence_name: ".visible".to_string(),
+                    captured_sha256: digest('v'),
+                    captured_byte_length: 22,
+                }),
+                updated_at: "2026-07-31T12:04:00Z".to_string(),
+            },
+        )
+        .unwrap();
+    store
+        .mark_generation_inode_evidence_resolved(
+            "delta-2",
+            0,
+            GenerationInodeEvidenceResolution {
+                captured_sha256: digest('p'),
+                captured_byte_length: 11,
+                visible_captured_sha256: digest('v'),
+                visible_captured_byte_length: 22,
+                updated_at: "2026-07-31T12:05:00Z".to_string(),
+            },
+        )
+        .unwrap();
+    let db_path = store.db_path.clone();
+    drop(store);
+
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE generation_inode_evidence DROP COLUMN resolved_at;
+             UPDATE state_components
+             SET version = 4, min_reader_version = 4
+             WHERE component_id = 'durable:generation_delivery';",
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    let evidence = reopened.list_generation_inode_evidence().unwrap().remove(0);
+    assert_eq!(
+        evidence.resolved_at.as_deref(),
+        Some("2026-07-31T12:05:00Z")
+    );
+    assert!(evidence.visible_evidence.is_some());
+    assert_eq!(
+        reopened.list_generation_paths(&fixture.mount_id).unwrap()[0].state,
+        GenerationPathState::Dirty
+    );
+}
+
+#[test]
 fn reservation_fails_closed_on_generation_layout_and_old_identity_mismatch() {
     let fixture = Fixture::new("mismatch");
     let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
@@ -1117,6 +1386,65 @@ fn genuine_schema_21_component_v1_fixture_migrates_without_losing_active_state()
 }
 
 #[test]
+fn current_schema_generation_v3_migrates_dual_inode_evidence_and_tombstone_columns() {
+    use rusqlite::Connection;
+
+    let fixture = Fixture::new("generation-v3-to-v6");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let db_path = store.db_path.clone();
+    drop(store);
+
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE generation_inode_evidence DROP COLUMN visible_evidence_name;
+             ALTER TABLE generation_inode_evidence DROP COLUMN visible_expected_sha256;
+             ALTER TABLE generation_inode_evidence DROP COLUMN visible_byte_length;
+             ALTER TABLE generation_inode_evidence DROP COLUMN resolved_at;
+             UPDATE state_components
+             SET version = 3, min_reader_version = 3
+             WHERE component_id = 'durable:generation_delivery';",
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    assert_eq!(
+        reopened.list_generation_paths(&fixture.mount_id).unwrap()[0].logical_path,
+        "Roadmap.md"
+    );
+    let connection = Connection::open(&db_path).unwrap();
+    for column in [
+        "visible_evidence_name",
+        "visible_expected_sha256",
+        "visible_byte_length",
+        "resolved_at",
+    ] {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('generation_inode_evidence')
+                    WHERE name = ?1
+                 )",
+                [column],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(present, "v6 migration did not add {column}");
+    }
+    let component: (i64, i64) = connection
+        .query_row(
+            "SELECT version, min_reader_version FROM state_components
+             WHERE component_id = 'durable:generation_delivery'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(component, (6, 6));
+}
+
+#[test]
 fn partial_v2_v6_generation_migration_is_atomic_and_resumable_per_column() {
     use rusqlite::Connection;
 
@@ -1133,6 +1461,10 @@ fn partial_v2_v6_generation_migration_is_atomic_and_resumable_per_column() {
              ALTER TABLE generation_paths DROP COLUMN local_logical_path;
              ALTER TABLE generation_paths DROP COLUMN conflict_payload_entry_index;
              ALTER TABLE generation_inode_evidence DROP COLUMN base_payload_entry_index;
+             ALTER TABLE generation_inode_evidence DROP COLUMN visible_evidence_name;
+             ALTER TABLE generation_inode_evidence DROP COLUMN visible_expected_sha256;
+             ALTER TABLE generation_inode_evidence DROP COLUMN visible_byte_length;
+             ALTER TABLE generation_inode_evidence DROP COLUMN resolved_at;
              CREATE TRIGGER fail_generation_path_backfill
              BEFORE UPDATE ON generation_paths
              BEGIN
@@ -1155,6 +1487,10 @@ fn partial_v2_v6_generation_migration_is_atomic_and_resumable_per_column() {
         ("generation_paths", "local_logical_path"),
         ("generation_paths", "conflict_payload_entry_index"),
         ("generation_inode_evidence", "base_payload_entry_index"),
+        ("generation_inode_evidence", "visible_evidence_name"),
+        ("generation_inode_evidence", "visible_expected_sha256"),
+        ("generation_inode_evidence", "visible_byte_length"),
+        ("generation_inode_evidence", "resolved_at"),
     ] {
         let present: bool = connection
             .query_row(
@@ -1192,6 +1528,10 @@ fn partial_v2_v6_generation_migration_is_atomic_and_resumable_per_column() {
         ("generation_paths", "local_logical_path"),
         ("generation_paths", "conflict_payload_entry_index"),
         ("generation_inode_evidence", "base_payload_entry_index"),
+        ("generation_inode_evidence", "visible_evidence_name"),
+        ("generation_inode_evidence", "visible_expected_sha256"),
+        ("generation_inode_evidence", "visible_byte_length"),
+        ("generation_inode_evidence", "resolved_at"),
     ] {
         let present: bool = connection
             .query_row(

@@ -874,10 +874,31 @@ The managed-cell contract is:
   arbitrary SQL;
 - atomically materialize into a staging directory and expose the tree only after
   the tar response completes. A truncated response is discarded and restarted;
-  resumable cursors are added only if measurements justify them; and
+  resumable cursors are added only if measurements justify them. Local refresh
+  receipts and crash journals are HMAC-authenticated with a capability derived
+  from the Workspace Profile key and bind the root plus a cryptographically
+  random materializer marker's exact content and filesystem identity; writable
+  sibling JSON, a forged marker, or a reused inode/file ID is not ownership
+  authority. Publication and recovery hold an exclusive sibling lock, and
+  cleanup preflights the complete generation without crossing filesystem,
+  mount, volume, or reparse boundaries. Linux cleanup performs every directory
+  descent with descriptor-relative `openat2(RESOLVE_BENEATH | RESOLVE_NO_XDEV |
+  RESOLVE_NO_SYMLINKS)`, including best-effort staging cleanup. Unix retains an
+  exclusive lock on the anchored parent descriptor for the operation; Windows
+  denies delete sharing on the lock object and reads the sealed marker through
+  a read-only no-follow handle; and
 - destroy plaintext task volumes with the sandbox. `grep` requires plaintext
   local files, so the sandbox filesystem and process boundary remain part of the
   trusted execution environment.
+
+Local ownership continuity follows the Workspace Profile secret, not a display
+identifier or profile revision. Reissuing the exact same profile key preserves
+the ownership capability and can recover or refresh its existing replica. A
+rotated key with a new secret intentionally fails closed: it cannot adopt,
+clean, or re-sign the old replica. The operator must either materialize to a new
+destination, or explicitly decommission the old root and its sibling receipt,
+journal, and lock after independently confirming that the old replica is no
+longer needed. There is no automatic ownership-transfer path.
 
 An employee with only object-store console access cannot read PostgreSQL rows.
 An employee or service with sufficiently privileged database `SELECT` access can
@@ -1370,6 +1391,21 @@ ordinal, source connection ID, projection ID, normalized logical path, file kind
 sorted effective-action labels, content SHA-256, and byte length. Public exact
 goldens bind the preimage and digest so the backend and client cannot disagree
 about JSON formatting, collation, or field omission.
+
+HTTP API generation 2 adds a separate workspace inventory domain and does not
+change the flat API-v1 archive. Every authorized directory or file retains its
+connector logical path and is mapped through the sealed scope ordinal and mount
+to `<target>/<logical-path>`. The inventory emits each authorized target root,
+including empty targets, and the terminal control plus completion receipt repeat
+the layout version/digest, session and export-attempt IDs, inventory digest,
+target declarations, and exact counts. The shared pure planner rejects unknown
+ordinals, mounts, or targets; a file whose source is absent from the sealed
+source-generation vector or differs from its sealed scope-to-source authority;
+unsafe or colliding portable paths; links/devices; and any stream where the
+unique control member is not last. Inventory decoding always recomputes these
+facts against the session layout and offer. Terminal-control JSON is accepted
+only in its exact compact canonical encoding. Absolute host roots are outside
+this protocol and are never serialized.
 
 Start with Zstd level 1. It normally reduces Locality's Markdown/JSON-heavy wire
 bytes substantially while retaining fast, bounded-memory streaming decode.

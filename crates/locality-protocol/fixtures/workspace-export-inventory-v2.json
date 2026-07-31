@@ -1,0 +1,109 @@
+{
+  "scope_sources": [
+    {
+      "scope_ordinal": 0,
+      "source_connection_id": "source-notion"
+    },
+    {
+      "scope_ordinal": 1,
+      "source_connection_id": "source-drive"
+    },
+    {
+      "scope_ordinal": 2,
+      "source_connection_id": "source-notion"
+    },
+    {
+      "scope_ordinal": 3,
+      "source_connection_id": "source-drive"
+    }
+  ],
+  "target_directories": [
+    {
+      "mount_id": "mount-alpha",
+      "target": "Engineering",
+      "directory_count": 1,
+      "file_count": 0,
+      "content_bytes": 0
+    },
+    {
+      "mount_id": "mount-zeta",
+      "target": "Sales",
+      "directory_count": 3,
+      "file_count": 2,
+      "content_bytes": 17
+    }
+  ],
+  "records": [
+    {
+      "record_class": "target_directory",
+      "mount_id": "mount-alpha",
+      "target": "Engineering",
+      "member_path": "Engineering"
+    },
+    {
+      "record_class": "target_directory",
+      "mount_id": "mount-zeta",
+      "target": "Sales",
+      "member_path": "Sales"
+    },
+    {
+      "record_class": "directory",
+      "winning_scope_ordinal": 0,
+      "mount_id": "mount-zeta",
+      "target": "Sales",
+      "logical_path": "Projects",
+      "member_path": "Sales/Projects"
+    },
+    {
+      "record_class": "directory",
+      "winning_scope_ordinal": 0,
+      "mount_id": "mount-zeta",
+      "target": "Sales",
+      "logical_path": "Projects/Roadmap",
+      "member_path": "Sales/Projects/Roadmap"
+    },
+    {
+      "record_class": "file",
+      "winning_scope_ordinal": 0,
+      "mount_id": "mount-zeta",
+      "target": "Sales",
+      "logical_path": "Projects/Roadmap/page.md",
+      "member_path": "Sales/Projects/Roadmap/page.md",
+      "projection_id": "projection-roadmap",
+      "source_connection_id": "source-notion",
+      "file_kind": "markdown",
+      "effective_actions": [
+        "read",
+        "update"
+      ],
+      "content_sha256": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+      "byte_length": 10
+    },
+    {
+      "record_class": "file",
+      "winning_scope_ordinal": 2,
+      "mount_id": "mount-zeta",
+      "target": "Sales",
+      "logical_path": "README.md",
+      "member_path": "Sales/README.md",
+      "projection_id": "projection-readme",
+      "source_connection_id": "source-notion",
+      "file_kind": "markdown",
+      "effective_actions": [
+        "read"
+      ],
+      "content_sha256": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+      "byte_length": 7
+    },
+    {
+      "record_class": "control",
+      "member_path": ".loc/session.json"
+    }
+  ],
+  "control_entry_count": 1,
+  "file_count": 2,
+  "directory_count": 4,
+  "archive_entry_count": 7,
+  "selected_content_bytes": 17,
+  "inventory_sha256": "sha256:3282a9e3a380a97d53bead78c1e025e2ed428b6627b3446ddb4266bd6d06b0c4"
+}

@@ -150,9 +150,42 @@ operation is idempotently recognizable after a crash, so recovery can record
 the missing outcome and continue. Only after every entry has an applied,
 deleted, or conflict outcome does one SQLite transaction advance affected mount
 heads and clean path bases. Dirty local bytes stay in place and become explicit
-conflicts. Reconciliation retains only authenticated payloads for current live
-conflicts, removes successful/superseded/orphan payloads, and enforces bounded
-per-mount and global retained-conflict quotas.
+conflicts. A write through a descriptor retained across a clean three-way merge
+renames the visible merged inode to a deterministic retained name while keeping
+the pre-merge inode retained too. The logical path contains only a small,
+deterministic manifest naming both resolvable versions, so two individually
+bounded files can never produce an inline conflict larger than the 64 MiB file
+limit. Both inode hashes and byte lengths advance atomically in SQLite after
+later writes, and both lengths count toward per-mount and global evidence
+quotas. Recovery recognizes the visible-inode rename as a durable checkpoint,
+including a crash before manifest publication, and idempotently finishes the
+manifest and fences without unlinking either inode. Recovery also reconstructs
+the pre-merge fence when merged bytes were published before evidence was
+persisted. To resolve this conflict, the user closes writers, copies exactly one
+named retained file over the manifest, and syncs again. Reconciliation fsyncs
+and re-fences that exact choice, then atomically restores the path to `dirty`,
+records the apply as `merged`, and marks the dual-inode evidence row resolved.
+Both retained files remain as a tombstoned GC journal. Their `captured_sha256`
+and `captured_byte_length` values are frozen snapshots of bytes Locality managed
+at capture or resolution. Admission treats those captured lengths as a logical
+managed-evidence reservation; it is not an actual-disk quota. A foreign file
+descriptor opened earlier can grow either inode without Locality's involvement,
+so that reachable, user-owned recovery growth is deliberately outside the
+managed reservation. Apply, reconciliation, and ordinary startup never open,
+fingerprint, require, or unlink resolved tombstones. They account only frozen
+captured reservations plus the active update's prospective Locality-managed
+preimage. Consequently, an unavailable mount containing only resolved
+tombstones cannot block unrelated polling, recovery, or evidence-producing
+updates, including deltas with old-identity metadata.
+
+Cleanup is deferred to a future GC that must hold an explicit exclusive
+no-active-mount lifecycle gate and must define how external-descriptor growth is
+handled; no such GC runs today. Arbitrary custom replacement bytes are preserved
+but intentionally do not clear the conflict. Reconciliation retains only
+authenticated payloads for current live conflicts and removes successful,
+superseded, or orphan payloads. Per-mount and global limits bound Locality's
+captured managed-evidence reservations and current conflict payloads, not later
+user-owned writes to retained inodes.
 
 The original public `PreparedGenerationApply`, `GenerationApplyJournalRecord`,
 and required `GenerationDeliveryRepository` methods remain source-compatible.

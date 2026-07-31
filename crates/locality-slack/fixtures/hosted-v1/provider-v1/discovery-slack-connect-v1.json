@@ -1,0 +1,32 @@
+{
+  "ok": true,
+  "channels": [
+    {
+      "id": "C08CONNECT01",
+      "context_team_id": "T08LOCALITY1",
+      "team_id": "T08LOCALITY1",
+      "name": "shared-partner",
+      "topic": {
+        "value": "Cross-company coordination"
+      },
+      "purpose": {
+        "value": "Slack Connect"
+      },
+      "created": 1780000000,
+      "updated": 1780000010123,
+      "is_archived": false,
+      "is_private": true,
+      "is_shared": true,
+      "is_ext_shared": true,
+      "is_org_shared": false,
+      "is_member": true,
+      "shared_team_ids": [
+        "T08EXTERNAL1",
+        "T08LOCALITY1"
+      ]
+    }
+  ],
+  "response_metadata": {
+    "next_cursor": ""
+  }
+}

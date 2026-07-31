@@ -5,7 +5,7 @@
 //! or per-file SQLite state.
 
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -13,7 +13,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 #[cfg(unix)]
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -23,9 +23,12 @@ use rustix::fd::{AsFd, OwnedFd};
     any(target_vendor = "apple", target_os = "linux", target_os = "android")
 ))]
 use rustix::fs::RenameFlags;
+#[cfg(target_os = "linux")]
+use rustix::fs::ResolveFlags;
 #[cfg(unix)]
-use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat};
+use rustix::fs::{AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, Stat};
 
+use caseless::default_case_fold_str;
 use locality_core::portable::LogicalPath;
 use locality_protocol::{
     CanonicalControlOrderKey, CanonicalDirectoryOrderKey, CanonicalExportRecord,
@@ -36,10 +39,185 @@ use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
+#[cfg(windows)]
+#[path = "windows_workspace_fs.rs"]
+mod windows_workspace_fs;
+#[cfg(windows)]
+pub(crate) use windows_workspace_fs::read_regular_file_no_follow as read_windows_publication_state_file;
+#[cfg(windows)]
+use windows_workspace_fs::{
+    WindowsDirectory, lock_file_exclusive as lock_windows_file_exclusive,
+    set_file_read_only as set_windows_file_read_only,
+};
 
 const TAR_BLOCK_BYTES: usize = 512;
 const READ_ONLY_FILE_MODE: u32 = 0o444;
 const READ_ONLY_DIRECTORY_MODE: u32 = 0o555;
+
+/// Stable identity of one opened workspace generation. Publication journals
+/// persist the equivalent values and pass them back into descriptor-anchored
+/// exchange and cleanup operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WorkspaceGenerationIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) inode_high: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkspaceGenerationFileBinding {
+    pub(crate) identity: WorkspaceGenerationIdentity,
+    pub(crate) content: Vec<u8>,
+}
+
+pub(crate) struct WorkspacePublicationLock {
+    #[cfg(unix)]
+    _file: OwnedFd,
+    #[cfg(unix)]
+    _parent: OwnedFd,
+    #[cfg(unix)]
+    _lock_name: OsString,
+    #[cfg(windows)]
+    _file: fs::File,
+}
+
+impl WorkspacePublicationLock {
+    #[cfg(unix)]
+    pub(crate) fn parent_directory(&self) -> &OwnedFd {
+        &self._parent
+    }
+
+    pub(crate) fn verify_visible_parent(&self, parent_path: &Path) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            let visible = rustix::fs::open(
+                parent_path,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
+            let visible_identity = rustix::fs::fstat(&visible)?;
+            let retained_identity = rustix::fs::fstat(&self._parent)?;
+            if !same_file_identity(&visible_identity, &retained_identity) {
+                return Err(io::Error::other(
+                    "workspace publication parent detached from its visible path",
+                ));
+            }
+            let lock_identity = rustix::fs::fstat(&self._file)?;
+            if !named_entry_matches(&self._parent, &self._lock_name, &lock_identity)
+                .unwrap_or(false)
+            {
+                return Err(io::Error::other(
+                    "workspace publication lock detached from its parent namespace",
+                ));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = parent_path;
+        Ok(())
+    }
+}
+
+pub(crate) fn acquire_workspace_publication_lock(
+    parent_path: &Path,
+    lock_name: &str,
+) -> io::Result<WorkspacePublicationLock> {
+    if lock_name.is_empty() || lock_name.contains(['/', '\\']) {
+        return Err(io::Error::other("invalid workspace publication lock name"));
+    }
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "solaris",
+            target_os = "vita",
+            target_os = "wasi"
+        ))
+    ))]
+    {
+        let parent = rustix::fs::open(
+            parent_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let opened_parent = rustix::fs::fstat(&parent)?;
+        let named_parent = rustix::fs::stat(parent_path)?;
+        if !same_file_identity(&opened_parent, &named_parent) {
+            return Err(io::Error::other(
+                "workspace publication lock parent changed while opening",
+            ));
+        }
+        rustix::fs::flock(&parent, FlockOperation::LockExclusive)?;
+        let named_parent = rustix::fs::stat(parent_path)?;
+        if !same_file_identity(&opened_parent, &named_parent) {
+            return Err(io::Error::other(
+                "workspace publication lock parent changed while locking",
+            ));
+        }
+        let file = rustix::fs::openat(
+            &parent,
+            lock_name,
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )?;
+        let opened = rustix::fs::fstat(&file)?;
+        if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile
+            || opened.st_dev != opened_parent.st_dev
+        {
+            return Err(io::Error::other(
+                "workspace publication lock is not a same-filesystem ordinary file",
+            ));
+        }
+        rustix::fs::flock(&file, FlockOperation::LockExclusive)?;
+        let named = rustix::fs::statat(&parent, lock_name, AtFlags::SYMLINK_NOFOLLOW)?;
+        if !same_file_identity(&opened, &named) {
+            return Err(io::Error::other(
+                "workspace publication lock changed while acquiring",
+            ));
+        }
+        Ok(WorkspacePublicationLock {
+            _file: file,
+            _parent: parent,
+            _lock_name: lock_name.into(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        let parent = WindowsDirectory::open_absolute(parent_path)?;
+        let file = parent.open_or_create_lock_file(OsStr::new(lock_name))?;
+        lock_windows_file_exclusive(&file)?;
+        Ok(WorkspacePublicationLock { _file: file })
+    }
+    #[cfg(any(
+        not(any(unix, windows)),
+        all(
+            unix,
+            any(
+                target_os = "espidf",
+                target_os = "horizon",
+                target_os = "solaris",
+                target_os = "vita",
+                target_os = "wasi"
+            )
+        )
+    ))]
+    {
+        let _ = parent_path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "workspace publication locking is unsupported on this platform",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn workspace_identity_from_stat(stat: &Stat) -> WorkspaceGenerationIdentity {
+    WorkspaceGenerationIdentity {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino as u64,
+        inode_high: 0,
+    }
+}
 
 /// Resource bounds applied before and during extraction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -426,7 +604,8 @@ fn materialize_replica_archive_inner<Body: Read>(
             destination.to_path_buf(),
         ));
     }
-    staging.publish(destination)?;
+    let staging_identity = staging.identity()?;
+    staging.publish(destination, staging_identity)?;
     Ok(summary)
 }
 
@@ -512,7 +691,8 @@ fn materialize_scope_authorized_replica_archive_inner<Body: Read>(
             destination.to_path_buf(),
         ));
     }
-    staging.publish(destination)?;
+    let staging_identity = staging.identity()?;
+    staging.publish(destination, staging_identity)?;
     // The hidden control member is an archive entry, but not a materialized
     // file or byte. `extract_scope_authorized_tar` already counted it here.
     summary.entries = offer.archive_entry_count;
@@ -1019,7 +1199,7 @@ impl ExtractionState {
 }
 
 #[cfg(not(unix))]
-fn write_file_at_path<R: Read>(
+fn write_file_at_path<R: Read + ?Sized>(
     path: &Path,
     reader: &mut R,
     expected_size: u64,
@@ -1089,7 +1269,47 @@ fn make_child_directories_read_only(directory: &OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(unix)]
+fn sync_directory_tree(directory: &OwnedFd) -> io::Result<()> {
+    let entries = Dir::read_from(directory)?;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let metadata = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        match FileType::from_raw_mode(metadata.st_mode) {
+            FileType::Directory => {
+                let child = open_directory_at(directory, name)?;
+                sync_directory_tree(&child)?;
+            }
+            FileType::RegularFile => {
+                let file = rustix::fs::openat(
+                    directory,
+                    name,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )?;
+                rustix::fs::fsync(&file)?;
+            }
+            _ => {
+                return Err(io::Error::other(format!(
+                    "staging tree contains a non-file, non-directory entry: {}",
+                    name.to_string_lossy()
+                )));
+            }
+        }
+    }
+    rustix::fs::fsync(directory).map_err(Into::into)
+}
+
+#[cfg(windows)]
+fn make_tree_read_only(_staging: &StagingDirectory) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn make_tree_read_only(staging: &StagingDirectory) -> io::Result<()> {
     let root = staging.path();
     let mut directories = Vec::new();
@@ -1106,7 +1326,7 @@ fn make_tree_read_only(staging: &StagingDirectory) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn collect_directories(root: &Path, directories: &mut Vec<PathBuf>) -> io::Result<()> {
     directories.push(root.to_path_buf());
     for entry in fs::read_dir(root)? {
@@ -1116,6 +1336,45 @@ fn collect_directories(root: &Path, directories: &mut Vec<PathBuf>) -> io::Resul
         }
     }
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_path_tree(root: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(io::Error::other(
+                "staging tree contains a symbolic link or reparse point",
+            ));
+        }
+        if file_type.is_dir() {
+            sync_path_tree(&entry.path())?;
+        } else if file_type.is_file() {
+            fs::File::open(entry.path())?.sync_all()?;
+        } else {
+            return Err(io::Error::other(
+                "staging tree contains a non-file, non-directory entry",
+            ));
+        }
+    }
+    sync_directory_if_supported(root)
+}
+
+#[cfg(not(unix))]
+fn sync_directory_if_supported(path: &Path) -> io::Result<()> {
+    match fs::File::open(path).and_then(|directory| directory.sync_all()) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(not(unix))]
@@ -1177,32 +1436,119 @@ fn open_directory_at<Fd: AsFd, P: rustix::path::Arg>(
     .map_err(Into::into)
 }
 
+#[cfg(target_os = "linux")]
+fn open_cleanup_directory_at<Fd: AsFd, P: rustix::path::Arg>(
+    directory: Fd,
+    path: P,
+) -> io::Result<OwnedFd> {
+    rustix::fs::openat2(
+        directory,
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_XDEV | ResolveFlags::NO_SYMLINKS | ResolveFlags::BENEATH,
+    )
+    .map_err(Into::into)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn open_cleanup_directory_at<Fd: AsFd, P: rustix::path::Arg>(
+    directory: Fd,
+    path: P,
+) -> io::Result<OwnedFd> {
+    open_directory_at(directory, path)
+}
+
 #[cfg(unix)]
-fn remove_directory_contents(directory: &OwnedFd) {
-    let _ = rustix::fs::fchmod(directory, Mode::from_raw_mode(0o700));
-    let Ok(entries) = Dir::read_from(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
+fn preflight_directory_contents(directory: &OwnedFd, expected_device: u64) -> io::Result<()> {
+    let entries = Dir::read_from(directory)?;
+    for entry in entries {
+        let entry = entry?;
         let name = entry.file_name();
         if name.to_bytes() == b"." || name.to_bytes() == b".." {
             continue;
         }
-        let Ok(metadata) = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) else {
-            continue;
+        let metadata = match rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(metadata) => metadata,
+            Err(rustix::io::Errno::NOENT) => continue,
+            Err(error) => return Err(error.into()),
         };
+        if metadata.st_dev as u64 != expected_device {
+            return Err(io::Error::other(
+                "workspace cleanup refuses to cross a filesystem boundary",
+            ));
+        }
+        if FileType::from_raw_mode(metadata.st_mode) == FileType::Directory {
+            let child = open_cleanup_directory_at(directory, name)?;
+            let opened = rustix::fs::fstat(&child)?;
+            if !same_file_identity(&metadata, &opened) {
+                return Err(io::Error::other(
+                    "workspace cleanup entry changed during preflight",
+                ));
+            }
+            preflight_directory_contents(&child, expected_device)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_directory_contents(directory: &OwnedFd, expected_device: u64) -> io::Result<()> {
+    rustix::fs::fchmod(directory, Mode::from_raw_mode(0o700))?;
+    let entries = Dir::read_from(directory)?;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let name_os = OsString::from_vec(name.to_bytes().to_vec());
+        let metadata = match rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(metadata) => metadata,
+            Err(rustix::io::Errno::NOENT) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.st_dev as u64 != expected_device {
+            return Err(io::Error::other(
+                "workspace cleanup refuses to cross a filesystem boundary",
+            ));
+        }
         if FileType::from_raw_mode(metadata.st_mode) == FileType::Directory
-            && let Ok(child) = open_directory_at(directory, name)
+            && let Ok(child) = open_cleanup_directory_at(directory, name)
         {
-            remove_directory_contents(&child);
+            let opened = rustix::fs::fstat(&child)?;
+            if !same_file_identity(&metadata, &opened)
+                || !named_entry_matches(directory, &name_os, &opened).unwrap_or(false)
+            {
+                return Err(io::Error::other(
+                    "workspace cleanup entry changed before traversal",
+                ));
+            }
+            remove_directory_contents(&child, expected_device)?;
+            if !named_entry_matches(directory, &name_os, &opened).unwrap_or(false) {
+                return Err(io::Error::other(
+                    "workspace cleanup entry changed before removal",
+                ));
+            }
             if rustix::fs::unlinkat(directory, name, AtFlags::REMOVEDIR).is_ok() {
                 continue;
             }
         }
         // unlinkat without REMOVEDIR never follows symlinks and safely
         // removes regular files, links, devices, fifos, and sockets.
-        let _ = rustix::fs::unlinkat(directory, name, AtFlags::empty());
+        let observed = match rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(observed) => observed,
+            Err(rustix::io::Errno::NOENT) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !same_file_identity(&metadata, &observed) {
+            return Err(io::Error::other(
+                "workspace cleanup entry changed before removal",
+            ));
+        }
+        rustix::fs::unlinkat(directory, name, AtFlags::empty())?;
     }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1211,9 +1557,255 @@ fn same_file_identity(left: &Stat, right: &Stat) -> bool {
 }
 
 #[cfg(unix)]
+fn stat_matches_workspace_identity(stat: &Stat, expected: WorkspaceGenerationIdentity) -> bool {
+    workspace_identity_from_stat(stat) == expected
+}
+
+#[cfg(unix)]
 fn named_entry_matches(directory: &OwnedFd, name: &OsStr, expected: &Stat) -> io::Result<bool> {
     let observed = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)?;
     Ok(same_file_identity(&observed, expected))
+}
+
+#[cfg(unix)]
+fn preflight_existing_destination_spelling(
+    parent: &OwnedFd,
+    destination_name: &OsStr,
+    expected: &Stat,
+) -> io::Result<()> {
+    let entries = Dir::read_from(parent)?;
+    for entry in entries {
+        let entry = entry?;
+        let observed_name = entry.file_name();
+        if observed_name.to_bytes() == b"." || observed_name.to_bytes() == b".." {
+            continue;
+        }
+        let observed = match rustix::fs::statat(parent, observed_name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(observed) => observed,
+            Err(rustix::io::Errno::NOENT) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if same_file_identity(&observed, expected) {
+            if observed_name.to_bytes() != destination_name.as_bytes() {
+                return Err(io::Error::other(
+                    "workspace destination spelling changed on the filesystem",
+                ));
+            }
+            return Ok(());
+        }
+    }
+    Err(io::Error::other(
+        "workspace destination identity is not bound to its requested spelling",
+    ))
+}
+
+#[cfg(unix)]
+fn filesystem_collision_key(name: &str) -> String {
+    default_case_fold_str(name).nfc().collect()
+}
+
+#[cfg(unix)]
+fn preflight_new_destination_spelling(
+    parent: &OwnedFd,
+    destination_name: &OsStr,
+) -> io::Result<()> {
+    let requested = destination_name
+        .to_str()
+        .ok_or_else(|| io::Error::other("workspace destination name is not UTF-8"))?;
+    if requested.nfc().collect::<String>() != requested {
+        return Err(io::Error::other(
+            "workspace destination name is not canonical NFC",
+        ));
+    }
+    let requested_key = filesystem_collision_key(requested);
+    let entries = Dir::read_from(parent)?;
+    for entry in entries {
+        let entry = entry?;
+        let observed_name = entry.file_name();
+        if observed_name.to_bytes() == b"." || observed_name.to_bytes() == b".." {
+            continue;
+        }
+        if observed_name.to_bytes() == destination_name.as_bytes() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "workspace destination already exists",
+            ));
+        }
+        if let Ok(observed) = std::str::from_utf8(observed_name.to_bytes())
+            && filesystem_collision_key(observed) == requested_key
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "workspace destination collides under filesystem spelling rules",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn workspace_generation_identity_if_exists_at(
+    parent: &OwnedFd,
+    name: &OsStr,
+) -> io::Result<Option<WorkspaceGenerationIdentity>> {
+    let stat = match rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+        return Err(io::Error::other(
+            "workspace generation is not an ordinary directory",
+        ));
+    }
+    let parent_stat = rustix::fs::fstat(parent)?;
+    if stat.st_dev != parent_stat.st_dev {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "workspace generation is on a different filesystem",
+        ));
+    }
+    Ok(Some(workspace_identity_from_stat(&stat)))
+}
+
+#[cfg(unix)]
+fn open_generation_file_binding_at(
+    root: &OwnedFd,
+    name: &str,
+    max_content_bytes: usize,
+) -> io::Result<WorkspaceGenerationFileBinding> {
+    let file = rustix::fs::openat(
+        root,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let stat = rustix::fs::fstat(&file)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(io::Error::other(
+            "workspace ownership marker is not an ordinary file",
+        ));
+    }
+    let identity = workspace_identity_from_stat(&stat);
+    let mut content = Vec::new();
+    std::fs::File::from(file)
+        .take(max_content_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut content)?;
+    if content.len() > max_content_bytes {
+        return Err(io::Error::other(
+            "workspace ownership marker exceeds its content bound",
+        ));
+    }
+    Ok(WorkspaceGenerationFileBinding { identity, content })
+}
+
+#[cfg(unix)]
+fn verify_open_generation_file(
+    root: &OwnedFd,
+    name: &str,
+    expected_identity: WorkspaceGenerationIdentity,
+    expected_content: &[u8],
+) -> io::Result<()> {
+    let binding = open_generation_file_binding_at(root, name, expected_content.len())?;
+    if binding.identity != expected_identity || binding.content != expected_content {
+        return Err(io::Error::other(
+            "workspace ownership marker changed before cleanup",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn workspace_generation_file_binding_at(
+    parent: &OwnedFd,
+    root_name: &OsStr,
+    name: &str,
+    max_content_bytes: usize,
+) -> io::Result<WorkspaceGenerationFileBinding> {
+    let root = rustix::fs::openat(
+        parent,
+        root_name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    open_generation_file_binding_at(&root, name, max_content_bytes)
+}
+
+#[cfg(windows)]
+pub(crate) fn workspace_generation_file_binding(
+    root: &Path,
+    name: &str,
+    max_content_bytes: usize,
+) -> io::Result<WorkspaceGenerationFileBinding> {
+    let root = WindowsDirectory::open_absolute_read_only(root)?;
+    root.file_binding(OsStr::new(name), max_content_bytes)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn workspace_generation_file_binding(
+    root: &Path,
+    name: &str,
+    max_content_bytes: usize,
+) -> io::Result<WorkspaceGenerationFileBinding> {
+    let metadata = fs::symlink_metadata(root.join(name))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::other(
+            "workspace ownership marker is not an ordinary file",
+        ));
+    }
+    let content = fs::read(root.join(name))?;
+    if content.len() > max_content_bytes {
+        return Err(io::Error::other(
+            "workspace ownership marker exceeds its content bound",
+        ));
+    }
+    Ok(WorkspaceGenerationFileBinding {
+        identity: WorkspaceGenerationIdentity {
+            device: 0,
+            inode: 0,
+            inode_high: 0,
+        },
+        content,
+    })
+}
+
+#[cfg(windows)]
+pub(crate) fn workspace_generation_identity_if_exists(
+    path: &Path,
+) -> io::Result<Option<WorkspaceGenerationIdentity>> {
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| io::Error::other("workspace generation has no parent"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("workspace generation has no file name"))?;
+    let parent = WindowsDirectory::open_absolute_read_only(parent_path)?;
+    match parent.open_directory_read_only(name) {
+        Ok(directory) => directory.identity().map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn workspace_generation_identity_if_exists(
+    path: &Path,
+) -> io::Result<Option<WorkspaceGenerationIdentity>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            Ok(Some(WorkspaceGenerationIdentity {
+                device: 0,
+                inode: 0,
+                inode_high: 0,
+            }))
+        }
+        Ok(_) => Err(io::Error::other(
+            "workspace generation is not an ordinary directory",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(all(
@@ -1235,6 +1827,99 @@ fn rename_directory_noreplace(
     .map_err(Into::into)
 }
 
+#[cfg(target_os = "linux")]
+fn anchored_workspace_root_crosses_mount(
+    parent: &OwnedFd,
+    name: &OsStr,
+) -> Result<bool, ReplicaMaterializationError> {
+    match open_cleanup_directory_at(parent, name) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::CrossesDevices => Ok(true),
+        Err(error) => Err(ReplicaMaterializationError::Publish(error)),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn anchored_workspace_root_crosses_mount(
+    _parent: &OwnedFd,
+    _name: &OsStr,
+) -> Result<bool, ReplicaMaterializationError> {
+    Ok(false)
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+fn workspace_root_is_mount_point(path: &Path) -> Result<bool, ReplicaMaterializationError> {
+    use std::ffi::CString;
+    use std::mem::MaybeUninit;
+
+    let canonical = fs::canonicalize(path).map_err(ReplicaMaterializationError::Publish)?;
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        ReplicaMaterializationError::Publish(io::Error::other("workspace destination contains NUL"))
+    })?;
+    let mut stat = MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `statfs` initializes the output on
+    // success. The mount-name field is a fixed-size C character array.
+    if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(ReplicaMaterializationError::Publish(
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: successful `statfs` initialized `stat` above.
+    let stat = unsafe { stat.assume_init() };
+    let mount_name_bytes = stat
+        .f_mntonname
+        .iter()
+        .take_while(|byte| **byte != 0)
+        .map(|byte| *byte as u8)
+        .collect::<Vec<_>>();
+    Ok(canonical.as_os_str().as_bytes() == mount_name_bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn decode_mountinfo_path(input: &[u8]) -> Result<Vec<u8>, ReplicaMaterializationError> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut cursor = 0;
+    while cursor < input.len() {
+        if input[cursor] != b'\\' {
+            output.push(input[cursor]);
+            cursor += 1;
+            continue;
+        }
+        let digits = input.get(cursor + 1..cursor + 4).ok_or_else(|| {
+            ReplicaMaterializationError::Publish(io::Error::other("malformed mountinfo escape"))
+        })?;
+        if !digits.iter().all(|digit| matches!(digit, b'0'..=b'7')) {
+            return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                "malformed mountinfo escape",
+            )));
+        }
+        let value = (digits[0] - b'0') * 64 + (digits[1] - b'0') * 8 + (digits[2] - b'0');
+        output.push(value);
+        cursor += 4;
+    }
+    Ok(output)
+}
+
+#[cfg(target_os = "linux")]
+fn mountinfo_has_workspace_mount(root: &Path, mountinfo: &[u8]) -> io::Result<bool> {
+    for line in mountinfo.split(|byte| *byte == b'\n') {
+        let Some(separator) = line.windows(3).position(|window| window == b" - ") else {
+            continue;
+        };
+        let Some(encoded_mount_point) = line[..separator].split(|byte| *byte == b' ').nth(4) else {
+            continue;
+        };
+        let mount_point = PathBuf::from(OsString::from_vec(
+            decode_mountinfo_path(encoded_mount_point)
+                .map_err(|error| io::Error::other(error.to_string()))?,
+        ));
+        if mount_point.starts_with(root) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[cfg(all(
     unix,
     not(any(target_vendor = "apple", target_os = "linux", target_os = "android"))
@@ -1251,24 +1936,21 @@ fn rename_directory_noreplace(
 }
 
 #[cfg(unix)]
-fn unlink_named_entry(directory: &OwnedFd, name: &OsStr) {
-    let Ok(metadata) = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) else {
-        return;
-    };
-    let flags = if FileType::from_raw_mode(metadata.st_mode) == FileType::Directory {
-        AtFlags::REMOVEDIR
-    } else {
-        AtFlags::empty()
-    };
-    let _ = rustix::fs::unlinkat(directory, name, flags);
-}
-
-#[cfg(unix)]
-fn remove_open_staging_directory(parent: &OwnedFd, root: &OwnedFd, hinted_name: &OsStr) {
-    remove_directory_contents(root);
+fn remove_open_staging_directory(
+    parent: &OwnedFd,
+    root: &OwnedFd,
+    hinted_name: &OsStr,
+    path: &Path,
+) {
     let Ok(root_identity) = rustix::fs::fstat(root) else {
         return;
     };
+    let expected_device = root_identity.st_dev as u64;
+    if preflight_directory_contents(root, expected_device).is_err()
+        || remove_directory_contents(root, expected_device).is_err()
+    {
+        return;
+    }
 
     let matching_name = Dir::read_from(parent).ok().and_then(|entries| {
         entries.filter_map(Result::ok).find_map(|entry| {
@@ -1286,14 +1968,216 @@ fn remove_open_staging_directory(parent: &OwnedFd, root: &OwnedFd, hinted_name: 
     if let Some(name) = matching_name {
         let _ = rustix::fs::unlinkat(parent, &name, AtFlags::REMOVEDIR);
     }
-
-    // A same-user substitution may leave a symlink or regular file at the
-    // expected name. Remove that entry without following it. A non-empty
-    // replacement directory is deliberately left untouched.
-    unlink_named_entry(parent, hinted_name);
+    let _ = hinted_name;
+    let _ = path;
 }
 
-struct StagingDirectory {
+#[cfg(unix)]
+pub(crate) fn remove_workspace_generation_at(
+    parent: &OwnedFd,
+    name: &OsStr,
+    expected: WorkspaceGenerationIdentity,
+    marker_name: &str,
+    expected_marker: WorkspaceGenerationIdentity,
+    expected_marker_content: &[u8],
+) -> io::Result<()> {
+    let root = open_cleanup_directory_at(parent, name)?;
+    let opened = rustix::fs::fstat(&root)?;
+    if !stat_matches_workspace_identity(&opened, expected)
+        || !named_entry_matches(parent, name, &opened).unwrap_or(false)
+    {
+        return Err(io::Error::other(
+            "workspace generation identity changed before cleanup",
+        ));
+    }
+    verify_open_generation_file(&root, marker_name, expected_marker, expected_marker_content)?;
+    let parent_identity = rustix::fs::fstat(parent)?;
+    if opened.st_dev != parent_identity.st_dev {
+        return Err(io::Error::other(
+            "workspace cleanup refuses a cross-filesystem generation",
+        ));
+    }
+    preflight_directory_contents(&root, expected.device)?;
+    verify_open_generation_file(&root, marker_name, expected_marker, expected_marker_content)?;
+    remove_directory_contents(&root, expected.device)?;
+    if !named_entry_matches(parent, name, &opened).unwrap_or(false) {
+        return Err(io::Error::other(
+            "workspace generation identity changed before removal",
+        ));
+    }
+    rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR)?;
+    rustix::fs::fsync(parent)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn remove_workspace_generation(
+    path: &Path,
+    expected: WorkspaceGenerationIdentity,
+    marker_name: &str,
+    expected_marker: WorkspaceGenerationIdentity,
+    expected_marker_content: &[u8],
+) -> io::Result<()> {
+    #[cfg(not(unix))]
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| io::Error::other("workspace generation has no parent"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("workspace generation has no file name"))?;
+    #[cfg(windows)]
+    {
+        let validation_parent = WindowsDirectory::open_absolute_read_only(parent_path)?;
+        let validation_root = validation_parent.open_directory_read_only(name)?;
+        if validation_root.identity()? != expected {
+            return Err(io::Error::other(
+                "workspace generation identity changed before cleanup",
+            ));
+        }
+        let marker =
+            validation_root.file_binding(OsStr::new(marker_name), expected_marker_content.len())?;
+        if marker.identity != expected_marker || marker.content != expected_marker_content {
+            return Err(io::Error::other(
+                "workspace ownership marker changed before cleanup",
+            ));
+        }
+        validation_root.preflight_contents(path, expected.device)?;
+        drop(validation_root);
+        drop(validation_parent);
+
+        let parent = WindowsDirectory::open_absolute(parent_path)?;
+        let root = parent.open_directory_for_cleanup(name)?;
+        if root.identity()? != expected {
+            return Err(io::Error::other(
+                "workspace generation identity changed before cleanup",
+            ));
+        }
+        let marker = root.file_binding(OsStr::new(marker_name), expected_marker_content.len())?;
+        if marker.identity != expected_marker || marker.content != expected_marker_content {
+            return Err(io::Error::other(
+                "workspace ownership marker changed before cleanup",
+            ));
+        }
+        root.preflight_contents(path, expected.device)?;
+        root.remove_contents(path, expected.device)?;
+        if parent.open_directory_read_only(name)?.identity()? != expected {
+            return Err(io::Error::other(
+                "workspace generation identity changed before removal",
+            ));
+        }
+        root.mark_delete()?;
+        parent.sync()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(io::Error::other(
+                "workspace generation is not an ordinary directory",
+            ));
+        }
+        let marker =
+            workspace_generation_file_binding(path, marker_name, expected_marker_content.len())?;
+        if marker.identity != expected_marker || marker.content != expected_marker_content {
+            return Err(io::Error::other(
+                "workspace ownership marker changed before cleanup",
+            ));
+        }
+        let _ = expected;
+        make_tree_removable(path);
+        fs::remove_dir_all(path)?;
+        sync_directory_if_supported(parent_path)
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn repair_workspace_generation_at(
+    parent: &OwnedFd,
+    name: &OsStr,
+    expected: WorkspaceGenerationIdentity,
+) -> io::Result<()> {
+    let root = rustix::fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let opened = rustix::fs::fstat(&root)?;
+    if !stat_matches_workspace_identity(&opened, expected)
+        || !named_entry_matches(parent, name, &opened).unwrap_or(false)
+    {
+        return Err(io::Error::other(
+            "workspace generation identity changed before mode repair",
+        ));
+    }
+    rustix::fs::fchmod(&root, Mode::from_raw_mode(0o555))?;
+    rustix::fs::fsync(&root)?;
+    if !named_entry_matches(parent, name, &opened).unwrap_or(false) {
+        return Err(io::Error::other(
+            "workspace generation identity changed while mode was repaired",
+        ));
+    }
+    rustix::fs::fsync(parent)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn repair_workspace_generation(
+    path: &Path,
+    expected: WorkspaceGenerationIdentity,
+) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let parent_path = path
+            .parent()
+            .ok_or_else(|| io::Error::other("workspace generation has no parent"))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| io::Error::other("workspace generation has no file name"))?;
+        let validation_parent = WindowsDirectory::open_absolute_read_only(parent_path)?;
+        let validation_root = validation_parent.open_directory_read_only(name)?;
+        if validation_root.identity()? != expected {
+            return Err(io::Error::other(
+                "workspace generation identity changed before mode repair",
+            ));
+        }
+        drop(validation_root);
+        drop(validation_parent);
+
+        let parent = WindowsDirectory::open_absolute(parent_path)?;
+        let root = parent.open_directory_for_attributes(name)?;
+        if root.identity()? != expected {
+            return Err(io::Error::other(
+                "workspace generation identity changed before mode repair",
+            ));
+        }
+        root.set_read_only()?;
+        root.sync()?;
+        if parent.open_directory_read_only(name)?.identity()? != expected {
+            return Err(io::Error::other(
+                "workspace generation identity changed while mode was repaired",
+            ));
+        }
+        parent.sync()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        if workspace_generation_identity_if_exists(path)? != Some(expected) {
+            return Err(io::Error::other(
+                "workspace generation identity changed before mode repair",
+            ));
+        }
+        set_directory_read_only(path)?;
+        sync_directory_if_supported(path)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("workspace generation has no parent"))?;
+        sync_directory_if_supported(parent)
+    }
+}
+
+pub(crate) struct StagingDirectory {
     path: PathBuf,
     #[cfg(unix)]
     parent: OwnedFd,
@@ -1301,11 +2185,110 @@ struct StagingDirectory {
     root: OwnedFd,
     #[cfg(unix)]
     name: OsString,
+    #[cfg(windows)]
+    parent: WindowsDirectory,
+    #[cfg(windows)]
+    root: WindowsDirectory,
+    #[cfg(windows)]
+    name: OsString,
     published: bool,
 }
 
 impl StagingDirectory {
-    fn create(parent: &Path) -> Result<Self, ReplicaMaterializationError> {
+    pub(crate) fn create_for_publication(
+        parent: &Path,
+        lock: &WorkspacePublicationLock,
+    ) -> Result<Self, ReplicaMaterializationError> {
+        #[cfg(unix)]
+        {
+            let parent_descriptor = lock
+                ._parent
+                .try_clone()
+                .map_err(ReplicaMaterializationError::Staging)?;
+            Self::create_in_open_unix_parent(parent, parent_descriptor)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = lock;
+            Self::create(parent)
+        }
+    }
+
+    #[cfg(unix)]
+    fn create_in_open_unix_parent(
+        parent: &Path,
+        parent_descriptor: OwnedFd,
+    ) -> Result<Self, ReplicaMaterializationError> {
+        for _ in 0..16 {
+            let mut random = [0_u8; 16];
+            getrandom::fill(&mut random).map_err(|error| {
+                ReplicaMaterializationError::Staging(io::Error::other(error.to_string()))
+            })?;
+            let suffix = random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let name = OsString::from(format!(".locality-stage-{suffix}"));
+            let path = parent.join(&name);
+            match rustix::fs::mkdirat(&parent_descriptor, &name, Mode::from_raw_mode(0o700)) {
+                Ok(()) => {
+                    let root = match rustix::fs::openat(
+                        &parent_descriptor,
+                        &name,
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    ) {
+                        Ok(root) => root,
+                        Err(error) => {
+                            let _ =
+                                rustix::fs::unlinkat(&parent_descriptor, &name, AtFlags::REMOVEDIR);
+                            return Err(ReplicaMaterializationError::Staging(error.into()));
+                        }
+                    };
+                    if let Err(error) = rustix::fs::fchmod(&root, Mode::from_raw_mode(0o700)) {
+                        let _ = rustix::fs::unlinkat(&parent_descriptor, &name, AtFlags::REMOVEDIR);
+                        return Err(ReplicaMaterializationError::Staging(error.into()));
+                    }
+                    return Ok(Self {
+                        path,
+                        parent: parent_descriptor,
+                        root,
+                        name,
+                        published: false,
+                    });
+                }
+                Err(rustix::io::Errno::EXIST) => continue,
+                Err(error) => return Err(ReplicaMaterializationError::Staging(error.into())),
+            }
+        }
+        Err(ReplicaMaterializationError::Staging(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique staging directory",
+        )))
+    }
+
+    pub(crate) fn verify_publication_parent(
+        &self,
+        lock: &WorkspacePublicationLock,
+    ) -> Result<(), ReplicaMaterializationError> {
+        #[cfg(unix)]
+        {
+            let staging_parent = rustix::fs::fstat(&self.parent)
+                .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+            let locked_parent = rustix::fs::fstat(&lock._parent)
+                .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+            if !same_file_identity(&staging_parent, &locked_parent) {
+                return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                    "workspace staging directory is outside the locked parent namespace",
+                )));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = lock;
+        Ok(())
+    }
+
+    pub(crate) fn create(parent: &Path) -> Result<Self, ReplicaMaterializationError> {
         // The pre-open metadata check alone is not enough: the path can be
         // replaced with a symlink before `open`. Keep the descriptor anchored
         // to the requested directory and let the identity checks below detect
@@ -1329,6 +2312,9 @@ impl StagingDirectory {
                 )));
             }
         }
+        #[cfg(windows)]
+        let parent_descriptor = WindowsDirectory::open_absolute(parent)
+            .map_err(ReplicaMaterializationError::Staging)?;
         for _ in 0..16 {
             let mut random = [0_u8; 16];
             getrandom::fill(&mut random).map_err(|error| {
@@ -1338,20 +2324,23 @@ impl StagingDirectory {
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             let name = OsString::from(format!(".locality-stage-{suffix}"));
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             let path = parent.join(&name);
-            #[cfg(not(unix))]
+            #[cfg(not(any(unix, windows)))]
             let path = parent.join(format!(".locality-stage-{suffix}"));
             #[cfg(unix)]
             let create_result =
                 rustix::fs::mkdirat(&parent_descriptor, &name, Mode::from_raw_mode(0o700))
+                    .map(|()| None::<()>)
                     .map_err(io::Error::from);
-            #[cfg(not(unix))]
-            let create_result = fs::create_dir(&path);
+            #[cfg(windows)]
+            let create_result = parent_descriptor.create_directory(&name).map(Some);
+            #[cfg(not(any(unix, windows)))]
+            let create_result = fs::create_dir(&path).map(|()| None::<()>);
             match create_result {
-                Ok(()) => {
+                Ok(_created_root) => {
                     #[cfg(unix)]
                     let root = match rustix::fs::openat(
                         &parent_descriptor,
@@ -1371,7 +2360,9 @@ impl StagingDirectory {
                         let _ = rustix::fs::unlinkat(&parent_descriptor, &name, AtFlags::REMOVEDIR);
                         return Err(ReplicaMaterializationError::Staging(error.into()));
                     }
-                    #[cfg(not(unix))]
+                    #[cfg(windows)]
+                    let root = _created_root.expect("Windows create returns an opened root");
+                    #[cfg(not(any(unix, windows)))]
                     make_directory_writable(&path).map_err(ReplicaMaterializationError::Staging)?;
                     return Ok(Self {
                         path,
@@ -1380,6 +2371,12 @@ impl StagingDirectory {
                         #[cfg(unix)]
                         root,
                         #[cfg(unix)]
+                        name,
+                        #[cfg(windows)]
+                        parent: parent_descriptor,
+                        #[cfg(windows)]
+                        root,
+                        #[cfg(windows)]
                         name,
                         published: false,
                     });
@@ -1394,8 +2391,253 @@ impl StagingDirectory {
         )))
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn identity(
+        &self,
+    ) -> Result<WorkspaceGenerationIdentity, ReplicaMaterializationError> {
+        #[cfg(unix)]
+        {
+            let root = rustix::fs::fstat(&self.root)
+                .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+            Ok(workspace_identity_from_stat(&root))
+        }
+        #[cfg(windows)]
+        {
+            self.root
+                .identity()
+                .map_err(ReplicaMaterializationError::Publish)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            workspace_generation_identity_if_exists(&self.path)
+                .map_err(ReplicaMaterializationError::Publish)?
+                .ok_or_else(|| {
+                    ReplicaMaterializationError::Publish(io::Error::other(
+                        "workspace staging root disappeared",
+                    ))
+                })
+        }
+    }
+
+    pub(crate) fn file_binding(
+        &self,
+        name: &str,
+        max_content_bytes: usize,
+    ) -> Result<WorkspaceGenerationFileBinding, ReplicaMaterializationError> {
+        #[cfg(unix)]
+        {
+            let file = rustix::fs::openat(
+                &self.root,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+            let stat = rustix::fs::fstat(&file)
+                .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+                return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                    "workspace ownership marker is not an ordinary file",
+                )));
+            }
+            let identity = workspace_identity_from_stat(&stat);
+            let mut content = Vec::new();
+            std::fs::File::from(file)
+                .take(max_content_bytes.saturating_add(1) as u64)
+                .read_to_end(&mut content)
+                .map_err(ReplicaMaterializationError::Publish)?;
+            if content.len() > max_content_bytes {
+                return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                    "workspace ownership marker exceeds its content bound",
+                )));
+            }
+            Ok(WorkspaceGenerationFileBinding { identity, content })
+        }
+        #[cfg(windows)]
+        {
+            self.root
+                .file_binding(OsStr::new(name), max_content_bytes)
+                .map_err(ReplicaMaterializationError::Publish)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            workspace_generation_file_binding(&self.path, name, max_content_bytes)
+                .map_err(ReplicaMaterializationError::Publish)
+        }
+    }
+
+    pub(crate) fn finalize_durable(&self) -> Result<(), ReplicaMaterializationError> {
+        make_tree_read_only(self).map_err(|source| ReplicaMaterializationError::Write {
+            path: self.path.clone(),
+            source,
+        })?;
+        #[cfg(unix)]
+        sync_directory_tree(&self.root).map_err(|source| ReplicaMaterializationError::Write {
+            path: self.path.clone(),
+            source,
+        })?;
+        #[cfg(windows)]
+        self.root
+            .sync()
+            .map_err(|source| ReplicaMaterializationError::Write {
+                path: self.path.clone(),
+                source,
+            })?;
+        #[cfg(not(any(unix, windows)))]
+        sync_path_tree(&self.path).map_err(|source| ReplicaMaterializationError::Write {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    pub(crate) fn sync_parent(&self) -> Result<(), ReplicaMaterializationError> {
+        #[cfg(unix)]
+        {
+            rustix::fs::fsync(&self.parent)
+                .map_err(io::Error::from)
+                .map_err(ReplicaMaterializationError::Publish)
+        }
+        #[cfg(windows)]
+        {
+            self.parent
+                .sync()
+                .map_err(ReplicaMaterializationError::Publish)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let parent = self
+                .path
+                .parent()
+                .ok_or(ReplicaMaterializationError::InvalidDestination)?;
+            sync_directory_if_supported(parent).map_err(ReplicaMaterializationError::Publish)
+        }
+    }
+
+    #[cfg(all(
+        unix,
+        any(target_vendor = "apple", target_os = "linux", target_os = "android")
+    ))]
+    pub(crate) fn exchange(
+        &mut self,
+        destination: &Path,
+        expected_staging: WorkspaceGenerationIdentity,
+        expected_destination: WorkspaceGenerationIdentity,
+    ) -> Result<PathBuf, ReplicaMaterializationError> {
+        let parent_path = self
+            .path
+            .parent()
+            .ok_or(ReplicaMaterializationError::InvalidDestination)?
+            .to_path_buf();
+        if destination.parent() != Some(parent_path.as_path()) {
+            return Err(ReplicaMaterializationError::InvalidDestination);
+        }
+        let destination_name = destination
+            .file_name()
+            .ok_or(ReplicaMaterializationError::InvalidDestination)?;
+        let root_identity = rustix::fs::fstat(&self.root)
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        let old_identity =
+            rustix::fs::statat(&self.parent, destination_name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        if FileType::from_raw_mode(old_identity.st_mode) != FileType::Directory {
+            return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                "workspace publication root is not an ordinary directory",
+            )));
+        }
+        if !stat_matches_workspace_identity(&root_identity, expected_staging)
+            || !stat_matches_workspace_identity(&old_identity, expected_destination)
+        {
+            return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                "workspace generation identity changed before exchange",
+            )));
+        }
+        let parent_identity = rustix::fs::fstat(&self.parent)
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        if old_identity.st_dev != parent_identity.st_dev
+            || anchored_workspace_root_crosses_mount(&self.parent, destination_name)?
+        {
+            return Err(ReplicaMaterializationError::Publish(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "workspace publication root is a mount point or different filesystem",
+            )));
+        }
+        let immediate_old =
+            rustix::fs::statat(&self.parent, destination_name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        let immediate_root = rustix::fs::fstat(&self.root)
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        if !stat_matches_workspace_identity(&immediate_old, expected_destination)
+            || !stat_matches_workspace_identity(&immediate_root, expected_staging)
+            || immediate_old.st_dev != parent_identity.st_dev
+            || !named_entry_matches(&self.parent, &self.name, &immediate_root).unwrap_or(false)
+        {
+            return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                "workspace generation identity changed immediately before exchange",
+            )));
+        }
+        preflight_existing_destination_spelling(&self.parent, destination_name, &immediate_old)
+            .map_err(ReplicaMaterializationError::Publish)?;
+        if !named_entry_matches(&self.parent, &self.name, &root_identity).unwrap_or(false) {
+            return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                "workspace staging root identity changed before exchange",
+            )));
+        }
+        let swap_old =
+            rustix::fs::statat(&self.parent, destination_name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        let swap_staging = rustix::fs::statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        if !stat_matches_workspace_identity(&swap_old, expected_destination)
+            || !stat_matches_workspace_identity(&swap_staging, expected_staging)
+        {
+            return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                "workspace generation identity changed at exchange",
+            )));
+        }
+        let old_path = self.path.clone();
+        rustix::fs::renameat_with(
+            &self.parent,
+            &self.name,
+            &self.parent,
+            destination_name,
+            RenameFlags::EXCHANGE,
+        )
+        .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        self.published = true;
+        if !named_entry_matches(&self.parent, destination_name, &root_identity).unwrap_or(false)
+            || !named_entry_matches(&self.parent, &self.name, &old_identity).unwrap_or(false)
+        {
+            return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                "workspace root identity changed during atomic exchange",
+            )));
+        }
+        rustix::fs::fchmod(&self.root, Mode::from_raw_mode(0o555))
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        rustix::fs::fsync(&self.root)
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        self.path = destination.to_path_buf();
+        self.sync_parent()?;
+        Ok(old_path)
+    }
+
+    #[cfg(not(all(
+        unix,
+        any(target_vendor = "apple", target_os = "linux", target_os = "android")
+    )))]
+    pub(crate) fn exchange(
+        &mut self,
+        _destination: &Path,
+        _expected_staging: WorkspaceGenerationIdentity,
+        _expected_destination: WorkspaceGenerationIdentity,
+    ) -> Result<PathBuf, ReplicaMaterializationError> {
+        Err(ReplicaMaterializationError::Publish(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic workspace directory exchange is unavailable on this platform",
+        )))
     }
 
     #[cfg(unix)]
@@ -1428,7 +2670,10 @@ impl StagingDirectory {
     }
 
     #[cfg(unix)]
-    fn create_directory(&self, logical_path: &str) -> Result<(), ReplicaMaterializationError> {
+    pub(crate) fn create_directory(
+        &self,
+        logical_path: &str,
+    ) -> Result<(), ReplicaMaterializationError> {
         self.open_or_create_directory(logical_path)
             .map(|_| ())
             .map_err(|source| ReplicaMaterializationError::Write {
@@ -1437,15 +2682,43 @@ impl StagingDirectory {
             })
     }
 
-    #[cfg(not(unix))]
-    fn create_directory(&self, logical_path: &str) -> Result<(), ReplicaMaterializationError> {
+    #[cfg(windows)]
+    fn open_or_create_windows_directory(&self, logical_path: &str) -> io::Result<WindowsDirectory> {
+        let mut current = None;
+        for component in logical_path.split('/') {
+            let parent = current.as_ref().unwrap_or(&self.root);
+            let child = parent.open_or_create_directory(OsStr::new(component))?;
+            child.set_read_only()?;
+            current = Some(child);
+        }
+        current.ok_or_else(|| io::Error::other("empty logical directory path"))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn create_directory(
+        &self,
+        logical_path: &str,
+    ) -> Result<(), ReplicaMaterializationError> {
+        self.open_or_create_windows_directory(logical_path)
+            .map(|_| ())
+            .map_err(|source| ReplicaMaterializationError::Write {
+                path: self.path.join(logical_path),
+                source,
+            })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub(crate) fn create_directory(
+        &self,
+        logical_path: &str,
+    ) -> Result<(), ReplicaMaterializationError> {
         let path = self.path.join(logical_path);
         fs::create_dir_all(&path)
             .map_err(|source| ReplicaMaterializationError::Write { path, source })
     }
 
     #[cfg(unix)]
-    fn write_file<R: Read>(
+    pub(crate) fn write_file<R: Read + ?Sized>(
         &self,
         logical_path: &str,
         reader: &mut R,
@@ -1501,8 +2774,53 @@ impl StagingDirectory {
         })
     }
 
-    #[cfg(not(unix))]
-    fn write_file<R: Read>(
+    #[cfg(windows)]
+    pub(crate) fn write_file<R: Read + ?Sized>(
+        &self,
+        logical_path: &str,
+        reader: &mut R,
+        expected_size: u64,
+    ) -> Result<(), ReplicaMaterializationError> {
+        let target = self.path.join(logical_path);
+        let (parent_path, name) = logical_path
+            .rsplit_once('/')
+            .map_or((None, logical_path), |(parent, name)| (Some(parent), name));
+        let parent = parent_path
+            .map(|parent| self.open_or_create_windows_directory(parent))
+            .transpose()
+            .map_err(|source| ReplicaMaterializationError::Write {
+                path: target.clone(),
+                source,
+            })?;
+        let directory = parent.as_ref().unwrap_or(&self.root);
+        let mut file = directory.create_file(OsStr::new(name)).map_err(|source| {
+            ReplicaMaterializationError::Write {
+                path: target.clone(),
+                source,
+            }
+        })?;
+        let written =
+            io::copy(reader, &mut file).map_err(|source| ReplicaMaterializationError::Write {
+                path: target.clone(),
+                source,
+            })?;
+        if written != expected_size {
+            return Err(ReplicaMaterializationError::MalformedTar(format!(
+                "entry `{}` ended after {written} of {expected_size} bytes",
+                target.display()
+            )));
+        }
+        file.flush()
+            .and_then(|()| set_windows_file_read_only(&file))
+            .and_then(|()| file.sync_all())
+            .map_err(|source| ReplicaMaterializationError::Write {
+                path: target,
+                source,
+            })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub(crate) fn write_file<R: Read + ?Sized>(
         &self,
         logical_path: &str,
         reader: &mut R,
@@ -1519,7 +2837,30 @@ impl StagingDirectory {
     }
 
     #[cfg(unix)]
-    fn publish(&mut self, destination: &Path) -> Result<(), ReplicaMaterializationError> {
+    pub(crate) fn publish(
+        &mut self,
+        destination: &Path,
+        expected_staging: WorkspaceGenerationIdentity,
+    ) -> Result<(), ReplicaMaterializationError> {
+        self.publish_with_destination_policy(destination, expected_staging, false)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn publish_portable_workspace(
+        &mut self,
+        destination: &Path,
+        expected_staging: WorkspaceGenerationIdentity,
+    ) -> Result<(), ReplicaMaterializationError> {
+        self.publish_with_destination_policy(destination, expected_staging, true)
+    }
+
+    #[cfg(unix)]
+    fn publish_with_destination_policy(
+        &mut self,
+        destination: &Path,
+        expected_staging: WorkspaceGenerationIdentity,
+        portable_spelling: bool,
+    ) -> Result<(), ReplicaMaterializationError> {
         let parent_path = self
             .path
             .parent()
@@ -1533,15 +2874,35 @@ impl StagingDirectory {
             .ok_or(ReplicaMaterializationError::InvalidDestination)?;
         let root_identity = rustix::fs::fstat(&self.root)
             .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
-        let parent_identity = rustix::fs::fstat(&self.parent)
-            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
-        let named_parent = rustix::fs::stat(&parent_path)
-            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
-        if !same_file_identity(&parent_identity, &named_parent)
-            || !named_entry_matches(&self.parent, &self.name, &root_identity).unwrap_or(false)
-        {
+        if !stat_matches_workspace_identity(&root_identity, expected_staging) {
+            return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                "workspace staging root identity changed before publication",
+            )));
+        }
+        if !named_entry_matches(&self.parent, &self.name, &root_identity).unwrap_or(false) {
             return Err(ReplicaMaterializationError::Publish(io::Error::other(
                 "replica staging root identity changed before publication",
+            )));
+        }
+
+        if portable_spelling {
+            preflight_new_destination_spelling(&self.parent, destination_name).map_err(
+                |error| {
+                    if error.kind() == io::ErrorKind::AlreadyExists {
+                        ReplicaMaterializationError::DestinationExists(destination.to_path_buf())
+                    } else {
+                        ReplicaMaterializationError::Publish(error)
+                    }
+                },
+            )?;
+        }
+        let immediate_root = rustix::fs::fstat(&self.root)
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        if !stat_matches_workspace_identity(&immediate_root, expected_staging)
+            || !named_entry_matches(&self.parent, &self.name, &immediate_root).unwrap_or(false)
+        {
+            return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                "workspace staging root identity changed immediately before publication",
             )));
         }
 
@@ -1563,11 +2924,9 @@ impl StagingDirectory {
         }
         rustix::fs::fchmod(&self.root, Mode::from_raw_mode(0o555))
             .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
-        let named_parent = rustix::fs::stat(&parent_path)
+        rustix::fs::fsync(&self.root)
             .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
-        if !same_file_identity(&parent_identity, &named_parent)
-            || !named_entry_matches(&self.parent, &self.name, &root_identity).unwrap_or(false)
-        {
+        if !named_entry_matches(&self.parent, &self.name, &root_identity).unwrap_or(false) {
             return Err(ReplicaMaterializationError::Publish(io::Error::other(
                 "replica staging root identity changed while publication was finalized",
             )));
@@ -1576,19 +2935,105 @@ impl StagingDirectory {
         Ok(())
     }
 
-    #[cfg(not(unix))]
-    fn publish(&mut self, destination: &Path) -> Result<(), ReplicaMaterializationError> {
-        match fs::rename(&self.path, destination) {
-            Ok(()) => {
-                if let Err(error) = set_directory_read_only(destination) {
-                    let _ = fs::rename(destination, &self.path);
-                    return Err(ReplicaMaterializationError::Publish(error));
-                }
-                self.published = true;
-                Ok(())
-            }
-            Err(error) => Err(ReplicaMaterializationError::Publish(error)),
+    #[cfg(windows)]
+    pub(crate) fn publish_portable_workspace(
+        &mut self,
+        destination: &Path,
+        expected_staging: WorkspaceGenerationIdentity,
+    ) -> Result<(), ReplicaMaterializationError> {
+        self.publish(destination, expected_staging)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn publish(
+        &mut self,
+        destination: &Path,
+        expected_staging: WorkspaceGenerationIdentity,
+    ) -> Result<(), ReplicaMaterializationError> {
+        let parent_path = self
+            .path
+            .parent()
+            .ok_or(ReplicaMaterializationError::InvalidDestination)?;
+        if destination.parent() != Some(parent_path) {
+            return Err(ReplicaMaterializationError::InvalidDestination);
         }
+        let destination_name = destination
+            .file_name()
+            .ok_or(ReplicaMaterializationError::InvalidDestination)?;
+        let named_parent = WindowsDirectory::open_absolute_read_only(parent_path)
+            .map_err(ReplicaMaterializationError::Publish)?;
+        if named_parent
+            .identity()
+            .map_err(ReplicaMaterializationError::Publish)?
+            != self
+                .parent
+                .identity()
+                .map_err(ReplicaMaterializationError::Publish)?
+            || self
+                .root
+                .identity()
+                .map_err(ReplicaMaterializationError::Publish)?
+                != expected_staging
+        {
+            return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                "workspace staging or parent identity changed before publication",
+            )));
+        }
+        match self.parent.open_directory_read_only(destination_name) {
+            Ok(_) => {
+                return Err(ReplicaMaterializationError::DestinationExists(
+                    destination.to_path_buf(),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ReplicaMaterializationError::Publish(error)),
+        }
+        self.root
+            .rename_no_replace(&self.parent, destination_name)
+            .map_err(ReplicaMaterializationError::Publish)?;
+        let published = self
+            .parent
+            .open_directory_read_only(destination_name)
+            .map_err(ReplicaMaterializationError::Publish)?;
+        if published
+            .identity()
+            .map_err(ReplicaMaterializationError::Publish)?
+            != expected_staging
+        {
+            return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                "workspace root identity changed during publication",
+            )));
+        }
+        self.root
+            .set_read_only()
+            .and_then(|()| self.root.sync())
+            .and_then(|()| self.parent.sync())
+            .map_err(ReplicaMaterializationError::Publish)?;
+        self.path = destination.to_path_buf();
+        self.name = destination_name.to_os_string();
+        self.published = true;
+        Ok(())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub(crate) fn publish_portable_workspace(
+        &mut self,
+        destination: &Path,
+        expected_staging: WorkspaceGenerationIdentity,
+    ) -> Result<(), ReplicaMaterializationError> {
+        self.publish(destination, expected_staging)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub(crate) fn publish(
+        &mut self,
+        destination: &Path,
+        _expected_staging: WorkspaceGenerationIdentity,
+    ) -> Result<(), ReplicaMaterializationError> {
+        fs::rename(&self.path, destination).map_err(ReplicaMaterializationError::Publish)?;
+        set_directory_read_only(destination).map_err(ReplicaMaterializationError::Publish)?;
+        self.published = true;
+        Ok(())
     }
 }
 
@@ -1597,14 +3042,80 @@ impl Drop for StagingDirectory {
         if !self.published {
             #[cfg(unix)]
             {
-                remove_open_staging_directory(&self.parent, &self.root, &self.name);
+                remove_open_staging_directory(&self.parent, &self.root, &self.name, &self.path);
             }
-            #[cfg(not(unix))]
+            #[cfg(windows)]
+            {
+                if let (Ok(expected), Ok(named)) = (
+                    self.root.identity(),
+                    self.parent.open_directory_read_only(&self.name),
+                ) && named.identity().ok() == Some(expected)
+                {
+                    let _ = self
+                        .root
+                        .preflight_contents(&self.path, expected.device)
+                        .and_then(|()| self.root.remove_contents(&self.path, expected.device));
+                    if self
+                        .parent
+                        .open_directory_read_only(&self.name)
+                        .and_then(|directory| directory.identity())
+                        .ok()
+                        == Some(expected)
+                    {
+                        let _ = self.root.mark_delete();
+                    }
+                }
+            }
+            #[cfg(not(any(unix, windows)))]
             {
                 make_tree_removable(&self.path);
                 let _ = fs::remove_dir_all(&self.path);
             }
         }
+    }
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod apple_tests {
+    use super::*;
+
+    #[test]
+    fn macos_mount_detection_rejects_the_filesystem_root() {
+        assert!(workspace_root_is_mount_point(Path::new("/")).expect("inspect root mount"));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn nested_bind_mount_is_detected_before_cleanup() {
+        let mountinfo = b"35 24 0:31 / / rw - ext4 /dev/root rw\n\
+36 35 0:31 /bound /tmp/workspace/nested rw - ext4 /dev/root rw\n";
+        assert!(
+            mountinfo_has_workspace_mount(Path::new("/tmp/workspace"), mountinfo)
+                .expect("parse mountinfo")
+        );
+        assert!(
+            !mountinfo_has_workspace_mount(Path::new("/tmp/other"), mountinfo)
+                .expect("parse unrelated mountinfo")
+        );
+    }
+
+    #[test]
+    fn cleanup_open_refuses_to_cross_the_proc_mount() {
+        if !Path::new("/proc/self/mountinfo").exists() {
+            return;
+        }
+        let root = rustix::fs::open(
+            "/",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open filesystem root");
+        open_cleanup_directory_at(&root, "proc")
+            .expect_err("RESOLVE_NO_XDEV must reject the proc mount");
     }
 }
 

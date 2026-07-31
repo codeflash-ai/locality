@@ -33,6 +33,7 @@ pub struct SlackConversation {
     pub is_member: Option<bool>,
     #[serde(default)]
     pub is_archived: bool,
+    /// Raw epoch-millisecond channel-settings timestamp from Slack.
     #[serde(default)]
     pub updated: Option<u64>,
     #[serde(default)]
@@ -189,7 +190,7 @@ mod tests {
               "is_mpim": false,
               "is_archived": false,
               "is_private": false,
-              "updated": 1780000000000000,
+              "updated": 1780000000123,
               "num_members": 12,
               "topic": { "value": "Company-wide updates" },
               "purpose": { "value": "Announcements" }
@@ -202,6 +203,7 @@ mod tests {
         assert!(page.ok);
         assert_eq!(page.channels[0].id, "C123");
         assert_eq!(page.channels[0].name.as_deref(), Some("general"));
+        assert_eq!(page.channels[0].updated, Some(1_780_000_000_123));
         assert_eq!(page.response_metadata.next_cursor.as_deref(), Some("abc"));
     }
 

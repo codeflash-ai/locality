@@ -42,8 +42,9 @@ use crate::discovery::{
 use crate::error::{StoreError, StoreResult};
 use crate::generation_delivery::{
     GENERATION_DELIVERY_COMPONENT_VERSION, GenerationApplyJournalRecord, GenerationApplyOutcome,
-    GenerationApplyStatus, GenerationDeliveryRepository, GenerationInodeEvidenceRecord,
-    GenerationPathRecord, GenerationPathState, GenerationTransportSelectionBinding,
+    GenerationApplyStatus, GenerationDeliveryRepository, GenerationInodeEvidenceConflictUpdate,
+    GenerationInodeEvidenceRecord, GenerationInodeEvidenceResolution, GenerationPathRecord,
+    GenerationPathState, GenerationRetainedInodeRecord, GenerationTransportSelectionBinding,
     NegotiatedGenerationApplyJournalRecord, ObservedGenerationRecord, PreparedGenerationApply,
     PreparedGenerationApplyV2, PreparedGenerationApplyV3,
 };
@@ -60,8 +61,12 @@ use crate::repository::{
     FreshnessStateRepository, HydrationJobRepository, JournalRepository,
     MetadataDiscoveryJobRepository, MountLiveModeRepository, MountRepository,
     RemoteObservationRepository, ShadowRepository, VirtualMoveRepository, VirtualMoveTransition,
-    VirtualMutationRepository, validate_virtual_move_transition, virtual_move_content_changed,
-    virtual_move_missing,
+    VirtualMutationRepository, WorkspaceBindingRepository, validate_virtual_move_transition,
+    virtual_move_content_changed, virtual_move_missing,
+};
+use crate::workspace_binding::{
+    WorkspaceBinding, WorkspaceBindingRecord, WorkspaceRebindBlocker, binding_from_legacy_mount,
+    unique_binding,
 };
 use locality_protocol::freshness_delivery_transport::GenerationTransportCapabilities;
 
@@ -180,6 +185,15 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
         data_json: "{}",
     },
     StateComponentDefinition {
+        component_id: "durable:workspace_bindings",
+        component_kind: "durable_json",
+        current_version: 1,
+        min_reader_version: 1,
+        required: true,
+        rebuildable: false,
+        data_json: "{\"format\":\"workspace_binding.v1\"}",
+    },
+    StateComponentDefinition {
         component_id: "durable:metadata_discovery",
         component_kind: "durable_queue",
         current_version: 1,
@@ -249,8 +263,8 @@ impl SqliteStateStore {
         std::fs::create_dir_all(&root)?;
         let db_path = root.join(DB_FILE);
         let store = Self { root, db_path };
-        let connection = store.connection()?;
-        initialize_schema(&connection)?;
+        let mut connection = store.connection()?;
+        initialize_schema(&mut connection)?;
         ensure_current_state_is_readable(&connection)?;
         Ok(store)
     }
@@ -638,9 +652,10 @@ impl GenerationDeliveryRepository for SqliteStateStore {
     fn seed_observed_generation(
         &mut self,
         observed: ObservedGenerationRecord,
-        paths: Vec<GenerationPathRecord>,
+        mut paths: Vec<GenerationPathRecord>,
     ) -> StoreResult<()> {
         validate_seed_generation(&observed, &paths)?;
+        paths.sort_by(|left, right| left.projection_id.cmp(&right.projection_id));
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mount_exists = transaction.query_row(
@@ -1126,11 +1141,19 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         &mut self,
         evidence: GenerationInodeEvidenceRecord,
     ) -> StoreResult<()> {
+        // The SQL column names predate the captured-reservation model and stay
+        // stable for schema compatibility. They store captured snapshots, not
+        // live post-resolution filesystem fingerprints or disk usage.
+        if evidence.resolved_at.is_some() {
+            return Err(StoreError::InvalidState(
+                "new generation inode evidence cannot start resolved".to_string(),
+            ));
+        }
         let connection = self.connection()?;
         let entry_index = i64::try_from(evidence.entry_index).map_err(|_| {
             StoreError::InvalidState("generation evidence index is too large".to_string())
         })?;
-        let byte_length = i64::try_from(evidence.byte_length).map_err(|_| {
+        let byte_length = i64::try_from(evidence.captured_byte_length).map_err(|_| {
             StoreError::InvalidState("generation evidence length is too large".to_string())
         })?;
         let changed = connection.execute(
@@ -1146,7 +1169,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 evidence.mount_id.0.as_str(),
                 evidence.logical_path.as_str(),
                 evidence.evidence_name.as_str(),
-                evidence.expected_sha256.as_str(),
+                evidence.captured_sha256.as_str(),
                 byte_length,
                 evidence.base_payload_delta_id.as_deref(),
                 evidence
@@ -1165,6 +1188,10 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                         AND expected_sha256 = ?6 AND byte_length = ?7
                         AND base_payload_delta_id IS ?8 AND base_payload_entry_index IS ?9
                         AND created_at = ?10
+                        AND visible_evidence_name IS NULL
+                        AND visible_expected_sha256 IS NULL
+                        AND visible_byte_length IS NULL
+                        AND resolved_at IS NULL
                  FROM generation_inode_evidence WHERE delta_id = ?1 AND entry_index = ?2",
                 params![
                     evidence.delta_id.as_str(),
@@ -1172,7 +1199,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                     evidence.mount_id.0.as_str(),
                     evidence.logical_path.as_str(),
                     evidence.evidence_name.as_str(),
-                    evidence.expected_sha256.as_str(),
+                    evidence.captured_sha256.as_str(),
                     byte_length,
                     evidence.base_payload_delta_id.as_deref(),
                     evidence
@@ -1199,8 +1226,9 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT delta_id, entry_index, mount_id, logical_path, evidence_name,
-                    expected_sha256, byte_length, base_payload_delta_id,
-                    base_payload_entry_index, created_at
+                    expected_sha256, byte_length, visible_evidence_name,
+                    visible_expected_sha256, visible_byte_length,
+                    base_payload_delta_id, base_payload_entry_index, resolved_at, created_at
              FROM generation_inode_evidence ORDER BY created_at, delta_id, entry_index",
         )?;
         let rows = statement.query_map([], |row| {
@@ -1213,8 +1241,12 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 row.get::<_, String>(5)?,
                 row.get::<_, i64>(6)?,
                 row.get::<_, Option<String>>(7)?,
-                row.get::<_, Option<i64>>(8)?,
-                row.get::<_, String>(9)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<i64>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, String>(13)?,
             ))
         })?;
         rows.map(|row| {
@@ -1227,13 +1259,34 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 mount_id: MountId::new(row.2),
                 logical_path: row.3,
                 evidence_name: row.4,
-                expected_sha256: row.5,
-                byte_length: u64::try_from(row.6).map_err(|_| {
+                captured_sha256: row.5,
+                captured_byte_length: u64::try_from(row.6).map_err(|_| {
                     StoreError::InvalidState("negative generation evidence length".to_string())
                 })?,
-                base_payload_delta_id: row.7,
+                visible_evidence: match (row.7, row.8, row.9) {
+                    (Some(evidence_name), Some(captured_sha256), Some(captured_byte_length)) => {
+                        Some(GenerationRetainedInodeRecord {
+                            evidence_name,
+                            captured_sha256,
+                            captured_byte_length: u64::try_from(captured_byte_length).map_err(
+                                |_| {
+                                    StoreError::InvalidState(
+                                        "negative visible generation evidence length".to_string(),
+                                    )
+                                },
+                            )?,
+                        })
+                    }
+                    (None, None, None) => None,
+                    _ => {
+                        return Err(StoreError::InvalidState(
+                            "partial visible generation inode evidence".to_string(),
+                        ));
+                    }
+                },
+                base_payload_delta_id: row.10,
                 base_payload_entry_index: row
-                    .8
+                    .11
                     .map(|value| {
                         u64::try_from(value).map_err(|_| {
                             StoreError::InvalidState(
@@ -1242,7 +1295,8 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                         })
                     })
                     .transpose()?,
-                created_at: row.9,
+                resolved_at: row.12,
+                created_at: row.13,
             })
         })
         .collect()
@@ -1252,8 +1306,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         &mut self,
         delta_id: &str,
         entry_index: u64,
-        local_sha256: &str,
-        updated_at: &str,
+        update: GenerationInodeEvidenceConflictUpdate,
     ) -> StoreResult<()> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1353,17 +1406,17 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 conflict_payload_delta_id,
                 conflict_payload_entry_index,
                 incoming.map(to_json).transpose()?,
-                updated_at,
+                update.updated_at.as_str(),
             ],
         )?;
         let converted_outcome = if was_over_quota {
             GenerationApplyOutcome::ConflictOverQuota {
-                local_sha256: Some(local_sha256.to_string()),
+                local_sha256: Some(update.local_sha256.clone()),
                 incoming_identity: incoming.cloned(),
             }
         } else {
             GenerationApplyOutcome::Conflict {
-                local_sha256: Some(local_sha256.to_string()),
+                local_sha256: Some(update.local_sha256.clone()),
                 incoming_identity: incoming.cloned(),
             }
         };
@@ -1376,19 +1429,177 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                     "generation evidence index is too large".to_string()
                 ))?,
                 to_json(&converted_outcome)?,
-                updated_at,
+                update.updated_at.as_str(),
             ],
         )?;
+        let byte_length = i64::try_from(update.captured_byte_length).map_err(|_| {
+            StoreError::InvalidState("generation evidence length is too large".to_string())
+        })?;
+        let visible_byte_length = update
+            .visible_evidence
+            .as_ref()
+            .map(|visible| i64::try_from(visible.captured_byte_length))
+            .transpose()
+            .map_err(|_| {
+                StoreError::InvalidState(
+                    "visible generation evidence length is too large".to_string(),
+                )
+            })?;
         transaction.execute(
-            "UPDATE generation_inode_evidence SET expected_sha256 = ?3
+            "UPDATE generation_inode_evidence
+             SET expected_sha256 = ?3, byte_length = ?4,
+                 visible_evidence_name = ?5, visible_expected_sha256 = ?6,
+                 visible_byte_length = ?7, resolved_at = NULL
              WHERE delta_id = ?1 AND entry_index = ?2",
             params![
                 delta_id,
                 i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
                     "generation evidence index is too large".to_string()
                 ))?,
-                local_sha256
+                update.captured_sha256.as_str(),
+                byte_length,
+                update
+                    .visible_evidence
+                    .as_ref()
+                    .map(|visible| visible.evidence_name.as_str()),
+                update
+                    .visible_evidence
+                    .as_ref()
+                    .map(|visible| visible.captured_sha256.as_str()),
+                visible_byte_length,
             ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn mark_generation_inode_evidence_resolved(
+        &mut self,
+        delta_id: &str,
+        entry_index: u64,
+        resolution: GenerationInodeEvidenceResolution,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let journal =
+            generation_apply_from_connection(&transaction, delta_id)?.ok_or_else(|| {
+                StoreError::InvalidState(format!("generation apply `{delta_id}` is missing"))
+            })?;
+        if journal.status != GenerationApplyStatus::Completed {
+            return Err(StoreError::InvalidState(
+                "inode evidence resolution requires a completed generation apply".to_string(),
+            ));
+        }
+        let entry = journal
+            .delta
+            .entries
+            .get(entry_index as usize)
+            .ok_or_else(|| {
+                StoreError::InvalidState("generation evidence index is out of bounds".to_string())
+            })?;
+        let new = entry.new.as_ref().ok_or_else(|| {
+            StoreError::InvalidState(
+                "retained inode resolution requires an incoming identity".to_string(),
+            )
+        })?;
+        let index = i64::try_from(entry_index).map_err(|_| {
+            StoreError::InvalidState("generation evidence index is too large".to_string())
+        })?;
+        let byte_length = i64::try_from(resolution.captured_byte_length).map_err(|_| {
+            StoreError::InvalidState("generation evidence length is too large".to_string())
+        })?;
+        let visible_byte_length =
+            i64::try_from(resolution.visible_captured_byte_length).map_err(|_| {
+                StoreError::InvalidState(
+                    "visible generation evidence length is too large".to_string(),
+                )
+            })?;
+        let exact_evidence: bool = transaction
+            .query_row(
+                "SELECT expected_sha256 = ?3 AND byte_length = ?4
+                        AND visible_expected_sha256 = ?5
+                        AND visible_byte_length = ?6
+                 FROM generation_inode_evidence
+                 WHERE delta_id = ?1 AND entry_index = ?2
+                       AND visible_evidence_name IS NOT NULL
+                       AND resolved_at IS NULL",
+                params![
+                    delta_id,
+                    index,
+                    resolution.captured_sha256.as_str(),
+                    byte_length,
+                    resolution.visible_captured_sha256.as_str(),
+                    visible_byte_length,
+                ],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::InvalidState(
+                    "generation inode evidence disappeared during resolution".to_string(),
+                )
+            })?;
+        if !exact_evidence {
+            return Err(StoreError::InvalidState(
+                "generation inode evidence changed during resolution".to_string(),
+            ));
+        }
+        let existing = select_generation_path(
+            &transaction,
+            &MountId::new(journal.delta.mount_id.as_str()),
+            &new.projection_id,
+        )?;
+        let local_logical_path = existing.as_ref().map_or(new.logical_path.as_str(), |path| {
+            path.local_logical_path.as_str()
+        });
+        transaction.execute(
+            "INSERT INTO generation_paths (
+                mount_id, projection_id, logical_path, local_logical_path,
+                base_generation_id, base_identity_json,
+                base_payload_delta_id, base_payload_entry_index,
+                conflict_payload_delta_id, conflict_payload_entry_index,
+                state, incoming_identity_json, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL,
+                       'dirty', NULL, ?9)
+             ON CONFLICT(mount_id, projection_id) DO UPDATE SET
+                logical_path = excluded.logical_path,
+                local_logical_path = excluded.local_logical_path,
+                base_generation_id = excluded.base_generation_id,
+                base_identity_json = excluded.base_identity_json,
+                base_payload_delta_id = excluded.base_payload_delta_id,
+                base_payload_entry_index = excluded.base_payload_entry_index,
+                conflict_payload_delta_id = NULL,
+                conflict_payload_entry_index = NULL,
+                state = 'dirty', incoming_identity_json = NULL,
+                updated_at = excluded.updated_at",
+            params![
+                journal.delta.mount_id.as_str(),
+                new.projection_id.as_str(),
+                new.logical_path.as_str(),
+                local_logical_path,
+                journal.delta.target_generation_id.as_str(),
+                to_json(new)?,
+                delta_id,
+                index,
+                resolution.updated_at.as_str(),
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE generation_apply_outcomes
+             SET outcome_json = ?3, updated_at = ?4
+             WHERE delta_id = ?1 AND entry_index = ?2",
+            params![
+                delta_id,
+                index,
+                to_json(&GenerationApplyOutcome::Merged)?,
+                resolution.updated_at.as_str(),
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE generation_inode_evidence
+             SET resolved_at = ?3
+             WHERE delta_id = ?1 AND entry_index = ?2",
+            params![delta_id, index, resolution.updated_at.as_str()],
         )?;
         transaction.commit()?;
         Ok(())
@@ -1689,6 +1900,7 @@ impl MountRepository for SqliteStateStore {
             .optional()?
             .map(mount_from_row)
             .transpose()?;
+        let is_new_mount = existing.is_none();
         if existing
             .as_ref()
             .is_some_and(|existing| mount_source_identity_changed(existing, &mount))
@@ -1718,6 +1930,7 @@ impl MountRepository for SqliteStateStore {
                 mount.settings_json.as_str(),
             ],
         )?;
+        ensure_workspace_binding_for_mount(&transaction, &mount, is_new_mount)?;
         transaction.commit()?;
         Ok(())
     }
@@ -1769,6 +1982,149 @@ impl MountRepository for SqliteStateStore {
         })?;
 
         rows.map(|row| mount_from_row(row?)).collect()
+    }
+}
+
+impl WorkspaceBindingRepository for SqliteStateStore {
+    fn save_workspace_binding(&mut self, record: WorkspaceBindingRecord) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mount_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mounts WHERE mount_id = ?1)",
+            params![record.mount_id.0.as_str()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !mount_exists {
+            return Err(StoreError::MountMissing(record.mount_id));
+        }
+        let existing = transaction
+            .query_row(
+                "SELECT binding_json, target_collision_key
+                 FROM workspace_bindings
+                 WHERE mount_id = ?1",
+                params![record.mount_id.0.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .map(workspace_binding_from_row)
+            .transpose()?;
+        if let Some(existing) = existing {
+            if existing == record.binding {
+                return Ok(());
+            }
+            return Err(StoreError::WorkspaceBindingTargetImmutable {
+                mount_id: record.mount_id,
+                existing_target: existing.mount_target().as_str().to_string(),
+                requested_target: record.binding.mount_target().as_str().to_string(),
+            });
+        }
+        let collision_key = record.binding.collision_key();
+        let collision = transaction
+            .query_row(
+                "SELECT mount_id
+                 FROM workspace_bindings
+                 WHERE target_collision_key = ?1 AND mount_id <> ?2",
+                params![collision_key.as_str(), record.mount_id.0.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(existing_mount_id) = collision {
+            return Err(StoreError::WorkspaceMountTargetCollision {
+                target: record.binding.mount_target().as_str().to_string(),
+                existing_mount_id: MountId(existing_mount_id),
+            });
+        }
+        transaction.execute(
+            "INSERT INTO workspace_bindings (mount_id, binding_json, target_collision_key)
+             VALUES (?1, ?2, ?3)",
+            params![
+                record.mount_id.0.as_str(),
+                to_json(&record.binding)?,
+                collision_key,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn get_workspace_binding(&self, mount_id: &MountId) -> StoreResult<Option<WorkspaceBinding>> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT binding_json, target_collision_key
+                 FROM workspace_bindings
+                 WHERE mount_id = ?1",
+                params![mount_id.0.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .map(workspace_binding_from_row)
+            .transpose()
+    }
+
+    fn load_workspace_bindings(&self) -> StoreResult<Vec<WorkspaceBindingRecord>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT mount_id, binding_json, target_collision_key
+             FROM workspace_bindings
+             ORDER BY mount_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (mount_id, binding_json, collision_key) = row?;
+            Ok(WorkspaceBindingRecord::new(
+                MountId(mount_id),
+                workspace_binding_from_row((binding_json, collision_key))?,
+            ))
+        })
+        .collect()
+    }
+
+    fn check_workspace_rebind(&self, mount_id: &MountId) -> StoreResult<()> {
+        let mount = self
+            .get_mount(mount_id)?
+            .ok_or_else(|| StoreError::MountMissing(mount_id.clone()))?;
+        if self.get_workspace_binding(mount_id)?.is_none() {
+            return Err(StoreError::WorkspaceBindingMissing(mount_id.clone()));
+        }
+        let blocker = if self.list_entities(mount_id)?.iter().any(|entity| {
+            matches!(
+                entity.hydration,
+                HydrationState::Dirty | HydrationState::Conflicted
+            )
+        }) {
+            WorkspaceRebindBlocker::DirtyOrConflictedState
+        } else if self
+            .list_journal()?
+            .iter()
+            .any(|journal| journal.mount_id == *mount_id && journal.status.is_unsettled())
+        {
+            WorkspaceRebindBlocker::UnsettledApplyJournal
+        } else if !self.list_virtual_mutations(mount_id)?.is_empty() {
+            WorkspaceRebindBlocker::PendingVirtualMutation
+        } else {
+            let connection = self.connection()?;
+            let persisted_projection_state = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM projection_state WHERE mount_id = ?1)",
+                params![mount_id.0.as_str()],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if mount.projection.uses_virtual_filesystem() || persisted_projection_state {
+                WorkspaceRebindBlocker::ActiveProjection
+            } else {
+                WorkspaceRebindBlocker::RequiresOwningCoordinator
+            }
+        };
+        Err(StoreError::WorkspaceRebindBlocked {
+            mount_id: mount_id.clone(),
+            blocker,
+        })
     }
 }
 
@@ -4245,7 +4601,7 @@ type MetadataDiscoveryJobRow = (
     String,
 );
 
-fn initialize_schema(connection: &Connection) -> StoreResult<()> {
+fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
     let user_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if user_version > SCHEMA_VERSION {
         return Err(StoreError::SchemaVersion {
@@ -4255,6 +4611,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
     }
     if user_version == SCHEMA_VERSION {
         ensure_state_components_safe_before_mutation(connection, user_version)?;
+        validate_workspace_bindings(connection)?;
         retire_removed_state_components(connection)?;
         repair_missing_state_components(connection)?;
         ensure_state_components_allow_schema_migration(connection, user_version)?;
@@ -4269,7 +4626,6 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
 
     if user_version >= 13 {
         ensure_state_components_safe_before_mutation(connection, user_version)?;
-        retire_removed_state_components(connection)?;
         ensure_state_components_allow_schema_migration(connection, user_version)?;
     }
 
@@ -4875,7 +5231,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         }
     }
 
-    if user_version == 21 {
+    if user_version == 21 && !column_exists(connection, "generation_apply_journals", "mount_id")? {
         migrate_generation_delivery_journals_to_mount_relation(connection)?;
         record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
     }
@@ -4890,10 +5246,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
 
     if user_version < SCHEMA_VERSION {
         seed_default_notion_profile(connection)?;
-        migrate_linux_fuse_projection_layout_to_v2(connection, user_version < 13)?;
-        migrate_windows_cloud_files_projection_layout_to_v2(connection, user_version < 13)?;
-        seed_current_state_components(connection)?;
-        connection.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+        migrate_workspace_bindings_schema_v21(connection, user_version)?;
     }
 
     Ok(())
@@ -5020,8 +5373,185 @@ fn state_component_issue_allows_schema_migration(
     ) || matches!(
         issue,
         StateCompatibilityIssue::MissingComponent { component_id }
-            if user_version < 21 && component_id == "durable:generation_delivery"
+            if user_version < 22 && component_id == "durable:generation_delivery"
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::MissingComponent { component_id }
+            if user_version < SCHEMA_VERSION && component_id == "durable:workspace_bindings"
     )
+}
+
+fn migrate_workspace_bindings_schema_v21(
+    connection: &mut Connection,
+    user_version: i64,
+) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    if user_version >= 13 {
+        ensure_state_components_safe_before_mutation(&transaction, user_version)?;
+        retire_removed_state_components_in_transaction(&transaction)?;
+        ensure_state_components_allow_schema_migration(&transaction, user_version)?;
+    }
+
+    migrate_virtual_projection_layout_to_v2_in_transaction(
+        &transaction,
+        user_version < 13,
+        "projection:linux_fuse",
+        ProjectionMode::LinuxFuse,
+        LINUX_FUSE_PROJECTION_LAYOUT_VERSION,
+        MissingProjectionComponent::Error,
+    )?;
+    migrate_virtual_projection_layout_to_v2_in_transaction(
+        &transaction,
+        user_version < 13,
+        "projection:windows_cloud_files",
+        ProjectionMode::WindowsCloudFiles,
+        WINDOWS_CLOUD_FILES_PROJECTION_LAYOUT_VERSION,
+        MissingProjectionComponent::TreatAsV1,
+    )?;
+    migrate_entity_search_component_to_v2(&transaction)?;
+    create_workspace_bindings_table(&transaction)?;
+    backfill_legacy_workspace_bindings(&transaction)?;
+    seed_current_state_components(&transaction)?;
+    record_schema_migration(&transaction, user_version, SCHEMA_VERSION)?;
+    transaction.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+    validate_workspace_bindings(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn create_workspace_bindings_table(connection: &Connection) -> StoreResult<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS workspace_bindings (
+            mount_id TEXT PRIMARY KEY,
+            binding_json TEXT NOT NULL,
+            target_collision_key TEXT NOT NULL UNIQUE,
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );",
+    )?;
+    Ok(())
+}
+
+fn backfill_legacy_workspace_bindings(connection: &Connection) -> StoreResult<()> {
+    create_workspace_bindings_table(connection)?;
+    let missing_mounts = {
+        let mut statement = connection.prepare(
+            "SELECT m.mount_id, m.connector, m.root, m.remote_root_id, m.read_only,
+                    m.projection_json, m.connection_id, m.settings_json
+             FROM mounts m
+             LEFT JOIN workspace_bindings b ON b.mount_id = m.mount_id
+             WHERE b.mount_id IS NULL
+             ORDER BY m.mount_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?;
+        rows.map(|row| mount_from_row(row?))
+            .collect::<StoreResult<Vec<_>>>()?
+    };
+    for mount in missing_mounts {
+        ensure_workspace_binding_for_mount(connection, &mount, true)?;
+    }
+    validate_workspace_bindings(connection)?;
+    Ok(())
+}
+
+fn validate_workspace_bindings(connection: &Connection) -> StoreResult<()> {
+    if !table_exists(connection, "workspace_bindings")? {
+        return Err(StoreError::StateCompatibility(
+            "missing required non-rebuildable workspace binding table".to_string(),
+        ));
+    }
+    let missing_binding = connection
+        .query_row(
+            "SELECT m.mount_id
+             FROM mounts m
+             LEFT JOIN workspace_bindings b ON b.mount_id = m.mount_id
+             WHERE b.mount_id IS NULL
+             ORDER BY m.mount_id
+             LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(mount_id) = missing_binding {
+        return Err(StoreError::StateCompatibility(format!(
+            "missing required non-rebuildable workspace binding for mount `{mount_id}`"
+        )));
+    }
+    let mut statement = connection.prepare(
+        "SELECT binding_json, target_collision_key
+         FROM workspace_bindings
+         ORDER BY mount_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        workspace_binding_from_row(row?)?;
+    }
+    Ok(())
+}
+
+fn ensure_workspace_binding_for_mount(
+    connection: &Connection,
+    mount: &MountConfig,
+    allow_legacy_or_new_binding: bool,
+) -> StoreResult<()> {
+    let exists = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workspace_bindings WHERE mount_id = ?1)",
+        params![mount.mount_id.0.as_str()],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if exists {
+        return Ok(());
+    }
+    if !allow_legacy_or_new_binding {
+        return Err(StoreError::WorkspaceBindingMissing(mount.mount_id.clone()));
+    }
+
+    let used_collision_keys = {
+        let mut statement =
+            connection.prepare("SELECT target_collision_key FROM workspace_bindings")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<BTreeSet<_>>>()?
+    };
+    let binding = unique_binding(
+        binding_from_legacy_mount(&mount.mount_id, &mount.root),
+        &used_collision_keys,
+    );
+    connection.execute(
+        "INSERT INTO workspace_bindings (mount_id, binding_json, target_collision_key)
+         VALUES (?1, ?2, ?3)",
+        params![
+            mount.mount_id.0.as_str(),
+            to_json(&binding)?,
+            binding.collision_key(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn workspace_binding_from_row(row: (String, String)) -> StoreResult<WorkspaceBinding> {
+    let binding = serde_json::from_str::<WorkspaceBinding>(&row.0).map_err(|error| {
+        StoreError::StateCompatibility(format!(
+            "workspace binding metadata is not readable by this binary; update required or repair invalid metadata: {error}"
+        ))
+    })?;
+    if binding.collision_key() != row.1 {
+        return Err(StoreError::InvalidState(
+            "workspace binding target collision key does not match its metadata".to_string(),
+        ));
+    }
+    Ok(binding)
 }
 
 fn mount_from_row(row: MountRow) -> StoreResult<MountConfig> {
@@ -5876,8 +6406,12 @@ fn create_generation_delivery_tables(connection: &Connection) -> StoreResult<()>
             evidence_name TEXT NOT NULL,
             expected_sha256 TEXT NOT NULL,
             byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+            visible_evidence_name TEXT,
+            visible_expected_sha256 TEXT,
+            visible_byte_length INTEGER CHECK (visible_byte_length >= 0),
             base_payload_delta_id TEXT,
             base_payload_entry_index INTEGER CHECK (base_payload_entry_index >= 0),
+            resolved_at TEXT,
             created_at TEXT NOT NULL,
             PRIMARY KEY (delta_id, entry_index),
             FOREIGN KEY (delta_id) REFERENCES generation_apply_journals(delta_id) ON DELETE CASCADE,
@@ -5935,12 +6469,27 @@ fn migrate_generation_delivery_to_v6(
     {
         return Ok(());
     }
+    let selected_capabilities_preexisted = column_exists(
+        connection,
+        "generation_apply_journals",
+        "selected_capabilities_json",
+    )?;
+    let finalized_inode_evidence_preexisted =
+        column_exists(
+            connection,
+            "generation_inode_evidence",
+            "visible_evidence_name",
+        )? && column_exists(connection, "generation_inode_evidence", "resolved_at")?;
     let transaction = connection.unchecked_transaction()?;
     migrate_generation_delivery_storage_to_v2(&transaction)?;
     migrate_generation_delivery_storage_to_v3(&transaction)?;
     migrate_generation_delivery_storage_to_v4(&transaction)?;
     migrate_generation_delivery_storage_to_v5(&transaction)?;
-    migrate_generation_delivery_storage_to_v6(&transaction)?;
+    migrate_generation_delivery_storage_to_v6(
+        &transaction,
+        selected_capabilities_preexisted,
+        finalized_inode_evidence_preexisted,
+    )?;
     verify_generation_delivery_storage_v6(&transaction)?;
     if update_component {
         migrate_generation_delivery_component_to_v6(&transaction)?;
@@ -6004,6 +6553,10 @@ fn migrate_generation_delivery_storage_to_v2(connection: &Connection) -> StoreRe
             evidence_name TEXT NOT NULL,
             expected_sha256 TEXT NOT NULL,
             byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+            visible_evidence_name TEXT,
+            visible_expected_sha256 TEXT,
+            visible_byte_length INTEGER CHECK (visible_byte_length >= 0),
+            resolved_at TEXT,
             created_at TEXT NOT NULL,
             PRIMARY KEY (delta_id, entry_index),
             FOREIGN KEY (delta_id) REFERENCES generation_apply_journals(delta_id) ON DELETE CASCADE,
@@ -6059,7 +6612,26 @@ fn migrate_generation_delivery_storage_to_v4(connection: &Connection) -> StoreRe
         "generation_apply_journals",
         "acknowledged_at",
         "TEXT",
-    )
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_inode_evidence",
+        "visible_evidence_name",
+        "TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_inode_evidence",
+        "visible_expected_sha256",
+        "TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_inode_evidence",
+        "visible_byte_length",
+        "INTEGER CHECK (visible_byte_length >= 0)",
+    )?;
+    Ok(())
 }
 
 fn migrate_generation_delivery_storage_to_v5(connection: &Connection) -> StoreResult<()> {
@@ -6077,10 +6649,39 @@ fn migrate_generation_delivery_storage_to_v5(connection: &Connection) -> StoreRe
            AND selected_capabilities_json = '{}'",
         [],
     )?;
+    add_column_if_missing(
+        connection,
+        "generation_inode_evidence",
+        "resolved_at",
+        "TEXT",
+    )?;
+    connection.execute(
+        "UPDATE generation_inode_evidence
+         SET resolved_at = (
+             SELECT outcomes.updated_at
+             FROM generation_apply_outcomes AS outcomes
+             WHERE outcomes.delta_id = generation_inode_evidence.delta_id
+               AND outcomes.entry_index = generation_inode_evidence.entry_index
+               AND json_extract(outcomes.outcome_json, '$.kind') = 'merged'
+         )
+         WHERE resolved_at IS NULL
+           AND visible_evidence_name IS NOT NULL
+           AND EXISTS (
+               SELECT 1 FROM generation_apply_outcomes AS outcomes
+               WHERE outcomes.delta_id = generation_inode_evidence.delta_id
+                 AND outcomes.entry_index = generation_inode_evidence.entry_index
+                 AND json_extract(outcomes.outcome_json, '$.kind') = 'merged'
+           )",
+        [],
+    )?;
     Ok(())
 }
 
-fn migrate_generation_delivery_storage_to_v6(connection: &Connection) -> StoreResult<()> {
+fn migrate_generation_delivery_storage_to_v6(
+    connection: &Connection,
+    selected_capabilities_preexisted: bool,
+    finalized_inode_evidence_preexisted: bool,
+) -> StoreResult<()> {
     let prior_component_version = if table_exists(connection, "state_components")? {
         connection
             .query_row(
@@ -6093,12 +6694,8 @@ fn migrate_generation_delivery_storage_to_v6(connection: &Connection) -> StoreRe
     } else {
         None
     };
-    let selected_capabilities_preexisted = column_exists(
-        connection,
-        "generation_apply_journals",
-        "selected_capabilities_json",
-    )? && prior_component_version
-        .is_some_and(|version| version >= 5);
+    let selected_capabilities_preexisted = selected_capabilities_preexisted
+        && prior_component_version.is_some_and(|version| version >= 5);
     add_column_if_missing(
         connection,
         "generation_apply_journals",
@@ -6128,8 +6725,11 @@ fn migrate_generation_delivery_storage_to_v6(connection: &Connection) -> StoreRe
     };
 
     for (delta_id, status, active, selected_json, acknowledgment_required) in candidates {
-        let known_legacy_binding =
-            prior_component_version.is_some_and(|version| version <= 3) && !acknowledgment_required;
+        let known_legacy_binding = (prior_component_version.is_some_and(|version| version <= 3)
+            || (prior_component_version == Some(5)
+                && finalized_inode_evidence_preexisted
+                && !selected_capabilities_preexisted))
+            && !acknowledgment_required;
         let recoverable_persisted_binding = selected_capabilities_preexisted
             && from_json::<GenerationTransportCapabilities>(&selected_json)
                 .ok()
@@ -6182,7 +6782,14 @@ fn verify_generation_delivery_storage_v6(connection: &Connection) -> StoreResult
         ),
         (
             "generation_inode_evidence",
-            &["base_payload_delta_id", "base_payload_entry_index"][..],
+            &[
+                "base_payload_delta_id",
+                "base_payload_entry_index",
+                "visible_evidence_name",
+                "visible_expected_sha256",
+                "visible_byte_length",
+                "resolved_at",
+            ][..],
         ),
         (
             "generation_apply_journals",
@@ -6214,6 +6821,35 @@ fn verify_generation_delivery_storage_v6(connection: &Connection) -> StoreResult
             "generation delivery migration left a null local logical path".to_string(),
         ));
     }
+    let partial_visible_evidence: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_inode_evidence
+            WHERE (visible_evidence_name IS NULL)
+                != (visible_expected_sha256 IS NULL)
+               OR (visible_evidence_name IS NULL) != (visible_byte_length IS NULL)
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if partial_visible_evidence {
+        return Err(StoreError::InvalidState(
+            "generation delivery migration left partial visible inode evidence".to_string(),
+        ));
+    }
+    let invalid_tombstone: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_inode_evidence
+            WHERE resolved_at IS NOT NULL AND visible_evidence_name IS NULL
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_tombstone {
+        return Err(StoreError::InvalidState(
+            "generation delivery migration left a tombstone without both retained inodes"
+                .to_string(),
+        ));
+    }
     if !generation_delivery_storage_v6_is_complete(connection)? {
         return Err(StoreError::InvalidState(
             "generation delivery migration left an unsafe transport selection binding".to_string(),
@@ -6236,7 +6872,14 @@ fn generation_delivery_storage_v6_is_complete(connection: &Connection) -> StoreR
         ),
         (
             "generation_inode_evidence",
-            &["base_payload_delta_id", "base_payload_entry_index"][..],
+            &[
+                "base_payload_delta_id",
+                "base_payload_entry_index",
+                "visible_evidence_name",
+                "visible_expected_sha256",
+                "visible_byte_length",
+                "resolved_at",
+            ][..],
         ),
         (
             "generation_apply_journals",
@@ -6274,7 +6917,25 @@ fn generation_delivery_storage_v6_is_complete(connection: &Connection) -> StoreR
         [],
         |row| row.get(0),
     )?;
-    Ok(!invalid_binding)
+    let partial_visible_evidence: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_inode_evidence
+            WHERE (visible_evidence_name IS NULL)
+                != (visible_expected_sha256 IS NULL)
+               OR (visible_evidence_name IS NULL) != (visible_byte_length IS NULL)
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    let invalid_tombstone: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_inode_evidence
+            WHERE resolved_at IS NOT NULL AND visible_evidence_name IS NULL
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(!invalid_binding && !partial_visible_evidence && !invalid_tombstone)
 }
 
 fn migrate_journals_component_to_v3(connection: &Connection) -> StoreResult<()> {
@@ -6389,6 +7050,27 @@ fn migrate_virtual_projection_layout_to_v2(
     layout_version: i64,
     missing_component: MissingProjectionComponent,
 ) -> StoreResult<()> {
+    let transaction = connection.unchecked_transaction()?;
+    migrate_virtual_projection_layout_to_v2_in_transaction(
+        &transaction,
+        pre_state_components_schema,
+        component_id,
+        projection,
+        layout_version,
+        missing_component,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_virtual_projection_layout_to_v2_in_transaction(
+    connection: &Connection,
+    pre_state_components_schema: bool,
+    component_id: &str,
+    projection: ProjectionMode,
+    layout_version: i64,
+    missing_component: MissingProjectionComponent,
+) -> StoreResult<()> {
     create_state_management_tables(connection)?;
     let component = connection
         .query_row(
@@ -6420,10 +7102,9 @@ fn migrate_virtual_projection_layout_to_v2(
         )));
     }
 
-    let transaction = connection.unchecked_transaction()?;
     let projection_json = to_json(&projection)?;
     let mounts = {
-        let mut statement = transaction.prepare(
+        let mut statement = connection.prepare(
             "SELECT mount_id, connector, root
          FROM mounts
          WHERE projection_json = ?1
@@ -6454,7 +7135,7 @@ fn migrate_virtual_projection_layout_to_v2(
         } else {
             root.join(connector_root)
         };
-        transaction.execute(
+        connection.execute(
             "UPDATE mounts
              SET root = ?1
              WHERE mount_id = ?2",
@@ -6467,7 +7148,7 @@ fn migrate_virtual_projection_layout_to_v2(
         .find(|definition| definition.component_id == component_id)
         .expect("known state component definition");
     let updated_at = unix_timestamp_string();
-    transaction.execute(
+    connection.execute(
         "INSERT INTO state_components (
             component_id,
             component_kind,
@@ -6498,7 +7179,6 @@ fn migrate_virtual_projection_layout_to_v2(
             &updated_at,
         ],
     )?;
-    transaction.commit()?;
     Ok(())
 }
 
@@ -6600,7 +7280,7 @@ fn seed_missing_state_components(connection: &Connection) -> StoreResult<()> {
 fn repairable_missing_state_component(component_id: &str) -> bool {
     !matches!(
         component_id,
-        "projection:linux_fuse" | "projection:windows_cloud_files"
+        "projection:linux_fuse" | "projection:windows_cloud_files" | "durable:workspace_bindings"
     )
 }
 
@@ -6624,10 +7304,22 @@ fn retire_removed_state_components(connection: &Connection) -> StoreResult<()> {
     if !table_exists(connection, "state_components")? {
         return Ok(());
     }
-    retire_notion_workspace_roots_component(connection)
+    let transaction = connection.unchecked_transaction()?;
+    retire_removed_state_components_in_transaction(&transaction)?;
+    transaction.commit()?;
+    Ok(())
 }
 
-fn retire_notion_workspace_roots_component(connection: &Connection) -> StoreResult<()> {
+fn retire_removed_state_components_in_transaction(connection: &Connection) -> StoreResult<()> {
+    if !table_exists(connection, "state_components")? {
+        return Ok(());
+    }
+    retire_notion_workspace_roots_component_in_transaction(connection)
+}
+
+fn retire_notion_workspace_roots_component_in_transaction(
+    connection: &Connection,
+) -> StoreResult<()> {
     let component = connection
         .query_row(
             "SELECT version, min_reader_version
@@ -6655,86 +7347,81 @@ fn retire_notion_workspace_roots_component(connection: &Connection) -> StoreResu
         return Ok(());
     }
 
-    let transaction = connection.unchecked_transaction()?;
     let mut changed = 0usize;
-    changed += delete_retired_notion_workspace_root_rows(&transaction, "shadows", "entity_id")?;
-    changed += delete_retired_notion_workspace_root_rows(&transaction, "entities", "remote_id")?;
+    changed += delete_retired_notion_workspace_root_rows(connection, "shadows", "entity_id")?;
+    changed += delete_retired_notion_workspace_root_rows(connection, "entities", "remote_id")?;
     changed +=
-        delete_retired_notion_workspace_root_rows(&transaction, "hydration_jobs", "remote_id")?;
+        delete_retired_notion_workspace_root_rows(connection, "hydration_jobs", "remote_id")?;
     changed +=
-        delete_retired_notion_workspace_root_rows(&transaction, "freshness_states", "remote_id")?;
-    changed += delete_retired_notion_workspace_root_rows(
-        &transaction,
-        "remote_observations",
-        "remote_id",
-    )?;
+        delete_retired_notion_workspace_root_rows(connection, "freshness_states", "remote_id")?;
+    changed +=
+        delete_retired_notion_workspace_root_rows(connection, "remote_observations", "remote_id")?;
     changed += clear_retired_notion_workspace_root_parent(
-        &transaction,
+        connection,
         "remote_observations",
         "parent_remote_id",
     )?;
     changed += clear_retired_notion_workspace_root_parent(
-        &transaction,
+        connection,
         "virtual_mutations",
         "parent_remote_id",
     )?;
     changed += rewrite_retired_notion_workspace_root_paths(
-        &transaction,
+        connection,
         "entities",
         "path",
         "AND remote_id NOT IN ('notion-root:private', 'notion-root:workspace')",
         false,
     )?;
     changed += rewrite_retired_notion_workspace_root_paths(
-        &transaction,
+        connection,
         "remote_observations",
         "projected_path",
         "",
         false,
     )?;
     changed += rewrite_retired_notion_workspace_root_paths(
-        &transaction,
+        connection,
         "hydration_jobs",
         "path",
         "",
         false,
     )?;
     changed += rewrite_retired_notion_workspace_root_paths(
-        &transaction,
+        connection,
         "virtual_mutations",
         "projected_path",
         "",
         false,
     )?;
     changed += rewrite_retired_notion_workspace_root_paths(
-        &transaction,
+        connection,
         "virtual_mutations",
         "original_path",
         "",
         false,
     )?;
     changed += rewrite_retired_notion_workspace_root_paths(
-        &transaction,
+        connection,
         "virtual_mutations",
         "content_path",
         "",
         true,
     )?;
     changed += rewrite_retired_notion_workspace_root_paths(
-        &transaction,
+        connection,
         "auto_save_enrollments",
         "path",
         "",
         false,
     )?;
-    changed += transaction.execute(
+    changed += connection.execute(
         "DELETE FROM state_components WHERE component_id = ?1",
         params![RETIRED_NOTION_WORKSPACE_ROOTS_COMPONENT_ID],
     )?;
-    if changed > 0 && table_exists(&transaction, "entities")? {
-        rebuild_entity_search_index(&transaction)?;
+    if changed > 0 && table_exists(connection, "entities")? {
+        rebuild_entity_search_index(connection)?;
     }
-    transaction.commit()?;
     Ok(())
 }
 

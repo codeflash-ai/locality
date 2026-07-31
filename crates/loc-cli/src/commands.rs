@@ -200,7 +200,7 @@ enum LocalityCommand {
     },
     #[command(about = "Run read-only diagnostics for daemon, mounts, providers, and auth")]
     Doctor,
-    #[command(about = "Bootstrap a sealed read-only sandbox replica")]
+    #[command(about = "Materialize a sealed read-only workspace replica")]
     Sandbox {
         #[command(subcommand)]
         command: SandboxCommand,
@@ -258,7 +258,7 @@ enum LocalityCommand {
 
 #[derive(Debug, Subcommand)]
 enum SandboxCommand {
-    #[command(about = "Initialize a sealed read-only sandbox replica")]
+    #[command(about = "Materialize or refresh a sealed read-only workspace replica")]
     Init(SandboxInitArgs),
 }
 
@@ -269,7 +269,7 @@ struct SandboxInitArgs {
     #[arg(
         long,
         value_name = "PATH",
-        help = "Absent destination path for the read-only replica"
+        help = "Destination path; profile-key generation-2 runs may refresh a Locality-owned replica"
     )]
     root: String,
     #[arg(
@@ -10042,8 +10042,10 @@ mod tests {
                 vec!["sandbox", "init", "--help"],
                 vec![
                     "Usage: loc sandbox init",
+                    "Materialize or refresh a sealed read-only workspace replica",
                     "--api-url <URL>",
                     "--root <PATH>",
+                    "profile-key generation-2 runs may refresh a Locality-owned replica",
                     "--encoding <ENCODING>",
                     "--bootstrap-token-stdin",
                     "--profile-key-stdin",

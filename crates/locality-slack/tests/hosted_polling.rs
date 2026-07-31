@@ -1,12 +1,16 @@
 use locality_protocol::{HostedSlackChannelSelector, ProviderSourceScopeSelector};
 use locality_slack::portable::hosted::{
-    HostedSlackHistoryMessageV1, HostedSlackHistoryPageV1, HostedSlackPageApplyOutcomeV1,
-    HostedSlackPollCheckpointV1, HostedSlackPollError, HostedSlackPollKindV1,
+    HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3, HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3,
+    HostedSlackHistoryMessageV1, HostedSlackHistoryPageV1, HostedSlackHistoryPageV2,
+    HostedSlackPageApplyOutcomeV1, HostedSlackPollCheckpointV1, HostedSlackPollError,
+    HostedSlackPollEvidenceV1, HostedSlackPollKindV1, HostedSlackPollKindV2,
     HostedSlackPollOutputV1, HostedSlackPollPhaseV1, HostedSlackRepliesPageV1,
-    MAX_HOSTED_SLACK_CHECKPOINT_BYTES_V1, MAX_HOSTED_SLACK_CURSOR_BYTES_V1,
-    MAX_HOSTED_SLACK_POLL_PAGE_BYTES_V1, MAX_HOSTED_SLACK_POLL_PAGE_MESSAGES_V1,
-    RawHostedSlackMessage, RawHostedSlackNativeSnapshot, decode_hosted_slack_history_page_v1,
-    decode_hosted_slack_poll_checkpoint_v1, decode_hosted_slack_replies_page_v1,
+    HostedSlackRepliesPageV2, MAX_HOSTED_SLACK_CHECKPOINT_BYTES_V1,
+    MAX_HOSTED_SLACK_CURSOR_BYTES_V1, MAX_HOSTED_SLACK_POLL_PAGE_BYTES_V1,
+    MAX_HOSTED_SLACK_POLL_PAGE_MESSAGES_V1, RawHostedSlackMessage, RawHostedSlackNativeSnapshot,
+    decode_hosted_slack_history_page_v1, decode_hosted_slack_poll_checkpoint_v1,
+    decode_hosted_slack_poll_checkpoint_v2, decode_hosted_slack_poll_checkpoint_v3,
+    decode_hosted_slack_replies_page_v1,
 };
 use serde::Serialize;
 
@@ -222,7 +226,9 @@ fn catch_up_replies_boundary() -> HostedSlackPollCheckpointV1 {
     checkpoint
 }
 
-fn complete_poll(mut checkpoint: HostedSlackPollCheckpointV1) -> HostedSlackPollOutputV1 {
+fn completed_checkpoint(
+    mut checkpoint: HostedSlackPollCheckpointV1,
+) -> HostedSlackPollCheckpointV1 {
     finish_historical(&mut checkpoint);
     checkpoint
         .begin_catch_up("2026-06-02T00:00:00Z".to_string())
@@ -242,7 +248,13 @@ fn complete_poll(mut checkpoint: HostedSlackPollCheckpointV1) -> HostedSlackPoll
     checkpoint
         .apply_replies_page(&terminal)
         .expect("catch-up replies terminal");
-    checkpoint.completed_output().expect("complete output")
+    checkpoint
+}
+
+fn complete_poll(checkpoint: HostedSlackPollCheckpointV1) -> HostedSlackPollOutputV1 {
+    completed_checkpoint(checkpoint)
+        .completed_output()
+        .expect("complete output")
 }
 
 #[test]
@@ -1036,6 +1048,16 @@ fn page_and_checkpoint_decoders_enforce_bounds_unknown_fields_and_scope() {
         Err(HostedSlackPollError::InvalidJson("history page"))
     );
 
+    let mut unversioned_reconciliation =
+        serde_json::from_slice::<serde_json::Value>(REPLIES_PAGE).unwrap();
+    unversioned_reconciliation["reconciliation"] = serde_json::json!("thread_not_found");
+    assert_eq!(
+        decode_hosted_slack_replies_page_v1(
+            &serde_json::to_vec(&unversioned_reconciliation).unwrap()
+        ),
+        Err(HostedSlackPollError::InvalidJson("replies page"))
+    );
+
     let mut too_many = history_page();
     too_many.messages =
         vec![too_many.messages[0].clone(); MAX_HOSTED_SLACK_POLL_PAGE_MESSAGES_V1 + 1];
@@ -1120,6 +1142,336 @@ fn full_repair_and_poll_only_bootstrap_converge_without_events() {
     assert_eq!(
         complete_poll(checkpoint_with_kind(HostedSlackPollKindV1::FullRepair)),
         complete_poll(checkpoint_with_kind(HostedSlackPollKindV1::Bootstrap))
+    );
+}
+
+#[test]
+fn incremental_poll_starts_from_applied_candidate_and_reconciles_late_old_root_replies() {
+    let applied = completed_checkpoint(checkpoint());
+    let mut wrong_non_incremental_version = serde_json::to_value(&applied).unwrap();
+    wrong_non_incremental_version["checkpoint_format_version"] = 3.into();
+    wrong_non_incremental_version["minimum_reader_version"] = 3.into();
+    assert!(
+        decode_hosted_slack_poll_checkpoint_v2(
+            &serde_json::to_vec(&wrong_non_incremental_version).unwrap()
+        )
+        .is_err()
+    );
+    let applied_snapshot = applied.completed_output().unwrap().snapshot;
+    let mut incremental = HostedSlackPollCheckpointV1::incremental_from_applied(
+        &applied,
+        raw_snapshot().channel,
+        "2026-06-01T23:55:00Z".to_string(),
+    )
+    .expect("incremental checkpoint");
+    assert_eq!(
+        incremental.poll_kind_v2(),
+        HostedSlackPollKindV2::Incremental
+    );
+    assert_eq!(
+        incremental.phase(),
+        HostedSlackPollPhaseV1::AwaitingCatchUpCut
+    );
+    assert_eq!(incremental.backfill_cut_at(), "2026-06-02T00:00:00Z");
+    let encoded = serde_json::to_vec(&incremental).unwrap();
+    let encoded_value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(encoded_value["evidence"][0]["kind"], "incremental_baseline");
+    assert!(encoded_value["evidence"][0].get("candidate").is_none());
+    assert!(
+        serde_json::to_vec(&encoded_value["evidence"][0])
+            .unwrap()
+            .len()
+            < 256,
+        "the applied candidate must not be duplicated into replay evidence"
+    );
+    assert_eq!(
+        decode_hosted_slack_poll_checkpoint_v3(&encoded).unwrap(),
+        incremental
+    );
+    assert!(decode_hosted_slack_poll_checkpoint_v2(&encoded).is_err());
+    assert!(decode_hosted_slack_poll_checkpoint_v1(&encoded).is_err());
+    let mut wrong_incremental_version = encoded_value.clone();
+    wrong_incremental_version["checkpoint_format_version"] = 2.into();
+    wrong_incremental_version["minimum_reader_version"] = 2.into();
+    assert!(
+        decode_hosted_slack_poll_checkpoint_v2(
+            &serde_json::to_vec(&wrong_incremental_version).unwrap()
+        )
+        .is_err()
+    );
+
+    incremental
+        .begin_catch_up("2026-06-02T00:05:00Z".to_string())
+        .unwrap();
+    let mut page: HostedSlackHistoryPageV2 = catch_up_page().into();
+    page.page_format_version = HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3;
+    page.minimum_reader_version = HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3;
+    page.poll_kind = HostedSlackPollKindV2::Incremental;
+    page.backfill_cut_at = "2026-06-02T00:00:00Z".to_string();
+    page.poll_overlap_watermark = "2026-06-01T23:55:00Z".to_string();
+    page.poll_cut_at = Some("2026-06-02T00:05:00Z".to_string());
+    page.observed_at = "2026-06-02T00:05:01Z".to_string();
+    incremental.apply_history_page_v2(&page).unwrap();
+    assert_eq!(
+        incremental.phase(),
+        HostedSlackPollPhaseV1::CatchUpReplies,
+        "an empty incremental history window must still reconcile retained roots"
+    );
+    assert_eq!(
+        incremental.current_root_message_id(),
+        Some("1780000000.000100")
+    );
+
+    let mut replies: HostedSlackRepliesPageV2 = old_root_late_replies_page().into();
+    replies.page_format_version = HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3;
+    replies.minimum_reader_version = HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3;
+    replies.poll_kind = HostedSlackPollKindV2::Incremental;
+    replies.backfill_cut_at = "2026-06-02T00:00:00Z".to_string();
+    replies.poll_overlap_watermark = "2026-06-01T23:55:00Z".to_string();
+    replies.poll_cut_at = Some("2026-06-02T00:05:00Z".to_string());
+    replies.observed_at = "2026-06-02T00:05:02Z".to_string();
+    incremental.apply_replies_page_v2(&replies).unwrap();
+
+    let output = incremental.completed_output().unwrap();
+    assert_ne!(output.snapshot, applied_snapshot);
+    assert_eq!(output.snapshot.threads()[0].reply_message_ids().len(), 3);
+    assert!(
+        output
+            .snapshot
+            .messages()
+            .iter()
+            .any(|message| message.text() == "Late non-broadcast reply")
+    );
+    assert!(output.operational_status.coverage_complete);
+    assert_eq!(
+        output.operational_status.freshness_state,
+        locality_protocol::ReplicaFreshnessState::Fresh
+    );
+}
+
+#[test]
+fn incremental_compaction_preserves_conflicts_terminal_replay_and_freshness() {
+    let applied = completed_checkpoint(checkpoint());
+    let mut incremental = HostedSlackPollCheckpointV1::incremental_from_applied(
+        &applied,
+        raw_snapshot().channel,
+        "2026-05-28T20:00:00Z".to_string(),
+    )
+    .unwrap();
+    incremental
+        .begin_catch_up("2026-06-02T00:05:00Z".to_string())
+        .unwrap();
+
+    let mut history: HostedSlackHistoryPageV2 = catch_up_root_page().into();
+    history.page_format_version = HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3;
+    history.minimum_reader_version = HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3;
+    history.poll_kind = HostedSlackPollKindV2::Incremental;
+    history.backfill_cut_at = "2026-06-02T00:00:00Z".to_string();
+    history.poll_overlap_watermark = "2026-05-28T20:00:00Z".to_string();
+    history.poll_cut_at = Some("2026-06-02T00:05:00Z".to_string());
+    history.observed_at = "2026-06-02T00:05:01Z".to_string();
+    incremental.apply_history_page_v2(&history).unwrap();
+    assert_eq!(incremental.phase(), HostedSlackPollPhaseV1::CatchUpReplies);
+
+    let encoded = serde_json::to_vec(&incremental).unwrap();
+    assert!(encoded.len() <= MAX_HOSTED_SLACK_CHECKPOINT_BYTES_V1);
+    let mut resumed = decode_hosted_slack_poll_checkpoint_v3(&encoded).unwrap();
+
+    let mut replies: HostedSlackRepliesPageV2 = catch_up_replies_page(replies_page()).into();
+    replies.page_format_version = HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3;
+    replies.minimum_reader_version = HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3;
+    replies.poll_kind = HostedSlackPollKindV2::Incremental;
+    replies.backfill_cut_at = "2026-06-02T00:00:00Z".to_string();
+    replies.poll_overlap_watermark = "2026-05-28T20:00:00Z".to_string();
+    replies.poll_cut_at = Some("2026-06-02T00:05:00Z".to_string());
+    replies.observed_at = "2026-06-02T00:05:02Z".to_string();
+
+    let before_count_conflict = resumed.clone();
+    let mut count_conflict = replies.clone();
+    count_conflict.root_reply_count = 3;
+    assert_eq!(
+        resumed.apply_replies_page_v2(&count_conflict),
+        Err(HostedSlackPollError::ReplyCountMismatch {
+            root_message_id: "1780000000.000100".to_string(),
+            expected: 2,
+            actual: 3,
+        })
+    );
+    assert_eq!(resumed, before_count_conflict);
+
+    let before_message_conflict = resumed.clone();
+    let mut message_conflict = replies.clone();
+    message_conflict
+        .messages
+        .iter_mut()
+        .find(|message| message.ts == message_conflict.root_message_id)
+        .unwrap()
+        .text = "contradictory reply-page root".to_string();
+    assert_eq!(
+        resumed.apply_replies_page_v2(&message_conflict),
+        Err(HostedSlackPollError::ConflictingMessage(
+            "1780000000.000100".to_string()
+        ))
+    );
+    assert_eq!(resumed, before_message_conflict);
+
+    resumed.apply_replies_page_v2(&replies).unwrap();
+    let mut terminal: HostedSlackRepliesPageV2 =
+        catch_up_replies_page(replies_terminal_page()).into();
+    terminal.page_format_version = HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3;
+    terminal.minimum_reader_version = HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3;
+    terminal.poll_kind = HostedSlackPollKindV2::Incremental;
+    terminal.backfill_cut_at = "2026-06-02T00:00:00Z".to_string();
+    terminal.poll_overlap_watermark = "2026-05-28T20:00:00Z".to_string();
+    terminal.poll_cut_at = Some("2026-06-02T00:05:00Z".to_string());
+    terminal.observed_at = "2026-06-02T00:05:03Z".to_string();
+    resumed.apply_replies_page_v2(&terminal).unwrap();
+    let after_terminal = resumed.clone();
+    assert_eq!(
+        resumed.apply_replies_page_v2(&terminal),
+        Ok(HostedSlackPageApplyOutcomeV1::ExactReplay)
+    );
+    assert_eq!(resumed, after_terminal);
+
+    let output = resumed.completed_output().unwrap();
+    assert!(output.operational_status.coverage_complete);
+    assert_eq!(
+        output.operational_status.freshness_state,
+        locality_protocol::ReplicaFreshnessState::Fresh
+    );
+}
+
+#[test]
+fn incremental_old_root_sweep_resumes_beyond_evidence_page_bound() {
+    let mut applied = checkpoint();
+    let mut empty_history = history_page();
+    empty_history.next_cursor = None;
+    empty_history.messages.clear();
+    empty_history.users.clear();
+    empty_history.files.clear();
+    applied.apply_history_page(&empty_history).unwrap();
+    applied
+        .begin_catch_up("2026-06-02T00:00:00Z".to_string())
+        .unwrap();
+
+    let template = history_page().messages[0].clone();
+    let roots = (0..300)
+        .map(|offset| {
+            let mut root = template.clone();
+            root.message.ts = format!("1780272000.{offset:06}");
+            root.message.thread_ts = None;
+            root.message.user_id = None;
+            root.message.file_ids.clear();
+            root.reply_count = 0;
+            root
+        })
+        .collect::<Vec<_>>();
+    let mut seed = catch_up_page();
+    seed.messages.clone_from(&roots);
+    applied.apply_history_page(&seed).unwrap();
+    assert!(applied.completed_output().is_ok());
+
+    let mut sweep = HostedSlackPollCheckpointV1::incremental_from_applied(
+        &applied,
+        raw_snapshot().channel,
+        "2026-06-01T23:55:00Z".to_string(),
+    )
+    .unwrap();
+    sweep
+        .begin_catch_up("2026-06-02T00:05:00Z".to_string())
+        .unwrap();
+    let mut empty_incremental: HostedSlackHistoryPageV2 = catch_up_page().into();
+    empty_incremental.page_format_version = HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3;
+    empty_incremental.minimum_reader_version = HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3;
+    empty_incremental.poll_kind = HostedSlackPollKindV2::Incremental;
+    empty_incremental.backfill_cut_at = "2026-06-02T00:00:00Z".to_string();
+    empty_incremental.poll_overlap_watermark = "2026-06-01T23:55:00Z".to_string();
+    empty_incremental.poll_cut_at = Some("2026-06-02T00:05:00Z".to_string());
+    empty_incremental.observed_at = "2026-06-02T00:05:01Z".to_string();
+    sweep.apply_history_page_v2(&empty_incremental).unwrap();
+
+    for (offset, root) in roots.iter().enumerate() {
+        assert!(
+            sweep.completed_output().is_err(),
+            "no false Fresh at {offset}"
+        );
+        let mut page: HostedSlackRepliesPageV2 = catch_up_replies_page(replies_page()).into();
+        page.page_format_version = HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3;
+        page.minimum_reader_version = HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3;
+        page.poll_kind = HostedSlackPollKindV2::Incremental;
+        page.backfill_cut_at = "2026-06-02T00:00:00Z".to_string();
+        page.poll_overlap_watermark = "2026-06-01T23:55:00Z".to_string();
+        page.poll_cut_at = Some("2026-06-02T00:05:00Z".to_string());
+        page.request_cursor = None;
+        page.next_cursor = None;
+        page.root_message_id.clone_from(&root.message.ts);
+        page.root_reply_count = u32::from(offset == 298);
+        page.observed_at = "2026-06-02T00:05:02Z".to_string();
+        page.messages = vec![root.message.clone()];
+        page.users.clear();
+        page.files.clear();
+        if offset == 298 {
+            let mut late = root.message.clone();
+            late.ts = "1780272200.000001".to_string();
+            late.thread_ts = Some(root.message.ts.clone());
+            late.text = "late near sweep end".to_string();
+            page.messages.push(late);
+        }
+
+        if offset == 150 {
+            let encoded = serde_json::to_vec(&sweep).unwrap();
+            assert!(encoded.len() <= MAX_HOSTED_SLACK_CHECKPOINT_BYTES_V1);
+            let mut replay = decode_hosted_slack_poll_checkpoint_v3(&encoded).unwrap();
+            sweep.apply_replies_page_v2(&page).unwrap();
+            replay.apply_replies_page_v2(&page).unwrap();
+            assert_eq!(sweep, replay, "interruption/replay must be exact");
+        } else {
+            sweep
+                .apply_replies_page_v2(&page)
+                .unwrap_or_else(|error| panic!("root {offset}: {error:?}"));
+        }
+    }
+
+    let encoded = serde_json::to_vec(&sweep).unwrap();
+    assert!(encoded.len() <= MAX_HOSTED_SLACK_CHECKPOINT_BYTES_V1);
+    assert!(decode_hosted_slack_poll_checkpoint_v2(&encoded).is_err());
+    let output = sweep.completed_output().unwrap();
+    assert!(output.operational_status.coverage_complete);
+    assert_eq!(
+        output.operational_status.freshness_state,
+        locality_protocol::ReplicaFreshnessState::Fresh
+    );
+    assert_eq!(
+        output
+            .snapshot
+            .messages()
+            .iter()
+            .filter(|message| message.text() == "late near sweep end")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn v1_poll_enums_remain_exhaustive_and_source_compatible() {
+    fn kind_name(kind: HostedSlackPollKindV1) -> &'static str {
+        match kind {
+            HostedSlackPollKindV1::Bootstrap => "bootstrap",
+            HostedSlackPollKindV1::FullRepair => "full_repair",
+        }
+    }
+    fn evidence_name(evidence: HostedSlackPollEvidenceV1) -> &'static str {
+        match evidence {
+            HostedSlackPollEvidenceV1::AppliedPage { .. } => "applied_page",
+            HostedSlackPollEvidenceV1::BeginCatchUp { .. } => "begin_catch_up",
+        }
+    }
+    assert_eq!(kind_name(HostedSlackPollKindV1::Bootstrap), "bootstrap");
+    assert_eq!(
+        evidence_name(HostedSlackPollEvidenceV1::BeginCatchUp {
+            poll_cut_at: "2026-06-02T00:05:00Z".to_string(),
+        }),
+        "begin_catch_up"
     );
 }
 
