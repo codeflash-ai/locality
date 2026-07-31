@@ -26,6 +26,11 @@ use locality_protocol::{
     canonical_writable_metadata_sha256,
 };
 use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
+#[cfg(not(all(
+    unix,
+    any(target_vendor = "apple", target_os = "linux", target_os = "android")
+)))]
+use localityd::replica_materializer::ReplicaMaterializationError;
 use localityd::workspace_archive::{
     WorkspaceArchiveLimits, WorkspaceArchiveSink, validate_workspace_tar,
 };
@@ -1488,6 +1493,10 @@ fn marker_forged_after_journal_is_rejected_immediately_before_exchange() {
     );
 }
 
+#[cfg(all(
+    unix,
+    any(target_vendor = "apple", target_os = "linux", target_os = "android")
+))]
 #[test]
 fn marker_forged_after_exchange_is_rejected_before_cleanup() {
     let fixture = fixture();
@@ -1529,6 +1538,75 @@ fn marker_forged_after_exchange_is_rejected_before_cleanup() {
     assert_eq!(
         fs::read(old_generation.join("Sales/README.md")).expect("old generation survives"),
         b"Public\n"
+    );
+}
+
+#[cfg(not(all(
+    unix,
+    any(target_vendor = "apple", target_os = "linux", target_os = "android")
+)))]
+#[test]
+fn post_exchange_marker_hook_fails_closed_when_exchange_is_unsupported() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("unsupported-forged-marker-before-cleanup");
+    materialize_workspace_archive_durable(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("publish old generation");
+    let active_receipt = load_workspace_publication_receipt(&directory.root())
+        .expect("load active receipt")
+        .expect("active receipt");
+    let staged = stage_workspace_archive(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("stage replacement");
+    let staging_path = staged.staging_path().to_path_buf();
+    let mut forge = ForgeMarkerAt {
+        checkpoint: WorkspacePublicationCheckpoint::ReceiptDurable,
+        generation: staging_path.clone(),
+    };
+
+    let error = publish_staged_workspace_with_hooks(staged, &directory.root(), &mut forge)
+        .expect_err("platform must fail closed before a post-exchange hook");
+    match error {
+        WorkspaceMaterializationError::Filesystem(ReplicaMaterializationError::Publish(source)) => {
+            assert_eq!(source.kind(), io::ErrorKind::Unsupported)
+        }
+        other => panic!("expected typed unsupported exchange error, got {other:?}"),
+    }
+
+    assert_eq!(
+        load_workspace_publication_receipt(&directory.root())
+            .expect("reload active receipt")
+            .expect("active receipt survives"),
+        active_receipt
+    );
+    assert_eq!(
+        fs::read(directory.root().join("Sales/README.md")).expect("active root survives"),
+        b"Public\n"
+    );
+    assert!(!staging_path.exists(), "recovery removes unused staging");
+    assert!(
+        !directory
+            .0
+            .join(".locality-Locality.publication.json")
+            .exists(),
+        "recovery clears the failed publication journal"
     );
 }
 
