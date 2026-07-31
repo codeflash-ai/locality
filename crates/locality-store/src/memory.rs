@@ -36,7 +36,8 @@ use crate::repository::{
     virtual_move_content_changed, virtual_move_missing,
 };
 use crate::workspace_binding::{
-    WorkspaceBinding, WorkspaceBindingRecord, binding_from_legacy_mount, unique_binding,
+    WorkspaceBinding, WorkspaceBindingRecord, WorkspaceRebindBlocker, binding_from_legacy_mount,
+    unique_binding,
 };
 
 type EntityKey = (MountId, RemoteId);
@@ -227,22 +228,44 @@ impl WorkspaceBindingRepository for InMemoryStateStore {
             .collect())
     }
 
-    fn rebind_workspace_root(
-        &mut self,
-        mount_id: &MountId,
-        workspace_root: &Path,
-    ) -> StoreResult<MountConfig> {
-        let binding = self
-            .workspace_bindings
-            .get(mount_id)
-            .cloned()
-            .ok_or_else(|| StoreError::WorkspaceBindingMissing(mount_id.clone()))?;
+    fn check_workspace_rebind(&self, mount_id: &MountId) -> StoreResult<()> {
         let mount = self
             .mounts
-            .get_mut(mount_id)
+            .get(mount_id)
             .ok_or_else(|| StoreError::MountMissing(mount_id.clone()))?;
-        mount.root = binding.mount_root(workspace_root);
-        Ok(mount.clone())
+        if !self.workspace_bindings.contains_key(mount_id) {
+            return Err(StoreError::WorkspaceBindingMissing(mount_id.clone()));
+        }
+        let blocker = if self.entities.values().any(|entity| {
+            entity.mount_id == *mount_id
+                && matches!(
+                    entity.hydration,
+                    locality_core::model::HydrationState::Dirty
+                        | locality_core::model::HydrationState::Conflicted
+                )
+        }) {
+            WorkspaceRebindBlocker::DirtyOrConflictedState
+        } else if self
+            .journals
+            .values()
+            .any(|journal| journal.mount_id == *mount_id && journal.status.is_unsettled())
+        {
+            WorkspaceRebindBlocker::UnsettledApplyJournal
+        } else if self
+            .virtual_mutations
+            .values()
+            .any(|mutation| mutation.mount_id == *mount_id)
+        {
+            WorkspaceRebindBlocker::PendingVirtualMutation
+        } else if mount.projection.uses_virtual_filesystem() {
+            WorkspaceRebindBlocker::ActiveProjection
+        } else {
+            WorkspaceRebindBlocker::RequiresOwningCoordinator
+        };
+        Err(StoreError::WorkspaceRebindBlocked {
+            mount_id: mount_id.clone(),
+            blocker,
+        })
     }
 }
 

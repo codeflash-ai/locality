@@ -441,6 +441,14 @@ old mount-root basename. Unicode-equivalent target collisions receive stable
 suffixes in mount-ID order; the legacy absolute root remains readable during
 the compatibility window.
 
+Changing a host workspace root is not a metadata-store operation. The store can
+only reject unsafe requests when it sees dirty/conflicted entities, unsettled
+apply journals, pending virtual mutations, or an active platform projection.
+Even after those checks pass, a Desktop/daemon owner must stop watchers and
+materializers, prepare or move the destination with crash recovery, update the
+stored host root, and re-register the projection before restarting work. The
+metadata layer never silently updates `mounts.root`.
+
 ## Desktop Packaging
 
 The desktop app should use the same platform layer as the CLI:

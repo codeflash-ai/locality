@@ -31,13 +31,11 @@ pub trait WorkspaceBindingRepository {
     fn get_workspace_binding(&self, mount_id: &MountId) -> StoreResult<Option<WorkspaceBinding>>;
     fn load_workspace_bindings(&self) -> StoreResult<Vec<WorkspaceBindingRecord>>;
 
-    /// Move one mount beneath a host-specific workspace root without changing
-    /// its source identity or portable target.
-    fn rebind_workspace_root(
-        &mut self,
-        mount_id: &MountId,
-        workspace_root: &Path,
-    ) -> StoreResult<MountConfig>;
+    /// Report the first durable blocker to a workspace move. This metadata
+    /// boundary never updates roots or moves files; even a clean plain-file
+    /// mount is rejected with `RequiresOwningCoordinator` after all durable
+    /// checks pass.
+    fn check_workspace_rebind(&self, mount_id: &MountId) -> StoreResult<()>;
 }
 
 pub trait MountLiveModeRepository {

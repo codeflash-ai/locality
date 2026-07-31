@@ -11,6 +11,8 @@ use locality_core::LocalityError;
 use locality_core::journal::PushId;
 use locality_core::model::{MountId, RemoteId};
 
+use crate::workspace_binding::WorkspaceRebindBlocker;
+
 pub type StoreResult<T> = Result<T, StoreError>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,6 +22,10 @@ pub enum StoreError {
     WorkspaceMountTargetCollision {
         target: String,
         existing_mount_id: MountId,
+    },
+    WorkspaceRebindBlocked {
+        mount_id: MountId,
+        blocker: WorkspaceRebindBlocker,
     },
     EntityMissing {
         mount_id: MountId,
@@ -70,6 +76,13 @@ impl Display for StoreError {
                 "workspace mount target `{target}` collides with mount `{}`",
                 existing_mount_id.0
             ),
+            Self::WorkspaceRebindBlocked { mount_id, blocker } => {
+                write!(
+                    f,
+                    "workspace move for mount `{}` is blocked: {blocker}",
+                    mount_id.0
+                )
+            }
             Self::EntityMissing {
                 mount_id,
                 remote_id,

@@ -127,6 +127,43 @@ pub struct WorkspaceBindingRecord {
     pub binding: WorkspaceBinding,
 }
 
+/// Metadata-visible reasons that prevent a workspace move from being safe.
+///
+/// Even when none of the durable blockers are present, this crate never moves
+/// files or changes a mount root. An owning Desktop/daemon coordinator must
+/// stop observers, move or materialize the destination, update registration,
+/// and provide crash recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceRebindBlocker {
+    DirtyOrConflictedState,
+    UnsettledApplyJournal,
+    PendingVirtualMutation,
+    ActiveProjection,
+    RequiresOwningCoordinator,
+}
+
+impl Display for WorkspaceRebindBlocker {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DirtyOrConflictedState => {
+                formatter.write_str("mount has dirty or conflicted local state")
+            }
+            Self::UnsettledApplyJournal => {
+                formatter.write_str("mount has an unsettled apply journal")
+            }
+            Self::PendingVirtualMutation => {
+                formatter.write_str("mount has a pending virtual mutation")
+            }
+            Self::ActiveProjection => {
+                formatter.write_str("mount has an active platform projection")
+            }
+            Self::RequiresOwningCoordinator => {
+                formatter.write_str("workspace moves require an owning Desktop/daemon coordinator")
+            }
+        }
+    }
+}
+
 impl WorkspaceBindingRecord {
     pub fn new(mount_id: MountId, binding: WorkspaceBinding) -> Self {
         Self { mount_id, binding }

@@ -12,7 +12,7 @@ use locality_core::shadow::ShadowDocument;
 use locality_store::{
     EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository,
     ProjectionMode, ShadowRepository, SqliteStateStore, StateCompatibilityIssue,
-    StateCompatibilityStatus, StoreError, WorkspaceBindingRepository,
+    StateCompatibilityStatus, StoreError, WorkspaceBindingRepository, WorkspaceRebindBlocker,
 };
 use rusqlite::{Connection, params};
 
@@ -112,7 +112,7 @@ fn legacy_v20_upgrade_preserves_dirty_shadow_apply_journal_and_mount_identity() 
 }
 
 #[test]
-fn migrated_binding_survives_restart_and_rebinds_across_host_roots_without_state_reset() {
+fn migrated_binding_survives_restart_and_resolves_host_roots_without_mutating_mount() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
     let mount = fixture.mount_config(ProjectionMode::LinuxFuse);
@@ -126,22 +126,31 @@ fn migrated_binding_survives_restart_and_rebinds_across_host_roots_without_state
         .expect("save shadow");
     store.append_journal(journal.clone()).expect("save journal");
 
+    let binding = store
+        .get_workspace_binding(&fixture.mount_id)
+        .expect("binding")
+        .expect("binding exists");
+    let logical = locality_core::portable::LogicalPath::new("Engineering/Roadmap/page.md")
+        .expect("logical path");
     let mac_root = Path::new("/Users/alice/Library/CloudStorage/Locality");
-    let rebound_mac = store
-        .rebind_workspace_root(&fixture.mount_id, mac_root)
-        .expect("rebind mac root");
     assert_eq!(
-        rebound_mac.root,
-        mac_root.join("notion-main"),
-        "the physical root is placement, not identity"
+        binding.projected_path(mac_root, &logical),
+        mac_root.join("notion-main/Engineering/Roadmap/page.md")
     );
 
     let linux_root = Path::new("/home/alice/Locality");
-    let rebound_linux = store
-        .rebind_workspace_root(&fixture.mount_id, linux_root)
-        .expect("rebind linux root");
-    assert_eq!(rebound_linux.root, linux_root.join("notion-main"));
-    assert_eq!(rebound_linux.mount_id, fixture.mount_id);
+    assert_eq!(
+        binding.projected_path(linux_root, &logical),
+        linux_root.join("notion-main/Engineering/Roadmap/page.md")
+    );
+    assert_eq!(
+        store
+            .get_mount(&fixture.mount_id)
+            .expect("mount")
+            .expect("mount exists")
+            .root,
+        fixture.mount_root
+    );
     drop(store);
 
     let restarted = fixture.open();
@@ -160,7 +169,7 @@ fn migrated_binding_survives_restart_and_rebinds_across_host_roots_without_state
             .expect("mount after restart")
             .expect("mount")
             .root,
-        linux_root.join("notion-main")
+        fixture.mount_root
     );
     assert_eq!(
         restarted
@@ -179,6 +188,309 @@ fn migrated_binding_survives_restart_and_rebinds_across_host_roots_without_state
             .get_journal(&PushId("push-applying".to_string()))
             .expect("journal after rebind"),
         Some(journal)
+    );
+}
+
+#[test]
+fn workspace_rebind_preflight_rejects_dirty_state_without_changing_root() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let mount = fixture.mount_config(ProjectionMode::PlainFiles);
+    store.save_mount(mount.clone()).expect("save mount");
+    store
+        .save_entity(dirty_entity(&fixture.mount_id).with_hydration(HydrationState::Dirty))
+        .expect("save dirty entity");
+
+    assert_eq!(
+        store.check_workspace_rebind(&fixture.mount_id),
+        Err(StoreError::WorkspaceRebindBlocked {
+            mount_id: fixture.mount_id.clone(),
+            blocker: WorkspaceRebindBlocker::DirtyOrConflictedState,
+        })
+    );
+    assert_eq!(
+        store
+            .get_mount(&fixture.mount_id)
+            .expect("mount")
+            .expect("mount exists")
+            .root,
+        mount.root
+    );
+}
+
+#[test]
+fn workspace_rebind_preflight_rejects_unsettled_apply_journal() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config(ProjectionMode::PlainFiles))
+        .expect("save mount");
+    store
+        .append_journal(applying_journal(&fixture.mount_id))
+        .expect("save applying journal");
+
+    assert_eq!(
+        store.check_workspace_rebind(&fixture.mount_id),
+        Err(StoreError::WorkspaceRebindBlocked {
+            mount_id: fixture.mount_id.clone(),
+            blocker: WorkspaceRebindBlocker::UnsettledApplyJournal,
+        })
+    );
+}
+
+#[test]
+fn workspace_rebind_preflight_rejects_active_virtual_projection() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config(ProjectionMode::MacosFileProvider))
+        .expect("save mount");
+
+    assert_eq!(
+        store.check_workspace_rebind(&fixture.mount_id),
+        Err(StoreError::WorkspaceRebindBlocked {
+            mount_id: fixture.mount_id.clone(),
+            blocker: WorkspaceRebindBlocker::ActiveProjection,
+        })
+    );
+}
+
+#[test]
+fn clean_plain_mount_still_requires_an_owning_rebind_coordinator() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config(ProjectionMode::PlainFiles))
+        .expect("save mount");
+
+    assert_eq!(
+        store.check_workspace_rebind(&fixture.mount_id),
+        Err(StoreError::WorkspaceRebindBlocked {
+            mount_id: fixture.mount_id.clone(),
+            blocker: WorkspaceRebindBlocker::RequiresOwningCoordinator,
+        })
+    );
+}
+
+#[test]
+fn v20_linux_fuse_binding_uses_post_migration_mount_point() {
+    assert_legacy_virtual_binding_uses_final_mount_point(ProjectionMode::LinuxFuse);
+}
+
+#[test]
+fn v20_windows_cloud_files_binding_uses_post_migration_mount_point() {
+    assert_legacy_virtual_binding_uses_final_mount_point(ProjectionMode::WindowsCloudFiles);
+}
+
+fn assert_legacy_virtual_binding_uses_final_mount_point(projection: ProjectionMode) {
+    let fixture = Fixture::new();
+    let shared_root = fixture.root.join("LegacyLocality");
+    fs::create_dir_all(&shared_root).expect("shared root");
+    let mut store = fixture.open();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", shared_root.clone())
+                .projection(projection.clone()),
+        )
+        .expect("save legacy projection mount");
+    downgrade_to_v20(&store.db_path);
+    mark_projection_component_v1(&store.db_path, &projection);
+    drop(store);
+
+    let migrated = fixture.open();
+    let mount = migrated
+        .get_mount(&fixture.mount_id)
+        .expect("mount")
+        .expect("mount exists");
+    let binding = migrated
+        .get_workspace_binding(&fixture.mount_id)
+        .expect("binding")
+        .expect("binding exists");
+    assert_eq!(mount.root, shared_root.join("notion"));
+    assert_eq!(binding.mount_target().as_str(), "notion");
+}
+
+#[test]
+fn current_v21_open_rejects_missing_binding_without_reconstructing_it() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config(ProjectionMode::PlainFiles))
+        .expect("save mount");
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    connection
+        .execute(
+            "DELETE FROM workspace_bindings WHERE mount_id = ?1",
+            params![fixture.mount_id.0.as_str()],
+        )
+        .expect("remove required binding");
+    drop(connection);
+    drop(store);
+
+    assert!(matches!(
+        SqliteStateStore::open(fixture.state_root.clone()),
+        Err(StoreError::StateCompatibility(message))
+            if message.contains("missing required non-rebuildable workspace binding")
+    ));
+    let connection =
+        Connection::open(fixture.state_root.join("state.sqlite3")).expect("raw failed-open state");
+    let binding_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM workspace_bindings", [], |row| {
+            row.get(0)
+        })
+        .expect("binding count");
+    assert_eq!(binding_count, 0, "current state must not be reconstructed");
+}
+
+#[test]
+fn current_v21_save_of_existing_mount_does_not_reconstruct_missing_binding() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let mount = fixture.mount_config(ProjectionMode::PlainFiles);
+    store.save_mount(mount.clone()).expect("save mount");
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    connection
+        .execute(
+            "DELETE FROM workspace_bindings WHERE mount_id = ?1",
+            params![fixture.mount_id.0.as_str()],
+        )
+        .expect("remove required binding");
+    drop(connection);
+
+    assert_eq!(
+        store.save_mount(mount),
+        Err(StoreError::WorkspaceBindingMissing(
+            fixture.mount_id.clone()
+        ))
+    );
+    let connection = Connection::open(&store.db_path).expect("raw unchanged state");
+    let binding_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM workspace_bindings", [], |row| {
+            row.get(0)
+        })
+        .expect("binding count");
+    assert_eq!(binding_count, 0);
+}
+
+#[test]
+fn current_v21_open_rejects_missing_non_rebuildable_binding_component() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config(ProjectionMode::PlainFiles))
+        .expect("save mount");
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    connection
+        .execute(
+            "DELETE FROM state_components
+             WHERE component_id = 'durable:workspace_bindings'",
+            [],
+        )
+        .expect("remove required component");
+    drop(connection);
+    drop(store);
+
+    assert!(matches!(
+        SqliteStateStore::open(fixture.state_root.clone()),
+        Err(StoreError::StateCompatibility(message))
+            if message.contains("durable:workspace_bindings")
+    ));
+    let connection =
+        Connection::open(fixture.state_root.join("state.sqlite3")).expect("raw failed-open state");
+    let component_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM state_components
+             WHERE component_id = 'durable:workspace_bindings'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("component count");
+    assert_eq!(component_count, 0, "component must not be repaired");
+}
+
+#[test]
+fn v21_transition_rolls_back_table_roots_components_and_version_on_failure() {
+    let fixture = Fixture::new();
+    let shared_root = fixture.root.join("LegacyLocality");
+    fs::create_dir_all(&shared_root).expect("shared root");
+    let mut store = fixture.open();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", shared_root.clone())
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save legacy mount");
+    downgrade_to_v20(&store.db_path);
+    mark_projection_component_v1(&store.db_path, &ProjectionMode::LinuxFuse);
+    let connection = Connection::open(&store.db_path).expect("raw failpoint connection");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_workspace_binding_component
+             BEFORE INSERT ON state_components
+             WHEN NEW.component_id = 'durable:workspace_bindings'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected workspace binding migration failure');
+             END;",
+        )
+        .expect("install migration failpoint");
+    drop(connection);
+    drop(store);
+
+    assert!(SqliteStateStore::open(fixture.state_root.clone()).is_err());
+    let db_path = fixture.state_root.join("state.sqlite3");
+    let connection = Connection::open(&db_path).expect("raw rolled-back state");
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("user version");
+    let binding_table_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'workspace_bindings'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("binding table count");
+    let stored_root: String = connection
+        .query_row(
+            "SELECT root FROM mounts WHERE mount_id = ?1",
+            params![fixture.mount_id.0.as_str()],
+            |row| row.get(0),
+        )
+        .expect("rolled-back mount root");
+    let projection_version: i64 = connection
+        .query_row(
+            "SELECT version FROM state_components
+             WHERE component_id = 'projection:linux_fuse'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("rolled-back projection component");
+    assert_eq!(user_version, 20);
+    assert_eq!(binding_table_count, 0);
+    assert_eq!(stored_root, shared_root.to_string_lossy());
+    assert_eq!(projection_version, 1);
+    connection
+        .execute_batch("DROP TRIGGER fail_workspace_binding_component;")
+        .expect("remove failpoint");
+    drop(connection);
+
+    let restarted = fixture.open();
+    assert_eq!(
+        restarted
+            .get_mount(&fixture.mount_id)
+            .expect("mount")
+            .expect("mount exists")
+            .root,
+        shared_root.join("notion")
+    );
+    assert_eq!(
+        restarted
+            .get_workspace_binding(&fixture.mount_id)
+            .expect("binding")
+            .expect("binding exists")
+            .mount_target()
+            .as_str(),
+        "notion"
     );
 }
 
@@ -276,6 +588,23 @@ fn downgrade_to_v20(db_path: &Path) {
              PRAGMA user_version = 20;",
         )
         .expect("downgrade to legacy v20 metadata");
+}
+
+fn mark_projection_component_v1(db_path: &Path, projection: &ProjectionMode) {
+    let component_id = match projection {
+        ProjectionMode::LinuxFuse => "projection:linux_fuse",
+        ProjectionMode::WindowsCloudFiles => "projection:windows_cloud_files",
+        other => panic!("unsupported legacy projection fixture: {other:?}"),
+    };
+    let connection = Connection::open(db_path).expect("raw projection downgrade connection");
+    connection
+        .execute(
+            "UPDATE state_components
+             SET version = 1, min_reader_version = 1
+             WHERE component_id = ?1",
+            params![component_id],
+        )
+        .expect("mark projection component v1");
 }
 
 fn dirty_entity(mount_id: &MountId) -> EntityRecord {

@@ -60,5 +60,5 @@ pub use reset::{
 pub use sqlite::SqliteStateStore;
 pub use workspace_binding::{
     WORKSPACE_BINDING_LAYOUT_VERSION, WORKSPACE_BINDING_VERSION, WorkspaceBinding,
-    WorkspaceBindingError, WorkspaceBindingRecord,
+    WorkspaceBindingError, WorkspaceBindingRecord, WorkspaceRebindBlocker,
 };
