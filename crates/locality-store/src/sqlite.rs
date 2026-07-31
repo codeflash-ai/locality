@@ -41,8 +41,8 @@ use crate::discovery::{
 use crate::error::{StoreError, StoreResult};
 use crate::generation_delivery::{
     GENERATION_DELIVERY_COMPONENT_VERSION, GenerationApplyJournalRecord, GenerationApplyOutcome,
-    GenerationApplyStatus, GenerationDeliveryRepository, GenerationPathRecord, GenerationPathState,
-    ObservedGenerationRecord, PreparedGenerationApply,
+    GenerationApplyStatus, GenerationDeliveryRepository, GenerationInodeEvidenceRecord,
+    GenerationPathRecord, GenerationPathState, ObservedGenerationRecord, PreparedGenerationApply,
 };
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
@@ -62,7 +62,7 @@ use crate::repository::{
 };
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 22;
+const SCHEMA_VERSION: i64 = 23;
 const ENTITY_SEARCH_COMPONENT_VERSION: i64 = 2;
 const JOURNALS_COMPONENT_VERSION: i64 = 3;
 const LINUX_FUSE_PROJECTION_LAYOUT_VERSION: i64 = 2;
@@ -354,6 +354,8 @@ fn generation_path_from_row(
         String,
         String,
         Option<String>,
+        Option<String>,
+        Option<i64>,
         String,
         Option<String>,
         String,
@@ -366,9 +368,18 @@ fn generation_path_from_row(
         base_generation_id: locality_core::portable::SourceGenerationId::new(row.3)
             .map_err(|error| StoreError::InvalidState(error.to_string()))?,
         base_identity: row.4.map(|value| from_json(&value)).transpose()?,
-        state: parse_generation_path_state(&row.5)?,
-        incoming_identity: row.6.map(|value| from_json(&value)).transpose()?,
-        updated_at: row.7,
+        base_payload_delta_id: row.5,
+        base_payload_entry_index: row
+            .6
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    StoreError::InvalidState("negative generation base payload index".to_string())
+                })
+            })
+            .transpose()?,
+        state: parse_generation_path_state(&row.7)?,
+        incoming_identity: row.8.map(|value| from_json(&value)).transpose()?,
+        updated_at: row.9,
     })
 }
 
@@ -380,7 +391,8 @@ fn select_generation_path(
     connection
         .query_row(
             "SELECT mount_id, projection_id, logical_path, base_generation_id,
-                    base_identity_json, state, incoming_identity_json, updated_at
+                    base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                    state, incoming_identity_json, updated_at
              FROM generation_paths WHERE mount_id = ?1 AND projection_id = ?2",
             params![mount_id.0.as_str(), projection_id.as_str()],
             |row| {
@@ -393,6 +405,8 @@ fn select_generation_path(
                     row.get(5)?,
                     row.get(6)?,
                     row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
                 ))
             },
         )
@@ -407,7 +421,8 @@ fn list_generation_paths_from_connection(
 ) -> StoreResult<Vec<GenerationPathRecord>> {
     let mut statement = connection.prepare(
         "SELECT mount_id, projection_id, logical_path, base_generation_id,
-                base_identity_json, state, incoming_identity_json, updated_at
+                base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                state, incoming_identity_json, updated_at
          FROM generation_paths WHERE mount_id = ?1 ORDER BY projection_id",
     )?;
     let rows = statement.query_map(params![mount_id.0.as_str()], |row| {
@@ -420,6 +435,8 @@ fn list_generation_paths_from_connection(
             row.get(5)?,
             row.get(6)?,
             row.get(7)?,
+            row.get(8)?,
+            row.get(9)?,
         ))
     })?;
     rows.map(|row| generation_path_from_row(row?)).collect()
@@ -578,14 +595,22 @@ impl GenerationDeliveryRepository for SqliteStateStore {
             transaction.execute(
                 "INSERT INTO generation_paths (
                     mount_id, projection_id, logical_path, base_generation_id,
-                    base_identity_json, state, incoming_identity_json, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                    state, incoming_identity_json, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     path.mount_id.0.as_str(),
                     path.projection_id.as_str(),
                     path.logical_path.as_str(),
                     path.base_generation_id.as_str(),
                     path.base_identity.as_ref().map(to_json).transpose()?,
+                    path.base_payload_delta_id.as_deref(),
+                    path.base_payload_entry_index
+                        .map(i64::try_from)
+                        .transpose()
+                        .map_err(|_| StoreError::InvalidState(
+                            "generation base payload index is too large".to_string()
+                        ))?,
                     generation_path_state_label(path.state),
                     path.incoming_identity.as_ref().map(to_json).transpose()?,
                     path.updated_at.as_str(),
@@ -850,6 +875,182 @@ impl GenerationDeliveryRepository for SqliteStateStore {
             .collect()
     }
 
+    fn record_generation_inode_evidence(
+        &mut self,
+        evidence: GenerationInodeEvidenceRecord,
+    ) -> StoreResult<()> {
+        let connection = self.connection()?;
+        let entry_index = i64::try_from(evidence.entry_index).map_err(|_| {
+            StoreError::InvalidState("generation evidence index is too large".to_string())
+        })?;
+        let byte_length = i64::try_from(evidence.byte_length).map_err(|_| {
+            StoreError::InvalidState("generation evidence length is too large".to_string())
+        })?;
+        let changed = connection.execute(
+            "INSERT INTO generation_inode_evidence (
+                delta_id, entry_index, mount_id, logical_path, evidence_name,
+                expected_sha256, byte_length, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(delta_id, entry_index) DO NOTHING",
+            params![
+                evidence.delta_id.as_str(),
+                entry_index,
+                evidence.mount_id.0.as_str(),
+                evidence.logical_path.as_str(),
+                evidence.evidence_name.as_str(),
+                evidence.expected_sha256.as_str(),
+                byte_length,
+                evidence.created_at.as_str(),
+            ],
+        )?;
+        if changed == 0 {
+            let exact: bool = connection.query_row(
+                "SELECT mount_id = ?3 AND logical_path = ?4 AND evidence_name = ?5
+                        AND expected_sha256 = ?6 AND byte_length = ?7 AND created_at = ?8
+                 FROM generation_inode_evidence WHERE delta_id = ?1 AND entry_index = ?2",
+                params![
+                    evidence.delta_id.as_str(),
+                    entry_index,
+                    evidence.mount_id.0.as_str(),
+                    evidence.logical_path.as_str(),
+                    evidence.evidence_name.as_str(),
+                    evidence.expected_sha256.as_str(),
+                    byte_length,
+                    evidence.created_at.as_str(),
+                ],
+                |row| row.get(0),
+            )?;
+            if !exact {
+                return Err(StoreError::InvalidState(
+                    "generation inode evidence replay changed".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn list_generation_inode_evidence(&self) -> StoreResult<Vec<GenerationInodeEvidenceRecord>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT delta_id, entry_index, mount_id, logical_path, evidence_name,
+                    expected_sha256, byte_length, created_at
+             FROM generation_inode_evidence ORDER BY created_at, delta_id, entry_index",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let row = row?;
+            Ok(GenerationInodeEvidenceRecord {
+                delta_id: row.0,
+                entry_index: u64::try_from(row.1).map_err(|_| {
+                    StoreError::InvalidState("negative generation evidence index".to_string())
+                })?,
+                mount_id: MountId::new(row.2),
+                logical_path: row.3,
+                evidence_name: row.4,
+                expected_sha256: row.5,
+                byte_length: u64::try_from(row.6).map_err(|_| {
+                    StoreError::InvalidState("negative generation evidence length".to_string())
+                })?,
+                created_at: row.7,
+            })
+        })
+        .collect()
+    }
+
+    fn mark_generation_inode_evidence_conflict(
+        &mut self,
+        delta_id: &str,
+        entry_index: u64,
+        local_sha256: &str,
+        updated_at: &str,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let journal =
+            generation_apply_from_connection(&transaction, delta_id)?.ok_or_else(|| {
+                StoreError::InvalidState(format!("generation apply `{delta_id}` is missing"))
+            })?;
+        if journal.status != GenerationApplyStatus::Completed {
+            return Err(StoreError::InvalidState(
+                "late inode conflict requires a completed generation apply".to_string(),
+            ));
+        }
+        let entry = journal
+            .delta
+            .entries
+            .get(entry_index as usize)
+            .ok_or_else(|| {
+                StoreError::InvalidState("generation evidence index is out of bounds".to_string())
+            })?;
+        let old = entry.old.as_ref().ok_or_else(|| {
+            StoreError::InvalidState("generation evidence entry has no old identity".to_string())
+        })?;
+        let incoming = entry.new.as_ref().map(to_json).transpose()?;
+        transaction.execute(
+            "INSERT INTO generation_paths (
+                mount_id, projection_id, logical_path, base_generation_id,
+                base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                state, incoming_identity_json, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, 'conflicted', ?6, ?7)
+             ON CONFLICT(mount_id, projection_id) DO UPDATE SET
+                logical_path = excluded.logical_path,
+                base_generation_id = excluded.base_generation_id,
+                base_identity_json = excluded.base_identity_json,
+                state = 'conflicted', incoming_identity_json = excluded.incoming_identity_json,
+                updated_at = excluded.updated_at",
+            params![
+                journal.delta.mount_id.as_str(),
+                old.projection_id.as_str(),
+                old.logical_path.as_str(),
+                journal.delta.base_generation_id.as_str(),
+                to_json(old)?,
+                incoming,
+                updated_at,
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE generation_inode_evidence SET expected_sha256 = ?3
+             WHERE delta_id = ?1 AND entry_index = ?2",
+            params![
+                delta_id,
+                i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
+                    "generation evidence index is too large".to_string()
+                ))?,
+                local_sha256
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn remove_generation_inode_evidence(
+        &mut self,
+        delta_id: &str,
+        entry_index: u64,
+    ) -> StoreResult<()> {
+        self.connection()?.execute(
+            "DELETE FROM generation_inode_evidence WHERE delta_id = ?1 AND entry_index = ?2",
+            params![
+                delta_id,
+                i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
+                    "generation evidence index is too large".to_string()
+                ))?
+            ],
+        )?;
+        Ok(())
+    }
+
     fn complete_generation_apply(
         &mut self,
         delta_id: &str,
@@ -878,7 +1079,13 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         }
 
         let mount_id = MountId::new(journal.delta.mount_id.as_str());
-        for (entry, (_, outcome)) in journal.delta.entries.iter().zip(&journal.outcomes) {
+        for (entry_index, (entry, (_, outcome))) in journal
+            .delta
+            .entries
+            .iter()
+            .zip(&journal.outcomes)
+            .enumerate()
+        {
             match outcome {
                 GenerationApplyOutcome::Applied => {
                     let new = entry.new.as_ref().ok_or_else(|| {
@@ -887,12 +1094,15 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                     transaction.execute(
                         "INSERT INTO generation_paths (
                             mount_id, projection_id, logical_path, base_generation_id,
-                            base_identity_json, state, incoming_identity_json, updated_at
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, 'clean', NULL, ?6)
+                            base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                            state, incoming_identity_json, updated_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'clean', NULL, ?8)
                          ON CONFLICT(mount_id, projection_id) DO UPDATE SET
                             logical_path = excluded.logical_path,
                             base_generation_id = excluded.base_generation_id,
                             base_identity_json = excluded.base_identity_json,
+                            base_payload_delta_id = excluded.base_payload_delta_id,
+                            base_payload_entry_index = excluded.base_payload_entry_index,
                             state = 'clean', incoming_identity_json = NULL,
                             updated_at = excluded.updated_at",
                         params![
@@ -901,6 +1111,42 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                             new.logical_path.as_str(),
                             journal.delta.target_generation_id.as_str(),
                             to_json(new)?,
+                            journal.delta.delta_id.as_str(),
+                            i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
+                                "generation entry index is too large".to_string()
+                            ))?,
+                            completed_at,
+                        ],
+                    )?;
+                }
+                GenerationApplyOutcome::Merged => {
+                    let new = entry.new.as_ref().ok_or_else(|| {
+                        StoreError::InvalidState("merged outcome has no new identity".to_string())
+                    })?;
+                    transaction.execute(
+                        "INSERT INTO generation_paths (
+                            mount_id, projection_id, logical_path, base_generation_id,
+                            base_identity_json, base_payload_delta_id, base_payload_entry_index,
+                            state, incoming_identity_json, updated_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'dirty', NULL, ?8)
+                         ON CONFLICT(mount_id, projection_id) DO UPDATE SET
+                            logical_path = excluded.logical_path,
+                            base_generation_id = excluded.base_generation_id,
+                            base_identity_json = excluded.base_identity_json,
+                            base_payload_delta_id = excluded.base_payload_delta_id,
+                            base_payload_entry_index = excluded.base_payload_entry_index,
+                            state = 'dirty', incoming_identity_json = NULL,
+                            updated_at = excluded.updated_at",
+                        params![
+                            mount_id.0.as_str(),
+                            new.projection_id.as_str(),
+                            new.logical_path.as_str(),
+                            journal.delta.target_generation_id.as_str(),
+                            to_json(new)?,
+                            journal.delta.delta_id.as_str(),
+                            i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
+                                "generation entry index is too large".to_string()
+                            ))?,
                             completed_at,
                         ],
                     )?;
@@ -3294,6 +3540,41 @@ fn clear_mount_source_state(connection: &Connection, mount_id: &MountId) -> Stor
             mount_id.0
         )));
     }
+    let preserved_path: Option<(String, String)> = connection
+        .query_row(
+            "SELECT projection_id, state FROM generation_paths
+             WHERE mount_id = ?1 AND state IN ('dirty', 'conflicted') LIMIT 1",
+            params![&mount_id.0],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((projection_id, state)) = preserved_path {
+        return Err(StoreError::InvalidState(format!(
+            "mount `{}` cannot change source while generation path `{projection_id}` is {state}",
+            mount_id.0
+        )));
+    }
+    let retained_inode: Option<String> = connection
+        .query_row(
+            "SELECT evidence.logical_path
+             FROM generation_inode_evidence AS evidence
+             WHERE evidence.mount_id = ?1 LIMIT 1",
+            params![&mount_id.0],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(logical_path) = retained_inode {
+        return Err(StoreError::InvalidState(format!(
+            "mount `{}` cannot change source while displaced inode evidence for `{logical_path}` is retained",
+            mount_id.0
+        )));
+    }
+    // Retire only completed clean lineage in the same transaction as the
+    // source reset. Active, dirty, and conflicted lineage is preserved above.
+    connection.execute(
+        "DELETE FROM generation_apply_journals WHERE mount_id = ?1 AND active = 0",
+        params![&mount_id.0],
+    )?;
     for table in [
         "generation_paths",
         "observed_generations",
@@ -3515,6 +3796,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         migrate_journals_component_to_v3(connection)?;
         migrate_virtual_mutations_component_to_v3(connection)?;
         migrate_entity_search_component_to_v2(connection)?;
+        migrate_generation_delivery_component_to_v2(connection)?;
         return Ok(());
     }
 
@@ -4120,6 +4402,14 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
     }
 
+    if user_version < 23 {
+        migrate_generation_delivery_storage_to_v2(connection)?;
+        if user_version >= 21 {
+            migrate_generation_delivery_component_to_v2(connection)?;
+            record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
+        }
+    }
+
     if user_version < SCHEMA_VERSION {
         seed_default_notion_profile(connection)?;
         migrate_linux_fuse_projection_layout_to_v2(connection, user_version < 13)?;
@@ -4187,6 +4477,13 @@ fn state_component_issue_allows_schema_migration(
             found,
             current: SCHEMA_VERSION,
         } if component_id == "core:schema" && *found == user_version && user_version < SCHEMA_VERSION
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::OlderComponent {
+            component_id,
+            found: 1,
+            current: GENERATION_DELIVERY_COMPONENT_VERSION,
+        } if component_id == "durable:generation_delivery"
     ) || matches!(
         issue,
         StateCompatibilityIssue::OlderComponent {
@@ -5033,6 +5330,8 @@ fn create_generation_delivery_tables(connection: &Connection) -> StoreResult<()>
             logical_path TEXT NOT NULL,
             base_generation_id TEXT NOT NULL,
             base_identity_json TEXT,
+            base_payload_delta_id TEXT,
+            base_payload_entry_index INTEGER CHECK (base_payload_entry_index >= 0),
             state TEXT NOT NULL CHECK (state IN ('clean', 'dirty', 'conflicted')),
             incoming_identity_json TEXT,
             updated_at TEXT NOT NULL,
@@ -5075,6 +5374,20 @@ fn create_generation_delivery_tables(connection: &Connection) -> StoreResult<()>
             PRIMARY KEY (delta_id, entry_index),
             FOREIGN KEY (delta_id) REFERENCES generation_apply_journals(delta_id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS generation_inode_evidence (
+            delta_id TEXT NOT NULL,
+            entry_index INTEGER NOT NULL CHECK (entry_index >= 0),
+            mount_id TEXT NOT NULL,
+            logical_path TEXT NOT NULL,
+            evidence_name TEXT NOT NULL,
+            expected_sha256 TEXT NOT NULL,
+            byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (delta_id, entry_index),
+            FOREIGN KEY (delta_id) REFERENCES generation_apply_journals(delta_id) ON DELETE CASCADE,
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
         ",
     )?;
     Ok(())
@@ -5110,6 +5423,36 @@ fn migrate_windows_cloud_files_projection_layout_to_v2(
 
 fn migrate_virtual_mutations_component_to_v3(connection: &Connection) -> StoreResult<()> {
     migrate_state_component_to_current(connection, "durable:virtual_mutations")
+}
+
+fn migrate_generation_delivery_component_to_v2(connection: &Connection) -> StoreResult<()> {
+    migrate_state_component_to_current(connection, "durable:generation_delivery")
+}
+
+fn migrate_generation_delivery_storage_to_v2(connection: &Connection) -> StoreResult<()> {
+    if !column_exists(connection, "generation_paths", "base_payload_delta_id")? {
+        connection.execute_batch(
+            "ALTER TABLE generation_paths ADD COLUMN base_payload_delta_id TEXT;
+             ALTER TABLE generation_paths ADD COLUMN base_payload_entry_index INTEGER
+                 CHECK (base_payload_entry_index >= 0);",
+        )?;
+    }
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS generation_inode_evidence (
+            delta_id TEXT NOT NULL,
+            entry_index INTEGER NOT NULL CHECK (entry_index >= 0),
+            mount_id TEXT NOT NULL,
+            logical_path TEXT NOT NULL,
+            evidence_name TEXT NOT NULL,
+            expected_sha256 TEXT NOT NULL,
+            byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (delta_id, entry_index),
+            FOREIGN KEY (delta_id) REFERENCES generation_apply_journals(delta_id) ON DELETE CASCADE,
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+         );",
+    )?;
+    Ok(())
 }
 
 fn migrate_journals_component_to_v3(connection: &Connection) -> StoreResult<()> {

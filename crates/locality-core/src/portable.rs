@@ -9,7 +9,9 @@ use std::fmt::{Display, Formatter};
 use std::path::{Component, PathBuf};
 use std::str::FromStr;
 
+use caseless::Caseless;
 use serde::{Deserialize, Deserializer, Serialize};
+use unicode_normalization_v16::UnicodeNormalization;
 
 use crate::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
 use crate::planner::{
@@ -135,6 +137,25 @@ impl LogicalPath {
     /// `PathBuf`. This does not bind the path to a host root.
     pub fn to_relative_path_buf(&self) -> PathBuf {
         PathBuf::from(&self.0)
+    }
+
+    /// ADR0005 portable filesystem collision key.
+    ///
+    /// Each component uses Unicode 16 full default non-Turkic case folding
+    /// followed by NFC. Separators remain structural, so this is safe to use
+    /// for whole-tree collision detection without consulting the host OS.
+    pub fn portable_collision_key(&self) -> String {
+        self.0
+            .split('/')
+            .map(|component| {
+                component
+                    .chars()
+                    .default_case_fold()
+                    .nfc()
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("/")
     }
 }
 

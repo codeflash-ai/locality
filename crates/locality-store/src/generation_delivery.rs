@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{StoreError, StoreResult};
 
-pub const GENERATION_DELIVERY_COMPONENT_VERSION: i64 = 1;
+pub const GENERATION_DELIVERY_COMPONENT_VERSION: i64 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservedGenerationRecord {
@@ -42,6 +42,9 @@ pub struct GenerationPathRecord {
     pub logical_path: String,
     pub base_generation_id: SourceGenerationId,
     pub base_identity: Option<GenerationFileIdentity>,
+    /// Authenticated staged payload that contains the exact merge-base bytes.
+    pub base_payload_delta_id: Option<String>,
+    pub base_payload_entry_index: Option<u64>,
     pub state: GenerationPathState,
     pub incoming_identity: Option<GenerationFileIdentity>,
     pub updated_at: String,
@@ -84,6 +87,8 @@ impl GenerationApplyStatus {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GenerationApplyOutcome {
     Applied,
+    /// Remote advanced and a clean three-way merge retained local edits.
+    Merged,
     Deleted,
     Conflict {
         local_sha256: Option<String>,
@@ -137,6 +142,18 @@ pub struct GenerationApplyJournalRecord {
     pub completed_at: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenerationInodeEvidenceRecord {
+    pub delta_id: String,
+    pub entry_index: u64,
+    pub mount_id: MountId,
+    pub logical_path: String,
+    pub evidence_name: String,
+    pub expected_sha256: String,
+    pub byte_length: u64,
+    pub created_at: String,
+}
+
 pub trait GenerationDeliveryRepository {
     /// Seeds or exactly replays a complete local base. Replacing a different
     /// observed head is intentionally not part of this operation.
@@ -184,6 +201,27 @@ pub trait GenerationDeliveryRepository {
     /// Lists active and completed journals so the staging owner can reconcile
     /// retained conflict evidence and discard non-live payloads.
     fn list_generation_applies(&self) -> StoreResult<Vec<GenerationApplyJournalRecord>>;
+
+    fn record_generation_inode_evidence(
+        &mut self,
+        evidence: GenerationInodeEvidenceRecord,
+    ) -> StoreResult<()>;
+
+    fn list_generation_inode_evidence(&self) -> StoreResult<Vec<GenerationInodeEvidenceRecord>>;
+
+    fn mark_generation_inode_evidence_conflict(
+        &mut self,
+        delta_id: &str,
+        entry_index: u64,
+        local_sha256: &str,
+        updated_at: &str,
+    ) -> StoreResult<()>;
+
+    fn remove_generation_inode_evidence(
+        &mut self,
+        delta_id: &str,
+        entry_index: u64,
+    ) -> StoreResult<()>;
 
     /// Atomically advances every affected mount head and its per-path bases
     /// after every journal entry has a terminal local outcome.

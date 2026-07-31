@@ -14,6 +14,11 @@ use std::path::{Component, Path};
 use rustix::fd::OwnedFd;
 
 pub(crate) const GENERATION_MOUNT_LOCK_FILE: &str = ".locality-generation.lock";
+pub(crate) const GENERATION_STATE_LOCK_FILE: &str = ".generation-delivery.lock";
+
+pub(crate) struct GenerationStateLock {
+    _file: File,
+}
 
 pub(crate) struct SecureMount {
     #[cfg(unix)]
@@ -49,11 +54,14 @@ impl SecureMount {
         #[cfg(windows)]
         {
             let root = open_windows_root(root)?;
-            let mut options = cap_std::fs::OpenOptions::new();
-            options.read(true).write(true).create(true);
-            let lock = root
-                .open_with(GENERATION_MOUNT_LOCK_FILE, &options)?
-                .into_std();
+            let lock = open_windows_regular_file(
+                &root,
+                OsStr::new(GENERATION_MOUNT_LOCK_FILE),
+                true,
+                true,
+                false,
+            )?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "mount lock disappeared"))?;
             lock_windows_file(&lock)?;
             Ok(Self { root, _lock: lock })
         }
@@ -116,6 +124,50 @@ impl SecureMount {
     }
 }
 
+impl GenerationStateLock {
+    pub(crate) fn acquire(root: &Path) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags, open, openat};
+
+            let directory = open(
+                root,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
+            let file = openat(
+                &directory,
+                GENERATION_STATE_LOCK_FILE,
+                OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o600),
+            )?;
+            rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+            Ok(Self {
+                _file: File::from(file),
+            })
+        }
+        #[cfg(windows)]
+        {
+            let directory = open_windows_root(root)?;
+            let file = open_windows_regular_file(
+                &directory,
+                OsStr::new(GENERATION_STATE_LOCK_FILE),
+                true,
+                true,
+                false,
+            )?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "state lock disappeared"))?;
+            lock_windows_file(&file)?;
+            Ok(Self { _file: file })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = root;
+            Err(unsupported_platform())
+        }
+    }
+}
+
 #[cfg(unix)]
 fn open_child_directory(parent: OwnedFd, name: &OsStr, create: bool) -> io::Result<OwnedFd> {
     use rustix::fs::{Mode, OFlags, fsync, mkdirat, openat};
@@ -161,18 +213,7 @@ impl SecureTarget {
         }
         #[cfg(windows)]
         {
-            match self.parent.symlink_metadata(name) {
-                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-                    Err(not_regular_file())
-                }
-                Ok(_) => self
-                    .parent
-                    .open(name)
-                    .map(cap_std::fs::File::into_std)
-                    .map(Some),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-                Err(error) => Err(error),
-            }
+            open_windows_regular_file(&self.parent, name, false, false, false)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -254,11 +295,8 @@ impl SecureTarget {
         }
         #[cfg(windows)]
         {
-            let mut options = cap_std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            self.parent
-                .open_with(name, &options)
-                .map(cap_std::fs::File::into_std)
+            open_windows_regular_file(&self.parent, name, true, true, true)?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "created file disappeared"))
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -376,6 +414,69 @@ fn open_windows_child_directory(
     let child = parent.open_with(name, &options)?.into_std();
     validate_windows_directory_handle(&child)?;
     Ok(cap_std::fs::Dir::from_std_file(child))
+}
+
+#[cfg(windows)]
+fn open_windows_regular_file(
+    parent: &cap_std::fs::Dir,
+    name: &OsStr,
+    write: bool,
+    create: bool,
+    exclusive: bool,
+) -> io::Result<Option<File>> {
+    use cap_std::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(write)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    if create {
+        if exclusive {
+            options.create_new(true);
+        } else {
+            options.create(true);
+        }
+    }
+    match parent.open_with(name, &options) {
+        Ok(file) => {
+            let file = file.into_std();
+            validate_windows_regular_handle(&file)?;
+            Ok(Some(file))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn validate_windows_regular_handle(file: &File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+        FileAttributeTagInfo, GetFileInformationByHandleEx,
+    };
+
+    let mut attributes = FILE_ATTRIBUTE_TAG_INFO::default();
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as _,
+            FileAttributeTagInfo,
+            (&mut attributes as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if attributes.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return Err(not_regular_file());
+    }
+    Ok(())
 }
 
 #[cfg(windows)]

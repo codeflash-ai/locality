@@ -6,13 +6,14 @@
 //! `loc pull` and Live Mode integration.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+use locality_core::conflict::{ThreeWayTextMerge, merge_text_with_base};
 use locality_core::model::MountId;
 use locality_core::portable::{SourceConnectionId, SourceGenerationId};
 use locality_protocol::freshness_delivery::{
@@ -20,15 +21,22 @@ use locality_protocol::freshness_delivery::{
 };
 use locality_store::{
     GenerationApplyOutcome, GenerationApplyStatus, GenerationDeliveryRepository,
-    GenerationPathState, PreparedGenerationApply, SqliteStateStore,
+    GenerationInodeEvidenceRecord, GenerationPathState, PreparedGenerationApply, SqliteStateStore,
 };
 use sha2::{Digest, Sha256};
 
 use crate::durable_fs::{create_dir_all_durable, remove_path_durable, rename_noreplace_durable};
-use crate::generation_mount::{GENERATION_MOUNT_LOCK_FILE, SecureMount, SecureTarget};
+use crate::generation_mount::{
+    GENERATION_MOUNT_LOCK_FILE, GenerationStateLock, SecureMount, SecureTarget,
+};
 
 const DEFAULT_PER_MOUNT_CONFLICT_BYTES: u64 = 1024 * 1024 * 1024;
 const DEFAULT_GLOBAL_CONFLICT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+// A displaced inode may still be writable through an editor's old descriptor.
+// POSIX has no portable way to prove that descriptor is closed, so evidence is
+// never age-GCed. The bounded quotas fail closed instead of risking local-byte
+// loss; source resets are likewise blocked while evidence remains.
 
 #[derive(Clone, Copy)]
 struct ConflictRetentionLimits {
@@ -130,7 +138,10 @@ where
 pub fn recover_generation_delivery_staging(
     store: &SqliteStateStore,
 ) -> Result<(), GenerationSyncError> {
-    reconcile_generation_staging(store).map(|_| ())
+    let _process_guard = generation_stage_process_lock()?;
+    let _state_guard =
+        GenerationStateLock::acquire(&store.root).map_err(GenerationSyncError::StateCoordinator)?;
+    reconcile_generation_staging_locked(store).map(|_| ())
 }
 
 pub fn apply_authorized_delivery<T: GenerationDeliveryTransport>(
@@ -156,6 +167,7 @@ struct ApplyHooks<'a> {
     after_target_open: Option<&'a mut dyn FnMut()>,
     after_preimage_move: Option<&'a mut dyn FnMut()>,
     after_preimage_verified: Option<&'a mut dyn FnMut()>,
+    after_preimage_reverified: Option<&'a mut dyn FnMut()>,
 }
 
 fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
@@ -167,31 +179,40 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
     interrupt_after_filesystem_mutations: Option<usize>,
     hooks: &mut ApplyHooks<'_>,
 ) -> Result<GenerationSyncSummary, GenerationSyncError> {
+    let _process_guard = generation_stage_process_lock()?;
+    let _state_guard =
+        GenerationStateLock::acquire(&store.root).map_err(GenerationSyncError::StateCoordinator)?;
     delivery
         .terminal_receipt
         .validate_against(&delivery.delta)
         .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
     validate_mount_delta(&delivery.delta, mount_id)?;
 
-    let retained = reconcile_generation_staging(store)?;
+    let mut retained = reconcile_generation_staging_locked(store)?;
     let existing = store.get_generation_apply(&delivery.delta.delta_id)?;
     if let Some(existing) = &existing {
         if existing.delta != delivery.delta || existing.receipt != delivery.terminal_receipt {
             return Err(GenerationSyncError::JournalMismatch);
         }
-        if existing.status == GenerationApplyStatus::Completed {
-            return Ok(summary(existing, true));
-        }
-    } else {
-        enforce_conflict_retention_quota(
-            &retained,
-            &delivery.delta,
-            DEFAULT_CONFLICT_RETENTION_LIMITS,
-        )?;
     }
-    validate_local_base(store, mount_id, &delivery.delta)?;
+    if !existing
+        .as_ref()
+        .is_some_and(|journal| journal.status == GenerationApplyStatus::Completed)
+    {
+        validate_local_base(store, mount_id, &delivery.delta)?;
+    }
     let _mount_guard = MountApplyGuard::acquire(mount_root)?;
     let secure_mount = SecureMount::open(mount_root).map_err(GenerationSyncError::MountAccess)?;
+    if let Some(existing) = &existing
+        && existing.status == GenerationApplyStatus::Completed
+    {
+        let late_conflicts = reconcile_completed_inode_evidence(store, &secure_mount, existing)?;
+        let mut replay = summary(existing, true);
+        replay.conflicted_paths = replay.conflicted_paths.saturating_add(late_conflicts);
+        replay.applied_paths = replay.applied_paths.saturating_sub(late_conflicts);
+        replay.deleted_paths = replay.deleted_paths.saturating_sub(late_conflicts);
+        return Ok(replay);
+    }
 
     let stage_relative = stage_relative_path(&delivery.delta)?;
     let stage_root = store.root.join(&stage_relative);
@@ -215,6 +236,17 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
     stage_contents(&stage_root, &journal.delta, &already_recorded, transport)?;
     store.mark_generation_apply_started(&journal.delta.delta_id, &created_at)?;
     let mut filesystem_mutations = 0_usize;
+    let merge_bases = generation_merge_bases(store, mount_id)?;
+    let mut superseded_conflicts = store
+        .list_generation_paths(mount_id)?
+        .into_iter()
+        .filter_map(|path| {
+            (path.state == GenerationPathState::Conflicted)
+                .then_some(path.incoming_identity)
+                .flatten()
+                .map(|identity| (path.projection_id, identity.byte_length))
+        })
+        .collect::<BTreeMap<_, _>>();
 
     for (index, entry) in journal.delta.entries.iter().enumerate() {
         let index = index as u64;
@@ -227,14 +259,46 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
             &journal.delta.delta_id,
             index,
             entry,
+            merge_bases.get(entry.projection_id().expect("validated entry has identity")),
             hooks,
         )?;
         if mutated {
+            if let Some(old) = &entry.old {
+                let evidence_name = preimage_name(&journal.delta.delta_id, index);
+                store.record_generation_inode_evidence(GenerationInodeEvidenceRecord {
+                    delta_id: journal.delta.delta_id.clone(),
+                    entry_index: index,
+                    mount_id: mount_id.clone(),
+                    logical_path: old.logical_path.as_str().to_string(),
+                    evidence_name: evidence_name
+                        .into_string()
+                        .map_err(|_| GenerationSyncError::InvalidStagePath)?,
+                    expected_sha256: old.content_sha256.clone(),
+                    byte_length: old.byte_length,
+                    created_at: created_at.clone(),
+                })?;
+            }
             filesystem_mutations += 1;
             if interrupt_after_filesystem_mutations == Some(filesystem_mutations) {
                 return Err(GenerationSyncError::InjectedInterruption);
             }
         }
+        if let Some(bytes) = superseded_conflicts.remove(
+            entry
+                .projection_id()
+                .expect("validated entry has a projection identity"),
+        ) {
+            retained.global_bytes = retained.global_bytes.saturating_sub(bytes);
+            if let Some(mount_bytes) = retained.by_mount.get_mut(journal.delta.mount_id.as_str()) {
+                *mount_bytes = mount_bytes.saturating_sub(bytes);
+            }
+        }
+        charge_actual_conflict_evidence(
+            &mut retained,
+            journal.delta.mount_id.as_str(),
+            &outcome,
+            DEFAULT_CONFLICT_RETENTION_LIMITS,
+        )?;
         store.record_generation_apply_outcome(
             &journal.delta.delta_id,
             index,
@@ -246,8 +310,102 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
 
     let completed = store.complete_generation_apply(&journal.delta.delta_id, &created_at)?;
     let completed_summary = summary(&completed, false);
-    reconcile_generation_staging(store)?;
+    reconcile_generation_staging_locked(store)?;
     Ok(completed_summary)
+}
+
+fn reconcile_completed_inode_evidence(
+    store: &mut SqliteStateStore,
+    mount: &SecureMount,
+    journal: &locality_store::GenerationApplyJournalRecord,
+) -> Result<u64, GenerationSyncError> {
+    let mut conflicts = 0_u64;
+    for evidence in store
+        .list_generation_inode_evidence()?
+        .into_iter()
+        .filter(|evidence| evidence.delta_id == journal.delta.delta_id)
+    {
+        let entry = journal
+            .delta
+            .entries
+            .get(evidence.entry_index as usize)
+            .ok_or(GenerationSyncError::JournalMismatch)?;
+        let old = entry
+            .old
+            .as_ref()
+            .ok_or(GenerationSyncError::JournalMismatch)?;
+        let target = mount.target(&old.logical_path.to_relative_path_buf(), false)?;
+        let Some(mut file) = target.open_named(OsStr::new(&evidence.evidence_name))? else {
+            if journal
+                .outcomes
+                .iter()
+                .find(|(index, _)| *index == evidence.entry_index)
+                .is_some_and(|(_, outcome)| {
+                    matches!(outcome, GenerationApplyOutcome::Conflict { .. })
+                })
+            {
+                store.remove_generation_inode_evidence(&evidence.delta_id, evidence.entry_index)?;
+                continue;
+            }
+            return Err(GenerationSyncError::MissingInodeEvidence(
+                evidence.logical_path,
+            ));
+        };
+        let actual = digest_open_file_handle(&mut file)?;
+        if actual == evidence.expected_sha256 {
+            continue;
+        }
+        let current = digest_target(&target)?;
+        let remote_digest = entry
+            .new
+            .as_ref()
+            .map(|identity| identity.content_sha256.as_str());
+        let restored = current.is_none() || current.as_deref() == remote_digest;
+        if restored {
+            if current.is_some() {
+                target.remove_current()?;
+            }
+            target.restore_named(OsStr::new(&evidence.evidence_name))?;
+        }
+        store.mark_generation_inode_evidence_conflict(
+            &evidence.delta_id,
+            evidence.entry_index,
+            &actual,
+            &journal.receipt.completed_at,
+        )?;
+        if restored {
+            store.remove_generation_inode_evidence(&evidence.delta_id, evidence.entry_index)?;
+        }
+        conflicts += 1;
+    }
+    Ok(conflicts)
+}
+
+fn generation_merge_bases(
+    store: &SqliteStateStore,
+    mount_id: &MountId,
+) -> Result<BTreeMap<locality_core::portable::ProjectionId, PathBuf>, GenerationSyncError> {
+    let mut bases = BTreeMap::new();
+    for path in store.list_generation_paths(mount_id)? {
+        let (Some(delta_id), Some(entry_index)) = (
+            path.base_payload_delta_id.as_deref(),
+            path.base_payload_entry_index,
+        ) else {
+            continue;
+        };
+        let journal = store
+            .get_generation_apply(delta_id)?
+            .ok_or(GenerationSyncError::JournalMismatch)?;
+        bases.insert(
+            path.projection_id,
+            store
+                .root
+                .join(journal.stage_root)
+                .join("payloads")
+                .join(entry_index.to_string()),
+        );
+    }
+    Ok(bases)
 }
 
 #[derive(Default)]
@@ -258,23 +416,69 @@ struct RetainedConflictUsage {
 
 static GENERATION_STAGE_RECONCILE: OnceLock<Mutex<()>> = OnceLock::new();
 
-fn reconcile_generation_staging(
-    store: &SqliteStateStore,
-) -> Result<RetainedConflictUsage, GenerationSyncError> {
-    let _guard = GENERATION_STAGE_RECONCILE
+fn generation_stage_process_lock() -> Result<std::sync::MutexGuard<'static, ()>, GenerationSyncError>
+{
+    GENERATION_STAGE_RECONCILE
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .map_err(|_| GenerationSyncError::MountCoordinatorPoisoned)?;
+        .map_err(|_| GenerationSyncError::MountCoordinatorPoisoned)
+}
+
+fn reconcile_generation_staging_locked(
+    store: &SqliteStateStore,
+) -> Result<RetainedConflictUsage, GenerationSyncError> {
     let journals = store.list_generation_applies()?;
+    let inode_evidence = store.list_generation_inode_evidence()?;
+    let inode_evidence_bytes = inode_evidence.iter().try_fold(0_u64, |total, evidence| {
+        total
+            .checked_add(evidence.byte_length)
+            .ok_or(GenerationSyncError::EvidenceRetentionQuotaExceeded)
+    })?;
+    if inode_evidence_bytes > DEFAULT_GLOBAL_CONFLICT_BYTES {
+        return Err(GenerationSyncError::EvidenceRetentionQuotaExceeded);
+    }
+    let mut evidence_by_mount = BTreeMap::<String, u64>::new();
+    for evidence in &inode_evidence {
+        let bytes = evidence_by_mount
+            .entry(evidence.mount_id.0.clone())
+            .or_default();
+        *bytes = bytes
+            .checked_add(evidence.byte_length)
+            .ok_or(GenerationSyncError::EvidenceRetentionQuotaExceeded)?;
+    }
+    if evidence_by_mount
+        .values()
+        .any(|bytes| *bytes > DEFAULT_PER_MOUNT_CONFLICT_BYTES)
+    {
+        return Err(GenerationSyncError::EvidenceRetentionQuotaExceeded);
+    }
     let mut usage = RetainedConflictUsage::default();
     let mut live_stages = BTreeSet::new();
     let mut current_conflicts = BTreeMap::new();
+    let mut current_bases = BTreeSet::new();
+    let mut base_bytes_global = 0_u64;
+    let mut base_bytes_by_mount = BTreeMap::<String, u64>::new();
     for mount_id in journals
         .iter()
         .map(|journal| journal.delta.mount_id.as_str())
         .collect::<BTreeSet<_>>()
     {
         for path in store.list_generation_paths(&MountId::new(mount_id))? {
+            if let (Some(delta_id), Some(entry_index)) = (
+                path.base_payload_delta_id.as_deref(),
+                path.base_payload_entry_index,
+            ) {
+                current_bases.insert((delta_id.to_string(), entry_index));
+                if let Some(identity) = &path.base_identity {
+                    base_bytes_global = base_bytes_global
+                        .checked_add(identity.byte_length)
+                        .ok_or(GenerationSyncError::BaseRetentionQuotaExceeded)?;
+                    let bytes = base_bytes_by_mount.entry(mount_id.to_string()).or_default();
+                    *bytes = bytes
+                        .checked_add(identity.byte_length)
+                        .ok_or(GenerationSyncError::BaseRetentionQuotaExceeded)?;
+                }
+            }
             if path.state == GenerationPathState::Conflicted
                 && let Some(incoming) = path.incoming_identity
             {
@@ -282,6 +486,13 @@ fn reconcile_generation_staging(
                     .insert((mount_id.to_string(), path.projection_id.clone()), incoming);
             }
         }
+    }
+    if base_bytes_global > DEFAULT_GLOBAL_CONFLICT_BYTES
+        || base_bytes_by_mount
+            .values()
+            .any(|bytes| *bytes > DEFAULT_PER_MOUNT_CONFLICT_BYTES)
+    {
+        return Err(GenerationSyncError::BaseRetentionQuotaExceeded);
     }
 
     for journal in &journals {
@@ -299,6 +510,7 @@ fn reconcile_generation_staging(
             .collect::<BTreeMap<_, _>>();
         let mut keep = BTreeSet::new();
         let mut conflict = BTreeSet::new();
+        let mut base = BTreeSet::new();
         let mut pending = BTreeSet::new();
         for (index, entry) in journal.delta.entries.iter().enumerate() {
             let index = index as u64;
@@ -322,6 +534,12 @@ fn reconcile_generation_staging(
                 None if journal.status.is_active() => {
                     keep.insert(index);
                     pending.insert(index);
+                }
+                Some(GenerationApplyOutcome::Applied | GenerationApplyOutcome::Merged)
+                    if current_bases.contains(&(journal.delta.delta_id.clone(), index)) =>
+                {
+                    keep.insert(index);
+                    base.insert(index);
                 }
                 _ => {}
             }
@@ -360,6 +578,10 @@ fn reconcile_generation_staging(
                 return Err(GenerationSyncError::MissingConflictEvidence(
                     identity.content_version_id.as_str().to_string(),
                 ));
+            } else if base.contains(&index) {
+                return Err(GenerationSyncError::MissingMergeBaseEvidence(
+                    identity.content_version_id.as_str().to_string(),
+                ));
             }
             if conflict.contains(&index) {
                 usage.global_bytes = usage
@@ -376,7 +598,11 @@ fn reconcile_generation_staging(
             }
         }
 
-        if !journal.status.is_active() && conflict.is_empty() && stage_root.exists() {
+        if !journal.status.is_active()
+            && conflict.is_empty()
+            && base.is_empty()
+            && stage_root.exists()
+        {
             remove_path_durable(&stage_root)?;
             live_stages.remove(&expected_relative);
         }
@@ -405,24 +631,27 @@ fn reconcile_generation_staging(
     Ok(usage)
 }
 
-fn enforce_conflict_retention_quota(
-    retained: &RetainedConflictUsage,
-    delta: &GenerationDelta,
+fn charge_actual_conflict_evidence(
+    retained: &mut RetainedConflictUsage,
+    mount_id: &str,
+    outcome: &GenerationApplyOutcome,
     limits: ConflictRetentionLimits,
 ) -> Result<(), GenerationSyncError> {
-    let incoming = delta
-        .changed_content_bytes()
-        .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
-    let mount_retained = retained
-        .by_mount
-        .get(delta.mount_id.as_str())
-        .copied()
-        .unwrap_or(0);
-    if mount_retained.saturating_add(incoming) > limits.per_mount_bytes
-        || retained.global_bytes.saturating_add(incoming) > limits.global_bytes
+    let GenerationApplyOutcome::Conflict {
+        incoming_identity: Some(incoming),
+        ..
+    } = outcome
+    else {
+        return Ok(());
+    };
+    let mount_retained = retained.by_mount.get(mount_id).copied().unwrap_or(0);
+    if mount_retained.saturating_add(incoming.byte_length) > limits.per_mount_bytes
+        || retained.global_bytes.saturating_add(incoming.byte_length) > limits.global_bytes
     {
         return Err(GenerationSyncError::ConflictRetentionQuotaExceeded);
     }
+    retained.global_bytes += incoming.byte_length;
+    *retained.by_mount.entry(mount_id.to_string()).or_default() += incoming.byte_length;
     Ok(())
 }
 
@@ -433,10 +662,12 @@ fn cleanup_terminal_payload(
 ) -> Result<(), GenerationSyncError> {
     if matches!(
         outcome,
-        GenerationApplyOutcome::Conflict {
-            incoming_identity: Some(_),
-            ..
-        }
+        GenerationApplyOutcome::Applied
+            | GenerationApplyOutcome::Merged
+            | GenerationApplyOutcome::Conflict {
+                incoming_identity: Some(_),
+                ..
+            }
     ) {
         return Ok(());
     }
@@ -527,11 +758,13 @@ fn validate_mount_delta(
         return Err(GenerationSyncError::UnexpectedMount);
     }
     if delta.entries.iter().any(|entry| {
-        entry
-            .old
-            .iter()
-            .chain(entry.new.iter())
-            .any(|identity| identity.logical_path.as_str() == GENERATION_MOUNT_LOCK_FILE)
+        entry.old.iter().chain(entry.new.iter()).any(|identity| {
+            let key = identity.logical_path.portable_collision_key();
+            key == GENERATION_MOUNT_LOCK_FILE
+                || key
+                    .split('/')
+                    .any(|component| component.starts_with(".locality-generation-"))
+        })
     }) {
         return Err(GenerationSyncError::Contract(
             "generation delta targets the reserved mount lock path".to_string(),
@@ -592,13 +825,26 @@ fn apply_entry(
     delta_id: &str,
     index: u64,
     entry: &GenerationDeltaEntry,
+    merge_base: Option<&PathBuf>,
     hooks: &mut ApplyHooks<'_>,
 ) -> Result<(GenerationApplyOutcome, bool), GenerationSyncError> {
     if let (Some(old), Some(new)) = (&entry.old, &entry.new)
         && old.logical_path != new.logical_path
     {
-        let target = mount.target(&old.logical_path.to_relative_path_buf(), true)?;
-        return conflict_outcome(&target, Some(new));
+        let source = mount.target(&old.logical_path.to_relative_path_buf(), true)?;
+        let destination = mount.target(&new.logical_path.to_relative_path_buf(), true)?;
+        call_hook(&mut hooks.after_target_open);
+        return apply_fenced_rename(
+            &source,
+            &destination,
+            stage_root,
+            delta_id,
+            index,
+            old,
+            new,
+            hooks,
+            0,
+        );
     }
     match (&entry.old, &entry.new) {
         (None, Some(new)) => {
@@ -624,6 +870,13 @@ fn apply_entry(
         (Some(old), Some(new)) => {
             let target = mount.target(&old.logical_path.to_relative_path_buf(), true)?;
             call_hook(&mut hooks.after_target_open);
+            if let Some(base) = merge_base
+                && let Some(outcome) = apply_three_way_update(
+                    &target, base, stage_root, delta_id, index, old, new, hooks,
+                )?
+            {
+                return Ok(outcome);
+            }
             apply_fenced_update(&target, stage_root, delta_id, index, old, new, hooks, 0)
         }
         (Some(old), None) => {
@@ -635,6 +888,214 @@ fn apply_entry(
             "delta entry has no identity".to_string(),
         )),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_fenced_rename(
+    source: &SecureTarget,
+    destination: &SecureTarget,
+    stage_root: &Path,
+    delta_id: &str,
+    index: u64,
+    old: &GenerationFileIdentity,
+    new: &GenerationFileIdentity,
+    hooks: &mut ApplyHooks<'_>,
+    attempt: u8,
+) -> Result<(GenerationApplyOutcome, bool), GenerationSyncError> {
+    if attempt >= 8 {
+        return Err(GenerationSyncError::ConcurrentMutation);
+    }
+    let preimage = preimage_name(delta_id, index);
+    let destination_digest = digest_target(destination)?;
+    if destination_digest
+        .as_deref()
+        .is_some_and(|digest| digest != new.content_sha256)
+    {
+        return conflict_outcome(source, Some(new));
+    }
+
+    if let Some(mut evidence) = source.open_named(&preimage)? {
+        let digest = digest_open_file_handle(&mut evidence)?;
+        if digest != old.content_sha256 {
+            return conflict_outcome(source, Some(new));
+        }
+        call_hook(&mut hooks.after_preimage_verified);
+        if digest_open_file_handle(&mut evidence)? != old.content_sha256 {
+            if digest_target(source)?.is_none() {
+                source.restore_named(&preimage)?;
+            }
+            return conflict_outcome(source, Some(new));
+        }
+        call_hook(&mut hooks.after_preimage_reverified);
+        if digest_open_file_handle(&mut evidence)? != old.content_sha256 {
+            if digest_target(source)?.is_none() {
+                source.restore_named(&preimage)?;
+            }
+            return conflict_outcome(source, Some(new));
+        }
+        if destination_digest.is_none() {
+            match publish_payload(destination, stage_root, delta_id, index, new)? {
+                PublishResult::Published => {}
+                PublishResult::Occupied => {
+                    return apply_fenced_rename(
+                        source,
+                        destination,
+                        stage_root,
+                        delta_id,
+                        index,
+                        old,
+                        new,
+                        hooks,
+                        attempt + 1,
+                    );
+                }
+            }
+        }
+        return Ok((GenerationApplyOutcome::Applied, true));
+    }
+
+    match digest_target(source)? {
+        Some(actual) if actual == old.content_sha256 => {
+            source.move_current_to(&preimage)?;
+            call_hook(&mut hooks.after_preimage_move);
+            apply_fenced_rename(
+                source,
+                destination,
+                stage_root,
+                delta_id,
+                index,
+                old,
+                new,
+                hooks,
+                attempt + 1,
+            )
+        }
+        None if destination_digest.as_deref() == Some(new.content_sha256.as_str()) => {
+            Ok((GenerationApplyOutcome::Applied, false))
+        }
+        _ => conflict_outcome(source, Some(new)),
+    }
+}
+
+fn apply_three_way_update(
+    target: &SecureTarget,
+    base_path: &Path,
+    stage_root: &Path,
+    delta_id: &str,
+    index: u64,
+    old: &GenerationFileIdentity,
+    new: &GenerationFileIdentity,
+    hooks: &mut ApplyHooks<'_>,
+) -> Result<Option<(GenerationApplyOutcome, bool)>, GenerationSyncError> {
+    verify_file(base_path, old)?;
+    let incoming_path = stage_root.join("payloads").join(index.to_string());
+    verify_file(&incoming_path, new)?;
+    let preimage = preimage_name(delta_id, index);
+
+    let retained_local = target
+        .open_named(&preimage)?
+        .map(|mut file| {
+            let bytes = read_bounded_file(&mut file, old.byte_length.max(new.byte_length))?;
+            let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+            Ok::<_, GenerationSyncError>((bytes, digest))
+        })
+        .transpose()?;
+    let (local_bytes, local_sha256, already_displaced) = match retained_local {
+        Some((bytes, digest)) if digest != old.content_sha256 => (bytes, digest, true),
+        _ => {
+            let Some(mut file) = target.open_current()? else {
+                return Ok(None);
+            };
+            let bytes = read_bounded_file(&mut file, old.byte_length.max(new.byte_length))?;
+            let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+            if digest == old.content_sha256 || digest == new.content_sha256 {
+                return Ok(None);
+            }
+            (bytes, digest, false)
+        }
+    };
+
+    let base = std::fs::read(base_path)?;
+    let incoming = std::fs::read(&incoming_path)?;
+    let (Ok(base), Ok(local), Ok(incoming)) = (
+        std::str::from_utf8(&base),
+        std::str::from_utf8(&local_bytes),
+        std::str::from_utf8(&incoming),
+    ) else {
+        return Ok(None);
+    };
+    let ThreeWayTextMerge::Clean(merged) = merge_text_with_base(base, local, incoming) else {
+        return Ok(None);
+    };
+
+    if already_displaced && let Some(mut current) = target.open_current()? {
+        let current_bytes = read_bounded_file(&mut current, merged.len() as u64)?;
+        if current_bytes == merged.as_bytes() {
+            return Ok(Some((GenerationApplyOutcome::Merged, false)));
+        }
+        return Ok(None);
+    }
+
+    if !already_displaced {
+        target.move_current_to(&preimage)?;
+        call_hook(&mut hooks.after_preimage_move);
+    }
+    let mut evidence = target
+        .open_named(&preimage)?
+        .ok_or(GenerationSyncError::ConcurrentMutation)?;
+    if digest_open_file_handle(&mut evidence)? != local_sha256 {
+        if target.open_current()?.is_none() {
+            target.restore_named(&preimage)?;
+        }
+        return Ok(Some((
+            GenerationApplyOutcome::Conflict {
+                local_sha256: Some(digest_open_file_handle(&mut evidence)?),
+                incoming_identity: Some(new.clone()),
+            },
+            true,
+        )));
+    }
+    publish_local_bytes(target, delta_id, index, merged.as_bytes())?;
+    Ok(Some((GenerationApplyOutcome::Merged, true)))
+}
+
+fn read_bounded_file(file: &mut File, expected_hint: u64) -> Result<Vec<u8>, GenerationSyncError> {
+    file.seek(SeekFrom::Start(0))?;
+    let limit = locality_protocol::freshness_delivery::MAX_GENERATION_FILE_BYTES;
+    let capacity = usize::try_from(expected_hint.min(limit)).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(GenerationSyncError::Contract(
+            "local merge candidate exceeds generation file byte limit".to_string(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn publish_local_bytes(
+    target: &SecureTarget,
+    delta_id: &str,
+    index: u64,
+    bytes: &[u8],
+) -> Result<(), GenerationSyncError> {
+    let temporary = OsString::from(format!(
+        ".locality-generation-{}-{index}.merge",
+        short_safe_id(delta_id)
+    ));
+    if target.open_named(&temporary)?.is_some() {
+        target.remove_named(&temporary)?;
+    }
+    let mut file = target.create_named(&temporary)?;
+    if let Err(error) = (|| -> std::io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()
+    })() {
+        let _ = target.remove_named(&temporary);
+        return Err(error.into());
+    }
+    target.publish_named(&temporary)?;
+    Ok(())
 }
 
 fn conflict_outcome(
@@ -698,14 +1159,30 @@ fn apply_fenced_update(
                 true,
             ));
         }
+        call_hook(&mut hooks.after_preimage_reverified);
+        let final_digest = digest_open_file_handle(&mut preimage_file)?;
+        if final_digest != old.content_sha256 {
+            let current = digest_target(target)?;
+            if current.as_deref() == Some(new.content_sha256.as_str()) {
+                target.remove_current()?;
+            } else if current.is_some() {
+                return Err(GenerationSyncError::ConcurrentMutation);
+            }
+            target.restore_named(&preimage)?;
+            return Ok((
+                GenerationApplyOutcome::Conflict {
+                    local_sha256: Some(final_digest),
+                    incoming_identity: Some(new.clone()),
+                },
+                true,
+            ));
+        }
         let current = digest_target(target)?;
         match current {
             Some(actual) if actual == new.content_sha256 => {
-                target.remove_named(&preimage)?;
                 return Ok((GenerationApplyOutcome::Applied, true));
             }
             Some(actual) => {
-                target.remove_named(&preimage)?;
                 return Ok((
                     GenerationApplyOutcome::Conflict {
                         local_sha256: Some(actual),
@@ -716,7 +1193,6 @@ fn apply_fenced_update(
             }
             None => match publish_payload(target, stage_root, delta_id, index, new)? {
                 PublishResult::Published => {
-                    target.remove_named(&preimage)?;
                     return Ok((GenerationApplyOutcome::Applied, true));
                 }
                 PublishResult::Occupied => {
@@ -819,8 +1295,23 @@ fn apply_fenced_delete(
                 true,
             ));
         }
+        call_hook(&mut hooks.after_preimage_reverified);
+        let final_digest = digest_open_file_handle(&mut preimage_file)?;
+        if final_digest != old.content_sha256 {
+            let current = digest_target(target)?;
+            if current.is_some() {
+                return Err(GenerationSyncError::ConcurrentMutation);
+            }
+            target.restore_named(&preimage)?;
+            return Ok((
+                GenerationApplyOutcome::Conflict {
+                    local_sha256: Some(final_digest),
+                    incoming_identity: None,
+                },
+                true,
+            ));
+        }
         let current = digest_target(target)?;
-        target.remove_named(&preimage)?;
         return match current {
             None => Ok((GenerationApplyOutcome::Deleted, true)),
             Some(actual) => Ok((
@@ -1047,7 +1538,9 @@ fn summary(
     };
     for (_, outcome) in &journal.outcomes {
         match outcome {
-            GenerationApplyOutcome::Applied => summary.applied_paths += 1,
+            GenerationApplyOutcome::Applied | GenerationApplyOutcome::Merged => {
+                summary.applied_paths += 1
+            }
             GenerationApplyOutcome::Deleted => summary.deleted_paths += 1,
             GenerationApplyOutcome::Conflict { .. } => summary.conflicted_paths += 1,
         }
@@ -1060,6 +1553,7 @@ pub enum GenerationSyncError {
     Store(locality_store::StoreError),
     Io(std::io::Error),
     MountAccess(std::io::Error),
+    StateCoordinator(std::io::Error),
     MountBusy,
     MountCoordinatorPoisoned,
     Transport(String),
@@ -1072,7 +1566,11 @@ pub enum GenerationSyncError {
     JournalMismatch,
     ConcurrentMutation,
     MissingConflictEvidence(String),
+    MissingMergeBaseEvidence(String),
+    MissingInodeEvidence(String),
     ConflictRetentionQuotaExceeded,
+    EvidenceRetentionQuotaExceeded,
+    BaseRetentionQuotaExceeded,
     InjectedInterruption,
 }
 
@@ -1083,6 +1581,12 @@ impl Display for GenerationSyncError {
             Self::Io(error) => Display::fmt(error, formatter),
             Self::MountAccess(error) => {
                 write!(formatter, "generation mount is busy or unsafe: {error}")
+            }
+            Self::StateCoordinator(error) => {
+                write!(
+                    formatter,
+                    "generation staging coordinator is busy or unsafe: {error}"
+                )
             }
             Self::MountBusy => formatter.write_str("generation mount already has an active apply"),
             Self::MountCoordinatorPoisoned => {
@@ -1112,8 +1616,23 @@ impl Display for GenerationSyncError {
             Self::MissingConflictEvidence(id) => {
                 write!(formatter, "retained conflict content `{id}` is missing")
             }
+            Self::MissingMergeBaseEvidence(id) => {
+                write!(formatter, "retained merge-base content `{id}` is missing")
+            }
+            Self::MissingInodeEvidence(path) => {
+                write!(
+                    formatter,
+                    "retained displaced inode for `{path}` is missing"
+                )
+            }
             Self::ConflictRetentionQuotaExceeded => {
                 formatter.write_str("generation conflict-retention quota would be exceeded")
+            }
+            Self::EvidenceRetentionQuotaExceeded => {
+                formatter.write_str("generation displaced-inode evidence quota is exceeded")
+            }
+            Self::BaseRetentionQuotaExceeded => {
+                formatter.write_str("generation merge-base retention quota is exceeded")
             }
             Self::InjectedInterruption => {
                 formatter.write_str("injected generation apply interruption")
@@ -1310,6 +1829,8 @@ mod tests {
                         logical_path: identity.logical_path.as_str().to_string(),
                         base_generation_id: SourceGenerationId::new("generation-1").unwrap(),
                         base_identity: Some(identity),
+                        base_payload_delta_id: None,
+                        base_payload_entry_index: None,
                         state: GenerationPathState::Clean,
                         incoming_identity: None,
                         updated_at: "2026-07-31T11:00:00Z".to_string(),
@@ -1386,7 +1907,14 @@ mod tests {
         assert!(!recovered.replayed);
         assert_eq!(transport.content_fetches, 1, "recovery reused staged bytes");
         let completed_journal = store.get_generation_apply("delta-crash").unwrap().unwrap();
-        assert!(!store.root.join(completed_journal.stage_root).exists());
+        assert!(
+            store
+                .root
+                .join(completed_journal.stage_root)
+                .join("payloads/0")
+                .exists(),
+            "the authenticated payload becomes the retained merge base"
+        );
 
         let replay = apply_authorized_delivery(
             &mut store,
@@ -1488,7 +2016,7 @@ mod tests {
             "conflict retains staged incoming bytes"
         );
         let payload_root = store.root.join(&journal.stage_root).join("payloads");
-        assert!(!payload_root.join("2").exists());
+        assert_eq!(fs::read(payload_root.join("2")).unwrap(), b"remote clean");
         assert_eq!(fs::read(payload_root.join("1")).unwrap(), b"remote");
 
         fs::write(payload_root.join("2"), b"remote clean").unwrap();
@@ -1496,7 +2024,7 @@ mod tests {
         fs::create_dir_all(&orphan).unwrap();
         fs::write(orphan.join("0"), b"orphan").unwrap();
         recover_generation_delivery_staging(&store).unwrap();
-        assert!(!payload_root.join("2").exists());
+        assert_eq!(fs::read(payload_root.join("2")).unwrap(), b"remote clean");
         assert_eq!(fs::read(payload_root.join("1")).unwrap(), b"remote");
         assert!(!store.root.join("generation-delivery/orphan").exists());
 
@@ -1510,7 +2038,7 @@ mod tests {
         )
         .unwrap();
         assert!(replay.replayed);
-        assert!(!payload_root.join("2").exists());
+        assert_eq!(fs::read(payload_root.join("2")).unwrap(), b"remote clean");
         assert_eq!(fs::read(payload_root.join("1")).unwrap(), b"remote");
         assert_eq!(
             store
@@ -1526,23 +2054,20 @@ mod tests {
     #[test]
     fn conflict_retention_enforces_mount_and_global_quotas() {
         let incoming = identity("projection-a", "Roadmap.md", "incoming", b"123456");
-        let delta = delivery(
-            "delta-quota",
-            vec![GenerationDeltaEntry {
-                old: None,
-                new: Some(incoming),
-            }],
-        )
-        .delta;
+        let outcome = GenerationApplyOutcome::Conflict {
+            local_sha256: None,
+            incoming_identity: Some(incoming),
+        };
 
-        let mount_usage = RetainedConflictUsage {
+        let mut mount_usage = RetainedConflictUsage {
             global_bytes: 6,
             by_mount: BTreeMap::from([("mount-main".to_string(), 6)]),
         };
         assert!(matches!(
-            enforce_conflict_retention_quota(
-                &mount_usage,
-                &delta,
+            charge_actual_conflict_evidence(
+                &mut mount_usage,
+                "mount-main",
+                &outcome,
                 ConflictRetentionLimits {
                     per_mount_bytes: 10,
                     global_bytes: 100,
@@ -1551,14 +2076,15 @@ mod tests {
             Err(GenerationSyncError::ConflictRetentionQuotaExceeded)
         ));
 
-        let global_usage = RetainedConflictUsage {
+        let mut global_usage = RetainedConflictUsage {
             global_bytes: 6,
             ..RetainedConflictUsage::default()
         };
         assert!(matches!(
-            enforce_conflict_retention_quota(
-                &global_usage,
-                &delta,
+            charge_actual_conflict_evidence(
+                &mut global_usage,
+                "mount-main",
+                &outcome,
                 ConflictRetentionLimits {
                     per_mount_bytes: 100,
                     global_bytes: 10,
@@ -1652,6 +2178,170 @@ mod tests {
     }
 
     #[test]
+    fn clean_rename_is_replayable_and_preserves_displaced_inode_evidence() {
+        let fixture = Fixture::new("clean-rename");
+        let old = identity("projection-a", "Old.md", "content-old", b"old");
+        let new = identity("projection-a", "New.md", "content-new", b"renamed");
+        fs::write(fixture.mount_root.join("Old.md"), b"old").unwrap();
+        let mut store = seed(&fixture, vec![old.clone()]);
+        let delivery = delivery(
+            "delta-clean-rename",
+            vec![GenerationDeltaEntry {
+                old: Some(old),
+                new: Some(new.clone()),
+            }],
+        );
+        let mut transport = FakeTransport::default();
+        transport
+            .contents
+            .insert("content-new".to_string(), b"renamed".to_vec());
+
+        let summary = apply_authorized_delivery(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            delivery.clone(),
+            &mut transport,
+        )
+        .unwrap();
+        assert_eq!(summary.applied_paths, 1);
+        assert!(!fixture.mount_root.join("Old.md").exists());
+        assert_eq!(
+            fs::read(fixture.mount_root.join("New.md")).unwrap(),
+            b"renamed"
+        );
+        assert_eq!(store.list_generation_inode_evidence().unwrap().len(), 1);
+
+        let replay = apply_authorized_delivery(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            delivery,
+            &mut FakeTransport::default(),
+        )
+        .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(
+            fs::read(fixture.mount_root.join("New.md")).unwrap(),
+            b"renamed"
+        );
+        let path = store
+            .list_generation_paths(&fixture.mount_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(path.logical_path, new.logical_path.as_str());
+    }
+
+    #[test]
+    fn retained_base_three_way_merges_disjoint_local_and_remote_edits() {
+        let fixture = Fixture::new("three-way-merge");
+        let base = identity(
+            "projection-a",
+            "Roadmap.md",
+            "content-base",
+            b"one\nmiddle\ntwo\n",
+        );
+        let mut store = seed(&fixture, Vec::new());
+        let first = delivery(
+            "delta-base",
+            vec![GenerationDeltaEntry {
+                old: None,
+                new: Some(base.clone()),
+            }],
+        );
+        let mut first_transport = FakeTransport::default();
+        first_transport
+            .contents
+            .insert("content-base".to_string(), b"one\nmiddle\ntwo\n".to_vec());
+        apply_authorized_delivery(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            first,
+            &mut first_transport,
+        )
+        .unwrap();
+        fs::write(
+            fixture.mount_root.join("Roadmap.md"),
+            b"local\nmiddle\ntwo\n",
+        )
+        .unwrap();
+
+        let remote = identity(
+            "projection-a",
+            "Roadmap.md",
+            "content-remote",
+            b"one\nmiddle\nremote\n",
+        );
+        let mut second = delivery(
+            "delta-three-way",
+            vec![GenerationDeltaEntry {
+                old: Some(base),
+                new: Some(remote),
+            }],
+        );
+        second.delta.base_generation_id = SourceGenerationId::new("generation-2").unwrap();
+        second.delta.target_generation_id = SourceGenerationId::new("generation-3").unwrap();
+        second.delta.target_inventory_sha256 = sha256_label(b"target-inventory-3");
+        second.terminal_receipt.base_generation_id = second.delta.base_generation_id.clone();
+        second.terminal_receipt.target_generation_id = second.delta.target_generation_id.clone();
+        second.terminal_receipt.target_inventory_sha256 =
+            second.delta.target_inventory_sha256.clone();
+        second.terminal_receipt.delta_sha256 = second.delta.canonical_sha256().unwrap();
+        let mut second_transport = FakeTransport::default();
+        second_transport.contents.insert(
+            "content-remote".to_string(),
+            b"one\nmiddle\nremote\n".to_vec(),
+        );
+
+        let interrupted = apply_authorized_delivery_inner(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            second.clone(),
+            &mut second_transport,
+            Some(1),
+            &mut ApplyHooks::default(),
+        )
+        .expect_err("crash after merged bytes are published but before outcome");
+        assert!(matches!(
+            interrupted,
+            GenerationSyncError::InjectedInterruption
+        ));
+        let summary = apply_authorized_delivery(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            second,
+            &mut second_transport,
+        )
+        .unwrap();
+        assert_eq!(second_transport.content_fetches, 1);
+        assert_eq!(summary.applied_paths, 1);
+        assert_eq!(
+            fs::read(fixture.mount_root.join("Roadmap.md")).unwrap(),
+            b"local\nmiddle\nremote\n"
+        );
+        let path = store
+            .list_generation_paths(&fixture.mount_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(path.state, GenerationPathState::Dirty);
+        assert!(path.base_payload_delta_id.is_some());
+    }
+
+    #[test]
+    fn staging_reconciliation_uses_a_cross_process_capable_state_lock() {
+        let fixture = Fixture::new("state-lock-contention");
+        let store = seed(&fixture, Vec::new());
+        let _guard = GenerationStateLock::acquire(&store.root).unwrap();
+        assert!(matches!(
+            recover_generation_delivery_staging(&store),
+            Err(GenerationSyncError::StateCoordinator(_))
+        ));
+    }
+
+    #[test]
     fn fake_transport_receives_observed_head_and_bad_content_is_journaled_before_download() {
         let fixture = Fixture::new("transport-contract");
         let old = identity("projection-a", "Roadmap.md", "content-old", b"old");
@@ -1728,7 +2418,7 @@ mod tests {
         let mut store = seed(&fixture, Vec::new());
         let incoming = identity(
             "projection-lock",
-            GENERATION_MOUNT_LOCK_FILE,
+            ".LOCALITY-GENERATION.LOCK",
             "lock-content",
             b"remote",
         );
@@ -1844,7 +2534,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn old_inode_write_after_preimage_verification_is_restored_as_update_conflict() {
+    fn old_inode_write_after_second_digest_is_restored_as_update_conflict() {
         let fixture = Fixture::new("concurrent-update");
         let old = identity("projection-a", "Roadmap.md", "content-old", b"old");
         let new = identity("projection-a", "Roadmap.md", "content-new", b"remote");
@@ -1885,7 +2575,7 @@ mod tests {
             finished.wait();
         };
         let mut hooks = ApplyHooks {
-            after_preimage_verified: Some(&mut interleave),
+            after_preimage_reverified: Some(&mut interleave),
             ..ApplyHooks::default()
         };
 
@@ -1907,7 +2597,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn old_inode_write_after_preimage_verification_is_restored_instead_of_deleted() {
+    fn old_inode_write_after_second_digest_is_restored_instead_of_deleted() {
         let fixture = Fixture::new("concurrent-delete");
         let old = identity("projection-a", "Delete.md", "content-old", b"old");
         let path = fixture.mount_root.join("Delete.md");
@@ -1943,7 +2633,7 @@ mod tests {
             finished.wait();
         };
         let mut hooks = ApplyHooks {
-            after_preimage_verified: Some(&mut interleave),
+            after_preimage_reverified: Some(&mut interleave),
             ..ApplyHooks::default()
         };
 
@@ -1961,6 +2651,64 @@ mod tests {
 
         assert_eq!(summary.conflicted_paths, 1);
         assert_eq!(fs::read(path).unwrap(), b"keep me");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_replay_recovers_a_write_to_the_displaced_inode_after_completion() {
+        let fixture = Fixture::new("late-completed-inode-write");
+        let old = identity("projection-a", "Roadmap.md", "content-old", b"old");
+        let new = identity("projection-a", "Roadmap.md", "content-new", b"remote");
+        let path = fixture.mount_root.join("Roadmap.md");
+        fs::write(&path, b"old").unwrap();
+        let mut writer = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut store = seed(&fixture, vec![old.clone()]);
+        let delivery = delivery(
+            "delta-late-completed-write",
+            vec![GenerationDeltaEntry {
+                old: Some(old),
+                new: Some(new),
+            }],
+        );
+        let mut transport = FakeTransport::default();
+        transport
+            .contents
+            .insert("content-new".to_string(), b"remote".to_vec());
+        apply_authorized_delivery(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            delivery.clone(),
+            &mut transport,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"remote");
+
+        writer.seek(SeekFrom::Start(0)).unwrap();
+        writer.set_len(0).unwrap();
+        writer.write_all(b"late local edit").unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+
+        let replay = apply_authorized_delivery(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            delivery,
+            &mut FakeTransport::default(),
+        )
+        .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.conflicted_paths, 1);
+        assert_eq!(fs::read(path).unwrap(), b"late local edit");
+        assert_eq!(
+            store.list_generation_paths(&fixture.mount_id).unwrap()[0].state,
+            GenerationPathState::Conflicted
+        );
     }
 
     #[cfg(unix)]

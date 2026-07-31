@@ -395,10 +395,10 @@ impl GenerationDelta {
 
             let mut entry_paths = BTreeSet::new();
             if let Some(old) = &entry.old {
-                entry_paths.insert(old.logical_path.as_str());
+                entry_paths.insert(old.logical_path.portable_collision_key());
             }
             if let Some(new) = &entry.new {
-                entry_paths.insert(new.logical_path.as_str());
+                entry_paths.insert(new.logical_path.portable_collision_key());
             }
             for path in entry_paths {
                 if !claimed_paths.insert(path) {

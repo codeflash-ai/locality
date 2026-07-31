@@ -104,6 +104,8 @@ fn seed(store: &mut SqliteStateStore, fixture: &Fixture) {
                 logical_path: "Roadmap.md".to_string(),
                 base_generation_id: generation("generation-1"),
                 base_identity: Some(identity("content-1", '1', 3)),
+                base_payload_delta_id: None,
+                base_payload_entry_index: None,
                 state: GenerationPathState::Clean,
                 incoming_identity: None,
                 updated_at: "2026-07-31T11:00:00Z".to_string(),
@@ -287,6 +289,104 @@ fn active_apply_blocks_connection_and_settings_source_reset_transactionally() {
 }
 
 #[test]
+fn source_reset_retires_clean_completed_lineage_but_preserves_conflicts() {
+    let clean_fixture = Fixture::new("completed-clean-reset");
+    let mut clean_store = SqliteStateStore::open(clean_fixture.state_root.clone()).unwrap();
+    seed(&mut clean_store, &clean_fixture);
+    let mut clean_delta = delta();
+    clean_delta.delta_id = "delta-clean-lineage".to_string();
+    clean_delta.entries.clear();
+    let clean_receipt = receipt(&clean_delta);
+    clean_store
+        .reserve_generation_apply(PreparedGenerationApply {
+            receipt_sha256: clean_receipt.canonical_sha256().unwrap(),
+            receipt: clean_receipt,
+            delta: clean_delta,
+            stage_root: "generation-delivery/clean-lineage".to_string(),
+            created_at: "2026-07-31T12:01:00Z".to_string(),
+        })
+        .unwrap();
+    clean_store
+        .complete_generation_apply("delta-clean-lineage", "2026-07-31T12:02:00Z")
+        .unwrap();
+    clean_store
+        .save_mount(
+            MountConfig::new(
+                clean_fixture.mount_id.clone(),
+                "backend",
+                &clean_fixture.mount_root,
+            )
+            .with_settings_json(r#"{"view":"new"}"#),
+        )
+        .unwrap();
+    assert!(
+        clean_store
+            .get_generation_apply("delta-clean-lineage")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        clean_store
+            .get_observed_generation(&clean_fixture.mount_id)
+            .unwrap()
+            .is_none()
+    );
+
+    let conflict_fixture = Fixture::new("completed-conflict-reset");
+    let mut conflict_store = SqliteStateStore::open(conflict_fixture.state_root.clone()).unwrap();
+    seed(&mut conflict_store, &conflict_fixture);
+    let conflict_delta = delta();
+    let conflict_receipt = receipt(&conflict_delta);
+    conflict_store
+        .reserve_generation_apply(PreparedGenerationApply {
+            receipt_sha256: conflict_receipt.canonical_sha256().unwrap(),
+            receipt: conflict_receipt,
+            delta: conflict_delta.clone(),
+            stage_root: "generation-delivery/conflict-lineage".to_string(),
+            created_at: "2026-07-31T12:01:00Z".to_string(),
+        })
+        .unwrap();
+    conflict_store
+        .record_generation_apply_outcome(
+            &conflict_delta.delta_id,
+            0,
+            GenerationApplyOutcome::Conflict {
+                local_sha256: Some(digest('9')),
+                incoming_identity: conflict_delta.entries[0].new.clone(),
+            },
+            "2026-07-31T12:02:00Z",
+        )
+        .unwrap();
+    conflict_store
+        .complete_generation_apply(&conflict_delta.delta_id, "2026-07-31T12:03:00Z")
+        .unwrap();
+    let error = conflict_store
+        .save_mount(
+            MountConfig::new(
+                conflict_fixture.mount_id.clone(),
+                "backend",
+                &conflict_fixture.mount_root,
+            )
+            .with_connection_id(ConnectionId::new("replacement")),
+        )
+        .expect_err("completed conflict evidence must survive source reset");
+    assert!(matches!(error, StoreError::InvalidState(_)));
+    assert!(
+        conflict_store
+            .get_generation_apply(&conflict_delta.delta_id)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        conflict_store
+            .list_generation_paths(&conflict_fixture.mount_id)
+            .unwrap()[0]
+            .state,
+        GenerationPathState::Conflicted
+    );
+}
+
+#[test]
 fn schema_20_migration_preserves_pending_local_state_and_adds_delivery_tables() {
     use locality_core::journal::{JournalEntry, JournalStatus, PushId};
     use locality_core::planner::PushPlan;
@@ -360,7 +460,7 @@ fn schema_20_migration_preserves_pending_local_state_and_adds_delivery_tables() 
         fs::read(fixture.mount_root.join("dirty.md")).unwrap(),
         b"local pending bytes"
     );
-    assert_eq!(SqliteStateStore::current_schema_version(), 22);
+    assert_eq!(SqliteStateStore::current_schema_version(), 23);
     assert!(
         reopened
             .get_observed_generation(&fixture.mount_id)

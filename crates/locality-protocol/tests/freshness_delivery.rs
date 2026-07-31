@@ -340,6 +340,32 @@ fn delete_create_path_reuse_is_rejected_in_both_canonical_orders() {
 }
 
 #[test]
+fn portable_casefold_and_unicode_path_collisions_are_rejected() {
+    for (first, second) in [
+        ("Docs/Roadmap.md", "docs/roadmap.MD"),
+        ("Docs/é.md", "Docs/e\u{301}.md"),
+        ("Docs/ß.md", "docs/ss.md"),
+    ] {
+        let mut candidate = delta();
+        candidate.entries = vec![
+            GenerationDeltaEntry {
+                old: None,
+                new: Some(identity("projection-a", first, "content-a", '1', 1)),
+            },
+            GenerationDeltaEntry {
+                old: None,
+                new: Some(identity("projection-b", second, "content-b", '2', 1)),
+            },
+        ];
+        assert_eq!(
+            candidate.validate(),
+            Err(FreshnessDeliveryError::CrossEntryPathReuse),
+            "portable collision should reject {first:?} and {second:?}"
+        );
+    }
+}
+
+#[test]
 fn empty_delta_advances_generation_and_content_limits_are_bounded() {
     let mut empty = delta();
     empty.entries.clear();
