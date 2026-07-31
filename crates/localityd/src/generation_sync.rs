@@ -2331,14 +2331,44 @@ mod tests {
     }
 
     #[test]
-    fn staging_reconciliation_uses_a_cross_process_capable_state_lock() {
+    fn staging_reconciliation_rejects_another_process() {
         let fixture = Fixture::new("state-lock-contention");
         let store = seed(&fixture, Vec::new());
-        let _guard = GenerationStateLock::acquire(&store.root).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("generation_sync::tests::state_lock_child_process")
+            .arg("--nocapture")
+            .env("LOCALITY_TEST_GENERATION_STATE_LOCK_ROOT", &store.root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        loop {
+            let mut ready = String::new();
+            assert_ne!(output.read_line(&mut ready).unwrap(), 0);
+            if ready.contains("generation-state-lock-held") {
+                break;
+            }
+        }
         assert!(matches!(
             recover_generation_delivery_staging(&store),
             Err(GenerationSyncError::StateCoordinator(_))
         ));
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn state_lock_child_process() {
+        let Some(root) = std::env::var_os("LOCALITY_TEST_GENERATION_STATE_LOCK_ROOT") else {
+            return;
+        };
+        let _held = GenerationStateLock::acquire(Path::new(&root)).unwrap();
+        println!("generation-state-lock-held");
+        std::io::stdout().flush().unwrap();
+        let mut release = String::new();
+        std::io::stdin().read_line(&mut release).unwrap();
     }
 
     #[test]
