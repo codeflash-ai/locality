@@ -596,9 +596,10 @@ impl GenerationDeliveryRepository for SqliteStateStore {
     fn seed_observed_generation(
         &mut self,
         observed: ObservedGenerationRecord,
-        paths: Vec<GenerationPathRecord>,
+        mut paths: Vec<GenerationPathRecord>,
     ) -> StoreResult<()> {
         validate_seed_generation(&observed, &paths)?;
+        paths.sort_by(|left, right| left.projection_id.cmp(&right.projection_id));
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mount_exists = transaction.query_row(

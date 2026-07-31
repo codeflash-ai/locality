@@ -285,6 +285,7 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
         if already_recorded.contains(&index) {
             continue;
         }
+        let mut displaced_inode_fingerprint = None;
         let (mut outcome, mutated) = apply_entry(
             &secure_mount,
             &stage_root,
@@ -297,25 +298,29 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
                     .expect("validated entry has projection identity"),
             ),
             merge_bases.get(entry.projection_id().expect("validated entry has identity")),
+            &mut displaced_inode_fingerprint,
             hooks,
         )?;
         if mutated {
             if let Some(old) = &entry.old {
                 let evidence_name = preimage_name(&journal.delta.delta_id, index);
                 let previous_path = path_states.get(&old.projection_id);
+                let logical_path = previous_path.map_or_else(
+                    || old.logical_path.as_str().to_string(),
+                    |path| path.local_logical_path.clone(),
+                );
+                let (expected_sha256, byte_length) = displaced_inode_fingerprint
+                    .unwrap_or_else(|| (old.content_sha256.clone(), old.byte_length));
                 store.record_generation_inode_evidence(GenerationInodeEvidenceRecord {
                     delta_id: journal.delta.delta_id.clone(),
                     entry_index: index,
                     mount_id: mount_id.clone(),
-                    logical_path: previous_path.map_or_else(
-                        || old.logical_path.as_str().to_string(),
-                        |path| path.local_logical_path.clone(),
-                    ),
+                    logical_path,
                     evidence_name: evidence_name
                         .into_string()
                         .map_err(|_| GenerationSyncError::InvalidStagePath)?,
-                    expected_sha256: old.content_sha256.clone(),
-                    byte_length: old.byte_length,
+                    expected_sha256,
+                    byte_length,
                     base_payload_delta_id: previous_path
                         .and_then(|path| path.base_payload_delta_id.clone()),
                     base_payload_entry_index: previous_path
@@ -1015,6 +1020,7 @@ fn apply_entry(
     entry: &GenerationDeltaEntry,
     existing_path: Option<&GenerationPathRecord>,
     merge_base: Option<&GenerationMergeBase>,
+    displaced_inode_fingerprint: &mut Option<(String, u64)>,
     hooks: &mut ApplyHooks<'_>,
 ) -> Result<(GenerationApplyOutcome, bool), GenerationSyncError> {
     if let (Some(old), Some(new)) = (&entry.old, &entry.new)
@@ -1031,7 +1037,15 @@ fn apply_entry(
         if source_path == new.logical_path {
             if let Some(base) = merge_base
                 && let Some(outcome) = apply_three_way_update(
-                    &source, base, stage_root, delta_id, index, old, new, hooks,
+                    &source,
+                    base,
+                    stage_root,
+                    delta_id,
+                    index,
+                    old,
+                    new,
+                    displaced_inode_fingerprint,
+                    hooks,
                 )?
             {
                 return Ok(outcome);
@@ -1081,7 +1095,15 @@ fn apply_entry(
             call_hook(&mut hooks.after_target_open);
             if let Some(base) = merge_base
                 && let Some(outcome) = apply_three_way_update(
-                    &target, base, stage_root, delta_id, index, old, new, hooks,
+                    &target,
+                    base,
+                    stage_root,
+                    delta_id,
+                    index,
+                    old,
+                    new,
+                    displaced_inode_fingerprint,
+                    hooks,
                 )?
             {
                 return Ok(outcome);
@@ -1199,6 +1221,7 @@ fn apply_three_way_update(
     index: u64,
     old: &GenerationFileIdentity,
     new: &GenerationFileIdentity,
+    displaced_inode_fingerprint: &mut Option<(String, u64)>,
     hooks: &mut ApplyHooks<'_>,
 ) -> Result<Option<(GenerationApplyOutcome, bool)>, GenerationSyncError> {
     verify_file(&merge_base.path, &merge_base.identity)?;
@@ -1270,6 +1293,7 @@ fn apply_three_way_update(
         )));
     }
     publish_local_bytes(target, delta_id, index, merged.as_bytes())?;
+    *displaced_inode_fingerprint = Some((local_sha256, local_bytes.len() as u64));
     Ok(Some((GenerationApplyOutcome::Merged, true)))
 }
 
@@ -2794,6 +2818,24 @@ mod tests {
             .remove(0);
         assert_eq!(path.state, GenerationPathState::Dirty);
         assert!(path.base_payload_delta_id.is_some());
+
+        let evidence = store.list_generation_inode_evidence().unwrap().remove(0);
+        assert_eq!(
+            evidence.expected_sha256,
+            sha256_label(b"local\nmiddle\ntwo\n")
+        );
+        assert_eq!(evidence.byte_length, b"local\nmiddle\ntwo\n".len() as u64);
+
+        reconcile_all_completed_inode_evidence(&mut store).unwrap();
+        let reconciled = store
+            .list_generation_paths(&fixture.mount_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(reconciled.state, GenerationPathState::Dirty);
+        assert_eq!(
+            fs::read(fixture.mount_root.join("Roadmap.md")).unwrap(),
+            b"local\nmiddle\nremote\n"
+        );
     }
 
     #[test]

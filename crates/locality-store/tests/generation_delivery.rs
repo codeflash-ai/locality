@@ -118,6 +118,59 @@ fn seed(store: &mut SqliteStateStore, fixture: &Fixture) {
 }
 
 #[test]
+fn observed_generation_seed_exact_replay_is_path_order_independent() {
+    let fixture = Fixture::new("seed-replay-path-order");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "backend",
+            &fixture.mount_root,
+        ))
+        .unwrap();
+    let observed = ObservedGenerationRecord {
+        mount_id: fixture.mount_id.clone(),
+        source_connection_id: SourceConnectionId::new("source-main"),
+        generation_id: generation("generation-1"),
+        inventory_sha256: digest('1'),
+        workspace_layout_version: 1,
+        workspace_layout_digest: digest('a'),
+        last_receipt_sha256: None,
+        updated_at: "2026-07-31T11:00:00Z".to_string(),
+    };
+    let path = |projection: &str, logical_path: &str| GenerationPathRecord {
+        mount_id: fixture.mount_id.clone(),
+        projection_id: ProjectionId::new(projection),
+        logical_path: logical_path.to_string(),
+        local_logical_path: logical_path.to_string(),
+        base_generation_id: generation("generation-1"),
+        base_identity: None,
+        base_payload_delta_id: None,
+        base_payload_entry_index: None,
+        conflict_payload_delta_id: None,
+        conflict_payload_entry_index: None,
+        state: GenerationPathState::Clean,
+        incoming_identity: None,
+        updated_at: "2026-07-31T11:00:00Z".to_string(),
+    };
+    let first = path("projection-a", "A.md");
+    let second = path("projection-b", "B.md");
+    let expected = vec![first.clone(), second.clone()];
+
+    store
+        .seed_observed_generation(observed.clone(), expected.clone())
+        .unwrap();
+    store
+        .seed_observed_generation(observed, vec![second, first])
+        .unwrap();
+
+    assert_eq!(
+        store.list_generation_paths(&fixture.mount_id).unwrap(),
+        expected
+    );
+}
+
+#[test]
 fn observed_generation_apply_is_persisted_exact_replayable_and_atomic() {
     let fixture = Fixture::new("persist-replay");
     let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
