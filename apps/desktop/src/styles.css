@@ -65,6 +65,12 @@
   --live-control-bg: rgba(229, 245, 238, 0.82);
   --live-control-hover-bg: rgba(219, 243, 232, 0.96);
   --live-control-active-bg: rgba(208, 239, 224, 0.98);
+  --switch-track-bg: #dde5e0;
+  --switch-track-border: rgba(25, 36, 31, 0.16);
+  --switch-track-active-bg: var(--accent);
+  --switch-thumb-bg: #ffffff;
+  --switch-thumb-active-bg: var(--accent-ink);
+  --switch-thumb-shadow: 0 1px 5px rgba(20, 30, 43, 0.22);
   --nav-hover-bg: rgba(229, 245, 238, 0.72);
   --nav-active-bg: rgba(15, 143, 98, 0.14);
   --nav-active-text: var(--accent);
@@ -164,6 +170,12 @@
   --live-control-bg: #2a2d2b;
   --live-control-hover-bg: #303532;
   --live-control-active-bg: rgba(0, 215, 124, 0.16);
+  --switch-track-bg: #343936;
+  --switch-track-border: rgba(255, 255, 255, 0.2);
+  --switch-track-active-bg: var(--accent);
+  --switch-thumb-bg: #f0f3ed;
+  --switch-thumb-active-bg: var(--accent-ink);
+  --switch-thumb-shadow: 0 1px 6px rgba(0, 0, 0, 0.34);
   --nav-hover-bg: #262927;
   --nav-active-bg: rgba(0, 215, 124, 0.12);
   --nav-active-text: var(--accent);
@@ -4596,7 +4608,7 @@ button.home-stat:hover {
 :root[data-theme="dark"] .source-ready-card,
 :root[data-theme="dark"] .connector-choice-card.active,
 :root[data-theme="dark"] .mount-card.active {
-  border-color: var(--control-border-hover);
+  border-color: var(--line);
   background: var(--surface-muted);
   color: var(--ink);
 }
@@ -4645,11 +4657,22 @@ button.home-stat:hover {
 }
 
 :root[data-theme="dark"] .toggle {
-  background: var(--control-disabled-bg);
+  background: var(--switch-track-bg);
+  box-shadow: inset 0 0 0 1px var(--switch-track-border);
 }
 
 :root[data-theme="dark"] .toggle i {
-  background: var(--surface-raised);
+  background: var(--switch-thumb-bg);
+  box-shadow: var(--switch-thumb-shadow);
+}
+
+:root[data-theme="dark"] .toggle.enabled {
+  background: var(--switch-track-active-bg);
+  box-shadow: inset 0 0 0 1px var(--switch-track-active-bg);
+}
+
+:root[data-theme="dark"] .toggle.enabled i {
+  background: var(--switch-thumb-active-bg);
 }
 
 .setting-link {
@@ -4674,8 +4697,11 @@ button.home-stat:hover {
   height: 24px;
   border: 0;
   border-radius: 999px;
-  background: var(--control-disabled-bg);
-  transition: background-color 160ms ease;
+  background: var(--switch-track-bg);
+  box-shadow: inset 0 0 0 1px var(--switch-track-border);
+  transition:
+    background-color 160ms ease,
+    box-shadow 160ms ease;
 }
 
 .toggle i {
@@ -4685,9 +4711,11 @@ button.home-stat:hover {
   width: 18px;
   height: 18px;
   border-radius: 50%;
-  background: var(--surface-raised);
-  box-shadow: var(--surface-shadow);
-  transition: left 160ms ease;
+  background: var(--switch-thumb-bg);
+  box-shadow: var(--switch-thumb-shadow);
+  transition:
+    background-color 160ms ease,
+    left 160ms ease;
 }
 
 .toggle:disabled {
@@ -4695,12 +4723,13 @@ button.home-stat:hover {
 }
 
 .toggle.enabled {
-  background: var(--accent);
+  background: var(--switch-track-active-bg);
+  box-shadow: inset 0 0 0 1px var(--switch-track-active-bg);
 }
 
 .toggle.enabled i {
   left: 21px;
-  background: var(--accent-ink);
+  background: var(--switch-thumb-active-bg);
 }
 
 .option-row {

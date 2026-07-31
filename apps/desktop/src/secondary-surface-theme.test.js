@@ -278,13 +278,19 @@ describe("desktop secondary surface theme contract", () => {
     expect(cssBlock(':root[data-theme="dark"] .search-state.conflict,\n:root[data-theme="dark"] .search-state.no_access,\n:root[data-theme="dark"] .search-state.not_found')).toContain("background: var(--status-danger-bg);");
     expect(cssBlock(':root[data-theme="dark"] .search-state.conflict,\n:root[data-theme="dark"] .search-state.no_access,\n:root[data-theme="dark"] .search-state.not_found')).toContain("color: var(--status-danger-text);");
     expect(cssBlock(':root[data-theme="dark"] .tray-section-heading button,\n:root[data-theme="dark"] .tray-result button,\n:root[data-theme="dark"] .tray-suggestion button,\n:root[data-theme="dark"] .tray-controls-row button,\n:root[data-theme="dark"] .tray-footer button,\n:root[data-theme="dark"] .tray-list-row em')).toContain("color: var(--accent);");
-    expect(cssBlock(".toggle")).toContain("background: var(--control-disabled-bg);");
-    expect(cssBlock(".toggle i")).toContain("background: var(--surface-raised);");
-    expect(cssBlock(".toggle i")).toContain("box-shadow: var(--surface-shadow);");
-    expect(cssBlock(".toggle.enabled")).toContain("background: var(--accent);");
-    expect(cssBlock(".toggle.enabled i")).toContain("background: var(--accent-ink);");
-    expect(cssBlock(':root[data-theme="dark"] .toggle')).toContain("background: var(--control-disabled-bg);");
-    expect(cssBlock(':root[data-theme="dark"] .toggle i')).toContain("background: var(--surface-raised);");
+    expect(cssBlock(".toggle")).toContain("background: var(--switch-track-bg);");
+    expect(cssBlock(".toggle")).toContain("box-shadow: inset 0 0 0 1px var(--switch-track-border);");
+    expect(cssBlock(".toggle i")).toContain("background: var(--switch-thumb-bg);");
+    expect(cssBlock(".toggle i")).toContain("box-shadow: var(--switch-thumb-shadow);");
+    expect(cssBlock(".toggle.enabled")).toContain("background: var(--switch-track-active-bg);");
+    expect(cssBlock(".toggle.enabled i")).toContain("background: var(--switch-thumb-active-bg);");
+    expect(cssBlock(':root[data-theme="dark"] .toggle')).toContain("background: var(--switch-track-bg);");
+    expect(cssBlock(':root[data-theme="dark"] .toggle')).toContain("box-shadow: inset 0 0 0 1px var(--switch-track-border);");
+    expect(cssBlock(':root[data-theme="dark"] .toggle i')).toContain("background: var(--switch-thumb-bg);");
+    expect(cssBlock(':root[data-theme="dark"] .toggle i')).toContain("box-shadow: var(--switch-thumb-shadow);");
+    expect(cssBlock(':root[data-theme="dark"] .toggle.enabled')).toContain("background: var(--switch-track-active-bg);");
+    expect(cssBlock(':root[data-theme="dark"] .toggle.enabled')).toContain("box-shadow: inset 0 0 0 1px var(--switch-track-active-bg);");
+    expect(cssBlock(':root[data-theme="dark"] .toggle.enabled i')).toContain("background: var(--switch-thumb-active-bg);");
 
     expectNoRawSurfaceColors(cssBlock(".tray-live-mode-control:hover:not(:disabled)"));
     expectNoRawSurfaceColors(cssBlock(".tray-review-summary"));
@@ -294,6 +300,8 @@ describe("desktop secondary surface theme contract", () => {
     expectNoRawSurfaceColors(cssBlock(".toggle.enabled i"));
     expectNoRawSurfaceColors(cssBlock(':root[data-theme="dark"] .toggle'));
     expectNoRawSurfaceColors(cssBlock(':root[data-theme="dark"] .toggle i'));
+    expectNoRawSurfaceColors(cssBlock(':root[data-theme="dark"] .toggle.enabled'));
+    expectNoRawSurfaceColors(cssBlock(':root[data-theme="dark"] .toggle.enabled i'));
     expectNoRawSurfaceColors(cssBlock(".tray-quit-menu button:hover:not(:disabled)"));
     expectNoRawSurfaceColors(
       cssBlock(

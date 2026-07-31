@@ -193,7 +193,7 @@ describe("desktop component theme contract", () => {
     expectToken(settingsNavState, "color", "--control-selected-text");
     expectToken(darkSettingsNavSmall, "color", "--control-muted");
     expectToken(darkSharedActive, "box-shadow", "--surface-shadow");
-    expectToken(darkSourceCards, "border-color", "--control-border-hover");
+    expectToken(darkSourceCards, "border-color", "--line");
     expectToken(darkSourceCards, "background", "--surface-muted");
     expectToken(darkSourceCards, "color", "--ink");
     expectToken(primaryButton, "box-shadow", "--surface-shadow");
