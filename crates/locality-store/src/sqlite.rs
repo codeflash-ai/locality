@@ -1063,6 +1063,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         delta_id: &str,
         entry_index: u64,
         local_sha256: &str,
+        evidence_sha256: &str,
         updated_at: &str,
     ) -> StoreResult<()> {
         let mut connection = self.connection()?;
@@ -1197,7 +1198,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
                     "generation evidence index is too large".to_string()
                 ))?,
-                local_sha256
+                evidence_sha256
             ],
         )?;
         transaction.commit()?;

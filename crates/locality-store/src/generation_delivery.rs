@@ -226,11 +226,15 @@ pub trait GenerationDeliveryRepository {
 
     fn list_generation_inode_evidence(&self) -> StoreResult<Vec<GenerationInodeEvidenceRecord>>;
 
+    /// Converts a completed apply to conflict. `local_sha256` identifies the
+    /// visible resolvable file, while `evidence_sha256` advances the fence for
+    /// the displaced inode that may still have a live writer.
     fn mark_generation_inode_evidence_conflict(
         &mut self,
         delta_id: &str,
         entry_index: u64,
         local_sha256: &str,
+        evidence_sha256: &str,
         updated_at: &str,
     ) -> StoreResult<()>;
 

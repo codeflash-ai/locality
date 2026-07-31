@@ -137,9 +137,13 @@ operation is idempotently recognizable after a crash, so recovery can record
 the missing outcome and continue. Only after every entry has an applied,
 deleted, or conflict outcome does one SQLite transaction advance affected mount
 heads and clean path bases. Dirty local bytes stay in place and become explicit
-conflicts. Reconciliation retains only authenticated payloads for current live
-conflicts, removes successful/superseded/orphan payloads, and enforces bounded
-per-mount and global retained-conflict quotas.
+conflicts. A write through a descriptor retained across a clean three-way merge
+materializes the late and already-merged local versions as inline conflict
+markers; the displaced-inode fence remains durable for later writes. Recovery
+also reconstructs that fence when merged bytes were published before evidence
+was persisted. Reconciliation retains only authenticated payloads for current
+live conflicts, removes successful/superseded/orphan payloads, and enforces
+bounded per-mount and global retained-conflict quotas.
 
 V1 deltas are mount-scoped. Empty entry lists are valid when a complete target
 generation changes no projected bytes. A logical path may occur in only one
