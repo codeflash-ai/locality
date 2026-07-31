@@ -167,4 +167,31 @@ describe("onboarding redesign structure", () => {
     expectNoRawSurfaceColors(cssBlock(".connector-card-accessory"));
     expectNoRawSurfaceColors(cssBlock(".connector-option.connected .connector-card-accessory"));
   });
+
+  it("renders the ready screen as a centered success state with one folder card", () => {
+    expect(appSource).toContain('className="onboarding-ready-mark"');
+    expect(appSource).toContain("<h1>Locality is ready</h1>");
+    expect(appSource).toContain('<SecondaryButton icon={<ChevronRight />} onClick={() => openOptionalGuide(5)}>');
+    expect(appSource).toContain("View optional guide");
+    expect(appSource).toContain('className="folder-inline final-folder-card onboarding-folder-card"');
+    expect(appSource).toContain("<strong>Folder</strong>");
+    expect(appSource).toContain('<span className="onboarding-pill">Mounted</span>');
+    expect(appSource).toContain("Open page");
+    expect(appSource).not.toContain("compact-agent-demo");
+
+    expectDeclarations(".onboarding-ready-mark", [
+      "background: var(--onboarding-ready-mark-bg);",
+      "color: var(--accent);",
+    ]);
+    expectDeclarations(".onboarding-folder-card", [
+      "background: var(--surface-raised);",
+    ]);
+    expectDeclarations(".final-setup .ready-path-field", [
+      "background: var(--field-bg);",
+    ]);
+
+    expectNoRawSurfaceColors(cssBlock(".onboarding-ready-mark"));
+    expectNoRawSurfaceColors(cssBlock(".onboarding-folder-card"));
+    expectNoRawSurfaceColors(cssBlock(".final-setup .ready-path-field"));
+  });
 });

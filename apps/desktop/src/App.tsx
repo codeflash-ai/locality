@@ -861,7 +861,7 @@ function onboardingConnectorPills(connector: OnboardingConnectorId) {
 function onboardingReadyCopy(connector: OnboardingConnectorId) {
   switch (connector) {
     case "notion":
-      return "Your local workspace is ready. Agents can open this folder, edit Markdown, and leave changes for Review Center. Open the app to review changes, manage sync, and turn on Live Mode when you want file saves to update Notion and new Notion changes to appear locally.";
+      return "Your local workspace is ready. Agents can open this folder, edit Markdown, and leave changes for Review Center. Open the app to review changes, manage sync, and enable Live Mode when you're ready for file changes to sync back to Notion.";
     case "google-docs":
       return "Your Google Docs workspace is ready as local files. Agents can edit docs in Markdown and leave changes for Review Center before anything is pushed back.";
     case "google-calendar":
@@ -875,12 +875,6 @@ function onboardingReadyCopy(connector: OnboardingConnectorId) {
     case "slack":
       return "Your Slack conversations are ready as local read-only files. Agents can search recent accessible channels, private channels, DMs, group DMs, and users with normal file tools.";
   }
-}
-
-function onboardingPromptHint(connector: OnboardingConnectorId) {
-  return connector === "granola" || connector === "slack"
-    ? "Ask an agent to use the mounted read-only files."
-    : "Claude and Codex are now set up to use Locality.";
 }
 
 function sampleAgentGuidanceReport(mountPath: string): AgentGuidanceInstallReport {
@@ -2385,9 +2379,6 @@ function Onboarding({
   }
 
   const workspaceLabel = connectedWorkspace || snapshot.connection.workspaceName || "Your workspace";
-  const finalPrompt = selectedOnboardingConnector === "notion" && agentGuidanceReport?.prompt
-    ? agentGuidanceReport.prompt
-    : suggestedAgentPrompt(mountPath, selectedOnboardingConnector);
   const mountSetupError =
     mountOnboarding?.state === "failed"
       ? classifyMountSetupError(mountOnboarding.message)
@@ -2676,9 +2667,12 @@ function Onboarding({
         )}
 
         {step === 5 && (
-          <SetupContent mark={<BrandTile variant="ready" />} variant="final">
-            <div>
-              <h1>Locality is ready!</h1>
+          <SetupContent variant="final">
+            <div className="onboarding-ready-copy">
+              <div className="onboarding-ready-mark">
+                <Check />
+              </div>
+              <h1>Locality is ready</h1>
               <p>{onboardingReadyCopy(selectedOnboardingConnector)}</p>
             </div>
             {mountOnboarding && <p className="field-error">{mountOnboarding.message}</p>}
@@ -2686,11 +2680,11 @@ function Onboarding({
               <PrimaryButton onClick={finishOnboarding}>
                 Open Locality
               </PrimaryButton>
-              <SecondaryButton onClick={() => openOptionalGuide(5)}>
-                View Optional Guide
+              <SecondaryButton icon={<ChevronRight />} onClick={() => openOptionalGuide(5)}>
+                View optional guide
               </SecondaryButton>
             </div>
-            <div className="folder-inline final-folder-card">
+            <div className="folder-inline final-folder-card onboarding-folder-card">
               <div className="ready-head">
                 <div>
                   <strong>Folder</strong>
@@ -2700,24 +2694,10 @@ function Onboarding({
               </div>
               <div className="path-field ready-path-field">
                 <span>{mountPath}</span>
-                <SecondaryButton onClick={() => void openMountFolder()}>
-                  Open Folder
+                <SecondaryButton compact onClick={() => void openMountFolder()}>
+                  Open page
                 </SecondaryButton>
               </div>
-            </div>
-            <div className="agent-demo compact-agent-demo">
-              <div className="agent-demo-header">
-                <div>
-                  <strong>Try this agent prompt</strong>
-                  <p>{onboardingPromptHint(selectedOnboardingConnector)}</p>
-                </div>
-                <SecondaryButton
-                  onClick={() => copyText(finalPrompt)}
-                >
-                  Copy
-                </SecondaryButton>
-              </div>
-              <div className="agent-demo-command">{finalPrompt}</div>
             </div>
           </SetupContent>
         )}

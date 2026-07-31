@@ -608,10 +608,11 @@ p {
 .setup-content.final-setup {
   align-content: center;
   justify-content: center;
-  max-width: 760px;
+  max-width: 720px;
   width: 100%;
   margin: 0 auto;
-  padding: 42px 78px;
+  padding: 74px 48px 58px;
+  text-align: center;
 }
 
 .setup-content h1 {
@@ -630,22 +631,38 @@ p {
   line-height: 1.58;
 }
 
-.final-setup .brand-tile {
-  width: 50px;
-  height: 50px;
-  margin-bottom: 0;
+.onboarding-ready-copy {
+  display: grid;
+  justify-items: center;
+  gap: 16px;
+}
+
+.onboarding-ready-mark {
+  display: grid;
+  width: 56px;
+  height: 56px;
+  place-items: center;
+  border: 1px solid var(--accent);
   border-radius: 16px;
+  background: var(--onboarding-ready-mark-bg);
+  color: var(--accent);
+}
+
+.onboarding-ready-mark svg {
+  width: 24px;
+  height: 24px;
 }
 
 .final-setup h1 {
-  font-size: 42px;
+  max-width: none;
+  font-size: 40px;
 }
 
-.final-setup > div:first-of-type p {
-  max-width: 620px;
-  margin-top: 14px;
-  font-size: 15px;
-  line-height: 1.48;
+.final-setup .onboarding-ready-copy p {
+  max-width: 560px;
+  margin-top: 0;
+  font-size: 14px;
+  line-height: 1.42;
 }
 
 .live-mode-intro {
@@ -1823,18 +1840,24 @@ p {
 
 .folder-inline {
   display: grid;
-  gap: 8px;
+  gap: 16px;
   width: 100%;
   max-width: 620px;
-  padding: 12px;
+  padding: 20px;
   border: 1px solid var(--line);
-  border-radius: 15px;
+  border-radius: 14px;
   background: var(--surface-raised);
+}
+
+.onboarding-folder-card {
+  margin-top: 16px;
+  background: var(--surface-raised);
+  text-align: left;
 }
 
 .ready-head {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 14px;
 }
@@ -1849,22 +1872,26 @@ p {
 }
 
 .ready-head p {
-  margin-top: 2px;
+  margin-top: 6px;
   color: var(--muted);
   font-size: 13px;
   line-height: 1.35;
 }
 
 .ready-path-field {
-  min-height: 46px;
+  min-height: 42px;
   font-size: 12px;
+}
+
+.final-setup .ready-path-field {
+  background: var(--field-bg);
 }
 
 .ready-path-field > span {
   flex: 1;
   min-width: 0;
   overflow: hidden;
-  color: var(--ink);
+  color: var(--muted);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
   text-overflow: ellipsis;

@@ -215,6 +215,16 @@ describe("desktop secondary surface theme contract", () => {
     ]);
     expectCssBlock(".ready-folder", ["background: var(--surface-active);"]);
     expectCssBlock(".folder-inline", ["background: var(--surface-raised);"]);
+    expectCssBlock(".onboarding-ready-mark", [
+      "background: var(--onboarding-ready-mark-bg);",
+      "color: var(--accent);",
+    ]);
+    expectCssBlock(".onboarding-folder-card", [
+      "background: var(--surface-raised);",
+    ]);
+    expectCssBlock(".final-setup .ready-path-field", [
+      "background: var(--field-bg);",
+    ]);
 
     expectNoRawSurfaceColors(cssBlock(".finder-enable-illustration"));
     expectNoRawSurfaceColors(cssBlock(".finder-enable-control"));
@@ -222,6 +232,9 @@ describe("desktop secondary surface theme contract", () => {
     expectNoRawSurfaceColors(cssBlock('[data-theme="dark"] .finder-enable-toolbar'));
     expectNoRawSurfaceColors(cssBlock('[data-theme="dark"] .finder-enable-sidebar'));
     expectNoRawSurfaceColors(cssBlock('[data-theme="dark"] .finder-enable-control'));
+    expectNoRawSurfaceColors(cssBlock(".onboarding-ready-mark"));
+    expectNoRawSurfaceColors(cssBlock(".onboarding-folder-card"));
+    expectNoRawSurfaceColors(cssBlock(".final-setup .ready-path-field"));
   });
 
   it("keeps setup status strips and onboarding badges tokenized", () => {
