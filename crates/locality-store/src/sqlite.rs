@@ -20,6 +20,7 @@ use locality_core::planner::{PlanSummary, PushOperation, PushPlan};
 use locality_core::readable_diff::ReadableDiffOutput;
 use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::shadow::ShadowDocument;
+use locality_protocol::freshness_delivery::GenerationDelta;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -61,7 +62,7 @@ use crate::repository::{
 };
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 21;
+const SCHEMA_VERSION: i64 = 22;
 const ENTITY_SEARCH_COMPONENT_VERSION: i64 = 2;
 const JOURNALS_COMPONENT_VERSION: i64 = 3;
 const LINUX_FUSE_PROJECTION_LAYOUT_VERSION: i64 = 2;
@@ -251,8 +252,11 @@ impl SqliteStateStore {
     }
 
     pub fn clear_mount_source_state(&mut self, mount_id: &MountId) -> StoreResult<()> {
-        let connection = self.connection()?;
-        clear_mount_source_state(&connection, mount_id)
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        clear_mount_source_state(&transaction, mount_id)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     fn connection(&self) -> StoreResult<Connection> {
@@ -427,7 +431,7 @@ fn generation_apply_from_connection(
 ) -> StoreResult<Option<GenerationApplyJournalRecord>> {
     let row = connection
         .query_row(
-            "SELECT delta_json, receipt_json, receipt_sha256, stage_root, status,
+            "SELECT mount_id, delta_json, receipt_json, receipt_sha256, stage_root, status,
                     created_at, updated_at, completed_at
              FROM generation_apply_journals WHERE delta_id = ?1",
             params![delta_id],
@@ -440,7 +444,8 @@ fn generation_apply_from_connection(
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
-                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             },
         )
@@ -465,16 +470,22 @@ fn generation_apply_from_connection(
             from_json(&outcome_json)?,
         ));
     }
+    let delta: GenerationDelta = from_json(&row.1)?;
+    if delta.mount_id.as_str() != row.0 {
+        return Err(StoreError::InvalidState(format!(
+            "generation apply `{delta_id}` mount relation does not match its delta"
+        )));
+    }
     Ok(Some(GenerationApplyJournalRecord {
-        delta: from_json(&row.0)?,
-        receipt: from_json(&row.1)?,
-        receipt_sha256: row.2,
-        stage_root: row.3,
-        status: GenerationApplyStatus::parse(&row.4)?,
+        delta,
+        receipt: from_json(&row.2)?,
+        receipt_sha256: row.3,
+        stage_root: row.4,
+        status: GenerationApplyStatus::parse(&row.5)?,
         outcomes,
-        created_at: row.5,
-        updated_at: row.6,
-        completed_at: row.7,
+        created_at: row.6,
+        updated_at: row.7,
+        completed_at: row.8,
     }))
 }
 
@@ -675,12 +686,13 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         }
         transaction.execute(
             "INSERT INTO generation_apply_journals (
-                delta_id, source_connection_id, base_generation_id,
+                delta_id, mount_id, source_connection_id, base_generation_id,
                 target_generation_id, delta_json, receipt_json, receipt_sha256,
                 stage_root, status, active, created_at, updated_at, completed_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'staged', 1, ?9, ?9, NULL)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'staged', 1, ?10, ?10, NULL)",
             params![
                 prepared.delta.delta_id.as_str(),
+                prepared.delta.mount_id.as_str(),
                 prepared.delta.source_connection_id.as_str(),
                 prepared.delta.base_generation_id.as_str(),
                 prepared.delta.target_generation_id.as_str(),
@@ -813,6 +825,26 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                     StoreError::InvalidState(format!(
                         "active generation apply `{delta_id}` disappeared"
                     ))
+                })
+            })
+            .collect()
+    }
+
+    fn list_generation_applies(&self) -> StoreResult<Vec<GenerationApplyJournalRecord>> {
+        let connection = self.connection()?;
+        let delta_ids = {
+            let mut statement = connection.prepare(
+                "SELECT delta_id FROM generation_apply_journals ORDER BY created_at, delta_id",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        delta_ids
+            .iter()
+            .map(|delta_id| {
+                generation_apply_from_connection(&connection, delta_id)?.ok_or_else(|| {
+                    StoreError::InvalidState(format!("generation apply `{delta_id}` disappeared"))
                 })
             })
             .collect()
@@ -974,7 +1006,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
 impl MountRepository for SqliteStateStore {
     fn save_mount(&mut self, mount: MountConfig) -> StoreResult<()> {
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = transaction
             .query_row(
                 "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, settings_json
@@ -3248,6 +3280,20 @@ fn mount_source_identity_changed(existing: &MountConfig, next: &MountConfig) -> 
 }
 
 fn clear_mount_source_state(connection: &Connection, mount_id: &MountId) -> StoreResult<()> {
+    let active_delta: Option<String> = connection
+        .query_row(
+            "SELECT delta_id FROM generation_apply_journals
+             WHERE mount_id = ?1 AND active = 1 LIMIT 1",
+            params![&mount_id.0],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(delta_id) = active_delta {
+        return Err(StoreError::InvalidState(format!(
+            "mount `{}` has active generation apply `{delta_id}`",
+            mount_id.0
+        )));
+    }
     for table in [
         "generation_paths",
         "observed_generations",
@@ -3764,6 +3810,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
 
         CREATE TABLE IF NOT EXISTS generation_apply_journals (
             delta_id TEXT PRIMARY KEY,
+            mount_id TEXT NOT NULL,
             source_connection_id TEXT NOT NULL,
             base_generation_id TEXT NOT NULL,
             target_generation_id TEXT NOT NULL,
@@ -3779,7 +3826,8 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             CHECK (
                 (active = 0 AND status = 'completed' AND completed_at IS NOT NULL)
                 OR (active = 1 AND status IN ('staged', 'applying') AND completed_at IS NULL)
-            )
+            ),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
         );
 
         CREATE UNIQUE INDEX IF NOT EXISTS generation_apply_one_active_per_source
@@ -4065,6 +4113,11 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         if user_version >= 13 {
             record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
         }
+    }
+
+    if user_version == 21 {
+        migrate_generation_delivery_journals_to_mount_relation(connection)?;
+        record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
     }
 
     if user_version < SCHEMA_VERSION {
@@ -4894,6 +4947,71 @@ fn create_state_management_tables(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+fn migrate_generation_delivery_journals_to_mount_relation(
+    connection: &Connection,
+) -> StoreResult<()> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         ALTER TABLE generation_apply_outcomes RENAME TO generation_apply_outcomes_v21;
+         ALTER TABLE generation_apply_journals RENAME TO generation_apply_journals_v21;
+         DROP INDEX generation_apply_one_active_per_source;
+
+         CREATE TABLE generation_apply_journals (
+            delta_id TEXT PRIMARY KEY,
+            mount_id TEXT NOT NULL,
+            source_connection_id TEXT NOT NULL,
+            base_generation_id TEXT NOT NULL,
+            target_generation_id TEXT NOT NULL,
+            delta_json TEXT NOT NULL,
+            receipt_json TEXT NOT NULL,
+            receipt_sha256 TEXT NOT NULL,
+            stage_root TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('staged', 'applying', 'completed')),
+            active INTEGER NOT NULL CHECK (active IN (0, 1)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            CHECK (
+                (active = 0 AND status = 'completed' AND completed_at IS NOT NULL)
+                OR (active = 1 AND status IN ('staged', 'applying') AND completed_at IS NULL)
+            ),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+         );
+
+         INSERT INTO generation_apply_journals (
+            delta_id, mount_id, source_connection_id, base_generation_id,
+            target_generation_id, delta_json, receipt_json, receipt_sha256,
+            stage_root, status, active, created_at, updated_at, completed_at
+         )
+         SELECT delta_id, json_extract(delta_json, '$.mount_id'), source_connection_id,
+                base_generation_id, target_generation_id, delta_json, receipt_json,
+                receipt_sha256, stage_root, status, active, created_at, updated_at,
+                completed_at
+         FROM generation_apply_journals_v21;
+
+         CREATE UNIQUE INDEX generation_apply_one_active_per_source
+         ON generation_apply_journals(source_connection_id)
+         WHERE active = 1;
+
+         CREATE TABLE generation_apply_outcomes (
+            delta_id TEXT NOT NULL,
+            entry_index INTEGER NOT NULL CHECK (entry_index >= 0),
+            outcome_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (delta_id, entry_index),
+            FOREIGN KEY (delta_id) REFERENCES generation_apply_journals(delta_id) ON DELETE CASCADE
+         );
+         INSERT INTO generation_apply_outcomes
+         SELECT delta_id, entry_index, outcome_json, updated_at
+         FROM generation_apply_outcomes_v21;
+
+         DROP TABLE generation_apply_outcomes_v21;
+         DROP TABLE generation_apply_journals_v21;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
 fn create_generation_delivery_tables(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         "
@@ -4925,6 +5043,7 @@ fn create_generation_delivery_tables(connection: &Connection) -> StoreResult<()>
 
         CREATE TABLE IF NOT EXISTS generation_apply_journals (
             delta_id TEXT PRIMARY KEY,
+            mount_id TEXT NOT NULL,
             source_connection_id TEXT NOT NULL,
             base_generation_id TEXT NOT NULL,
             target_generation_id TEXT NOT NULL,
@@ -4940,7 +5059,8 @@ fn create_generation_delivery_tables(connection: &Connection) -> StoreResult<()>
             CHECK (
                 (active = 0 AND status = 'completed' AND completed_at IS NOT NULL)
                 OR (active = 1 AND status IN ('staged', 'applying') AND completed_at IS NULL)
-            )
+            ),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
         );
 
         CREATE UNIQUE INDEX IF NOT EXISTS generation_apply_one_active_per_source

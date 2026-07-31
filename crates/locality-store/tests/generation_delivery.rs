@@ -15,7 +15,7 @@ use locality_protocol::freshness_delivery::{
 };
 use locality_protocol::workspace_layout::LayoutDigest;
 use locality_store::{
-    GenerationApplyOutcome, GenerationApplyStatus, GenerationDeliveryRepository,
+    ConnectionId, GenerationApplyOutcome, GenerationApplyStatus, GenerationDeliveryRepository,
     GenerationPathRecord, GenerationPathState, MountConfig, MountRepository,
     ObservedGenerationRecord, PreparedGenerationApply, SqliteStateStore, StoreError,
 };
@@ -242,6 +242,51 @@ fn empty_mount_delta_completes_and_advances_observed_generation() {
 }
 
 #[test]
+fn active_apply_blocks_connection_and_settings_source_reset_transactionally() {
+    let fixture = Fixture::new("active-reset-fence");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let delta = delta();
+    let receipt = receipt(&delta);
+    store
+        .reserve_generation_apply(PreparedGenerationApply {
+            receipt_sha256: receipt.canonical_sha256().unwrap(),
+            receipt,
+            delta,
+            stage_root: "generation-delivery/delta-2".to_string(),
+            created_at: "2026-07-31T12:01:00Z".to_string(),
+        })
+        .unwrap();
+
+    let changed_connection =
+        MountConfig::new(fixture.mount_id.clone(), "backend", &fixture.mount_root)
+            .with_connection_id(ConnectionId::new("replacement"));
+    let connection_error = store
+        .save_mount(changed_connection)
+        .expect_err("connection reset must not orphan active apply");
+    assert!(matches!(connection_error, StoreError::InvalidState(_)));
+
+    let changed_settings =
+        MountConfig::new(fixture.mount_id.clone(), "backend", &fixture.mount_root)
+            .with_settings_json(r#"{"view":"replacement"}"#);
+    let settings_error = store
+        .save_mount(changed_settings)
+        .expect_err("settings reset must not orphan active apply");
+    assert!(matches!(settings_error, StoreError::InvalidState(_)));
+
+    let mount = store.get_mount(&fixture.mount_id).unwrap().unwrap();
+    assert_eq!(mount.connection_id, None);
+    assert_eq!(mount.settings_json, "{}");
+    assert!(
+        store
+            .get_observed_generation(&fixture.mount_id)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(store.list_active_generation_applies().unwrap().len(), 1);
+}
+
+#[test]
 fn schema_20_migration_preserves_pending_local_state_and_adds_delivery_tables() {
     use locality_core::journal::{JournalEntry, JournalStatus, PushId};
     use locality_core::planner::PushPlan;
@@ -315,13 +360,92 @@ fn schema_20_migration_preserves_pending_local_state_and_adds_delivery_tables() 
         fs::read(fixture.mount_root.join("dirty.md")).unwrap(),
         b"local pending bytes"
     );
-    assert_eq!(SqliteStateStore::current_schema_version(), 21);
+    assert_eq!(SqliteStateStore::current_schema_version(), 22);
     assert!(
         reopened
             .get_observed_generation(&fixture.mount_id)
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn schema_21_migration_relates_active_journal_to_mount_and_preserves_it() {
+    use rusqlite::Connection;
+
+    let fixture = Fixture::new("migration-v21-journal-mount");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let delta = delta();
+    let receipt = receipt(&delta);
+    store
+        .reserve_generation_apply(PreparedGenerationApply {
+            receipt_sha256: receipt.canonical_sha256().unwrap(),
+            receipt,
+            delta,
+            stage_root: "generation-delivery/delta-2".to_string(),
+            created_at: "2026-07-31T12:01:00Z".to_string(),
+        })
+        .unwrap();
+    let db_path = store.db_path.clone();
+    drop(store);
+
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             BEGIN IMMEDIATE;
+             ALTER TABLE generation_apply_outcomes RENAME TO generation_apply_outcomes_v22;
+             ALTER TABLE generation_apply_journals RENAME TO generation_apply_journals_v22;
+             DROP INDEX generation_apply_one_active_per_source;
+             CREATE TABLE generation_apply_journals (
+                delta_id TEXT PRIMARY KEY,
+                source_connection_id TEXT NOT NULL,
+                base_generation_id TEXT NOT NULL,
+                target_generation_id TEXT NOT NULL,
+                delta_json TEXT NOT NULL,
+                receipt_json TEXT NOT NULL,
+                receipt_sha256 TEXT NOT NULL,
+                stage_root TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('staged', 'applying', 'completed')),
+                active INTEGER NOT NULL CHECK (active IN (0, 1)),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+             );
+             INSERT INTO generation_apply_journals
+             SELECT delta_id, source_connection_id, base_generation_id,
+                    target_generation_id, delta_json, receipt_json, receipt_sha256,
+                    stage_root, status, active, created_at, updated_at, completed_at
+             FROM generation_apply_journals_v22;
+             CREATE UNIQUE INDEX generation_apply_one_active_per_source
+             ON generation_apply_journals(source_connection_id) WHERE active = 1;
+             CREATE TABLE generation_apply_outcomes (
+                delta_id TEXT NOT NULL,
+                entry_index INTEGER NOT NULL,
+                outcome_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (delta_id, entry_index)
+             );
+             INSERT INTO generation_apply_outcomes
+             SELECT * FROM generation_apply_outcomes_v22;
+             DROP TABLE generation_apply_outcomes_v22;
+             DROP TABLE generation_apply_journals_v22;
+             UPDATE state_components SET version = 21 WHERE component_id = 'core:schema';
+             PRAGMA user_version = 21;
+             COMMIT;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    let active = reopened.list_active_generation_applies().unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].delta.mount_id.as_str(), fixture.mount_id.as_str());
+    let error = reopened
+        .clear_mount_source_state(&fixture.mount_id)
+        .expect_err("migrated active journal must fence source reset");
+    assert!(matches!(error, StoreError::InvalidState(_)));
 }
 
 struct Fixture {

@@ -181,6 +181,10 @@ pub trait GenerationDeliveryRepository {
 
     fn list_active_generation_applies(&self) -> StoreResult<Vec<GenerationApplyJournalRecord>>;
 
+    /// Lists active and completed journals so the staging owner can reconcile
+    /// retained conflict evidence and discard non-live payloads.
+    fn list_generation_applies(&self) -> StoreResult<Vec<GenerationApplyJournalRecord>>;
+
     /// Atomically advances every affected mount head and its per-path bases
     /// after every journal entry has a terminal local outcome.
     fn complete_generation_apply(
