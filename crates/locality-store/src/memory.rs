@@ -32,8 +32,11 @@ use crate::repository::{
     EntityRepository, EntitySearchRepository, FreshnessStateRepository, HydrationJobRepository,
     JournalRepository, MetadataDiscoveryJobRepository, MountLiveModeRepository, MountRepository,
     RemoteObservationRepository, ShadowRepository, VirtualMoveRepository, VirtualMoveTransition,
-    VirtualMutationRepository, validate_virtual_move_transition, virtual_move_content_changed,
-    virtual_move_missing,
+    VirtualMutationRepository, WorkspaceBindingRepository, validate_virtual_move_transition,
+    virtual_move_content_changed, virtual_move_missing,
+};
+use crate::workspace_binding::{
+    WorkspaceBinding, WorkspaceBindingRecord, binding_from_legacy_mount, unique_binding,
 };
 
 type EntityKey = (MountId, RemoteId);
@@ -63,6 +66,7 @@ fn illegal_transition(
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryStateStore {
     mounts: BTreeMap<MountId, MountConfig>,
+    workspace_bindings: BTreeMap<MountId, WorkspaceBinding>,
     mount_live_modes: BTreeMap<MountId, MountLiveModeRecord>,
     connections: BTreeMap<ConnectionId, ConnectionRecord>,
     connector_profiles: BTreeMap<ConnectorProfileId, ConnectorProfileRecord>,
@@ -162,6 +166,19 @@ impl MountRepository for InMemoryStateStore {
         {
             self.clear_mount_source_state(&mount.mount_id);
         }
+        if !self.workspace_bindings.contains_key(&mount.mount_id) {
+            let used_collision_keys = self
+                .workspace_bindings
+                .values()
+                .map(WorkspaceBinding::collision_key)
+                .collect();
+            let binding = unique_binding(
+                binding_from_legacy_mount(&mount.mount_id, &mount.root),
+                &used_collision_keys,
+            );
+            self.workspace_bindings
+                .insert(mount.mount_id.clone(), binding);
+        }
         self.mounts.insert(mount.mount_id.clone(), mount);
         Ok(())
     }
@@ -172,6 +189,60 @@ impl MountRepository for InMemoryStateStore {
 
     fn load_mounts(&self) -> StoreResult<Vec<MountConfig>> {
         Ok(self.mounts.values().cloned().collect())
+    }
+}
+
+impl WorkspaceBindingRepository for InMemoryStateStore {
+    fn save_workspace_binding(&mut self, record: WorkspaceBindingRecord) -> StoreResult<()> {
+        if !self.mounts.contains_key(&record.mount_id) {
+            return Err(StoreError::MountMissing(record.mount_id));
+        }
+        if let Some((existing_mount_id, _)) =
+            self.workspace_bindings.iter().find(|(mount_id, binding)| {
+                **mount_id != record.mount_id
+                    && binding.collision_key() == record.binding.collision_key()
+            })
+        {
+            return Err(StoreError::WorkspaceMountTargetCollision {
+                target: record.binding.mount_target().as_str().to_string(),
+                existing_mount_id: existing_mount_id.clone(),
+            });
+        }
+        self.workspace_bindings
+            .insert(record.mount_id, record.binding);
+        Ok(())
+    }
+
+    fn get_workspace_binding(&self, mount_id: &MountId) -> StoreResult<Option<WorkspaceBinding>> {
+        Ok(self.workspace_bindings.get(mount_id).cloned())
+    }
+
+    fn load_workspace_bindings(&self) -> StoreResult<Vec<WorkspaceBindingRecord>> {
+        Ok(self
+            .workspace_bindings
+            .iter()
+            .map(|(mount_id, binding)| {
+                WorkspaceBindingRecord::new(mount_id.clone(), binding.clone())
+            })
+            .collect())
+    }
+
+    fn rebind_workspace_root(
+        &mut self,
+        mount_id: &MountId,
+        workspace_root: &Path,
+    ) -> StoreResult<MountConfig> {
+        let binding = self
+            .workspace_bindings
+            .get(mount_id)
+            .cloned()
+            .ok_or_else(|| StoreError::WorkspaceBindingMissing(mount_id.clone()))?;
+        let mount = self
+            .mounts
+            .get_mut(mount_id)
+            .ok_or_else(|| StoreError::MountMissing(mount_id.clone()))?;
+        mount.root = binding.mount_root(workspace_root);
+        Ok(mount.clone())
     }
 }
 

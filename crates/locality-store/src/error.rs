@@ -16,6 +16,11 @@ pub type StoreResult<T> = Result<T, StoreError>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreError {
     MountMissing(MountId),
+    WorkspaceBindingMissing(MountId),
+    WorkspaceMountTargetCollision {
+        target: String,
+        existing_mount_id: MountId,
+    },
     EntityMissing {
         mount_id: MountId,
         remote_id: RemoteId,
@@ -50,6 +55,21 @@ impl Display for StoreError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MountMissing(mount_id) => write!(f, "mount `{}` was not found", mount_id.0),
+            Self::WorkspaceBindingMissing(mount_id) => {
+                write!(
+                    f,
+                    "workspace binding for mount `{}` was not found",
+                    mount_id.0
+                )
+            }
+            Self::WorkspaceMountTargetCollision {
+                target,
+                existing_mount_id,
+            } => write!(
+                f,
+                "workspace mount target `{target}` collides with mount `{}`",
+                existing_mount_id.0
+            ),
             Self::EntityMissing {
                 mount_id,
                 remote_id,

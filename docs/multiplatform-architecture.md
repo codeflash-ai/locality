@@ -420,6 +420,27 @@ pub struct PlatformCapabilities {
 
 This removes the need for scattered `cfg(target_os)` logic in command parsing.
 
+### Portable Workspace Binding
+
+The durable mount ID remains the source and File Provider identity. Physical
+placement is separate metadata: each mount has a versioned `workspace_binding`
+containing the portable workspace-layout version and one validated mount target.
+The binding never stores an absolute host path as identity.
+
+Desktop, CLI, and daemon paths resolve as:
+
+```text
+<host workspace root>/<mount target>/<logical path>
+```
+
+The host workspace root may therefore be the macOS File Provider URL on one
+machine and `~/Locality` for CLI or Linux FUSE on another without changing the
+mount ID, mount target, logical paths, pending journals, or synced shadows.
+Legacy mount rows are upgraded in place by deriving a portable target from the
+old mount-root basename. Unicode-equivalent target collisions receive stable
+suffixes in mount-ID order; the legacy absolute root remains readable during
+the compatibility window.
+
 ## Desktop Packaging
 
 The desktop app should use the same platform layer as the CLI:

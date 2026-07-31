@@ -17,11 +17,27 @@ use crate::records::{
     HydrationJobRecord, MetadataDiscoveryJobRecord, MountConfig, MountLiveModeRecord,
     RemoteObservationRecord, ShadowSnapshotRecord, VirtualMutationRecord,
 };
+use crate::workspace_binding::{WorkspaceBinding, WorkspaceBindingRecord};
 
 pub trait MountRepository {
     fn save_mount(&mut self, mount: MountConfig) -> StoreResult<()>;
     fn get_mount(&self, mount_id: &MountId) -> StoreResult<Option<MountConfig>>;
     fn load_mounts(&self) -> StoreResult<Vec<MountConfig>>;
+}
+
+/// Durable portable placement metadata keyed by the existing mount identity.
+pub trait WorkspaceBindingRepository {
+    fn save_workspace_binding(&mut self, record: WorkspaceBindingRecord) -> StoreResult<()>;
+    fn get_workspace_binding(&self, mount_id: &MountId) -> StoreResult<Option<WorkspaceBinding>>;
+    fn load_workspace_bindings(&self) -> StoreResult<Vec<WorkspaceBindingRecord>>;
+
+    /// Move one mount beneath a host-specific workspace root without changing
+    /// its source identity or portable target.
+    fn rebind_workspace_root(
+        &mut self,
+        mount_id: &MountId,
+        workspace_root: &Path,
+    ) -> StoreResult<MountConfig>;
 }
 
 pub trait MountLiveModeRepository {
