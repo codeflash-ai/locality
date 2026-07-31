@@ -1,0 +1,836 @@
+use locality_core::portable::{
+    ContentVersionId, LogicalPath, ProjectionId, SourceConnectionId, SourceGenerationId,
+};
+use locality_core::workspace_layout::PortableMountId;
+use locality_protocol::freshness_delivery::{
+    GENERATION_DELTA_RECEIPT_V1_GOLDEN_JSON, GenerationDeltaTerminalReceipt,
+    GenerationFileIdentity, MAX_GENERATION_DELTA_METADATA_BYTES,
+};
+use locality_protocol::freshness_delivery_transport::{
+    GENERATION_BODY_WINDOW_CONTENT_TYPE, GENERATION_BODY_WINDOW_FRAME_V1_GOLDEN_HEX,
+    GENERATION_BODY_WINDOW_METADATA_V1_GOLDEN_JSON, GENERATION_BODY_WINDOW_REQUEST_V1_GOLDEN_JSON,
+    GENERATION_DELIVERY_ACKNOWLEDGMENT_V1_GOLDEN_JSON,
+    GENERATION_DELIVERY_POLL_ENVELOPE_HEADROOM_BYTES, GENERATION_DELIVERY_POLL_V1_GOLDEN_JSON,
+    GENERATION_DELIVERY_REQUEST_V1_GOLDEN_JSON, GENERATION_PIN_LEASE_V1_GOLDEN_JSON,
+    GENERATION_TRANSPORT_CAPABILITIES_V1_GOLDEN_JSON, GENERATION_TRANSPORT_FORMAT_VERSION,
+    GENERATION_TRANSPORT_READER_VERSION, GenerationBodyRange, GenerationBodyWindowCapability,
+    GenerationBodyWindowFrame, GenerationBodyWindowMetadata, GenerationBodyWindowRequest,
+    GenerationDeliveryAcknowledgment, GenerationDeliveryAcknowledgmentRequest,
+    GenerationDeliveryPollResponse, GenerationDeliveryRequest, GenerationPinFallbackPolicy,
+    GenerationPinLeaseAcquireRequest, GenerationPinLeaseAcquireResponse,
+    GenerationPinLeaseCapability, GenerationPinLeaseRelease, GenerationPinLeaseReleaseRequest,
+    GenerationPinLeaseRenewRequest, GenerationPinLeaseRenewal, GenerationTransportCapabilities,
+    GenerationTransportContractError, MAX_GENERATION_BODY_WINDOW_BYTES,
+    MAX_GENERATION_BODY_WINDOW_METADATA_BYTES, MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES,
+    MAX_GENERATION_PIN_LEASE_SECONDS, MAX_GENERATION_PIN_LEASES_PER_DEVICE,
+    MAX_GENERATION_PIN_OPERATION_ID_BYTES, MAX_GENERATION_TRANSPORT_REQUEST_BYTES,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+fn pretty_json(value: &impl Serialize) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec_pretty(value).expect("serialize JSON");
+    bytes.push(b'\n');
+    bytes
+}
+
+fn decode_hex_fixture(input: &[u8]) -> Vec<u8> {
+    let input = std::str::from_utf8(input).unwrap().trim().as_bytes();
+    assert_eq!(input.len() % 2, 0);
+    input
+        .chunks_exact(2)
+        .map(|pair| {
+            let digit = |byte| match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                _ => panic!("invalid fixture hex"),
+            };
+            digit(pair[0]) * 16 + digit(pair[1])
+        })
+        .collect()
+}
+
+fn capabilities() -> GenerationTransportCapabilities {
+    GenerationTransportCapabilities::decode_json(GENERATION_TRANSPORT_CAPABILITIES_V1_GOLDEN_JSON)
+        .expect("capabilities fixture")
+}
+
+fn pin_capability() -> GenerationPinLeaseCapability {
+    capabilities()
+        .generation_pin_leases
+        .expect("pin capability fixture")
+}
+
+fn body_request() -> GenerationBodyWindowRequest {
+    serde_json::from_slice(GENERATION_BODY_WINDOW_REQUEST_V1_GOLDEN_JSON)
+        .expect("body request fixture")
+}
+
+fn body_metadata() -> GenerationBodyWindowMetadata {
+    serde_json::from_slice(GENERATION_BODY_WINDOW_METADATA_V1_GOLDEN_JSON)
+        .expect("body metadata fixture")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct AcknowledgmentGolden {
+    request: GenerationDeliveryAcknowledgmentRequest,
+    response: GenerationDeliveryAcknowledgment,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PinLeaseGolden {
+    acquire_request: GenerationPinLeaseAcquireRequest,
+    acquire_response: GenerationPinLeaseAcquireResponse,
+    renew_request: GenerationPinLeaseRenewRequest,
+    renewal: GenerationPinLeaseRenewal,
+    release_request: GenerationPinLeaseReleaseRequest,
+    release: GenerationPinLeaseRelease,
+    quota_unavailable: GenerationPinLeaseAcquireResponse,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DeliveryPollGolden {
+    delivery: GenerationDeliveryPollResponse,
+    no_delivery: GenerationDeliveryPollResponse,
+    error: GenerationDeliveryPollResponse,
+}
+
+#[test]
+fn transport_contracts_match_exact_lf_json_goldens() {
+    let capabilities = capabilities();
+    capabilities.validate().expect("capabilities");
+    assert_eq!(
+        pretty_json(&capabilities),
+        GENERATION_TRANSPORT_CAPABILITIES_V1_GOLDEN_JSON
+    );
+    let delivery_request =
+        GenerationDeliveryRequest::decode_json(GENERATION_DELIVERY_REQUEST_V1_GOLDEN_JSON)
+            .expect("delivery request fixture");
+    delivery_request.validate().expect("delivery request");
+    assert_eq!(
+        pretty_json(&delivery_request),
+        GENERATION_DELIVERY_REQUEST_V1_GOLDEN_JSON
+    );
+
+    let request = body_request();
+    request.validate().expect("body request");
+    assert_eq!(
+        pretty_json(&request),
+        GENERATION_BODY_WINDOW_REQUEST_V1_GOLDEN_JSON
+    );
+    let metadata = body_metadata();
+    metadata.validate_against(&request).expect("body metadata");
+    metadata.validate_body(b"hello wo").expect("body integrity");
+    assert_eq!(
+        pretty_json(&metadata),
+        GENERATION_BODY_WINDOW_METADATA_V1_GOLDEN_JSON
+    );
+
+    let acknowledgment: AcknowledgmentGolden =
+        serde_json::from_slice(GENERATION_DELIVERY_ACKNOWLEDGMENT_V1_GOLDEN_JSON)
+            .expect("acknowledgment fixture");
+    GenerationDeliveryAcknowledgmentRequest::decode_json(
+        &serde_json::to_vec(&acknowledgment.request).unwrap(),
+    )
+    .expect("bounded acknowledgment request");
+    let receipt: GenerationDeltaTerminalReceipt =
+        serde_json::from_slice(GENERATION_DELTA_RECEIPT_V1_GOLDEN_JSON).expect("receipt fixture");
+    acknowledgment
+        .request
+        .validate_against_receipt(&receipt)
+        .expect("ack request");
+    acknowledgment
+        .response
+        .validate_against(&acknowledgment.request)
+        .expect("ack response");
+    assert_eq!(
+        pretty_json(&acknowledgment),
+        GENERATION_DELIVERY_ACKNOWLEDGMENT_V1_GOLDEN_JSON
+    );
+
+    let pins: PinLeaseGolden =
+        serde_json::from_slice(GENERATION_PIN_LEASE_V1_GOLDEN_JSON).expect("pin fixture");
+    let pin_capability = pin_capability();
+    GenerationPinLeaseAcquireRequest::decode_json(
+        &serde_json::to_vec(&pins.acquire_request).unwrap(),
+    )
+    .expect("bounded acquire request");
+    GenerationPinLeaseRenewRequest::decode_json(&serde_json::to_vec(&pins.renew_request).unwrap())
+        .expect("bounded renew request");
+    GenerationPinLeaseReleaseRequest::decode_json(
+        &serde_json::to_vec(&pins.release_request).unwrap(),
+    )
+    .expect("bounded release request");
+    pins.acquire_response
+        .validate_against(&pins.acquire_request, &pin_capability)
+        .expect("acquire");
+    pins.renewal
+        .validate_against(&pins.renew_request, &pin_capability)
+        .expect("renew");
+    pins.release
+        .validate_against(&pins.release_request)
+        .expect("release");
+    pins.quota_unavailable
+        .validate_against(&pins.acquire_request, &pin_capability)
+        .expect("quota unavailable");
+    assert_eq!(pretty_json(&pins), GENERATION_PIN_LEASE_V1_GOLDEN_JSON);
+
+    let polls: DeliveryPollGolden =
+        serde_json::from_slice(GENERATION_DELIVERY_POLL_V1_GOLDEN_JSON).expect("poll fixture");
+    for poll in [&polls.delivery, &polls.no_delivery, &polls.error] {
+        poll.validate_against(&delivery_request)
+            .expect("poll response");
+        GenerationDeliveryPollResponse::decode_json(
+            &serde_json::to_vec(poll).unwrap(),
+            &delivery_request,
+        )
+        .expect("bounded poll response");
+    }
+    assert_eq!(pretty_json(&polls), GENERATION_DELIVERY_POLL_V1_GOLDEN_JSON);
+}
+
+#[test]
+fn poll_envelope_statuses_are_bounded_and_bound_to_the_request() {
+    let request =
+        GenerationDeliveryRequest::decode_json(GENERATION_DELIVERY_REQUEST_V1_GOLDEN_JSON).unwrap();
+    let polls: DeliveryPollGolden =
+        serde_json::from_slice(GENERATION_DELIVERY_POLL_V1_GOLDEN_JSON).unwrap();
+
+    let mut ambiguous = polls.no_delivery.clone();
+    ambiguous.delivery = polls.delivery.delivery.clone();
+    assert_eq!(
+        ambiguous.validate_against(&request),
+        Err(GenerationTransportContractError::AmbiguousPollResponse)
+    );
+
+    let mut crossed = polls.delivery.clone();
+    crossed.observed_generation_id = SourceGenerationId::new("generation-crossed").unwrap();
+    assert_eq!(
+        crossed.validate_against(&request),
+        Err(GenerationTransportContractError::PollResponseMismatch)
+    );
+
+    let mut invalid_receipt = polls.delivery.clone();
+    invalid_receipt
+        .delivery
+        .as_mut()
+        .unwrap()
+        .terminal_receipt
+        .delta_sha256 =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+    assert!(matches!(
+        invalid_receipt.validate_against(&request),
+        Err(GenerationTransportContractError::TerminalReceipt(_))
+    ));
+
+    let mut unknown = serde_json::to_value(&polls.no_delivery).unwrap();
+    unknown["status"] = json!("future_status");
+    let unknown = serde_json::from_value::<GenerationDeliveryPollResponse>(unknown).unwrap();
+    assert_eq!(
+        unknown.validate_against(&request),
+        Err(GenerationTransportContractError::UnknownPollStatus)
+    );
+
+    let mut additive = serde_json::to_value(&polls.no_delivery).unwrap();
+    additive["format_version"] = json!(2);
+    additive["future_additive_field"] = json!({"ignored": true});
+    GenerationDeliveryPollResponse::decode_json(&serde_json::to_vec(&additive).unwrap(), &request)
+        .expect("additive V1-compatible response");
+
+    additive["minimum_reader_version"] = json!(2);
+    assert_eq!(
+        GenerationDeliveryPollResponse::decode_json(
+            &serde_json::to_vec(&additive).unwrap(),
+            &request,
+        ),
+        Err(GenerationTransportContractError::UpdateRequired {
+            minimum: 2,
+            supported: 1,
+        })
+    );
+
+    let normal_delivery = serde_json::to_vec(&polls.delivery).unwrap();
+    assert!(normal_delivery.len() < MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES);
+    GenerationDeliveryPollResponse::decode_json(&normal_delivery, &request)
+        .expect("normal delivery poll");
+
+    assert_eq!(
+        MAX_GENERATION_DELTA_METADATA_BYTES + GENERATION_DELIVERY_POLL_ENVELOPE_HEADROOM_BYTES,
+        MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES
+    );
+    let mut boundary = serde_json::to_vec(&polls.no_delivery).unwrap();
+    boundary.resize(MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES, b' ');
+    GenerationDeliveryPollResponse::decode_json(&boundary, &request)
+        .expect("poll at exact response boundary");
+    boundary.push(b' ');
+    assert!(matches!(
+        GenerationDeliveryPollResponse::decode_json(&boundary, &request),
+        Err(GenerationTransportContractError::EncodingTooLarge { .. })
+    ));
+}
+
+#[test]
+fn body_window_http_frame_matches_exact_golden_and_rejects_crossed_wire_facts() {
+    let request = body_request();
+    let frame = GenerationBodyWindowFrame {
+        metadata: body_metadata(),
+        body: b"hello wo".to_vec(),
+    };
+    let encoded = frame.encode_http_body(&request).expect("encode body frame");
+    assert_eq!(
+        encoded,
+        decode_hex_fixture(GENERATION_BODY_WINDOW_FRAME_V1_GOLDEN_HEX)
+    );
+    assert_eq!(
+        GenerationBodyWindowFrame::decode_http_body(
+            &request,
+            GENERATION_BODY_WINDOW_CONTENT_TYPE,
+            encoded.len() as u64,
+            &encoded,
+        )
+        .unwrap(),
+        frame
+    );
+
+    assert_eq!(
+        GenerationBodyWindowFrame::decode_http_body(
+            &request,
+            "application/octet-stream",
+            encoded.len() as u64,
+            &encoded,
+        ),
+        Err(GenerationTransportContractError::InvalidBodyWindowContentType)
+    );
+    assert_eq!(
+        GenerationBodyWindowFrame::decode_http_body(
+            &request,
+            GENERATION_BODY_WINDOW_CONTENT_TYPE,
+            encoded.len() as u64 + 1,
+            &encoded,
+        ),
+        Err(GenerationTransportContractError::BodyContentLengthMismatch)
+    );
+
+    let mut crossed_auth = request.clone();
+    crossed_auth.terminal_receipt_sha256 =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+    assert_eq!(
+        GenerationBodyWindowFrame::decode_http_body(
+            &crossed_auth,
+            GENERATION_BODY_WINDOW_CONTENT_TYPE,
+            encoded.len() as u64,
+            &encoded,
+        ),
+        Err(GenerationTransportContractError::BodyWindowMismatch)
+    );
+
+    let mut crossed_range = request.clone();
+    crossed_range.offset = 1;
+    assert_eq!(
+        GenerationBodyWindowFrame::decode_http_body(
+            &crossed_range,
+            GENERATION_BODY_WINDOW_CONTENT_TYPE,
+            encoded.len() as u64,
+            &encoded,
+        ),
+        Err(GenerationTransportContractError::BodyWindowMismatch)
+    );
+
+    let mut changed_body = encoded.clone();
+    *changed_body.last_mut().unwrap() ^= 1;
+    assert_eq!(
+        GenerationBodyWindowFrame::decode_http_body(
+            &request,
+            GENERATION_BODY_WINDOW_CONTENT_TYPE,
+            changed_body.len() as u64,
+            &changed_body,
+        ),
+        Err(GenerationTransportContractError::BodyIntegrityMismatch)
+    );
+
+    let mut oversized_metadata =
+        Vec::with_capacity(4 + MAX_GENERATION_BODY_WINDOW_METADATA_BYTES + 1);
+    oversized_metadata.extend_from_slice(
+        &u32::try_from(MAX_GENERATION_BODY_WINDOW_METADATA_BYTES + 1)
+            .unwrap()
+            .to_be_bytes(),
+    );
+    oversized_metadata.resize(4 + MAX_GENERATION_BODY_WINDOW_METADATA_BYTES + 1, b' ');
+    assert_eq!(
+        GenerationBodyWindowFrame::decode_http_body(
+            &request,
+            GENERATION_BODY_WINDOW_CONTENT_TYPE,
+            oversized_metadata.len() as u64,
+            &oversized_metadata,
+        ),
+        Err(GenerationTransportContractError::InvalidBodyFrame)
+    );
+}
+
+#[test]
+fn body_windows_bind_identity_range_and_integrity_with_hard_limits() {
+    let request = body_request();
+    let metadata = body_metadata();
+
+    let mut changed = metadata.clone();
+    changed.content.content_version_id = ContentVersionId::new("substituted");
+    assert_eq!(
+        changed.validate_against(&request),
+        Err(GenerationTransportContractError::BodyWindowMismatch)
+    );
+
+    let mut skipped = metadata.clone();
+    skipped.range.offset = 1;
+    assert_eq!(
+        skipped.validate_against(&request),
+        Err(GenerationTransportContractError::BodyWindowMismatch)
+    );
+
+    let mut false_terminal = metadata.clone();
+    false_terminal.range.complete = true;
+    assert_eq!(
+        false_terminal.validate_against(&request),
+        Err(GenerationTransportContractError::InvalidBodyRange)
+    );
+    assert_eq!(
+        metadata.validate_body(b"evilbody"),
+        Err(GenerationTransportContractError::BodyIntegrityMismatch)
+    );
+
+    let mut oversized = request.clone();
+    oversized.max_bytes = MAX_GENERATION_BODY_WINDOW_BYTES + 1;
+    assert_eq!(
+        oversized.validate(),
+        Err(GenerationTransportContractError::InvalidBodyWindowLimit {
+            actual: MAX_GENERATION_BODY_WINDOW_BYTES + 1,
+        })
+    );
+    assert!(matches!(
+        GenerationBodyWindowRequest::decode_json(&vec![
+            b' ';
+            MAX_GENERATION_TRANSPORT_REQUEST_BYTES + 1
+        ]),
+        Err(GenerationTransportContractError::EncodingTooLarge { .. })
+    ));
+}
+
+#[test]
+fn capabilities_are_explicit_bounded_and_selection_is_a_subset() {
+    let offered = capabilities();
+    let selected = GenerationTransportCapabilities {
+        body_windows: Some(GenerationBodyWindowCapability {
+            max_window_bytes: 256 * 1024,
+        }),
+        terminal_receipt_acknowledgments: true,
+        generation_pin_leases: Some(GenerationPinLeaseCapability {
+            min_lease_seconds: 600,
+            max_lease_seconds: 1800,
+            max_active_leases_per_device: 4,
+            fallback_policies: vec![GenerationPinFallbackPolicy::RequireExact],
+        }),
+        ..GenerationTransportCapabilities::legacy()
+    };
+    selected
+        .validate_selection(&offered)
+        .expect("selected subset");
+
+    let mut not_offered = selected.clone();
+    not_offered.body_windows.as_mut().unwrap().max_window_bytes = 2 * 1024 * 1024;
+    assert_eq!(
+        not_offered.validate_selection(&offered),
+        Err(GenerationTransportContractError::CapabilityNotOffered)
+    );
+
+    let mut quota = selected.clone();
+    quota
+        .generation_pin_leases
+        .as_mut()
+        .unwrap()
+        .max_active_leases_per_device = MAX_GENERATION_PIN_LEASES_PER_DEVICE + 1;
+    assert_eq!(
+        quota.validate(),
+        Err(GenerationTransportContractError::InvalidPinCapability)
+    );
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct PriorGenerationDeliveryRequest {
+    mount_id: PortableMountId,
+    source_connection_id: SourceConnectionId,
+    observed_generation_id: SourceGenerationId,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct PriorPinLease {
+    lease_id: String,
+    device_scope_id: String,
+    source_connection_id: SourceConnectionId,
+    generation_id: SourceGenerationId,
+    lease_seconds: u64,
+    expires_at: String,
+    active_leases_for_device: u16,
+    max_active_leases_per_device: u16,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct PriorPinLeaseAcquireResponse {
+    format_version: u16,
+    minimum_reader_version: u16,
+    requested_generation_id: SourceGenerationId,
+    fallback_applied: bool,
+    lease: PriorPinLease,
+}
+
+#[test]
+fn additive_versions_and_legacy_delivery_requests_decode_tolerantly() {
+    let legacy_json = json!({
+        "mount_id": "mount-alpha",
+        "source_connection_id": "source-018f4f6e",
+        "observed_generation_id": "generation-0007"
+    });
+    let decoded: GenerationDeliveryRequest = serde_json::from_value(legacy_json).unwrap();
+    decoded.validate().expect("legacy request");
+    assert_eq!(
+        decoded.capabilities,
+        GenerationTransportCapabilities::legacy()
+    );
+
+    let request = GenerationDeliveryRequest {
+        format_version: GENERATION_TRANSPORT_FORMAT_VERSION,
+        minimum_reader_version: GENERATION_TRANSPORT_READER_VERSION,
+        mount_id: PortableMountId::new("mount-alpha").unwrap(),
+        source_connection_id: SourceConnectionId::new("source-018f4f6e"),
+        observed_generation_id: SourceGenerationId::new("generation-0007").unwrap(),
+        capabilities: capabilities(),
+    };
+    let prior: PriorGenerationDeliveryRequest =
+        serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+    assert_eq!(prior.mount_id, request.mount_id);
+
+    let pins: PinLeaseGolden = serde_json::from_slice(GENERATION_PIN_LEASE_V1_GOLDEN_JSON).unwrap();
+    let prior_pin: PriorPinLeaseAcquireResponse =
+        serde_json::from_value(serde_json::to_value(&pins.acquire_response).unwrap()).unwrap();
+    assert_eq!(
+        prior_pin,
+        PriorPinLeaseAcquireResponse {
+            format_version: 1,
+            minimum_reader_version: 1,
+            requested_generation_id: pins.acquire_request.generation_id.clone(),
+            fallback_applied: false,
+            lease: PriorPinLease {
+                lease_id: "lease-opaque-01".to_string(),
+                device_scope_id: "device-scope-opaque-01".to_string(),
+                source_connection_id: SourceConnectionId::new("source-018f4f6e"),
+                generation_id: SourceGenerationId::new("generation-0008").unwrap(),
+                lease_seconds: 900,
+                expires_at: "2026-07-31T12:50:00Z".to_string(),
+                active_leases_for_device: 2,
+                max_active_leases_per_device: 8,
+            },
+        }
+    );
+
+    let mut future = serde_json::to_value(&request).unwrap();
+    future["format_version"] = json!(2);
+    future["future_additive_field"] = json!({"safe_to_ignore": true});
+    future["capabilities"]["future_capability"] = json!({"version": 1});
+    let decoded: GenerationDeliveryRequest = serde_json::from_value(future).unwrap();
+    decoded.validate().expect("additive future format");
+
+    let mut update_required = serde_json::to_value(&request).unwrap();
+    update_required["format_version"] = json!(2);
+    update_required["minimum_reader_version"] = json!(2);
+    let decoded: GenerationDeliveryRequest = serde_json::from_value(update_required).unwrap();
+    assert_eq!(
+        decoded.validate(),
+        Err(GenerationTransportContractError::UpdateRequired {
+            minimum: 2,
+            supported: 1,
+        })
+    );
+}
+
+#[test]
+fn opaque_and_content_bearing_debug_output_is_redacted() {
+    let acknowledgment: AcknowledgmentGolden =
+        serde_json::from_slice(GENERATION_DELIVERY_ACKNOWLEDGMENT_V1_GOLDEN_JSON).unwrap();
+    let pins: PinLeaseGolden = serde_json::from_slice(GENERATION_PIN_LEASE_V1_GOLDEN_JSON).unwrap();
+    let values = [
+        format!("{:?}", body_request()),
+        format!("{:?}", body_metadata()),
+        format!(
+            "{:?}",
+            GenerationBodyWindowFrame {
+                metadata: body_metadata(),
+                body: b"hello wo".to_vec(),
+            }
+        ),
+        format!(
+            "{:?}",
+            serde_json::from_slice::<DeliveryPollGolden>(GENERATION_DELIVERY_POLL_V1_GOLDEN_JSON)
+                .unwrap()
+                .delivery
+        ),
+        format!("{:?}", acknowledgment.request),
+        format!("{:?}", acknowledgment.response),
+        format!("{:?}", pins.acquire_request),
+        format!("{:?}", pins.acquire_response),
+        format!("{:?}", pins.renew_request),
+        format!("{:?}", pins.renewal),
+        format!("{:?}", pins.release_request),
+        format!("{:?}", pins.release),
+    ];
+    for debug in values {
+        assert!(debug.contains("<redacted>"), "{debug}");
+        for secret in [
+            "device-scope-opaque-01",
+            "lease-opaque-01",
+            "pin-acquire-op-01",
+            "pin-renew-op-01",
+            "pin-release-op-01",
+            "Engineering/roadmap.md",
+            "3ec8d4089470a2e4620d65c03a01635c028200982c94dfbc2e34eac95e2370b1",
+            "delta-poll-v1",
+            "hello wo",
+        ] {
+            assert!(!debug.contains(secret), "{debug}");
+        }
+    }
+}
+
+#[test]
+fn pin_leases_enforce_expiry_quota_and_safe_fallback_semantics() {
+    let pins: PinLeaseGolden = serde_json::from_slice(GENERATION_PIN_LEASE_V1_GOLDEN_JSON).unwrap();
+    let capability = pin_capability();
+    let mut excessive = pins.acquire_request.clone();
+    excessive.requested_lease_seconds = MAX_GENERATION_PIN_LEASE_SECONDS + 1;
+    assert_eq!(
+        excessive.validate(),
+        Err(GenerationTransportContractError::InvalidPinLeaseDuration {
+            actual: MAX_GENERATION_PIN_LEASE_SECONDS + 1,
+        })
+    );
+
+    let mut oversized_operation = pins.acquire_request.clone();
+    oversized_operation.operation_id = "x".repeat(MAX_GENERATION_PIN_OPERATION_ID_BYTES + 1);
+    assert_eq!(
+        oversized_operation.validate(),
+        Err(GenerationTransportContractError::InvalidOpaqueValue(
+            "operation_id"
+        ))
+    );
+
+    let mut malformed_expiry = pins.renewal.clone();
+    malformed_expiry.lease.expires_at = "2026-02-30T12:00:00Z".to_string();
+    assert_eq!(
+        malformed_expiry.validate_against(&pins.renew_request, &capability),
+        Err(GenerationTransportContractError::InvalidTimestamp)
+    );
+
+    let mut inconsistent_expiry = pins.renewal.clone();
+    inconsistent_expiry.lease.expires_at = "2026-07-31T13:04:59Z".to_string();
+    assert_eq!(
+        inconsistent_expiry.validate_against(&pins.renew_request, &capability),
+        Err(GenerationTransportContractError::InvalidPinLeaseExpiry)
+    );
+
+    let mut expired = pins.renewal.clone();
+    expired.server_time = expired.lease.expires_at.clone();
+    assert_eq!(
+        expired.validate_against(&pins.renew_request, &capability),
+        Err(GenerationTransportContractError::ExpiredPinLease)
+    );
+
+    let mut wrong_device = pins.acquire_response.clone();
+    let GenerationPinLeaseAcquireResponse::Granted { lease, .. } = &mut wrong_device else {
+        panic!("granted fixture");
+    };
+    lease.device_scope_id = "another-device".to_string();
+    assert_eq!(
+        wrong_device.validate_against(&pins.acquire_request, &capability),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+
+    let crossed_request = GenerationPinLeaseAcquireRequest {
+        operation_id: "pin-acquire-op-crossed".to_string(),
+        device_scope_id: "crossed-device".to_string(),
+        requested_lease_seconds: 600,
+        fallback_policy: GenerationPinFallbackPolicy::UseLatestRetained,
+        ..pins.acquire_request.clone()
+    };
+    assert_eq!(
+        pins.acquire_response
+            .validate_against(&crossed_request, &capability),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+    assert_eq!(
+        pins.quota_unavailable
+            .validate_against(&crossed_request, &capability),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+
+    let mut renewal_retarget = pins.renewal.clone();
+    renewal_retarget.lease.source_connection_id = SourceConnectionId::new("source-crossed");
+    renewal_retarget.lease.generation_id = SourceGenerationId::new("generation-crossed").unwrap();
+    assert_eq!(
+        renewal_retarget.validate_against(&pins.renew_request, &capability),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+
+    let fallback_request = GenerationPinLeaseAcquireRequest {
+        fallback_policy: GenerationPinFallbackPolicy::UseLatestRetained,
+        ..pins.acquire_request.clone()
+    };
+    let mut fallback_response = pins.acquire_response.clone();
+    let GenerationPinLeaseAcquireResponse::Granted {
+        fallback_applied,
+        fallback_policy,
+        lease,
+        ..
+    } = &mut fallback_response
+    else {
+        panic!("granted fixture");
+    };
+    *fallback_applied = true;
+    *fallback_policy = GenerationPinFallbackPolicy::UseLatestRetained;
+    lease.generation_id = SourceGenerationId::new("generation-0009").unwrap();
+    fallback_response
+        .validate_against(&fallback_request, &capability)
+        .expect("newer retained generation remains pinned");
+
+    let unsafe_fallback = GenerationPinLeaseAcquireRequest {
+        fallback_policy: GenerationPinFallbackPolicy::RequireExact,
+        ..fallback_request
+    };
+    assert_eq!(
+        fallback_response.validate_against(&unsafe_fallback, &capability),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+}
+
+#[test]
+fn pin_responses_are_bounded_by_the_exact_selected_capability() {
+    let pins: PinLeaseGolden = serde_json::from_slice(GENERATION_PIN_LEASE_V1_GOLDEN_JSON).unwrap();
+    let capability = pin_capability();
+
+    let duration_selection = GenerationPinLeaseCapability {
+        max_lease_seconds: 600,
+        ..capability.clone()
+    };
+    assert_eq!(
+        pins.acquire_response
+            .validate_against(&pins.acquire_request, &duration_selection),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+    assert_eq!(
+        pins.quota_unavailable
+            .validate_against(&pins.acquire_request, &duration_selection),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+    assert_eq!(
+        pins.renewal
+            .validate_against(&pins.renew_request, &duration_selection),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+
+    let quota_selection = GenerationPinLeaseCapability {
+        max_active_leases_per_device: 4,
+        ..capability.clone()
+    };
+    assert_eq!(
+        pins.acquire_response
+            .validate_against(&pins.acquire_request, &quota_selection),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+    assert_eq!(
+        pins.renewal
+            .validate_against(&pins.renew_request, &quota_selection),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+    let mut active_quota_overflow = pins.acquire_response.clone();
+    let GenerationPinLeaseAcquireResponse::Granted { lease, .. } = &mut active_quota_overflow
+    else {
+        panic!("granted fixture");
+    };
+    lease.active_leases_for_device = 5;
+    lease.max_active_leases_per_device = 5;
+    assert_eq!(
+        active_quota_overflow.validate_against(&pins.acquire_request, &quota_selection),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+
+    let fallback_request = GenerationPinLeaseAcquireRequest {
+        fallback_policy: GenerationPinFallbackPolicy::UseLatestRetained,
+        ..pins.acquire_request.clone()
+    };
+    let mut fallback_response = pins.acquire_response.clone();
+    let GenerationPinLeaseAcquireResponse::Granted {
+        fallback_applied,
+        fallback_policy,
+        lease,
+        ..
+    } = &mut fallback_response
+    else {
+        panic!("granted fixture");
+    };
+    *fallback_applied = true;
+    *fallback_policy = GenerationPinFallbackPolicy::UseLatestRetained;
+    lease.generation_id = SourceGenerationId::new("generation-0009").unwrap();
+    let exact_only_selection = GenerationPinLeaseCapability {
+        fallback_policies: vec![GenerationPinFallbackPolicy::RequireExact],
+        ..capability
+    };
+    assert_eq!(
+        fallback_response.validate_against(&fallback_request, &exact_only_selection),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+    let mut unavailable_fallback = pins.quota_unavailable.clone();
+    let GenerationPinLeaseAcquireResponse::Unavailable {
+        fallback_policy, ..
+    } = &mut unavailable_fallback
+    else {
+        panic!("unavailable fixture");
+    };
+    *fallback_policy = GenerationPinFallbackPolicy::UseLatestRetained;
+    assert_eq!(
+        unavailable_fallback.validate_against(&fallback_request, &exact_only_selection),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+}
+
+#[test]
+fn terminal_windows_must_end_exactly_at_content_length() {
+    let request = GenerationBodyWindowRequest {
+        format_version: 1,
+        minimum_reader_version: 1,
+        delta_id: "delta-empty-check".to_string(),
+        terminal_receipt_sha256:
+            "sha256:3ec8d4089470a2e4620d65c03a01635c028200982c94dfbc2e34eac95e2370b1".to_string(),
+        content: GenerationFileIdentity {
+            projection_id: ProjectionId::new("projection-a"),
+            logical_path: LogicalPath::new("file.md").unwrap(),
+            content_version_id: ContentVersionId::new("content-a"),
+            content_sha256:
+                "sha256:7509e5bda0c762d2bac7f90d758b5b2263fa01ccbc542ab5e3df163be08e6ca9"
+                    .to_string(),
+            byte_length: 12,
+        },
+        offset: 8,
+        max_bytes: 8,
+    };
+    let metadata = GenerationBodyWindowMetadata {
+        format_version: 1,
+        minimum_reader_version: 1,
+        delta_id: request.delta_id.clone(),
+        terminal_receipt_sha256: request.terminal_receipt_sha256.clone(),
+        content: request.content.clone(),
+        range: GenerationBodyRange {
+            offset: 8,
+            length: 4,
+            complete: true,
+        },
+        window_sha256: "sha256:0f75130f1d4d2f3d788ec780452cb5327299f550e3fcf01dd7a6cf6d2f452076"
+            .to_string(),
+    };
+    metadata.validate_against(&request).expect("terminal range");
+}

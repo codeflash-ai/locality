@@ -1,0 +1,17 @@
+{
+  "format_version": 1,
+  "minimum_reader_version": 1,
+  "body_windows": {
+    "max_window_bytes": 1048576
+  },
+  "terminal_receipt_acknowledgments": true,
+  "generation_pin_leases": {
+    "min_lease_seconds": 300,
+    "max_lease_seconds": 3600,
+    "max_active_leases_per_device": 8,
+    "fallback_policies": [
+      "require_exact",
+      "use_latest_retained"
+    ]
+  }
+}

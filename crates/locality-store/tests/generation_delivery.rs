@@ -13,13 +13,18 @@ use locality_protocol::freshness_delivery::{
     FRESHNESS_DELIVERY_READER_VERSION, GENERATION_DELTA_FORMAT_VERSION, GenerationDelta,
     GenerationDeltaEntry, GenerationDeltaTerminalReceipt, GenerationFileIdentity,
 };
+use locality_protocol::freshness_delivery_transport::{
+    GenerationBodyWindowCapability, GenerationPinFallbackPolicy, GenerationPinLeaseCapability,
+    GenerationTransportCapabilities,
+};
 use locality_protocol::workspace_layout::LayoutDigest;
 use locality_store::{
     ConnectionId, GenerationApplyOutcome, GenerationApplyStatus, GenerationDeliveryRepository,
     GenerationInodeEvidenceConflictUpdate, GenerationInodeEvidenceRecord,
     GenerationInodeEvidenceResolution, GenerationPathRecord, GenerationPathState,
-    GenerationRetainedInodeRecord, MountConfig, MountRepository, ObservedGenerationRecord,
-    PreparedGenerationApply, SqliteStateStore, StoreError,
+    GenerationRetainedInodeRecord, GenerationTransportSelectionBinding, MountConfig,
+    MountRepository, ObservedGenerationRecord, PreparedGenerationApply, PreparedGenerationApplyV2,
+    PreparedGenerationApplyV3, SqliteStateStore, StoreError,
 };
 
 fn digest(character: char) -> String {
@@ -229,6 +234,505 @@ fn observed_generation_apply_is_persisted_exact_replayable_and_atomic() {
             .list_active_generation_applies()
             .unwrap()
             .is_empty()
+    );
+}
+
+#[test]
+fn completed_required_acknowledgment_is_durable_exact_and_idempotent() {
+    let fixture = Fixture::new("durable-acknowledgment");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let delta = delta();
+    let receipt = receipt(&delta);
+    let receipt_sha256 = receipt.canonical_sha256().unwrap();
+    store
+        .reserve_generation_apply_v2(PreparedGenerationApplyV2::new(
+            PreparedGenerationApply {
+                delta: delta.clone(),
+                receipt,
+                receipt_sha256: receipt_sha256.clone(),
+                stage_root: "generation-delivery/durable-ack".to_string(),
+                created_at: "2026-07-31T12:01:00Z".to_string(),
+            },
+            true,
+        ))
+        .unwrap();
+    store
+        .record_generation_apply_outcome(
+            &delta.delta_id,
+            0,
+            GenerationApplyOutcome::Applied,
+            "2026-07-31T12:02:00Z",
+        )
+        .unwrap();
+    store
+        .complete_generation_apply(&delta.delta_id, "2026-07-31T12:03:00Z")
+        .unwrap();
+    drop(store);
+
+    let mut reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    let pending = reopened
+        .list_pending_generation_acknowledgments(&fixture.mount_id)
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].receipt_sha256, receipt_sha256);
+    let reset_error = reopened
+        .clear_mount_source_state(&fixture.mount_id)
+        .expect_err("pending terminal acknowledgment must fence source reset");
+    assert!(matches!(reset_error, StoreError::InvalidState(_)));
+    assert!(
+        reopened
+            .mark_generation_acknowledged(&delta.delta_id, &digest('f'), "2026-07-31T12:04:00Z",)
+            .is_err()
+    );
+    let acknowledged = reopened
+        .mark_generation_acknowledged(&delta.delta_id, &receipt_sha256, "2026-07-31T12:04:00Z")
+        .unwrap();
+    assert_eq!(
+        reopened
+            .mark_generation_acknowledged(&delta.delta_id, &receipt_sha256, "2026-07-31T12:05:00Z",)
+            .unwrap(),
+        acknowledged
+    );
+    assert!(
+        reopened
+            .list_pending_generation_acknowledgments(&fixture.mount_id)
+            .unwrap()
+            .is_empty()
+    );
+    reopened
+        .clear_mount_source_state(&fixture.mount_id)
+        .expect("acknowledged clean lineage may be retired");
+}
+
+#[test]
+fn complete_negotiated_transport_selection_is_immutable_and_survives_reopen() {
+    let fixture = Fixture::new("durable-complete-transport-selection");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let delta = delta();
+    let receipt = receipt(&delta);
+    let prepared = PreparedGenerationApply {
+        delta: delta.clone(),
+        receipt: receipt.clone(),
+        receipt_sha256: receipt.canonical_sha256().unwrap(),
+        stage_root: "generation-delivery/selection".to_string(),
+        created_at: "2026-07-31T12:01:00Z".to_string(),
+    };
+    let selected = GenerationTransportCapabilities {
+        body_windows: Some(GenerationBodyWindowCapability {
+            max_window_bytes: 256 * 1024,
+        }),
+        terminal_receipt_acknowledgments: true,
+        generation_pin_leases: Some(GenerationPinLeaseCapability {
+            min_lease_seconds: 60,
+            max_lease_seconds: 900,
+            max_active_leases_per_device: 8,
+            fallback_policies: vec![
+                GenerationPinFallbackPolicy::RequireExact,
+                GenerationPinFallbackPolicy::UseLatestRetained,
+            ],
+        }),
+        ..GenerationTransportCapabilities::legacy()
+    };
+    store
+        .reserve_generation_apply_v3(PreparedGenerationApplyV3::new(
+            prepared.clone(),
+            selected.clone(),
+        ))
+        .unwrap();
+    drop(store);
+
+    let mut reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    let stored = reopened
+        .get_generation_apply_v2(&delta.delta_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.selection_binding,
+        GenerationTransportSelectionBinding::Bound(selected.clone())
+    );
+
+    let mut changed = selected;
+    changed.body_windows.as_mut().unwrap().max_window_bytes /= 2;
+    assert!(
+        reopened
+            .reserve_generation_apply_v3(PreparedGenerationApplyV3::new(prepared, changed))
+            .is_err()
+    );
+}
+
+#[test]
+fn schema_24_component_v3_migrates_existing_journals_without_pending_acknowledgments() {
+    use rusqlite::Connection;
+
+    let fixture = Fixture::new("migration-v24-component-v3");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let delta = delta();
+    let receipt = receipt(&delta);
+    store
+        .reserve_generation_apply(PreparedGenerationApply {
+            delta: delta.clone(),
+            receipt: receipt.clone(),
+            receipt_sha256: receipt.canonical_sha256().unwrap(),
+            stage_root: "generation-delivery/prior-v3".to_string(),
+            created_at: "2026-07-31T12:01:00Z".to_string(),
+        })
+        .unwrap();
+    store
+        .record_generation_apply_outcome(
+            &delta.delta_id,
+            0,
+            GenerationApplyOutcome::Applied,
+            "2026-07-31T12:02:00Z",
+        )
+        .unwrap();
+    store
+        .complete_generation_apply(&delta.delta_id, "2026-07-31T12:03:00Z")
+        .unwrap();
+    let db_path = store.db_path.clone();
+    drop(store);
+
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE generation_apply_journals DROP COLUMN acknowledged_at;
+             ALTER TABLE generation_apply_journals DROP COLUMN acknowledgment_required;
+             ALTER TABLE generation_apply_journals DROP COLUMN selected_capabilities_json;
+             ALTER TABLE generation_apply_journals DROP COLUMN selection_binding;
+             UPDATE state_components
+             SET version = 3, min_reader_version = 3
+             WHERE component_id = 'durable:generation_delivery';
+             UPDATE state_components SET version = 24
+             WHERE component_id = 'core:schema';
+             PRAGMA user_version = 24;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    let journal = reopened
+        .get_generation_apply(&delta.delta_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(journal.delta.delta_id, delta.delta_id);
+    assert_eq!(
+        reopened
+            .get_generation_apply_v2(&delta.delta_id)
+            .unwrap()
+            .unwrap()
+            .selection_binding,
+        GenerationTransportSelectionBinding::Bound(GenerationTransportCapabilities::legacy())
+    );
+    assert!(
+        reopened
+            .list_pending_generation_acknowledgments(&fixture.mount_id)
+            .unwrap()
+            .is_empty()
+    );
+    let connection = Connection::open(&db_path).unwrap();
+    let component: (i64, i64) = connection
+        .query_row(
+            "SELECT version, min_reader_version FROM state_components
+             WHERE component_id = 'durable:generation_delivery'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(component, (6, 6));
+    assert_eq!(user_version, 26);
+}
+
+#[test]
+fn schema_25_completed_acknowledgment_migrates_without_inventing_selection() {
+    use rusqlite::Connection;
+
+    let fixture = Fixture::new("migration-v25-component-v4-pending-ack");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let delta = delta();
+    let receipt = receipt(&delta);
+    store
+        .reserve_generation_apply_v2(PreparedGenerationApplyV2::new(
+            PreparedGenerationApply {
+                delta: delta.clone(),
+                receipt: receipt.clone(),
+                receipt_sha256: receipt.canonical_sha256().unwrap(),
+                stage_root: "generation-delivery/prior-v4-ack".to_string(),
+                created_at: "2026-07-31T12:01:00Z".to_string(),
+            },
+            true,
+        ))
+        .unwrap();
+    store
+        .record_generation_apply_outcome(
+            &delta.delta_id,
+            0,
+            GenerationApplyOutcome::Applied,
+            "2026-07-31T12:02:00Z",
+        )
+        .unwrap();
+    store
+        .complete_generation_apply(&delta.delta_id, "2026-07-31T12:03:00Z")
+        .unwrap();
+    let db_path = store.db_path.clone();
+    drop(store);
+
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE generation_apply_journals DROP COLUMN selected_capabilities_json;
+             ALTER TABLE generation_apply_journals DROP COLUMN selection_binding;
+             UPDATE state_components
+             SET version = 4, min_reader_version = 4
+             WHERE component_id = 'durable:generation_delivery';
+             UPDATE state_components SET version = 25
+             WHERE component_id = 'core:schema';
+             PRAGMA user_version = 25;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    let selection_binding = reopened
+        .get_generation_apply_v2(&delta.delta_id)
+        .unwrap()
+        .unwrap()
+        .selection_binding;
+    assert_eq!(
+        selection_binding,
+        GenerationTransportSelectionBinding::PreBindingCompleted {
+            terminal_receipt_acknowledgments: true,
+        }
+    );
+    assert_eq!(
+        reopened
+            .list_pending_generation_acknowledgments(&fixture.mount_id)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let replay = reopened
+        .reserve_generation_apply_v3(PreparedGenerationApplyV3::new(
+            PreparedGenerationApply {
+                delta: delta.clone(),
+                receipt: receipt.clone(),
+                receipt_sha256: receipt.canonical_sha256().unwrap(),
+                stage_root: "generation-delivery/prior-v4-ack".to_string(),
+                created_at: "2026-07-31T12:01:00Z".to_string(),
+            },
+            GenerationTransportCapabilities {
+                body_windows: Some(GenerationBodyWindowCapability {
+                    max_window_bytes: 64 * 1024,
+                }),
+                ..GenerationTransportCapabilities::legacy()
+            },
+        ))
+        .expect("completed pre-binding replay must not renegotiate or mismatch");
+    assert_eq!(replay.selection_binding, selection_binding);
+}
+
+#[test]
+fn schema_25_active_nonlegacy_apply_fails_atomically_and_retry_preserves_v25() {
+    use rusqlite::Connection;
+
+    let fixture = Fixture::new("migration-v25-active-nonlegacy");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let delta = delta();
+    let receipt = receipt(&delta);
+    let selected = GenerationTransportCapabilities {
+        body_windows: Some(GenerationBodyWindowCapability {
+            max_window_bytes: 64 * 1024,
+        }),
+        terminal_receipt_acknowledgments: true,
+        generation_pin_leases: Some(GenerationPinLeaseCapability {
+            min_lease_seconds: 60,
+            max_lease_seconds: 600,
+            max_active_leases_per_device: 4,
+            fallback_policies: vec![GenerationPinFallbackPolicy::RequireExact],
+        }),
+        ..GenerationTransportCapabilities::legacy()
+    };
+    store
+        .reserve_generation_apply_v3(PreparedGenerationApplyV3::new(
+            PreparedGenerationApply {
+                delta: delta.clone(),
+                receipt: receipt.clone(),
+                receipt_sha256: receipt.canonical_sha256().unwrap(),
+                stage_root: "generation-delivery/v25-active".to_string(),
+                created_at: "2026-07-31T12:01:00Z".to_string(),
+            },
+            selected,
+        ))
+        .unwrap();
+    store
+        .mark_generation_apply_started(&delta.delta_id, "2026-07-31T12:01:30Z")
+        .unwrap();
+    let db_path = store.db_path.clone();
+    drop(store);
+
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE generation_apply_journals DROP COLUMN selected_capabilities_json;
+             ALTER TABLE generation_apply_journals DROP COLUMN selection_binding;
+             UPDATE state_components
+             SET version = 4, min_reader_version = 4
+             WHERE component_id = 'durable:generation_delivery';
+             UPDATE state_components SET version = 25
+             WHERE component_id = 'core:schema';
+             PRAGMA user_version = 25;",
+        )
+        .unwrap();
+    drop(connection);
+
+    for _ in 0..2 {
+        let error = SqliteStateStore::open(fixture.state_root.clone())
+            .expect_err("ambiguous active v25 selection must block migration");
+        assert!(
+            error
+                .to_string()
+                .contains("has no complete immutable transport selection")
+        );
+        let connection = Connection::open(&db_path).unwrap();
+        let user_version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        let component: (i64, i64) = connection
+            .query_row(
+                "SELECT version, min_reader_version FROM state_components
+                 WHERE component_id = 'durable:generation_delivery'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let selection_columns: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('generation_apply_journals')
+                 WHERE name IN ('selected_capabilities_json', 'selection_binding')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(user_version, 25);
+        assert_eq!(component, (4, 4));
+        assert_eq!(selection_columns, 0, "failed migration must roll back");
+    }
+
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE generation_apply_journals
+             ADD COLUMN selected_capabilities_json TEXT NOT NULL DEFAULT '{}';
+             UPDATE generation_apply_journals
+             SET selected_capabilities_json =
+                 '{\"format_version\":1,\"minimum_reader_version\":1,\"terminal_receipt_acknowledgments\":true}';
+             UPDATE state_components
+             SET version = 5, min_reader_version = 5
+             WHERE component_id = 'durable:generation_delivery';
+             UPDATE state_components SET version = 26
+             WHERE component_id = 'core:schema';
+             PRAGMA user_version = 26;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = SqliteStateStore::open(fixture.state_root.clone())
+        .expect_err("prerelease v26 ack-only backfill remains ambiguous");
+    assert!(
+        error
+            .to_string()
+            .contains("has no complete immutable transport selection")
+    );
+    let connection = Connection::open(&db_path).unwrap();
+    let component: (i64, i64) = connection
+        .query_row(
+            "SELECT version, min_reader_version FROM state_components
+             WHERE component_id = 'durable:generation_delivery'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let binding_columns: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('generation_apply_journals')
+             WHERE name = 'selection_binding'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(component, (5, 5));
+    assert_eq!(binding_columns, 0, "component-v6 migration must roll back");
+}
+
+#[test]
+fn prerelease_v26_active_nonlegacy_selection_is_faithfully_recovered() {
+    use rusqlite::Connection;
+
+    let fixture = Fixture::new("migration-prerelease-v26-active-nonlegacy");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let delta = delta();
+    let receipt = receipt(&delta);
+    let prepared = PreparedGenerationApply {
+        delta: delta.clone(),
+        receipt: receipt.clone(),
+        receipt_sha256: receipt.canonical_sha256().unwrap(),
+        stage_root: "generation-delivery/v26-active".to_string(),
+        created_at: "2026-07-31T12:01:00Z".to_string(),
+    };
+    let selected = GenerationTransportCapabilities {
+        body_windows: Some(GenerationBodyWindowCapability {
+            max_window_bytes: 64 * 1024,
+        }),
+        generation_pin_leases: Some(GenerationPinLeaseCapability {
+            min_lease_seconds: 60,
+            max_lease_seconds: 600,
+            max_active_leases_per_device: 4,
+            fallback_policies: vec![GenerationPinFallbackPolicy::RequireExact],
+        }),
+        ..GenerationTransportCapabilities::legacy()
+    };
+    store
+        .reserve_generation_apply_v3(PreparedGenerationApplyV3::new(
+            prepared.clone(),
+            selected.clone(),
+        ))
+        .unwrap();
+    let db_path = store.db_path.clone();
+    drop(store);
+
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE generation_apply_journals DROP COLUMN selection_binding;
+             UPDATE state_components
+             SET version = 5, min_reader_version = 5
+             WHERE component_id = 'durable:generation_delivery';",
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    let stored = reopened
+        .get_generation_apply_v2(&delta.delta_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.selection_binding,
+        GenerationTransportSelectionBinding::Bound(selected.clone())
+    );
+    assert_eq!(
+        reopened
+            .reserve_generation_apply_v3(PreparedGenerationApplyV3::new(prepared, selected))
+            .unwrap(),
+        stored
     );
 }
 
@@ -805,7 +1309,7 @@ fn schema_20_migration_preserves_pending_local_state_and_adds_delivery_tables() 
         fs::read(fixture.mount_root.join("dirty.md")).unwrap(),
         b"local pending bytes"
     );
-    assert_eq!(SqliteStateStore::current_schema_version(), 25);
+    assert_eq!(SqliteStateStore::current_schema_version(), 26);
     assert!(
         reopened
             .get_observed_generation(&fixture.mount_id)
@@ -874,7 +1378,7 @@ fn genuine_schema_21_component_v1_fixture_migrates_without_losing_active_state()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(component, (5, 5));
+    assert_eq!(component, (6, 6));
     let error = reopened
         .clear_mount_source_state(&fixture.mount_id)
         .expect_err("migrated active journal must fence source reset");
@@ -885,7 +1389,7 @@ fn genuine_schema_21_component_v1_fixture_migrates_without_losing_active_state()
 fn current_schema_generation_v3_migrates_dual_inode_evidence_and_tombstone_columns() {
     use rusqlite::Connection;
 
-    let fixture = Fixture::new("generation-v3-to-v5");
+    let fixture = Fixture::new("generation-v3-to-v6");
     let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
     seed(&mut store, &fixture);
     let db_path = store.db_path.clone();
@@ -927,7 +1431,7 @@ fn current_schema_generation_v3_migrates_dual_inode_evidence_and_tombstone_colum
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(present, "v5 migration did not add {column}");
+        assert!(present, "v6 migration did not add {column}");
     }
     let component: (i64, i64) = connection
         .query_row(
@@ -937,14 +1441,14 @@ fn current_schema_generation_v3_migrates_dual_inode_evidence_and_tombstone_colum
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(component, (5, 5));
+    assert_eq!(component, (6, 6));
 }
 
 #[test]
-fn partial_v2_v5_generation_migration_is_atomic_and_resumable_per_column() {
+fn partial_v2_v6_generation_migration_is_atomic_and_resumable_per_column() {
     use rusqlite::Connection;
 
-    let fixture = Fixture::new("partial-v2-v3-migration");
+    let fixture = Fixture::new("partial-v2-v6-migration");
     let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
     seed(&mut store, &fixture);
     let db_path = store.db_path.clone();
@@ -1051,8 +1555,8 @@ fn partial_v2_v5_generation_migration_is_atomic_and_resumable_per_column() {
     let user_version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(component, (5, 5));
-    assert_eq!(user_version, 25);
+    assert_eq!(component, (6, 6));
+    assert_eq!(user_version, 26);
     assert_eq!(
         reopened.list_generation_paths(&fixture.mount_id).unwrap()[0].local_logical_path,
         "Roadmap.md"

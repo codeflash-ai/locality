@@ -7,10 +7,12 @@ use locality_protocol::freshness_delivery::{
     FRESHNESS_HEALTH_V1_GOLDEN_JSON, FreshnessDeliveryError, FreshnessHealth, FreshnessReasonCode,
     FreshnessRetry, FreshnessRetryClass, GENERATION_DELTA_FORMAT_VERSION,
     GENERATION_DELTA_PREIMAGE_V1_GOLDEN_JSON, GENERATION_DELTA_RECEIPT_V1_GOLDEN_JSON,
-    GENERATION_DELTA_V1_GOLDEN_JSON, GenerationDelta, GenerationDeltaEntry,
-    GenerationDeltaTerminalReceipt, GenerationFileIdentity, MAX_GENERATION_DELTA_CONTENT_BYTES,
+    GENERATION_DELTA_V1_GOLDEN_JSON, GENERATION_TARGET_INVENTORY_V1_VECTORS_JSON, GenerationDelta,
+    GenerationDeltaEntry, GenerationDeltaTerminalReceipt, GenerationFileIdentity,
+    MAX_GENERATION_DELTA_CONTENT_BYTES, MAX_GENERATION_DELTA_METADATA_BYTES,
     MAX_GENERATION_FILE_BYTES, ProviderHealth, ProviderHealthState, ProviderWorkerProgress,
-    PublicationGenerationHealth, PublicationGenerationState,
+    PublicationGenerationHealth, PublicationGenerationState, canonical_target_inventory_preimage,
+    canonical_target_inventory_sha256,
 };
 use locality_protocol::workspace_layout::LayoutDigest;
 use locality_protocol::{FreshnessEpoch, ScopeFreshnessEpochs};
@@ -190,6 +192,14 @@ struct PreimageGolden {
     terminal_receipt_sha256: String,
 }
 
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+struct TargetInventoryVector {
+    name: String,
+    inventory: Vec<GenerationFileIdentity>,
+    preimage_hex: String,
+    sha256: String,
+}
+
 #[test]
 fn canonical_delivery_values_match_exact_lf_goldens() {
     let health = health();
@@ -229,6 +239,69 @@ fn canonical_delivery_values_match_exact_lf_goldens() {
     assert_eq!(
         pretty_json(&decoded_preimage),
         GENERATION_DELTA_PREIMAGE_V1_GOLDEN_JSON
+    );
+}
+
+#[test]
+fn canonical_target_inventory_matches_cross_implementation_vectors() {
+    let vectors: Vec<TargetInventoryVector> =
+        serde_json::from_slice(GENERATION_TARGET_INVENTORY_V1_VECTORS_JSON)
+            .expect("target inventory vectors");
+    assert_eq!(
+        vectors
+            .iter()
+            .map(|vector| vector.name.as_str())
+            .collect::<Vec<_>>(),
+        ["empty", "single_ascii", "multi_unicode_and_boundaries"]
+    );
+    for vector in vectors {
+        let preimage = canonical_target_inventory_preimage(&vector.inventory)
+            .unwrap_or_else(|error| panic!("{} preimage failed: {error}", vector.name));
+        assert_eq!(
+            hex(&preimage),
+            vector.preimage_hex,
+            "{} preimage",
+            vector.name
+        );
+        assert_eq!(
+            canonical_target_inventory_sha256(&vector.inventory).unwrap(),
+            vector.sha256,
+            "{} digest",
+            vector.name
+        );
+    }
+}
+
+#[test]
+fn target_inventory_digest_rejects_reorder_collision_and_substitution() {
+    let mut inventory = vec![
+        identity("projection-a", "Docs/A.md", "content-a", '1', 1),
+        identity("projection-b", "Docs/B.md", "content-b", '2', 2),
+    ];
+    let mut candidate = delta();
+    candidate.target_inventory_sha256 = canonical_target_inventory_sha256(&inventory).unwrap();
+    candidate
+        .validate_target_inventory(&inventory)
+        .expect("exact target inventory");
+
+    inventory.swap(0, 1);
+    assert_eq!(
+        canonical_target_inventory_sha256(&inventory),
+        Err(FreshnessDeliveryError::NonCanonicalTargetInventoryOrder)
+    );
+
+    inventory.swap(0, 1);
+    inventory[1].logical_path = LogicalPath::new("docs/a.MD").unwrap();
+    assert_eq!(
+        canonical_target_inventory_sha256(&inventory),
+        Err(FreshnessDeliveryError::TargetInventoryPathReuse)
+    );
+
+    inventory[1].logical_path = LogicalPath::new("Docs/B.md").unwrap();
+    inventory[1].content_version_id = ContentVersionId::new("substituted");
+    assert_eq!(
+        candidate.validate_target_inventory(&inventory),
+        Err(FreshnessDeliveryError::TargetInventoryMismatch)
     );
 }
 
@@ -402,4 +475,30 @@ fn empty_delta_advances_generation_and_content_limits_are_bounded() {
         oversized_delta.validate(),
         Err(FreshnessDeliveryError::DeltaContentTooLarge { .. })
     ));
+}
+
+#[test]
+fn structurally_valid_delta_rejects_oversized_exact_json_metadata() {
+    let mut oversized = delta();
+    let escaped_id_tail = "\0".repeat(123);
+    let escaped_content_id = "\0".repeat(128);
+    oversized.entries = (0..42_000)
+        .map(|index| GenerationDeltaEntry {
+            old: None,
+            new: Some(identity(
+                &format!("{index:05}{escaped_id_tail}"),
+                &format!("file-{index:05}"),
+                &escaped_content_id,
+                '3',
+                1,
+            )),
+        })
+        .collect();
+
+    let actual = oversized.serialized_metadata_len().unwrap();
+    assert!(actual > MAX_GENERATION_DELTA_METADATA_BYTES);
+    assert_eq!(
+        oversized.validate(),
+        Err(FreshnessDeliveryError::DeltaMetadataTooLarge { actual })
+    );
 }

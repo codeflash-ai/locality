@@ -9,11 +9,12 @@ use locality_core::portable::{ProjectionId, SourceConnectionId, SourceGeneration
 use locality_protocol::freshness_delivery::{
     GenerationDelta, GenerationDeltaTerminalReceipt, GenerationFileIdentity,
 };
+use locality_protocol::freshness_delivery_transport::GenerationTransportCapabilities;
 use serde::{Deserialize, Serialize};
 
 use crate::{StoreError, StoreResult};
 
-pub const GENERATION_DELIVERY_COMPONENT_VERSION: i64 = 5;
+pub const GENERATION_DELIVERY_COMPONENT_VERSION: i64 = 6;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservedGenerationRecord {
@@ -142,6 +143,43 @@ impl PreparedGenerationApply {
     }
 }
 
+/// Additive reservation envelope for delivery capabilities that need durable
+/// state beyond the original generation-apply repository contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedGenerationApplyV2 {
+    pub apply: PreparedGenerationApply,
+    pub acknowledgment_required: bool,
+}
+
+impl PreparedGenerationApplyV2 {
+    pub const fn new(apply: PreparedGenerationApply, acknowledgment_required: bool) -> Self {
+        Self {
+            apply,
+            acknowledgment_required,
+        }
+    }
+}
+
+/// Reservation envelope that durably binds the complete authenticated server
+/// selection. The selection controls every replay of this apply.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedGenerationApplyV3 {
+    pub apply: PreparedGenerationApply,
+    pub selected_capabilities: GenerationTransportCapabilities,
+}
+
+impl PreparedGenerationApplyV3 {
+    pub const fn new(
+        apply: PreparedGenerationApply,
+        selected_capabilities: GenerationTransportCapabilities,
+    ) -> Self {
+        Self {
+            apply,
+            selected_capabilities,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GenerationApplyJournalRecord {
     pub delta: GenerationDelta,
@@ -153,6 +191,43 @@ pub struct GenerationApplyJournalRecord {
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
+}
+
+/// Additive journal view containing either the immutable negotiated transport
+/// selection or the explicit terminal-only compatibility state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NegotiatedGenerationApplyJournalRecord {
+    pub apply: GenerationApplyJournalRecord,
+    pub selection_binding: GenerationTransportSelectionBinding,
+}
+
+/// Whether a journal has a complete authenticated transport selection. A
+/// pre-binding journal is legal only after completion: replay is an exact
+/// delta/receipt no-op and only its recorded acknowledgment bit remains live.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GenerationTransportSelectionBinding {
+    Bound(GenerationTransportCapabilities),
+    PreBindingCompleted {
+        terminal_receipt_acknowledgments: bool,
+    },
+}
+
+impl GenerationTransportSelectionBinding {
+    pub fn selected_capabilities(&self) -> Option<&GenerationTransportCapabilities> {
+        match self {
+            Self::Bound(capabilities) => Some(capabilities),
+            Self::PreBindingCompleted { .. } => None,
+        }
+    }
+
+    pub const fn terminal_receipt_acknowledgments(&self) -> bool {
+        match self {
+            Self::Bound(capabilities) => capabilities.terminal_receipt_acknowledgments,
+            Self::PreBindingCompleted {
+                terminal_receipt_acknowledgments,
+            } => *terminal_receipt_acknowledgments,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -237,6 +312,42 @@ pub trait GenerationDeliveryRepository {
         prepared: PreparedGenerationApply,
     ) -> StoreResult<GenerationApplyJournalRecord>;
 
+    /// Additive V2 reservation. Legacy repositories safely support only
+    /// reservations that do not require a durable terminal acknowledgment.
+    fn reserve_generation_apply_v2(
+        &mut self,
+        prepared: PreparedGenerationApplyV2,
+    ) -> StoreResult<GenerationApplyJournalRecord> {
+        if prepared.acknowledgment_required {
+            return Err(StoreError::InvalidState(
+                "generation repository does not support durable terminal acknowledgments"
+                    .to_string(),
+            ));
+        }
+        self.reserve_generation_apply(prepared.apply)
+    }
+
+    /// Additive V3 reservation. Legacy repositories may safely accept only the
+    /// legacy selection, which requires no negotiated durable behavior.
+    fn reserve_generation_apply_v3(
+        &mut self,
+        prepared: PreparedGenerationApplyV3,
+    ) -> StoreResult<NegotiatedGenerationApplyJournalRecord> {
+        if prepared.selected_capabilities != GenerationTransportCapabilities::legacy() {
+            return Err(StoreError::InvalidState(
+                "generation repository does not support durable transport selection".to_string(),
+            ));
+        }
+        self.reserve_generation_apply(prepared.apply).map(|apply| {
+            NegotiatedGenerationApplyJournalRecord {
+                apply,
+                selection_binding: GenerationTransportSelectionBinding::Bound(
+                    GenerationTransportCapabilities::legacy(),
+                ),
+            }
+        })
+    }
+
     fn mark_generation_apply_started(
         &mut self,
         delta_id: &str,
@@ -256,11 +367,44 @@ pub trait GenerationDeliveryRepository {
         delta_id: &str,
     ) -> StoreResult<Option<GenerationApplyJournalRecord>>;
 
+    fn get_generation_apply_v2(
+        &self,
+        delta_id: &str,
+    ) -> StoreResult<Option<NegotiatedGenerationApplyJournalRecord>> {
+        self.get_generation_apply(delta_id).map(|journal| {
+            journal.map(|apply| NegotiatedGenerationApplyJournalRecord {
+                apply,
+                selection_binding: GenerationTransportSelectionBinding::Bound(
+                    GenerationTransportCapabilities::legacy(),
+                ),
+            })
+        })
+    }
+
     fn list_active_generation_applies(&self) -> StoreResult<Vec<GenerationApplyJournalRecord>>;
 
     /// Lists active and completed journals so the staging owner can reconcile
     /// retained conflict evidence and discard non-live payloads.
     fn list_generation_applies(&self) -> StoreResult<Vec<GenerationApplyJournalRecord>>;
+
+    /// Completed acknowledgments are replayed before polling for another delta.
+    fn list_pending_generation_acknowledgments(
+        &self,
+        _mount_id: &MountId,
+    ) -> StoreResult<Vec<GenerationApplyJournalRecord>> {
+        Ok(Vec::new())
+    }
+
+    fn mark_generation_acknowledged(
+        &mut self,
+        _delta_id: &str,
+        _receipt_sha256: &str,
+        _acknowledged_at: &str,
+    ) -> StoreResult<GenerationApplyJournalRecord> {
+        Err(StoreError::InvalidState(
+            "generation repository does not support durable terminal acknowledgments".to_string(),
+        ))
+    }
 
     fn record_generation_inode_evidence(
         &mut self,

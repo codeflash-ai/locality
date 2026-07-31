@@ -19,11 +19,21 @@ use locality_core::portable::{LogicalPath, SourceConnectionId, SourceGenerationI
 use locality_protocol::freshness_delivery::{
     GenerationDelta, GenerationDeltaEntry, GenerationDeltaTerminalReceipt, GenerationFileIdentity,
 };
+use locality_protocol::freshness_delivery_transport::{
+    GENERATION_TRANSPORT_FORMAT_VERSION, GENERATION_TRANSPORT_READER_VERSION,
+    GenerationBodyWindowMetadata, GenerationBodyWindowRequest, GenerationDeliveryAcknowledgment,
+    GenerationDeliveryAcknowledgmentRequest,
+    GenerationDeliveryRequest as VersionedGenerationDeliveryRequest,
+    GenerationPinLeaseAcquireRequest, GenerationPinLeaseAcquireResponse, GenerationPinLeaseRelease,
+    GenerationPinLeaseReleaseRequest, GenerationPinLeaseRenewRequest, GenerationPinLeaseRenewal,
+    GenerationTransportCapabilities,
+};
 use locality_store::{
     GenerationApplyOutcome, GenerationApplyStatus, GenerationDeliveryRepository,
     GenerationInodeEvidenceConflictUpdate, GenerationInodeEvidenceRecord,
     GenerationInodeEvidenceResolution, GenerationPathRecord, GenerationPathState,
-    GenerationRetainedInodeRecord, MountRepository, PreparedGenerationApply, SqliteStateStore,
+    GenerationRetainedInodeRecord, MountRepository, PreparedGenerationApply,
+    PreparedGenerationApplyV3, SqliteStateStore,
 };
 use sha2::{Digest, Sha256};
 
@@ -54,16 +64,35 @@ const DEFAULT_CONFLICT_RETENTION_LIMITS: ConflictRetentionLimits = ConflictReten
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizedGenerationDelivery {
+    pub delta: GenerationDelta,
+    pub terminal_receipt: GenerationDeltaTerminalReceipt,
+}
+
+/// One authenticated poll result. The client offer remains in the request;
+/// this envelope carries the server's selected subset even when no delta is
+/// available, so a transport never mutates its future client offer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizedGenerationDeliveryPoll {
+    pub selected_capabilities: GenerationTransportCapabilities,
+    pub delivery: Option<AuthorizedGenerationDelivery>,
+}
+
+/// Legacy local adapter request retained source-compatibly. Versioned portable
+/// negotiation is exposed by the additive transport extension method below.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GenerationDeliveryRequest {
     pub mount_id: MountId,
     pub source_connection_id: SourceConnectionId,
     pub observed_generation_id: SourceGenerationId,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AuthorizedGenerationDelivery {
-    pub delta: GenerationDelta,
-    pub terminal_receipt: GenerationDeltaTerminalReceipt,
+/// One authenticated metadata envelope and its separately streamed body.
+/// HTTP status/header parsing and response authentication remain adapter
+/// responsibilities; local delivery validates the portable metadata and bytes.
+pub struct AuthorizedGenerationBodyWindow {
+    pub metadata: GenerationBodyWindowMetadata,
+    pub body: Box<dyn Read + Send>,
 }
 
 /// Authenticated backend transport boundary. Implementations may use HTTP,
@@ -72,17 +101,87 @@ pub struct AuthorizedGenerationDelivery {
 pub trait GenerationDeliveryTransport {
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Stable client offer. Authenticated server selection is returned by
+    /// [`Self::next_delta_poll`] and must never replace or narrow this offer.
+    fn capabilities(&self) -> GenerationTransportCapabilities {
+        GenerationTransportCapabilities::legacy()
+    }
+
     fn next_delta(
         &mut self,
         request: &GenerationDeliveryRequest,
     ) -> Result<Option<AuthorizedGenerationDelivery>, Self::Error>;
+
+    /// Additive v1 entry point for adapters that negotiate portable delivery
+    /// capabilities. Existing adapters continue to implement `next_delta`.
+    fn next_delta_versioned(
+        &mut self,
+        request: &VersionedGenerationDeliveryRequest,
+    ) -> Result<Option<AuthorizedGenerationDelivery>, Self::Error> {
+        self.next_delta(&GenerationDeliveryRequest {
+            mount_id: MountId::new(request.mount_id.as_str()),
+            source_connection_id: request.source_connection_id.clone(),
+            observed_generation_id: request.observed_generation_id.clone(),
+        })
+    }
+
+    /// Additive authenticated poll envelope. Legacy adapters select the legacy
+    /// whole-body contract and continue through `next_delta_versioned`.
+    fn next_delta_poll(
+        &mut self,
+        request: &VersionedGenerationDeliveryRequest,
+    ) -> Result<AuthorizedGenerationDeliveryPoll, Self::Error> {
+        self.next_delta_versioned(request)
+            .map(|delivery| AuthorizedGenerationDeliveryPoll {
+                selected_capabilities: GenerationTransportCapabilities::legacy(),
+                delivery,
+            })
+    }
 
     fn open_content(
         &mut self,
         delta_id: &str,
         identity: &GenerationFileIdentity,
     ) -> Result<Box<dyn Read + Send>, Self::Error>;
+
+    fn open_content_window(
+        &mut self,
+        _request: &GenerationBodyWindowRequest,
+    ) -> Result<Option<AuthorizedGenerationBodyWindow>, Self::Error> {
+        Ok(None)
+    }
+
+    fn acknowledge_terminal_receipt(
+        &mut self,
+        _request: &GenerationDeliveryAcknowledgmentRequest,
+    ) -> Result<Option<GenerationDeliveryAcknowledgment>, Self::Error> {
+        Ok(None)
+    }
+
+    fn acquire_generation_pin(
+        &mut self,
+        _request: &GenerationPinLeaseAcquireRequest,
+    ) -> Result<Option<GenerationPinLeaseAcquireResponse>, Self::Error> {
+        Ok(None)
+    }
+
+    fn renew_generation_pin(
+        &mut self,
+        _request: &GenerationPinLeaseRenewRequest,
+    ) -> Result<Option<GenerationPinLeaseRenewal>, Self::Error> {
+        Ok(None)
+    }
+
+    fn release_generation_pin(
+        &mut self,
+        _request: &GenerationPinLeaseReleaseRequest,
+    ) -> Result<Option<GenerationPinLeaseRelease>, Self::Error> {
+        Ok(None)
+    }
 }
+
+/// Compatibility name retained for existing public adapters.
+pub use GenerationDeliveryTransport as GenerationTransport;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GenerationSyncSummary {
@@ -117,23 +216,95 @@ where
     ) -> Result<GenerationSyncSummary, GenerationSyncError> {
         recover_generation_delivery_staging(store)?;
         reconcile_all_completed_inode_evidence(store)?;
+        replay_pending_acknowledgments(store, mount_id, &mut self.transport)?;
         let observed = store
             .get_observed_generation(mount_id)?
             .ok_or_else(|| GenerationSyncError::MissingObservedGeneration(mount_id.clone()))?;
-        let request = GenerationDeliveryRequest {
-            mount_id: mount_id.clone(),
+        let capabilities = self.transport.capabilities();
+        capabilities
+            .validate()
+            .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
+        let request = VersionedGenerationDeliveryRequest {
+            format_version: GENERATION_TRANSPORT_FORMAT_VERSION,
+            minimum_reader_version: GENERATION_TRANSPORT_READER_VERSION,
+            mount_id: locality_core::workspace_layout::PortableMountId::new(mount_id.as_str())
+                .map_err(|error| GenerationSyncError::Contract(error.to_string()))?,
             source_connection_id: observed.source_connection_id,
             observed_generation_id: observed.generation_id,
+            capabilities,
         };
-        let Some(delivery) = self
+        let poll = self
             .transport
-            .next_delta(&request)
-            .map_err(|error| GenerationSyncError::Transport(error.to_string()))?
-        else {
+            .next_delta_poll(&request)
+            .map_err(|error| GenerationSyncError::Transport(error.to_string()))?;
+        poll.selected_capabilities
+            .validate_selection(&request.capabilities)
+            .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
+        let Some(delivery) = poll.delivery else {
             return Ok(GenerationSyncSummary::default());
         };
-        apply_authorized_delivery(store, mount_id, mount_root, delivery, &mut self.transport)
+        let acknowledgment =
+            GenerationDeliveryAcknowledgmentRequest::from_receipt(&delivery.terminal_receipt)
+                .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
+        let summary = apply_authorized_delivery_with_capabilities(
+            store,
+            mount_id,
+            mount_root,
+            delivery,
+            &mut self.transport,
+            &poll.selected_capabilities,
+        )?;
+        let acknowledgment_required = store
+            .get_generation_apply_v2(&acknowledgment.delta_id)?
+            .ok_or(GenerationSyncError::JournalMismatch)?
+            .selection_binding
+            .terminal_receipt_acknowledgments();
+        if acknowledgment_required {
+            acknowledge_terminal_receipt(store, &mut self.transport, &acknowledgment)?;
+        }
+        Ok(summary)
     }
+}
+
+fn replay_pending_acknowledgments<T: GenerationDeliveryTransport>(
+    store: &mut SqliteStateStore,
+    mount_id: &MountId,
+    transport: &mut T,
+) -> Result<(), GenerationSyncError> {
+    for journal in store.list_pending_generation_acknowledgments(mount_id)? {
+        let request = GenerationDeliveryAcknowledgmentRequest::from_receipt(&journal.receipt)
+            .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
+        if request.terminal_receipt_sha256 != journal.receipt_sha256 {
+            return Err(GenerationSyncError::JournalMismatch);
+        }
+        acknowledge_terminal_receipt(store, transport, &request)?;
+    }
+    Ok(())
+}
+
+fn acknowledge_terminal_receipt<T: GenerationDeliveryTransport>(
+    store: &mut SqliteStateStore,
+    transport: &mut T,
+    request: &GenerationDeliveryAcknowledgmentRequest,
+) -> Result<(), GenerationSyncError> {
+    let response = transport
+        .acknowledge_terminal_receipt(request)
+        .map_err(|error| GenerationSyncError::Transport(error.to_string()))?
+        .ok_or_else(|| {
+            GenerationSyncError::Contract(
+                "transport selected terminal receipt acknowledgments but returned no acknowledgment"
+                    .to_string(),
+            )
+        })?;
+    response
+        .validate_against(request)
+        .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
+    store.mark_generation_acknowledged(
+        &request.delta_id,
+        &request.terminal_receipt_sha256,
+        &response.acknowledged_at,
+    )?;
+    Ok(())
 }
 
 fn reconcile_all_completed_inode_evidence(
@@ -189,19 +360,40 @@ pub fn apply_authorized_delivery<T: GenerationDeliveryTransport>(
     delivery: AuthorizedGenerationDelivery,
     transport: &mut T,
 ) -> Result<GenerationSyncSummary, GenerationSyncError> {
-    apply_authorized_delivery_inner(
+    let capabilities = transport.capabilities();
+    capabilities
+        .validate()
+        .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
+    apply_authorized_delivery_with_capabilities(
         store,
         mount_id,
         mount_root,
         delivery,
         transport,
-        None,
-        &mut ApplyHooks::default(),
+        &capabilities,
+    )
+}
+
+fn apply_authorized_delivery_with_capabilities<T: GenerationDeliveryTransport>(
+    store: &mut SqliteStateStore,
+    mount_id: &MountId,
+    mount_root: &Path,
+    delivery: AuthorizedGenerationDelivery,
+    transport: &mut T,
+    capabilities: &GenerationTransportCapabilities,
+) -> Result<GenerationSyncSummary, GenerationSyncError> {
+    let mut hooks = ApplyHooks {
+        capabilities: Some(capabilities),
+        ..ApplyHooks::default()
+    };
+    apply_authorized_delivery_inner(
+        store, mount_id, mount_root, delivery, transport, None, &mut hooks,
     )
 }
 
 #[derive(Default)]
 struct ApplyHooks<'a> {
+    capabilities: Option<&'a GenerationTransportCapabilities>,
     after_target_open: Option<&'a mut dyn FnMut()>,
     after_preimage_move: Option<&'a mut dyn FnMut()>,
     after_preimage_verified: Option<&'a mut dyn FnMut()>,
@@ -227,11 +419,23 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
         .validate_against(&delivery.delta)
         .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
     validate_mount_delta(&delivery.delta, mount_id)?;
+    let capabilities = hooks
+        .capabilities
+        .cloned()
+        .unwrap_or_else(GenerationTransportCapabilities::legacy);
 
     let mut retained = reconcile_generation_staging_locked(store)?;
-    let existing = store.get_generation_apply(&delivery.delta.delta_id)?;
+    let existing = store.get_generation_apply_v2(&delivery.delta.delta_id)?;
     if let Some(existing) = &existing {
-        if existing.delta != delivery.delta || existing.receipt != delivery.terminal_receipt {
+        if existing.apply.delta != delivery.delta
+            || existing.apply.receipt != delivery.terminal_receipt
+            || existing
+                .selection_binding
+                .selected_capabilities()
+                .is_some_and(|bound| bound != &capabilities)
+            || (existing.selection_binding.selected_capabilities().is_none()
+                && existing.apply.status != GenerationApplyStatus::Completed)
+        {
             return Err(GenerationSyncError::JournalMismatch);
         }
     }
@@ -239,10 +443,10 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
     let secure_mount = SecureMount::open(mount_root).map_err(GenerationSyncError::MountAccess)?;
     reconcile_completed_mount_inode_evidence(store, mount_id, &secure_mount)?;
     if let Some(existing) = &existing
-        && existing.status == GenerationApplyStatus::Completed
+        && existing.apply.status == GenerationApplyStatus::Completed
     {
         let replay = store
-            .get_generation_apply(&existing.delta.delta_id)?
+            .get_generation_apply(&existing.apply.delta.delta_id)?
             .ok_or(GenerationSyncError::JournalMismatch)?;
         return Ok(summary(&replay, true));
     }
@@ -252,6 +456,7 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
         .as_ref()
         .map(|journal| {
             journal
+                .apply
                 .outcomes
                 .iter()
                 .map(|(index, _)| *index)
@@ -301,19 +506,35 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
         .canonical_sha256()
         .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
     let created_at = delivery.terminal_receipt.completed_at.clone();
-    let journal = store.reserve_generation_apply(PreparedGenerationApply {
-        delta: delivery.delta,
-        receipt: delivery.terminal_receipt,
-        receipt_sha256,
-        stage_root: path_to_portable_text(&stage_relative)?,
-        created_at: created_at.clone(),
-    })?;
+    let negotiated_journal = store.reserve_generation_apply_v3(PreparedGenerationApplyV3::new(
+        PreparedGenerationApply {
+            delta: delivery.delta,
+            receipt: delivery.terminal_receipt,
+            receipt_sha256,
+            stage_root: path_to_portable_text(&stage_relative)?,
+            created_at: created_at.clone(),
+        },
+        capabilities.clone(),
+    ))?;
+    let capabilities = negotiated_journal
+        .selection_binding
+        .selected_capabilities()
+        .cloned()
+        .ok_or(GenerationSyncError::JournalMismatch)?;
+    let journal = negotiated_journal.apply;
     let already_recorded = journal
         .outcomes
         .iter()
         .map(|(index, _)| *index)
         .collect::<BTreeSet<_>>();
-    stage_contents(&stage_root, &journal.delta, &already_recorded, transport)?;
+    stage_contents(
+        &stage_root,
+        &journal.delta,
+        &journal.receipt_sha256,
+        &already_recorded,
+        &capabilities,
+        transport,
+    )?;
     store.mark_generation_apply_started(&journal.delta.delta_id, &created_at)?;
     let mut filesystem_mutations = 0_usize;
     let merge_bases = generation_merge_bases(store, mount_id)?;
@@ -1374,6 +1595,10 @@ fn validate_resulting_inventory(
             .map(|identity| &identity.logical_path),
     )?;
     validate_inventory_path_set(local_inventory.values())?;
+    let target_inventory = remote_inventory.into_values().collect::<Vec<_>>();
+    delta
+        .validate_target_inventory(&target_inventory)
+        .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
     Ok(paths)
 }
 
@@ -1440,7 +1665,9 @@ fn stage_relative_path(delta: &GenerationDelta) -> Result<PathBuf, GenerationSyn
 fn stage_contents<T: GenerationDeliveryTransport>(
     stage_root: &Path,
     delta: &GenerationDelta,
+    terminal_receipt_sha256: &str,
     already_recorded: &BTreeSet<u64>,
+    capabilities: &GenerationTransportCapabilities,
     transport: &mut T,
 ) -> Result<(), GenerationSyncError> {
     let payload_root = stage_root.join("payloads");
@@ -1467,13 +1694,115 @@ fn stage_contents<T: GenerationDeliveryTransport>(
             }
             remove_path_durable(&partial)?;
         }
-        let mut content = transport
-            .open_content(&delta.delta_id, identity)
-            .map_err(|error| GenerationSyncError::Transport(error.to_string()))?;
-        write_verified_stream(&partial, content.as_mut(), identity)?;
+        if let Some(body_windows) = &capabilities.body_windows {
+            write_verified_windows(
+                &partial,
+                &delta.delta_id,
+                terminal_receipt_sha256,
+                identity,
+                body_windows.max_window_bytes,
+                transport,
+            )?;
+        } else {
+            let mut content = transport
+                .open_content(&delta.delta_id, identity)
+                .map_err(|error| GenerationSyncError::Transport(error.to_string()))?;
+            write_verified_stream(&partial, content.as_mut(), identity)?;
+        }
         rename_noreplace_durable(&partial, &payload)?;
     }
     Ok(())
+}
+
+fn write_verified_windows<T: GenerationTransport>(
+    path: &Path,
+    delta_id: &str,
+    terminal_receipt_sha256: &str,
+    identity: &GenerationFileIdentity,
+    max_window_bytes: u64,
+    transport: &mut T,
+) -> Result<(), GenerationSyncError> {
+    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    let result = (|| {
+        let mut content_digest = Sha256::new();
+        let mut offset = 0_u64;
+        if identity.byte_length == 0 {
+            if format!("sha256:{:x}", content_digest.finalize()) != identity.content_sha256 {
+                return Err(content_mismatch(identity));
+            }
+            file.sync_all()?;
+            return Ok(());
+        }
+
+        loop {
+            let request = GenerationBodyWindowRequest {
+                format_version: GENERATION_TRANSPORT_FORMAT_VERSION,
+                minimum_reader_version: GENERATION_TRANSPORT_READER_VERSION,
+                delta_id: delta_id.to_string(),
+                terminal_receipt_sha256: terminal_receipt_sha256.to_string(),
+                content: identity.clone(),
+                offset,
+                max_bytes: max_window_bytes,
+            };
+            request
+                .validate()
+                .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
+            let mut window = transport
+                .open_content_window(&request)
+                .map_err(|error| GenerationSyncError::Transport(error.to_string()))?
+                .ok_or_else(|| {
+                    GenerationSyncError::Contract(
+                        "transport selected body windows but returned no window".to_string(),
+                    )
+                })?;
+            window
+                .metadata
+                .validate_against(&request)
+                .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
+
+            let mut remaining = window.metadata.range.length;
+            let mut window_digest = Sha256::new();
+            let mut buffer = [0_u8; 64 * 1024];
+            while remaining != 0 {
+                let limit = usize::try_from(remaining.min(buffer.len() as u64))
+                    .expect("window read size fits usize");
+                let read = window.body.read(&mut buffer[..limit])?;
+                if read == 0 {
+                    return Err(content_mismatch(identity));
+                }
+                remaining -= read as u64;
+                window_digest.update(&buffer[..read]);
+                content_digest.update(&buffer[..read]);
+                file.write_all(&buffer[..read])?;
+            }
+            if window.body.read(&mut [0_u8; 1])? != 0 {
+                return Err(content_mismatch(identity));
+            }
+            let actual_window_sha256 = format!("sha256:{:x}", window_digest.finalize());
+            window
+                .metadata
+                .validate_body_digest(window.metadata.range.length, &actual_window_sha256)
+                .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
+            offset = offset
+                .checked_add(window.metadata.range.length)
+                .ok_or_else(|| content_mismatch(identity))?;
+            if window.metadata.range.complete {
+                break;
+            }
+        }
+        if offset != identity.byte_length
+            || format!("sha256:{:x}", content_digest.finalize()) != identity.content_sha256
+        {
+            return Err(content_mismatch(identity));
+        }
+        file.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        drop(file);
+        let _ = remove_path_durable(path);
+    }
+    result
 }
 
 fn apply_entry(
@@ -2389,11 +2718,14 @@ mod tests {
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use locality_core::portable::{ContentVersionId, LogicalPath, ProjectionId};
+    use locality_core::portable::{
+        ContentVersionId, LogicalPath, ProjectionId, SourceConnectionId, SourceGenerationId,
+    };
     use locality_core::workspace_layout::PortableMountId;
     use locality_protocol::FreshnessEpoch;
     use locality_protocol::freshness_delivery::{
         FRESHNESS_DELIVERY_READER_VERSION, GENERATION_DELTA_FORMAT_VERSION,
+        canonical_target_inventory_sha256,
     };
     use locality_protocol::workspace_layout::LayoutDigest;
     use locality_store::{
@@ -2420,6 +2752,13 @@ mod tests {
         contents: BTreeMap<String, Vec<u8>>,
         content_readers: VecDeque<Box<dyn Read + Send>>,
         requests: Vec<GenerationDeliveryRequest>,
+        versioned_requests: Vec<VersionedGenerationDeliveryRequest>,
+        capabilities: GenerationTransportCapabilities,
+        selected_capabilities: Option<GenerationTransportCapabilities>,
+        body_window_requests: Vec<GenerationBodyWindowRequest>,
+        acknowledgment_requests: Vec<GenerationDeliveryAcknowledgmentRequest>,
+        acknowledgment_failures_remaining: usize,
+        events: Vec<&'static str>,
         content_fetches: usize,
         before_next_delta: Option<Box<dyn FnMut() -> Result<(), FakeTransportError>>>,
     }
@@ -2427,15 +2766,46 @@ mod tests {
     impl GenerationDeliveryTransport for FakeTransport {
         type Error = FakeTransportError;
 
+        fn capabilities(&self) -> GenerationTransportCapabilities {
+            self.capabilities.clone()
+        }
+
         fn next_delta(
             &mut self,
             request: &GenerationDeliveryRequest,
         ) -> Result<Option<AuthorizedGenerationDelivery>, Self::Error> {
+            self.events.push("next_delta");
             if let Some(before_next_delta) = &mut self.before_next_delta {
                 before_next_delta()?;
             }
             self.requests.push(request.clone());
             Ok(self.deliveries.pop_front())
+        }
+
+        fn next_delta_versioned(
+            &mut self,
+            request: &VersionedGenerationDeliveryRequest,
+        ) -> Result<Option<AuthorizedGenerationDelivery>, Self::Error> {
+            self.versioned_requests.push(request.clone());
+            self.next_delta(&GenerationDeliveryRequest {
+                mount_id: MountId::new(request.mount_id.as_str()),
+                source_connection_id: request.source_connection_id.clone(),
+                observed_generation_id: request.observed_generation_id.clone(),
+            })
+        }
+
+        fn next_delta_poll(
+            &mut self,
+            request: &VersionedGenerationDeliveryRequest,
+        ) -> Result<AuthorizedGenerationDeliveryPoll, Self::Error> {
+            let delivery = self.next_delta_versioned(request)?;
+            Ok(AuthorizedGenerationDeliveryPoll {
+                selected_capabilities: self
+                    .selected_capabilities
+                    .clone()
+                    .unwrap_or_else(|| self.capabilities.clone()),
+                delivery,
+            })
         }
 
         fn open_content(
@@ -2452,6 +2822,64 @@ mod tests {
                 .cloned()
                 .map(|content| Box::new(std::io::Cursor::new(content)) as Box<dyn Read + Send>)
                 .ok_or_else(|| FakeTransportError("missing fake content".to_string()))
+        }
+
+        fn open_content_window(
+            &mut self,
+            request: &GenerationBodyWindowRequest,
+        ) -> Result<Option<AuthorizedGenerationBodyWindow>, Self::Error> {
+            self.body_window_requests.push(request.clone());
+            let content = self
+                .contents
+                .get(request.content.content_version_id.as_str())
+                .ok_or_else(|| FakeTransportError("missing fake content".to_string()))?;
+            let start = usize::try_from(request.offset)
+                .map_err(|_| FakeTransportError("invalid fake window offset".to_string()))?;
+            let requested_end = request.offset.saturating_add(request.max_bytes);
+            let end = usize::try_from(requested_end.min(request.content.byte_length))
+                .map_err(|_| FakeTransportError("invalid fake window end".to_string()))?;
+            let bytes = content
+                .get(start..end)
+                .ok_or_else(|| FakeTransportError("missing fake content window".to_string()))?
+                .to_vec();
+            Ok(Some(AuthorizedGenerationBodyWindow {
+                metadata: GenerationBodyWindowMetadata {
+                    format_version: GENERATION_TRANSPORT_FORMAT_VERSION,
+                    minimum_reader_version: GENERATION_TRANSPORT_READER_VERSION,
+                    delta_id: request.delta_id.clone(),
+                    terminal_receipt_sha256: request.terminal_receipt_sha256.clone(),
+                    content: request.content.clone(),
+                    range: locality_protocol::freshness_delivery_transport::GenerationBodyRange {
+                        offset: request.offset,
+                        length: bytes.len() as u64,
+                        complete: end as u64 == request.content.byte_length,
+                    },
+                    window_sha256: sha256_label(&bytes),
+                },
+                body: Box::new(std::io::Cursor::new(bytes)),
+            }))
+        }
+
+        fn acknowledge_terminal_receipt(
+            &mut self,
+            request: &GenerationDeliveryAcknowledgmentRequest,
+        ) -> Result<Option<GenerationDeliveryAcknowledgment>, Self::Error> {
+            self.events.push("acknowledgment");
+            self.acknowledgment_requests.push(request.clone());
+            if self.acknowledgment_failures_remaining > 0 {
+                self.acknowledgment_failures_remaining -= 1;
+                return Err(FakeTransportError(
+                    "injected terminal acknowledgment failure".to_string(),
+                ));
+            }
+            Ok(Some(GenerationDeliveryAcknowledgment {
+                format_version: GENERATION_TRANSPORT_FORMAT_VERSION,
+                minimum_reader_version: GENERATION_TRANSPORT_READER_VERSION,
+                delta_id: request.delta_id.clone(),
+                terminal_receipt_sha256: request.terminal_receipt_sha256.clone(),
+                status: locality_protocol::freshness_delivery_transport::GenerationDeliveryAcknowledgmentStatus::Accepted,
+                acknowledged_at: "2026-07-31T14:00:00Z".to_string(),
+            }))
         }
     }
 
@@ -2490,6 +2918,10 @@ mod tests {
     }
 
     fn delivery(id: &str, entries: Vec<GenerationDeltaEntry>) -> AuthorizedGenerationDelivery {
+        let target_inventory = entries
+            .iter()
+            .filter_map(|entry| entry.new.clone())
+            .collect::<Vec<_>>();
         let delta = GenerationDelta {
             format_version: GENERATION_DELTA_FORMAT_VERSION,
             minimum_reader_version: FRESHNESS_DELIVERY_READER_VERSION,
@@ -2499,7 +2931,7 @@ mod tests {
             base_generation_id: SourceGenerationId::new("generation-1").unwrap(),
             target_generation_id: SourceGenerationId::new("generation-2").unwrap(),
             target_complete: true,
-            target_inventory_sha256: sha256_label(b"target-inventory"),
+            target_inventory_sha256: canonical_target_inventory_sha256(&target_inventory).unwrap(),
             workspace_layout_version: 1,
             workspace_layout_digest: LayoutDigest::new(sha256_label(b"layout")).unwrap(),
             entries,
@@ -2530,8 +2962,6 @@ mod tests {
     fn retarget_delivery(delivery: &mut AuthorizedGenerationDelivery, base: &str, target: &str) {
         delivery.delta.base_generation_id = SourceGenerationId::new(base).unwrap();
         delivery.delta.target_generation_id = SourceGenerationId::new(target).unwrap();
-        delivery.delta.target_inventory_sha256 =
-            sha256_label(format!("inventory-{target}").as_bytes());
         delivery.terminal_receipt.base_generation_id = delivery.delta.base_generation_id.clone();
         delivery.terminal_receipt.target_generation_id =
             delivery.delta.target_generation_id.clone();
@@ -2540,6 +2970,37 @@ mod tests {
         delivery.terminal_receipt.delta_sha256 = delivery.delta.canonical_sha256().unwrap();
         delivery.terminal_receipt.changed_content_bytes =
             delivery.delta.changed_content_bytes().unwrap();
+    }
+
+    fn reseal_target_inventory(
+        delivery: &mut AuthorizedGenerationDelivery,
+        inventory: &[GenerationFileIdentity],
+    ) {
+        delivery.delta.target_inventory_sha256 =
+            canonical_target_inventory_sha256(inventory).unwrap();
+        delivery.terminal_receipt.target_inventory_sha256 =
+            delivery.delta.target_inventory_sha256.clone();
+        delivery.terminal_receipt.delta_sha256 = delivery.delta.canonical_sha256().unwrap();
+    }
+
+    fn authoritative_target_inventory(
+        store: &SqliteStateStore,
+        mount_id: &MountId,
+    ) -> Vec<GenerationFileIdentity> {
+        let mut inventory = store
+            .list_generation_paths(mount_id)
+            .unwrap()
+            .into_iter()
+            .filter_map(|path| {
+                if path.state == GenerationPathState::Conflicted {
+                    path.incoming_identity
+                } else {
+                    path.base_identity
+                }
+            })
+            .collect::<Vec<_>>();
+        inventory.sort_by(|left, right| left.projection_id.cmp(&right.projection_id));
+        inventory
     }
 
     #[cfg(unix)]
@@ -3069,6 +3530,57 @@ mod tests {
     }
 
     #[test]
+    fn target_inventory_mismatch_fails_before_journal_download_or_publication() {
+        let fixture = Fixture::new("target-inventory-mismatch");
+        let old = identity("projection-a", "Roadmap.md", "content-old", b"old");
+        let new = identity("projection-a", "Roadmap.md", "content-new", b"new");
+        fs::write(fixture.mount_root.join("Roadmap.md"), b"old").unwrap();
+        let mut store = seed(&fixture, vec![old.clone()]);
+        let mut delivery = delivery(
+            "delta-target-inventory-mismatch",
+            vec![GenerationDeltaEntry {
+                old: Some(old),
+                new: Some(new),
+            }],
+        );
+        delivery.delta.target_inventory_sha256 = sha256_label(b"substituted-inventory");
+        delivery.terminal_receipt.target_inventory_sha256 =
+            delivery.delta.target_inventory_sha256.clone();
+        delivery.terminal_receipt.delta_sha256 = delivery.delta.canonical_sha256().unwrap();
+        let mut transport = FakeTransport::default();
+        transport
+            .contents
+            .insert("content-new".to_string(), b"new".to_vec());
+
+        let error = apply_authorized_delivery(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            delivery,
+            &mut transport,
+        )
+        .expect_err("mismatched target inventory must fail closed");
+
+        assert!(matches!(error, GenerationSyncError::Contract(_)));
+        assert!(error.to_string().contains("target inventory digest"));
+        assert_eq!(transport.content_fetches, 0);
+        assert!(store.list_generation_applies().unwrap().is_empty());
+        assert_eq!(
+            store
+                .get_observed_generation(&fixture.mount_id)
+                .unwrap()
+                .unwrap()
+                .generation_id
+                .as_str(),
+            "generation-1"
+        );
+        assert_eq!(
+            fs::read(fixture.mount_root.join("Roadmap.md")).unwrap(),
+            b"old"
+        );
+    }
+
+    #[test]
     fn resulting_inventory_retains_conflicted_local_path_occupancy() {
         let fixture = Fixture::new("conflicted-local-occupancy");
         let base = identity("projection-a", "Local.md", "base", b"base");
@@ -3218,14 +3730,7 @@ mod tests {
                 new: Some(incoming_three.clone()),
             }],
         );
-        second.delta.base_generation_id = SourceGenerationId::new("generation-2").unwrap();
-        second.delta.target_generation_id = SourceGenerationId::new("generation-3").unwrap();
-        second.delta.target_inventory_sha256 = sha256_label(b"target-inventory-3");
-        second.terminal_receipt.base_generation_id = second.delta.base_generation_id.clone();
-        second.terminal_receipt.target_generation_id = second.delta.target_generation_id.clone();
-        second.terminal_receipt.target_inventory_sha256 =
-            second.delta.target_inventory_sha256.clone();
-        second.terminal_receipt.delta_sha256 = second.delta.canonical_sha256().unwrap();
+        retarget_delivery(&mut second, "generation-2", "generation-3");
         let mut second_transport = FakeTransport::default();
         second_transport
             .contents
@@ -3361,14 +3866,7 @@ mod tests {
                 new: Some(remote),
             }],
         );
-        second.delta.base_generation_id = SourceGenerationId::new("generation-2").unwrap();
-        second.delta.target_generation_id = SourceGenerationId::new("generation-3").unwrap();
-        second.delta.target_inventory_sha256 = sha256_label(b"target-inventory-3");
-        second.terminal_receipt.base_generation_id = second.delta.base_generation_id.clone();
-        second.terminal_receipt.target_generation_id = second.delta.target_generation_id.clone();
-        second.terminal_receipt.target_inventory_sha256 =
-            second.delta.target_inventory_sha256.clone();
-        second.terminal_receipt.delta_sha256 = second.delta.canonical_sha256().unwrap();
+        retarget_delivery(&mut second, "generation-2", "generation-3");
         let mut second_transport = FakeTransport::default();
         second_transport.contents.insert(
             "content-remote".to_string(),
@@ -3622,6 +4120,10 @@ mod tests {
 
         let mut next = delivery(&format!("{delta_id}-next"), Vec::new());
         retarget_delivery(&mut next, "generation-3", "generation-4");
+        reseal_target_inventory(
+            &mut next,
+            &authoritative_target_inventory(&store, &fixture.mount_id),
+        );
         let next_summary = apply_authorized_delivery(
             &mut store,
             &fixture.mount_id,
@@ -4051,6 +4553,10 @@ mod tests {
 
         let mut next = delivery("delta-after-post-commit-held-fd-race", Vec::new());
         retarget_delivery(&mut next, "generation-3", "generation-4");
+        reseal_target_inventory(
+            &mut next,
+            &authoritative_target_inventory(&store, &fixture.mount_id),
+        );
         let next_summary = apply_authorized_delivery(
             &mut store,
             &fixture.mount_id,
@@ -4539,6 +5045,285 @@ mod tests {
             fs::read(fixture.mount_root.join("Roadmap.md")).unwrap(),
             b"old"
         );
+    }
+
+    #[test]
+    fn negotiated_windows_are_bounded_and_terminal_receipts_are_acknowledged() {
+        let fixture = Fixture::new("windowed-transport-contract");
+        let old = identity("projection-a", "Roadmap.md", "content-old", b"old");
+        let new = identity("projection-a", "Roadmap.md", "content-new", b"good");
+        fs::write(fixture.mount_root.join("Roadmap.md"), b"old").unwrap();
+        let mut store = seed(&fixture, vec![old.clone()]);
+        let delivery = delivery(
+            "delta-windowed-content",
+            vec![GenerationDeltaEntry {
+                old: Some(old),
+                new: Some(new),
+            }],
+        );
+        let mut transport = FakeTransport {
+            capabilities: GenerationTransportCapabilities {
+                body_windows: Some(
+                    locality_protocol::freshness_delivery_transport::GenerationBodyWindowCapability {
+                        max_window_bytes: 2,
+                    },
+                ),
+                terminal_receipt_acknowledgments: true,
+                ..GenerationTransportCapabilities::legacy()
+            },
+            ..FakeTransport::default()
+        };
+        transport.deliveries.push_back(delivery);
+        transport
+            .contents
+            .insert("content-new".to_string(), b"good".to_vec());
+        let mut client = GenerationSyncClient::new(transport);
+
+        let summary = client
+            .sync_mount(&mut store, &fixture.mount_id, &fixture.mount_root)
+            .unwrap();
+
+        assert_eq!(summary.applied_paths, 1);
+        assert_eq!(
+            fs::read(fixture.mount_root.join("Roadmap.md")).unwrap(),
+            b"good"
+        );
+        assert_eq!(client.transport().content_fetches, 0);
+        assert_eq!(
+            client
+                .transport()
+                .body_window_requests
+                .iter()
+                .map(|request| (request.offset, request.max_bytes))
+                .collect::<Vec<_>>(),
+            vec![(0, 2), (2, 2)]
+        );
+        assert_eq!(client.transport().acknowledgment_requests.len(), 1);
+        assert_eq!(
+            store
+                .get_generation_apply_v2("delta-windowed-content")
+                .unwrap()
+                .unwrap()
+                .selection_binding
+                .selected_capabilities(),
+            Some(&client.transport().capabilities)
+        );
+        assert_eq!(
+            client.transport().versioned_requests[0].capabilities,
+            client.transport().capabilities
+        );
+        assert_eq!(
+            client.transport().capabilities(),
+            client.transport().capabilities,
+            "authenticated selection must not mutate the next client offer"
+        );
+    }
+
+    #[test]
+    fn completed_pre_binding_journal_replays_without_selection_mismatch() {
+        let fixture = Fixture::new("completed-pre-binding-replay");
+        let mut store = seed(&fixture, Vec::new());
+        let delivery = delivery("delta-pre-binding-replay", Vec::new());
+        let selected = GenerationTransportCapabilities {
+            body_windows: Some(
+                locality_protocol::freshness_delivery_transport::GenerationBodyWindowCapability {
+                    max_window_bytes: 64 * 1024,
+                },
+            ),
+            terminal_receipt_acknowledgments: true,
+            generation_pin_leases: Some(
+                locality_protocol::freshness_delivery_transport::GenerationPinLeaseCapability {
+                    min_lease_seconds: 60,
+                    max_lease_seconds: 600,
+                    max_active_leases_per_device: 4,
+                    fallback_policies: vec![
+                        locality_protocol::freshness_delivery_transport::GenerationPinFallbackPolicy::RequireExact,
+                    ],
+                },
+            ),
+            ..GenerationTransportCapabilities::legacy()
+        };
+        apply_authorized_delivery_with_capabilities(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            delivery.clone(),
+            &mut FakeTransport::default(),
+            &selected,
+        )
+        .unwrap();
+
+        let connection = rusqlite::Connection::open(&store.db_path).unwrap();
+        connection
+            .execute(
+                "UPDATE generation_apply_journals
+                 SET selection_binding = 'pre_binding_completed',
+                     selected_capabilities_json = '{}'
+                 WHERE delta_id = ?1",
+                [&delivery.delta.delta_id],
+            )
+            .unwrap();
+        drop(connection);
+
+        let replay = apply_authorized_delivery_with_capabilities(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            delivery,
+            &mut FakeTransport::default(),
+            &GenerationTransportCapabilities::legacy(),
+        )
+        .expect("completed pre-binding state must be an exact no-op replay");
+        assert!(replay.replayed);
+    }
+
+    #[test]
+    fn invalid_selected_capability_is_rejected_before_any_apply_mutation() {
+        let fixture = Fixture::new("invalid-selected-capability-before-mutation");
+        let old = identity("projection-a", "Roadmap.md", "content-old", b"old");
+        let new = identity("projection-a", "Roadmap.md", "content-new", b"new");
+        fs::write(fixture.mount_root.join("Roadmap.md"), b"old").unwrap();
+        let mut store = seed(&fixture, vec![old.clone()]);
+        let mut transport = FakeTransport {
+            selected_capabilities: Some(GenerationTransportCapabilities {
+                terminal_receipt_acknowledgments: true,
+                ..GenerationTransportCapabilities::legacy()
+            }),
+            ..FakeTransport::default()
+        };
+        transport.deliveries.push_back(delivery(
+            "delta-invalid-selection",
+            vec![GenerationDeltaEntry {
+                old: Some(old),
+                new: Some(new),
+            }],
+        ));
+        transport
+            .contents
+            .insert("content-new".to_string(), b"new".to_vec());
+        let mut client = GenerationSyncClient::new(transport);
+
+        let error = client
+            .sync_mount(&mut store, &fixture.mount_id, &fixture.mount_root)
+            .expect_err("server selected an unoffered capability");
+
+        assert!(matches!(error, GenerationSyncError::Contract(_)));
+        assert_eq!(
+            fs::read(fixture.mount_root.join("Roadmap.md")).unwrap(),
+            b"old"
+        );
+        assert!(store.list_generation_applies().unwrap().is_empty());
+        assert_eq!(client.transport().content_fetches, 0);
+        assert_eq!(
+            store
+                .get_observed_generation(&fixture.mount_id)
+                .unwrap()
+                .unwrap()
+                .generation_id
+                .as_str(),
+            "generation-1"
+        );
+    }
+
+    #[test]
+    fn failed_terminal_acknowledgment_is_replayed_before_a_no_delivery_poll() {
+        let fixture = Fixture::new("durable-ack-replay-before-empty-poll");
+        let old = identity("projection-a", "Roadmap.md", "content-old", b"old");
+        let new = identity("projection-a", "Roadmap.md", "content-new", b"new");
+        fs::write(fixture.mount_root.join("Roadmap.md"), b"old").unwrap();
+        let mut store = seed(&fixture, vec![old.clone()]);
+        let mut transport = FakeTransport {
+            capabilities: GenerationTransportCapabilities {
+                terminal_receipt_acknowledgments: true,
+                ..GenerationTransportCapabilities::legacy()
+            },
+            acknowledgment_failures_remaining: 1,
+            ..FakeTransport::default()
+        };
+        transport.deliveries.push_back(delivery(
+            "delta-ack-retry",
+            vec![GenerationDeltaEntry {
+                old: Some(old),
+                new: Some(new),
+            }],
+        ));
+        transport
+            .contents
+            .insert("content-new".to_string(), b"new".to_vec());
+        let mut client = GenerationSyncClient::new(transport);
+
+        let first_error = client
+            .sync_mount(&mut store, &fixture.mount_id, &fixture.mount_root)
+            .expect_err("first terminal acknowledgment fails after durable apply");
+        assert!(matches!(first_error, GenerationSyncError::Transport(_)));
+        assert_eq!(
+            fs::read(fixture.mount_root.join("Roadmap.md")).unwrap(),
+            b"new"
+        );
+        assert_eq!(
+            store
+                .list_pending_generation_acknowledgments(&fixture.mount_id)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let second = client
+            .sync_mount(&mut store, &fixture.mount_id, &fixture.mount_root)
+            .expect("pending receipt is acknowledged before an empty poll");
+        assert_eq!(second, GenerationSyncSummary::default());
+        assert!(
+            store
+                .list_pending_generation_acknowledgments(&fixture.mount_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(client.transport().acknowledgment_requests.len(), 2);
+        assert_eq!(client.transport().versioned_requests.len(), 2);
+        assert_eq!(
+            &client.transport().events[client.transport().events.len() - 2..],
+            &["acknowledgment", "next_delta"]
+        );
+    }
+
+    #[test]
+    fn legacy_transport_implements_only_the_original_public_surface() {
+        #[derive(Default)]
+        struct LegacyOnlyTransport {
+            requests: Vec<GenerationDeliveryRequest>,
+        }
+
+        impl GenerationDeliveryTransport for LegacyOnlyTransport {
+            type Error = FakeTransportError;
+
+            fn next_delta(
+                &mut self,
+                request: &GenerationDeliveryRequest,
+            ) -> Result<Option<AuthorizedGenerationDelivery>, Self::Error> {
+                self.requests.push(request.clone());
+                Ok(None)
+            }
+
+            fn open_content(
+                &mut self,
+                _delta_id: &str,
+                _identity: &GenerationFileIdentity,
+            ) -> Result<Box<dyn Read + Send>, Self::Error> {
+                unreachable!("an empty legacy poll never opens content")
+            }
+        }
+
+        let fixture = Fixture::new("legacy-transport-surface");
+        let mut store = seed(&fixture, Vec::new());
+        let mut client = GenerationSyncClient::new(LegacyOnlyTransport::default());
+        assert_eq!(
+            client
+                .sync_mount(&mut store, &fixture.mount_id, &fixture.mount_root)
+                .unwrap(),
+            GenerationSyncSummary::default()
+        );
+        assert_eq!(client.transport().requests.len(), 1);
+        assert_eq!(client.transport().requests[0].mount_id, fixture.mount_id);
     }
 
     #[test]

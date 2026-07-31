@@ -36,8 +36,9 @@ pub use generation_delivery::{
     GenerationApplyJournalRecord, GenerationApplyOutcome, GenerationApplyStatus,
     GenerationDeliveryRepository, GenerationInodeEvidenceConflictUpdate,
     GenerationInodeEvidenceRecord, GenerationInodeEvidenceResolution, GenerationPathRecord,
-    GenerationPathState, GenerationRetainedInodeRecord, ObservedGenerationRecord,
-    PreparedGenerationApply,
+    GenerationPathState, GenerationRetainedInodeRecord, GenerationTransportSelectionBinding,
+    NegotiatedGenerationApplyJournalRecord, ObservedGenerationRecord, PreparedGenerationApply,
+    PreparedGenerationApplyV2, PreparedGenerationApplyV3,
 };
 pub use live_mode::{
     LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountLiveModeStateChangeError,

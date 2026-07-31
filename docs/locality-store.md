@@ -60,6 +60,17 @@
 - SQLite migrates v21 rows to v22 by relating each differential-apply journal
   to its mount. Connection, remote-root, and settings changes fail closed while
   that mount has an active journal, preventing source resets from orphaning it.
+- SQLite schema v25 / generation-delivery component v4 adds durable pending
+  terminal-acknowledgment state without storing a private route or credential.
+- SQLite schema v26 / generation-delivery component v5 binds the complete
+  authenticated transport selection to each apply journal. Exact retries and
+  recovery therefore preserve body-window bounds, acknowledgment state, and
+  selected pin-lease policy without renegotiating an in-flight apply.
+- Generation-delivery component v6 marks whether that selection is fully bound.
+  Ambiguous active v25 journals fail migration atomically; completed pre-binding
+  journals permit only exact terminal replay and preserve only their recorded
+  acknowledgment requirement. Prerelease v26 rows are bound only when their
+  stored body-window or pin data proves the complete selection.
 - SQLite records component versions for durable subsystems so compatibility is
   decided from persisted state contracts instead of desktop build IDs.
 - SQLite enables WAL mode, a busy timeout, foreign keys, and `PRAGMA user_version` schema versioning.
@@ -129,9 +140,11 @@ changes, generation gaps, and old-identity mismatches fail before the local tree
 is changed.
 
 `generation_apply_journals` stores the owning mount, canonical delta and
-terminal receipt, staging root, lifecycle, and per-entry outcomes. Source
+terminal receipt, staging root, lifecycle, per-entry outcomes, and whether an
+authenticated terminal receipt still requires acknowledgment. Source
 identity/settings resets are transactionally blocked while that mount has an
-active apply. The daemon stages and verifies
+active apply or an unacknowledged required receipt. The daemon replays completed
+pending receipts before polling for more delivery, then stages and verifies
 incoming bytes before applying clean creates/updates/deletions. Each filesystem
 operation is idempotently recognizable after a crash, so recovery can record
 the missing outcome and continue. Only after every entry has an applied,
@@ -173,6 +186,14 @@ authenticated payloads for current live conflicts and removes successful,
 superseded, or orphan payloads. Per-mount and global limits bound Locality's
 captured managed-evidence reservations and current conflict payloads, not later
 user-owned writes to retained inodes.
+
+The original public `PreparedGenerationApply`, `GenerationApplyJournalRecord`,
+and required `GenerationDeliveryRepository` methods remain source-compatible.
+Acknowledgment-aware reservation uses the additive
+`PreparedGenerationApplyV2`/`reserve_generation_apply_v2` surface. New
+acknowledgment methods have safe defaults: legacy repositories report no
+pending acknowledgments and reject an acknowledgment-required V2 reservation
+instead of silently losing retry state.
 
 V1 deltas are mount-scoped. Empty entry lists are valid when a complete target
 generation changes no projected bytes. A logical path may occur in only one

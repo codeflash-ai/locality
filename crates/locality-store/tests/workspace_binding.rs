@@ -49,7 +49,7 @@ fn legacy_v20_upgrade_preserves_dirty_shadow_apply_journal_and_mount_identity() 
         before.issues,
         vec![StateCompatibilityIssue::OlderSchema {
             found: 20,
-            current: 25,
+            current: 26,
         }]
     );
 

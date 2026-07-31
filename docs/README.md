@@ -11,6 +11,8 @@ Use this directory for repo-facing documentation that helps contributors underst
 - [`architecture.md`](architecture.md): currently shipped local-first system.
 - [`cloud-sandbox-data-plane.md`](cloud-sandbox-data-plane.md): proposed backend
   and client architecture for cloud coding-agent sandboxes.
+- [`freshness-wait-transport.md`](freshness-wait-transport.md): public,
+  capability-gated durable freshness wait-attempt wire contract.
 
 ## Static collaboration artifacts
 
