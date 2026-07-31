@@ -538,6 +538,215 @@ fn archive_entity_reverses_to_restore_archived_entity() {
 }
 
 #[test]
+fn undo_reverses_complete_journaled_apply_order_instead_of_original_plan_order() {
+    let operations = vec![
+        PushOperation::ArchiveEntity {
+            entity_id: RemoteId::new("page-1"),
+        },
+        PushOperation::ArchiveBlock {
+            block_id: RemoteId::new("paragraph-1"),
+        },
+    ];
+    let mut entry = journal_entry_with_shadow(operations, shadow_with_frontmatter());
+    entry.apply_effects = vec![
+        JournalApplyEffect::ArchivedBlock {
+            operation_id: PushOperationId::for_operation(
+                &entry.push_id,
+                1,
+                &entry.plan.operations[1],
+            ),
+            operation_index: 1,
+            block_id: RemoteId::new("paragraph-1"),
+        },
+        JournalApplyEffect::ArchivedEntity {
+            operation_id: PushOperationId::for_operation(
+                &entry.push_id,
+                0,
+                &entry.plan.operations[0],
+            ),
+            operation_index: 0,
+            entity_id: RemoteId::new("page-1"),
+        },
+    ];
+
+    let plan = plan_journal_undo(&entry);
+
+    assert_eq!(plan.status, UndoPlanStatus::Complete);
+    assert_eq!(
+        plan.operations,
+        vec![
+            UndoOperation::RestoreArchivedEntity {
+                entity_id: RemoteId::new("page-1"),
+                expected: EntityUndoState {
+                    parent_id: RemoteId::new("old-parent"),
+                    title: "Roadmap".to_string(),
+                    properties: BTreeMap::from([
+                        ("Points".to_string(), PropertyValue::Number("2".to_string())),
+                        (
+                            "Status".to_string(),
+                            PropertyValue::String("Todo".to_string()),
+                        ),
+                    ]),
+                    body: "# Roadmap\n\nOld paragraph.".to_string(),
+                    archived: true,
+                },
+            },
+            UndoOperation::RestoreArchivedBlock {
+                block_id: RemoteId::new("paragraph-1"),
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("heading-1")),
+                content: "Old paragraph.".to_string(),
+                native_kind: None,
+            },
+        ]
+    );
+}
+
+#[test]
+fn nested_archive_effects_reverse_to_ancestor_first_restore_order() {
+    let operations = vec![
+        PushOperation::UpdateBlock {
+            block_id: RemoteId::new("survivor-1"),
+            content: "Updated survivor.".to_string(),
+        },
+        PushOperation::ArchiveBlock {
+            block_id: RemoteId::new("parent-1"),
+        },
+        PushOperation::ArchiveBlock {
+            block_id: RemoteId::new("child-1"),
+        },
+        PushOperation::ArchiveBlock {
+            block_id: RemoteId::new("grandchild-1"),
+        },
+    ];
+    let shadow = ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        "Original survivor.\n\nParent.\n\nChild.\n\nGrandchild.",
+        9,
+        [
+            RemoteId::new("survivor-1"),
+            RemoteId::new("parent-1"),
+            RemoteId::new("child-1"),
+            RemoteId::new("grandchild-1"),
+        ],
+    )
+    .expect("nested archive shadow");
+    let mut entry = journal_entry_with_shadow(operations, shadow);
+    entry.apply_effects = vec![
+        JournalApplyEffect::UpdatedBlock {
+            operation_id: PushOperationId::for_operation(
+                &entry.push_id,
+                0,
+                &entry.plan.operations[0],
+            ),
+            operation_index: 0,
+            block_id: RemoteId::new("survivor-1"),
+        },
+        JournalApplyEffect::ArchivedBlock {
+            operation_id: PushOperationId::for_operation(
+                &entry.push_id,
+                3,
+                &entry.plan.operations[3],
+            ),
+            operation_index: 3,
+            block_id: RemoteId::new("grandchild-1"),
+        },
+        JournalApplyEffect::ArchivedBlock {
+            operation_id: PushOperationId::for_operation(
+                &entry.push_id,
+                2,
+                &entry.plan.operations[2],
+            ),
+            operation_index: 2,
+            block_id: RemoteId::new("child-1"),
+        },
+        JournalApplyEffect::ArchivedBlock {
+            operation_id: PushOperationId::for_operation(
+                &entry.push_id,
+                1,
+                &entry.plan.operations[1],
+            ),
+            operation_index: 1,
+            block_id: RemoteId::new("parent-1"),
+        },
+    ];
+
+    let plan = plan_journal_undo(&entry);
+
+    assert_eq!(plan.status, UndoPlanStatus::Complete);
+    assert_eq!(
+        plan.operations
+            .iter()
+            .filter_map(|operation| match operation {
+                UndoOperation::RestoreArchivedBlock { block_id, .. } => {
+                    Some(block_id.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        ["parent-1", "child-1", "grandchild-1"]
+    );
+    assert!(matches!(
+        plan.operations.last(),
+        Some(UndoOperation::RestoreBlockContent { block_id, content })
+            if block_id == &RemoteId::new("survivor-1")
+                && content == "Original survivor."
+    ));
+}
+
+#[test]
+fn undo_does_not_treat_non_archive_effect_order_as_remote_execution_order() {
+    let operations = vec![
+        PushOperation::UpdateBlock {
+            block_id: RemoteId::new("a"),
+            content: "Updated A".to_string(),
+        },
+        PushOperation::UpdateBlock {
+            block_id: RemoteId::new("b"),
+            content: "Updated B".to_string(),
+        },
+    ];
+    let mut entry = journal_entry_with_shadow(operations, multi_block_shadow());
+    entry.apply_effects = vec![
+        JournalApplyEffect::UpdatedBlock {
+            operation_id: PushOperationId::for_operation(
+                &entry.push_id,
+                1,
+                &entry.plan.operations[1],
+            ),
+            operation_index: 1,
+            block_id: RemoteId::new("b"),
+        },
+        JournalApplyEffect::UpdatedBlock {
+            operation_id: PushOperationId::for_operation(
+                &entry.push_id,
+                0,
+                &entry.plan.operations[0],
+            ),
+            operation_index: 0,
+            block_id: RemoteId::new("a"),
+        },
+    ];
+
+    let plan = plan_journal_undo(&entry);
+
+    assert_eq!(plan.status, UndoPlanStatus::Complete);
+    assert_eq!(
+        plan.operations,
+        vec![
+            UndoOperation::RestoreBlockContent {
+                block_id: RemoteId::new("b"),
+                content: "B".to_string(),
+            },
+            UndoOperation::RestoreBlockContent {
+                block_id: RemoteId::new("a"),
+                content: "A".to_string(),
+            },
+        ]
+    );
+}
+
+#[test]
 fn archive_entity_without_entity_preimage_is_blocked() {
     let mut entry = journal_entry(vec![PushOperation::ArchiveEntity {
         entity_id: RemoteId::new("page-1"),

@@ -979,6 +979,104 @@ fn apply_normalizes_append_after_nested_block_to_direct_child_ancestor() {
 }
 
 #[test]
+fn apply_defers_archives_until_child_updates_finish_and_archives_deepest_first() {
+    let mut parent = callout_block("parent-1", "Parent");
+    parent.has_children = true;
+    let mut api = RecordingNotionApi::with_blocks("2026-06-10T00:00:00.000Z", vec![parent]);
+    api.children.insert(
+        ("parent-1".to_string(), None),
+        PaginatedListDto {
+            results: vec![paragraph_block("child-1", "Before.", false)],
+            next_cursor: None,
+            has_more: false,
+        },
+    );
+    let api = Arc::new(api);
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![
+            PushOperation::ArchiveEntity {
+                entity_id: RemoteId::new("page-1"),
+            },
+            PushOperation::ArchiveBlock {
+                block_id: RemoteId::new("parent-1"),
+            },
+            PushOperation::ArchiveBlock {
+                block_id: RemoteId::new("child-1"),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("child-1"),
+                content: "After.".to_string(),
+            },
+        ],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let result = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("apply");
+
+    assert_eq!(
+        result.effects,
+        vec![
+            JournalApplyEffect::UpdatedBlock {
+                operation_id: operation_ids[3].clone(),
+                operation_index: 3,
+                block_id: RemoteId::new("child-1"),
+            },
+            JournalApplyEffect::ArchivedBlock {
+                operation_id: operation_ids[2].clone(),
+                operation_index: 2,
+                block_id: RemoteId::new("child-1"),
+            },
+            JournalApplyEffect::ArchivedBlock {
+                operation_id: operation_ids[1].clone(),
+                operation_index: 1,
+                block_id: RemoteId::new("parent-1"),
+            },
+            JournalApplyEffect::ArchivedEntity {
+                operation_id: operation_ids[0].clone(),
+                operation_index: 0,
+                entity_id: RemoteId::new("page-1"),
+            },
+        ]
+    );
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [
+            WriteCall::Update {
+                block_id: "child-1".to_string(),
+                body: json!({
+                    "paragraph": {
+                        "rich_text": rich_text_json("After."),
+                    },
+                }),
+            },
+            WriteCall::Delete {
+                block_id: "child-1".to_string(),
+            },
+            WriteCall::Delete {
+                block_id: "parent-1".to_string(),
+            },
+            WriteCall::Delete {
+                block_id: "page-1".to_string(),
+            },
+        ]
+    );
+}
+
+#[test]
 fn apply_appends_tier_one_markdown_block_shapes() {
     let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
     let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
@@ -2271,7 +2369,7 @@ fn apply_preserves_link_to_database_when_native_move_is_planned_as_append_archiv
 }
 
 #[test]
-fn apply_undo_restores_archived_block_by_appending_replacement() {
+fn apply_undo_restores_archived_block_in_place() {
     let api = Arc::new(RecordingNotionApi::with_blocks(
         "2026-06-10T00:00:00.000Z",
         vec![paragraph_block("paragraph-1", "Old paragraph.", false)],
@@ -2307,21 +2405,66 @@ fn apply_undo_restores_archived_block_by_appending_replacement() {
     let writes = api.writes.lock().expect("writes");
     assert_eq!(
         *writes,
-        vec![WriteCall::Append {
-            block_id: "page-1".to_string(),
-            body: json!({
-                "children": [{
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {
-                        "rich_text": rich_text_json("Old paragraph."),
-                    },
-                }],
-                "position": {
-                    "type": "start",
-                },
-            }),
+        vec![WriteCall::Update {
+            block_id: "paragraph-1".to_string(),
+            body: json!({ "in_trash": false }),
         }]
+    );
+}
+
+#[test]
+fn apply_undo_restores_nested_archived_blocks_in_place_ancestor_first() {
+    let api = Arc::new(RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![paragraph_block("survivor-1", "Survivor.", false)],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let push_id = PushId("push-nested-archive".to_string());
+    let mount_id = MountId::new("notion-main");
+    let restore = |block_id: &str, parent_id: &str| UndoOperation::RestoreArchivedBlock {
+        block_id: RemoteId::new(block_id),
+        parent_id: RemoteId::new(parent_id),
+        after: Some(RemoteId::new("intentionally-ignored-anchor")),
+        content: format!("Restored {block_id}."),
+        native_kind: Some("paragraph".to_string()),
+    };
+    let undo_plan = UndoPlan {
+        target_push_id: push_id.clone(),
+        mount_id: mount_id.clone(),
+        affected_entities: vec![RemoteId::new("page-1")],
+        operations: vec![
+            restore("parent-1", "page-1"),
+            restore("child-1", "parent-1"),
+            restore("grandchild-1", "child-1"),
+        ],
+        unsupported: vec![],
+        status: UndoPlanStatus::Complete,
+    };
+
+    connector
+        .apply_undo(ApplyUndoRequest {
+            target_push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &undo_plan,
+        })
+        .expect("restore nested archived blocks");
+
+    assert_eq!(
+        api.writes.lock().expect("writes").as_slice(),
+        [
+            WriteCall::Update {
+                block_id: "parent-1".to_string(),
+                body: json!({ "in_trash": false }),
+            },
+            WriteCall::Update {
+                block_id: "child-1".to_string(),
+                body: json!({ "in_trash": false }),
+            },
+            WriteCall::Update {
+                block_id: "grandchild-1".to_string(),
+                body: json!({ "in_trash": false }),
+            },
+        ]
     );
 }
 
@@ -2361,32 +2504,15 @@ fn apply_undo_restores_archived_paragraph_link_labeled_like_link_to_page_as_para
     let writes = api.writes.lock().expect("writes");
     assert_eq!(
         *writes,
-        vec![WriteCall::Append {
-            block_id: "page-1".to_string(),
-            body: json!({
-                "children": [{
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {
-                        "rich_text": [{
-                            "type": "mention",
-                            "mention": {
-                                "type": "page",
-                                "page": { "id": target_id },
-                            },
-                        }],
-                    },
-                }],
-                "position": {
-                    "type": "start",
-                },
-            }),
+        vec![WriteCall::Update {
+            block_id: "paragraph-1".to_string(),
+            body: json!({ "in_trash": false }),
         }]
     );
 }
 
 #[test]
-fn apply_undo_restores_archived_directive_by_appending_replacement() {
+fn apply_undo_restores_archived_directive_in_place() {
     let api = Arc::new(RecordingNotionApi::with_blocks(
         "2026-06-10T00:00:00.000Z",
         vec![paragraph_block("paragraph-1", "Anchor.", false)],
@@ -2420,16 +2546,10 @@ fn apply_undo_restores_archived_directive_by_appending_replacement() {
     let writes = api.writes.lock().expect("writes");
     assert_eq!(
         *writes,
-        vec![append_call(
-            "paragraph-1",
-            json!({
-                "object": "block",
-                "type": "table_of_contents",
-                "table_of_contents": {
-                    "color": "default",
-                },
-            }),
-        )]
+        vec![WriteCall::Update {
+            block_id: "toc-1".to_string(),
+            body: json!({ "in_trash": false }),
+        }]
     );
 }
 

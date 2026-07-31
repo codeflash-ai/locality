@@ -125,6 +125,16 @@ block next to the old block, journal the created block ID, then archive the old
 block. Auto-save treats replacements as review-required because the old remote
 block ID is removed.
 
+The Notion connector defers standalone block and entity archives until all
+other writes finish, then archives nested descendants before their ancestors.
+This keeps later child updates and deletes valid when one approved plan removes
+a parent block or page and also changes or removes content beneath it. Notion
+records this complete archive-last execution shape in its apply effects so undo
+can reverse the actual order and restore ancestors before descendants. Notion
+restores archived blocks in place by clearing `in_trash`, preserving their IDs,
+parents, sibling positions, children, and native block types. Other connectors
+and legacy or incomplete journals continue to use reverse plan order.
+
 `CreateEntity` is the connector-neutral shape for local file creation. For the filesystem projection it carries the parent remote ID, user title, initial property values, initial body, and the source path that produced the create request. Connectors assign the real remote ID and return a `CreatedEntity` apply effect; reconciliation then reads the created remote entity back, materializes the canonical projected path, saves the shadow, and lets undo archive the created entity by ID.
 
 ## Undo Contract
@@ -135,9 +145,10 @@ Journal entries now include shadow preimages for affected entities. The undo pla
 - block replacements reverse to archiving the replacement block and restoring
   the original block from the preimage when the replacement ID was journaled;
 - block moves reverse to the previous sibling position;
-- archived blocks reverse to a restore operation with original content, position,
-  and native block kind when the preimage carries it, so connectors can avoid
-  restoring Markdown lookalikes as the wrong native block type;
+- archived blocks reverse to a restore operation with original content,
+  position, and native block kind when the preimage carries it. Connectors may
+  use that reconstruction payload when necessary; Notion restores the original
+  block identity in place instead;
 - appends reverse to archiving the created block when apply journaled the created block ID;
 - whole-entity body updates carry the pushed body as expected-current state and
   restore `shadow.rendered_body`;

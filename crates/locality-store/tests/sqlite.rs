@@ -116,8 +116,8 @@ fn sqlite_store_seeds_state_compatibility_components() {
             (
                 "durable:journals".to_string(),
                 "durable_json".to_string(),
-                3,
-                3,
+                4,
+                4,
                 1,
                 0
             ),
@@ -809,132 +809,83 @@ fn sqlite_store_reports_virtual_mutations_v4_without_mutating_state() {
 }
 
 #[test]
-fn sqlite_store_migrates_journals_component_v2_to_v3_without_rewriting_rows() {
-    let fixture = SqliteFixture::new();
-    let mut store = fixture.open();
-    store
-        .save_mount(fixture.mount_config())
-        .expect("save mount");
-    let connection = Connection::open(&store.db_path).expect("raw connection");
-    insert_released_v2_journal(&connection);
-    connection
-        .execute(
-            "UPDATE state_components
-             SET version = 2, min_reader_version = 1
-             WHERE component_id = 'durable:journals'",
-            [],
-        )
-        .expect("mark journal component v2");
-    let before_row = journal_json_row(&connection, "push-v2");
-    let before_user_version: i64 = connection
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .expect("user version");
-    drop(connection);
-    drop(store);
+fn sqlite_store_migrates_journals_component_v1_v2_v3_to_v4_without_rewriting_rows() {
+    for old_version in [1, 2, 3] {
+        let fixture = SqliteFixture::new();
+        let mut store = fixture.open();
+        store
+            .save_mount(fixture.mount_config())
+            .expect("save mount");
+        let connection = Connection::open(&store.db_path).expect("raw connection");
+        insert_released_v2_journal(&connection);
+        connection
+            .execute(
+                "UPDATE state_components
+                 SET version = ?1, min_reader_version = 1
+                 WHERE component_id = 'durable:journals'",
+                [old_version],
+            )
+            .expect("mark old journal component");
+        let before_row = journal_json_row(&connection, "push-v2");
+        let before_user_version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user version");
+        drop(connection);
+        drop(store);
 
-    let before =
-        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect v2");
-    assert_eq!(before.status, StateCompatibilityStatus::Migratable);
-    assert_eq!(
-        before.issues,
-        vec![StateCompatibilityIssue::OlderComponent {
-            component_id: "durable:journals".to_string(),
-            found: 2,
-            current: 3,
-        }]
-    );
+        let before = SqliteStateStore::inspect_compatibility(fixture.state_root.clone())
+            .expect("inspect old journals component");
+        assert_eq!(before.status, StateCompatibilityStatus::Migratable);
+        assert_eq!(
+            before.issues,
+            vec![StateCompatibilityIssue::OlderComponent {
+                component_id: "durable:journals".to_string(),
+                found: old_version,
+                current: 4,
+            }]
+        );
 
-    let reopened = fixture.open();
-    let connection = Connection::open(&reopened.db_path).expect("raw reopened connection");
-    let (version, min_reader_version): (i64, i64) = connection
-        .query_row(
-            "SELECT version, min_reader_version
-             FROM state_components
-             WHERE component_id = 'durable:journals'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("journal component metadata");
-    let after_user_version: i64 = connection
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .expect("user version");
-    let after_row = journal_json_row(&connection, "push-v2");
-    let loaded = reopened
-        .get_journal(&PushId("push-v2".to_string()))
-        .expect("read migrated journal")
-        .expect("journal");
+        let reopened = fixture.open();
+        let connection = Connection::open(&reopened.db_path).expect("raw reopened connection");
+        let component: (i64, i64) = connection
+            .query_row(
+                "SELECT version, min_reader_version
+                 FROM state_components
+                 WHERE component_id = 'durable:journals'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("journal component metadata");
+        let after_user_version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user version");
+        let after_row = journal_json_row(&connection, "push-v2");
+        let loaded = reopened
+            .get_journal(&PushId("push-v2".to_string()))
+            .expect("read migrated journal")
+            .expect("journal");
 
-    assert_eq!((version, min_reader_version), (3, 3));
-    assert_eq!(before_user_version, 20);
-    assert_eq!(after_user_version, before_user_version);
-    assert_eq!(after_row, before_row);
-    assert_eq!(
-        loaded,
-        journal_entry("push-v2", JournalStatus::Reconciled)
-            .with_apply_effects(apply_effects("push-v2"))
-    );
+        assert_eq!(component, (4, 4));
+        assert_eq!(before_user_version, 20);
+        assert_eq!(after_user_version, before_user_version);
+        assert_eq!(after_row, before_row);
+        assert_eq!(
+            loaded,
+            journal_entry("push-v2", JournalStatus::Reconciled)
+                .with_apply_effects(apply_effects("push-v2"))
+        );
+    }
 }
 
 #[test]
-fn sqlite_store_migrates_journals_component_v1_to_v3_at_current_schema() {
-    let fixture = SqliteFixture::new();
-    let store = fixture.open();
-    let connection = Connection::open(&store.db_path).expect("raw connection");
-    let before_user_version: i64 = connection
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .expect("user version");
-    connection
-        .execute(
-            "UPDATE state_components
-             SET version = 1, min_reader_version = 1
-             WHERE component_id = 'durable:journals'",
-            [],
-        )
-        .expect("mark journal component v1");
-    drop(connection);
-    drop(store);
-
-    let before =
-        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect v1");
-    assert_eq!(before.status, StateCompatibilityStatus::Migratable);
-    assert_eq!(
-        before.issues,
-        vec![StateCompatibilityIssue::OlderComponent {
-            component_id: "durable:journals".to_string(),
-            found: 1,
-            current: 3,
-        }]
-    );
-
-    let reopened = fixture.open();
-    let connection = Connection::open(&reopened.db_path).expect("raw reopened connection");
-    let component: (i64, i64) = connection
-        .query_row(
-            "SELECT version, min_reader_version
-             FROM state_components
-             WHERE component_id = 'durable:journals'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("journal component metadata");
-    let after_user_version: i64 = connection
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .expect("user version");
-
-    assert_eq!(component, (3, 3));
-    assert_eq!(before_user_version, 20);
-    assert_eq!(after_user_version, before_user_version);
-}
-
-#[test]
-fn sqlite_store_reports_journals_component_v4_as_needs_update() {
+fn sqlite_store_reports_journals_component_v5_as_needs_update() {
     let fixture = SqliteFixture::new();
     let store = fixture.open();
     let connection = Connection::open(&store.db_path).expect("raw connection");
     connection
         .execute(
             "UPDATE state_components
-             SET version = 4, min_reader_version = 4
+             SET version = 5, min_reader_version = 5
              WHERE component_id = 'durable:journals'",
             [],
         )
@@ -943,17 +894,17 @@ fn sqlite_store_reports_journals_component_v4_as_needs_update() {
     drop(store);
 
     let report =
-        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect v4");
+        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect v5");
     assert_eq!(report.status, StateCompatibilityStatus::NeedsUpdate);
     assert_eq!(
         report.issues,
         vec![StateCompatibilityIssue::NewerComponent {
             component_id: "durable:journals".to_string(),
-            found: 4,
-            supported: 3,
+            found: 5,
+            supported: 4,
         }]
     );
-    let error = SqliteStateStore::open(fixture.state_root.clone()).expect_err("v4 open blocked");
+    let error = SqliteStateStore::open(fixture.state_root.clone()).expect_err("v5 open blocked");
     assert!(matches!(error, StoreError::StateCompatibility(_)));
 }
 
@@ -1727,7 +1678,7 @@ fn sqlite_store_blocks_newer_component_versions() {
 }
 
 #[test]
-fn sqlite_store_migrates_v2_journal_component_to_v3() {
+fn sqlite_store_migrates_v2_journal_component_to_v4() {
     let fixture = SqliteFixture::new();
     let store = fixture.open();
     let connection = Connection::open(&store.db_path).expect("raw connection");
@@ -1754,7 +1705,7 @@ fn sqlite_store_migrates_v2_journal_component_to_v3() {
         )
         .expect("journal component versions");
 
-    assert_eq!((version, min_reader_version), (3, 3));
+    assert_eq!((version, min_reader_version), (4, 4));
 }
 
 #[test]
@@ -1781,7 +1732,7 @@ fn sqlite_store_blocks_components_that_require_newer_readers() {
         vec![StateCompatibilityIssue::ComponentRequiresNewerReader {
             component_id: "durable:journals".to_string(),
             min_reader_version: 999,
-            supported: 3,
+            supported: 4,
         }]
     );
 
@@ -1813,7 +1764,7 @@ fn sqlite_store_blocks_newer_journal_component_versions() {
         vec![StateCompatibilityIssue::NewerComponent {
             component_id: "durable:journals".to_string(),
             found: 999,
-            supported: 3,
+            supported: 4,
         }]
     );
 
@@ -3479,7 +3430,7 @@ fn journal_reader_remaps_mixed_legacy_operation_indexes_for_undo() {
 }
 
 #[test]
-fn sqlite_store_round_trips_v3_entity_body_journal_rows() {
+fn sqlite_store_round_trips_entity_body_journal_rows_at_v4() {
     let fixture = SqliteFixture::new();
     let mut store = fixture.open();
     store
@@ -3522,7 +3473,7 @@ fn sqlite_store_round_trips_v3_entity_body_journal_rows() {
         .expect("journal component metadata");
 
     assert_eq!(loaded, entry);
-    assert_eq!(component, (3, 3));
+    assert_eq!(component, (4, 4));
 }
 
 #[test]
@@ -3734,7 +3685,7 @@ fn sqlite_store_migrates_v16_journals_with_empty_edit_metadata() {
         .expect("journal");
 
     assert_eq!(user_version, 20);
-    assert_eq!(journals_component_version, 3);
+    assert_eq!(journals_component_version, 4);
     assert_eq!(
         metadata_json,
         serde_json::to_string(&JournalMetadata::default()).expect("default metadata json")
@@ -3819,7 +3770,7 @@ fn sqlite_store_migrates_v17_mounts_with_default_settings_json() {
     assert_eq!(user_version, 20);
     assert_eq!(settings_json, "{}");
     assert_eq!(migration_count, 1);
-    assert_eq!(journal_component, (3, 3));
+    assert_eq!(journal_component, (4, 4));
 }
 
 fn query_state_components(connection: &Connection) -> Vec<(String, String, i64, i64, i64, i64)> {
