@@ -470,7 +470,9 @@ impl HostedSlackPollCheckpointV1 {
         }
         let first_page = page.request_cursor.is_none();
         let deleted_root_reconciliation = is_deleted_root_reconciliation_page(page);
-        if deleted_root_reconciliation {
+        if deleted_root_reconciliation
+            && next.checkpoint_format_version < HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V2
+        {
             next.checkpoint_format_version = HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V2;
             next.minimum_reader_version = HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V2;
         }
@@ -948,6 +950,7 @@ fn validate_next_cursor(
                         || page.next_cursor.as_deref() == Some(next_cursor))
             }
             HostedSlackPollEvidenceV1::BeginCatchUp { .. } => false,
+            HostedSlackPollEvidenceV1::IncrementalBaseline { .. } => false,
         })
     {
         return Err(HostedSlackPollError::CursorCycle);
@@ -1029,7 +1032,9 @@ fn prepare_reply_phase(
             return Err(HostedSlackPollError::MissingRoot(root.clone()));
         }
     }
-    let pending = if history_phase == HostedSlackPollPhaseV1::HistoricalHistory {
+    let pending = if history_phase == HostedSlackPollPhaseV1::HistoricalHistory
+        || checkpoint.poll_kind == HostedSlackPollKindV1::Incremental
+    {
         checkpoint
             .completed_roots
             .retain(|root| !touched.contains(&root.root_message_id));
@@ -1387,10 +1392,13 @@ fn rebuild_candidate_reference_metadata(
         .collect::<BTreeSet<_>>();
     let mut files = Vec::new();
     for evidence in &checkpoint.evidence {
-        let HostedSlackPollEvidenceV1::AppliedPage { page } = evidence else {
-            continue;
+        let page_files = match evidence {
+            HostedSlackPollEvidenceV1::IncrementalBaseline { candidate, .. } => {
+                candidate.files.clone()
+            }
+            HostedSlackPollEvidenceV1::AppliedPage { page } => page_reference_metadata(page)?.1,
+            HostedSlackPollEvidenceV1::BeginCatchUp { .. } => continue,
         };
-        let (_, page_files) = page_reference_metadata(page)?;
         for file in page_files {
             if referenced_file_ids.contains(&file.id) {
                 upsert_by(&mut files, file, |value| &value.id);
@@ -1407,10 +1415,13 @@ fn rebuild_candidate_reference_metadata(
     referenced_user_ids.extend(files.iter().filter_map(|file| file.user_id.clone()));
     let mut users = Vec::new();
     for evidence in &checkpoint.evidence {
-        let HostedSlackPollEvidenceV1::AppliedPage { page } = evidence else {
-            continue;
+        let page_users = match evidence {
+            HostedSlackPollEvidenceV1::IncrementalBaseline { candidate, .. } => {
+                candidate.users.clone()
+            }
+            HostedSlackPollEvidenceV1::AppliedPage { page } => page_reference_metadata(page)?.0,
+            HostedSlackPollEvidenceV1::BeginCatchUp { .. } => continue,
         };
-        let (page_users, _) = page_reference_metadata(page)?;
         for user in page_users {
             if referenced_user_ids.contains(&user.id) {
                 upsert_by(&mut users, user, |value| &value.id);

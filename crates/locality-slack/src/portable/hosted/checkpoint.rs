@@ -19,6 +19,8 @@ pub const HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V1: u16 = 1;
 pub const HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V1: u16 = 1;
 pub const HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V2: u16 = 2;
 pub const HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V2: u16 = 2;
+pub const HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V3: u16 = 3;
+pub const HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V3: u16 = 3;
 pub const MAX_HOSTED_SLACK_CURSOR_BYTES_V1: usize = 1024;
 pub const MAX_HOSTED_SLACK_APPLIED_PAGES_V1: usize = 256;
 pub const MAX_HOSTED_SLACK_REPLAY_BYTES_V1: usize = 512 * 1024;
@@ -28,6 +30,7 @@ pub const MAX_HOSTED_SLACK_CHECKPOINT_BYTES_V1: usize = 2 * 1024 * 1024;
 #[serde(rename_all = "snake_case")]
 pub enum HostedSlackPollKindV1 {
     Bootstrap,
+    Incremental,
     FullRepair,
 }
 
@@ -71,8 +74,17 @@ pub struct HostedSlackAppliedPageV1 {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HostedSlackPollEvidenceV1 {
-    AppliedPage { page: HostedSlackAppliedPageV1 },
-    BeginCatchUp { poll_cut_at: String },
+    IncrementalBaseline {
+        candidate: HostedSlackPollCandidateV1,
+        completed_roots: Vec<HostedSlackCompletedRootV1>,
+        latest_observed_message_timestamp: Option<String>,
+    },
+    AppliedPage {
+        page: HostedSlackAppliedPageV1,
+    },
+    BeginCatchUp {
+        poll_cut_at: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,6 +282,11 @@ impl HostedSlackPollCheckpointV1 {
         backfill_cut_at: String,
         poll_overlap_watermark: String,
     ) -> Result<Self, HostedSlackPollError> {
+        if poll_kind == HostedSlackPollKindV1::Incremental {
+            return Err(HostedSlackPollError::IncompleteCandidate(
+                "incremental applied baseline",
+            ));
+        }
         selector
             .validate()
             .map_err(|_| HostedSlackPollError::InvalidIdentity("selector"))?;
@@ -280,6 +297,42 @@ impl HostedSlackPollCheckpointV1 {
             backfill_cut_at,
             poll_overlap_watermark,
         );
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+
+    pub fn incremental_from_applied(
+        applied: &Self,
+        channel: RawHostedSlackChannel,
+        poll_overlap_watermark: String,
+    ) -> Result<Self, HostedSlackPollError> {
+        applied.validate()?;
+        if applied.phase != HostedSlackPollPhaseV1::CompleteCandidate {
+            return Err(HostedSlackPollError::IncompleteCandidate(
+                "applied checkpoint phase",
+            ));
+        }
+        let backfill_cut_at =
+            applied
+                .poll_cut_at
+                .clone()
+                .ok_or(HostedSlackPollError::IncompleteCandidate(
+                    "applied poll cut",
+                ))?;
+        let mut checkpoint = Self::genesis(
+            &applied.selector(),
+            channel,
+            HostedSlackPollKindV1::Incremental,
+            backfill_cut_at,
+            poll_overlap_watermark,
+        );
+        checkpoint.checkpoint_format_version = HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V3;
+        checkpoint.minimum_reader_version = HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V3;
+        checkpoint.install_incremental_baseline(
+            applied.candidate.clone(),
+            applied.completed_roots.clone(),
+            applied.latest_observed_message_timestamp.clone(),
+        )?;
         checkpoint.validate()?;
         Ok(checkpoint)
     }
@@ -337,8 +390,8 @@ impl HostedSlackPollCheckpointV1 {
         validate_checkpoint_versions_for_reader(
             self.checkpoint_format_version,
             self.minimum_reader_version,
-            HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V2,
-            HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V2,
+            HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V3,
+            HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V3,
         )?;
         let selector = self.selector();
         selector
@@ -404,6 +457,15 @@ impl HostedSlackPollCheckpointV1 {
         );
         for evidence in self.evidence.clone() {
             match evidence {
+                HostedSlackPollEvidenceV1::IncrementalBaseline {
+                    candidate,
+                    completed_roots,
+                    latest_observed_message_timestamp,
+                } => rebuilt.install_incremental_baseline(
+                    candidate,
+                    completed_roots,
+                    latest_observed_message_timestamp,
+                )?,
                 HostedSlackPollEvidenceV1::AppliedPage { page } => {
                     super::poll::replay_applied_page_evidence(&mut rebuilt, &page)?;
                 }
@@ -414,6 +476,38 @@ impl HostedSlackPollCheckpointV1 {
         }
         rebuilt.validate_internal()?;
         Ok(rebuilt)
+    }
+
+    fn install_incremental_baseline(
+        &mut self,
+        candidate: HostedSlackPollCandidateV1,
+        completed_roots: Vec<HostedSlackCompletedRootV1>,
+        latest_observed_message_timestamp: Option<String>,
+    ) -> Result<(), HostedSlackPollError> {
+        if self.poll_kind != HostedSlackPollKindV1::Incremental
+            || !self.evidence.is_empty()
+            || self.phase != HostedSlackPollPhaseV1::HistoricalHistory
+        {
+            return Err(HostedSlackPollError::IncompleteCandidate(
+                "incremental baseline position",
+            ));
+        }
+        let mut next = self.clone();
+        next.checkpoint_format_version = HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V3;
+        next.minimum_reader_version = HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V3;
+        next.candidate = candidate.clone();
+        next.completed_roots = completed_roots.clone();
+        next.latest_observed_message_timestamp = latest_observed_message_timestamp.clone();
+        next.phase = HostedSlackPollPhaseV1::AwaitingCatchUpCut;
+        next.evidence
+            .push(HostedSlackPollEvidenceV1::IncrementalBaseline {
+                candidate,
+                completed_roots,
+                latest_observed_message_timestamp,
+            });
+        next.validate_internal()?;
+        *self = next;
+        Ok(())
     }
 
     pub fn selector(&self) -> HostedSlackChannelSelector {
@@ -458,8 +552,8 @@ pub fn decode_hosted_slack_poll_checkpoint_v1(
 ) -> Result<HostedSlackPollCheckpointV1, HostedSlackPollError> {
     decode_hosted_slack_poll_checkpoint_for_reader(
         bytes,
-        HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V2,
-        HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V2,
+        HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V3,
+        HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V3,
     )
 }
 
@@ -628,6 +722,9 @@ pub(crate) fn validate_checkpoint_versions_for_reader(
         ) | (
             HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V2,
             HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V2
+        ) | (
+            HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V3,
+            HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V3
         )
     ) {
         return Err(HostedSlackPollError::UnsupportedVersion {
@@ -945,15 +1042,37 @@ fn validate_candidate(
 }
 
 fn validate_evidence(checkpoint: &HostedSlackPollCheckpointV1) -> Result<(), HostedSlackPollError> {
-    if checkpoint.evidence.len() > MAX_HOSTED_SLACK_APPLIED_PAGES_V1 + 1 {
+    if checkpoint.evidence.len() > MAX_HOSTED_SLACK_APPLIED_PAGES_V1 + 2 {
         return Err(HostedSlackPollError::CollectionTooLarge("evidence"));
     }
     let mut keys = BTreeSet::new();
     let mut replay_bytes = 0usize;
     let mut transitions = 0usize;
+    let mut baselines = 0usize;
     let mut applied_pages = 0usize;
     for evidence in &checkpoint.evidence {
         match evidence {
+            HostedSlackPollEvidenceV1::IncrementalBaseline {
+                candidate,
+                completed_roots,
+                latest_observed_message_timestamp,
+            } => {
+                baselines += 1;
+                if baselines > 1 || checkpoint.evidence.first() != Some(evidence) {
+                    return Err(HostedSlackPollError::DuplicateValue(
+                        "incremental baseline evidence",
+                    ));
+                }
+                replay_bytes = replay_bytes.saturating_add(
+                    serde_json::to_vec(&(
+                        candidate,
+                        completed_roots,
+                        latest_observed_message_timestamp,
+                    ))
+                    .map_err(|_| HostedSlackPollError::Serialization)?
+                    .len(),
+                );
+            }
             HostedSlackPollEvidenceV1::AppliedPage { page } => {
                 applied_pages += 1;
                 if applied_pages > MAX_HOSTED_SLACK_APPLIED_PAGES_V1 {
@@ -989,6 +1108,11 @@ fn validate_evidence(checkpoint: &HostedSlackPollCheckpointV1) -> Result<(), Hos
                 replay_bytes = replay_bytes.saturating_add(poll_cut_at.len());
             }
         }
+    }
+    if (checkpoint.poll_kind == HostedSlackPollKindV1::Incremental) != (baselines == 1) {
+        return Err(HostedSlackPollError::IncompleteCandidate(
+            "incremental baseline evidence",
+        ));
     }
     if replay_bytes > MAX_HOSTED_SLACK_REPLAY_BYTES_V1 {
         return Err(HostedSlackPollError::InputTooLarge {

@@ -222,7 +222,9 @@ fn catch_up_replies_boundary() -> HostedSlackPollCheckpointV1 {
     checkpoint
 }
 
-fn complete_poll(mut checkpoint: HostedSlackPollCheckpointV1) -> HostedSlackPollOutputV1 {
+fn completed_checkpoint(
+    mut checkpoint: HostedSlackPollCheckpointV1,
+) -> HostedSlackPollCheckpointV1 {
     finish_historical(&mut checkpoint);
     checkpoint
         .begin_catch_up("2026-06-02T00:00:00Z".to_string())
@@ -242,7 +244,13 @@ fn complete_poll(mut checkpoint: HostedSlackPollCheckpointV1) -> HostedSlackPoll
     checkpoint
         .apply_replies_page(&terminal)
         .expect("catch-up replies terminal");
-    checkpoint.completed_output().expect("complete output")
+    checkpoint
+}
+
+fn complete_poll(checkpoint: HostedSlackPollCheckpointV1) -> HostedSlackPollOutputV1 {
+    completed_checkpoint(checkpoint)
+        .completed_output()
+        .expect("complete output")
 }
 
 #[test]
@@ -1130,6 +1138,49 @@ fn full_repair_and_poll_only_bootstrap_converge_without_events() {
     assert_eq!(
         complete_poll(checkpoint_with_kind(HostedSlackPollKindV1::FullRepair)),
         complete_poll(checkpoint_with_kind(HostedSlackPollKindV1::Bootstrap))
+    );
+}
+
+#[test]
+fn incremental_poll_starts_from_applied_candidate_and_skips_historical_and_untouched_replies() {
+    let applied = completed_checkpoint(checkpoint());
+    let applied_snapshot = applied.completed_output().unwrap().snapshot;
+    let mut incremental = HostedSlackPollCheckpointV1::incremental_from_applied(
+        &applied,
+        raw_snapshot().channel,
+        "2026-06-01T23:55:00Z".to_string(),
+    )
+    .expect("incremental checkpoint");
+    assert_eq!(incremental.poll_kind(), HostedSlackPollKindV1::Incremental);
+    assert_eq!(
+        incremental.phase(),
+        HostedSlackPollPhaseV1::AwaitingCatchUpCut
+    );
+    assert_eq!(incremental.backfill_cut_at(), "2026-06-02T00:00:00Z");
+    let encoded = serde_json::to_vec(&incremental).unwrap();
+    assert_eq!(
+        decode_hosted_slack_poll_checkpoint_v1(&encoded).unwrap(),
+        incremental
+    );
+
+    incremental
+        .begin_catch_up("2026-06-02T00:05:00Z".to_string())
+        .unwrap();
+    let mut page = catch_up_page();
+    page.poll_kind = HostedSlackPollKindV1::Incremental;
+    page.backfill_cut_at = "2026-06-02T00:00:00Z".to_string();
+    page.poll_overlap_watermark = "2026-06-01T23:55:00Z".to_string();
+    page.poll_cut_at = Some("2026-06-02T00:05:00Z".to_string());
+    page.observed_at = "2026-06-02T00:05:01Z".to_string();
+    incremental.apply_history_page(&page).unwrap();
+    assert_eq!(
+        incremental.phase(),
+        HostedSlackPollPhaseV1::CompleteCandidate,
+        "an empty incremental window must retain untouched applied roots without a reply sweep"
+    );
+    assert_eq!(
+        incremental.completed_output().unwrap().snapshot,
+        applied_snapshot
     );
 }
 
