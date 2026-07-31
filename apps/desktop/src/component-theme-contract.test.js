@@ -241,4 +241,36 @@ describe("desktop component theme contract", () => {
 
     expectNoRawShadowValues(darkSharedActive);
   });
+
+  it("centers compact source-card controls without broad span overrides", () => {
+    const sourceReadyCopy = cssBlock(".source-ready-card strong,\n.source-ready-card > div > span");
+    const sourceReadyControls = cssBlock(
+      ".source-ready-card .status-pill,\n.source-ready-card .secondary-button.compact,\n.connector-choice-card .primary-button.compact,\n.connector-choice-card .secondary-button.compact,\n.mount-details-button",
+    );
+    const sourceReadyControlIcons = cssBlock(
+      ".source-ready-card .secondary-button.compact svg,\n.connector-choice-card .primary-button.compact svg,\n.connector-choice-card .secondary-button.compact svg,\n.mount-details-button svg",
+    );
+    const sourceReadyButtonText = cssBlock(
+      ".source-ready-card .secondary-button.compact span,\n.connector-choice-card .primary-button.compact span,\n.connector-choice-card .secondary-button.compact span",
+    );
+
+    expect(styles).not.toMatch(/\.source-ready-card strong,\s*\.source-ready-card span\s*\{/);
+    expect(sourceReadyCopy).toContain("display: block;");
+    expect(sourceReadyControls).toContain("display: inline-flex;");
+    expect(sourceReadyControls).toContain("align-items: center;");
+    expect(sourceReadyControls).toContain("justify-content: center;");
+    expect(sourceReadyControls).toContain("line-height: 1;");
+    expect(sourceReadyControlIcons).toContain("flex: 0 0 auto;");
+    expect(sourceReadyControlIcons).toContain("width: 13px;");
+    expect(sourceReadyControlIcons).toContain("height: 13px;");
+    expect(sourceReadyButtonText).toContain("display: inline-flex;");
+    expect(sourceReadyButtonText).toContain("align-items: center;");
+    expect(sourceReadyButtonText).toContain("line-height: 1;");
+  });
+
+  it("keeps collapsed sidebar navigation spaced below the mark", () => {
+    const collapsedNav = cssBlock(".sidebar-collapsed .sidebar nav");
+
+    expect(collapsedNav).toContain("margin-top: 10px;");
+  });
 });

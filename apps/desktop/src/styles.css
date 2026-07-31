@@ -2066,7 +2066,7 @@ p {
 
 .sidebar-collapsed .sidebar nav {
   justify-items: center;
-  margin-top: 0;
+  margin-top: 10px;
 }
 
 .sidebar-collapsed .sidebar-link {
@@ -2688,7 +2688,7 @@ button.home-stat:hover {
 }
 
 .source-ready-card strong,
-.source-ready-card span {
+.source-ready-card > div > span {
   display: block;
   min-width: 0;
   overflow: hidden;
@@ -2701,11 +2701,41 @@ button.home-stat:hover {
   font-size: 13px;
 }
 
-.source-ready-card span {
+.source-ready-card > div > span {
   margin-top: 2px;
   color: var(--muted);
   font-size: 11px;
   font-weight: 760;
+}
+
+.source-ready-card .status-pill,
+.source-ready-card .secondary-button.compact,
+.connector-choice-card .primary-button.compact,
+.connector-choice-card .secondary-button.compact,
+.mount-details-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.source-ready-card .secondary-button.compact svg,
+.connector-choice-card .primary-button.compact svg,
+.connector-choice-card .secondary-button.compact svg,
+.mount-details-button svg {
+  flex: 0 0 auto;
+  width: 13px;
+  height: 13px;
+}
+
+.source-ready-card .secondary-button.compact span,
+.connector-choice-card .primary-button.compact span,
+.connector-choice-card .secondary-button.compact span {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  line-height: 1;
 }
 
 .mount-card {
