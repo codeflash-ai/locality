@@ -38,6 +38,11 @@ use crate::discovery::{
     reservation_changed, transaction_missing, validate_envelope_version,
 };
 use crate::error::{StoreError, StoreResult};
+use crate::generation_delivery::{
+    GENERATION_DELIVERY_COMPONENT_VERSION, GenerationApplyJournalRecord, GenerationApplyOutcome,
+    GenerationApplyStatus, GenerationDeliveryRepository, GenerationPathRecord, GenerationPathState,
+    ObservedGenerationRecord, PreparedGenerationApply,
+};
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorStateRecord, EntityRecord, FreshnessStateRecord,
@@ -56,7 +61,7 @@ use crate::repository::{
 };
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 21;
 const ENTITY_SEARCH_COMPONENT_VERSION: i64 = 2;
 const JOURNALS_COMPONENT_VERSION: i64 = 3;
 const LINUX_FUSE_PROJECTION_LAYOUT_VERSION: i64 = 2;
@@ -188,6 +193,15 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
         data_json: "{}",
     },
     StateComponentDefinition {
+        component_id: "durable:generation_delivery",
+        component_kind: "durable_transaction",
+        current_version: GENERATION_DELIVERY_COMPONENT_VERSION,
+        min_reader_version: GENERATION_DELIVERY_COMPONENT_VERSION,
+        required: true,
+        rebuildable: false,
+        data_json: "{}",
+    },
+    StateComponentDefinition {
         component_id: "auth:connections",
         component_kind: "secret_binding",
         current_version: 1,
@@ -251,6 +265,726 @@ impl SqliteStateStore {
             ",
         )?;
         Ok(connection)
+    }
+}
+
+fn generation_path_state_label(state: GenerationPathState) -> &'static str {
+    match state {
+        GenerationPathState::Clean => "clean",
+        GenerationPathState::Dirty => "dirty",
+        GenerationPathState::Conflicted => "conflicted",
+    }
+}
+
+fn parse_generation_path_state(value: &str) -> StoreResult<GenerationPathState> {
+    match value {
+        "clean" => Ok(GenerationPathState::Clean),
+        "dirty" => Ok(GenerationPathState::Dirty),
+        "conflicted" => Ok(GenerationPathState::Conflicted),
+        _ => Err(StoreError::InvalidState(format!(
+            "unknown generation path state `{value}`"
+        ))),
+    }
+}
+
+fn observed_generation_from_row(
+    row: (
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        Option<String>,
+        String,
+    ),
+) -> StoreResult<ObservedGenerationRecord> {
+    Ok(ObservedGenerationRecord {
+        mount_id: MountId::new(row.0),
+        source_connection_id: locality_core::portable::SourceConnectionId::new(row.1),
+        generation_id: locality_core::portable::SourceGenerationId::new(row.2)
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?,
+        inventory_sha256: row.3,
+        workspace_layout_version: u16::try_from(row.4).map_err(|_| {
+            StoreError::InvalidState("invalid stored workspace layout version".to_string())
+        })?,
+        workspace_layout_digest: row.5,
+        last_receipt_sha256: row.6,
+        updated_at: row.7,
+    })
+}
+
+fn select_observed_generation(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<Option<ObservedGenerationRecord>> {
+    connection
+        .query_row(
+            "SELECT mount_id, source_connection_id, generation_id, inventory_sha256,
+                    workspace_layout_version, workspace_layout_digest,
+                    last_receipt_sha256, updated_at
+             FROM observed_generations WHERE mount_id = ?1",
+            params![mount_id.0.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(observed_generation_from_row)
+        .transpose()
+}
+
+fn generation_path_from_row(
+    row: (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        String,
+    ),
+) -> StoreResult<GenerationPathRecord> {
+    Ok(GenerationPathRecord {
+        mount_id: MountId::new(row.0),
+        projection_id: locality_core::portable::ProjectionId::new(row.1),
+        logical_path: row.2,
+        base_generation_id: locality_core::portable::SourceGenerationId::new(row.3)
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?,
+        base_identity: row.4.map(|value| from_json(&value)).transpose()?,
+        state: parse_generation_path_state(&row.5)?,
+        incoming_identity: row.6.map(|value| from_json(&value)).transpose()?,
+        updated_at: row.7,
+    })
+}
+
+fn select_generation_path(
+    connection: &Connection,
+    mount_id: &MountId,
+    projection_id: &locality_core::portable::ProjectionId,
+) -> StoreResult<Option<GenerationPathRecord>> {
+    connection
+        .query_row(
+            "SELECT mount_id, projection_id, logical_path, base_generation_id,
+                    base_identity_json, state, incoming_identity_json, updated_at
+             FROM generation_paths WHERE mount_id = ?1 AND projection_id = ?2",
+            params![mount_id.0.as_str(), projection_id.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(generation_path_from_row)
+        .transpose()
+}
+
+fn list_generation_paths_from_connection(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<Vec<GenerationPathRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT mount_id, projection_id, logical_path, base_generation_id,
+                base_identity_json, state, incoming_identity_json, updated_at
+         FROM generation_paths WHERE mount_id = ?1 ORDER BY projection_id",
+    )?;
+    let rows = statement.query_map(params![mount_id.0.as_str()], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+        ))
+    })?;
+    rows.map(|row| generation_path_from_row(row?)).collect()
+}
+
+fn generation_apply_from_connection(
+    connection: &Connection,
+    delta_id: &str,
+) -> StoreResult<Option<GenerationApplyJournalRecord>> {
+    let row = connection
+        .query_row(
+            "SELECT delta_json, receipt_json, receipt_sha256, stage_root, status,
+                    created_at, updated_at, completed_at
+             FROM generation_apply_journals WHERE delta_id = ?1",
+            params![delta_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let mut outcomes = Vec::new();
+    let mut statement = connection.prepare(
+        "SELECT entry_index, outcome_json
+         FROM generation_apply_outcomes WHERE delta_id = ?1 ORDER BY entry_index",
+    )?;
+    let rows = statement.query_map(params![delta_id], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (entry_index, outcome_json) = row?;
+        outcomes.push((
+            u64::try_from(entry_index).map_err(|_| {
+                StoreError::InvalidState("negative generation outcome index".to_string())
+            })?,
+            from_json(&outcome_json)?,
+        ));
+    }
+    Ok(Some(GenerationApplyJournalRecord {
+        delta: from_json(&row.0)?,
+        receipt: from_json(&row.1)?,
+        receipt_sha256: row.2,
+        stage_root: row.3,
+        status: GenerationApplyStatus::parse(&row.4)?,
+        outcomes,
+        created_at: row.5,
+        updated_at: row.6,
+        completed_at: row.7,
+    }))
+}
+
+fn validate_seed_generation(
+    observed: &ObservedGenerationRecord,
+    paths: &[GenerationPathRecord],
+) -> StoreResult<()> {
+    if observed.workspace_layout_version == 0
+        || observed.workspace_layout_digest.is_empty()
+        || observed.inventory_sha256.is_empty()
+        || observed.updated_at.is_empty()
+    {
+        return Err(StoreError::InvalidState(
+            "observed generation has incomplete metadata".to_string(),
+        ));
+    }
+    let mut projections = BTreeSet::new();
+    let mut logical_paths = BTreeSet::new();
+    for path in paths {
+        if path.mount_id != observed.mount_id
+            || path.base_generation_id != observed.generation_id
+            || path.logical_path.is_empty()
+            || path.updated_at.is_empty()
+            || !projections.insert(path.projection_id.clone())
+            || !logical_paths.insert(path.logical_path.clone())
+        {
+            return Err(StoreError::InvalidState(
+                "generation path seed does not match its observed generation".to_string(),
+            ));
+        }
+        if let Some(identity) = &path.base_identity
+            && (identity.projection_id != path.projection_id
+                || identity.logical_path.as_str() != path.logical_path)
+        {
+            return Err(StoreError::InvalidState(
+                "generation path base identity does not match its row".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl GenerationDeliveryRepository for SqliteStateStore {
+    fn seed_observed_generation(
+        &mut self,
+        observed: ObservedGenerationRecord,
+        paths: Vec<GenerationPathRecord>,
+    ) -> StoreResult<()> {
+        validate_seed_generation(&observed, &paths)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mount_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mounts WHERE mount_id = ?1)",
+            params![observed.mount_id.0.as_str()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !mount_exists {
+            return Err(StoreError::MountMissing(observed.mount_id));
+        }
+        if let Some(existing) = select_observed_generation(&transaction, &observed.mount_id)? {
+            let existing_paths =
+                list_generation_paths_from_connection(&transaction, &observed.mount_id)?;
+            if existing == observed && existing_paths == paths {
+                transaction.commit()?;
+                return Ok(());
+            }
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` already has a different observed generation",
+                observed.mount_id.0
+            )));
+        }
+        transaction.execute(
+            "INSERT INTO observed_generations (
+                mount_id, source_connection_id, generation_id, inventory_sha256,
+                workspace_layout_version, workspace_layout_digest,
+                last_receipt_sha256, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                observed.mount_id.0.as_str(),
+                observed.source_connection_id.as_str(),
+                observed.generation_id.as_str(),
+                observed.inventory_sha256.as_str(),
+                observed.workspace_layout_version,
+                observed.workspace_layout_digest.as_str(),
+                observed.last_receipt_sha256.as_deref(),
+                observed.updated_at.as_str(),
+            ],
+        )?;
+        for path in paths {
+            transaction.execute(
+                "INSERT INTO generation_paths (
+                    mount_id, projection_id, logical_path, base_generation_id,
+                    base_identity_json, state, incoming_identity_json, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    path.mount_id.0.as_str(),
+                    path.projection_id.as_str(),
+                    path.logical_path.as_str(),
+                    path.base_generation_id.as_str(),
+                    path.base_identity.as_ref().map(to_json).transpose()?,
+                    generation_path_state_label(path.state),
+                    path.incoming_identity.as_ref().map(to_json).transpose()?,
+                    path.updated_at.as_str(),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn get_observed_generation(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Option<ObservedGenerationRecord>> {
+        select_observed_generation(&self.connection()?, mount_id)
+    }
+
+    fn list_generation_paths(&self, mount_id: &MountId) -> StoreResult<Vec<GenerationPathRecord>> {
+        list_generation_paths_from_connection(&self.connection()?, mount_id)
+    }
+
+    fn reserve_generation_apply(
+        &mut self,
+        prepared: PreparedGenerationApply,
+    ) -> StoreResult<GenerationApplyJournalRecord> {
+        prepared.validate()?;
+        if prepared.delta.entries.is_empty() {
+            return Err(StoreError::InvalidState(
+                "generation apply delta has no entries".to_string(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) =
+            generation_apply_from_connection(&transaction, &prepared.delta.delta_id)?
+        {
+            if existing.delta == prepared.delta
+                && existing.receipt == prepared.receipt
+                && existing.receipt_sha256 == prepared.receipt_sha256
+                && existing.stage_root == prepared.stage_root
+                && existing.created_at == prepared.created_at
+            {
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            return Err(StoreError::InvalidState(format!(
+                "generation apply `{}` replay changed its immutable payload",
+                prepared.delta.delta_id
+            )));
+        }
+
+        let mut mount_ids = BTreeSet::new();
+        for entry in &prepared.delta.entries {
+            mount_ids.insert(MountId::new(entry.mount_id.as_str()));
+            let observed =
+                select_observed_generation(&transaction, &MountId::new(entry.mount_id.as_str()))?
+                    .ok_or_else(|| {
+                    StoreError::InvalidState(format!(
+                        "mount `{}` has no observed generation",
+                        entry.mount_id
+                    ))
+                })?;
+            if observed.source_connection_id != prepared.delta.source_connection_id
+                || observed.generation_id != prepared.delta.base_generation_id
+                || observed.workspace_layout_version != prepared.delta.workspace_layout_version
+                || observed.workspace_layout_digest
+                    != prepared.delta.workspace_layout_digest.as_str()
+            {
+                return Err(StoreError::InvalidState(format!(
+                    "mount `{}` generation or layout does not match delta base",
+                    entry.mount_id
+                )));
+            }
+            if let Some(old) = &entry.old {
+                let path = select_generation_path(
+                    &transaction,
+                    &MountId::new(entry.mount_id.as_str()),
+                    &old.projection_id,
+                )?
+                .ok_or_else(|| {
+                    StoreError::InvalidState(format!(
+                        "delta old projection `{}` has no local merge base",
+                        old.projection_id.as_str()
+                    ))
+                })?;
+                let expected = if path.state == GenerationPathState::Conflicted {
+                    path.incoming_identity.as_ref()
+                } else {
+                    path.base_identity.as_ref()
+                };
+                if expected != Some(old) {
+                    return Err(StoreError::InvalidState(format!(
+                        "delta old projection `{}` does not match local merge state",
+                        old.projection_id.as_str()
+                    )));
+                }
+            }
+        }
+        let active: Option<String> = transaction
+            .query_row(
+                "SELECT delta_id FROM generation_apply_journals
+                 WHERE source_connection_id = ?1 AND active = 1",
+                params![prepared.delta.source_connection_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(active) = active {
+            return Err(StoreError::InvalidState(format!(
+                "source already has active generation apply `{active}`"
+            )));
+        }
+        transaction.execute(
+            "INSERT INTO generation_apply_journals (
+                delta_id, source_connection_id, base_generation_id,
+                target_generation_id, delta_json, receipt_json, receipt_sha256,
+                stage_root, status, active, created_at, updated_at, completed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'staged', 1, ?9, ?9, NULL)",
+            params![
+                prepared.delta.delta_id.as_str(),
+                prepared.delta.source_connection_id.as_str(),
+                prepared.delta.base_generation_id.as_str(),
+                prepared.delta.target_generation_id.as_str(),
+                to_json(&prepared.delta)?,
+                to_json(&prepared.receipt)?,
+                prepared.receipt_sha256.as_str(),
+                prepared.stage_root.as_str(),
+                prepared.created_at.as_str(),
+            ],
+        )?;
+        let record = generation_apply_from_connection(&transaction, &prepared.delta.delta_id)?
+            .expect("inserted generation journal exists");
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    fn mark_generation_apply_started(
+        &mut self,
+        delta_id: &str,
+        updated_at: &str,
+    ) -> StoreResult<GenerationApplyJournalRecord> {
+        let connection = self.connection()?;
+        let existing =
+            generation_apply_from_connection(&connection, delta_id)?.ok_or_else(|| {
+                StoreError::InvalidState(format!("generation apply `{delta_id}` is missing"))
+            })?;
+        if existing.status == GenerationApplyStatus::Completed {
+            return Ok(existing);
+        }
+        connection.execute(
+            "UPDATE generation_apply_journals
+             SET status = 'applying', updated_at = ?2
+             WHERE delta_id = ?1 AND active = 1",
+            params![delta_id, updated_at],
+        )?;
+        generation_apply_from_connection(&connection, delta_id)?.ok_or_else(|| {
+            StoreError::InvalidState(format!("generation apply `{delta_id}` disappeared"))
+        })
+    }
+
+    fn record_generation_apply_outcome(
+        &mut self,
+        delta_id: &str,
+        entry_index: u64,
+        outcome: GenerationApplyOutcome,
+        updated_at: &str,
+    ) -> StoreResult<GenerationApplyJournalRecord> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let journal =
+            generation_apply_from_connection(&transaction, delta_id)?.ok_or_else(|| {
+                StoreError::InvalidState(format!("generation apply `{delta_id}` is missing"))
+            })?;
+        if journal.status == GenerationApplyStatus::Completed {
+            let exact = journal
+                .outcomes
+                .iter()
+                .find(|(index, _)| *index == entry_index)
+                .is_some_and(|(_, existing)| existing == &outcome);
+            return if exact {
+                Ok(journal)
+            } else {
+                Err(StoreError::InvalidState(format!(
+                    "completed generation apply `{delta_id}` outcome changed"
+                )))
+            };
+        }
+        if entry_index >= journal.delta.entries.len() as u64 {
+            return Err(StoreError::InvalidState(format!(
+                "generation apply `{delta_id}` outcome index is out of bounds"
+            )));
+        }
+        if let Some((_, existing)) = journal
+            .outcomes
+            .iter()
+            .find(|(index, _)| *index == entry_index)
+        {
+            return if existing == &outcome {
+                Ok(journal)
+            } else {
+                Err(StoreError::InvalidState(format!(
+                    "generation apply `{delta_id}` outcome replay changed"
+                )))
+            };
+        }
+        transaction.execute(
+            "INSERT INTO generation_apply_outcomes (delta_id, entry_index, outcome_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                delta_id,
+                i64::try_from(entry_index).map_err(|_| StoreError::InvalidState(
+                    "generation apply outcome index is too large".to_string()
+                ))?,
+                to_json(&outcome)?,
+                updated_at
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE generation_apply_journals SET status = 'applying', updated_at = ?2
+             WHERE delta_id = ?1 AND active = 1",
+            params![delta_id, updated_at],
+        )?;
+        let updated = generation_apply_from_connection(&transaction, delta_id)?
+            .expect("generation journal remains present");
+        transaction.commit()?;
+        Ok(updated)
+    }
+
+    fn get_generation_apply(
+        &self,
+        delta_id: &str,
+    ) -> StoreResult<Option<GenerationApplyJournalRecord>> {
+        generation_apply_from_connection(&self.connection()?, delta_id)
+    }
+
+    fn list_active_generation_applies(&self) -> StoreResult<Vec<GenerationApplyJournalRecord>> {
+        let connection = self.connection()?;
+        let delta_ids = {
+            let mut statement = connection.prepare(
+                "SELECT delta_id FROM generation_apply_journals WHERE active = 1 ORDER BY delta_id",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        delta_ids
+            .iter()
+            .map(|delta_id| {
+                generation_apply_from_connection(&connection, delta_id)?.ok_or_else(|| {
+                    StoreError::InvalidState(format!(
+                        "active generation apply `{delta_id}` disappeared"
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    fn complete_generation_apply(
+        &mut self,
+        delta_id: &str,
+        completed_at: &str,
+    ) -> StoreResult<GenerationApplyJournalRecord> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let journal =
+            generation_apply_from_connection(&transaction, delta_id)?.ok_or_else(|| {
+                StoreError::InvalidState(format!("generation apply `{delta_id}` is missing"))
+            })?;
+        if journal.status == GenerationApplyStatus::Completed {
+            transaction.commit()?;
+            return Ok(journal);
+        }
+        if journal.outcomes.len() != journal.delta.entries.len()
+            || journal
+                .outcomes
+                .iter()
+                .enumerate()
+                .any(|(expected, (actual, _))| *actual != expected as u64)
+        {
+            return Err(StoreError::InvalidState(format!(
+                "generation apply `{delta_id}` does not have one outcome per entry"
+            )));
+        }
+
+        let mut mount_ids = BTreeSet::new();
+        for (entry, (_, outcome)) in journal.delta.entries.iter().zip(&journal.outcomes) {
+            let mount_id = MountId::new(entry.mount_id.as_str());
+            mount_ids.insert(mount_id.clone());
+            match outcome {
+                GenerationApplyOutcome::Applied => {
+                    let new = entry.new.as_ref().ok_or_else(|| {
+                        StoreError::InvalidState("applied outcome has no new identity".to_string())
+                    })?;
+                    transaction.execute(
+                        "INSERT INTO generation_paths (
+                            mount_id, projection_id, logical_path, base_generation_id,
+                            base_identity_json, state, incoming_identity_json, updated_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, 'clean', NULL, ?6)
+                         ON CONFLICT(mount_id, projection_id) DO UPDATE SET
+                            logical_path = excluded.logical_path,
+                            base_generation_id = excluded.base_generation_id,
+                            base_identity_json = excluded.base_identity_json,
+                            state = 'clean', incoming_identity_json = NULL,
+                            updated_at = excluded.updated_at",
+                        params![
+                            mount_id.0.as_str(),
+                            new.projection_id.as_str(),
+                            new.logical_path.as_str(),
+                            journal.delta.target_generation_id.as_str(),
+                            to_json(new)?,
+                            completed_at,
+                        ],
+                    )?;
+                }
+                GenerationApplyOutcome::Deleted => {
+                    let old = entry.old.as_ref().ok_or_else(|| {
+                        StoreError::InvalidState("deleted outcome has no old identity".to_string())
+                    })?;
+                    if entry.new.is_some() {
+                        return Err(StoreError::InvalidState(
+                            "deleted outcome names a non-deletion entry".to_string(),
+                        ));
+                    }
+                    transaction.execute(
+                        "DELETE FROM generation_paths WHERE mount_id = ?1 AND projection_id = ?2",
+                        params![mount_id.0.as_str(), old.projection_id.as_str()],
+                    )?;
+                }
+                GenerationApplyOutcome::Conflict {
+                    local_sha256: _,
+                    incoming_identity,
+                } => {
+                    let projection_id = entry
+                        .projection_id()
+                        .expect("validated delta entry has projection identity");
+                    let existing = select_generation_path(&transaction, &mount_id, projection_id)?;
+                    let logical_path = entry
+                        .old
+                        .as_ref()
+                        .or(entry.new.as_ref())
+                        .expect("validated delta entry has identity")
+                        .logical_path
+                        .as_str();
+                    let base_generation_id = existing
+                        .as_ref()
+                        .map_or(&journal.delta.base_generation_id, |path| {
+                            &path.base_generation_id
+                        });
+                    let base_identity = existing
+                        .as_ref()
+                        .and_then(|path| path.base_identity.as_ref())
+                        .or(entry.old.as_ref());
+                    transaction.execute(
+                        "INSERT INTO generation_paths (
+                            mount_id, projection_id, logical_path, base_generation_id,
+                            base_identity_json, state, incoming_identity_json, updated_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, 'conflicted', ?6, ?7)
+                         ON CONFLICT(mount_id, projection_id) DO UPDATE SET
+                            logical_path = excluded.logical_path,
+                            state = 'conflicted',
+                            incoming_identity_json = excluded.incoming_identity_json,
+                            updated_at = excluded.updated_at",
+                        params![
+                            mount_id.0.as_str(),
+                            projection_id.as_str(),
+                            logical_path,
+                            base_generation_id.as_str(),
+                            base_identity.map(to_json).transpose()?,
+                            incoming_identity.as_ref().map(to_json).transpose()?,
+                            completed_at,
+                        ],
+                    )?;
+                }
+            }
+        }
+        for mount_id in mount_ids {
+            let changed = transaction.execute(
+                "UPDATE observed_generations
+                 SET generation_id = ?2, inventory_sha256 = ?3,
+                     workspace_layout_version = ?4, workspace_layout_digest = ?5,
+                     last_receipt_sha256 = ?6, updated_at = ?7
+                 WHERE mount_id = ?1 AND source_connection_id = ?8 AND generation_id = ?9",
+                params![
+                    mount_id.0.as_str(),
+                    journal.delta.target_generation_id.as_str(),
+                    journal.delta.target_inventory_sha256.as_str(),
+                    journal.delta.workspace_layout_version,
+                    journal.delta.workspace_layout_digest.as_str(),
+                    journal.receipt_sha256.as_str(),
+                    completed_at,
+                    journal.delta.source_connection_id.as_str(),
+                    journal.delta.base_generation_id.as_str(),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::InvalidState(format!(
+                    "mount `{}` observed generation changed during apply",
+                    mount_id.0
+                )));
+            }
+        }
+        transaction.execute(
+            "UPDATE generation_apply_journals
+             SET status = 'completed', active = 0, updated_at = ?2, completed_at = ?2
+             WHERE delta_id = ?1 AND active = 1",
+            params![delta_id, completed_at],
+        )?;
+        let completed = generation_apply_from_connection(&transaction, delta_id)?
+            .expect("completed generation journal remains present");
+        transaction.commit()?;
+        Ok(completed)
     }
 }
 
@@ -2532,6 +3266,8 @@ fn mount_source_identity_changed(existing: &MountConfig, next: &MountConfig) -> 
 
 fn clear_mount_source_state(connection: &Connection, mount_id: &MountId) -> StoreResult<()> {
     for table in [
+        "generation_paths",
+        "observed_generations",
         "entities",
         "shadows",
         "hydration_jobs",
@@ -3016,6 +3752,65 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             readable_diff_json TEXT,
             FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS observed_generations (
+            mount_id TEXT PRIMARY KEY,
+            source_connection_id TEXT NOT NULL,
+            generation_id TEXT NOT NULL,
+            inventory_sha256 TEXT NOT NULL,
+            workspace_layout_version INTEGER NOT NULL CHECK (workspace_layout_version > 0),
+            workspace_layout_digest TEXT NOT NULL,
+            last_receipt_sha256 TEXT,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS generation_paths (
+            mount_id TEXT NOT NULL,
+            projection_id TEXT NOT NULL,
+            logical_path TEXT NOT NULL,
+            base_generation_id TEXT NOT NULL,
+            base_identity_json TEXT,
+            state TEXT NOT NULL CHECK (state IN ('clean', 'dirty', 'conflicted')),
+            incoming_identity_json TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (mount_id, projection_id),
+            UNIQUE (mount_id, logical_path),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS generation_apply_journals (
+            delta_id TEXT PRIMARY KEY,
+            source_connection_id TEXT NOT NULL,
+            base_generation_id TEXT NOT NULL,
+            target_generation_id TEXT NOT NULL,
+            delta_json TEXT NOT NULL,
+            receipt_json TEXT NOT NULL,
+            receipt_sha256 TEXT NOT NULL,
+            stage_root TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('staged', 'applying', 'completed')),
+            active INTEGER NOT NULL CHECK (active IN (0, 1)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            CHECK (
+                (active = 0 AND status = 'completed' AND completed_at IS NOT NULL)
+                OR (active = 1 AND status IN ('staged', 'applying') AND completed_at IS NULL)
+            )
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS generation_apply_one_active_per_source
+        ON generation_apply_journals(source_connection_id)
+        WHERE active = 1;
+
+        CREATE TABLE IF NOT EXISTS generation_apply_outcomes (
+            delta_id TEXT NOT NULL,
+            entry_index INTEGER NOT NULL CHECK (entry_index >= 0),
+            outcome_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (delta_id, entry_index),
+            FOREIGN KEY (delta_id) REFERENCES generation_apply_journals(delta_id) ON DELETE CASCADE
+        );
         ",
     )?;
 
@@ -3282,6 +4077,13 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         }
     }
 
+    if user_version < 21 {
+        create_generation_delivery_tables(connection)?;
+        if user_version >= 13 {
+            record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
+        }
+    }
+
     if user_version < SCHEMA_VERSION {
         seed_default_notion_profile(connection)?;
         migrate_linux_fuse_projection_layout_to_v2(connection, user_version < 13)?;
@@ -3404,6 +4206,10 @@ fn state_component_issue_allows_schema_migration(
         issue,
         StateCompatibilityIssue::MissingComponent { component_id }
             if user_version < 19 && component_id == "durable:discovery_projection"
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::MissingComponent { component_id }
+            if user_version < 21 && component_id == "durable:generation_delivery"
     )
 }
 
@@ -4099,6 +4905,72 @@ fn create_state_management_tables(connection: &Connection) -> StoreResult<()> {
             updated_at TEXT NOT NULL,
             PRIMARY KEY (mount_id, projection),
             FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+        ",
+    )?;
+    Ok(())
+}
+
+fn create_generation_delivery_tables(connection: &Connection) -> StoreResult<()> {
+    connection.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS observed_generations (
+            mount_id TEXT PRIMARY KEY,
+            source_connection_id TEXT NOT NULL,
+            generation_id TEXT NOT NULL,
+            inventory_sha256 TEXT NOT NULL,
+            workspace_layout_version INTEGER NOT NULL CHECK (workspace_layout_version > 0),
+            workspace_layout_digest TEXT NOT NULL,
+            last_receipt_sha256 TEXT,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS generation_paths (
+            mount_id TEXT NOT NULL,
+            projection_id TEXT NOT NULL,
+            logical_path TEXT NOT NULL,
+            base_generation_id TEXT NOT NULL,
+            base_identity_json TEXT,
+            state TEXT NOT NULL CHECK (state IN ('clean', 'dirty', 'conflicted')),
+            incoming_identity_json TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (mount_id, projection_id),
+            UNIQUE (mount_id, logical_path),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS generation_apply_journals (
+            delta_id TEXT PRIMARY KEY,
+            source_connection_id TEXT NOT NULL,
+            base_generation_id TEXT NOT NULL,
+            target_generation_id TEXT NOT NULL,
+            delta_json TEXT NOT NULL,
+            receipt_json TEXT NOT NULL,
+            receipt_sha256 TEXT NOT NULL,
+            stage_root TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('staged', 'applying', 'completed')),
+            active INTEGER NOT NULL CHECK (active IN (0, 1)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            CHECK (
+                (active = 0 AND status = 'completed' AND completed_at IS NOT NULL)
+                OR (active = 1 AND status IN ('staged', 'applying') AND completed_at IS NULL)
+            )
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS generation_apply_one_active_per_source
+        ON generation_apply_journals(source_connection_id)
+        WHERE active = 1;
+
+        CREATE TABLE IF NOT EXISTS generation_apply_outcomes (
+            delta_id TEXT NOT NULL,
+            entry_index INTEGER NOT NULL CHECK (entry_index >= 0),
+            outcome_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (delta_id, entry_index),
+            FOREIGN KEY (delta_id) REFERENCES generation_apply_journals(delta_id) ON DELETE CASCADE
         );
         ",
     )?;

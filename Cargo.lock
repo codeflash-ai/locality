@@ -2332,6 +2332,7 @@ name = "locality-store"
 version = "0.3.6"
 dependencies = [
  "locality-core",
+ "locality-protocol",
  "rusqlite",
  "serde",
  "serde_json",

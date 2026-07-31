@@ -1,0 +1,325 @@
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use locality_core::model::{MountId, RemoteId};
+use locality_core::portable::{
+    ContentVersionId, LogicalPath, ProjectionId, SourceConnectionId, SourceGenerationId,
+};
+use locality_core::workspace_layout::PortableMountId;
+use locality_protocol::FreshnessEpoch;
+use locality_protocol::freshness_delivery::{
+    FRESHNESS_DELIVERY_READER_VERSION, GENERATION_DELTA_FORMAT_VERSION, GenerationDelta,
+    GenerationDeltaEntry, GenerationDeltaTerminalReceipt, GenerationFileIdentity,
+};
+use locality_protocol::workspace_layout::LayoutDigest;
+use locality_store::{
+    GenerationApplyOutcome, GenerationApplyStatus, GenerationDeliveryRepository,
+    GenerationPathRecord, GenerationPathState, MountConfig, MountRepository,
+    ObservedGenerationRecord, PreparedGenerationApply, SqliteStateStore, StoreError,
+};
+
+fn digest(character: char) -> String {
+    format!("sha256:{}", character.to_string().repeat(64))
+}
+
+fn generation(value: &str) -> SourceGenerationId {
+    SourceGenerationId::new(value).unwrap()
+}
+
+fn identity(version: &str, digest_character: char, bytes: u64) -> GenerationFileIdentity {
+    GenerationFileIdentity {
+        projection_id: ProjectionId::new("projection-roadmap"),
+        logical_path: LogicalPath::new("Roadmap.md").unwrap(),
+        content_version_id: ContentVersionId::new(version),
+        content_sha256: digest(digest_character),
+        byte_length: bytes,
+    }
+}
+
+fn delta() -> GenerationDelta {
+    GenerationDelta {
+        format_version: GENERATION_DELTA_FORMAT_VERSION,
+        minimum_reader_version: FRESHNESS_DELIVERY_READER_VERSION,
+        delta_id: "delta-2".to_string(),
+        source_connection_id: SourceConnectionId::new("source-main"),
+        base_generation_id: generation("generation-1"),
+        target_generation_id: generation("generation-2"),
+        target_complete: true,
+        target_inventory_sha256: digest('2'),
+        workspace_layout_version: 1,
+        workspace_layout_digest: LayoutDigest::new(digest('a')).unwrap(),
+        entries: vec![GenerationDeltaEntry {
+            mount_id: PortableMountId::new("mount-main").unwrap(),
+            old: Some(identity("content-1", '1', 3)),
+            new: Some(identity("content-2", '2', 4)),
+        }],
+    }
+}
+
+fn receipt(delta: &GenerationDelta) -> GenerationDeltaTerminalReceipt {
+    GenerationDeltaTerminalReceipt {
+        format_version: delta.format_version,
+        minimum_reader_version: delta.minimum_reader_version,
+        delta_id: delta.delta_id.clone(),
+        source_connection_id: delta.source_connection_id.clone(),
+        base_generation_id: delta.base_generation_id.clone(),
+        target_generation_id: delta.target_generation_id.clone(),
+        target_inventory_sha256: delta.target_inventory_sha256.clone(),
+        workspace_layout_version: delta.workspace_layout_version,
+        workspace_layout_digest: delta.workspace_layout_digest.clone(),
+        delta_sha256: delta.canonical_sha256().unwrap(),
+        entry_count: 1,
+        changed_content_bytes: 4,
+        authorization_epoch: FreshnessEpoch::new(7).unwrap(),
+        completed_at: "2026-07-31T12:00:00Z".to_string(),
+    }
+}
+
+fn seed(store: &mut SqliteStateStore, fixture: &Fixture) {
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "backend",
+            &fixture.mount_root,
+        ))
+        .unwrap();
+    store
+        .seed_observed_generation(
+            ObservedGenerationRecord {
+                mount_id: fixture.mount_id.clone(),
+                source_connection_id: SourceConnectionId::new("source-main"),
+                generation_id: generation("generation-1"),
+                inventory_sha256: digest('1'),
+                workspace_layout_version: 1,
+                workspace_layout_digest: digest('a'),
+                last_receipt_sha256: None,
+                updated_at: "2026-07-31T11:00:00Z".to_string(),
+            },
+            vec![GenerationPathRecord {
+                mount_id: fixture.mount_id.clone(),
+                projection_id: ProjectionId::new("projection-roadmap"),
+                logical_path: "Roadmap.md".to_string(),
+                base_generation_id: generation("generation-1"),
+                base_identity: Some(identity("content-1", '1', 3)),
+                state: GenerationPathState::Clean,
+                incoming_identity: None,
+                updated_at: "2026-07-31T11:00:00Z".to_string(),
+            }],
+        )
+        .unwrap();
+}
+
+#[test]
+fn observed_generation_apply_is_persisted_exact_replayable_and_atomic() {
+    let fixture = Fixture::new("persist-replay");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let delta = delta();
+    let receipt = receipt(&delta);
+    let prepared = PreparedGenerationApply {
+        delta: delta.clone(),
+        receipt: receipt.clone(),
+        receipt_sha256: receipt.canonical_sha256().unwrap(),
+        stage_root: "generation-delivery/delta-2".to_string(),
+        created_at: "2026-07-31T12:01:00Z".to_string(),
+    };
+
+    let reserved = store.reserve_generation_apply(prepared.clone()).unwrap();
+    assert_eq!(reserved.status, GenerationApplyStatus::Staged);
+    assert_eq!(store.reserve_generation_apply(prepared).unwrap(), reserved);
+    store
+        .record_generation_apply_outcome(
+            "delta-2",
+            0,
+            GenerationApplyOutcome::Applied,
+            "2026-07-31T12:02:00Z",
+        )
+        .unwrap();
+    let completed = store
+        .complete_generation_apply("delta-2", "2026-07-31T12:03:00Z")
+        .unwrap();
+    assert_eq!(completed.status, GenerationApplyStatus::Completed);
+    assert_eq!(
+        store
+            .complete_generation_apply("delta-2", "2026-07-31T12:04:00Z")
+            .unwrap(),
+        completed
+    );
+    drop(store);
+
+    let reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    let observed = reopened
+        .get_observed_generation(&fixture.mount_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed.generation_id, generation("generation-2"));
+    assert_eq!(
+        observed.last_receipt_sha256,
+        Some(receipt.canonical_sha256().unwrap())
+    );
+    let paths = reopened.list_generation_paths(&fixture.mount_id).unwrap();
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].state, GenerationPathState::Clean);
+    assert_eq!(paths[0].base_identity, delta.entries[0].new);
+    assert!(
+        reopened
+            .list_active_generation_applies()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn reservation_fails_closed_on_generation_layout_and_old_identity_mismatch() {
+    let fixture = Fixture::new("mismatch");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+
+    for changed in ["generation", "layout", "identity"] {
+        let mut delta = delta();
+        match changed {
+            "generation" => delta.base_generation_id = generation("generation-0"),
+            "layout" => {
+                delta.workspace_layout_digest = LayoutDigest::new(digest('f')).unwrap();
+            }
+            "identity" => {
+                delta.entries[0].old.as_mut().unwrap().content_version_id =
+                    ContentVersionId::new("different");
+            }
+            _ => unreachable!(),
+        }
+        delta.delta_id = format!("delta-{changed}");
+        let receipt = receipt(&delta);
+        let error = store
+            .reserve_generation_apply(PreparedGenerationApply {
+                receipt_sha256: receipt.canonical_sha256().unwrap(),
+                receipt,
+                delta,
+                stage_root: format!("generation-delivery/{changed}"),
+                created_at: "2026-07-31T12:01:00Z".to_string(),
+            })
+            .expect_err("mismatch must fail closed");
+        assert!(matches!(error, StoreError::InvalidState(_)));
+    }
+    assert!(store.list_active_generation_applies().unwrap().is_empty());
+}
+
+#[test]
+fn schema_20_migration_preserves_pending_local_state_and_adds_delivery_tables() {
+    use locality_core::journal::{JournalEntry, JournalStatus, PushId};
+    use locality_core::planner::PushPlan;
+    use locality_store::{
+        JournalRepository, VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
+    };
+    use rusqlite::Connection;
+
+    let fixture = Fixture::new("migration-v20");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "notion",
+            &fixture.mount_root,
+        ))
+        .unwrap();
+    let journal = JournalEntry::new(
+        PushId("push-pending".to_string()),
+        fixture.mount_id.clone(),
+        vec![RemoteId::new("page-1")],
+        PushPlan::default(),
+        JournalStatus::Prepared,
+    );
+    store.append_journal(journal.clone()).unwrap();
+    let mutation = VirtualMutationRecord {
+        mount_id: fixture.mount_id.clone(),
+        local_id: "local-dirty".to_string(),
+        mutation_kind: VirtualMutationKind::Create,
+        target_remote_id: None,
+        parent_remote_id: None,
+        original_path: None,
+        projected_path: PathBuf::from("dirty.md"),
+        title: "Dirty".to_string(),
+        content_path: Some(fixture.mount_root.join("dirty.md")),
+        created_at: "2026-07-31T10:00:00Z".to_string(),
+        updated_at: "2026-07-31T10:00:00Z".to_string(),
+    };
+    store.save_virtual_mutation(mutation.clone()).unwrap();
+    fs::write(fixture.mount_root.join("dirty.md"), b"local pending bytes").unwrap();
+    let db_path = store.db_path.clone();
+    drop(store);
+
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE generation_apply_outcomes;
+         DROP INDEX generation_apply_one_active_per_source;
+         DROP TABLE generation_apply_journals;
+         DROP TABLE generation_paths;
+         DROP TABLE observed_generations;
+         DELETE FROM state_components WHERE component_id = 'durable:generation_delivery';
+         UPDATE state_components SET version = 20 WHERE component_id = 'core:schema';
+         PRAGMA user_version = 20;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    assert_eq!(
+        reopened.get_journal(&journal.push_id).unwrap(),
+        Some(journal)
+    );
+    assert_eq!(
+        reopened
+            .get_virtual_mutation(&fixture.mount_id, "local-dirty")
+            .unwrap(),
+        Some(mutation)
+    );
+    assert_eq!(
+        fs::read(fixture.mount_root.join("dirty.md")).unwrap(),
+        b"local pending bytes"
+    );
+    assert_eq!(SqliteStateStore::current_schema_version(), 21);
+    assert!(
+        reopened
+            .get_observed_generation(&fixture.mount_id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+struct Fixture {
+    state_root: PathBuf,
+    mount_root: PathBuf,
+    mount_id: MountId,
+}
+
+impl Fixture {
+    fn new(label: &str) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "locality-generation-delivery-{label}-{}-{stamp}-{nonce}",
+            std::process::id()
+        ));
+        let state_root = root.join("state");
+        let mount_root = root.join("mount");
+        fs::create_dir_all(&mount_root).unwrap();
+        Self {
+            state_root,
+            mount_root,
+            mount_id: MountId::new("mount-main"),
+        }
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(self.state_root.parent().unwrap());
+    }
+}
