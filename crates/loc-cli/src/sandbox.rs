@@ -15,6 +15,10 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use locality_protocol::workspace_api_v2::{
+    WorkspaceClientCapabilitiesV2, WorkspaceExportOfferV2, WorkspaceProfileSessionRequestV2,
+    WorkspaceProfileSessionV2, WorkspaceSessionStatusV2,
+};
 use locality_protocol::{
     ExportAttemptLimits, ExportAttemptRequest, OpaqueBootstrapExchangeRequest,
     SCOPE_AUTHORIZED_COMPONENT_VERSIONS, SandboxSessionState, SandboxSessionStatus,
@@ -27,6 +31,12 @@ use localityd::replica_materializer::{
     ReplicaMaterializationLimits, ReplicaMaterializationSummary,
     materialize_replica_archive_with_expected_receipt,
     materialize_scope_authorized_replica_archive,
+};
+use localityd::workspace_archive::WorkspaceArchiveLimits;
+use localityd::workspace_materializer::{
+    PublishedWorkspace, WorkspaceMaterializationError, WorkspaceMaterializationLimits,
+    WorkspaceOwnershipCapability, materialize_workspace_archive_durable,
+    recover_and_verify_workspace_publication_state, recover_workspace_publication,
 };
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
@@ -165,6 +175,14 @@ impl SandboxProfileKey {
 
     fn expose(&self) -> &str {
         &self.0
+    }
+
+    fn ownership_capability(&self) -> WorkspaceOwnershipCapability {
+        let mut secret = [0_u8; 32];
+        for (output, pair) in secret.iter_mut().zip(self.0.as_bytes().chunks_exact(2)) {
+            *output = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
+        }
+        WorkspaceOwnershipCapability::new(secret)
     }
 }
 
@@ -565,6 +583,21 @@ pub fn run_sandbox_init(
     )
 }
 
+/// Headless `loc` integration for an authenticated generation-2 export.
+///
+/// Desktop calls the same public localityd materializer directly. Keeping this
+/// additive entry point separate leaves every API-v1 bootstrap path unchanged.
+pub fn materialize_workspace_export_v2<Body: Read>(
+    archive: ReplicaArchive<Body>,
+    destination: &Path,
+    limits: WorkspaceMaterializationLimits,
+    session: &WorkspaceProfileSessionV2,
+    offer: &WorkspaceExportOfferV2,
+    ownership: &WorkspaceOwnershipCapability,
+) -> Result<PublishedWorkspace, WorkspaceMaterializationError> {
+    materialize_workspace_archive_durable(archive, destination, limits, session, offer, ownership)
+}
+
 /// Initializes a sandbox with an explicit export content-negotiation policy.
 ///
 /// The existing [`run_sandbox_init`] entry point remains automatic for source
@@ -663,6 +696,14 @@ enum SandboxCredential {
     Session(SessionCapability),
 }
 
+enum WorkspaceProfileNegotiation {
+    Generation1(SessionCapability),
+    Generation2 {
+        session: WorkspaceProfileSessionV2,
+        capabilities: WorkspaceClientCapabilitiesV2,
+    },
+}
+
 fn run_sandbox_init_internal(
     options: SandboxInitOptions,
     credential: SandboxCredential,
@@ -670,7 +711,20 @@ fn run_sandbox_init_internal(
     mut profile: Option<&mut SandboxInitProfile>,
 ) -> Result<SandboxInitReport, SandboxInitError> {
     let root = absolute_destination(&options.root)?;
-    validate_destination(&root)?;
+    validate_destination_parent(&root)?;
+    let ownership = match &credential {
+        SandboxCredential::ProfileKey(profile_key) => Some(profile_key.ownership_capability()),
+        _ => None,
+    };
+    if let Some(ownership) = ownership.as_ref() {
+        let verified_v2_state = recover_and_verify_workspace_publication_state(&root, ownership)
+            .map_err(|error| SandboxInitError::Materialization(error.to_string()))?;
+        if !verified_v2_state {
+            validate_destination_absent(&root)?;
+        }
+    } else {
+        validate_destination_absent(&root)?;
+    }
     let client = SandboxHttpClient::new(&options.api_url)?;
     mark_profile(&mut profile, PROFILE_CLIENT_SETUP);
 
@@ -679,7 +733,32 @@ fn run_sandbox_init_internal(
             client.exchange_bootstrap(&bootstrap_token)?
         }
         SandboxCredential::ProfileKey(profile_key) => {
-            client.create_workspace_profile_session(&profile_key)?
+            match client.create_workspace_profile_session_negotiated(&profile_key)? {
+                WorkspaceProfileNegotiation::Generation1(capability) => {
+                    validate_destination_absent(&root)?;
+                    capability
+                }
+                WorkspaceProfileNegotiation::Generation2 {
+                    session,
+                    capabilities,
+                } => {
+                    mark_profile(&mut profile, PROFILE_BOOTSTRAP_EXCHANGE);
+                    let ownership = ownership
+                        .as_ref()
+                        .expect("profile-key ownership capability");
+                    recover_workspace_publication(&root, ownership)
+                        .map_err(|error| SandboxInitError::Materialization(error.to_string()))?;
+                    return run_generation2_workspace_init(
+                        &client,
+                        &root,
+                        content_encoding,
+                        session,
+                        capabilities,
+                        ownership,
+                        profile,
+                    );
+                }
+            }
         }
         SandboxCredential::Session(capability) => capability,
     };
@@ -765,6 +844,140 @@ fn run_sandbox_init_internal(
     };
 
     Ok(report(&root, &capability, encoding, summary))
+}
+
+fn run_generation2_workspace_init(
+    client: &SandboxHttpClient,
+    root: &Path,
+    content_encoding: SandboxContentEncodingPreference,
+    session: WorkspaceProfileSessionV2,
+    capabilities: WorkspaceClientCapabilitiesV2,
+    ownership: &WorkspaceOwnershipCapability,
+    mut profile: Option<&mut SandboxInitProfile>,
+) -> Result<SandboxInitReport, SandboxInitError> {
+    let capability = SessionCapability {
+        session_id: session.session_id().clone(),
+        opaque_capability: session.opaque_capability().to_string(),
+        expires_at: session.expires_at().to_string(),
+    };
+    validate_capability(&capability)?;
+    let status = client.workspace_session_status(&session, &capabilities)?;
+    mark_profile(&mut profile, PROFILE_SESSION_STATUS);
+    if status.state() != SandboxSessionState::Ready {
+        return Err(SandboxInitError::SessionNotReady {
+            state: status.state(),
+            code: status.error().map(|error| error.code),
+        });
+    }
+    if status.error().is_some() {
+        return Err(SandboxInitError::InvalidReadySession("error is present"));
+    }
+    let export_limits =
+        status
+            .export_attempt_limits()
+            .ok_or(SandboxInitError::InvalidReadySession(
+                "export-attempt limits are absent",
+            ))?;
+    let request = export_attempt_request(&capability, content_encoding, export_limits)?;
+    let offer =
+        client.create_workspace_export_attempt(&session, &status, &capabilities, &request)?;
+    let encoding = replica_encoding_for_protocol(offer.offer().content_encoding);
+    if let Some(required) = content_encoding.required_encoding()
+        && required != encoding
+    {
+        return Err(SandboxInitError::UnsupportedExportEncoding(format!(
+            "{} (requested {})",
+            encoding_name(encoding),
+            encoding_name(required)
+        )));
+    }
+    let response = client.open_workspace_export_attempt(&session, &offer)?;
+    mark_profile(&mut profile, PROFILE_EXPORT_OPEN_HEADERS);
+    let limits = workspace_limits_for_offer(&offer)?;
+    let published = materialize_workspace_export_response(
+        response, encoding, root, limits, &session, &offer, ownership, profile,
+    )?;
+    let summary = ReplicaMaterializationSummary {
+        entries: published.validated.archive_entries,
+        files: published.validated.files,
+        directories: published.validated.directories,
+        materialized_bytes: published.validated.content_bytes,
+        decoded_bytes: published.decoded_bytes,
+    };
+    Ok(report(root, &capability, encoding, summary))
+}
+
+fn workspace_limits_for_offer(
+    offer: &WorkspaceExportOfferV2,
+) -> Result<WorkspaceMaterializationLimits, SandboxInitError> {
+    let sealed = offer.offer();
+    if sealed.archive_entry_count > ReplicaMaterializationLimits::default().max_entries {
+        return Err(SandboxInitError::ExportLimit {
+            limit: "archive entries",
+            offered: sealed.archive_entry_count,
+            maximum: ReplicaMaterializationLimits::default().max_entries,
+        });
+    }
+    if sealed.selected_content_bytes > ReplicaMaterializationLimits::default().max_disk_bytes {
+        return Err(SandboxInitError::ExportLimit {
+            limit: "selected content bytes",
+            offered: sealed.selected_content_bytes,
+            maximum: ReplicaMaterializationLimits::default().max_disk_bytes,
+        });
+    }
+    Ok(WorkspaceMaterializationLimits {
+        archive: WorkspaceArchiveLimits {
+            max_entries: sealed.archive_entry_count,
+            max_file_bytes: ReplicaMaterializationLimits::default().max_file_bytes,
+            max_content_bytes: sealed.selected_content_bytes,
+        },
+        ..WorkspaceMaterializationLimits::default()
+    })
+}
+
+fn materialize_workspace_export_response(
+    response: Response,
+    encoding: ReplicaArchiveEncoding,
+    root: &Path,
+    limits: WorkspaceMaterializationLimits,
+    session: &WorkspaceProfileSessionV2,
+    offer: &WorkspaceExportOfferV2,
+    ownership: &WorkspaceOwnershipCapability,
+    mut profile: Option<&mut SandboxInitProfile>,
+) -> Result<PublishedWorkspace, SandboxInitError> {
+    let (body, mut producer) =
+        spawn_export_read_ahead(response).map_err(|error| SandboxInitError::Http {
+            operation: "workspace export read-ahead setup",
+            detail: error.to_string(),
+        })?;
+    let profiled_body = ProfiledExportBody::new(body, profile.as_deref_mut());
+    let archive = ReplicaArchive::new(encoding, profiled_body);
+    let materialization =
+        materialize_workspace_export_v2(archive, root, limits, session, offer, ownership);
+    let producer_outcome = producer.join();
+    if let Some(profile) = profile {
+        profile.mark(PROFILE_STREAM_DECODE_MATERIALIZE);
+    }
+    let published =
+        materialization.map_err(|error| SandboxInitError::Materialization(error.to_string()))?;
+    match producer_outcome {
+        Ok(ReadAheadProducerOutcome::CleanEof) => Ok(published),
+        Ok(ReadAheadProducerOutcome::ConsumerClosed | ReadAheadProducerOutcome::ErrorDelivered) => {
+            Err(SandboxInitError::Materialization(
+                "workspace export transport ended without a clean EOF".to_string(),
+            ))
+        }
+        Err(()) => Err(SandboxInitError::Materialization(
+            "workspace export read-ahead worker panicked".to_string(),
+        )),
+    }
+}
+
+fn replica_encoding_for_protocol(encoding: TarContentEncoding) -> ReplicaArchiveEncoding {
+    match encoding {
+        TarContentEncoding::Identity => ReplicaArchiveEncoding::Identity,
+        TarContentEncoding::Zstd => ReplicaArchiveEncoding::Zstd,
+    }
 }
 
 struct ExportStreamFailure {
@@ -1078,7 +1291,7 @@ fn absolute_destination(path: &Path) -> Result<PathBuf, SandboxInitError> {
     }
 }
 
-fn validate_destination(root: &Path) -> Result<(), SandboxInitError> {
+fn validate_destination_parent(root: &Path) -> Result<(), SandboxInitError> {
     let parent = root
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1094,6 +1307,10 @@ fn validate_destination(root: &Path) -> Result<(), SandboxInitError> {
             ));
         }
     }
+    Ok(())
+}
+
+fn validate_destination_absent(root: &Path) -> Result<(), SandboxInitError> {
     if fs::symlink_metadata(root).is_ok() {
         return Err(SandboxInitError::DestinationExists(root.to_path_buf()));
     }
@@ -1465,6 +1682,39 @@ struct SandboxHttpClient {
     api_url: reqwest::Url,
 }
 
+/// Validates the exact API URL shape accepted by sandbox and portable
+/// workspace clients without performing network I/O.
+pub fn validate_sandbox_api_url(api_url: &str) -> Result<(), SandboxInitError> {
+    parse_sandbox_api_url(api_url).map(|_| ())
+}
+
+fn parse_sandbox_api_url(api_url: &str) -> Result<reqwest::Url, SandboxInitError> {
+    let api_url = reqwest::Url::parse(api_url)
+        .map_err(|_| SandboxInitError::InvalidApiUrl("URL cannot be parsed"))?;
+    if !matches!(api_url.scheme(), "http" | "https") {
+        return Err(SandboxInitError::InvalidApiUrl(
+            "scheme must be http or https",
+        ));
+    }
+    require_api_host(&api_url)?;
+    if !api_url.username().is_empty() || api_url.password().is_some() {
+        return Err(SandboxInitError::InvalidApiUrl(
+            "embedded credentials are not allowed",
+        ));
+    }
+    if api_url.query().is_some() || api_url.fragment().is_some() {
+        return Err(SandboxInitError::InvalidApiUrl(
+            "query strings and fragments are not allowed",
+        ));
+    }
+    if api_url.path() != "/" && !api_url.path().is_empty() {
+        return Err(SandboxInitError::InvalidApiUrl(
+            "URL must not contain a path",
+        ));
+    }
+    Ok(api_url)
+}
+
 impl SandboxHttpClient {
     fn new(api_url: &str) -> Result<Self, SandboxInitError> {
         Self::new_with_read_timeout(api_url, HTTP_READ_TIMEOUT)
@@ -1474,29 +1724,7 @@ impl SandboxHttpClient {
         api_url: &str,
         read_timeout: Duration,
     ) -> Result<Self, SandboxInitError> {
-        let api_url = reqwest::Url::parse(api_url)
-            .map_err(|_| SandboxInitError::InvalidApiUrl("URL cannot be parsed"))?;
-        if !matches!(api_url.scheme(), "http" | "https") {
-            return Err(SandboxInitError::InvalidApiUrl(
-                "scheme must be http or https",
-            ));
-        }
-        require_api_host(&api_url)?;
-        if !api_url.username().is_empty() || api_url.password().is_some() {
-            return Err(SandboxInitError::InvalidApiUrl(
-                "embedded credentials are not allowed",
-            ));
-        }
-        if api_url.query().is_some() || api_url.fragment().is_some() {
-            return Err(SandboxInitError::InvalidApiUrl(
-                "query strings and fragments are not allowed",
-            ));
-        }
-        if api_url.path() != "/" && !api_url.path().is_empty() {
-            return Err(SandboxInitError::InvalidApiUrl(
-                "URL must not contain a path",
-            ));
-        }
+        let api_url = parse_sandbox_api_url(api_url)?;
         REQWEST_CRYPTO_PROVIDER.get_or_init(|| {
             let _ = rustls::crypto::ring::default_provider().install_default();
         });
@@ -1637,6 +1865,145 @@ impl SandboxHttpClient {
             });
         }
         unreachable!("profile session attempt loop always returns")
+    }
+
+    fn create_workspace_profile_session_negotiated(
+        &self,
+        profile_key: &SandboxProfileKey,
+    ) -> Result<WorkspaceProfileNegotiation, SandboxInitError> {
+        let capabilities = WorkspaceClientCapabilitiesV2::workspace_layout_v1(true);
+        let request = WorkspaceProfileSessionRequestV2::new(capabilities.clone());
+        let response = self
+            .client
+            .post(self.workspace_profile_sessions_v2_url())
+            .header(ACCEPT, JSON_MEDIA_TYPE)
+            .header(IDEMPOTENCY_KEY_HEADER, random_idempotency_key()?)
+            .bearer_auth(profile_key.expose())
+            .json(&request)
+            .send()
+            .map_err(|error| SandboxInitError::Http {
+                operation: "generation-2 Workspace Profile session creation",
+                detail: error.without_url().to_string(),
+            })?;
+        if matches!(
+            response.status(),
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            return self
+                .create_workspace_profile_session(profile_key)
+                .map(WorkspaceProfileNegotiation::Generation1);
+        }
+        let bytes = read_json_response_bytes(
+            response,
+            "generation-2 Workspace Profile session creation",
+            StatusCode::CREATED,
+        )?;
+        let session = WorkspaceProfileSessionV2::decode_json(&bytes).map_err(|error| {
+            SandboxInitError::InvalidJson {
+                operation: "generation-2 Workspace Profile session creation",
+                detail: error.to_string(),
+            }
+        })?;
+        Ok(WorkspaceProfileNegotiation::Generation2 {
+            session,
+            capabilities,
+        })
+    }
+
+    fn workspace_session_status(
+        &self,
+        session: &WorkspaceProfileSessionV2,
+        capabilities: &WorkspaceClientCapabilitiesV2,
+    ) -> Result<WorkspaceSessionStatusV2, SandboxInitError> {
+        let response = self
+            .client
+            .get(self.workspace_session_v2_url(session.session_id().as_str()))
+            .header(ACCEPT, JSON_MEDIA_TYPE)
+            .bearer_auth(session.opaque_capability())
+            .send()
+            .map_err(|error| SandboxInitError::Http {
+                operation: "generation-2 session status",
+                detail: error.without_url().to_string(),
+            })?;
+        let bytes =
+            read_json_response_bytes(response, "generation-2 session status", StatusCode::OK)?;
+        WorkspaceSessionStatusV2::decode_json(&bytes, session, capabilities).map_err(|error| {
+            SandboxInitError::InvalidJson {
+                operation: "generation-2 session status",
+                detail: error.to_string(),
+            }
+        })
+    }
+
+    fn create_workspace_export_attempt(
+        &self,
+        session: &WorkspaceProfileSessionV2,
+        status: &WorkspaceSessionStatusV2,
+        capabilities: &WorkspaceClientCapabilitiesV2,
+        request: &ExportAttemptRequest,
+    ) -> Result<WorkspaceExportOfferV2, SandboxInitError> {
+        let response = self
+            .client
+            .post(self.workspace_export_attempts_v2_url(session.session_id().as_str()))
+            .header(ACCEPT, JSON_MEDIA_TYPE)
+            .bearer_auth(session.opaque_capability())
+            .json(request)
+            .send()
+            .map_err(|error| SandboxInitError::Http {
+                operation: "generation-2 export-attempt creation",
+                detail: error.without_url().to_string(),
+            })?;
+        let bytes = read_json_response_bytes(
+            response,
+            "generation-2 export-attempt creation",
+            StatusCode::OK,
+        )?;
+        WorkspaceExportOfferV2::decode_json(&bytes, session, status, capabilities).map_err(
+            |error| SandboxInitError::InvalidJson {
+                operation: "generation-2 export-attempt creation",
+                detail: error.to_string(),
+            },
+        )
+    }
+
+    fn open_workspace_export_attempt(
+        &self,
+        session: &WorkspaceProfileSessionV2,
+        offer: &WorkspaceExportOfferV2,
+    ) -> Result<Response, SandboxInitError> {
+        let encoding = offer.offer().content_encoding;
+        let response = self
+            .export_client
+            .get(self.workspace_export_attempt_v2_url(
+                session.session_id().as_str(),
+                offer.offer().export_attempt_id.as_str(),
+            ))
+            .header(ACCEPT, TAR_MEDIA_TYPE)
+            .header(
+                ACCEPT_ENCODING,
+                match encoding {
+                    TarContentEncoding::Identity => "identity",
+                    TarContentEncoding::Zstd => "zstd",
+                },
+            )
+            .bearer_auth(session.opaque_capability())
+            .send()
+            .map_err(|error| SandboxInitError::Http {
+                operation: "generation-2 export-attempt stream",
+                detail: error.without_url().to_string(),
+            })?;
+        ensure_success(&response, "generation-2 export-attempt stream")?;
+        require_media_type(
+            response.headers(),
+            "generation-2 export-attempt stream",
+            TAR_MEDIA_TYPE,
+        )?;
+        if protocol_encoding(response_encoding(response.headers())?) != encoding {
+            return Err(SandboxInitError::UnsupportedExportEncoding(
+                "generation-2 stream does not match its sealed encoding".to_string(),
+            ));
+        }
+        Ok(response)
     }
 
     fn session_status(
@@ -1799,6 +2166,35 @@ impl SandboxHttpClient {
         endpoint_url(&self.api_url, &["v1", "workspace-profile-sessions"])
     }
 
+    fn workspace_profile_sessions_v2_url(&self) -> reqwest::Url {
+        endpoint_url(&self.api_url, &["v2", "workspace-profile-sessions"])
+    }
+
+    fn workspace_session_v2_url(&self, session_id: &str) -> reqwest::Url {
+        endpoint_url(&self.api_url, &["v2", "sessions", session_id])
+    }
+
+    fn workspace_export_attempts_v2_url(&self, session_id: &str) -> reqwest::Url {
+        endpoint_url(
+            &self.api_url,
+            &["v2", "sessions", session_id, "export-attempts"],
+        )
+    }
+
+    fn workspace_export_attempt_v2_url(&self, session_id: &str, attempt_id: &str) -> reqwest::Url {
+        endpoint_url(
+            &self.api_url,
+            &[
+                "v2",
+                "sessions",
+                session_id,
+                "export-attempts",
+                attempt_id,
+                "export",
+            ],
+        )
+    }
+
     fn session_url(&self, session_id: &str) -> reqwest::Url {
         endpoint_url(&self.api_url, &["v1", "sessions", session_id])
     }
@@ -1894,10 +2290,22 @@ fn read_json_response<T: DeserializeOwned>(
 }
 
 fn read_json_response_with_status<T: DeserializeOwned>(
-    mut response: Response,
+    response: Response,
     operation: &'static str,
     expected_status: StatusCode,
 ) -> Result<T, SandboxInitError> {
+    let bytes = read_json_response_bytes(response, operation, expected_status)?;
+    serde_json::from_slice(&bytes).map_err(|error| SandboxInitError::InvalidJson {
+        operation,
+        detail: error.to_string(),
+    })
+}
+
+fn read_json_response_bytes(
+    mut response: Response,
+    operation: &'static str,
+    expected_status: StatusCode,
+) -> Result<Vec<u8>, SandboxInitError> {
     ensure_status(&response, operation, expected_status)?;
     require_media_type(response.headers(), operation, JSON_MEDIA_TYPE)?;
     let mut bytes = Vec::new();
@@ -1915,10 +2323,7 @@ fn read_json_response_with_status<T: DeserializeOwned>(
             limit: MAX_JSON_RESPONSE_BYTES,
         });
     }
-    serde_json::from_slice(&bytes).map_err(|error| SandboxInitError::InvalidJson {
-        operation,
-        detail: error.to_string(),
-    })
+    Ok(bytes)
 }
 
 fn ensure_success(response: &Response, operation: &'static str) -> Result<(), SandboxInitError> {
@@ -2414,6 +2819,155 @@ mod tests {
         assert_eq!(
             requests[0].headers.get("authorization").map(String::as_str),
             Some(expected_authorization.as_str())
+        );
+    }
+
+    #[test]
+    fn workspace_profile_negotiation_sends_generation2_capabilities() {
+        let server = TestServer::start(
+            vec![TestResponse::Json {
+                status: "201 Created",
+                body: locality_protocol::workspace_api_v2::WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON
+                    .to_vec(),
+            }],
+            true,
+        );
+        let client = SandboxHttpClient::new(&server.api_url).expect("HTTP client");
+        let profile_key = SandboxProfileKey::new("a".repeat(64)).expect("profile key");
+
+        let negotiated = client
+            .create_workspace_profile_session_negotiated(&profile_key)
+            .expect("generation-2 profile session");
+        assert!(matches!(
+            negotiated,
+            WorkspaceProfileNegotiation::Generation2 { .. }
+        ));
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "/v2/workspace-profile-sessions");
+        let request = WorkspaceProfileSessionRequestV2::decode_json(&requests[0].body)
+            .expect("strict generation-2 request");
+        assert_eq!(request.api_generation(), 2);
+        assert!(
+            request
+                .capabilities()
+                .supports_tar_encoding(TarContentEncoding::Zstd)
+        );
+    }
+
+    #[test]
+    fn workspace_profile_negotiation_falls_back_only_after_no_route() {
+        let session = WorkspaceProfileSession {
+            session_id: SessionId::new("session-profile-fallback"),
+            opaque_capability: "ephemeral-session-secret".to_string(),
+            expires_at: "2026-07-29T08:00:00Z".to_string(),
+            profile_id: "00000000-0000-0000-0000-000000000007".to_string(),
+            profile_revision: 9,
+        };
+        let server = TestServer::start(
+            vec![
+                TestResponse::Json {
+                    status: "404 Not Found",
+                    body: Vec::new(),
+                },
+                TestResponse::Json {
+                    status: "201 Created",
+                    body: serde_json::to_vec(&session).expect("serialize profile session"),
+                },
+            ],
+            true,
+        );
+        let client = SandboxHttpClient::new(&server.api_url).expect("HTTP client");
+        let profile_key = SandboxProfileKey::new("a".repeat(64)).expect("profile key");
+
+        assert!(matches!(
+            client
+                .create_workspace_profile_session_negotiated(&profile_key)
+                .expect("generation-1 fallback"),
+            WorkspaceProfileNegotiation::Generation1(_)
+        ));
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].path, "/v2/workspace-profile-sessions");
+        assert!(!requests[0].body.is_empty());
+        assert_eq!(requests[1].path, "/v1/workspace-profile-sessions");
+        assert!(requests[1].body.is_empty());
+    }
+
+    #[test]
+    fn generation2_client_invokes_bound_status_and_export_routes() {
+        let mut offer_json: serde_json::Value = serde_json::from_slice(
+            locality_protocol::workspace_api_v2::WORKSPACE_EXPORT_OFFER_V2_GOLDEN_JSON,
+        )
+        .expect("golden offer JSON");
+        offer_json["offer"]["content_encoding"] = serde_json::json!("identity");
+        let server = TestServer::start(
+            vec![
+                TestResponse::Json {
+                    status: "200 OK",
+                    body:
+                        locality_protocol::workspace_api_v2::WORKSPACE_SESSION_STATUS_V2_GOLDEN_JSON
+                            .to_vec(),
+                },
+                TestResponse::Json {
+                    status: "200 OK",
+                    body: serde_json::to_vec(&offer_json).expect("identity offer JSON"),
+                },
+                TestResponse::ProgressingExport {
+                    chunks: vec![Vec::new()],
+                    pause: Duration::ZERO,
+                },
+            ],
+            true,
+        );
+        let client = SandboxHttpClient::new(&server.api_url).expect("HTTP client");
+        let session = WorkspaceProfileSessionV2::decode_json(
+            locality_protocol::workspace_api_v2::WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON,
+        )
+        .expect("golden profile session");
+        let capabilities = WorkspaceClientCapabilitiesV2::workspace_layout_v1(true);
+        let status = client
+            .workspace_session_status(&session, &capabilities)
+            .expect("generation-2 status");
+        let capability = SessionCapability {
+            session_id: session.session_id().clone(),
+            opaque_capability: session.opaque_capability().to_string(),
+            expires_at: session.expires_at().to_string(),
+        };
+        let request = export_attempt_request(
+            &capability,
+            SandboxContentEncodingPreference::Automatic,
+            status.export_attempt_limits().expect("attempt limits"),
+        )
+        .expect("export request");
+        let offer = client
+            .create_workspace_export_attempt(&session, &status, &capabilities, &request)
+            .expect("generation-2 offer");
+        assert_eq!(offer.offer().export_attempt_id.as_str(), "export-attempt-9");
+        let _response = client
+            .open_workspace_export_attempt(&session, &offer)
+            .expect("generation-2 export stream");
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].path, "/v2/sessions/session-scope-7");
+        assert_eq!(
+            requests[1].path,
+            "/v2/sessions/session-scope-7/export-attempts"
+        );
+        let decoded: ExportAttemptRequest =
+            serde_json::from_slice(&requests[1].body).expect("export request JSON");
+        assert_eq!(decoded, request);
+        assert_eq!(
+            requests[2].path,
+            "/v2/sessions/session-scope-7/export-attempts/export-attempt-9/export"
+        );
+        assert_eq!(
+            requests[2]
+                .headers
+                .get("accept-encoding")
+                .map(String::as_str),
+            Some("identity")
         );
     }
 

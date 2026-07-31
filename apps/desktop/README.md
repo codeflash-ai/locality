@@ -96,3 +96,8 @@ starts the Notion broker OAuth flow, exposes the main daily-use screens, and
 opens a tray popover window. Remaining product gaps, especially workspace-level
 Notion mount creation and multi-file push orchestration, are tracked in
 `docs/deviations.md`.
+
+The Hosted settings panel is an explicitly manual generation-2 materializer
+preview. It accepts an API origin, absolute destination, and Workspace Profile
+key for one invocation; it is not canonical Desktop source/mount integration
+and does not persist hosted credentials.
