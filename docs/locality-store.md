@@ -138,12 +138,19 @@ the missing outcome and continue. Only after every entry has an applied,
 deleted, or conflict outcome does one SQLite transaction advance affected mount
 heads and clean path bases. Dirty local bytes stay in place and become explicit
 conflicts. A write through a descriptor retained across a clean three-way merge
-materializes the late and already-merged local versions as inline conflict
-markers; the displaced-inode fence remains durable for later writes. Recovery
-also reconstructs that fence when merged bytes were published before evidence
-was persisted. Reconciliation retains only authenticated payloads for current
-live conflicts, removes successful/superseded/orphan payloads, and enforces
-bounded per-mount and global retained-conflict quotas.
+renames the visible merged inode to a deterministic retained name while keeping
+the pre-merge inode retained too. The logical path contains only a small,
+deterministic manifest naming both resolvable versions, so two individually
+bounded files can never produce an inline conflict larger than the 64 MiB file
+limit. Both inode hashes and byte lengths advance atomically in SQLite after
+later writes, and both lengths count toward per-mount and global evidence
+quotas. Recovery recognizes the visible-inode rename as a durable checkpoint,
+including a crash before manifest publication, and idempotently finishes the
+manifest and fences without unlinking either inode. Recovery also reconstructs
+the pre-merge fence when merged bytes were published before evidence was
+persisted. Reconciliation retains only authenticated payloads for current live
+conflicts, removes successful/superseded/orphan payloads, and enforces bounded
+per-mount and global retained-conflict quotas.
 
 V1 deltas are mount-scoped. Empty entry lists are valid when a complete target
 generation changes no projected bytes. A logical path may occur in only one

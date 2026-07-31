@@ -34,8 +34,9 @@ pub use discovery::{
 pub use error::{StoreError, StoreResult};
 pub use generation_delivery::{
     GenerationApplyJournalRecord, GenerationApplyOutcome, GenerationApplyStatus,
-    GenerationDeliveryRepository, GenerationInodeEvidenceRecord, GenerationPathRecord,
-    GenerationPathState, ObservedGenerationRecord, PreparedGenerationApply,
+    GenerationDeliveryRepository, GenerationInodeEvidenceConflictUpdate,
+    GenerationInodeEvidenceRecord, GenerationPathRecord, GenerationPathState,
+    GenerationRetainedInodeRecord, ObservedGenerationRecord, PreparedGenerationApply,
 };
 pub use live_mode::{
     LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountLiveModeStateChangeError,

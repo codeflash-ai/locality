@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{StoreError, StoreResult};
 
-pub const GENERATION_DELIVERY_COMPONENT_VERSION: i64 = 3;
+pub const GENERATION_DELIVERY_COMPONENT_VERSION: i64 = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservedGenerationRecord {
@@ -164,11 +164,34 @@ pub struct GenerationInodeEvidenceRecord {
     pub evidence_name: String,
     pub expected_sha256: String,
     pub byte_length: u64,
+    /// The second local inode retained when a late write races a published
+    /// merge. Keeping this inode named means a descriptor opened on the
+    /// published merge cannot become unreachable after conflict conversion.
+    pub visible_evidence: Option<GenerationRetainedInodeRecord>,
     /// Merge-base payload lineage that must be restored if a late writer turns
     /// this completed apply into a local conflict.
     pub base_payload_delta_id: Option<String>,
     pub base_payload_entry_index: Option<u64>,
     pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenerationRetainedInodeRecord {
+    pub evidence_name: String,
+    pub expected_sha256: String,
+    pub byte_length: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenerationInodeEvidenceConflictUpdate {
+    /// Digest of the small conflict manifest at the logical path.
+    pub local_sha256: String,
+    /// Current fingerprint of the pre-merge retained inode.
+    pub expected_sha256: String,
+    pub byte_length: u64,
+    /// Current fingerprint of the retained visible merged inode.
+    pub visible_evidence: Option<GenerationRetainedInodeRecord>,
+    pub updated_at: String,
 }
 
 pub trait GenerationDeliveryRepository {
@@ -226,16 +249,13 @@ pub trait GenerationDeliveryRepository {
 
     fn list_generation_inode_evidence(&self) -> StoreResult<Vec<GenerationInodeEvidenceRecord>>;
 
-    /// Converts a completed apply to conflict. `local_sha256` identifies the
-    /// visible resolvable file, while `evidence_sha256` advances the fence for
-    /// the displaced inode that may still have a live writer.
+    /// Converts a completed apply to conflict and atomically advances both
+    /// retained-inode fences, including their quota-accounted lengths.
     fn mark_generation_inode_evidence_conflict(
         &mut self,
         delta_id: &str,
         entry_index: u64,
-        local_sha256: &str,
-        evidence_sha256: &str,
-        updated_at: &str,
+        update: GenerationInodeEvidenceConflictUpdate,
     ) -> StoreResult<()>;
 
     fn remove_generation_inode_evidence(
