@@ -9,9 +9,10 @@ use serde::{Deserialize, Serialize};
 use super::checkpoint::{
     HOSTED_SLACK_POLL_CHECKPOINT_FORMAT_VERSION_V2, HOSTED_SLACK_POLL_MINIMUM_READER_VERSION_V2,
     HostedSlackAppliedPageV1, HostedSlackCompletedRootV1, HostedSlackPollCheckpointV1,
-    HostedSlackPollError, HostedSlackPollEvidenceV1, HostedSlackPollKindV1, HostedSlackPollPhaseV1,
-    HostedSlackRootExpectationV1, MAX_HOSTED_SLACK_APPLIED_PAGES_V1, compare_slack_timestamps,
-    parse_canonical_utc_timestamp, parse_slack_timestamp, validate_cursor, validate_page_scope_id,
+    HostedSlackPollError, HostedSlackPollEvidenceV2, HostedSlackPollKindV1, HostedSlackPollKindV2,
+    HostedSlackPollPhaseV1, HostedSlackRootExpectationV1, MAX_HOSTED_SLACK_APPLIED_PAGES_V1,
+    compare_slack_timestamps, parse_canonical_utc_timestamp, parse_slack_timestamp,
+    validate_cursor, validate_page_scope_id,
 };
 use super::native::{
     HostedSlackFileMetadata, HostedSlackMessage, HostedSlackNativeSnapshot, HostedSlackUser,
@@ -88,6 +89,106 @@ pub struct HostedSlackRepliesPageV1 {
     pub files: Vec<RawHostedSlackFileMetadata>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedSlackHistoryPageV2 {
+    pub page_format_version: u16,
+    pub minimum_reader_version: u16,
+    pub poll_kind: HostedSlackPollKindV2,
+    pub phase: HostedSlackPollPhaseV1,
+    pub installation_id: SlackInstallationId,
+    pub team_id: String,
+    pub channel_id: String,
+    pub sharing: SlackChannelSharingClassification,
+    pub authorized_history_start_at: String,
+    pub backfill_cut_at: String,
+    pub poll_cut_at: Option<String>,
+    pub poll_overlap_watermark: String,
+    pub request_cursor: Option<String>,
+    pub next_cursor: Option<String>,
+    pub observed_at: String,
+    pub messages: Vec<HostedSlackHistoryMessageV1>,
+    pub users: Vec<RawHostedSlackUser>,
+    pub files: Vec<RawHostedSlackFileMetadata>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedSlackRepliesPageV2 {
+    pub page_format_version: u16,
+    pub minimum_reader_version: u16,
+    pub poll_kind: HostedSlackPollKindV2,
+    pub phase: HostedSlackPollPhaseV1,
+    pub installation_id: SlackInstallationId,
+    pub team_id: String,
+    pub channel_id: String,
+    pub sharing: SlackChannelSharingClassification,
+    pub authorized_history_start_at: String,
+    pub backfill_cut_at: String,
+    pub poll_cut_at: Option<String>,
+    pub poll_overlap_watermark: String,
+    pub root_message_id: String,
+    pub root_reply_count: u32,
+    pub request_cursor: Option<String>,
+    pub next_cursor: Option<String>,
+    pub observed_at: String,
+    pub messages: Vec<RawHostedSlackMessage>,
+    pub users: Vec<RawHostedSlackUser>,
+    pub files: Vec<RawHostedSlackFileMetadata>,
+}
+
+impl From<HostedSlackHistoryPageV1> for HostedSlackHistoryPageV2 {
+    fn from(page: HostedSlackHistoryPageV1) -> Self {
+        Self {
+            page_format_version: page.page_format_version,
+            minimum_reader_version: page.minimum_reader_version,
+            poll_kind: page.poll_kind.into(),
+            phase: page.phase,
+            installation_id: page.installation_id,
+            team_id: page.team_id,
+            channel_id: page.channel_id,
+            sharing: page.sharing,
+            authorized_history_start_at: page.authorized_history_start_at,
+            backfill_cut_at: page.backfill_cut_at,
+            poll_cut_at: page.poll_cut_at,
+            poll_overlap_watermark: page.poll_overlap_watermark,
+            request_cursor: page.request_cursor,
+            next_cursor: page.next_cursor,
+            observed_at: page.observed_at,
+            messages: page.messages,
+            users: page.users,
+            files: page.files,
+        }
+    }
+}
+
+impl From<HostedSlackRepliesPageV1> for HostedSlackRepliesPageV2 {
+    fn from(page: HostedSlackRepliesPageV1) -> Self {
+        Self {
+            page_format_version: page.page_format_version,
+            minimum_reader_version: page.minimum_reader_version,
+            poll_kind: page.poll_kind.into(),
+            phase: page.phase,
+            installation_id: page.installation_id,
+            team_id: page.team_id,
+            channel_id: page.channel_id,
+            sharing: page.sharing,
+            authorized_history_start_at: page.authorized_history_start_at,
+            backfill_cut_at: page.backfill_cut_at,
+            poll_cut_at: page.poll_cut_at,
+            poll_overlap_watermark: page.poll_overlap_watermark,
+            root_message_id: page.root_message_id,
+            root_reply_count: page.root_reply_count,
+            request_cursor: page.request_cursor,
+            next_cursor: page.next_cursor,
+            observed_at: page.observed_at,
+            messages: page.messages,
+            users: page.users,
+            files: page.files,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostedSlackPageApplyOutcomeV1 {
     Applied,
@@ -110,9 +211,16 @@ pub fn hosted_slack_history_page_reference_closure_v1(
     checkpoint: &HostedSlackPollCheckpointV1,
     page: &HostedSlackHistoryPageV1,
 ) -> Result<HostedSlackPageReferenceClosureV1, HostedSlackPollError> {
+    hosted_slack_history_page_reference_closure_v2(checkpoint, &page.clone().into())
+}
+
+pub fn hosted_slack_history_page_reference_closure_v2(
+    checkpoint: &HostedSlackPollCheckpointV1,
+    page: &HostedSlackHistoryPageV2,
+) -> Result<HostedSlackPageReferenceClosureV1, HostedSlackPollError> {
     page.validate()?;
-    validate_history_page_scope(checkpoint, page)?;
-    let accepted = accepted_history_evidence_page(checkpoint, page)?;
+    validate_history_page_scope(checkpoint, &page)?;
+    let accepted = accepted_history_evidence_page(checkpoint, &page)?;
     Ok(page_reference_closure(
         accepted.messages.iter().map(|wrapped| &wrapped.message),
     ))
@@ -122,17 +230,22 @@ pub fn hosted_slack_replies_page_reference_closure_v1(
     checkpoint: &HostedSlackPollCheckpointV1,
     page: &HostedSlackRepliesPageV1,
 ) -> Result<HostedSlackPageReferenceClosureV1, HostedSlackPollError> {
+    hosted_slack_replies_page_reference_closure_v2(checkpoint, &page.clone().into())
+}
+
+pub fn hosted_slack_replies_page_reference_closure_v2(
+    checkpoint: &HostedSlackPollCheckpointV1,
+    page: &HostedSlackRepliesPageV2,
+) -> Result<HostedSlackPageReferenceClosureV1, HostedSlackPollError> {
     page.validate()?;
-    validate_replies_page_scope(checkpoint, page)?;
+    validate_replies_page_scope(checkpoint, &page)?;
     Ok(page_reference_closure(page.messages.iter()))
 }
 
 impl HostedSlackHistoryPageV1 {
     pub fn validate(&self) -> Result<(), HostedSlackPollError> {
         validate_page_versions(self.page_format_version, self.minimum_reader_version)?;
-        if (self.poll_kind == HostedSlackPollKindV1::Incremental)
-            != (self.page_format_version == HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3)
-        {
+        if self.page_format_version == HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3 {
             return Err(HostedSlackPollError::UnsupportedVersion {
                 format_version: self.page_format_version,
                 minimum_reader_version: self.minimum_reader_version,
@@ -202,9 +315,7 @@ impl HostedSlackHistoryPageV1 {
 impl HostedSlackRepliesPageV1 {
     pub fn validate(&self) -> Result<(), HostedSlackPollError> {
         validate_page_versions(self.page_format_version, self.minimum_reader_version)?;
-        if (self.poll_kind == HostedSlackPollKindV1::Incremental)
-            != (self.page_format_version == HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3)
-        {
+        if self.page_format_version == HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3 {
             return Err(HostedSlackPollError::UnsupportedVersion {
                 format_version: self.page_format_version,
                 minimum_reader_version: self.minimum_reader_version,
@@ -267,7 +378,7 @@ impl HostedSlackRepliesPageV1 {
                 "replies page messages",
             ));
         }
-        let deleted_root_reconciliation = is_deleted_root_reconciliation_page(self);
+        let deleted_root_reconciliation = is_deleted_root_reconciliation_page(&self.clone().into());
         if self.page_format_version == HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2
             && !deleted_root_reconciliation
         {
@@ -315,14 +426,117 @@ impl HostedSlackRepliesPageV1 {
     }
 }
 
+impl HostedSlackHistoryPageV2 {
+    pub fn validate(&self) -> Result<(), HostedSlackPollError> {
+        validate_page_versions(self.page_format_version, self.minimum_reader_version)?;
+        if (self.poll_kind == HostedSlackPollKindV2::Incremental)
+            != (self.page_format_version == HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3)
+        {
+            return Err(HostedSlackPollError::UnsupportedVersion {
+                format_version: self.page_format_version,
+                minimum_reader_version: self.minimum_reader_version,
+            });
+        }
+        let legacy = HostedSlackHistoryPageV1 {
+            page_format_version: self
+                .page_format_version
+                .min(HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2),
+            minimum_reader_version: self
+                .minimum_reader_version
+                .min(HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2),
+            poll_kind: self
+                .poll_kind
+                .try_into()
+                .unwrap_or(HostedSlackPollKindV1::FullRepair),
+            phase: self.phase,
+            installation_id: self.installation_id.clone(),
+            team_id: self.team_id.clone(),
+            channel_id: self.channel_id.clone(),
+            sharing: self.sharing,
+            authorized_history_start_at: self.authorized_history_start_at.clone(),
+            backfill_cut_at: self.backfill_cut_at.clone(),
+            poll_cut_at: self.poll_cut_at.clone(),
+            poll_overlap_watermark: self.poll_overlap_watermark.clone(),
+            request_cursor: self.request_cursor.clone(),
+            next_cursor: self.next_cursor.clone(),
+            observed_at: self.observed_at.clone(),
+            messages: self.messages.clone(),
+            users: self.users.clone(),
+            files: self.files.clone(),
+        };
+        legacy.validate()?;
+        validate_serialized_page_size(self, "history page")
+    }
+}
+
+impl HostedSlackRepliesPageV2 {
+    pub fn validate(&self) -> Result<(), HostedSlackPollError> {
+        validate_page_versions(self.page_format_version, self.minimum_reader_version)?;
+        if (self.poll_kind == HostedSlackPollKindV2::Incremental)
+            != (self.page_format_version == HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3)
+        {
+            return Err(HostedSlackPollError::UnsupportedVersion {
+                format_version: self.page_format_version,
+                minimum_reader_version: self.minimum_reader_version,
+            });
+        }
+        let legacy = HostedSlackRepliesPageV1 {
+            page_format_version: self
+                .page_format_version
+                .min(HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2),
+            minimum_reader_version: self
+                .minimum_reader_version
+                .min(HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2),
+            poll_kind: self
+                .poll_kind
+                .try_into()
+                .unwrap_or(HostedSlackPollKindV1::FullRepair),
+            phase: self.phase,
+            installation_id: self.installation_id.clone(),
+            team_id: self.team_id.clone(),
+            channel_id: self.channel_id.clone(),
+            sharing: self.sharing,
+            authorized_history_start_at: self.authorized_history_start_at.clone(),
+            backfill_cut_at: self.backfill_cut_at.clone(),
+            poll_cut_at: self.poll_cut_at.clone(),
+            poll_overlap_watermark: self.poll_overlap_watermark.clone(),
+            root_message_id: self.root_message_id.clone(),
+            root_reply_count: self.root_reply_count,
+            request_cursor: self.request_cursor.clone(),
+            next_cursor: self.next_cursor.clone(),
+            observed_at: self.observed_at.clone(),
+            messages: self.messages.clone(),
+            users: self.users.clone(),
+            files: self.files.clone(),
+        };
+        legacy.validate()?;
+        validate_serialized_page_size(self, "replies page")
+    }
+}
+
 pub fn decode_hosted_slack_history_page_v1(
     bytes: &[u8],
 ) -> Result<HostedSlackHistoryPageV1, HostedSlackPollError> {
     decode_hosted_slack_history_page_for_reader(
         bytes,
+        HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2,
+        HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2,
+    )
+}
+
+pub fn decode_hosted_slack_history_page_v2(
+    bytes: &[u8],
+) -> Result<HostedSlackHistoryPageV2, HostedSlackPollError> {
+    validate_page_bytes("history page", bytes)?;
+    validate_page_header_for_reader(
+        bytes,
         HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3,
         HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3,
-    )
+    )?;
+    let page = serde_json::from_slice::<HostedSlackHistoryPageV2>(bytes)
+        .map_err(|_| HostedSlackPollError::InvalidJson("history page"))?;
+    page.validate()?;
+    Ok(page)
 }
 
 fn decode_hosted_slack_history_page_for_reader(
@@ -343,9 +557,24 @@ pub fn decode_hosted_slack_replies_page_v1(
 ) -> Result<HostedSlackRepliesPageV1, HostedSlackPollError> {
     decode_hosted_slack_replies_page_for_reader(
         bytes,
+        HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V2,
+        HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V2,
+    )
+}
+
+pub fn decode_hosted_slack_replies_page_v2(
+    bytes: &[u8],
+) -> Result<HostedSlackRepliesPageV2, HostedSlackPollError> {
+    validate_page_bytes("replies page", bytes)?;
+    validate_page_header_for_reader(
+        bytes,
         HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3,
         HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3,
-    )
+    )?;
+    let page = serde_json::from_slice::<HostedSlackRepliesPageV2>(bytes)
+        .map_err(|_| HostedSlackPollError::InvalidJson("replies page"))?;
+    page.validate()?;
+    Ok(page)
 }
 
 fn decode_hosted_slack_replies_page_for_reader(
@@ -365,6 +594,13 @@ impl HostedSlackPollCheckpointV1 {
     pub fn apply_history_page(
         &mut self,
         page: &HostedSlackHistoryPageV1,
+    ) -> Result<HostedSlackPageApplyOutcomeV1, HostedSlackPollError> {
+        self.apply_history_page_v2(&page.clone().into())
+    }
+
+    pub fn apply_history_page_v2(
+        &mut self,
+        page: &HostedSlackHistoryPageV2,
     ) -> Result<HostedSlackPageApplyOutcomeV1, HostedSlackPollError> {
         page.validate()?;
         validate_history_page_scope(self, page)?;
@@ -462,6 +698,13 @@ impl HostedSlackPollCheckpointV1 {
     pub fn apply_replies_page(
         &mut self,
         page: &HostedSlackRepliesPageV1,
+    ) -> Result<HostedSlackPageApplyOutcomeV1, HostedSlackPollError> {
+        self.apply_replies_page_v2(&page.clone().into())
+    }
+
+    pub fn apply_replies_page_v2(
+        &mut self,
+        page: &HostedSlackRepliesPageV2,
     ) -> Result<HostedSlackPageApplyOutcomeV1, HostedSlackPollError> {
         page.validate()?;
         validate_replies_page_scope(self, page)?;
@@ -661,7 +904,7 @@ pub(crate) fn replay_applied_page_evidence(
     match record.phase {
         HostedSlackPollPhaseV1::HistoricalHistory | HostedSlackPollPhaseV1::CatchUpHistory => {
             let page =
-                serde_json::from_str::<HostedSlackHistoryPageV1>(&record.canonical_page_json)
+                serde_json::from_str::<HostedSlackHistoryPageV2>(&record.canonical_page_json)
                     .map_err(|_| HostedSlackPollError::InvalidJson("checkpoint replay evidence"))?;
             if serde_json::to_string(&page).map_err(|_| HostedSlackPollError::Serialization)?
                 != record.canonical_page_json
@@ -674,13 +917,13 @@ pub(crate) fn replay_applied_page_evidence(
                     "history page replay evidence",
                 ));
             }
-            if checkpoint.apply_history_page(&page)? != HostedSlackPageApplyOutcomeV1::Applied {
+            if checkpoint.apply_history_page_v2(&page)? != HostedSlackPageApplyOutcomeV1::Applied {
                 return Err(HostedSlackPollError::ConflictingReplay);
             }
         }
         HostedSlackPollPhaseV1::HistoricalReplies | HostedSlackPollPhaseV1::CatchUpReplies => {
             let page =
-                serde_json::from_str::<HostedSlackRepliesPageV1>(&record.canonical_page_json)
+                serde_json::from_str::<HostedSlackRepliesPageV2>(&record.canonical_page_json)
                     .map_err(|_| HostedSlackPollError::InvalidJson("checkpoint replay evidence"))?;
             if serde_json::to_string(&page).map_err(|_| HostedSlackPollError::Serialization)?
                 != record.canonical_page_json
@@ -693,7 +936,7 @@ pub(crate) fn replay_applied_page_evidence(
                     "replies page replay evidence",
                 ));
             }
-            if checkpoint.apply_replies_page(&page)? != HostedSlackPageApplyOutcomeV1::Applied {
+            if checkpoint.apply_replies_page_v2(&page)? != HostedSlackPageApplyOutcomeV1::Applied {
                 return Err(HostedSlackPollError::ConflictingReplay);
             }
         }
@@ -859,7 +1102,7 @@ fn validate_serialized_page_size(
 
 fn validate_history_page_scope(
     checkpoint: &HostedSlackPollCheckpointV1,
-    page: &HostedSlackHistoryPageV1,
+    page: &HostedSlackHistoryPageV2,
 ) -> Result<(), HostedSlackPollError> {
     validate_scope_match(
         checkpoint,
@@ -879,7 +1122,7 @@ fn validate_history_page_scope(
 
 fn validate_replies_page_scope(
     checkpoint: &HostedSlackPollCheckpointV1,
-    page: &HostedSlackRepliesPageV1,
+    page: &HostedSlackRepliesPageV2,
 ) -> Result<(), HostedSlackPollError> {
     validate_scope_match(
         checkpoint,
@@ -900,7 +1143,7 @@ fn validate_replies_page_scope(
 #[allow(clippy::too_many_arguments)]
 fn validate_scope_match(
     checkpoint: &HostedSlackPollCheckpointV1,
-    poll_kind: HostedSlackPollKindV1,
+    poll_kind: HostedSlackPollKindV2,
     installation_id: &SlackInstallationId,
     team_id: &str,
     channel_id: &str,
@@ -980,7 +1223,7 @@ fn replay_outcome(
         .evidence
         .iter()
         .find_map(|evidence| match evidence {
-            HostedSlackPollEvidenceV1::AppliedPage { page }
+            HostedSlackPollEvidenceV2::AppliedPage { page }
                 if page.phase == phase
                     && page.root_message_id.as_deref() == root_message_id
                     && page.request_cursor.as_deref() == request_cursor =>
@@ -1010,14 +1253,14 @@ fn validate_next_cursor(
     };
     if Some(next_cursor) == request_cursor
         || checkpoint.evidence.iter().any(|evidence| match evidence {
-            HostedSlackPollEvidenceV1::AppliedPage { page } => {
+            HostedSlackPollEvidenceV2::AppliedPage { page } => {
                 page.phase == phase
                     && page.root_message_id.as_deref() == root_message_id
                     && (page.request_cursor.as_deref() == Some(next_cursor)
                         || page.next_cursor.as_deref() == Some(next_cursor))
             }
-            HostedSlackPollEvidenceV1::BeginCatchUp { .. } => false,
-            HostedSlackPollEvidenceV1::IncrementalBaseline { .. } => false,
+            HostedSlackPollEvidenceV2::BeginCatchUp { .. } => false,
+            HostedSlackPollEvidenceV2::IncrementalBaseline { .. } => false,
         })
     {
         return Err(HostedSlackPollError::CursorCycle);
@@ -1100,7 +1343,7 @@ fn prepare_reply_phase(
         }
     }
     let pending = if history_phase == HostedSlackPollPhaseV1::HistoricalHistory
-        || checkpoint.poll_kind == HostedSlackPollKindV1::Incremental
+        || checkpoint.poll_kind == HostedSlackPollKindV2::Incremental
     {
         checkpoint
             .completed_roots
@@ -1168,7 +1411,7 @@ fn prepare_reply_phase(
         let applied_pages = checkpoint
             .evidence
             .iter()
-            .filter(|evidence| matches!(evidence, HostedSlackPollEvidenceV1::AppliedPage { .. }))
+            .filter(|evidence| matches!(evidence, HostedSlackPollEvidenceV2::AppliedPage { .. }))
             .count();
         let minimum_required_pages = applied_pages.saturating_add(pending.len());
         if minimum_required_pages > MAX_HOSTED_SLACK_APPLIED_PAGES_V1 {
@@ -1269,14 +1512,14 @@ fn catch_up_history_contains_root(
     root: &str,
 ) -> Result<bool, HostedSlackPollError> {
     for evidence in &checkpoint.evidence {
-        let HostedSlackPollEvidenceV1::AppliedPage { page } = evidence else {
+        let HostedSlackPollEvidenceV2::AppliedPage { page } = evidence else {
             continue;
         };
         if page.phase != HostedSlackPollPhaseV1::CatchUpHistory {
             continue;
         }
         let history =
-            serde_json::from_str::<HostedSlackHistoryPageV1>(&page.canonical_page_json)
+            serde_json::from_str::<HostedSlackHistoryPageV2>(&page.canonical_page_json)
                 .map_err(|_| HostedSlackPollError::InvalidJson("checkpoint replay evidence"))?;
         if history.messages.iter().any(|wrapped| {
             wrapped.message.ts == root && normalized_root_id(&wrapped.message).is_none()
@@ -1357,8 +1600,8 @@ fn build_snapshot(
 
 fn accepted_history_evidence_page(
     checkpoint: &HostedSlackPollCheckpointV1,
-    source: &HostedSlackHistoryPageV1,
-) -> Result<HostedSlackHistoryPageV1, HostedSlackPollError> {
+    source: &HostedSlackHistoryPageV2,
+) -> Result<HostedSlackHistoryPageV2, HostedSlackPollError> {
     let (window_start, window_end) = history_window(checkpoint, source.phase)?;
     let history_start = parse_canonical_utc_timestamp(
         "authorized_history_start_at",
@@ -1389,7 +1632,7 @@ fn accepted_history_evidence_page(
     Ok(accepted)
 }
 
-fn accepted_replies_evidence_page(source: &HostedSlackRepliesPageV1) -> HostedSlackRepliesPageV1 {
+fn accepted_replies_evidence_page(source: &HostedSlackRepliesPageV2) -> HostedSlackRepliesPageV2 {
     let (users, files) =
         retained_page_metadata(source.messages.iter(), &source.users, &source.files);
     let mut accepted = source.clone();
@@ -1457,7 +1700,7 @@ fn rebuild_candidate_reference_metadata(
         .iter()
         .flat_map(|message| message.file_ids.iter().cloned())
         .collect::<BTreeSet<_>>();
-    let mut files = if checkpoint.poll_kind == HostedSlackPollKindV1::Incremental {
+    let mut files = if checkpoint.poll_kind == HostedSlackPollKindV2::Incremental {
         checkpoint
             .candidate
             .files
@@ -1470,9 +1713,9 @@ fn rebuild_candidate_reference_metadata(
     };
     for evidence in &checkpoint.evidence {
         let page_files = match evidence {
-            HostedSlackPollEvidenceV1::IncrementalBaseline { .. } => continue,
-            HostedSlackPollEvidenceV1::AppliedPage { page } => page_reference_metadata(page)?.1,
-            HostedSlackPollEvidenceV1::BeginCatchUp { .. } => continue,
+            HostedSlackPollEvidenceV2::IncrementalBaseline { .. } => continue,
+            HostedSlackPollEvidenceV2::AppliedPage { page } => page_reference_metadata(page)?.1,
+            HostedSlackPollEvidenceV2::BeginCatchUp { .. } => continue,
         };
         for file in page_files {
             if referenced_file_ids.contains(&file.id) {
@@ -1488,7 +1731,7 @@ fn rebuild_candidate_reference_metadata(
         .filter_map(|message| message.user_id.clone())
         .collect::<BTreeSet<_>>();
     referenced_user_ids.extend(files.iter().filter_map(|file| file.user_id.clone()));
-    let mut users = if checkpoint.poll_kind == HostedSlackPollKindV1::Incremental {
+    let mut users = if checkpoint.poll_kind == HostedSlackPollKindV2::Incremental {
         checkpoint
             .candidate
             .users
@@ -1501,9 +1744,9 @@ fn rebuild_candidate_reference_metadata(
     };
     for evidence in &checkpoint.evidence {
         let page_users = match evidence {
-            HostedSlackPollEvidenceV1::IncrementalBaseline { .. } => continue,
-            HostedSlackPollEvidenceV1::AppliedPage { page } => page_reference_metadata(page)?.0,
-            HostedSlackPollEvidenceV1::BeginCatchUp { .. } => continue,
+            HostedSlackPollEvidenceV2::IncrementalBaseline { .. } => continue,
+            HostedSlackPollEvidenceV2::AppliedPage { page } => page_reference_metadata(page)?.0,
+            HostedSlackPollEvidenceV2::BeginCatchUp { .. } => continue,
         };
         for user in page_users {
             if referenced_user_ids.contains(&user.id) {
@@ -1522,13 +1765,13 @@ fn page_reference_metadata(
     match record.phase {
         HostedSlackPollPhaseV1::HistoricalHistory | HostedSlackPollPhaseV1::CatchUpHistory => {
             let page =
-                serde_json::from_str::<HostedSlackHistoryPageV1>(&record.canonical_page_json)
+                serde_json::from_str::<HostedSlackHistoryPageV2>(&record.canonical_page_json)
                     .map_err(|_| HostedSlackPollError::InvalidJson("checkpoint replay evidence"))?;
             Ok((page.users, page.files))
         }
         HostedSlackPollPhaseV1::HistoricalReplies | HostedSlackPollPhaseV1::CatchUpReplies => {
             let page =
-                serde_json::from_str::<HostedSlackRepliesPageV1>(&record.canonical_page_json)
+                serde_json::from_str::<HostedSlackRepliesPageV2>(&record.canonical_page_json)
                     .map_err(|_| HostedSlackPollError::InvalidJson("checkpoint replay evidence"))?;
             Ok((page.users, page.files))
         }
@@ -1544,7 +1787,7 @@ fn messages_seen_in_refresh(
 ) -> Result<BTreeMap<String, RawHostedSlackMessage>, HostedSlackPollError> {
     let mut seen = BTreeMap::new();
     for evidence in &checkpoint.evidence {
-        let HostedSlackPollEvidenceV1::AppliedPage { page } = evidence else {
+        let HostedSlackPollEvidenceV2::AppliedPage { page } = evidence else {
             continue;
         };
         let relevant = match incoming_phase {
@@ -1571,7 +1814,7 @@ fn messages_seen_in_refresh(
         match page.phase {
             HostedSlackPollPhaseV1::HistoricalHistory | HostedSlackPollPhaseV1::CatchUpHistory => {
                 let history =
-                    serde_json::from_str::<HostedSlackHistoryPageV1>(&page.canonical_page_json)
+                    serde_json::from_str::<HostedSlackHistoryPageV2>(&page.canonical_page_json)
                         .map_err(|_| {
                             HostedSlackPollError::InvalidJson("checkpoint replay evidence")
                         })?;
@@ -1581,7 +1824,7 @@ fn messages_seen_in_refresh(
             }
             HostedSlackPollPhaseV1::HistoricalReplies | HostedSlackPollPhaseV1::CatchUpReplies => {
                 let replies =
-                    serde_json::from_str::<HostedSlackRepliesPageV1>(&page.canonical_page_json)
+                    serde_json::from_str::<HostedSlackRepliesPageV2>(&page.canonical_page_json)
                         .map_err(|_| {
                             HostedSlackPollError::InvalidJson("checkpoint replay evidence")
                         })?;
@@ -1747,7 +1990,7 @@ fn normalized_root_id(message: &RawHostedSlackMessage) -> Option<&str> {
 // V2 deliberately adds no fields to the deny-unknown V1 schema. Its explicit
 // format/minimum-reader pair reserves this terminal tombstone shape for a root
 // Slack reports as thread_not_found, including after continuation pages.
-fn is_deleted_root_reconciliation_page(page: &HostedSlackRepliesPageV1) -> bool {
+fn is_deleted_root_reconciliation_page(page: &HostedSlackRepliesPageV2) -> bool {
     matches!(
         (page.page_format_version, page.minimum_reader_version),
         (
@@ -1780,7 +2023,7 @@ fn record_page(
 ) {
     checkpoint
         .evidence
-        .push(HostedSlackPollEvidenceV1::AppliedPage {
+        .push(HostedSlackPollEvidenceV2::AppliedPage {
             page: HostedSlackAppliedPageV1 {
                 phase,
                 root_message_id,

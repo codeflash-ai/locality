@@ -1,8 +1,9 @@
 use locality_protocol::{HostedSlackChannelSelector, ProviderSourceScopeSelector};
 use locality_slack::portable::hosted::{
     HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3, HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3,
-    HostedSlackHistoryMessageV1, HostedSlackHistoryPageV1, HostedSlackPageApplyOutcomeV1,
-    HostedSlackPollCheckpointV1, HostedSlackPollError, HostedSlackPollKindV1,
+    HostedSlackHistoryMessageV1, HostedSlackHistoryPageV1, HostedSlackHistoryPageV2,
+    HostedSlackPageApplyOutcomeV1, HostedSlackPollCheckpointV1, HostedSlackPollError,
+    HostedSlackPollEvidenceV1, HostedSlackPollKindV1, HostedSlackPollKindV2,
     HostedSlackPollOutputV1, HostedSlackPollPhaseV1, HostedSlackRepliesPageV1,
     MAX_HOSTED_SLACK_CHECKPOINT_BYTES_V1, MAX_HOSTED_SLACK_CURSOR_BYTES_V1,
     MAX_HOSTED_SLACK_POLL_PAGE_BYTES_V1, MAX_HOSTED_SLACK_POLL_PAGE_MESSAGES_V1,
@@ -1145,6 +1146,15 @@ fn full_repair_and_poll_only_bootstrap_converge_without_events() {
 #[test]
 fn incremental_poll_starts_from_applied_candidate_and_skips_historical_and_untouched_replies() {
     let applied = completed_checkpoint(checkpoint());
+    let mut wrong_non_incremental_version = serde_json::to_value(&applied).unwrap();
+    wrong_non_incremental_version["checkpoint_format_version"] = 3.into();
+    wrong_non_incremental_version["minimum_reader_version"] = 3.into();
+    assert!(
+        decode_hosted_slack_poll_checkpoint_v1(
+            &serde_json::to_vec(&wrong_non_incremental_version).unwrap()
+        )
+        .is_err()
+    );
     let applied_snapshot = applied.completed_output().unwrap().snapshot;
     let mut incremental = HostedSlackPollCheckpointV1::incremental_from_applied(
         &applied,
@@ -1152,7 +1162,10 @@ fn incremental_poll_starts_from_applied_candidate_and_skips_historical_and_untou
         "2026-06-01T23:55:00Z".to_string(),
     )
     .expect("incremental checkpoint");
-    assert_eq!(incremental.poll_kind(), HostedSlackPollKindV1::Incremental);
+    assert_eq!(
+        incremental.poll_kind_v2(),
+        HostedSlackPollKindV2::Incremental
+    );
     assert_eq!(
         incremental.phase(),
         HostedSlackPollPhaseV1::AwaitingCatchUpCut
@@ -1173,19 +1186,28 @@ fn incremental_poll_starts_from_applied_candidate_and_skips_historical_and_untou
         decode_hosted_slack_poll_checkpoint_v1(&encoded).unwrap(),
         incremental
     );
+    let mut wrong_incremental_version = encoded_value.clone();
+    wrong_incremental_version["checkpoint_format_version"] = 2.into();
+    wrong_incremental_version["minimum_reader_version"] = 2.into();
+    assert!(
+        decode_hosted_slack_poll_checkpoint_v1(
+            &serde_json::to_vec(&wrong_incremental_version).unwrap()
+        )
+        .is_err()
+    );
 
     incremental
         .begin_catch_up("2026-06-02T00:05:00Z".to_string())
         .unwrap();
-    let mut page = catch_up_page();
+    let mut page: HostedSlackHistoryPageV2 = catch_up_page().into();
     page.page_format_version = HOSTED_SLACK_POLL_PAGE_FORMAT_VERSION_V3;
     page.minimum_reader_version = HOSTED_SLACK_POLL_PAGE_MINIMUM_READER_VERSION_V3;
-    page.poll_kind = HostedSlackPollKindV1::Incremental;
+    page.poll_kind = HostedSlackPollKindV2::Incremental;
     page.backfill_cut_at = "2026-06-02T00:00:00Z".to_string();
     page.poll_overlap_watermark = "2026-06-01T23:55:00Z".to_string();
     page.poll_cut_at = Some("2026-06-02T00:05:00Z".to_string());
     page.observed_at = "2026-06-02T00:05:01Z".to_string();
-    incremental.apply_history_page(&page).unwrap();
+    incremental.apply_history_page_v2(&page).unwrap();
     assert_eq!(
         incremental.phase(),
         HostedSlackPollPhaseV1::CompleteCandidate,
@@ -1194,6 +1216,29 @@ fn incremental_poll_starts_from_applied_candidate_and_skips_historical_and_untou
     assert_eq!(
         incremental.completed_output().unwrap().snapshot,
         applied_snapshot
+    );
+}
+
+#[test]
+fn v1_poll_enums_remain_exhaustive_and_source_compatible() {
+    fn kind_name(kind: HostedSlackPollKindV1) -> &'static str {
+        match kind {
+            HostedSlackPollKindV1::Bootstrap => "bootstrap",
+            HostedSlackPollKindV1::FullRepair => "full_repair",
+        }
+    }
+    fn evidence_name(evidence: HostedSlackPollEvidenceV1) -> &'static str {
+        match evidence {
+            HostedSlackPollEvidenceV1::AppliedPage { .. } => "applied_page",
+            HostedSlackPollEvidenceV1::BeginCatchUp { .. } => "begin_catch_up",
+        }
+    }
+    assert_eq!(kind_name(HostedSlackPollKindV1::Bootstrap), "bootstrap");
+    assert_eq!(
+        evidence_name(HostedSlackPollEvidenceV1::BeginCatchUp {
+            poll_cut_at: "2026-06-02T00:05:00Z".to_string(),
+        }),
+        "begin_catch_up"
     );
 }
 
