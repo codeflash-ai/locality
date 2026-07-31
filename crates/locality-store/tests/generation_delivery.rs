@@ -572,6 +572,19 @@ fn genuine_schema_21_component_v1_fixture_migrates_without_losing_active_state()
             "fixtures/generation-delivery-v21-component-v1.sql"
         ))
         .unwrap();
+    let constraint_error = connection
+        .execute(
+            "UPDATE generation_apply_journals
+             SET status = 'completed'
+             WHERE delta_id = 'delta-2'",
+            [],
+        )
+        .expect_err("released v21 active/status CHECK must be present");
+    assert!(
+        constraint_error
+            .to_string()
+            .contains("CHECK constraint failed")
+    );
     drop(connection);
 
     let mut reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
@@ -597,6 +610,113 @@ fn genuine_schema_21_component_v1_fixture_migrates_without_losing_active_state()
         .clear_mount_source_state(&fixture.mount_id)
         .expect_err("migrated active journal must fence source reset");
     assert!(matches!(error, StoreError::InvalidState(_)));
+}
+
+#[test]
+fn partial_v2_v3_generation_migration_is_atomic_and_resumable_per_column() {
+    use rusqlite::Connection;
+
+    let fixture = Fixture::new("partial-v2-v3-migration");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let db_path = store.db_path.clone();
+    drop(store);
+
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE generation_paths DROP COLUMN base_payload_entry_index;
+             ALTER TABLE generation_paths DROP COLUMN local_logical_path;
+             ALTER TABLE generation_paths DROP COLUMN conflict_payload_entry_index;
+             ALTER TABLE generation_inode_evidence DROP COLUMN base_payload_entry_index;
+             CREATE TRIGGER fail_generation_path_backfill
+             BEFORE UPDATE ON generation_paths
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected migration interruption');
+             END;
+             UPDATE state_components
+             SET version = 2, min_reader_version = 2
+             WHERE component_id = 'durable:generation_delivery';
+             UPDATE state_components SET version = 23
+             WHERE component_id = 'core:schema';
+             PRAGMA user_version = 23;",
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(SqliteStateStore::open(fixture.state_root.clone()).is_err());
+    let connection = Connection::open(&db_path).unwrap();
+    for (table, column) in [
+        ("generation_paths", "base_payload_entry_index"),
+        ("generation_paths", "local_logical_path"),
+        ("generation_paths", "conflict_payload_entry_index"),
+        ("generation_inode_evidence", "base_payload_entry_index"),
+    ] {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2
+                 )",
+                rusqlite::params![table, column],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!present, "failed migration advanced {table}.{column}");
+    }
+    let component: (i64, i64) = connection
+        .query_row(
+            "SELECT version, min_reader_version FROM state_components
+             WHERE component_id = 'durable:generation_delivery'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(component, (2, 2));
+    assert_eq!(user_version, 23);
+    connection
+        .execute_batch("DROP TRIGGER fail_generation_path_backfill;")
+        .unwrap();
+    drop(connection);
+
+    let reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    let connection = Connection::open(&reopened.db_path).unwrap();
+    for (table, column) in [
+        ("generation_paths", "base_payload_entry_index"),
+        ("generation_paths", "local_logical_path"),
+        ("generation_paths", "conflict_payload_entry_index"),
+        ("generation_inode_evidence", "base_payload_entry_index"),
+    ] {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2
+                 )",
+                rusqlite::params![table, column],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(present, "retry did not restore {table}.{column}");
+    }
+    let component: (i64, i64) = connection
+        .query_row(
+            "SELECT version, min_reader_version FROM state_components
+             WHERE component_id = 'durable:generation_delivery'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(component, (3, 3));
+    assert_eq!(user_version, 24);
+    assert_eq!(
+        reopened.list_generation_paths(&fixture.mount_id).unwrap()[0].local_logical_path,
+        "Roadmap.md"
+    );
 }
 
 struct Fixture {

@@ -21,7 +21,7 @@ use locality_protocol::freshness_delivery::{
 };
 use locality_store::{
     GenerationApplyOutcome, GenerationApplyStatus, GenerationDeliveryRepository,
-    GenerationInodeEvidenceRecord, GenerationPathRecord, GenerationPathState,
+    GenerationInodeEvidenceRecord, GenerationPathRecord, GenerationPathState, MountRepository,
     PreparedGenerationApply, SqliteStateStore,
 };
 use sha2::{Digest, Sha256};
@@ -113,6 +113,7 @@ where
         mount_root: &Path,
     ) -> Result<GenerationSyncSummary, GenerationSyncError> {
         recover_generation_delivery_staging(store)?;
+        reconcile_all_completed_inode_evidence(store)?;
         let observed = store
             .get_observed_generation(mount_id)?
             .ok_or_else(|| GenerationSyncError::MissingObservedGeneration(mount_id.clone()))?;
@@ -130,6 +131,38 @@ where
         };
         apply_authorized_delivery(store, mount_id, mount_root, delivery, &mut self.transport)
     }
+}
+
+fn reconcile_all_completed_inode_evidence(
+    store: &mut SqliteStateStore,
+) -> Result<(), GenerationSyncError> {
+    let _process_guard = generation_stage_process_lock()?;
+    let _state_guard =
+        GenerationStateLock::acquire(&store.root).map_err(GenerationSyncError::StateCoordinator)?;
+    let evidence_mounts = store
+        .list_generation_inode_evidence()?
+        .into_iter()
+        .map(|evidence| evidence.mount_id)
+        .collect::<BTreeSet<_>>();
+    if evidence_mounts.is_empty() {
+        return Ok(());
+    }
+    let mounts = store
+        .load_mounts()?
+        .into_iter()
+        .map(|mount| (mount.mount_id.clone(), mount))
+        .collect::<BTreeMap<_, _>>();
+    for mount_id in evidence_mounts {
+        let mount = mounts
+            .get(&mount_id)
+            .ok_or(GenerationSyncError::JournalMismatch)?;
+        let _mount_guard = MountApplyGuard::acquire(&mount.root)?;
+        let secure_mount =
+            SecureMount::open(&mount.root).map_err(GenerationSyncError::MountAccess)?;
+        reconcile_completed_mount_inode_evidence(store, &mount_id, &secure_mount)?;
+    }
+    reconcile_generation_staging_locked(store)?;
+    Ok(())
 }
 
 /// Reconciles crash leftovers at daemon/client startup without contacting a
@@ -852,10 +885,17 @@ fn validate_resulting_inventory(
             return Err(GenerationSyncError::LocalBaseMismatch);
         }
         remote_inventory.remove(&projection_id);
-        local_inventory.remove(&projection_id);
+        let retains_conflicted_local_path = paths
+            .get(&projection_id)
+            .is_some_and(|path| path.state == GenerationPathState::Conflicted);
+        if !retains_conflicted_local_path {
+            local_inventory.remove(&projection_id);
+        }
         if let Some(new) = &entry.new {
             remote_inventory.insert(projection_id.clone(), new.clone());
-            local_inventory.insert(projection_id, new.logical_path.clone());
+            if !retains_conflicted_local_path {
+                local_inventory.insert(projection_id, new.logical_path.clone());
+            }
         }
     }
 
@@ -1873,6 +1913,7 @@ mod tests {
         content_readers: VecDeque<Box<dyn Read + Send>>,
         requests: Vec<GenerationDeliveryRequest>,
         content_fetches: usize,
+        before_next_delta: Option<Box<dyn FnMut() -> Result<(), FakeTransportError>>>,
     }
 
     impl GenerationDeliveryTransport for FakeTransport {
@@ -1882,6 +1923,9 @@ mod tests {
             &mut self,
             request: &GenerationDeliveryRequest,
         ) -> Result<Option<AuthorizedGenerationDelivery>, Self::Error> {
+            if let Some(before_next_delta) = &mut self.before_next_delta {
+                before_next_delta()?;
+            }
             self.requests.push(request.clone());
             Ok(self.deliveries.pop_front())
         }
@@ -2405,6 +2449,74 @@ mod tests {
         assert_eq!(
             fs::read(fixture.mount_root.join("Docs/ß.md")).unwrap(),
             b"unchanged"
+        );
+    }
+
+    #[test]
+    fn resulting_inventory_retains_conflicted_local_path_occupancy() {
+        let fixture = Fixture::new("conflicted-local-occupancy");
+        let base = identity("projection-a", "Local.md", "base", b"base");
+        let remote_two = identity("projection-a", "Remote-2.md", "remote-2", b"remote two");
+        fs::write(fixture.mount_root.join("Local.md"), b"local edit").unwrap();
+        let mut store = seed(&fixture, vec![base.clone()]);
+        let first = delivery(
+            "delta-conflicted-local-occupancy",
+            vec![GenerationDeltaEntry {
+                old: Some(base),
+                new: Some(remote_two.clone()),
+            }],
+        );
+        let mut first_transport = FakeTransport::default();
+        first_transport
+            .contents
+            .insert("remote-2".to_string(), b"remote two".to_vec());
+        apply_authorized_delivery(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            first,
+            &mut first_transport,
+        )
+        .unwrap();
+
+        let remote_three = identity("projection-a", "Remote-3.md", "remote-3", b"remote three");
+        let colliding_create = identity("projection-b", "Local.md", "created", b"created");
+        let mut second = delivery(
+            "delta-collides-with-conflicted-local",
+            vec![
+                GenerationDeltaEntry {
+                    old: Some(remote_two),
+                    new: Some(remote_three),
+                },
+                GenerationDeltaEntry {
+                    old: None,
+                    new: Some(colliding_create),
+                },
+            ],
+        );
+        retarget_delivery(&mut second, "generation-2", "generation-3");
+        let mut second_transport = FakeTransport::default();
+        second_transport
+            .contents
+            .insert("remote-3".to_string(), b"remote three".to_vec());
+        second_transport
+            .contents
+            .insert("created".to_string(), b"created".to_vec());
+
+        let error = apply_authorized_delivery(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            second,
+            &mut second_transport,
+        )
+        .expect_err("conflicted local working path must remain occupied");
+
+        assert!(matches!(error, GenerationSyncError::Contract(_)));
+        assert_eq!(second_transport.content_fetches, 0);
+        assert_eq!(
+            fs::read(fixture.mount_root.join("Local.md")).unwrap(),
+            b"local edit"
         );
     }
 
@@ -3206,6 +3318,99 @@ mod tests {
             &converted.outcomes[0].1,
             GenerationApplyOutcome::Conflict { .. }
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_delta_poll_reconciles_completed_inode_evidence_for_other_mounts_first() {
+        let fixture = Fixture::new("no-delta-reconciles-all-mounts");
+        let old = identity("projection-a", "Roadmap.md", "content-old", b"old");
+        let new = identity("projection-a", "Roadmap.md", "content-new", b"remote");
+        let path = fixture.mount_root.join("Roadmap.md");
+        fs::write(&path, b"old").unwrap();
+        let mut store = seed(&fixture, vec![old.clone()]);
+        let mut writer = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let update = delivery(
+            "delta-before-no-delta-poll",
+            vec![GenerationDeltaEntry {
+                old: Some(old),
+                new: Some(new),
+            }],
+        );
+        let mut update_transport = FakeTransport::default();
+        update_transport
+            .contents
+            .insert("content-new".to_string(), b"remote".to_vec());
+        apply_authorized_delivery(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            update,
+            &mut update_transport,
+        )
+        .unwrap();
+
+        writer.seek(SeekFrom::Start(0)).unwrap();
+        writer.set_len(0).unwrap();
+        writer.write_all(b"late local bytes").unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+
+        let other_mount_id = MountId::new("mount-other");
+        let other_mount_root = fixture.root.join("other-mount");
+        fs::create_dir_all(&other_mount_root).unwrap();
+        store
+            .save_mount(MountConfig::new(
+                other_mount_id.clone(),
+                "backend",
+                &other_mount_root,
+            ))
+            .unwrap();
+        store
+            .seed_observed_generation(
+                ObservedGenerationRecord {
+                    mount_id: other_mount_id.clone(),
+                    source_connection_id: SourceConnectionId::new("source-other"),
+                    generation_id: SourceGenerationId::new("generation-other").unwrap(),
+                    inventory_sha256: sha256_label(b"other-inventory"),
+                    workspace_layout_version: 1,
+                    workspace_layout_digest: sha256_label(b"layout"),
+                    last_receipt_sha256: None,
+                    updated_at: "2026-07-31T13:00:00Z".to_string(),
+                },
+                Vec::new(),
+            )
+            .unwrap();
+
+        let check_path = path.clone();
+        let transport = FakeTransport {
+            before_next_delta: Some(Box::new(move || {
+                if fs::read(&check_path).ok().as_deref() != Some(b"late local bytes") {
+                    return Err(FakeTransportError(
+                        "inode evidence was not reconciled before next_delta".to_string(),
+                    ));
+                }
+                Ok(())
+            })),
+            ..FakeTransport::default()
+        };
+        let mut client = GenerationSyncClient::new(transport);
+
+        let summary = client
+            .sync_mount(&mut store, &other_mount_id, &other_mount_root)
+            .unwrap();
+
+        assert_eq!(summary, GenerationSyncSummary::default());
+        assert_eq!(client.transport().requests.len(), 1);
+        assert_eq!(fs::read(path).unwrap(), b"late local bytes");
+        assert_eq!(
+            store.list_generation_paths(&fixture.mount_id).unwrap()[0].state,
+            GenerationPathState::Conflicted
+        );
     }
 
     #[test]

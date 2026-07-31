@@ -152,18 +152,22 @@ impl LogicalPath {
     /// followed by NFC. Separators remain structural, so this is safe to use
     /// for whole-tree collision detection without consulting the host OS.
     pub fn portable_collision_key(&self) -> String {
-        self.0
-            .split('/')
-            .map(|component| {
-                component
-                    .chars()
-                    .default_case_fold()
-                    .nfc()
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("/")
+        portable_path_collision_key(&self.0)
     }
+}
+
+fn portable_path_collision_key(value: &str) -> String {
+    value
+        .split('/')
+        .map(|component| {
+            component
+                .chars()
+                .default_case_fold()
+                .nfc()
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 impl Display for LogicalPath {
@@ -266,7 +270,9 @@ fn validate_logical_path(value: &str) -> Result<(), LogicalPathError> {
     if value.contains('\\') {
         return Err(LogicalPathError::Backslash);
     }
-    if value.eq_ignore_ascii_case(RESERVED_EXPORT_METADATA_PATH) {
+    if portable_path_collision_key(value)
+        == portable_path_collision_key(RESERVED_EXPORT_METADATA_PATH)
+    {
         return Err(LogicalPathError::ReservedMetadata);
     }
     if value.len() > MAX_LOGICAL_PATH_UTF8_BYTES
@@ -744,6 +750,7 @@ mod tests {
             "safe/./dot.md",
             ".loc/session.json",
             ".LOC/SESSION.JSON",
+            ".loc/ſession.json",
             "safe/NUL.txt",
             "safe/COM¹.txt",
             "safe/CONOUT$.log",
@@ -758,6 +765,14 @@ mod tests {
                 "hostile logical path unexpectedly accepted: {value:?}"
             );
         }
+    }
+
+    #[test]
+    fn reserved_export_metadata_uses_the_full_adr0005_collision_key() {
+        assert_eq!(
+            LogicalPath::new(".loc/ſession.json"),
+            Err(LogicalPathError::ReservedMetadata)
+        );
     }
 
     #[test]

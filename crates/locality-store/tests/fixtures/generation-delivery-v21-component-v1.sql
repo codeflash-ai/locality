@@ -39,7 +39,11 @@ CREATE TABLE generation_apply_journals (
     active INTEGER NOT NULL CHECK (active IN (0, 1)),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    completed_at TEXT
+    completed_at TEXT,
+    CHECK (
+        (active = 0 AND status = 'completed' AND completed_at IS NOT NULL)
+        OR (active = 1 AND status IN ('staged', 'applying') AND completed_at IS NULL)
+    )
 );
 INSERT INTO generation_apply_journals
 SELECT delta_id, source_connection_id, base_generation_id, target_generation_id,

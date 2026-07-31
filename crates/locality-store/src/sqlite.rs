@@ -4043,7 +4043,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         migrate_journals_component_to_v3(connection)?;
         migrate_virtual_mutations_component_to_v3(connection)?;
         migrate_entity_search_component_to_v2(connection)?;
-        migrate_generation_delivery_component_to_v3(connection)?;
+        migrate_generation_delivery_to_v3(connection, None, true)?;
         return Ok(());
     }
 
@@ -4654,19 +4654,12 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
     }
 
-    if user_version < 23 {
-        migrate_generation_delivery_storage_to_v2(connection)?;
-        if user_version >= 21 {
-            record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
-        }
-    }
-
     if user_version < 24 {
-        migrate_generation_delivery_storage_to_v3(connection)?;
-        if user_version >= 21 {
-            migrate_generation_delivery_component_to_v3(connection)?;
-            record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
-        }
+        migrate_generation_delivery_to_v3(
+            connection,
+            (user_version >= 21).then_some(user_version),
+            user_version >= 21,
+        )?;
     }
 
     if user_version < SCHEMA_VERSION {
@@ -5693,14 +5686,74 @@ fn migrate_generation_delivery_component_to_v3(connection: &Connection) -> Store
     migrate_state_component_to_current(connection, "durable:generation_delivery")
 }
 
-fn migrate_generation_delivery_storage_to_v2(connection: &Connection) -> StoreResult<()> {
-    if !column_exists(connection, "generation_paths", "base_payload_delta_id")? {
-        connection.execute_batch(
-            "ALTER TABLE generation_paths ADD COLUMN base_payload_delta_id TEXT;
-             ALTER TABLE generation_paths ADD COLUMN base_payload_entry_index INTEGER
-                 CHECK (base_payload_entry_index >= 0);",
-        )?;
+fn migrate_generation_delivery_to_v3(
+    connection: &Connection,
+    record_from_schema: Option<i64>,
+    update_component: bool,
+) -> StoreResult<()> {
+    if record_from_schema.is_none()
+        && generation_delivery_storage_v3_is_complete(connection)?
+        && (!update_component || generation_delivery_component_is_current(connection)?)
+    {
+        return Ok(());
     }
+    let transaction = connection.unchecked_transaction()?;
+    migrate_generation_delivery_storage_to_v2(&transaction)?;
+    migrate_generation_delivery_storage_to_v3(&transaction)?;
+    verify_generation_delivery_storage_v3(&transaction)?;
+    if update_component {
+        migrate_generation_delivery_component_to_v3(&transaction)?;
+    }
+    if let Some(from) = record_from_schema {
+        record_schema_migration(&transaction, from, SCHEMA_VERSION)?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn generation_delivery_component_is_current(connection: &Connection) -> StoreResult<bool> {
+    connection
+        .query_row(
+            "SELECT version = ?2 AND min_reader_version = ?2
+             FROM state_components WHERE component_id = ?1",
+            params![
+                "durable:generation_delivery",
+                GENERATION_DELIVERY_COMPONENT_VERSION
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(|value| value.unwrap_or(false))
+        .map_err(Into::into)
+}
+
+fn add_column_if_missing(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> StoreResult<()> {
+    if !column_exists(connection, table, column)? {
+        connection.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition};"
+        ))?;
+    }
+    Ok(())
+}
+
+fn migrate_generation_delivery_storage_to_v2(connection: &Connection) -> StoreResult<()> {
+    add_column_if_missing(
+        connection,
+        "generation_paths",
+        "base_payload_delta_id",
+        "TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_paths",
+        "base_payload_entry_index",
+        "INTEGER CHECK (base_payload_entry_index >= 0)",
+    )?;
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS generation_inode_evidence (
             delta_id TEXT NOT NULL,
@@ -5720,28 +5773,113 @@ fn migrate_generation_delivery_storage_to_v2(connection: &Connection) -> StoreRe
 }
 
 fn migrate_generation_delivery_storage_to_v3(connection: &Connection) -> StoreResult<()> {
-    if !column_exists(connection, "generation_paths", "local_logical_path")? {
-        connection.execute_batch(
-            "ALTER TABLE generation_paths ADD COLUMN local_logical_path TEXT;
-             UPDATE generation_paths SET local_logical_path = logical_path
-             WHERE local_logical_path IS NULL;
-             ALTER TABLE generation_paths ADD COLUMN conflict_payload_delta_id TEXT;
-             ALTER TABLE generation_paths ADD COLUMN conflict_payload_entry_index INTEGER
-                 CHECK (conflict_payload_entry_index >= 0);",
-        )?;
-    }
-    if !column_exists(
+    add_column_if_missing(connection, "generation_paths", "local_logical_path", "TEXT")?;
+    connection.execute(
+        "UPDATE generation_paths SET local_logical_path = logical_path
+         WHERE local_logical_path IS NULL",
+        [],
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_paths",
+        "conflict_payload_delta_id",
+        "TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_paths",
+        "conflict_payload_entry_index",
+        "INTEGER CHECK (conflict_payload_entry_index >= 0)",
+    )?;
+    add_column_if_missing(
         connection,
         "generation_inode_evidence",
         "base_payload_delta_id",
-    )? {
-        connection.execute_batch(
-            "ALTER TABLE generation_inode_evidence ADD COLUMN base_payload_delta_id TEXT;
-             ALTER TABLE generation_inode_evidence ADD COLUMN base_payload_entry_index INTEGER
-                 CHECK (base_payload_entry_index >= 0);",
-        )?;
+        "TEXT",
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_inode_evidence",
+        "base_payload_entry_index",
+        "INTEGER CHECK (base_payload_entry_index >= 0)",
+    )?;
+    Ok(())
+}
+
+fn verify_generation_delivery_storage_v3(connection: &Connection) -> StoreResult<()> {
+    if generation_delivery_storage_v3_is_complete(connection)? {
+        return Ok(());
+    }
+    for (table, columns) in [
+        (
+            "generation_paths",
+            &[
+                "base_payload_delta_id",
+                "base_payload_entry_index",
+                "local_logical_path",
+                "conflict_payload_delta_id",
+                "conflict_payload_entry_index",
+            ][..],
+        ),
+        (
+            "generation_inode_evidence",
+            &["base_payload_delta_id", "base_payload_entry_index"][..],
+        ),
+    ] {
+        for column in columns {
+            if !column_exists(connection, table, column)? {
+                return Err(StoreError::InvalidState(format!(
+                    "generation delivery migration left `{table}.{column}` incomplete"
+                )));
+            }
+        }
+    }
+    let null_local_path: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_paths WHERE local_logical_path IS NULL
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if null_local_path {
+        return Err(StoreError::InvalidState(
+            "generation delivery migration left a null local logical path".to_string(),
+        ));
     }
     Ok(())
+}
+
+fn generation_delivery_storage_v3_is_complete(connection: &Connection) -> StoreResult<bool> {
+    for (table, columns) in [
+        (
+            "generation_paths",
+            &[
+                "base_payload_delta_id",
+                "base_payload_entry_index",
+                "local_logical_path",
+                "conflict_payload_delta_id",
+                "conflict_payload_entry_index",
+            ][..],
+        ),
+        (
+            "generation_inode_evidence",
+            &["base_payload_delta_id", "base_payload_entry_index"][..],
+        ),
+    ] {
+        for column in columns {
+            if !column_exists(connection, table, column)? {
+                return Ok(false);
+            }
+        }
+    }
+    let null_local_path: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM generation_paths WHERE local_logical_path IS NULL
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(!null_local_path)
 }
 
 fn migrate_journals_component_to_v3(connection: &Connection) -> StoreResult<()> {
