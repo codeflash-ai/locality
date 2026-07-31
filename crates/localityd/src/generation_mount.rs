@@ -696,7 +696,7 @@ fn not_regular_file() -> io::Error {
 mod windows_tests {
     use super::*;
     use std::fs;
-    use std::io::Read;
+    use std::io::{Read, Seek, SeekFrom};
     use std::mem::size_of;
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -815,16 +815,28 @@ mod windows_tests {
         let root = temp_root("lock-nonreplaceable");
         fs::write(root.join("lock"), b"lock bytes").unwrap();
         let directory = open_windows_root(&root).unwrap();
-        let lock =
+        let mut lock =
             open_windows_regular_file(&directory, OsStr::new("lock"), true, false, false, false)
                 .unwrap()
                 .unwrap();
         lock_windows_file(&lock).unwrap();
 
-        rename_windows_noreplace(&directory, OsStr::new("lock"), OsStr::new("displaced"))
-            .unwrap_err();
+        let error =
+            rename_windows_noreplace(&directory, OsStr::new("lock"), OsStr::new("displaced"))
+                .unwrap_err();
+        assert_eq!(
+            error.raw_os_error().map(|code| code as u32),
+            Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION)
+        );
 
-        assert_eq!(fs::read(root.join("lock")).unwrap(), b"lock bytes");
+        // An exclusive LockFileEx byte-range lock rejects overlapping reads
+        // through a second handle with ERROR_LOCK_VIOLATION. Verify the bytes
+        // through the handle that owns the lock instead.
+        lock.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        lock.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"lock bytes");
+        assert!(root.join("lock").exists());
         assert!(!root.join("displaced").exists());
         drop(lock);
         drop(directory);
