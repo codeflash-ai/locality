@@ -29,6 +29,7 @@ pub const MAX_GENERATION_PIN_LEASES_PER_DEVICE: u16 = 32;
 pub const MAX_GENERATION_PIN_RETRY_AFTER_SECONDS: u64 = 60 * 60;
 pub const MAX_OPAQUE_DEVICE_SCOPE_ID_BYTES: usize = 128;
 pub const MAX_OPAQUE_PIN_LEASE_ID_BYTES: usize = 256;
+pub const MAX_GENERATION_PIN_OPERATION_ID_BYTES: usize = 128;
 
 pub const GENERATION_TRANSPORT_CAPABILITIES_V1_GOLDEN_JSON: &[u8] =
     include_bytes!("../fixtures/generation-transport-capabilities-v1.json");
@@ -500,6 +501,7 @@ pub struct GenerationPinLeaseAcquireRequest {
     pub format_version: u16,
     #[serde(default = "v1")]
     pub minimum_reader_version: u16,
+    pub operation_id: String,
     pub device_scope_id: String,
     pub source_connection_id: SourceConnectionId,
     pub generation_id: SourceGenerationId,
@@ -514,6 +516,11 @@ impl GenerationPinLeaseAcquireRequest {
 
     pub fn validate(&self) -> Result<(), GenerationTransportContractError> {
         validate_versions(self.format_version, self.minimum_reader_version)?;
+        validate_opaque(
+            "operation_id",
+            &self.operation_id,
+            MAX_GENERATION_PIN_OPERATION_ID_BYTES,
+        )?;
         validate_opaque(
             "device_scope_id",
             &self.device_scope_id,
@@ -532,6 +539,7 @@ impl Debug for GenerationPinLeaseAcquireRequest {
             .debug_struct("GenerationPinLeaseAcquireRequest")
             .field("format_version", &self.format_version)
             .field("minimum_reader_version", &self.minimum_reader_version)
+            .field("operation_id", &"<redacted>")
             .field("device_scope_id", &"<redacted>")
             .field("source_connection_id", &self.source_connection_id)
             .field("generation_id", &self.generation_id)
@@ -548,6 +556,7 @@ pub struct GenerationPinLease {
     pub source_connection_id: SourceConnectionId,
     pub generation_id: SourceGenerationId,
     pub lease_seconds: u64,
+    pub issued_at: String,
     pub expires_at: String,
     pub active_leases_for_device: u16,
     pub max_active_leases_per_device: u16,
@@ -564,13 +573,33 @@ impl GenerationPinLease {
         validate_identifier("source_connection_id", self.source_connection_id.as_str())?;
         validate_identifier("generation_id", self.generation_id.as_str())?;
         validate_lease_seconds(self.lease_seconds)?;
+        validate_timestamp(&self.issued_at)?;
         validate_timestamp(&self.expires_at)?;
+        let issued_at = canonical_utc_seconds(&self.issued_at)?;
+        let expires_at = canonical_utc_seconds(&self.expires_at)?;
+        if expires_at.checked_sub(issued_at) != Some(self.lease_seconds as i64) {
+            return Err(GenerationTransportContractError::InvalidPinLeaseExpiry);
+        }
         if self.active_leases_for_device == 0
             || self.max_active_leases_per_device == 0
             || self.active_leases_for_device > self.max_active_leases_per_device
             || self.max_active_leases_per_device > MAX_GENERATION_PIN_LEASES_PER_DEVICE
         {
             return Err(GenerationTransportContractError::InvalidPinQuota);
+        }
+        Ok(())
+    }
+
+    pub fn validate_at(
+        &self,
+        trusted_server_time: &str,
+    ) -> Result<(), GenerationTransportContractError> {
+        self.validate()?;
+        let issued_at = canonical_utc_seconds(&self.issued_at)?;
+        let server_time = canonical_utc_seconds(trusted_server_time)?;
+        let expires_at = canonical_utc_seconds(&self.expires_at)?;
+        if server_time < issued_at || server_time >= expires_at {
+            return Err(GenerationTransportContractError::ExpiredPinLease);
         }
         Ok(())
     }
@@ -585,6 +614,7 @@ impl Debug for GenerationPinLease {
             .field("source_connection_id", &self.source_connection_id)
             .field("generation_id", &self.generation_id)
             .field("lease_seconds", &self.lease_seconds)
+            .field("issued_at", &self.issued_at)
             .field("expires_at", &self.expires_at)
             .field("active_leases_for_device", &self.active_leases_for_device)
             .field(
@@ -606,7 +636,7 @@ pub enum GenerationPinLeaseUnavailableReason {
     Unknown,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum GenerationPinLeaseAcquireResponse {
     Granted {
@@ -614,7 +644,13 @@ pub enum GenerationPinLeaseAcquireResponse {
         format_version: u16,
         #[serde(default = "v1")]
         minimum_reader_version: u16,
+        operation_id: String,
+        device_scope_id: String,
+        source_connection_id: SourceConnectionId,
         requested_generation_id: SourceGenerationId,
+        requested_lease_seconds: u64,
+        fallback_policy: GenerationPinFallbackPolicy,
+        server_time: String,
         fallback_applied: bool,
         lease: GenerationPinLease,
     },
@@ -623,10 +659,73 @@ pub enum GenerationPinLeaseAcquireResponse {
         format_version: u16,
         #[serde(default = "v1")]
         minimum_reader_version: u16,
+        operation_id: String,
+        device_scope_id: String,
+        source_connection_id: SourceConnectionId,
         requested_generation_id: SourceGenerationId,
+        requested_lease_seconds: u64,
+        fallback_policy: GenerationPinFallbackPolicy,
+        server_time: String,
         reason: GenerationPinLeaseUnavailableReason,
         retry_after_seconds: Option<u64>,
     },
+}
+
+impl Debug for GenerationPinLeaseAcquireResponse {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Granted {
+                format_version,
+                minimum_reader_version,
+                source_connection_id,
+                requested_generation_id,
+                requested_lease_seconds,
+                fallback_policy,
+                server_time,
+                fallback_applied,
+                lease,
+                ..
+            } => formatter
+                .debug_struct("GenerationPinLeaseAcquireResponse::Granted")
+                .field("format_version", format_version)
+                .field("minimum_reader_version", minimum_reader_version)
+                .field("operation_id", &"<redacted>")
+                .field("device_scope_id", &"<redacted>")
+                .field("source_connection_id", source_connection_id)
+                .field("requested_generation_id", requested_generation_id)
+                .field("requested_lease_seconds", requested_lease_seconds)
+                .field("fallback_policy", fallback_policy)
+                .field("server_time", server_time)
+                .field("fallback_applied", fallback_applied)
+                .field("lease", lease)
+                .finish(),
+            Self::Unavailable {
+                format_version,
+                minimum_reader_version,
+                source_connection_id,
+                requested_generation_id,
+                requested_lease_seconds,
+                fallback_policy,
+                server_time,
+                reason,
+                retry_after_seconds,
+                ..
+            } => formatter
+                .debug_struct("GenerationPinLeaseAcquireResponse::Unavailable")
+                .field("format_version", format_version)
+                .field("minimum_reader_version", minimum_reader_version)
+                .field("operation_id", &"<redacted>")
+                .field("device_scope_id", &"<redacted>")
+                .field("source_connection_id", source_connection_id)
+                .field("requested_generation_id", requested_generation_id)
+                .field("requested_lease_seconds", requested_lease_seconds)
+                .field("fallback_policy", fallback_policy)
+                .field("server_time", server_time)
+                .field("reason", reason)
+                .field("retry_after_seconds", retry_after_seconds)
+                .finish(),
+        }
+    }
 }
 
 impl GenerationPinLeaseAcquireResponse {
@@ -639,13 +738,25 @@ impl GenerationPinLeaseAcquireResponse {
             Self::Granted {
                 format_version,
                 minimum_reader_version,
+                operation_id,
+                device_scope_id,
+                source_connection_id,
                 requested_generation_id,
+                requested_lease_seconds,
+                fallback_policy,
+                server_time,
                 fallback_applied,
                 lease,
             } => {
                 validate_versions(*format_version, *minimum_reader_version)?;
-                lease.validate()?;
-                if requested_generation_id != &request.generation_id
+                validate_timestamp(server_time)?;
+                lease.validate_at(server_time)?;
+                if operation_id != &request.operation_id
+                    || device_scope_id != &request.device_scope_id
+                    || source_connection_id != &request.source_connection_id
+                    || requested_generation_id != &request.generation_id
+                    || *requested_lease_seconds != request.requested_lease_seconds
+                    || *fallback_policy != request.fallback_policy
                     || lease.device_scope_id != request.device_scope_id
                     || lease.source_connection_id != request.source_connection_id
                     || lease.lease_seconds > request.requested_lease_seconds
@@ -661,12 +772,24 @@ impl GenerationPinLeaseAcquireResponse {
             Self::Unavailable {
                 format_version,
                 minimum_reader_version,
+                operation_id,
+                device_scope_id,
+                source_connection_id,
                 requested_generation_id,
+                requested_lease_seconds,
+                fallback_policy,
+                server_time,
                 reason,
                 retry_after_seconds,
             } => {
                 validate_versions(*format_version, *minimum_reader_version)?;
-                if requested_generation_id != &request.generation_id
+                validate_timestamp(server_time)?;
+                if operation_id != &request.operation_id
+                    || device_scope_id != &request.device_scope_id
+                    || source_connection_id != &request.source_connection_id
+                    || requested_generation_id != &request.generation_id
+                    || *requested_lease_seconds != request.requested_lease_seconds
+                    || *fallback_policy != request.fallback_policy
                     || *reason == GenerationPinLeaseUnavailableReason::Unknown
                     || retry_after_seconds.is_some_and(|seconds| {
                         seconds == 0 || seconds > MAX_GENERATION_PIN_RETRY_AFTER_SECONDS
@@ -686,8 +809,11 @@ pub struct GenerationPinLeaseRenewRequest {
     pub format_version: u16,
     #[serde(default = "v1")]
     pub minimum_reader_version: u16,
+    pub operation_id: String,
     pub lease_id: String,
     pub device_scope_id: String,
+    pub source_connection_id: SourceConnectionId,
+    pub generation_id: SourceGenerationId,
     pub requested_lease_seconds: u64,
 }
 
@@ -698,12 +824,19 @@ impl GenerationPinLeaseRenewRequest {
 
     pub fn validate(&self) -> Result<(), GenerationTransportContractError> {
         validate_versions(self.format_version, self.minimum_reader_version)?;
+        validate_opaque(
+            "operation_id",
+            &self.operation_id,
+            MAX_GENERATION_PIN_OPERATION_ID_BYTES,
+        )?;
         validate_opaque("lease_id", &self.lease_id, MAX_OPAQUE_PIN_LEASE_ID_BYTES)?;
         validate_opaque(
             "device_scope_id",
             &self.device_scope_id,
             MAX_OPAQUE_DEVICE_SCOPE_ID_BYTES,
         )?;
+        validate_identifier("source_connection_id", self.source_connection_id.as_str())?;
+        validate_identifier("generation_id", self.generation_id.as_str())?;
         validate_lease_seconds(self.requested_lease_seconds)
     }
 }
@@ -714,20 +847,40 @@ impl Debug for GenerationPinLeaseRenewRequest {
             .debug_struct("GenerationPinLeaseRenewRequest")
             .field("format_version", &self.format_version)
             .field("minimum_reader_version", &self.minimum_reader_version)
+            .field("operation_id", &"<redacted>")
             .field("lease_id", &"<redacted>")
             .field("device_scope_id", &"<redacted>")
+            .field("source_connection_id", &self.source_connection_id)
+            .field("generation_id", &self.generation_id)
             .field("requested_lease_seconds", &self.requested_lease_seconds)
             .finish()
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationPinLeaseRenewal {
     #[serde(default = "v1")]
     pub format_version: u16,
     #[serde(default = "v1")]
     pub minimum_reader_version: u16,
+    pub operation_id: String,
+    pub requested_lease_seconds: u64,
+    pub server_time: String,
     pub lease: GenerationPinLease,
+}
+
+impl Debug for GenerationPinLeaseRenewal {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GenerationPinLeaseRenewal")
+            .field("format_version", &self.format_version)
+            .field("minimum_reader_version", &self.minimum_reader_version)
+            .field("operation_id", &"<redacted>")
+            .field("requested_lease_seconds", &self.requested_lease_seconds)
+            .field("server_time", &self.server_time)
+            .field("lease", &self.lease)
+            .finish()
+    }
 }
 
 impl GenerationPinLeaseRenewal {
@@ -737,9 +890,19 @@ impl GenerationPinLeaseRenewal {
     ) -> Result<(), GenerationTransportContractError> {
         request.validate()?;
         validate_versions(self.format_version, self.minimum_reader_version)?;
-        self.lease.validate()?;
-        if self.lease.lease_id != request.lease_id
+        validate_opaque(
+            "operation_id",
+            &self.operation_id,
+            MAX_GENERATION_PIN_OPERATION_ID_BYTES,
+        )?;
+        validate_timestamp(&self.server_time)?;
+        self.lease.validate_at(&self.server_time)?;
+        if self.operation_id != request.operation_id
+            || self.requested_lease_seconds != request.requested_lease_seconds
+            || self.lease.lease_id != request.lease_id
             || self.lease.device_scope_id != request.device_scope_id
+            || self.lease.source_connection_id != request.source_connection_id
+            || self.lease.generation_id != request.generation_id
             || self.lease.lease_seconds > request.requested_lease_seconds
         {
             return Err(GenerationTransportContractError::PinLeaseMismatch);
@@ -754,6 +917,7 @@ pub struct GenerationPinLeaseReleaseRequest {
     pub format_version: u16,
     #[serde(default = "v1")]
     pub minimum_reader_version: u16,
+    pub operation_id: String,
     pub lease_id: String,
     pub device_scope_id: String,
 }
@@ -765,6 +929,11 @@ impl GenerationPinLeaseReleaseRequest {
 
     pub fn validate(&self) -> Result<(), GenerationTransportContractError> {
         validate_versions(self.format_version, self.minimum_reader_version)?;
+        validate_opaque(
+            "operation_id",
+            &self.operation_id,
+            MAX_GENERATION_PIN_OPERATION_ID_BYTES,
+        )?;
         validate_opaque("lease_id", &self.lease_id, MAX_OPAQUE_PIN_LEASE_ID_BYTES)?;
         validate_opaque(
             "device_scope_id",
@@ -780,6 +949,7 @@ impl Debug for GenerationPinLeaseReleaseRequest {
             .debug_struct("GenerationPinLeaseReleaseRequest")
             .field("format_version", &self.format_version)
             .field("minimum_reader_version", &self.minimum_reader_version)
+            .field("operation_id", &"<redacted>")
             .field("lease_id", &"<redacted>")
             .field("device_scope_id", &"<redacted>")
             .finish()
@@ -802,6 +972,7 @@ pub struct GenerationPinLeaseRelease {
     pub format_version: u16,
     #[serde(default = "v1")]
     pub minimum_reader_version: u16,
+    pub operation_id: String,
     pub lease_id: String,
     pub device_scope_id: String,
     pub status: GenerationPinLeaseReleaseStatus,
@@ -815,8 +986,14 @@ impl GenerationPinLeaseRelease {
     ) -> Result<(), GenerationTransportContractError> {
         request.validate()?;
         validate_versions(self.format_version, self.minimum_reader_version)?;
+        validate_opaque(
+            "operation_id",
+            &self.operation_id,
+            MAX_GENERATION_PIN_OPERATION_ID_BYTES,
+        )?;
         validate_timestamp(&self.released_at)?;
         if self.status == GenerationPinLeaseReleaseStatus::Unknown
+            || self.operation_id != request.operation_id
             || self.lease_id != request.lease_id
             || self.device_scope_id != request.device_scope_id
         {
@@ -832,6 +1009,7 @@ impl Debug for GenerationPinLeaseRelease {
             .debug_struct("GenerationPinLeaseRelease")
             .field("format_version", &self.format_version)
             .field("minimum_reader_version", &self.minimum_reader_version)
+            .field("operation_id", &"<redacted>")
             .field("lease_id", &"<redacted>")
             .field("device_scope_id", &"<redacted>")
             .field("status", &self.status)
@@ -859,6 +1037,8 @@ pub enum GenerationTransportContractError {
     CapabilityNotOffered,
     InvalidPinCapability,
     InvalidPinLeaseDuration { actual: u64 },
+    InvalidPinLeaseExpiry,
+    ExpiredPinLease,
     InvalidPinQuota,
     UnknownPinFallback,
     PinLeaseMismatch,
@@ -914,6 +1094,12 @@ impl Display for GenerationTransportContractError {
                 formatter,
                 "pin lease duration {actual} is outside {MIN_GENERATION_PIN_LEASE_SECONDS}..={MAX_GENERATION_PIN_LEASE_SECONDS}"
             ),
+            Self::InvalidPinLeaseExpiry => {
+                formatter.write_str("pin lease expiry does not match its issued time and duration")
+            }
+            Self::ExpiredPinLease => {
+                formatter.write_str("pin lease is not live at authenticated server time")
+            }
             Self::InvalidPinQuota => formatter.write_str("invalid bounded device pin quota"),
             Self::UnknownPinFallback => {
                 formatter.write_str("unknown generation pin fallback policy")
@@ -1039,6 +1225,37 @@ fn validate_timestamp(value: &str) -> Result<(), GenerationTransportContractErro
     }
     crate::validate_canonical_utc_timestamp("generation_transport_timestamp", value)
         .map_err(|_| GenerationTransportContractError::InvalidTimestamp)
+}
+
+fn canonical_utc_seconds(value: &str) -> Result<i64, GenerationTransportContractError> {
+    validate_timestamp(value)?;
+    let bytes = value.as_bytes();
+    let year = decimal(&bytes[0..4]);
+    let month = decimal(&bytes[5..7]);
+    let day = decimal(&bytes[8..10]);
+    let hour = decimal(&bytes[11..13]);
+    let minute = decimal(&bytes[14..16]);
+    let second = decimal(&bytes[17..19]);
+    let days = days_from_civil(year, month, day);
+    Ok(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+fn decimal(bytes: &[u8]) -> i64 {
+    bytes
+        .iter()
+        .fold(0_i64, |value, byte| value * 10 + i64::from(*byte - b'0'))
+}
+
+// Howard Hinnant's civil-calendar conversion, shifted to the Unix epoch. The
+// canonical timestamp validator has already bounded every calendar field.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let shifted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 fn validate_sha256(value: &str) -> Result<(), GenerationTransportContractError> {

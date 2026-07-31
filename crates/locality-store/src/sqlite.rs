@@ -62,7 +62,7 @@ use crate::repository::{
 };
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 24;
+const SCHEMA_VERSION: i64 = 25;
 const ENTITY_SEARCH_COMPONENT_VERSION: i64 = 2;
 const JOURNALS_COMPONENT_VERSION: i64 = 3;
 const LINUX_FUSE_PROJECTION_LAYOUT_VERSION: i64 = 2;
@@ -471,7 +471,8 @@ fn generation_apply_from_connection(
 ) -> StoreResult<Option<GenerationApplyJournalRecord>> {
     let row = connection
         .query_row(
-            "SELECT mount_id, delta_json, receipt_json, receipt_sha256, stage_root, status,
+            "SELECT mount_id, delta_json, receipt_json, receipt_sha256,
+                    acknowledgment_required, acknowledged_at, stage_root, status,
                     created_at, updated_at, completed_at
              FROM generation_apply_journals WHERE delta_id = ?1",
             params![delta_id],
@@ -481,11 +482,13 @@ fn generation_apply_from_connection(
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
-                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, Option<String>>(10)?,
                 ))
             },
         )
@@ -520,12 +523,14 @@ fn generation_apply_from_connection(
         delta,
         receipt: from_json(&row.2)?,
         receipt_sha256: row.3,
-        stage_root: row.4,
-        status: GenerationApplyStatus::parse(&row.5)?,
+        acknowledgment_required: row.4,
+        acknowledged_at: row.5,
+        stage_root: row.6,
+        status: GenerationApplyStatus::parse(&row.7)?,
         outcomes,
-        created_at: row.6,
-        updated_at: row.7,
-        completed_at: row.8,
+        created_at: row.8,
+        updated_at: row.9,
+        completed_at: row.10,
     }))
 }
 
@@ -688,6 +693,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
             if existing.delta == prepared.delta
                 && existing.receipt == prepared.receipt
                 && existing.receipt_sha256 == prepared.receipt_sha256
+                && existing.acknowledgment_required == prepared.acknowledgment_required
                 && existing.stage_root == prepared.stage_root
                 && existing.created_at == prepared.created_at
             {
@@ -756,8 +762,9 @@ impl GenerationDeliveryRepository for SqliteStateStore {
             "INSERT INTO generation_apply_journals (
                 delta_id, mount_id, source_connection_id, base_generation_id,
                 target_generation_id, delta_json, receipt_json, receipt_sha256,
+                acknowledgment_required, acknowledged_at,
                 stage_root, status, active, created_at, updated_at, completed_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'staged', 1, ?10, ?10, NULL)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, 'staged', 1, ?11, ?11, NULL)",
             params![
                 prepared.delta.delta_id.as_str(),
                 prepared.delta.mount_id.as_str(),
@@ -767,6 +774,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 to_json(&prepared.delta)?,
                 to_json(&prepared.receipt)?,
                 prepared.receipt_sha256.as_str(),
+                prepared.acknowledgment_required,
                 prepared.stage_root.as_str(),
                 prepared.created_at.as_str(),
             ],
@@ -916,6 +924,81 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 })
             })
             .collect()
+    }
+
+    fn list_pending_generation_acknowledgments(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Vec<GenerationApplyJournalRecord>> {
+        let connection = self.connection()?;
+        let delta_ids = {
+            let mut statement = connection.prepare(
+                "SELECT delta_id FROM generation_apply_journals
+                 WHERE mount_id = ?1 AND status = 'completed'
+                   AND acknowledgment_required = 1 AND acknowledged_at IS NULL
+                 ORDER BY completed_at, delta_id",
+            )?;
+            statement
+                .query_map(params![mount_id.as_str()], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        delta_ids
+            .iter()
+            .map(|delta_id| {
+                generation_apply_from_connection(&connection, delta_id)?.ok_or_else(|| {
+                    StoreError::InvalidState(format!(
+                        "pending generation acknowledgment `{delta_id}` disappeared"
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    fn mark_generation_acknowledged(
+        &mut self,
+        delta_id: &str,
+        receipt_sha256: &str,
+        acknowledged_at: &str,
+    ) -> StoreResult<GenerationApplyJournalRecord> {
+        if acknowledged_at.is_empty() {
+            return Err(StoreError::InvalidState(
+                "generation acknowledgment timestamp must not be empty".to_string(),
+            ));
+        }
+        let connection = self.connection()?;
+        let journal =
+            generation_apply_from_connection(&connection, delta_id)?.ok_or_else(|| {
+                StoreError::InvalidState(format!("generation apply `{delta_id}` is missing"))
+            })?;
+        if journal.status != GenerationApplyStatus::Completed
+            || !journal.acknowledgment_required
+            || journal.receipt_sha256 != receipt_sha256
+        {
+            return Err(StoreError::InvalidState(format!(
+                "generation acknowledgment `{delta_id}` does not match a completed required receipt"
+            )));
+        }
+        if journal.acknowledged_at.is_some() {
+            return Ok(journal);
+        }
+        let changed = connection.execute(
+            "UPDATE generation_apply_journals
+             SET acknowledged_at = ?3, updated_at = ?3
+             WHERE delta_id = ?1 AND receipt_sha256 = ?2
+               AND status = 'completed' AND acknowledgment_required = 1
+               AND acknowledged_at IS NULL",
+            params![delta_id, receipt_sha256, acknowledged_at],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidState(format!(
+                "generation acknowledgment `{delta_id}` changed concurrently"
+            )));
+        }
+        generation_apply_from_connection(&connection, delta_id)?.ok_or_else(|| {
+            StoreError::InvalidState(format!(
+                "acknowledged generation apply `{delta_id}` disappeared"
+            ))
+        })
     }
 
     fn record_generation_inode_evidence(
@@ -3787,6 +3870,22 @@ fn clear_mount_source_state(connection: &Connection, mount_id: &MountId) -> Stor
             mount_id.0
         )));
     }
+    let pending_acknowledgment: Option<String> = connection
+        .query_row(
+            "SELECT delta_id FROM generation_apply_journals
+             WHERE mount_id = ?1 AND status = 'completed'
+               AND acknowledgment_required = 1 AND acknowledged_at IS NULL
+             LIMIT 1",
+            params![&mount_id.0],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(delta_id) = pending_acknowledgment {
+        return Err(StoreError::InvalidState(format!(
+            "mount `{}` has pending terminal acknowledgment for generation apply `{delta_id}`",
+            mount_id.0
+        )));
+    }
     let preserved_path: Option<(String, String)> = connection
         .query_row(
             "SELECT projection_id, state FROM generation_paths
@@ -4043,7 +4142,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         migrate_journals_component_to_v3(connection)?;
         migrate_virtual_mutations_component_to_v3(connection)?;
         migrate_entity_search_component_to_v2(connection)?;
-        migrate_generation_delivery_to_v3(connection, None, true)?;
+        migrate_generation_delivery_to_v4(connection, None, true)?;
         return Ok(());
     }
 
@@ -4351,6 +4450,9 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             delta_json TEXT NOT NULL,
             receipt_json TEXT NOT NULL,
             receipt_sha256 TEXT NOT NULL,
+            acknowledgment_required INTEGER NOT NULL DEFAULT 0
+                CHECK (acknowledgment_required IN (0, 1)),
+            acknowledged_at TEXT,
             stage_root TEXT NOT NULL,
             status TEXT NOT NULL CHECK (status IN ('staged', 'applying', 'completed')),
             active INTEGER NOT NULL CHECK (active IN (0, 1)),
@@ -4654,8 +4756,8 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
     }
 
-    if user_version < 24 {
-        migrate_generation_delivery_to_v3(
+    if user_version < 25 {
+        migrate_generation_delivery_to_v4(
             connection,
             (user_version >= 21).then_some(user_version),
             user_version >= 21,
@@ -4735,7 +4837,7 @@ fn state_component_issue_allows_schema_migration(
             component_id,
             found,
             current: GENERATION_DELIVERY_COMPONENT_VERSION,
-        } if component_id == "durable:generation_delivery" && matches!(*found, 1 | 2)
+        } if component_id == "durable:generation_delivery" && matches!(*found, 1..=3)
     ) || matches!(
         issue,
         StateCompatibilityIssue::OlderComponent {
@@ -5514,6 +5616,9 @@ fn migrate_generation_delivery_journals_to_mount_relation(
             delta_json TEXT NOT NULL,
             receipt_json TEXT NOT NULL,
             receipt_sha256 TEXT NOT NULL,
+            acknowledgment_required INTEGER NOT NULL DEFAULT 0
+                CHECK (acknowledgment_required IN (0, 1)),
+            acknowledged_at TEXT,
             stage_root TEXT NOT NULL,
             status TEXT NOT NULL CHECK (status IN ('staged', 'applying', 'completed')),
             active INTEGER NOT NULL CHECK (active IN (0, 1)),
@@ -5604,6 +5709,9 @@ fn create_generation_delivery_tables(connection: &Connection) -> StoreResult<()>
             delta_json TEXT NOT NULL,
             receipt_json TEXT NOT NULL,
             receipt_sha256 TEXT NOT NULL,
+            acknowledgment_required INTEGER NOT NULL DEFAULT 0
+                CHECK (acknowledgment_required IN (0, 1)),
+            acknowledged_at TEXT,
             stage_root TEXT NOT NULL,
             status TEXT NOT NULL CHECK (status IN ('staged', 'applying', 'completed')),
             active INTEGER NOT NULL CHECK (active IN (0, 1)),
@@ -5682,17 +5790,17 @@ fn migrate_virtual_mutations_component_to_v3(connection: &Connection) -> StoreRe
     migrate_state_component_to_current(connection, "durable:virtual_mutations")
 }
 
-fn migrate_generation_delivery_component_to_v3(connection: &Connection) -> StoreResult<()> {
+fn migrate_generation_delivery_component_to_v4(connection: &Connection) -> StoreResult<()> {
     migrate_state_component_to_current(connection, "durable:generation_delivery")
 }
 
-fn migrate_generation_delivery_to_v3(
+fn migrate_generation_delivery_to_v4(
     connection: &Connection,
     record_from_schema: Option<i64>,
     update_component: bool,
 ) -> StoreResult<()> {
     if record_from_schema.is_none()
-        && generation_delivery_storage_v3_is_complete(connection)?
+        && generation_delivery_storage_v4_is_complete(connection)?
         && (!update_component || generation_delivery_component_is_current(connection)?)
     {
         return Ok(());
@@ -5700,9 +5808,10 @@ fn migrate_generation_delivery_to_v3(
     let transaction = connection.unchecked_transaction()?;
     migrate_generation_delivery_storage_to_v2(&transaction)?;
     migrate_generation_delivery_storage_to_v3(&transaction)?;
-    verify_generation_delivery_storage_v3(&transaction)?;
+    migrate_generation_delivery_storage_to_v4(&transaction)?;
+    verify_generation_delivery_storage_v4(&transaction)?;
     if update_component {
-        migrate_generation_delivery_component_to_v3(&transaction)?;
+        migrate_generation_delivery_component_to_v4(&transaction)?;
     }
     if let Some(from) = record_from_schema {
         record_schema_migration(&transaction, from, SCHEMA_VERSION)?;
@@ -5806,8 +5915,23 @@ fn migrate_generation_delivery_storage_to_v3(connection: &Connection) -> StoreRe
     Ok(())
 }
 
-fn verify_generation_delivery_storage_v3(connection: &Connection) -> StoreResult<()> {
-    if generation_delivery_storage_v3_is_complete(connection)? {
+fn migrate_generation_delivery_storage_to_v4(connection: &Connection) -> StoreResult<()> {
+    add_column_if_missing(
+        connection,
+        "generation_apply_journals",
+        "acknowledgment_required",
+        "INTEGER NOT NULL DEFAULT 0 CHECK (acknowledgment_required IN (0, 1))",
+    )?;
+    add_column_if_missing(
+        connection,
+        "generation_apply_journals",
+        "acknowledged_at",
+        "TEXT",
+    )
+}
+
+fn verify_generation_delivery_storage_v4(connection: &Connection) -> StoreResult<()> {
+    if generation_delivery_storage_v4_is_complete(connection)? {
         return Ok(());
     }
     for (table, columns) in [
@@ -5824,6 +5948,10 @@ fn verify_generation_delivery_storage_v3(connection: &Connection) -> StoreResult
         (
             "generation_inode_evidence",
             &["base_payload_delta_id", "base_payload_entry_index"][..],
+        ),
+        (
+            "generation_apply_journals",
+            &["acknowledgment_required", "acknowledged_at"][..],
         ),
     ] {
         for column in columns {
@@ -5849,7 +5977,7 @@ fn verify_generation_delivery_storage_v3(connection: &Connection) -> StoreResult
     Ok(())
 }
 
-fn generation_delivery_storage_v3_is_complete(connection: &Connection) -> StoreResult<bool> {
+fn generation_delivery_storage_v4_is_complete(connection: &Connection) -> StoreResult<bool> {
     for (table, columns) in [
         (
             "generation_paths",
@@ -5864,6 +5992,10 @@ fn generation_delivery_storage_v3_is_complete(connection: &Connection) -> StoreR
         (
             "generation_inode_evidence",
             &["base_payload_delta_id", "base_payload_entry_index"][..],
+        ),
+        (
+            "generation_apply_journals",
+            &["acknowledgment_required", "acknowledged_at"][..],
         ),
     ] {
         for column in columns {

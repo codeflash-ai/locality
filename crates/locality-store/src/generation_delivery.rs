@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{StoreError, StoreResult};
 
-pub const GENERATION_DELIVERY_COMPONENT_VERSION: i64 = 3;
+pub const GENERATION_DELIVERY_COMPONENT_VERSION: i64 = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservedGenerationRecord {
@@ -114,6 +114,9 @@ pub struct PreparedGenerationApply {
     pub delta: GenerationDelta,
     pub receipt: GenerationDeltaTerminalReceipt,
     pub receipt_sha256: String,
+    /// The authenticated capability selection requires a durable terminal
+    /// acknowledgment after this apply completes.
+    pub acknowledgment_required: bool,
     pub stage_root: String,
     pub created_at: String,
 }
@@ -147,6 +150,8 @@ pub struct GenerationApplyJournalRecord {
     pub delta: GenerationDelta,
     pub receipt: GenerationDeltaTerminalReceipt,
     pub receipt_sha256: String,
+    pub acknowledgment_required: bool,
+    pub acknowledged_at: Option<String>,
     pub stage_root: String,
     pub status: GenerationApplyStatus,
     pub outcomes: Vec<(u64, GenerationApplyOutcome)>,
@@ -218,6 +223,19 @@ pub trait GenerationDeliveryRepository {
     /// Lists active and completed journals so the staging owner can reconcile
     /// retained conflict evidence and discard non-live payloads.
     fn list_generation_applies(&self) -> StoreResult<Vec<GenerationApplyJournalRecord>>;
+
+    /// Completed acknowledgments are replayed before polling for another delta.
+    fn list_pending_generation_acknowledgments(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Vec<GenerationApplyJournalRecord>>;
+
+    fn mark_generation_acknowledged(
+        &mut self,
+        delta_id: &str,
+        receipt_sha256: &str,
+        acknowledged_at: &str,
+    ) -> StoreResult<GenerationApplyJournalRecord>;
 
     fn record_generation_inode_evidence(
         &mut self,

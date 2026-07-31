@@ -15,14 +15,15 @@ use std::sync::{Mutex, OnceLock};
 
 use locality_core::conflict::{ThreeWayTextMerge, merge_text_with_base};
 use locality_core::model::MountId;
-use locality_core::portable::LogicalPath;
+use locality_core::portable::{LogicalPath, SourceConnectionId, SourceGenerationId};
 use locality_protocol::freshness_delivery::{
     GenerationDelta, GenerationDeltaEntry, GenerationDeltaTerminalReceipt, GenerationFileIdentity,
 };
 use locality_protocol::freshness_delivery_transport::{
     GENERATION_TRANSPORT_FORMAT_VERSION, GENERATION_TRANSPORT_READER_VERSION,
     GenerationBodyWindowMetadata, GenerationBodyWindowRequest, GenerationDeliveryAcknowledgment,
-    GenerationDeliveryAcknowledgmentRequest, GenerationDeliveryRequest,
+    GenerationDeliveryAcknowledgmentRequest,
+    GenerationDeliveryRequest as VersionedGenerationDeliveryRequest,
     GenerationPinLeaseAcquireRequest, GenerationPinLeaseAcquireResponse, GenerationPinLeaseRelease,
     GenerationPinLeaseReleaseRequest, GenerationPinLeaseRenewRequest, GenerationPinLeaseRenewal,
     GenerationTransportCapabilities,
@@ -64,6 +65,15 @@ pub struct AuthorizedGenerationDelivery {
     pub terminal_receipt: GenerationDeltaTerminalReceipt,
 }
 
+/// Legacy local adapter request retained source-compatibly. Versioned portable
+/// negotiation is exposed by the additive transport extension method below.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenerationDeliveryRequest {
+    pub mount_id: MountId,
+    pub source_connection_id: SourceConnectionId,
+    pub observed_generation_id: SourceGenerationId,
+}
+
 /// One authenticated metadata envelope and its separately streamed body.
 /// HTTP status/header parsing and response authentication remain adapter
 /// responsibilities; local delivery validates the portable metadata and bytes.
@@ -75,7 +85,7 @@ pub struct AuthorizedGenerationBodyWindow {
 /// Authenticated backend transport boundary. Implementations may use HTTP,
 /// IPC, or another authenticated channel, but the public local-sync code does
 /// not assume or invent a route.
-pub trait GenerationTransport {
+pub trait GenerationDeliveryTransport {
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// Capabilities offered before `next_delta` and selected afterward. An
@@ -89,6 +99,19 @@ pub trait GenerationTransport {
         &mut self,
         request: &GenerationDeliveryRequest,
     ) -> Result<Option<AuthorizedGenerationDelivery>, Self::Error>;
+
+    /// Additive v1 entry point for adapters that negotiate portable delivery
+    /// capabilities. Existing adapters continue to implement `next_delta`.
+    fn next_delta_versioned(
+        &mut self,
+        request: &VersionedGenerationDeliveryRequest,
+    ) -> Result<Option<AuthorizedGenerationDelivery>, Self::Error> {
+        self.next_delta(&GenerationDeliveryRequest {
+            mount_id: MountId::new(request.mount_id.as_str()),
+            source_connection_id: request.source_connection_id.clone(),
+            observed_generation_id: request.observed_generation_id.clone(),
+        })
+    }
 
     fn open_content(
         &mut self,
@@ -133,7 +156,7 @@ pub trait GenerationTransport {
 }
 
 /// Compatibility name retained for existing public adapters.
-pub use GenerationTransport as GenerationDeliveryTransport;
+pub use GenerationDeliveryTransport as GenerationTransport;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GenerationSyncSummary {
@@ -150,7 +173,7 @@ pub struct GenerationSyncClient<T> {
 
 impl<T> GenerationSyncClient<T>
 where
-    T: GenerationTransport,
+    T: GenerationDeliveryTransport,
 {
     pub fn new(transport: T) -> Self {
         Self { transport }
@@ -168,6 +191,7 @@ where
     ) -> Result<GenerationSyncSummary, GenerationSyncError> {
         recover_generation_delivery_staging(store)?;
         reconcile_all_completed_inode_evidence(store)?;
+        replay_pending_acknowledgments(store, mount_id, &mut self.transport)?;
         let observed = store
             .get_observed_generation(mount_id)?
             .ok_or_else(|| GenerationSyncError::MissingObservedGeneration(mount_id.clone()))?;
@@ -175,7 +199,7 @@ where
         capabilities
             .validate()
             .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
-        let request = GenerationDeliveryRequest {
+        let request = VersionedGenerationDeliveryRequest {
             format_version: GENERATION_TRANSPORT_FORMAT_VERSION,
             minimum_reader_version: GENERATION_TRANSPORT_READER_VERSION,
             mount_id: locality_core::workspace_layout::PortableMountId::new(mount_id.as_str())
@@ -184,39 +208,74 @@ where
             observed_generation_id: observed.generation_id,
             capabilities,
         };
-        let Some(delivery) = self
+        let delivery = self
             .transport
-            .next_delta(&request)
-            .map_err(|error| GenerationSyncError::Transport(error.to_string()))?
-        else {
+            .next_delta_versioned(&request)
+            .map_err(|error| GenerationSyncError::Transport(error.to_string()))?;
+        let selected = self.transport.capabilities();
+        selected
+            .validate_selection(&request.capabilities)
+            .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
+        let Some(delivery) = delivery else {
             return Ok(GenerationSyncSummary::default());
         };
         let acknowledgment =
             GenerationDeliveryAcknowledgmentRequest::from_receipt(&delivery.terminal_receipt)
                 .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
-        let summary =
-            apply_authorized_delivery(store, mount_id, mount_root, delivery, &mut self.transport)?;
-        let selected = self.transport.capabilities();
-        selected
-            .validate_selection(&request.capabilities)
-            .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
+        let summary = apply_authorized_delivery_with_capabilities(
+            store,
+            mount_id,
+            mount_root,
+            delivery,
+            &mut self.transport,
+            &selected,
+        )?;
         if selected.terminal_receipt_acknowledgments {
-            let response = self
-                .transport
-                .acknowledge_terminal_receipt(&acknowledgment)
-                .map_err(|error| GenerationSyncError::Transport(error.to_string()))?
-                .ok_or_else(|| {
-                    GenerationSyncError::Contract(
-                        "transport selected terminal receipt acknowledgments but returned no acknowledgment"
-                            .to_string(),
-                    )
-                })?;
-            response
-                .validate_against(&acknowledgment)
-                .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
+            acknowledge_terminal_receipt(store, &mut self.transport, &acknowledgment)?;
         }
         Ok(summary)
     }
+}
+
+fn replay_pending_acknowledgments<T: GenerationDeliveryTransport>(
+    store: &mut SqliteStateStore,
+    mount_id: &MountId,
+    transport: &mut T,
+) -> Result<(), GenerationSyncError> {
+    for journal in store.list_pending_generation_acknowledgments(mount_id)? {
+        let request = GenerationDeliveryAcknowledgmentRequest::from_receipt(&journal.receipt)
+            .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
+        if request.terminal_receipt_sha256 != journal.receipt_sha256 {
+            return Err(GenerationSyncError::JournalMismatch);
+        }
+        acknowledge_terminal_receipt(store, transport, &request)?;
+    }
+    Ok(())
+}
+
+fn acknowledge_terminal_receipt<T: GenerationDeliveryTransport>(
+    store: &mut SqliteStateStore,
+    transport: &mut T,
+    request: &GenerationDeliveryAcknowledgmentRequest,
+) -> Result<(), GenerationSyncError> {
+    let response = transport
+        .acknowledge_terminal_receipt(request)
+        .map_err(|error| GenerationSyncError::Transport(error.to_string()))?
+        .ok_or_else(|| {
+            GenerationSyncError::Contract(
+                "transport selected terminal receipt acknowledgments but returned no acknowledgment"
+                    .to_string(),
+            )
+        })?;
+    response
+        .validate_against(request)
+        .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
+    store.mark_generation_acknowledged(
+        &request.delta_id,
+        &request.terminal_receipt_sha256,
+        &response.acknowledged_at,
+    )?;
+    Ok(())
 }
 
 fn reconcile_all_completed_inode_evidence(
@@ -271,19 +330,40 @@ pub fn apply_authorized_delivery<T: GenerationDeliveryTransport>(
     delivery: AuthorizedGenerationDelivery,
     transport: &mut T,
 ) -> Result<GenerationSyncSummary, GenerationSyncError> {
-    apply_authorized_delivery_inner(
+    let capabilities = transport.capabilities();
+    capabilities
+        .validate()
+        .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
+    apply_authorized_delivery_with_capabilities(
         store,
         mount_id,
         mount_root,
         delivery,
         transport,
-        None,
-        &mut ApplyHooks::default(),
+        &capabilities,
+    )
+}
+
+fn apply_authorized_delivery_with_capabilities<T: GenerationDeliveryTransport>(
+    store: &mut SqliteStateStore,
+    mount_id: &MountId,
+    mount_root: &Path,
+    delivery: AuthorizedGenerationDelivery,
+    transport: &mut T,
+    capabilities: &GenerationTransportCapabilities,
+) -> Result<GenerationSyncSummary, GenerationSyncError> {
+    let mut hooks = ApplyHooks {
+        capabilities: Some(capabilities),
+        ..ApplyHooks::default()
+    };
+    apply_authorized_delivery_inner(
+        store, mount_id, mount_root, delivery, transport, None, &mut hooks,
     )
 }
 
 #[derive(Default)]
 struct ApplyHooks<'a> {
+    capabilities: Option<&'a GenerationTransportCapabilities>,
     after_target_open: Option<&'a mut dyn FnMut()>,
     after_preimage_move: Option<&'a mut dyn FnMut()>,
     after_preimage_verified: Option<&'a mut dyn FnMut()>,
@@ -308,6 +388,10 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
         .validate_against(&delivery.delta)
         .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
     validate_mount_delta(&delivery.delta, mount_id)?;
+    let capabilities = hooks
+        .capabilities
+        .cloned()
+        .unwrap_or_else(GenerationTransportCapabilities::legacy);
 
     let mut retained = reconcile_generation_staging_locked(store)?;
     let existing = store.get_generation_apply(&delivery.delta.delta_id)?;
@@ -341,6 +425,7 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
         delta: delivery.delta,
         receipt: delivery.terminal_receipt,
         receipt_sha256,
+        acknowledgment_required: capabilities.terminal_receipt_acknowledgments,
         stage_root: path_to_portable_text(&stage_relative)?,
         created_at: created_at.clone(),
     })?;
@@ -354,6 +439,7 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
         &journal.delta,
         &journal.receipt_sha256,
         &already_recorded,
+        &capabilities,
         transport,
     )?;
     store.mark_generation_apply_started(&journal.delta.delta_id, &created_at)?;
@@ -1065,12 +1151,9 @@ fn stage_contents<T: GenerationDeliveryTransport>(
     delta: &GenerationDelta,
     terminal_receipt_sha256: &str,
     already_recorded: &BTreeSet<u64>,
+    capabilities: &GenerationTransportCapabilities,
     transport: &mut T,
 ) -> Result<(), GenerationSyncError> {
-    let capabilities = transport.capabilities();
-    capabilities
-        .validate()
-        .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
     let payload_root = stage_root.join("payloads");
     create_dir_all_durable(&payload_root)?;
     for (index, entry) in delta.entries.iter().enumerate() {
@@ -2114,9 +2197,14 @@ mod tests {
         contents: BTreeMap<String, Vec<u8>>,
         content_readers: VecDeque<Box<dyn Read + Send>>,
         requests: Vec<GenerationDeliveryRequest>,
+        versioned_requests: Vec<VersionedGenerationDeliveryRequest>,
         capabilities: GenerationTransportCapabilities,
+        selected_capabilities: Option<GenerationTransportCapabilities>,
+        delta_polled: bool,
         body_window_requests: Vec<GenerationBodyWindowRequest>,
         acknowledgment_requests: Vec<GenerationDeliveryAcknowledgmentRequest>,
+        acknowledgment_failures_remaining: usize,
+        events: Vec<&'static str>,
         content_fetches: usize,
         before_next_delta: Option<Box<dyn FnMut() -> Result<(), FakeTransportError>>>,
     }
@@ -2125,18 +2213,38 @@ mod tests {
         type Error = FakeTransportError;
 
         fn capabilities(&self) -> GenerationTransportCapabilities {
-            self.capabilities.clone()
+            if self.delta_polled {
+                self.selected_capabilities
+                    .clone()
+                    .unwrap_or_else(|| self.capabilities.clone())
+            } else {
+                self.capabilities.clone()
+            }
         }
 
         fn next_delta(
             &mut self,
             request: &GenerationDeliveryRequest,
         ) -> Result<Option<AuthorizedGenerationDelivery>, Self::Error> {
+            self.events.push("next_delta");
             if let Some(before_next_delta) = &mut self.before_next_delta {
                 before_next_delta()?;
             }
             self.requests.push(request.clone());
+            self.delta_polled = true;
             Ok(self.deliveries.pop_front())
+        }
+
+        fn next_delta_versioned(
+            &mut self,
+            request: &VersionedGenerationDeliveryRequest,
+        ) -> Result<Option<AuthorizedGenerationDelivery>, Self::Error> {
+            self.versioned_requests.push(request.clone());
+            self.next_delta(&GenerationDeliveryRequest {
+                mount_id: MountId::new(request.mount_id.as_str()),
+                source_connection_id: request.source_connection_id.clone(),
+                observed_generation_id: request.observed_generation_id.clone(),
+            })
         }
 
         fn open_content(
@@ -2195,7 +2303,14 @@ mod tests {
             &mut self,
             request: &GenerationDeliveryAcknowledgmentRequest,
         ) -> Result<Option<GenerationDeliveryAcknowledgment>, Self::Error> {
+            self.events.push("acknowledgment");
             self.acknowledgment_requests.push(request.clone());
+            if self.acknowledgment_failures_remaining > 0 {
+                self.acknowledgment_failures_remaining -= 1;
+                return Err(FakeTransportError(
+                    "injected terminal acknowledgment failure".to_string(),
+                ));
+            }
             Ok(Some(GenerationDeliveryAcknowledgment {
                 format_version: GENERATION_TRANSPORT_FORMAT_VERSION,
                 minimum_reader_version: GENERATION_TRANSPORT_READER_VERSION,
@@ -3191,9 +3306,158 @@ mod tests {
         );
         assert_eq!(client.transport().acknowledgment_requests.len(), 1);
         assert_eq!(
-            client.transport().requests[0].capabilities,
+            client.transport().versioned_requests[0].capabilities,
             client.transport().capabilities
         );
+    }
+
+    #[test]
+    fn invalid_selected_capability_is_rejected_before_any_apply_mutation() {
+        let fixture = Fixture::new("invalid-selected-capability-before-mutation");
+        let old = identity("projection-a", "Roadmap.md", "content-old", b"old");
+        let new = identity("projection-a", "Roadmap.md", "content-new", b"new");
+        fs::write(fixture.mount_root.join("Roadmap.md"), b"old").unwrap();
+        let mut store = seed(&fixture, vec![old.clone()]);
+        let mut transport = FakeTransport {
+            selected_capabilities: Some(GenerationTransportCapabilities {
+                terminal_receipt_acknowledgments: true,
+                ..GenerationTransportCapabilities::legacy()
+            }),
+            ..FakeTransport::default()
+        };
+        transport.deliveries.push_back(delivery(
+            "delta-invalid-selection",
+            vec![GenerationDeltaEntry {
+                old: Some(old),
+                new: Some(new),
+            }],
+        ));
+        transport
+            .contents
+            .insert("content-new".to_string(), b"new".to_vec());
+        let mut client = GenerationSyncClient::new(transport);
+
+        let error = client
+            .sync_mount(&mut store, &fixture.mount_id, &fixture.mount_root)
+            .expect_err("server selected an unoffered capability");
+
+        assert!(matches!(error, GenerationSyncError::Contract(_)));
+        assert_eq!(
+            fs::read(fixture.mount_root.join("Roadmap.md")).unwrap(),
+            b"old"
+        );
+        assert!(store.list_generation_applies().unwrap().is_empty());
+        assert_eq!(client.transport().content_fetches, 0);
+        assert_eq!(
+            store
+                .get_observed_generation(&fixture.mount_id)
+                .unwrap()
+                .unwrap()
+                .generation_id
+                .as_str(),
+            "generation-1"
+        );
+    }
+
+    #[test]
+    fn failed_terminal_acknowledgment_is_replayed_before_a_no_delivery_poll() {
+        let fixture = Fixture::new("durable-ack-replay-before-empty-poll");
+        let old = identity("projection-a", "Roadmap.md", "content-old", b"old");
+        let new = identity("projection-a", "Roadmap.md", "content-new", b"new");
+        fs::write(fixture.mount_root.join("Roadmap.md"), b"old").unwrap();
+        let mut store = seed(&fixture, vec![old.clone()]);
+        let mut transport = FakeTransport {
+            capabilities: GenerationTransportCapabilities {
+                terminal_receipt_acknowledgments: true,
+                ..GenerationTransportCapabilities::legacy()
+            },
+            acknowledgment_failures_remaining: 1,
+            ..FakeTransport::default()
+        };
+        transport.deliveries.push_back(delivery(
+            "delta-ack-retry",
+            vec![GenerationDeltaEntry {
+                old: Some(old),
+                new: Some(new),
+            }],
+        ));
+        transport
+            .contents
+            .insert("content-new".to_string(), b"new".to_vec());
+        let mut client = GenerationSyncClient::new(transport);
+
+        let first_error = client
+            .sync_mount(&mut store, &fixture.mount_id, &fixture.mount_root)
+            .expect_err("first terminal acknowledgment fails after durable apply");
+        assert!(matches!(first_error, GenerationSyncError::Transport(_)));
+        assert_eq!(
+            fs::read(fixture.mount_root.join("Roadmap.md")).unwrap(),
+            b"new"
+        );
+        assert_eq!(
+            store
+                .list_pending_generation_acknowledgments(&fixture.mount_id)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let second = client
+            .sync_mount(&mut store, &fixture.mount_id, &fixture.mount_root)
+            .expect("pending receipt is acknowledged before an empty poll");
+        assert_eq!(second, GenerationSyncSummary::default());
+        assert!(
+            store
+                .list_pending_generation_acknowledgments(&fixture.mount_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(client.transport().acknowledgment_requests.len(), 2);
+        assert_eq!(client.transport().versioned_requests.len(), 2);
+        assert_eq!(
+            &client.transport().events[client.transport().events.len() - 2..],
+            &["acknowledgment", "next_delta"]
+        );
+    }
+
+    #[test]
+    fn legacy_transport_implements_only_the_original_public_surface() {
+        #[derive(Default)]
+        struct LegacyOnlyTransport {
+            requests: Vec<GenerationDeliveryRequest>,
+        }
+
+        impl GenerationDeliveryTransport for LegacyOnlyTransport {
+            type Error = FakeTransportError;
+
+            fn next_delta(
+                &mut self,
+                request: &GenerationDeliveryRequest,
+            ) -> Result<Option<AuthorizedGenerationDelivery>, Self::Error> {
+                self.requests.push(request.clone());
+                Ok(None)
+            }
+
+            fn open_content(
+                &mut self,
+                _delta_id: &str,
+                _identity: &GenerationFileIdentity,
+            ) -> Result<Box<dyn Read + Send>, Self::Error> {
+                unreachable!("an empty legacy poll never opens content")
+            }
+        }
+
+        let fixture = Fixture::new("legacy-transport-surface");
+        let mut store = seed(&fixture, Vec::new());
+        let mut client = GenerationSyncClient::new(LegacyOnlyTransport::default());
+        assert_eq!(
+            client
+                .sync_mount(&mut store, &fixture.mount_id, &fixture.mount_root)
+                .unwrap(),
+            GenerationSyncSummary::default()
+        );
+        assert_eq!(client.transport().requests.len(), 1);
+        assert_eq!(client.transport().requests[0].mount_id, fixture.mount_id);
     }
 
     #[test]

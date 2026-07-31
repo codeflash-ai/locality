@@ -2,6 +2,7 @@
   "acquire_request": {
     "format_version": 1,
     "minimum_reader_version": 1,
+    "operation_id": "pin-acquire-op-01",
     "device_scope_id": "device-scope-opaque-01",
     "source_connection_id": "source-018f4f6e",
     "generation_id": "generation-0008",
@@ -12,7 +13,13 @@
     "status": "granted",
     "format_version": 1,
     "minimum_reader_version": 1,
+    "operation_id": "pin-acquire-op-01",
+    "device_scope_id": "device-scope-opaque-01",
+    "source_connection_id": "source-018f4f6e",
     "requested_generation_id": "generation-0008",
+    "requested_lease_seconds": 900,
+    "fallback_policy": "require_exact",
+    "server_time": "2026-07-31T12:35:00Z",
     "fallback_applied": false,
     "lease": {
       "lease_id": "lease-opaque-01",
@@ -20,6 +27,7 @@
       "source_connection_id": "source-018f4f6e",
       "generation_id": "generation-0008",
       "lease_seconds": 900,
+      "issued_at": "2026-07-31T12:35:00Z",
       "expires_at": "2026-07-31T12:50:00Z",
       "active_leases_for_device": 2,
       "max_active_leases_per_device": 8
@@ -28,19 +36,26 @@
   "renew_request": {
     "format_version": 1,
     "minimum_reader_version": 1,
+    "operation_id": "pin-renew-op-01",
     "lease_id": "lease-opaque-01",
     "device_scope_id": "device-scope-opaque-01",
+    "source_connection_id": "source-018f4f6e",
+    "generation_id": "generation-0008",
     "requested_lease_seconds": 900
   },
   "renewal": {
     "format_version": 1,
     "minimum_reader_version": 1,
+    "operation_id": "pin-renew-op-01",
+    "requested_lease_seconds": 900,
+    "server_time": "2026-07-31T12:50:00Z",
     "lease": {
       "lease_id": "lease-opaque-01",
       "device_scope_id": "device-scope-opaque-01",
       "source_connection_id": "source-018f4f6e",
       "generation_id": "generation-0008",
       "lease_seconds": 900,
+      "issued_at": "2026-07-31T12:50:00Z",
       "expires_at": "2026-07-31T13:05:00Z",
       "active_leases_for_device": 2,
       "max_active_leases_per_device": 8
@@ -49,12 +64,14 @@
   "release_request": {
     "format_version": 1,
     "minimum_reader_version": 1,
+    "operation_id": "pin-release-op-01",
     "lease_id": "lease-opaque-01",
     "device_scope_id": "device-scope-opaque-01"
   },
   "release": {
     "format_version": 1,
     "minimum_reader_version": 1,
+    "operation_id": "pin-release-op-01",
     "lease_id": "lease-opaque-01",
     "device_scope_id": "device-scope-opaque-01",
     "status": "released",
@@ -64,7 +81,13 @@
     "status": "unavailable",
     "format_version": 1,
     "minimum_reader_version": 1,
+    "operation_id": "pin-acquire-op-01",
+    "device_scope_id": "device-scope-opaque-01",
+    "source_connection_id": "source-018f4f6e",
     "requested_generation_id": "generation-0008",
+    "requested_lease_seconds": 900,
+    "fallback_policy": "require_exact",
+    "server_time": "2026-07-31T12:35:00Z",
     "reason": "quota_exceeded",
     "retry_after_seconds": 60
   }

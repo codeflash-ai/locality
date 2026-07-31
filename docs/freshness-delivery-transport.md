@@ -6,7 +6,7 @@ generation delivery. The Rust values live in
 `localityd::generation_sync::GenerationTransport`.
 
 The public repository does not define a hosted route, base URL, bearer token,
-tenant identifier, database schema, lease repository, or cloud resource. A
+tenant identifier, private lease repository, or cloud resource. A
 private authenticated adapter maps its API to these values and must authenticate
 and authorize each response before returning it to local delivery code.
 
@@ -22,13 +22,17 @@ The client advertises `GenerationTransportCapabilities` with the next-delta
 request. The authenticated response may select only a subset with limits no
 larger than the offer. The three V1 capabilities are bounded content body
 windows, idempotent terminal receipt acknowledgments, and device-scoped
-generation pin leases.
+generation pin leases. Local sync validates the selected set immediately after
+the poll returns and before journal, filesystem, or observed-generation state
+can change. That immutable validated selection controls the complete apply.
 
-An existing adapter can continue implementing `GenerationDeliveryTransport`,
-which remains a compatibility name for `GenerationTransport`. Its default
-capability set is legacy, and its existing `open_content` stream remains the
-fallback. Selecting a capability and then omitting its response is a contract
-error; selection never silently falls back.
+An existing adapter can continue implementing the original
+`GenerationDeliveryTransport` trait and `GenerationDeliveryRequest` without
+source changes. `next_delta_versioned` is an additive default adapter method,
+and `GenerationTransport` is a compatibility alias. The default capability set
+is legacy, and the existing `open_content` stream remains the fallback.
+Selecting a capability and then omitting its response is a contract error;
+selection never silently falls back.
 
 ## Body windows
 
@@ -56,19 +60,30 @@ canonical terminal receipt digest. The authenticated response is either
 `accepted` or `already_accepted` and repeats the receipt binding.
 
 An acknowledgment transport failure does not roll back the completed local
-apply. The next retry replays the completed journal and repeats the idempotent
-acknowledgment.
+apply. When acknowledgment was negotiated, the local SQLite apply journal
+durably records the completed receipt as pending. Every later mount sync
+replays pending acknowledgments before polling for another delta, including
+when that poll would return no delivery. Exact receipt identity is checked
+before the journal is marked acknowledged. Source reset cannot discard a
+pending acknowledgment. This is local delivery state, not a claim about any
+private service's persistence.
 
 ## Generation pin leases
 
 Pin leases prevent a retained immutable generation from disappearing while a
 device delivers it. IDs are opaque and bounded; a device scope is not a tenant
-route or credential. Acquire, renew, and release are separate idempotent
-transport operations. The public contracts do not persist leases.
+route or credential. Acquire, renew, and release carry bounded opaque operation
+IDs echoed by their responses. Acquire results also echo the exact device,
+source, requested generation, duration, and fallback policy. Renewal repeats
+the source and generation and cannot retarget the immutable lease identity.
+The public contracts do not persist leases.
 
 V1 bounds a lease to 60 seconds through 24 hours and a negotiated quota of at
 most 32 active leases per device. Responses report the effective duration,
-expiry, active count, and maximum count. Retry advice is capped at one hour.
+trusted issue/server time, expiry, active count, and maximum count. The expiry
+must equal issue time plus the stated duration, and validation at authenticated
+server time rejects already-expired or not-yet-issued leases. Retry advice is
+capped at one hour.
 
 Fallback is explicit:
 
@@ -90,6 +105,7 @@ is integrated with generation selection.
 | Request/metadata JSON | 16 KiB |
 | Body window | 4 MiB |
 | Device scope ID | 128 bytes |
+| Pin operation ID | 128 bytes |
 | Lease ID | 256 bytes |
 | Lease duration | 24 hours |
 | Active leases per device | 32 |

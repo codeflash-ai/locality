@@ -60,6 +60,8 @@
 - SQLite migrates v21 rows to v22 by relating each differential-apply journal
   to its mount. Connection, remote-root, and settings changes fail closed while
   that mount has an active journal, preventing source resets from orphaning it.
+- SQLite schema v25 / generation-delivery component v4 adds durable pending
+  terminal-acknowledgment state without storing a private route or credential.
 - SQLite records component versions for durable subsystems so compatibility is
   decided from persisted state contracts instead of desktop build IDs.
 - SQLite enables WAL mode, a busy timeout, foreign keys, and `PRAGMA user_version` schema versioning.
@@ -129,9 +131,11 @@ changes, generation gaps, and old-identity mismatches fail before the local tree
 is changed.
 
 `generation_apply_journals` stores the owning mount, canonical delta and
-terminal receipt, staging root, lifecycle, and per-entry outcomes. Source
+terminal receipt, staging root, lifecycle, per-entry outcomes, and whether an
+authenticated terminal receipt still requires acknowledgment. Source
 identity/settings resets are transactionally blocked while that mount has an
-active apply. The daemon stages and verifies
+active apply or an unacknowledged required receipt. The daemon replays completed
+pending receipts before polling for more delivery, then stages and verifies
 incoming bytes before applying clean creates/updates/deletions. Each filesystem
 operation is idempotently recognizable after a crash, so recovery can record
 the missing outcome and continue. Only after every entry has an applied,

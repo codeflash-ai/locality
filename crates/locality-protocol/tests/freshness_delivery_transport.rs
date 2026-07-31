@@ -17,7 +17,8 @@ use locality_protocol::freshness_delivery_transport::{
     GenerationPinLeaseReleaseRequest, GenerationPinLeaseRenewRequest, GenerationPinLeaseRenewal,
     GenerationTransportCapabilities, GenerationTransportContractError,
     MAX_GENERATION_BODY_WINDOW_BYTES, MAX_GENERATION_PIN_LEASE_SECONDS,
-    MAX_GENERATION_PIN_LEASES_PER_DEVICE, MAX_GENERATION_TRANSPORT_REQUEST_BYTES,
+    MAX_GENERATION_PIN_LEASES_PER_DEVICE, MAX_GENERATION_PIN_OPERATION_ID_BYTES,
+    MAX_GENERATION_TRANSPORT_REQUEST_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -233,6 +234,27 @@ struct PriorGenerationDeliveryRequest {
     observed_generation_id: SourceGenerationId,
 }
 
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct PriorPinLease {
+    lease_id: String,
+    device_scope_id: String,
+    source_connection_id: SourceConnectionId,
+    generation_id: SourceGenerationId,
+    lease_seconds: u64,
+    expires_at: String,
+    active_leases_for_device: u16,
+    max_active_leases_per_device: u16,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct PriorPinLeaseAcquireResponse {
+    format_version: u16,
+    minimum_reader_version: u16,
+    requested_generation_id: SourceGenerationId,
+    fallback_applied: bool,
+    lease: PriorPinLease,
+}
+
 #[test]
 fn additive_versions_and_legacy_delivery_requests_decode_tolerantly() {
     let legacy_json = json!({
@@ -258,6 +280,29 @@ fn additive_versions_and_legacy_delivery_requests_decode_tolerantly() {
     let prior: PriorGenerationDeliveryRequest =
         serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
     assert_eq!(prior.mount_id, request.mount_id);
+
+    let pins: PinLeaseGolden = serde_json::from_slice(GENERATION_PIN_LEASE_V1_GOLDEN_JSON).unwrap();
+    let prior_pin: PriorPinLeaseAcquireResponse =
+        serde_json::from_value(serde_json::to_value(&pins.acquire_response).unwrap()).unwrap();
+    assert_eq!(
+        prior_pin,
+        PriorPinLeaseAcquireResponse {
+            format_version: 1,
+            minimum_reader_version: 1,
+            requested_generation_id: pins.acquire_request.generation_id.clone(),
+            fallback_applied: false,
+            lease: PriorPinLease {
+                lease_id: "lease-opaque-01".to_string(),
+                device_scope_id: "device-scope-opaque-01".to_string(),
+                source_connection_id: SourceConnectionId::new("source-018f4f6e"),
+                generation_id: SourceGenerationId::new("generation-0008").unwrap(),
+                lease_seconds: 900,
+                expires_at: "2026-07-31T12:50:00Z".to_string(),
+                active_leases_for_device: 2,
+                max_active_leases_per_device: 8,
+            },
+        }
+    );
 
     let mut future = serde_json::to_value(&request).unwrap();
     future["format_version"] = json!(2);
@@ -301,6 +346,9 @@ fn opaque_and_content_bearing_debug_output_is_redacted() {
         for secret in [
             "device-scope-opaque-01",
             "lease-opaque-01",
+            "pin-acquire-op-01",
+            "pin-renew-op-01",
+            "pin-release-op-01",
             "Engineering/roadmap.md",
             "3ec8d4089470a2e4620d65c03a01635c028200982c94dfbc2e34eac95e2370b1",
         ] {
@@ -321,11 +369,34 @@ fn pin_leases_enforce_expiry_quota_and_safe_fallback_semantics() {
         })
     );
 
+    let mut oversized_operation = pins.acquire_request.clone();
+    oversized_operation.operation_id = "x".repeat(MAX_GENERATION_PIN_OPERATION_ID_BYTES + 1);
+    assert_eq!(
+        oversized_operation.validate(),
+        Err(GenerationTransportContractError::InvalidOpaqueValue(
+            "operation_id"
+        ))
+    );
+
     let mut malformed_expiry = pins.renewal.clone();
     malformed_expiry.lease.expires_at = "2026-02-30T12:00:00Z".to_string();
     assert_eq!(
         malformed_expiry.validate_against(&pins.renew_request),
         Err(GenerationTransportContractError::InvalidTimestamp)
+    );
+
+    let mut inconsistent_expiry = pins.renewal.clone();
+    inconsistent_expiry.lease.expires_at = "2026-07-31T13:04:59Z".to_string();
+    assert_eq!(
+        inconsistent_expiry.validate_against(&pins.renew_request),
+        Err(GenerationTransportContractError::InvalidPinLeaseExpiry)
+    );
+
+    let mut expired = pins.renewal.clone();
+    expired.server_time = expired.lease.expires_at.clone();
+    assert_eq!(
+        expired.validate_against(&pins.renew_request),
+        Err(GenerationTransportContractError::ExpiredPinLease)
     );
 
     let mut wrong_device = pins.acquire_response.clone();
@@ -338,6 +409,30 @@ fn pin_leases_enforce_expiry_quota_and_safe_fallback_semantics() {
         Err(GenerationTransportContractError::PinLeaseMismatch)
     );
 
+    let crossed_request = GenerationPinLeaseAcquireRequest {
+        operation_id: "pin-acquire-op-crossed".to_string(),
+        device_scope_id: "crossed-device".to_string(),
+        requested_lease_seconds: 600,
+        fallback_policy: GenerationPinFallbackPolicy::UseLatestRetained,
+        ..pins.acquire_request.clone()
+    };
+    assert_eq!(
+        pins.acquire_response.validate_against(&crossed_request),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+    assert_eq!(
+        pins.quota_unavailable.validate_against(&crossed_request),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+
+    let mut renewal_retarget = pins.renewal.clone();
+    renewal_retarget.lease.source_connection_id = SourceConnectionId::new("source-crossed");
+    renewal_retarget.lease.generation_id = SourceGenerationId::new("generation-crossed").unwrap();
+    assert_eq!(
+        renewal_retarget.validate_against(&pins.renew_request),
+        Err(GenerationTransportContractError::PinLeaseMismatch)
+    );
+
     let fallback_request = GenerationPinLeaseAcquireRequest {
         fallback_policy: GenerationPinFallbackPolicy::UseLatestRetained,
         ..pins.acquire_request.clone()
@@ -345,6 +440,7 @@ fn pin_leases_enforce_expiry_quota_and_safe_fallback_semantics() {
     let mut fallback_response = pins.acquire_response.clone();
     let GenerationPinLeaseAcquireResponse::Granted {
         fallback_applied,
+        fallback_policy,
         lease,
         ..
     } = &mut fallback_response
@@ -352,6 +448,7 @@ fn pin_leases_enforce_expiry_quota_and_safe_fallback_semantics() {
         panic!("granted fixture");
     };
     *fallback_applied = true;
+    *fallback_policy = GenerationPinFallbackPolicy::UseLatestRetained;
     lease.generation_id = SourceGenerationId::new("generation-0009").unwrap();
     fallback_response
         .validate_against(&fallback_request)

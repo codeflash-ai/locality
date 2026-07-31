@@ -128,6 +128,7 @@ fn observed_generation_apply_is_persisted_exact_replayable_and_atomic() {
         delta: delta.clone(),
         receipt: receipt.clone(),
         receipt_sha256: receipt.canonical_sha256().unwrap(),
+        acknowledgment_required: false,
         stage_root: "generation-delivery/delta-2".to_string(),
         created_at: "2026-07-31T12:01:00Z".to_string(),
     };
@@ -178,6 +179,154 @@ fn observed_generation_apply_is_persisted_exact_replayable_and_atomic() {
 }
 
 #[test]
+fn completed_required_acknowledgment_is_durable_exact_and_idempotent() {
+    let fixture = Fixture::new("durable-acknowledgment");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let delta = delta();
+    let receipt = receipt(&delta);
+    let receipt_sha256 = receipt.canonical_sha256().unwrap();
+    store
+        .reserve_generation_apply(PreparedGenerationApply {
+            delta: delta.clone(),
+            receipt,
+            receipt_sha256: receipt_sha256.clone(),
+            acknowledgment_required: true,
+            stage_root: "generation-delivery/durable-ack".to_string(),
+            created_at: "2026-07-31T12:01:00Z".to_string(),
+        })
+        .unwrap();
+    store
+        .record_generation_apply_outcome(
+            &delta.delta_id,
+            0,
+            GenerationApplyOutcome::Applied,
+            "2026-07-31T12:02:00Z",
+        )
+        .unwrap();
+    store
+        .complete_generation_apply(&delta.delta_id, "2026-07-31T12:03:00Z")
+        .unwrap();
+    drop(store);
+
+    let mut reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    let pending = reopened
+        .list_pending_generation_acknowledgments(&fixture.mount_id)
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].acknowledgment_required);
+    assert_eq!(pending[0].acknowledged_at, None);
+    let reset_error = reopened
+        .clear_mount_source_state(&fixture.mount_id)
+        .expect_err("pending terminal acknowledgment must fence source reset");
+    assert!(matches!(reset_error, StoreError::InvalidState(_)));
+    assert!(
+        reopened
+            .mark_generation_acknowledged(&delta.delta_id, &digest('f'), "2026-07-31T12:04:00Z",)
+            .is_err()
+    );
+    let acknowledged = reopened
+        .mark_generation_acknowledged(&delta.delta_id, &receipt_sha256, "2026-07-31T12:04:00Z")
+        .unwrap();
+    assert_eq!(
+        acknowledged.acknowledged_at.as_deref(),
+        Some("2026-07-31T12:04:00Z")
+    );
+    assert_eq!(
+        reopened
+            .mark_generation_acknowledged(&delta.delta_id, &receipt_sha256, "2026-07-31T12:05:00Z",)
+            .unwrap(),
+        acknowledged
+    );
+    assert!(
+        reopened
+            .list_pending_generation_acknowledgments(&fixture.mount_id)
+            .unwrap()
+            .is_empty()
+    );
+    reopened
+        .clear_mount_source_state(&fixture.mount_id)
+        .expect("acknowledged clean lineage may be retired");
+}
+
+#[test]
+fn schema_24_component_v3_migrates_existing_journals_without_pending_acknowledgments() {
+    use rusqlite::Connection;
+
+    let fixture = Fixture::new("migration-v24-component-v3");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let delta = delta();
+    let receipt = receipt(&delta);
+    store
+        .reserve_generation_apply(PreparedGenerationApply {
+            delta: delta.clone(),
+            receipt: receipt.clone(),
+            receipt_sha256: receipt.canonical_sha256().unwrap(),
+            acknowledgment_required: false,
+            stage_root: "generation-delivery/prior-v3".to_string(),
+            created_at: "2026-07-31T12:01:00Z".to_string(),
+        })
+        .unwrap();
+    store
+        .record_generation_apply_outcome(
+            &delta.delta_id,
+            0,
+            GenerationApplyOutcome::Applied,
+            "2026-07-31T12:02:00Z",
+        )
+        .unwrap();
+    store
+        .complete_generation_apply(&delta.delta_id, "2026-07-31T12:03:00Z")
+        .unwrap();
+    let db_path = store.db_path.clone();
+    drop(store);
+
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE generation_apply_journals DROP COLUMN acknowledged_at;
+             ALTER TABLE generation_apply_journals DROP COLUMN acknowledgment_required;
+             UPDATE state_components
+             SET version = 3, min_reader_version = 3
+             WHERE component_id = 'durable:generation_delivery';
+             UPDATE state_components SET version = 24
+             WHERE component_id = 'core:schema';
+             PRAGMA user_version = 24;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    let journal = reopened
+        .get_generation_apply(&delta.delta_id)
+        .unwrap()
+        .unwrap();
+    assert!(!journal.acknowledgment_required);
+    assert_eq!(journal.acknowledged_at, None);
+    assert!(
+        reopened
+            .list_pending_generation_acknowledgments(&fixture.mount_id)
+            .unwrap()
+            .is_empty()
+    );
+    let connection = Connection::open(&db_path).unwrap();
+    let component: (i64, i64) = connection
+        .query_row(
+            "SELECT version, min_reader_version FROM state_components
+             WHERE component_id = 'durable:generation_delivery'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(component, (4, 4));
+    assert_eq!(user_version, 25);
+}
+
+#[test]
 fn reservation_fails_closed_on_generation_layout_and_old_identity_mismatch() {
     let fixture = Fixture::new("mismatch");
     let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
@@ -201,6 +350,7 @@ fn reservation_fails_closed_on_generation_layout_and_old_identity_mismatch() {
         let error = store
             .reserve_generation_apply(PreparedGenerationApply {
                 receipt_sha256: receipt.canonical_sha256().unwrap(),
+                acknowledgment_required: false,
                 receipt,
                 delta,
                 stage_root: format!("generation-delivery/{changed}"),
@@ -224,6 +374,7 @@ fn empty_mount_delta_completes_and_advances_observed_generation() {
     store
         .reserve_generation_apply(PreparedGenerationApply {
             receipt_sha256: receipt.canonical_sha256().unwrap(),
+            acknowledgment_required: false,
             receipt,
             delta,
             stage_root: "generation-delivery/delta-empty".to_string(),
@@ -256,6 +407,7 @@ fn active_apply_blocks_connection_and_settings_source_reset_transactionally() {
     store
         .reserve_generation_apply(PreparedGenerationApply {
             receipt_sha256: receipt.canonical_sha256().unwrap(),
+            acknowledgment_required: false,
             receipt,
             delta,
             stage_root: "generation-delivery/delta-2".to_string(),
@@ -303,6 +455,7 @@ fn source_reset_retires_clean_completed_lineage_but_preserves_conflicts() {
     clean_store
         .reserve_generation_apply(PreparedGenerationApply {
             receipt_sha256: clean_receipt.canonical_sha256().unwrap(),
+            acknowledgment_required: false,
             receipt: clean_receipt,
             delta: clean_delta,
             stage_root: "generation-delivery/clean-lineage".to_string(),
@@ -343,6 +496,7 @@ fn source_reset_retires_clean_completed_lineage_but_preserves_conflicts() {
     conflict_store
         .reserve_generation_apply(PreparedGenerationApply {
             receipt_sha256: conflict_receipt.canonical_sha256().unwrap(),
+            acknowledgment_required: false,
             receipt: conflict_receipt,
             delta: conflict_delta.clone(),
             stage_root: "generation-delivery/conflict-lineage".to_string(),
@@ -536,7 +690,7 @@ fn schema_20_migration_preserves_pending_local_state_and_adds_delivery_tables() 
         fs::read(fixture.mount_root.join("dirty.md")).unwrap(),
         b"local pending bytes"
     );
-    assert_eq!(SqliteStateStore::current_schema_version(), 24);
+    assert_eq!(SqliteStateStore::current_schema_version(), 25);
     assert!(
         reopened
             .get_observed_generation(&fixture.mount_id)
@@ -557,6 +711,7 @@ fn genuine_schema_21_component_v1_fixture_migrates_without_losing_active_state()
     store
         .reserve_generation_apply(PreparedGenerationApply {
             receipt_sha256: receipt.canonical_sha256().unwrap(),
+            acknowledgment_required: false,
             receipt,
             delta,
             stage_root: "generation-delivery/delta-2".to_string(),
@@ -605,7 +760,7 @@ fn genuine_schema_21_component_v1_fixture_migrates_without_losing_active_state()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(component, (3, 3));
+    assert_eq!(component, (4, 4));
     let error = reopened
         .clear_mount_source_state(&fixture.mount_id)
         .expect_err("migrated active journal must fence source reset");
@@ -613,10 +768,10 @@ fn genuine_schema_21_component_v1_fixture_migrates_without_losing_active_state()
 }
 
 #[test]
-fn partial_v2_v3_generation_migration_is_atomic_and_resumable_per_column() {
+fn partial_v2_v4_generation_migration_is_atomic_and_resumable_per_column() {
     use rusqlite::Connection;
 
-    let fixture = Fixture::new("partial-v2-v3-migration");
+    let fixture = Fixture::new("partial-v2-v4-migration");
     let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
     seed(&mut store, &fixture);
     let db_path = store.db_path.clone();
@@ -711,8 +866,8 @@ fn partial_v2_v3_generation_migration_is_atomic_and_resumable_per_column() {
     let user_version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(component, (3, 3));
-    assert_eq!(user_version, 24);
+    assert_eq!(component, (4, 4));
+    assert_eq!(user_version, 25);
     assert_eq!(
         reopened.list_generation_paths(&fixture.mount_id).unwrap()[0].local_logical_path,
         "Roadmap.md"
