@@ -107,34 +107,18 @@ seed_fixture() {
       --mount-id "$mount_id" \
       --projection linux-fuse \
       --json >/dev/null
+  # The empty second root exercises shared FUSE-root multiplexing. Create it
+  # through the supported CLI path so mount and binding metadata stay atomic.
+  LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_DISABLE=1 NOTION_TOKEN="ci-fuse-smoke-token" \
+    "$loc_bin" mount notion "$GOOGLE_MOUNT" \
+      --workspace \
+      --mount-id "$google_mount_id" \
+      --projection linux-fuse \
+      --json >/dev/null
 
   local db="$state_root/state.sqlite3"
   local content_root="$state_root/content/$mount_id/files"
   mkdir -p "$content_root/Teamspace Home/Launch Plan"
-
-  local google_mount_id_sql
-  local google_mount_root_sql
-  local google_connector_sql
-  local linux_fuse_projection_sql
-  google_mount_id_sql="$(sql_text_literal "$google_mount_id")"
-  google_mount_root_sql="$(sql_text_literal "$GOOGLE_MOUNT")"
-  google_connector_sql="$(sql_text_literal "google-docs")"
-  linux_fuse_projection_sql="$(sql_text_literal '"linux_fuse"')"
-
-  sqlite3 "$db" <<SQL
-INSERT INTO mounts (
-  mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id
-) VALUES (
-  $google_mount_id_sql, $google_connector_sql, $google_mount_root_sql, NULL, 0, $linux_fuse_projection_sql, NULL
-)
-ON CONFLICT(mount_id) DO UPDATE SET
-  connector = excluded.connector,
-  root = excluded.root,
-  remote_root_id = excluded.remote_root_id,
-  read_only = excluded.read_only,
-  projection_json = excluded.projection_json,
-  connection_id = excluded.connection_id;
-SQL
 
   local home_frontmatter
   local home_body

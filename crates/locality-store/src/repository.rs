@@ -17,11 +17,28 @@ use crate::records::{
     HydrationJobRecord, MetadataDiscoveryJobRecord, MountConfig, MountLiveModeRecord,
     RemoteObservationRecord, ShadowSnapshotRecord, VirtualMutationRecord,
 };
+use crate::workspace_binding::{WorkspaceBinding, WorkspaceBindingRecord};
 
 pub trait MountRepository {
     fn save_mount(&mut self, mount: MountConfig) -> StoreResult<()>;
     fn get_mount(&self, mount_id: &MountId) -> StoreResult<Option<MountConfig>>;
     fn load_mounts(&self) -> StoreResult<Vec<MountConfig>>;
+}
+
+/// Durable portable placement metadata keyed by the existing mount identity.
+pub trait WorkspaceBindingRepository {
+    /// Insert binding metadata or replay the exact existing value. Changing an
+    /// existing target requires a future coordinator-owned compare-and-swap
+    /// workflow and is rejected by this metadata API.
+    fn save_workspace_binding(&mut self, record: WorkspaceBindingRecord) -> StoreResult<()>;
+    fn get_workspace_binding(&self, mount_id: &MountId) -> StoreResult<Option<WorkspaceBinding>>;
+    fn load_workspace_bindings(&self) -> StoreResult<Vec<WorkspaceBindingRecord>>;
+
+    /// Report the first durable blocker to a workspace move. This metadata
+    /// boundary never updates roots or moves files; even a clean plain-file
+    /// mount is rejected with `RequiresOwningCoordinator` after all durable
+    /// checks pass.
+    fn check_workspace_rebind(&self, mount_id: &MountId) -> StoreResult<()>;
 }
 
 pub trait MountLiveModeRepository {
