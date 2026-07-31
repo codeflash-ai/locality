@@ -1,6 +1,9 @@
 # Locality Onboarding Redesign Draft
 
-Status: discovery and wireframe draft, not implementation.
+Status: historical discovery. The active desktop implementation direction uses
+the July 31 four-segment visual comps: Meet Locality, Connect Source, Local
+Folder, and Ready. The optional agent guide remains available from secondary
+actions but is outside the required progress rail.
 
 ## Goal
 
