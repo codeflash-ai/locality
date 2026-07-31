@@ -148,9 +148,16 @@ quotas. Recovery recognizes the visible-inode rename as a durable checkpoint,
 including a crash before manifest publication, and idempotently finishes the
 manifest and fences without unlinking either inode. Recovery also reconstructs
 the pre-merge fence when merged bytes were published before evidence was
-persisted. Reconciliation retains only authenticated payloads for current live
-conflicts, removes successful/superseded/orphan payloads, and enforces bounded
-per-mount and global retained-conflict quotas.
+persisted. To resolve this conflict, the user closes writers, copies exactly one
+named retained file over the manifest, and syncs again. Reconciliation fsyncs
+and re-fences that exact choice, atomically restores the path to `dirty`, keeps
+the evidence row as a crash-recoverable cleanup journal, and only then removes
+both retained files and the row. A concurrent held-descriptor write cancels the
+transition and keeps every version reachable. Arbitrary custom replacement
+bytes are preserved but intentionally do not clear the conflict. Reconciliation
+retains only authenticated payloads for current live conflicts, removes
+successful/superseded/orphan payloads, and enforces bounded per-mount and global
+retained-conflict quotas.
 
 V1 deltas are mount-scoped. Empty entry lists are valid when a complete target
 generation changes no projected bytes. A logical path may occur in only one

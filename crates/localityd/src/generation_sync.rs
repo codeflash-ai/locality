@@ -21,9 +21,9 @@ use locality_protocol::freshness_delivery::{
 };
 use locality_store::{
     GenerationApplyOutcome, GenerationApplyStatus, GenerationDeliveryRepository,
-    GenerationInodeEvidenceConflictUpdate, GenerationInodeEvidenceRecord, GenerationPathRecord,
-    GenerationPathState, GenerationRetainedInodeRecord, MountRepository, PreparedGenerationApply,
-    SqliteStateStore,
+    GenerationInodeEvidenceConflictUpdate, GenerationInodeEvidenceRecord,
+    GenerationInodeEvidenceResolution, GenerationPathRecord, GenerationPathState,
+    GenerationRetainedInodeRecord, MountRepository, PreparedGenerationApply, SqliteStateStore,
 };
 use sha2::{Digest, Sha256};
 
@@ -384,15 +384,18 @@ fn reconcile_completed_mount_inode_evidence(
 }
 
 #[derive(Default)]
-struct InodeReconcileHooks {
+struct InodeReconcileHooks<'a> {
     interrupt_after_visible_snapshot_move: bool,
+    before_resolution_commit: Option<&'a mut dyn FnMut()>,
+    after_resolution_commit: Option<&'a mut dyn FnMut()>,
+    interrupt_after_resolution_commit: bool,
 }
 
 fn reconcile_completed_mount_inode_evidence_inner(
     store: &mut SqliteStateStore,
     mount_id: &MountId,
     mount: &SecureMount,
-    hooks: &mut InodeReconcileHooks,
+    hooks: &mut InodeReconcileHooks<'_>,
 ) -> Result<u64, GenerationSyncError> {
     let mut conflicts = 0_u64;
     for evidence in store
@@ -418,6 +421,22 @@ fn reconcile_completed_mount_inode_evidence_inner(
         let evidence_path = LogicalPath::new(evidence.logical_path.clone())
             .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
         let target = mount.target(&evidence_path.to_relative_path_buf(), false)?;
+        let outcome = journal
+            .outcomes
+            .iter()
+            .find(|(index, _)| *index == evidence.entry_index)
+            .map(|(_, outcome)| outcome)
+            .ok_or(GenerationSyncError::JournalMismatch)?;
+        if evidence.visible_evidence.is_some() && matches!(outcome, GenerationApplyOutcome::Merged)
+        {
+            conflicts += finish_resolved_inode_evidence(
+                store,
+                &target,
+                &evidence,
+                &journal.receipt.completed_at,
+            )?;
+            continue;
+        }
         let Some(mut file) = target.open_named(OsStr::new(&evidence.evidence_name))? else {
             if evidence.visible_evidence.is_none()
                 && journal
@@ -457,34 +476,105 @@ fn reconcile_completed_mount_inode_evidence_inner(
                 GenerationSyncError::MissingInodeEvidence(evidence.logical_path.clone())
             })?;
             let (visible_sha256, visible_length) = fingerprint_open_file_handle(&mut visible)?;
-            ensure_retained_versions_manifest(
-                &target,
-                &manifest,
-                &manifest_sha256,
-                &evidence.delta_id,
-                evidence.entry_index,
-            )?;
-            if actual != evidence.expected_sha256
+            let current = fingerprint_target(&target)?;
+            let evidence_changed = actual != evidence.expected_sha256
                 || actual_length != evidence.byte_length
                 || visible_sha256 != expected_visible.expected_sha256
-                || visible_length != expected_visible.byte_length
-            {
-                store.mark_generation_inode_evidence_conflict(
-                    &evidence.delta_id,
-                    evidence.entry_index,
-                    GenerationInodeEvidenceConflictUpdate {
-                        local_sha256: manifest_sha256,
-                        expected_sha256: actual,
-                        byte_length: actual_length,
-                        visible_evidence: Some(GenerationRetainedInodeRecord {
-                            evidence_name: visible_snapshot_text.to_string(),
-                            expected_sha256: visible_sha256,
-                            byte_length: visible_length,
-                        }),
-                        updated_at: journal.receipt.completed_at.clone(),
+                || visible_length != expected_visible.byte_length;
+            if evidence_changed {
+                record_changed_dual_inode_evidence(
+                    store,
+                    &target,
+                    &evidence,
+                    current.as_ref(),
+                    DualInodeFingerprints {
+                        pre_merge: (&actual, actual_length),
+                        visible: (&visible_sha256, visible_length),
                     },
+                    RetainedVersionsManifest {
+                        bytes: &manifest,
+                        sha256: &manifest_sha256,
+                    },
+                    &journal.receipt.completed_at,
                 )?;
                 conflicts += 1;
+                continue;
+            }
+
+            match current.as_ref() {
+                Some((sha256, _)) if sha256 == &manifest_sha256 => {}
+                None => ensure_retained_versions_manifest(
+                    &target,
+                    &manifest,
+                    &manifest_sha256,
+                    &evidence.delta_id,
+                    evidence.entry_index,
+                )?,
+                Some(current)
+                    if fingerprint_matches(current, (&actual, actual_length))
+                        || fingerprint_matches(current, (&visible_sha256, visible_length)) =>
+                {
+                    target.sync_current()?;
+                    call_hook(&mut hooks.before_resolution_commit);
+                    let current_after = fingerprint_target(&target)?
+                        .ok_or(GenerationSyncError::ConcurrentMutation)?;
+                    let mut pre_merge_after = target
+                        .open_named(OsStr::new(&evidence.evidence_name))?
+                        .ok_or_else(|| {
+                            GenerationSyncError::MissingInodeEvidence(evidence.logical_path.clone())
+                        })?;
+                    let pre_merge_after = fingerprint_open_file_handle(&mut pre_merge_after)?;
+                    let mut visible_after =
+                        target.open_named(&visible_snapshot)?.ok_or_else(|| {
+                            GenerationSyncError::MissingInodeEvidence(evidence.logical_path.clone())
+                        })?;
+                    let visible_after = fingerprint_open_file_handle(&mut visible_after)?;
+                    if &current_after != current
+                        || pre_merge_after != (actual.clone(), actual_length)
+                        || visible_after != (visible_sha256.clone(), visible_length)
+                    {
+                        record_changed_dual_inode_evidence(
+                            store,
+                            &target,
+                            &evidence,
+                            Some(&current_after),
+                            DualInodeFingerprints {
+                                pre_merge: (&pre_merge_after.0, pre_merge_after.1),
+                                visible: (&visible_after.0, visible_after.1),
+                            },
+                            RetainedVersionsManifest {
+                                bytes: &manifest,
+                                sha256: &manifest_sha256,
+                            },
+                            &journal.receipt.completed_at,
+                        )?;
+                        conflicts += 1;
+                        continue;
+                    }
+                    store.mark_generation_inode_evidence_resolved(
+                        &evidence.delta_id,
+                        evidence.entry_index,
+                        GenerationInodeEvidenceResolution {
+                            expected_sha256: actual,
+                            byte_length: actual_length,
+                            visible_expected_sha256: visible_sha256,
+                            visible_byte_length: visible_length,
+                            updated_at: journal.receipt.completed_at.clone(),
+                        },
+                    )?;
+                    call_hook(&mut hooks.after_resolution_commit);
+                    if hooks.interrupt_after_resolution_commit {
+                        hooks.interrupt_after_resolution_commit = false;
+                        return Err(GenerationSyncError::InjectedInterruption);
+                    }
+                    conflicts += finish_resolved_inode_evidence(
+                        store,
+                        &target,
+                        &evidence,
+                        &journal.receipt.completed_at,
+                    )?;
+                }
+                Some(_) => return Err(GenerationSyncError::ConcurrentMutation),
             }
             continue;
         }
@@ -558,6 +648,166 @@ fn reconcile_completed_mount_inode_evidence_inner(
     Ok(conflicts)
 }
 
+fn fingerprint_target(target: &SecureTarget) -> Result<Option<(String, u64)>, GenerationSyncError> {
+    target
+        .open_current()?
+        .map(|mut file| fingerprint_open_file_handle(&mut file))
+        .transpose()
+}
+
+fn fingerprint_matches(actual: &(String, u64), expected: (&str, u64)) -> bool {
+    actual.0 == expected.0 && actual.1 == expected.1
+}
+
+struct DualInodeFingerprints<'a> {
+    pre_merge: (&'a str, u64),
+    visible: (&'a str, u64),
+}
+
+struct RetainedVersionsManifest<'a> {
+    bytes: &'a [u8],
+    sha256: &'a str,
+}
+
+fn record_changed_dual_inode_evidence(
+    store: &mut SqliteStateStore,
+    target: &SecureTarget,
+    evidence: &GenerationInodeEvidenceRecord,
+    current: Option<&(String, u64)>,
+    fingerprints: DualInodeFingerprints<'_>,
+    manifest: RetainedVersionsManifest<'_>,
+    updated_at: &str,
+) -> Result<(), GenerationSyncError> {
+    let current_is_retained = current.is_some_and(|current| {
+        fingerprint_matches(current, fingerprints.pre_merge)
+            || fingerprint_matches(current, fingerprints.visible)
+    });
+    let local_sha256 = if current.is_none() || current_is_retained {
+        if current.is_some() {
+            target.remove_current()?;
+        }
+        ensure_retained_versions_manifest(
+            target,
+            manifest.bytes,
+            manifest.sha256,
+            &evidence.delta_id,
+            evidence.entry_index,
+        )?;
+        manifest.sha256.to_string()
+    } else {
+        current
+            .map(|current| current.0.clone())
+            .ok_or(GenerationSyncError::ConcurrentMutation)?
+    };
+    let visible_evidence = evidence
+        .visible_evidence
+        .as_ref()
+        .ok_or(GenerationSyncError::JournalMismatch)?;
+    store.mark_generation_inode_evidence_conflict(
+        &evidence.delta_id,
+        evidence.entry_index,
+        GenerationInodeEvidenceConflictUpdate {
+            local_sha256,
+            expected_sha256: fingerprints.pre_merge.0.to_string(),
+            byte_length: fingerprints.pre_merge.1,
+            visible_evidence: Some(GenerationRetainedInodeRecord {
+                evidence_name: visible_evidence.evidence_name.clone(),
+                expected_sha256: fingerprints.visible.0.to_string(),
+                byte_length: fingerprints.visible.1,
+            }),
+            updated_at: updated_at.to_string(),
+        },
+    )?;
+    Ok(())
+}
+
+fn finish_resolved_inode_evidence(
+    store: &mut SqliteStateStore,
+    target: &SecureTarget,
+    evidence: &GenerationInodeEvidenceRecord,
+    updated_at: &str,
+) -> Result<u64, GenerationSyncError> {
+    target.sync_current()?;
+    let current = fingerprint_target(target)?.ok_or(GenerationSyncError::ConcurrentMutation)?;
+    let pre_merge_name = OsStr::new(&evidence.evidence_name);
+    let visible_evidence = evidence
+        .visible_evidence
+        .as_ref()
+        .ok_or(GenerationSyncError::JournalMismatch)?;
+    let visible_name = OsStr::new(&visible_evidence.evidence_name);
+    let mut pre_merge = target
+        .open_named(pre_merge_name)?
+        .map(|mut file| fingerprint_open_file_handle(&mut file))
+        .transpose()?;
+    let mut visible = target
+        .open_named(visible_name)?
+        .map(|mut file| fingerprint_open_file_handle(&mut file))
+        .transpose()?;
+
+    let pre_merge_changed = pre_merge.as_ref().is_some_and(|fingerprint| {
+        !fingerprint_matches(
+            fingerprint,
+            (&evidence.expected_sha256, evidence.byte_length),
+        )
+    });
+    let visible_changed = visible.as_ref().is_some_and(|fingerprint| {
+        !fingerprint_matches(
+            fingerprint,
+            (
+                &visible_evidence.expected_sha256,
+                visible_evidence.byte_length,
+            ),
+        )
+    });
+    if pre_merge_changed || visible_changed {
+        let (Some(pre_merge), Some(visible)) = (pre_merge.as_ref(), visible.as_ref()) else {
+            return Err(GenerationSyncError::ConcurrentMutation);
+        };
+        let manifest = retained_local_versions_manifest(
+            &evidence.evidence_name,
+            &visible_evidence.evidence_name,
+        );
+        let manifest_sha256 = format!("sha256:{:x}", Sha256::digest(&manifest));
+        record_changed_dual_inode_evidence(
+            store,
+            target,
+            evidence,
+            Some(&current),
+            DualInodeFingerprints {
+                pre_merge: (&pre_merge.0, pre_merge.1),
+                visible: (&visible.0, visible.1),
+            },
+            RetainedVersionsManifest {
+                bytes: &manifest,
+                sha256: &manifest_sha256,
+            },
+            updated_at,
+        )?;
+        return Ok(1);
+    }
+
+    let remove_pre_merge_first = pre_merge
+        .as_ref()
+        .is_some_and(|pre_merge| fingerprint_matches(&current, (&pre_merge.0, pre_merge.1)));
+    if remove_pre_merge_first {
+        if pre_merge.take().is_some() {
+            target.remove_named(pre_merge_name)?;
+        }
+        if visible.take().is_some() {
+            target.remove_named(visible_name)?;
+        }
+    } else {
+        if visible.take().is_some() {
+            target.remove_named(visible_name)?;
+        }
+        if pre_merge.take().is_some() {
+            target.remove_named(pre_merge_name)?;
+        }
+    }
+    store.remove_generation_inode_evidence(&evidence.delta_id, evidence.entry_index)?;
+    Ok(0)
+}
+
 fn retain_visible_inode_and_publish_manifest(
     target: &SecureTarget,
     visible_snapshot: &OsStr,
@@ -565,7 +815,7 @@ fn retain_visible_inode_and_publish_manifest(
     manifest_sha256: &str,
     delta_id: &str,
     entry_index: u64,
-    hooks: &mut InodeReconcileHooks,
+    hooks: &mut InodeReconcileHooks<'_>,
 ) -> Result<(String, u64), GenerationSyncError> {
     let mut visible = if let Some(snapshot) = target.open_named(visible_snapshot)? {
         snapshot
@@ -611,7 +861,8 @@ fn ensure_retained_versions_manifest(
 fn retained_local_versions_manifest(pre_merge: &str, visible_merged: &str) -> Vec<u8> {
     format!(
         "LOCALITY RETAINED LOCAL VERSIONS v1\n\
-         Resolve this conflict by copying the chosen retained file over this manifest.\n\
+         To resolve: close writers, copy exactly one retained file over this manifest, then sync again.\n\
+         Custom replacement contents are preserved but do not clear this conflict.\n\
          pre_merge={pre_merge}\n\
          visible_merged={visible_merged}\n"
     )
@@ -2358,6 +2609,27 @@ mod tests {
         file.sync_all().unwrap();
     }
 
+    #[cfg(unix)]
+    fn prepare_retained_version_conflict(
+        fixture: &Fixture,
+        delta_id: &str,
+    ) -> (SqliteStateStore, AuthorizedGenerationDelivery, File, File) {
+        let (mut store, merged, mut pre_merge, visible_merged) =
+            prepare_two_held_descriptor_merge(fixture, delta_id);
+        replace_held_file(&mut pre_merge, b"late local\nmiddle\ntwo\n");
+        let replay = apply_authorized_delivery(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            merged.clone(),
+            &mut FakeTransport::default(),
+        )
+        .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.conflicted_paths, 1);
+        (store, merged, pre_merge, visible_merged)
+    }
+
     fn seed(fixture: &Fixture, paths: Vec<GenerationFileIdentity>) -> SqliteStateStore {
         let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
         store
@@ -3252,6 +3524,450 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn assert_retained_version_choice_resolves(
+        fixture_name: &str,
+        delta_id: &str,
+        choose_visible: bool,
+    ) {
+        let fixture = Fixture::new(fixture_name);
+        let (mut store, merged, pre_merge_writer, visible_writer) =
+            prepare_retained_version_conflict(&fixture, delta_id);
+        drop((pre_merge_writer, visible_writer));
+        let pre_merge_name = preimage_name(delta_id, 0);
+        let visible_name = visible_conflict_snapshot_name(delta_id, 0);
+        let choice = if choose_visible {
+            &visible_name
+        } else {
+            &pre_merge_name
+        };
+        let chosen_bytes = fs::read(fixture.mount_root.join(choice)).unwrap();
+        fs::copy(
+            fixture.mount_root.join(choice),
+            fixture.mount_root.join("Roadmap.md"),
+        )
+        .unwrap();
+
+        let replay = apply_authorized_delivery(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            merged,
+            &mut FakeTransport::default(),
+        )
+        .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.conflicted_paths, 0);
+        assert_eq!(
+            fs::read(fixture.mount_root.join("Roadmap.md")).unwrap(),
+            chosen_bytes
+        );
+        assert!(!fixture.mount_root.join(pre_merge_name).exists());
+        assert!(!fixture.mount_root.join(visible_name).exists());
+        assert!(store.list_generation_inode_evidence().unwrap().is_empty());
+        assert_eq!(
+            store.list_generation_paths(&fixture.mount_id).unwrap()[0].state,
+            GenerationPathState::Dirty
+        );
+        assert!(matches!(
+            store
+                .get_generation_apply(delta_id)
+                .unwrap()
+                .unwrap()
+                .outcomes[0]
+                .1,
+            GenerationApplyOutcome::Merged
+        ));
+
+        let mut next = delivery(&format!("{delta_id}-next"), Vec::new());
+        retarget_delivery(&mut next, "generation-3", "generation-4");
+        let next_summary = apply_authorized_delivery(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            next,
+            &mut FakeTransport::default(),
+        )
+        .unwrap();
+        assert_eq!(next_summary.conflicted_paths, 0);
+        assert_eq!(
+            store
+                .get_observed_generation(&fixture.mount_id)
+                .unwrap()
+                .unwrap()
+                .generation_id
+                .as_str(),
+            "generation-4"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copying_pre_merge_version_over_manifest_resolves_and_next_sync_proceeds() {
+        assert_retained_version_choice_resolves(
+            "resolve-pre-merge-choice",
+            "delta-resolve-pre-merge",
+            false,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copying_visible_merged_version_over_manifest_resolves_and_next_sync_proceeds() {
+        assert_retained_version_choice_resolves(
+            "resolve-visible-choice",
+            "delta-resolve-visible",
+            true,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolution_store_failure_rolls_back_without_retiring_versions() {
+        let fixture = Fixture::new("resolution-store-rollback");
+        let delta_id = "delta-resolution-store-rollback";
+        let (mut store, merged, pre_merge_writer, visible_writer) =
+            prepare_retained_version_conflict(&fixture, delta_id);
+        drop((pre_merge_writer, visible_writer));
+        let pre_merge_name = preimage_name(delta_id, 0);
+        let visible_name = visible_conflict_snapshot_name(delta_id, 0);
+        let chosen = fs::read(fixture.mount_root.join(&pre_merge_name)).unwrap();
+        fs::copy(
+            fixture.mount_root.join(&pre_merge_name),
+            fixture.mount_root.join("Roadmap.md"),
+        )
+        .unwrap();
+        let connection = rusqlite::Connection::open(&store.db_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_retained_resolution
+                 BEFORE UPDATE ON generation_paths
+                 WHEN OLD.state = 'conflicted' AND NEW.state = 'dirty'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected retained resolution failure');
+                 END;",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            apply_authorized_delivery(
+                &mut store,
+                &fixture.mount_id,
+                &fixture.mount_root,
+                merged.clone(),
+                &mut FakeTransport::default(),
+            ),
+            Err(GenerationSyncError::Store(_))
+        ));
+        assert_eq!(
+            fs::read(fixture.mount_root.join("Roadmap.md")).unwrap(),
+            chosen
+        );
+        assert!(fixture.mount_root.join(&pre_merge_name).exists());
+        assert!(fixture.mount_root.join(&visible_name).exists());
+        assert_eq!(store.list_generation_inode_evidence().unwrap().len(), 1);
+        assert_eq!(
+            store.list_generation_paths(&fixture.mount_id).unwrap()[0].state,
+            GenerationPathState::Conflicted
+        );
+        assert!(matches!(
+            store
+                .get_generation_apply(delta_id)
+                .unwrap()
+                .unwrap()
+                .outcomes[0]
+                .1,
+            GenerationApplyOutcome::Conflict { .. }
+        ));
+
+        let connection = rusqlite::Connection::open(&store.db_path).unwrap();
+        connection
+            .execute_batch("DROP TRIGGER fail_retained_resolution;")
+            .unwrap();
+        drop(connection);
+        let replay = apply_authorized_delivery(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            merged,
+            &mut FakeTransport::default(),
+        )
+        .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.conflicted_paths, 0);
+        assert!(store.list_generation_inode_evidence().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn crash_after_resolution_commit_resumes_evidence_cleanup() {
+        let fixture = Fixture::new("resolution-cleanup-interruption");
+        let delta_id = "delta-resolution-cleanup-interruption";
+        let (mut store, merged, pre_merge_writer, visible_writer) =
+            prepare_retained_version_conflict(&fixture, delta_id);
+        drop((pre_merge_writer, visible_writer));
+        let pre_merge_name = preimage_name(delta_id, 0);
+        let visible_name = visible_conflict_snapshot_name(delta_id, 0);
+        let chosen = fs::read(fixture.mount_root.join(&visible_name)).unwrap();
+        fs::copy(
+            fixture.mount_root.join(&visible_name),
+            fixture.mount_root.join("Roadmap.md"),
+        )
+        .unwrap();
+        let secure_mount = SecureMount::open(&fixture.mount_root).unwrap();
+        let error = reconcile_completed_mount_inode_evidence_inner(
+            &mut store,
+            &fixture.mount_id,
+            &secure_mount,
+            &mut InodeReconcileHooks {
+                interrupt_after_resolution_commit: true,
+                ..InodeReconcileHooks::default()
+            },
+        )
+        .expect_err("interrupt after durable resolution transition");
+        assert!(matches!(error, GenerationSyncError::InjectedInterruption));
+        drop(secure_mount);
+
+        assert_eq!(
+            fs::read(fixture.mount_root.join("Roadmap.md")).unwrap(),
+            chosen
+        );
+        assert!(fixture.mount_root.join(&pre_merge_name).exists());
+        assert!(fixture.mount_root.join(&visible_name).exists());
+        assert_eq!(store.list_generation_inode_evidence().unwrap().len(), 1);
+        assert_eq!(
+            store.list_generation_paths(&fixture.mount_id).unwrap()[0].state,
+            GenerationPathState::Dirty
+        );
+        assert!(matches!(
+            store
+                .get_generation_apply(delta_id)
+                .unwrap()
+                .unwrap()
+                .outcomes[0]
+                .1,
+            GenerationApplyOutcome::Merged
+        ));
+
+        let replay = apply_authorized_delivery(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            merged,
+            &mut FakeTransport::default(),
+        )
+        .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.conflicted_paths, 0);
+        assert!(store.list_generation_inode_evidence().unwrap().is_empty());
+        assert!(!fixture.mount_root.join(pre_merge_name).exists());
+        assert!(!fixture.mount_root.join(visible_name).exists());
+        assert_eq!(
+            fs::read(fixture.mount_root.join("Roadmap.md")).unwrap(),
+            chosen
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_resolution_bytes_are_preserved_but_do_not_retire_evidence() {
+        let fixture = Fixture::new("custom-resolution-preserved");
+        let delta_id = "delta-custom-resolution";
+        let (mut store, merged, pre_merge_writer, visible_writer) =
+            prepare_retained_version_conflict(&fixture, delta_id);
+        drop((pre_merge_writer, visible_writer));
+        let custom = b"manually combined custom resolution\n";
+        fs::write(fixture.mount_root.join("Roadmap.md"), custom).unwrap();
+
+        assert!(matches!(
+            apply_authorized_delivery(
+                &mut store,
+                &fixture.mount_id,
+                &fixture.mount_root,
+                merged,
+                &mut FakeTransport::default(),
+            ),
+            Err(GenerationSyncError::ConcurrentMutation)
+        ));
+        assert_eq!(
+            fs::read(fixture.mount_root.join("Roadmap.md")).unwrap(),
+            custom
+        );
+        assert!(fixture.mount_root.join(preimage_name(delta_id, 0)).exists());
+        assert!(
+            fixture
+                .mount_root
+                .join(visible_conflict_snapshot_name(delta_id, 0))
+                .exists()
+        );
+        assert_eq!(store.list_generation_inode_evidence().unwrap().len(), 1);
+        assert_eq!(
+            store.list_generation_paths(&fixture.mount_id).unwrap()[0].state,
+            GenerationPathState::Conflicted
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_fd_write_during_resolution_restores_manifest_without_loss() {
+        let fixture = Fixture::new("resolution-held-fd-race");
+        let delta_id = "delta-resolution-held-fd-race";
+        let (mut store, merged, mut pre_merge_writer, visible_writer) =
+            prepare_retained_version_conflict(&fixture, delta_id);
+        let pre_merge_name = preimage_name(delta_id, 0);
+        let visible_name = visible_conflict_snapshot_name(delta_id, 0);
+        fs::copy(
+            fixture.mount_root.join(&visible_name),
+            fixture.mount_root.join("Roadmap.md"),
+        )
+        .unwrap();
+        let raced_bytes = b"held fd changed during resolution\nmiddle\ntwo\n";
+        {
+            let mut mutate = || replace_held_file(&mut pre_merge_writer, raced_bytes);
+            let secure_mount = SecureMount::open(&fixture.mount_root).unwrap();
+            let conflicts = reconcile_completed_mount_inode_evidence_inner(
+                &mut store,
+                &fixture.mount_id,
+                &secure_mount,
+                &mut InodeReconcileHooks {
+                    before_resolution_commit: Some(&mut mutate),
+                    ..InodeReconcileHooks::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(conflicts, 1);
+        }
+
+        let manifest = retained_local_versions_manifest(
+            pre_merge_name.to_str().unwrap(),
+            visible_name.to_str().unwrap(),
+        );
+        assert_eq!(
+            fs::read(fixture.mount_root.join("Roadmap.md")).unwrap(),
+            manifest
+        );
+        assert_eq!(
+            fs::read(fixture.mount_root.join(&pre_merge_name)).unwrap(),
+            raced_bytes
+        );
+        assert!(fixture.mount_root.join(&visible_name).exists());
+        let evidence = store.list_generation_inode_evidence().unwrap().remove(0);
+        assert_eq!(evidence.expected_sha256, sha256_label(raced_bytes));
+        assert_eq!(evidence.byte_length, raced_bytes.len() as u64);
+        assert_eq!(
+            store.list_generation_paths(&fixture.mount_id).unwrap()[0].state,
+            GenerationPathState::Conflicted
+        );
+
+        drop((pre_merge_writer, visible_writer));
+        fs::copy(
+            fixture.mount_root.join(&pre_merge_name),
+            fixture.mount_root.join("Roadmap.md"),
+        )
+        .unwrap();
+        let replay = apply_authorized_delivery(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            merged,
+            &mut FakeTransport::default(),
+        )
+        .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.conflicted_paths, 0);
+        assert_eq!(
+            fs::read(fixture.mount_root.join("Roadmap.md")).unwrap(),
+            raced_bytes
+        );
+        assert!(store.list_generation_inode_evidence().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_fd_write_after_resolution_commit_rolls_back_without_loss() {
+        let fixture = Fixture::new("resolution-post-commit-held-fd-race");
+        let delta_id = "delta-resolution-post-commit-held-fd-race";
+        let (mut store, merged, pre_merge_writer, mut visible_writer) =
+            prepare_retained_version_conflict(&fixture, delta_id);
+        let pre_merge_name = preimage_name(delta_id, 0);
+        let visible_name = visible_conflict_snapshot_name(delta_id, 0);
+        fs::copy(
+            fixture.mount_root.join(&pre_merge_name),
+            fixture.mount_root.join("Roadmap.md"),
+        )
+        .unwrap();
+        let raced_bytes = b"held visible fd changed after resolution commit\nmiddle\nremote\n";
+        {
+            let mut mutate = || replace_held_file(&mut visible_writer, raced_bytes);
+            let secure_mount = SecureMount::open(&fixture.mount_root).unwrap();
+            let conflicts = reconcile_completed_mount_inode_evidence_inner(
+                &mut store,
+                &fixture.mount_id,
+                &secure_mount,
+                &mut InodeReconcileHooks {
+                    after_resolution_commit: Some(&mut mutate),
+                    ..InodeReconcileHooks::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(conflicts, 1);
+        }
+
+        let manifest = retained_local_versions_manifest(
+            pre_merge_name.to_str().unwrap(),
+            visible_name.to_str().unwrap(),
+        );
+        assert_eq!(
+            fs::read(fixture.mount_root.join("Roadmap.md")).unwrap(),
+            manifest
+        );
+        assert!(fixture.mount_root.join(&pre_merge_name).exists());
+        assert_eq!(
+            fs::read(fixture.mount_root.join(&visible_name)).unwrap(),
+            raced_bytes
+        );
+        let evidence = store.list_generation_inode_evidence().unwrap().remove(0);
+        let visible_evidence = evidence.visible_evidence.unwrap();
+        assert_eq!(visible_evidence.expected_sha256, sha256_label(raced_bytes));
+        assert_eq!(visible_evidence.byte_length, raced_bytes.len() as u64);
+        assert_eq!(
+            store.list_generation_paths(&fixture.mount_id).unwrap()[0].state,
+            GenerationPathState::Conflicted
+        );
+        assert!(matches!(
+            store
+                .get_generation_apply(delta_id)
+                .unwrap()
+                .unwrap()
+                .outcomes[0]
+                .1,
+            GenerationApplyOutcome::Conflict { .. }
+        ));
+
+        drop((pre_merge_writer, visible_writer));
+        fs::copy(
+            fixture.mount_root.join(&visible_name),
+            fixture.mount_root.join("Roadmap.md"),
+        )
+        .unwrap();
+        let replay = apply_authorized_delivery(
+            &mut store,
+            &fixture.mount_id,
+            &fixture.mount_root,
+            merged,
+            &mut FakeTransport::default(),
+        )
+        .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.conflicted_paths, 0);
+        assert_eq!(
+            fs::read(fixture.mount_root.join("Roadmap.md")).unwrap(),
+            raced_bytes
+        );
+        assert!(store.list_generation_inode_evidence().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn crash_after_visible_inode_rename_recovers_manifest_and_both_fences() {
         let fixture = Fixture::new("visible-inode-rename-interruption");
@@ -3268,6 +3984,7 @@ mod tests {
             &secure_mount,
             &mut InodeReconcileHooks {
                 interrupt_after_visible_snapshot_move: true,
+                ..InodeReconcileHooks::default()
             },
         )
         .expect_err("interrupt exactly after visible inode rename");

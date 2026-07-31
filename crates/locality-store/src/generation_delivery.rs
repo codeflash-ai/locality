@@ -194,6 +194,15 @@ pub struct GenerationInodeEvidenceConflictUpdate {
     pub updated_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenerationInodeEvidenceResolution {
+    pub expected_sha256: String,
+    pub byte_length: u64,
+    pub visible_expected_sha256: String,
+    pub visible_byte_length: u64,
+    pub updated_at: String,
+}
+
 pub trait GenerationDeliveryRepository {
     /// Seeds or exactly replays a complete local base. Replacing a different
     /// observed head is intentionally not part of this operation.
@@ -256,6 +265,16 @@ pub trait GenerationDeliveryRepository {
         delta_id: &str,
         entry_index: u64,
         update: GenerationInodeEvidenceConflictUpdate,
+    ) -> StoreResult<()>;
+
+    /// Atomically clears the late-write conflict after the visible file was
+    /// durably replaced by one exact retained version. The evidence row stays
+    /// live as a crash-recoverable filesystem-cleanup journal.
+    fn mark_generation_inode_evidence_resolved(
+        &mut self,
+        delta_id: &str,
+        entry_index: u64,
+        resolution: GenerationInodeEvidenceResolution,
     ) -> StoreResult<()>;
 
     fn remove_generation_inode_evidence(

@@ -42,8 +42,9 @@ use crate::error::{StoreError, StoreResult};
 use crate::generation_delivery::{
     GENERATION_DELIVERY_COMPONENT_VERSION, GenerationApplyJournalRecord, GenerationApplyOutcome,
     GenerationApplyStatus, GenerationDeliveryRepository, GenerationInodeEvidenceConflictUpdate,
-    GenerationInodeEvidenceRecord, GenerationPathRecord, GenerationPathState,
-    GenerationRetainedInodeRecord, ObservedGenerationRecord, PreparedGenerationApply,
+    GenerationInodeEvidenceRecord, GenerationInodeEvidenceResolution, GenerationPathRecord,
+    GenerationPathState, GenerationRetainedInodeRecord, ObservedGenerationRecord,
+    PreparedGenerationApply,
 };
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
@@ -1250,6 +1251,128 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                     .as_ref()
                     .map(|visible| visible.expected_sha256.as_str()),
                 visible_byte_length,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn mark_generation_inode_evidence_resolved(
+        &mut self,
+        delta_id: &str,
+        entry_index: u64,
+        resolution: GenerationInodeEvidenceResolution,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let journal =
+            generation_apply_from_connection(&transaction, delta_id)?.ok_or_else(|| {
+                StoreError::InvalidState(format!("generation apply `{delta_id}` is missing"))
+            })?;
+        if journal.status != GenerationApplyStatus::Completed {
+            return Err(StoreError::InvalidState(
+                "inode evidence resolution requires a completed generation apply".to_string(),
+            ));
+        }
+        let entry = journal
+            .delta
+            .entries
+            .get(entry_index as usize)
+            .ok_or_else(|| {
+                StoreError::InvalidState("generation evidence index is out of bounds".to_string())
+            })?;
+        let new = entry.new.as_ref().ok_or_else(|| {
+            StoreError::InvalidState(
+                "retained inode resolution requires an incoming identity".to_string(),
+            )
+        })?;
+        let index = i64::try_from(entry_index).map_err(|_| {
+            StoreError::InvalidState("generation evidence index is too large".to_string())
+        })?;
+        let byte_length = i64::try_from(resolution.byte_length).map_err(|_| {
+            StoreError::InvalidState("generation evidence length is too large".to_string())
+        })?;
+        let visible_byte_length = i64::try_from(resolution.visible_byte_length).map_err(|_| {
+            StoreError::InvalidState("visible generation evidence length is too large".to_string())
+        })?;
+        let exact_evidence: bool = transaction
+            .query_row(
+                "SELECT expected_sha256 = ?3 AND byte_length = ?4
+                        AND visible_expected_sha256 = ?5
+                        AND visible_byte_length = ?6
+                 FROM generation_inode_evidence
+                 WHERE delta_id = ?1 AND entry_index = ?2
+                       AND visible_evidence_name IS NOT NULL",
+                params![
+                    delta_id,
+                    index,
+                    resolution.expected_sha256.as_str(),
+                    byte_length,
+                    resolution.visible_expected_sha256.as_str(),
+                    visible_byte_length,
+                ],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::InvalidState(
+                    "generation inode evidence disappeared during resolution".to_string(),
+                )
+            })?;
+        if !exact_evidence {
+            return Err(StoreError::InvalidState(
+                "generation inode evidence changed during resolution".to_string(),
+            ));
+        }
+        let existing = select_generation_path(
+            &transaction,
+            &MountId::new(journal.delta.mount_id.as_str()),
+            &new.projection_id,
+        )?;
+        let local_logical_path = existing.as_ref().map_or(new.logical_path.as_str(), |path| {
+            path.local_logical_path.as_str()
+        });
+        transaction.execute(
+            "INSERT INTO generation_paths (
+                mount_id, projection_id, logical_path, local_logical_path,
+                base_generation_id, base_identity_json,
+                base_payload_delta_id, base_payload_entry_index,
+                conflict_payload_delta_id, conflict_payload_entry_index,
+                state, incoming_identity_json, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL,
+                       'dirty', NULL, ?9)
+             ON CONFLICT(mount_id, projection_id) DO UPDATE SET
+                logical_path = excluded.logical_path,
+                local_logical_path = excluded.local_logical_path,
+                base_generation_id = excluded.base_generation_id,
+                base_identity_json = excluded.base_identity_json,
+                base_payload_delta_id = excluded.base_payload_delta_id,
+                base_payload_entry_index = excluded.base_payload_entry_index,
+                conflict_payload_delta_id = NULL,
+                conflict_payload_entry_index = NULL,
+                state = 'dirty', incoming_identity_json = NULL,
+                updated_at = excluded.updated_at",
+            params![
+                journal.delta.mount_id.as_str(),
+                new.projection_id.as_str(),
+                new.logical_path.as_str(),
+                local_logical_path,
+                journal.delta.target_generation_id.as_str(),
+                to_json(new)?,
+                delta_id,
+                index,
+                resolution.updated_at.as_str(),
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE generation_apply_outcomes
+             SET outcome_json = ?3, updated_at = ?4
+             WHERE delta_id = ?1 AND entry_index = ?2",
+            params![
+                delta_id,
+                index,
+                to_json(&GenerationApplyOutcome::Merged)?,
+                resolution.updated_at.as_str(),
             ],
         )?;
         transaction.commit()?;
