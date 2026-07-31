@@ -24,12 +24,18 @@ already-expired responses explicit failures instead of implicit deadline
 extension.
 
 The returned `FreshnessWaitAttempt` adds a bounded opaque wait-attempt ID and a
-positive sequence. An exact snapshot replay is valid. A changed successor must
-advance sequence by exactly one and advance update time; applied epochs cannot
-decrease. Attempt ID, session, idempotency key, selected capability, sealed
-requirement, creation time, derived deadline, source order, source identities,
-and target epochs are immutable. Satisfied or failed sources cannot reopen, and
-an aggregate terminal snapshot absorbs every changed successor.
+positive sequence. Sequence is the replay cursor, not a delivery count or an
+acknowledgment: the server may return its latest durable snapshot without
+retaining every intermediate response. An exact snapshot replay is valid. A
+changed successor must have a strictly greater sequence, while gaps are valid
+after a lost poll or concurrent progress. `updated_at` cannot regress but may
+remain equal across revisions because V1 timestamps have one-second precision.
+Attempt ID, session, idempotency key, selected capability, sealed requirement,
+creation time, derived deadline, source order, source-and-scope identities, and
+target epochs are immutable. Satisfied or failed sources cannot reopen, and an
+aggregate terminal snapshot absorbs every changed successor. Clients retain
+only the last accepted snapshot as their cursor; no separate client ack is
+needed for correctness.
 
 The contract is available only after `freshness_wait: 1` negotiation. The
 request capability set is always a client offer. `selected_capability` in the
@@ -42,10 +48,13 @@ generation 2.
 
 ## Multi-source progress
 
-Each attempt contains one to 64 source targets in the session's canonical
-source order. A target carries the source connection ID, captured target epoch,
-current applied epoch, typed source state, stable freshness reason, and optional
-shared retry classification. Epochs use the public `FreshnessEpoch` canonical
+Each attempt contains one to 64 source targets in the session's canonical scope
+ordinal order. A target carries the source connection ID, immutable source
+scope ID, captured target epoch, current applied epoch, typed source state,
+stable freshness reason, and optional shared retry classification. One source
+connection may therefore contribute several independently tracked scopes. The
+connection-and-scope pair is unique within an attempt and remains at the same
+ordinal for every successor. Epochs use the public `FreshnessEpoch` canonical
 quoted-decimal encoding, preserving the ADR 0003 `BIGINT` range without
 JavaScript precision loss.
 
@@ -55,8 +64,8 @@ Source facts are fail-closed:
 - `satisfied` requires `applied_epoch >= target_epoch` and no reason or retry;
 - `failed` requires an unapplied target and a reason.
 
-Duplicate sources, noncanonical ordinals, unknown labels, contradictory state,
-and source arrays beyond the fixed bound are rejected.
+Duplicate connection-and-scope pairs, noncanonical ordinals, unknown labels,
+contradictory state, and source arrays beyond the fixed bound are rejected.
 
 ## Polling and terminal outcomes
 
@@ -87,7 +96,7 @@ durable refresh.
 | Start/resume request JSON | 4 KiB |
 | Attempt status JSON | 64 KiB |
 | Source targets | 64 |
-| Session, source, and wait-attempt IDs | 128 bytes |
+| Session, source connection, source scope, and wait-attempt IDs | 128 bytes |
 | Idempotency key | 128 bytes |
 | Durable wait window | 5 minutes |
 | Poll delay | 1 hour |

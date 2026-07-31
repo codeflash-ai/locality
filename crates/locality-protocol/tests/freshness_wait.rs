@@ -1,4 +1,4 @@
-use locality_core::portable::{SessionId, SourceConnectionId};
+use locality_core::portable::{SessionId, SourceConnectionId, SourceScopeId};
 use locality_protocol::freshness_delivery::{
     FreshnessReasonCode, FreshnessRetry, FreshnessRetryClass,
 };
@@ -274,6 +274,14 @@ fn strict_status_decoder_rejects_unknown_oversized_and_ambiguous_inputs() {
     leading_zero_epoch["source_targets"][0]["target_epoch"] = json!("044");
     assert!(serde_json::from_value::<FreshnessWaitAttempt>(leading_zero_epoch).is_err());
 
+    let mut missing_scope: Value =
+        serde_json::from_slice(FRESHNESS_WAIT_ATTEMPT_V1_GOLDEN_JSON).unwrap();
+    missing_scope["source_targets"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("source_scope_id");
+    assert!(serde_json::from_value::<FreshnessWaitAttempt>(missing_scope).is_err());
+
     for (path, label) in [
         ("source_state", "future_source_state"),
         ("aggregate_state", "future_aggregate_state"),
@@ -314,13 +322,36 @@ fn strict_status_decoder_rejects_unknown_oversized_and_ambiguous_inputs() {
 
 #[test]
 fn source_targets_are_bounded_unique_and_canonical() {
+    let same_connection_scopes = waiting_attempt();
+    assert_eq!(
+        same_connection_scopes.source_targets[0].source_connection_id,
+        same_connection_scopes.source_targets[1].source_connection_id
+    );
+    assert_ne!(
+        same_connection_scopes.source_targets[0].source_scope_id,
+        same_connection_scopes.source_targets[1].source_scope_id
+    );
+    same_connection_scopes
+        .validate()
+        .expect("one connection may contribute multiple ordered scopes");
+
     let mut duplicate = waiting_attempt();
-    duplicate.source_targets[1].source_connection_id =
-        duplicate.source_targets[0].source_connection_id.clone();
+    duplicate.source_targets[1].source_scope_id =
+        duplicate.source_targets[0].source_scope_id.clone();
     assert!(matches!(
         duplicate.validate(),
         Err(FreshnessWaitContractError::DuplicateSource { index: 1 })
     ));
+
+    let mut invalid_scope = waiting_attempt();
+    invalid_scope.source_targets[0].source_scope_id =
+        SourceScopeId::new(" scope-drive-product").unwrap();
+    assert_eq!(
+        invalid_scope.validate(),
+        Err(FreshnessWaitContractError::InvalidOpaqueValue(
+            "source_scope_id"
+        ))
+    );
 
     let mut reordered = waiting_attempt();
     reordered.source_targets.swap(0, 1);
@@ -336,6 +367,8 @@ fn source_targets_are_bounded_unique_and_canonical() {
             let mut target = template.clone();
             target.ordinal = index as u32;
             target.source_connection_id = SourceConnectionId::new(format!("source-{index}"));
+            target.source_scope_id =
+                SourceScopeId::new(format!("scope-{index}")).expect("scope ID");
             target
         })
         .collect();
@@ -389,6 +422,8 @@ fn successor_and_exact_replay_validation_bind_all_immutable_facts() {
         "created",
         "deadline",
         "source",
+        "scope",
+        "scope_order",
         "order",
         "target",
     ] {
@@ -411,6 +446,16 @@ fn successor_and_exact_replay_validation_bind_all_immutable_facts() {
                 candidate.source_targets[0].source_connection_id =
                     SourceConnectionId::new("different-source")
             }
+            "scope" => {
+                candidate.source_targets[0].source_scope_id =
+                    SourceScopeId::new("different-scope").unwrap()
+            }
+            "scope_order" => {
+                let first_scope = candidate.source_targets[0].source_scope_id.clone();
+                candidate.source_targets[0].source_scope_id =
+                    candidate.source_targets[1].source_scope_id.clone();
+                candidate.source_targets[1].source_scope_id = first_scope;
+            }
             "order" => candidate.source_targets.swap(0, 1),
             "target" => candidate.source_targets[0].target_epoch = FreshnessEpoch::new(45).unwrap(),
             _ => unreachable!(),
@@ -425,20 +470,50 @@ fn successor_and_exact_replay_validation_bind_all_immutable_facts() {
 }
 
 #[test]
-fn successor_rejects_sequence_time_epoch_regression_and_terminal_mutation() {
+fn successor_accepts_lost_polls_and_same_second_concurrent_progress() {
     let previous = waiting_attempt();
     let mut skipped = next_waiting(&previous);
-    skipped.sequence += 1;
-    assert_eq!(
-        skipped.validate_successor(&previous, &request(), "2026-07-31T12:00:10Z"),
-        Err(FreshnessWaitContractError::NonMonotonicAttemptSequence)
-    );
+    skipped.sequence += 4;
+    skipped
+        .validate_successor(&previous, &request(), "2026-07-31T12:00:10Z")
+        .expect("a newer durable cursor may skip unobserved poll snapshots");
 
     let mut same_time = next_waiting(&previous);
     same_time.updated_at = previous.updated_at.clone();
     same_time.poll.as_mut().unwrap().observed_at = same_time.updated_at.clone();
+    same_time
+        .validate_successor(&previous, &request(), SNAPSHOT_TIME)
+        .expect("concurrent progress may share a second-resolution timestamp");
+
+    let mut skipped_terminal = satisfied_terminal(&previous);
+    skipped_terminal.sequence += 3;
+    skipped_terminal
+        .validate_successor(&previous, &request(), "2026-07-31T12:00:10Z")
+        .expect("a lost poll may be followed directly by a terminal snapshot");
+}
+
+#[test]
+fn successor_rejects_cursor_time_epoch_regression_and_terminal_mutation() {
+    let previous = waiting_attempt();
+    let mut unchanged_sequence = next_waiting(&previous);
+    unchanged_sequence.sequence = previous.sequence;
     assert_eq!(
-        same_time.validate_successor(&previous, &request(), SNAPSHOT_TIME),
+        unchanged_sequence.validate_successor(&previous, &request(), "2026-07-31T12:00:10Z"),
+        Err(FreshnessWaitContractError::NonMonotonicAttemptSequence)
+    );
+
+    let mut regressed_sequence = next_waiting(&previous);
+    regressed_sequence.sequence = previous.sequence - 1;
+    assert_eq!(
+        regressed_sequence.validate_successor(&previous, &request(), "2026-07-31T12:00:10Z"),
+        Err(FreshnessWaitContractError::NonMonotonicAttemptSequence)
+    );
+
+    let mut regressed_time = next_waiting(&previous);
+    regressed_time.updated_at = "2026-07-31T12:00:07Z".to_string();
+    regressed_time.poll.as_mut().unwrap().observed_at = regressed_time.updated_at.clone();
+    assert_eq!(
+        regressed_time.validate_successor(&previous, &request(), SNAPSHOT_TIME),
         Err(FreshnessWaitContractError::NonMonotonicAttemptTime)
     );
 
@@ -467,6 +542,9 @@ fn successor_rejects_sequence_time_epoch_regression_and_terminal_mutation() {
     terminal
         .validate_successor(&previous, &request(), "2026-07-31T12:00:10Z")
         .expect("waiting may become terminal");
+    terminal
+        .validate_successor(&terminal, &request(), "2026-07-31T12:00:10Z")
+        .expect("the exact terminal snapshot remains idempotent");
     let mut changed_terminal = terminal.clone();
     changed_terminal.sequence += 1;
     changed_terminal.updated_at = "2026-07-31T12:00:11Z".to_string();

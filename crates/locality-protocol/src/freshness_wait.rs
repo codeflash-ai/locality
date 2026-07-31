@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Display, Formatter};
 
-use locality_core::portable::{SessionId, SourceConnectionId};
+use locality_core::portable::{SessionId, SourceConnectionId, SourceScopeId};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::freshness_delivery::{FreshnessReasonCode, FreshnessRetry, FreshnessRetryClass};
@@ -162,6 +162,7 @@ pub enum FreshnessWaitSourceState {
 pub struct FreshnessWaitSourceTarget {
     pub ordinal: u32,
     pub source_connection_id: SourceConnectionId,
+    pub source_scope_id: SourceScopeId,
     pub target_epoch: FreshnessEpoch,
     pub applied_epoch: FreshnessEpoch,
     pub state: FreshnessWaitSourceState,
@@ -190,6 +191,7 @@ impl From<StrictFreshnessRetryWire> for FreshnessRetry {
 struct FreshnessWaitSourceTargetWire {
     ordinal: u32,
     source_connection_id: SourceConnectionId,
+    source_scope_id: SourceScopeId,
     target_epoch: FreshnessEpoch,
     applied_epoch: FreshnessEpoch,
     state: FreshnessWaitSourceState,
@@ -206,6 +208,7 @@ impl<'de> Deserialize<'de> for FreshnessWaitSourceTarget {
         let target = Self {
             ordinal: wire.ordinal,
             source_connection_id: wire.source_connection_id,
+            source_scope_id: wire.source_scope_id,
             target_epoch: wire.target_epoch,
             applied_epoch: wire.applied_epoch,
             state: wire.state,
@@ -222,6 +225,11 @@ impl FreshnessWaitSourceTarget {
         validate_opaque(
             "source_connection_id",
             self.source_connection_id.as_str(),
+            MAX_FRESHNESS_WAIT_ID_BYTES,
+        )?;
+        validate_opaque(
+            "source_scope_id",
+            self.source_scope_id.as_str(),
             MAX_FRESHNESS_WAIT_ID_BYTES,
         )?;
         validate_reason(self.reason)?;
@@ -506,9 +514,11 @@ impl FreshnessWaitAttempt {
         self.validate_at(authenticated_server_time)
     }
 
-    /// Accepts an exact replay or the next immutable snapshot. Sequence and
-    /// time advance strictly, applied epochs never decrease, source targets and
-    /// order cannot change, and a terminal snapshot absorbs all successors.
+    /// Accepts an exact replay or a newer immutable snapshot. Sequence is the
+    /// replay cursor and advances strictly, but gaps are valid when polls are
+    /// lost or progress is concurrent. Update time cannot regress, applied
+    /// epochs never decrease, source targets and order cannot change, and a
+    /// terminal snapshot absorbs all successors.
     pub fn validate_successor(
         &self,
         previous: &Self,
@@ -526,18 +536,13 @@ impl FreshnessWaitAttempt {
         if previous.state == FreshnessWaitAggregateState::Terminal {
             return Err(FreshnessWaitContractError::TerminalAttemptChanged);
         }
-        if self.sequence
-            != previous
-                .sequence
-                .checked_add(1)
-                .ok_or(FreshnessWaitContractError::NonMonotonicAttemptSequence)?
-        {
+        if self.sequence <= previous.sequence {
             return Err(FreshnessWaitContractError::NonMonotonicAttemptSequence);
         }
         if !self.same_immutable_attempt(previous) {
             return Err(FreshnessWaitContractError::AttemptBindingMismatch);
         }
-        if self.updated_at <= previous.updated_at {
+        if self.updated_at < previous.updated_at {
             return Err(FreshnessWaitContractError::NonMonotonicAttemptTime);
         }
         for (prior, next) in previous
@@ -579,6 +584,7 @@ impl FreshnessWaitAttempt {
                 .all(|(left, right)| {
                     left.ordinal == right.ordinal
                         && left.source_connection_id == right.source_connection_id
+                        && left.source_scope_id == right.source_scope_id
                         && left.target_epoch == right.target_epoch
                 })
     }
@@ -759,7 +765,7 @@ impl Display for FreshnessWaitContractError {
             ),
             Self::DuplicateSource { index } => write!(
                 formatter,
-                "freshness wait source at index {index} duplicates a source connection ID"
+                "freshness wait source at index {index} duplicates a source connection and scope pair"
             ),
             Self::UnknownReason => formatter.write_str("unknown freshness wait reason"),
             Self::UnknownSourceState => formatter.write_str("unknown freshness wait source state"),
@@ -790,10 +796,10 @@ impl Display for FreshnessWaitContractError {
                 formatter.write_str("freshness wait attempt changed immutable identity or targets")
             }
             Self::NonMonotonicAttemptSequence => {
-                formatter.write_str("freshness wait sequence is not the exact successor")
+                formatter.write_str("freshness wait sequence did not advance")
             }
             Self::NonMonotonicAttemptTime => {
-                formatter.write_str("freshness wait update time did not advance")
+                formatter.write_str("freshness wait update time regressed")
             }
             Self::AppliedEpochRegressed => {
                 formatter.write_str("freshness wait applied epoch regressed")
@@ -907,7 +913,7 @@ fn validate_source_targets(
                 actual: target.ordinal,
             });
         }
-        if !sources.insert(&target.source_connection_id) {
+        if !sources.insert((&target.source_connection_id, &target.source_scope_id)) {
             return Err(FreshnessWaitContractError::DuplicateSource { index });
         }
         target.validate()?;

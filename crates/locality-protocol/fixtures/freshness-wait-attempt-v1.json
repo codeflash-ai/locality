@@ -20,6 +20,7 @@
     {
       "ordinal": 0,
       "source_connection_id": "source-drive",
+      "source_scope_id": "scope-drive-product",
       "target_epoch": "44",
       "applied_epoch": "43",
       "state": "waiting",
@@ -31,7 +32,8 @@
     },
     {
       "ordinal": 1,
-      "source_connection_id": "source-notion",
+      "source_connection_id": "source-drive",
+      "source_scope_id": "scope-drive-go-to-market",
       "target_epoch": "109",
       "applied_epoch": "109",
       "state": "satisfied",
