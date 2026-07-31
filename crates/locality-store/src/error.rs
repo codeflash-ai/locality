@@ -23,6 +23,11 @@ pub enum StoreError {
         target: String,
         existing_mount_id: MountId,
     },
+    WorkspaceBindingTargetImmutable {
+        mount_id: MountId,
+        existing_target: String,
+        requested_target: String,
+    },
     WorkspaceRebindBlocked {
         mount_id: MountId,
         blocker: WorkspaceRebindBlocker,
@@ -75,6 +80,15 @@ impl Display for StoreError {
                 f,
                 "workspace mount target `{target}` collides with mount `{}`",
                 existing_mount_id.0
+            ),
+            Self::WorkspaceBindingTargetImmutable {
+                mount_id,
+                existing_target,
+                requested_target,
+            } => write!(
+                f,
+                "workspace binding target for mount `{}` is immutable outside the owning coordinator: `{existing_target}` cannot be changed to `{requested_target}`",
+                mount_id.0
             ),
             Self::WorkspaceRebindBlocked { mount_id, blocker } => {
                 write!(

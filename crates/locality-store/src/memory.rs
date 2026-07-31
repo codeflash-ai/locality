@@ -198,6 +198,16 @@ impl WorkspaceBindingRepository for InMemoryStateStore {
         if !self.mounts.contains_key(&record.mount_id) {
             return Err(StoreError::MountMissing(record.mount_id));
         }
+        if let Some(existing) = self.workspace_bindings.get(&record.mount_id) {
+            if existing == &record.binding {
+                return Ok(());
+            }
+            return Err(StoreError::WorkspaceBindingTargetImmutable {
+                mount_id: record.mount_id,
+                existing_target: existing.mount_target().as_str().to_string(),
+                requested_target: record.binding.mount_target().as_str().to_string(),
+            });
+        }
         if let Some((existing_mount_id, _)) =
             self.workspace_bindings.iter().find(|(mount_id, binding)| {
                 **mount_id != record.mount_id

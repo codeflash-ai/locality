@@ -390,6 +390,27 @@ impl WorkspaceBindingRepository for SqliteStateStore {
         if !mount_exists {
             return Err(StoreError::MountMissing(record.mount_id));
         }
+        let existing = transaction
+            .query_row(
+                "SELECT binding_json, target_collision_key
+                 FROM workspace_bindings
+                 WHERE mount_id = ?1",
+                params![record.mount_id.0.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .map(workspace_binding_from_row)
+            .transpose()?;
+        if let Some(existing) = existing {
+            if existing == record.binding {
+                return Ok(());
+            }
+            return Err(StoreError::WorkspaceBindingTargetImmutable {
+                mount_id: record.mount_id,
+                existing_target: existing.mount_target().as_str().to_string(),
+                requested_target: record.binding.mount_target().as_str().to_string(),
+            });
+        }
         let collision_key = record.binding.collision_key();
         let collision = transaction
             .query_row(
@@ -408,10 +429,7 @@ impl WorkspaceBindingRepository for SqliteStateStore {
         }
         transaction.execute(
             "INSERT INTO workspace_bindings (mount_id, binding_json, target_collision_key)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(mount_id) DO UPDATE SET
-                binding_json = excluded.binding_json,
-                target_collision_key = excluded.target_collision_key",
+             VALUES (?1, ?2, ?3)",
             params![
                 record.mount_id.0.as_str(),
                 to_json(&record.binding)?,
@@ -2896,7 +2914,6 @@ fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
 
     if user_version >= 13 {
         ensure_state_components_safe_before_mutation(connection, user_version)?;
-        retire_removed_state_components(connection)?;
         ensure_state_components_allow_schema_migration(connection, user_version)?;
     }
 
@@ -3556,7 +3573,7 @@ fn migrate_workspace_bindings_schema_v21(
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
     if user_version >= 13 {
         ensure_state_components_safe_before_mutation(&transaction, user_version)?;
-        retire_removed_state_components(&transaction)?;
+        retire_removed_state_components_in_transaction(&transaction)?;
         ensure_state_components_allow_schema_migration(&transaction, user_version)?;
     }
 
@@ -3576,6 +3593,7 @@ fn migrate_workspace_bindings_schema_v21(
         WINDOWS_CLOUD_FILES_PROJECTION_LAYOUT_VERSION,
         MissingProjectionComponent::TreatAsV1,
     )?;
+    migrate_entity_search_component_to_v2(&transaction)?;
     create_workspace_bindings_table(&transaction)?;
     backfill_legacy_workspace_bindings(&transaction)?;
     seed_current_state_components(&transaction)?;
@@ -4817,10 +4835,22 @@ fn retire_removed_state_components(connection: &Connection) -> StoreResult<()> {
     if !table_exists(connection, "state_components")? {
         return Ok(());
     }
-    retire_notion_workspace_roots_component(connection)
+    let transaction = connection.unchecked_transaction()?;
+    retire_removed_state_components_in_transaction(&transaction)?;
+    transaction.commit()?;
+    Ok(())
 }
 
-fn retire_notion_workspace_roots_component(connection: &Connection) -> StoreResult<()> {
+fn retire_removed_state_components_in_transaction(connection: &Connection) -> StoreResult<()> {
+    if !table_exists(connection, "state_components")? {
+        return Ok(());
+    }
+    retire_notion_workspace_roots_component_in_transaction(connection)
+}
+
+fn retire_notion_workspace_roots_component_in_transaction(
+    connection: &Connection,
+) -> StoreResult<()> {
     let component = connection
         .query_row(
             "SELECT version, min_reader_version
@@ -4848,86 +4878,81 @@ fn retire_notion_workspace_roots_component(connection: &Connection) -> StoreResu
         return Ok(());
     }
 
-    let transaction = connection.unchecked_transaction()?;
     let mut changed = 0usize;
-    changed += delete_retired_notion_workspace_root_rows(&transaction, "shadows", "entity_id")?;
-    changed += delete_retired_notion_workspace_root_rows(&transaction, "entities", "remote_id")?;
+    changed += delete_retired_notion_workspace_root_rows(connection, "shadows", "entity_id")?;
+    changed += delete_retired_notion_workspace_root_rows(connection, "entities", "remote_id")?;
     changed +=
-        delete_retired_notion_workspace_root_rows(&transaction, "hydration_jobs", "remote_id")?;
+        delete_retired_notion_workspace_root_rows(connection, "hydration_jobs", "remote_id")?;
     changed +=
-        delete_retired_notion_workspace_root_rows(&transaction, "freshness_states", "remote_id")?;
-    changed += delete_retired_notion_workspace_root_rows(
-        &transaction,
-        "remote_observations",
-        "remote_id",
-    )?;
+        delete_retired_notion_workspace_root_rows(connection, "freshness_states", "remote_id")?;
+    changed +=
+        delete_retired_notion_workspace_root_rows(connection, "remote_observations", "remote_id")?;
     changed += clear_retired_notion_workspace_root_parent(
-        &transaction,
+        connection,
         "remote_observations",
         "parent_remote_id",
     )?;
     changed += clear_retired_notion_workspace_root_parent(
-        &transaction,
+        connection,
         "virtual_mutations",
         "parent_remote_id",
     )?;
     changed += rewrite_retired_notion_workspace_root_paths(
-        &transaction,
+        connection,
         "entities",
         "path",
         "AND remote_id NOT IN ('notion-root:private', 'notion-root:workspace')",
         false,
     )?;
     changed += rewrite_retired_notion_workspace_root_paths(
-        &transaction,
+        connection,
         "remote_observations",
         "projected_path",
         "",
         false,
     )?;
     changed += rewrite_retired_notion_workspace_root_paths(
-        &transaction,
+        connection,
         "hydration_jobs",
         "path",
         "",
         false,
     )?;
     changed += rewrite_retired_notion_workspace_root_paths(
-        &transaction,
+        connection,
         "virtual_mutations",
         "projected_path",
         "",
         false,
     )?;
     changed += rewrite_retired_notion_workspace_root_paths(
-        &transaction,
+        connection,
         "virtual_mutations",
         "original_path",
         "",
         false,
     )?;
     changed += rewrite_retired_notion_workspace_root_paths(
-        &transaction,
+        connection,
         "virtual_mutations",
         "content_path",
         "",
         true,
     )?;
     changed += rewrite_retired_notion_workspace_root_paths(
-        &transaction,
+        connection,
         "auto_save_enrollments",
         "path",
         "",
         false,
     )?;
-    changed += transaction.execute(
+    changed += connection.execute(
         "DELETE FROM state_components WHERE component_id = ?1",
         params![RETIRED_NOTION_WORKSPACE_ROOTS_COMPONENT_ID],
     )?;
-    if changed > 0 && table_exists(&transaction, "entities")? {
-        rebuild_entity_search_index(&transaction)?;
+    if changed > 0 && table_exists(connection, "entities")? {
+        rebuild_entity_search_index(connection)?;
     }
-    transaction.commit()?;
     Ok(())
 }
 

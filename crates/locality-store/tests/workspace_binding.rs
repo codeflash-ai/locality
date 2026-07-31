@@ -9,10 +9,12 @@ use locality_core::journal::{
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use locality_core::planner::{PushOperation, PushPlan};
 use locality_core::shadow::ShadowDocument;
+use locality_core::workspace_layout::MountTarget;
 use locality_store::{
-    EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository,
-    ProjectionMode, ShadowRepository, SqliteStateStore, StateCompatibilityIssue,
-    StateCompatibilityStatus, StoreError, WorkspaceBindingRepository, WorkspaceRebindBlocker,
+    EntityRecord, EntityRepository, EntitySearchRepository, InMemoryStateStore, JournalRepository,
+    MountConfig, MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
+    StateCompatibilityIssue, StateCompatibilityStatus, StoreError, WorkspaceBinding,
+    WorkspaceBindingRecord, WorkspaceBindingRepository, WorkspaceRebindBlocker,
 };
 use rusqlite::{Connection, params};
 
@@ -273,6 +275,23 @@ fn clean_plain_mount_still_requires_an_owning_rebind_coordinator() {
 }
 
 #[test]
+fn existing_binding_target_is_immutable_with_dirty_journal_or_projection_state() {
+    for active_state in [
+        ActiveMountState::Dirty,
+        ActiveMountState::Journal,
+        ActiveMountState::Projection,
+    ] {
+        let fixture = Fixture::new();
+        assert_existing_binding_target_is_immutable(
+            InMemoryStateStore::new(),
+            &fixture,
+            active_state,
+        );
+        assert_existing_binding_target_is_immutable(fixture.open(), &fixture, active_state);
+    }
+}
+
+#[test]
 fn v20_linux_fuse_binding_uses_post_migration_mount_point() {
     assert_legacy_virtual_binding_uses_final_mount_point(ProjectionMode::LinuxFuse);
 }
@@ -280,6 +299,62 @@ fn v20_linux_fuse_binding_uses_post_migration_mount_point() {
 #[test]
 fn v20_windows_cloud_files_binding_uses_post_migration_mount_point() {
     assert_legacy_virtual_binding_uses_final_mount_point(ProjectionMode::WindowsCloudFiles);
+}
+
+#[test]
+fn v20_entity_search_v1_rebuilds_fts_before_component_seeding() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config(ProjectionMode::PlainFiles))
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("page-search"),
+            EntityKind::Page,
+            "Stale index title",
+            "Search.md",
+        ))
+        .expect("save indexed entity");
+    let connection = Connection::open(&store.db_path).expect("raw legacy search state");
+    connection
+        .execute(
+            "UPDATE entities
+             SET title = 'Quasar migration result'
+             WHERE mount_id = ?1 AND remote_id = 'page-search'",
+            params![fixture.mount_id.0.as_str()],
+        )
+        .expect("make search index stale");
+    drop(connection);
+    assert!(
+        store
+            .list_entity_search_candidates(&fixture.mount_id, "quasar", None)
+            .expect("search stale index")
+            .expect("sqlite search")
+            .is_empty()
+    );
+    downgrade_to_v20(&store.db_path);
+    mark_entity_search_component_v1(&store.db_path);
+    drop(store);
+
+    let migrated = fixture.open();
+    let matches = migrated
+        .list_entity_search_candidates(&fixture.mount_id, "quasar", None)
+        .expect("search rebuilt index")
+        .expect("sqlite search");
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].entity.remote_id, RemoteId::new("page-search"));
+    let connection = Connection::open(&migrated.db_path).expect("raw migrated state");
+    let component_version: i64 = connection
+        .query_row(
+            "SELECT version FROM state_components
+             WHERE component_id = 'cache:entity_search'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("entity search component version");
+    assert_eq!(component_version, 2);
 }
 
 fn assert_legacy_virtual_binding_uses_final_mount_point(projection: ProjectionMode) {
@@ -425,7 +500,22 @@ fn v21_transition_rolls_back_table_roots_components_and_version_on_failure() {
     let connection = Connection::open(&store.db_path).expect("raw failpoint connection");
     connection
         .execute_batch(
-            "CREATE TRIGGER fail_workspace_binding_component
+            "INSERT INTO state_components (
+                component_id, component_kind, version, min_reader_version,
+                required, rebuildable, data_json, updated_at
+             ) VALUES (
+                'projection:notion_workspace_roots', 'projection_layout', 2, 1,
+                1, 0, '{}', 'legacy'
+             );
+             INSERT INTO entities (
+                mount_id, remote_id, kind_json, title, path, hydration_json,
+                content_hash, remote_edited_at
+             ) VALUES
+                ('notion-main', 'notion-root:workspace', '\"directory\"',
+                 'Workspace', 'Workspace', '\"virtual\"', NULL, NULL),
+                ('notion-main', 'legacy-child', '\"page\"',
+                 'Legacy child', 'Workspace/Legacy/page.md', '\"hydrated\"', NULL, NULL);
+             CREATE TRIGGER fail_workspace_binding_component
              BEFORE INSERT ON state_components
              WHEN NEW.component_id = 'durable:workspace_bindings'
              BEGIN
@@ -465,10 +555,36 @@ fn v21_transition_rolls_back_table_roots_components_and_version_on_failure() {
             |row| row.get(0),
         )
         .expect("rolled-back projection component");
+    let retired_component_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM state_components
+             WHERE component_id = 'projection:notion_workspace_roots'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("rolled-back retired component");
+    let retired_root_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM entities
+             WHERE remote_id = 'notion-root:workspace'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("rolled-back retired root");
+    let legacy_child_path: String = connection
+        .query_row(
+            "SELECT path FROM entities WHERE remote_id = 'legacy-child'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("rolled-back legacy child path");
     assert_eq!(user_version, 20);
     assert_eq!(binding_table_count, 0);
     assert_eq!(stored_root, shared_root.to_string_lossy());
     assert_eq!(projection_version, 1);
+    assert_eq!(retired_component_count, 1);
+    assert_eq!(retired_root_count, 1);
+    assert_eq!(legacy_child_path, "Workspace/Legacy/page.md");
     connection
         .execute_batch("DROP TRIGGER fail_workspace_binding_component;")
         .expect("remove failpoint");
@@ -492,6 +608,20 @@ fn v21_transition_rolls_back_table_roots_components_and_version_on_failure() {
             .as_str(),
         "notion"
     );
+    let connection = Connection::open(&restarted.db_path).expect("raw restarted state");
+    let retired_state: (i64, i64, String) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM state_components
+                 WHERE component_id = 'projection:notion_workspace_roots'),
+                (SELECT COUNT(*) FROM entities
+                 WHERE remote_id = 'notion-root:workspace'),
+                (SELECT path FROM entities WHERE remote_id = 'legacy-child')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("retired state after successful restart");
+    assert_eq!(retired_state, (0, 0, "Legacy/page.md".to_string()));
 }
 
 #[test]
@@ -605,6 +735,83 @@ fn mark_projection_component_v1(db_path: &Path, projection: &ProjectionMode) {
             params![component_id],
         )
         .expect("mark projection component v1");
+}
+
+fn mark_entity_search_component_v1(db_path: &Path) {
+    let connection = Connection::open(db_path).expect("raw entity search downgrade connection");
+    let changed = connection
+        .execute(
+            "UPDATE state_components
+             SET version = 1, min_reader_version = 1
+             WHERE component_id = 'cache:entity_search'",
+            [],
+        )
+        .expect("mark entity search component v1");
+    assert_eq!(changed, 1);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ActiveMountState {
+    Dirty,
+    Journal,
+    Projection,
+}
+
+fn assert_existing_binding_target_is_immutable<S>(
+    mut store: S,
+    fixture: &Fixture,
+    active_state: ActiveMountState,
+) where
+    S: MountRepository + WorkspaceBindingRepository + EntityRepository + JournalRepository,
+{
+    let projection = match active_state {
+        ActiveMountState::Projection => ProjectionMode::MacosFileProvider,
+        ActiveMountState::Dirty | ActiveMountState::Journal => ProjectionMode::PlainFiles,
+    };
+    store
+        .save_mount(fixture.mount_config(projection))
+        .expect("save mount");
+    match active_state {
+        ActiveMountState::Dirty => store
+            .save_entity(dirty_entity(&fixture.mount_id).with_hydration(HydrationState::Dirty))
+            .expect("save dirty entity"),
+        ActiveMountState::Journal => store
+            .append_journal(applying_journal(&fixture.mount_id))
+            .expect("save applying journal"),
+        ActiveMountState::Projection => {}
+    }
+
+    let existing = store
+        .get_workspace_binding(&fixture.mount_id)
+        .expect("read existing binding")
+        .expect("binding exists");
+    store
+        .save_workspace_binding(WorkspaceBindingRecord::new(
+            fixture.mount_id.clone(),
+            existing.clone(),
+        ))
+        .expect("exact binding replay");
+    let requested = WorkspaceBinding::new(
+        MountTarget::new(format!("moved-{active_state:?}"))
+            .expect("valid replacement mount target"),
+    );
+    assert_eq!(
+        store.save_workspace_binding(WorkspaceBindingRecord::new(
+            fixture.mount_id.clone(),
+            requested.clone(),
+        )),
+        Err(StoreError::WorkspaceBindingTargetImmutable {
+            mount_id: fixture.mount_id.clone(),
+            existing_target: existing.mount_target().as_str().to_string(),
+            requested_target: requested.mount_target().as_str().to_string(),
+        })
+    );
+    assert_eq!(
+        store
+            .get_workspace_binding(&fixture.mount_id)
+            .expect("read unchanged binding"),
+        Some(existing)
+    );
 }
 
 fn dirty_entity(mount_id: &MountId) -> EntityRecord {

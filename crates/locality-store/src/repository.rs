@@ -27,6 +27,9 @@ pub trait MountRepository {
 
 /// Durable portable placement metadata keyed by the existing mount identity.
 pub trait WorkspaceBindingRepository {
+    /// Insert binding metadata or replay the exact existing value. Changing an
+    /// existing target requires a future coordinator-owned compare-and-swap
+    /// workflow and is rejected by this metadata API.
     fn save_workspace_binding(&mut self, record: WorkspaceBindingRecord) -> StoreResult<()>;
     fn get_workspace_binding(&self, mount_id: &MountId) -> StoreResult<Option<WorkspaceBinding>>;
     fn load_workspace_bindings(&self) -> StoreResult<Vec<WorkspaceBindingRecord>>;

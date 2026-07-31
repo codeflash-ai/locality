@@ -449,6 +449,10 @@ materializers, prepare or move the destination with crash recovery, update the
 stored host root, and re-register the projection before restarting work. The
 metadata layer never silently updates `mounts.root`.
 
+Persisted binding targets are likewise immutable through the metadata API.
+Exact saves are idempotent, while changing a target is reserved for a future
+coordinator-owned compare-and-swap workflow that can prove the move completed.
+
 ## Desktop Packaging
 
 The desktop app should use the same platform layer as the CLI:
