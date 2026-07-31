@@ -110,6 +110,13 @@ import {
   type SourceConnectorId,
   type SourceSetupState,
 } from "./source-setup";
+import {
+  invokePortableWorkspace,
+  portableWorkspaceSuccessMessage,
+  validatePortableWorkspaceForm,
+  workspaceWorkflowCommand,
+  type PortableWorkspaceReport,
+} from "./portable-workspace";
 import gmailIconUrl from "./assets/connectors/gmail.svg";
 import googleCalendarIconUrl from "./assets/connectors/google-calendar.svg";
 import googleDocsIconUrl from "./assets/connectors/google-docs.svg";
@@ -131,7 +138,7 @@ type OnboardingConnectorId = SourceConnectorId;
 type ReviewFilter = "all" | "approvals" | "problems";
 type FileStatusFilter = "all" | "review" | "conflict" | "synced";
 type DestructiveSettingsAction = "reset" | "uninstall";
-type SettingsSection = "general" | "sources" | "sync" | "activity" | "agents" | "advanced" | "about";
+type SettingsSection = "general" | "sources" | "hosted" | "sync" | "activity" | "agents" | "advanced" | "about";
 type SourceListViewMode = "list" | "tiles";
 type AppTheme = "system" | "light" | "dark";
 
@@ -3108,7 +3115,7 @@ function HomeView({
   async function createMount() {
     setActionError("");
     const report = await callCommand<ActionReport>(
-      "create_workspace_mount",
+      workspaceWorkflowCommand("local"),
       { path: snapshot.mount.localPath },
       { ok: true, message: "Created demo mount." },
     );
@@ -5954,6 +5961,13 @@ function SettingsView({
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
   const [busySetting, setBusySetting] = useState("");
   const [localSettings, setLocalSettings] = useState(snapshot.settings);
+  const [portableApiUrl, setPortableApiUrl] = useState("");
+  const [portableRoot, setPortableRoot] = useState("");
+  const [portableProfileKey, setPortableProfileKey] = useState("");
+  const [portableWorkspaceState, setPortableWorkspaceState] = useState<
+    "idle" | "materializing" | "success" | "error"
+  >("idle");
+  const [portableWorkspaceMessage, setPortableWorkspaceMessage] = useState("");
   const daemonStopped = snapshot.health.state === "stopped";
   const runtimeStopped = snapshot.health.state === "runtime_stopped";
   const runtimeNeedsRepair = daemonStopped || runtimeStopped;
@@ -6131,9 +6145,51 @@ function SettingsView({
     }
   }
 
+  async function materializePortableWorkspace() {
+    if (portableWorkspaceState === "materializing") {
+      return;
+    }
+    const validation = validatePortableWorkspaceForm({
+      apiUrl: portableApiUrl,
+      root: portableRoot,
+      profileKey: portableProfileKey,
+    });
+    if (!validation.ok) {
+      setPortableWorkspaceState("error");
+      setPortableWorkspaceMessage(validation.message);
+      return;
+    }
+    setPortableWorkspaceState("materializing");
+    setPortableWorkspaceMessage("Negotiating and materializing the hosted workspace…");
+    try {
+      const fallback: PortableWorkspaceReport = {
+        ok: true,
+        root: validation.request.root,
+        session_id: "demo-session",
+        content_encoding: "identity",
+        entries: 0,
+        files: 0,
+        directories: 0,
+        materialized_bytes: 0,
+        decoded_bytes: 0,
+      };
+      const report = await invokePortableWorkspace(
+        (command, args) => callCommand<PortableWorkspaceReport>(command, args, fallback),
+        validation.request,
+      );
+      setPortableProfileKey("");
+      setPortableWorkspaceState("success");
+      setPortableWorkspaceMessage(portableWorkspaceSuccessMessage(report));
+    } catch (error) {
+      setPortableWorkspaceState("error");
+      setPortableWorkspaceMessage(errorMessage(error));
+    }
+  }
+
   const settingsSections: Array<{ id: SettingsSection; label: string; description: string }> = [
     { id: "general", label: "General", description: "Startup and desktop behavior" },
     { id: "sources", label: "Sources", description: "Connected workspaces and local folders" },
+    { id: "hosted", label: "Hosted (preview)", description: "Manual portable materializer" },
     { id: "sync", label: "Sync", description: "Live Mode and review policy" },
     { id: "activity", label: "Activity", description: "Recent events and debug queue" },
     { id: "agents", label: "Agents", description: "Local agent instructions" },
@@ -6214,6 +6270,68 @@ function SettingsView({
                   Refresh
                 </SecondaryButton>
               </div>
+            </section>
+          )}
+
+          {settingsSection === "hosted" && (
+            <section className="panel settings-section-panel portable-workspace-panel">
+              <PanelTitle title="Hosted materializer preview" />
+              <p className="quiet-note">
+                Manually materialize or recover a generation-2 workspace. This preview is not yet bound to Desktop sources, mounts, or stored credentials.
+              </p>
+              <div className="portable-workspace-fields">
+                <label className="source-inline-field">
+                  <span>Workspace API URL</span>
+                  <input
+                    type="url"
+                    value={portableApiUrl}
+                    placeholder="https://workspace.example.com"
+                    disabled={portableWorkspaceState === "materializing"}
+                    onChange={(event) => setPortableApiUrl(event.target.value)}
+                  />
+                </label>
+                <label className="source-inline-field">
+                  <span>Local workspace root</span>
+                  <input
+                    value={portableRoot}
+                    placeholder="/mnt/locality"
+                    disabled={portableWorkspaceState === "materializing"}
+                    onChange={(event) => setPortableRoot(event.target.value)}
+                  />
+                </label>
+                <label className="source-inline-field portable-workspace-key-field">
+                  <span>Workspace Profile key</span>
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    value={portableProfileKey}
+                    placeholder="64-character key"
+                    disabled={portableWorkspaceState === "materializing"}
+                    onChange={(event) => setPortableProfileKey(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        void materializePortableWorkspace();
+                      }
+                    }}
+                  />
+                </label>
+              </div>
+              <PrimaryButton
+                compact
+                icon={portableWorkspaceState === "materializing" ? <Loader2 className="spin-icon" /> : <Download />}
+                disabled={portableWorkspaceState === "materializing"}
+                onClick={() => void materializePortableWorkspace()}
+              >
+                {portableWorkspaceState === "materializing" ? "Materializing" : "Materialize Workspace"}
+              </PrimaryButton>
+              {portableWorkspaceMessage && (
+                <p
+                  className={portableWorkspaceState === "error" ? "field-error" : "quiet-note inline-note"}
+                  role={portableWorkspaceState === "error" ? "alert" : "status"}
+                >
+                  {portableWorkspaceMessage}
+                </p>
+              )}
             </section>
           )}
 

@@ -4411,6 +4411,21 @@ button.home-stat:hover {
   max-width: 720px;
 }
 
+.portable-workspace-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.portable-workspace-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.portable-workspace-key-field {
+  grid-column: 1 / -1;
+}
+
 .settings-activity-list {
   display: grid;
   gap: 8px;
