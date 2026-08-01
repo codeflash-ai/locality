@@ -36,8 +36,9 @@ use crate::repository::{
     virtual_move_content_changed, virtual_move_missing,
 };
 use crate::workspace_binding::{
-    WorkspaceBinding, WorkspaceBindingRecord, WorkspaceHostBinding, WorkspaceId,
-    WorkspaceRebindBlocker, legacy_mount_collision_key,
+    WorkspaceBinding, WorkspaceBindingRecord, WorkspaceHostBinding, WorkspaceHostBindingResolver,
+    WorkspaceId, WorkspaceRebindBlocker, legacy_mount_collision_key,
+    legacy_mount_collision_key_for_host,
 };
 
 type EntityKey = (MountId, RemoteId);
@@ -267,6 +268,13 @@ impl WorkspaceBindingRepository for InMemoryStateStore {
                 mount.root.display()
             )));
         }
+        WorkspaceHostBindingResolver::current()
+            .validate_persistent_mount_root(
+                &host_binding,
+                &mount.root,
+                record.binding.mount_target(),
+            )
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?;
 
         let existing_binding = self.workspace_bindings.get(&record.mount_id);
         let exact_replay = existing_binding == Some(&record.binding);
@@ -321,11 +329,16 @@ impl WorkspaceBindingRepository for InMemoryStateStore {
                 if *mount_id == record.mount_id {
                     return None;
                 }
-                let collision_key = self
-                    .workspace_bindings
-                    .get(mount_id)
-                    .map(WorkspaceBinding::collision_key)
-                    .or_else(|| legacy_mount_collision_key(&mount.root));
+                let collision_key = match self.workspace_bindings.get(mount_id) {
+                    Some(binding) if binding.workspace_id().is_some() => (binding.workspace_id()
+                        == Some(workspace_id))
+                    .then(|| binding.collision_key()),
+                    Some(binding) => {
+                        legacy_mount_collision_key_for_host(&host_binding, &mount.root)
+                            .filter(|key| key == &binding.collision_key())
+                    }
+                    None => legacy_mount_collision_key_for_host(&host_binding, &mount.root),
+                };
                 (collision_key.as_deref() == Some(requested_collision_key.as_str()))
                     .then(|| mount_id.clone())
             }) {
@@ -340,6 +353,21 @@ impl WorkspaceBindingRepository for InMemoryStateStore {
             .insert(workspace_id.clone(), host_binding);
         self.workspace_bindings
             .insert(record.mount_id, record.binding);
+        Ok(())
+    }
+
+    fn save_mount_with_workspace_binding(
+        &mut self,
+        mount: MountConfig,
+        host_binding: WorkspaceHostBinding,
+        record: WorkspaceBindingRecord,
+    ) -> StoreResult<()> {
+        let previous = self.clone();
+        self.save_mount(mount)?;
+        if let Err(error) = self.commit_workspace_binding(host_binding, record) {
+            *self = previous;
+            return Err(error);
+        }
         Ok(())
     }
 

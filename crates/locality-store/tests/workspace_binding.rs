@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -289,6 +291,169 @@ fn layout1_commit_rejects_a_host_root_that_would_move_the_mount() {
 }
 
 #[test]
+fn failed_atomic_remount_preserves_mount_root_and_source_state() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let original = fixture.mount_config(ProjectionMode::LinuxFuse);
+    let workspace_id = WorkspaceId::new("locality.workspace.linux_fuse").expect("workspace ID");
+    let projection_identity = WorkspaceProjectionIdentity::new("linux-fuse:locality-shared-root")
+        .expect("projection identity");
+    let host = WorkspaceHostBinding::new(
+        WorkspaceHostPlatform::current(),
+        workspace_id.clone(),
+        fixture.mount_root.parent().expect("workspace root"),
+        projection_identity.clone(),
+        1,
+    )
+    .expect("host binding");
+    let record = WorkspaceBindingRecord::new(
+        fixture.mount_id.clone(),
+        WorkspaceBinding::for_workspace(
+            workspace_id.clone(),
+            MountTarget::new("notion-main").expect("target"),
+        ),
+    );
+    store
+        .save_mount_with_workspace_binding(original.clone(), host, record.clone())
+        .expect("initial atomic mount");
+    let entity = dirty_entity(&fixture.mount_id);
+    store
+        .save_entity(entity.clone())
+        .expect("save source state");
+
+    let moved_parent = fixture.root.join("MovedLocality");
+    fs::create_dir_all(&moved_parent).expect("moved parent");
+    let requested = MountConfig::new(
+        fixture.mount_id.clone(),
+        "different-connector",
+        moved_parent.join("notion-main"),
+    )
+    .projection(ProjectionMode::LinuxFuse)
+    .with_settings_json("{\"changed\":true}");
+    let requested_host = WorkspaceHostBinding::new(
+        WorkspaceHostPlatform::current(),
+        workspace_id,
+        moved_parent,
+        projection_identity,
+        1,
+    )
+    .expect("requested host");
+
+    assert!(matches!(
+        store.save_mount_with_workspace_binding(requested, requested_host, record),
+        Err(StoreError::InvalidState(message))
+            if message.contains("immutable outside an owning coordinator")
+    ));
+    assert_eq!(
+        store
+            .get_mount(&fixture.mount_id)
+            .expect("mount after failure"),
+        Some(original)
+    );
+    assert_eq!(
+        store
+            .get_entity(&fixture.mount_id, &RemoteId::new("page-1"))
+            .expect("source state after failure"),
+        Some(entity)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_binding_rejects_mount_symlink_that_escapes_trusted_root() {
+    let fixture = Fixture::new();
+    let trusted_root = fixture.root.join("TrustedLocality");
+    let outside = fixture.root.join("Outside/notion-main");
+    fs::create_dir_all(&trusted_root).expect("trusted root");
+    fs::create_dir_all(&outside).expect("outside target");
+    let mount_root = trusted_root.join("notion-main");
+    symlink(&outside, &mount_root).expect("escaping mount symlink");
+    let workspace_id = WorkspaceId::new("locality.workspace.symlink-test").expect("workspace ID");
+    let host = WorkspaceHostBinding::new(
+        WorkspaceHostPlatform::current(),
+        workspace_id.clone(),
+        &trusted_root,
+        WorkspaceProjectionIdentity::new("linux-fuse:symlink-test").expect("projection identity"),
+        1,
+    )
+    .expect("host binding");
+    let mount_id = MountId::new("symlink-mount");
+    let mount = MountConfig::new(mount_id.clone(), "notion", &mount_root)
+        .projection(ProjectionMode::LinuxFuse);
+    let record = WorkspaceBindingRecord::new(
+        mount_id.clone(),
+        WorkspaceBinding::for_workspace(
+            workspace_id,
+            MountTarget::new("notion-main").expect("target"),
+        ),
+    );
+    let mut store = fixture.open();
+
+    assert!(matches!(
+        store.save_mount_with_workspace_binding(mount, host, record),
+        Err(StoreError::InvalidState(message)) if message.contains("escapes")
+    ));
+    assert_eq!(store.get_mount(&mount_id).expect("mount lookup"), None);
+}
+
+#[test]
+fn identical_targets_are_unique_per_workspace_not_globally() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    for (ordinal, workspace_name) in ["alpha", "beta"].into_iter().enumerate() {
+        let workspace_root = fixture.root.join(format!("Locality-{workspace_name}"));
+        fs::create_dir_all(&workspace_root).expect("workspace root");
+        let mount_id = MountId::new(format!("mount-{workspace_name}"));
+        let workspace_id =
+            WorkspaceId::new(format!("locality.workspace.{workspace_name}")).expect("workspace");
+        let host = WorkspaceHostBinding::new(
+            WorkspaceHostPlatform::current(),
+            workspace_id.clone(),
+            &workspace_root,
+            WorkspaceProjectionIdentity::new(format!("linux-fuse:{workspace_name}"))
+                .expect("projection identity"),
+            1,
+        )
+        .expect("host binding");
+        let mount = MountConfig::new(
+            mount_id.clone(),
+            "notion",
+            workspace_root.join("shared-target"),
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let record = WorkspaceBindingRecord::new(
+            mount_id,
+            WorkspaceBinding::for_workspace(
+                workspace_id,
+                MountTarget::new("shared-target").expect("target"),
+            ),
+        );
+        store
+            .save_mount_with_workspace_binding(mount, host, record)
+            .unwrap_or_else(|error| panic!("workspace {ordinal} commit: {error}"));
+    }
+
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    let scopes: Vec<String> = connection
+        .prepare(
+            "SELECT workspace_id FROM workspace_bindings
+             WHERE target_collision_key = 'shared-target' ORDER BY workspace_id",
+        )
+        .expect("prepare scopes")
+        .query_map([], |row| row.get(0))
+        .expect("query scopes")
+        .collect::<Result<_, _>>()
+        .expect("collect scopes");
+    assert_eq!(
+        scopes,
+        vec![
+            "locality.workspace.alpha".to_string(),
+            "locality.workspace.beta".to_string(),
+        ]
+    );
+}
+
+#[test]
 fn current_v2_component_migration_preserves_existing_v1_sqlite_binding() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
@@ -333,6 +498,76 @@ fn current_v2_component_migration_preserves_existing_v1_sqlite_binding() {
         )
         .expect("component version");
     assert_eq!(component_version, 3);
+}
+
+#[test]
+fn workspace_component_upgrade_preflights_global_compatibility_before_schema_mutation() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    connection
+        .execute_batch(
+            "DROP TABLE workspace_bindings;
+             DROP TABLE workspace_host_bindings;
+             CREATE TABLE workspace_bindings (
+                 mount_id TEXT PRIMARY KEY,
+                 binding_json TEXT NOT NULL,
+                 target_collision_key TEXT NOT NULL UNIQUE,
+                 FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+             );
+             UPDATE state_components
+             SET version = 2, min_reader_version = 2
+             WHERE component_id = 'durable:workspace_bindings';
+             INSERT INTO state_components (
+                 component_id, component_kind, version, min_reader_version,
+                 required, rebuildable, data_json, updated_at
+             ) VALUES (
+                 'future:incompatible', 'durable_json', 1, 99,
+                 1, 0, '{}', '2026-08-02T00:00:00Z'
+             );",
+        )
+        .expect("prepare incompatible component fixture");
+    drop(connection);
+    let db_path = store.db_path.clone();
+    drop(store);
+
+    assert!(matches!(
+        SqliteStateStore::open(fixture.state_root.clone()),
+        Err(StoreError::StateCompatibility(message))
+            if message.contains("future:incompatible")
+    ));
+    let connection = Connection::open(db_path).expect("raw failed-upgrade connection");
+    let host_table_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'workspace_host_bindings'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("host table existence");
+    let workspace_column_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('workspace_bindings')
+                WHERE name = 'workspace_id'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("workspace column existence");
+    let component_version: i64 = connection
+        .query_row(
+            "SELECT version FROM state_components
+             WHERE component_id = 'durable:workspace_bindings'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("workspace component version");
+    assert!(!host_table_exists);
+    assert!(!workspace_column_exists);
+    assert_eq!(component_version, 2);
 }
 
 #[test]

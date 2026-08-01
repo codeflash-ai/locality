@@ -51,6 +51,25 @@ pub trait WorkspaceBindingRepository {
         ))
     }
 
+    /// Atomically save a mount and its accepted layout-1 binding. Production
+    /// stores override this so a failed binding preflight cannot change the
+    /// mount row or clear source-scoped state.
+    fn save_mount_with_workspace_binding(
+        &mut self,
+        _mount: MountConfig,
+        _host_binding: WorkspaceHostBinding,
+        _record: WorkspaceBindingRecord,
+    ) -> StoreResult<()>
+    where
+        Self: MountRepository,
+    {
+        // A compatibility fallback cannot emulate this with two writes: either
+        // order can expose partial state if the second operation fails.
+        Err(StoreError::NotImplemented(
+            "atomic portable workspace mount persistence",
+        ))
+    }
+
     fn get_workspace_host_binding(
         &self,
         _workspace_id: &WorkspaceId,

@@ -120,7 +120,6 @@ where
         mount = mount.with_connection_id(connection_id);
     }
 
-    store.save_mount(mount.clone()).map_err(MountError::Store)?;
     if mount.projection.uses_virtual_filesystem() {
         // The virtual projection root is an explicit coordinator-owned host
         // binding, validated above. Generic stores must never infer this trust
@@ -163,9 +162,15 @@ where
             (plan.host_binding(), plan.layout1_bindings().first())
         {
             store
-                .commit_workspace_binding(host_binding.clone(), binding.clone())
+                .save_mount_with_workspace_binding(
+                    mount.clone(),
+                    host_binding.clone(),
+                    binding.clone(),
+                )
                 .map_err(MountError::Store)?;
         }
+    } else {
+        store.save_mount(mount.clone()).map_err(MountError::Store)?;
     }
 
     Ok(MountReport {

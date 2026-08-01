@@ -544,10 +544,12 @@ impl WorkspaceBindingMigrationPlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkspaceHostBindingError {
     InvalidTrustedWorkspaceRoot,
+    InvalidBoundMountRoot,
     InvalidPublicationRoot,
     InvalidActiveMountRoot { mount_id: MountId },
     HostPathInspection { path: PathBuf, detail: String },
     PublicationOverlapsActiveMount { mount_id: MountId },
+    BoundMountEscapesTrustedWorkspaceRoot,
 }
 
 impl Display for WorkspaceHostBindingError {
@@ -555,6 +557,9 @@ impl Display for WorkspaceHostBindingError {
         match self {
             Self::InvalidTrustedWorkspaceRoot => formatter.write_str(
                 "trusted workspace root must be an absolute host path without parent traversal",
+            ),
+            Self::InvalidBoundMountRoot => formatter.write_str(
+                "bound mount root must be the target's direct child of its trusted workspace root",
             ),
             Self::InvalidPublicationRoot => formatter.write_str(
                 "sandbox publication root must be an absolute host path without parent traversal",
@@ -573,6 +578,9 @@ impl Display for WorkspaceHostBindingError {
                 formatter,
                 "sandbox publication root overlaps active mount `{}`",
                 mount_id.as_str()
+            ),
+            Self::BoundMountEscapesTrustedWorkspaceRoot => formatter.write_str(
+                "bound mount root escapes its trusted workspace root through a filesystem alias",
             ),
         }
     }
@@ -619,6 +627,64 @@ impl WorkspaceHostBindingResolver {
             .ok_or(WorkspaceHostBindingError::InvalidTrustedWorkspaceRoot)?;
         let trusted_workspace_root = host_binding.trusted_workspace_root().to_path_buf();
         self.plan_migration(&trusted_workspace_root, Some(host_binding), mounts)
+    }
+
+    /// Revalidate one persistent mount binding at the commit boundary.
+    ///
+    /// The lexical check is platform-table-testable. On the running host the
+    /// resolver additionally canonicalizes existing symlinks, junctions, and
+    /// reparse points (while preserving a missing tail) and requires the
+    /// canonical mount to remain the same named direct child of the canonical
+    /// trusted root.
+    pub fn validate_persistent_mount_root(
+        &self,
+        host_binding: &WorkspaceHostBinding,
+        mount_root: &Path,
+        mount_target: &MountTarget,
+    ) -> Result<(), WorkspaceHostBindingError> {
+        let trusted = ParsedHostPath::parse(self.platform, host_binding.trusted_workspace_root())
+            .ok_or(WorkspaceHostBindingError::InvalidTrustedWorkspaceRoot)?;
+        let mount = ParsedHostPath::parse(self.platform, mount_root)
+            .ok_or(WorkspaceHostBindingError::InvalidBoundMountRoot)?;
+        let Some(component) = mount.direct_child_of(self.platform, &trusted) else {
+            return Err(WorkspaceHostBindingError::InvalidBoundMountRoot);
+        };
+        if !path_token_eq(self.platform, component, mount_target.as_str()) {
+            return Err(WorkspaceHostBindingError::InvalidBoundMountRoot);
+        }
+
+        if self.platform != WorkspaceHostPlatform::current() {
+            return Ok(());
+        }
+        let trusted_aliases = HostFilesystemAliases::inspect(host_binding.trusted_workspace_root())
+            .map_err(|source| WorkspaceHostBindingError::HostPathInspection {
+                path: host_binding.trusted_workspace_root().to_path_buf(),
+                detail: source.to_string(),
+            })?;
+        let mount_aliases = HostFilesystemAliases::inspect(mount_root).map_err(|source| {
+            WorkspaceHostBindingError::HostPathInspection {
+                path: mount_root.to_path_buf(),
+                detail: source.to_string(),
+            }
+        })?;
+        let Some(canonical_trusted) =
+            ParsedHostPath::parse(self.platform, &trusted_aliases.canonical)
+        else {
+            return Err(WorkspaceHostBindingError::InvalidTrustedWorkspaceRoot);
+        };
+        let Some(canonical_mount) = ParsedHostPath::parse(self.platform, &mount_aliases.canonical)
+        else {
+            return Err(WorkspaceHostBindingError::InvalidBoundMountRoot);
+        };
+        let Some(canonical_component) =
+            canonical_mount.direct_child_of(self.platform, &canonical_trusted)
+        else {
+            return Err(WorkspaceHostBindingError::BoundMountEscapesTrustedWorkspaceRoot);
+        };
+        if !path_token_eq(self.platform, canonical_component, mount_target.as_str()) {
+            return Err(WorkspaceHostBindingError::BoundMountEscapesTrustedWorkspaceRoot);
+        }
+        Ok(())
     }
 
     fn plan_migration(
@@ -1007,6 +1073,19 @@ pub(crate) fn legacy_mount_collision_key(root: &Path) -> Option<String> {
         .map(|target| target.collision_key())
 }
 
+pub(crate) fn legacy_mount_collision_key_for_host(
+    host_binding: &WorkspaceHostBinding,
+    root: &Path,
+) -> Option<String> {
+    let target = root.file_name()?.to_str()?;
+    let normalized = target.chars().nfc().collect::<String>();
+    let target = MountTarget::new(normalized).ok()?;
+    WorkspaceHostBindingResolver::current()
+        .validate_persistent_mount_root(host_binding, root, &target)
+        .ok()?;
+    Some(target.collision_key())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1097,6 +1176,44 @@ mod tests {
         assert_eq!(
             binding.projected_path(Path::new("/home/alice/Locality"), &logical),
             Path::new("/home/alice/Locality/notion-main/Engineering/Roadmap/page.md")
+        );
+    }
+
+    #[test]
+    fn persistent_mount_validation_has_windows_safe_lexical_contract() {
+        let workspace_id = WorkspaceId::new("locality.workspace.windows").expect("workspace");
+        let host = WorkspaceHostBinding::new(
+            WorkspaceHostPlatform::Windows,
+            workspace_id,
+            r"C:\Locality",
+            WorkspaceProjectionIdentity::new(
+                "windows-cloud-files:codeflash.ai.loc!default!locality",
+            )
+            .expect("projection identity"),
+            1,
+        )
+        .expect("host binding");
+        let target = MountTarget::new("notion-main").expect("target");
+        let resolver = WorkspaceHostBindingResolver::new(WorkspaceHostPlatform::Windows);
+
+        resolver
+            .validate_persistent_mount_root(&host, Path::new(r"c:\LOCALITY\Notion-Main"), &target)
+            .expect("Windows spelling resolves to the same direct child");
+        assert_eq!(
+            resolver.validate_persistent_mount_root(
+                &host,
+                Path::new(r"C:\Locality\notion-main\..\outside"),
+                &target,
+            ),
+            Err(super::WorkspaceHostBindingError::InvalidBoundMountRoot)
+        );
+        assert_eq!(
+            resolver.validate_persistent_mount_root(
+                &host,
+                Path::new(r"C:\Locality\other"),
+                &target,
+            ),
+            Err(super::WorkspaceHostBindingError::InvalidBoundMountRoot)
         );
     }
 

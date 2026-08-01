@@ -450,7 +450,7 @@ shadows: mount_id, entity_id, frontmatter, body_hash, rendered_body, blocks_json
 state_components: component_id, component_kind, version, min_reader_version, required, rebuildable, data_json, updated_at
 state_migrations: migration_id, from_schema_version, to_schema_version, app_version, app_build_id, daemon_build_id, started_at, finished_at, status, error_json
 virtual_mutations: mount_id, local_id, mutation_kind_json, target_remote_id, parent_remote_id, original_path, projected_path, title, content_path, created_at, updated_at
-workspace_bindings: mount_id, binding_json, target_collision_key
+workspace_bindings: mount_id, workspace_id, binding_json, target_collision_key
 workspace_host_bindings: workspace_id, binding_json"
     );
 }

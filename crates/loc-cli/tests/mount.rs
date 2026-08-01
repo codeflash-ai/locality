@@ -310,6 +310,39 @@ fn cli_resolves_the_canonical_path_from_the_persisted_workspace_binding() {
 }
 
 #[test]
+fn failed_cli_virtual_remount_keeps_the_persisted_mount_unchanged() {
+    let fixture = MountFixture::new("loc-cli-atomic-workspace-remount");
+    let original_root = fixture.root.join("Locality/notion-main");
+    let moved_root = fixture.root.join("MovedLocality/notion-main");
+    let mount_id = MountId::new("notion-main");
+    let mut store = InMemoryStateStore::new();
+    let options = |root: PathBuf, connector: &str| MountOptions {
+        mount_id: mount_id.clone(),
+        connector: connector.to_string(),
+        root,
+        remote_root_id: None,
+        connection_id: None,
+        read_only: false,
+        projection: ProjectionMode::LinuxFuse,
+        settings_json: "{}".to_string(),
+    };
+
+    run_mount(&mut store, options(original_root.clone(), "notion")).expect("initial virtual mount");
+    let original = store
+        .get_mount(&mount_id)
+        .expect("load initial mount")
+        .expect("initial mount exists");
+
+    run_mount(&mut store, options(moved_root, "different-connector"))
+        .expect_err("trusted workspace root is immutable");
+
+    assert_eq!(
+        store.get_mount(&mount_id).expect("mount after failure"),
+        Some(original)
+    );
+}
+
+#[test]
 fn virtual_mount_rejects_direct_home_child_mount_point() {
     let Some(home) = std::env::var_os("HOME") else {
         return;
