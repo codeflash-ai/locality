@@ -243,15 +243,27 @@ fn source_descriptors_match_manifest_defaults_and_projection_policy() {
 
 #[test]
 fn read_only_manifests_reject_host_write_create_and_move_paths() {
-    let registry = bundled_connector_registry().expect("manifest registry");
-    for id in ["granola", "slack"] {
-        let manifest = registry.connector(id).expect("manifest");
-        assert!(manifest.mount.read_only);
+    for contract in registered_source_contracts().expect("registered source contracts") {
+        let manifest = contract.manifest;
+        assert_eq!(
+            contract.content_read_only_reason.is_some(),
+            manifest.mount.read_only,
+            "code-owned host policy drifted for {}",
+            manifest.id
+        );
+        if !manifest.mount.read_only {
+            continue;
+        }
+
         assert!(manifest.push_operations.is_empty());
-        let mut mount = MountConfig::new(MountId::new(format!("{id}-main")), id, "/tmp/source");
+        let mut mount = MountConfig::new(
+            MountId::new(format!("{}-conformance", manifest.id)),
+            &manifest.id,
+            "/tmp/source",
+        );
         mount.read_only = false;
         check_read_only_rejection(
-            manifest,
+            &manifest,
             [
                 source_write_decision_for_path(&mount, Path::new("item/page.md")).is_writable(),
                 source_create_decision_for_parent_path(&mount, Path::new("item")).is_writable(),
@@ -259,18 +271,6 @@ fn read_only_manifests_reject_host_write_create_and_move_paths() {
             ],
         )
         .expect("read-only host rejection");
-    }
-
-    for id in [
-        "notion",
-        "google-docs",
-        "google-calendar",
-        "gmail",
-        "linear",
-    ] {
-        let manifest = registry.connector(id).expect("manifest");
-        assert!(!manifest.mount.read_only);
-        assert!(!manifest.push_operations.is_empty());
     }
 }
 

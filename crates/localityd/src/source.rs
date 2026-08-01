@@ -98,6 +98,7 @@ type SourceValidationFn = fn(SourceValidationContext<'_>) -> LocalityResult<Vali
 #[derive(Clone, Copy)]
 struct SourceRegistration {
     manifest_id: &'static str,
+    content_read_only_reason: Option<&'static str>,
     descriptor: fn() -> SourceDescriptor,
     resolve: SourceResolver,
     validate_changed_frontmatter: SourceValidationFn,
@@ -107,6 +108,7 @@ struct SourceRegistration {
 const SOURCE_REGISTRY: &[SourceRegistration] = &[
     SourceRegistration {
         manifest_id: "notion",
+        content_read_only_reason: None,
         descriptor: notion_source_descriptor,
         resolve: resolve_notion_source,
         validate_changed_frontmatter: crate::notion::validate_notion_changed_frontmatter,
@@ -114,6 +116,7 @@ const SOURCE_REGISTRY: &[SourceRegistration] = &[
     },
     SourceRegistration {
         manifest_id: GOOGLE_DOCS_CONNECTOR_ID,
+        content_read_only_reason: None,
         descriptor: google_docs_source_descriptor,
         resolve: resolve_google_docs_source,
         validate_changed_frontmatter: crate::google_docs::validate_google_docs_frontmatter,
@@ -121,6 +124,7 @@ const SOURCE_REGISTRY: &[SourceRegistration] = &[
     },
     SourceRegistration {
         manifest_id: GOOGLE_CALENDAR_CONNECTOR_ID,
+        content_read_only_reason: None,
         descriptor: google_calendar_source_descriptor,
         resolve: resolve_google_calendar_source,
         validate_changed_frontmatter:
@@ -130,6 +134,7 @@ const SOURCE_REGISTRY: &[SourceRegistration] = &[
     },
     SourceRegistration {
         manifest_id: GMAIL_CONNECTOR_ID,
+        content_read_only_reason: None,
         descriptor: gmail_source_descriptor,
         resolve: resolve_gmail_source,
         validate_changed_frontmatter: crate::gmail::validate_gmail_changed_frontmatter,
@@ -137,6 +142,7 @@ const SOURCE_REGISTRY: &[SourceRegistration] = &[
     },
     SourceRegistration {
         manifest_id: GRANOLA_CONNECTOR_ID,
+        content_read_only_reason: Some("Granola meetings are read-only"),
         descriptor: granola_source_descriptor,
         resolve: resolve_granola_source,
         validate_changed_frontmatter: crate::granola::validate_granola_frontmatter,
@@ -144,6 +150,7 @@ const SOURCE_REGISTRY: &[SourceRegistration] = &[
     },
     SourceRegistration {
         manifest_id: LINEAR_CONNECTOR_ID,
+        content_read_only_reason: None,
         descriptor: linear_source_descriptor,
         resolve: resolve_linear_source,
         validate_changed_frontmatter: crate::linear::validate_linear_frontmatter,
@@ -151,6 +158,7 @@ const SOURCE_REGISTRY: &[SourceRegistration] = &[
     },
     SourceRegistration {
         manifest_id: SLACK_CONNECTOR_ID,
+        content_read_only_reason: Some("Slack conversations are read-only"),
         descriptor: slack_source_descriptor,
         resolve: resolve_slack_source,
         validate_changed_frontmatter: crate::slack::validate_slack_frontmatter,
@@ -286,21 +294,14 @@ pub fn source_write_decision_for_path(
             reason: "mount is read-only",
         };
     }
+    if let Some(decision) = registered_content_read_only_decision(&mount.connector) {
+        return decision;
+    }
     if mount.connector == "gmail" {
         return gmail_write_decision_for_path(relative_path);
     }
     if mount.connector == GOOGLE_CALENDAR_CONNECTOR_ID {
         return google_calendar_write_decision_for_path(relative_path);
-    }
-    if mount.connector == GRANOLA_CONNECTOR_ID {
-        return SourceWriteDecision::ReadOnly {
-            reason: "Granola meetings are read-only",
-        };
-    }
-    if mount.connector == SLACK_CONNECTOR_ID {
-        return SourceWriteDecision::ReadOnly {
-            reason: "Slack conversations are read-only",
-        };
     }
     if mount.connector == LINEAR_CONNECTOR_ID {
         return linear_write_decision_for_path(relative_path);
@@ -316,6 +317,9 @@ pub fn source_create_decision_for_parent_path(
         return SourceWriteDecision::ReadOnly {
             reason: "mount is read-only",
         };
+    }
+    if let Some(decision) = registered_content_read_only_decision(&mount.connector) {
+        return decision;
     }
     if mount.connector == "gmail" {
         return if parent_path == Path::new("draft") {
@@ -335,16 +339,6 @@ pub fn source_create_decision_for_parent_path(
             }
         };
     }
-    if mount.connector == GRANOLA_CONNECTOR_ID {
-        return SourceWriteDecision::ReadOnly {
-            reason: "Granola meetings are read-only",
-        };
-    }
-    if mount.connector == SLACK_CONNECTOR_ID {
-        return SourceWriteDecision::ReadOnly {
-            reason: "Slack conversations are read-only",
-        };
-    }
     if mount.connector == LINEAR_CONNECTOR_ID {
         return SourceWriteDecision::ReadOnly {
             reason: "Linear issue creates are not supported yet",
@@ -362,6 +356,9 @@ pub fn source_move_decision_for_parent_path(
             reason: "mount is read-only",
         };
     }
+    if let Some(decision) = registered_content_read_only_decision(&mount.connector) {
+        return decision;
+    }
     if mount.connector == "gmail" {
         return if parent_path == Path::new("draft") {
             SourceWriteDecision::Writable
@@ -369,16 +366,6 @@ pub fn source_move_decision_for_parent_path(
             SourceWriteDecision::ReadOnly {
                 reason: "Gmail moves are only supported directly inside draft/",
             }
-        };
-    }
-    if mount.connector == GRANOLA_CONNECTOR_ID {
-        return SourceWriteDecision::ReadOnly {
-            reason: "Granola meetings are read-only",
-        };
-    }
-    if mount.connector == SLACK_CONNECTOR_ID {
-        return SourceWriteDecision::ReadOnly {
-            reason: "Slack conversations are read-only",
         };
     }
     if mount.connector == LINEAR_CONNECTOR_ID {
@@ -399,6 +386,7 @@ pub fn supported_source_connectors() -> Vec<&'static str> {
 pub struct RegisteredSourceContract {
     pub manifest: &'static ConnectorManifest,
     pub descriptor: SourceDescriptor,
+    pub content_read_only_reason: Option<&'static str>,
 }
 
 pub fn registered_source_contracts() -> Result<Vec<RegisteredSourceContract>, ManifestError> {
@@ -422,6 +410,7 @@ pub fn registered_source_contracts() -> Result<Vec<RegisteredSourceContract>, Ma
             Ok(RegisteredSourceContract {
                 manifest,
                 descriptor: (registration.descriptor)(),
+                content_read_only_reason: registration.content_read_only_reason,
             })
         })
         .collect()
@@ -431,6 +420,12 @@ fn source_registration(connector: &str) -> Option<&'static SourceRegistration> {
     SOURCE_REGISTRY
         .iter()
         .find(|registration| registration.manifest_id == connector)
+}
+
+fn registered_content_read_only_decision(connector: &str) -> Option<SourceWriteDecision> {
+    source_registration(connector)
+        .and_then(|registration| registration.content_read_only_reason)
+        .map(|reason| SourceWriteDecision::ReadOnly { reason })
 }
 
 fn notion_source_descriptor() -> SourceDescriptor {
