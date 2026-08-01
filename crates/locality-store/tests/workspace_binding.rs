@@ -56,11 +56,12 @@ fn legacy_v20_upgrade_preserves_dirty_shadow_apply_journal_and_mount_identity() 
     );
 
     let reopened = fixture.open();
-    let binding = reopened
-        .get_workspace_binding(&fixture.mount_id)
-        .expect("read migrated binding")
-        .expect("binding");
-    assert_eq!(binding.mount_target().as_str(), "notion-main");
+    assert_eq!(
+        reopened
+            .get_workspace_binding(&fixture.mount_id)
+            .expect("read layout zero binding"),
+        None
+    );
     assert_eq!(
         reopened
             .get_mount(&fixture.mount_id)
@@ -101,18 +102,14 @@ fn legacy_v20_upgrade_preserves_dirty_shadow_apply_journal_and_mount_identity() 
         .expect("old mounts reader remains valid");
     assert_eq!(legacy_row.0, fixture.mount_id.0);
     assert_eq!(legacy_row.1, fixture.mount_root.to_string_lossy());
-    let binding_json: String = raw
+    let binding_count: i64 = raw
         .query_row(
-            "SELECT binding_json FROM workspace_bindings WHERE mount_id = ?1",
+            "SELECT COUNT(*) FROM workspace_bindings WHERE mount_id = ?1",
             params![fixture.mount_id.0.as_str()],
             |row| row.get(0),
         )
-        .expect("binding json");
-    assert_eq!(
-        binding_json,
-        r#"{"binding_version":1,"layout_version":1,"mount_target":"notion-main"}"#
-    );
-    assert!(!binding_json.contains(fixture.root.to_string_lossy().as_ref()));
+        .expect("binding count");
+    assert_eq!(binding_count, 0);
 }
 
 #[test]
@@ -379,12 +376,13 @@ fn assert_legacy_virtual_binding_uses_final_mount_point(projection: ProjectionMo
         .get_mount(&fixture.mount_id)
         .expect("mount")
         .expect("mount exists");
-    let binding = migrated
-        .get_workspace_binding(&fixture.mount_id)
-        .expect("binding")
-        .expect("binding exists");
     assert_eq!(mount.root, shared_root.join("notion"));
-    assert_eq!(binding.mount_target().as_str(), "notion");
+    assert_eq!(
+        migrated
+            .get_workspace_binding(&fixture.mount_id)
+            .expect("layout zero binding"),
+        None
+    );
 }
 
 #[test]
@@ -517,6 +515,59 @@ fn save_mount_atomically_creates_binding_or_rolls_back_mount() {
 }
 
 #[test]
+fn workspace_binding_collision_includes_unbound_layout_zero_mounts() {
+    assert_layout_zero_collision_is_reserved(InMemoryStateStore::default());
+
+    let fixture = Fixture::new();
+    assert_layout_zero_collision_is_reserved(fixture.open());
+}
+
+fn assert_layout_zero_collision_is_reserved<S>(mut store: S)
+where
+    S: MountRepository + WorkspaceBindingRepository,
+{
+    let bound = MountId::new("bound");
+    let layout_zero = MountId::new("layout-zero");
+    let candidate = MountId::new("candidate");
+    store
+        .save_mount(MountConfig::new(
+            bound,
+            "notion",
+            "/tmp/workspace-one/Alpha",
+        ))
+        .expect("save bound mount");
+    store
+        .save_mount(MountConfig::new(
+            layout_zero.clone(),
+            "notion",
+            "/tmp/workspace-two/Beta",
+        ))
+        .expect("save layout zero mount");
+    store
+        .save_mount(MountConfig::new(
+            candidate.clone(),
+            "notion",
+            "/tmp/workspace-three/Gamma",
+        ))
+        .expect("save candidate mount");
+    assert_eq!(
+        store
+            .get_workspace_binding(&layout_zero)
+            .expect("layout zero lookup"),
+        None
+    );
+
+    let binding = WorkspaceBinding::new(MountTarget::new("BETA").expect("target"));
+    assert_eq!(
+        store.save_workspace_binding(WorkspaceBindingRecord::new(candidate, binding)),
+        Err(StoreError::WorkspaceMountTargetCollision {
+            target: "BETA".to_string(),
+            existing_mount_id: layout_zero,
+        })
+    );
+}
+
+#[test]
 fn current_schema_open_rejects_missing_non_rebuildable_binding_component() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
@@ -550,6 +601,81 @@ fn current_schema_open_rejects_missing_non_rebuildable_binding_component() {
         )
         .expect("component count");
     assert_eq!(component_count, 0, "component must not be repaired");
+}
+
+#[test]
+fn mount_root_inspection_reads_legacy_schema_without_migrating_it() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config(ProjectionMode::PlainFiles))
+        .expect("save mount");
+    downgrade_to_v20(&store.db_path);
+    drop(store);
+
+    let mounts = SqliteStateStore::inspect_mount_roots_read_only(&fixture.state_root)
+        .expect("inspect legacy roots");
+    assert_eq!(
+        mounts,
+        vec![LegacyWorkspaceMount::new(
+            fixture.mount_id.clone(),
+            fixture.mount_root.clone(),
+        )]
+    );
+    let connection =
+        Connection::open(fixture.state_root.join("state.sqlite3")).expect("reopen legacy state");
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("legacy version");
+    let binding_table: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'workspace_bindings'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("binding table count");
+    assert_eq!((user_version, binding_table), (20, 0));
+}
+
+#[test]
+fn mount_root_inspection_does_not_initialize_unrelated_sqlite() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(&fixture.state_root).expect("create state root");
+    let db_path = fixture.state_root.join("state.sqlite3");
+    let connection = Connection::open(&db_path).expect("create unrelated sqlite");
+    connection
+        .execute_batch(
+            "CREATE TABLE sentinel (value TEXT NOT NULL);
+             INSERT INTO sentinel (value) VALUES ('unchanged');
+             PRAGMA user_version = 7;",
+        )
+        .expect("seed unrelated sqlite");
+    drop(connection);
+
+    assert!(matches!(
+        SqliteStateStore::inspect_mount_roots_read_only(&fixture.state_root),
+        Err(StoreError::StateCompatibility(message)) if message.contains("mounts table")
+    ));
+    let connection = Connection::open(db_path).expect("reopen unrelated sqlite");
+    let sentinel: String = connection
+        .query_row("SELECT value FROM sentinel", [], |row| row.get(0))
+        .expect("sentinel");
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("unrelated version");
+    let locality_tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name IN ('mounts', 'workspace_bindings', 'state_components')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("Locality table count");
+    assert_eq!(
+        (sentinel.as_str(), user_version, locality_tables),
+        ("unchanged", 7, 0)
+    );
 }
 
 #[test]
@@ -719,11 +845,8 @@ fn workspace_binding_transition_rolls_back_roots_components_and_version_on_failu
     assert_eq!(
         restarted
             .get_workspace_binding(&fixture.mount_id)
-            .expect("binding")
-            .expect("binding exists")
-            .mount_target()
-            .as_str(),
-        "notion"
+            .expect("layout zero binding"),
+        None
     );
     let connection = Connection::open(&restarted.db_path).expect("raw restarted state");
     let retired_state: (i64, i64, String) = connection
@@ -1016,6 +1139,65 @@ fn sandbox_publication_is_whole_root_and_rejects_platform_overlap() {
             .resolve_ephemeral_publication_root(requested, &[])
             .expect("ephemeral whole root"),
         requested
+    );
+
+    let windows = WorkspaceHostBindingResolver::new(WorkspaceHostPlatform::Windows);
+    let active = [LegacyWorkspaceMount::new(
+        MountId::new("notion"),
+        r"C:\Users\Ada\Locality\notion",
+    )];
+    for alias in [
+        r"\\?\C:\Users\Ada\Locality\notion\sandbox",
+        r"C:\Users\Ada\Locality\notion.\sandbox",
+    ] {
+        assert_eq!(
+            windows.resolve_ephemeral_publication_root(Path::new(alias), &active),
+            Err(WorkspaceHostBindingError::PublicationOverlapsActiveMount {
+                mount_id: MountId::new("notion"),
+            }),
+            "Windows alias {alias}"
+        );
+    }
+
+    let unc_active = [LegacyWorkspaceMount::new(
+        MountId::new("unc"),
+        r"\\server\share\Locality\notion",
+    )];
+    assert_eq!(
+        windows.resolve_ephemeral_publication_root(
+            Path::new(r"\\?\unc\SERVER\SHARE\Locality\notion\sandbox"),
+            &unc_active,
+        ),
+        Err(WorkspaceHostBindingError::PublicationOverlapsActiveMount {
+            mount_id: MountId::new("unc"),
+        })
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sandbox_publication_rejects_symlink_alias_of_active_mount() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    let real_parent = fixture.root.join("real");
+    let active_root = real_parent.join("notion");
+    let alias_parent = fixture.root.join("alias");
+    fs::create_dir_all(&active_root).expect("create active root");
+    symlink(&real_parent, &alias_parent).expect("create parent alias");
+
+    let active = [LegacyWorkspaceMount::new(
+        MountId::new("notion"),
+        &active_root,
+    )];
+    assert_eq!(
+        WorkspaceHostBindingResolver::current().resolve_ephemeral_publication_root_on_current_host(
+            &alias_parent.join("notion/sandbox"),
+            &active,
+        ),
+        Err(WorkspaceHostBindingError::PublicationOverlapsActiveMount {
+            mount_id: MountId::new("notion"),
+        })
     );
 }
 

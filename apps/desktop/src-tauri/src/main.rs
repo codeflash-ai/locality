@@ -49,7 +49,7 @@ use loc_cli::push::{
 use loc_cli::restore::{RestoreOptions, run_restore};
 use loc_cli::sandbox::{
     SandboxContentEncodingPreference, SandboxInitOptions, SandboxInitReport, SandboxProfileKey,
-    resolve_sandbox_init_options_at_state_root, run_sandbox_init_with_profile_key,
+    resolve_sandbox_init_options_at_state_root, run_sandbox_init_with_profile_key_at_state_root,
     validate_sandbox_api_url,
 };
 use loc_cli::search::{
@@ -1446,10 +1446,13 @@ async fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
 async fn materialize_portable_workspace(
     request: PortableWorkspaceMaterializationRequest,
 ) -> Result<SandboxInitReport, String> {
-    let (options, profile_key) = portable_workspace_options(request)?;
     tauri::async_runtime::spawn_blocking(move || {
-        run_sandbox_init_with_profile_key(
+        let state_root = default_state_root();
+        let (options, profile_key) =
+            portable_workspace_options_at_state_root(request, &state_root)?;
+        run_sandbox_init_with_profile_key_at_state_root(
             options,
+            &state_root,
             profile_key,
             SandboxContentEncodingPreference::Automatic,
         )
@@ -1459,6 +1462,7 @@ async fn materialize_portable_workspace(
     .map_err(|error| format!("Portable workspace worker failed: {error}"))?
 }
 
+#[cfg(test)]
 fn portable_workspace_options(
     request: PortableWorkspaceMaterializationRequest,
 ) -> Result<(SandboxInitOptions, SandboxProfileKey), String> {

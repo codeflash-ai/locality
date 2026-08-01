@@ -66,7 +66,7 @@ use crate::repository::{
 };
 use crate::workspace_binding::{
     LegacyWorkspaceMount, WorkspaceBinding, WorkspaceBindingRecord, WorkspaceRebindBlocker,
-    plan_legacy_migration_from_common_parent,
+    legacy_mount_collision_key, plan_legacy_migration_from_common_parent,
 };
 use locality_protocol::freshness_delivery_transport::GenerationTransportCapabilities;
 
@@ -257,6 +257,34 @@ impl SqliteStateStore {
 
     pub fn inspect_compatibility(root: PathBuf) -> StoreResult<StateCompatibilityReport> {
         inspect_state_compatibility(root)
+    }
+
+    /// Read configured mount roots without creating, migrating, or repairing
+    /// Locality state. This intentionally supports older schemas whose `mounts`
+    /// table already has the stable `mount_id` and `root` columns.
+    pub fn inspect_mount_roots_read_only(
+        root: impl AsRef<Path>,
+    ) -> StoreResult<Vec<LegacyWorkspaceMount>> {
+        let db_path = root.as_ref().join(DB_FILE);
+        if !db_path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        if !table_exists(&connection, "mounts")? {
+            return Err(StoreError::StateCompatibility(
+                "state database has no readable mounts table".to_string(),
+            ));
+        }
+        let mut statement =
+            connection.prepare("SELECT mount_id, root FROM mounts ORDER BY mount_id")?;
+        let rows = statement.query_map([], |row| {
+            Ok(LegacyWorkspaceMount::new(
+                MountId(row.get::<_, String>(0)?),
+                PathBuf::from(row.get::<_, String>(1)?),
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn open(root: PathBuf) -> StoreResult<Self> {
@@ -2019,15 +2047,44 @@ impl WorkspaceBindingRepository for SqliteStateStore {
             });
         }
         let collision_key = record.binding.collision_key();
-        let collision = transaction
-            .query_row(
-                "SELECT mount_id
-                 FROM workspace_bindings
-                 WHERE target_collision_key = ?1 AND mount_id <> ?2",
-                params![collision_key.as_str(), record.mount_id.0.as_str()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
+        let collision = {
+            let mut statement = transaction.prepare(
+                "SELECT m.mount_id, m.root, b.binding_json, b.target_collision_key
+                 FROM mounts m
+                 LEFT JOIN workspace_bindings b ON b.mount_id = m.mount_id
+                 WHERE m.mount_id <> ?1
+                 ORDER BY m.mount_id",
+            )?;
+            let rows = statement.query_map(params![record.mount_id.0.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    PathBuf::from(row.get::<_, String>(1)?),
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?;
+            let mut collision = None;
+            for row in rows {
+                let (mount_id, root, binding_json, stored_collision_key) = row?;
+                let existing_collision_key = match (binding_json, stored_collision_key) {
+                    (Some(binding_json), Some(stored_collision_key)) => Some(
+                        workspace_binding_from_row((binding_json, stored_collision_key))?
+                            .collision_key(),
+                    ),
+                    (None, None) => legacy_mount_collision_key(&root),
+                    _ => {
+                        return Err(StoreError::InvalidState(
+                            "workspace binding row is partially present".to_string(),
+                        ));
+                    }
+                };
+                if existing_collision_key.as_deref() == Some(collision_key.as_str()) {
+                    collision = Some(mount_id);
+                    break;
+                }
+            }
+            collision
+        };
         if let Some(existing_mount_id) = collision {
             return Err(StoreError::WorkspaceMountTargetCollision {
                 target: record.binding.mount_target().as_str().to_string(),
@@ -5417,7 +5474,7 @@ fn migrate_workspace_bindings_schema_v21(
     )?;
     migrate_entity_search_component_to_v2(&transaction)?;
     create_workspace_bindings_table(&transaction)?;
-    reconcile_legacy_workspace_bindings(&transaction)?;
+    discard_untrusted_legacy_workspace_bindings(&transaction)?;
     seed_current_state_components(&transaction)?;
     record_schema_migration(&transaction, user_version, SCHEMA_VERSION)?;
     transaction.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -5438,52 +5495,13 @@ fn create_workspace_bindings_table(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
-fn reconcile_legacy_workspace_bindings(connection: &Connection) -> StoreResult<()> {
+fn discard_untrusted_legacy_workspace_bindings(connection: &Connection) -> StoreResult<()> {
     create_workspace_bindings_table(connection)?;
-    let mounts = {
-        let mut statement = connection.prepare(
-            "SELECT m.mount_id, m.connector, m.root, m.remote_root_id, m.read_only,
-                    m.projection_json, m.connection_id, m.settings_json
-             FROM mounts m
-             ORDER BY m.mount_id",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, String>(7)?,
-            ))
-        })?;
-        rows.map(|row| mount_from_row(row?))
-            .collect::<StoreResult<Vec<_>>>()?
-    };
-    let legacy_mounts = mounts
-        .iter()
-        .map(|mount| LegacyWorkspaceMount::new(mount.mount_id.clone(), mount.root.clone()))
-        .collect::<Vec<_>>();
-    let plan = plan_legacy_migration_from_common_parent(&legacy_mounts);
-
-    // Version 1 incorrectly synthesized and suffixed targets. Rebuild only the
-    // additive binding metadata; mounts and every user-visible root stay exact.
+    // Version 1 bindings were inferred without a persisted trusted workspace
+    // identity. Schema migration cannot distinguish them from coordinator-owned
+    // records, so every legacy row remains layout 0 until an owning coordinator
+    // performs an atomic migration with its trusted root.
     connection.execute("DELETE FROM workspace_bindings", [])?;
-    if let Some(plan) = plan {
-        for record in plan.layout1_bindings() {
-            connection.execute(
-                "INSERT INTO workspace_bindings (mount_id, binding_json, target_collision_key)
-                 VALUES (?1, ?2, ?3)",
-                params![
-                    record.mount_id.0.as_str(),
-                    to_json(&record.binding)?,
-                    record.binding.collision_key(),
-                ],
-            )?;
-        }
-    }
     validate_workspace_bindings(connection)?;
     Ok(())
 }
@@ -5530,7 +5548,6 @@ fn ensure_workspace_binding_for_mount(
         let mut statement = connection.prepare(
             "SELECT m.mount_id, m.root
              FROM mounts m
-             INNER JOIN workspace_bindings b ON b.mount_id = m.mount_id
              WHERE m.mount_id <> ?1
              ORDER BY m.mount_id",
         )?;

@@ -456,15 +456,29 @@ let root = resolver.resolve_ephemeral_publication_root(&requested_root, &active_
 Here `mounts` and `active_mounts` are `&[LegacyWorkspaceMount]`. Desktop or
 another persistent owner may persist only `plan.layout1_bindings()` and must
 continue resolving every `plan.layout0_mounts()` entry through the exact legacy
-`MountConfig.root`. The ephemeral method returns the exact requested whole
-root, never appends a mount target, and rejects a root that is equal to,
-contains, or is contained by an active persistent mount root under macOS,
-Linux, or Windows path semantics.
+`MountConfig.root`. The ephemeral method returns the exact requested whole root
+and never appends a mount target. Its platform-neutral form rejects equal,
+ancestor, and descendant overlap under macOS, Linux, or Windows lexical
+semantics. On the running host, the publication guard additionally resolves
+existing filesystem aliases: Unix symlinks plus device/inode anchors, and
+Windows canonical junction/reparse paths plus verbatim and trailing-dot
+spellings where the OS exposes them.
 
-SQLite schema v27 repairs the prerelease binding backfill by deleting only
-synthesized invalid, suffixed, colliding, or ambiguous binding rows. It does not
-change `mounts.root` or filesystem content. A mount without a binding is valid
-layout 0 state, not corrupt or rebuildable metadata.
+SQLite schema v27 cannot prove that any prerelease binding came from a persisted
+trusted workspace root and coordinator-owned atomic migration. It therefore
+deletes every prerelease binding row and leaves all upgraded mounts in layout 0.
+It does not change `mounts.root` or filesystem content. A mount without a
+binding is valid layout 0 state, not corrupt or rebuildable metadata.
+
+Sandbox overlap inspection opens the mount database read-only and supports old
+`mounts(mount_id, root)` schemas without initializing, migrating, or repairing
+state. CLI and Desktop inspect once before network work and again after staging,
+immediately before the publication primitive. The second generation-2 check is
+inside the destination publication lock; generation-1 checks run immediately
+before the descriptor-relative/no-replace rename. There is not yet one lock
+shared by mount creation and sandbox publication, so a mount committed after
+the final read remains a narrow race; callers must still allocate dedicated
+sandbox roots rather than relying on this guard as global coordination.
 
 Changing a host workspace root is not a metadata-store operation. The store can
 only reject unsafe requests when it sees dirty/conflicted entities, unsettled

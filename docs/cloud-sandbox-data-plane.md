@@ -1992,10 +1992,11 @@ loc push /mnt/locality/notion/Projects/Agent\ Work/Design/page.md
 `--root` names the complete ephemeral publication unit exactly; it is not
 rewritten as a persistent workspace binding and no target suffix is appended.
 CLI and Desktop invoke the same host-binding resolver before network access and
-reject publication equal to, above, or below any configured active persistent
-mount root. Orchestrators should therefore allocate a dedicated sandbox path
-such as `/mnt/locality`, never a live Desktop/File Provider/FUSE/Cloud Files
-root.
+again after staging, immediately before publication. Read-only state inspection
+and local filesystem alias resolution reject a root equal to, above, or below a
+configured persistent mount. The check is not a global lock shared with mount
+creation, so orchestrators must allocate a dedicated sandbox path such as
+`/mnt/locality`, never a live Desktop/File Provider/FUSE/Cloud Files root.
 
 In backend mode, `loc diff` is the agent-accessible review step and `loc push`
 means "submit this explicitly selected local plan to the Locality changeset

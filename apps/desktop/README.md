@@ -103,7 +103,11 @@ key for one invocation; it is not canonical Desktop source/mount integration
 and does not persist hosted credentials. The destination remains the exact
 whole-root ephemeral publication requested by the user. Before invoking the
 materializer, Desktop uses the shared host-binding resolver and rejects any
-destination that overlaps a configured persistent mount root.
+destination that overlaps a configured persistent mount root. The inspection
+runs off the async UI thread, opens existing mount state read-only without
+schema migration, and is repeated at the materializer's prepublication
+boundary. It recognizes locally resolvable filesystem aliases, but does not
+provide a global lock against a mount created after the final inspection.
 
 Production Desktop mounts continue to resolve from `MountConfig.root`; they do
 not replace active File Provider, FUSE, or Cloud Files roots with

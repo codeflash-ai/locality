@@ -6,8 +6,14 @@
 //! this host.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 use caseless::Caseless;
 use locality_core::model::MountId;
@@ -260,6 +266,7 @@ pub enum WorkspaceHostBindingError {
     InvalidTrustedWorkspaceRoot,
     InvalidPublicationRoot,
     InvalidActiveMountRoot { mount_id: MountId },
+    HostPathInspection { path: PathBuf, detail: String },
     PublicationOverlapsActiveMount { mount_id: MountId },
 }
 
@@ -276,6 +283,11 @@ impl Display for WorkspaceHostBindingError {
                 formatter,
                 "active mount `{}` has an invalid host root",
                 mount_id.as_str()
+            ),
+            Self::HostPathInspection { path, detail } => write!(
+                formatter,
+                "could not inspect host path `{}` for filesystem aliases: {detail}",
+                path.display()
             ),
             Self::PublicationOverlapsActiveMount { mount_id } => write!(
                 formatter,
@@ -394,6 +406,43 @@ impl WorkspaceHostBindingResolver {
         Ok(requested_root.to_path_buf())
     }
 
+    /// Resolve an ephemeral root on the running host, including aliases that
+    /// only the local filesystem can identify. The lexical platform contract
+    /// remains available through [`Self::resolve_ephemeral_publication_root`]
+    /// for migration planning and cross-platform tests.
+    pub fn resolve_ephemeral_publication_root_on_current_host(
+        &self,
+        requested_root: &Path,
+        active_mounts: &[LegacyWorkspaceMount],
+    ) -> Result<PathBuf, WorkspaceHostBindingError> {
+        let resolved = self.resolve_ephemeral_publication_root(requested_root, active_mounts)?;
+        if self.platform != WorkspaceHostPlatform::current() {
+            return Ok(resolved);
+        }
+
+        let requested_aliases =
+            HostFilesystemAliases::inspect(requested_root).map_err(|source| {
+                WorkspaceHostBindingError::HostPathInspection {
+                    path: requested_root.to_path_buf(),
+                    detail: source.to_string(),
+                }
+            })?;
+        for mount in active_mounts {
+            let active_aliases = HostFilesystemAliases::inspect(&mount.root).map_err(|source| {
+                WorkspaceHostBindingError::HostPathInspection {
+                    path: mount.root.clone(),
+                    detail: source.to_string(),
+                }
+            })?;
+            if requested_aliases.overlaps(self.platform, &active_aliases) {
+                return Err(WorkspaceHostBindingError::PublicationOverlapsActiveMount {
+                    mount_id: mount.mount_id.clone(),
+                });
+            }
+        }
+        Ok(resolved)
+    }
+
     pub(crate) fn same_host_path(&self, left: &Path, right: &Path) -> bool {
         match (
             ParsedHostPath::parse(self.platform, left),
@@ -419,7 +468,7 @@ impl ParsedHostPath {
                 if !value.starts_with('/') {
                     return None;
                 }
-                let components = parse_components(&value[1..], '/')?;
+                let components = parse_components(platform, &value[1..], '/')?;
                 Some(Self {
                     prefix: "/".to_string(),
                     components,
@@ -430,13 +479,21 @@ impl ParsedHostPath {
     }
 
     fn parse_windows(value: &str) -> Option<Self> {
-        let normalized = value.replace('\\', "/");
+        let mut normalized = value.replace('\\', "/");
+        if normalized
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("//?/UNC/"))
+        {
+            normalized = format!("//{}", &normalized[8..]);
+        } else if let Some(rest) = normalized.strip_prefix("//?/") {
+            normalized = rest.to_string();
+        }
         if let Some(rest) = normalized.strip_prefix("//") {
             let mut parts = rest.split('/');
             let server = parts.next().filter(|part| !part.is_empty())?;
             let share = parts.next().filter(|part| !part.is_empty())?;
             let remainder = parts.collect::<Vec<_>>().join("/");
-            let components = parse_components(&remainder, '/')?;
+            let components = parse_components(WorkspaceHostPlatform::Windows, &remainder, '/')?;
             return Some(Self {
                 prefix: format!("//{server}/{share}"),
                 components,
@@ -452,7 +509,7 @@ impl ParsedHostPath {
         }
         Some(Self {
             prefix: normalized[..2].to_string(),
-            components: parse_components(&normalized[3..], '/')?,
+            components: parse_components(WorkspaceHostPlatform::Windows, &normalized[3..], '/')?,
         })
     }
 
@@ -499,16 +556,144 @@ impl ParsedHostPath {
     }
 }
 
-fn parse_components(value: &str, separator: char) -> Option<Vec<String>> {
+fn parse_components(
+    platform: WorkspaceHostPlatform,
+    value: &str,
+    separator: char,
+) -> Option<Vec<String>> {
     let mut components = Vec::new();
     for component in value.split(separator) {
         match component {
             "" | "." => {}
             ".." => return None,
-            component => components.push(component.to_string()),
+            component => {
+                let component = if platform == WorkspaceHostPlatform::Windows {
+                    component.trim_end_matches(['.', ' '])
+                } else {
+                    component
+                };
+                if component.is_empty() {
+                    return None;
+                }
+                components.push(component.to_string());
+            }
         }
     }
     Some(components)
+}
+
+#[derive(Clone, Debug)]
+struct HostFilesystemAliases {
+    canonical: PathBuf,
+    #[cfg(unix)]
+    native_anchors: Vec<NativePathAnchor>,
+}
+
+impl HostFilesystemAliases {
+    fn inspect(path: &Path) -> io::Result<Self> {
+        let canonical = canonicalize_with_missing_tail(path)?;
+        #[cfg(unix)]
+        let native_anchors = unix_native_anchors(path)?;
+        Ok(Self {
+            canonical,
+            #[cfg(unix)]
+            native_anchors,
+        })
+    }
+
+    fn overlaps(&self, platform: WorkspaceHostPlatform, other: &Self) -> bool {
+        if let (Some(left), Some(right)) = (
+            ParsedHostPath::parse(platform, &self.canonical),
+            ParsedHostPath::parse(platform, &other.canonical),
+        ) && left.overlaps(platform, &right)
+        {
+            return true;
+        }
+
+        #[cfg(unix)]
+        if self.native_anchors.iter().any(|left| {
+            other.native_anchors.iter().any(|right| {
+                left.identity == right.identity
+                    && relative_components_overlap(platform, &left.suffix, &right.suffix)
+            })
+        }) {
+            return true;
+        }
+
+        false
+    }
+}
+
+fn canonicalize_with_missing_tail(path: &Path) -> io::Result<PathBuf> {
+    let mut missing = Vec::<OsString>::new();
+    let mut candidate = path;
+    loop {
+        match fs::canonicalize(candidate) {
+            Ok(mut canonical) => {
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let Some(name) = candidate.file_name() else {
+                    return Err(error);
+                };
+                missing.push(name.to_os_string());
+                candidate = candidate.parent().ok_or(error)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct NativePathAnchor {
+    identity: (u64, u64),
+    suffix: Vec<OsString>,
+}
+
+#[cfg(unix)]
+fn unix_native_anchors(path: &Path) -> io::Result<Vec<NativePathAnchor>> {
+    let prefixes = path.ancestors().collect::<Vec<_>>();
+    let mut anchors = Vec::new();
+    for (index, prefix) in prefixes.iter().enumerate() {
+        match fs::metadata(prefix) {
+            Ok(metadata) => {
+                let suffix = prefixes[..index]
+                    .iter()
+                    .rev()
+                    .filter_map(|path| path.file_name().map(OsString::from))
+                    .collect();
+                anchors.push(NativePathAnchor {
+                    identity: (metadata.dev(), metadata.ino()),
+                    suffix,
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(anchors)
+}
+
+#[cfg(unix)]
+fn relative_components_overlap(
+    platform: WorkspaceHostPlatform,
+    left: &[OsString],
+    right: &[OsString],
+) -> bool {
+    let is_prefix = |prefix: &[OsString], full: &[OsString]| {
+        prefix.len() <= full.len()
+            && prefix.iter().zip(full).all(|(left, right)| {
+                let (Some(left), Some(right)) = (left.to_str(), right.to_str()) else {
+                    return left == right;
+                };
+                path_token_eq(platform, left, right)
+            })
+    };
+    is_prefix(left, right) || is_prefix(right, left)
 }
 
 fn path_token_eq(platform: WorkspaceHostPlatform, left: &str, right: &str) -> bool {
@@ -536,6 +721,14 @@ pub(crate) fn plan_legacy_migration_from_common_parent(
         return None;
     }
     resolver.plan_legacy_migration(&workspace_root, mounts).ok()
+}
+
+pub(crate) fn legacy_mount_collision_key(root: &Path) -> Option<String> {
+    let target = root.file_name()?.to_str()?;
+    let normalized = target.chars().nfc().collect::<String>();
+    MountTarget::new(normalized)
+        .ok()
+        .map(|target| target.collision_key())
 }
 
 #[cfg(test)]

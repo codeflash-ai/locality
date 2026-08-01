@@ -37,7 +37,7 @@ use crate::repository::{
 };
 use crate::workspace_binding::{
     LegacyWorkspaceMount, WorkspaceBinding, WorkspaceBindingRecord, WorkspaceRebindBlocker,
-    plan_legacy_migration_from_common_parent,
+    legacy_mount_collision_key, plan_legacy_migration_from_common_parent,
 };
 
 type EntityKey = (MountId, RemoteId);
@@ -170,9 +170,8 @@ impl MountRepository for InMemoryStateStore {
         }
         if is_new_mount && !self.workspace_bindings.contains_key(&mount.mount_id) {
             let mut legacy_mounts = self
-                .workspace_bindings
-                .keys()
-                .filter_map(|mount_id| self.mounts.get(mount_id))
+                .mounts
+                .values()
                 .map(|existing| {
                     LegacyWorkspaceMount::new(existing.mount_id.clone(), existing.root.clone())
                 })
@@ -219,15 +218,23 @@ impl WorkspaceBindingRepository for InMemoryStateStore {
                 requested_target: record.binding.mount_target().as_str().to_string(),
             });
         }
-        if let Some((existing_mount_id, _)) =
-            self.workspace_bindings.iter().find(|(mount_id, binding)| {
-                **mount_id != record.mount_id
-                    && binding.collision_key() == record.binding.collision_key()
-            })
-        {
+        let requested_collision_key = record.binding.collision_key();
+        let collision = self.mounts.iter().find_map(|(mount_id, mount)| {
+            if *mount_id == record.mount_id {
+                return None;
+            }
+            let collision_key = self
+                .workspace_bindings
+                .get(mount_id)
+                .map(WorkspaceBinding::collision_key)
+                .or_else(|| legacy_mount_collision_key(&mount.root));
+            (collision_key.as_deref() == Some(requested_collision_key.as_str()))
+                .then(|| mount_id.clone())
+        });
+        if let Some(existing_mount_id) = collision {
             return Err(StoreError::WorkspaceMountTargetCollision {
                 target: record.binding.mount_target().as_str().to_string(),
-                existing_mount_id: existing_mount_id.clone(),
+                existing_mount_id,
             });
         }
         self.workspace_bindings

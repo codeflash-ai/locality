@@ -112,10 +112,13 @@ use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
 use crate::sandbox::{
     PROFILE_BOOTSTRAP_TOKEN_INPUT, PROFILE_TOTAL, SandboxContentEncodingPreference,
     SandboxInitOptions, SandboxInitProfile, SandboxInitReport, resolve_bootstrap_token,
-    resolve_profile_key, resolve_sandbox_init_options_at_state_root, resolve_session_credential,
-    run_sandbox_init_with_encoding, run_sandbox_init_with_encoding_and_profile,
-    run_sandbox_init_with_profile_key, run_sandbox_init_with_profile_key_and_profile,
-    run_sandbox_init_with_session_credential, run_sandbox_init_with_session_credential_and_profile,
+    resolve_profile_key, resolve_session_credential,
+    run_sandbox_init_with_encoding_and_profile_at_state_root,
+    run_sandbox_init_with_encoding_at_state_root,
+    run_sandbox_init_with_profile_key_and_profile_at_state_root,
+    run_sandbox_init_with_profile_key_at_state_root,
+    run_sandbox_init_with_session_credential_and_profile_at_state_root,
+    run_sandbox_init_with_session_credential_at_state_root,
 };
 use crate::search::{
     SearchError, SearchOptions, SearchReport, SearchResult, is_notion_url_host, notion_id_from_url,
@@ -1759,47 +1762,58 @@ fn sandbox_init(options: SandboxInitArgs, json: bool) -> i32 {
         api_url: options.api_url,
         root: PathBuf::from(options.root),
     };
-    let init_options =
-        match resolve_sandbox_init_options_at_state_root(init_options, &default_state_root()) {
-            Ok(options) => options,
-            Err(error) => {
-                finish_sandbox_profile(profile.as_mut());
-                return sandbox_init_command_error(json, error);
-            }
-        };
+    let state_root = default_state_root();
     let outcome = match (credential, profile.as_mut()) {
         (SandboxInitCredential::Bootstrap(token), Some(profile)) => {
-            run_sandbox_init_with_encoding_and_profile(
+            run_sandbox_init_with_encoding_and_profile_at_state_root(
                 init_options,
+                &state_root,
                 token,
                 content_encoding,
                 profile,
             )
         }
         (SandboxInitCredential::Bootstrap(token), None) => {
-            run_sandbox_init_with_encoding(init_options, token, content_encoding)
+            run_sandbox_init_with_encoding_at_state_root(
+                init_options,
+                &state_root,
+                token,
+                content_encoding,
+            )
         }
         (SandboxInitCredential::ProfileKey(key), Some(profile)) => {
-            run_sandbox_init_with_profile_key_and_profile(
+            run_sandbox_init_with_profile_key_and_profile_at_state_root(
                 init_options,
+                &state_root,
                 key,
                 content_encoding,
                 profile,
             )
         }
         (SandboxInitCredential::ProfileKey(key), None) => {
-            run_sandbox_init_with_profile_key(init_options, key, content_encoding)
+            run_sandbox_init_with_profile_key_at_state_root(
+                init_options,
+                &state_root,
+                key,
+                content_encoding,
+            )
         }
         (SandboxInitCredential::Session(capability), Some(profile)) => {
-            run_sandbox_init_with_session_credential_and_profile(
+            run_sandbox_init_with_session_credential_and_profile_at_state_root(
                 init_options,
+                &state_root,
                 capability,
                 content_encoding,
                 profile,
             )
         }
         (SandboxInitCredential::Session(capability), None) => {
-            run_sandbox_init_with_session_credential(init_options, capability, content_encoding)
+            run_sandbox_init_with_session_credential_at_state_root(
+                init_options,
+                &state_root,
+                capability,
+                content_encoding,
+            )
         }
     };
     finish_sandbox_profile(profile.as_mut());

@@ -572,10 +572,6 @@ fn sqlite_store_migrates_released_workspace_v21_with_generation_tables_absent() 
     store
         .append_journal(pending_journal.clone())
         .expect("save pending journal");
-    let expected_binding = store
-        .get_workspace_binding(&fixture.mount_id)
-        .expect("read workspace binding")
-        .expect("workspace binding");
     let db_path = store.db_path.clone();
     drop(store);
 
@@ -607,8 +603,8 @@ fn sqlite_store_migrates_released_workspace_v21_with_generation_tables_absent() 
     assert_eq!(
         reopened
             .get_workspace_binding(&fixture.mount_id)
-            .expect("read migrated workspace binding"),
-        Some(expected_binding)
+            .expect("read layout zero workspace binding"),
+        None
     );
     assert_eq!(
         reopened
@@ -681,11 +677,11 @@ fn sqlite_store_migrates_freshness_v24_with_workspace_binding_absent() {
 
     assert_eq!(user_version, 27);
     assert_eq!(migration_count, 1);
-    assert!(
+    assert_eq!(
         reopened
             .get_workspace_binding(&fixture.mount_id)
-            .expect("read backfilled workspace binding")
-            .is_some()
+            .expect("read layout zero workspace binding"),
+        None
     );
     assert_eq!(
         reopened

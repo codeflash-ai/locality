@@ -68,6 +68,7 @@ pub enum WorkspaceMaterializationError {
     Journal { path: PathBuf, source: io::Error },
     RecoveryRequired(PathBuf),
     RecoveryConflict(String),
+    PrepublicationCheck(io::Error),
 }
 
 impl Display for WorkspaceMaterializationError {
@@ -114,6 +115,9 @@ impl Display for WorkspaceMaterializationError {
                     "workspace publication recovery conflict: {message}"
                 )
             }
+            Self::PrepublicationCheck(source) => {
+                write!(formatter, "workspace prepublication check failed: {source}")
+            }
         }
     }
 }
@@ -124,6 +128,7 @@ impl std::error::Error for WorkspaceMaterializationError {
             Self::Archive(error) => Some(error),
             Self::Filesystem(error) => Some(error),
             Self::Journal { source, .. } => Some(source),
+            Self::PrepublicationCheck(source) => Some(source),
             _ => None,
         }
     }
@@ -297,6 +302,10 @@ pub enum WorkspacePublicationCheckpoint {
 /// Fault-injection and host-observation seam. Production callers use `()`;
 /// tests can simulate process loss or storage errors at durable boundaries.
 pub trait WorkspacePublicationHooks {
+    fn before_publication(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
     fn checkpoint(&mut self, checkpoint: WorkspacePublicationCheckpoint) -> io::Result<()>;
 }
 
@@ -372,13 +381,38 @@ pub fn materialize_workspace_archive_durable<Body: Read>(
     offer: &WorkspaceExportOfferV2,
     ownership: &WorkspaceOwnershipCapability,
 ) -> Result<PublishedWorkspace, WorkspaceMaterializationError> {
+    materialize_workspace_archive_durable_with_hooks(
+        archive,
+        destination,
+        limits,
+        session,
+        offer,
+        ownership,
+        &mut (),
+    )
+}
+
+/// Durable generation-2 materialization with a caller safety check executed
+/// under the workspace publication lock immediately before publication.
+pub fn materialize_workspace_archive_durable_with_hooks<
+    Body: Read,
+    H: WorkspacePublicationHooks,
+>(
+    archive: ReplicaArchive<Body>,
+    destination: &Path,
+    limits: WorkspaceMaterializationLimits,
+    session: &WorkspaceProfileSessionV2,
+    offer: &WorkspaceExportOfferV2,
+    ownership: &WorkspaceOwnershipCapability,
+    hooks: &mut H,
+) -> Result<PublishedWorkspace, WorkspaceMaterializationError> {
     let paths = PublicationPaths::new(destination)?;
     let lock = paths.acquire_lock()?;
     recover_workspace_publication_locked(destination, ownership, &paths, &lock)?;
     let staged =
         stage_workspace_archive_locked(archive, destination, limits, session, offer, Some(&lock))?;
     let published =
-        publish_staged_workspace_locked(staged, destination, ownership, &mut (), &paths, &lock)?;
+        publish_staged_workspace_locked(staged, destination, ownership, hooks, &paths, &lock)?;
     paths.verify_visible_parent(&lock)?;
     Ok(published)
 }
@@ -505,6 +539,11 @@ fn publish_staged_workspace_locked<H: WorkspacePublicationHooks>(
             ownership,
             "active generation immediately before exchange",
         )?;
+    }
+
+    if let Err(source) = hooks.before_publication() {
+        remove_journal_if_present(paths, lock)?;
+        return Err(WorkspaceMaterializationError::PrepublicationCheck(source));
     }
 
     let publication = if destination_exists {

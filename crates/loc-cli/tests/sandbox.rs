@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use loc_cli::sandbox::{
     SandboxBootstrapToken, SandboxContentEncodingPreference, SandboxInitError, SandboxInitOptions,
     SandboxProfileKey, resolve_bootstrap_token, resolve_sandbox_init_options_at_state_root,
-    run_sandbox_init, run_sandbox_init_with_encoding, run_sandbox_init_with_profile_key,
+    run_sandbox_init, run_sandbox_init_with_encoding, run_sandbox_init_with_encoding_at_state_root,
+    run_sandbox_init_with_profile_key,
 };
 use locality_core::model::MountId;
 use locality_core::portable::{
@@ -41,7 +42,8 @@ use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 use localityd::replica_materializer::ReplicaMaterializationLimits;
 use localityd::workspace_materializer::{
     WorkspaceMaterializationLimits, WorkspaceOwnershipCapability, WorkspacePublicationCheckpoint,
-    WorkspacePublicationHooks, publish_staged_workspace_with_hooks, stage_workspace_archive,
+    WorkspacePublicationHooks, materialize_workspace_archive_durable_with_hooks,
+    publish_staged_workspace_with_hooks, stage_workspace_archive,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -304,6 +306,131 @@ fn cli_sandbox_init_rejects_publication_inside_active_mount_before_network() {
         "{stderr}"
     );
     assert!(!stderr.contains("backend request"), "{stderr}");
+}
+
+#[test]
+fn sandbox_revalidates_mount_overlap_after_staging_before_publication() {
+    let directory = TestDirectory::new("late-mount-overlap");
+    let state_root = directory.0.join("state");
+    let destination = directory.root();
+    let tar = tar_file(b"readme.md", b"staged\n");
+    let capability = capability();
+    let status = ready_status(
+        capability.session_id.clone(),
+        COMPONENT_VERSIONS,
+        &tar,
+        BTreeSet::from([TarContentEncoding::Identity]),
+    );
+    let response =
+        ResponseFixture::streaming_export("identity", tar, 512 + 4, Duration::from_millis(100))
+            .with_staging_gate(
+                destination
+                    .parent()
+                    .expect("destination parent")
+                    .to_path_buf(),
+                PathBuf::from("readme.md"),
+                destination.clone(),
+            );
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&capability),
+        ResponseFixture::json(&status),
+        response,
+    ]);
+
+    let watcher_parent = directory.0.clone();
+    let watcher_state_root = state_root.clone();
+    let watcher = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let staged = fs::read_dir(&watcher_parent)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".locality-stage-")
+                });
+            if staged {
+                let mut store =
+                    SqliteStateStore::open(watcher_state_root).expect("open late state");
+                store
+                    .save_mount(MountConfig::new(
+                        MountId::new("late-active"),
+                        "notion",
+                        &watcher_parent,
+                    ))
+                    .expect("save late active mount");
+                return;
+            }
+            assert!(Instant::now() < deadline, "staging was not observed");
+            thread::sleep(Duration::from_millis(2));
+        }
+    });
+
+    let error = run_sandbox_init_with_encoding_at_state_root(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: destination.clone(),
+        },
+        &state_root,
+        SandboxBootstrapToken::new("late-overlap-token").expect("token"),
+        SandboxContentEncodingPreference::Identity,
+    )
+    .expect_err("late active mount must stop publication");
+    watcher.join().expect("late mount watcher");
+
+    assert_eq!(error.code(), "materialization_failed");
+    assert!(
+        error
+            .to_string()
+            .contains("overlaps active mount `late-active`")
+    );
+    assert!(
+        !destination.exists(),
+        "guard failure must leave root unpublished"
+    );
+}
+
+#[test]
+fn generation2_prepublication_check_runs_under_durable_publication_path() {
+    let directory = TestDirectory::new("workspace-v2-prepublication-check");
+    let (session, offer, tar) = workspace_v2_fixture();
+    let ownership = WorkspaceOwnershipCapability::new([0x44; 32]);
+    let mut hooks = RejectBeforePublication;
+
+    let error = materialize_workspace_archive_durable_with_hooks(
+        ReplicaArchive::new(ReplicaArchiveEncoding::Identity, Cursor::new(tar)),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &session,
+        &offer,
+        &ownership,
+        &mut hooks,
+    )
+    .expect_err("prepublication rejection must stop generation 2");
+
+    assert!(error.to_string().contains("prepublication check failed"));
+    assert!(!directory.root().exists());
+    assert!(
+        !directory
+            .0
+            .join(".locality-replica.publication.json")
+            .exists()
+    );
+}
+
+struct RejectBeforePublication;
+
+impl WorkspacePublicationHooks for RejectBeforePublication {
+    fn before_publication(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other("injected prepublication rejection"))
+    }
+
+    fn checkpoint(&mut self, _checkpoint: WorkspacePublicationCheckpoint) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[test]
