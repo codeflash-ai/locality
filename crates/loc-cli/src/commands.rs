@@ -100,7 +100,9 @@ use crate::local_oauth::{
     LocalOAuthAuthorization, LocalOAuthError, local_redirect, random_state,
     run_local_oauth_authorization,
 };
-use crate::mount::{MountError, MountOptions, MountReport, run_mount};
+use crate::mount::{
+    MountError, MountOptions, MountReport, resolve_workspace_mount_root, run_mount,
+};
 use crate::mv::{MvError, MvOptions, MvReport, run_mv_with_daemon_at_state_root};
 use crate::okf::{OkfExportError, OkfExportOptions, OkfExportReport, run_okf_export};
 use crate::pull::{PullError, PullReport, run_pull_with_state_root};
@@ -8015,9 +8017,13 @@ fn file_provider_list_lines(report: &FileProviderCommandReport) -> Vec<String> {
 }
 
 fn resolve_mount_target(store: &SqliteStateStore, target: &str) -> Result<MountConfig, String> {
-    let mounts = store
+    let mut mounts = store
         .load_mounts()
         .map_err(|error| format!("failed to load mounts: {error}"))?;
+    for mount in &mut mounts {
+        mount.root = resolve_workspace_mount_root(store, mount)
+            .map_err(|error| format!("failed to resolve portable workspace path: {error}"))?;
+    }
     if let Some(mount) = mounts
         .iter()
         .find(|mount| mount.mount_id.0 == target)

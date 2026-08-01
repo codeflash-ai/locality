@@ -6,7 +6,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use loc_cli::mount::{GuidanceFileAction, MountOptions, run_mount};
+use loc_cli::mount::{GuidanceFileAction, MountOptions, resolve_workspace_mount_root, run_mount};
 use locality_connector::ConnectorCapabilities;
 use locality_core::model::{MountId, RemoteId};
 use locality_gmail::{GMAIL_OAUTH_SCOPES, gmail_capabilities_json};
@@ -263,9 +263,50 @@ fn linux_fuse_cli_mounts_persist_bindings_before_daemon_reopen() {
     );
     assert_eq!(bindings[1].mount_id, MountId::new("notion-main"));
     assert_eq!(bindings[1].binding.mount_target().as_str(), "notion-main");
+    let workspace_id = bindings[0]
+        .binding
+        .workspace_id()
+        .expect("new CLI binding has stable workspace identity");
+    assert_eq!(bindings[1].binding.workspace_id(), Some(workspace_id));
+    let host_binding = store
+        .get_workspace_host_binding(workspace_id)
+        .expect("load host binding")
+        .expect("host binding exists");
+    assert_eq!(host_binding.trusted_workspace_root(), locality_root);
+    assert_eq!(host_binding.layout_sequence(), 2);
     drop(store);
 
     SqliteStateStore::open(state_root).expect("daemon process transition remains readable");
+}
+
+#[test]
+fn cli_resolves_the_canonical_path_from_the_persisted_workspace_binding() {
+    let fixture = MountFixture::new("loc-cli-shared-workspace-resolver");
+    let mount_root = fixture.root.join("Locality/notion-main");
+    let mut store = InMemoryStateStore::new();
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: MountId::new("notion-main"),
+            connector: "notion".to_string(),
+            root: mount_root.clone(),
+            remote_root_id: None,
+            connection_id: None,
+            read_only: false,
+            projection: ProjectionMode::LinuxFuse,
+            settings_json: "{}".to_string(),
+        },
+    )
+    .expect("mount through CLI coordinator");
+    let mount = store
+        .get_mount(&MountId::new("notion-main"))
+        .expect("load mount")
+        .expect("mount exists");
+
+    assert_eq!(
+        resolve_workspace_mount_root(&store, &mount).expect("resolve CLI path"),
+        mount_root
+    );
 }
 
 #[test]

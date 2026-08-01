@@ -423,9 +423,12 @@ This removes the need for scattered `cfg(target_os)` logic in command parsing.
 ### Portable Workspace Binding
 
 The durable mount ID remains the source and File Provider identity. Physical
-placement is separate metadata: each mount has a versioned `workspace_binding`
-containing the portable workspace-layout version and one validated mount target.
-The binding never stores an absolute host path as identity.
+placement is separate metadata: each layout-1 mount binding contains a stable
+host-local `WorkspaceId`, the portable workspace-layout version, and one
+validated mount target. A separate `WorkspaceHostBinding` stores that
+workspace's trusted absolute root, stable projection/domain identity, and
+monotonic layout sequence. The absolute root is local placement, never portable
+identity or backend authority.
 
 Desktop, CLI, and daemon paths resolve as:
 
@@ -473,6 +476,16 @@ binding is valid layout 0 state, not corrupt or rebuildable metadata.
 layout 1 begins only when an owning coordinator supplies its trusted workspace
 root, accepts the resolver plan, and explicitly persists the binding.
 
+Workspace-binding component v3 remains within schema v27. It adds the separate
+host-binding table and preserves released component-v2/v1 mount-binding rows.
+Those legacy rows continue to resolve through the exact `MountConfig.root`.
+New virtual mounts atomically commit the host record and accepted mount binding;
+the commit requires the derived root to equal the preserved mount root, freezes
+workspace/root/projection identity, and advances the layout sequence for each
+new mount. CLI and Desktop then use the same repository resolver: layout-1 rows
+derive `<trusted root>/<target>`, while missing and v1 rows retain the legacy
+root.
+
 Sandbox overlap inspection opens the mount database read-only and supports old
 `mounts(mount_id, root)` schemas without initializing, migrating, or repairing
 state. CLI and Desktop inspect once before network work and again after staging,
@@ -498,14 +511,11 @@ Persisted binding targets are likewise immutable through the metadata API.
 Exact saves are idempotent, while changing a target is reserved for a future
 coordinator-owned compare-and-swap workflow that can prove the move completed.
 
-Production Desktop mount resolution still uses persistent `MountConfig.root`.
-Switching it to `WorkspaceBinding` in this increment would replace established
-File Provider/FUSE/Cloud Files roots without the ADR-required workspace record,
-layout transaction, and projection lifecycle. The next reconciliation step is
-for the Desktop coordinator to persist a trusted workspace root, call
-`plan_legacy_migration`, atomically commit the accepted binding set and layout
-sequence, and then resolve only those accepted mounts with
-`WorkspaceBinding::mount_root`; layout 0 mounts continue on their legacy roots.
+Desktop mount creation and path matching now route accepted virtual mounts
+through the shared binding resolver. Existing layout-0 and v1 mounts continue
+on their exact legacy roots. Full target rename/removal, workspace relocation,
+change-anchor replay, and projection lifecycle reconciliation remain future
+owning-coordinator work; this increment does not move files or reset domains.
 
 ## Desktop Packaging
 

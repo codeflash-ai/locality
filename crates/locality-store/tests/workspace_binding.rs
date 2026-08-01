@@ -15,8 +15,8 @@ use locality_store::{
     LegacyLayout0Reason, LegacyWorkspaceMount, MountConfig, MountRepository, ProjectionMode,
     ShadowRepository, SqliteStateStore, StateCompatibilityIssue, StateCompatibilityStatus,
     StoreError, WorkspaceBinding, WorkspaceBindingRecord, WorkspaceBindingRepository,
-    WorkspaceHostBindingError, WorkspaceHostBindingResolver, WorkspaceHostPlatform,
-    WorkspaceRebindBlocker,
+    WorkspaceHostBinding, WorkspaceHostBindingError, WorkspaceHostBindingResolver,
+    WorkspaceHostPlatform, WorkspaceId, WorkspaceProjectionIdentity, WorkspaceRebindBlocker,
 };
 use rusqlite::{Connection, params};
 
@@ -191,6 +191,148 @@ fn coordinator_binding_survives_restart_and_resolves_host_roots_without_mutating
             .expect("journal after rebind"),
         Some(journal)
     );
+}
+
+#[test]
+fn layout1_host_binding_persists_identity_root_domain_sequence_and_resolves_mount() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let mount = fixture.mount_config(ProjectionMode::LinuxFuse);
+    store.save_mount(mount.clone()).expect("save mount");
+    let workspace_id = WorkspaceId::new("locality.workspace.linux_fuse").expect("workspace ID");
+    let host = WorkspaceHostBinding::new(
+        WorkspaceHostPlatform::current(),
+        workspace_id.clone(),
+        fixture.mount_root.parent().expect("workspace root"),
+        WorkspaceProjectionIdentity::new("linux-fuse:locality-shared-root")
+            .expect("projection identity"),
+        1,
+    )
+    .expect("host binding");
+    let binding = WorkspaceBinding::for_workspace(
+        workspace_id.clone(),
+        MountTarget::new("notion-main").expect("target"),
+    );
+    store
+        .commit_workspace_binding(
+            host.clone(),
+            WorkspaceBindingRecord::new(fixture.mount_id.clone(), binding),
+        )
+        .expect("commit workspace binding");
+
+    assert_eq!(
+        store
+            .resolve_workspace_mount_root(&mount)
+            .expect("resolve root"),
+        fixture.mount_root
+    );
+    drop(store);
+
+    let reopened = fixture.open();
+    assert_eq!(
+        reopened
+            .get_workspace_host_binding(&workspace_id)
+            .expect("read host binding"),
+        Some(host)
+    );
+    assert_eq!(
+        reopened
+            .resolve_workspace_mount_root(&mount)
+            .expect("resolve after restart"),
+        fixture.mount_root
+    );
+}
+
+#[test]
+fn layout1_commit_rejects_a_host_root_that_would_move_the_mount() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config(ProjectionMode::LinuxFuse))
+        .expect("save mount");
+    let workspace_id = WorkspaceId::new("locality.workspace.linux_fuse").expect("workspace ID");
+    let host = WorkspaceHostBinding::new(
+        WorkspaceHostPlatform::current(),
+        workspace_id.clone(),
+        fixture.root.join("DifferentLocality"),
+        WorkspaceProjectionIdentity::new("linux-fuse:locality-shared-root")
+            .expect("projection identity"),
+        1,
+    )
+    .expect("host binding");
+    let result = store.commit_workspace_binding(
+        host,
+        WorkspaceBindingRecord::new(
+            fixture.mount_id.clone(),
+            WorkspaceBinding::for_workspace(
+                workspace_id.clone(),
+                MountTarget::new("notion-main").expect("target"),
+            ),
+        ),
+    );
+
+    assert!(
+        matches!(result, Err(StoreError::InvalidState(message)) if message.contains("preserved root"))
+    );
+    assert_eq!(
+        store
+            .get_workspace_binding(&fixture.mount_id)
+            .expect("binding lookup"),
+        None
+    );
+    assert_eq!(
+        store
+            .get_workspace_host_binding(&workspace_id)
+            .expect("host lookup"),
+        None
+    );
+}
+
+#[test]
+fn current_v2_component_migration_preserves_existing_v1_sqlite_binding() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let mount = fixture.mount_config(ProjectionMode::LinuxFuse);
+    store.save_mount(mount.clone()).expect("save mount");
+    save_trusted_fixture_binding(&mut store, &fixture);
+    drop(store);
+
+    let connection = Connection::open(fixture.state_root.join("state.sqlite3"))
+        .expect("raw current schema connection");
+    connection
+        .execute_batch(
+            "DROP TABLE workspace_host_bindings;
+             UPDATE state_components
+             SET version = 2, min_reader_version = 2,
+                 data_json = '{\"format\":\"workspace_binding.v1\",\"layout_0_without_binding\":true}'
+             WHERE component_id = 'durable:workspace_bindings';",
+        )
+        .expect("downgrade workspace component");
+    drop(connection);
+
+    let reopened = fixture.open();
+    let binding = reopened
+        .get_workspace_binding(&fixture.mount_id)
+        .expect("read migrated binding")
+        .expect("binding preserved");
+    assert_eq!(binding.mount_target().as_str(), "notion-main");
+    assert_eq!(binding.workspace_id(), None);
+    assert_eq!(
+        reopened
+            .resolve_workspace_mount_root(&mount)
+            .expect("legacy binding fallback"),
+        fixture.mount_root
+    );
+    let connection = Connection::open(fixture.state_root.join("state.sqlite3"))
+        .expect("raw migrated connection");
+    let component_version: i64 = connection
+        .query_row(
+            "SELECT version FROM state_components WHERE component_id = 'durable:workspace_bindings'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("component version");
+    assert_eq!(component_version, 3);
 }
 
 #[test]
@@ -1236,7 +1378,7 @@ fn current_reader_rejects_newer_binding_metadata_without_touching_mount() {
              SET binding_json = ?1
              WHERE mount_id = ?2",
             params![
-                r#"{"binding_version":2,"layout_version":1,"mount_target":"notion-main"}"#,
+                r#"{"binding_version":3,"layout_version":1,"mount_target":"notion-main"}"#,
                 fixture.mount_id.0.as_str()
             ],
         )

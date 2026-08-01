@@ -41,7 +41,7 @@ use loc_cli::file_provider::{
     run_macos_file_provider_helper,
 };
 use loc_cli::local_oauth::run_local_oauth_authorization;
-use loc_cli::mount::{MountOptions, run_mount};
+use loc_cli::mount::{MountOptions, resolve_workspace_mount_root, run_mount};
 use loc_cli::pull::{PullReport, run_pull_with_state_root};
 use loc_cli::push::{
     PushOptions, PushReport, push_report_exit_code, run_push_with_daemon_at_state_root,
@@ -7735,10 +7735,12 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
         None
     };
 
+    let canonical_mount_root = resolve_workspace_mount_root(&store, &mount)
+        .map_err(|error| format!("Could not resolve portable workspace path: {error}"))?;
     let mut message = format!(
         "Mounted {} at {} with {}.",
         connector_label(&mount.connector),
-        absolute_display_path(&mount_access_root(&mount)),
+        absolute_display_path(&canonical_mount_root),
         projection_label(&mount.projection)
     );
     if let Some(preserved) = preserved {
@@ -11493,7 +11495,11 @@ fn resolve_desktop_mount_path(
     store: &SqliteStateStore,
     target: &Path,
 ) -> Result<(MountConfig, PathBuf), String> {
-    let mounts = store.load_mounts().map_err(|error| error.to_string())?;
+    let mut mounts = store.load_mounts().map_err(|error| error.to_string())?;
+    for mount in &mut mounts {
+        mount.root = resolve_workspace_mount_root(store, mount)
+            .map_err(|error| format!("Could not resolve portable workspace path: {error}"))?;
+    }
     daemon_file_provider::find_mount_for_path(&mounts, target)
         .map(|(mount, matched)| (mount.clone(), matched.relative_path))
         .ok_or_else(|| format!("Path is not inside an Locality mount: {}", target.display()))
@@ -12936,6 +12942,11 @@ mod tests {
         assert_eq!(mount.remote_root_id, None);
         assert!(mount.read_only);
         assert_eq!(mount.settings_json, settings_json);
+        assert_eq!(
+            super::resolve_workspace_mount_root(&store, &mount)
+                .expect("resolve Desktop canonical path"),
+            mount_root
+        );
     }
 
     #[cfg(not(target_os = "macos"))]

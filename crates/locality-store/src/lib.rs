@@ -68,9 +68,10 @@ pub use reset::{
 };
 pub use sqlite::SqliteStateStore;
 pub use workspace_binding::{
-    LegacyLayout0Mount, LegacyLayout0Reason, LegacyWorkspaceMount,
-    WORKSPACE_BINDING_LAYOUT_VERSION, WORKSPACE_BINDING_VERSION, WorkspaceBinding,
-    WorkspaceBindingError, WorkspaceBindingMigrationPlan, WorkspaceBindingRecord,
-    WorkspaceHostBindingError, WorkspaceHostBindingResolver, WorkspaceHostPlatform,
-    WorkspaceRebindBlocker,
+    LEGACY_WORKSPACE_BINDING_VERSION, LegacyLayout0Mount, LegacyLayout0Reason,
+    LegacyWorkspaceMount, WORKSPACE_BINDING_LAYOUT_VERSION, WORKSPACE_BINDING_VERSION,
+    WORKSPACE_HOST_BINDING_VERSION, WorkspaceBinding, WorkspaceBindingError,
+    WorkspaceBindingMigrationPlan, WorkspaceBindingRecord, WorkspaceHostBinding,
+    WorkspaceHostBindingError, WorkspaceHostBindingResolver, WorkspaceHostPlatform, WorkspaceId,
+    WorkspaceProjectionIdentity, WorkspaceRebindBlocker,
 };

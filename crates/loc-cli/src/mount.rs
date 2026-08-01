@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use locality_core::model::{MountId, RemoteId};
 use locality_store::{
     ConnectionId, LegacyWorkspaceMount, MountConfig, MountRepository, ProjectionMode, StoreError,
-    WorkspaceBindingRepository, WorkspaceHostBindingError, WorkspaceHostBindingResolver,
+    WorkspaceBindingRepository, WorkspaceHostBinding, WorkspaceHostBindingError,
+    WorkspaceHostBindingResolver, WorkspaceHostPlatform, WorkspaceId, WorkspaceProjectionIdentity,
 };
 use localityd::source::source_descriptor;
 use serde::Serialize;
@@ -125,13 +126,44 @@ where
         // binding, validated above. Generic stores must never infer this trust
         // from a common parent during save_mount.
         let trusted_workspace_root = localityd::virtual_fs::virtual_projection_root(&mount);
+        let workspace_id = virtual_workspace_id(&mount.projection);
+        let existing_host = store
+            .get_workspace_host_binding(&workspace_id)
+            .map_err(MountError::Store)?;
+        let existing_binding = store
+            .get_workspace_binding(&mount.mount_id)
+            .map_err(MountError::Store)?;
+        let layout_sequence = match &existing_host {
+            Some(host)
+                if existing_binding
+                    .as_ref()
+                    .and_then(|binding| binding.workspace_id())
+                    == Some(&workspace_id) =>
+            {
+                host.layout_sequence()
+            }
+            Some(host) => host
+                .next_layout_sequence()
+                .map_err(|error| MountError::Store(StoreError::InvalidState(error.to_string())))?,
+            None => 1,
+        };
+        let host_binding = WorkspaceHostBinding::new(
+            WorkspaceHostPlatform::current(),
+            workspace_id,
+            trusted_workspace_root,
+            virtual_projection_identity(&mount.projection),
+            layout_sequence,
+        )
+        .map_err(MountError::HostBinding)?;
         let legacy = LegacyWorkspaceMount::new(mount.mount_id.clone(), mount.root.clone());
         let plan = WorkspaceHostBindingResolver::current()
-            .plan_legacy_migration(&trusted_workspace_root, std::slice::from_ref(&legacy))
+            .plan_workspace_migration(host_binding, std::slice::from_ref(&legacy))
             .map_err(MountError::HostBinding)?;
-        if let Some(binding) = plan.layout1_bindings().first() {
+        if let (Some(host_binding), Some(binding)) =
+            (plan.host_binding(), plan.layout1_bindings().first())
+        {
             store
-                .save_workspace_binding(binding.clone())
+                .commit_workspace_binding(host_binding.clone(), binding.clone())
                 .map_err(MountError::Store)?;
         }
     }
@@ -149,6 +181,36 @@ where
         settings_json: options.settings_json,
         guidance,
     })
+}
+
+/// Shared CLI/Desktop mount-root resolver. Layout-1 bindings resolve through
+/// their persisted trusted workspace root; v1 and unbound mounts retain the
+/// exact legacy root.
+pub fn resolve_workspace_mount_root<S>(
+    store: &S,
+    mount: &MountConfig,
+) -> Result<PathBuf, StoreError>
+where
+    S: WorkspaceBindingRepository,
+{
+    store.resolve_workspace_mount_root(mount)
+}
+
+fn virtual_workspace_id(projection: &ProjectionMode) -> WorkspaceId {
+    WorkspaceId::new(format!("locality.workspace.{}", projection.as_str()))
+        .expect("static virtual workspace identity is valid")
+}
+
+fn virtual_projection_identity(projection: &ProjectionMode) -> WorkspaceProjectionIdentity {
+    let identity = match projection {
+        ProjectionMode::MacosFileProvider => "macos-file-provider:loc",
+        ProjectionMode::LinuxFuse => "linux-fuse:locality-shared-root",
+        ProjectionMode::WindowsCloudFiles => {
+            "windows-cloud-files:codeflash.ai.loc!default!locality"
+        }
+        ProjectionMode::PlainFiles => "plain-files:locality",
+    };
+    WorkspaceProjectionIdentity::new(identity).expect("static virtual projection identity is valid")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

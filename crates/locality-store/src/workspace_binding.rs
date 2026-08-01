@@ -22,22 +22,203 @@ use locality_core::workspace_layout::MountTarget;
 use serde::{Deserialize, Deserializer, Serialize};
 use unicode_normalization_v16::UnicodeNormalization;
 
-pub const WORKSPACE_BINDING_VERSION: u16 = 1;
+pub const LEGACY_WORKSPACE_BINDING_VERSION: u16 = 1;
+pub const WORKSPACE_BINDING_VERSION: u16 = 2;
 pub const WORKSPACE_BINDING_LAYOUT_VERSION: u16 = 1;
+pub const WORKSPACE_HOST_BINDING_VERSION: u16 = 1;
+
+/// Stable, host-local identity for one portable workspace namespace.
+///
+/// This is deliberately distinct from provider workspace IDs and hosted
+/// profile IDs. It is opaque, never joined to a path, and remains stable when
+/// the trusted host root is relocated by a future owning coordinator.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct WorkspaceId(String);
+
+impl WorkspaceId {
+    pub const MAX_UTF8_BYTES: usize = 128;
+    pub const MAX_UTF16_UNITS: usize = 128;
+
+    pub fn new(value: impl Into<String>) -> Result<Self, WorkspaceBindingError> {
+        let value = value.into();
+        validate_opaque_identity("workspace ID", &value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkspaceId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Stable operating-system projection/domain identity for one workspace.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct WorkspaceProjectionIdentity(String);
+
+impl WorkspaceProjectionIdentity {
+    pub const MAX_UTF8_BYTES: usize = 256;
+    pub const MAX_UTF16_UNITS: usize = 256;
+
+    pub fn new(value: impl Into<String>) -> Result<Self, WorkspaceBindingError> {
+        let value = value.into();
+        validate_projection_identity(&value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkspaceProjectionIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Trusted host placement and projection identity for one workspace.
+///
+/// Absolute paths remain local placement only. They are persisted separately
+/// from the portable per-mount target so a mount binding cannot invent or
+/// replace a host root by itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceHostBinding {
+    host_binding_version: u16,
+    workspace_id: WorkspaceId,
+    trusted_workspace_root: PathBuf,
+    projection_identity: WorkspaceProjectionIdentity,
+    layout_sequence: u64,
+}
+
+impl WorkspaceHostBinding {
+    pub fn new(
+        platform: WorkspaceHostPlatform,
+        workspace_id: WorkspaceId,
+        trusted_workspace_root: impl Into<PathBuf>,
+        projection_identity: WorkspaceProjectionIdentity,
+        layout_sequence: u64,
+    ) -> Result<Self, WorkspaceHostBindingError> {
+        let trusted_workspace_root = trusted_workspace_root.into();
+        ParsedHostPath::parse(platform, &trusted_workspace_root)
+            .ok_or(WorkspaceHostBindingError::InvalidTrustedWorkspaceRoot)?;
+        Ok(Self {
+            host_binding_version: WORKSPACE_HOST_BINDING_VERSION,
+            workspace_id,
+            trusted_workspace_root,
+            projection_identity,
+            layout_sequence,
+        })
+    }
+
+    pub fn workspace_id(&self) -> &WorkspaceId {
+        &self.workspace_id
+    }
+
+    pub fn trusted_workspace_root(&self) -> &Path {
+        &self.trusted_workspace_root
+    }
+
+    pub fn projection_identity(&self) -> &WorkspaceProjectionIdentity {
+        &self.projection_identity
+    }
+
+    pub fn layout_sequence(&self) -> u64 {
+        self.layout_sequence
+    }
+
+    pub fn next_layout_sequence(&self) -> Result<u64, WorkspaceBindingError> {
+        self.layout_sequence
+            .checked_add(1)
+            .ok_or(WorkspaceBindingError::LayoutSequenceOverflow)
+    }
+
+    pub fn mount_root(&self, target: &MountTarget) -> PathBuf {
+        self.trusted_workspace_root.join(target.as_str())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceHostBindingWire {
+    host_binding_version: u16,
+    workspace_id: WorkspaceId,
+    trusted_workspace_root: PathBuf,
+    projection_identity: WorkspaceProjectionIdentity,
+    layout_sequence: u64,
+}
+
+impl<'de> Deserialize<'de> for WorkspaceHostBinding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = WorkspaceHostBindingWire::deserialize(deserializer)?;
+        if wire.host_binding_version != WORKSPACE_HOST_BINDING_VERSION {
+            return Err(serde::de::Error::custom(
+                WorkspaceBindingError::UnsupportedHostBindingVersion {
+                    actual: wire.host_binding_version,
+                },
+            ));
+        }
+        if !wire.trusted_workspace_root.is_absolute()
+            || wire
+                .trusted_workspace_root
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(serde::de::Error::custom(
+                WorkspaceHostBindingError::InvalidTrustedWorkspaceRoot,
+            ));
+        }
+        Ok(Self {
+            host_binding_version: wire.host_binding_version,
+            workspace_id: wire.workspace_id,
+            trusted_workspace_root: wire.trusted_workspace_root,
+            projection_identity: wire.projection_identity,
+            layout_sequence: wire.layout_sequence,
+        })
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceBinding {
     binding_version: u16,
     layout_version: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_id: Option<WorkspaceId>,
     mount_target: MountTarget,
 }
 
 impl WorkspaceBinding {
     pub fn new(mount_target: MountTarget) -> Self {
         Self {
+            binding_version: LEGACY_WORKSPACE_BINDING_VERSION,
+            layout_version: WORKSPACE_BINDING_LAYOUT_VERSION,
+            workspace_id: None,
+            mount_target,
+        }
+    }
+
+    pub fn for_workspace(workspace_id: WorkspaceId, mount_target: MountTarget) -> Self {
+        Self {
             binding_version: WORKSPACE_BINDING_VERSION,
             layout_version: WORKSPACE_BINDING_LAYOUT_VERSION,
+            workspace_id: Some(workspace_id),
             mount_target,
         }
     }
@@ -52,6 +233,10 @@ impl WorkspaceBinding {
 
     pub fn mount_target(&self) -> &MountTarget {
         &self.mount_target
+    }
+
+    pub fn workspace_id(&self) -> Option<&WorkspaceId> {
+        self.workspace_id.as_ref()
     }
 
     /// Resolve this portable binding beneath one host's selected workspace root.
@@ -75,6 +260,8 @@ impl WorkspaceBinding {
 struct WorkspaceBindingWire {
     binding_version: u16,
     layout_version: u16,
+    #[serde(default)]
+    workspace_id: Option<WorkspaceId>,
     mount_target: MountTarget,
 }
 
@@ -84,7 +271,10 @@ impl<'de> Deserialize<'de> for WorkspaceBinding {
         D: Deserializer<'de>,
     {
         let wire = WorkspaceBindingWire::deserialize(deserializer)?;
-        if wire.binding_version != WORKSPACE_BINDING_VERSION {
+        if !matches!(
+            wire.binding_version,
+            LEGACY_WORKSPACE_BINDING_VERSION | WORKSPACE_BINDING_VERSION
+        ) {
             return Err(serde::de::Error::custom(
                 WorkspaceBindingError::UnsupportedBindingVersion {
                     actual: wire.binding_version,
@@ -98,23 +288,62 @@ impl<'de> Deserialize<'de> for WorkspaceBinding {
                 },
             ));
         }
-        Ok(Self::new(wire.mount_target))
+        match (wire.binding_version, wire.workspace_id) {
+            (LEGACY_WORKSPACE_BINDING_VERSION, None) => Ok(Self::new(wire.mount_target)),
+            (WORKSPACE_BINDING_VERSION, Some(workspace_id)) => {
+                Ok(Self::for_workspace(workspace_id, wire.mount_target))
+            }
+            (LEGACY_WORKSPACE_BINDING_VERSION, Some(_)) => Err(serde::de::Error::custom(
+                WorkspaceBindingError::LegacyBindingHasWorkspaceIdentity,
+            )),
+            (WORKSPACE_BINDING_VERSION, None) => Err(serde::de::Error::custom(
+                WorkspaceBindingError::WorkspaceIdentityMissing,
+            )),
+            _ => unreachable!("binding version was validated above"),
+        }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkspaceBindingError {
+    EmptyIdentity { kind: &'static str },
+    IdentityNotNfc { kind: &'static str },
+    IdentityTooLong { kind: &'static str },
+    IdentityContainsControl { kind: &'static str },
+    LayoutSequenceOverflow,
+    LegacyBindingHasWorkspaceIdentity,
     UnsupportedBindingVersion { actual: u16 },
+    UnsupportedHostBindingVersion { actual: u16 },
     UnsupportedLayoutVersion { actual: u16 },
+    WorkspaceIdentityMissing,
 }
 
 impl Display for WorkspaceBindingError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::EmptyIdentity { kind } => write!(formatter, "{kind} is empty"),
+            Self::IdentityNotNfc { kind } => write!(formatter, "{kind} is not Unicode NFC"),
+            Self::IdentityTooLong { kind } => {
+                write!(formatter, "{kind} exceeds its portable bound")
+            }
+            Self::IdentityContainsControl { kind } => {
+                write!(formatter, "{kind} contains NUL or a control character")
+            }
+            Self::LayoutSequenceOverflow => {
+                formatter.write_str("workspace layout sequence is exhausted")
+            }
+            Self::LegacyBindingHasWorkspaceIdentity => formatter
+                .write_str("legacy workspace binding must not contain a workspace identity"),
             Self::UnsupportedBindingVersion { actual } => {
                 write!(
                     formatter,
                     "workspace binding version {actual} is unsupported"
+                )
+            }
+            Self::UnsupportedHostBindingVersion { actual } => {
+                write!(
+                    formatter,
+                    "workspace host binding version {actual} is unsupported"
                 )
             }
             Self::UnsupportedLayoutVersion { actual } => {
@@ -123,8 +352,54 @@ impl Display for WorkspaceBindingError {
                     "workspace layout version {actual} is unsupported"
                 )
             }
+            Self::WorkspaceIdentityMissing => {
+                formatter.write_str("workspace binding is missing its workspace identity")
+            }
         }
     }
+}
+
+fn validate_opaque_identity(kind: &'static str, value: &str) -> Result<(), WorkspaceBindingError> {
+    if value.is_empty() {
+        return Err(WorkspaceBindingError::EmptyIdentity { kind });
+    }
+    if !value.nfc().eq(value.chars()) {
+        return Err(WorkspaceBindingError::IdentityNotNfc { kind });
+    }
+    if value.len() > WorkspaceId::MAX_UTF8_BYTES
+        || value.encode_utf16().count() > WorkspaceId::MAX_UTF16_UNITS
+    {
+        return Err(WorkspaceBindingError::IdentityTooLong { kind });
+    }
+    if value
+        .chars()
+        .any(|character| character == '\0' || character.is_control())
+    {
+        return Err(WorkspaceBindingError::IdentityContainsControl { kind });
+    }
+    Ok(())
+}
+
+fn validate_projection_identity(value: &str) -> Result<(), WorkspaceBindingError> {
+    let kind = "workspace projection identity";
+    if value.is_empty() {
+        return Err(WorkspaceBindingError::EmptyIdentity { kind });
+    }
+    if !value.nfc().eq(value.chars()) {
+        return Err(WorkspaceBindingError::IdentityNotNfc { kind });
+    }
+    if value.len() > WorkspaceProjectionIdentity::MAX_UTF8_BYTES
+        || value.encode_utf16().count() > WorkspaceProjectionIdentity::MAX_UTF16_UNITS
+    {
+        return Err(WorkspaceBindingError::IdentityTooLong { kind });
+    }
+    if value
+        .chars()
+        .any(|character| character == '\0' || character.is_control())
+    {
+        return Err(WorkspaceBindingError::IdentityContainsControl { kind });
+    }
+    Ok(())
 }
 
 impl std::error::Error for WorkspaceBindingError {}
@@ -243,6 +518,7 @@ pub struct LegacyLayout0Mount {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceBindingMigrationPlan {
     workspace_root: PathBuf,
+    host_binding: Option<WorkspaceHostBinding>,
     layout1_bindings: Vec<WorkspaceBindingRecord>,
     layout0_mounts: Vec<LegacyLayout0Mount>,
 }
@@ -254,6 +530,10 @@ impl WorkspaceBindingMigrationPlan {
 
     pub fn layout1_bindings(&self) -> &[WorkspaceBindingRecord] {
         &self.layout1_bindings
+    }
+
+    pub fn host_binding(&self) -> Option<&WorkspaceHostBinding> {
+        self.host_binding.as_ref()
     }
 
     pub fn layout0_mounts(&self) -> &[LegacyLayout0Mount] {
@@ -324,6 +604,29 @@ impl WorkspaceHostBindingResolver {
         trusted_workspace_root: &Path,
         mounts: &[LegacyWorkspaceMount],
     ) -> Result<WorkspaceBindingMigrationPlan, WorkspaceHostBindingError> {
+        self.plan_migration(trusted_workspace_root, None, mounts)
+    }
+
+    /// Plan a coordinator-owned layout-1 binding against one persisted host
+    /// workspace identity. The plan remains mutation free; callers must commit
+    /// its host binding and accepted mount bindings atomically.
+    pub fn plan_workspace_migration(
+        &self,
+        host_binding: WorkspaceHostBinding,
+        mounts: &[LegacyWorkspaceMount],
+    ) -> Result<WorkspaceBindingMigrationPlan, WorkspaceHostBindingError> {
+        ParsedHostPath::parse(self.platform, host_binding.trusted_workspace_root())
+            .ok_or(WorkspaceHostBindingError::InvalidTrustedWorkspaceRoot)?;
+        let trusted_workspace_root = host_binding.trusted_workspace_root().to_path_buf();
+        self.plan_migration(&trusted_workspace_root, Some(host_binding), mounts)
+    }
+
+    fn plan_migration(
+        &self,
+        trusted_workspace_root: &Path,
+        host_binding: Option<WorkspaceHostBinding>,
+        mounts: &[LegacyWorkspaceMount],
+    ) -> Result<WorkspaceBindingMigrationPlan, WorkspaceHostBindingError> {
         let trusted = ParsedHostPath::parse(self.platform, trusted_workspace_root)
             .ok_or(WorkspaceHostBindingError::InvalidTrustedWorkspaceRoot)?;
         let mut mounts = mounts.to_vec();
@@ -363,10 +666,16 @@ impl WorkspaceHostBindingResolver {
         let mut layout0_mounts = Vec::new();
         for (mount, outcome) in candidates {
             match outcome {
-                Ok(target) => layout1_bindings.push(WorkspaceBindingRecord::new(
-                    mount.mount_id,
-                    WorkspaceBinding::new(target),
-                )),
+                Ok(target) => {
+                    let binding = match &host_binding {
+                        Some(host_binding) => WorkspaceBinding::for_workspace(
+                            host_binding.workspace_id().clone(),
+                            target,
+                        ),
+                        None => WorkspaceBinding::new(target),
+                    };
+                    layout1_bindings.push(WorkspaceBindingRecord::new(mount.mount_id, binding));
+                }
                 Err(reason) => layout0_mounts.push(LegacyLayout0Mount {
                     mount_id: mount.mount_id,
                     root: mount.root,
@@ -377,6 +686,7 @@ impl WorkspaceHostBindingResolver {
 
         Ok(WorkspaceBindingMigrationPlan {
             workspace_root: trusted_workspace_root.to_path_buf(),
+            host_binding,
             layout1_bindings,
             layout0_mounts,
         })
@@ -700,9 +1010,10 @@ pub(crate) fn legacy_mount_collision_key(root: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LegacyLayout0Reason, LegacyWorkspaceMount, WORKSPACE_BINDING_LAYOUT_VERSION,
-        WORKSPACE_BINDING_VERSION, WorkspaceBinding, WorkspaceHostBindingResolver,
-        WorkspaceHostPlatform,
+        LEGACY_WORKSPACE_BINDING_VERSION, LegacyLayout0Reason, LegacyWorkspaceMount,
+        WORKSPACE_BINDING_LAYOUT_VERSION, WORKSPACE_BINDING_VERSION, WorkspaceBinding,
+        WorkspaceHostBinding, WorkspaceHostBindingResolver, WorkspaceHostPlatform, WorkspaceId,
+        WorkspaceProjectionIdentity,
     };
     use std::path::Path;
 
@@ -711,21 +1022,21 @@ mod tests {
     use locality_core::workspace_layout::MountTarget;
 
     #[test]
-    fn binding_json_has_no_host_path_and_rejects_newer_versions() {
+    fn legacy_binding_json_has_no_host_path_and_v2_requires_workspace_identity() {
         let binding = WorkspaceBinding::new(MountTarget::new("notion-main").expect("target"));
         assert_eq!(
             serde_json::to_string(&binding).expect("serialize binding"),
             r#"{"binding_version":1,"layout_version":1,"mount_target":"notion-main"}"#
         );
-        assert_eq!(binding.binding_version(), WORKSPACE_BINDING_VERSION);
+        assert_eq!(binding.binding_version(), LEGACY_WORKSPACE_BINDING_VERSION);
         assert_eq!(binding.layout_version(), WORKSPACE_BINDING_LAYOUT_VERSION);
         assert!(
             serde_json::from_str::<WorkspaceBinding>(
                 r#"{"binding_version":2,"layout_version":1,"mount_target":"notion-main"}"#
             )
-            .expect_err("new binding version")
+            .expect_err("v2 identity is required")
             .to_string()
-            .contains("unsupported")
+            .contains("missing")
         );
         assert!(
             serde_json::from_str::<WorkspaceBinding>(
@@ -734,6 +1045,38 @@ mod tests {
             .expect_err("new layout version")
             .to_string()
             .contains("unsupported")
+        );
+    }
+
+    #[test]
+    fn v2_binding_separates_portable_target_from_trusted_host_placement() {
+        let workspace_id = WorkspaceId::new("locality.workspace.linux_fuse").expect("workspace");
+        let host = WorkspaceHostBinding::new(
+            WorkspaceHostPlatform::Linux,
+            workspace_id.clone(),
+            "/home/alice/Locality",
+            WorkspaceProjectionIdentity::new("linux-fuse:locality-shared-root")
+                .expect("projection identity"),
+            7,
+        )
+        .expect("host binding");
+        let binding = WorkspaceBinding::for_workspace(
+            workspace_id,
+            MountTarget::new("notion-main").expect("target"),
+        );
+
+        assert_eq!(binding.binding_version(), WORKSPACE_BINDING_VERSION);
+        assert_eq!(host.layout_sequence(), 7);
+        assert_eq!(
+            host.mount_root(binding.mount_target()),
+            Path::new("/home/alice/Locality/notion-main")
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkspaceBinding>(
+                &serde_json::to_string(&binding).expect("serialize")
+            )
+            .expect("deserialize"),
+            binding
         );
     }
 

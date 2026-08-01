@@ -17,7 +17,9 @@ use crate::records::{
     HydrationJobRecord, MetadataDiscoveryJobRecord, MountConfig, MountLiveModeRecord,
     RemoteObservationRecord, ShadowSnapshotRecord, VirtualMutationRecord,
 };
-use crate::workspace_binding::{WorkspaceBinding, WorkspaceBindingRecord};
+use crate::workspace_binding::{
+    WorkspaceBinding, WorkspaceBindingRecord, WorkspaceHostBinding, WorkspaceId,
+};
 
 pub trait MountRepository {
     fn save_mount(&mut self, mount: MountConfig) -> StoreResult<()>;
@@ -35,6 +37,47 @@ pub trait WorkspaceBindingRepository {
     fn save_workspace_binding(&mut self, record: WorkspaceBindingRecord) -> StoreResult<()>;
     fn get_workspace_binding(&self, mount_id: &MountId) -> StoreResult<Option<WorkspaceBinding>>;
     fn load_workspace_bindings(&self) -> StoreResult<Vec<WorkspaceBindingRecord>>;
+
+    /// Atomically commit one workspace-level host binding and one accepted
+    /// mount binding. Implementations reject root/domain changes and require a
+    /// monotonic sequence for a newly added mount.
+    fn commit_workspace_binding(
+        &mut self,
+        _host_binding: WorkspaceHostBinding,
+        _record: WorkspaceBindingRecord,
+    ) -> StoreResult<()> {
+        Err(StoreError::NotImplemented(
+            "atomic portable workspace binding persistence",
+        ))
+    }
+
+    fn get_workspace_host_binding(
+        &self,
+        _workspace_id: &WorkspaceId,
+    ) -> StoreResult<Option<WorkspaceHostBinding>> {
+        Ok(None)
+    }
+
+    /// Resolve the actual mount root through trusted layout-1 metadata when it
+    /// exists. Missing and v1 bindings retain the exact legacy root.
+    fn resolve_workspace_mount_root(&self, mount: &MountConfig) -> StoreResult<std::path::PathBuf> {
+        let Some(binding) = self.get_workspace_binding(&mount.mount_id)? else {
+            return Ok(mount.root.clone());
+        };
+        let Some(workspace_id) = binding.workspace_id() else {
+            return Ok(mount.root.clone());
+        };
+        let host_binding = self
+            .get_workspace_host_binding(workspace_id)?
+            .ok_or_else(|| {
+                StoreError::InvalidState(format!(
+                    "workspace binding for mount `{}` references missing workspace `{}`",
+                    mount.mount_id.as_str(),
+                    workspace_id.as_str()
+                ))
+            })?;
+        Ok(host_binding.mount_root(binding.mount_target()))
+    }
 
     /// Report the first durable blocker to a workspace move. This metadata
     /// boundary never updates roots or moves files; even a clean plain-file
