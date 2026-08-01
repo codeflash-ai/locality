@@ -861,22 +861,42 @@ fn is_sensitive_setting_key(key: &str) -> bool {
     }) {
         return true;
     }
-    if segments
-        .windows(2)
-        .any(|pair| matches!(pair, ["api" | "private", "key"]))
-    {
+    if segments.windows(2).any(|pair| {
+        matches!(
+            pair,
+            ["api", "key"]
+                | ["private", "key"]
+                | ["access", "token"]
+                | ["client", "secret"]
+                | ["bearer", "token"]
+        )
+    }) {
         return true;
     }
 
-    let compact = segments.concat();
-    compact.ends_with("token")
-        || compact.ends_with("secret")
-        || compact.ends_with("password")
-        || compact.ends_with("credential")
-        || compact.ends_with("credentials")
-        || compact.ends_with("authorization")
-        || compact.starts_with("bearer")
-        || ["apikey", "privatekey", "secretkey"]
-            .iter()
-            .any(|marker| compact.contains(marker))
+    let [compact] = segments.as_slice() else {
+        return false;
+    };
+    const SENSITIVE_COMPOUNDS: &[&str] = &[
+        "apikey",
+        "privatekey",
+        "accesstoken",
+        "clientsecret",
+        "bearertoken",
+    ];
+    const METADATA_SUFFIXES: &[&str] = &[
+        "value",
+        "id",
+        "ref",
+        "reference",
+        "handle",
+        "path",
+        "file",
+        "name",
+    ];
+    SENSITIVE_COMPOUNDS.iter().any(|compound| {
+        compact
+            .strip_prefix(compound)
+            .is_some_and(|suffix| suffix.is_empty() || METADATA_SUFFIXES.contains(&suffix))
+    })
 }
