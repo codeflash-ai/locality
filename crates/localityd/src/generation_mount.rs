@@ -37,6 +37,15 @@ pub(crate) struct SecureTarget {
     name: OsString,
 }
 
+#[cfg(unix)]
+impl Drop for SecureMount {
+    fn drop(&mut self) {
+        // Targets use dup'd root descriptors. Release coordinator ownership
+        // when the mount guard ends instead of waiting for every duplicate.
+        let _ = rustix::fs::flock(&self.root, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
 impl SecureMount {
     pub(crate) fn open(root: &Path) -> io::Result<Self> {
         #[cfg(unix)]
