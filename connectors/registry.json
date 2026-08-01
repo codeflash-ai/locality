@@ -1,0 +1,500 @@
+{
+  "$schema": "./registry.schema.json",
+  "schema_version": 1,
+  "connectors": [
+    {
+      "id": "notion",
+      "version": "notion.v1",
+      "display_name": "Notion",
+      "crate": "crates/locality-notion",
+      "default_profile_id": "notion-oauth-default",
+      "default_connection_id": "notion-default",
+      "profiles": [
+        {
+          "id": "notion-oauth-default",
+          "display_name": "Notion OAuth",
+          "auth_kind": "oauth",
+          "scopes": [],
+          "actions": ["read", "write"]
+        },
+        {
+          "id": "notion-token-default",
+          "display_name": "Notion token auth",
+          "auth_kind": "token",
+          "scopes": [],
+          "actions": ["read", "write"]
+        }
+      ],
+      "mount": {
+        "default_id": "notion-main",
+        "read_only": false,
+        "default_projection_mode": "plain_files",
+        "default_settings": {},
+        "settings_schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "maxProperties": 0
+        }
+      },
+      "capabilities": {
+        "supports_block_updates": true,
+        "supports_entity_body_updates": false,
+        "supports_databases": true,
+        "supports_oauth": true,
+        "supports_remote_observation": true,
+        "supports_lazy_child_enumeration": true,
+        "supports_media_download": true,
+        "supports_undo": true,
+        "supports_batch_observation": false
+      },
+      "push_operations": [
+        "update_block",
+        "replace_block",
+        "append_block",
+        "move_block",
+        "update_media",
+        "archive_block",
+        "archive_entity",
+        "update_properties",
+        "move_entity",
+        "create_entity",
+        "create_database"
+      ],
+      "membership_operations": [],
+      "projection": {
+        "source_root_create_parent_kind": null,
+        "create_entity_parent_kinds": ["page", "database"],
+        "move_entity_parent_kinds": ["page", "database"],
+        "body_diff_mode": "block",
+        "virtual_rename_policy": "filename_derived",
+        "periodic_discovery_seconds": null,
+        "max_background_discovery_workers": 3
+      },
+      "ui": {
+        "icon": "notion.svg",
+        "docs_slug": "notion"
+      }
+    },
+    {
+      "id": "google-docs",
+      "version": "google-docs.v1",
+      "display_name": "Google Docs",
+      "crate": "crates/locality-google-docs",
+      "default_profile_id": "google-docs-oauth-default",
+      "default_connection_id": "google-docs-default",
+      "profiles": [
+        {
+          "id": "google-docs-oauth-default",
+          "display_name": "Google Docs OAuth",
+          "auth_kind": "oauth",
+          "scopes": [
+            "openid",
+            "email",
+            "profile",
+            "https://www.googleapis.com/auth/documents",
+            "https://www.googleapis.com/auth/drive.file",
+            "https://www.googleapis.com/auth/drive.metadata"
+          ],
+          "actions": ["read", "write"]
+        }
+      ],
+      "mount": {
+        "default_id": "google-docs-main",
+        "read_only": false,
+        "default_projection_mode": "plain_files",
+        "default_settings": {},
+        "settings_schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "maxProperties": 0
+        }
+      },
+      "capabilities": {
+        "supports_block_updates": true,
+        "supports_entity_body_updates": false,
+        "supports_databases": false,
+        "supports_oauth": true,
+        "supports_remote_observation": true,
+        "supports_lazy_child_enumeration": true,
+        "supports_media_download": false,
+        "supports_undo": false,
+        "supports_batch_observation": false
+      },
+      "push_operations": [
+        "update_block",
+        "replace_block",
+        "append_block",
+        "archive_block",
+        "archive_entity",
+        "update_properties",
+        "move_entity",
+        "create_entity"
+      ],
+      "membership_operations": [],
+      "projection": {
+        "source_root_create_parent_kind": "directory",
+        "create_entity_parent_kinds": ["directory"],
+        "move_entity_parent_kinds": ["directory"],
+        "body_diff_mode": "block",
+        "virtual_rename_policy": "filename_derived",
+        "periodic_discovery_seconds": null,
+        "max_background_discovery_workers": 4
+      },
+      "ui": {
+        "icon": "google-docs.svg",
+        "docs_slug": "google-docs"
+      }
+    },
+    {
+      "id": "google-calendar",
+      "version": "google-calendar.v1",
+      "display_name": "Google Calendar",
+      "crate": "crates/locality-google-calendar",
+      "default_profile_id": "google-calendar-oauth-default",
+      "default_connection_id": "google-calendar-default",
+      "profiles": [
+        {
+          "id": "google-calendar-oauth-default",
+          "display_name": "Google Calendar OAuth",
+          "auth_kind": "oauth",
+          "scopes": [
+            "openid",
+            "email",
+            "profile",
+            "https://www.googleapis.com/auth/calendar.events"
+          ],
+          "actions": ["read", "create"]
+        }
+      ],
+      "mount": {
+        "default_id": "google-calendar-main",
+        "read_only": false,
+        "default_projection_mode": "plain_files",
+        "default_settings": {},
+        "settings_schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "google_calendar": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "date_window": {
+                  "type": ["object", "null"],
+                  "additionalProperties": false,
+                  "required": ["after", "before"],
+                  "properties": {
+                    "after": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+                    "before": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "capabilities": {
+        "supports_block_updates": false,
+        "supports_entity_body_updates": false,
+        "supports_databases": false,
+        "supports_oauth": true,
+        "supports_remote_observation": true,
+        "supports_lazy_child_enumeration": true,
+        "supports_media_download": false,
+        "supports_undo": false,
+        "supports_batch_observation": false
+      },
+      "push_operations": ["create_entity"],
+      "membership_operations": [],
+      "projection": {
+        "source_root_create_parent_kind": null,
+        "create_entity_parent_kinds": ["directory"],
+        "move_entity_parent_kinds": [],
+        "body_diff_mode": "block",
+        "virtual_rename_policy": "filename_derived",
+        "periodic_discovery_seconds": null,
+        "max_background_discovery_workers": 4
+      },
+      "ui": {
+        "icon": "google-calendar.svg",
+        "docs_slug": "google-calendar"
+      }
+    },
+    {
+      "id": "gmail",
+      "version": "gmail.v1",
+      "display_name": "Gmail",
+      "crate": "crates/locality-gmail",
+      "default_profile_id": "gmail-oauth-default",
+      "default_connection_id": "gmail-default",
+      "profiles": [
+        {
+          "id": "gmail-oauth-default",
+          "display_name": "Gmail OAuth",
+          "auth_kind": "oauth",
+          "scopes": [
+            "openid",
+            "email",
+            "profile",
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/gmail.compose"
+          ],
+          "actions": ["read", "send"]
+        }
+      ],
+      "mount": {
+        "default_id": "gmail-main",
+        "read_only": false,
+        "default_projection_mode": "plain_files",
+        "default_settings": {},
+        "settings_schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "gmail": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "date_window": {
+                  "type": ["object", "null"],
+                  "additionalProperties": false,
+                  "required": ["after", "before"],
+                  "properties": {
+                    "after": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+                    "before": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}
+                  }
+                },
+                "view": {"type": "string", "enum": ["messages", "threads"]}
+              }
+            }
+          }
+        }
+      },
+      "capabilities": {
+        "supports_block_updates": false,
+        "supports_entity_body_updates": false,
+        "supports_databases": false,
+        "supports_oauth": true,
+        "supports_remote_observation": true,
+        "supports_lazy_child_enumeration": true,
+        "supports_media_download": false,
+        "supports_undo": false,
+        "supports_batch_observation": false
+      },
+      "push_operations": ["create_entity"],
+      "membership_operations": [],
+      "projection": {
+        "source_root_create_parent_kind": null,
+        "create_entity_parent_kinds": ["directory"],
+        "move_entity_parent_kinds": ["directory"],
+        "body_diff_mode": "block",
+        "virtual_rename_policy": "filename_derived",
+        "periodic_discovery_seconds": null,
+        "max_background_discovery_workers": 4
+      },
+      "ui": {
+        "icon": "gmail.svg",
+        "docs_slug": "gmail"
+      }
+    },
+    {
+      "id": "granola",
+      "version": "granola.v1",
+      "display_name": "Granola",
+      "crate": "crates/locality-granola",
+      "default_profile_id": "granola-api-key-default",
+      "default_connection_id": "granola-default",
+      "profiles": [
+        {
+          "id": "granola-api-key-default",
+          "display_name": "Granola API key",
+          "auth_kind": "api_key",
+          "scopes": ["read"],
+          "actions": ["read"]
+        }
+      ],
+      "mount": {
+        "default_id": "granola-main",
+        "read_only": true,
+        "default_projection_mode": "plain_files",
+        "default_settings": {},
+        "settings_schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "maxProperties": 0
+        }
+      },
+      "capabilities": {
+        "supports_block_updates": false,
+        "supports_entity_body_updates": false,
+        "supports_databases": false,
+        "supports_oauth": false,
+        "supports_remote_observation": true,
+        "supports_lazy_child_enumeration": true,
+        "supports_media_download": false,
+        "supports_undo": false,
+        "supports_batch_observation": false
+      },
+      "push_operations": [],
+      "membership_operations": [],
+      "projection": {
+        "source_root_create_parent_kind": null,
+        "create_entity_parent_kinds": [],
+        "move_entity_parent_kinds": [],
+        "body_diff_mode": "block",
+        "virtual_rename_policy": "filename_derived",
+        "periodic_discovery_seconds": 300,
+        "max_background_discovery_workers": 3
+      },
+      "ui": {
+        "icon": "granola.svg",
+        "docs_slug": "granola"
+      }
+    },
+    {
+      "id": "linear",
+      "version": "linear.v1",
+      "display_name": "Linear",
+      "crate": "crates/locality-linear",
+      "default_profile_id": "linear-api-key-default",
+      "default_connection_id": "linear-default",
+      "profiles": [
+        {
+          "id": "linear-api-key-default",
+          "display_name": "Linear API key",
+          "auth_kind": "api_key",
+          "scopes": ["issues:read", "issues:write"],
+          "actions": ["read", "write"]
+        }
+      ],
+      "mount": {
+        "default_id": "linear-main",
+        "read_only": false,
+        "default_projection_mode": "plain_files",
+        "default_settings": {},
+        "settings_schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "maxProperties": 0
+        }
+      },
+      "capabilities": {
+        "supports_block_updates": false,
+        "supports_entity_body_updates": true,
+        "supports_databases": false,
+        "supports_oauth": false,
+        "supports_remote_observation": true,
+        "supports_lazy_child_enumeration": true,
+        "supports_media_download": true,
+        "supports_undo": false,
+        "supports_batch_observation": true
+      },
+      "push_operations": ["update_entity_body", "update_properties", "move_entity"],
+      "membership_operations": [],
+      "projection": {
+        "source_root_create_parent_kind": null,
+        "create_entity_parent_kinds": [],
+        "move_entity_parent_kinds": ["directory"],
+        "body_diff_mode": "whole_entity",
+        "virtual_rename_policy": "preserve_canonical",
+        "periodic_discovery_seconds": 300,
+        "max_background_discovery_workers": 3
+      },
+      "ui": {
+        "icon": "linear.svg",
+        "docs_slug": "linear"
+      }
+    },
+    {
+      "id": "slack",
+      "version": "slack.v1",
+      "display_name": "Slack",
+      "crate": "crates/locality-slack",
+      "default_profile_id": "slack-oauth-default",
+      "default_connection_id": "slack-default",
+      "profiles": [
+        {
+          "id": "slack-oauth-default",
+          "display_name": "Slack OAuth",
+          "auth_kind": "oauth",
+          "scopes": [
+            "channels:read",
+            "channels:history",
+            "groups:read",
+            "groups:history",
+            "im:read",
+            "im:history",
+            "mpim:read",
+            "mpim:history",
+            "users:read",
+            "team:read",
+            "files:read",
+            "channels:join"
+          ],
+          "actions": []
+        }
+      ],
+      "mount": {
+        "default_id": "slack-main",
+        "read_only": true,
+        "default_projection_mode": "plain_files",
+        "default_settings": {
+          "slack": {
+            "history_limit": 15,
+            "types": ["public_channel", "private_channel", "im", "mpim"],
+            "auto_join_public_channels": true
+          }
+        },
+        "settings_schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "slack": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "history_limit": {"type": "integer", "minimum": 1, "maximum": 15},
+                "types": {
+                  "type": "array",
+                  "minItems": 1,
+                  "uniqueItems": true,
+                  "items": {
+                    "type": "string",
+                    "enum": ["public_channel", "private_channel", "im", "mpim"]
+                  }
+                },
+                "auto_join_public_channels": {"type": "boolean"}
+              }
+            }
+          }
+        }
+      },
+      "capabilities": {
+        "supports_block_updates": false,
+        "supports_entity_body_updates": false,
+        "supports_databases": false,
+        "supports_oauth": true,
+        "supports_remote_observation": true,
+        "supports_lazy_child_enumeration": true,
+        "supports_media_download": false,
+        "supports_undo": false,
+        "supports_batch_observation": false
+      },
+      "push_operations": [],
+      "membership_operations": ["join_public_channels"],
+      "projection": {
+        "source_root_create_parent_kind": null,
+        "create_entity_parent_kinds": [],
+        "move_entity_parent_kinds": [],
+        "body_diff_mode": "block",
+        "virtual_rename_policy": "filename_derived",
+        "periodic_discovery_seconds": null,
+        "max_background_discovery_workers": 1
+      },
+      "ui": {
+        "icon": "slack.svg",
+        "docs_slug": "slack"
+      }
+    }
+  ]
+}

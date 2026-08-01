@@ -64,9 +64,9 @@ Locality currently includes:
   restoring, inspecting, and debugging mounts;
 - a per-user daemon process, `localityd`, that owns hydration, background freshness,
   virtual filesystem requests, local write tracking, and Live Mode;
-- a Notion connector that renders pages/databases to canonical Markdown,
-  supports conservative block/property writes, handles media under `.loc/media`,
-  and reconciles changed pages after pushes;
+- seven direct connectors: Notion and Google Docs with conservative document
+  writes, Google Calendar and Gmail with reviewed draft creation, Linear with
+  issue edits, and read-only Granola and Slack projections;
 - virtual filesystem projections through macOS File Provider, Linux FUSE, and
   Windows Cloud Files.
 - generated `AGENTS.md` and `CLAUDE.md` guidance inside mounts so coding agents
@@ -225,7 +225,7 @@ locality-core + locality-store
   three-tree planner, validation, journals, SQLite state
         |
         v
-connector SDK
+connector SDK + descriptive connector registry
         |
         v
 locality-notion -> Notion API
@@ -240,7 +240,13 @@ Core crates and directories:
 | `crates/localityd` | Per-user daemon for mounts, hydration, freshness, virtual filesystem IPC, and Live Mode. |
 | `crates/locality-core` | Connector-neutral sync model, canonical Markdown, diff planning, validation, guardrails, conflicts, and journals. |
 | `crates/locality-connector` | Connector trait and data types for enumerate, fetch, render, parse, apply, and reverse apply. |
+| `connectors/` | Versioned language-neutral connector registry and JSON schema. |
 | `crates/locality-notion` | Notion API client, DTOs, renderer, parser/apply support, database schema handling, media, and OAuth integration. |
+| `crates/locality-google-docs` | Google Docs/Drive projection, rendering, OAuth, and conservative document writes. |
+| `crates/locality-google-calendar` | Primary-calendar event projection and reviewed event-draft creation. |
+| `crates/locality-gmail` | Read-only mail projection and reviewed Gmail draft creation. |
+| `crates/locality-granola` | Read-only Granola meeting summary and transcript projection. |
+| `crates/locality-linear` | Linear issue projection, issue edits, context sidecars, and API-key auth. |
 | `crates/locality-slack` | Slack Web API client, OAuth credential handling, read-only conversation projection, and Markdown rendering. |
 | `crates/locality-store` | SQLite state store, migrations, mounts, entities, shadows, journals, credentials metadata, and freshness state. |
 | `platform/linux/locality-fuse` | Linux FUSE helper for online-only virtual mounts. |

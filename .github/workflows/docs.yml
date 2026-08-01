@@ -6,13 +6,19 @@ on:
       - main
     paths:
       - ".github/workflows/docs.yml"
+      - "connectors/**"
+      - "docs/connector-development.md"
       - "Makefile"
+      - "README.md"
       - "docs-site/**"
       - "scripts/mintlify-docs.sh"
   pull_request:
     paths:
       - ".github/workflows/docs.yml"
+      - "connectors/**"
+      - "docs/connector-development.md"
       - "Makefile"
+      - "README.md"
       - "docs-site/**"
       - "scripts/mintlify-docs.sh"
   workflow_dispatch:

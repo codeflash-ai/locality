@@ -1,0 +1,63 @@
+---
+title: "Gmail connector"
+description: "Mount Gmail messages and threads as files and create reviewed drafts."
+---
+
+The Gmail connector projects inbox and sent mail as read-only Markdown and
+uses reviewed files under `draft/` to create Gmail drafts.
+
+## Connect
+
+```bash
+loc connect gmail --name gmail-default
+```
+
+Locality requests scoped Gmail read-only and compose access. It does not request
+the full-mailbox `https://mail.google.com/` scope.
+
+## Mount
+
+```bash
+loc mount gmail ~/Locality/gmail-main --projection plain-files
+loc pull ~/Locality/gmail-main
+```
+
+Optional mount settings include `--view messages|threads` and a bounded date
+window with both `--after YYYY-MM-DD` and `--before YYYY-MM-DD`.
+
+## Projection
+
+```text
+gmail-main/
+  inbox/
+    message-id.md
+  sent/
+    message-id.md
+  draft/
+```
+
+- `inbox/` and `sent/` are read-only;
+- attachments are projected under stable local attachment paths;
+- `draft/` accepts new Markdown files directly inside the directory.
+
+## Creating a draft
+
+```markdown
+---
+to:
+  - person@example.com
+subject: Follow up
+---
+
+Thanks for the conversation. Here are the next steps.
+```
+
+Review and push the file with `loc diff` and `loc push -y`. Locality creates a
+Gmail UI draft; it does not send mail.
+
+## Current limits
+
+- Existing inbox and sent messages cannot be edited.
+- Draft files must be direct children of `draft/`.
+- V1 creates drafts but does not send, reply, forward, label, archive, or delete
+  messages.

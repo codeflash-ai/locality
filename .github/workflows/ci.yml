@@ -67,6 +67,10 @@ jobs:
           fi
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
+      - name: Validate connector extension contracts
+        run: |
+          cargo test -p locality-connector --test manifest_contract --test conformance_testkit
+          cargo test -p localityd --test connector_manifest
       - name: Run Rust tests
         run: cargo test --workspace --all-targets
       - name: Run real Linux FUSE smoke test

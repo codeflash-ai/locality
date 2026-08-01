@@ -17,7 +17,7 @@ use locality_slack::{
 const DEFAULT_SETTINGS: &[u8] = include_bytes!("../fixtures/direct-v1/settings-default.json");
 const CUSTOM_SETTINGS: &[u8] = include_bytes!("../fixtures/direct-v1/settings-custom.json");
 const OAUTH_CAPABILITIES: &[u8] = include_bytes!("../fixtures/direct-v1/oauth-capabilities.json");
-const OAUTH_SCOPES: &[u8] = include_bytes!("../fixtures/direct-v1/oauth-scopes.json");
+const OAUTH_SCOPES: &[u8] = include_bytes!("../fixtures/direct-v1/auth-scopes.json");
 const TREE_PATHS: &[u8] = include_bytes!("../fixtures/direct-v1/tree-paths.txt");
 const NATIVE_USERS: &[u8] = include_bytes!("../fixtures/direct-v1/native-users.json");
 const NATIVE_RECENT: &[u8] = include_bytes!("../fixtures/direct-v1/native-recent.json");
