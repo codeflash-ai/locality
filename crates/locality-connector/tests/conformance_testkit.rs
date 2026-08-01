@@ -2,11 +2,25 @@ use std::fmt;
 use std::path::Path;
 
 use locality_connector::conformance::{
-    FixtureLayout, check_debug_redaction, check_fixture_layout, is_safe_relative_path,
+    DirectFixtureAuth, FixtureLayout, check_debug_redaction, check_direct_fixture_layout,
+    check_fixture_layout, is_safe_relative_path,
 };
 
 struct RedactedConfig {
     secret: String,
+}
+
+#[test]
+fn direct_fixture_versions_must_be_canonical_positive_integers() {
+    for invalid in ["direct", "direct-v0", "direct-v01", "v1", "../direct-v1"] {
+        let error = check_direct_fixture_layout(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            invalid,
+            DirectFixtureAuth::Oauth,
+        )
+        .expect_err("invalid version directory rejected");
+        assert!(error.to_string().contains("direct-v<positive integer>"));
+    }
 }
 
 impl fmt::Debug for RedactedConfig {

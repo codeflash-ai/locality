@@ -5,12 +5,12 @@ use std::time::Duration;
 
 use locality_connector::Connector;
 use locality_connector::conformance::{
-    FixtureLayout, check_capability_operation_agreement, check_debug_redaction,
-    check_fixture_layout, check_manifest_asset_paths, check_manifest_identity,
+    DirectFixtureAuth, check_capability_operation_agreement, check_debug_redaction,
+    check_direct_fixture_layout, check_manifest_asset_paths, check_manifest_identity,
     check_read_only_rejection,
 };
 use locality_connector::manifest::{
-    BodyDiffMode as ManifestBodyDiffMode, ManifestEntityKind,
+    AuthKind, BodyDiffMode as ManifestBodyDiffMode, ManifestEntityKind,
     VirtualRenamePolicy as ManifestRenamePolicy, bundled_connector_registry,
 };
 use locality_core::model::{EntityKind, MountId, RemoteId};
@@ -327,20 +327,35 @@ fn manifest_docs_icons_and_existing_direct_fixture_layout_exist() {
         );
     }
 
-    check_fixture_layout(
-        &repository_root.join("crates/locality-slack"),
-        &FixtureLayout {
-            version_directory: "direct-v1",
-            required_files: &[
-                "tree-paths.txt",
-                "native-recent.json",
-                "recent.md",
-                "settings-default.json",
-                "oauth-scopes.json",
-            ],
-        },
-    )
-    .expect("Slack direct fixture layout");
+    let grandfathered_without_direct_v1 = [
+        "notion",
+        "google-docs",
+        "google-calendar",
+        "gmail",
+        "granola",
+        "linear",
+    ];
+    let mut missing_direct_v1 = Vec::new();
+    for manifest in &bundled_connector_registry().expect("registry").connectors {
+        let crate_root = repository_root.join(&manifest.crate_path);
+        if !crate_root.join("fixtures/direct-v1").is_dir() {
+            missing_direct_v1.push(manifest.id.as_str());
+            continue;
+        }
+        let default_profile = manifest
+            .profiles
+            .iter()
+            .find(|profile| profile.id == manifest.default_profile_id)
+            .expect("default profile");
+        let auth = match default_profile.auth_kind {
+            AuthKind::Oauth => DirectFixtureAuth::Oauth,
+            AuthKind::Token => DirectFixtureAuth::Token,
+            AuthKind::ApiKey => DirectFixtureAuth::ApiKey,
+        };
+        check_direct_fixture_layout(&crate_root, "direct-v1", auth)
+            .unwrap_or_else(|error| panic!("{} direct-v1: {error}", manifest.id));
+    }
+    assert_eq!(missing_direct_v1, grandfathered_without_direct_v1);
 }
 
 #[test]

@@ -56,7 +56,7 @@ crates/locality-<id>/fixtures/direct-v1/
   native-<case>.json
   <case>.md
   settings-default.json
-  auth-scopes.json       # OAuth connectors
+  auth-scopes.json       # OAuth connectors; exact standardized filename
   auth-kind.txt          # token/API-key connectors
 ```
 
@@ -66,9 +66,15 @@ must contain no credentials. OAuth scope fixtures contain scope names only;
 token/API-key fixtures contain only the auth-kind enum. Add more versioned
 directories instead of silently changing an incompatible fixture contract.
 
-Use `FixtureLayout` and `check_fixture_layout` to enforce the files relevant to
-the connector. Existing connectors can adopt this layout incrementally; the
-Slack direct-v1 fixtures are the first applied example.
+Use `check_direct_fixture_layout` to enforce the complete versioned layout.
+The registry-v1 grandfathering list is exactly `notion`, `google-docs`,
+`google-calendar`, `gmail`, `granola`, and `linear`: those connectors may omit
+the entire `direct-v1` directory while their existing fixtures are migrated.
+They may not add a partial directory. Slack is not grandfathered. New
+connectors are never added to the list and must provide the complete layout;
+once a grandfathered connector adds it, remove that connector from the list in
+the daemon contract test. OAuth fixtures must be named `auth-scopes.json`;
+`oauth-scopes.json` is rejected rather than treated as an alias.
 
 ## Host hooks and boundaries
 
