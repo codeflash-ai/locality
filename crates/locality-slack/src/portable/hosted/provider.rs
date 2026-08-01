@@ -14,6 +14,7 @@ use reqwest::{Client, Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
+use tokio::time::Instant as TokioInstant;
 
 use super::checkpoint::{
     HostedSlackPollCheckpointV1, HostedSlackPollError, HostedSlackPollKindV2,
@@ -43,6 +44,7 @@ pub const MAX_HOSTED_SLACK_PROVIDER_METADATA_IDS_V1: usize = 256;
 pub const MAX_HOSTED_SLACK_PROVIDER_PAGE_APPLICATIONS_V1: usize = 256;
 pub const MAX_HOSTED_SLACK_PROVIDER_REQUESTS_V1: usize = 4 * 1024;
 pub const MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1: Duration = Duration::from_secs(5 * 60);
+const HOSTED_SLACK_PROVIDER_GATE_FALLBACK_RETRY_AFTER: Duration = Duration::from_secs(6 * 60);
 pub const HOSTED_SLACK_DISCOVERY_PAGE_LIMIT_V1: u32 = 100;
 pub const MAX_HOSTED_SLACK_DISCOVERY_PAGES_V1: usize = 10;
 pub const MAX_HOSTED_SLACK_DISCOVERY_CHANNELS_V1: usize = 1_000;
@@ -1452,18 +1454,18 @@ struct HostedSlackMethodGateState {
     waiting: usize,
     in_flight: usize,
     tokens: f64,
-    last_refill: Instant,
+    last_refill: TokioInstant,
     cooldown: Option<HostedSlackMethodCooldown>,
 }
 
 struct HostedSlackMethodCooldown {
-    started_at: Instant,
+    started_at: TokioInstant,
     duration: Duration,
-    checked_until: Option<Instant>,
+    checked_until: Option<TokioInstant>,
 }
 
 impl HostedSlackMethodCooldown {
-    fn new(started_at: Instant, duration: Duration) -> Self {
+    fn new(started_at: TokioInstant, duration: Duration) -> Self {
         Self {
             started_at,
             duration,
@@ -1471,7 +1473,7 @@ impl HostedSlackMethodCooldown {
         }
     }
 
-    fn remaining(&self, now: Instant) -> Duration {
+    fn remaining(&self, now: TokioInstant) -> Duration {
         self.checked_until.map_or_else(
             || {
                 self.duration
@@ -1483,7 +1485,7 @@ impl HostedSlackMethodCooldown {
 }
 
 impl HostedSlackMethodGateState {
-    fn refill(&mut self, config: &ConnectorNetworkConfig, now: Instant) {
+    fn refill(&mut self, config: &ConnectorNetworkConfig, now: TokioInstant) {
         if let Some(cooldown) = &self.cooldown
             && !cooldown.remaining(now).is_zero()
         {
@@ -1513,7 +1515,7 @@ impl HostedSlackMethodGate {
                     waiting: 0,
                     in_flight: 0,
                     tokens,
-                    last_refill: Instant::now(),
+                    last_refill: TokioInstant::now(),
                     cooldown: None,
                 }),
                 changed,
@@ -1527,7 +1529,7 @@ impl HostedSlackMethodGate {
         loop {
             let delay = {
                 let mut state = self.inner.state.lock().expect("hosted Slack gate lock");
-                let now = Instant::now();
+                let now = TokioInstant::now();
                 state.refill(&self.inner.config, now);
                 if state.in_flight < self.inner.config.max_in_flight && state.tokens >= 1.0 {
                     state.waiting = state.waiting.saturating_sub(1);
@@ -1571,7 +1573,7 @@ impl HostedSlackMethodGate {
     }
 
     fn record_cooldown(&self, delay: Duration) {
-        let now = Instant::now();
+        let now = TokioInstant::now();
         let candidate = HostedSlackMethodCooldown::new(now, delay);
         {
             let mut state = self.inner.state.lock().expect("hosted Slack gate lock");
@@ -1591,7 +1593,7 @@ impl HostedSlackMethodGate {
     #[cfg(test)]
     fn status(&self) -> HostedSlackMethodGateStatus {
         let mut state = self.inner.state.lock().expect("hosted Slack gate lock");
-        let now = Instant::now();
+        let now = TokioInstant::now();
         state.refill(&self.inner.config, now);
         HostedSlackMethodGateStatus {
             waiting: state.waiting,
@@ -2715,15 +2717,24 @@ fn http_status_error(
 fn rate_limit_error_and_cooldown(
     retry_after: Option<Duration>,
 ) -> (HostedSlackProviderError, Duration) {
+    let error = match retry_after {
+        Some(retry_after) if !retry_after.is_zero() => {
+            HostedSlackProviderError::RateLimited { retry_after }
+        }
+        Some(_) | None => HostedSlackProviderError::InvalidResponse("Retry-After"),
+    };
+    (error, normalized_gate_retry_after(retry_after))
+}
+
+fn normalized_gate_retry_after(retry_after: Option<Duration>) -> Duration {
     match retry_after {
-        Some(retry_after) if !retry_after.is_zero() => (
-            HostedSlackProviderError::RateLimited { retry_after },
-            retry_after,
-        ),
-        Some(_) | None => (
-            HostedSlackProviderError::InvalidResponse("Retry-After"),
-            MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1,
-        ),
+        Some(retry_after)
+            if !retry_after.is_zero()
+                && retry_after <= MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1 =>
+        {
+            retry_after
+        }
+        Some(_) | None => HOSTED_SLACK_PROVIDER_GATE_FALLBACK_RETRY_AFTER,
     }
 }
 
@@ -2732,7 +2743,9 @@ fn shared_cooldown_delay(
     operation: HostedSlackProviderOperationV1,
 ) -> Option<Duration> {
     match error {
-        HostedSlackProviderError::RateLimited { retry_after } => Some(*retry_after),
+        HostedSlackProviderError::RateLimited { retry_after } => {
+            Some(normalized_gate_retry_after(Some(*retry_after)))
+        }
         HostedSlackProviderError::Transient => Some(operation.retry_config().initial_backoff),
         _ => None,
     }
@@ -2885,6 +2898,20 @@ mod tests {
         headers: Vec<(&'static str, &'static str)>,
         body: &'static str,
     }
+
+    const CONVERSATIONS_INFO_OK: &str = r#"{
+        "ok": true,
+        "channel": {
+            "id": "C08ENGINEER1",
+            "context_team_id": "T08LOCALITY1",
+            "is_private": true,
+            "is_shared": true,
+            "is_ext_shared": true,
+            "is_org_shared": false,
+            "is_member": true,
+            "shared_team_ids": ["T08LOCALITY1"]
+        }
+    }"#;
 
     #[derive(Debug)]
     struct StubDiscoveryProvider {
@@ -3096,6 +3123,63 @@ mod tests {
             }
         });
         (format!("http://{address}"), request_rx, server)
+    }
+
+    async fn assert_http_retry_after_gate_reopens(
+        retry_after: &'static str,
+        expected_error: HostedSlackProviderError,
+        expected_cooldown: Duration,
+    ) {
+        let (base_url, requests, server) = spawn_stub_server(vec![
+            StubResponse {
+                status: "429 Too Many Requests",
+                headers: vec![("Retry-After", retry_after)],
+                body: r#"{"ok":false,"error":"rate-secret"}"#,
+            },
+            StubResponse {
+                status: "200 OK",
+                headers: Vec::new(),
+                body: CONVERSATIONS_INFO_OK,
+            },
+        ]);
+        let mut provider = test_provider(base_url);
+        provider.client = Client::builder().build().unwrap();
+        assert_eq!(
+            provider
+                .conversations_info("C08ENGINEER1".to_string())
+                .await,
+            Err(expected_error)
+        );
+        let first_request = requests.recv().unwrap();
+        assert!(first_request.starts_with("GET /conversations.info?"));
+
+        let gate = provider
+            .gates
+            .gate(HostedSlackProviderOperationV1::ConversationsInfo);
+        assert_eq!(gate.status().cooldown_remaining, Some(expected_cooldown));
+
+        let next_provider = provider.clone();
+        let next = tokio::spawn(async move {
+            next_provider
+                .conversations_info("C08ENGINEER1".to_string())
+                .await
+        });
+        while gate.status().waiting == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!next.is_finished());
+        assert!(requests.try_recv().is_err());
+
+        tokio::time::advance(expected_cooldown - Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(!next.is_finished());
+        assert!(requests.try_recv().is_err());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        next.await.unwrap().unwrap();
+        let second_request = requests.recv().unwrap();
+        assert!(second_request.starts_with("GET /conversations.info?"));
+        server.join().unwrap();
     }
 
     fn spawn_stalling_server() -> (String, Receiver<()>, mpsc::Sender<()>, JoinHandle<()>) {
@@ -3927,25 +4011,34 @@ mod tests {
         server.join().unwrap();
     }
 
-    #[tokio::test]
-    async fn invalid_and_long_429s_install_the_required_shared_cooldown() {
+    #[tokio::test(start_paused = true)]
+    async fn invalid_and_long_429s_install_the_bounded_fallback_cooldown() {
         let cases = [
             (
                 Vec::new(),
                 HostedSlackProviderError::InvalidResponse("Retry-After"),
-                Duration::from_secs(299),
-                MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1,
+                HOSTED_SLACK_PROVIDER_GATE_FALLBACK_RETRY_AFTER,
             ),
             (
                 vec![("Retry-After", "not-a-delay")],
                 HostedSlackProviderError::InvalidResponse("Retry-After"),
-                Duration::from_secs(299),
-                MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1,
+                HOSTED_SLACK_PROVIDER_GATE_FALLBACK_RETRY_AFTER,
             ),
             (
                 vec![("Retry-After", "0")],
                 HostedSlackProviderError::InvalidResponse("Retry-After"),
-                Duration::from_secs(299),
+                HOSTED_SLACK_PROVIDER_GATE_FALLBACK_RETRY_AFTER,
+            ),
+            (
+                vec![("Retry-After", "18446744073709551616")],
+                HostedSlackProviderError::InvalidResponse("Retry-After"),
+                HOSTED_SLACK_PROVIDER_GATE_FALLBACK_RETRY_AFTER,
+            ),
+            (
+                vec![("Retry-After", "300")],
+                HostedSlackProviderError::RateLimited {
+                    retry_after: MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1,
+                },
                 MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1,
             ),
             (
@@ -3953,26 +4046,25 @@ mod tests {
                 HostedSlackProviderError::RateLimited {
                     retry_after: Duration::from_secs(301),
                 },
-                MAX_HOSTED_SLACK_PROVIDER_RETRY_AFTER_V1,
-                Duration::from_secs(301),
+                HOSTED_SLACK_PROVIDER_GATE_FALLBACK_RETRY_AFTER,
             ),
             (
                 vec![("Retry-After", "18446744073709551615")],
                 HostedSlackProviderError::RateLimited {
                     retry_after: Duration::from_secs(u64::MAX),
                 },
-                Duration::from_secs(u64::MAX - 1),
-                Duration::from_secs(u64::MAX),
+                HOSTED_SLACK_PROVIDER_GATE_FALLBACK_RETRY_AFTER,
             ),
         ];
 
-        for (headers, expected, minimum_cooldown, maximum_cooldown) in cases {
+        for (headers, expected, expected_cooldown) in cases {
             let (base_url, _requests, server) = spawn_stub_server(vec![StubResponse {
                 status: "429 Too Many Requests",
                 headers,
                 body: r#"{"ok":false,"error":"rate-secret"}"#,
             }]);
-            let provider = test_provider(base_url);
+            let mut provider = test_provider(base_url);
+            provider.client = Client::builder().build().unwrap();
             assert_eq!(
                 provider
                     .conversations_info("C08ENGINEER1".to_string())
@@ -3984,35 +4076,32 @@ mod tests {
             let gate = provider
                 .gates
                 .gate(HostedSlackProviderOperationV1::ConversationsInfo);
-            let cooldown = gate.status().cooldown_remaining.unwrap();
-            assert!(cooldown > minimum_cooldown);
-            assert!(cooldown <= maximum_cooldown);
-
-            let concurrent_provider = provider.clone();
-            let concurrent = tokio::spawn(async move {
-                concurrent_provider
-                    .conversations_info("C08ENGINEER1".to_string())
-                    .await
-            });
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while gate.status().waiting == 0 && !concurrent.is_finished() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            assert_eq!(gate.status().waiting, 1);
-            assert!(!concurrent.is_finished());
-            concurrent.abort();
-            assert!(concurrent.await.unwrap_err().is_cancelled());
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while gate.status().waiting != 0 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
+            assert_eq!(gate.status().cooldown_remaining, Some(expected_cooldown));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn huge_retry_after_uses_bounded_gate_fallback_and_same_key_proceeds() {
+        assert_http_retry_after_gate_reopens(
+            "18446744073709551615",
+            HostedSlackProviderError::RateLimited {
+                retry_after: Duration::from_secs(u64::MAX),
+            },
+            HOSTED_SLACK_PROVIDER_GATE_FALLBACK_RETRY_AFTER,
+        )
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn valid_retry_after_uses_exact_gate_delay_and_same_key_proceeds() {
+        assert_http_retry_after_gate_reopens(
+            "7",
+            HostedSlackProviderError::RateLimited {
+                retry_after: Duration::from_secs(7),
+            },
+            Duration::from_secs(7),
+        )
+        .await;
     }
 
     #[tokio::test]
