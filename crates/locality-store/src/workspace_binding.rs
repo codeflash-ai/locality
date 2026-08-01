@@ -5,14 +5,22 @@
 //! a stable mount identity and logical path below whichever root is active on
 //! this host.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
+use caseless::Caseless;
 use locality_core::model::MountId;
 use locality_core::portable::LogicalPath;
 use locality_core::workspace_layout::MountTarget;
 use serde::{Deserialize, Deserializer, Serialize};
+use unicode_normalization_v16::UnicodeNormalization;
 
 pub const WORKSPACE_BINDING_VERSION: u16 = 1;
 pub const WORKSPACE_BINDING_LAYOUT_VERSION: u16 = 1;
@@ -170,78 +178,532 @@ impl WorkspaceBindingRecord {
     }
 }
 
-pub(crate) fn binding_from_legacy_mount(mount_id: &MountId, root: &Path) -> WorkspaceBinding {
-    let target = root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| MountTarget::new(name.to_string()).ok())
-        .unwrap_or_else(|| fallback_mount_target(mount_id));
-    WorkspaceBinding::new(target)
+/// Host path comparison rules used without compiling for the target host.
+///
+/// This keeps migration and publication checks table-testable on every CI
+/// runner. It is deliberately separate from portable layout identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceHostPlatform {
+    Macos,
+    Linux,
+    Windows,
 }
 
-pub(crate) fn unique_binding(
-    preferred: WorkspaceBinding,
-    used_collision_keys: &BTreeSet<String>,
-) -> WorkspaceBinding {
-    if !used_collision_keys.contains(&preferred.collision_key()) {
-        return preferred;
-    }
-
-    let base = preferred.mount_target().as_str();
-    for suffix_number in 2_u64.. {
-        let suffix = format!("-{suffix_number}");
-        let mut prefix = base;
-        while prefix.len() + suffix.len() > MountTarget::MAX_UTF8_BYTES
-            || prefix.encode_utf16().count() + suffix.len() > MountTarget::MAX_UTF16_UNITS
+impl WorkspaceHostPlatform {
+    pub fn current() -> Self {
+        #[cfg(target_os = "macos")]
         {
-            let Some((index, _)) = prefix.char_indices().next_back() else {
-                break;
-            };
-            prefix = &prefix[..index];
+            Self::Macos
         }
-        let Ok(target) = MountTarget::new(format!("{prefix}{suffix}")) else {
-            continue;
-        };
-        let candidate = WorkspaceBinding::new(target);
-        if !used_collision_keys.contains(&candidate.collision_key()) {
-            return candidate;
+        #[cfg(target_os = "linux")]
+        {
+            Self::Linux
+        }
+        #[cfg(target_os = "windows")]
+        {
+            Self::Windows
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        {
+            Self::Linux
         }
     }
-    unreachable!("u64 mount-target suffix space is inexhaustible")
 }
 
-fn fallback_mount_target(mount_id: &MountId) -> MountTarget {
-    let mut slug = String::new();
-    let mut previous_separator = false;
-    for character in mount_id.as_str().chars() {
-        if character.is_ascii_alphanumeric() {
-            slug.push(character.to_ascii_lowercase());
-            previous_separator = false;
-        } else if !previous_separator && !slug.is_empty() {
-            slug.push('-');
-            previous_separator = true;
-        }
-        if slug.len() >= 100 {
-            break;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacyWorkspaceMount {
+    pub mount_id: MountId,
+    pub root: PathBuf,
+}
+
+impl LegacyWorkspaceMount {
+    pub fn new(mount_id: MountId, root: impl Into<PathBuf>) -> Self {
+        Self {
+            mount_id,
+            root: root.into(),
         }
     }
-    while slug.ends_with('-') {
-        slug.pop();
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LegacyLayout0Reason {
+    InvalidHostPath,
+    OutsideTrustedWorkspaceRoot,
+    InvalidMountTarget,
+    MountTargetCollision,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacyLayout0Mount {
+    pub mount_id: MountId,
+    pub root: PathBuf,
+    pub reason: LegacyLayout0Reason,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceBindingMigrationPlan {
+    workspace_root: PathBuf,
+    layout1_bindings: Vec<WorkspaceBindingRecord>,
+    layout0_mounts: Vec<LegacyLayout0Mount>,
+}
+
+impl WorkspaceBindingMigrationPlan {
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
     }
-    if slug.is_empty() {
-        slug.push_str("source");
+
+    pub fn layout1_bindings(&self) -> &[WorkspaceBindingRecord] {
+        &self.layout1_bindings
     }
-    MountTarget::new(format!("mount-{slug}"))
-        .expect("ASCII legacy mount fallback is always a valid target")
+
+    pub fn layout0_mounts(&self) -> &[LegacyLayout0Mount] {
+        &self.layout0_mounts
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkspaceHostBindingError {
+    InvalidTrustedWorkspaceRoot,
+    InvalidPublicationRoot,
+    InvalidActiveMountRoot { mount_id: MountId },
+    HostPathInspection { path: PathBuf, detail: String },
+    PublicationOverlapsActiveMount { mount_id: MountId },
+}
+
+impl Display for WorkspaceHostBindingError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidTrustedWorkspaceRoot => formatter.write_str(
+                "trusted workspace root must be an absolute host path without parent traversal",
+            ),
+            Self::InvalidPublicationRoot => formatter.write_str(
+                "sandbox publication root must be an absolute host path without parent traversal",
+            ),
+            Self::InvalidActiveMountRoot { mount_id } => write!(
+                formatter,
+                "active mount `{}` has an invalid host root",
+                mount_id.as_str()
+            ),
+            Self::HostPathInspection { path, detail } => write!(
+                formatter,
+                "could not inspect host path `{}` for filesystem aliases: {detail}",
+                path.display()
+            ),
+            Self::PublicationOverlapsActiveMount { mount_id } => write!(
+                formatter,
+                "sandbox publication root overlaps active mount `{}`",
+                mount_id.as_str()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WorkspaceHostBindingError {}
+
+/// Shared, mutation-free host binding contract for CLI and Desktop owners.
+///
+/// The resolver never sanitizes, suffixes, reparents, renames, or moves a
+/// legacy root. A coordinator may persist only `layout1_bindings`; every
+/// `layout0_mount` must continue using its exact legacy root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkspaceHostBindingResolver {
+    platform: WorkspaceHostPlatform,
+}
+
+impl WorkspaceHostBindingResolver {
+    pub fn new(platform: WorkspaceHostPlatform) -> Self {
+        Self { platform }
+    }
+
+    pub fn current() -> Self {
+        Self::new(WorkspaceHostPlatform::current())
+    }
+
+    pub fn plan_legacy_migration(
+        &self,
+        trusted_workspace_root: &Path,
+        mounts: &[LegacyWorkspaceMount],
+    ) -> Result<WorkspaceBindingMigrationPlan, WorkspaceHostBindingError> {
+        let trusted = ParsedHostPath::parse(self.platform, trusted_workspace_root)
+            .ok_or(WorkspaceHostBindingError::InvalidTrustedWorkspaceRoot)?;
+        let mut mounts = mounts.to_vec();
+        mounts.sort_by(|left, right| left.mount_id.cmp(&right.mount_id));
+
+        let mut candidates = Vec::with_capacity(mounts.len());
+        let mut collision_groups = BTreeMap::<String, Vec<usize>>::new();
+        for mount in mounts {
+            let outcome = match ParsedHostPath::parse(self.platform, &mount.root) {
+                None => Err(LegacyLayout0Reason::InvalidHostPath),
+                Some(root) => match root.direct_child_of(self.platform, &trusted) {
+                    None => Err(LegacyLayout0Reason::OutsideTrustedWorkspaceRoot),
+                    Some(component) => MountTarget::new(component.to_string())
+                        .map_err(|_| LegacyLayout0Reason::InvalidMountTarget),
+                },
+            };
+            let index = candidates.len();
+            if let Ok(target) = &outcome {
+                collision_groups
+                    .entry(target.collision_key())
+                    .or_default()
+                    .push(index);
+            }
+            candidates.push((mount, outcome));
+        }
+
+        for indexes in collision_groups
+            .values()
+            .filter(|indexes| indexes.len() > 1)
+        {
+            for index in indexes {
+                candidates[*index].1 = Err(LegacyLayout0Reason::MountTargetCollision);
+            }
+        }
+
+        let mut layout1_bindings = Vec::new();
+        let mut layout0_mounts = Vec::new();
+        for (mount, outcome) in candidates {
+            match outcome {
+                Ok(target) => layout1_bindings.push(WorkspaceBindingRecord::new(
+                    mount.mount_id,
+                    WorkspaceBinding::new(target),
+                )),
+                Err(reason) => layout0_mounts.push(LegacyLayout0Mount {
+                    mount_id: mount.mount_id,
+                    root: mount.root,
+                    reason,
+                }),
+            }
+        }
+
+        Ok(WorkspaceBindingMigrationPlan {
+            workspace_root: trusted_workspace_root.to_path_buf(),
+            layout1_bindings,
+            layout0_mounts,
+        })
+    }
+
+    /// Resolve the historical sandbox `--root` as one whole ephemeral
+    /// publication unit. No mount target is appended.
+    pub fn resolve_ephemeral_publication_root(
+        &self,
+        requested_root: &Path,
+        active_mounts: &[LegacyWorkspaceMount],
+    ) -> Result<PathBuf, WorkspaceHostBindingError> {
+        let requested = ParsedHostPath::parse(self.platform, requested_root)
+            .ok_or(WorkspaceHostBindingError::InvalidPublicationRoot)?;
+        for mount in active_mounts {
+            let active = ParsedHostPath::parse(self.platform, &mount.root).ok_or_else(|| {
+                WorkspaceHostBindingError::InvalidActiveMountRoot {
+                    mount_id: mount.mount_id.clone(),
+                }
+            })?;
+            if requested.overlaps(self.platform, &active) {
+                return Err(WorkspaceHostBindingError::PublicationOverlapsActiveMount {
+                    mount_id: mount.mount_id.clone(),
+                });
+            }
+        }
+        Ok(requested_root.to_path_buf())
+    }
+
+    /// Resolve an ephemeral root on the running host, including aliases that
+    /// only the local filesystem can identify. The lexical platform contract
+    /// remains available through [`Self::resolve_ephemeral_publication_root`]
+    /// for migration planning and cross-platform tests.
+    pub fn resolve_ephemeral_publication_root_on_current_host(
+        &self,
+        requested_root: &Path,
+        active_mounts: &[LegacyWorkspaceMount],
+    ) -> Result<PathBuf, WorkspaceHostBindingError> {
+        let resolved = self.resolve_ephemeral_publication_root(requested_root, active_mounts)?;
+        if self.platform != WorkspaceHostPlatform::current() {
+            return Ok(resolved);
+        }
+
+        let requested_aliases =
+            HostFilesystemAliases::inspect(requested_root).map_err(|source| {
+                WorkspaceHostBindingError::HostPathInspection {
+                    path: requested_root.to_path_buf(),
+                    detail: source.to_string(),
+                }
+            })?;
+        for mount in active_mounts {
+            let active_aliases = HostFilesystemAliases::inspect(&mount.root).map_err(|source| {
+                WorkspaceHostBindingError::HostPathInspection {
+                    path: mount.root.clone(),
+                    detail: source.to_string(),
+                }
+            })?;
+            if requested_aliases.overlaps(self.platform, &active_aliases) {
+                return Err(WorkspaceHostBindingError::PublicationOverlapsActiveMount {
+                    mount_id: mount.mount_id.clone(),
+                });
+            }
+        }
+        Ok(resolved)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedHostPath {
+    prefix: String,
+    components: Vec<String>,
+}
+
+impl ParsedHostPath {
+    fn parse(platform: WorkspaceHostPlatform, path: &Path) -> Option<Self> {
+        let value = path.to_str()?;
+        match platform {
+            WorkspaceHostPlatform::Macos | WorkspaceHostPlatform::Linux => {
+                if !value.starts_with('/') {
+                    return None;
+                }
+                let components = parse_components(platform, &value[1..], '/')?;
+                Some(Self {
+                    prefix: "/".to_string(),
+                    components,
+                })
+            }
+            WorkspaceHostPlatform::Windows => Self::parse_windows(value),
+        }
+    }
+
+    fn parse_windows(value: &str) -> Option<Self> {
+        let mut normalized = value.replace('\\', "/");
+        if normalized
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("//?/UNC/"))
+        {
+            normalized = format!("//{}", &normalized[8..]);
+        } else if let Some(rest) = normalized.strip_prefix("//?/") {
+            normalized = rest.to_string();
+        }
+        if let Some(rest) = normalized.strip_prefix("//") {
+            let mut parts = rest.split('/');
+            let server = parts.next().filter(|part| !part.is_empty())?;
+            let share = parts.next().filter(|part| !part.is_empty())?;
+            let remainder = parts.collect::<Vec<_>>().join("/");
+            let components = parse_components(WorkspaceHostPlatform::Windows, &remainder, '/')?;
+            return Some(Self {
+                prefix: format!("//{server}/{share}"),
+                components,
+            });
+        }
+        let bytes = normalized.as_bytes();
+        if bytes.len() < 3
+            || !bytes[0].is_ascii_alphabetic()
+            || bytes[1] != b':'
+            || bytes[2] != b'/'
+        {
+            return None;
+        }
+        Some(Self {
+            prefix: normalized[..2].to_string(),
+            components: parse_components(WorkspaceHostPlatform::Windows, &normalized[3..], '/')?,
+        })
+    }
+
+    fn direct_child_of<'a>(
+        &'a self,
+        platform: WorkspaceHostPlatform,
+        parent: &Self,
+    ) -> Option<&'a str> {
+        if self.components.len() != parent.components.len() + 1
+            || !path_token_eq(platform, &self.prefix, &parent.prefix)
+            || !self
+                .components
+                .iter()
+                .zip(&parent.components)
+                .all(|(left, right)| path_token_eq(platform, left, right))
+        {
+            return None;
+        }
+        self.components.last().map(String::as_str)
+    }
+
+    fn is_ancestor_of(&self, platform: WorkspaceHostPlatform, other: &Self) -> bool {
+        self.components.len() <= other.components.len()
+            && path_token_eq(platform, &self.prefix, &other.prefix)
+            && self
+                .components
+                .iter()
+                .zip(&other.components)
+                .all(|(left, right)| path_token_eq(platform, left, right))
+    }
+
+    fn overlaps(&self, platform: WorkspaceHostPlatform, other: &Self) -> bool {
+        self.is_ancestor_of(platform, other) || other.is_ancestor_of(platform, self)
+    }
+}
+
+fn parse_components(
+    platform: WorkspaceHostPlatform,
+    value: &str,
+    separator: char,
+) -> Option<Vec<String>> {
+    let mut components = Vec::new();
+    for component in value.split(separator) {
+        match component {
+            "" | "." => {}
+            ".." => return None,
+            component => {
+                let component = if platform == WorkspaceHostPlatform::Windows {
+                    component.trim_end_matches(['.', ' '])
+                } else {
+                    component
+                };
+                if component.is_empty() {
+                    return None;
+                }
+                components.push(component.to_string());
+            }
+        }
+    }
+    Some(components)
+}
+
+#[derive(Clone, Debug)]
+struct HostFilesystemAliases {
+    canonical: PathBuf,
+    #[cfg(unix)]
+    native_anchors: Vec<NativePathAnchor>,
+}
+
+impl HostFilesystemAliases {
+    fn inspect(path: &Path) -> io::Result<Self> {
+        let canonical = canonicalize_with_missing_tail(path)?;
+        #[cfg(unix)]
+        let native_anchors = unix_native_anchors(path)?;
+        Ok(Self {
+            canonical,
+            #[cfg(unix)]
+            native_anchors,
+        })
+    }
+
+    fn overlaps(&self, platform: WorkspaceHostPlatform, other: &Self) -> bool {
+        if let (Some(left), Some(right)) = (
+            ParsedHostPath::parse(platform, &self.canonical),
+            ParsedHostPath::parse(platform, &other.canonical),
+        ) && left.overlaps(platform, &right)
+        {
+            return true;
+        }
+
+        #[cfg(unix)]
+        if self.native_anchors.iter().any(|left| {
+            other.native_anchors.iter().any(|right| {
+                left.identity == right.identity
+                    && relative_components_overlap(platform, &left.suffix, &right.suffix)
+            })
+        }) {
+            return true;
+        }
+
+        false
+    }
+}
+
+fn canonicalize_with_missing_tail(path: &Path) -> io::Result<PathBuf> {
+    let mut missing = Vec::<OsString>::new();
+    let mut candidate = path;
+    loop {
+        match fs::canonicalize(candidate) {
+            Ok(mut canonical) => {
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let Some(name) = candidate.file_name() else {
+                    return Err(error);
+                };
+                missing.push(name.to_os_string());
+                candidate = candidate.parent().ok_or(error)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct NativePathAnchor {
+    identity: (u64, u64),
+    suffix: Vec<OsString>,
+}
+
+#[cfg(unix)]
+fn unix_native_anchors(path: &Path) -> io::Result<Vec<NativePathAnchor>> {
+    let prefixes = path.ancestors().collect::<Vec<_>>();
+    let mut anchors = Vec::new();
+    for (index, prefix) in prefixes.iter().enumerate() {
+        match fs::metadata(prefix) {
+            Ok(metadata) => {
+                let suffix = prefixes[..index]
+                    .iter()
+                    .rev()
+                    .filter_map(|path| path.file_name().map(OsString::from))
+                    .collect();
+                anchors.push(NativePathAnchor {
+                    identity: (metadata.dev(), metadata.ino()),
+                    suffix,
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(anchors)
+}
+
+#[cfg(unix)]
+fn relative_components_overlap(
+    platform: WorkspaceHostPlatform,
+    left: &[OsString],
+    right: &[OsString],
+) -> bool {
+    let is_prefix = |prefix: &[OsString], full: &[OsString]| {
+        prefix.len() <= full.len()
+            && prefix.iter().zip(full).all(|(left, right)| {
+                let (Some(left), Some(right)) = (left.to_str(), right.to_str()) else {
+                    return left == right;
+                };
+                path_token_eq(platform, left, right)
+            })
+    };
+    is_prefix(left, right) || is_prefix(right, left)
+}
+
+fn path_token_eq(platform: WorkspaceHostPlatform, left: &str, right: &str) -> bool {
+    match platform {
+        WorkspaceHostPlatform::Macos | WorkspaceHostPlatform::Windows => {
+            host_case_key(left) == host_case_key(right)
+        }
+        WorkspaceHostPlatform::Linux => left == right,
+    }
+}
+
+fn host_case_key(value: &str) -> String {
+    value.chars().default_case_fold().nfc().collect()
+}
+
+pub(crate) fn legacy_mount_collision_key(root: &Path) -> Option<String> {
+    let target = root.file_name()?.to_str()?;
+    let normalized = target.chars().nfc().collect::<String>();
+    MountTarget::new(normalized)
+        .ok()
+        .map(|target| target.collision_key())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        WORKSPACE_BINDING_LAYOUT_VERSION, WORKSPACE_BINDING_VERSION, WorkspaceBinding,
-        binding_from_legacy_mount, unique_binding,
+        LegacyLayout0Reason, LegacyWorkspaceMount, WORKSPACE_BINDING_LAYOUT_VERSION,
+        WORKSPACE_BINDING_VERSION, WorkspaceBinding, WorkspaceHostBindingResolver,
+        WorkspaceHostPlatform,
     };
-    use std::collections::BTreeSet;
     use std::path::Path;
 
     use locality_core::model::MountId;
@@ -296,23 +758,36 @@ mod tests {
     }
 
     #[test]
-    fn legacy_invalid_target_falls_back_without_using_absolute_path() {
-        let binding = binding_from_legacy_mount(
-            &MountId::new("Notion / Production"),
-            Path::new("/tmp/Locality/.."),
+    fn legacy_invalid_target_remains_layout_zero_without_rewriting() {
+        let mount =
+            LegacyWorkspaceMount::new(MountId::new("notion-production"), "/tmp/Locality/trailing.");
+        let plan = WorkspaceHostBindingResolver::new(WorkspaceHostPlatform::Linux)
+            .plan_legacy_migration(Path::new("/tmp/Locality"), std::slice::from_ref(&mount))
+            .expect("migration plan");
+
+        assert!(plan.layout1_bindings().is_empty());
+        assert_eq!(plan.layout0_mounts()[0].root, mount.root);
+        assert_eq!(
+            plan.layout0_mounts()[0].reason,
+            LegacyLayout0Reason::InvalidMountTarget
         );
-        assert_eq!(binding.mount_target().as_str(), "mount-notion-production");
     }
 
     #[test]
-    fn unicode_collisions_receive_deterministic_suffixes() {
-        let first = WorkspaceBinding::new(MountTarget::new("Straße").expect("target"));
-        let used = BTreeSet::from([first.collision_key()]);
-        let second = unique_binding(
-            WorkspaceBinding::new(MountTarget::new("STRASSE").expect("target")),
-            &used,
-        );
-        assert_eq!(second.mount_target().as_str(), "STRASSE-2");
-        assert_ne!(first.collision_key(), second.collision_key());
+    fn unicode_collisions_all_remain_layout_zero_without_suffixes() {
+        let mounts = [
+            LegacyWorkspaceMount::new(MountId::new("first"), "/tmp/Locality/Straße"),
+            LegacyWorkspaceMount::new(MountId::new("second"), "/tmp/Locality/STRASSE"),
+        ];
+        let plan = WorkspaceHostBindingResolver::new(WorkspaceHostPlatform::Linux)
+            .plan_legacy_migration(Path::new("/tmp/Locality"), &mounts)
+            .expect("migration plan");
+
+        assert!(plan.layout1_bindings().is_empty());
+        assert_eq!(plan.layout0_mounts().len(), 2);
+        assert!(plan.layout0_mounts().iter().all(|mount| {
+            mount.reason == LegacyLayout0Reason::MountTargetCollision
+                && (mount.root.ends_with("Straße") || mount.root.ends_with("STRASSE"))
+        }));
     }
 }

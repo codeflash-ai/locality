@@ -832,6 +832,26 @@ struct PauseAtJournal {
 }
 
 #[cfg(unix)]
+struct RetargetAncestorBeforePublication {
+    visible: PathBuf,
+    replacement: PathBuf,
+}
+
+#[cfg(unix)]
+impl WorkspacePublicationHooks for RetargetAncestorBeforePublication {
+    fn before_publication(&mut self) -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        fs::remove_file(&self.visible)?;
+        symlink(&self.replacement, &self.visible)
+    }
+
+    fn checkpoint(&mut self, _checkpoint: WorkspacePublicationCheckpoint) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
 struct ReplaceLockAtJournal {
     lock: PathBuf,
 }
@@ -1135,6 +1155,48 @@ fn publication_fails_closed_when_parent_is_renamed_and_replaced() {
 
     make_removable(&retained);
     fs::remove_dir_all(&retained).expect("remove retained parent");
+}
+
+#[cfg(unix)]
+#[test]
+fn generation2_rejects_ancestor_symlink_retarget_at_publication_commit() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let directory = TestDirectory::new("generation2-parent-retarget");
+    let original = directory.0.join("original");
+    let replacement = directory.0.join("replacement");
+    let original_parent = original.join("workspace");
+    let replacement_parent = replacement.join("workspace");
+    fs::create_dir_all(&original_parent).expect("create original parent");
+    fs::create_dir_all(&replacement_parent).expect("create replacement parent");
+    let visible = directory.0.join("visible");
+    symlink(&original, &visible).expect("create visible ancestor symlink");
+    let root = visible.join("workspace/Locality");
+    let staged = stage_workspace_archive(
+        ReplicaArchive::new(
+            ReplicaArchiveEncoding::Identity,
+            Cursor::new(archive(&fixture, &contract.control)),
+        ),
+        &root,
+        WorkspaceMaterializationLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("stage publication through symlink ancestor");
+    let mut retarget = RetargetAncestorBeforePublication {
+        visible,
+        replacement,
+    };
+
+    let error =
+        publish_staged_workspace_with_hooks_secure(staged, &root, &test_ownership(), &mut retarget)
+            .expect_err("retargeted publication parent must fail closed");
+
+    assert!(error.to_string().contains("parent detached"), "{error}");
+    assert!(!original_parent.join("Locality").exists());
+    assert!(!replacement_parent.join("Locality").exists());
 }
 
 #[cfg(unix)]

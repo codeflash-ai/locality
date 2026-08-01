@@ -26,6 +26,7 @@ use localityd::replica_materializer::{
     ExpectedReplicaMaterializationReceipt, ReplicaMaterializationLimits,
     ReplicaMaterializationSummary, materialize_replica_archive,
     materialize_replica_archive_with_expected_receipt,
+    materialize_replica_archive_with_expected_receipt_and_prepublication_check,
     materialize_scope_authorized_replica_archive,
 };
 use sha2::{Digest, Sha256};
@@ -1163,6 +1164,50 @@ fn rejects_staging_root_replaced_by_symlink_before_publication() {
     );
     assert!(!outside.0.join("payload.txt").exists());
     assert_modes(&outside.0, 0o711);
+}
+
+#[cfg(unix)]
+#[test]
+fn generation1_rejects_ancestor_symlink_retarget_at_publication_commit() {
+    use std::os::unix::fs::symlink;
+
+    let root = TestDirectory::new("generation1-parent-retarget");
+    let original = root.0.join("original");
+    let replacement = root.0.join("replacement");
+    let original_parent = original.join("workspace");
+    let replacement_parent = replacement.join("workspace");
+    fs::create_dir_all(&original_parent).expect("create original parent");
+    fs::create_dir_all(&replacement_parent).expect("create replacement parent");
+    let visible = root.0.join("visible");
+    symlink(&original, &visible).expect("create visible ancestor symlink");
+    let destination = visible.join("workspace/replica");
+    let tar = tar_archive(&[TestMember::file("payload.txt", "contained\n")]);
+    let expected = expected_receipt(&tar, 1);
+
+    let error = materialize_replica_archive_with_expected_receipt_and_prepublication_check(
+        ReplicaArchive::new(ReplicaArchiveEncoding::Identity, Cursor::new(tar)),
+        &destination,
+        ReplicaMaterializationLimits::default(),
+        expected,
+        || {
+            fs::remove_file(&visible)?;
+            symlink(&replacement, &visible)
+        },
+    )
+    .expect_err("retargeted publication parent must fail closed");
+
+    assert!(error.to_string().contains("parent detached"), "{error}");
+    assert!(!original_parent.join("replica").exists());
+    assert!(!replacement_parent.join("replica").exists());
+    assert!(
+        fs::read_dir(&original_parent)
+            .expect("read original parent")
+            .all(|entry| !entry
+                .expect("original parent entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".locality-stage-"))
+    );
 }
 
 #[test]

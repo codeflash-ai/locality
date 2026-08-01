@@ -36,8 +36,7 @@ use crate::repository::{
     virtual_move_content_changed, virtual_move_missing,
 };
 use crate::workspace_binding::{
-    WorkspaceBinding, WorkspaceBindingRecord, WorkspaceRebindBlocker, binding_from_legacy_mount,
-    unique_binding,
+    WorkspaceBinding, WorkspaceBindingRecord, WorkspaceRebindBlocker, legacy_mount_collision_key,
 };
 
 type EntityKey = (MountId, RemoteId);
@@ -167,19 +166,6 @@ impl MountRepository for InMemoryStateStore {
         {
             self.clear_mount_source_state(&mount.mount_id);
         }
-        if !self.workspace_bindings.contains_key(&mount.mount_id) {
-            let used_collision_keys = self
-                .workspace_bindings
-                .values()
-                .map(WorkspaceBinding::collision_key)
-                .collect();
-            let binding = unique_binding(
-                binding_from_legacy_mount(&mount.mount_id, &mount.root),
-                &used_collision_keys,
-            );
-            self.workspace_bindings
-                .insert(mount.mount_id.clone(), binding);
-        }
         self.mounts.insert(mount.mount_id.clone(), mount);
         Ok(())
     }
@@ -208,15 +194,23 @@ impl WorkspaceBindingRepository for InMemoryStateStore {
                 requested_target: record.binding.mount_target().as_str().to_string(),
             });
         }
-        if let Some((existing_mount_id, _)) =
-            self.workspace_bindings.iter().find(|(mount_id, binding)| {
-                **mount_id != record.mount_id
-                    && binding.collision_key() == record.binding.collision_key()
-            })
-        {
+        let requested_collision_key = record.binding.collision_key();
+        let collision = self.mounts.iter().find_map(|(mount_id, mount)| {
+            if *mount_id == record.mount_id {
+                return None;
+            }
+            let collision_key = self
+                .workspace_bindings
+                .get(mount_id)
+                .map(WorkspaceBinding::collision_key)
+                .or_else(|| legacy_mount_collision_key(&mount.root));
+            (collision_key.as_deref() == Some(requested_collision_key.as_str()))
+                .then(|| mount_id.clone())
+        });
+        if let Some(existing_mount_id) = collision {
             return Err(StoreError::WorkspaceMountTargetCollision {
                 target: record.binding.mount_target().as_str().to_string(),
-                existing_mount_id: existing_mount_id.clone(),
+                existing_mount_id,
             });
         }
         self.workspace_bindings

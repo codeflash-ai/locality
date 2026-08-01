@@ -437,9 +437,54 @@ The host workspace root may therefore be the macOS File Provider URL on one
 machine and `~/Locality` for CLI or Linux FUSE on another without changing the
 mount ID, mount target, logical paths, pending journals, or synced shadows.
 Legacy mount rows are upgraded in place by deriving a portable target from the
-old mount-root basename. Unicode-equivalent target collisions receive stable
-suffixes in mount-ID order; the legacy absolute root remains readable during
-the compatibility window.
+old mount-root basename only when the owning coordinator supplies one trusted
+workspace root and the old root is its direct child. The basename must already
+be a valid `MountTarget` and must be unique by the portable collision key.
+Invalid roots, roots under an ambiguous parent, and every member of a collision
+remain layout 0. Migration never sanitizes, suffixes, reparents, renames, or
+moves a legacy root.
+
+`WorkspaceHostBindingResolver` is the shared coordinator contract. Its exact
+entry points are:
+
+```rust
+let resolver = WorkspaceHostBindingResolver::new(platform);
+let plan = resolver.plan_legacy_migration(&trusted_workspace_root, &mounts)?;
+let root = resolver.resolve_ephemeral_publication_root(&requested_root, &active_mounts)?;
+```
+
+Here `mounts` and `active_mounts` are `&[LegacyWorkspaceMount]`. Desktop or
+another persistent owner may persist only `plan.layout1_bindings()` and must
+continue resolving every `plan.layout0_mounts()` entry through the exact legacy
+`MountConfig.root`. The ephemeral method returns the exact requested whole root
+and never appends a mount target. Its platform-neutral form rejects equal,
+ancestor, and descendant overlap under macOS, Linux, or Windows lexical
+semantics. On the running host, the publication guard additionally resolves
+existing filesystem aliases: Unix symlinks plus device/inode anchors, and
+Windows canonical junction/reparse paths plus verbatim and trailing-dot
+spellings where the OS exposes them.
+
+SQLite schema v27 cannot prove that any prerelease binding came from a persisted
+trusted workspace root and coordinator-owned atomic migration. It therefore
+deletes every prerelease binding row and leaves all upgraded mounts in layout 0.
+It does not change `mounts.root` or filesystem content. A mount without a
+binding is valid layout 0 state, not corrupt or rebuildable metadata.
+`save_mount` never promotes a new mount from a coincidental common parent;
+layout 1 begins only when an owning coordinator supplies its trusted workspace
+root, accepts the resolver plan, and explicitly persists the binding.
+
+Sandbox overlap inspection opens the mount database read-only and supports old
+`mounts(mount_id, root)` schemas without initializing, migrating, or repairing
+state. CLI and Desktop inspect once before network work and again after staging,
+immediately before the publication primitive. The second generation-2 check is
+inside the destination publication lock; generation-1 checks run immediately
+before the descriptor-relative/no-replace rename. Both generations reopen the
+visible parent path and compare its filesystem identity with the retained
+publication-parent descriptor at the commit boundary, so retargeting an
+ancestor symlink or reparse path after overlap inspection fails closed. There is not yet one lock
+shared by mount creation and sandbox publication, so a mount committed after
+the final read remains a narrow race; callers must still allocate dedicated
+sandbox roots rather than relying on this guard as global coordination.
 
 Changing a host workspace root is not a metadata-store operation. The store can
 only reject unsafe requests when it sees dirty/conflicted entities, unsettled
@@ -452,6 +497,15 @@ metadata layer never silently updates `mounts.root`.
 Persisted binding targets are likewise immutable through the metadata API.
 Exact saves are idempotent, while changing a target is reserved for a future
 coordinator-owned compare-and-swap workflow that can prove the move completed.
+
+Production Desktop mount resolution still uses persistent `MountConfig.root`.
+Switching it to `WorkspaceBinding` in this increment would replace established
+File Provider/FUSE/Cloud Files roots without the ADR-required workspace record,
+layout transaction, and projection lifecycle. The next reconciliation step is
+for the Desktop coordinator to persist a trusted workspace root, call
+`plan_legacy_migration`, atomically commit the accepted binding set and layout
+sequence, and then resolve only those accepted mounts with
+`WorkspaceBinding::mount_root`; layout 0 mounts continue on their legacy roots.
 
 ## Desktop Packaging
 

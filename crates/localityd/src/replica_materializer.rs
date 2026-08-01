@@ -79,6 +79,8 @@ pub(crate) struct WorkspacePublicationLock {
     _lock_name: OsString,
     #[cfg(windows)]
     _file: fs::File,
+    #[cfg(windows)]
+    _parent: WindowsDirectory,
 }
 
 impl WorkspacePublicationLock {
@@ -111,7 +113,16 @@ impl WorkspacePublicationLock {
                 ));
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let visible = WindowsDirectory::open_absolute_read_only(parent_path)?;
+            if visible.identity()? != self._parent.identity()? {
+                return Err(io::Error::other(
+                    "workspace publication parent detached from its visible path",
+                ));
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         let _ = parent_path;
         Ok(())
     }
@@ -186,7 +197,10 @@ pub(crate) fn acquire_workspace_publication_lock(
         let parent = WindowsDirectory::open_absolute(parent_path)?;
         let file = parent.open_or_create_lock_file(OsStr::new(lock_name))?;
         lock_windows_file_exclusive(&file)?;
-        Ok(WorkspacePublicationLock { _file: file })
+        Ok(WorkspacePublicationLock {
+            _file: file,
+            _parent: parent,
+        })
     }
     #[cfg(any(
         not(any(unix, windows)),
@@ -479,7 +493,7 @@ pub fn materialize_replica_archive<Body: Read>(
     destination: &Path,
     limits: ReplicaMaterializationLimits,
 ) -> Result<ReplicaMaterializationSummary, ReplicaMaterializationError> {
-    materialize_replica_archive_inner(archive, destination, limits, None)
+    materialize_replica_archive_inner(archive, destination, limits, None, &mut || Ok(()))
 }
 
 /// Validate, extract, receipt-check, and atomically publish one replica archive.
@@ -493,7 +507,23 @@ pub fn materialize_replica_archive_with_expected_receipt<Body: Read>(
     limits: ReplicaMaterializationLimits,
     expected: ExpectedReplicaMaterializationReceipt,
 ) -> Result<ReplicaMaterializationSummary, ReplicaMaterializationError> {
-    materialize_replica_archive_inner(archive, destination, limits, Some(expected))
+    materialize_replica_archive_inner(archive, destination, limits, Some(expected), &mut || Ok(()))
+}
+
+/// Receipt-checked materialization with a final caller-owned safety check.
+/// The check runs after extraction and validation, immediately before the
+/// no-replace publication primitive.
+pub fn materialize_replica_archive_with_expected_receipt_and_prepublication_check<
+    Body: Read,
+    Check: FnMut() -> io::Result<()>,
+>(
+    archive: ReplicaArchive<Body>,
+    destination: &Path,
+    limits: ReplicaMaterializationLimits,
+    expected: ExpectedReplicaMaterializationReceipt,
+    mut check: Check,
+) -> Result<ReplicaMaterializationSummary, ReplicaMaterializationError> {
+    materialize_replica_archive_inner(archive, destination, limits, Some(expected), &mut check)
 }
 
 /// Validate and atomically publish one scope-authorized v2 replica archive.
@@ -511,7 +541,36 @@ pub fn materialize_scope_authorized_replica_archive<Body: Read>(
     offer
         .validate()
         .map_err(|error| ReplicaMaterializationError::ScopeExport(error.to_string()))?;
-    materialize_scope_authorized_replica_archive_inner(archive, destination, limits, offer)
+    materialize_scope_authorized_replica_archive_inner(
+        archive,
+        destination,
+        limits,
+        offer,
+        &mut || Ok(()),
+    )
+}
+
+/// Scope-authorized materialization with a final caller-owned safety check.
+pub fn materialize_scope_authorized_replica_archive_with_prepublication_check<
+    Body: Read,
+    Check: FnMut() -> io::Result<()>,
+>(
+    archive: ReplicaArchive<Body>,
+    destination: &Path,
+    limits: ReplicaMaterializationLimits,
+    offer: &SealedExportOffer,
+    mut check: Check,
+) -> Result<ReplicaMaterializationSummary, ReplicaMaterializationError> {
+    offer
+        .validate()
+        .map_err(|error| ReplicaMaterializationError::ScopeExport(error.to_string()))?;
+    materialize_scope_authorized_replica_archive_inner(
+        archive,
+        destination,
+        limits,
+        offer,
+        &mut check,
+    )
 }
 
 fn materialize_replica_archive_inner<Body: Read>(
@@ -519,6 +578,7 @@ fn materialize_replica_archive_inner<Body: Read>(
     destination: &Path,
     limits: ReplicaMaterializationLimits,
     expected: Option<ExpectedReplicaMaterializationReceipt>,
+    prepublication_check: &mut impl FnMut() -> io::Result<()>,
 ) -> Result<ReplicaMaterializationSummary, ReplicaMaterializationError> {
     let parent = destination
         .parent()
@@ -605,6 +665,7 @@ fn materialize_replica_archive_inner<Body: Read>(
         ));
     }
     let staging_identity = staging.identity()?;
+    prepublication_check().map_err(ReplicaMaterializationError::Publish)?;
     staging.publish(destination, staging_identity)?;
     Ok(summary)
 }
@@ -614,6 +675,7 @@ fn materialize_scope_authorized_replica_archive_inner<Body: Read>(
     destination: &Path,
     limits: ReplicaMaterializationLimits,
     offer: &SealedExportOffer,
+    prepublication_check: &mut impl FnMut() -> io::Result<()>,
 ) -> Result<ReplicaMaterializationSummary, ReplicaMaterializationError> {
     let parent = destination
         .parent()
@@ -692,6 +754,7 @@ fn materialize_scope_authorized_replica_archive_inner<Body: Read>(
         ));
     }
     let staging_identity = staging.identity()?;
+    prepublication_check().map_err(ReplicaMaterializationError::Publish)?;
     staging.publish(destination, staging_identity)?;
     // The hidden control member is an archive entry, but not a materialized
     // file or byte. `extract_scope_authorized_tar` already counted it here.
@@ -2288,6 +2351,29 @@ impl StagingDirectory {
         Ok(())
     }
 
+    #[cfg(unix)]
+    fn verify_visible_publication_parent(
+        &self,
+        parent_path: &Path,
+    ) -> Result<(), ReplicaMaterializationError> {
+        let visible = rustix::fs::open(
+            parent_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        let visible_identity = rustix::fs::fstat(&visible)
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        let retained_identity = rustix::fs::fstat(&self.parent)
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        if !same_file_identity(&visible_identity, &retained_identity) {
+            return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                "workspace publication parent detached from its visible path",
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn create(parent: &Path) -> Result<Self, ReplicaMaterializationError> {
         // The pre-open metadata check alone is not enough: the path can be
         // replaced with a symlink before `open`. Keep the descriptor anchored
@@ -2598,6 +2684,7 @@ impl StagingDirectory {
                 "workspace generation identity changed at exchange",
             )));
         }
+        self.verify_visible_publication_parent(&parent_path)?;
         let old_path = self.path.clone();
         rustix::fs::renameat_with(
             &self.parent,
@@ -2905,6 +2992,7 @@ impl StagingDirectory {
                 "workspace staging root identity changed immediately before publication",
             )));
         }
+        self.verify_visible_publication_parent(&parent_path)?;
 
         if let Err(error) = rename_directory_noreplace(&self.parent, &self.name, destination_name) {
             if error.kind() == io::ErrorKind::AlreadyExists {

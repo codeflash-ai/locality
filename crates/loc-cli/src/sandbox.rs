@@ -25,17 +25,19 @@ use locality_protocol::{
     SealedExportOffer, SessionCapability, SessionErrorCode, TarContentEncoding, TarExportOffer,
     WorkspaceProfileSession,
 };
+use locality_store::{SqliteStateStore, WorkspaceHostBindingError, WorkspaceHostBindingResolver};
 use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 use localityd::replica_materializer::{
     ExpectedReplicaMaterializationReceipt, ReplicaMaterializationError,
     ReplicaMaterializationLimits, ReplicaMaterializationSummary,
-    materialize_replica_archive_with_expected_receipt,
-    materialize_scope_authorized_replica_archive,
+    materialize_replica_archive_with_expected_receipt_and_prepublication_check,
+    materialize_scope_authorized_replica_archive_with_prepublication_check,
 };
 use localityd::workspace_archive::WorkspaceArchiveLimits;
 use localityd::workspace_materializer::{
     PublishedWorkspace, WorkspaceMaterializationError, WorkspaceMaterializationLimits,
-    WorkspaceOwnershipCapability, materialize_workspace_archive_durable,
+    WorkspaceOwnershipCapability, WorkspacePublicationCheckpoint, WorkspacePublicationHooks,
+    materialize_workspace_archive_durable_with_hooks,
     recover_and_verify_workspace_publication_state, recover_workspace_publication,
 };
 use reqwest::StatusCode;
@@ -204,6 +206,71 @@ pub struct SandboxInitOptions {
     pub root: PathBuf,
 }
 
+/// Bind the historical sandbox destination as one whole ephemeral root while
+/// proving that it does not overlap any configured persistent mount root.
+///
+/// Both the CLI and Desktop call this boundary before network or filesystem
+/// publication. Workspace targets are intentionally not appended to `--root`.
+pub fn resolve_sandbox_init_options_at_state_root(
+    mut options: SandboxInitOptions,
+    state_root: &Path,
+) -> Result<SandboxInitOptions, SandboxInitError> {
+    let root = absolute_destination(&options.root)?;
+    revalidate_sandbox_publication_at_state_root(&root, state_root)?;
+    options.root = root;
+    Ok(options)
+}
+
+/// Re-read mount roots without schema migration and reject lexical or
+/// filesystem-alias overlap on the running host.
+pub fn revalidate_sandbox_publication_at_state_root(
+    root: &Path,
+    state_root: &Path,
+) -> Result<(), SandboxInitError> {
+    let active_mounts = SqliteStateStore::inspect_mount_roots_read_only(state_root)
+        .map_err(|error| SandboxInitError::WorkspaceState(error.to_string()))?;
+    WorkspaceHostBindingResolver::current()
+        .resolve_ephemeral_publication_root_on_current_host(root, &active_mounts)
+        .map_err(SandboxInitError::HostBinding)?;
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct SandboxPublicationGuard {
+    state_root: PathBuf,
+}
+
+impl SandboxPublicationGuard {
+    fn new(state_root: &Path) -> Self {
+        Self {
+            state_root: state_root.to_path_buf(),
+        }
+    }
+
+    fn check(&self, root: &Path) -> Result<(), SandboxInitError> {
+        revalidate_sandbox_publication_at_state_root(root, &self.state_root)
+    }
+
+    fn check_io(&self, root: &Path) -> io::Result<()> {
+        self.check(root).map_err(io::Error::other)
+    }
+}
+
+struct SandboxWorkspacePublicationHooks<'a> {
+    guard: &'a SandboxPublicationGuard,
+    root: &'a Path,
+}
+
+impl WorkspacePublicationHooks for SandboxWorkspacePublicationHooks<'_> {
+    fn before_publication(&mut self) -> io::Result<()> {
+        self.guard.check_io(self.root)
+    }
+
+    fn checkpoint(&mut self, _checkpoint: WorkspacePublicationCheckpoint) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Controls HTTP content negotiation for a sandbox export.
 ///
 /// [`Self::Automatic`] preserves the original preference for Zstd with an
@@ -269,6 +336,8 @@ pub enum SandboxInitError {
     InvalidDestination,
     DestinationParentMissing(PathBuf),
     DestinationExists(PathBuf),
+    WorkspaceState(String),
+    HostBinding(WorkspaceHostBindingError),
     Http {
         operation: &'static str,
         detail: String,
@@ -328,7 +397,9 @@ impl SandboxInitError {
             Self::CurrentDirectory(_) => "current_directory_failed",
             Self::InvalidDestination
             | Self::DestinationParentMissing(_)
-            | Self::DestinationExists(_) => "destination_invalid",
+            | Self::DestinationExists(_)
+            | Self::HostBinding(_) => "destination_invalid",
+            Self::WorkspaceState(_) => "workspace_state_invalid",
             Self::Http { .. } | Self::HttpStatus { .. } => "backend_request_failed",
             Self::JsonResponseTooLarge { .. }
             | Self::InvalidJson { .. }
@@ -365,6 +436,8 @@ impl SandboxInitError {
                 | Self::InvalidDestination
                 | Self::DestinationParentMissing(_)
                 | Self::DestinationExists(_)
+                | Self::WorkspaceState(_)
+                | Self::HostBinding(_)
         )
     }
 }
@@ -423,6 +496,10 @@ impl Display for SandboxInitError {
             Self::DestinationExists(path) => {
                 write!(formatter, "sandbox root already exists: {}", path.display())
             }
+            Self::WorkspaceState(detail) => {
+                write!(formatter, "could not inspect active workspace roots: {detail}")
+            }
+            Self::HostBinding(error) => write!(formatter, "invalid sandbox host binding: {error}"),
             Self::Http { operation, detail } => {
                 write!(formatter, "{operation} failed: {detail}")
             }
@@ -595,7 +672,51 @@ pub fn materialize_workspace_export_v2<Body: Read>(
     offer: &WorkspaceExportOfferV2,
     ownership: &WorkspaceOwnershipCapability,
 ) -> Result<PublishedWorkspace, WorkspaceMaterializationError> {
-    materialize_workspace_archive_durable(archive, destination, limits, session, offer, ownership)
+    materialize_workspace_export_v2_at_state_root(
+        archive,
+        destination,
+        limits,
+        session,
+        offer,
+        ownership,
+        &locality_platform::default_state_root(),
+    )
+}
+
+/// Generation-2 materialization bound to an explicit Locality state root.
+pub fn materialize_workspace_export_v2_at_state_root<Body: Read>(
+    archive: ReplicaArchive<Body>,
+    destination: &Path,
+    limits: WorkspaceMaterializationLimits,
+    session: &WorkspaceProfileSessionV2,
+    offer: &WorkspaceExportOfferV2,
+    ownership: &WorkspaceOwnershipCapability,
+    state_root: &Path,
+) -> Result<PublishedWorkspace, WorkspaceMaterializationError> {
+    let destination = if destination.is_absolute() {
+        destination.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|current| current.join(destination))
+            .map_err(WorkspaceMaterializationError::PrepublicationCheck)?
+    };
+    let guard = SandboxPublicationGuard::new(state_root);
+    guard.check(&destination).map_err(|error| {
+        WorkspaceMaterializationError::PrepublicationCheck(io::Error::other(error))
+    })?;
+    let mut hooks = SandboxWorkspacePublicationHooks {
+        guard: &guard,
+        root: &destination,
+    };
+    materialize_workspace_archive_durable_with_hooks(
+        archive,
+        &destination,
+        limits,
+        session,
+        offer,
+        ownership,
+        &mut hooks,
+    )
 }
 
 /// Initializes a sandbox with an explicit export content-negotiation policy.
@@ -614,11 +735,28 @@ pub fn run_sandbox_init_with_encoding(
     bootstrap_token: SandboxBootstrapToken,
     content_encoding: SandboxContentEncodingPreference,
 ) -> Result<SandboxInitReport, SandboxInitError> {
+    run_sandbox_init_with_encoding_at_state_root(
+        options,
+        &locality_platform::default_state_root(),
+        bootstrap_token,
+        content_encoding,
+    )
+}
+
+pub fn run_sandbox_init_with_encoding_at_state_root(
+    options: SandboxInitOptions,
+    state_root: &Path,
+    bootstrap_token: SandboxBootstrapToken,
+    content_encoding: SandboxContentEncodingPreference,
+) -> Result<SandboxInitReport, SandboxInitError> {
+    let options = resolve_sandbox_init_options_at_state_root(options, state_root)?;
+    let guard = SandboxPublicationGuard::new(state_root);
     run_sandbox_init_internal(
         options,
         SandboxCredential::Bootstrap(bootstrap_token),
         content_encoding,
         None,
+        &guard,
     )
 }
 
@@ -627,11 +765,28 @@ pub fn run_sandbox_init_with_profile_key(
     profile_key: SandboxProfileKey,
     content_encoding: SandboxContentEncodingPreference,
 ) -> Result<SandboxInitReport, SandboxInitError> {
+    run_sandbox_init_with_profile_key_at_state_root(
+        options,
+        &locality_platform::default_state_root(),
+        profile_key,
+        content_encoding,
+    )
+}
+
+pub fn run_sandbox_init_with_profile_key_at_state_root(
+    options: SandboxInitOptions,
+    state_root: &Path,
+    profile_key: SandboxProfileKey,
+    content_encoding: SandboxContentEncodingPreference,
+) -> Result<SandboxInitReport, SandboxInitError> {
+    let options = resolve_sandbox_init_options_at_state_root(options, state_root)?;
+    let guard = SandboxPublicationGuard::new(state_root);
     run_sandbox_init_internal(
         options,
         SandboxCredential::ProfileKey(profile_key),
         content_encoding,
         None,
+        &guard,
     )
 }
 
@@ -640,53 +795,82 @@ pub fn run_sandbox_init_with_session_credential(
     capability: SessionCapability,
     content_encoding: SandboxContentEncodingPreference,
 ) -> Result<SandboxInitReport, SandboxInitError> {
+    run_sandbox_init_with_session_credential_at_state_root(
+        options,
+        &locality_platform::default_state_root(),
+        capability,
+        content_encoding,
+    )
+}
+
+pub fn run_sandbox_init_with_session_credential_at_state_root(
+    options: SandboxInitOptions,
+    state_root: &Path,
+    capability: SessionCapability,
+    content_encoding: SandboxContentEncodingPreference,
+) -> Result<SandboxInitReport, SandboxInitError> {
+    let options = resolve_sandbox_init_options_at_state_root(options, state_root)?;
+    let guard = SandboxPublicationGuard::new(state_root);
     run_sandbox_init_internal(
         options,
         SandboxCredential::Session(capability),
         content_encoding,
         None,
+        &guard,
     )
 }
 
-pub(crate) fn run_sandbox_init_with_encoding_and_profile(
+pub(crate) fn run_sandbox_init_with_encoding_and_profile_at_state_root(
     options: SandboxInitOptions,
+    state_root: &Path,
     bootstrap_token: SandboxBootstrapToken,
     content_encoding: SandboxContentEncodingPreference,
     profile: &mut SandboxInitProfile,
 ) -> Result<SandboxInitReport, SandboxInitError> {
+    let options = resolve_sandbox_init_options_at_state_root(options, state_root)?;
+    let guard = SandboxPublicationGuard::new(state_root);
     run_sandbox_init_internal(
         options,
         SandboxCredential::Bootstrap(bootstrap_token),
         content_encoding,
         Some(profile),
+        &guard,
     )
 }
 
-pub(crate) fn run_sandbox_init_with_profile_key_and_profile(
+pub(crate) fn run_sandbox_init_with_profile_key_and_profile_at_state_root(
     options: SandboxInitOptions,
+    state_root: &Path,
     profile_key: SandboxProfileKey,
     content_encoding: SandboxContentEncodingPreference,
     profile: &mut SandboxInitProfile,
 ) -> Result<SandboxInitReport, SandboxInitError> {
+    let options = resolve_sandbox_init_options_at_state_root(options, state_root)?;
+    let guard = SandboxPublicationGuard::new(state_root);
     run_sandbox_init_internal(
         options,
         SandboxCredential::ProfileKey(profile_key),
         content_encoding,
         Some(profile),
+        &guard,
     )
 }
 
-pub(crate) fn run_sandbox_init_with_session_credential_and_profile(
+pub(crate) fn run_sandbox_init_with_session_credential_and_profile_at_state_root(
     options: SandboxInitOptions,
+    state_root: &Path,
     capability: SessionCapability,
     content_encoding: SandboxContentEncodingPreference,
     profile: &mut SandboxInitProfile,
 ) -> Result<SandboxInitReport, SandboxInitError> {
+    let options = resolve_sandbox_init_options_at_state_root(options, state_root)?;
+    let guard = SandboxPublicationGuard::new(state_root);
     run_sandbox_init_internal(
         options,
         SandboxCredential::Session(capability),
         content_encoding,
         Some(profile),
+        &guard,
     )
 }
 
@@ -709,6 +893,7 @@ fn run_sandbox_init_internal(
     credential: SandboxCredential,
     content_encoding: SandboxContentEncodingPreference,
     mut profile: Option<&mut SandboxInitProfile>,
+    publication_guard: &SandboxPublicationGuard,
 ) -> Result<SandboxInitReport, SandboxInitError> {
     let root = absolute_destination(&options.root)?;
     validate_destination_parent(&root)?;
@@ -746,6 +931,7 @@ fn run_sandbox_init_internal(
                     let ownership = ownership
                         .as_ref()
                         .expect("profile-key ownership capability");
+                    publication_guard.check(&root)?;
                     recover_workspace_publication(&root, ownership)
                         .map_err(|error| SandboxInitError::Materialization(error.to_string()))?;
                     return run_generation2_workspace_init(
@@ -756,6 +942,7 @@ fn run_sandbox_init_internal(
                         capabilities,
                         ownership,
                         profile,
+                        publication_guard,
                     );
                 }
             }
@@ -783,6 +970,7 @@ fn run_sandbox_init_internal(
                 limits,
                 &ExportValidation::Legacy(expected_receipt),
                 profile.as_deref_mut(),
+                publication_guard,
             )
             .map_err(|failure| failure.error)?;
             (encoding, summary)
@@ -819,6 +1007,7 @@ fn run_sandbox_init_internal(
                     limits,
                     &validation,
                     profile.as_deref_mut(),
+                    publication_guard,
                 ) {
                     Ok(summary) => {
                         completed = Some((encoding, summary));
@@ -854,6 +1043,7 @@ fn run_generation2_workspace_init(
     capabilities: WorkspaceClientCapabilitiesV2,
     ownership: &WorkspaceOwnershipCapability,
     mut profile: Option<&mut SandboxInitProfile>,
+    publication_guard: &SandboxPublicationGuard,
 ) -> Result<SandboxInitReport, SandboxInitError> {
     let capability = SessionCapability {
         session_id: session.session_id().clone(),
@@ -895,7 +1085,15 @@ fn run_generation2_workspace_init(
     mark_profile(&mut profile, PROFILE_EXPORT_OPEN_HEADERS);
     let limits = workspace_limits_for_offer(&offer)?;
     let published = materialize_workspace_export_response(
-        response, encoding, root, limits, &session, &offer, ownership, profile,
+        response,
+        encoding,
+        root,
+        limits,
+        &session,
+        &offer,
+        ownership,
+        profile,
+        publication_guard,
     )?;
     let summary = ReplicaMaterializationSummary {
         entries: published.validated.archive_entries,
@@ -944,7 +1142,9 @@ fn materialize_workspace_export_response(
     offer: &WorkspaceExportOfferV2,
     ownership: &WorkspaceOwnershipCapability,
     mut profile: Option<&mut SandboxInitProfile>,
+    publication_guard: &SandboxPublicationGuard,
 ) -> Result<PublishedWorkspace, SandboxInitError> {
+    publication_guard.check(root)?;
     let (body, mut producer) =
         spawn_export_read_ahead(response).map_err(|error| SandboxInitError::Http {
             operation: "workspace export read-ahead setup",
@@ -952,8 +1152,13 @@ fn materialize_workspace_export_response(
         })?;
     let profiled_body = ProfiledExportBody::new(body, profile.as_deref_mut());
     let archive = ReplicaArchive::new(encoding, profiled_body);
-    let materialization =
-        materialize_workspace_export_v2(archive, root, limits, session, offer, ownership);
+    let mut hooks = SandboxWorkspacePublicationHooks {
+        guard: publication_guard,
+        root,
+    };
+    let materialization = materialize_workspace_archive_durable_with_hooks(
+        archive, root, limits, session, offer, ownership, &mut hooks,
+    );
     let producer_outcome = producer.join();
     if let Some(profile) = profile {
         profile.mark(PROFILE_STREAM_DECODE_MATERIALIZE);
@@ -1001,6 +1206,7 @@ fn materialize_export_response(
     limits: ReplicaMaterializationLimits,
     validation: &ExportValidation,
     mut profile: Option<&mut SandboxInitProfile>,
+    publication_guard: &SandboxPublicationGuard,
 ) -> Result<ReplicaMaterializationSummary, ExportStreamFailure> {
     let (body, mut producer) =
         spawn_export_read_ahead(response).map_err(|error| ExportStreamFailure {
@@ -1012,17 +1218,25 @@ fn materialize_export_response(
         })?;
     let profiled_body = ProfiledExportBody::new(body, profile.as_deref_mut());
     let archive = ReplicaArchive::new(encoding, profiled_body);
+    let mut prepublication_check = || publication_guard.check_io(root);
     let materialization = match validation {
         ExportValidation::Legacy(expected_receipt) => {
-            materialize_replica_archive_with_expected_receipt(
+            materialize_replica_archive_with_expected_receipt_and_prepublication_check(
                 archive,
                 root,
                 limits,
                 *expected_receipt,
+                &mut prepublication_check,
             )
         }
         ExportValidation::ScopeAuthorized(offer) => {
-            materialize_scope_authorized_replica_archive(archive, root, limits, offer)
+            materialize_scope_authorized_replica_archive_with_prepublication_check(
+                archive,
+                root,
+                limits,
+                offer,
+                &mut prepublication_check,
+            )
         }
     };
     let producer_outcome = producer.join();

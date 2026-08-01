@@ -9,7 +9,10 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use locality_core::model::{MountId, RemoteId};
-use locality_store::{ConnectionId, MountConfig, MountRepository, ProjectionMode, StoreError};
+use locality_store::{
+    ConnectionId, LegacyWorkspaceMount, MountConfig, MountRepository, ProjectionMode, StoreError,
+    WorkspaceBindingRepository, WorkspaceHostBindingError, WorkspaceHostBindingResolver,
+};
 use localityd::source::source_descriptor;
 use serde::Serialize;
 
@@ -79,7 +82,7 @@ impl GuidanceFileAction {
 
 pub fn run_mount<S>(store: &mut S, options: MountOptions) -> Result<MountReport, MountError>
 where
-    S: MountRepository,
+    S: MountRepository + WorkspaceBindingRepository,
 {
     let root = absolute_path(&options.root)?;
     if options.projection.uses_virtual_filesystem() {
@@ -116,7 +119,22 @@ where
         mount = mount.with_connection_id(connection_id);
     }
 
-    store.save_mount(mount).map_err(MountError::Store)?;
+    store.save_mount(mount.clone()).map_err(MountError::Store)?;
+    if mount.projection.uses_virtual_filesystem() {
+        // The virtual projection root is an explicit coordinator-owned host
+        // binding, validated above. Generic stores must never infer this trust
+        // from a common parent during save_mount.
+        let trusted_workspace_root = localityd::virtual_fs::virtual_projection_root(&mount);
+        let legacy = LegacyWorkspaceMount::new(mount.mount_id.clone(), mount.root.clone());
+        let plan = WorkspaceHostBindingResolver::current()
+            .plan_legacy_migration(&trusted_workspace_root, std::slice::from_ref(&legacy))
+            .map_err(MountError::HostBinding)?;
+        if let Some(binding) = plan.layout1_bindings().first() {
+            store
+                .save_workspace_binding(binding.clone())
+                .map_err(MountError::Store)?;
+        }
+    }
 
     Ok(MountReport {
         ok: true,
@@ -140,6 +158,7 @@ pub enum MountError {
         message: String,
     },
     CurrentDir(String),
+    HostBinding(WorkspaceHostBindingError),
     MountPointConflict {
         root: PathBuf,
         mount_point: String,
@@ -166,6 +185,7 @@ impl MountError {
         match self {
             Self::CreateRoot { .. } => "create_mount_root_failed",
             Self::CurrentDir(_) => "current_dir_failed",
+            Self::HostBinding(_) => "invalid_mount_binding",
             Self::MountPointConflict { .. } => "mount_point_conflict",
             Self::UnsafeVirtualProjectionRoot { .. } => "unsafe_virtual_projection_root",
             Self::ReadGuidance { .. } => "read_mount_guidance_failed",
@@ -183,6 +203,7 @@ impl MountError {
                 )
             }
             Self::CurrentDir(message) => format!("failed to resolve current directory: {message}"),
+            Self::HostBinding(error) => format!("invalid virtual mount host binding: {error}"),
             Self::MountPointConflict {
                 root,
                 mount_point,

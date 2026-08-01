@@ -11,9 +11,11 @@ use std::time::{Duration, Instant};
 
 use loc_cli::sandbox::{
     SandboxBootstrapToken, SandboxContentEncodingPreference, SandboxInitError, SandboxInitOptions,
-    SandboxProfileKey, resolve_bootstrap_token, run_sandbox_init, run_sandbox_init_with_encoding,
+    SandboxProfileKey, resolve_bootstrap_token, resolve_sandbox_init_options_at_state_root,
+    run_sandbox_init, run_sandbox_init_with_encoding, run_sandbox_init_with_encoding_at_state_root,
     run_sandbox_init_with_profile_key,
 };
+use locality_core::model::MountId;
 use locality_core::portable::{
     ExportAttemptId, LogicalPath, ProjectionFileKind, ProjectionId, SessionId, SourceAction,
     SourceConnectionId, SourceGenerationId,
@@ -35,11 +37,13 @@ use locality_protocol::{
     SessionProtocolError, StaleSessionBehavior, TarContentEncoding, TarExportOffer,
     canonical_export_inventory_sha256, canonical_writable_metadata_sha256,
 };
+use locality_store::{MountConfig, MountRepository, ProjectionMode, SqliteStateStore};
 use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 use localityd::replica_materializer::ReplicaMaterializationLimits;
 use localityd::workspace_materializer::{
     WorkspaceMaterializationLimits, WorkspaceOwnershipCapability, WorkspacePublicationCheckpoint,
-    WorkspacePublicationHooks, publish_staged_workspace_with_hooks, stage_workspace_archive,
+    WorkspacePublicationHooks, materialize_workspace_archive_durable_with_hooks,
+    publish_staged_workspace_with_hooks, stage_workspace_archive,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -89,6 +93,7 @@ struct ResponseFixture {
     split_after: Option<(usize, Duration)>,
     body_chunk_size: Option<usize>,
     staging_gate: Option<(PathBuf, PathBuf, PathBuf)>,
+    mount_after_staging: Option<(PathBuf, MountConfig)>,
 }
 
 impl ResponseFixture {
@@ -101,6 +106,7 @@ impl ResponseFixture {
             split_after: None,
             body_chunk_size: None,
             staging_gate: None,
+            mount_after_staging: None,
         }
     }
 
@@ -116,6 +122,7 @@ impl ResponseFixture {
             split_after: None,
             body_chunk_size: None,
             staging_gate: None,
+            mount_after_staging: None,
         }
     }
 
@@ -156,6 +163,11 @@ impl ResponseFixture {
         destination: PathBuf,
     ) -> Self {
         self.staging_gate = Some((parent, logical_path, destination));
+        self
+    }
+
+    fn with_mount_after_staging(mut self, state_root: PathBuf, mount: MountConfig) -> Self {
+        self.mount_after_staging = Some((state_root, mount));
         self
     }
 }
@@ -223,6 +235,180 @@ impl Drop for MockServer {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[test]
+fn sandbox_root_binding_preserves_whole_root_and_rejects_active_workspace_overlap() {
+    let directory = TestDirectory::new("host-binding");
+    let state_root = directory.0.join("state");
+    let active_root = directory.0.join("Locality/notion");
+    fs::create_dir_all(&active_root).expect("create active root");
+    let mut store = SqliteStateStore::open(state_root.clone()).expect("open state");
+    store
+        .save_mount(
+            MountConfig::new(MountId::new("notion"), "notion", &active_root)
+                .projection(ProjectionMode::PlainFiles),
+        )
+        .expect("save active mount");
+    drop(store);
+
+    let requested = active_root.join("sandbox");
+    let error = resolve_sandbox_init_options_at_state_root(
+        SandboxInitOptions {
+            api_url: "https://workspace.example.test".to_string(),
+            root: requested,
+        },
+        &state_root,
+    )
+    .expect_err("active workspace overlap must fail");
+    assert!(matches!(error, SandboxInitError::HostBinding(_)));
+
+    let isolated_root = directory.0.join("isolated-sandbox");
+    let resolved = resolve_sandbox_init_options_at_state_root(
+        SandboxInitOptions {
+            api_url: "https://workspace.example.test".to_string(),
+            root: isolated_root.clone(),
+        },
+        &state_root,
+    )
+    .expect("isolated whole-root binding");
+    assert_eq!(resolved.root, isolated_root);
+}
+
+#[test]
+fn cli_sandbox_init_rejects_publication_inside_active_mount_before_network() {
+    let directory = TestDirectory::new("cli-active-root");
+    let state_root = directory.0.join("state");
+    let active_root = directory.0.join("Locality/notion");
+    fs::create_dir_all(&active_root).expect("create active root");
+    let mut store = SqliteStateStore::open(state_root.clone()).expect("open state");
+    store
+        .save_mount(MountConfig::new(
+            MountId::new("notion"),
+            "notion",
+            &active_root,
+        ))
+        .expect("save active mount");
+    drop(store);
+
+    let requested_root = active_root.join("sandbox").to_string_lossy().into_owned();
+    let output = Command::new(env!("CARGO_BIN_EXE_loc"))
+        .args([
+            "sandbox",
+            "init",
+            "--api-url",
+            "http://127.0.0.1:9",
+            "--root",
+            &requested_root,
+        ])
+        .env("LOCALITY_STATE_DIR", &state_root)
+        .env("LOCALITY_BOOTSTRAP_TOKEN", "sealed-token")
+        .output()
+        .expect("run loc sandbox init");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr UTF-8");
+    assert!(
+        stderr.contains("overlaps active mount `notion`"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("backend request"), "{stderr}");
+}
+
+#[test]
+fn sandbox_revalidates_mount_overlap_after_staging_before_publication() {
+    let directory = TestDirectory::new("late-mount-overlap");
+    let state_root = directory.0.join("state");
+    let destination = directory.root();
+    let tar = tar_file(b"readme.md", b"staged\n");
+    let capability = capability();
+    let status = ready_status(
+        capability.session_id.clone(),
+        COMPONENT_VERSIONS,
+        &tar,
+        BTreeSet::from([TarContentEncoding::Identity]),
+    );
+    let response =
+        ResponseFixture::streaming_export("identity", tar, 512 + 4, Duration::from_millis(100))
+            .with_staging_gate(
+                destination
+                    .parent()
+                    .expect("destination parent")
+                    .to_path_buf(),
+                PathBuf::from("readme.md"),
+                destination.clone(),
+            )
+            .with_mount_after_staging(
+                state_root.clone(),
+                MountConfig::new(MountId::new("late-active"), "notion", &directory.0),
+            );
+    let server = MockServer::start(vec![
+        ResponseFixture::json(&capability),
+        ResponseFixture::json(&status),
+        response,
+    ]);
+
+    let error = run_sandbox_init_with_encoding_at_state_root(
+        SandboxInitOptions {
+            api_url: server.api_url.clone(),
+            root: destination.clone(),
+        },
+        &state_root,
+        SandboxBootstrapToken::new("late-overlap-token").expect("token"),
+        SandboxContentEncodingPreference::Identity,
+    )
+    .expect_err("late active mount must stop publication");
+
+    assert_eq!(error.code(), "materialization_failed");
+    assert!(
+        error
+            .to_string()
+            .contains("overlaps active mount `late-active`")
+    );
+    assert!(
+        !destination.exists(),
+        "guard failure must leave root unpublished"
+    );
+}
+
+#[test]
+fn generation2_prepublication_check_runs_under_durable_publication_path() {
+    let directory = TestDirectory::new("workspace-v2-prepublication-check");
+    let (session, offer, tar) = workspace_v2_fixture();
+    let ownership = WorkspaceOwnershipCapability::new([0x44; 32]);
+    let mut hooks = RejectBeforePublication;
+
+    let error = materialize_workspace_archive_durable_with_hooks(
+        ReplicaArchive::new(ReplicaArchiveEncoding::Identity, Cursor::new(tar)),
+        &directory.root(),
+        WorkspaceMaterializationLimits::default(),
+        &session,
+        &offer,
+        &ownership,
+        &mut hooks,
+    )
+    .expect_err("prepublication rejection must stop generation 2");
+
+    assert!(error.to_string().contains("prepublication check failed"));
+    assert!(!directory.root().exists());
+    assert!(
+        !directory
+            .0
+            .join(".locality-replica.publication.json")
+            .exists()
+    );
+}
+
+struct RejectBeforePublication;
+
+impl WorkspacePublicationHooks for RejectBeforePublication {
+    fn before_publication(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other("injected prepublication rejection"))
+    }
+
+    fn checkpoint(&mut self, _checkpoint: WorkspacePublicationCheckpoint) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -1483,6 +1669,7 @@ fn bearer_authenticated_redirect_is_not_followed() {
             split_after: None,
             body_chunk_size: None,
             staging_gate: None,
+            mount_after_staging: None,
         },
     ]);
 
@@ -1658,6 +1845,7 @@ fn version_session_offer_media_and_response_encoding_are_validated() {
                 split_after: None,
                 body_chunk_size: None,
                 staging_gate: None,
+                mount_after_staging: None,
             }),
             "backend_protocol_invalid",
         ),
@@ -1763,6 +1951,7 @@ fn cli_forced_identity_reports_encoding_without_leaking_environment_token() {
             "identity",
             "--json",
         ])
+        .env("LOCALITY_STATE_DIR", directory.0.join("state"))
         .env("LOCALITY_BOOTSTRAP_TOKEN", "cli-bootstrap-secret")
         .output()
         .expect("run loc sandbox init");
@@ -1829,6 +2018,7 @@ fn cli_profile_has_stable_monotonic_phases_and_no_request_details() {
             "--profile",
             "--json",
         ])
+        .env("LOCALITY_STATE_DIR", directory.0.join("state"))
         .env("LOCALITY_BOOTSTRAP_TOKEN", "profile-bootstrap-secret")
         .output()
         .expect("run profiled loc sandbox init");
@@ -1948,6 +2138,7 @@ fn cli_profile_failure_prints_completed_phases_and_total() {
             "zstd",
             "--profile",
         ])
+        .env("LOCALITY_STATE_DIR", directory.0.join("state"))
         .env("LOCALITY_BOOTSTRAP_TOKEN", "failed-profile-secret")
         .output()
         .expect("run failing profiled loc sandbox init");
@@ -2724,6 +2915,13 @@ fn write_response(stream: &mut TcpStream, response: ResponseFixture) {
                     "materializer did not stage the first file while the response was paused"
                 );
                 thread::sleep(Duration::from_millis(2));
+            }
+            if let Some((state_root, mount)) = &response.mount_after_staging {
+                let mut store =
+                    SqliteStateStore::open(state_root.clone()).expect("open staged test state");
+                store
+                    .save_mount(mount.clone())
+                    .expect("save mount after staging");
             }
         }
         thread::sleep(pause);
