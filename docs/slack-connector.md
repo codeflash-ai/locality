@@ -83,9 +83,17 @@ apps may have different provider limits, but Locality still treats Slack 429
 responses as provider cooldowns.
 
 The hosted provider scopes its process-local gates and cooldowns by the
-non-secret Slack app ID, team ID, and exact Web API method. Its public
-coordination scope exposes the same serializable identity for hosts that keep
-durable cooldown state.
+non-secret Slack app ID, team ID, and exact Web API method. New durable hosts
+use `HostedSlackProviderCoordinationScopeV2` for the same exact identity.
+`HostedSlackProviderCoordinationScopeV1` and the existing
+`coordination_scope(operation)` API retain their original team-and-operation
+wire contract for compatibility.
+
+During a durable cooldown migration, hosts must continue reading and honoring
+unexpired V1 records while writing new cooldowns under V2 keys. A V1 key cannot
+be safely rewritten as V2 because it contains no app ID; V1 records should age
+out under their original broader scope instead of being silently dropped or
+assigned to an app.
 
 Freshness checks use the bounded conversation history and user metadata payload.
 Thread reply bodies are expanded when `recent.md` hydrates, so reply-only edits

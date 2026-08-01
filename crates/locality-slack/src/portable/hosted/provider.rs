@@ -53,7 +53,7 @@ const HOSTED_SLACK_MAX_RETRIES: usize = 4;
 
 static HOSTED_SLACK_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 static HOSTED_SLACK_PROVIDER_GATES: OnceLock<
-    Mutex<BTreeMap<HostedSlackProviderCoordinationScopeV1, HostedSlackMethodGate>>,
+    Mutex<BTreeMap<HostedSlackProviderCoordinationScopeV2, HostedSlackMethodGate>>,
 > = OnceLock::new();
 
 pub type HostedSlackProviderFuture<'a, T> =
@@ -71,9 +71,20 @@ pub enum HostedSlackProviderOperationV1 {
     FilesInfo,
 }
 
-/// Exact Slack Web API method used for hosted request coordination.
+/// Legacy team-and-operation key for durable hosted request coordination.
+///
+/// This V1 shape is retained for existing durable cooldown state. New durable
+/// coordinators should use [`HostedSlackProviderCoordinationScopeV2`].
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedSlackProviderCoordinationScopeV1 {
+    pub team_id: String,
+    pub operation: HostedSlackProviderOperationV1,
+}
+
+/// Exact Slack Web API method used for V2 hosted request coordination.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum HostedSlackApiMethodV1 {
+pub enum HostedSlackApiMethodV2 {
     #[serde(rename = "auth.test")]
     AuthTest,
     #[serde(rename = "conversations.list")]
@@ -90,17 +101,17 @@ pub enum HostedSlackApiMethodV1 {
     FilesInfo,
 }
 
-/// Stable app, team, and exact-method key for hosted request coordination.
+/// Stable app, team, and exact-method key for V2 hosted request coordination.
 ///
 /// The HTTP provider's built-in gate is process-local only. A hosted backend can
 /// persist and coordinate this serializable, non-secret scope outside the public
 /// provider.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct HostedSlackProviderCoordinationScopeV1 {
+pub struct HostedSlackProviderCoordinationScopeV2 {
     pub api_app_id: String,
     pub team_id: String,
-    pub method: HostedSlackApiMethodV1,
+    pub method: HostedSlackApiMethodV2,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -577,15 +588,15 @@ impl From<HostedSlackPortableError> for HostedSlackProviderError {
 }
 
 impl HostedSlackProviderOperationV1 {
-    pub const fn api_method(self) -> HostedSlackApiMethodV1 {
+    pub const fn api_method(self) -> HostedSlackApiMethodV2 {
         match self {
-            Self::VerifyInstallation => HostedSlackApiMethodV1::AuthTest,
-            Self::ConversationsList => HostedSlackApiMethodV1::ConversationsList,
-            Self::ConversationsInfo => HostedSlackApiMethodV1::ConversationsInfo,
-            Self::ConversationsHistory => HostedSlackApiMethodV1::ConversationsHistory,
-            Self::ConversationsReplies => HostedSlackApiMethodV1::ConversationsReplies,
-            Self::UsersInfo => HostedSlackApiMethodV1::UsersInfo,
-            Self::FilesInfo => HostedSlackApiMethodV1::FilesInfo,
+            Self::VerifyInstallation => HostedSlackApiMethodV2::AuthTest,
+            Self::ConversationsList => HostedSlackApiMethodV2::ConversationsList,
+            Self::ConversationsInfo => HostedSlackApiMethodV2::ConversationsInfo,
+            Self::ConversationsHistory => HostedSlackApiMethodV2::ConversationsHistory,
+            Self::ConversationsReplies => HostedSlackApiMethodV2::ConversationsReplies,
+            Self::UsersInfo => HostedSlackApiMethodV2::UsersInfo,
+            Self::FilesInfo => HostedSlackApiMethodV2::FilesInfo,
         }
     }
 
@@ -605,6 +616,20 @@ impl HostedSlackProviderOperationV1 {
                 Duration::from_secs(15),
                 Duration::from_secs(60),
             ),
+        }
+    }
+}
+
+impl HostedSlackApiMethodV2 {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthTest => "auth.test",
+            Self::ConversationsList => "conversations.list",
+            Self::ConversationsInfo => "conversations.info",
+            Self::ConversationsHistory => "conversations.history",
+            Self::ConversationsReplies => "conversations.replies",
+            Self::UsersInfo => "users.info",
+            Self::FilesInfo => "files.info",
         }
     }
 }
@@ -1378,7 +1403,7 @@ impl HostedSlackProviderGates {
             .lock()
             .expect("hosted Slack gate registry lock");
         let mut gate = |operation: HostedSlackProviderOperationV1| {
-            let scope = HostedSlackProviderCoordinationScopeV1 {
+            let scope = HostedSlackProviderCoordinationScopeV2 {
                 api_app_id: api_app_id.to_string(),
                 team_id: team_id.to_string(),
                 method: operation.api_method(),
@@ -1698,11 +1723,27 @@ impl HttpHostedSlackProvider {
         })
     }
 
+    /// Returns the legacy V1 team-and-operation scope without changing its
+    /// source or wire representation.
     pub fn coordination_scope(
         &self,
         operation: HostedSlackProviderOperationV1,
     ) -> HostedSlackProviderCoordinationScopeV1 {
         HostedSlackProviderCoordinationScopeV1 {
+            team_id: self.credential_identity.team_id.clone(),
+            operation,
+        }
+    }
+
+    /// Returns the exact V2 scope for new durable coordination.
+    ///
+    /// Migrating hosts should also consult [`Self::coordination_scope`] until
+    /// any unexpired durable V1 cooldowns have aged out.
+    pub fn coordination_scope_v2(
+        &self,
+        operation: HostedSlackProviderOperationV1,
+    ) -> HostedSlackProviderCoordinationScopeV2 {
+        HostedSlackProviderCoordinationScopeV2 {
             api_app_id: self.credential_identity.api_app_id.clone(),
             team_id: self.credential_identity.team_id.clone(),
             method: operation.api_method(),
@@ -1712,7 +1753,6 @@ impl HttpHostedSlackProvider {
     async fn request<T: DeserializeOwned + SlackProviderEnvelope>(
         &self,
         method: Method,
-        endpoint: &'static str,
         query: Vec<(&'static str, String)>,
         operation: HostedSlackProviderOperationV1,
     ) -> Result<T, HostedSlackProviderError> {
@@ -1721,7 +1761,10 @@ impl HttpHostedSlackProvider {
         let result = async {
             let response = self
                 .client
-                .request(method, format!("{}/{endpoint}", self.base_url))
+                .request(
+                    method,
+                    format!("{}/{}", self.base_url, operation.api_method().as_str()),
+                )
                 .bearer_auth(&self.access_token)
                 .query(&query)
                 .send()
@@ -1763,7 +1806,6 @@ impl HostedSlackProviderPort for HttpHostedSlackProvider {
             let response = self
                 .request::<AuthTestResponse>(
                     Method::POST,
-                    "auth.test",
                     Vec::new(),
                     HostedSlackProviderOperationV1::VerifyInstallation,
                 )
@@ -1812,7 +1854,6 @@ impl HostedSlackProviderPort for HttpHostedSlackProvider {
             let response = self
                 .request::<ConversationInfoResponse>(
                     Method::GET,
-                    "conversations.info",
                     vec![("channel", channel_id.clone())],
                     HostedSlackProviderOperationV1::ConversationsInfo,
                 )
@@ -1843,7 +1884,6 @@ impl HostedSlackProviderPort for HttpHostedSlackProvider {
             let response = self
                 .request::<HistoryResponse>(
                     Method::GET,
-                    "conversations.history",
                     query,
                     HostedSlackProviderOperationV1::ConversationsHistory,
                 )
@@ -1874,7 +1914,6 @@ impl HostedSlackProviderPort for HttpHostedSlackProvider {
             let response = self
                 .request::<HistoryResponse>(
                     Method::GET,
-                    "conversations.replies",
                     query,
                     HostedSlackProviderOperationV1::ConversationsReplies,
                 )
@@ -1889,7 +1928,6 @@ impl HostedSlackProviderPort for HttpHostedSlackProvider {
             let response = self
                 .request::<UserInfoResponse>(
                     Method::GET,
-                    "users.info",
                     vec![("user", user_id.clone())],
                     HostedSlackProviderOperationV1::UsersInfo,
                 )
@@ -1908,7 +1946,6 @@ impl HostedSlackProviderPort for HttpHostedSlackProvider {
             let response = self
                 .request::<FileInfoResponse>(
                     Method::GET,
-                    "files.info",
                     vec![("file", file_id.clone())],
                     HostedSlackProviderOperationV1::FilesInfo,
                 )
@@ -1943,7 +1980,6 @@ impl HostedSlackDiscoveryProviderPort for HttpHostedSlackProvider {
             let response = self
                 .request::<ConversationsListResponse>(
                     Method::GET,
-                    "conversations.list",
                     query,
                     HostedSlackProviderOperationV1::ConversationsList,
                 )
@@ -4148,7 +4184,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_coordination_scope_uses_app_team_and_exact_method() {
+    fn provider_exposes_legacy_v1_and_exact_v2_coordination_scopes() {
         let provider = HttpHostedSlackProvider::with_base_url(
             "xoxb-scope-test",
             HostedSlackObservedInstallationIdentity {
@@ -4165,6 +4201,14 @@ mod tests {
         assert_eq!(
             serde_json::to_string(
                 &provider.coordination_scope(HostedSlackProviderOperationV1::ConversationsHistory,)
+            )
+            .unwrap(),
+            r#"{"team_id":"T08SCOPE001","operation":"conversations_history"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(
+                &provider
+                    .coordination_scope_v2(HostedSlackProviderOperationV1::ConversationsHistory,)
             )
             .unwrap(),
             r#"{"api_app_id":"A08LOCALITY1","team_id":"T08SCOPE001","method":"conversations.history"}"#
