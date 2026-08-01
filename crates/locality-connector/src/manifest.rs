@@ -801,19 +801,7 @@ fn reject_sensitive_keys(value: &Value, path: &str, violations: &mut Vec<Manifes
         Value::Object(object) => {
             for (key, nested) in object {
                 let nested_path = format!("{path}.{key}");
-                let normalized = key.to_ascii_lowercase();
-                if [
-                    "token",
-                    "secret",
-                    "password",
-                    "api_key",
-                    "credential",
-                    "authorization",
-                ]
-                .iter()
-                .any(|sensitive| {
-                    normalized == *sensitive || normalized.ends_with(&format!("_{sensitive}"))
-                }) {
+                if is_sensitive_setting_key(key) {
                     violations.push(ManifestViolation::new(
                         &nested_path,
                         "connector manifests cannot contain credential-bearing settings",
@@ -829,4 +817,51 @@ fn reject_sensitive_keys(value: &Value, path: &str, violations: &mut Vec<Manifes
         }
         _ => {}
     }
+}
+
+fn is_sensitive_setting_key(key: &str) -> bool {
+    let chars = key.chars().collect::<Vec<_>>();
+    let mut normalized = String::with_capacity(key.len());
+    for (index, character) in chars.iter().copied().enumerate() {
+        if !character.is_ascii_alphanumeric() {
+            if !normalized.is_empty() && !normalized.ends_with('_') {
+                normalized.push('_');
+            }
+            continue;
+        }
+        let previous = index.checked_sub(1).and_then(|index| chars.get(index));
+        let next = chars.get(index + 1);
+        let camel_boundary = character.is_ascii_uppercase()
+            && previous.is_some_and(|previous| {
+                previous.is_ascii_lowercase()
+                    || previous.is_ascii_digit()
+                    || (previous.is_ascii_uppercase() && next.is_some_and(char::is_ascii_lowercase))
+            });
+        if camel_boundary && !normalized.is_empty() && !normalized.ends_with('_') {
+            normalized.push('_');
+        }
+        normalized.push(character.to_ascii_lowercase());
+    }
+
+    let segments = normalized
+        .split('_')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.iter().any(|segment| {
+        matches!(
+            *segment,
+            "token"
+                | "secret"
+                | "password"
+                | "credential"
+                | "credentials"
+                | "authorization"
+                | "bearer"
+        )
+    }) {
+        return true;
+    }
+    segments
+        .windows(2)
+        .any(|pair| matches!(pair, ["api" | "private", "key"]))
 }

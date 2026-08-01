@@ -164,3 +164,37 @@ fn debug_omits_settings_and_scope_values() {
     assert!(debug.contains("<5 descriptive scopes>"));
     assert!(!debug.contains("gmail.compose"));
 }
+
+#[test]
+fn sensitive_setting_keys_are_rejected_across_common_naming_styles() {
+    for key in [
+        "accessToken",
+        "refresh-token",
+        "client_secret",
+        "private_key",
+        "privateKeyPem",
+        "apiKey",
+        "APIKey",
+        "bearer",
+        "bearerToken",
+        "authorizationHeader",
+        "credentials",
+    ] {
+        let mut invalid = registry_value();
+        invalid["connectors"][0]["mount"]["default_settings"] = json!({key: "sentinel"});
+        let error = ConnectorRegistry::parse(&invalid.to_string())
+            .expect_err(&format!("sensitive key `{key}` was accepted"));
+        let messages = validation_messages(error);
+        assert!(
+            messages.contains("cannot contain credential-bearing settings"),
+            "sensitive key `{key}` was not classified: {messages}"
+        );
+    }
+
+    for key in ["monkey", "keyboard_layout", "tokenizer"] {
+        let mut valid = registry_value();
+        valid["connectors"][0]["mount"]["default_settings"] = json!({key: true});
+        ConnectorRegistry::parse(&valid.to_string())
+            .unwrap_or_else(|error| panic!("safe key `{key}` was rejected: {error}"));
+    }
+}
