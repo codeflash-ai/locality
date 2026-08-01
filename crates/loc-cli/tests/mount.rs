@@ -739,7 +739,7 @@ fn cli_mount_slack_persists_auto_join_public_channels_setting() {
 }
 
 #[test]
-fn cli_mount_slack_omits_auto_join_when_public_channel_type_is_excluded() {
+fn cli_mount_slack_persists_disabled_auto_join_when_public_channel_type_is_excluded() {
     let fixture = MountFixture::new("loc-cli-slack-auto-join-public-excluded");
     fs::create_dir_all(&fixture.root).expect("create fixture root");
     let state_root = fixture.root.join("state");
@@ -765,7 +765,7 @@ fn cli_mount_slack_omits_auto_join_when_public_channel_type_is_excluded() {
 
     assert_eq!(
         report["settings_json"],
-        r#"{"slack":{"history_limit":15,"types":["im","mpim"]}}"#
+        r#"{"slack":{"history_limit":15,"types":["im","mpim"],"auto_join_public_channels":false}}"#
     );
 }
 
