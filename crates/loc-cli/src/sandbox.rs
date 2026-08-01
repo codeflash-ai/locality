@@ -25,6 +25,10 @@ use locality_protocol::{
     SealedExportOffer, SessionCapability, SessionErrorCode, TarContentEncoding, TarExportOffer,
     WorkspaceProfileSession,
 };
+use locality_store::{
+    LegacyWorkspaceMount, MountRepository, SqliteStateStore, WorkspaceHostBindingError,
+    WorkspaceHostBindingResolver,
+};
 use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 use localityd::replica_materializer::{
     ExpectedReplicaMaterializationReceipt, ReplicaMaterializationError,
@@ -204,6 +208,35 @@ pub struct SandboxInitOptions {
     pub root: PathBuf,
 }
 
+/// Bind the historical sandbox destination as one whole ephemeral root while
+/// proving that it does not overlap any configured persistent mount root.
+///
+/// Both the CLI and Desktop call this boundary before network or filesystem
+/// publication. Workspace targets are intentionally not appended to `--root`.
+pub fn resolve_sandbox_init_options_at_state_root(
+    mut options: SandboxInitOptions,
+    state_root: &Path,
+) -> Result<SandboxInitOptions, SandboxInitError> {
+    let root = absolute_destination(&options.root)?;
+    let db_path = state_root.join("state.sqlite3");
+    let active_mounts = if db_path.exists() {
+        let store = SqliteStateStore::open(state_root.to_path_buf())
+            .map_err(|error| SandboxInitError::WorkspaceState(error.to_string()))?;
+        store
+            .load_mounts()
+            .map_err(|error| SandboxInitError::WorkspaceState(error.to_string()))?
+            .into_iter()
+            .map(|mount| LegacyWorkspaceMount::new(mount.mount_id, mount.root))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    options.root = WorkspaceHostBindingResolver::current()
+        .resolve_ephemeral_publication_root(&root, &active_mounts)
+        .map_err(SandboxInitError::HostBinding)?;
+    Ok(options)
+}
+
 /// Controls HTTP content negotiation for a sandbox export.
 ///
 /// [`Self::Automatic`] preserves the original preference for Zstd with an
@@ -269,6 +302,8 @@ pub enum SandboxInitError {
     InvalidDestination,
     DestinationParentMissing(PathBuf),
     DestinationExists(PathBuf),
+    WorkspaceState(String),
+    HostBinding(WorkspaceHostBindingError),
     Http {
         operation: &'static str,
         detail: String,
@@ -328,7 +363,9 @@ impl SandboxInitError {
             Self::CurrentDirectory(_) => "current_directory_failed",
             Self::InvalidDestination
             | Self::DestinationParentMissing(_)
-            | Self::DestinationExists(_) => "destination_invalid",
+            | Self::DestinationExists(_)
+            | Self::HostBinding(_) => "destination_invalid",
+            Self::WorkspaceState(_) => "workspace_state_invalid",
             Self::Http { .. } | Self::HttpStatus { .. } => "backend_request_failed",
             Self::JsonResponseTooLarge { .. }
             | Self::InvalidJson { .. }
@@ -365,6 +402,8 @@ impl SandboxInitError {
                 | Self::InvalidDestination
                 | Self::DestinationParentMissing(_)
                 | Self::DestinationExists(_)
+                | Self::WorkspaceState(_)
+                | Self::HostBinding(_)
         )
     }
 }
@@ -423,6 +462,10 @@ impl Display for SandboxInitError {
             Self::DestinationExists(path) => {
                 write!(formatter, "sandbox root already exists: {}", path.display())
             }
+            Self::WorkspaceState(detail) => {
+                write!(formatter, "could not inspect active workspace roots: {detail}")
+            }
+            Self::HostBinding(error) => write!(formatter, "invalid sandbox host binding: {error}"),
             Self::Http { operation, detail } => {
                 write!(formatter, "{operation} failed: {detail}")
             }

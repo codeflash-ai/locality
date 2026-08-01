@@ -12,9 +12,11 @@ use locality_core::shadow::ShadowDocument;
 use locality_core::workspace_layout::MountTarget;
 use locality_store::{
     EntityRecord, EntityRepository, EntitySearchRepository, InMemoryStateStore, JournalRepository,
-    MountConfig, MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
-    StateCompatibilityIssue, StateCompatibilityStatus, StoreError, WorkspaceBinding,
-    WorkspaceBindingRecord, WorkspaceBindingRepository, WorkspaceRebindBlocker,
+    LegacyLayout0Reason, LegacyWorkspaceMount, MountConfig, MountRepository, ProjectionMode,
+    ShadowRepository, SqliteStateStore, StateCompatibilityIssue, StateCompatibilityStatus,
+    StoreError, WorkspaceBinding, WorkspaceBindingRecord, WorkspaceBindingRepository,
+    WorkspaceHostBindingError, WorkspaceHostBindingResolver, WorkspaceHostPlatform,
+    WorkspaceRebindBlocker,
 };
 use rusqlite::{Connection, params};
 
@@ -49,7 +51,7 @@ fn legacy_v20_upgrade_preserves_dirty_shadow_apply_journal_and_mount_identity() 
         before.issues,
         vec![StateCompatibilityIssue::OlderSchema {
             found: 20,
-            current: 26,
+            current: 27,
         }]
     );
 
@@ -386,7 +388,7 @@ fn assert_legacy_virtual_binding_uses_final_mount_point(projection: ProjectionMo
 }
 
 #[test]
-fn current_v25_open_rejects_missing_binding_without_reconstructing_it() {
+fn current_layout_zero_mount_opens_without_reconstructing_a_binding() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
     store
@@ -402,11 +404,14 @@ fn current_v25_open_rejects_missing_binding_without_reconstructing_it() {
     drop(connection);
     drop(store);
 
-    assert!(matches!(
-        SqliteStateStore::open(fixture.state_root.clone()),
-        Err(StoreError::StateCompatibility(message))
-            if message.contains("missing required non-rebuildable workspace binding")
-    ));
+    let reopened = SqliteStateStore::open(fixture.state_root.clone())
+        .expect("layout zero state remains readable");
+    assert_eq!(
+        reopened
+            .get_workspace_binding(&fixture.mount_id)
+            .expect("layout zero binding lookup"),
+        None
+    );
     let connection =
         Connection::open(fixture.state_root.join("state.sqlite3")).expect("raw failed-open state");
     let binding_count: i64 = connection
@@ -418,7 +423,7 @@ fn current_v25_open_rejects_missing_binding_without_reconstructing_it() {
 }
 
 #[test]
-fn current_v25_save_of_existing_mount_does_not_reconstruct_missing_binding() {
+fn current_layout_zero_mount_save_does_not_reconstruct_missing_binding() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
     let mount = fixture.mount_config(ProjectionMode::PlainFiles);
@@ -432,12 +437,9 @@ fn current_v25_save_of_existing_mount_does_not_reconstruct_missing_binding() {
         .expect("remove required binding");
     drop(connection);
 
-    assert_eq!(
-        store.save_mount(mount),
-        Err(StoreError::WorkspaceBindingMissing(
-            fixture.mount_id.clone()
-        ))
-    );
+    store
+        .save_mount(mount)
+        .expect("layout zero mount remains writable without migration");
     let connection = Connection::open(&store.db_path).expect("raw unchanged state");
     let binding_count: i64 = connection
         .query_row("SELECT COUNT(*) FROM workspace_bindings", [], |row| {
@@ -515,7 +517,7 @@ fn save_mount_atomically_creates_binding_or_rolls_back_mount() {
 }
 
 #[test]
-fn current_v25_open_rejects_missing_non_rebuildable_binding_component() {
+fn current_schema_open_rejects_missing_non_rebuildable_binding_component() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
     store
@@ -551,7 +553,7 @@ fn current_v25_open_rejects_missing_non_rebuildable_binding_component() {
 }
 
 #[test]
-fn v25_transition_rolls_back_table_roots_components_and_version_on_failure() {
+fn workspace_binding_transition_rolls_back_roots_components_and_version_on_failure() {
     let fixture = Fixture::new();
     let shared_root = fixture.root.join("LegacyLocality");
     fs::create_dir_all(&shared_root).expect("shared root");
@@ -765,21 +767,21 @@ fn v25_transition_rolls_back_table_roots_components_and_version_on_failure() {
 }
 
 #[test]
-fn legacy_unicode_target_collisions_are_disambiguated_in_mount_id_order() {
+fn legacy_unicode_target_collisions_remain_layout_zero_without_root_changes() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
     store
         .save_mount(MountConfig::new(
             MountId::new("z-mount"),
             "notion",
-            fixture.root.join("one/Straße"),
+            fixture.root.join("Locality/Straße"),
         ))
         .expect("save first legacy mount");
     store
         .save_mount(MountConfig::new(
             MountId::new("a-mount"),
             "notion",
-            fixture.root.join("two/STRASSE"),
+            fixture.root.join("Locality/STRASSE"),
         ))
         .expect("save second legacy mount");
     downgrade_to_v20(&store.db_path);
@@ -789,21 +791,232 @@ fn legacy_unicode_target_collisions_are_disambiguated_in_mount_id_order() {
     let records = migrated
         .load_workspace_bindings()
         .expect("load migrated bindings");
-    let targets = records
-        .iter()
-        .map(|record| {
-            (
-                record.mount_id.0.as_str(),
-                record.binding.mount_target().as_str(),
-                record.binding.mount_target().collision_key(),
+    assert!(records.is_empty());
+    let mounts = migrated.load_mounts().expect("load unchanged mounts");
+    assert_eq!(mounts[0].root, fixture.root.join("Locality/STRASSE"));
+    assert_eq!(mounts[1].root, fixture.root.join("Locality/Straße"));
+}
+
+#[test]
+fn legacy_roots_with_ambiguous_parents_all_remain_layout_zero() {
+    let fixture = Fixture::new();
+    let first_root = fixture.root.join("first/notion");
+    let second_root = fixture.root.join("second/drive");
+    let mut store = fixture.open();
+    store
+        .save_mount(MountConfig::new(
+            MountId::new("notion"),
+            "notion",
+            &first_root,
+        ))
+        .expect("save first mount");
+    store
+        .save_mount(MountConfig::new(
+            MountId::new("drive"),
+            "google-docs",
+            &second_root,
+        ))
+        .expect("save second mount");
+    downgrade_to_v20(&store.db_path);
+    drop(store);
+
+    let migrated = fixture.open();
+    assert!(
+        migrated
+            .load_workspace_bindings()
+            .expect("load bindings")
+            .is_empty()
+    );
+    let mounts = migrated.load_mounts().expect("load mounts");
+    assert_eq!(mounts[0].root, second_root);
+    assert_eq!(mounts[1].root, first_root);
+}
+
+#[test]
+fn v26_invalid_synthesized_target_is_removed_without_changing_legacy_root() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config(ProjectionMode::PlainFiles))
+        .expect("save mount");
+    let invalid_root = fixture.root.join("Locality/trailing.");
+    let synthesized = WorkspaceBinding::new(MountTarget::new("mount-notion-main").unwrap());
+    let connection = Connection::open(&store.db_path).expect("raw v26 state");
+    connection
+        .execute(
+            "UPDATE mounts SET root = ?1 WHERE mount_id = ?2",
+            params![invalid_root.to_string_lossy(), fixture.mount_id.0.as_str()],
+        )
+        .expect("write invalid legacy root");
+    connection
+        .execute(
+            "UPDATE workspace_bindings
+             SET binding_json = ?1, target_collision_key = ?2
+             WHERE mount_id = ?3",
+            params![
+                serde_json::to_string(&synthesized).unwrap(),
+                synthesized.mount_target().collision_key(),
+                fixture.mount_id.0.as_str()
+            ],
+        )
+        .expect("write synthesized binding");
+    mark_workspace_binding_v1(&connection);
+    drop(connection);
+    drop(store);
+
+    let migrated = fixture.open();
+    assert_eq!(
+        migrated
+            .get_workspace_binding(&fixture.mount_id)
+            .expect("binding lookup"),
+        None
+    );
+    assert_eq!(
+        migrated
+            .get_mount(&fixture.mount_id)
+            .expect("mount lookup")
+            .expect("mount")
+            .root,
+        invalid_root
+    );
+}
+
+#[test]
+fn v26_suffixed_collision_bindings_are_removed_without_renaming_roots() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    for (mount_id, target) in [("a-mount", "Alpha"), ("z-mount", "Beta")] {
+        store
+            .save_mount(MountConfig::new(
+                MountId::new(mount_id),
+                "notion",
+                fixture.root.join("Locality").join(target),
+            ))
+            .expect("save mount");
+    }
+    let first = WorkspaceBinding::new(MountTarget::new("STRASSE").unwrap());
+    let suffixed = WorkspaceBinding::new(MountTarget::new("Straße-2").unwrap());
+    let connection = Connection::open(&store.db_path).expect("raw v26 state");
+    for (mount_id, root, binding) in [
+        ("a-mount", fixture.root.join("Locality/STRASSE"), first),
+        ("z-mount", fixture.root.join("Locality/Straße"), suffixed),
+    ] {
+        connection
+            .execute(
+                "UPDATE mounts SET root = ?1 WHERE mount_id = ?2",
+                params![root.to_string_lossy(), mount_id],
             )
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(targets[0].0, "a-mount");
-    assert_eq!(targets[0].1, "STRASSE");
-    assert_eq!(targets[1].0, "z-mount");
-    assert_eq!(targets[1].1, "Straße-2");
-    assert_ne!(targets[0].2, targets[1].2);
+            .expect("write colliding root");
+        connection
+            .execute(
+                "UPDATE workspace_bindings
+                 SET binding_json = ?1, target_collision_key = ?2
+                 WHERE mount_id = ?3",
+                params![
+                    serde_json::to_string(&binding).unwrap(),
+                    binding.mount_target().collision_key(),
+                    mount_id
+                ],
+            )
+            .expect("write v26 binding");
+    }
+    mark_workspace_binding_v1(&connection);
+    drop(connection);
+    drop(store);
+
+    let migrated = fixture.open();
+    assert!(
+        migrated
+            .load_workspace_bindings()
+            .expect("load bindings")
+            .is_empty()
+    );
+    let mounts = migrated.load_mounts().expect("load mounts");
+    assert_eq!(mounts[0].root, fixture.root.join("Locality/STRASSE"));
+    assert_eq!(mounts[1].root, fixture.root.join("Locality/Straße"));
+}
+
+#[test]
+fn host_binding_resolver_has_explicit_macos_linux_and_windows_semantics() {
+    for (platform, workspace_root, mount_root, target) in [
+        (
+            WorkspaceHostPlatform::Macos,
+            "/Users/Ada/Library/CloudStorage/Locality",
+            "/users/ada/library/cloudstorage/locality/Engineering",
+            "Engineering",
+        ),
+        (
+            WorkspaceHostPlatform::Linux,
+            "/home/ada/Locality",
+            "/home/ada/Locality/engineering",
+            "engineering",
+        ),
+        (
+            WorkspaceHostPlatform::Windows,
+            r"C:\Users\Ada\Locality",
+            r"c:/users/ada/locality/Engineering",
+            "Engineering",
+        ),
+    ] {
+        let mount = LegacyWorkspaceMount::new(MountId::new("mount-1"), mount_root);
+        let plan = WorkspaceHostBindingResolver::new(platform)
+            .plan_legacy_migration(Path::new(workspace_root), &[mount])
+            .expect("cross-platform plan");
+        assert_eq!(plan.layout1_bindings().len(), 1);
+        assert_eq!(
+            plan.layout1_bindings()[0].binding.mount_target().as_str(),
+            target
+        );
+        assert!(plan.layout0_mounts().is_empty());
+    }
+
+    let case_mismatch =
+        LegacyWorkspaceMount::new(MountId::new("mount-1"), "/home/Ada/locality/Engineering");
+    let plan = WorkspaceHostBindingResolver::new(WorkspaceHostPlatform::Linux)
+        .plan_legacy_migration(Path::new("/home/Ada/Locality"), &[case_mismatch])
+        .expect("Linux plan");
+    assert_eq!(
+        plan.layout0_mounts()[0].reason,
+        LegacyLayout0Reason::OutsideTrustedWorkspaceRoot
+    );
+}
+
+#[test]
+fn sandbox_publication_is_whole_root_and_rejects_platform_overlap() {
+    for (platform, requested, active) in [
+        (
+            WorkspaceHostPlatform::Macos,
+            "/Users/Ada/Library/CloudStorage/Locality/notion/sandbox",
+            "/Users/Ada/Library/CloudStorage/Locality/notion",
+        ),
+        (
+            WorkspaceHostPlatform::Linux,
+            "/home/ada/Locality",
+            "/home/ada/Locality/notion",
+        ),
+        (
+            WorkspaceHostPlatform::Windows,
+            r"c:\users\ada\locality\NOTION\sandbox",
+            r"C:\Users\Ada\Locality\notion",
+        ),
+    ] {
+        let active = [LegacyWorkspaceMount::new(MountId::new("notion"), active)];
+        assert_eq!(
+            WorkspaceHostBindingResolver::new(platform)
+                .resolve_ephemeral_publication_root(Path::new(requested), &active),
+            Err(WorkspaceHostBindingError::PublicationOverlapsActiveMount {
+                mount_id: MountId::new("notion"),
+            })
+        );
+    }
+
+    let requested = Path::new("/mnt/locality");
+    assert_eq!(
+        WorkspaceHostBindingResolver::new(WorkspaceHostPlatform::Linux)
+            .resolve_ephemeral_publication_root(requested, &[])
+            .expect("ephemeral whole root"),
+        requested
+    );
 }
 
 #[test]
@@ -858,6 +1071,20 @@ fn downgrade_to_v20(db_path: &Path) {
              PRAGMA user_version = 20;",
         )
         .expect("downgrade to legacy v20 metadata");
+}
+
+fn mark_workspace_binding_v1(connection: &Connection) {
+    connection
+        .execute_batch(
+            "UPDATE state_components
+             SET version = 1, min_reader_version = 1,
+                 data_json = '{\"format\":\"workspace_binding.v1\"}'
+             WHERE component_id = 'durable:workspace_bindings';
+             UPDATE state_components SET version = 26
+             WHERE component_id = 'core:schema';
+             PRAGMA user_version = 26;",
+        )
+        .expect("mark workspace binding v1 state");
 }
 
 fn mark_projection_component_v1(db_path: &Path, projection: &ProjectionMode) {

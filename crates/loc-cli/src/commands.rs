@@ -112,10 +112,10 @@ use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
 use crate::sandbox::{
     PROFILE_BOOTSTRAP_TOKEN_INPUT, PROFILE_TOTAL, SandboxContentEncodingPreference,
     SandboxInitOptions, SandboxInitProfile, SandboxInitReport, resolve_bootstrap_token,
-    resolve_profile_key, resolve_session_credential, run_sandbox_init_with_encoding,
-    run_sandbox_init_with_encoding_and_profile, run_sandbox_init_with_profile_key,
-    run_sandbox_init_with_profile_key_and_profile, run_sandbox_init_with_session_credential,
-    run_sandbox_init_with_session_credential_and_profile,
+    resolve_profile_key, resolve_sandbox_init_options_at_state_root, resolve_session_credential,
+    run_sandbox_init_with_encoding, run_sandbox_init_with_encoding_and_profile,
+    run_sandbox_init_with_profile_key, run_sandbox_init_with_profile_key_and_profile,
+    run_sandbox_init_with_session_credential, run_sandbox_init_with_session_credential_and_profile,
 };
 use crate::search::{
     SearchError, SearchOptions, SearchReport, SearchResult, is_notion_url_host, notion_id_from_url,
@@ -1759,6 +1759,14 @@ fn sandbox_init(options: SandboxInitArgs, json: bool) -> i32 {
         api_url: options.api_url,
         root: PathBuf::from(options.root),
     };
+    let init_options =
+        match resolve_sandbox_init_options_at_state_root(init_options, &default_state_root()) {
+            Ok(options) => options,
+            Err(error) => {
+                finish_sandbox_profile(profile.as_mut());
+                return sandbox_init_command_error(json, error);
+            }
+        };
     let outcome = match (credential, profile.as_mut()) {
         (SandboxInitCredential::Bootstrap(token), Some(profile)) => {
             run_sandbox_init_with_encoding_and_profile(

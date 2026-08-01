@@ -65,13 +65,13 @@ use crate::repository::{
     virtual_move_content_changed, virtual_move_missing,
 };
 use crate::workspace_binding::{
-    WorkspaceBinding, WorkspaceBindingRecord, WorkspaceRebindBlocker, binding_from_legacy_mount,
-    unique_binding,
+    LegacyWorkspaceMount, WorkspaceBinding, WorkspaceBindingRecord, WorkspaceRebindBlocker,
+    plan_legacy_migration_from_common_parent,
 };
 use locality_protocol::freshness_delivery_transport::GenerationTransportCapabilities;
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 26;
+const SCHEMA_VERSION: i64 = 27;
 const ENTITY_SEARCH_COMPONENT_VERSION: i64 = 2;
 const JOURNALS_COMPONENT_VERSION: i64 = 3;
 const LINUX_FUSE_PROJECTION_LAYOUT_VERSION: i64 = 2;
@@ -187,11 +187,11 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
     StateComponentDefinition {
         component_id: "durable:workspace_bindings",
         component_kind: "durable_json",
-        current_version: 1,
-        min_reader_version: 1,
+        current_version: 2,
+        min_reader_version: 2,
         required: true,
         rebuildable: false,
-        data_json: "{\"format\":\"workspace_binding.v1\"}",
+        data_json: "{\"format\":\"workspace_binding.v1\",\"layout_0_without_binding\":true}",
     },
     StateComponentDefinition {
         component_id: "durable:metadata_discovery",
@@ -5376,6 +5376,13 @@ fn state_component_issue_allows_schema_migration(
             if user_version < 22 && component_id == "durable:generation_delivery"
     ) || matches!(
         issue,
+        StateCompatibilityIssue::OlderComponent {
+            component_id,
+            found: 1,
+            current: 2,
+        } if user_version < SCHEMA_VERSION && component_id == "durable:workspace_bindings"
+    ) || matches!(
+        issue,
         StateCompatibilityIssue::MissingComponent { component_id }
             if user_version < SCHEMA_VERSION && component_id == "durable:workspace_bindings"
     )
@@ -5410,7 +5417,7 @@ fn migrate_workspace_bindings_schema_v21(
     )?;
     migrate_entity_search_component_to_v2(&transaction)?;
     create_workspace_bindings_table(&transaction)?;
-    backfill_legacy_workspace_bindings(&transaction)?;
+    reconcile_legacy_workspace_bindings(&transaction)?;
     seed_current_state_components(&transaction)?;
     record_schema_migration(&transaction, user_version, SCHEMA_VERSION)?;
     transaction.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -5431,15 +5438,13 @@ fn create_workspace_bindings_table(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
-fn backfill_legacy_workspace_bindings(connection: &Connection) -> StoreResult<()> {
+fn reconcile_legacy_workspace_bindings(connection: &Connection) -> StoreResult<()> {
     create_workspace_bindings_table(connection)?;
-    let missing_mounts = {
+    let mounts = {
         let mut statement = connection.prepare(
             "SELECT m.mount_id, m.connector, m.root, m.remote_root_id, m.read_only,
                     m.projection_json, m.connection_id, m.settings_json
              FROM mounts m
-             LEFT JOIN workspace_bindings b ON b.mount_id = m.mount_id
-             WHERE b.mount_id IS NULL
              ORDER BY m.mount_id",
         )?;
         let rows = statement.query_map([], |row| {
@@ -5457,8 +5462,27 @@ fn backfill_legacy_workspace_bindings(connection: &Connection) -> StoreResult<()
         rows.map(|row| mount_from_row(row?))
             .collect::<StoreResult<Vec<_>>>()?
     };
-    for mount in missing_mounts {
-        ensure_workspace_binding_for_mount(connection, &mount, true)?;
+    let legacy_mounts = mounts
+        .iter()
+        .map(|mount| LegacyWorkspaceMount::new(mount.mount_id.clone(), mount.root.clone()))
+        .collect::<Vec<_>>();
+    let plan = plan_legacy_migration_from_common_parent(&legacy_mounts);
+
+    // Version 1 incorrectly synthesized and suffixed targets. Rebuild only the
+    // additive binding metadata; mounts and every user-visible root stay exact.
+    connection.execute("DELETE FROM workspace_bindings", [])?;
+    if let Some(plan) = plan {
+        for record in plan.layout1_bindings() {
+            connection.execute(
+                "INSERT INTO workspace_bindings (mount_id, binding_json, target_collision_key)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    record.mount_id.0.as_str(),
+                    to_json(&record.binding)?,
+                    record.binding.collision_key(),
+                ],
+            )?;
+        }
     }
     validate_workspace_bindings(connection)?;
     Ok(())
@@ -5469,23 +5493,6 @@ fn validate_workspace_bindings(connection: &Connection) -> StoreResult<()> {
         return Err(StoreError::StateCompatibility(
             "missing required non-rebuildable workspace binding table".to_string(),
         ));
-    }
-    let missing_binding = connection
-        .query_row(
-            "SELECT m.mount_id
-             FROM mounts m
-             LEFT JOIN workspace_bindings b ON b.mount_id = m.mount_id
-             WHERE b.mount_id IS NULL
-             ORDER BY m.mount_id
-             LIMIT 1",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    if let Some(mount_id) = missing_binding {
-        return Err(StoreError::StateCompatibility(format!(
-            "missing required non-rebuildable workspace binding for mount `{mount_id}`"
-        )));
     }
     let mut statement = connection.prepare(
         "SELECT binding_json, target_collision_key
@@ -5504,7 +5511,7 @@ fn validate_workspace_bindings(connection: &Connection) -> StoreResult<()> {
 fn ensure_workspace_binding_for_mount(
     connection: &Connection,
     mount: &MountConfig,
-    allow_legacy_or_new_binding: bool,
+    is_new_mount: bool,
 ) -> StoreResult<()> {
     let exists = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM workspace_bindings WHERE mount_id = ?1)",
@@ -5514,27 +5521,48 @@ fn ensure_workspace_binding_for_mount(
     if exists {
         return Ok(());
     }
-    if !allow_legacy_or_new_binding {
-        return Err(StoreError::WorkspaceBindingMissing(mount.mount_id.clone()));
+    if !is_new_mount {
+        // Absence is durable layout 0, not missing or rebuildable metadata.
+        return Ok(());
     }
 
-    let used_collision_keys = {
-        let mut statement =
-            connection.prepare("SELECT target_collision_key FROM workspace_bindings")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        rows.collect::<rusqlite::Result<BTreeSet<_>>>()?
+    let mut legacy_mounts = {
+        let mut statement = connection.prepare(
+            "SELECT m.mount_id, m.root
+             FROM mounts m
+             INNER JOIN workspace_bindings b ON b.mount_id = m.mount_id
+             WHERE m.mount_id <> ?1
+             ORDER BY m.mount_id",
+        )?;
+        let rows = statement.query_map(params![mount.mount_id.0.as_str()], |row| {
+            Ok(LegacyWorkspaceMount::new(
+                MountId(row.get::<_, String>(0)?),
+                PathBuf::from(row.get::<_, String>(1)?),
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    let binding = unique_binding(
-        binding_from_legacy_mount(&mount.mount_id, &mount.root),
-        &used_collision_keys,
-    );
+    legacy_mounts.push(LegacyWorkspaceMount::new(
+        mount.mount_id.clone(),
+        mount.root.clone(),
+    ));
+    let Some(plan) = plan_legacy_migration_from_common_parent(&legacy_mounts) else {
+        return Ok(());
+    };
+    let Some(record) = plan
+        .layout1_bindings()
+        .iter()
+        .find(|record| record.mount_id == mount.mount_id)
+    else {
+        return Ok(());
+    };
     connection.execute(
         "INSERT INTO workspace_bindings (mount_id, binding_json, target_collision_key)
          VALUES (?1, ?2, ?3)",
         params![
             mount.mount_id.0.as_str(),
-            to_json(&binding)?,
-            binding.collision_key(),
+            to_json(&record.binding)?,
+            record.binding.collision_key(),
         ],
     )?;
     Ok(())

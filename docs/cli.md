@@ -39,6 +39,7 @@ The `loc` command is the single supported control surface for users and coding a
 - `loc log [path] [--push-id <push-id>] [--diff] [--json]`
 - `loc config set <key=value>`
 - `loc file-provider register|start|run|stop|status|restart|open|unregister|list|reset [target] [--json]`
+- `loc sandbox init --api-url <origin> --root <path> [--bootstrap-token-stdin|--profile-key-stdin|--session-credential-stdin] [--encoding identity|zstd] [--profile] [--json]`
 
 ## Exit-code contract
 
@@ -55,6 +56,17 @@ Remaining categories to assign before `loc push` applies remote mutations:
 
 - conflict;
 - remote concurrency failure.
+
+## Sandbox root binding
+
+`loc sandbox init --root <path>` preserves its historical whole-root ephemeral
+behavior: `<path>` is the publication root itself, not a persistent Locality
+workspace root and not a parent beneath which the CLI appends mount targets.
+Before any backend request, the CLI resolves the path with the shared
+cross-platform host-binding contract and compares it with configured mount
+roots. It rejects equal, ancestor, or descendant overlap so atomic sandbox
+publication cannot replace or publish inside an active Desktop/CLI projection.
+An isolated root is returned with its spelling unchanged.
 
 ## Provider Connections
 

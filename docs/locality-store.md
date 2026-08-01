@@ -66,6 +66,12 @@
   authenticated transport selection to each apply journal. Exact retries and
   recovery therefore preserve body-window bounds, acknowledgment state, and
   selected pin-lease policy without renegotiating an in-flight apply.
+- SQLite schema v27 / workspace-binding component v2 makes absence of a binding
+  the durable layout 0 representation. Upgrade removes prerelease targets that
+  were sanitized, suffixed, colliding, or inferred across ambiguous parents;
+  it never edits `mounts.root` or user files. New mounts receive an automatic
+  layout 1 binding only when the exact basename is portable, collision-free,
+  and belongs to the one unambiguous workspace parent.
 - Generation-delivery component v6 marks whether that selection is fully bound.
   Ambiguous active v25 journals fail migration atomically; completed pre-binding
   journals permit only exact terminal replay and preserve only their recorded

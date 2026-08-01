@@ -26,6 +26,8 @@ pub trait MountRepository {
 }
 
 /// Durable portable placement metadata keyed by the existing mount identity.
+/// A missing record is valid legacy layout 0 state and must not be synthesized
+/// from an invalid, ambiguous, or colliding root.
 pub trait WorkspaceBindingRepository {
     /// Insert binding metadata or replay the exact existing value. Changing an
     /// existing target requires a future coordinator-owned compare-and-swap

@@ -100,4 +100,15 @@ Notion mount creation and multi-file push orchestration, are tracked in
 The Hosted settings panel is an explicitly manual generation-2 materializer
 preview. It accepts an API origin, absolute destination, and Workspace Profile
 key for one invocation; it is not canonical Desktop source/mount integration
-and does not persist hosted credentials.
+and does not persist hosted credentials. The destination remains the exact
+whole-root ephemeral publication requested by the user. Before invoking the
+materializer, Desktop uses the shared host-binding resolver and rejects any
+destination that overlaps a configured persistent mount root.
+
+Production Desktop mounts continue to resolve from `MountConfig.root`; they do
+not replace active File Provider, FUSE, or Cloud Files roots with
+`WorkspaceBinding`. The next integration step is a Desktop-owned coordinator
+transaction that supplies its trusted workspace root to
+`WorkspaceHostBindingResolver::plan_legacy_migration`, commits only returned
+layout 1 bindings with a layout-change sequence, and leaves returned layout 0
+mounts on their exact legacy roots.

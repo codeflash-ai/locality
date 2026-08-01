@@ -49,7 +49,8 @@ use loc_cli::push::{
 use loc_cli::restore::{RestoreOptions, run_restore};
 use loc_cli::sandbox::{
     SandboxContentEncodingPreference, SandboxInitOptions, SandboxInitReport, SandboxProfileKey,
-    run_sandbox_init_with_profile_key, validate_sandbox_api_url,
+    resolve_sandbox_init_options_at_state_root, run_sandbox_init_with_profile_key,
+    validate_sandbox_api_url,
 };
 use loc_cli::search::{
     SearchOptions, SearchResult, is_notion_url_host, notion_id_from_url,
@@ -1461,6 +1462,13 @@ async fn materialize_portable_workspace(
 fn portable_workspace_options(
     request: PortableWorkspaceMaterializationRequest,
 ) -> Result<(SandboxInitOptions, SandboxProfileKey), String> {
+    portable_workspace_options_at_state_root(request, &default_state_root())
+}
+
+fn portable_workspace_options_at_state_root(
+    request: PortableWorkspaceMaterializationRequest,
+    state_root: &Path,
+) -> Result<(SandboxInitOptions, SandboxProfileKey), String> {
     validate_sandbox_api_url(&request.api_url)
         .map_err(|error| format!("Portable workspace API URL is invalid: {error}"))?;
     let root = PathBuf::from(request.root);
@@ -1469,13 +1477,15 @@ fn portable_workspace_options(
     }
     let profile_key = SandboxProfileKey::new(request.profile_key)
         .map_err(|error| format!("Portable workspace credential is invalid: {error}"))?;
-    Ok((
+    let options = resolve_sandbox_init_options_at_state_root(
         SandboxInitOptions {
             api_url: request.api_url,
             root,
         },
-        profile_key,
-    ))
+        state_root,
+    )
+    .map_err(|error| format!("Portable workspace root is unsafe: {error}"))?;
+    Ok((options, profile_key))
 }
 
 #[tauri::command]
@@ -12163,21 +12173,53 @@ mod tests {
 
     #[test]
     fn portable_workspace_invoke_boundary_accepts_https_and_loopback_http() {
+        let temp = TestTempDir::new("portable-workspace-valid-root");
+        let state_root = temp.path().join("state");
         for api_url in [
             "https://workspace.example.test",
             "http://127.0.0.1:8080",
             "http://127.1:8080",
         ] {
-            let (options, _) =
-                super::portable_workspace_options(super::PortableWorkspaceMaterializationRequest {
+            let (options, _) = super::portable_workspace_options_at_state_root(
+                super::PortableWorkspaceMaterializationRequest {
                     api_url: api_url.to_string(),
-                    root: std::env::temp_dir().join("Locality").display().to_string(),
+                    root: temp.path().join("Locality").display().to_string(),
                     profile_key: "a".repeat(64),
-                })
-                .expect("valid Desktop workspace request");
+                },
+                &state_root,
+            )
+            .expect("valid Desktop workspace request");
             assert_eq!(options.api_url, api_url);
             assert!(options.root.is_absolute());
         }
+    }
+
+    #[test]
+    fn portable_workspace_invoke_boundary_rejects_active_desktop_root() {
+        let temp = TestTempDir::new("portable-workspace-active-root");
+        let state_root = temp.path().join("state");
+        let active_root = temp.path().join("Locality/notion");
+        fs::create_dir_all(&active_root).expect("create active Desktop root");
+        let mut store = SqliteStateStore::open(state_root.clone()).expect("open state");
+        store
+            .save_mount(
+                MountConfig::new(MountId::new("notion"), "notion", &active_root)
+                    .projection(ProjectionMode::MacosFileProvider),
+            )
+            .expect("save Desktop mount");
+        drop(store);
+
+        let error = super::portable_workspace_options_at_state_root(
+            super::PortableWorkspaceMaterializationRequest {
+                api_url: "https://workspace.example.test".to_string(),
+                root: active_root.join("sandbox").display().to_string(),
+                profile_key: "a".repeat(64),
+            },
+            &state_root,
+        )
+        .expect_err("active Desktop root must not receive sandbox publication");
+
+        assert!(error.contains("overlaps active mount `notion`"), "{error}");
     }
 
     #[cfg(unix)]

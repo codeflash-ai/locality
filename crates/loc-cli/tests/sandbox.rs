@@ -11,9 +11,10 @@ use std::time::{Duration, Instant};
 
 use loc_cli::sandbox::{
     SandboxBootstrapToken, SandboxContentEncodingPreference, SandboxInitError, SandboxInitOptions,
-    SandboxProfileKey, resolve_bootstrap_token, run_sandbox_init, run_sandbox_init_with_encoding,
-    run_sandbox_init_with_profile_key,
+    SandboxProfileKey, resolve_bootstrap_token, resolve_sandbox_init_options_at_state_root,
+    run_sandbox_init, run_sandbox_init_with_encoding, run_sandbox_init_with_profile_key,
 };
+use locality_core::model::MountId;
 use locality_core::portable::{
     ExportAttemptId, LogicalPath, ProjectionFileKind, ProjectionId, SessionId, SourceAction,
     SourceConnectionId, SourceGenerationId,
@@ -35,6 +36,7 @@ use locality_protocol::{
     SessionProtocolError, StaleSessionBehavior, TarContentEncoding, TarExportOffer,
     canonical_export_inventory_sha256, canonical_writable_metadata_sha256,
 };
+use locality_store::{MountConfig, MountRepository, ProjectionMode, SqliteStateStore};
 use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 use localityd::replica_materializer::ReplicaMaterializationLimits;
 use localityd::workspace_materializer::{
@@ -224,6 +226,84 @@ impl Drop for MockServer {
             let _ = handle.join();
         }
     }
+}
+
+#[test]
+fn sandbox_root_binding_preserves_whole_root_and_rejects_active_workspace_overlap() {
+    let directory = TestDirectory::new("host-binding");
+    let state_root = directory.0.join("state");
+    let active_root = directory.0.join("Locality/notion");
+    fs::create_dir_all(&active_root).expect("create active root");
+    let mut store = SqliteStateStore::open(state_root.clone()).expect("open state");
+    store
+        .save_mount(
+            MountConfig::new(MountId::new("notion"), "notion", &active_root)
+                .projection(ProjectionMode::PlainFiles),
+        )
+        .expect("save active mount");
+    drop(store);
+
+    let requested = active_root.join("sandbox");
+    let error = resolve_sandbox_init_options_at_state_root(
+        SandboxInitOptions {
+            api_url: "https://workspace.example.test".to_string(),
+            root: requested,
+        },
+        &state_root,
+    )
+    .expect_err("active workspace overlap must fail");
+    assert!(matches!(error, SandboxInitError::HostBinding(_)));
+
+    let isolated_root = directory.0.join("isolated-sandbox");
+    let resolved = resolve_sandbox_init_options_at_state_root(
+        SandboxInitOptions {
+            api_url: "https://workspace.example.test".to_string(),
+            root: isolated_root.clone(),
+        },
+        &state_root,
+    )
+    .expect("isolated whole-root binding");
+    assert_eq!(resolved.root, isolated_root);
+}
+
+#[test]
+fn cli_sandbox_init_rejects_publication_inside_active_mount_before_network() {
+    let directory = TestDirectory::new("cli-active-root");
+    let state_root = directory.0.join("state");
+    let active_root = directory.0.join("Locality/notion");
+    fs::create_dir_all(&active_root).expect("create active root");
+    let mut store = SqliteStateStore::open(state_root.clone()).expect("open state");
+    store
+        .save_mount(MountConfig::new(
+            MountId::new("notion"),
+            "notion",
+            &active_root,
+        ))
+        .expect("save active mount");
+    drop(store);
+
+    let requested_root = active_root.join("sandbox").to_string_lossy().into_owned();
+    let output = Command::new(env!("CARGO_BIN_EXE_loc"))
+        .args([
+            "sandbox",
+            "init",
+            "--api-url",
+            "http://127.0.0.1:9",
+            "--root",
+            &requested_root,
+        ])
+        .env("LOCALITY_STATE_DIR", &state_root)
+        .env("LOCALITY_BOOTSTRAP_TOKEN", "sealed-token")
+        .output()
+        .expect("run loc sandbox init");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr UTF-8");
+    assert!(
+        stderr.contains("overlaps active mount `notion`"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("backend request"), "{stderr}");
 }
 
 #[test]
@@ -1763,6 +1843,7 @@ fn cli_forced_identity_reports_encoding_without_leaking_environment_token() {
             "identity",
             "--json",
         ])
+        .env("LOCALITY_STATE_DIR", directory.0.join("state"))
         .env("LOCALITY_BOOTSTRAP_TOKEN", "cli-bootstrap-secret")
         .output()
         .expect("run loc sandbox init");
@@ -1829,6 +1910,7 @@ fn cli_profile_has_stable_monotonic_phases_and_no_request_details() {
             "--profile",
             "--json",
         ])
+        .env("LOCALITY_STATE_DIR", directory.0.join("state"))
         .env("LOCALITY_BOOTSTRAP_TOKEN", "profile-bootstrap-secret")
         .output()
         .expect("run profiled loc sandbox init");
@@ -1948,6 +2030,7 @@ fn cli_profile_failure_prints_completed_phases_and_total() {
             "zstd",
             "--profile",
         ])
+        .env("LOCALITY_STATE_DIR", directory.0.join("state"))
         .env("LOCALITY_BOOTSTRAP_TOKEN", "failed-profile-secret")
         .output()
         .expect("run failing profiled loc sandbox init");
