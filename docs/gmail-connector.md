@@ -41,20 +41,9 @@ The broker allowlist also supports:
 http://127.0.0.1:8757/oauth/gmail/callback
 ```
 
-Gmail, Google Calendar, and Google Docs use the same broker-configured Google
-OAuth client: `LOCALITY_GOOGLE_CLIENT_ID` and
-`LOCALITY_GOOGLE_CLIENT_SECRET`. In production, the Google OAuth client must
-register the hosted HTTPS callbacks used by the broker:
-
-```text
-https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-docs/callback
-https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-calendar/callback
-https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/gmail/callback
-```
-
-The localhost callbacks remain broker loopback allowlists for the local handoff.
-Developer-owned or direct OAuth setups may still register and use local callbacks
-where applicable.
+Gmail and Google Docs use the same broker-configured Google OAuth client:
+`LOCALITY_GOOGLE_CLIENT_ID` and `LOCALITY_GOOGLE_CLIENT_SECRET`. Register both
+the Gmail and Google Docs localhost callbacks on that Google OAuth client.
 
 The default connection ID is `gmail-default`, the default mount ID is
 `gmail-main`, and the default OAuth profile is `gmail-oauth-default`.
