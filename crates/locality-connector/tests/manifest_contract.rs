@@ -179,6 +179,21 @@ fn sensitive_setting_keys_are_rejected_across_common_naming_styles() {
         "bearerToken",
         "authorizationHeader",
         "credentials",
+        "apikey",
+        "serviceapikey",
+        "PRIVATEKEY",
+        "privatekeypem",
+        "accesstoken",
+        "RefreshTOKEN",
+        "sessiontoken",
+        "clientsecret",
+        "SIGNINGSECRET",
+        "databasepassword",
+        "servicecredential",
+        "customauthorization",
+        "bearerheader",
+        "BEARERCREDENTIAL",
+        "secretkey",
     ] {
         let mut invalid = registry_value();
         invalid["connectors"][0]["mount"]["default_settings"] = json!({key: "sentinel"});
@@ -191,7 +206,19 @@ fn sensitive_setting_keys_are_rejected_across_common_naming_styles() {
         );
     }
 
-    for key in ["monkey", "keyboard_layout", "tokenizer"] {
+    for key in [
+        "monkey",
+        "hockey",
+        "keynote",
+        "keyboard_layout",
+        "tokenizer",
+        "secretary",
+        "secretariat",
+        "bearberry",
+        "accessibility",
+        "private_mode",
+        "api_latency",
+    ] {
         let mut valid = registry_value();
         valid["connectors"][0]["mount"]["default_settings"] = json!({key: true});
         ConnectorRegistry::parse(&valid.to_string())

@@ -861,7 +861,22 @@ fn is_sensitive_setting_key(key: &str) -> bool {
     }) {
         return true;
     }
-    segments
+    if segments
         .windows(2)
         .any(|pair| matches!(pair, ["api" | "private", "key"]))
+    {
+        return true;
+    }
+
+    let compact = segments.concat();
+    compact.ends_with("token")
+        || compact.ends_with("secret")
+        || compact.ends_with("password")
+        || compact.ends_with("credential")
+        || compact.ends_with("credentials")
+        || compact.ends_with("authorization")
+        || compact.starts_with("bearer")
+        || ["apikey", "privatekey", "secretkey"]
+            .iter()
+            .any(|marker| compact.contains(marker))
 }
