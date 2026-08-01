@@ -545,6 +545,10 @@ fn publish_staged_workspace_locked<H: WorkspacePublicationHooks>(
         remove_journal_if_present(paths, lock)?;
         return Err(WorkspaceMaterializationError::PrepublicationCheck(source));
     }
+    // A caller check can traverse the destination path and can race with an
+    // ancestor symlink or reparse-point retarget. Rebind the visible path to
+    // the retained parent handle at the atomic commit boundary.
+    paths.verify_visible_parent(lock)?;
 
     let publication = if destination_exists {
         validate_journal_receipt_bindings(&journal, ownership)?;

@@ -66,7 +66,7 @@ use crate::repository::{
 };
 use crate::workspace_binding::{
     LegacyWorkspaceMount, WorkspaceBinding, WorkspaceBindingRecord, WorkspaceRebindBlocker,
-    legacy_mount_collision_key, plan_legacy_migration_from_common_parent,
+    legacy_mount_collision_key,
 };
 use locality_protocol::freshness_delivery_transport::GenerationTransportCapabilities;
 
@@ -1928,7 +1928,6 @@ impl MountRepository for SqliteStateStore {
             .optional()?
             .map(mount_from_row)
             .transpose()?;
-        let is_new_mount = existing.is_none();
         if existing
             .as_ref()
             .is_some_and(|existing| mount_source_identity_changed(existing, &mount))
@@ -1958,7 +1957,6 @@ impl MountRepository for SqliteStateStore {
                 mount.settings_json.as_str(),
             ],
         )?;
-        ensure_workspace_binding_for_mount(&transaction, &mount, is_new_mount)?;
         transaction.commit()?;
         Ok(())
     }
@@ -5523,65 +5521,6 @@ fn validate_workspace_bindings(connection: &Connection) -> StoreResult<()> {
     for row in rows {
         workspace_binding_from_row(row?)?;
     }
-    Ok(())
-}
-
-fn ensure_workspace_binding_for_mount(
-    connection: &Connection,
-    mount: &MountConfig,
-    is_new_mount: bool,
-) -> StoreResult<()> {
-    let exists = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM workspace_bindings WHERE mount_id = ?1)",
-        params![mount.mount_id.0.as_str()],
-        |row| row.get::<_, bool>(0),
-    )?;
-    if exists {
-        return Ok(());
-    }
-    if !is_new_mount {
-        // Absence is durable layout 0, not missing or rebuildable metadata.
-        return Ok(());
-    }
-
-    let mut legacy_mounts = {
-        let mut statement = connection.prepare(
-            "SELECT m.mount_id, m.root
-             FROM mounts m
-             WHERE m.mount_id <> ?1
-             ORDER BY m.mount_id",
-        )?;
-        let rows = statement.query_map(params![mount.mount_id.0.as_str()], |row| {
-            Ok(LegacyWorkspaceMount::new(
-                MountId(row.get::<_, String>(0)?),
-                PathBuf::from(row.get::<_, String>(1)?),
-            ))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    legacy_mounts.push(LegacyWorkspaceMount::new(
-        mount.mount_id.clone(),
-        mount.root.clone(),
-    ));
-    let Some(plan) = plan_legacy_migration_from_common_parent(&legacy_mounts) else {
-        return Ok(());
-    };
-    let Some(record) = plan
-        .layout1_bindings()
-        .iter()
-        .find(|record| record.mount_id == mount.mount_id)
-    else {
-        return Ok(());
-    };
-    connection.execute(
-        "INSERT INTO workspace_bindings (mount_id, binding_json, target_collision_key)
-         VALUES (?1, ?2, ?3)",
-        params![
-            mount.mount_id.0.as_str(),
-            to_json(&record.binding)?,
-            record.binding.collision_key(),
-        ],
-    )?;
     Ok(())
 }
 

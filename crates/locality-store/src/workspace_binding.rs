@@ -442,16 +442,6 @@ impl WorkspaceHostBindingResolver {
         }
         Ok(resolved)
     }
-
-    pub(crate) fn same_host_path(&self, left: &Path, right: &Path) -> bool {
-        match (
-            ParsedHostPath::parse(self.platform, left),
-            ParsedHostPath::parse(self.platform, right),
-        ) {
-            (Some(left), Some(right)) => left.equals(self.platform, &right),
-            _ => false,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -529,16 +519,6 @@ impl ParsedHostPath {
             return None;
         }
         self.components.last().map(String::as_str)
-    }
-
-    fn equals(&self, platform: WorkspaceHostPlatform, other: &Self) -> bool {
-        self.components.len() == other.components.len()
-            && path_token_eq(platform, &self.prefix, &other.prefix)
-            && self
-                .components
-                .iter()
-                .zip(&other.components)
-                .all(|(left, right)| path_token_eq(platform, left, right))
     }
 
     fn is_ancestor_of(&self, platform: WorkspaceHostPlatform, other: &Self) -> bool {
@@ -707,20 +687,6 @@ fn path_token_eq(platform: WorkspaceHostPlatform, left: &str, right: &str) -> bo
 
 fn host_case_key(value: &str) -> String {
     value.chars().default_case_fold().nfc().collect()
-}
-
-pub(crate) fn plan_legacy_migration_from_common_parent(
-    mounts: &[LegacyWorkspaceMount],
-) -> Option<WorkspaceBindingMigrationPlan> {
-    let resolver = WorkspaceHostBindingResolver::current();
-    let workspace_root = mounts.first()?.root.parent()?.to_path_buf();
-    if mounts.iter().any(|mount| match mount.root.parent() {
-        Some(parent) => !resolver.same_host_path(parent, &workspace_root),
-        None => true,
-    }) {
-        return None;
-    }
-    resolver.plan_legacy_migration(&workspace_root, mounts).ok()
 }
 
 pub(crate) fn legacy_mount_collision_key(root: &Path) -> Option<String> {

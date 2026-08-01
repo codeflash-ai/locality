@@ -70,8 +70,10 @@
   the durable layout 0 representation. Because prerelease state did not persist
   the trusted workspace identity/root or a coordinator migration record, upgrade
   discards every prerelease binding and leaves every legacy mount in layout 0;
-  it never edits `mounts.root` or user files. New-mount binding checks include
-  every configured mount, including unbound layout 0 roots, so an unbound
+  it never edits `mounts.root` or user files. `save_mount` also leaves every new
+  mount in layout 0: only an owning coordinator may plan against its explicitly
+  trusted workspace root and save an accepted binding. Explicit binding inserts
+  check every configured mount, including unbound layout 0 roots, so an unbound
   basename cannot later collide with a portable target.
 - Generation-delivery component v6 marks whether that selection is fully bound.
   Ambiguous active v25 journals fail migration atomically; completed pre-binding

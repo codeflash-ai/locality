@@ -93,6 +93,7 @@ struct ResponseFixture {
     split_after: Option<(usize, Duration)>,
     body_chunk_size: Option<usize>,
     staging_gate: Option<(PathBuf, PathBuf, PathBuf)>,
+    mount_after_staging: Option<(PathBuf, MountConfig)>,
 }
 
 impl ResponseFixture {
@@ -105,6 +106,7 @@ impl ResponseFixture {
             split_after: None,
             body_chunk_size: None,
             staging_gate: None,
+            mount_after_staging: None,
         }
     }
 
@@ -120,6 +122,7 @@ impl ResponseFixture {
             split_after: None,
             body_chunk_size: None,
             staging_gate: None,
+            mount_after_staging: None,
         }
     }
 
@@ -160,6 +163,11 @@ impl ResponseFixture {
         destination: PathBuf,
     ) -> Self {
         self.staging_gate = Some((parent, logical_path, destination));
+        self
+    }
+
+    fn with_mount_after_staging(mut self, state_root: PathBuf, mount: MountConfig) -> Self {
+        self.mount_after_staging = Some((state_root, mount));
         self
     }
 }
@@ -330,44 +338,16 @@ fn sandbox_revalidates_mount_overlap_after_staging_before_publication() {
                     .to_path_buf(),
                 PathBuf::from("readme.md"),
                 destination.clone(),
+            )
+            .with_mount_after_staging(
+                state_root.clone(),
+                MountConfig::new(MountId::new("late-active"), "notion", &directory.0),
             );
     let server = MockServer::start(vec![
         ResponseFixture::json(&capability),
         ResponseFixture::json(&status),
         response,
     ]);
-
-    let watcher_parent = directory.0.clone();
-    let watcher_state_root = state_root.clone();
-    let watcher = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let staged = fs::read_dir(&watcher_parent)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .any(|entry| {
-                    entry
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with(".locality-stage-")
-                });
-            if staged {
-                let mut store =
-                    SqliteStateStore::open(watcher_state_root).expect("open late state");
-                store
-                    .save_mount(MountConfig::new(
-                        MountId::new("late-active"),
-                        "notion",
-                        &watcher_parent,
-                    ))
-                    .expect("save late active mount");
-                return;
-            }
-            assert!(Instant::now() < deadline, "staging was not observed");
-            thread::sleep(Duration::from_millis(2));
-        }
-    });
 
     let error = run_sandbox_init_with_encoding_at_state_root(
         SandboxInitOptions {
@@ -379,7 +359,6 @@ fn sandbox_revalidates_mount_overlap_after_staging_before_publication() {
         SandboxContentEncodingPreference::Identity,
     )
     .expect_err("late active mount must stop publication");
-    watcher.join().expect("late mount watcher");
 
     assert_eq!(error.code(), "materialization_failed");
     assert!(
@@ -1690,6 +1669,7 @@ fn bearer_authenticated_redirect_is_not_followed() {
             split_after: None,
             body_chunk_size: None,
             staging_gate: None,
+            mount_after_staging: None,
         },
     ]);
 
@@ -1865,6 +1845,7 @@ fn version_session_offer_media_and_response_encoding_are_validated() {
                 split_after: None,
                 body_chunk_size: None,
                 staging_gate: None,
+                mount_after_staging: None,
             }),
             "backend_protocol_invalid",
         ),
@@ -2934,6 +2915,13 @@ fn write_response(stream: &mut TcpStream, response: ResponseFixture) {
                     "materializer did not stage the first file while the response was paused"
                 );
                 thread::sleep(Duration::from_millis(2));
+            }
+            if let Some((state_root, mount)) = &response.mount_after_staging {
+                let mut store =
+                    SqliteStateStore::open(state_root.clone()).expect("open staged test state");
+                store
+                    .save_mount(mount.clone())
+                    .expect("save mount after staging");
             }
         }
         thread::sleep(pause);

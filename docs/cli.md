@@ -69,6 +69,9 @@ after staging and immediately before publication. Equal, ancestor, descendant,
 and locally resolvable filesystem-alias overlap are rejected. The guard does not
 share a global lock with mount creation, so callers must use a dedicated sandbox
 root; an isolated root is returned with its spelling unchanged.
+Library callers cannot opt out accidentally: convenience sandbox, profile-key,
+session-credential, and generation-2 materialization APIs inspect the default
+state root, while `*_at_state_root` variants accept an explicit state root.
 
 ## Provider Connections
 

@@ -469,13 +469,19 @@ trusted workspace root and coordinator-owned atomic migration. It therefore
 deletes every prerelease binding row and leaves all upgraded mounts in layout 0.
 It does not change `mounts.root` or filesystem content. A mount without a
 binding is valid layout 0 state, not corrupt or rebuildable metadata.
+`save_mount` never promotes a new mount from a coincidental common parent;
+layout 1 begins only when an owning coordinator supplies its trusted workspace
+root, accepts the resolver plan, and explicitly persists the binding.
 
 Sandbox overlap inspection opens the mount database read-only and supports old
 `mounts(mount_id, root)` schemas without initializing, migrating, or repairing
 state. CLI and Desktop inspect once before network work and again after staging,
 immediately before the publication primitive. The second generation-2 check is
 inside the destination publication lock; generation-1 checks run immediately
-before the descriptor-relative/no-replace rename. There is not yet one lock
+before the descriptor-relative/no-replace rename. Both generations reopen the
+visible parent path and compare its filesystem identity with the retained
+publication-parent descriptor at the commit boundary, so retargeting an
+ancestor symlink or reparse path after overlap inspection fails closed. There is not yet one lock
 shared by mount creation and sandbox publication, so a mount committed after
 the final read remains a narrow race; callers must still allocate dedicated
 sandbox roots rather than relying on this guard as global coordination.

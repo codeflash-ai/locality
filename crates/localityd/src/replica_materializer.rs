@@ -79,6 +79,8 @@ pub(crate) struct WorkspacePublicationLock {
     _lock_name: OsString,
     #[cfg(windows)]
     _file: fs::File,
+    #[cfg(windows)]
+    _parent: WindowsDirectory,
 }
 
 impl WorkspacePublicationLock {
@@ -111,7 +113,16 @@ impl WorkspacePublicationLock {
                 ));
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let visible = WindowsDirectory::open_absolute_read_only(parent_path)?;
+            if visible.identity()? != self._parent.identity()? {
+                return Err(io::Error::other(
+                    "workspace publication parent detached from its visible path",
+                ));
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         let _ = parent_path;
         Ok(())
     }
@@ -186,7 +197,10 @@ pub(crate) fn acquire_workspace_publication_lock(
         let parent = WindowsDirectory::open_absolute(parent_path)?;
         let file = parent.open_or_create_lock_file(OsStr::new(lock_name))?;
         lock_windows_file_exclusive(&file)?;
-        Ok(WorkspacePublicationLock { _file: file })
+        Ok(WorkspacePublicationLock {
+            _file: file,
+            _parent: parent,
+        })
     }
     #[cfg(any(
         not(any(unix, windows)),
@@ -2337,6 +2351,29 @@ impl StagingDirectory {
         Ok(())
     }
 
+    #[cfg(unix)]
+    fn verify_visible_publication_parent(
+        &self,
+        parent_path: &Path,
+    ) -> Result<(), ReplicaMaterializationError> {
+        let visible = rustix::fs::open(
+            parent_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        let visible_identity = rustix::fs::fstat(&visible)
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        let retained_identity = rustix::fs::fstat(&self.parent)
+            .map_err(|error| ReplicaMaterializationError::Publish(error.into()))?;
+        if !same_file_identity(&visible_identity, &retained_identity) {
+            return Err(ReplicaMaterializationError::Publish(io::Error::other(
+                "workspace publication parent detached from its visible path",
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn create(parent: &Path) -> Result<Self, ReplicaMaterializationError> {
         // The pre-open metadata check alone is not enough: the path can be
         // replaced with a symlink before `open`. Keep the descriptor anchored
@@ -2647,6 +2684,7 @@ impl StagingDirectory {
                 "workspace generation identity changed at exchange",
             )));
         }
+        self.verify_visible_publication_parent(&parent_path)?;
         let old_path = self.path.clone();
         rustix::fs::renameat_with(
             &self.parent,
@@ -2954,6 +2992,7 @@ impl StagingDirectory {
                 "workspace staging root identity changed immediately before publication",
             )));
         }
+        self.verify_visible_publication_parent(&parent_path)?;
 
         if let Err(error) = rename_directory_noreplace(&self.parent, &self.name, destination_name) {
             if error.kind() == io::ErrorKind::AlreadyExists {

@@ -113,7 +113,7 @@ fn legacy_v20_upgrade_preserves_dirty_shadow_apply_journal_and_mount_identity() 
 }
 
 #[test]
-fn migrated_binding_survives_restart_and_resolves_host_roots_without_mutating_mount() {
+fn coordinator_binding_survives_restart_and_resolves_host_roots_without_mutating_mount() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
     let mount = fixture.mount_config(ProjectionMode::LinuxFuse);
@@ -121,6 +121,7 @@ fn migrated_binding_survives_restart_and_resolves_host_roots_without_mutating_mo
     let shadow = synced_shadow();
     let journal = applying_journal(&fixture.mount_id);
     store.save_mount(mount).expect("save mount");
+    save_trusted_fixture_binding(&mut store, &fixture);
     store.save_entity(entity.clone()).expect("save entity");
     store
         .save_shadow(&fixture.mount_id, shadow.clone())
@@ -198,6 +199,7 @@ fn workspace_rebind_preflight_rejects_dirty_state_without_changing_root() {
     let mut store = fixture.open();
     let mount = fixture.mount_config(ProjectionMode::PlainFiles);
     store.save_mount(mount.clone()).expect("save mount");
+    save_trusted_fixture_binding(&mut store, &fixture);
     store
         .save_entity(dirty_entity(&fixture.mount_id).with_hydration(HydrationState::Dirty))
         .expect("save dirty entity");
@@ -226,6 +228,7 @@ fn workspace_rebind_preflight_rejects_unsettled_apply_journal() {
     store
         .save_mount(fixture.mount_config(ProjectionMode::PlainFiles))
         .expect("save mount");
+    save_trusted_fixture_binding(&mut store, &fixture);
     store
         .append_journal(applying_journal(&fixture.mount_id))
         .expect("save applying journal");
@@ -246,6 +249,7 @@ fn workspace_rebind_preflight_rejects_active_virtual_projection() {
     store
         .save_mount(fixture.mount_config(ProjectionMode::MacosFileProvider))
         .expect("save mount");
+    save_trusted_fixture_binding(&mut store, &fixture);
 
     assert_eq!(
         store.check_workspace_rebind(&fixture.mount_id),
@@ -263,6 +267,7 @@ fn clean_plain_mount_still_requires_an_owning_rebind_coordinator() {
     store
         .save_mount(fixture.mount_config(ProjectionMode::PlainFiles))
         .expect("save mount");
+    save_trusted_fixture_binding(&mut store, &fixture);
 
     assert_eq!(
         store.check_workspace_rebind(&fixture.mount_id),
@@ -448,7 +453,7 @@ fn current_layout_zero_mount_save_does_not_reconstruct_missing_binding() {
 }
 
 #[test]
-fn save_mount_atomically_creates_binding_or_rolls_back_mount() {
+fn new_mount_remains_layout_zero_until_a_trusted_coordinator_saves_binding() {
     let fixture = Fixture::new();
     let mut store = fixture.open();
     let mount_id = MountId::new("google-docs-main");
@@ -458,42 +463,30 @@ fn save_mount_atomically_creates_binding_or_rolls_back_mount() {
         fixture.root.join("Locality/google-docs-main"),
     )
     .projection(ProjectionMode::LinuxFuse);
-    let connection = Connection::open(&store.db_path).expect("raw failpoint connection");
-    connection
-        .execute_batch(
-            "CREATE TRIGGER fail_google_docs_binding
-             BEFORE INSERT ON workspace_bindings
-             WHEN NEW.mount_id = 'google-docs-main'
-             BEGIN
-                 SELECT RAISE(ABORT, 'injected binding insert failure');
-             END;",
-        )
-        .expect("install binding failpoint");
-    drop(connection);
-
-    assert!(store.save_mount(mount.clone()).is_err());
-    let connection = Connection::open(&store.db_path).expect("raw rolled-back mount state");
-    let partial_rows: (i64, i64) = connection
-        .query_row(
-            "SELECT
-                (SELECT COUNT(*) FROM mounts WHERE mount_id = 'google-docs-main'),
-                (SELECT COUNT(*) FROM workspace_bindings
-                 WHERE mount_id = 'google-docs-main')",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("partial mount and binding rows");
-    assert_eq!(partial_rows, (0, 0));
-    connection
-        .execute_batch("DROP TRIGGER fail_google_docs_binding;")
-        .expect("remove binding failpoint");
-    drop(connection);
-
     store.save_mount(mount.clone()).expect("save mount");
     assert_eq!(
         store
             .get_workspace_binding(&mount_id)
-            .expect("read binding")
+            .expect("read binding"),
+        None,
+        "save_mount must not infer trust from a common parent"
+    );
+
+    let legacy = LegacyWorkspaceMount::new(mount_id.clone(), mount.root.clone());
+    let plan = WorkspaceHostBindingResolver::current()
+        .plan_legacy_migration(
+            mount.root.parent().expect("trusted workspace root"),
+            std::slice::from_ref(&legacy),
+        )
+        .expect("trusted coordinator plan");
+    let binding = plan.layout1_bindings()[0].clone();
+    store
+        .save_workspace_binding(binding)
+        .expect("save coordinator-approved binding");
+    assert_eq!(
+        store
+            .get_workspace_binding(&mount_id)
+            .expect("read explicit binding")
             .expect("binding exists")
             .mount_target()
             .as_str(),
@@ -504,13 +497,23 @@ fn save_mount_atomically_creates_binding_or_rolls_back_mount() {
     let restarted = fixture.open();
     assert_eq!(
         restarted.get_mount(&mount_id).expect("read mount"),
-        Some(mount)
+        Some(mount.clone())
     );
     assert!(
         restarted
             .get_workspace_binding(&mount_id)
             .expect("read restarted binding")
             .is_some()
+    );
+
+    let mut memory = InMemoryStateStore::new();
+    memory.save_mount(mount).expect("save memory mount");
+    assert_eq!(
+        memory
+            .get_workspace_binding(&mount_id)
+            .expect("read memory binding"),
+        None,
+        "in-memory save_mount must follow the same layout-0 contract"
     );
 }
 
@@ -964,6 +967,12 @@ fn v26_invalid_synthesized_target_is_removed_without_changing_legacy_root() {
         .expect("save mount");
     let invalid_root = fixture.root.join("Locality/trailing.");
     let synthesized = WorkspaceBinding::new(MountTarget::new("mount-notion-main").unwrap());
+    store
+        .save_workspace_binding(WorkspaceBindingRecord::new(
+            fixture.mount_id.clone(),
+            synthesized.clone(),
+        ))
+        .expect("seed prerelease synthesized binding");
     let connection = Connection::open(&store.db_path).expect("raw v26 state");
     connection
         .execute(
@@ -1019,6 +1028,18 @@ fn v26_suffixed_collision_bindings_are_removed_without_renaming_roots() {
     }
     let first = WorkspaceBinding::new(MountTarget::new("STRASSE").unwrap());
     let suffixed = WorkspaceBinding::new(MountTarget::new("Straße-2").unwrap());
+    store
+        .save_workspace_binding(WorkspaceBindingRecord::new(
+            MountId::new("a-mount"),
+            first.clone(),
+        ))
+        .expect("seed first prerelease binding");
+    store
+        .save_workspace_binding(WorkspaceBindingRecord::new(
+            MountId::new("z-mount"),
+            suffixed.clone(),
+        ))
+        .expect("seed suffixed prerelease binding");
     let connection = Connection::open(&store.db_path).expect("raw v26 state");
     for (mount_id, root, binding) in [
         ("a-mount", fixture.root.join("Locality/STRASSE"), first),
@@ -1207,6 +1228,7 @@ fn current_reader_rejects_newer_binding_metadata_without_touching_mount() {
     let mut store = fixture.open();
     let mount = fixture.mount_config(ProjectionMode::PlainFiles);
     store.save_mount(mount.clone()).expect("save mount");
+    save_trusted_fixture_binding(&mut store, &fixture);
     let connection = Connection::open(&store.db_path).expect("raw connection");
     connection
         .execute(
@@ -1320,6 +1342,7 @@ fn assert_existing_binding_target_is_immutable<S>(
     store
         .save_mount(fixture.mount_config(projection))
         .expect("save mount");
+    save_trusted_fixture_binding(&mut store, fixture);
     match active_state {
         ActiveMountState::Dirty => store
             .save_entity(dirty_entity(&fixture.mount_id).with_hydration(HydrationState::Dirty))
@@ -1361,6 +1384,28 @@ fn assert_existing_binding_target_is_immutable<S>(
             .expect("read unchanged binding"),
         Some(existing)
     );
+}
+
+fn save_trusted_fixture_binding<S>(store: &mut S, fixture: &Fixture)
+where
+    S: WorkspaceBindingRepository,
+{
+    let trusted_root = fixture
+        .mount_root
+        .parent()
+        .expect("fixture mount has a trusted workspace root");
+    let legacy = LegacyWorkspaceMount::new(fixture.mount_id.clone(), fixture.mount_root.clone());
+    let plan = WorkspaceHostBindingResolver::current()
+        .plan_legacy_migration(trusted_root, std::slice::from_ref(&legacy))
+        .expect("trusted fixture migration plan");
+    let binding = plan
+        .layout1_bindings()
+        .first()
+        .expect("fixture is a valid trusted direct child")
+        .clone();
+    store
+        .save_workspace_binding(binding)
+        .expect("save trusted fixture binding");
 }
 
 fn dirty_entity(mount_id: &MountId) -> EntityRecord {

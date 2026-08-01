@@ -36,8 +36,7 @@ use crate::repository::{
     virtual_move_content_changed, virtual_move_missing,
 };
 use crate::workspace_binding::{
-    LegacyWorkspaceMount, WorkspaceBinding, WorkspaceBindingRecord, WorkspaceRebindBlocker,
-    legacy_mount_collision_key, plan_legacy_migration_from_common_parent,
+    WorkspaceBinding, WorkspaceBindingRecord, WorkspaceRebindBlocker, legacy_mount_collision_key,
 };
 
 type EntityKey = (MountId, RemoteId);
@@ -160,35 +159,12 @@ impl InMemoryStateStore {
 
 impl MountRepository for InMemoryStateStore {
     fn save_mount(&mut self, mount: MountConfig) -> StoreResult<()> {
-        let is_new_mount = !self.mounts.contains_key(&mount.mount_id);
         if self
             .mounts
             .get(&mount.mount_id)
             .is_some_and(|existing| mount_source_identity_changed(existing, &mount))
         {
             self.clear_mount_source_state(&mount.mount_id);
-        }
-        if is_new_mount && !self.workspace_bindings.contains_key(&mount.mount_id) {
-            let mut legacy_mounts = self
-                .mounts
-                .values()
-                .map(|existing| {
-                    LegacyWorkspaceMount::new(existing.mount_id.clone(), existing.root.clone())
-                })
-                .collect::<Vec<_>>();
-            legacy_mounts.push(LegacyWorkspaceMount::new(
-                mount.mount_id.clone(),
-                mount.root.clone(),
-            ));
-            if let Some(plan) = plan_legacy_migration_from_common_parent(&legacy_mounts)
-                && let Some(record) = plan
-                    .layout1_bindings()
-                    .iter()
-                    .find(|record| record.mount_id == mount.mount_id)
-            {
-                self.workspace_bindings
-                    .insert(mount.mount_id.clone(), record.binding.clone());
-            }
         }
         self.mounts.insert(mount.mount_id.clone(), mount);
         Ok(())
