@@ -36,6 +36,7 @@
         "mount",
         "capabilities",
         "push_operations",
+        "membership_operations",
         "projection",
         "ui"
       ],
@@ -69,6 +70,12 @@
           "maxItems": 12,
           "uniqueItems": true,
           "items": {"$ref": "#/$defs/push_operation"}
+        },
+        "membership_operations": {
+          "type": "array",
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {"enum": ["join_public_channels"]}
         },
         "projection": {"$ref": "#/$defs/projection"},
         "ui": {"$ref": "#/$defs/ui"}

@@ -53,6 +53,7 @@ pub struct ConnectorManifest {
     pub mount: ConnectorMountManifest,
     pub capabilities: ManifestCapabilities,
     pub push_operations: Vec<ManifestPushOperation>,
+    pub membership_operations: Vec<MembershipOperation>,
     pub projection: ProjectionPolicyManifest,
     pub ui: ConnectorUiManifest,
 }
@@ -202,6 +203,13 @@ pub enum ManifestPushOperation {
     MoveEntity,
     CreateEntity,
     CreateDatabase,
+}
+
+/// Remote membership changes that are not content writes or push authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MembershipOperation {
+    JoinPublicChannels,
 }
 
 impl ManifestPushOperation {
@@ -609,6 +617,12 @@ fn validate_operations(
         &format!("{path}.push_operations"),
         violations,
     );
+    validate_unique_values(
+        &connector.membership_operations,
+        4,
+        &format!("{path}.membership_operations"),
+        violations,
+    );
     let operations = connector
         .push_operations
         .iter()
@@ -679,6 +693,19 @@ fn validate_operations(
                 "read-only connectors cannot describe mutating actions",
             ));
         }
+    }
+    if connector
+        .membership_operations
+        .contains(&MembershipOperation::JoinPublicChannels)
+        && !connector
+            .profiles
+            .iter()
+            .any(|profile| profile.scopes.iter().any(|scope| scope == "channels:join"))
+    {
+        violations.push(ManifestViolation::new(
+            format!("{path}.membership_operations"),
+            "join_public_channels requires a profile with channels:join scope",
+        ));
     }
 }
 

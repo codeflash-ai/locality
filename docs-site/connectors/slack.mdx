@@ -12,9 +12,11 @@ Markdown.
 loc connect slack
 ```
 
-Locality requests read-only bot scopes for conversation metadata and history,
-users and team metadata, and file metadata. It does not request `chat:write`,
-admin scopes, search scopes, or user email scope.
+Locality requests bot scopes for conversation metadata and history, users and
+team metadata, file metadata, and `channels:join`. The last scope allows the
+app to join public channels before reading them; this membership mutation is
+separate from content writes. Locality does not request `chat:write`, admin
+scopes, search scopes, or user email scope.
 
 ## Mount
 
@@ -26,8 +28,12 @@ loc pull ~/Locality/slack-main
 Default settings:
 
 ```json
-{"slack":{"history_limit":15,"types":["public_channel","private_channel","im","mpim"]}}
+{"slack":{"history_limit":15,"types":["public_channel","private_channel","im","mpim"],"auto_join_public_channels":true}}
 ```
+
+Set `auto_join_public_channels` to `false` to prevent membership changes.
+Unjoined public channels will be omitted; already joined public channels remain
+readable. This option does not change the connector's read-only content policy.
 
 ## Projection
 

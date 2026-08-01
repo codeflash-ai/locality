@@ -1013,6 +1013,43 @@ mod tests {
     }
 
     #[test]
+    fn disabled_auto_join_does_not_mutate_membership_or_project_unjoined_public_channels() {
+        let api = FakeSlackApi::default().with_conversations(vec![SlackConversation {
+            id: "C_unjoined".to_string(),
+            name: Some("unjoined".to_string()),
+            is_channel: true,
+            is_member: Some(false),
+            ..SlackConversation::default()
+        }]);
+        let settings = SlackMountSettings::from_json(
+            r#"{"slack":{"types":["public_channel"],"auto_join_public_channels":false}}"#,
+        )
+        .expect("settings");
+        let connector = SlackConnector::with_api(
+            SlackConfig::new("xoxb-token").with_settings(settings),
+            Arc::new(api.clone()),
+        );
+
+        let result = connector
+            .list_children(ListChildrenRequest {
+                mount_id: MountId::new("slack-main"),
+                container: ChildContainer::DirectoryChildren(RemoteId::new(
+                    "slack-folder:channels",
+                )),
+                parent_path: PathBuf::from("channels"),
+            })
+            .expect("list channels");
+
+        assert!(
+            api.joined_channels
+                .lock()
+                .expect("joined channels")
+                .is_empty()
+        );
+        assert!(result.entries.is_empty());
+    }
+
+    #[test]
     fn auto_join_public_channels_skips_unjoined_private_channels() {
         let api = FakeSlackApi::default().with_conversations(vec![SlackConversation {
             id: "G_private".to_string(),

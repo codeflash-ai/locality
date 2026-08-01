@@ -60,6 +60,7 @@
         "create_entity",
         "create_database"
       ],
+      "membership_operations": [],
       "projection": {
         "source_root_create_parent_kind": null,
         "create_entity_parent_kinds": ["page", "database"],
@@ -129,6 +130,7 @@
         "move_entity",
         "create_entity"
       ],
+      "membership_operations": [],
       "projection": {
         "source_root_create_parent_kind": "directory",
         "create_entity_parent_kinds": ["directory"],
@@ -203,6 +205,7 @@
         "supports_batch_observation": false
       },
       "push_operations": ["create_entity"],
+      "membership_operations": [],
       "projection": {
         "source_root_create_parent_kind": null,
         "create_entity_parent_kinds": ["directory"],
@@ -279,6 +282,7 @@
         "supports_batch_observation": false
       },
       "push_operations": ["create_entity"],
+      "membership_operations": [],
       "projection": {
         "source_root_create_parent_kind": null,
         "create_entity_parent_kinds": ["directory"],
@@ -332,6 +336,7 @@
         "supports_batch_observation": false
       },
       "push_operations": [],
+      "membership_operations": [],
       "projection": {
         "source_root_create_parent_kind": null,
         "create_entity_parent_kinds": [],
@@ -385,6 +390,7 @@
         "supports_batch_observation": true
       },
       "push_operations": ["update_entity_body", "update_properties", "move_entity"],
+      "membership_operations": [],
       "projection": {
         "source_root_create_parent_kind": null,
         "create_entity_parent_kinds": [],
@@ -475,6 +481,7 @@
         "supports_batch_observation": false
       },
       "push_operations": [],
+      "membership_operations": ["join_public_channels"],
       "projection": {
         "source_root_create_parent_kind": null,
         "create_entity_parent_kinds": [],

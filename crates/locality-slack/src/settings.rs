@@ -37,18 +37,23 @@ impl SlackConversationType {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SlackMountSettings {
     #[serde(default)]
     pub slack: SlackSettings,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SlackSettings {
     #[serde(default = "default_history_limit")]
     pub history_limit: u32,
     #[serde(default = "default_conversation_types")]
     pub types: BTreeSet<SlackConversationType>,
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        default = "default_auto_join_public_channels",
+        skip_serializing_if = "is_false"
+    )]
     pub auto_join_public_channels: bool,
 }
 
@@ -99,16 +104,23 @@ impl SlackMountSettings {
     }
 
     fn normalize(&mut self) -> LocalityResult<()> {
-        self.slack.history_limit = self.slack.history_limit.clamp(1, MAX_SLACK_HISTORY_LIMIT);
+        if !(1..=MAX_SLACK_HISTORY_LIMIT).contains(&self.slack.history_limit) {
+            return Err(settings_validation(format!(
+                "Slack history_limit must be between 1 and {MAX_SLACK_HISTORY_LIMIT}"
+            )));
+        }
         if self.slack.types.is_empty() {
             return Err(settings_validation(
                 "Slack settings must include at least one Slack conversation type",
             ));
         }
-        self.slack.auto_join_public_channels = self
+        if !self
             .slack
             .types
-            .contains(&SlackConversationType::PublicChannel);
+            .contains(&SlackConversationType::PublicChannel)
+        {
+            self.slack.auto_join_public_channels = false;
+        }
         Ok(())
     }
 }
@@ -126,6 +138,10 @@ fn default_conversation_types() -> BTreeSet<SlackConversationType> {
     ]
     .into_iter()
     .collect()
+}
+
+fn default_auto_join_public_channels() -> bool {
+    true
 }
 
 fn is_false(value: &bool) -> bool {
@@ -169,9 +185,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_json_settings_with_clamped_history_limit() {
+    fn omitted_auto_join_uses_the_documented_default() {
         let settings = SlackMountSettings::from_json(
-            r#"{"slack":{"history_limit":50,"types":["public_channel","im"]}}"#,
+            r#"{"slack":{"history_limit":15,"types":["public_channel","im"]}}"#,
         )
         .expect("parse settings");
 
@@ -181,6 +197,41 @@ mod tests {
             settings.conversations_api_types(),
             "public_channel,im".to_string()
         );
+    }
+
+    #[test]
+    fn explicit_false_disables_public_channel_auto_join() {
+        let settings = SlackMountSettings::from_json(
+            r#"{"slack":{"types":["public_channel"],"auto_join_public_channels":false}}"#,
+        )
+        .expect("parse settings");
+
+        assert!(!settings.slack.auto_join_public_channels);
+        assert_eq!(
+            settings.to_json().expect("settings json"),
+            r#"{"slack":{"history_limit":15,"types":["public_channel"]}}"#
+        );
+    }
+
+    #[test]
+    fn rejects_history_limits_outside_the_manifest_schema() {
+        for history_limit in [0, 16, 50] {
+            let error = SlackMountSettings::from_json(&format!(
+                r#"{{"slack":{{"history_limit":{history_limit}}}}}"#
+            ))
+            .expect_err("out-of-range history limit rejected");
+            let LocalityError::Validation(issues) = error else {
+                panic!("expected settings validation error");
+            };
+            assert_eq!(issues.len(), 1);
+            assert!(issues[0].message.contains("between 1 and 15"));
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_settings_fields() {
+        assert!(SlackMountSettings::from_json(r#"{"unexpected":true}"#).is_err());
+        assert!(SlackMountSettings::from_json(r#"{"slack":{"unexpected":true}}"#).is_err());
     }
 
     #[test]

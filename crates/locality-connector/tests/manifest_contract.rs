@@ -1,6 +1,6 @@
 use locality_connector::manifest::{
     CONNECTOR_REGISTRY_JSON, CONNECTOR_REGISTRY_SCHEMA_JSON, ConnectorRegistry, ManifestError,
-    bundled_connector_registry,
+    MembershipOperation, bundled_connector_registry,
 };
 use serde_json::{Value, json};
 
@@ -72,6 +72,21 @@ fn every_default_mount_setting_matches_its_connector_schema() {
 }
 
 #[test]
+fn slack_membership_mutation_is_separate_from_content_push_operations() {
+    let registry = bundled_connector_registry().expect("registry");
+    let slack = registry.connector("slack").expect("Slack manifest");
+
+    assert_eq!(
+        slack.membership_operations,
+        [MembershipOperation::JoinPublicChannels]
+    );
+    assert!(slack.mount.read_only);
+    assert!(slack.push_operations.is_empty());
+    assert!(!slack.capabilities.supports_block_updates);
+    assert!(!slack.capabilities.supports_entity_body_updates);
+}
+
+#[test]
 fn strict_parser_rejects_unknown_fields_and_enums() {
     let mut unknown_field = registry_value();
     unknown_field["connectors"][0]["executable"] = json!("/tmp/plugin");
@@ -123,6 +138,20 @@ fn validation_rejects_unsafe_assets_credentials_and_inconsistent_capabilities() 
     assert!(messages.contains("safe kebab-case identifier"));
     assert!(messages.contains("cannot contain credential-bearing settings"));
     assert!(messages.contains("must agree with declared block push operations"));
+}
+
+#[test]
+fn public_channel_membership_mutation_requires_its_oauth_scope() {
+    let mut invalid = registry_value();
+    let scopes = invalid["connectors"][6]["profiles"][0]["scopes"]
+        .as_array_mut()
+        .expect("Slack scopes");
+    scopes.retain(|scope| scope != "channels:join");
+
+    let messages = validation_messages(
+        ConnectorRegistry::parse(&invalid.to_string()).expect_err("missing scope must fail"),
+    );
+    assert!(messages.contains("join_public_channels requires a profile with channels:join scope"));
 }
 
 #[test]
