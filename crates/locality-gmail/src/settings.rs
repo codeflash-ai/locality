@@ -4,7 +4,7 @@ use locality_core::{LocalityError, LocalityResult};
 use serde::{Deserialize, Deserializer, Serialize, de};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GmailMountSettings {
     pub gmail: GmailSettings,
 }
@@ -54,7 +54,7 @@ impl GmailMountSettings {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GmailSettings {
     pub date_window: Option<GmailDateWindow>,
     pub view: GmailProjectionView,
@@ -115,6 +115,7 @@ impl<'de> Deserialize<'de> for GmailDateWindow {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct RawGmailDateWindow {
             after: String,
             before: String,
@@ -366,6 +367,20 @@ mod tests {
             GmailProjectionView::Threads
         );
         assert!(GmailProjectionView::parse("conversation").is_err());
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected_at_every_settings_level() {
+        for value in [
+            r#"{"unexpected":true}"#,
+            r#"{"gmail":{"unexpected":true}}"#,
+            r#"{"gmail":{"date_window":{"after":"2026-07-01","before":"2026-07-15","unexpected":true}}}"#,
+        ] {
+            assert!(
+                GmailMountSettings::from_json(value).is_err(),
+                "unknown field accepted in {value}"
+            );
+        }
     }
 
     fn assert_settings_json_error(error: LocalityError, expected_message: &str) {

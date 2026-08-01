@@ -15,13 +15,15 @@ use locality_connector::manifest::{
 };
 use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_core::push::BodyDiffMode;
-use locality_gmail::{GmailConfig, GmailConnector};
-use locality_google_calendar::{GoogleCalendarConfig, GoogleCalendarConnector};
+use locality_gmail::{GmailConfig, GmailConnector, GmailMountSettings};
+use locality_google_calendar::{
+    GoogleCalendarConfig, GoogleCalendarConnector, GoogleCalendarMountSettings,
+};
 use locality_google_docs::{GoogleDocsConfig, GoogleDocsConnector, StoredGoogleDocsCredential};
 use locality_granola::{GranolaConfig, GranolaConnector};
 use locality_linear::{LinearConfig, LinearConnector};
 use locality_notion::{NotionConfig, NotionConnector};
-use locality_slack::{SlackConfig, SlackConnector};
+use locality_slack::{SlackConfig, SlackConnector, SlackMountSettings};
 use locality_store::MountConfig;
 use localityd::source::{
     VirtualRenamePolicy, registered_source_contracts, source_create_decision_for_parent_path,
@@ -242,6 +244,34 @@ fn source_descriptors_match_manifest_defaults_and_projection_policy() {
 }
 
 #[test]
+fn representative_runtime_settings_round_trip_through_manifest_schemas() {
+    assert_settings_schema_runtime_round_trip(
+        "google-calendar",
+        &[
+            r#"{}"#,
+            r#"{"google_calendar":{"date_window":{"after":"2026-07-01","before":"2026-07-31"}}}"#,
+        ],
+        |json| GoogleCalendarMountSettings::from_json(json)?.to_json(),
+    );
+    assert_settings_schema_runtime_round_trip(
+        "gmail",
+        &[
+            r#"{}"#,
+            r#"{"gmail":{"date_window":{"after":"2026-07-01","before":"2026-07-31"},"view":"threads"}}"#,
+        ],
+        |json| GmailMountSettings::from_json(json)?.to_json(),
+    );
+    assert_settings_schema_runtime_round_trip(
+        "slack",
+        &[
+            r#"{"slack":{"history_limit":15,"types":["public_channel","private_channel","im","mpim"],"auto_join_public_channels":true}}"#,
+            r#"{"slack":{"history_limit":7,"types":["public_channel","im"],"auto_join_public_channels":false}}"#,
+        ],
+        |json| SlackMountSettings::from_json(json)?.to_json(),
+    );
+}
+
+#[test]
 fn read_only_manifests_reject_host_write_create_and_move_paths() {
     for contract in registered_source_contracts().expect("registered source contracts") {
         let manifest = contract.manifest;
@@ -378,5 +408,52 @@ fn runtime_entity_kind(kind: ManifestEntityKind) -> EntityKind {
         ManifestEntityKind::Page => EntityKind::Page,
         ManifestEntityKind::Database => EntityKind::Database,
         ManifestEntityKind::Directory => EntityKind::Directory,
+    }
+}
+
+fn assert_settings_schema_runtime_round_trip(
+    connector_id: &str,
+    examples: &[&str],
+    runtime_round_trip: impl Fn(&str) -> locality_core::LocalityResult<String>,
+) {
+    let registry = bundled_connector_registry().expect("manifest registry");
+    let manifest = registry
+        .connector(connector_id)
+        .expect("connector manifest");
+    let validator = jsonschema::validator_for(&manifest.mount.settings_schema)
+        .unwrap_or_else(|error| panic!("{connector_id} settings schema: {error}"));
+
+    for example in examples {
+        let input = serde_json::from_str::<serde_json::Value>(example).expect("settings JSON");
+        let input_errors = validator
+            .iter_errors(&input)
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            input_errors.is_empty(),
+            "{connector_id} representative input violates schema: {input_errors:?}"
+        );
+
+        let encoded = runtime_round_trip(example).unwrap_or_else(|error| {
+            panic!("{connector_id} runtime rejected schema input: {error}")
+        });
+        let runtime_value =
+            serde_json::from_str::<serde_json::Value>(&encoded).expect("runtime settings JSON");
+        let output_errors = validator
+            .iter_errors(&runtime_value)
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            output_errors.is_empty(),
+            "{connector_id} runtime output violates schema: {output_errors:?}"
+        );
+
+        let encoded_again = runtime_round_trip(&encoded)
+            .unwrap_or_else(|error| panic!("{connector_id} runtime rejected its output: {error}"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded_again).expect("second output"),
+            runtime_value,
+            "{connector_id} settings normalization is not stable"
+        );
     }
 }
