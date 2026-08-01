@@ -232,7 +232,7 @@ fn connect_notion_oauth_stores_oauth_bundle_and_metadata() {
 fn connect_notion_broker_oauth_stores_refresh_handle_without_client_secret() {
     let mut store = InMemoryStateStore::new();
     let credentials = InMemoryCredentialStore::new();
-    let exchange = FakeBrokerOAuthExchange::default();
+    let exchange = FakeBrokerOAuthExchange;
 
     let report = run_connect_notion_broker_oauth(
         &mut store,
@@ -281,54 +281,10 @@ fn connect_notion_broker_oauth_stores_refresh_handle_without_client_secret() {
 }
 
 #[test]
-fn connect_notion_broker_oauth_can_store_local_credentials_after_hosted_exchange_redirect() {
-    let mut store = InMemoryStateStore::new();
-    let credentials = InMemoryCredentialStore::new();
-
-    let report = run_connect_notion_broker_oauth(
-        &mut store,
-        &credentials,
-        BrokerOAuthConnectOptions {
-            connection_id: Some(ConnectionId::new("notion-hosted")),
-            broker_url: "https://afs-oauth-broker.saurabh-b07.workers.dev".to_string(),
-            client_id: "client-id".to_string(),
-            session: "broker-session".to_string(),
-            state: "state-1".to_string(),
-            code: "oauth-code".to_string(),
-            redirect_uri:
-                "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/notion/callback"
-                    .to_string(),
-        },
-        &FakeBrokerOAuthExchange {
-            expected_redirect_uri:
-                "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/notion/callback",
-        },
-    )
-    .expect("broker OAuth connect");
-
-    assert_eq!(report.connection_id, "notion-hosted");
-    assert_eq!(report.auth_kind, "oauth");
-    let saved = store
-        .get_connection(&ConnectionId::new("notion-hosted"))
-        .expect("get connection")
-        .expect("saved connection");
-    assert_eq!(saved.auth_kind, "oauth");
-    assert_eq!(saved.secret_ref, "connection:notion-hosted");
-    let secret = credentials
-        .get("connection:notion-hosted")
-        .expect("credential saved");
-    assert!(
-        secret
-            .contains("\"oauth_broker_url\":\"https://afs-oauth-broker.saurabh-b07.workers.dev\"")
-    );
-    assert!(secret.contains("\"refresh_token_handle\":\"opaque-refresh-handle\""));
-}
-
-#[test]
 fn connect_google_docs_broker_oauth_stores_refresh_handle_without_secrets() {
     let mut store = InMemoryStateStore::new();
     let credentials = InMemoryCredentialStore::new();
-    let exchange = FakeGoogleDocsBrokerOAuthExchange::default();
+    let exchange = FakeGoogleDocsBrokerOAuthExchange;
 
     let report = run_connect_google_docs_broker_oauth(
         &mut store,
@@ -374,55 +330,10 @@ fn connect_google_docs_broker_oauth_stores_refresh_handle_without_secrets() {
 }
 
 #[test]
-fn connect_google_docs_broker_oauth_can_store_local_credentials_after_hosted_exchange_redirect() {
-    let mut store = InMemoryStateStore::new();
-    let credentials = InMemoryCredentialStore::new();
-
-    let report = run_connect_google_docs_broker_oauth(
-        &mut store,
-        &credentials,
-        GoogleDocsBrokerOAuthConnectOptions {
-            connection_id: Some(ConnectionId::new("docs-hosted")),
-            broker_url: "https://afs-oauth-broker.saurabh-b07.workers.dev".to_string(),
-            client_id: "google-client-id".to_string(),
-            session: "broker-session".to_string(),
-            state: "state-1".to_string(),
-            code: "oauth-code".to_string(),
-            redirect_uri:
-                "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-docs/callback"
-                    .to_string(),
-        },
-        &FakeGoogleDocsBrokerOAuthExchange {
-            expected_redirect_uri:
-                "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-docs/callback",
-        },
-    )
-    .expect("broker OAuth connect");
-
-    assert_eq!(report.connection_id, "docs-hosted");
-    assert_eq!(report.connector, "google-docs");
-    assert_eq!(report.auth_kind, "oauth");
-    let saved = store
-        .get_connection(&ConnectionId::new("docs-hosted"))
-        .expect("get connection")
-        .expect("saved connection");
-    assert_eq!(saved.auth_kind, "oauth");
-    assert_eq!(saved.secret_ref, "connection:docs-hosted");
-    let secret = credentials
-        .get("connection:docs-hosted")
-        .expect("credential saved");
-    assert!(
-        secret
-            .contains("\"oauth_broker_url\":\"https://afs-oauth-broker.saurabh-b07.workers.dev\"")
-    );
-    assert!(secret.contains("\"refresh_token_handle\":\"opaque-refresh-handle\""));
-}
-
-#[test]
 fn connect_gmail_broker_oauth_stores_refresh_handle_without_secrets() {
     let mut store = InMemoryStateStore::new();
     let credentials = InMemoryCredentialStore::new();
-    let exchange = FakeGmailBrokerOAuthExchange::default();
+    let exchange = FakeGmailBrokerOAuthExchange;
 
     let report = run_connect_gmail_broker_oauth(
         &mut store,
@@ -468,54 +379,10 @@ fn connect_gmail_broker_oauth_stores_refresh_handle_without_secrets() {
 }
 
 #[test]
-fn connect_gmail_broker_oauth_can_store_local_credentials_after_hosted_exchange_redirect() {
-    let mut store = InMemoryStateStore::new();
-    let credentials = InMemoryCredentialStore::new();
-
-    let report = run_connect_gmail_broker_oauth(
-        &mut store,
-        &credentials,
-        GmailBrokerOAuthConnectOptions {
-            connection_id: Some(ConnectionId::new("gmail-hosted")),
-            broker_url: "https://afs-oauth-broker.saurabh-b07.workers.dev".to_string(),
-            client_id: "google-client-id".to_string(),
-            session: "broker-session".to_string(),
-            state: "state-1".to_string(),
-            code: "oauth-code".to_string(),
-            redirect_uri: "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/gmail/callback"
-                .to_string(),
-        },
-        &FakeGmailBrokerOAuthExchange {
-            expected_redirect_uri:
-                "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/gmail/callback",
-        },
-    )
-    .expect("broker OAuth connect");
-
-    assert_eq!(report.connection_id, "gmail-hosted");
-    assert_eq!(report.connector, "gmail");
-    assert_eq!(report.auth_kind, "oauth");
-    let saved = store
-        .get_connection(&ConnectionId::new("gmail-hosted"))
-        .expect("get connection")
-        .expect("saved connection");
-    assert_eq!(saved.auth_kind, "oauth");
-    assert_eq!(saved.secret_ref, "connection:gmail-hosted");
-    let secret = credentials
-        .get("connection:gmail-hosted")
-        .expect("credential saved");
-    assert!(
-        secret
-            .contains("\"oauth_broker_url\":\"https://afs-oauth-broker.saurabh-b07.workers.dev\"")
-    );
-    assert!(secret.contains("\"refresh_token_handle\":\"opaque-refresh-handle\""));
-}
-
-#[test]
 fn connect_google_calendar_broker_oauth_stores_refresh_handle_without_secrets() {
     let mut store = InMemoryStateStore::new();
     let credentials = InMemoryCredentialStore::new();
-    let exchange = FakeGoogleCalendarBrokerOAuthExchange::default();
+    let exchange = FakeGoogleCalendarBrokerOAuthExchange;
 
     let report = run_connect_google_calendar_broker_oauth(
         &mut store,
@@ -562,56 +429,10 @@ fn connect_google_calendar_broker_oauth_stores_refresh_handle_without_secrets() 
 }
 
 #[test]
-fn connect_google_calendar_broker_oauth_can_store_local_credentials_after_hosted_exchange_redirect()
-{
-    let mut store = InMemoryStateStore::new();
-    let credentials = InMemoryCredentialStore::new();
-
-    let report = run_connect_google_calendar_broker_oauth(
-        &mut store,
-        &credentials,
-        GoogleCalendarBrokerOAuthConnectOptions {
-            connection_id: Some(ConnectionId::new("google-calendar-hosted")),
-            broker_url: "https://afs-oauth-broker.saurabh-b07.workers.dev".to_string(),
-            client_id: "google-client-id".to_string(),
-            session: "broker-session".to_string(),
-            state: "state-1".to_string(),
-            code: "oauth-code".to_string(),
-            redirect_uri:
-                "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-calendar/callback"
-                    .to_string(),
-        },
-        &FakeGoogleCalendarBrokerOAuthExchange {
-            expected_redirect_uri:
-                "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/google-calendar/callback",
-        },
-    )
-    .expect("broker OAuth connect");
-
-    assert_eq!(report.connection_id, "google-calendar-hosted");
-    assert_eq!(report.connector, "google-calendar");
-    assert_eq!(report.auth_kind, "oauth");
-    let saved = store
-        .get_connection(&ConnectionId::new("google-calendar-hosted"))
-        .expect("get connection")
-        .expect("saved connection");
-    assert_eq!(saved.auth_kind, "oauth");
-    assert_eq!(saved.secret_ref, "connection:google-calendar-hosted");
-    let secret = credentials
-        .get("connection:google-calendar-hosted")
-        .expect("credential saved");
-    assert!(
-        secret
-            .contains("\"oauth_broker_url\":\"https://afs-oauth-broker.saurabh-b07.workers.dev\"")
-    );
-    assert!(secret.contains("\"refresh_token_handle\":\"opaque-refresh-handle\""));
-}
-
-#[test]
 fn connect_slack_broker_oauth_stores_refresh_handle_without_secrets() {
     let mut store = InMemoryStateStore::new();
     let credentials = InMemoryCredentialStore::new();
-    let exchange = FakeSlackBrokerOAuthExchange::default();
+    let exchange = FakeSlackBrokerOAuthExchange;
 
     let report = run_connect_slack_broker_oauth(
         &mut store,
@@ -653,50 +474,6 @@ fn connect_slack_broker_oauth_stores_refresh_handle_without_secrets() {
     assert!(!json.contains("xoxb-access-token"));
     assert!(!json.contains("opaque-refresh-handle"));
     assert!(!json.contains("secret_ref"));
-}
-
-#[test]
-fn connect_slack_broker_oauth_can_store_local_credentials_after_hosted_exchange_redirect() {
-    let mut store = InMemoryStateStore::new();
-    let credentials = InMemoryCredentialStore::new();
-
-    let report = run_connect_slack_broker_oauth(
-        &mut store,
-        &credentials,
-        SlackBrokerOAuthConnectOptions {
-            connection_id: Some(ConnectionId::new("slack-hosted")),
-            broker_url: "https://afs-oauth-broker.saurabh-b07.workers.dev".to_string(),
-            client_id: "slack-client-id".to_string(),
-            session: "broker-session".to_string(),
-            state: "state-1".to_string(),
-            code: "oauth-code".to_string(),
-            redirect_uri: "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/slack/callback"
-                .to_string(),
-        },
-        &FakeSlackBrokerOAuthExchange {
-            expected_redirect_uri:
-                "https://afs-oauth-broker.saurabh-b07.workers.dev/v1/oauth/slack/callback",
-        },
-    )
-    .expect("broker OAuth connect");
-
-    assert_eq!(report.connection_id, "slack-hosted");
-    assert_eq!(report.connector, "slack");
-    assert_eq!(report.auth_kind, "oauth");
-    let saved = store
-        .get_connection(&ConnectionId::new("slack-hosted"))
-        .expect("get connection")
-        .expect("saved connection");
-    assert_eq!(saved.auth_kind, "oauth");
-    assert_eq!(saved.secret_ref, "connection:slack-hosted");
-    let secret = credentials
-        .get("connection:slack-hosted")
-        .expect("credential saved");
-    assert!(
-        secret
-            .contains("\"oauth_broker_url\":\"https://afs-oauth-broker.saurabh-b07.workers.dev\"")
-    );
-    assert!(secret.contains("\"refresh_token_handle\":\"opaque-refresh-handle\""));
 }
 
 #[test]
@@ -969,7 +746,7 @@ fn connect_gmail_broker_oauth_credential_store_failure_reports_gmail_guidance() 
     let credentials = FailingCredentialStore {
         error: CredentialError::Unavailable("keychain locked".to_string()),
     };
-    let exchange = FakeGmailBrokerOAuthExchange::default();
+    let exchange = FakeGmailBrokerOAuthExchange;
 
     let error = run_connect_gmail_broker_oauth(
         &mut store,
@@ -1179,7 +956,7 @@ fn connect_gmail_broker_oauth_rejects_full_mailbox_scope_from_worker_scope_strin
 fn connect_google_docs_reuses_default_id_when_previous_default_is_revoked() {
     let mut store = InMemoryStateStore::new();
     let credentials = InMemoryCredentialStore::new();
-    let exchange = FakeGoogleDocsBrokerOAuthExchange::default();
+    let exchange = FakeGoogleDocsBrokerOAuthExchange;
 
     run_connect_google_docs_broker_oauth(
         &mut store,
@@ -1355,17 +1132,7 @@ impl NotionOAuthExchange for FakeOAuthExchange {
 }
 
 #[derive(Clone, Debug)]
-struct FakeBrokerOAuthExchange {
-    expected_redirect_uri: &'static str,
-}
-
-impl Default for FakeBrokerOAuthExchange {
-    fn default() -> Self {
-        Self {
-            expected_redirect_uri: "http://localhost:8757/oauth/notion/callback",
-        }
-    }
-}
+struct FakeBrokerOAuthExchange;
 
 impl NotionOAuthBrokerExchange for FakeBrokerOAuthExchange {
     fn exchange_code(
@@ -1375,7 +1142,10 @@ impl NotionOAuthBrokerExchange for FakeBrokerOAuthExchange {
         assert_eq!(request.session, "broker-session");
         assert_eq!(request.state, "state-1");
         assert_eq!(request.code, "oauth-code");
-        assert_eq!(request.redirect_uri, self.expected_redirect_uri);
+        assert_eq!(
+            request.redirect_uri,
+            "http://localhost:8757/oauth/notion/callback"
+        );
         Ok(NotionOAuthToken {
             access_token: "oauth-access-token".to_string(),
             token_type: Some("bearer".to_string()),
@@ -1394,17 +1164,7 @@ impl NotionOAuthBrokerExchange for FakeBrokerOAuthExchange {
 }
 
 #[derive(Clone, Debug)]
-struct FakeGoogleDocsBrokerOAuthExchange {
-    expected_redirect_uri: &'static str,
-}
-
-impl Default for FakeGoogleDocsBrokerOAuthExchange {
-    fn default() -> Self {
-        Self {
-            expected_redirect_uri: "http://localhost:8757/oauth/google-docs/callback",
-        }
-    }
-}
+struct FakeGoogleDocsBrokerOAuthExchange;
 
 impl GoogleDocsOAuthBrokerExchange for FakeGoogleDocsBrokerOAuthExchange {
     fn exchange_code(
@@ -1415,7 +1175,10 @@ impl GoogleDocsOAuthBrokerExchange for FakeGoogleDocsBrokerOAuthExchange {
         assert_eq!(request.session, "broker-session");
         assert_eq!(request.state, "state-1");
         assert_eq!(request.code, "oauth-code");
-        assert_eq!(request.redirect_uri, self.expected_redirect_uri);
+        assert_eq!(
+            request.redirect_uri,
+            "http://localhost:8757/oauth/google-docs/callback"
+        );
         Ok(OAuthBrokerToken {
             access_token: "oauth-access-token".to_string(),
             token_type: Some("Bearer".to_string()),
@@ -1434,17 +1197,7 @@ impl GoogleDocsOAuthBrokerExchange for FakeGoogleDocsBrokerOAuthExchange {
 }
 
 #[derive(Clone, Debug)]
-struct FakeGmailBrokerOAuthExchange {
-    expected_redirect_uri: &'static str,
-}
-
-impl Default for FakeGmailBrokerOAuthExchange {
-    fn default() -> Self {
-        Self {
-            expected_redirect_uri: "http://localhost:8757/oauth/gmail/callback",
-        }
-    }
-}
+struct FakeGmailBrokerOAuthExchange;
 
 impl GmailOAuthBrokerExchange for FakeGmailBrokerOAuthExchange {
     fn exchange_code(
@@ -1455,7 +1208,10 @@ impl GmailOAuthBrokerExchange for FakeGmailBrokerOAuthExchange {
         assert_eq!(request.session, "broker-session");
         assert_eq!(request.state, "state-1");
         assert_eq!(request.code, "oauth-code");
-        assert_eq!(request.redirect_uri, self.expected_redirect_uri);
+        assert_eq!(
+            request.redirect_uri,
+            "http://localhost:8757/oauth/gmail/callback"
+        );
         Ok(OAuthBrokerToken {
             access_token: "oauth-access-token".to_string(),
             token_type: Some("Bearer".to_string()),
@@ -1475,17 +1231,7 @@ impl GmailOAuthBrokerExchange for FakeGmailBrokerOAuthExchange {
 }
 
 #[derive(Clone, Debug)]
-struct FakeGoogleCalendarBrokerOAuthExchange {
-    expected_redirect_uri: &'static str,
-}
-
-impl Default for FakeGoogleCalendarBrokerOAuthExchange {
-    fn default() -> Self {
-        Self {
-            expected_redirect_uri: "http://localhost:8757/oauth/google-calendar/callback",
-        }
-    }
-}
+struct FakeGoogleCalendarBrokerOAuthExchange;
 
 impl GoogleCalendarOAuthBrokerExchange for FakeGoogleCalendarBrokerOAuthExchange {
     fn exchange_code(
@@ -1496,7 +1242,10 @@ impl GoogleCalendarOAuthBrokerExchange for FakeGoogleCalendarBrokerOAuthExchange
         assert_eq!(request.session, "broker-session");
         assert_eq!(request.state, "state-1");
         assert_eq!(request.code, "oauth-code");
-        assert_eq!(request.redirect_uri, self.expected_redirect_uri);
+        assert_eq!(
+            request.redirect_uri,
+            "http://localhost:8757/oauth/google-calendar/callback"
+        );
         Ok(google_calendar_broker_token(
             GOOGLE_CALENDAR_OAUTH_SCOPES
                 .iter()
@@ -1530,17 +1279,7 @@ impl GoogleCalendarOAuthBrokerExchange for ScopedFakeGoogleCalendarBrokerOAuthEx
 }
 
 #[derive(Clone, Debug)]
-struct FakeSlackBrokerOAuthExchange {
-    expected_redirect_uri: &'static str,
-}
-
-impl Default for FakeSlackBrokerOAuthExchange {
-    fn default() -> Self {
-        Self {
-            expected_redirect_uri: "http://localhost:8757/oauth/slack/callback",
-        }
-    }
-}
+struct FakeSlackBrokerOAuthExchange;
 
 impl SlackOAuthBrokerExchange for FakeSlackBrokerOAuthExchange {
     fn exchange_code(
@@ -1551,7 +1290,10 @@ impl SlackOAuthBrokerExchange for FakeSlackBrokerOAuthExchange {
         assert_eq!(request.session, "broker-session");
         assert_eq!(request.state, "state-1");
         assert_eq!(request.code, "oauth-code");
-        assert_eq!(request.redirect_uri, self.expected_redirect_uri);
+        assert_eq!(
+            request.redirect_uri,
+            "http://localhost:8757/oauth/slack/callback"
+        );
         Ok(slack_broker_token(slack_scopes_with_join()))
     }
 }

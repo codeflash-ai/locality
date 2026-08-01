@@ -34,8 +34,8 @@ The broker supports two refresh modes:
 - OAuth sessions are short-lived HMAC-signed payloads.
 - Session verification checks state, connector, redirect URI, expiry, and payload
   shape before exchanging a code.
-- Local callback URIs are restricted to configured allowlists before any browser
-  handoff or token exchange.
+- Notion, Google Docs, and Gmail redirect URIs are restricted to configured
+  loopback callback URLs.
 - Production handle mode keeps provider refresh tokens inside encrypted opaque
   handles before returning them to local clients.
 - Upstream OAuth error bodies are not returned to callers.
@@ -56,15 +56,6 @@ Deployment controls to add before public launch:
 
 ## Redirects
 
-The broker keeps two redirect boundaries separate for every OAuth connector:
-
-- `LOCALITY_<CONNECTOR>_REDIRECT_URIS` is a loopback-only allowlist for local callbacks such as `http://localhost:8757/oauth/gmail/callback`.
-- `LOCALITY_<CONNECTOR>_HOSTED_CALLBACK_URI` is one exact HTTPS callback served by this broker at the connector's `/v1/oauth/<connector>/callback` path.
-
-When hosted handoff is enabled by both a configured hosted callback URI and a
-start request with `hosted_callback_handoff: true`, the provider authorization
-request uses the hosted callback URI. The callback route verifies a signed state
-payload before redirecting to a loopback URI from the allowlist. The token
-exchange also uses the hosted callback URI so the provider sees the same
-redirect URI in both OAuth steps. Clients that do not opt in stay on the direct
-loopback flow.
+The broker accepts only configured loopback redirect URIs for Notion, Google
+Docs, and Gmail. The Locality CLI should use stable localhost callbacks so each
+provider integration can keep a small static redirect allowlist.
