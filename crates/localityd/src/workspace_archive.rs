@@ -14,7 +14,7 @@ use locality_protocol::workspace_api_v2::{WorkspaceExportOfferV2, WorkspaceProfi
 use locality_protocol::workspace_export_v2::{
     WorkspaceArchiveEntryKindV2, WorkspaceArchiveMemberV2, WorkspaceAuthorizedExportEntryV2,
     WorkspaceExportTerminalControlV2, WorkspaceMaterializationPlanV2,
-    WorkspaceNamespacedInventoryV2,
+    WorkspaceMaterializationPlanWithInventoryV2, WorkspaceNamespacedInventoryV2,
 };
 use locality_protocol::{
     DeliveredBodyDigestV2, ExportV2FilePaxMetadata, MAX_EXPORT_TERMINAL_CONTROL_BYTES,
@@ -220,14 +220,37 @@ pub trait WorkspaceArchiveSink {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidatedWorkspaceArchive {
     pub plan: WorkspaceMaterializationPlanV2,
-    /// Exact canonical inventory validated for the same session, offer,
-    /// terminal control, and archive members as `plan`.
-    pub inventory: WorkspaceNamespacedInventoryV2,
     pub terminal_control: WorkspaceExportTerminalControlV2,
     pub archive_entries: u64,
     pub files: u64,
     pub directories: u64,
     pub content_bytes: u64,
+}
+
+/// Opt-in generation-2 validation result that carries the exact canonical
+/// inventory built while producing the materialization plan.
+///
+/// [`ValidatedWorkspaceArchive`] remains unchanged for source compatibility.
+/// New callers that need baseline authority should use
+/// [`validate_workspace_tar_with_inventory_v2`] and retain this result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatedWorkspaceArchiveWithInventoryV2 {
+    validated: ValidatedWorkspaceArchive,
+    inventory: WorkspaceNamespacedInventoryV2,
+}
+
+impl ValidatedWorkspaceArchiveWithInventoryV2 {
+    pub fn validated(&self) -> &ValidatedWorkspaceArchive {
+        &self.validated
+    }
+
+    pub fn inventory(&self) -> &WorkspaceNamespacedInventoryV2 {
+        &self.inventory
+    }
+
+    pub fn into_parts(self) -> (ValidatedWorkspaceArchive, WorkspaceNamespacedInventoryV2) {
+        (self.validated, self.inventory)
+    }
 }
 
 #[derive(Debug)]
@@ -321,6 +344,23 @@ pub fn validate_workspace_tar<R: Read, S: WorkspaceArchiveSink>(
     session: &WorkspaceProfileSessionV2,
     offer: &WorkspaceExportOfferV2,
 ) -> Result<ValidatedWorkspaceArchive, WorkspaceArchiveError> {
+    validate_workspace_tar_with_inventory_v2(reader, sink, limits, session, offer)
+        .map(|result| result.validated)
+}
+
+/// Consume, stage, and validate one decoded standard tar stream while
+/// retaining the exact canonical generation-2 inventory.
+///
+/// This opt-in API returns the inventory produced by the same planner call as
+/// the materialization plan. It does not reconstruct inventory authority from
+/// the validated plan or clone archive authorized entries into a second list.
+pub fn validate_workspace_tar_with_inventory_v2<R: Read, S: WorkspaceArchiveSink>(
+    reader: &mut R,
+    sink: &mut S,
+    limits: WorkspaceArchiveLimits,
+    session: &WorkspaceProfileSessionV2,
+    offer: &WorkspaceExportOfferV2,
+) -> Result<ValidatedWorkspaceArchiveWithInventoryV2, WorkspaceArchiveError> {
     session
         .validate()
         .map_err(|error| WorkspaceArchiveError::Planner(error.to_string()))?;
@@ -562,19 +602,14 @@ pub fn validate_workspace_tar<R: Read, S: WorkspaceArchiveSink>(
     let terminal_control = raw_control.ok_or_else(|| {
         WorkspaceArchiveError::InvalidControl("the control member is missing".to_string())
     })?;
-    let authorized_entries = members
-        .iter()
-        .filter_map(|member| member.authorized_entry.clone())
-        .collect::<Vec<_>>();
-    let inventory = WorkspaceNamespacedInventoryV2::plan(
-        session.session_layout(),
+    let planned = WorkspaceMaterializationPlanWithInventoryV2::plan(
+        session,
         offer,
-        terminal_control.metadata.scope_sources(),
-        &authorized_entries,
+        &terminal_control,
+        &members,
     )
     .map_err(|error| WorkspaceArchiveError::Planner(error.to_string()))?;
-    let plan = WorkspaceMaterializationPlanV2::plan(session, offer, &terminal_control, &members)
-        .map_err(|error| WorkspaceArchiveError::Planner(error.to_string()))?;
+    let (plan, inventory) = planned.into_parts();
     let delivered_body_sha256 = delivered
         .finish()
         .map_err(|error| WorkspaceArchiveError::Planner(error.to_string()))?;
@@ -587,14 +622,16 @@ pub fn validate_workspace_tar<R: Read, S: WorkspaceArchiveSink>(
         return Err(WorkspaceArchiveError::DeliveredBodyDigestMismatch);
     }
 
-    Ok(ValidatedWorkspaceArchive {
-        plan,
+    Ok(ValidatedWorkspaceArchiveWithInventoryV2 {
+        validated: ValidatedWorkspaceArchive {
+            plan,
+            terminal_control,
+            archive_entries: u64::try_from(members.len()).unwrap_or(u64::MAX),
+            files,
+            directories,
+            content_bytes,
+        },
         inventory,
-        terminal_control,
-        archive_entries: u64::try_from(members.len()).unwrap_or(u64::MAX),
-        files,
-        directories,
-        content_bytes,
     })
 }
 

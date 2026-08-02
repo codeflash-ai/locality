@@ -33,7 +33,8 @@ use localityd::remote_truth::{ReplicaArchive, ReplicaArchiveEncoding};
 )))]
 use localityd::replica_materializer::ReplicaMaterializationError;
 use localityd::workspace_archive::{
-    WorkspaceArchiveLimits, WorkspaceArchiveSink, validate_workspace_tar,
+    ValidatedWorkspaceArchive, WorkspaceArchiveLimits, WorkspaceArchiveSink,
+    validate_workspace_tar, validate_workspace_tar_with_inventory_v2,
 };
 use localityd::workspace_materializer::{
     PublishedWorkspace, StagedWorkspaceMaterialization, WorkspaceMaterializationError,
@@ -424,13 +425,46 @@ fn append_member(
 }
 
 #[test]
+fn validated_workspace_archive_preserves_exhaustive_pattern_and_struct_literal_compatibility() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let validated = validate_workspace_tar(
+        &mut Cursor::new(archive(&fixture, &contract.control)),
+        &mut MemorySink::default(),
+        WorkspaceArchiveLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("validate through the original API");
+
+    let ValidatedWorkspaceArchive {
+        plan,
+        terminal_control,
+        archive_entries,
+        files,
+        directories,
+        content_bytes,
+    } = validated;
+    let rebuilt = ValidatedWorkspaceArchive {
+        plan,
+        terminal_control,
+        archive_entries,
+        files,
+        directories,
+        content_bytes,
+    };
+
+    assert_eq!(rebuilt.archive_entries, 7);
+}
+
+#[test]
 fn production_tar_adapter_executes_the_validated_namespaced_plan() {
     let fixture = fixture();
     let contract = contract(&fixture);
     let tar = archive(&fixture, &contract.control);
     let mut sink = MemorySink::default();
 
-    let validated = validate_workspace_tar(
+    let result = validate_workspace_tar_with_inventory_v2(
         &mut Cursor::new(tar),
         &mut sink,
         WorkspaceArchiveLimits::default(),
@@ -438,16 +472,17 @@ fn production_tar_adapter_executes_the_validated_namespaced_plan() {
         &contract.offer,
     )
     .expect("validate workspace archive");
+    let validated = result.validated();
+    let inventory = result.inventory();
 
     assert_eq!(validated.archive_entries, 7);
     assert_eq!(validated.directories, 4);
     assert_eq!(validated.files, 2);
     assert_eq!(validated.content_bytes, 17);
     assert_eq!(validated.plan.entries().len(), 6);
-    assert_eq!(validated.inventory, contract.inventory);
+    assert_eq!(inventory, &contract.inventory);
     assert_eq!(
-        validated
-            .inventory
+        inventory
             .records()
             .iter()
             .filter(|record| !matches!(record, WorkspaceNamespacedExportRecordV2::Control { .. }))
@@ -461,7 +496,7 @@ fn production_tar_adapter_executes_the_validated_namespaced_plan() {
             .collect::<Vec<_>>()
     );
     assert_eq!(
-        validated.inventory.inventory_sha256(),
+        inventory.inventory_sha256(),
         validated.terminal_control.metadata.inventory_sha256()
     );
     assert_eq!(sink.directories.len(), 4);
@@ -497,7 +532,7 @@ fn exported_inventory_retains_empty_sources_across_shared_multi_source_mounts() 
     let contract = contract_with_scope_sources(&fixture, scope_sources.clone());
     let mut sink = MemorySink::default();
 
-    let validated = validate_workspace_tar(
+    let result = validate_workspace_tar_with_inventory_v2(
         &mut Cursor::new(archive(&fixture, &contract.control)),
         &mut sink,
         WorkspaceArchiveLimits::default(),
@@ -505,12 +540,14 @@ fn exported_inventory_retains_empty_sources_across_shared_multi_source_mounts() 
         &contract.offer,
     )
     .expect("validate empty shared-mount workspace archive");
+    let validated = result.validated();
+    let inventory = result.inventory();
 
-    assert_eq!(validated.inventory, contract.inventory);
-    assert_eq!(validated.inventory.scope_sources(), scope_sources);
-    assert_eq!(validated.inventory.file_count(), 0);
-    assert_eq!(validated.inventory.directory_count(), 2);
-    assert_eq!(validated.inventory.records().len(), 3);
+    assert_eq!(inventory, &contract.inventory);
+    assert_eq!(inventory.scope_sources(), scope_sources);
+    assert_eq!(inventory.file_count(), 0);
+    assert_eq!(inventory.directory_count(), 2);
+    assert_eq!(inventory.records().len(), 3);
     assert_eq!(validated.plan.entries().len(), 2);
 
     let mount_by_scope = contract
@@ -521,7 +558,7 @@ fn exported_inventory_retains_empty_sources_across_shared_multi_source_mounts() 
         .map(|entry| (entry.scope_ordinal(), entry.mount_id().as_str()))
         .collect::<BTreeMap<_, _>>();
     let mut sources_by_mount = BTreeMap::<_, BTreeSet<_>>::new();
-    for authority in validated.inventory.scope_sources() {
+    for authority in inventory.scope_sources() {
         sources_by_mount
             .entry(mount_by_scope[&authority.scope_ordinal()])
             .or_default()
@@ -536,7 +573,7 @@ fn exported_inventory_is_portable_and_fails_closed_on_context_or_control_tamperi
     let fixture = fixture();
     let contract = contract(&fixture);
     let mut sink = MemorySink::default();
-    let validated = validate_workspace_tar(
+    let result = validate_workspace_tar_with_inventory_v2(
         &mut Cursor::new(archive(&fixture, &contract.control)),
         &mut sink,
         WorkspaceArchiveLimits::default(),
@@ -544,14 +581,14 @@ fn exported_inventory_is_portable_and_fails_closed_on_context_or_control_tamperi
         &contract.offer,
     )
     .expect("validate portable inventory");
-    let encoded = serde_json::to_string(&validated.inventory).expect("serialize inventory");
+    let inventory = result.inventory();
+    let encoded = serde_json::to_string(inventory).expect("serialize inventory");
     assert!(!encoded.contains("provider_precondition"));
     assert!(!encoded.contains("source_remote_ids"));
     assert!(!encoded.contains("opaque-v4"));
     assert!(!encoded.contains("page-roadmap"));
     assert!(
-        validated
-            .inventory
+        inventory
             .records()
             .iter()
             .all(|record| !record.member_path().starts_with('/'))
@@ -562,7 +599,7 @@ fn exported_inventory_is_portable_and_fails_closed_on_context_or_control_tamperi
     other_session_json["session_id"] = Value::String("session-substituted".to_string());
     let other_session: WorkspaceProfileSessionV2 =
         serde_json::from_value(other_session_json).expect("substituted session");
-    let error = validate_workspace_tar(
+    let error = validate_workspace_tar_with_inventory_v2(
         &mut Cursor::new(archive(&fixture, &contract.control)),
         &mut MemorySink::default(),
         WorkspaceArchiveLimits::default(),
@@ -582,7 +619,7 @@ fn exported_inventory_is_portable_and_fails_closed_on_context_or_control_tamperi
     control_json["completion_receipt"]["receipt"]["inventory_sha256"] = substituted_digest;
     let tampered_control: WorkspaceExportTerminalControlV2 =
         serde_json::from_value(control_json).expect("shape-valid tampered control");
-    let error = validate_workspace_tar(
+    let error = validate_workspace_tar_with_inventory_v2(
         &mut Cursor::new(archive(&fixture, &tampered_control)),
         &mut MemorySink::default(),
         WorkspaceArchiveLimits::default(),
@@ -628,7 +665,7 @@ fn archive_limits_bound_the_inventory_that_can_be_returned() {
             "content is 17 bytes",
         ),
     ] {
-        let error = validate_workspace_tar(
+        let error = validate_workspace_tar_with_inventory_v2(
             &mut Cursor::new(archive(&fixture, &contract.control)),
             &mut MemorySink::default(),
             limits,

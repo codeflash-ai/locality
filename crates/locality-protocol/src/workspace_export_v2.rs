@@ -219,7 +219,7 @@ impl WorkspaceNamespacedInventoryV2 {
         scope_sources: &[WorkspaceScopeSourceAuthorityV2],
         entries: &[WorkspaceAuthorizedExportEntryV2],
     ) -> Result<Self, WorkspaceExportV2Error> {
-        plan_inventory(session_layout, offer, scope_sources, entries)
+        plan_inventory(session_layout, offer, scope_sources, entries.iter())
     }
 
     /// Decode and recompute the complete inventory from its authorized
@@ -661,6 +661,42 @@ pub struct WorkspaceMaterializationPlanV2 {
 }
 
 impl WorkspaceMaterializationPlanV2 {
+    /// Build only the host-neutral materialization plan.
+    ///
+    /// Callers that also need the canonical inventory must use
+    /// [`WorkspaceMaterializationPlanWithInventoryV2::plan`] so the inventory
+    /// produced while validating this plan is returned instead of recomputed.
+    pub fn plan(
+        session: &WorkspaceProfileSessionV2,
+        offer: &WorkspaceExportOfferV2,
+        control: &WorkspaceExportTerminalControlV2,
+        members: &[WorkspaceArchiveMemberV2],
+    ) -> Result<Self, WorkspaceExportV2Error> {
+        WorkspaceMaterializationPlanWithInventoryV2::plan(session, offer, control, members)
+            .map(|result| result.plan)
+    }
+
+    pub fn target_directories(&self) -> &[WorkspaceTargetDirectoryV2] {
+        &self.target_directories
+    }
+
+    pub fn entries(&self) -> &[WorkspaceMaterializationEntryV2] {
+        &self.entries
+    }
+}
+
+/// Combined generation-2 planner result for callers that need both the exact
+/// canonical inventory and its materialization plan.
+///
+/// The inventory is built once directly from borrowed archive members. No
+/// intermediate clone of the authorized entries is constructed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceMaterializationPlanWithInventoryV2 {
+    plan: WorkspaceMaterializationPlanV2,
+    inventory: WorkspaceNamespacedInventoryV2,
+}
+
+impl WorkspaceMaterializationPlanWithInventoryV2 {
     pub fn plan(
         session: &WorkspaceProfileSessionV2,
         offer: &WorkspaceExportOfferV2,
@@ -675,7 +711,6 @@ impl WorkspaceMaterializationPlanV2 {
             .iter()
             .map(|entry| entry.target().as_str())
             .collect::<BTreeSet<_>>();
-        let mut authorized_entries = Vec::new();
         for member in members {
             match member.kind {
                 WorkspaceArchiveEntryKindV2::Directory | WorkspaceArchiveEntryKindV2::File => {
@@ -702,7 +737,6 @@ impl WorkspaceMaterializationPlanV2 {
                     if !kind_matches {
                         return Err(WorkspaceExportV2Error::EntryKindMismatch);
                     }
-                    authorized_entries.push(entry.clone());
                 }
                 WorkspaceArchiveEntryKindV2::Control => {
                     if member.authorized_entry.is_some() {
@@ -717,11 +751,13 @@ impl WorkspaceMaterializationPlanV2 {
             }
         }
 
-        let inventory = WorkspaceNamespacedInventoryV2::plan(
+        let inventory = plan_inventory(
             session.session_layout(),
             offer,
             control.metadata.scope_sources(),
-            &authorized_entries,
+            members
+                .iter()
+                .filter_map(|member| member.authorized_entry.as_ref()),
         )?;
         control.validate_against(session, offer, &inventory)?;
         if members.len() != inventory.records.len() {
@@ -757,18 +793,28 @@ impl WorkspaceMaterializationPlanV2 {
             .iter()
             .filter_map(materialization_entry)
             .collect();
-        Ok(Self {
-            target_directories: inventory.target_directories,
+        let plan = WorkspaceMaterializationPlanV2 {
+            target_directories: inventory.target_directories.clone(),
             entries,
-        })
+        };
+        Ok(Self { plan, inventory })
     }
 
-    pub fn target_directories(&self) -> &[WorkspaceTargetDirectoryV2] {
-        &self.target_directories
+    pub fn materialization_plan(&self) -> &WorkspaceMaterializationPlanV2 {
+        &self.plan
     }
 
-    pub fn entries(&self) -> &[WorkspaceMaterializationEntryV2] {
-        &self.entries
+    pub fn inventory(&self) -> &WorkspaceNamespacedInventoryV2 {
+        &self.inventory
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        WorkspaceMaterializationPlanV2,
+        WorkspaceNamespacedInventoryV2,
+    ) {
+        (self.plan, self.inventory)
     }
 }
 
@@ -1014,11 +1060,11 @@ impl From<crate::ScopeContractError> for WorkspaceExportV2Error {
     }
 }
 
-fn plan_inventory(
+fn plan_inventory<'a>(
     session_layout: &SessionLayout,
     offer: &WorkspaceExportOfferV2,
     scope_sources: &[WorkspaceScopeSourceAuthorityV2],
-    entries: &[WorkspaceAuthorizedExportEntryV2],
+    entries: impl IntoIterator<Item = &'a WorkspaceAuthorizedExportEntryV2>,
 ) -> Result<WorkspaceNamespacedInventoryV2, WorkspaceExportV2Error> {
     let source_by_scope = validate_scope_source_authorities(session_layout, offer, scope_sources)?;
     let offered_sources = offer
