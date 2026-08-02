@@ -379,7 +379,7 @@ where
         source_connection_id: &SourceConnectionId,
         mount_root: &Path,
     ) -> Result<GenerationSyncSummary, GenerationSyncError> {
-        replay_pending_acknowledgments(store, mount_id, source_connection_id, &mut self.transport)?;
+        replay_pending_acknowledgments(store, mount_id, &mut self.transport)?;
         let observed = store
             .get_observed_generation_for_source_v2(mount_id, source_connection_id)?
             .ok_or_else(|| GenerationSyncError::MissingObservedGenerationSource {
@@ -460,12 +460,9 @@ fn validate_delivery_request_binding(
 fn replay_pending_acknowledgments<T: GenerationDeliveryTransport>(
     store: &mut SqliteStateStore,
     mount_id: &MountId,
-    source_connection_id: &SourceConnectionId,
     transport: &mut T,
 ) -> Result<(), GenerationSyncError> {
-    for journal in
-        store.list_pending_generation_acknowledgments_for_source(mount_id, source_connection_id)?
-    {
+    for journal in store.list_pending_generation_acknowledgments(mount_id)? {
         let request = GenerationDeliveryAcknowledgmentRequest::from_receipt(&journal.receipt)
             .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
         if request.terminal_receipt_sha256 != journal.receipt_sha256 {
@@ -5947,6 +5944,99 @@ mod tests {
         assert_eq!(
             &client.transport().events[client.transport().events.len() - 2..],
             &["acknowledgment", "next_delta"]
+        );
+    }
+
+    #[test]
+    fn another_sources_pending_acknowledgment_is_replayed_before_mount_poll() {
+        let fixture = Fixture::new("cross-source-ack-replay-before-poll");
+        let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+        store
+            .save_mount(MountConfig::new(
+                fixture.mount_id.clone(),
+                "backend",
+                &fixture.mount_root,
+            ))
+            .unwrap();
+        let seed = |source: &str, generation: &str| {
+            GenerationBaselineSeedRecord::new(
+                ObservedGenerationRecord {
+                    mount_id: fixture.mount_id.clone(),
+                    source_connection_id: SourceConnectionId::new(source),
+                    generation_id: SourceGenerationId::new(generation).unwrap(),
+                    inventory_sha256: canonical_target_inventory_sha256(&[]).unwrap(),
+                    workspace_layout_version: 1,
+                    workspace_layout_digest: sha256_label(b"layout"),
+                    last_receipt_sha256: None,
+                    updated_at: "2026-07-31T11:00:00Z".to_string(),
+                },
+                Vec::new(),
+            )
+        };
+        store
+            .seed_observed_generations(vec![
+                seed("source-a", "generation-a1"),
+                seed("source-b", "generation-b1"),
+            ])
+            .unwrap();
+        let mut source_b = delivery("delta-b-pending-ack", Vec::new());
+        retarget_delivery_source(&mut source_b, "source-b", "generation-b1", "generation-b2");
+        let mut transport = FakeTransport {
+            capabilities: GenerationTransportCapabilities {
+                terminal_receipt_acknowledgments: true,
+                ..GenerationTransportCapabilities::legacy()
+            },
+            acknowledgment_failures_remaining: 1,
+            ..FakeTransport::default()
+        };
+        transport.deliveries.push_back(source_b);
+        let mut client = GenerationSyncClient::new(transport);
+        let first_error = client
+            .sync_mount_source(
+                &mut store,
+                &fixture.mount_id,
+                &SourceConnectionId::new("source-b"),
+                &fixture.mount_root,
+            )
+            .expect_err("source B acknowledgment fails after its apply is durable");
+        assert!(matches!(first_error, GenerationSyncError::Transport(_)));
+        assert_eq!(
+            store
+                .list_pending_generation_acknowledgments(&fixture.mount_id)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        client
+            .sync_mount_source(
+                &mut store,
+                &fixture.mount_id,
+                &SourceConnectionId::new("source-a"),
+                &fixture.mount_root,
+            )
+            .expect("source B receipt is acknowledged before source A is polled");
+
+        assert_eq!(
+            &client.transport().events[client.transport().events.len() - 2..],
+            ["acknowledgment", "next_delta"]
+        );
+        assert_eq!(client.transport().acknowledgment_requests.len(), 2);
+        assert_eq!(
+            client.transport().acknowledgment_requests[1]
+                .source_connection_id
+                .as_str(),
+            "source-b"
+        );
+        assert_eq!(
+            client.transport().requests[1].source_connection_id.as_str(),
+            "source-a"
+        );
+        assert!(
+            store
+                .list_pending_generation_acknowledgments(&fixture.mount_id)
+                .unwrap()
+                .is_empty()
         );
     }
 

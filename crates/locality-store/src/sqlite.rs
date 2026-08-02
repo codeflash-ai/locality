@@ -1238,8 +1238,15 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         let active_or_unacknowledged: Option<String> = transaction
             .query_row(
                 "SELECT delta_id FROM generation_apply_journals
-                 WHERE mount_id = ?1 AND source_connection_id = ?2
-                   AND (active = 1 OR (acknowledgment_required = 1 AND acknowledged_at IS NULL))
+                 WHERE mount_id = ?1
+                   AND (
+                       active = 1
+                       OR (
+                           source_connection_id = ?2
+                           AND acknowledgment_required = 1
+                           AND acknowledged_at IS NULL
+                       )
+                   )
                  ORDER BY delta_id LIMIT 1",
                 params![mount_id.as_str(), source_connection_id.as_str()],
                 |row| row.get(0),

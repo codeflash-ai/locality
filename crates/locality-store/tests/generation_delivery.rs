@@ -874,6 +874,66 @@ fn shared_mount_applies_and_acknowledgments_advance_sources_independently() {
 }
 
 #[test]
+fn source_reset_is_fenced_by_another_sources_active_mount_apply() {
+    let fixture = Fixture::new("shared-mount-reset-active-other-source");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "backend",
+            &fixture.mount_root,
+        ))
+        .unwrap();
+    let a1 = identity_for("projection-a", "A.md", "content-a1", 'a', 1);
+    let b1 = identity_for("projection-b", "B.md", "content-b1", 'b', 1);
+    let b2 = identity_for("projection-b", "B.md", "content-b2", 'd', 2);
+    store
+        .seed_observed_generations(vec![
+            source_seed(&fixture.mount_id, "source-a", "generation-a1", Some(a1)),
+            source_seed(
+                &fixture.mount_id,
+                "source-b",
+                "generation-b1",
+                Some(b1.clone()),
+            ),
+        ])
+        .unwrap();
+    let delta = delta_for_source(
+        "delta-b-active",
+        "source-b",
+        "generation-b1",
+        "generation-b2",
+        Some(b1),
+        Some(b2),
+    );
+    let terminal_receipt = receipt(&delta);
+    store
+        .reserve_generation_apply(PreparedGenerationApply {
+            delta,
+            receipt_sha256: terminal_receipt.canonical_sha256().unwrap(),
+            receipt: terminal_receipt,
+            stage_root: "generation-delivery/delta-b-active".to_string(),
+            created_at: "2026-07-31T12:01:00Z".to_string(),
+        })
+        .unwrap();
+
+    let error = store
+        .reset_observed_generation_source(&fixture.mount_id, &SourceConnectionId::new("source-a"))
+        .expect_err("source A reset must not invalidate source B's active mount transaction");
+
+    assert!(matches!(error, StoreError::InvalidState(_)));
+    assert!(
+        store
+            .get_observed_generation_for_source(
+                &fixture.mount_id,
+                &SourceConnectionId::new("source-a"),
+            )
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
 fn observed_generation_apply_is_persisted_exact_replayable_and_atomic() {
     let fixture = Fixture::new("persist-replay");
     let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
