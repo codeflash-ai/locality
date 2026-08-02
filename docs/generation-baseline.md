@@ -16,6 +16,29 @@ return only the baseline sealed for that exact completed attempt. This public
 crate defines no HTTP handler, credential flow, database query, or provider
 cursor.
 
+The public blocking client is `GenerationBaselineHttpClient` in `loc-cli`.
+Construction takes a verified `WorkspaceProfileSessionV2`, so its opaque
+capability cannot be separated from the session route identity. Fetching takes
+that same session plus the exact offer and namespaced inventory. The client
+derives the attempt route identity from the sealed offer, encodes both opaque
+IDs as individual URL path segments, sends the capability only in the
+`Authorization: Bearer` header, and never places it in a URL or diagnostic.
+The HTTP adapter rejects the exact opaque IDs `.` and `..` before network
+access because URL-standard dot-segment normalization cannot preserve them as
+exact route identities; they remain valid opaque values outside this route.
+
+The request is a replay-safe GET with `Accept: application/json` and
+`Cache-Control: no-store`. Every accepted response, including a structured
+error response, must have exact `Content-Type: application/json`, exact
+`Cache-Control: no-store`, a single valid `Content-Length`, and no transfer
+encoding. The success body is bounded before allocation by
+`maximum_encoded_bytes_for_export` for the exact verified export context.
+Only transient connection/timeout/body-framing failures and HTTP 502, 503, or
+504 are retried, with the identical method, route, authorization boundary, and
+headers. Authorization, missing/stale/expired attempt, update-required,
+malformed, oversized, and context/integrity failures are terminal typed errors
+whose diagnostics do not include response text or credentials.
+
 ## Required export authority
 
 Network callers must retain all three verified generation-2 values:

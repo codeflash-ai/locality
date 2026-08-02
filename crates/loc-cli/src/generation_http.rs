@@ -1,8 +1,9 @@
-//! Authenticated HTTP adapter for the private generation-delivery v2 routes.
+//! Authenticated HTTP adapters for private generation baseline and delivery
+//! v2 routes.
 //!
 //! The hosted service owns route implementation and authorization. This module
-//! only maps those fixed routes onto the public generation-delivery transport
-//! contract and validates every complete response before exposing it locally.
+//! only maps those fixed routes onto public protocol contracts and validates
+//! every complete response before exposing it locally.
 
 use std::fmt::{Debug, Display, Formatter};
 use std::io::{Cursor, Read};
@@ -24,6 +25,11 @@ use locality_protocol::freshness_delivery_transport::{
     MAX_GENERATION_BODY_WINDOW_BYTES, MAX_GENERATION_BODY_WINDOW_METADATA_BYTES,
     MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES, MAX_GENERATION_TRANSPORT_REQUEST_BYTES,
 };
+use locality_protocol::generation_baseline::{
+    GenerationBaselineError, GenerationBaselineResponseV1, maximum_encoded_bytes_for_export,
+};
+use locality_protocol::workspace_api_v2::{WorkspaceExportOfferV2, WorkspaceProfileSessionV2};
+use locality_protocol::workspace_export_v2::WorkspaceNamespacedInventoryV2;
 use locality_protocol::workspace_layout::WorkspaceProfileId;
 use localityd::generation_sync::{
     AuthorizedGenerationBodyWindow, AuthorizedGenerationDelivery, AuthorizedGenerationDeliveryPoll,
@@ -32,7 +38,8 @@ use localityd::generation_sync::{
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use reqwest::header::{
-    ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, TRANSFER_ENCODING,
+    ACCEPT, AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue,
+    TRANSFER_ENCODING,
 };
 use serde::Deserialize;
 
@@ -42,12 +49,15 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_ATTEMPTS: u8 = 3;
 const MAX_ATTEMPTS: u8 = 10;
 const JSON_MEDIA_TYPE: &str = "application/json";
+const MAX_INITIAL_RESPONSE_BODY_CAPACITY: usize = 8 * 1024;
+pub const GENERATION_BASELINE_CONTENT_TYPE: &str = JSON_MEDIA_TYPE;
+pub const GENERATION_BASELINE_CACHE_CONTROL: &str = "no-store";
 const BODY_WINDOW_FRAME_OVERHEAD: usize =
     std::mem::size_of::<u32>() + MAX_GENERATION_BODY_WINDOW_METADATA_BYTES;
 
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 
-/// Bounded retry policy for one exact generation-delivery request.
+/// Bounded retry policy for one exact generation HTTP request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GenerationHttpOptions {
     pub connect_timeout: Duration,
@@ -67,6 +77,7 @@ impl Default for GenerationHttpOptions {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GenerationHttpOperation {
+    Baseline,
     Poll,
     BodyWindow,
     Acknowledgment,
@@ -77,6 +88,7 @@ pub enum GenerationHttpOperation {
 impl Display for GenerationHttpOperation {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
+            Self::Baseline => "generation baseline",
             Self::Poll => "generation delivery poll",
             Self::BodyWindow => "generation body window",
             Self::Acknowledgment => "generation delivery acknowledgment",
@@ -109,6 +121,7 @@ pub enum GenerationHttpResponseProblem {
     ContentLengthTooLarge,
     ContentLengthMismatch,
     InvalidContentType,
+    InvalidCacheControl,
     InvalidJson,
     UnsupportedVersion,
     CorrelationMismatch,
@@ -124,6 +137,10 @@ pub enum GenerationHttpResponseProblem {
 pub enum GenerationHttpRemoteCode {
     InvalidRequest,
     Unauthorized,
+    Forbidden,
+    NotFound,
+    Conflict,
+    Gone,
     UnsupportedEncoding,
     NeedsUpdate,
     DeadlineExceeded,
@@ -141,8 +158,12 @@ impl GenerationHttpRemoteCode {
         match value {
             "invalid_request" => Self::InvalidRequest,
             "unauthorized" => Self::Unauthorized,
+            "forbidden" => Self::Forbidden,
+            "not_found" => Self::NotFound,
+            "conflict" => Self::Conflict,
+            "gone" => Self::Gone,
             "unsupported_encoding" => Self::UnsupportedEncoding,
-            "needs_update" => Self::NeedsUpdate,
+            "needs_update" | "update_required" => Self::NeedsUpdate,
             "deadline_exceeded" => Self::DeadlineExceeded,
             "unavailable" => Self::Unavailable,
             "bootstrapping" => Self::Bootstrapping,
@@ -158,6 +179,7 @@ impl GenerationHttpRemoteCode {
 #[derive(Debug, PartialEq, Eq)]
 pub enum GenerationHttpError {
     InvalidConfiguration(&'static str),
+    InvalidBaselineContext,
     UnsupportedOperation(GenerationHttpOperation),
     RequestContract(GenerationTransportContractError),
     Transport {
@@ -190,6 +212,7 @@ impl GenerationHttpError {
             | Self::InvalidResponse { retry, .. }
             | Self::RemoteHttp { retry, .. } => *retry,
             Self::InvalidConfiguration(_)
+            | Self::InvalidBaselineContext
             | Self::UnsupportedOperation(_)
             | Self::RequestContract(_)
             | Self::RemotePoll { .. } => GenerationHttpRetryClassification::Never,
@@ -203,6 +226,9 @@ impl Display for GenerationHttpError {
             Self::InvalidConfiguration(detail) => {
                 write!(formatter, "invalid generation HTTP configuration: {detail}")
             }
+            Self::InvalidBaselineContext => formatter.write_str(
+                "generation baseline authority does not match the configured session capability",
+            ),
             Self::UnsupportedOperation(operation) => {
                 write!(
                     formatter,
@@ -266,6 +292,196 @@ impl Debug for SessionSecret {
     }
 }
 
+/// Blocking authenticated client for the immutable generation-baseline route.
+///
+/// Construction accepts only a validated workspace session, keeping the
+/// opaque capability and its exact (possibly non-UUID) session route identity
+/// together.
+pub struct GenerationBaselineHttpClient {
+    client: Client,
+    base_url: reqwest::Url,
+    session_id: String,
+    session_secret: SessionSecret,
+    max_attempts: u8,
+}
+
+impl Debug for GenerationBaselineHttpClient {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GenerationBaselineHttpClient")
+            .field("base_url", &self.base_url)
+            .field("session_id", &"<redacted>")
+            .field("session_secret", &self.session_secret)
+            .field("max_attempts", &self.max_attempts)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GenerationBaselineHttpClient {
+    pub fn new(
+        base_url: &str,
+        session: &WorkspaceProfileSessionV2,
+    ) -> Result<Self, GenerationHttpError> {
+        Self::new_with_options(base_url, session, GenerationHttpOptions::default())
+    }
+
+    pub fn new_with_options(
+        base_url: &str,
+        session: &WorkspaceProfileSessionV2,
+        options: GenerationHttpOptions,
+    ) -> Result<Self, GenerationHttpError> {
+        validate_options(options)?;
+        session
+            .validate()
+            .map_err(|_| GenerationHttpError::InvalidBaselineContext)?;
+        require_route_safe_opaque_segment(session.session_id().as_str())?;
+        let base_url = parse_base_url(base_url)?;
+        let authorization = authorization_header(session.opaque_capability())?;
+        let client = build_client(&base_url, options)?;
+        Ok(Self {
+            client,
+            base_url,
+            session_id: session.session_id().as_str().to_string(),
+            session_secret: SessionSecret(authorization),
+            max_attempts: options.max_attempts,
+        })
+    }
+
+    /// Fetch and validate the immutable sidecar for one exact verified export.
+    ///
+    /// The caller cannot choose either route identity independently: the
+    /// session comes from the configured capability and the attempt comes from
+    /// the sealed offer. The response is exposed only after the context-bound
+    /// protocol decoder accepts it.
+    pub fn fetch_generation_baseline(
+        &self,
+        session: &WorkspaceProfileSessionV2,
+        offer: &WorkspaceExportOfferV2,
+        inventory: &WorkspaceNamespacedInventoryV2,
+    ) -> Result<GenerationBaselineResponseV1, GenerationHttpError> {
+        self.require_workspace_session_boundary(session)?;
+        require_route_safe_opaque_segment(offer.offer().export_attempt_id.as_str())?;
+        let maximum = maximum_encoded_bytes_for_export(session, offer, inventory)
+            .map_err(|_| GenerationHttpError::InvalidBaselineContext)?;
+        let response = self.get_json(
+            self.endpoint(&[
+                "export-attempts",
+                offer.offer().export_attempt_id.as_str(),
+                "generation-baseline",
+            ]),
+            maximum,
+        )?;
+        let response = self.require_success(response)?;
+        GenerationBaselineResponseV1::decode_json_against_export(
+            &response, session, offer, inventory,
+        )
+        .map_err(baseline_response_error)
+    }
+
+    fn endpoint(&self, tail: &[&str]) -> reqwest::Url {
+        let mut url = self.base_url.clone();
+        url.set_path("");
+        url.path_segments_mut()
+            .expect("validated HTTP URLs support path segments")
+            .extend(["v2", "sessions", self.session_id.as_str()])
+            .extend(tail);
+        url
+    }
+
+    fn require_workspace_session_boundary(
+        &self,
+        session: &WorkspaceProfileSessionV2,
+    ) -> Result<(), GenerationHttpError> {
+        let authorization = authorization_header(session.opaque_capability())
+            .map_err(|_| GenerationHttpError::InvalidBaselineContext)?;
+        if self.session_id == session.session_id().as_str()
+            && self.session_secret.0 == authorization
+        {
+            Ok(())
+        } else {
+            Err(GenerationHttpError::InvalidBaselineContext)
+        }
+    }
+
+    fn get_json(
+        &self,
+        url: reqwest::Url,
+        success_maximum: usize,
+    ) -> Result<WireResponse, GenerationHttpError> {
+        let operation = GenerationHttpOperation::Baseline;
+        for attempt in 1..=self.max_attempts {
+            let response = match self
+                .client
+                .get(url.clone())
+                .header(AUTHORIZATION, self.session_secret.0.clone())
+                .header(ACCEPT, GENERATION_BASELINE_CONTENT_TYPE)
+                .header(CACHE_CONTROL, GENERATION_BASELINE_CACHE_CONTROL)
+                .send()
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let (failure, retry) = classify_transport_error(&error);
+                    if retry == GenerationHttpRetryClassification::Transient
+                        && attempt < self.max_attempts
+                    {
+                        continue;
+                    }
+                    return Err(GenerationHttpError::Transport {
+                        operation,
+                        failure,
+                        retry,
+                    });
+                }
+            };
+
+            let status = response.status();
+            let status_retry = classify_status(status);
+            if status_retry == GenerationHttpRetryClassification::Transient
+                && attempt < self.max_attempts
+            {
+                continue;
+            }
+            let maximum = if status == StatusCode::OK {
+                success_maximum
+            } else {
+                MAX_GENERATION_TRANSPORT_REQUEST_BYTES
+            };
+            match read_baseline_response(response, operation, maximum, status_retry) {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if error.retry_classification()
+                        == GenerationHttpRetryClassification::Transient
+                        && attempt < self.max_attempts =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("validated maximum attempt count is positive")
+    }
+
+    fn require_success(&self, response: WireResponse) -> Result<Vec<u8>, GenerationHttpError> {
+        if response.status == StatusCode::OK {
+            return Ok(response.body);
+        }
+        let remote: RemoteErrorBody = serde_json::from_slice(&response.body).map_err(|_| {
+            GenerationHttpError::InvalidResponse {
+                operation: GenerationHttpOperation::Baseline,
+                status: Some(response.status.as_u16()),
+                problem: GenerationHttpResponseProblem::InvalidJson,
+                retry: classify_status(response.status),
+            }
+        })?;
+        Err(GenerationHttpError::RemoteHttp {
+            operation: GenerationHttpOperation::Baseline,
+            status: response.status.as_u16(),
+            code: baseline_remote_code(response.status, &remote.code),
+            retry: classify_status(response.status),
+        })
+    }
+}
+
 /// Blocking authenticated adapter for the private generation-delivery v2 API.
 pub struct GenerationHttpTransport {
     client: Client,
@@ -318,29 +534,8 @@ impl GenerationHttpTransport {
             ));
         }
         let session_secret = session_secret.into();
-        validate_secret(&session_secret)?;
-        let mut authorization = HeaderValue::from_str(&format!("Bearer {session_secret}"))
-            .map_err(|_| GenerationHttpError::InvalidConfiguration("invalid session secret"))?;
-        authorization.set_sensitive(true);
-
-        REQWEST_CRYPTO_PROVIDER.get_or_init(|| {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        });
-        let mut client = Client::builder()
-            .user_agent(USER_AGENT)
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .connect_timeout(options.connect_timeout)
-            .timeout(options.request_timeout);
-        if base_url.scheme() == "http" {
-            // Plaintext bearer authentication is permitted only to a literal
-            // loopback address and must never traverse environment or system
-            // proxy configuration. HTTPS retains the platform proxy policy.
-            client = client.no_proxy();
-        }
-        let client = client
-            .build()
-            .map_err(|_| GenerationHttpError::InvalidConfiguration("HTTP client setup failed"))?;
+        let authorization = authorization_header(&session_secret)?;
+        let client = build_client(&base_url, options)?;
         let capabilities = GenerationTransportCapabilities {
             format_version: GENERATION_TRANSPORT_FORMAT_VERSION,
             minimum_reader_version: GENERATION_TRANSPORT_READER_VERSION,
@@ -702,8 +897,63 @@ fn response_contract_error(
     }
 }
 
+fn baseline_response_error(error: GenerationBaselineError) -> GenerationHttpError {
+    let problem = match error {
+        GenerationBaselineError::InvalidJson(_) => GenerationHttpResponseProblem::InvalidJson,
+        GenerationBaselineError::EncodingTooLarge { .. } => {
+            GenerationHttpResponseProblem::ContentLengthTooLarge
+        }
+        GenerationBaselineError::UpdateRequired { .. }
+        | GenerationBaselineError::UnsupportedFormatVersion { .. }
+        | GenerationBaselineError::InvalidVersionEnvelope => {
+            GenerationHttpResponseProblem::UnsupportedVersion
+        }
+        GenerationBaselineError::ExportBindingMismatch
+        | GenerationBaselineError::InvalidExportContext
+        | GenerationBaselineError::InvalidExportInventory
+        | GenerationBaselineError::ScopeAuthorityMismatch => {
+            GenerationHttpResponseProblem::CorrelationMismatch
+        }
+        GenerationBaselineError::BaselineDigestMismatch
+        | GenerationBaselineError::TargetInventoryMismatch { .. }
+        | GenerationBaselineError::InventoryFileMismatch { .. }
+        | GenerationBaselineError::InventoryFilesMissing => {
+            GenerationHttpResponseProblem::IntegrityMismatch
+        }
+        _ => GenerationHttpResponseProblem::ProtocolViolation,
+    };
+    GenerationHttpError::InvalidResponse {
+        operation: GenerationHttpOperation::Baseline,
+        status: Some(StatusCode::OK.as_u16()),
+        problem,
+        retry: GenerationHttpRetryClassification::Never,
+    }
+}
+
+fn baseline_remote_code(status: StatusCode, body_code: &str) -> GenerationHttpRemoteCode {
+    match status {
+        StatusCode::UNAUTHORIZED => GenerationHttpRemoteCode::Unauthorized,
+        StatusCode::FORBIDDEN => GenerationHttpRemoteCode::Forbidden,
+        StatusCode::NOT_FOUND => GenerationHttpRemoteCode::NotFound,
+        StatusCode::CONFLICT => GenerationHttpRemoteCode::Conflict,
+        StatusCode::GONE => GenerationHttpRemoteCode::Gone,
+        StatusCode::UPGRADE_REQUIRED => GenerationHttpRemoteCode::NeedsUpdate,
+        _ => GenerationHttpRemoteCode::parse(body_code),
+    }
+}
+
 fn is_canonical_route_uuid(value: &str) -> bool {
     WorkspaceProfileId::new(value).is_ok()
+}
+
+fn require_route_safe_opaque_segment(value: &str) -> Result<(), GenerationHttpError> {
+    // `url` follows the URL standard and normalizes these two exact path
+    // segments, so accepting either would silently change the opaque route ID.
+    if matches!(value, "." | "..") {
+        Err(GenerationHttpError::InvalidBaselineContext)
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_request_delta_id(delta_id: &str) -> Result<(), GenerationHttpError> {
@@ -742,6 +992,30 @@ fn validate_options(options: GenerationHttpOptions) -> Result<(), GenerationHttp
         ));
     }
     Ok(())
+}
+
+fn build_client(
+    base_url: &reqwest::Url,
+    options: GenerationHttpOptions,
+) -> Result<Client, GenerationHttpError> {
+    REQWEST_CRYPTO_PROVIDER.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+    let mut client = Client::builder()
+        .user_agent(USER_AGENT)
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .connect_timeout(options.connect_timeout)
+        .timeout(options.request_timeout);
+    if base_url.scheme() == "http" {
+        // Plaintext bearer authentication is permitted only to a literal
+        // loopback address and must never traverse environment or system proxy
+        // configuration. HTTPS retains the platform proxy policy.
+        client = client.no_proxy();
+    }
+    client
+        .build()
+        .map_err(|_| GenerationHttpError::InvalidConfiguration("HTTP client setup failed"))
 }
 
 fn parse_base_url(base_url: &str) -> Result<reqwest::Url, GenerationHttpError> {
@@ -809,6 +1083,14 @@ fn validate_secret(secret: &str) -> Result<(), GenerationHttpError> {
     } else {
         Ok(())
     }
+}
+
+fn authorization_header(secret: &str) -> Result<HeaderValue, GenerationHttpError> {
+    validate_secret(secret)?;
+    let mut authorization = HeaderValue::from_str(&format!("Bearer {secret}"))
+        .map_err(|_| GenerationHttpError::InvalidConfiguration("invalid session secret"))?;
+    authorization.set_sensitive(true);
+    Ok(authorization)
 }
 
 fn classify_status(status: StatusCode) -> GenerationHttpRetryClassification {
@@ -884,7 +1166,7 @@ fn read_wire_response(
             problem: GenerationHttpResponseProblem::ContentLengthTooLarge,
             retry: GenerationHttpRetryClassification::Never,
         })?;
-    let mut body = Vec::with_capacity(content_length.min(maximum));
+    let mut body = Vec::with_capacity(initial_response_body_capacity(content_length));
     response
         .by_ref()
         .take(u64::try_from(hard_limit).unwrap_or(u64::MAX))
@@ -922,6 +1204,34 @@ fn read_wire_response(
         });
     }
     Ok(WireResponse { status, body })
+}
+
+fn initial_response_body_capacity(content_length: usize) -> usize {
+    content_length.min(MAX_INITIAL_RESPONSE_BODY_CAPACITY)
+}
+
+fn read_baseline_response(
+    response: reqwest::blocking::Response,
+    operation: GenerationHttpOperation,
+    maximum: usize,
+    retry: GenerationHttpRetryClassification,
+) -> Result<WireResponse, GenerationHttpError> {
+    let status = response.status();
+    require_no_store(response.headers()).map_err(|problem| {
+        GenerationHttpError::InvalidResponse {
+            operation,
+            status: Some(status.as_u16()),
+            problem,
+            retry,
+        }
+    })?;
+    read_wire_response(
+        response,
+        operation,
+        GENERATION_BASELINE_CONTENT_TYPE,
+        maximum,
+        retry,
+    )
 }
 
 fn classify_body_read_error(
@@ -967,6 +1277,18 @@ fn require_content_type(
     }
 }
 
+fn require_no_store(headers: &HeaderMap) -> Result<(), GenerationHttpResponseProblem> {
+    let mut values = headers.get_all(CACHE_CONTROL).iter();
+    let value = values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .ok_or(GenerationHttpResponseProblem::InvalidCacheControl)?;
+    if values.next().is_some() || !value.eq_ignore_ascii_case(GENERATION_BASELINE_CACHE_CONTROL) {
+        return Err(GenerationHttpResponseProblem::InvalidCacheControl);
+    }
+    Ok(())
+}
+
 fn require_content_length(
     headers: &HeaderMap,
     maximum: usize,
@@ -992,5 +1314,24 @@ fn require_content_length(
         Err(GenerationHttpResponseProblem::ContentLengthTooLarge)
     } else {
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_INITIAL_RESPONSE_BODY_CAPACITY, initial_response_body_capacity};
+
+    #[test]
+    fn response_body_initial_capacity_is_small_and_capped() {
+        assert_eq!(initial_response_body_capacity(0), 0);
+        assert_eq!(initial_response_body_capacity(17), 17);
+        assert_eq!(
+            initial_response_body_capacity(MAX_INITIAL_RESPONSE_BODY_CAPACITY),
+            MAX_INITIAL_RESPONSE_BODY_CAPACITY
+        );
+        assert_eq!(
+            initial_response_body_capacity(usize::MAX),
+            MAX_INITIAL_RESPONSE_BODY_CAPACITY
+        );
     }
 }
