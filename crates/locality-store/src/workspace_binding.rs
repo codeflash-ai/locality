@@ -12,8 +12,20 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
+use std::mem::size_of;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandleEx, SYNCHRONIZE,
+};
 
 use caseless::Caseless;
 use locality_core::model::MountId;
@@ -963,7 +975,7 @@ fn parse_components(
 #[derive(Clone, Debug)]
 struct HostFilesystemAliases {
     canonical: PathBuf,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     native_anchors: Vec<NativePathAnchor>,
 }
 
@@ -972,9 +984,11 @@ impl HostFilesystemAliases {
         let canonical = canonicalize_with_missing_tail(path)?;
         #[cfg(unix)]
         let native_anchors = unix_native_anchors(path)?;
+        #[cfg(windows)]
+        let native_anchors = windows_native_anchors(path)?;
         Ok(Self {
             canonical,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             native_anchors,
         })
     }
@@ -988,7 +1002,7 @@ impl HostFilesystemAliases {
             return true;
         }
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if self.native_anchors.iter().any(|left| {
             other.native_anchors.iter().any(|right| {
                 left.identity == right.identity
@@ -1011,21 +1025,19 @@ pub fn host_paths_equivalent(platform: WorkspaceHostPlatform, left: &Path, right
         return true;
     }
 
-    // Preserve the selected platform's lexical equivalence even when the
-    // paths cannot be inspected on this host (for example Windows spellings
-    // while validating a portable binding on Unix).
-    if let (Some(left), Some(right)) = (
-        ParsedHostPath::parse(platform, left),
-        ParsedHostPath::parse(platform, right),
-    ) && path_token_eq(platform, &left.prefix, &right.prefix)
-        && left.components.len() == right.components.len()
-        && left
-            .components
-            .iter()
-            .zip(&right.components)
-            .all(|(left, right)| path_token_eq(platform, left, right))
-    {
-        return true;
+    // Case folding is useful for collision planning, but it cannot prove host
+    // identity: APFS can be case-sensitive and Windows path matching does not
+    // implement Unicode default case folding. Off-host comparisons therefore
+    // fail closed unless parsing proves the same exact normalized spelling.
+    if platform != WorkspaceHostPlatform::current() {
+        return matches!(
+            (
+                ParsedHostPath::parse(platform, left),
+                ParsedHostPath::parse(platform, right),
+            ),
+            (Some(left), Some(right))
+                if left.prefix == right.prefix && left.components == right.components
+        );
     }
 
     let (Ok(left), Ok(right)) = (
@@ -1034,38 +1046,21 @@ pub fn host_paths_equivalent(platform: WorkspaceHostPlatform, left: &Path, right
     ) else {
         return false;
     };
-    let canonical_equal = match (
-        ParsedHostPath::parse(platform, &left.canonical),
-        ParsedHostPath::parse(platform, &right.canonical),
-    ) {
-        (Some(left), Some(right)) => {
-            left.components.len() == right.components.len()
-                && left
-                    .components
-                    .iter()
-                    .zip(&right.components)
-                    .all(|(left, right)| path_token_eq(platform, left, right))
-        }
-        _ => false,
-    };
-    if canonical_equal {
+    if left.canonical == right.canonical {
         return true;
     }
-    #[cfg(unix)]
-    if platform == WorkspaceHostPlatform::current()
-        && left.native_anchors.iter().any(|left| {
-            right.native_anchors.iter().any(|right| {
-                left.identity == right.identity
-                    && left.suffix.len() == right.suffix.len()
-                    && left.suffix.iter().zip(&right.suffix).all(|(left, right)| {
-                        match (left.to_str(), right.to_str()) {
-                            (Some(left), Some(right)) => path_token_eq(platform, left, right),
-                            _ => left == right,
-                        }
-                    })
-            })
+    #[cfg(any(unix, windows))]
+    if left.native_anchors.iter().any(|left| {
+        right.native_anchors.iter().any(|right| {
+            left.identity == right.identity
+                && left.suffix.len() == right.suffix.len()
+                && left
+                    .suffix
+                    .iter()
+                    .zip(&right.suffix)
+                    .all(|(left, right)| left == right)
         })
-    {
+    }) {
         return true;
     }
     false
@@ -1094,12 +1089,18 @@ fn canonicalize_with_missing_tail(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Clone, Debug)]
 struct NativePathAnchor {
-    identity: (u64, u64),
+    identity: NativePathIdentity,
     suffix: Vec<OsString>,
 }
+
+#[cfg(unix)]
+type NativePathIdentity = (u64, u64);
+
+#[cfg(windows)]
+type NativePathIdentity = (u64, u64, u64);
 
 #[cfg(unix)]
 fn unix_native_anchors(path: &Path) -> io::Result<Vec<NativePathAnchor>> {
@@ -1123,6 +1124,56 @@ fn unix_native_anchors(path: &Path) -> io::Result<Vec<NativePathAnchor>> {
         }
     }
     Ok(anchors)
+}
+
+#[cfg(windows)]
+fn windows_native_anchors(path: &Path) -> io::Result<Vec<NativePathAnchor>> {
+    let prefixes = path.ancestors().collect::<Vec<_>>();
+    let mut anchors = Vec::new();
+    for (index, prefix) in prefixes.iter().enumerate() {
+        match windows_path_identity(prefix) {
+            Ok(identity) => {
+                let suffix = prefixes[..index]
+                    .iter()
+                    .rev()
+                    .filter_map(|path| path.file_name().map(OsString::from))
+                    .collect();
+                anchors.push(NativePathAnchor { identity, suffix });
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(anchors)
+}
+
+#[cfg(windows)]
+fn windows_path_identity(path: &Path) -> io::Result<NativePathIdentity> {
+    let file = fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    let mut info = FILE_ID_INFO::default();
+    // SAFETY: the handle is live and the output pointer/length describe one
+    // initialized FILE_ID_INFO value.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle().cast(),
+            FileIdInfo,
+            (&mut info as *mut FILE_ID_INFO).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let bytes = info.FileId.Identifier;
+    Ok((
+        info.VolumeSerialNumber,
+        u64::from_le_bytes(bytes[..8].try_into().expect("fixed file ID")),
+        u64::from_le_bytes(bytes[8..].try_into().expect("fixed file ID")),
+    ))
 }
 
 #[cfg(unix)]
@@ -1234,7 +1285,8 @@ mod tests {
         WorkspaceHostBinding, WorkspaceHostBindingResolver, WorkspaceHostPlatform, WorkspaceId,
         WorkspaceProjectionIdentity,
     };
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use locality_core::model::MountId;
     use locality_core::portable::LogicalPath;
@@ -1358,17 +1410,50 @@ mod tests {
     }
 
     #[test]
-    fn host_path_equivalence_uses_selected_platform_case_rules() {
-        assert!(super::host_paths_equivalent(
+    fn lexical_case_folding_is_not_host_identity_proof() {
+        assert!(!super::host_paths_equivalent(
             WorkspaceHostPlatform::Windows,
-            Path::new(r"C:\Locality\Notion-Main"),
-            Path::new(r"c:/LOCALITY/notion-main"),
+            Path::new(r"C:\Locality\Straße"),
+            Path::new(r"c:/LOCALITY/STRASSE"),
         ));
         assert!(!super::host_paths_equivalent(
             WorkspaceHostPlatform::Linux,
             Path::new("/srv/Locality/notion-main"),
             Path::new("/srv/locality/notion-main"),
         ));
+    }
+
+    fn unique_host_equivalence_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "locality-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn current_host_equivalence_follows_native_identity_not_casefolding() {
+        let root = unique_host_equivalence_root("host-path-identity");
+        std::fs::create_dir_all(&root).expect("create identity root");
+        let mixed = root.join("Straße");
+        let folded = root.join("STRASSE");
+        std::fs::create_dir(&mixed).expect("create mixed-case directory");
+        match std::fs::create_dir(&folded) {
+            Ok(()) => assert!(
+                !super::host_paths_equivalent(WorkspaceHostPlatform::current(), &mixed, &folded,),
+                "distinct native objects must not become equivalent through Unicode case folding"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => assert!(
+                super::host_paths_equivalent(WorkspaceHostPlatform::current(), &mixed, &folded,),
+                "a case-insensitive host must prove both spellings resolve to the same object"
+            ),
+            Err(error) => panic!("create folded directory: {error}"),
+        }
+
+        std::fs::remove_dir_all(root).expect("remove identity root");
     }
 
     #[test]

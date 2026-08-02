@@ -84,9 +84,12 @@
   legacy roots until the persistent coordinator accepts
   `plan_workspace_migration`. New layout-1 bindings require an atomic host/mount
   commit whose derived root matches the preserved mount root under the running
-  platform's case, separator, canonical-alias, and physical-identity rules.
-  Equivalent replays retain the already persisted host-root spelling rather
-  than churning durable paths.
+  host's canonical-alias and physical-identity rules. Case folding remains a
+  collision-planning rule, not proof that two existing host paths are the same:
+  case-sensitive APFS objects and Windows Unicode names must retain distinct
+  identities. Equivalent replays retain the already persisted host-root
+  spelling only after canonical or native filesystem identity proves the
+  equivalence, rather than churning durable paths.
 - Virtual-mutations component v4 stores native content pointers with reversible
   platform path encoding. It continues reading released plain UTF-8 rows while
   preventing older readers from treating an encoded non-UTF-8 pointer as a

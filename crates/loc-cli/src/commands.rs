@@ -39,7 +39,9 @@ use locality_notion::oauth::{
     DEFAULT_LOCALITY_NOTION_OAUTH_BROKER_URL, DEFAULT_NOTION_OAUTH_AUTHORIZE_URL,
     HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NotionOAuthBrokerStart,
 };
-use locality_platform::{DaemonManagerRestartFence, DaemonProcessPaths};
+use locality_platform::{
+    DaemonManagerRestartFence, DaemonProcessPaths, restore_daemon_manager_supervision,
+};
 use locality_slack::{
     DEFAULT_SLACK_OAUTH_BROKER_URL, DEFAULT_SLACK_OAUTH_REDIRECT_URI, HttpSlackOAuthBrokerClient,
     SLACK_AUTO_JOIN_PUBLIC_CHANNELS_SCOPE, SLACK_CONNECTOR_ID, SlackConversationType,
@@ -3853,6 +3855,7 @@ fn remove_cli_staging_directory(
     removal.map_err(|error| format!("could not remove CLI remount staging: {error}"))
 }
 
+#[derive(Debug)]
 struct PersistedCliRemountJournal {
     recovery_id: String,
     marker_path: PathBuf,
@@ -3875,18 +3878,7 @@ impl PersistedCliRemountJournal {
                 marker_path.display()
             )
         })?;
-        let mut records = Vec::new();
-        for line in BufReader::new(file).split(b'\n') {
-            let line =
-                line.map_err(|error| format!("could not read CLI remount marker: {error}"))?;
-            if line.iter().all(u8::is_ascii_whitespace) {
-                continue;
-            }
-            records.push(
-                serde_json::from_slice::<WorkspaceRemountRecoveryRecord>(&line)
-                    .map_err(|error| format!("could not decode CLI remount marker: {error}"))?,
-            );
-        }
+        let records = read_cli_remount_records(file)?;
         let Some(WorkspaceRemountRecoveryRecord::Header {
             version,
             recovery_id: header_id,
@@ -4002,6 +3994,64 @@ impl PersistedCliRemountJournal {
     }
 }
 
+fn read_cli_remount_records(file: File) -> Result<Vec<WorkspaceRemountRecoveryRecord>, String> {
+    let mut reader = BufReader::new(file);
+    let mut records = Vec::new();
+    loop {
+        let mut line = Vec::new();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|error| format!("could not read CLI remount marker: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        let complete = line.ends_with(b"\n");
+        if complete {
+            line.pop();
+        } else {
+            // Appends become durable only with their newline and sync. A crash
+            // may leave one unterminated final write, but it can never make a
+            // complete or interior malformed record safe to ignore.
+            break;
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        records.push(
+            serde_json::from_slice::<WorkspaceRemountRecoveryRecord>(&line)
+                .map_err(|error| format!("could not decode CLI remount marker: {error}"))?,
+        );
+    }
+    Ok(records)
+}
+
+fn reconcile_cli_workspace_remount_fence(state_root: &Path) -> Result<(), String> {
+    reconcile_cli_workspace_remount_fence_with(state_root, |paths| {
+        restore_daemon_manager_supervision(paths).map_err(|error| error.message().to_string())
+    })
+}
+
+fn reconcile_cli_workspace_remount_fence_with(
+    state_root: &Path,
+    restore: impl FnOnce(&DaemonProcessPaths) -> Result<(), String>,
+) -> Result<(), String> {
+    let fence = locality_platform::daemon_remount_fence_path(state_root);
+    match fs::symlink_metadata(&fence) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "could not inspect persisted CLI remount fence `{}`: {error}",
+                fence.display()
+            ));
+        }
+        Ok(_) => {}
+    }
+    restore(&DaemonProcessPaths::new(state_root.to_path_buf())).map_err(|error| {
+        format!("could not restore daemon supervision after CLI remount recovery: {error}")
+    })?;
+    clear_workspace_remount_fence(state_root)
+}
+
 fn reconcile_cli_workspace_remount_recovery(
     store: &mut SqliteStateStore,
     state_root: &Path,
@@ -4011,7 +4061,9 @@ fn reconcile_cli_workspace_remount_recovery(
         .map_err(|error| format!("could not list CLI remount recoveries: {error}"))?;
     for (recovery_id, _, outcome) in outcomes {
         if !recovery_id.starts_with("cli-remount-") {
-            continue;
+            return Err(format!(
+                "workspace remount recovery `{recovery_id}` belongs to another coordinator; daemon supervision remains fenced until that coordinator reconciles it"
+            ));
         }
         let recovery = PersistedCliRemountJournal::load(state_root, &recovery_id)?;
         match outcome {
@@ -4024,32 +4076,40 @@ fn reconcile_cli_workspace_remount_recovery(
         recovery.remove_marker(state_root)?;
     }
     let recovery_root = state_root.join(CLI_REMOUNT_RECOVERY_DIRECTORY);
-    let entries = match fs::read_dir(&recovery_root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("could not scan CLI remount markers: {error}")),
-    };
-    for entry in entries {
-        let path = entry
-            .map_err(|error| format!("could not scan CLI remount marker: {error}"))?
-            .path();
-        let Some(recovery_id) = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .filter(|value| value.starts_with("cli-remount-"))
-        else {
-            continue;
-        };
-        let recovery = PersistedCliRemountJournal::load(state_root, recovery_id)?;
-        if recovery.has_artifacts() {
-            return Err(format!(
-                "CLI remount marker `{}` has staged artifacts but no atomic SQLite outcome; preserving them for review",
-                recovery.recovery_id
-            ));
+    match fs::read_dir(&recovery_root) {
+        Ok(entries) => {
+            for entry in entries {
+                let path = entry
+                    .map_err(|error| format!("could not scan CLI remount marker: {error}"))?
+                    .path();
+                let Some(recovery_id) = path.file_stem().and_then(|value| value.to_str()) else {
+                    continue;
+                };
+                if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                if !recovery_id.starts_with("cli-remount-") {
+                    return Err(format!(
+                        "workspace remount marker `{}` belongs to another coordinator; daemon supervision remains fenced until that coordinator reconciles it",
+                        path.display()
+                    ));
+                }
+                let recovery = PersistedCliRemountJournal::load(state_root, recovery_id)?;
+                if recovery.has_artifacts() {
+                    return Err(format!(
+                        "CLI remount marker `{}` has staged artifacts but no atomic SQLite outcome; preserving them for review",
+                        recovery.recovery_id
+                    ));
+                }
+                recovery.remove_marker(state_root)?;
+            }
         }
-        recovery.remove_marker(state_root)?;
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("could not scan CLI remount markers: {error}")),
     }
-    Ok(())
+    // Recovery owns the persisted fence too. Supervision must be restored
+    // durably before daemon startup is unfenced, including restart recovery.
+    reconcile_cli_workspace_remount_fence(state_root)
 }
 
 fn run_cli_coordinated_mount(
@@ -10695,6 +10755,134 @@ mod tests {
     }
 
     #[test]
+    fn cli_remount_journal_tolerates_only_an_unterminated_final_record() {
+        let root = unique_temp_path("loc-cli-remount-torn-tail");
+        let state_root = root.join("state");
+        fs::create_dir_all(&state_root).unwrap();
+        let mount_id = MountId::new("notion-main");
+        let previous = MountConfig::new(
+            mount_id.clone(),
+            "notion",
+            root.join("workspace/notion-main"),
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let intended = previous
+            .clone()
+            .with_connection_id(ConnectionId::new("account-b"));
+        let journal =
+            super::CliWorkspaceRemountJournal::create(&state_root, &previous, &intended).unwrap();
+        let recovery_id = journal.recovery_id.clone();
+        let marker_path = journal.marker_path.clone();
+        drop(journal);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&marker_path)
+            .unwrap()
+            .write_all(br#"{"record":"staging_directory""#)
+            .unwrap();
+
+        let recovery = super::PersistedCliRemountJournal::load(&state_root, &recovery_id)
+            .expect("ignore one torn final append");
+        assert!(recovery.staging_directory.is_none());
+        assert!(recovery.staged_path.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cli_remount_journal_rejects_complete_and_interior_malformed_records() {
+        for (label, suffix) in [
+            ("complete", b"{not-json}\n".as_slice()),
+            ("interior", b"{not-json}\n{}\n".as_slice()),
+        ] {
+            let root = unique_temp_path(&format!("loc-cli-remount-{label}-corruption"));
+            let state_root = root.join("state");
+            fs::create_dir_all(&state_root).unwrap();
+            let mount_id = MountId::new("notion-main");
+            let previous = MountConfig::new(mount_id, "notion", root.join("workspace/notion-main"))
+                .projection(ProjectionMode::LinuxFuse);
+            let journal =
+                super::CliWorkspaceRemountJournal::create(&state_root, &previous, &previous)
+                    .unwrap();
+            let recovery_id = journal.recovery_id.clone();
+            let marker_path = journal.marker_path.clone();
+            drop(journal);
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(marker_path)
+                .unwrap()
+                .write_all(suffix)
+                .unwrap();
+
+            let error = super::PersistedCliRemountJournal::load(&state_root, &recovery_id)
+                .expect_err("complete malformed JSONL must fail closed");
+            assert!(error.contains("could not decode CLI remount marker"));
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn cli_recovery_failure_keeps_daemon_start_fenced() {
+        let root = unique_temp_path("loc-cli-remount-corrupt-recovery-fence");
+        let state_root = root.join("state");
+        fs::create_dir_all(&state_root).unwrap();
+        let mut store = SqliteStateStore::open(state_root.clone()).unwrap();
+        let mount_id = MountId::new("notion-main");
+        let mount = MountConfig::new(
+            mount_id.clone(),
+            "notion",
+            root.join("workspace/notion-main"),
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        store.save_mount(mount.clone()).unwrap();
+        let journal =
+            super::CliWorkspaceRemountJournal::create(&state_root, &mount, &mount).unwrap();
+        let recovery_id = journal.recovery_id.clone();
+        let marker_path = journal.marker_path.clone();
+        store
+            .begin_workspace_remount_recovery(&recovery_id, &mount_id)
+            .unwrap();
+        drop(journal);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(marker_path)
+            .unwrap()
+            .write_all(b"{not-json}\n")
+            .unwrap();
+        crate::mount::persist_workspace_remount_fence(&state_root, &mount_id, "1").unwrap();
+
+        super::reconcile_cli_workspace_remount_recovery(&mut store, &state_root)
+            .expect_err("corrupt recovery must fail closed");
+
+        let paths = locality_platform::DaemonProcessPaths::new(state_root.clone());
+        assert!(locality_platform::daemon_remount_fence_path(&state_root).exists());
+        assert!(locality_platform::ensure_daemon_start_allowed(&paths).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cli_supervision_restore_failure_keeps_persisted_fence() {
+        let root = unique_temp_path("loc-cli-remount-restore-failure");
+        let state_root = root.join("state");
+        fs::create_dir_all(&state_root).unwrap();
+        let mount_id = MountId::new("notion-main");
+        crate::mount::persist_workspace_remount_fence(&state_root, &mount_id, "1").unwrap();
+
+        super::reconcile_cli_workspace_remount_fence_with(&state_root, |_| {
+            Err("injected restore failure".to_string())
+        })
+        .expect_err("restore failure must retain fence");
+
+        assert!(locality_platform::daemon_remount_fence_path(&state_root).exists());
+        assert!(
+            locality_platform::ensure_daemon_start_allowed(
+                &locality_platform::DaemonProcessPaths::new(state_root.clone())
+            )
+            .is_err()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn cli_precommit_crash_journal_restores_exact_cache_on_restart() {
         let root = unique_temp_path("loc-cli-remount-restart-recovery");
         let state_root = root.join("state");
@@ -10727,6 +10915,7 @@ mod tests {
         journal.stage().unwrap();
         drop(journal);
         assert!(!content_root.exists());
+        crate::mount::persist_workspace_remount_fence(&state_root, &mount_id, "1").unwrap();
 
         reconcile_cli_workspace_remount_recovery(&mut store, &state_root)
             .expect("restart reconciliation");
@@ -10741,6 +10930,25 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert!(!locality_platform::daemon_remount_fence_path(&state_root).exists());
+        locality_platform::ensure_daemon_start_allowed(
+            &locality_platform::DaemonProcessPaths::new(state_root.clone()),
+        )
+        .expect("daemon startup is allowed after completed recovery");
+
+        let mut next_options = crate::mount::MountOptions {
+            mount_id: mount_id.clone(),
+            connector: "notion".to_string(),
+            root: root.join("workspace/notion-main"),
+            remote_root_id: None,
+            connection_id: Some(ConnectionId::new("account-b")),
+            read_only: false,
+            projection: ProjectionMode::LinuxFuse,
+            settings_json: "{}".to_string(),
+        };
+        next_options.root = previous.root;
+        run_cli_coordinated_mount(&mut store, &state_root, next_options)
+            .expect("next remount proceeds after restart recovery");
         let _ = fs::remove_dir_all(root);
     }
 

@@ -17872,7 +17872,12 @@ mod tests {
             })
             .expect("persist staging identity");
         drop(marker);
-        fs::remove_dir(&staging).expect("remove original staging directory");
+        // Keep the original object alive under another name. Deleting and
+        // immediately recreating an empty directory can reuse its inode on
+        // Linux, which is not a replacement identity and made this regression
+        // nondeterministic.
+        let displaced = staging.with_extension("displaced-original");
+        fs::rename(&staging, &displaced).expect("displace original staging directory");
         fs::create_dir(&staging).expect("create replacement staging directory");
         fs::write(staging.join("keep.txt"), "replacement").expect("write replacement");
 

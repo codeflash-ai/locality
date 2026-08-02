@@ -464,8 +464,11 @@ and never appends a mount target. Its platform-neutral form rejects equal,
 ancestor, and descendant overlap under macOS, Linux, or Windows lexical
 semantics. On the running host, the publication guard additionally resolves
 existing filesystem aliases: Unix symlinks plus device/inode anchors, and
-Windows canonical junction/reparse paths plus verbatim and trailing-dot
-spellings where the OS exposes them.
+Windows canonical junction/reparse paths plus volume and 128-bit file
+identities. Case folding detects portable target collisions but never by itself
+proves two host paths equivalent; persisted spelling is retained only after
+canonical or native identity proof, including on case-sensitive APFS and for
+Windows Unicode names.
 
 SQLite schema v27 cannot prove that any prerelease binding came from a persisted
 trusted workspace root and coordinator-owned atomic migration. It therefore
@@ -498,7 +501,11 @@ is named by its exact recovery ID and binds every staging directory and moved
 path to its filesystem identity. Prepared outcomes restore the exact old cache;
 committed outcomes collect it. Startup never searches by a name prefix or
 recursively removes an unrecorded directory, and an identity mismatch remains
-fenced for review. CLI source changes additionally fail closed on dirty or
+fenced for review. CLI JSONL recovery ignores only one unterminated final
+append; malformed newline-terminated or interior records fail closed. Restart
+reconciliation restores daemon-manager supervision before durably removing the
+startup fence, so a failed restore continues to block daemon startup. CLI
+source changes additionally fail closed on dirty or
 conflicted entities and pending virtual creates or renames. A virtual-to-plain
 change is rejected until a dedicated migration can atomically retire its
 layout-1 binding.
