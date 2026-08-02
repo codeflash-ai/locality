@@ -1,0 +1,65 @@
+{
+  "format_version": 1,
+  "minimum_reader_version": 1,
+  "profile_id": "018f4f6e-9f2c-7b1a-8c3d-4e5f60718293",
+  "profile_revision": 7,
+  "session_id": "session-scope-7",
+  "export_attempt_id": "export-attempt-9",
+  "layout_version": 1,
+  "layout_digest": "sha256:6d739ad2748910520e4df1d680e9ea78a94230d0751e6346d3f5d3c57b9259b5",
+  "inventory_sha256": "sha256:3282a9e3a380a97d53bead78c1e025e2ed428b6627b3446ddb4266bd6d06b0c4",
+  "source_generations": [
+    {
+      "ordinal": 0,
+      "source_connection_id": "source-drive",
+      "source_generation_id": "generation-drive-44"
+    },
+    {
+      "ordinal": 1,
+      "source_connection_id": "source-notion",
+      "source_generation_id": "generation-notion-109"
+    }
+  ],
+  "mounts": [
+    {
+      "mount_id": "mount-alpha",
+      "sources": [
+        {
+          "source_connection_id": "source-drive",
+          "observed_generation_id": "generation-drive-44",
+          "target_inventory_sha256": "sha256:d0def1ff2059637c8f75a0471d0b50f28bec337f83adc54a8fc41f5b72b350cb",
+          "refresh_mode": "generation_delta_v1",
+          "files": []
+        }
+      ]
+    },
+    {
+      "mount_id": "mount-zeta",
+      "sources": [
+        {
+          "source_connection_id": "source-notion",
+          "observed_generation_id": "generation-notion-109",
+          "target_inventory_sha256": "sha256:f525c5d28f60d25f9d98df7bdf4f298e214974ec3bd23206ee4ba2902d31798b",
+          "refresh_mode": "generation_delta_v1",
+          "files": [
+            {
+              "projection_id": "projection-readme",
+              "logical_path": "README.md",
+              "content_version_id": "content-readme-v1",
+              "content_sha256": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+              "byte_length": 7
+            },
+            {
+              "projection_id": "projection-roadmap",
+              "logical_path": "Projects/Roadmap/page.md",
+              "content_version_id": "content-roadmap-v4",
+              "content_sha256": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+              "byte_length": 10
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "baseline_sha256": "sha256:7419cf70cda4febcc373e17567e3fee0d86f263903f15e298948b87ee459bd77"
+}

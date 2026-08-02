@@ -222,6 +222,9 @@ fn namespaced_inventory_golden_is_deterministic_and_keeps_empty_targets() {
         &offer(),
     )
     .expect("inventory golden");
+    decoded
+        .validate_against_export(&session_layout(), &offer())
+        .expect("inventory must recompute against the exact layout and offer");
     assert_eq!(decoded, inventory);
     assert_eq!(
         exact_pretty_json(&decoded),
