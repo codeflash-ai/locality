@@ -7,11 +7,6 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use loc_cli::generation_http::{
-    GenerationHttpError, GenerationHttpOperation, GenerationHttpOptions, GenerationHttpRemoteCode,
-    GenerationHttpResponseProblem, GenerationHttpRetryClassification, GenerationHttpTransport,
-    GenerationHttpTransportFailure,
-};
 use locality_core::model::MountId;
 use locality_core::portable::{SourceConnectionId, SourceGenerationId};
 use locality_protocol::freshness_delivery::{FreshnessReasonCode, FreshnessRetryClass};
@@ -25,6 +20,11 @@ use locality_protocol::freshness_delivery_transport::{
     GenerationDeliveryPollResponse, GenerationDeliveryRequest, GenerationTransportContractError,
     MAX_GENERATION_BODY_WINDOW_BYTES, MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES,
     MAX_GENERATION_TRANSPORT_REQUEST_BYTES,
+};
+use localityd::generation_http::{
+    GenerationHttpError, GenerationHttpOperation, GenerationHttpOptions, GenerationHttpRemoteCode,
+    GenerationHttpResponseProblem, GenerationHttpRetryClassification, GenerationHttpTransport,
+    GenerationHttpTransportFailure,
 };
 use localityd::generation_sync::{
     GenerationDeliveryRequest as LegacyGenerationDeliveryRequest, GenerationDeliveryTransport,
@@ -460,18 +460,32 @@ fn assert_response_diagnostics_redact(error: &GenerationHttpError, sentinels: &[
 }
 
 #[test]
-fn session_and_local_delta_routes_require_canonical_non_nil_uuids() {
-    for invalid in INVALID_ROUTE_UUIDS {
-        let error = GenerationHttpTransport::new("http://127.0.0.1:9", *invalid, SESSION_SECRET)
+fn session_routes_accept_opaque_protocol_ids_but_reject_route_collapse() {
+    for valid in [
+        SESSION_ID,
+        "session-scope-7",
+        "018F4F6E-1111-7222-8333-444444444444",
+        "not-a-uuid",
+    ] {
+        GenerationHttpTransport::new("http://127.0.0.1:9", valid, SESSION_SECRET)
+            .expect("valid opaque session route identity");
+    }
+    for invalid in ["", ".", ".."] {
+        let error = GenerationHttpTransport::new("http://127.0.0.1:9", invalid, SESSION_SECRET)
             .expect_err("invalid session route identity");
         assert_eq!(
             error,
             GenerationHttpError::InvalidConfiguration(
-                "session ID must be a canonical lowercase hyphenated non-nil UUID"
+                "session ID must be a non-empty opaque route segment"
             ),
             "session ID {invalid:?}"
         );
+    }
+}
 
+#[test]
+fn local_delta_routes_require_canonical_non_nil_uuids() {
+    for invalid in INVALID_ROUTE_UUIDS {
         let mut transport =
             GenerationHttpTransport::new("http://127.0.0.1:9", SESSION_ID, SESSION_SECRET).unwrap();
         let mut window = body_request();

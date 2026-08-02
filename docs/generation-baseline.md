@@ -16,7 +16,8 @@ return only the baseline sealed for that exact completed attempt. This public
 crate defines no HTTP handler, credential flow, database query, or provider
 cursor.
 
-The public blocking client is `GenerationBaselineHttpClient` in `loc-cli`.
+The public blocking client is `GenerationBaselineHttpClient` in `localityd`;
+`loc_cli::generation_http` re-exports it source-compatibly for existing callers.
 Construction takes a verified `WorkspaceProfileSessionV2`, so its opaque
 capability cannot be separated from the session route identity. Fetching takes
 that same session plus the exact offer and namespaced inventory. The client
@@ -133,3 +134,40 @@ that identity.
 All response, source-generation, mount, source-state, and file wire objects
 reject unknown fields. The contract contains no absolute host path,
 credential, provider cursor, mutable title, target label, or display name.
+
+## Durable local state boundary
+
+`locality-store` component `durable:generation_delivery` V7 is the local
+consumer boundary for every baseline source state. A client converts each
+source state into one `GenerationBaselineSeedRecordV2`: the observed row carries
+the exact mount ID, source connection ID, generation, target-inventory digest,
+sealed workspace layout, and typed `GenerationBaselineRefreshModeV1`; its path
+rows carry that source's file identities. Empty file inventories still produce
+an observed source record. `full_export_only` states are persisted so routing is
+durable, but they are never passed to the generation-delta transport. The
+released seed APIs remain source-compatible defaults for delta-eligible rows;
+they reject an ineligible row rather than silently labeling it delta-capable.
+
+All records selected from one baseline are committed with
+`seed_observed_generations_v2`. The batch is one SQLite transaction: exact
+replay is a no-op, while a changed record or mode, missing mount, active mount
+apply, or mount-wide projection or portable-path collision rolls back the
+entire batch. SQLite keys observed heads by `(mount_id,
+source_connection_id)` and durably binds every generation path to that pair.
+Projection IDs, remote logical paths, and local working paths remain mount-wide
+namespaces, so sharing a mount never permits two sources to claim colliding
+filesystem state. V6 rows migrate to `generation_delta_v1` only when their
+stored mount, source, generation, projection, content-version, and file-size
+facts fit the delta-V1 ceilings; other rows migrate to `full_export_only`.
+
+Polling, apply completion, retained merge bases, source-head advancement,
+clean-lineage reset, and terminal acknowledgments use the exact mount/source
+pair, while the filesystem transaction lock and durable active-journal
+constraint are mount-wide. Before polling any source, sync resumes the mount's
+active journal and validates every returned delivery against the exact requested
+mount, source, and observed base generation. `sync_shared_mount_v2` returns a
+typed `FullExportRequired` outcome for each full-export-only source and processes
+delta-capable sources deterministically; the compatibility entry point maps that
+outcome to a typed error. The legacy mount-only repository and sync entry points
+remain safe for single-source mounts and fail explicitly when a mount has
+multiple source heads.

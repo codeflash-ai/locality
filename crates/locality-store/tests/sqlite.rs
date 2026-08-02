@@ -117,8 +117,8 @@ fn sqlite_store_seeds_state_compatibility_components() {
             (
                 "durable:generation_delivery".to_string(),
                 "durable_transaction".to_string(),
-                6,
-                6,
+                7,
+                7,
                 1,
                 0
             ),
@@ -436,13 +436,13 @@ freshness_states: mount_id, remote_id, tier_json, last_checked_at, next_check_at
 generation_apply_journals: delta_id, mount_id, source_connection_id, base_generation_id, target_generation_id, delta_json, receipt_json, receipt_sha256, selected_capabilities_json, selection_binding, acknowledgment_required, acknowledged_at, stage_root, status, active, created_at, updated_at, completed_at
 generation_apply_outcomes: delta_id, entry_index, outcome_json, updated_at
 generation_inode_evidence: delta_id, entry_index, mount_id, logical_path, evidence_name, expected_sha256, byte_length, visible_evidence_name, visible_expected_sha256, visible_byte_length, base_payload_delta_id, base_payload_entry_index, resolved_at, created_at
-generation_paths: mount_id, projection_id, logical_path, local_logical_path, base_generation_id, base_identity_json, base_payload_delta_id, base_payload_entry_index, conflict_payload_delta_id, conflict_payload_entry_index, state, incoming_identity_json, updated_at
+generation_paths: mount_id, source_connection_id, projection_id, logical_path, local_logical_path, base_generation_id, base_identity_json, base_payload_delta_id, base_payload_entry_index, conflict_payload_delta_id, conflict_payload_entry_index, state, incoming_identity_json, updated_at
 hydration_jobs: mount_id, remote_id, path, target_state_json, reason_json, attempts, last_error
 journals: push_id, mount_id, remote_ids_json, plan_json, preimages_json, apply_effects_json, status_json, metadata_json, readable_diff_json
 metadata_discovery_jobs: mount_id, container_identifier, priority_json, depth, attempts, last_error, created_at, updated_at
 mount_live_modes: mount_id, enabled, state_json, last_reason, last_run_at, created_at, updated_at
 mounts: mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, settings_json
-observed_generations: mount_id, source_connection_id, generation_id, inventory_sha256, workspace_layout_version, workspace_layout_digest, last_receipt_sha256, updated_at
+observed_generations: mount_id, source_connection_id, generation_id, inventory_sha256, workspace_layout_version, workspace_layout_digest, last_receipt_sha256, updated_at, refresh_mode
 projection_state: mount_id, projection, layout_version, min_reader_version, os_domain_id, root_item_id, repair_generation, state_json, updated_at
 remote_observations: mount_id, remote_id, kind_json, title, parent_remote_id, projected_path, remote_version_json, observed_at, deleted, raw_metadata_json
 search_documents_fts: mount_id, remote_id, connector, kind, title, path, observed_title, observed_path, frontmatter, body, metadata_text, breadcrumbs, aliases, source_url
@@ -582,7 +582,8 @@ fn sqlite_store_migrates_released_workspace_v21_with_generation_tables_absent() 
         .execute_batch(
             "DROP TABLE generation_inode_evidence;
              DROP TABLE generation_apply_outcomes;
-             DROP INDEX generation_apply_one_active_per_source;
+             DROP INDEX IF EXISTS generation_apply_one_active_per_source;
+             DROP INDEX IF EXISTS generation_apply_one_active_per_mount;
              DROP TABLE generation_apply_journals;
              DROP TABLE generation_paths;
              DROP TABLE observed_generations;

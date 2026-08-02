@@ -28,6 +28,7 @@ use locality_protocol::freshness_delivery_transport::{
     GenerationPinLeaseReleaseRequest, GenerationPinLeaseRenewRequest, GenerationPinLeaseRenewal,
     GenerationTransportCapabilities,
 };
+use locality_protocol::generation_baseline::GenerationBaselineRefreshModeV1;
 use locality_store::{
     GenerationApplyOutcome, GenerationApplyStatus, GenerationDeliveryRepository,
     GenerationInodeEvidenceConflictUpdate, GenerationInodeEvidenceRecord,
@@ -194,6 +195,113 @@ pub struct GenerationSyncSummary {
     pub replayed: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenerationSourceSyncSummary {
+    pub source_connection_id: SourceConnectionId,
+    pub summary: GenerationSyncSummary,
+}
+
+/// Additive shared-mount routing result. Full-export-only sources are surfaced
+/// without ever invoking the generation-delta transport.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GenerationSourceSyncOutcome {
+    Synchronized(GenerationSourceSyncSummary),
+    FullExportRequired {
+        source_connection_id: SourceConnectionId,
+    },
+}
+
+/// Errors specific to selecting and synchronizing one or more sources on a
+/// shared mount. This additive surface keeps [`GenerationSyncError`]
+/// source-compatible for downstream exhaustive matches.
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum GenerationSourceSyncError {
+    Generation(GenerationSyncError),
+    MissingObservedGenerationSource {
+        mount_id: MountId,
+        source_connection_id: SourceConnectionId,
+    },
+    FullExportRequired {
+        mount_id: MountId,
+        source_connection_id: SourceConnectionId,
+    },
+    DeliveryRequestMismatch,
+}
+
+impl GenerationSourceSyncError {
+    fn into_legacy(self) -> GenerationSyncError {
+        match self {
+            Self::Generation(error) => error,
+            Self::MissingObservedGenerationSource { mount_id, .. } => {
+                GenerationSyncError::MissingObservedGeneration(mount_id)
+            }
+            Self::FullExportRequired {
+                mount_id,
+                source_connection_id,
+            } => GenerationSyncError::Contract(format!(
+                "mount `{}` source `{}` requires a full export",
+                mount_id.0,
+                source_connection_id.as_str()
+            )),
+            Self::DeliveryRequestMismatch => GenerationSyncError::Contract(
+                "generation delivery does not match the requested mount, source, and base generation"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+impl Display for GenerationSourceSyncError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Generation(error) => Display::fmt(error, formatter),
+            Self::MissingObservedGenerationSource {
+                mount_id,
+                source_connection_id,
+            } => write!(
+                formatter,
+                "mount `{}` source `{}` has no observed backend generation",
+                mount_id.0,
+                source_connection_id.as_str()
+            ),
+            Self::FullExportRequired {
+                mount_id,
+                source_connection_id,
+            } => write!(
+                formatter,
+                "mount `{}` source `{}` requires a full export",
+                mount_id.0,
+                source_connection_id.as_str()
+            ),
+            Self::DeliveryRequestMismatch => formatter.write_str(
+                "generation delivery does not match the requested mount, source, and base generation",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GenerationSourceSyncError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Generation(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<GenerationSyncError> for GenerationSourceSyncError {
+    fn from(value: GenerationSyncError) -> Self {
+        Self::Generation(value)
+    }
+}
+
+impl From<locality_store::StoreError> for GenerationSourceSyncError {
+    fn from(value: locality_store::StoreError) -> Self {
+        Self::Generation(GenerationSyncError::Store(value))
+    }
+}
+
 pub struct GenerationSyncClient<T> {
     transport: T,
 }
@@ -216,12 +324,171 @@ where
         mount_id: &MountId,
         mount_root: &Path,
     ) -> Result<GenerationSyncSummary, GenerationSyncError> {
-        recover_generation_delivery_staging(store)?;
-        reconcile_all_completed_inode_evidence(store)?;
-        replay_pending_acknowledgments(store, mount_id, &mut self.transport)?;
         let observed = store
             .get_observed_generation(mount_id)?
             .ok_or_else(|| GenerationSyncError::MissingObservedGeneration(mount_id.clone()))?;
+        self.sync_mount_source(store, mount_id, &observed.source_connection_id, mount_root)
+            .map_err(GenerationSourceSyncError::into_legacy)
+    }
+
+    /// Synchronizes one exact source head on a mount that may be shared.
+    pub fn sync_mount_source(
+        &mut self,
+        store: &mut SqliteStateStore,
+        mount_id: &MountId,
+        source_connection_id: &SourceConnectionId,
+        mount_root: &Path,
+    ) -> Result<GenerationSyncSummary, GenerationSourceSyncError> {
+        recover_generation_delivery_staging(store)?;
+        reconcile_all_completed_inode_evidence(store)?;
+        if let Some(resumed) = self.resume_active_mount_apply(store, mount_id, mount_root)?
+            && &resumed.source_connection_id == source_connection_id
+        {
+            return Ok(resumed.summary);
+        }
+        self.sync_mount_source_after_recovery(store, mount_id, source_connection_id, mount_root)
+    }
+
+    /// Deterministically synchronizes every source currently seeded for a
+    /// shared mount. An empty source inventory is a successful no-op.
+    pub fn sync_shared_mount(
+        &mut self,
+        store: &mut SqliteStateStore,
+        mount_id: &MountId,
+        mount_root: &Path,
+    ) -> Result<Vec<GenerationSourceSyncSummary>, GenerationSourceSyncError> {
+        let outcomes = self.sync_shared_mount_v2(store, mount_id, mount_root)?;
+        let mut summaries = Vec::with_capacity(outcomes.len());
+        for outcome in outcomes {
+            match outcome {
+                GenerationSourceSyncOutcome::Synchronized(summary) => summaries.push(summary),
+                GenerationSourceSyncOutcome::FullExportRequired {
+                    source_connection_id,
+                } => {
+                    return Err(GenerationSourceSyncError::FullExportRequired {
+                        mount_id: mount_id.clone(),
+                        source_connection_id,
+                    });
+                }
+            }
+        }
+        Ok(summaries)
+    }
+
+    /// Synchronizes delta-capable sources and explicitly routes every
+    /// full-export-only source to its owning coordinator.
+    pub fn sync_shared_mount_v2(
+        &mut self,
+        store: &mut SqliteStateStore,
+        mount_id: &MountId,
+        mount_root: &Path,
+    ) -> Result<Vec<GenerationSourceSyncOutcome>, GenerationSourceSyncError> {
+        recover_generation_delivery_staging(store)?;
+        reconcile_all_completed_inode_evidence(store)?;
+        let resumed = self.resume_active_mount_apply(store, mount_id, mount_root)?;
+        let resumed_source = resumed
+            .as_ref()
+            .map(|summary| summary.source_connection_id.clone());
+        let sources = store.list_observed_generations_v2(mount_id)?;
+        let mut outcomes = Vec::with_capacity(sources.len());
+        if let Some(summary) = resumed {
+            outcomes.push(GenerationSourceSyncOutcome::Synchronized(summary));
+        }
+        for source in sources {
+            let source_connection_id = source.observed.source_connection_id;
+            if resumed_source.as_ref() == Some(&source_connection_id) {
+                continue;
+            }
+            if source.refresh_mode == GenerationBaselineRefreshModeV1::FullExportOnly {
+                outcomes.push(GenerationSourceSyncOutcome::FullExportRequired {
+                    source_connection_id,
+                });
+                continue;
+            }
+            let summary = self.sync_mount_source_after_recovery(
+                store,
+                mount_id,
+                &source_connection_id,
+                mount_root,
+            )?;
+            outcomes.push(GenerationSourceSyncOutcome::Synchronized(
+                GenerationSourceSyncSummary {
+                    source_connection_id,
+                    summary,
+                },
+            ));
+        }
+        Ok(outcomes)
+    }
+
+    fn resume_active_mount_apply(
+        &mut self,
+        store: &mut SqliteStateStore,
+        mount_id: &MountId,
+        mount_root: &Path,
+    ) -> Result<Option<GenerationSourceSyncSummary>, GenerationSyncError> {
+        let mut active = store.list_active_generation_applies_for_mount(mount_id)?;
+        if active.len() > 1 {
+            return Err(GenerationSyncError::JournalMismatch);
+        }
+        let Some(journal) = active.pop() else {
+            return Ok(None);
+        };
+        let negotiated = store
+            .get_generation_apply_v2(&journal.delta.delta_id)?
+            .ok_or(GenerationSyncError::JournalMismatch)?;
+        let capabilities = negotiated
+            .selection_binding
+            .selected_capabilities()
+            .cloned()
+            .ok_or(GenerationSyncError::JournalMismatch)?;
+        let source_connection_id = journal.delta.source_connection_id.clone();
+        let acknowledgment =
+            GenerationDeliveryAcknowledgmentRequest::from_receipt(&journal.receipt)
+                .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
+        let summary = apply_authorized_delivery_with_capabilities(
+            store,
+            mount_id,
+            mount_root,
+            AuthorizedGenerationDelivery {
+                delta: journal.delta,
+                terminal_receipt: journal.receipt,
+            },
+            &mut self.transport,
+            &capabilities,
+        )?;
+        if capabilities.terminal_receipt_acknowledgments {
+            acknowledge_terminal_receipt(store, &mut self.transport, &acknowledgment)?;
+        }
+        Ok(Some(GenerationSourceSyncSummary {
+            source_connection_id,
+            summary,
+        }))
+    }
+
+    fn sync_mount_source_after_recovery(
+        &mut self,
+        store: &mut SqliteStateStore,
+        mount_id: &MountId,
+        source_connection_id: &SourceConnectionId,
+        mount_root: &Path,
+    ) -> Result<GenerationSyncSummary, GenerationSourceSyncError> {
+        replay_pending_acknowledgments(store, mount_id, &mut self.transport)?;
+        let observed = store
+            .get_observed_generation_for_source_v2(mount_id, source_connection_id)?
+            .ok_or_else(
+                || GenerationSourceSyncError::MissingObservedGenerationSource {
+                    mount_id: mount_id.clone(),
+                    source_connection_id: source_connection_id.clone(),
+                },
+            )?;
+        if observed.refresh_mode == GenerationBaselineRefreshModeV1::FullExportOnly {
+            return Err(GenerationSourceSyncError::FullExportRequired {
+                mount_id: mount_id.clone(),
+                source_connection_id: source_connection_id.clone(),
+            });
+        }
+        let observed = observed.observed;
         let capabilities = self.transport.capabilities();
         capabilities
             .validate()
@@ -245,6 +512,7 @@ where
         let Some(delivery) = poll.delivery else {
             return Ok(GenerationSyncSummary::default());
         };
+        validate_delivery_request_binding(&delivery, &request)?;
         let acknowledgment =
             GenerationDeliveryAcknowledgmentRequest::from_receipt(&delivery.terminal_receipt)
                 .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
@@ -266,6 +534,23 @@ where
         }
         Ok(summary)
     }
+}
+
+fn validate_delivery_request_binding(
+    delivery: &AuthorizedGenerationDelivery,
+    request: &VersionedGenerationDeliveryRequest,
+) -> Result<(), GenerationSourceSyncError> {
+    delivery
+        .terminal_receipt
+        .validate_against(&delivery.delta)
+        .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
+    if delivery.delta.mount_id != request.mount_id
+        || delivery.delta.source_connection_id != request.source_connection_id
+        || delivery.delta.base_generation_id != request.observed_generation_id
+    {
+        return Err(GenerationSourceSyncError::DeliveryRequestMismatch);
+    }
+    Ok(())
 }
 
 fn replay_pending_acknowledgments<T: GenerationDeliveryTransport>(
@@ -540,9 +825,9 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
     )?;
     store.mark_generation_apply_started(&journal.delta.delta_id, &created_at)?;
     let mut filesystem_mutations = 0_usize;
-    let merge_bases = generation_merge_bases(store, mount_id)?;
+    let merge_bases = generation_merge_bases(store, mount_id, &journal.delta.source_connection_id)?;
     let mut superseded_conflicts = store
-        .list_generation_paths(mount_id)?
+        .list_generation_paths_for_source(mount_id, &journal.delta.source_connection_id)?
         .into_iter()
         .filter_map(|path| {
             (path.state == GenerationPathState::Conflicted
@@ -1064,10 +1349,11 @@ struct GenerationMergeBase {
 fn generation_merge_bases(
     store: &SqliteStateStore,
     mount_id: &MountId,
+    source_connection_id: &SourceConnectionId,
 ) -> Result<BTreeMap<locality_core::portable::ProjectionId, GenerationMergeBase>, GenerationSyncError>
 {
     let mut bases = BTreeMap::new();
-    for path in store.list_generation_paths(mount_id)? {
+    for path in store.list_generation_paths_for_source(mount_id, source_connection_id)? {
         let (Some(delta_id), Some(entry_index), Some(base_identity)) = (
             path.base_payload_delta_id.as_deref(),
             path.base_payload_entry_index,
@@ -1097,6 +1383,20 @@ fn generation_merge_bases(
 struct RetainedConflictUsage {
     global_bytes: u64,
     by_mount: BTreeMap<String, u64>,
+}
+
+fn list_all_generation_paths(
+    store: &SqliteStateStore,
+    mount_id: &MountId,
+) -> Result<Vec<GenerationPathRecord>, GenerationSyncError> {
+    let mut paths = Vec::new();
+    for observed in store.list_observed_generations(mount_id)? {
+        paths.extend(
+            store.list_generation_paths_for_source(mount_id, &observed.source_connection_id)?,
+        );
+    }
+    paths.sort_by(|left, right| left.projection_id.cmp(&right.projection_id));
+    Ok(paths)
 }
 
 fn prospective_inode_evidence_bytes(
@@ -1242,7 +1542,7 @@ fn reconcile_generation_staging_locked(
         .map(|journal| journal.delta.mount_id.as_str())
         .collect::<BTreeSet<_>>()
     {
-        for path in store.list_generation_paths(&MountId::new(mount_id))? {
+        for path in list_all_generation_paths(store, &MountId::new(mount_id))? {
             if let (Some(delta_id), Some(entry_index)) = (
                 path.base_payload_delta_id.as_deref(),
                 path.base_payload_entry_index,
@@ -1501,17 +1801,16 @@ fn validate_local_base(
     delta: &GenerationDelta,
 ) -> Result<(), GenerationSyncError> {
     let observed = store
-        .get_observed_generation(mount_id)?
+        .get_observed_generation_for_source(mount_id, &delta.source_connection_id)?
         .ok_or_else(|| GenerationSyncError::MissingObservedGeneration(mount_id.clone()))?;
-    if observed.source_connection_id != delta.source_connection_id
-        || observed.generation_id != delta.base_generation_id
+    if observed.generation_id != delta.base_generation_id
         || observed.workspace_layout_version != delta.workspace_layout_version
         || observed.workspace_layout_digest != delta.workspace_layout_digest.as_str()
     {
         return Err(GenerationSyncError::LocalBaseMismatch);
     }
     let paths = store
-        .list_generation_paths(mount_id)?
+        .list_generation_paths_for_source(mount_id, &delta.source_connection_id)?
         .into_iter()
         .map(|path| (path.projection_id.clone(), path))
         .collect::<BTreeMap<_, _>>();
@@ -1543,10 +1842,32 @@ fn validate_resulting_inventory(
     GenerationSyncError,
 > {
     let paths = store
-        .list_generation_paths(mount_id)?
+        .list_generation_paths_for_source(mount_id, &delta.source_connection_id)?
         .into_iter()
         .map(|path| (path.projection_id.clone(), path))
         .collect::<BTreeMap<_, _>>();
+    let other_paths = store
+        .list_observed_generations(mount_id)?
+        .into_iter()
+        .filter(|observed| observed.source_connection_id != delta.source_connection_id)
+        .map(|observed| {
+            store.list_generation_paths_for_source(mount_id, &observed.source_connection_id)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let changed_projections = delta
+        .entries
+        .iter()
+        .filter_map(GenerationDeltaEntry::projection_id)
+        .collect::<BTreeSet<_>>();
+    if other_paths
+        .iter()
+        .any(|path| changed_projections.contains(&path.projection_id))
+    {
+        return Err(GenerationSyncError::LocalBaseMismatch);
+    }
     let mut remote_inventory = BTreeMap::new();
     let mut local_inventory = BTreeMap::new();
     for (projection_id, path) in &paths {
@@ -1592,12 +1913,25 @@ fn validate_resulting_inventory(
         }
     }
 
+    let other_remote_paths = other_paths.iter().filter_map(|path| {
+        if path.state == GenerationPathState::Conflicted {
+            path.incoming_identity.as_ref()
+        } else {
+            path.base_identity.as_ref()
+        }
+    });
     validate_inventory_path_set(
         remote_inventory
             .values()
-            .map(|identity| &identity.logical_path),
+            .map(|identity| &identity.logical_path)
+            .chain(other_remote_paths.map(|identity| &identity.logical_path)),
     )?;
-    validate_inventory_path_set(local_inventory.values())?;
+    let other_local_paths = other_paths
+        .iter()
+        .map(|path| LogicalPath::new(path.local_logical_path.clone()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| GenerationSyncError::Contract(error.to_string()))?;
+    validate_inventory_path_set(local_inventory.values().chain(other_local_paths.iter()))?;
     let target_inventory = remote_inventory.into_values().collect::<Vec<_>>();
     delta
         .validate_target_inventory(&target_inventory)
@@ -2735,10 +3069,11 @@ mod tests {
         FRESHNESS_DELIVERY_READER_VERSION, GENERATION_DELTA_FORMAT_VERSION,
         canonical_target_inventory_sha256,
     };
+    use locality_protocol::generation_baseline::GenerationBaselineRefreshModeV1;
     use locality_protocol::workspace_layout::LayoutDigest;
     use locality_store::{
-        GenerationPathRecord, GenerationPathState, MountConfig, MountRepository,
-        ObservedGenerationRecord,
+        GenerationBaselineSeedRecord, GenerationBaselineSeedRecordV2, GenerationPathRecord,
+        GenerationPathState, MountConfig, MountRepository, ObservedGenerationRecord,
     };
 
     use super::*;
@@ -2980,6 +3315,19 @@ mod tests {
             delivery.delta.changed_content_bytes().unwrap();
     }
 
+    fn retarget_delivery_source(
+        delivery: &mut AuthorizedGenerationDelivery,
+        source: &str,
+        base: &str,
+        target: &str,
+    ) {
+        retarget_delivery(delivery, base, target);
+        delivery.delta.source_connection_id = SourceConnectionId::new(source);
+        delivery.terminal_receipt.source_connection_id =
+            delivery.delta.source_connection_id.clone();
+        delivery.terminal_receipt.delta_sha256 = delivery.delta.canonical_sha256().unwrap();
+    }
+
     fn reseal_target_inventory(
         delivery: &mut AuthorizedGenerationDelivery,
         inventory: &[GenerationFileIdentity],
@@ -3121,6 +3469,9 @@ mod tests {
 
     fn seed(fixture: &Fixture, paths: Vec<GenerationFileIdentity>) -> SqliteStateStore {
         let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+        let mut canonical_inventory = paths.clone();
+        canonical_inventory.sort_by(|left, right| left.projection_id.cmp(&right.projection_id));
+        let inventory_sha256 = canonical_target_inventory_sha256(&canonical_inventory).unwrap();
         store
             .save_mount(MountConfig::new(
                 fixture.mount_id.clone(),
@@ -3134,7 +3485,7 @@ mod tests {
                     mount_id: fixture.mount_id.clone(),
                     source_connection_id: SourceConnectionId::new("source-main"),
                     generation_id: SourceGenerationId::new("generation-1").unwrap(),
-                    inventory_sha256: sha256_label(b"base-inventory"),
+                    inventory_sha256,
                     workspace_layout_version: 1,
                     workspace_layout_digest: sha256_label(b"layout"),
                     last_receipt_sha256: None,
@@ -5056,6 +5407,413 @@ mod tests {
     }
 
     #[test]
+    fn shared_mount_orchestration_processes_empty_sources_in_deterministic_order() {
+        let fixture = Fixture::new("shared-mount-orchestration");
+        let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+        store
+            .save_mount(MountConfig::new(
+                fixture.mount_id.clone(),
+                "backend",
+                &fixture.mount_root,
+            ))
+            .unwrap();
+        let seed = |source: &str, generation: &str| {
+            GenerationBaselineSeedRecord::new(
+                ObservedGenerationRecord {
+                    mount_id: fixture.mount_id.clone(),
+                    source_connection_id: SourceConnectionId::new(source),
+                    generation_id: SourceGenerationId::new(generation).unwrap(),
+                    inventory_sha256: canonical_target_inventory_sha256(&[]).unwrap(),
+                    workspace_layout_version: 1,
+                    workspace_layout_digest: sha256_label(b"layout"),
+                    last_receipt_sha256: None,
+                    updated_at: "2026-07-31T11:00:00Z".to_string(),
+                },
+                Vec::new(),
+            )
+        };
+        store
+            .seed_observed_generations(vec![
+                seed("source-z", "generation-z1"),
+                seed("source-a", "generation-a1"),
+            ])
+            .unwrap();
+
+        let mut a = delivery("delta-a2", Vec::new());
+        retarget_delivery_source(&mut a, "source-a", "generation-a1", "generation-a2");
+        let mut z = delivery("delta-z2", Vec::new());
+        retarget_delivery_source(&mut z, "source-z", "generation-z1", "generation-z2");
+        let mut transport = FakeTransport::default();
+        transport.deliveries.extend([a, z]);
+        let mut client = GenerationSyncClient::new(transport);
+
+        assert!(
+            client
+                .sync_mount(&mut store, &fixture.mount_id, &fixture.mount_root)
+                .is_err(),
+            "legacy mount-only sync must reject an ambiguous shared mount"
+        );
+        let summaries = client
+            .sync_shared_mount(&mut store, &fixture.mount_id, &fixture.mount_root)
+            .unwrap();
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| summary.source_connection_id.as_str())
+                .collect::<Vec<_>>(),
+            ["source-a", "source-z"]
+        );
+        assert_eq!(
+            client
+                .transport()
+                .requests
+                .iter()
+                .map(|request| request.source_connection_id.as_str())
+                .collect::<Vec<_>>(),
+            ["source-a", "source-z"]
+        );
+        assert_eq!(
+            store
+                .get_observed_generation_for_source(
+                    &fixture.mount_id,
+                    &SourceConnectionId::new("source-a"),
+                )
+                .unwrap()
+                .unwrap()
+                .generation_id
+                .as_str(),
+            "generation-a2"
+        );
+        assert_eq!(
+            store
+                .get_observed_generation_for_source(
+                    &fixture.mount_id,
+                    &SourceConnectionId::new("source-z"),
+                )
+                .unwrap()
+                .unwrap()
+                .generation_id
+                .as_str(),
+            "generation-z2"
+        );
+
+        let empty_fixture = Fixture::new("shared-mount-no-sources");
+        let mut empty_store = SqliteStateStore::open(empty_fixture.state_root.clone()).unwrap();
+        empty_store
+            .save_mount(MountConfig::new(
+                empty_fixture.mount_id.clone(),
+                "backend",
+                &empty_fixture.mount_root,
+            ))
+            .unwrap();
+        let before = client.transport().requests.len();
+        assert!(
+            client
+                .sync_shared_mount(
+                    &mut empty_store,
+                    &empty_fixture.mount_id,
+                    &empty_fixture.mount_root,
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(client.transport().requests.len(), before);
+    }
+
+    #[test]
+    fn exact_source_sync_reports_typed_missing_observed_generation() {
+        let fixture = Fixture::new("shared-mount-missing-source");
+        let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+        store
+            .save_mount(MountConfig::new(
+                fixture.mount_id.clone(),
+                "backend",
+                &fixture.mount_root,
+            ))
+            .unwrap();
+        let source_connection_id = SourceConnectionId::new("missing-source");
+        let mut client = GenerationSyncClient::new(FakeTransport::default());
+
+        let error = client
+            .sync_mount_source(
+                &mut store,
+                &fixture.mount_id,
+                &source_connection_id,
+                &fixture.mount_root,
+            )
+            .expect_err("an exact unseeded source must be reported");
+
+        assert!(matches!(
+            error,
+            GenerationSourceSyncError::MissingObservedGenerationSource {
+                mount_id,
+                source_connection_id: missing_source,
+            } if mount_id == fixture.mount_id && missing_source == source_connection_id
+        ));
+        assert!(client.transport().requests.is_empty());
+    }
+
+    #[test]
+    fn poll_delivery_is_bound_to_the_exact_requested_source_and_base() {
+        let make_seed = |fixture: &Fixture, source: &str, generation: &str| {
+            GenerationBaselineSeedRecord::new(
+                ObservedGenerationRecord {
+                    mount_id: fixture.mount_id.clone(),
+                    source_connection_id: SourceConnectionId::new(source),
+                    generation_id: SourceGenerationId::new(generation).unwrap(),
+                    inventory_sha256: canonical_target_inventory_sha256(&[]).unwrap(),
+                    workspace_layout_version: 1,
+                    workspace_layout_digest: sha256_label(b"layout"),
+                    last_receipt_sha256: None,
+                    updated_at: "2026-07-31T11:00:00Z".to_string(),
+                },
+                Vec::new(),
+            )
+        };
+
+        let fixture = Fixture::new("malicious-cross-source-poll");
+        let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+        store
+            .save_mount(MountConfig::new(
+                fixture.mount_id.clone(),
+                "backend",
+                &fixture.mount_root,
+            ))
+            .unwrap();
+        store
+            .seed_observed_generations(vec![
+                make_seed(&fixture, "source-a", "generation-a1"),
+                make_seed(&fixture, "source-b", "generation-b1"),
+            ])
+            .unwrap();
+        let mut crossed = delivery("delta-cross-source-poll", Vec::new());
+        retarget_delivery_source(&mut crossed, "source-b", "generation-b1", "generation-b2");
+        let mut transport = FakeTransport::default();
+        transport.deliveries.push_back(crossed);
+        let mut client = GenerationSyncClient::new(transport);
+        let error = client
+            .sync_mount_source(
+                &mut store,
+                &fixture.mount_id,
+                &SourceConnectionId::new("source-a"),
+                &fixture.mount_root,
+            )
+            .expect_err("a custom transport cannot cross a source request");
+        assert!(matches!(
+            error,
+            GenerationSourceSyncError::DeliveryRequestMismatch
+        ));
+        assert!(store.list_generation_applies().unwrap().is_empty());
+        assert_eq!(client.transport().content_fetches, 0);
+        assert_eq!(
+            store
+                .get_observed_generation_for_source(
+                    &fixture.mount_id,
+                    &SourceConnectionId::new("source-b"),
+                )
+                .unwrap()
+                .unwrap()
+                .generation_id
+                .as_str(),
+            "generation-b1"
+        );
+
+        let fixture = Fixture::new("malicious-cross-base-poll");
+        let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+        store
+            .save_mount(MountConfig::new(
+                fixture.mount_id.clone(),
+                "backend",
+                &fixture.mount_root,
+            ))
+            .unwrap();
+        store
+            .seed_observed_generations(vec![make_seed(&fixture, "source-a", "generation-a1")])
+            .unwrap();
+        let mut crossed = delivery("delta-cross-base-poll", Vec::new());
+        retarget_delivery_source(
+            &mut crossed,
+            "source-a",
+            "generation-stale",
+            "generation-a2",
+        );
+        let mut transport = FakeTransport::default();
+        transport.deliveries.push_back(crossed);
+        let mut client = GenerationSyncClient::new(transport);
+        let error = client
+            .sync_mount_source(
+                &mut store,
+                &fixture.mount_id,
+                &SourceConnectionId::new("source-a"),
+                &fixture.mount_root,
+            )
+            .expect_err("a custom transport cannot cross the observed base");
+        assert!(matches!(
+            error,
+            GenerationSourceSyncError::DeliveryRequestMismatch
+        ));
+        assert!(store.list_generation_applies().unwrap().is_empty());
+        assert_eq!(client.transport().content_fetches, 0);
+    }
+
+    #[test]
+    fn shared_sync_routes_full_export_only_without_polling() {
+        let fixture = Fixture::new("shared-full-export-route");
+        let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+        store
+            .save_mount(MountConfig::new(
+                fixture.mount_id.clone(),
+                "backend",
+                &fixture.mount_root,
+            ))
+            .unwrap();
+        let source = "s".repeat(129);
+        let seed = GenerationBaselineSeedRecord::new(
+            ObservedGenerationRecord {
+                mount_id: fixture.mount_id.clone(),
+                source_connection_id: SourceConnectionId::new(&source),
+                generation_id: SourceGenerationId::new("generation-full").unwrap(),
+                inventory_sha256: canonical_target_inventory_sha256(&[]).unwrap(),
+                workspace_layout_version: 1,
+                workspace_layout_digest: sha256_label(b"layout"),
+                last_receipt_sha256: None,
+                updated_at: "2026-07-31T11:00:00Z".to_string(),
+            },
+            Vec::new(),
+        );
+        store
+            .seed_observed_generations_v2(vec![GenerationBaselineSeedRecordV2::new(
+                seed,
+                GenerationBaselineRefreshModeV1::FullExportOnly,
+            )])
+            .unwrap();
+        let mut client = GenerationSyncClient::new(FakeTransport::default());
+
+        let outcomes = client
+            .sync_shared_mount_v2(&mut store, &fixture.mount_id, &fixture.mount_root)
+            .unwrap();
+
+        assert_eq!(
+            outcomes,
+            vec![GenerationSourceSyncOutcome::FullExportRequired {
+                source_connection_id: SourceConnectionId::new(&source),
+            }]
+        );
+        assert!(client.transport().requests.is_empty());
+        assert!(matches!(
+            client.sync_shared_mount(&mut store, &fixture.mount_id, &fixture.mount_root),
+            Err(GenerationSourceSyncError::FullExportRequired { .. })
+        ));
+        assert!(client.transport().requests.is_empty());
+    }
+
+    #[test]
+    fn restart_resumes_active_source_before_polling_another_source() {
+        let fixture = Fixture::new("shared-active-resume-order");
+        let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+        store
+            .save_mount(MountConfig::new(
+                fixture.mount_id.clone(),
+                "backend",
+                &fixture.mount_root,
+            ))
+            .unwrap();
+        let seed = |source: &str, generation: &str| {
+            GenerationBaselineSeedRecord::new(
+                ObservedGenerationRecord {
+                    mount_id: fixture.mount_id.clone(),
+                    source_connection_id: SourceConnectionId::new(source),
+                    generation_id: SourceGenerationId::new(generation).unwrap(),
+                    inventory_sha256: canonical_target_inventory_sha256(&[]).unwrap(),
+                    workspace_layout_version: 1,
+                    workspace_layout_digest: sha256_label(b"layout"),
+                    last_receipt_sha256: None,
+                    updated_at: "2026-07-31T11:00:00Z".to_string(),
+                },
+                Vec::new(),
+            )
+        };
+        store
+            .seed_observed_generations(vec![
+                seed("source-a", "generation-a1"),
+                seed("source-b", "generation-b1"),
+            ])
+            .unwrap();
+        let a_identity = identity("projection-a", "A.md", "content-a2", b"source-a-new");
+        let mut source_a = delivery(
+            "delta-a-resume",
+            vec![GenerationDeltaEntry {
+                old: None,
+                new: Some(a_identity),
+            }],
+        );
+        retarget_delivery_source(&mut source_a, "source-a", "generation-a1", "generation-a2");
+        let stage_root =
+            path_to_portable_text(&stage_relative_path(&source_a.delta).unwrap()).unwrap();
+        store
+            .reserve_generation_apply(PreparedGenerationApply {
+                receipt_sha256: source_a.terminal_receipt.canonical_sha256().unwrap(),
+                receipt: source_a.terminal_receipt,
+                delta: source_a.delta,
+                stage_root,
+                created_at: "2026-07-31T12:00:00Z".to_string(),
+            })
+            .unwrap();
+
+        let state_root = fixture.state_root.clone();
+        drop(store);
+        let mut restarted = SqliteStateStore::open(state_root).unwrap();
+        let mut source_b = delivery("delta-b-after-resume", Vec::new());
+        retarget_delivery_source(&mut source_b, "source-b", "generation-b1", "generation-b2");
+        let resumed_path = fixture.mount_root.join("A.md");
+        let mut transport = FakeTransport {
+            before_next_delta: Some(Box::new(move || {
+                if fs::read(&resumed_path).ok().as_deref() != Some(b"source-a-new") {
+                    return Err(FakeTransportError(
+                        "source B was polled before source A resumed".to_string(),
+                    ));
+                }
+                Ok(())
+            })),
+            ..FakeTransport::default()
+        };
+        transport.deliveries.push_back(source_b);
+        transport
+            .contents
+            .insert("content-a2".to_string(), b"source-a-new".to_vec());
+        let mut client = GenerationSyncClient::new(transport);
+
+        let outcomes = client
+            .sync_shared_mount_v2(&mut restarted, &fixture.mount_id, &fixture.mount_root)
+            .unwrap();
+
+        assert_eq!(outcomes.len(), 2);
+        assert!(matches!(
+            &outcomes[0],
+            GenerationSourceSyncOutcome::Synchronized(summary)
+                if summary.source_connection_id.as_str() == "source-a"
+                    && summary.summary.delta_id.as_deref() == Some("delta-a-resume")
+        ));
+        assert!(matches!(
+            &outcomes[1],
+            GenerationSourceSyncOutcome::Synchronized(summary)
+                if summary.source_connection_id.as_str() == "source-b"
+                    && summary.summary.delta_id.as_deref() == Some("delta-b-after-resume")
+        ));
+        assert_eq!(client.transport().requests.len(), 1);
+        assert_eq!(
+            client.transport().requests[0].source_connection_id.as_str(),
+            "source-b"
+        );
+        assert!(
+            restarted
+                .list_active_generation_applies()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn negotiated_windows_are_bounded_and_terminal_receipts_are_acknowledged() {
         let fixture = Fixture::new("windowed-transport-contract");
         let old = identity("projection-a", "Roadmap.md", "content-old", b"old");
@@ -5291,6 +6049,102 @@ mod tests {
         assert_eq!(
             &client.transport().events[client.transport().events.len() - 2..],
             &["acknowledgment", "next_delta"]
+        );
+    }
+
+    #[test]
+    fn another_sources_pending_acknowledgment_is_replayed_before_mount_poll() {
+        let fixture = Fixture::new("cross-source-ack-replay-before-poll");
+        let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+        store
+            .save_mount(MountConfig::new(
+                fixture.mount_id.clone(),
+                "backend",
+                &fixture.mount_root,
+            ))
+            .unwrap();
+        let seed = |source: &str, generation: &str| {
+            GenerationBaselineSeedRecord::new(
+                ObservedGenerationRecord {
+                    mount_id: fixture.mount_id.clone(),
+                    source_connection_id: SourceConnectionId::new(source),
+                    generation_id: SourceGenerationId::new(generation).unwrap(),
+                    inventory_sha256: canonical_target_inventory_sha256(&[]).unwrap(),
+                    workspace_layout_version: 1,
+                    workspace_layout_digest: sha256_label(b"layout"),
+                    last_receipt_sha256: None,
+                    updated_at: "2026-07-31T11:00:00Z".to_string(),
+                },
+                Vec::new(),
+            )
+        };
+        store
+            .seed_observed_generations(vec![
+                seed("source-a", "generation-a1"),
+                seed("source-b", "generation-b1"),
+            ])
+            .unwrap();
+        let mut source_b = delivery("delta-b-pending-ack", Vec::new());
+        retarget_delivery_source(&mut source_b, "source-b", "generation-b1", "generation-b2");
+        let mut transport = FakeTransport {
+            capabilities: GenerationTransportCapabilities {
+                terminal_receipt_acknowledgments: true,
+                ..GenerationTransportCapabilities::legacy()
+            },
+            acknowledgment_failures_remaining: 1,
+            ..FakeTransport::default()
+        };
+        transport.deliveries.push_back(source_b);
+        let mut client = GenerationSyncClient::new(transport);
+        let first_error = client
+            .sync_mount_source(
+                &mut store,
+                &fixture.mount_id,
+                &SourceConnectionId::new("source-b"),
+                &fixture.mount_root,
+            )
+            .expect_err("source B acknowledgment fails after its apply is durable");
+        assert!(matches!(
+            first_error,
+            GenerationSourceSyncError::Generation(GenerationSyncError::Transport(_))
+        ));
+        assert_eq!(
+            store
+                .list_pending_generation_acknowledgments(&fixture.mount_id)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        client
+            .sync_mount_source(
+                &mut store,
+                &fixture.mount_id,
+                &SourceConnectionId::new("source-a"),
+                &fixture.mount_root,
+            )
+            .expect("source B receipt is acknowledged before source A is polled");
+
+        assert_eq!(
+            &client.transport().events[client.transport().events.len() - 2..],
+            ["acknowledgment", "next_delta"]
+        );
+        assert_eq!(client.transport().acknowledgment_requests.len(), 2);
+        assert_eq!(
+            client.transport().acknowledgment_requests[1]
+                .source_connection_id
+                .as_str(),
+            "source-b"
+        );
+        assert_eq!(
+            client.transport().requests[1].source_connection_id.as_str(),
+            "source-a"
+        );
+        assert!(
+            store
+                .list_pending_generation_acknowledgments(&fixture.mount_id)
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -5839,7 +6693,7 @@ mod tests {
                     mount_id: other_mount_id.clone(),
                     source_connection_id: SourceConnectionId::new("source-other"),
                     generation_id: SourceGenerationId::new("generation-other").unwrap(),
-                    inventory_sha256: sha256_label(b"other-inventory"),
+                    inventory_sha256: canonical_target_inventory_sha256(&[]).unwrap(),
                     workspace_layout_version: 1,
                     workspace_layout_digest: sha256_label(b"layout"),
                     last_receipt_sha256: None,
@@ -5935,7 +6789,8 @@ mod tests {
                     mount_id: other_mount_id.clone(),
                     source_connection_id: SourceConnectionId::new("source-main"),
                     generation_id: SourceGenerationId::new("generation-1").unwrap(),
-                    inventory_sha256: sha256_label(b"other-inventory"),
+                    inventory_sha256: canonical_target_inventory_sha256(&[other_old.clone()])
+                        .unwrap(),
                     workspace_layout_version: 1,
                     workspace_layout_digest: sha256_label(b"layout"),
                     last_receipt_sha256: None,

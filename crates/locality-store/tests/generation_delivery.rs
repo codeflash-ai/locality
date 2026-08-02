@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use locality_core::model::{MountId, RemoteId};
@@ -12,14 +14,17 @@ use locality_protocol::FreshnessEpoch;
 use locality_protocol::freshness_delivery::{
     FRESHNESS_DELIVERY_READER_VERSION, GENERATION_DELTA_FORMAT_VERSION, GenerationDelta,
     GenerationDeltaEntry, GenerationDeltaTerminalReceipt, GenerationFileIdentity,
+    canonical_target_inventory_sha256,
 };
 use locality_protocol::freshness_delivery_transport::{
     GenerationBodyWindowCapability, GenerationPinFallbackPolicy, GenerationPinLeaseCapability,
     GenerationTransportCapabilities,
 };
+use locality_protocol::generation_baseline::GenerationBaselineRefreshModeV1;
 use locality_protocol::workspace_layout::LayoutDigest;
 use locality_store::{
-    ConnectionId, GenerationApplyOutcome, GenerationApplyStatus, GenerationDeliveryRepository,
+    ConnectionId, GenerationApplyOutcome, GenerationApplyStatus, GenerationBaselineSeedRecord,
+    GenerationBaselineSeedRecordV2, GenerationDeliveryRepository,
     GenerationInodeEvidenceConflictUpdate, GenerationInodeEvidenceRecord,
     GenerationInodeEvidenceResolution, GenerationPathRecord, GenerationPathState,
     GenerationRetainedInodeRecord, GenerationTransportSelectionBinding, MountConfig,
@@ -36,13 +41,72 @@ fn generation(value: &str) -> SourceGenerationId {
 }
 
 fn identity(version: &str, digest_character: char, bytes: u64) -> GenerationFileIdentity {
+    identity_for(
+        "projection-roadmap",
+        "Roadmap.md",
+        version,
+        digest_character,
+        bytes,
+    )
+}
+
+fn identity_for(
+    projection_id: &str,
+    logical_path: &str,
+    version: &str,
+    digest_character: char,
+    bytes: u64,
+) -> GenerationFileIdentity {
     GenerationFileIdentity {
-        projection_id: ProjectionId::new("projection-roadmap"),
-        logical_path: LogicalPath::new("Roadmap.md").unwrap(),
+        projection_id: ProjectionId::new(projection_id),
+        logical_path: LogicalPath::new(logical_path).unwrap(),
         content_version_id: ContentVersionId::new(version),
         content_sha256: digest(digest_character),
         byte_length: bytes,
     }
+}
+
+fn source_seed(
+    mount_id: &MountId,
+    source: &str,
+    generation_id: &str,
+    identity: Option<GenerationFileIdentity>,
+) -> GenerationBaselineSeedRecord {
+    let paths = identity
+        .into_iter()
+        .map(|identity| GenerationPathRecord {
+            mount_id: mount_id.clone(),
+            projection_id: identity.projection_id.clone(),
+            logical_path: identity.logical_path.as_str().to_string(),
+            local_logical_path: identity.logical_path.as_str().to_string(),
+            base_generation_id: generation(generation_id),
+            base_identity: Some(identity),
+            base_payload_delta_id: None,
+            base_payload_entry_index: None,
+            conflict_payload_delta_id: None,
+            conflict_payload_entry_index: None,
+            state: GenerationPathState::Clean,
+            incoming_identity: None,
+            updated_at: "2026-07-31T11:00:00Z".to_string(),
+        })
+        .collect::<Vec<_>>();
+    let inventory = paths
+        .iter()
+        .map(|path| path.base_identity.clone().unwrap())
+        .collect::<Vec<_>>();
+    GenerationBaselineSeedRecord::new(
+        ObservedGenerationRecord {
+            mount_id: mount_id.clone(),
+            source_connection_id: SourceConnectionId::new(source),
+            generation_id: generation(generation_id),
+            inventory_sha256: canonical_target_inventory_sha256(&inventory).unwrap(),
+            workspace_layout_version: 1,
+            workspace_layout_digest: digest('a'),
+            last_receipt_sha256: None,
+            updated_at: "2026-07-31T11:00:00Z".to_string(),
+        },
+        paths,
+    )
 }
 
 fn delta() -> GenerationDelta {
@@ -62,6 +126,31 @@ fn delta() -> GenerationDelta {
             old: Some(identity("content-1", '1', 3)),
             new: Some(identity("content-2", '2', 4)),
         }],
+    }
+}
+
+fn delta_for_source(
+    delta_id: &str,
+    source: &str,
+    base_generation: &str,
+    target_generation: &str,
+    old: Option<GenerationFileIdentity>,
+    new: Option<GenerationFileIdentity>,
+) -> GenerationDelta {
+    let target_inventory = new.iter().cloned().collect::<Vec<_>>();
+    GenerationDelta {
+        format_version: GENERATION_DELTA_FORMAT_VERSION,
+        minimum_reader_version: FRESHNESS_DELIVERY_READER_VERSION,
+        delta_id: delta_id.to_string(),
+        mount_id: PortableMountId::new("mount-main").unwrap(),
+        source_connection_id: SourceConnectionId::new(source),
+        base_generation_id: generation(base_generation),
+        target_generation_id: generation(target_generation),
+        target_complete: true,
+        target_inventory_sha256: canonical_target_inventory_sha256(&target_inventory).unwrap(),
+        workspace_layout_version: 1,
+        workspace_layout_digest: LayoutDigest::new(digest('a')).unwrap(),
+        entries: vec![GenerationDeltaEntry { old, new }],
     }
 }
 
@@ -86,6 +175,7 @@ fn receipt(delta: &GenerationDelta) -> GenerationDeltaTerminalReceipt {
 }
 
 fn seed(store: &mut SqliteStateStore, fixture: &Fixture) {
+    let base_identity = identity("content-1", '1', 3);
     store
         .save_mount(MountConfig::new(
             fixture.mount_id.clone(),
@@ -99,7 +189,8 @@ fn seed(store: &mut SqliteStateStore, fixture: &Fixture) {
                 mount_id: fixture.mount_id.clone(),
                 source_connection_id: SourceConnectionId::new("source-main"),
                 generation_id: generation("generation-1"),
-                inventory_sha256: digest('1'),
+                inventory_sha256: canonical_target_inventory_sha256(&[base_identity.clone()])
+                    .unwrap(),
                 workspace_layout_version: 1,
                 workspace_layout_digest: digest('a'),
                 last_receipt_sha256: None,
@@ -111,7 +202,7 @@ fn seed(store: &mut SqliteStateStore, fixture: &Fixture) {
                 logical_path: "Roadmap.md".to_string(),
                 local_logical_path: "Roadmap.md".to_string(),
                 base_generation_id: generation("generation-1"),
-                base_identity: Some(identity("content-1", '1', 3)),
+                base_identity: Some(base_identity),
                 base_payload_delta_id: None,
                 base_payload_entry_index: None,
                 conflict_payload_delta_id: None,
@@ -135,23 +226,23 @@ fn observed_generation_seed_exact_replay_is_path_order_independent() {
             &fixture.mount_root,
         ))
         .unwrap();
-    let observed = ObservedGenerationRecord {
-        mount_id: fixture.mount_id.clone(),
-        source_connection_id: SourceConnectionId::new("source-main"),
-        generation_id: generation("generation-1"),
-        inventory_sha256: digest('1'),
-        workspace_layout_version: 1,
-        workspace_layout_digest: digest('a'),
-        last_receipt_sha256: None,
-        updated_at: "2026-07-31T11:00:00Z".to_string(),
-    };
     let path = |projection: &str, logical_path: &str| GenerationPathRecord {
         mount_id: fixture.mount_id.clone(),
         projection_id: ProjectionId::new(projection),
         logical_path: logical_path.to_string(),
         local_logical_path: logical_path.to_string(),
         base_generation_id: generation("generation-1"),
-        base_identity: None,
+        base_identity: Some(identity_for(
+            projection,
+            logical_path,
+            &format!("content-{projection}"),
+            if projection == "projection-a" {
+                'a'
+            } else {
+                'b'
+            },
+            1,
+        )),
         base_payload_delta_id: None,
         base_payload_entry_index: None,
         conflict_payload_delta_id: None,
@@ -163,6 +254,20 @@ fn observed_generation_seed_exact_replay_is_path_order_independent() {
     let first = path("projection-a", "A.md");
     let second = path("projection-b", "B.md");
     let expected = vec![first.clone(), second.clone()];
+    let inventory = expected
+        .iter()
+        .map(|path| path.base_identity.clone().unwrap())
+        .collect::<Vec<_>>();
+    let observed = ObservedGenerationRecord {
+        mount_id: fixture.mount_id.clone(),
+        source_connection_id: SourceConnectionId::new("source-main"),
+        generation_id: generation("generation-1"),
+        inventory_sha256: canonical_target_inventory_sha256(&inventory).unwrap(),
+        workspace_layout_version: 1,
+        workspace_layout_digest: digest('a'),
+        last_receipt_sha256: None,
+        updated_at: "2026-07-31T11:00:00Z".to_string(),
+    };
 
     store
         .seed_observed_generation(observed.clone(), expected.clone())
@@ -174,6 +279,884 @@ fn observed_generation_seed_exact_replay_is_path_order_independent() {
     assert_eq!(
         store.list_generation_paths(&fixture.mount_id).unwrap(),
         expected
+    );
+}
+
+#[test]
+fn baseline_seed_rejects_incomplete_or_mismatched_inventory_before_commit() {
+    let fixture = Fixture::new("baseline-inventory-validation");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "backend",
+            &fixture.mount_root,
+        ))
+        .unwrap();
+
+    let valid = source_seed(
+        &fixture.mount_id,
+        "source-a",
+        "generation-a1",
+        Some(identity_for("projection-a", "A.md", "content-a1", 'a', 1)),
+    );
+    let mut mismatched_digest = valid.clone();
+    mismatched_digest.observed.inventory_sha256 = digest('f');
+    assert!(
+        store
+            .seed_observed_generations(vec![mismatched_digest])
+            .is_err()
+    );
+
+    let mut missing_identity = valid.clone();
+    missing_identity.paths[0].base_identity = None;
+    assert!(
+        store
+            .seed_observed_generations(vec![missing_identity])
+            .is_err()
+    );
+
+    let mut dirty_path = valid;
+    dirty_path.paths[0].state = GenerationPathState::Dirty;
+    assert!(store.seed_observed_generations(vec![dirty_path]).is_err());
+    assert!(
+        store
+            .list_observed_generations(&fixture.mount_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn shared_mount_baseline_rejects_mixed_layouts_atomically() {
+    let fixture = Fixture::new("baseline-shared-layout-validation");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "backend",
+            &fixture.mount_root,
+        ))
+        .unwrap();
+    let source_a = source_seed(
+        &fixture.mount_id,
+        "source-a",
+        "generation-a1",
+        Some(identity_for("projection-a", "A.md", "content-a1", 'a', 1)),
+    );
+    let mut source_b = source_seed(
+        &fixture.mount_id,
+        "source-b",
+        "generation-b1",
+        Some(identity_for("projection-b", "B.md", "content-b1", 'b', 1)),
+    );
+    source_b.observed.workspace_layout_digest = digest('b');
+
+    assert!(
+        store
+            .seed_observed_generations(vec![source_a, source_b])
+            .is_err()
+    );
+    assert!(
+        store
+            .list_observed_generations(&fixture.mount_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn multi_mount_baseline_rejects_mixed_layouts_atomically() {
+    let fixture = Fixture::new("baseline-multi-mount-layout-validation");
+    let other_mount_id = MountId::new("mount-other");
+    let other_mount_root = fixture.state_root.parent().unwrap().join("mount-other");
+    fs::create_dir_all(&other_mount_root).unwrap();
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    for (mount_id, mount_root) in [
+        (&fixture.mount_id, &fixture.mount_root),
+        (&other_mount_id, &other_mount_root),
+    ] {
+        store
+            .save_mount(MountConfig::new(mount_id.clone(), "backend", mount_root))
+            .unwrap();
+    }
+    let first_mount = source_seed(
+        &fixture.mount_id,
+        "source-a",
+        "generation-a1",
+        Some(identity_for("projection-a", "A.md", "content-a1", 'a', 1)),
+    );
+    let mut second_mount = source_seed(
+        &other_mount_id,
+        "source-b",
+        "generation-b1",
+        Some(identity_for("projection-b", "B.md", "content-b1", 'b', 1)),
+    );
+    second_mount.observed.workspace_layout_version = 2;
+    second_mount.observed.workspace_layout_digest = digest('b');
+
+    assert!(
+        store
+            .seed_observed_generations(vec![first_mount, second_mount])
+            .is_err()
+    );
+    for mount_id in [&fixture.mount_id, &other_mount_id] {
+        assert!(
+            store
+                .list_observed_generations(mount_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn shared_mount_sources_seed_atomically_replay_after_restart_and_keep_legacy_reads_safe() {
+    let fixture = Fixture::new("shared-mount-baseline");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "backend",
+            &fixture.mount_root,
+        ))
+        .unwrap();
+    let source_a = source_seed(
+        &fixture.mount_id,
+        "source-a",
+        "generation-a1",
+        Some(identity_for("projection-a", "A.md", "content-a1", 'a', 1)),
+    );
+    let source_b = source_seed(
+        &fixture.mount_id,
+        "source-b",
+        "generation-b1",
+        Some(identity_for("projection-b", "B.md", "content-b1", 'b', 1)),
+    );
+    let source_empty = source_seed(&fixture.mount_id, "source-empty", "generation-empty1", None);
+    let baseline = vec![source_b.clone(), source_empty.clone(), source_a.clone()];
+    store.seed_observed_generations(baseline.clone()).unwrap();
+
+    assert_eq!(
+        store
+            .list_observed_generations(&fixture.mount_id)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.source_connection_id)
+            .collect::<Vec<_>>(),
+        vec![
+            SourceConnectionId::new("source-a"),
+            SourceConnectionId::new("source-b"),
+            SourceConnectionId::new("source-empty"),
+        ]
+    );
+    assert!(store.get_observed_generation(&fixture.mount_id).is_err());
+    assert!(store.list_generation_paths(&fixture.mount_id).is_err());
+    assert!(
+        store
+            .seed_observed_generation(source_a.observed.clone(), source_a.paths.clone())
+            .is_err()
+    );
+    assert!(
+        store
+            .list_generation_paths_for_source(
+                &fixture.mount_id,
+                &SourceConnectionId::new("source-empty"),
+            )
+            .unwrap()
+            .is_empty()
+    );
+    drop(store);
+
+    let mut reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    reopened
+        .seed_observed_generations(baseline)
+        .expect("exact multi-source replay survives restart");
+    assert_eq!(
+        reopened
+            .get_observed_generation_for_source(
+                &fixture.mount_id,
+                &SourceConnectionId::new("source-b"),
+            )
+            .unwrap(),
+        Some(source_b.observed)
+    );
+}
+
+#[test]
+fn changed_multi_source_replay_rolls_back_new_source() {
+    let fixture = Fixture::new("shared-mount-baseline-rollback");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "backend",
+            &fixture.mount_root,
+        ))
+        .unwrap();
+    let source_a = source_seed(&fixture.mount_id, "source-a", "generation-a1", None);
+    store
+        .seed_observed_generations(vec![source_a.clone()])
+        .unwrap();
+    let mut changed_a = source_a;
+    changed_a.observed.inventory_sha256 = digest('z');
+    let source_b = source_seed(&fixture.mount_id, "source-b", "generation-b1", None);
+
+    assert!(
+        store
+            .seed_observed_generations(vec![source_b, changed_a])
+            .is_err()
+    );
+    assert!(
+        store
+            .get_observed_generation_for_source(
+                &fixture.mount_id,
+                &SourceConnectionId::new("source-b"),
+            )
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn sequential_partial_baselines_cannot_extend_an_existing_mount() {
+    let fixture = Fixture::new("shared-mount-sequential-partial-baselines");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "backend",
+            &fixture.mount_root,
+        ))
+        .unwrap();
+    let source_a = source_seed(&fixture.mount_id, "source-a", "generation-a1", None);
+    let source_b = source_seed(&fixture.mount_id, "source-b", "generation-b2", None);
+    store
+        .seed_observed_generations(vec![source_a.clone()])
+        .unwrap();
+
+    let error = store
+        .seed_observed_generations(vec![source_a, source_b])
+        .expect_err("a later baseline cannot append a source to an existing mount");
+
+    assert!(matches!(error, StoreError::InvalidState(_)));
+    let observed = store.list_observed_generations(&fixture.mount_id).unwrap();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(
+        observed[0].source_connection_id,
+        SourceConnectionId::new("source-a")
+    );
+}
+
+#[test]
+fn concurrent_partial_baselines_cannot_merge_on_an_empty_mount() {
+    let fixture = Fixture::new("shared-mount-concurrent-partial-baselines");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "backend",
+            &fixture.mount_root,
+        ))
+        .unwrap();
+    drop(store);
+
+    let barrier = Arc::new(Barrier::new(3));
+    let mut workers = Vec::new();
+    for (source, generation_id) in [("source-a", "generation-a1"), ("source-b", "generation-b2")] {
+        let state_root = fixture.state_root.clone();
+        let mount_id = fixture.mount_id.clone();
+        let barrier = Arc::clone(&barrier);
+        workers.push(thread::spawn(move || {
+            let mut store = SqliteStateStore::open(state_root).unwrap();
+            let seed = source_seed(&mount_id, source, generation_id, None);
+            barrier.wait();
+            store.seed_observed_generations(vec![seed])
+        }));
+    }
+    barrier.wait();
+
+    let results = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(StoreError::InvalidState(_))))
+            .count(),
+        1
+    );
+
+    let reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    assert_eq!(
+        reopened
+            .list_observed_generations(&fixture.mount_id)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn active_apply_is_mount_wide_and_fences_baseline_target_claims() {
+    let fixture = Fixture::new("shared-mount-active-fence");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "backend",
+            &fixture.mount_root,
+        ))
+        .unwrap();
+    store
+        .seed_observed_generations(vec![
+            source_seed(&fixture.mount_id, "source-a", "generation-a1", None),
+            source_seed(&fixture.mount_id, "source-b", "generation-b1", None),
+        ])
+        .unwrap();
+
+    let claimed = identity_for("projection-claim", "Claim.md", "content-a2", 'a', 1);
+    let delta_a = delta_for_source(
+        "delta-a-active",
+        "source-a",
+        "generation-a1",
+        "generation-a2",
+        None,
+        Some(claimed.clone()),
+    );
+    let receipt_a = receipt(&delta_a);
+    store
+        .reserve_generation_apply(PreparedGenerationApply {
+            delta: delta_a,
+            receipt_sha256: receipt_a.canonical_sha256().unwrap(),
+            receipt: receipt_a,
+            stage_root: "generation-delivery/delta-a-active".to_string(),
+            created_at: "2026-07-31T12:01:00Z".to_string(),
+        })
+        .unwrap();
+
+    let delta_b = delta_for_source(
+        "delta-b-concurrent",
+        "source-b",
+        "generation-b1",
+        "generation-b2",
+        None,
+        Some(identity_for("projection-b", "B.md", "content-b2", 'b', 1)),
+    );
+    let receipt_b = receipt(&delta_b);
+    assert!(
+        store
+            .reserve_generation_apply(PreparedGenerationApply {
+                delta: delta_b,
+                receipt_sha256: receipt_b.canonical_sha256().unwrap(),
+                receipt: receipt_b,
+                stage_root: "generation-delivery/delta-b-concurrent".to_string(),
+                created_at: "2026-07-31T12:01:00Z".to_string(),
+            })
+            .is_err(),
+        "another source cannot reserve an apply while the mount has a durable target claim"
+    );
+
+    let source_c = source_seed(
+        &fixture.mount_id,
+        "source-c",
+        "generation-c1",
+        Some(claimed),
+    );
+    assert!(store.seed_observed_generations(vec![source_c]).is_err());
+    assert!(
+        store
+            .get_observed_generation_for_source(
+                &fixture.mount_id,
+                &SourceConnectionId::new("source-c"),
+            )
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn typed_refresh_mode_is_validated_persisted_and_never_defaulted_for_ineligible_state() {
+    let fixture = Fixture::new("typed-refresh-mode");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "backend",
+            &fixture.mount_root,
+        ))
+        .unwrap();
+    let long_source = "s".repeat(129);
+    let seed = source_seed(
+        &fixture.mount_id,
+        &long_source,
+        "generation-full-export",
+        None,
+    );
+    assert!(
+        store.seed_observed_generations(vec![seed.clone()]).is_err(),
+        "the compatibility API must not silently label an ineligible source as delta-capable"
+    );
+    store
+        .seed_observed_generations_v2(vec![GenerationBaselineSeedRecordV2::new(
+            seed,
+            GenerationBaselineRefreshModeV1::FullExportOnly,
+        )])
+        .unwrap();
+    let persisted = store
+        .get_observed_generation_for_source_v2(
+            &fixture.mount_id,
+            &SourceConnectionId::new(long_source),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        persisted.refresh_mode,
+        GenerationBaselineRefreshModeV1::FullExportOnly
+    );
+}
+
+#[test]
+fn v6_fixture_migrates_exact_generation_rows_and_paths_to_v7() {
+    use rusqlite::Connection;
+
+    let fixture = Fixture::new("migration-component-v6");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let expected_observed = store
+        .get_observed_generation(&fixture.mount_id)
+        .unwrap()
+        .unwrap();
+    let expected_paths = store.list_generation_paths(&fixture.mount_id).unwrap();
+    let db_path = store.db_path.clone();
+    drop(store);
+
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(include_str!(
+            "fixtures/generation-delivery-component-v6.sql"
+        ))
+        .unwrap();
+    drop(connection);
+
+    let reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    assert_eq!(
+        reopened
+            .get_observed_generation_for_source(
+                &fixture.mount_id,
+                &expected_observed.source_connection_id,
+            )
+            .unwrap(),
+        Some(expected_observed.clone())
+    );
+    assert_eq!(
+        reopened
+            .list_generation_paths_for_source(
+                &fixture.mount_id,
+                &expected_observed.source_connection_id,
+            )
+            .unwrap(),
+        expected_paths
+    );
+    let connection = Connection::open(&db_path).unwrap();
+    let component: (i64, i64) = connection
+        .query_row(
+            "SELECT version, min_reader_version FROM state_components
+             WHERE component_id = 'durable:generation_delivery'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let primary_key = connection
+        .prepare(
+            "SELECT name FROM pragma_table_info('observed_generations')
+             WHERE pk > 0 ORDER BY pk",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(component, (7, 7));
+    assert_eq!(primary_key, ["mount_id", "source_connection_id"]);
+    assert_eq!(
+        reopened
+            .get_observed_generation_for_source_v2(
+                &fixture.mount_id,
+                &expected_observed.source_connection_id,
+            )
+            .unwrap()
+            .unwrap()
+            .refresh_mode,
+        GenerationBaselineRefreshModeV1::GenerationDeltaV1
+    );
+}
+
+#[test]
+fn v6_ineligible_generation_row_migrates_to_full_export_only() {
+    use rusqlite::Connection;
+
+    let fixture = Fixture::new("migration-component-v6-full-export");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let db_path = store.db_path.clone();
+    drop(store);
+
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(include_str!(
+            "fixtures/generation-delivery-component-v6.sql"
+        ))
+        .unwrap();
+    let long_source = "s".repeat(129);
+    connection
+        .execute(
+            "UPDATE observed_generations SET source_connection_id = ?1",
+            [&long_source],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    let migrated = reopened
+        .get_observed_generation_for_source_v2(
+            &fixture.mount_id,
+            &SourceConnectionId::new(long_source),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        migrated.refresh_mode,
+        GenerationBaselineRefreshModeV1::FullExportOnly
+    );
+}
+
+#[test]
+fn failed_v6_to_v7_rebuild_rolls_back_every_schema_and_component_change() {
+    use rusqlite::Connection;
+
+    let fixture = Fixture::new("migration-component-v6-rollback");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let db_path = store.db_path.clone();
+    drop(store);
+
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(include_str!(
+            "fixtures/generation-delivery-component-v6.sql"
+        ))
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO generation_paths (
+                mount_id, projection_id, logical_path, local_logical_path,
+                base_generation_id, base_identity_json,
+                base_payload_delta_id, base_payload_entry_index,
+                conflict_payload_delta_id, conflict_payload_entry_index,
+                state, incoming_identity_json, updated_at
+             )
+             SELECT mount_id, 'projection-injected', 'Injected.md', local_logical_path,
+                    base_generation_id, NULL, base_payload_delta_id,
+                    base_payload_entry_index, conflict_payload_delta_id,
+                    conflict_payload_entry_index, state, NULL, updated_at
+             FROM generation_paths LIMIT 1",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(SqliteStateStore::open(fixture.state_root.clone()).is_err());
+    let connection = Connection::open(&db_path).unwrap();
+    let component: (i64, i64) = connection
+        .query_row(
+            "SELECT version, min_reader_version FROM state_components
+             WHERE component_id = 'durable:generation_delivery'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let source_column: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('generation_paths')
+                WHERE name = 'source_connection_id'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let rows: i64 = connection
+        .query_row("SELECT COUNT(*) FROM generation_paths", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(component, (6, 6));
+    assert!(!source_column);
+    assert_eq!(rows, 2);
+    connection
+        .execute(
+            "DELETE FROM generation_paths WHERE projection_id = 'projection-injected'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    assert_eq!(
+        reopened
+            .list_generation_paths_for_source(
+                &fixture.mount_id,
+                &SourceConnectionId::new("source-main"),
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn shared_mount_applies_and_acknowledgments_advance_sources_independently() {
+    let fixture = Fixture::new("shared-mount-independent-applies");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "backend",
+            &fixture.mount_root,
+        ))
+        .unwrap();
+    let a1 = identity_for("projection-a", "A.md", "content-a1", 'a', 1);
+    let a2 = identity_for("projection-a", "A.md", "content-a2", 'c', 2);
+    let b1 = identity_for("projection-b", "B.md", "content-b1", 'b', 1);
+    let b2 = identity_for("projection-b", "B.md", "content-b2", 'd', 2);
+    store
+        .seed_observed_generations(vec![
+            source_seed(
+                &fixture.mount_id,
+                "source-a",
+                "generation-a1",
+                Some(a1.clone()),
+            ),
+            source_seed(
+                &fixture.mount_id,
+                "source-b",
+                "generation-b1",
+                Some(b1.clone()),
+            ),
+        ])
+        .unwrap();
+
+    let crossed = delta_for_source(
+        "delta-crossed",
+        "source-a",
+        "generation-a1",
+        "generation-a2",
+        Some(b1.clone()),
+        Some(b2.clone()),
+    );
+    let crossed_receipt = receipt(&crossed);
+    assert!(
+        store
+            .reserve_generation_apply(PreparedGenerationApply {
+                delta: crossed,
+                receipt_sha256: crossed_receipt.canonical_sha256().unwrap(),
+                receipt: crossed_receipt,
+                stage_root: "generation-delivery/crossed".to_string(),
+                created_at: "2026-07-31T12:00:00Z".to_string(),
+            })
+            .is_err(),
+        "source A must not inspect source B's projection base"
+    );
+
+    let deltas = [
+        delta_for_source(
+            "delta-a2",
+            "source-a",
+            "generation-a1",
+            "generation-a2",
+            Some(a1),
+            Some(a2),
+        ),
+        delta_for_source(
+            "delta-b2",
+            "source-b",
+            "generation-b1",
+            "generation-b2",
+            Some(b1),
+            Some(b2),
+        ),
+    ];
+    for delta in &deltas {
+        let receipt = receipt(delta);
+        store
+            .reserve_generation_apply_v2(PreparedGenerationApplyV2::new(
+                PreparedGenerationApply {
+                    delta: delta.clone(),
+                    receipt_sha256: receipt.canonical_sha256().unwrap(),
+                    receipt,
+                    stage_root: format!("generation-delivery/{}", delta.delta_id),
+                    created_at: "2026-07-31T12:01:00Z".to_string(),
+                },
+                true,
+            ))
+            .unwrap();
+        store
+            .record_generation_apply_outcome(
+                &delta.delta_id,
+                0,
+                GenerationApplyOutcome::Applied,
+                "2026-07-31T12:02:00Z",
+            )
+            .unwrap();
+        store
+            .complete_generation_apply(&delta.delta_id, "2026-07-31T12:03:00Z")
+            .unwrap();
+    }
+
+    assert_eq!(
+        store
+            .get_observed_generation_for_source(
+                &fixture.mount_id,
+                &SourceConnectionId::new("source-a"),
+            )
+            .unwrap()
+            .unwrap()
+            .generation_id,
+        generation("generation-a2")
+    );
+    assert_eq!(
+        store
+            .get_observed_generation_for_source(
+                &fixture.mount_id,
+                &SourceConnectionId::new("source-b"),
+            )
+            .unwrap()
+            .unwrap()
+            .generation_id,
+        generation("generation-b2")
+    );
+    assert_eq!(
+        store
+            .list_pending_generation_acknowledgments_for_source(
+                &fixture.mount_id,
+                &SourceConnectionId::new("source-a"),
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+    let a_journal = store.get_generation_apply("delta-a2").unwrap().unwrap();
+    store
+        .mark_generation_acknowledged(
+            "delta-a2",
+            &a_journal.receipt_sha256,
+            "2026-07-31T12:04:00Z",
+        )
+        .unwrap();
+    assert!(
+        store
+            .list_pending_generation_acknowledgments_for_source(
+                &fixture.mount_id,
+                &SourceConnectionId::new("source-a"),
+            )
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .list_pending_generation_acknowledgments_for_source(
+                &fixture.mount_id,
+                &SourceConnectionId::new("source-b"),
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+    store
+        .reset_observed_generation_source(&fixture.mount_id, &SourceConnectionId::new("source-a"))
+        .unwrap();
+    assert!(
+        store
+            .get_observed_generation_for_source(
+                &fixture.mount_id,
+                &SourceConnectionId::new("source-a"),
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .get_observed_generation_for_source(
+                &fixture.mount_id,
+                &SourceConnectionId::new("source-b"),
+            )
+            .unwrap()
+            .unwrap()
+            .generation_id,
+        generation("generation-b2")
+    );
+}
+
+#[test]
+fn source_reset_is_fenced_by_another_sources_active_mount_apply() {
+    let fixture = Fixture::new("shared-mount-reset-active-other-source");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "backend",
+            &fixture.mount_root,
+        ))
+        .unwrap();
+    let a1 = identity_for("projection-a", "A.md", "content-a1", 'a', 1);
+    let b1 = identity_for("projection-b", "B.md", "content-b1", 'b', 1);
+    let b2 = identity_for("projection-b", "B.md", "content-b2", 'd', 2);
+    store
+        .seed_observed_generations(vec![
+            source_seed(&fixture.mount_id, "source-a", "generation-a1", Some(a1)),
+            source_seed(
+                &fixture.mount_id,
+                "source-b",
+                "generation-b1",
+                Some(b1.clone()),
+            ),
+        ])
+        .unwrap();
+    let delta = delta_for_source(
+        "delta-b-active",
+        "source-b",
+        "generation-b1",
+        "generation-b2",
+        Some(b1),
+        Some(b2),
+    );
+    let terminal_receipt = receipt(&delta);
+    store
+        .reserve_generation_apply(PreparedGenerationApply {
+            delta,
+            receipt_sha256: terminal_receipt.canonical_sha256().unwrap(),
+            receipt: terminal_receipt,
+            stage_root: "generation-delivery/delta-b-active".to_string(),
+            created_at: "2026-07-31T12:01:00Z".to_string(),
+        })
+        .unwrap();
+
+    let error = store
+        .reset_observed_generation_source(&fixture.mount_id, &SourceConnectionId::new("source-a"))
+        .expect_err("source A reset must not invalidate source B's active mount transaction");
+
+    assert!(matches!(error, StoreError::InvalidState(_)));
+    assert!(
+        store
+            .get_observed_generation_for_source(
+                &fixture.mount_id,
+                &SourceConnectionId::new("source-a"),
+            )
+            .unwrap()
+            .is_some()
     );
 }
 
@@ -443,7 +1426,7 @@ fn schema_24_component_v3_migrates_existing_journals_without_pending_acknowledgm
     let user_version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(component, (6, 6));
+    assert_eq!(component, (7, 7));
     assert_eq!(user_version, 27);
 }
 
@@ -1283,7 +2266,8 @@ fn schema_20_migration_preserves_pending_local_state_and_adds_delivery_tables() 
     connection
         .execute_batch(
             "DROP TABLE generation_apply_outcomes;
-         DROP INDEX generation_apply_one_active_per_source;
+         DROP INDEX IF EXISTS generation_apply_one_active_per_source;
+         DROP INDEX IF EXISTS generation_apply_one_active_per_mount;
          DROP TABLE generation_apply_journals;
          DROP TABLE generation_paths;
          DROP TABLE observed_generations;
@@ -1378,7 +2362,7 @@ fn genuine_schema_21_component_v1_fixture_migrates_without_losing_active_state()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(component, (6, 6));
+    assert_eq!(component, (7, 7));
     let error = reopened
         .clear_mount_source_state(&fixture.mount_id)
         .expect_err("migrated active journal must fence source reset");
@@ -1389,7 +2373,7 @@ fn genuine_schema_21_component_v1_fixture_migrates_without_losing_active_state()
 fn current_schema_generation_v3_migrates_dual_inode_evidence_and_tombstone_columns() {
     use rusqlite::Connection;
 
-    let fixture = Fixture::new("generation-v3-to-v6");
+    let fixture = Fixture::new("generation-v3-to-v7");
     let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
     seed(&mut store, &fixture);
     let db_path = store.db_path.clone();
@@ -1431,7 +2415,7 @@ fn current_schema_generation_v3_migrates_dual_inode_evidence_and_tombstone_colum
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(present, "v6 migration did not add {column}");
+        assert!(present, "v7 migration did not add {column}");
     }
     let component: (i64, i64) = connection
         .query_row(
@@ -1441,11 +2425,11 @@ fn current_schema_generation_v3_migrates_dual_inode_evidence_and_tombstone_colum
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(component, (6, 6));
+    assert_eq!(component, (7, 7));
 }
 
 #[test]
-fn partial_v2_v6_generation_migration_is_atomic_and_resumable_per_column() {
+fn partial_v2_v7_generation_migration_is_atomic_and_resumable_per_column() {
     use rusqlite::Connection;
 
     let fixture = Fixture::new("partial-v2-v6-migration");
@@ -1456,7 +2440,8 @@ fn partial_v2_v6_generation_migration_is_atomic_and_resumable_per_column() {
 
     let connection = Connection::open(&db_path).unwrap();
     connection
-        .execute_batch(
+        .execute_batch(concat!(
+            include_str!("fixtures/generation-delivery-component-v6.sql"),
             "ALTER TABLE generation_paths DROP COLUMN base_payload_entry_index;
              ALTER TABLE generation_paths DROP COLUMN local_logical_path;
              ALTER TABLE generation_paths DROP COLUMN conflict_payload_entry_index;
@@ -1475,8 +2460,8 @@ fn partial_v2_v6_generation_migration_is_atomic_and_resumable_per_column() {
              WHERE component_id = 'durable:generation_delivery';
              UPDATE state_components SET version = 23
              WHERE component_id = 'core:schema';
-             PRAGMA user_version = 23;",
-        )
+             PRAGMA user_version = 23;"
+        ))
         .unwrap();
     drop(connection);
 
@@ -1555,7 +2540,7 @@ fn partial_v2_v6_generation_migration_is_atomic_and_resumable_per_column() {
     let user_version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(component, (6, 6));
+    assert_eq!(component, (7, 7));
     assert_eq!(user_version, 27);
     assert_eq!(
         reopened.list_generation_paths(&fixture.mount_id).unwrap()[0].local_logical_path,
