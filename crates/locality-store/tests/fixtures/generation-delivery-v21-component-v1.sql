@@ -25,7 +25,8 @@ DROP TABLE generation_paths_current;
 
 ALTER TABLE generation_apply_outcomes RENAME TO generation_apply_outcomes_current;
 ALTER TABLE generation_apply_journals RENAME TO generation_apply_journals_current;
-DROP INDEX generation_apply_one_active_per_source;
+DROP INDEX IF EXISTS generation_apply_one_active_per_source;
+DROP INDEX IF EXISTS generation_apply_one_active_per_mount;
 CREATE TABLE generation_apply_journals (
     delta_id TEXT PRIMARY KEY,
     source_connection_id TEXT NOT NULL,

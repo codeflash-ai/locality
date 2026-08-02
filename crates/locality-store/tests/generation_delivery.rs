@@ -18,14 +18,16 @@ use locality_protocol::freshness_delivery_transport::{
     GenerationBodyWindowCapability, GenerationPinFallbackPolicy, GenerationPinLeaseCapability,
     GenerationTransportCapabilities,
 };
+use locality_protocol::generation_baseline::GenerationBaselineRefreshModeV1;
 use locality_protocol::workspace_layout::LayoutDigest;
 use locality_store::{
     ConnectionId, GenerationApplyOutcome, GenerationApplyStatus, GenerationBaselineSeedRecord,
-    GenerationDeliveryRepository, GenerationInodeEvidenceConflictUpdate,
-    GenerationInodeEvidenceRecord, GenerationInodeEvidenceResolution, GenerationPathRecord,
-    GenerationPathState, GenerationRetainedInodeRecord, GenerationTransportSelectionBinding,
-    MountConfig, MountRepository, ObservedGenerationRecord, PreparedGenerationApply,
-    PreparedGenerationApplyV2, PreparedGenerationApplyV3, SqliteStateStore, StoreError,
+    GenerationBaselineSeedRecordV2, GenerationDeliveryRepository,
+    GenerationInodeEvidenceConflictUpdate, GenerationInodeEvidenceRecord,
+    GenerationInodeEvidenceResolution, GenerationPathRecord, GenerationPathState,
+    GenerationRetainedInodeRecord, GenerationTransportSelectionBinding, MountConfig,
+    MountRepository, ObservedGenerationRecord, PreparedGenerationApply, PreparedGenerationApplyV2,
+    PreparedGenerationApplyV3, SqliteStateStore, StoreError,
 };
 
 fn digest(character: char) -> String {
@@ -371,6 +373,125 @@ fn changed_multi_source_replay_rolls_back_new_source() {
 }
 
 #[test]
+fn active_apply_is_mount_wide_and_fences_baseline_target_claims() {
+    let fixture = Fixture::new("shared-mount-active-fence");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "backend",
+            &fixture.mount_root,
+        ))
+        .unwrap();
+    store
+        .seed_observed_generations(vec![
+            source_seed(&fixture.mount_id, "source-a", "generation-a1", None),
+            source_seed(&fixture.mount_id, "source-b", "generation-b1", None),
+        ])
+        .unwrap();
+
+    let claimed = identity_for("projection-claim", "Claim.md", "content-a2", 'a', 1);
+    let delta_a = delta_for_source(
+        "delta-a-active",
+        "source-a",
+        "generation-a1",
+        "generation-a2",
+        None,
+        Some(claimed.clone()),
+    );
+    let receipt_a = receipt(&delta_a);
+    store
+        .reserve_generation_apply(PreparedGenerationApply {
+            delta: delta_a,
+            receipt_sha256: receipt_a.canonical_sha256().unwrap(),
+            receipt: receipt_a,
+            stage_root: "generation-delivery/delta-a-active".to_string(),
+            created_at: "2026-07-31T12:01:00Z".to_string(),
+        })
+        .unwrap();
+
+    let delta_b = delta_for_source(
+        "delta-b-concurrent",
+        "source-b",
+        "generation-b1",
+        "generation-b2",
+        None,
+        Some(identity_for("projection-b", "B.md", "content-b2", 'b', 1)),
+    );
+    let receipt_b = receipt(&delta_b);
+    assert!(
+        store
+            .reserve_generation_apply(PreparedGenerationApply {
+                delta: delta_b,
+                receipt_sha256: receipt_b.canonical_sha256().unwrap(),
+                receipt: receipt_b,
+                stage_root: "generation-delivery/delta-b-concurrent".to_string(),
+                created_at: "2026-07-31T12:01:00Z".to_string(),
+            })
+            .is_err(),
+        "another source cannot reserve an apply while the mount has a durable target claim"
+    );
+
+    let source_c = source_seed(
+        &fixture.mount_id,
+        "source-c",
+        "generation-c1",
+        Some(claimed),
+    );
+    assert!(store.seed_observed_generations(vec![source_c]).is_err());
+    assert!(
+        store
+            .get_observed_generation_for_source(
+                &fixture.mount_id,
+                &SourceConnectionId::new("source-c"),
+            )
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn typed_refresh_mode_is_validated_persisted_and_never_defaulted_for_ineligible_state() {
+    let fixture = Fixture::new("typed-refresh-mode");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "backend",
+            &fixture.mount_root,
+        ))
+        .unwrap();
+    let long_source = "s".repeat(129);
+    let seed = source_seed(
+        &fixture.mount_id,
+        &long_source,
+        "generation-full-export",
+        None,
+    );
+    assert!(
+        store.seed_observed_generations(vec![seed.clone()]).is_err(),
+        "the compatibility API must not silently label an ineligible source as delta-capable"
+    );
+    store
+        .seed_observed_generations_v2(vec![GenerationBaselineSeedRecordV2::new(
+            seed,
+            GenerationBaselineRefreshModeV1::FullExportOnly,
+        )])
+        .unwrap();
+    let persisted = store
+        .get_observed_generation_for_source_v2(
+            &fixture.mount_id,
+            &SourceConnectionId::new(long_source),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        persisted.refresh_mode,
+        GenerationBaselineRefreshModeV1::FullExportOnly
+    );
+}
+
+#[test]
 fn v6_fixture_migrates_exact_generation_rows_and_paths_to_v7() {
     use rusqlite::Connection;
 
@@ -433,6 +554,56 @@ fn v6_fixture_migrates_exact_generation_rows_and_paths_to_v7() {
         .unwrap();
     assert_eq!(component, (7, 7));
     assert_eq!(primary_key, ["mount_id", "source_connection_id"]);
+    assert_eq!(
+        reopened
+            .get_observed_generation_for_source_v2(
+                &fixture.mount_id,
+                &expected_observed.source_connection_id,
+            )
+            .unwrap()
+            .unwrap()
+            .refresh_mode,
+        GenerationBaselineRefreshModeV1::GenerationDeltaV1
+    );
+}
+
+#[test]
+fn v6_ineligible_generation_row_migrates_to_full_export_only() {
+    use rusqlite::Connection;
+
+    let fixture = Fixture::new("migration-component-v6-full-export");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    seed(&mut store, &fixture);
+    let db_path = store.db_path.clone();
+    drop(store);
+
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(include_str!(
+            "fixtures/generation-delivery-component-v6.sql"
+        ))
+        .unwrap();
+    let long_source = "s".repeat(129);
+    connection
+        .execute(
+            "UPDATE observed_generations SET source_connection_id = ?1",
+            [&long_source],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    let migrated = reopened
+        .get_observed_generation_for_source_v2(
+            &fixture.mount_id,
+            &SourceConnectionId::new(long_source),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        migrated.refresh_mode,
+        GenerationBaselineRefreshModeV1::FullExportOnly
+    );
 }
 
 #[test]
@@ -605,8 +776,6 @@ fn shared_mount_applies_and_acknowledgments_advance_sources_independently() {
                 true,
             ))
             .unwrap();
-    }
-    for delta in &deltas {
         store
             .record_generation_apply_outcome(
                 &delta.delta_id,
@@ -1810,7 +1979,8 @@ fn schema_20_migration_preserves_pending_local_state_and_adds_delivery_tables() 
     connection
         .execute_batch(
             "DROP TABLE generation_apply_outcomes;
-         DROP INDEX generation_apply_one_active_per_source;
+         DROP INDEX IF EXISTS generation_apply_one_active_per_source;
+         DROP INDEX IF EXISTS generation_apply_one_active_per_mount;
          DROP TABLE generation_apply_journals;
          DROP TABLE generation_paths;
          DROP TABLE observed_generations;

@@ -442,7 +442,7 @@ journals: push_id, mount_id, remote_ids_json, plan_json, preimages_json, apply_e
 metadata_discovery_jobs: mount_id, container_identifier, priority_json, depth, attempts, last_error, created_at, updated_at
 mount_live_modes: mount_id, enabled, state_json, last_reason, last_run_at, created_at, updated_at
 mounts: mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, settings_json
-observed_generations: mount_id, source_connection_id, generation_id, inventory_sha256, workspace_layout_version, workspace_layout_digest, last_receipt_sha256, updated_at
+observed_generations: mount_id, source_connection_id, generation_id, inventory_sha256, workspace_layout_version, workspace_layout_digest, last_receipt_sha256, updated_at, refresh_mode
 projection_state: mount_id, projection, layout_version, min_reader_version, os_domain_id, root_item_id, repair_generation, state_json, updated_at
 remote_observations: mount_id, remote_id, kind_json, title, parent_remote_id, projected_path, remote_version_json, observed_at, deleted, raw_metadata_json
 search_documents_fts: mount_id, remote_id, connector, kind, title, path, observed_title, observed_path, frontmatter, body, metadata_text, breadcrumbs, aliases, source_url
@@ -580,7 +580,8 @@ fn sqlite_store_migrates_released_workspace_v21_with_generation_tables_absent() 
         .execute_batch(
             "DROP TABLE generation_inode_evidence;
              DROP TABLE generation_apply_outcomes;
-             DROP INDEX generation_apply_one_active_per_source;
+             DROP INDEX IF EXISTS generation_apply_one_active_per_source;
+             DROP INDEX IF EXISTS generation_apply_one_active_per_mount;
              DROP TABLE generation_apply_journals;
              DROP TABLE generation_paths;
              DROP TABLE observed_generations;

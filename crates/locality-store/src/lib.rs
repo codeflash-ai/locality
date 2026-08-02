@@ -34,12 +34,12 @@ pub use discovery::{
 pub use error::{StoreError, StoreResult};
 pub use generation_delivery::{
     GenerationApplyJournalRecord, GenerationApplyOutcome, GenerationApplyStatus,
-    GenerationBaselineSeedRecord, GenerationDeliveryRepository,
+    GenerationBaselineSeedRecord, GenerationBaselineSeedRecordV2, GenerationDeliveryRepository,
     GenerationInodeEvidenceConflictUpdate, GenerationInodeEvidenceRecord,
     GenerationInodeEvidenceResolution, GenerationPathRecord, GenerationPathState,
     GenerationRetainedInodeRecord, GenerationTransportSelectionBinding,
-    NegotiatedGenerationApplyJournalRecord, ObservedGenerationRecord, PreparedGenerationApply,
-    PreparedGenerationApplyV2, PreparedGenerationApplyV3,
+    NegotiatedGenerationApplyJournalRecord, ObservedGenerationRecord, ObservedGenerationRecordV2,
+    PreparedGenerationApply, PreparedGenerationApplyV2, PreparedGenerationApplyV3,
 };
 pub use live_mode::{
     LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountLiveModeStateChangeError,

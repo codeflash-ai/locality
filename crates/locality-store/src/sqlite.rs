@@ -21,7 +21,8 @@ use locality_core::planner::{PlanSummary, PushOperation, PushPlan};
 use locality_core::readable_diff::ReadableDiffOutput;
 use locality_core::search::{RAW_SEARCH_METADATA_KEY, SearchMetadata};
 use locality_core::shadow::ShadowDocument;
-use locality_protocol::freshness_delivery::GenerationDelta;
+use locality_protocol::freshness_delivery::{GenerationDelta, MAX_DELIVERY_ID_BYTES};
+use locality_protocol::generation_baseline::GenerationBaselineRefreshModeV1;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -42,12 +43,12 @@ use crate::discovery::{
 use crate::error::{StoreError, StoreResult};
 use crate::generation_delivery::{
     GENERATION_DELIVERY_COMPONENT_VERSION, GenerationApplyJournalRecord, GenerationApplyOutcome,
-    GenerationApplyStatus, GenerationBaselineSeedRecord, GenerationDeliveryRepository,
-    GenerationInodeEvidenceConflictUpdate, GenerationInodeEvidenceRecord,
-    GenerationInodeEvidenceResolution, GenerationPathRecord, GenerationPathState,
-    GenerationRetainedInodeRecord, GenerationTransportSelectionBinding,
-    NegotiatedGenerationApplyJournalRecord, ObservedGenerationRecord, PreparedGenerationApply,
-    PreparedGenerationApplyV2, PreparedGenerationApplyV3,
+    GenerationApplyStatus, GenerationBaselineSeedRecord, GenerationBaselineSeedRecordV2,
+    GenerationDeliveryRepository, GenerationInodeEvidenceConflictUpdate,
+    GenerationInodeEvidenceRecord, GenerationInodeEvidenceResolution, GenerationPathRecord,
+    GenerationPathState, GenerationRetainedInodeRecord, GenerationTransportSelectionBinding,
+    NegotiatedGenerationApplyJournalRecord, ObservedGenerationRecord, ObservedGenerationRecordV2,
+    PreparedGenerationApply, PreparedGenerationApplyV2, PreparedGenerationApplyV3,
 };
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
@@ -338,6 +339,50 @@ fn parse_generation_path_state(value: &str) -> StoreResult<GenerationPathState> 
     }
 }
 
+fn generation_baseline_refresh_mode_label(mode: GenerationBaselineRefreshModeV1) -> &'static str {
+    match mode {
+        GenerationBaselineRefreshModeV1::GenerationDeltaV1 => "generation_delta_v1",
+        GenerationBaselineRefreshModeV1::FullExportOnly => "full_export_only",
+    }
+}
+
+fn parse_generation_baseline_refresh_mode(
+    value: &str,
+) -> StoreResult<GenerationBaselineRefreshModeV1> {
+    match value {
+        "generation_delta_v1" => Ok(GenerationBaselineRefreshModeV1::GenerationDeltaV1),
+        "full_export_only" => Ok(GenerationBaselineRefreshModeV1::FullExportOnly),
+        _ => Err(StoreError::InvalidState(format!(
+            "unknown generation baseline refresh mode `{value}`"
+        ))),
+    }
+}
+
+fn generation_seed_refresh_mode(
+    observed: &ObservedGenerationRecord,
+    paths: &[GenerationPathRecord],
+) -> GenerationBaselineRefreshModeV1 {
+    let identifiers_fit = !observed.mount_id.as_str().is_empty()
+        && observed.mount_id.as_str().len() <= MAX_DELIVERY_ID_BYTES
+        && !observed.source_connection_id.as_str().is_empty()
+        && observed.source_connection_id.as_str().len() <= MAX_DELIVERY_ID_BYTES
+        && observed.generation_id.as_str().len() <= MAX_DELIVERY_ID_BYTES
+        && paths.iter().all(|path| {
+            !path.projection_id.as_str().is_empty()
+                && path.projection_id.as_str().len() <= MAX_DELIVERY_ID_BYTES
+                && path
+                    .base_identity
+                    .iter()
+                    .chain(path.incoming_identity.iter())
+                    .all(|identity| identity.validate().is_ok())
+        });
+    if identifiers_fit {
+        GenerationBaselineRefreshModeV1::GenerationDeltaV1
+    } else {
+        GenerationBaselineRefreshModeV1::FullExportOnly
+    }
+}
+
 fn observed_generation_from_row(
     row: (
         String,
@@ -411,6 +456,45 @@ fn select_observed_generation_for_source(
         .transpose()
 }
 
+fn select_observed_generation_for_source_v2(
+    connection: &Connection,
+    mount_id: &MountId,
+    source_connection_id: &locality_core::portable::SourceConnectionId,
+) -> StoreResult<Option<ObservedGenerationRecordV2>> {
+    connection
+        .query_row(
+            "SELECT mount_id, source_connection_id, generation_id, inventory_sha256,
+                    workspace_layout_version, workspace_layout_digest,
+                    last_receipt_sha256, updated_at, refresh_mode
+             FROM observed_generations
+             WHERE mount_id = ?1 AND source_connection_id = ?2",
+            params![mount_id.0.as_str(), source_connection_id.as_str()],
+            |row| {
+                Ok((
+                    (
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ),
+                    row.get::<_, String>(8)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(|(row, refresh_mode)| {
+            Ok(ObservedGenerationRecordV2::new(
+                observed_generation_from_row(row)?,
+                parse_generation_baseline_refresh_mode(&refresh_mode)?,
+            ))
+        })
+        .transpose()
+}
+
 fn list_observed_generations_from_connection(
     connection: &Connection,
     mount_id: &MountId,
@@ -436,6 +520,43 @@ fn list_observed_generations_from_connection(
         ))
     })?;
     rows.map(|row| observed_generation_from_row(row?)).collect()
+}
+
+fn list_observed_generations_v2_from_connection(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<Vec<ObservedGenerationRecordV2>> {
+    let mut statement = connection.prepare(
+        "SELECT mount_id, source_connection_id, generation_id, inventory_sha256,
+                workspace_layout_version, workspace_layout_digest,
+                last_receipt_sha256, updated_at, refresh_mode
+         FROM observed_generations
+         WHERE mount_id = ?1
+         ORDER BY source_connection_id",
+    )?;
+    let rows = statement.query_map(params![mount_id.0.as_str()], |row| {
+        Ok((
+            (
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ),
+            row.get::<_, String>(8)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (observed, refresh_mode) = row?;
+        Ok(ObservedGenerationRecordV2::new(
+            observed_generation_from_row(observed)?,
+            parse_generation_baseline_refresh_mode(&refresh_mode)?,
+        ))
+    })
+    .collect()
 }
 
 fn generation_path_from_row(
@@ -803,33 +924,64 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 observed.mount_id.0
             )));
         }
-        self.seed_observed_generations(vec![GenerationBaselineSeedRecord::new(observed, paths)])
+        self.seed_observed_generations_v2(vec![GenerationBaselineSeedRecordV2::new(
+            GenerationBaselineSeedRecord::new(observed, paths),
+            GenerationBaselineRefreshModeV1::GenerationDeltaV1,
+        )])
     }
 
     fn seed_observed_generations(
         &mut self,
-        mut seeds: Vec<GenerationBaselineSeedRecord>,
+        seeds: Vec<GenerationBaselineSeedRecord>,
+    ) -> StoreResult<()> {
+        self.seed_observed_generations_v2(
+            seeds
+                .into_iter()
+                .map(|seed| {
+                    GenerationBaselineSeedRecordV2::new(
+                        seed,
+                        GenerationBaselineRefreshModeV1::GenerationDeltaV1,
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn seed_observed_generations_v2(
+        &mut self,
+        mut seeds: Vec<GenerationBaselineSeedRecordV2>,
     ) -> StoreResult<()> {
         for seed in &mut seeds {
-            validate_seed_generation(&seed.observed, &seed.paths)?;
-            seed.paths
+            validate_seed_generation(&seed.seed.observed, &seed.seed.paths)?;
+            let expected_mode = generation_seed_refresh_mode(&seed.seed.observed, &seed.seed.paths);
+            if seed.refresh_mode != expected_mode {
+                return Err(StoreError::InvalidState(format!(
+                    "mount `{}` source `{}` baseline refresh mode does not match its generation state",
+                    seed.seed.observed.mount_id.0,
+                    seed.seed.observed.source_connection_id.as_str()
+                )));
+            }
+            seed.seed
+                .paths
                 .sort_by(|left, right| left.projection_id.cmp(&right.projection_id));
         }
         seeds.sort_by(|left, right| {
-            left.observed
+            left.seed
+                .observed
                 .mount_id
-                .cmp(&right.observed.mount_id)
+                .cmp(&right.seed.observed.mount_id)
                 .then_with(|| {
-                    left.observed
+                    left.seed
+                        .observed
                         .source_connection_id
-                        .cmp(&right.observed.source_connection_id)
+                        .cmp(&right.seed.observed.source_connection_id)
                 })
         });
         let mut source_pairs = BTreeSet::new();
         if seeds.iter().any(|seed| {
             !source_pairs.insert((
-                seed.observed.mount_id.clone(),
-                seed.observed.source_connection_id.clone(),
+                seed.seed.observed.mount_id.clone(),
+                seed.seed.observed.source_connection_id.clone(),
             ))
         }) {
             return Err(StoreError::InvalidState(
@@ -842,11 +994,34 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         for seed in &seeds {
             let mount_exists = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM mounts WHERE mount_id = ?1)",
-                params![seed.observed.mount_id.0.as_str()],
+                params![seed.seed.observed.mount_id.0.as_str()],
                 |row| row.get::<_, bool>(0),
             )?;
             if !mount_exists {
-                return Err(StoreError::MountMissing(seed.observed.mount_id.clone()));
+                return Err(StoreError::MountMissing(
+                    seed.seed.observed.mount_id.clone(),
+                ));
+            }
+        }
+
+        let mounts = seeds
+            .iter()
+            .map(|seed| seed.seed.observed.mount_id.clone())
+            .collect::<BTreeSet<_>>();
+        for mount_id in &mounts {
+            let active: Option<String> = transaction
+                .query_row(
+                    "SELECT delta_id FROM generation_apply_journals
+                     WHERE mount_id = ?1 AND active = 1 ORDER BY delta_id LIMIT 1",
+                    params![mount_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(delta_id) = active {
+                return Err(StoreError::InvalidState(format!(
+                    "mount `{}` cannot seed a generation baseline while apply `{delta_id}` is active",
+                    mount_id.0
+                )));
             }
         }
 
@@ -856,19 +1031,28 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         for (index, seed) in seeds.iter().enumerate() {
             if let Some(existing) = select_observed_generation_for_source(
                 &transaction,
-                &seed.observed.mount_id,
-                &seed.observed.source_connection_id,
+                &seed.seed.observed.mount_id,
+                &seed.seed.observed.source_connection_id,
             )? {
+                let existing_v2 = select_observed_generation_for_source_v2(
+                    &transaction,
+                    &seed.seed.observed.mount_id,
+                    &seed.seed.observed.source_connection_id,
+                )?
+                .expect("the same observed row was selected");
                 let existing_paths = list_generation_paths_for_source_from_connection(
                     &transaction,
-                    &seed.observed.mount_id,
-                    &seed.observed.source_connection_id,
+                    &seed.seed.observed.mount_id,
+                    &seed.seed.observed.source_connection_id,
                 )?;
-                if existing != seed.observed || existing_paths != seed.paths {
+                if existing != seed.seed.observed
+                    || existing_v2.refresh_mode != seed.refresh_mode
+                    || existing_paths != seed.seed.paths
+                {
                     return Err(StoreError::InvalidState(format!(
                         "mount `{}` source `{}` already has a different observed generation",
-                        seed.observed.mount_id.0,
-                        seed.observed.source_connection_id.as_str()
+                        seed.seed.observed.mount_id.0,
+                        seed.seed.observed.source_connection_id.as_str()
                     )));
                 }
             } else {
@@ -878,10 +1062,6 @@ impl GenerationDeliveryRepository for SqliteStateStore {
 
         // Projection IDs and both remote and local portable paths remain
         // mount-wide namespaces even when their source heads are independent.
-        let mounts = seeds
-            .iter()
-            .map(|seed| seed.observed.mount_id.clone())
-            .collect::<BTreeSet<_>>();
         let mut projections = BTreeSet::new();
         let mut logical_paths = BTreeSet::new();
         let mut local_paths = BTreeSet::new();
@@ -904,25 +1084,25 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         }
         for &index in &insert_indexes {
             let seed = &seeds[index];
-            for path in &seed.paths {
+            for path in &seed.seed.paths {
                 let logical = locality_core::portable::LogicalPath::new(path.logical_path.clone())
                     .map_err(|error| StoreError::InvalidState(error.to_string()))?;
                 let local =
                     locality_core::portable::LogicalPath::new(path.local_logical_path.clone())
                         .map_err(|error| StoreError::InvalidState(error.to_string()))?;
-                if !projections.insert((seed.observed.mount_id.clone(), path.projection_id.clone()))
-                    || !logical_paths.insert((
-                        seed.observed.mount_id.clone(),
-                        logical.portable_collision_key(),
-                    ))
-                    || !local_paths.insert((
-                        seed.observed.mount_id.clone(),
-                        local.portable_collision_key(),
-                    ))
-                {
+                if !projections.insert((
+                    seed.seed.observed.mount_id.clone(),
+                    path.projection_id.clone(),
+                )) || !logical_paths.insert((
+                    seed.seed.observed.mount_id.clone(),
+                    logical.portable_collision_key(),
+                )) || !local_paths.insert((
+                    seed.seed.observed.mount_id.clone(),
+                    local.portable_collision_key(),
+                )) {
                     return Err(StoreError::InvalidState(format!(
                         "mount `{}` generation baseline has a projection or path collision",
-                        seed.observed.mount_id.0
+                        seed.seed.observed.mount_id.0
                     )));
                 }
             }
@@ -930,13 +1110,13 @@ impl GenerationDeliveryRepository for SqliteStateStore {
 
         for index in insert_indexes {
             let seed = &seeds[index];
-            let observed = &seed.observed;
+            let observed = &seed.seed.observed;
             transaction.execute(
                 "INSERT INTO observed_generations (
                     mount_id, source_connection_id, generation_id, inventory_sha256,
                     workspace_layout_version, workspace_layout_digest,
-                    last_receipt_sha256, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    last_receipt_sha256, updated_at, refresh_mode
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     observed.mount_id.0.as_str(),
                     observed.source_connection_id.as_str(),
@@ -946,9 +1126,10 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                     observed.workspace_layout_digest.as_str(),
                     observed.last_receipt_sha256.as_deref(),
                     observed.updated_at.as_str(),
+                    generation_baseline_refresh_mode_label(seed.refresh_mode),
                 ],
             )?;
-            for path in &seed.paths {
+            for path in &seed.seed.paths {
                 transaction.execute(
                     "INSERT INTO generation_paths (
                         mount_id, source_connection_id, projection_id, logical_path,
@@ -1005,11 +1186,30 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         select_observed_generation_for_source(&self.connection()?, mount_id, source_connection_id)
     }
 
+    fn get_observed_generation_for_source_v2(
+        &self,
+        mount_id: &MountId,
+        source_connection_id: &locality_core::portable::SourceConnectionId,
+    ) -> StoreResult<Option<ObservedGenerationRecordV2>> {
+        select_observed_generation_for_source_v2(
+            &self.connection()?,
+            mount_id,
+            source_connection_id,
+        )
+    }
+
     fn list_observed_generations(
         &self,
         mount_id: &MountId,
     ) -> StoreResult<Vec<ObservedGenerationRecord>> {
         list_observed_generations_from_connection(&self.connection()?, mount_id)
+    }
+
+    fn list_observed_generations_v2(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Vec<ObservedGenerationRecordV2>> {
+        list_observed_generations_v2_from_connection(&self.connection()?, mount_id)
     }
 
     fn list_generation_paths(&self, mount_id: &MountId) -> StoreResult<Vec<GenerationPathRecord>> {
@@ -1167,7 +1367,7 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         }
 
         let mount_id = MountId::new(prepared.delta.mount_id.as_str());
-        let observed = select_observed_generation_for_source(
+        let observed = select_observed_generation_for_source_v2(
             &transaction,
             &mount_id,
             &prepared.delta.source_connection_id,
@@ -1179,6 +1379,14 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                 prepared.delta.source_connection_id.as_str()
             ))
         })?;
+        if observed.refresh_mode != GenerationBaselineRefreshModeV1::GenerationDeltaV1 {
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` source `{}` requires a full export",
+                prepared.delta.mount_id,
+                prepared.delta.source_connection_id.as_str()
+            )));
+        }
+        let observed = observed.observed;
         if observed.generation_id != prepared.delta.base_generation_id
             || observed.workspace_layout_version != prepared.delta.workspace_layout_version
             || observed.workspace_layout_digest != prepared.delta.workspace_layout_digest.as_str()
@@ -1218,14 +1426,14 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         let active: Option<String> = transaction
             .query_row(
                 "SELECT delta_id FROM generation_apply_journals
-                 WHERE source_connection_id = ?1 AND active = 1",
-                params![prepared.delta.source_connection_id.as_str()],
+                 WHERE mount_id = ?1 AND active = 1",
+                params![prepared.delta.mount_id.as_str()],
                 |row| row.get(0),
             )
             .optional()?;
         if let Some(active) = active {
             return Err(StoreError::InvalidState(format!(
-                "source already has active generation apply `{active}`"
+                "mount already has active generation apply `{active}`"
             )));
         }
         transaction.execute(
@@ -1385,6 +1593,34 @@ impl GenerationDeliveryRepository for SqliteStateStore {
             )?;
             statement
                 .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        delta_ids
+            .iter()
+            .map(|delta_id| {
+                generation_apply_from_connection(&connection, delta_id)?
+                    .map(|stored| stored.journal)
+                    .ok_or_else(|| {
+                        StoreError::InvalidState(format!(
+                            "active generation apply `{delta_id}` disappeared"
+                        ))
+                    })
+            })
+            .collect()
+    }
+
+    fn list_active_generation_applies_for_mount(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Vec<GenerationApplyJournalRecord>> {
+        let connection = self.connection()?;
+        let delta_ids = {
+            let mut statement = connection.prepare(
+                "SELECT delta_id FROM generation_apply_journals
+                 WHERE mount_id = ?1 AND active = 1 ORDER BY delta_id",
+            )?;
+            statement
+                .query_map(params![mount_id.as_str()], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         delta_ids
@@ -5381,6 +5617,8 @@ fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
             workspace_layout_digest TEXT NOT NULL,
             last_receipt_sha256 TEXT,
             updated_at TEXT NOT NULL,
+            refresh_mode TEXT NOT NULL
+                CHECK (refresh_mode IN ('generation_delta_v1', 'full_export_only')),
             PRIMARY KEY (mount_id, source_connection_id),
             FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
         );
@@ -5436,10 +5674,6 @@ fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
             FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
         );
 
-        CREATE UNIQUE INDEX IF NOT EXISTS generation_apply_one_active_per_source
-        ON generation_apply_journals(source_connection_id)
-        WHERE active = 1;
-
         CREATE TABLE IF NOT EXISTS generation_apply_outcomes (
             delta_id TEXT NOT NULL,
             entry_index INTEGER NOT NULL CHECK (entry_index >= 0),
@@ -5450,6 +5684,7 @@ fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
         );
         ",
     )?;
+    ensure_generation_active_index_for_schema(connection)?;
 
     if user_version < 2 && !column_exists(connection, "journals", "preimages_json")? {
         connection.execute_batch(
@@ -6678,7 +6913,8 @@ fn migrate_generation_delivery_journals_to_mount_relation(
         "BEGIN IMMEDIATE;
          ALTER TABLE generation_apply_outcomes RENAME TO generation_apply_outcomes_v21;
          ALTER TABLE generation_apply_journals RENAME TO generation_apply_journals_v21;
-         DROP INDEX generation_apply_one_active_per_source;
+         DROP INDEX IF EXISTS generation_apply_one_active_per_source;
+         DROP INDEX IF EXISTS generation_apply_one_active_per_mount;
 
          CREATE TABLE generation_apply_journals (
             delta_id TEXT PRIMARY KEY,
@@ -6719,8 +6955,8 @@ fn migrate_generation_delivery_journals_to_mount_relation(
                 completed_at
          FROM generation_apply_journals_v21;
 
-         CREATE UNIQUE INDEX generation_apply_one_active_per_source
-         ON generation_apply_journals(source_connection_id)
+         CREATE UNIQUE INDEX generation_apply_one_active_per_mount
+         ON generation_apply_journals(mount_id)
          WHERE active = 1;
 
          CREATE TABLE generation_apply_outcomes (
@@ -6754,6 +6990,8 @@ fn create_generation_delivery_tables(connection: &Connection) -> StoreResult<()>
             workspace_layout_digest TEXT NOT NULL,
             last_receipt_sha256 TEXT,
             updated_at TEXT NOT NULL,
+            refresh_mode TEXT NOT NULL
+                CHECK (refresh_mode IN ('generation_delta_v1', 'full_export_only')),
             PRIMARY KEY (mount_id, source_connection_id),
             FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
         );
@@ -6809,10 +7047,6 @@ fn create_generation_delivery_tables(connection: &Connection) -> StoreResult<()>
             FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
         );
 
-        CREATE UNIQUE INDEX IF NOT EXISTS generation_apply_one_active_per_source
-        ON generation_apply_journals(source_connection_id)
-        WHERE active = 1;
-
         CREATE TABLE IF NOT EXISTS generation_apply_outcomes (
             delta_id TEXT NOT NULL,
             entry_index INTEGER NOT NULL CHECK (entry_index >= 0),
@@ -6843,6 +7077,24 @@ fn create_generation_delivery_tables(connection: &Connection) -> StoreResult<()>
         );
         ",
     )?;
+    ensure_generation_active_index_for_schema(connection)?;
+    Ok(())
+}
+
+fn ensure_generation_active_index_for_schema(connection: &Connection) -> StoreResult<()> {
+    if column_exists(connection, "generation_apply_journals", "mount_id")? {
+        if !index_exists(connection, "generation_apply_one_active_per_source")? {
+            connection.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS generation_apply_one_active_per_mount
+                 ON generation_apply_journals(mount_id) WHERE active = 1;",
+            )?;
+        }
+    } else {
+        connection.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS generation_apply_one_active_per_source
+             ON generation_apply_journals(source_connection_id) WHERE active = 1;",
+        )?;
+    }
     Ok(())
 }
 
@@ -7195,6 +7447,21 @@ fn migrate_generation_delivery_storage_to_v7(connection: &Connection) -> StoreRe
     if generation_delivery_storage_v7_is_complete(connection)? {
         return Ok(());
     }
+    let already_multi_source =
+        column_exists(connection, "generation_paths", "source_connection_id")?
+            && table_primary_key_columns(connection, "observed_generations")?
+                == ["mount_id", "source_connection_id"];
+    if already_multi_source {
+        add_column_if_missing(
+            connection,
+            "observed_generations",
+            "refresh_mode",
+            "TEXT NOT NULL DEFAULT 'full_export_only' CHECK (refresh_mode IN ('generation_delta_v1', 'full_export_only'))",
+        )?;
+        backfill_generation_refresh_modes(connection)?;
+        migrate_generation_active_index_to_mount(connection)?;
+        return Ok(());
+    }
     if !generation_delivery_storage_v6_is_complete(connection)? {
         return Err(StoreError::InvalidState(
             "generation delivery v7 migration requires complete v6 storage".to_string(),
@@ -7213,6 +7480,8 @@ fn migrate_generation_delivery_storage_to_v7(connection: &Connection) -> StoreRe
             workspace_layout_digest TEXT NOT NULL,
             last_receipt_sha256 TEXT,
             updated_at TEXT NOT NULL,
+            refresh_mode TEXT NOT NULL
+                CHECK (refresh_mode IN ('generation_delta_v1', 'full_export_only')),
             PRIMARY KEY (mount_id, source_connection_id),
             FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
          );
@@ -7220,11 +7489,11 @@ fn migrate_generation_delivery_storage_to_v7(connection: &Connection) -> StoreRe
          INSERT INTO observed_generations (
             mount_id, source_connection_id, generation_id, inventory_sha256,
             workspace_layout_version, workspace_layout_digest,
-            last_receipt_sha256, updated_at
+            last_receipt_sha256, updated_at, refresh_mode
          )
          SELECT mount_id, source_connection_id, generation_id, inventory_sha256,
                 workspace_layout_version, workspace_layout_digest,
-                last_receipt_sha256, updated_at
+                last_receipt_sha256, updated_at, 'full_export_only'
          FROM observed_generations_v6;
 
          CREATE TABLE generation_paths (
@@ -7269,6 +7538,76 @@ fn migrate_generation_delivery_storage_to_v7(connection: &Connection) -> StoreRe
 
          DROP TABLE generation_paths_v6;
          DROP TABLE observed_generations_v6;",
+    )?;
+    backfill_generation_refresh_modes(connection)?;
+    migrate_generation_active_index_to_mount(connection)?;
+    Ok(())
+}
+
+fn backfill_generation_refresh_modes(connection: &Connection) -> StoreResult<()> {
+    let observed = {
+        let mut statement = connection.prepare(
+            "SELECT mount_id, source_connection_id, generation_id, inventory_sha256,
+                    workspace_layout_version, workspace_layout_digest,
+                    last_receipt_sha256, updated_at
+             FROM observed_generations ORDER BY mount_id, source_connection_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for row in observed {
+        let observed = observed_generation_from_row(row)?;
+        let paths = list_generation_paths_for_source_from_connection(
+            connection,
+            &observed.mount_id,
+            &observed.source_connection_id,
+        )?;
+        let mode = generation_seed_refresh_mode(&observed, &paths);
+        connection.execute(
+            "UPDATE observed_generations SET refresh_mode = ?3
+             WHERE mount_id = ?1 AND source_connection_id = ?2",
+            params![
+                observed.mount_id.as_str(),
+                observed.source_connection_id.as_str(),
+                generation_baseline_refresh_mode_label(mode),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_generation_active_index_to_mount(connection: &Connection) -> StoreResult<()> {
+    let duplicate_mount: Option<(String, i64)> = connection
+        .query_row(
+            "SELECT mount_id, COUNT(*) FROM generation_apply_journals
+             WHERE active = 1 GROUP BY mount_id HAVING COUNT(*) > 1
+             ORDER BY mount_id LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((mount_id, count)) = duplicate_mount {
+        return Err(StoreError::InvalidState(format!(
+            "mount `{mount_id}` has {count} active generation applies; complete all but one with the prerelease reader before retrying migration"
+        )));
+    }
+    connection.execute_batch(
+        "DROP INDEX IF EXISTS generation_apply_one_active_per_source;
+         DROP INDEX IF EXISTS generation_apply_one_active_per_mount;
+         CREATE UNIQUE INDEX generation_apply_one_active_per_mount
+         ON generation_apply_journals(mount_id) WHERE active = 1;",
     )?;
     Ok(())
 }
@@ -7320,6 +7659,18 @@ fn table_has_unique_columns(
     Ok(false)
 }
 
+fn index_exists(connection: &Connection, index: &str) -> StoreResult<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1
+             )",
+            params![index],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
 fn generation_paths_have_source_foreign_key(connection: &Connection) -> StoreResult<bool> {
     let mut statement = connection.prepare("PRAGMA foreign_key_list(generation_paths)")?;
     let rows = statement
@@ -7363,6 +7714,7 @@ fn verify_generation_delivery_storage_v7(connection: &Connection) -> StoreResult
 fn generation_delivery_storage_v7_is_complete(connection: &Connection) -> StoreResult<bool> {
     if !generation_delivery_storage_v6_is_complete(connection)?
         || !column_exists(connection, "generation_paths", "source_connection_id")?
+        || !column_exists(connection, "observed_generations", "refresh_mode")?
         || table_primary_key_columns(connection, "observed_generations")?
             != ["mount_id", "source_connection_id"]
         || !table_has_unique_columns(
@@ -7381,6 +7733,8 @@ fn generation_delivery_storage_v7_is_complete(connection: &Connection) -> StoreR
             &["mount_id", "local_logical_path"],
         )?
         || !generation_paths_have_source_foreign_key(connection)?
+        || !table_has_unique_columns(connection, "generation_apply_journals", &["mount_id"])?
+        || index_exists(connection, "generation_apply_one_active_per_source")?
     {
         return Ok(false);
     }
@@ -7395,7 +7749,15 @@ fn generation_delivery_storage_v7_is_complete(connection: &Connection) -> StoreR
         [],
         |row| row.get(0),
     )?;
-    Ok(!invalid_source_binding)
+    let invalid_refresh_mode: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM observed_generations
+            WHERE refresh_mode NOT IN ('generation_delta_v1', 'full_export_only')
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(!invalid_source_binding && !invalid_refresh_mode)
 }
 
 fn verify_generation_delivery_storage_v6(connection: &Connection) -> StoreResult<()> {

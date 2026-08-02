@@ -10,6 +10,7 @@ use locality_protocol::freshness_delivery::{
     GenerationDelta, GenerationDeltaTerminalReceipt, GenerationFileIdentity,
 };
 use locality_protocol::freshness_delivery_transport::GenerationTransportCapabilities;
+use locality_protocol::generation_baseline::GenerationBaselineRefreshModeV1;
 use serde::{Deserialize, Serialize};
 
 use crate::{StoreError, StoreResult};
@@ -69,6 +70,45 @@ pub struct GenerationBaselineSeedRecord {
 impl GenerationBaselineSeedRecord {
     pub const fn new(observed: ObservedGenerationRecord, paths: Vec<GenerationPathRecord>) -> Self {
         Self { observed, paths }
+    }
+}
+
+/// Additive baseline seed envelope that preserves the authenticated refresh
+/// route selected for one mount/source state. The original seed record remains
+/// source-compatible and means generation-delta V1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenerationBaselineSeedRecordV2 {
+    pub seed: GenerationBaselineSeedRecord,
+    pub refresh_mode: GenerationBaselineRefreshModeV1,
+}
+
+impl GenerationBaselineSeedRecordV2 {
+    pub const fn new(
+        seed: GenerationBaselineSeedRecord,
+        refresh_mode: GenerationBaselineRefreshModeV1,
+    ) -> Self {
+        Self { seed, refresh_mode }
+    }
+}
+
+/// Additive observed-head view containing the durable refresh route. Older
+/// repository implementations safely default their released rows to the only
+/// route they could previously represent: generation-delta V1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedGenerationRecordV2 {
+    pub observed: ObservedGenerationRecord,
+    pub refresh_mode: GenerationBaselineRefreshModeV1,
+}
+
+impl ObservedGenerationRecordV2 {
+    pub const fn new(
+        observed: ObservedGenerationRecord,
+        refresh_mode: GenerationBaselineRefreshModeV1,
+    ) -> Self {
+        Self {
+            observed,
+            refresh_mode,
+        }
     }
 }
 
@@ -329,6 +369,25 @@ pub trait GenerationDeliveryRepository {
         self.seed_observed_generation(seed.observed, seed.paths)
     }
 
+    /// Atomically seeds refresh-mode-aware source records. Legacy repositories
+    /// can preserve only the released generation-delta route and reject a
+    /// full-export-only state instead of later polling it as a delta source.
+    fn seed_observed_generations_v2(
+        &mut self,
+        seeds: Vec<GenerationBaselineSeedRecordV2>,
+    ) -> StoreResult<()> {
+        if seeds
+            .iter()
+            .any(|seed| seed.refresh_mode != GenerationBaselineRefreshModeV1::GenerationDeltaV1)
+        {
+            return Err(StoreError::InvalidState(
+                "generation repository does not support full-export-only baseline state"
+                    .to_string(),
+            ));
+        }
+        self.seed_observed_generations(seeds.into_iter().map(|seed| seed.seed).collect())
+    }
+
     fn get_observed_generation(
         &self,
         mount_id: &MountId,
@@ -346,6 +405,22 @@ pub trait GenerationDeliveryRepository {
         })
     }
 
+    fn get_observed_generation_for_source_v2(
+        &self,
+        mount_id: &MountId,
+        source_connection_id: &SourceConnectionId,
+    ) -> StoreResult<Option<ObservedGenerationRecordV2>> {
+        self.get_observed_generation_for_source(mount_id, source_connection_id)
+            .map(|record| {
+                record.map(|observed| {
+                    ObservedGenerationRecordV2::new(
+                        observed,
+                        GenerationBaselineRefreshModeV1::GenerationDeltaV1,
+                    )
+                })
+            })
+    }
+
     /// Lists source heads in deterministic source-ID order.
     fn list_observed_generations(
         &self,
@@ -353,6 +428,23 @@ pub trait GenerationDeliveryRepository {
     ) -> StoreResult<Vec<ObservedGenerationRecord>> {
         self.get_observed_generation(mount_id)
             .map(|record| record.into_iter().collect())
+    }
+
+    fn list_observed_generations_v2(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Vec<ObservedGenerationRecordV2>> {
+        self.list_observed_generations(mount_id).map(|records| {
+            records
+                .into_iter()
+                .map(|observed| {
+                    ObservedGenerationRecordV2::new(
+                        observed,
+                        GenerationBaselineRefreshModeV1::GenerationDeltaV1,
+                    )
+                })
+                .collect()
+        })
     }
 
     fn list_generation_paths(&self, mount_id: &MountId) -> StoreResult<Vec<GenerationPathRecord>>;
@@ -461,6 +553,20 @@ pub trait GenerationDeliveryRepository {
     }
 
     fn list_active_generation_applies(&self) -> StoreResult<Vec<GenerationApplyJournalRecord>>;
+
+    /// Lists the at-most-one active filesystem transaction for a mount. The
+    /// default filters the released global view for source compatibility.
+    fn list_active_generation_applies_for_mount(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Vec<GenerationApplyJournalRecord>> {
+        self.list_active_generation_applies().map(|journals| {
+            journals
+                .into_iter()
+                .filter(|journal| journal.delta.mount_id.as_str() == mount_id.as_str())
+                .collect()
+        })
+    }
 
     /// Lists active and completed journals so the staging owner can reconcile
     /// retained conflict evidence and discard non-live payloads.
