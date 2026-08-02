@@ -23,6 +23,20 @@ assert_not_contains() {
   fi
 }
 
+assert_line_before() {
+  local path="$1"
+  local first="$2"
+  local second="$3"
+  local first_line
+  local second_line
+
+  first_line="$(grep -nF -- "$first" "$path" | tail -n 1 | cut -d: -f1)"
+  second_line="$(grep -nF -- "$second" "$path" | head -n 1 | cut -d: -f1)"
+  if [ -z "$first_line" ] || [ -z "$second_line" ] || [ "$first_line" -ge "$second_line" ]; then
+    fail "expected ${first} before ${second} in ${path}"
+  fi
+}
+
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/loc-launch-readiness-amika-wrapper-test.XXXXXX")"
 cleanup() {
   rm -rf "$tmp_root"
@@ -52,11 +66,18 @@ fi
 
 case "${2:-}" in
   list)
-    printf '[{"name":"aseem-locality","state":"stopped"},{"name":"aseem-mcp","state":"stopped"},{"name":"custom-locality","state":"started"},{"name":"custom-mcp","state":"started"}]\n'
+    printf '%s\n' "${FAKE_AMIKA_LIST_JSON:?}"
     exit 0
     ;;
-  start)
+  create)
     shift 2
+    exit 0
+    ;;
+  delete)
+    shift 2
+    if [ -n "${FAKE_AMIKA_DELETE_EXIT_CODE:-}" ]; then
+      exit "$FAKE_AMIKA_DELETE_EXIT_CODE"
+    fi
     exit 0
     ;;
   ssh)
@@ -109,6 +130,7 @@ run_default_out="${tmp_root}/default-out"
 concurrency_dir="${tmp_root}/concurrency"
 PATH="${fake_bin}:$PATH" \
   FAKE_AMIKA_LOG="$fake_log" \
+  FAKE_AMIKA_LIST_JSON='[]' \
   FAKE_AMIKA_CONCURRENCY_DIR="$concurrency_dir" \
   RUN_ID="testrun" \
   SYNC_ARTIFACTS=0 \
@@ -118,23 +140,31 @@ PATH="${fake_bin}:$PATH" \
   CODEX_EXEC_TIMEOUT_SECONDS=12 \
   "$WRAPPER" --scenario scenario2 >/dev/null
 
-assert_contains "$run_default_out/run.env" "locality_sandbox=aseem-locality"
-assert_contains "$run_default_out/run.env" "mcp_sandbox=aseem-mcp"
+assert_contains "$run_default_out/run.env" "locality_sandbox=launch-readiness-testrun-locality"
+assert_contains "$run_default_out/run.env" "mcp_sandbox=launch-readiness-testrun-mcp"
+assert_contains "$run_default_out/run.env" "locality_snapshot=locality-snapshot"
+assert_contains "$run_default_out/run.env" "mcp_snapshot=mcp-snapshot"
 assert_contains "$run_default_out/run.env" "remote_worktree=/home/amika/workspace/locality-launch-readiness-testrun"
 assert_contains "$run_default_out/run.env" "locality_remote_out_dir=/home/amika/workspace/locality-launch-readiness-testrun/target/launch-readiness-testrun-locality"
 assert_contains "$run_default_out/run.env" "mcp_remote_out_dir=/home/amika/workspace/locality-launch-readiness-testrun/target/launch-readiness-testrun-mcp"
 assert_contains "$run_default_out/run.env" "remote_loc_bin=/usr/bin/loc"
 assert_contains "$run_default_out/run.env" "sync_artifacts=0"
 assert_contains "$run_default_out/run.env" "strategy_execution=parallel"
-assert_contains "$run_default_out/artifacts.tsv" "locality"$'\t'"aseem-locality"
-assert_contains "$run_default_out/artifacts.tsv" "notion-mcp"$'\t'"aseem-mcp"
-assert_contains "$fake_log" "amika sandbox list -o json"
-assert_contains "$fake_log" "amika sandbox start aseem-locality aseem-mcp"
+assert_contains "$run_default_out/artifacts.tsv" "locality"$'\t'"launch-readiness-testrun-locality"
+assert_contains "$run_default_out/artifacts.tsv" "notion-mcp"$'\t'"launch-readiness-testrun-mcp"
+assert_contains "$fake_log" "amika sandbox list --remote -o json"
+assert_contains "$fake_log" "amika sandbox create --remote --no-git --snapshot locality-snapshot --name launch-readiness-testrun-locality"
+assert_contains "$fake_log" "amika sandbox create --remote --no-git --snapshot mcp-snapshot --name launch-readiness-testrun-mcp"
+assert_contains "$fake_log" "amika sandbox delete --remote --force launch-readiness-testrun-locality launch-readiness-testrun-mcp"
+assert_not_contains "$fake_log" "amika sandbox start"
+assert_line_before "$fake_log" "amika sandbox create --remote --no-git --snapshot locality-snapshot --name launch-readiness-testrun-locality" "amika sandbox ssh"
+assert_line_before "$fake_log" "amika sandbox create --remote --no-git --snapshot mcp-snapshot --name launch-readiness-testrun-mcp" "amika sandbox ssh"
+assert_line_before "$fake_log" "amika sandbox ssh" "amika sandbox delete --remote --force launch-readiness-testrun-locality launch-readiness-testrun-mcp"
 test -f "$concurrency_dir/locality.overlapped" || fail "Locality launch did not overlap MCP launch"
 test -f "$concurrency_dir/notion-mcp.overlapped" || fail "MCP launch did not overlap Locality launch"
 
-assert_contains "$fake_log" "aseem-locality"
-assert_contains "$fake_log" "aseem-mcp"
+assert_contains "$fake_log" "launch-readiness-testrun-locality"
+assert_contains "$fake_log" "launch-readiness-testrun-mcp"
 assert_contains "$fake_log" "locality"
 assert_contains "$fake_log" "notion-mcp"
 assert_contains "$fake_log" "--scenario"
@@ -146,6 +176,7 @@ custom_log="${tmp_root}/custom-amika.log"
 custom_out="${tmp_root}/custom-out"
 PATH="${fake_bin}:$PATH" \
   FAKE_AMIKA_LOG="$custom_log" \
+  FAKE_AMIKA_LIST_JSON='[]' \
   RUN_ID="customrun" \
   SYNC_ARTIFACTS=0 \
   LOCALITY_SANDBOX="custom-locality" \
@@ -163,6 +194,23 @@ assert_contains "$custom_log" "custom-locality"
 assert_contains "$custom_log" "custom-mcp"
 assert_contains "$custom_log" "--scenario"
 assert_contains "$custom_log" "custom-scenario"
+
+cleanup_failure_log="${tmp_root}/cleanup-failure-amika.log"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$cleanup_failure_log" \
+  FAKE_AMIKA_LIST_JSON='[]' \
+  FAKE_AMIKA_DELETE_EXIT_CODE=43 \
+  RUN_ID="cleanup-failure" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/cleanup-failure-out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"${tmp_root}/cleanup-failure.err"
+cleanup_failure_rc=$?
+set -e
+if [ "$cleanup_failure_rc" -ne 43 ]; then
+  fail "successful benchmark should return cleanup failure, got ${cleanup_failure_rc}"
+fi
+assert_contains "$cleanup_failure_log" "amika sandbox delete --remote --force launch-readiness-cleanup-failure-locality launch-readiness-cleanup-failure-mcp"
 
 set +e
 PATH="${fake_bin}:$PATH" \

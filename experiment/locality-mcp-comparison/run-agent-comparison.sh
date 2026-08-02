@@ -10,8 +10,10 @@ Runs the launch-readiness benchmark concurrently on two remote sandboxes or inst
   - MCP strategy on MCP_SANDBOX
 
 Defaults:
-  LOCALITY_SANDBOX=aseem-locality
-  MCP_SANDBOX=aseem-mcp
+  LOCALITY_SANDBOX=launch-readiness-<UTC_RUN_ID>-locality
+  MCP_SANDBOX=launch-readiness-<UTC_RUN_ID>-mcp
+  LOCALITY_SNAPSHOT=locality-snapshot
+  MCP_SNAPSHOT=mcp-snapshot
   LOCAL_OUT_DIR=target/launch-readiness-amika/<UTC_RUN_ID>/
   REMOTE_HOME=/home/amika
   REMOTE_SOURCE_REPO=/home/amika/workspace/locality
@@ -23,6 +25,8 @@ Environment:
   RUN_ID                         Run id shared by both sandboxes.
   LOCALITY_SANDBOX               Label or Amika sandbox for Locality runs.
   MCP_SANDBOX                    Label or Amika sandbox for MCP runs.
+  LOCALITY_SNAPSHOT              Amika snapshot for Locality runs.
+  MCP_SNAPSHOT                   Amika snapshot for MCP runs.
   LOCAL_OUT_DIR or OUT_DIR       Local metadata/log output directory.
   REMOTE_SOURCE_REPO             Existing git checkout inside each sandbox.
   REMOTE_HOME                    Home directory inside each sandbox.
@@ -75,8 +79,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 
-LOCALITY_SANDBOX="${LOCALITY_SANDBOX:-aseem-locality}"
-MCP_SANDBOX="${MCP_SANDBOX:-aseem-mcp}"
+LOCALITY_SANDBOX="${LOCALITY_SANDBOX:-launch-readiness-$RUN_ID-locality}"
+MCP_SANDBOX="${MCP_SANDBOX:-launch-readiness-$RUN_ID-mcp}"
+LOCALITY_SNAPSHOT="${LOCALITY_SNAPSHOT:-locality-snapshot}"
+MCP_SNAPSHOT="${MCP_SNAPSHOT:-mcp-snapshot}"
+declare -a CREATED_AMIKA_SANDBOXES=()
 REMOTE_PROVIDER="${REMOTE_PROVIDER:-amika}"
 REMOTE_HOME="${REMOTE_HOME:-}"
 if [ -z "$REMOTE_HOME" ]; then
@@ -364,46 +371,44 @@ remote_ssh() {
   ssh "${SSH_ARGS[@]}" "$(remote_ssh_target "$sandbox")" "$@"
 }
 
-ensure_amika_sandboxes_started() {
+create_amika_sandboxes() {
   [ "$REMOTE_PROVIDER" = "amika" ] || return 0
 
-  local states_json
-  states_json="$(amika sandbox list -o json)"
+  local sandboxes_json
+  sandboxes_json="$(amika sandbox list --remote -o json)"
 
-  local to_start=()
-  local sandbox
-  local state
-  for sandbox in "$LOCALITY_SANDBOX" "$MCP_SANDBOX"; do
-    state="$(
-      SANDBOX_NAME="$sandbox" python3 -c '
+  LOCALITY_SANDBOX="$LOCALITY_SANDBOX" MCP_SANDBOX="$MCP_SANDBOX" python3 -c '
 import json
 import os
 import sys
 
-name = os.environ["SANDBOX_NAME"]
 try:
     sandboxes = json.load(sys.stdin)
 except json.JSONDecodeError as error:
     raise SystemExit(f"could not parse amika sandbox list JSON: {error}")
 
-for sandbox in sandboxes:
-    if sandbox.get("name") == name:
-        print(sandbox.get("state", ""))
-        break
-' <<< "$states_json"
-    )"
-    if [ -z "$state" ]; then
-      echo "amika sandbox not found: $sandbox" >&2
-      return 2
-    fi
-    if [ "$state" != "started" ]; then
-      to_start+=("$sandbox")
-    fi
-  done
+existing_names = {
+    sandbox.get("name")
+    for sandbox in sandboxes
+    if isinstance(sandbox, dict) and isinstance(sandbox.get("name"), str)
+}
+for name in (os.environ["LOCALITY_SANDBOX"], os.environ["MCP_SANDBOX"]):
+    if name in existing_names:
+        raise SystemExit(f"amika sandbox already exists: {name}")
+' <<< "$sandboxes_json"
 
-  if [ "${#to_start[@]}" -gt 0 ]; then
-    amika sandbox start "${to_start[@]}"
-  fi
+  amika sandbox create --remote --no-git --snapshot "$LOCALITY_SNAPSHOT" --name "$LOCALITY_SANDBOX"
+  CREATED_AMIKA_SANDBOXES+=("$LOCALITY_SANDBOX")
+  amika sandbox create --remote --no-git --snapshot "$MCP_SNAPSHOT" --name "$MCP_SANDBOX"
+  CREATED_AMIKA_SANDBOXES+=("$MCP_SANDBOX")
+}
+
+cleanup_amika_sandboxes() {
+  [ "$REMOTE_PROVIDER" = "amika" ] || return 0
+  [ "${#CREATED_AMIKA_SANDBOXES[@]}" -gt 0 ] || return 0
+
+  amika sandbox delete --remote --force "${CREATED_AMIKA_SANDBOXES[@]}" || return $?
+  CREATED_AMIKA_SANDBOXES=()
 }
 
 remote_rsync_ssh_command() {
@@ -979,6 +984,21 @@ stop_strategy_pipelines() {
   exit "$rc"
 }
 
+cleanup_amika_sandboxes_on_exit() {
+  local original_rc=$?
+  local cleanup_rc
+
+  trap - EXIT INT TERM
+  set +e
+  cleanup_amika_sandboxes
+  cleanup_rc=$?
+
+  if [ "$original_rc" -ne 0 ]; then
+    exit "$original_rc"
+  fi
+  exit "$cleanup_rc"
+}
+
 write_artifacts_manifest() {
   cat > "$LOCAL_OUT_DIR/artifacts.tsv" <<EOF
 strategy	sandbox	remote_out_dir	local_stdout	local_stderr	local_artifact_dir
@@ -992,6 +1012,10 @@ EOF
   printf 'locality_sandbox=%s\n' "$LOCALITY_SANDBOX"
   printf 'mcp_sandbox=%s\n' "$MCP_SANDBOX"
   printf 'remote_provider=%s\n' "$REMOTE_PROVIDER"
+  if [ "$REMOTE_PROVIDER" = "amika" ]; then
+    printf 'locality_snapshot=%s\n' "$LOCALITY_SNAPSHOT"
+    printf 'mcp_snapshot=%s\n' "$MCP_SNAPSHOT"
+  fi
   if [ "$REMOTE_PROVIDER" = "ssh" ]; then
     printf 'locality_ssh_target=%s\n' "$LOCALITY_SSH_TARGET"
     printf 'mcp_ssh_target=%s\n' "$MCP_SSH_TARGET"
@@ -1019,7 +1043,8 @@ EOF
 } > "$LOCAL_OUT_DIR/run.env"
 
 load_mcp_credentials_from_zshrc
-ensure_amika_sandboxes_started
+trap cleanup_amika_sandboxes_on_exit EXIT
+create_amika_sandboxes
 write_artifacts_manifest
 
 echo "Launching Locality and MCP strategy pipelines in parallel"
