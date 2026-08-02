@@ -1379,7 +1379,7 @@ pub fn remove_dir_all_durable_if_identity_windows(
     expected_inode: u64,
     expected_inode_high: u64,
 ) -> io::Result<()> {
-    remove_dir_durable_if_identity_windows_with_hook(
+    remove_dir_durable_if_identity_windows(
         trusted_root,
         path,
         crate::replica_materializer::WorkspaceGenerationIdentity {
@@ -1388,7 +1388,6 @@ pub fn remove_dir_all_durable_if_identity_windows(
             inode_high: expected_inode_high,
         },
         true,
-        || Ok(()),
     )
 }
 
@@ -1402,7 +1401,7 @@ pub fn remove_empty_dir_durable_if_identity_windows(
     expected_inode: u64,
     expected_inode_high: u64,
 ) -> io::Result<()> {
-    remove_dir_durable_if_identity_windows_with_hook(
+    remove_dir_durable_if_identity_windows(
         trusted_root,
         path,
         crate::replica_materializer::WorkspaceGenerationIdentity {
@@ -1411,22 +1410,19 @@ pub fn remove_empty_dir_durable_if_identity_windows(
             inode_high: expected_inode_high,
         },
         false,
-        || Ok(()),
     )
 }
 
 #[cfg(windows)]
-fn remove_dir_durable_if_identity_windows_with_hook(
+fn remove_dir_durable_if_identity_windows(
     trusted_root: &Path,
     path: &Path,
     expected: crate::replica_materializer::WorkspaceGenerationIdentity,
     recursive: bool,
-    before_open: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
     validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
     let (parents, name) = open_windows_parent_anchored(trusted_root, path, true)?;
     let parent = parents.last().expect("anchored cleanup parent");
-    before_open()?;
     let (directory, directory_sync) =
         parent.open_directory_for_anchored_cleanup_with_sync(&name)?;
     let actual = directory.identity()?;
@@ -1854,12 +1850,12 @@ mod tests {
             inode_high,
         };
 
-        remove_dir_durable_if_identity_windows_with_hook(&root, &path, expected, true, || {
-            fs::rename(&path, &displaced)?;
-            fs::create_dir(&path)?;
-            fs::write(path.join("keep.txt"), b"replacement")
-        })
-        .expect_err("cleanup handle must reject the racing replacement");
+        fs::rename(&path, &displaced).expect("displace original staging");
+        fs::create_dir(&path).expect("create replacement staging");
+        fs::write(path.join("keep.txt"), b"replacement").expect("write replacement bytes");
+
+        remove_dir_durable_if_identity_windows(&root, &path, expected, true)
+            .expect_err("cleanup handle must reject the racing replacement");
 
         assert_eq!(fs::read(path.join("keep.txt")).unwrap(), b"replacement");
         assert_eq!(fs::read(displaced.join("old.txt")).unwrap(), b"original");
