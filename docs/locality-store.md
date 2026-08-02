@@ -75,12 +75,13 @@
   trusted workspace root and save an accepted binding. Explicit binding inserts
   check every configured mount, including unbound layout 0 roots, so an unbound
   basename cannot later collide with a portable target.
-- Workspace-binding component v3 adds stable local workspace identity plus a
-  separate trusted host-root/projection record and layout sequence without a
-  schema-version bump. Opening released component-v2 state creates the host
-  table transactionally and preserves all v1 mount bindings; they keep resolving
-  through their exact legacy roots. New layout-1 bindings require an atomic
-  host/mount commit whose derived root matches the preserved mount root.
+- Workspace-binding component v4 adds stable local workspace identity plus a
+  separate trusted host-root/projection record, layout sequence, and durable
+  remount-recovery outcome without a schema-version bump. Opening released
+  component-v2/v3 state creates or completes these tables transactionally and
+  preserves all v1 mount bindings; they keep resolving through their exact
+  legacy roots. New layout-1 bindings require an atomic host/mount commit whose
+  derived root matches the preserved mount root.
 - Generation-delivery component v6 marks whether that selection is fully bound.
   Ambiguous active v25 journals fail migration atomically; completed pre-binding
   journals permit only exact terminal replay and preserve only their recorded

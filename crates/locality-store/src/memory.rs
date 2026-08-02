@@ -334,10 +334,7 @@ impl WorkspaceBindingRepository for InMemoryStateStore {
                     Some(binding) if binding.workspace_id().is_some() => (binding.workspace_id()
                         == Some(workspace_id))
                     .then(|| binding.collision_key()),
-                    Some(binding) => {
-                        legacy_mount_collision_key_for_host(&host_binding, &mount.root)
-                            .filter(|key| key == &binding.collision_key())
-                    }
+                    Some(_) => legacy_mount_collision_key_for_host(&host_binding, &mount.root),
                     None => legacy_mount_collision_key_for_host(&host_binding, &mount.root),
                 };
                 (collision_key.as_deref() == Some(requested_collision_key.as_str()))

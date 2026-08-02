@@ -1101,6 +1101,21 @@ fn sqlite_v1_upgrade_still_scans_workspace_collisions() {
 }
 
 #[test]
+fn in_memory_stale_v1_target_still_reserves_authoritative_legacy_root() {
+    let fixture = Fixture::new();
+    assert_stale_v1_target_reserves_authoritative_legacy_root(
+        InMemoryStateStore::default(),
+        &fixture.root,
+    );
+}
+
+#[test]
+fn sqlite_stale_v1_target_still_reserves_authoritative_legacy_root() {
+    let fixture = Fixture::new();
+    assert_stale_v1_target_reserves_authoritative_legacy_root(fixture.open(), &fixture.root);
+}
+
+#[test]
 fn exact_replay_skips_workspace_collision_scan() {
     let memory_fixture = Fixture::new();
     assert_exact_replay_skips_workspace_collision_scan(
@@ -1155,6 +1170,67 @@ where
     store
         .commit_workspace_binding(host, record)
         .expect("exact replay must not rescan later collisions");
+}
+
+fn assert_stale_v1_target_reserves_authoritative_legacy_root<S>(mut store: S, root: &Path)
+where
+    S: MountRepository + WorkspaceBindingRepository,
+{
+    let workspace_root = root.join("StaleV1Workspace");
+    fs::create_dir_all(&workspace_root).expect("workspace root");
+    let legacy_mount_id = MountId::new("legacy-stale-v1");
+    let candidate_mount_id = MountId::new("candidate-layout-1");
+    let authoritative_target = MountTarget::new("authoritative-root").expect("target");
+    let stale_target = MountTarget::new("stale-v1-metadata").expect("stale target");
+    let authoritative_root = workspace_root.join(authoritative_target.as_str());
+
+    store
+        .save_mount(MountConfig::new(
+            legacy_mount_id.clone(),
+            "notion",
+            authoritative_root.clone(),
+        ))
+        .expect("save legacy mount");
+    store
+        .save_workspace_binding(WorkspaceBindingRecord::new(
+            legacy_mount_id.clone(),
+            WorkspaceBinding::new(stale_target),
+        ))
+        .expect("save stale v1 binding");
+    store
+        .save_mount(MountConfig::new(
+            candidate_mount_id.clone(),
+            "google-docs",
+            authoritative_root,
+        ))
+        .expect("save layout-1 candidate");
+
+    let workspace_id = WorkspaceId::new("locality.workspace.stale-v1").expect("workspace");
+    let error = store
+        .commit_workspace_binding(
+            WorkspaceHostBinding::new(
+                WorkspaceHostPlatform::current(),
+                workspace_id.clone(),
+                &workspace_root,
+                WorkspaceProjectionIdentity::new("test:stale-v1-root")
+                    .expect("projection identity"),
+                1,
+            )
+            .expect("host binding"),
+            WorkspaceBindingRecord::new(
+                candidate_mount_id,
+                WorkspaceBinding::for_workspace(workspace_id, authoritative_target.clone()),
+            ),
+        )
+        .expect_err("authoritative legacy root must remain reserved");
+
+    assert_eq!(
+        error,
+        StoreError::WorkspaceMountTargetCollision {
+            target: authoritative_target.as_str().to_string(),
+            existing_mount_id: legacy_mount_id,
+        }
+    );
 }
 
 fn assert_v1_upgrade_scans_workspace_collisions<S>(mut store: S, root: &Path)

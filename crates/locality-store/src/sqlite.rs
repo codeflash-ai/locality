@@ -6179,8 +6179,7 @@ fn commit_workspace_binding_in_transaction(
                             Some(binding.collision_key())
                         }
                         Some(_) => None,
-                        None => legacy_mount_collision_key_for_host(host_binding, &root)
-                            .filter(|key| key == &binding.collision_key()),
+                        None => legacy_mount_collision_key_for_host(host_binding, &root),
                     }
                 }
                 (None, None) => legacy_mount_collision_key_for_host(host_binding, &root),

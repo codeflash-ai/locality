@@ -476,15 +476,15 @@ binding is valid layout 0 state, not corrupt or rebuildable metadata.
 layout 1 begins only when an owning coordinator supplies its trusted workspace
 root, accepts the resolver plan, and explicitly persists the binding.
 
-Workspace-binding component v3 remains within schema v27. It adds the separate
-host-binding table and preserves released component-v2/v1 mount-binding rows.
-Those legacy rows continue to resolve through the exact `MountConfig.root`.
-New virtual mounts atomically commit the host record and accepted mount binding;
-the commit requires the derived root to equal the preserved mount root, freezes
-workspace/root/projection identity, and advances the layout sequence for each
-new mount. CLI and Desktop then use the same repository resolver: layout-1 rows
-derive `<trusted root>/<target>`, while missing and v1 rows retain the legacy
-root.
+Workspace-binding component v4 remains within schema v27. It adds the separate
+host-binding and remount-recovery tables and preserves released
+component-v2/v3 and v1 mount-binding rows. Those legacy rows continue to resolve
+through the exact `MountConfig.root`. New virtual mounts atomically commit the
+host record and accepted mount binding; the commit requires the derived root to
+equal the preserved mount root, freezes workspace/root/projection identity, and
+advances the layout sequence for each new mount. CLI and Desktop then use the
+same repository resolver: layout-1 rows derive `<trusted root>/<target>`, while
+missing and v1 rows retain the legacy root.
 
 Sandbox overlap inspection opens the mount database read-only and supports old
 `mounts(mount_id, root)` schemas without initializing, migrating, or repairing

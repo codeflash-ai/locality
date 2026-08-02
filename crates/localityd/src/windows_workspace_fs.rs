@@ -69,6 +69,7 @@ const MUTABLE_FILE_ACCESS: u32 = FILE_READ_DATA
     | SYNCHRONIZE;
 const CLEANUP_FILE_ACCESS: u32 =
     FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | DELETE | SYNCHRONIZE;
+const IDENTITY_FILE_ACCESS: u32 = FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const READ_FILE_ACCESS: u32 = FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const LOCK_FILE_ACCESS: u32 = FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const SHARING: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
@@ -346,6 +347,32 @@ impl WindowsDirectory {
         Ok(File::from(handle))
     }
 
+    pub(crate) fn open_file_for_retained_identity_read(&self, name: &OsStr) -> io::Result<File> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            READ_FILE_ACCESS,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE,
+            SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(File::from(handle))
+    }
+
+    pub(crate) fn open_file_for_identity(&self, name: &OsStr) -> io::Result<File> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            IDENTITY_FILE_ACCESS,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(File::from(handle))
+    }
+
     pub(crate) fn open_file_for_durable_copy_allow_cloud_placeholder(
         &self,
         name: &OsStr,
@@ -545,6 +572,28 @@ impl WindowsDirectory {
             ANCHOR_SHARING,
         )?;
         reject_reparse(&handle)?;
+        mark_handle_delete(&handle)
+    }
+
+    pub(crate) fn remove_file_for_anchored_cleanup_if_identity(
+        &self,
+        name: &OsStr,
+        expected: WorkspaceGenerationIdentity,
+    ) -> io::Result<()> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            CLEANUP_FILE_ACCESS,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        if handle_identity(&handle)? != expected {
+            return Err(io::Error::other(
+                "file identity changed before anchored cleanup",
+            ));
+        }
         mark_handle_delete(&handle)
     }
 
@@ -1026,6 +1075,48 @@ mod lock_tests {
                 & windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
             0
         );
+    }
+
+    #[test]
+    fn identity_probe_needs_attributes_without_file_data_or_reparse_following() {
+        assert_ne!(IDENTITY_FILE_ACCESS & FILE_READ_ATTRIBUTES, 0);
+        assert_eq!(IDENTITY_FILE_ACCESS & FILE_READ_DATA, 0);
+        assert_eq!(
+            IDENTITY_FILE_ACCESS & (FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | DELETE),
+            0
+        );
+
+        let path = temporary_test_directory("identity-probe");
+        std::fs::create_dir(&path).expect("create identity probe directory");
+        let parent = WindowsDirectory::open_absolute(&path).expect("open identity probe parent");
+        let mut created = parent
+            .create_file(OsStr::new("attributes-only.txt"))
+            .expect("create identity probe file");
+        created.write_all(b"contents require data access").unwrap();
+        created.sync_all().unwrap();
+        let expected = handle_identity(&OwnedHandle::from(created)).expect("created identity");
+
+        let attributes_only = parent
+            .open_file_for_identity(OsStr::new("attributes-only.txt"))
+            .expect("open attributes-only identity handle");
+        let observed =
+            handle_identity(&OwnedHandle::from(attributes_only)).expect("observed identity");
+        assert_eq!(observed, expected);
+
+        let mut wrong = expected;
+        wrong.inode ^= 1;
+        parent
+            .remove_file_for_anchored_cleanup_if_identity(OsStr::new("attributes-only.txt"), wrong)
+            .expect_err("identity mismatch must preserve the named file");
+        parent
+            .open_file_for_identity(OsStr::new("attributes-only.txt"))
+            .expect("identity mismatch preserves file");
+
+        parent
+            .remove_file_for_anchored_cleanup(OsStr::new("attributes-only.txt"))
+            .expect("remove identity probe file");
+        drop(parent);
+        std::fs::remove_dir(path).expect("remove identity probe directory");
     }
 
     #[test]

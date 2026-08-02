@@ -27,7 +27,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::durable_fs::{
-    create_dir_all_durable, remove_path_durable, rename_noreplace_durable, write_new_file_durable,
+    create_dir_all_durable, remove_path_durable, rename_noreplace_durable, sync_directory,
+    write_new_file_durable,
 };
 use crate::hydration::{
     HydrationExecutor, HydrationOutcome, HydrationSource, write_parent_database_schema_cache,
@@ -53,7 +54,8 @@ const CLAUDE_FILE: &str = "CLAUDE.md";
 const AGENTS_GUIDANCE_IDENTIFIER: &str = "guidance:AGENTS.md";
 const CLAUDE_GUIDANCE_IDENTIFIER: &str = "guidance:CLAUDE.md";
 const VIRTUAL_MOVE_CLEANUP_DIRECTORY: &str = ".loc/virtual-move-cleanup";
-const VIRTUAL_MOVE_CLEANUP_VERSION: u32 = 2;
+const VIRTUAL_MOVE_CLEANUP_ANCHOR_DIRECTORY: &str = ".loc/virtual-move-cleanup-anchors";
+const VIRTUAL_MOVE_CLEANUP_VERSION: u32 = 3;
 const VIRTUAL_MOVE_CLEANUP_RECORD_MAX_BYTES: usize = 16 * 1024;
 
 #[cfg(target_os = "macos")]
@@ -2644,6 +2646,7 @@ where
                 source_root,
                 contents: opened.contents,
                 identity: opened.identity,
+                file: opened.file,
             }
         })
     } else {
@@ -2690,8 +2693,15 @@ where
         })
         .transpose()?;
     if let Some(cleanup) = cleanup.as_ref() {
-        persist_pending_virtual_move_cleanup(content_root, cleanup)?;
+        persist_pending_virtual_move_cleanup(
+            content_root,
+            cleanup,
+            &source.as_ref().expect("cleanup has source").file,
+        )?;
     }
+    // The durable hard-link anchor now pins the source object across retries;
+    // release the read handle before Windows opens the same object for delete.
+    drop(source);
 
     let finalized = match store
         .finalize_virtual_move_content(
@@ -2705,9 +2715,13 @@ where
     {
         Ok(finalized) => finalized,
         Err(error) => {
-            if cleanup.is_some() {
-                let _ =
-                    remove_pending_virtual_move_cleanup_record(content_root, &mount_id, &local_id);
+            if let Some(cleanup) = cleanup.as_ref() {
+                let _ = remove_pending_virtual_move_cleanup_state(
+                    content_root,
+                    &mount_id,
+                    &local_id,
+                    cleanup,
+                );
             }
             return Err(error);
         }
@@ -2727,6 +2741,7 @@ struct VirtualMoveCacheSource {
     source_root: PathBuf,
     contents: Vec<u8>,
     identity: VirtualMoveSourceIdentity,
+    file: std::fs::File,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -2864,20 +2879,136 @@ fn pending_virtual_move_cleanup_path(
     mount_id: &MountId,
     local_id: &str,
 ) -> PathBuf {
+    content_root
+        .join(VIRTUAL_MOVE_CLEANUP_DIRECTORY)
+        .join(format!(
+            "{}.json",
+            virtual_move_cleanup_key(mount_id, local_id)
+        ))
+}
+
+fn pending_virtual_move_cleanup_anchor_path(
+    source_root: &Path,
+    mount_id: &MountId,
+    local_id: &str,
+) -> PathBuf {
+    source_root
+        .join(VIRTUAL_MOVE_CLEANUP_ANCHOR_DIRECTORY)
+        .join(format!(
+            "{}.source",
+            virtual_move_cleanup_key(mount_id, local_id)
+        ))
+}
+
+fn pending_virtual_move_cleanup_candidate_path(
+    source_root: &Path,
+    mount_id: &MountId,
+    local_id: &str,
+) -> PathBuf {
+    source_root
+        .join(VIRTUAL_MOVE_CLEANUP_ANCHOR_DIRECTORY)
+        .join(format!(
+            "{}.candidate",
+            virtual_move_cleanup_key(mount_id, local_id)
+        ))
+}
+
+fn virtual_move_cleanup_key(mount_id: &MountId, local_id: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(mount_id.0.as_bytes());
     digest.update([0]);
     digest.update(local_id.as_bytes());
-    content_root
-        .join(VIRTUAL_MOVE_CLEANUP_DIRECTORY)
-        .join(format!("{:x}.json", digest.finalize()))
+    format!("{:x}", digest.finalize())
+}
+
+fn persist_pending_virtual_move_cleanup_anchor(
+    cleanup: &PendingVirtualMoveCleanup,
+    mount_id: &MountId,
+    source_file: &std::fs::File,
+) -> LocalityResult<()> {
+    let source_root = cleanup.source_root.to_path_buf()?;
+    let source_path = cleanup.source_path.to_path_buf()?;
+    let retained_identity = regular_file_identity(source_file).map_err(|error| {
+        LocalityError::Io(format!(
+            "failed to verify retained virtual move source `{}`: {error}",
+            source_path.display()
+        ))
+    })?;
+    if retained_identity != cleanup.source_identity {
+        return Err(LocalityError::InvalidState(format!(
+            "virtual move source `{}` changed before cleanup was anchored",
+            source_path.display()
+        )));
+    }
+
+    let anchor =
+        pending_virtual_move_cleanup_anchor_path(&source_root, mount_id, &cleanup.local_id);
+    let parent = anchor.parent().expect("cleanup anchor has parent");
+    create_dir_all_durable(&source_root, parent).map_err(|error| {
+        LocalityError::Io(format!(
+            "failed to create virtual move cleanup anchor directory `{}`: {error}",
+            parent.display()
+        ))
+    })?;
+    let created = match trusted_regular_file_identity(&source_root, &anchor).map_err(|error| {
+        LocalityError::Io(format!(
+            "failed to inspect virtual move cleanup anchor `{}`: {error}",
+            anchor.display()
+        ))
+    })? {
+        Some(identity) => {
+            if identity != retained_identity {
+                return Err(LocalityError::InvalidState(format!(
+                    "virtual move cleanup anchor `{}` belongs to a different source object",
+                    anchor.display()
+                )));
+            }
+            false
+        }
+        None => {
+            std::fs::hard_link(&source_path, &anchor).map_err(|error| {
+                LocalityError::Io(format!(
+                    "failed to anchor virtual move source `{}` at `{}`: {error}",
+                    source_path.display(),
+                    anchor.display()
+                ))
+            })?;
+            true
+        }
+    };
+    if created && let Err(error) = sync_directory(&source_root, parent) {
+        let _ = remove_path_durable(&source_root, &anchor);
+        return Err(LocalityError::Io(format!(
+            "failed to persist virtual move cleanup anchor `{}`: {error}",
+            anchor.display()
+        )));
+    }
+    let anchored_identity =
+        trusted_regular_file_identity(&source_root, &anchor).map_err(|error| {
+            LocalityError::Io(format!(
+                "failed to verify virtual move cleanup anchor `{}`: {error}",
+                anchor.display()
+            ))
+        })?;
+    if anchored_identity != Some(retained_identity) {
+        if created {
+            let _ = remove_path_durable(&source_root, &anchor);
+        }
+        return Err(LocalityError::InvalidState(format!(
+            "virtual move source `{}` changed while cleanup was being anchored",
+            source_path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn persist_pending_virtual_move_cleanup(
     content_root: &Path,
     cleanup: &PendingVirtualMoveCleanup,
+    source_file: &std::fs::File,
 ) -> LocalityResult<()> {
     let mount_id = MountId::new(cleanup.mount_id.clone());
+    persist_pending_virtual_move_cleanup_anchor(cleanup, &mount_id, source_file)?;
     let path = pending_virtual_move_cleanup_path(content_root, &mount_id, &cleanup.local_id);
     if let Some(existing) = read_pending_virtual_move_cleanup(content_root, &path)? {
         if existing == *cleanup {
@@ -3017,34 +3148,265 @@ where
             path.display()
         )));
     }
-    let Some(source_identity) = trusted_regular_file_identity(&authorized_root, &source_path)
-        .map_err(|error| {
+    let anchor = pending_virtual_move_cleanup_anchor_path(&source_root, mount_id, local_id);
+    let Some(anchor_identity) =
+        trusted_regular_file_identity(&source_root, &anchor).map_err(|error| {
+            LocalityError::Io(format!(
+                "failed to verify virtual move cleanup anchor `{}`: {error}",
+                anchor.display()
+            ))
+        })?
+    else {
+        return Err(LocalityError::InvalidState(format!(
+            "virtual move cleanup anchor `{}` is missing; refusing source removal",
+            anchor.display()
+        )));
+    };
+    if anchor_identity != cleanup.source_identity {
+        return Err(LocalityError::InvalidState(format!(
+            "virtual move cleanup anchor `{}` does not bind the recorded source object",
+            anchor.display()
+        )));
+    }
+    let candidate = pending_virtual_move_cleanup_candidate_path(&source_root, mount_id, local_id);
+    let candidate_identity =
+        trusted_regular_file_identity(&source_root, &candidate).map_err(|error| {
+            LocalityError::Io(format!(
+                "failed to verify quarantined virtual move source `{}`: {error}",
+                candidate.display()
+            ))
+        })?;
+    if let Some(candidate_identity) = candidate_identity {
+        if candidate_identity != cleanup.source_identity {
+            return Err(LocalityError::InvalidState(format!(
+                "quarantined virtual move source `{}` does not match the recorded object",
+                candidate.display()
+            )));
+        }
+        remove_trusted_regular_file_if_identity(&source_root, &candidate, cleanup.source_identity)
+            .map_err(|error| {
+                LocalityError::Io(format!(
+                    "failed to remove quarantined virtual move source `{}`: {error}",
+                    candidate.display()
+                ))
+            })?;
+    } else if let Some(source_identity) =
+        trusted_regular_file_identity(&authorized_root, &source_path).map_err(|error| {
             LocalityError::Io(format!(
                 "failed to verify obsolete virtual content `{}` before cleanup: {error}",
                 source_path.display()
             ))
         })?
-    else {
-        return remove_pending_virtual_move_cleanup_record(content_root, mount_id, local_id);
-    };
-    if source_identity != cleanup.source_identity {
-        return Err(LocalityError::InvalidState(format!(
-            "obsolete virtual content `{}` was replaced before cleanup; refusing to remove it",
-            source_path.display()
-        )));
-    }
-    match remove_path_durable(&authorized_root, &source_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(LocalityError::Io(format!(
-                "virtual move committed to `{}`, but durable cleanup of obsolete content `{}` failed: {error}",
-                destination_path.display(),
+    {
+        if source_identity != cleanup.source_identity {
+            return Err(LocalityError::InvalidState(format!(
+                "obsolete virtual content `{}` was replaced before cleanup; refusing to remove it",
                 source_path.display()
             )));
         }
+        // Atomically move the currently named object away before validating
+        // and unlinking it. A source replacement racing this boundary is
+        // quarantined and preserved instead of ever being deleted by path.
+        rename_noreplace_durable(&authorized_root, &source_path, &source_root, &candidate)
+            .map_err(|error| {
+                LocalityError::Io(format!(
+                    "failed to quarantine obsolete virtual content `{}` before cleanup: {error}",
+                    source_path.display()
+                ))
+            })?;
+        let quarantined_identity = trusted_regular_file_identity(&source_root, &candidate)
+            .map_err(|error| {
+                LocalityError::Io(format!(
+                    "failed to verify quarantined virtual move source `{}`: {error}",
+                    candidate.display()
+                ))
+            })?;
+        if quarantined_identity != Some(cleanup.source_identity) {
+            return Err(LocalityError::InvalidState(format!(
+                "obsolete virtual content `{}` changed at the cleanup boundary and was preserved at `{}`",
+                source_path.display(),
+                candidate.display()
+            )));
+        }
+        remove_trusted_regular_file_if_identity(
+            &source_root,
+            &candidate,
+            cleanup.source_identity,
+        )
+        .map_err(|error| {
+            LocalityError::Io(format!(
+                "virtual move committed to `{}`, but identity-bound cleanup of quarantined content `{}` failed: {error}",
+                destination_path.display(),
+                candidate.display()
+            ))
+        })?;
     }
+    remove_trusted_regular_file_if_identity(&source_root, &anchor, cleanup.source_identity)
+        .map_err(|error| {
+            LocalityError::Io(format!(
+                "failed to remove completed virtual move cleanup anchor `{}`: {error}",
+                anchor.display()
+            ))
+        })?;
     remove_pending_virtual_move_cleanup_record(content_root, mount_id, local_id)
+}
+
+fn remove_trusted_regular_file_if_identity(
+    trusted_root: &Path,
+    path: &Path,
+    expected: VirtualMoveSourceIdentity,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+
+        if !trusted_root.is_absolute() || !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "trusted root and file path must be absolute",
+            ));
+        }
+        let relative = path.strip_prefix(trusted_root).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "path `{}` is outside trusted root `{}`",
+                    path.display(),
+                    trusted_root.display()
+                ),
+            )
+        })?;
+        let components = relative
+            .components()
+            .map(|component| match component {
+                std::path::Component::Normal(component) => Ok(component),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("path `{}` contains unsafe components", path.display()),
+                )),
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let Some((name, parent_components)) = components.split_last() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "trusted file path must name a child",
+            ));
+        };
+        let root = rustix::fs::open(
+            trusted_root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?;
+        let mut directories = vec![root];
+        for component in parent_components {
+            let parent = directories.last().expect("retained cleanup parent");
+            directories.push(
+                rustix::fs::openat(
+                    parent,
+                    *component,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(io::Error::from)?,
+            );
+        }
+        let parent = directories.last().expect("retained cleanup parent");
+        let descriptor = rustix::fs::openat(
+            parent,
+            *name,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?;
+        let opened = rustix::fs::fstat(&descriptor).map_err(io::Error::from)?;
+        if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile
+            || opened.st_dev as u64 != expected.device
+            || opened.st_ino as u64 != expected.inode
+            || expected.inode_high != 0
+        {
+            return Err(io::Error::other(
+                "file identity changed before descriptor-relative cleanup",
+            ));
+        }
+        let named = rustix::fs::statat(parent, *name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(io::Error::from)?;
+        if FileType::from_raw_mode(named.st_mode) != FileType::RegularFile
+            || named.st_dev as u64 != expected.device
+            || named.st_ino as u64 != expected.inode
+        {
+            return Err(io::Error::other(
+                "named file identity changed at the unlink boundary",
+            ));
+        }
+        rustix::fs::unlinkat(parent, *name, AtFlags::empty()).map_err(io::Error::from)?;
+        rustix::fs::fsync(parent).map_err(io::Error::from)
+    }
+    #[cfg(windows)]
+    {
+        use crate::replica_materializer::WorkspaceGenerationIdentity;
+        use crate::windows_workspace_fs::WindowsDirectory;
+
+        if !trusted_root.is_absolute() || !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "trusted root and file path must be absolute",
+            ));
+        }
+        let relative = path.strip_prefix(trusted_root).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "path `{}` is outside trusted root `{}`",
+                    path.display(),
+                    trusted_root.display()
+                ),
+            )
+        })?;
+        let components = relative
+            .components()
+            .map(|component| match component {
+                std::path::Component::Normal(component) => Ok(component),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("path `{}` contains unsafe components", path.display()),
+                )),
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let Some((name, parent_components)) = components.split_last() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "trusted file path must name a child",
+            ));
+        };
+        let root = WindowsDirectory::open_absolute_anchor(trusted_root)?;
+        let mut directories = vec![root];
+        for component in parent_components {
+            let parent = directories.last().expect("retained cleanup parent");
+            directories.push(parent.open_directory_anchor(*component)?);
+        }
+        let parent = directories.last().expect("retained cleanup parent");
+        parent.remove_file_for_anchored_cleanup_if_identity(
+            *name,
+            WorkspaceGenerationIdentity {
+                device: expected.device,
+                inode: expected.inode,
+                inode_high: expected.inode_high,
+            },
+        )?;
+        sync_directory(
+            trusted_root,
+            path.parent().expect("trusted file path has parent"),
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (trusted_root, path, expected);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "identity-bound cleanup is unavailable on this platform",
+        ))
+    }
 }
 
 fn remove_pending_virtual_move_cleanup_record(
@@ -3061,6 +3423,27 @@ fn remove_pending_virtual_move_cleanup_record(
             path.display()
         ))),
     }
+}
+
+fn remove_pending_virtual_move_cleanup_state(
+    content_root: &Path,
+    mount_id: &MountId,
+    local_id: &str,
+    cleanup: &PendingVirtualMoveCleanup,
+) -> LocalityResult<()> {
+    let source_root = cleanup.source_root.to_path_buf()?;
+    let anchor = pending_virtual_move_cleanup_anchor_path(&source_root, mount_id, local_id);
+    match remove_trusted_regular_file_if_identity(&source_root, &anchor, cleanup.source_identity) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(LocalityError::Io(format!(
+                "failed to remove abandoned virtual move cleanup anchor `{}`: {error}",
+                anchor.display()
+            )));
+        }
+    }
+    remove_pending_virtual_move_cleanup_record(content_root, mount_id, local_id)
 }
 
 fn virtual_move_source_trusted_root(
@@ -3133,7 +3516,8 @@ fn read_virtual_move_cache(
     path: &Path,
     retitle: Option<&str>,
 ) -> LocalityResult<Option<TrustedRegularFileRead>> {
-    let Some(mut opened) = read_trusted_regular_file(trusted_root, path, None).map_err(|error| {
+    let Some(mut opened) =
+        read_trusted_regular_file_for_move(trusted_root, path, None).map_err(|error| {
         LocalityError::Io(format!(
             "failed to read virtual filesystem content `{}` through its trusted root `{}`: {error}",
             path.display(),
@@ -3173,15 +3557,16 @@ struct OpenedTrustedRegularFile {
 struct TrustedRegularFileRead {
     contents: Vec<u8>,
     identity: VirtualMoveSourceIdentity,
+    file: std::fs::File,
 }
 
 fn read_open_regular_file(
-    mut file: std::fs::File,
+    file: &mut std::fs::File,
     max_bytes: Option<usize>,
 ) -> io::Result<Vec<u8>> {
     let mut contents = Vec::new();
     if let Some(max_bytes) = max_bytes {
-        Read::by_ref(&mut file)
+        Read::by_ref(file)
             .take(max_bytes.saturating_add(1) as u64)
             .read_to_end(&mut contents)?;
         if contents.len() > max_bytes {
@@ -3198,28 +3583,57 @@ fn read_trusted_regular_file(
     path: &Path,
     max_bytes: Option<usize>,
 ) -> io::Result<Option<TrustedRegularFileRead>> {
-    let Some(opened) = open_trusted_regular_file(trusted_root, path)? else {
+    read_trusted_regular_file_with_options(trusted_root, path, max_bytes, false)
+}
+
+fn read_trusted_regular_file_for_move(
+    trusted_root: &Path,
+    path: &Path,
+    max_bytes: Option<usize>,
+) -> io::Result<Option<TrustedRegularFileRead>> {
+    read_trusted_regular_file_with_options(trusted_root, path, max_bytes, true)
+}
+
+fn read_trusted_regular_file_with_options(
+    trusted_root: &Path,
+    path: &Path,
+    max_bytes: Option<usize>,
+    allow_delete_sharing: bool,
+) -> io::Result<Option<TrustedRegularFileRead>> {
+    let Some(mut opened) =
+        open_trusted_regular_file(trusted_root, path, true, allow_delete_sharing)?
+    else {
         return Ok(None);
     };
     let identity = opened.identity;
-    read_open_regular_file(opened.file, max_bytes)
-        .map(|contents| Some(TrustedRegularFileRead { contents, identity }))
+    read_open_regular_file(&mut opened.file, max_bytes).map(|contents| {
+        Some(TrustedRegularFileRead {
+            contents,
+            identity,
+            file: opened.file,
+        })
+    })
 }
 
 fn trusted_regular_file_identity(
     trusted_root: &Path,
     path: &Path,
 ) -> io::Result<Option<VirtualMoveSourceIdentity>> {
-    open_trusted_regular_file(trusted_root, path).map(|opened| opened.map(|opened| opened.identity))
+    open_trusted_regular_file(trusted_root, path, false, false)
+        .map(|opened| opened.map(|opened| opened.identity))
 }
 
 fn open_trusted_regular_file(
     trusted_root: &Path,
     path: &Path,
+    read_contents: bool,
+    allow_delete_sharing: bool,
 ) -> io::Result<Option<OpenedTrustedRegularFile>> {
     #[cfg(unix)]
     {
         use rustix::fs::{FileType, Mode, OFlags};
+
+        let _ = (read_contents, allow_delete_sharing);
 
         if !trusted_root.is_absolute() || !path.is_absolute() {
             return Err(io::Error::new(
@@ -3369,7 +3783,7 @@ fn open_trusted_regular_file(
             let child = match parent.open_directory_anchor(*component) {
                 Ok(child) => child,
                 Err(directory_error) => {
-                    match parent.open_file_for_durable_copy(*component) {
+                    match parent.open_file_for_identity(*component) {
                         // An ordinary file blocks this destination ancestor.
                         // Treat the final path as absent so begin_virtual_move
                         // still commits before durable publication reports the
@@ -3391,7 +3805,13 @@ fn open_trusted_regular_file(
             directories.push(child);
         }
         let parent = directories.last().expect("retained trusted parent");
-        let file = match parent.open_file_for_durable_copy(*name) {
+        let file = match if read_contents && allow_delete_sharing {
+            parent.open_file_for_retained_identity_read(*name)
+        } else if read_contents {
+            parent.open_file_for_durable_copy(*name)
+        } else {
+            parent.open_file_for_identity(*name)
+        } {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
@@ -3401,10 +3821,34 @@ fn open_trusted_regular_file(
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (trusted_root, path);
+        let _ = (trusted_root, path, read_contents, allow_delete_sharing);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "descriptor-relative no-follow reads are unavailable on this platform",
+        ))
+    }
+}
+
+fn regular_file_identity(file: &std::fs::File) -> io::Result<VirtualMoveSourceIdentity> {
+    #[cfg(unix)]
+    {
+        let metadata = rustix::fs::fstat(file).map_err(io::Error::from)?;
+        return Ok(VirtualMoveSourceIdentity {
+            device: metadata.st_dev as u64,
+            inode: metadata.st_ino as u64,
+            inode_high: 0,
+        });
+    }
+    #[cfg(windows)]
+    {
+        windows_regular_file_identity(file)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "regular file identity is unavailable on this platform",
         ))
     }
 }
@@ -8971,9 +9415,10 @@ mod tests {
         store
             .save_virtual_mutation(mutation.clone())
             .expect("save pre-finalization pointer");
-        let source_identity = super::trusted_regular_file_identity(&content_root, &old_path)
+        let source = super::open_trusted_regular_file(&content_root, &old_path, true, true)
             .expect("inspect source")
-            .expect("source identity");
+            .expect("source file");
+        let source_identity = source.identity;
         let cleanup = super::PendingVirtualMoveCleanup::new(
             &mount_id,
             &mutation.local_id,
@@ -8983,8 +9428,9 @@ mod tests {
             source_identity,
         )
         .expect("build cleanup record");
-        super::persist_pending_virtual_move_cleanup(&content_root, &cleanup)
+        super::persist_pending_virtual_move_cleanup(&content_root, &cleanup, &source.file)
             .expect("persist cleanup before simulated crash");
+        drop(source);
 
         super::retry_pending_virtual_move_cleanup(
             &store,
@@ -9069,9 +9515,10 @@ mod tests {
         store
             .save_virtual_mutation(mutation.clone())
             .expect("save finalized mutation");
-        let source_identity = super::trusted_regular_file_identity(&content_root, &old_path)
+        let source = super::open_trusted_regular_file(&content_root, &old_path, true, true)
             .expect("inspect source")
-            .expect("source identity");
+            .expect("source file");
+        let source_identity = source.identity;
         let cleanup = super::PendingVirtualMoveCleanup::new(
             &mount_id,
             &mutation.local_id,
@@ -9081,11 +9528,19 @@ mod tests {
             source_identity,
         )
         .expect("build delayed cleanup record");
-        super::persist_pending_virtual_move_cleanup(&content_root, &cleanup)
+        super::persist_pending_virtual_move_cleanup(&content_root, &cleanup, &source.file)
             .expect("persist delayed cleanup record");
+        drop(source);
 
         fs::remove_file(&old_path).expect("remove original source");
-        fs::write(&old_path, "replacement bytes").expect("write replacement source");
+        fs::write(&old_path, "original bytes").expect("write identical replacement source");
+        let replacement_identity = super::trusted_regular_file_identity(&content_root, &old_path)
+            .expect("inspect identical replacement")
+            .expect("replacement identity");
+        assert_ne!(
+            replacement_identity, source_identity,
+            "durable anchor pins the original object and prevents file-ID reuse"
+        );
 
         let error = super::retry_pending_virtual_move_cleanup(
             &store,
@@ -9095,7 +9550,7 @@ mod tests {
         )
         .expect_err("replacement identity must block cleanup");
         assert!(matches!(error, LocalityError::InvalidState(_)));
-        assert_eq!(fs::read_to_string(&old_path).unwrap(), "replacement bytes");
+        assert_eq!(fs::read_to_string(&old_path).unwrap(), "original bytes");
 
         fs::remove_file(&old_path).expect("remove replacement file");
         fs::create_dir(&old_path).expect("replace source with tree");
@@ -9125,12 +9580,96 @@ mod tests {
             "identity mismatch keeps cleanup intent for review"
         );
 
-        super::remove_pending_virtual_move_cleanup_record(
+        super::remove_pending_virtual_move_cleanup_state(
+            &content_root,
+            &mount_id,
+            &mutation.local_id,
+            &cleanup,
+        )
+        .expect("remove test cleanup state");
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn virtual_move_cleanup_validates_expected_identity_at_unlink() {
+        let state_root = temp_root("loc-virtual-move-cleanup-unlink-identity");
+        let content_root = state_root.join("content/files");
+        let path = content_root.join("obsolete.md");
+        fs::create_dir_all(&content_root).expect("create content root");
+        fs::write(&path, "preserve me").expect("write cleanup candidate");
+        let mut wrong = super::trusted_regular_file_identity(&content_root, &path)
+            .expect("inspect cleanup candidate")
+            .expect("candidate identity");
+        wrong.inode ^= 1;
+
+        super::remove_trusted_regular_file_if_identity(&content_root, &path, wrong)
+            .expect_err("unlink boundary must reject the wrong expected identity");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "preserve me");
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn virtual_move_cleanup_retries_after_source_quarantine_crash() {
+        let mount_id = MountId::new("cleanup-quarantine-retry");
+        let state_root = temp_root("loc-virtual-move-cleanup-quarantine-retry");
+        let content_root = state_root.join("content/cleanup-quarantine-retry/files");
+        let old_path = content_root.join("old.md");
+        let new_path = content_root.join("new.md");
+        fs::create_dir_all(&content_root).expect("create content root");
+        fs::write(&old_path, "obsolete bytes").expect("write source");
+        fs::write(&new_path, "obsolete bytes").expect("write destination");
+
+        let mutation = VirtualMutationRecord {
+            mount_id: mount_id.clone(),
+            local_id: "local:cleanup-quarantine-retry".to_string(),
+            mutation_kind: VirtualMutationKind::Create,
+            target_remote_id: None,
+            parent_remote_id: None,
+            original_path: Some(PathBuf::from("old.md")),
+            projected_path: PathBuf::from("new.md"),
+            title: "New".to_string(),
+            content_path: Some(new_path.clone()),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_virtual_mutation(mutation.clone())
+            .expect("save finalized mutation");
+        let source = super::open_trusted_regular_file(&content_root, &old_path, true, true)
+            .expect("open source")
+            .expect("source file");
+        let cleanup = super::PendingVirtualMoveCleanup::new(
+            &mount_id,
+            &mutation.local_id,
+            &content_root,
+            &old_path,
+            &new_path,
+            source.identity,
+        )
+        .expect("build cleanup record");
+        super::persist_pending_virtual_move_cleanup(&content_root, &cleanup, &source.file)
+            .expect("persist cleanup state");
+        drop(source);
+
+        let candidate = super::pending_virtual_move_cleanup_candidate_path(
+            &content_root,
+            &mount_id,
+            &mutation.local_id,
+        );
+        super::rename_noreplace_durable(&content_root, &old_path, &content_root, &candidate)
+            .expect("simulate crash after source quarantine");
+
+        super::retry_pending_virtual_move_cleanup(
+            &store,
             &content_root,
             &mount_id,
             &mutation.local_id,
         )
-        .expect("remove test cleanup record");
+        .expect("retry removes the identity-bound quarantine");
+        assert!(!old_path.exists());
+        assert!(!candidate.exists());
+        assert_eq!(fs::read_to_string(new_path).unwrap(), "obsolete bytes");
         let _ = fs::remove_dir_all(state_root);
     }
 
@@ -9160,30 +9699,14 @@ mod tests {
             identity,
         )
         .expect("encode native paths");
-        super::persist_pending_virtual_move_cleanup(&content_root, &cleanup)
-            .expect("persist non-UTF-8 cleanup record");
-
-        let restored = super::read_pending_virtual_move_cleanup(
-            &content_root,
-            &super::pending_virtual_move_cleanup_path(
-                &content_root,
-                &mount_id,
-                "local:cleanup-non-utf8",
-            ),
-        )
-        .expect("read cleanup record")
-        .expect("cleanup record");
+        let encoded = serde_json::to_vec(&cleanup).expect("serialize non-UTF-8 cleanup record");
+        let restored: super::PendingVirtualMoveCleanup =
+            serde_json::from_slice(&encoded).expect("deserialize non-UTF-8 cleanup record");
         assert_eq!(restored.source_root.to_path_buf().unwrap(), content_root);
         assert_eq!(restored.source_path.to_path_buf().unwrap(), old_path);
         assert_eq!(restored.destination_path.to_path_buf().unwrap(), new_path);
         assert_eq!(restored.source_identity, identity);
 
-        super::remove_pending_virtual_move_cleanup_record(
-            &content_root,
-            &mount_id,
-            "local:cleanup-non-utf8",
-        )
-        .expect("remove test cleanup record");
         let _ = fs::remove_dir_all(state_root);
     }
 
