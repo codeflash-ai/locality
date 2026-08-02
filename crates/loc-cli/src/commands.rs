@@ -40,8 +40,8 @@ use locality_notion::oauth::{
     HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NotionOAuthBrokerStart,
 };
 use locality_platform::{
-    DaemonManagerRestartFence, DaemonProcessPaths, daemon_manager_supervision_enabled,
-    restore_daemon_manager_supervision,
+    DaemonManager, DaemonManagerRestartFence, DaemonProcessPaths,
+    daemon_manager_supervision_enabled, restore_daemon_manager_supervision,
 };
 use locality_slack::{
     DEFAULT_SLACK_OAUTH_BROKER_URL, DEFAULT_SLACK_OAUTH_REDIRECT_URI, HttpSlackOAuthBrokerClient,
@@ -4303,6 +4303,8 @@ struct CliQuiescedRemountRuntime<'a> {
     state_root: &'a Path,
     mount_id: &'a MountId,
     daemon_was_ready: Option<bool>,
+    daemon_manager: Option<DaemonManager>,
+    supervision_was_enabled: Option<bool>,
     cleanup_failure: Rc<RefCell<Option<String>>>,
     remount_ownership: Option<WorkspaceRemountOwnership>,
 }
@@ -4313,6 +4315,8 @@ impl<'a> CliQuiescedRemountRuntime<'a> {
             state_root,
             mount_id,
             daemon_was_ready: None,
+            daemon_manager: None,
+            supervision_was_enabled: None,
             cleanup_failure: Rc::new(RefCell::new(None)),
             remount_ownership: None,
         }
@@ -4329,16 +4333,32 @@ impl QuiescedWorkspaceRemountRuntime for CliQuiescedRemountRuntime<'_> {
             .as_nanos()
             .to_string();
         let paths = DaemonProcessPaths::new(self.state_root.to_path_buf());
+        let mut daemon_was_ready = false;
+        let mut daemon_manager = None;
         let ownership = WorkspaceRemountOwnership::begin_capturing_supervision(
             self.state_root,
             self.mount_id,
             "cli",
             &created_at,
             || {
+                daemon_was_ready = cli_daemon_is_ready(self.state_root);
+                if daemon_was_ready {
+                    let manager = crate::daemon::detected_daemon_manager(&paths);
+                    if manager == DaemonManager::Unknown {
+                        return Err(
+                            "could not determine whether the live daemon uses session or launchd"
+                                .to_string(),
+                        );
+                    }
+                    daemon_manager = Some(manager);
+                }
                 daemon_manager_supervision_enabled(&paths)
                     .map_err(|error| error.message().to_string())
             },
         )?;
+        self.daemon_was_ready = Some(daemon_was_ready);
+        self.daemon_manager = daemon_manager;
+        self.supervision_was_enabled = ownership.supervision_was_enabled();
         self.remount_ownership = Some(ownership);
         Ok(())
     }
@@ -4374,7 +4394,9 @@ impl QuiescedWorkspaceRemountRuntime for CliQuiescedRemountRuntime<'_> {
     }
 
     fn drain(&mut self) -> Result<(), String> {
-        let daemon_was_ready = cli_daemon_is_ready(self.state_root);
+        let daemon_was_ready = self
+            .daemon_was_ready
+            .unwrap_or_else(|| cli_daemon_is_ready(self.state_root));
         self.daemon_was_ready = Some(daemon_was_ready);
         if !daemon_was_ready {
             return Ok(());
@@ -4414,14 +4436,15 @@ impl QuiescedWorkspaceRemountRuntime for CliQuiescedRemountRuntime<'_> {
         if self.daemon_was_ready != Some(true) || cli_daemon_is_ready(self.state_root) {
             return Ok(());
         }
-        let args = vec![
-            "start".to_string(),
-            "--state-dir".to_string(),
-            self.state_root.display().to_string(),
-        ];
-        crate::daemon::run_daemon_control(&args)
-            .map(|_| ())
-            .map_err(|error| error.message())
+        let manager = self
+            .daemon_manager
+            .ok_or_else(|| "live daemon manager was not captured before remount".to_string())?;
+        crate::daemon::restart_daemon_after_remount(
+            self.state_root,
+            manager,
+            self.supervision_was_enabled,
+        )
+        .map_err(|error| error.message())
     }
 
     fn reactivate_after_failed_commit(&mut self) -> Result<(), String> {
