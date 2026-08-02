@@ -14,6 +14,7 @@ use locality_protocol::workspace_api_v2::{WorkspaceExportOfferV2, WorkspaceProfi
 use locality_protocol::workspace_export_v2::{
     WorkspaceArchiveEntryKindV2, WorkspaceArchiveMemberV2, WorkspaceAuthorizedExportEntryV2,
     WorkspaceExportTerminalControlV2, WorkspaceMaterializationPlanV2,
+    WorkspaceNamespacedInventoryV2,
 };
 use locality_protocol::{
     DeliveredBodyDigestV2, ExportV2FilePaxMetadata, MAX_EXPORT_TERMINAL_CONTROL_BYTES,
@@ -219,6 +220,9 @@ pub trait WorkspaceArchiveSink {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidatedWorkspaceArchive {
     pub plan: WorkspaceMaterializationPlanV2,
+    /// Exact canonical inventory validated for the same session, offer,
+    /// terminal control, and archive members as `plan`.
+    pub inventory: WorkspaceNamespacedInventoryV2,
     pub terminal_control: WorkspaceExportTerminalControlV2,
     pub archive_entries: u64,
     pub files: u64,
@@ -558,6 +562,17 @@ pub fn validate_workspace_tar<R: Read, S: WorkspaceArchiveSink>(
     let terminal_control = raw_control.ok_or_else(|| {
         WorkspaceArchiveError::InvalidControl("the control member is missing".to_string())
     })?;
+    let authorized_entries = members
+        .iter()
+        .filter_map(|member| member.authorized_entry.clone())
+        .collect::<Vec<_>>();
+    let inventory = WorkspaceNamespacedInventoryV2::plan(
+        session.session_layout(),
+        offer,
+        terminal_control.metadata.scope_sources(),
+        &authorized_entries,
+    )
+    .map_err(|error| WorkspaceArchiveError::Planner(error.to_string()))?;
     let plan = WorkspaceMaterializationPlanV2::plan(session, offer, &terminal_control, &members)
         .map_err(|error| WorkspaceArchiveError::Planner(error.to_string()))?;
     let delivered_body_sha256 = delivered
@@ -574,6 +589,7 @@ pub fn validate_workspace_tar<R: Read, S: WorkspaceArchiveSink>(
 
     Ok(ValidatedWorkspaceArchive {
         plan,
+        inventory,
         terminal_control,
         archive_entries: u64::try_from(members.len()).unwrap_or(u64::MAX),
         files,

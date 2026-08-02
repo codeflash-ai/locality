@@ -34,6 +34,17 @@ compares every baseline file to its authoritative export record. Mount ID,
 source connection ID, projection ID, logical path, content SHA-256, and byte
 length must all match file-for-file; missing and extra files fail closed.
 
+The generation-2 tar adapter retains that third value as
+`ValidatedWorkspaceArchive::inventory`. It is the canonical
+`WorkspaceNamespacedInventoryV2` planned from the exact bounded archive
+members, terminal-control scope authority, sealed session layout, and offer
+that also produce the returned materialization plan. Callers must carry this
+inventory forward; they must not reconstruct a baseline authority from the
+materialization plan, filesystem paths, or terminal-control counts. The
+inventory remains host-neutral and excludes writable provider preconditions
+and remote IDs. No inventory is returned when archive, content, control,
+context, or negotiated local-limit validation fails.
+
 `content_version_id` is not present in frozen export-v2 records. The
 authenticated endpoint supplies that authoritative immutable ID. Each
 per-source `target_inventory_sha256` commits the complete ordered tuple

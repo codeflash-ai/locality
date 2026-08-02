@@ -18,7 +18,8 @@ use locality_protocol::workspace_api_v2::{
 use locality_protocol::workspace_export_v2::{
     WorkspaceAuthorizedExportEntryV2, WorkspaceExportCompletionReceiptV2,
     WorkspaceExportControlMetadataV2, WorkspaceExportTerminalControlV2,
-    WorkspaceNamespacedInventoryV2, WorkspaceScopeSourceAuthorityV2,
+    WorkspaceNamespacedExportRecordV2, WorkspaceNamespacedInventoryV2,
+    WorkspaceScopeSourceAuthorityV2,
 };
 use locality_protocol::{
     DeliveredBodyDigestV2, ExportCompletionReceipt, ExportV2FilePaxMetadata,
@@ -155,6 +156,7 @@ impl WorkspaceArchiveSink for MemorySink {
 struct Contract {
     session: WorkspaceProfileSessionV2,
     offer: WorkspaceExportOfferV2,
+    inventory: WorkspaceNamespacedInventoryV2,
     control: WorkspaceExportTerminalControlV2,
 }
 
@@ -164,14 +166,21 @@ fn fixture() -> Fixture {
 }
 
 fn contract(fixture: &Fixture) -> Contract {
-    let session: WorkspaceProfileSessionV2 =
-        serde_json::from_slice(WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON).expect("session fixture");
     let scope_sources = vec![
         WorkspaceScopeSourceAuthorityV2::new(0, SourceConnectionId::new("source-notion")),
         WorkspaceScopeSourceAuthorityV2::new(1, SourceConnectionId::new("source-drive")),
         WorkspaceScopeSourceAuthorityV2::new(2, SourceConnectionId::new("source-notion")),
         WorkspaceScopeSourceAuthorityV2::new(3, SourceConnectionId::new("source-drive")),
     ];
+    contract_with_scope_sources(fixture, scope_sources)
+}
+
+fn contract_with_scope_sources(
+    fixture: &Fixture,
+    scope_sources: Vec<WorkspaceScopeSourceAuthorityV2>,
+) -> Contract {
+    let session: WorkspaceProfileSessionV2 =
+        serde_json::from_slice(WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON).expect("session fixture");
     let mount_by_scope = session
         .session_layout()
         .entries()
@@ -210,6 +219,17 @@ fn contract(fixture: &Fixture) -> Contract {
 
     let mut offer_json: Value =
         serde_json::from_slice(WORKSPACE_EXPORT_OFFER_V2_GOLDEN_JSON).expect("offer JSON");
+    let directory_count = fixture.directories.len() as u64;
+    let file_count = fixture.files.len() as u64;
+    let content_bytes = fixture
+        .files
+        .iter()
+        .map(|file| file.content.len() as u64)
+        .sum::<u64>();
+    offer_json["offer"]["file_count"] = Value::from(file_count);
+    offer_json["offer"]["directory_count"] = Value::from(directory_count);
+    offer_json["offer"]["archive_entry_count"] = Value::from(directory_count + file_count + 1);
+    offer_json["offer"]["selected_content_bytes"] = Value::from(content_bytes);
     offer_json["offer"]["inventory_sha256"] = Value::String(format!("sha256:{}", "0".repeat(64)));
     let placeholder_offer: WorkspaceExportOfferV2 =
         serde_json::from_value(offer_json.clone()).expect("placeholder offer");
@@ -223,20 +243,27 @@ fn contract(fixture: &Fixture) -> Contract {
     offer_json["offer"]["inventory_sha256"] =
         Value::String(inventory.inventory_sha256().to_string());
 
+    let writable_entries = fixture
+        .files
+        .iter()
+        .find(|file| file.projection_id == "projection-roadmap")
+        .map(|file| WritableMetadataEntry {
+            projection_id: ProjectionId::new(&file.projection_id),
+            logical_path: LogicalPath::new(&file.logical_path).expect("logical path"),
+            source_remote_ids: vec![RemoteId::new("page-roadmap")],
+            delivered_content_sha256: sha256_label(file.content.as_bytes()),
+            provider_precondition: "opaque-v4".to_string(),
+            effective_actions: file.effective_actions.clone(),
+            baseline_required: true,
+        })
+        .into_iter()
+        .collect();
     let writable_metadata = ScopeAuthorizedWritableExportMetadata {
         versions: placeholder_offer.offer().versions,
         session_id: SessionId::new("session-scope-7"),
         export_attempt_id: ExportAttemptId::new("export-attempt-9").expect("attempt ID"),
         source_generations: placeholder_offer.offer().source_generations.clone(),
-        writable_entries: vec![WritableMetadataEntry {
-            projection_id: ProjectionId::new("projection-roadmap"),
-            logical_path: LogicalPath::new("Projects/Roadmap/page.md").expect("logical path"),
-            source_remote_ids: vec![RemoteId::new("page-roadmap")],
-            delivered_content_sha256: sha256_label(b"# Roadmap\n"),
-            provider_precondition: "opaque-v4".to_string(),
-            effective_actions: BTreeSet::from([SourceAction::Read, SourceAction::Update]),
-            baseline_required: true,
-        }],
+        writable_entries,
     };
     offer_json["offer"]["writable_metadata_sha256"] = Value::String(
         canonical_writable_metadata_sha256(&writable_metadata).expect("writable digest"),
@@ -290,6 +317,7 @@ fn contract(fixture: &Fixture) -> Contract {
     Contract {
         session,
         offer,
+        inventory,
         control,
     }
 }
@@ -416,6 +444,26 @@ fn production_tar_adapter_executes_the_validated_namespaced_plan() {
     assert_eq!(validated.files, 2);
     assert_eq!(validated.content_bytes, 17);
     assert_eq!(validated.plan.entries().len(), 6);
+    assert_eq!(validated.inventory, contract.inventory);
+    assert_eq!(
+        validated
+            .inventory
+            .records()
+            .iter()
+            .filter(|record| !matches!(record, WorkspaceNamespacedExportRecordV2::Control { .. }))
+            .map(WorkspaceNamespacedExportRecordV2::member_path)
+            .collect::<Vec<_>>(),
+        validated
+            .plan
+            .entries()
+            .iter()
+            .map(|entry| entry.member_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        validated.inventory.inventory_sha256(),
+        validated.terminal_control.metadata.inventory_sha256()
+    );
     assert_eq!(sink.directories.len(), 4);
     assert_eq!(sink.files["Sales/README.md"], b"Public\n");
     assert!(
@@ -423,6 +471,176 @@ fn production_tar_adapter_executes_the_validated_namespaced_plan() {
             .files
             .contains_key(locality_protocol::RESERVED_EXPORT_METADATA_PATH)
     );
+}
+
+#[test]
+fn exported_inventory_retains_empty_sources_across_shared_multi_source_mounts() {
+    let fixture = Fixture {
+        directories: vec![
+            FixtureDirectory {
+                path: "Engineering".to_string(),
+                scope_ordinal: None,
+            },
+            FixtureDirectory {
+                path: "Sales".to_string(),
+                scope_ordinal: None,
+            },
+        ],
+        files: Vec::new(),
+    };
+    let scope_sources = vec![
+        WorkspaceScopeSourceAuthorityV2::new(0, SourceConnectionId::new("source-notion")),
+        WorkspaceScopeSourceAuthorityV2::new(1, SourceConnectionId::new("source-drive")),
+        WorkspaceScopeSourceAuthorityV2::new(2, SourceConnectionId::new("source-drive")),
+        WorkspaceScopeSourceAuthorityV2::new(3, SourceConnectionId::new("source-notion")),
+    ];
+    let contract = contract_with_scope_sources(&fixture, scope_sources.clone());
+    let mut sink = MemorySink::default();
+
+    let validated = validate_workspace_tar(
+        &mut Cursor::new(archive(&fixture, &contract.control)),
+        &mut sink,
+        WorkspaceArchiveLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("validate empty shared-mount workspace archive");
+
+    assert_eq!(validated.inventory, contract.inventory);
+    assert_eq!(validated.inventory.scope_sources(), scope_sources);
+    assert_eq!(validated.inventory.file_count(), 0);
+    assert_eq!(validated.inventory.directory_count(), 2);
+    assert_eq!(validated.inventory.records().len(), 3);
+    assert_eq!(validated.plan.entries().len(), 2);
+
+    let mount_by_scope = contract
+        .session
+        .session_layout()
+        .entries()
+        .iter()
+        .map(|entry| (entry.scope_ordinal(), entry.mount_id().as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut sources_by_mount = BTreeMap::<_, BTreeSet<_>>::new();
+    for authority in validated.inventory.scope_sources() {
+        sources_by_mount
+            .entry(mount_by_scope[&authority.scope_ordinal()])
+            .or_default()
+            .insert(authority.source_connection_id().as_str());
+    }
+    assert_eq!(sources_by_mount.len(), 2);
+    assert!(sources_by_mount.values().all(|sources| sources.len() == 2));
+}
+
+#[test]
+fn exported_inventory_is_portable_and_fails_closed_on_context_or_control_tampering() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    let mut sink = MemorySink::default();
+    let validated = validate_workspace_tar(
+        &mut Cursor::new(archive(&fixture, &contract.control)),
+        &mut sink,
+        WorkspaceArchiveLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect("validate portable inventory");
+    let encoded = serde_json::to_string(&validated.inventory).expect("serialize inventory");
+    assert!(!encoded.contains("provider_precondition"));
+    assert!(!encoded.contains("source_remote_ids"));
+    assert!(!encoded.contains("opaque-v4"));
+    assert!(!encoded.contains("page-roadmap"));
+    assert!(
+        validated
+            .inventory
+            .records()
+            .iter()
+            .all(|record| !record.member_path().starts_with('/'))
+    );
+
+    let mut other_session_json: Value =
+        serde_json::from_slice(WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON).expect("session JSON");
+    other_session_json["session_id"] = Value::String("session-substituted".to_string());
+    let other_session: WorkspaceProfileSessionV2 =
+        serde_json::from_value(other_session_json).expect("substituted session");
+    let error = validate_workspace_tar(
+        &mut Cursor::new(archive(&fixture, &contract.control)),
+        &mut MemorySink::default(),
+        WorkspaceArchiveLimits::default(),
+        &other_session,
+        &contract.offer,
+    )
+    .expect_err("inventory must remain bound to the verified session");
+    assert!(
+        error.to_string().contains("does not match session"),
+        "{error}"
+    );
+
+    let mut control_json = serde_json::to_value(&contract.control).expect("control JSON");
+    let substituted_digest = Value::String(format!("sha256:{}", "a".repeat(64)));
+    control_json["metadata"]["inventory_sha256"] = substituted_digest.clone();
+    control_json["completion_receipt"]["metadata"]["inventory_sha256"] = substituted_digest.clone();
+    control_json["completion_receipt"]["receipt"]["inventory_sha256"] = substituted_digest;
+    let tampered_control: WorkspaceExportTerminalControlV2 =
+        serde_json::from_value(control_json).expect("shape-valid tampered control");
+    let error = validate_workspace_tar(
+        &mut Cursor::new(archive(&fixture, &tampered_control)),
+        &mut MemorySink::default(),
+        WorkspaceArchiveLimits::default(),
+        &contract.session,
+        &contract.offer,
+    )
+    .expect_err("inventory must remain bound to terminal control");
+    assert!(
+        error
+            .to_string()
+            .contains("control metadata does not match"),
+        "{error}"
+    );
+}
+
+#[test]
+fn archive_limits_bound_the_inventory_that_can_be_returned() {
+    let fixture = fixture();
+    let contract = contract(&fixture);
+    for (label, limits, expected) in [
+        (
+            "entries",
+            WorkspaceArchiveLimits {
+                max_entries: 6,
+                ..WorkspaceArchiveLimits::default()
+            },
+            "entry limit",
+        ),
+        (
+            "file bytes",
+            WorkspaceArchiveLimits {
+                max_file_bytes: 9,
+                ..WorkspaceArchiveLimits::default()
+            },
+            "file `Sales/Projects/Roadmap/page.md`",
+        ),
+        (
+            "content bytes",
+            WorkspaceArchiveLimits {
+                max_content_bytes: 16,
+                ..WorkspaceArchiveLimits::default()
+            },
+            "content is 17 bytes",
+        ),
+    ] {
+        let error = validate_workspace_tar(
+            &mut Cursor::new(archive(&fixture, &contract.control)),
+            &mut MemorySink::default(),
+            limits,
+            &contract.session,
+            &contract.offer,
+        )
+        .expect_err("limit violation must not return an inventory");
+        assert!(
+            error.to_string().contains(expected),
+            "case {label}: {error}"
+        );
+    }
 }
 
 #[test]
