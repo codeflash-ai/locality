@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -22,14 +23,18 @@ use locality_protocol::freshness_delivery_transport::{
     GenerationDeliveryAcknowledgmentRequest, GenerationDeliveryAcknowledgmentStatus,
     GenerationDeliveryPollResponse, GenerationDeliveryRequest, GenerationTransportContractError,
     MAX_GENERATION_BODY_WINDOW_BYTES, MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES,
+    MAX_GENERATION_TRANSPORT_REQUEST_BYTES,
 };
 use localityd::generation_sync::{
     GenerationDeliveryRequest as LegacyGenerationDeliveryRequest, GenerationDeliveryTransport,
 };
 use serde::Deserialize;
 
-const SESSION_ID: &str = "session-test-01";
+const SESSION_ID: &str = "018f4f6e-7b8c-7d9e-8f01-23456789abcd";
+const DELTA_ID: &str = "018f4f6e-1111-7222-8333-444444444444";
+const CROSSED_DELTA_ID: &str = "018f4f6e-5555-7666-8777-888888888888";
 const SESSION_SECRET: &str = "session-secret-never-log-this";
+const PROXY_CHILD_TARGET_URL: &str = "LOCALITY_GENERATION_HTTP_TEST_TARGET_URL";
 
 #[derive(Clone, Deserialize)]
 struct PollFixtures {
@@ -150,6 +155,67 @@ impl ScriptedServer {
     }
 }
 
+struct ProxyProbe {
+    url: String,
+    requests: Arc<Mutex<Vec<CapturedRequest>>>,
+    handle: JoinHandle<()>,
+}
+
+impl ProxyProbe {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind proxy probe");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking proxy probe");
+        let address = listener.local_addr().expect("proxy address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let handle = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(750);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("blocking proxy stream");
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .expect("proxy read timeout");
+                        captured
+                            .lock()
+                            .expect("proxy captures")
+                            .push(read_request(&mut stream));
+                        let body = b"{\"code\":\"unavailable\"}";
+                        let response = format!(
+                            "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.write_all(body);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("accept proxy request: {error}"),
+                }
+            }
+        });
+        Self {
+            url: format!("http://{address}"),
+            requests,
+            handle,
+        }
+    }
+
+    fn finish(self) -> Vec<CapturedRequest> {
+        self.handle.join().expect("proxy probe thread");
+        Arc::try_unwrap(self.requests)
+            .expect("only test owns proxy captures")
+            .into_inner()
+            .expect("proxy captures")
+    }
+}
+
 fn accept_before(listener: &TcpListener, deadline: Instant) -> TcpStream {
     loop {
         match listener.accept() {
@@ -225,7 +291,20 @@ fn reason_phrase(status: u16) -> &'static str {
 }
 
 fn poll_fixtures() -> PollFixtures {
-    serde_json::from_slice(GENERATION_DELIVERY_POLL_V1_GOLDEN_JSON).expect("poll fixtures")
+    let mut fixtures: PollFixtures =
+        serde_json::from_slice(GENERATION_DELIVERY_POLL_V1_GOLDEN_JSON).expect("poll fixtures");
+    let delivery = fixtures
+        .delivery
+        .delivery
+        .as_mut()
+        .expect("delivery fixture payload");
+    delivery.delta.delta_id = DELTA_ID.to_string();
+    delivery.terminal_receipt.delta_id = DELTA_ID.to_string();
+    delivery.terminal_receipt.delta_sha256 = delivery
+        .delta
+        .canonical_sha256()
+        .expect("UUID-bound delta digest");
+    fixtures
 }
 
 fn delivery_request() -> GenerationDeliveryRequest {
@@ -239,18 +318,34 @@ fn delivery_request() -> GenerationDeliveryRequest {
 }
 
 fn body_request() -> GenerationBodyWindowRequest {
-    GenerationBodyWindowRequest::decode_json(GENERATION_BODY_WINDOW_REQUEST_V1_GOLDEN_JSON)
-        .expect("body-window request fixture")
+    let mut request =
+        GenerationBodyWindowRequest::decode_json(GENERATION_BODY_WINDOW_REQUEST_V1_GOLDEN_JSON)
+            .expect("body-window request fixture");
+    request.delta_id = DELTA_ID.to_string();
+    request.validate().expect("UUID-bound body request");
+    request
 }
 
 fn body_metadata() -> GenerationBodyWindowMetadata {
-    GenerationBodyWindowMetadata::decode_json(GENERATION_BODY_WINDOW_METADATA_V1_GOLDEN_JSON)
-        .expect("body-window metadata fixture")
+    let mut metadata =
+        GenerationBodyWindowMetadata::decode_json(GENERATION_BODY_WINDOW_METADATA_V1_GOLDEN_JSON)
+            .expect("body-window metadata fixture");
+    metadata.delta_id = DELTA_ID.to_string();
+    metadata.validate().expect("UUID-bound body metadata");
+    metadata
 }
 
 fn acknowledgment_fixture() -> AcknowledgmentFixture {
-    serde_json::from_slice(GENERATION_DELIVERY_ACKNOWLEDGMENT_V1_GOLDEN_JSON)
-        .expect("acknowledgment fixture")
+    let mut fixture: AcknowledgmentFixture =
+        serde_json::from_slice(GENERATION_DELIVERY_ACKNOWLEDGMENT_V1_GOLDEN_JSON)
+            .expect("acknowledgment fixture");
+    fixture.request.delta_id = DELTA_ID.to_string();
+    fixture.response.delta_id = DELTA_ID.to_string();
+    fixture
+        .request
+        .validate()
+        .expect("UUID-bound acknowledgment");
+    fixture
 }
 
 fn transport(server: &ScriptedServer) -> GenerationHttpTransport {
@@ -265,6 +360,13 @@ fn raw_frame(metadata: &GenerationBodyWindowMetadata, body: &[u8]) -> Vec<u8> {
     frame.extend_from_slice(&metadata);
     frame.extend_from_slice(body);
     frame
+}
+
+fn chunked_body(payload: &[u8]) -> Vec<u8> {
+    let mut body = format!("{:x}\r\n", payload.len()).into_bytes();
+    body.extend_from_slice(payload);
+    body.extend_from_slice(b"\r\n0\r\n\r\n");
+    body
 }
 
 fn assert_authenticated_request(request: &CapturedRequest, expected_path: &str) {
@@ -296,7 +398,7 @@ fn polls_no_delivery_and_delivery_with_the_exact_authenticated_route() {
     let delivery = transport.next_delta_poll(&request).expect("delivery");
     assert_eq!(
         delivery.delivery.expect("delivery payload").delta.delta_id,
-        "delta-poll-v1"
+        DELTA_ID
     );
 
     let requests = server.finish();
@@ -304,7 +406,7 @@ fn polls_no_delivery_and_delivery_with_the_exact_authenticated_route() {
     for captured in &requests {
         assert_authenticated_request(
             captured,
-            "/v2/sessions/session-test-01/generation-deliveries",
+            "/v2/sessions/018f4f6e-7b8c-7d9e-8f01-23456789abcd/generation-deliveries",
         );
         let sent = GenerationDeliveryRequest::decode_json(&captured.body).expect("sent poll");
         assert_eq!(sent, request);
@@ -430,7 +532,7 @@ fn body_window_accepts_valid_frame_and_rejects_truncation_extra_media_digest_and
     let requests = server.finish();
     assert_authenticated_request(
         &requests[0],
-        "/v2/sessions/session-test-01/generation-deliveries/delta-018f4f6e/body-windows",
+        "/v2/sessions/018f4f6e-7b8c-7d9e-8f01-23456789abcd/generation-deliveries/018f4f6e-1111-7222-8333-444444444444/body-windows",
     );
     assert_eq!(
         GenerationBodyWindowRequest::decode_json(&requests[0].body).unwrap(),
@@ -587,10 +689,90 @@ fn acknowledgments_accept_new_and_exact_replay_responses() {
     for request in &requests {
         assert_authenticated_request(
             request,
-            "/v2/sessions/session-test-01/generation-deliveries/delta-018f4f6e/acknowledgments",
+            "/v2/sessions/018f4f6e-7b8c-7d9e-8f01-23456789abcd/generation-deliveries/018f4f6e-1111-7222-8333-444444444444/acknowledgments",
         );
     }
     assert_eq!(requests[0].body, requests[1].body);
+}
+
+#[test]
+fn acknowledgment_rejects_malformed_crossed_and_oversized_responses() {
+    let fixture = acknowledgment_fixture();
+
+    let malformed = ScriptedServer::start(vec![ResponseSpec::json(200, b"{".to_vec())]);
+    let error = transport(&malformed)
+        .acknowledge_terminal_receipt(&fixture.request)
+        .expect_err("malformed acknowledgment");
+    assert!(matches!(
+        error,
+        GenerationHttpError::InvalidResponse {
+            problem: GenerationHttpResponseProblem::InvalidJson,
+            ..
+        }
+    ));
+    assert_eq!(malformed.finish().len(), 1);
+
+    let mut crossed = fixture.response.clone();
+    crossed.delta_id = CROSSED_DELTA_ID.to_string();
+    let crossed_server = ScriptedServer::start(vec![ResponseSpec::json(
+        200,
+        serde_json::to_vec(&crossed).unwrap(),
+    )]);
+    let error = transport(&crossed_server)
+        .acknowledge_terminal_receipt(&fixture.request)
+        .expect_err("crossed acknowledgment");
+    assert!(matches!(
+        error,
+        GenerationHttpError::RequestContract(
+            GenerationTransportContractError::AcknowledgmentMismatch
+        )
+    ));
+    assert_eq!(crossed_server.finish().len(), 1);
+
+    let oversized = ScriptedServer::start(vec![ResponseSpec {
+        status: 200,
+        content_type: Some("application/json"),
+        content_length: Some(MAX_GENERATION_TRANSPORT_REQUEST_BYTES + 1),
+        headers: Vec::new(),
+        body: Vec::new(),
+        delay: Duration::ZERO,
+    }]);
+    let error = transport(&oversized)
+        .acknowledge_terminal_receipt(&fixture.request)
+        .expect_err("oversized acknowledgment");
+    assert!(matches!(
+        error,
+        GenerationHttpError::InvalidResponse {
+            problem: GenerationHttpResponseProblem::ContentLengthTooLarge,
+            ..
+        }
+    ));
+    assert_eq!(oversized.finish().len(), 1);
+}
+
+#[test]
+fn contradictory_small_content_length_cannot_bypass_chunked_response_bound() {
+    let fixture = acknowledgment_fixture();
+    let payload = vec![b' '; MAX_GENERATION_TRANSPORT_REQUEST_BYTES + 1];
+    let server = ScriptedServer::start(vec![ResponseSpec {
+        status: 200,
+        content_type: Some("application/json"),
+        content_length: Some(1),
+        headers: vec![("Transfer-Encoding", "chunked")],
+        body: chunked_body(&payload),
+        delay: Duration::ZERO,
+    }]);
+    let error = transport(&server)
+        .acknowledge_terminal_receipt(&fixture.request)
+        .expect_err("chunked response exceeds the hard read bound");
+    assert!(matches!(
+        error,
+        GenerationHttpError::InvalidResponse {
+            problem: GenerationHttpResponseProblem::ContentLengthTooLarge,
+            ..
+        }
+    ));
+    assert_eq!(server.finish().len(), 1);
 }
 
 #[test]
@@ -626,6 +808,32 @@ fn retries_only_transient_statuses_with_identical_request_identity() {
             requests[0].headers.get("authorization")
         );
     }
+}
+
+#[test]
+fn truncated_success_response_retries_with_identical_request_identity() {
+    let success = serde_json::to_vec(&poll_fixtures().no_delivery).unwrap();
+    let server = ScriptedServer::start(vec![
+        ResponseSpec {
+            content_length: Some(success.len() + 17),
+            ..ResponseSpec::json(200, success.clone())
+        },
+        ResponseSpec::json(200, success),
+    ]);
+    let mut transport = transport(&server);
+    let poll = transport
+        .next_delta_poll(&delivery_request())
+        .expect("truncated success retries exactly");
+    assert!(poll.delivery.is_none());
+
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].path, requests[1].path);
+    assert_eq!(requests[0].body, requests[1].body);
+    assert_eq!(
+        requests[0].headers.get("authorization"),
+        requests[1].headers.get("authorization")
+    );
 }
 
 #[test]
@@ -697,6 +905,8 @@ fn bad_request_unauthorized_and_conflict_are_never_blindly_retried() {
 fn urls_redirects_legacy_methods_and_diagnostics_fail_closed_without_secrets() {
     for url in [
         "http://example.com",
+        "http://localhost:8757",
+        "http://localhost.:8757",
         "https://user:url-secret@example.com",
         "https://example.com?token=url-secret",
         "https://example.com/#url-secret",
@@ -707,6 +917,14 @@ fn urls_redirects_legacy_methods_and_diagnostics_fail_closed_without_secrets() {
         let diagnostic = format!("{error:?} {error}");
         assert!(!diagnostic.contains(SESSION_SECRET));
         assert!(!diagnostic.contains("url-secret"));
+    }
+    for url in [
+        "http://127.255.0.1:9",
+        "http://[::1]:9",
+        "https://localhost:8757",
+    ] {
+        GenerationHttpTransport::new(url, SESSION_ID, SESSION_SECRET)
+            .expect("literal loopback HTTP or authenticated HTTPS URL");
     }
 
     let redirect = ScriptedServer::start(vec![ResponseSpec {
@@ -745,4 +963,59 @@ fn urls_redirects_legacy_methods_and_diagnostics_fail_closed_without_secrets() {
             GenerationHttpOperation::LegacyOpenContent
         ))
     ));
+}
+
+#[test]
+fn plaintext_loopback_never_sends_bearer_through_environment_proxy() {
+    let target = ScriptedServer::start(vec![ResponseSpec::json(
+        200,
+        serde_json::to_vec(&poll_fixtures().no_delivery).unwrap(),
+    )]);
+    let proxy = ProxyProbe::start();
+    let output = Command::new(std::env::current_exe().expect("current test binary"))
+        .args([
+            "--exact",
+            "plaintext_loopback_proxy_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(PROXY_CHILD_TARGET_URL, &target.url)
+        .env("HTTP_PROXY", &proxy.url)
+        .env("http_proxy", &proxy.url)
+        .env("ALL_PROXY", &proxy.url)
+        .env("all_proxy", &proxy.url)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .output()
+        .expect("run isolated proxy child");
+    assert!(
+        output.status.success(),
+        "proxy child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let target_requests = target.finish();
+    assert_eq!(target_requests.len(), 1);
+    assert_authenticated_request(
+        &target_requests[0],
+        "/v2/sessions/018f4f6e-7b8c-7d9e-8f01-23456789abcd/generation-deliveries",
+    );
+    let proxy_requests = proxy.finish();
+    assert!(
+        proxy_requests.is_empty(),
+        "plaintext bearer request reached proxy: {proxy_requests:#?}"
+    );
+}
+
+#[test]
+#[ignore = "subprocess helper for proxy environment isolation"]
+fn plaintext_loopback_proxy_child() {
+    let target = std::env::var(PROXY_CHILD_TARGET_URL).expect("target URL from parent test");
+    let mut transport = GenerationHttpTransport::new(&target, SESSION_ID, SESSION_SECRET)
+        .expect("direct plaintext loopback transport");
+    let poll = transport
+        .next_delta_poll(&delivery_request())
+        .expect("direct request bypasses environment proxy");
+    assert!(poll.delivery.is_none());
 }

@@ -6,7 +6,7 @@
 
 use std::fmt::{Debug, Display, Formatter};
 use std::io::{Cursor, Read};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -317,11 +317,19 @@ impl GenerationHttpTransport {
         REQWEST_CRYPTO_PROVIDER.get_or_init(|| {
             let _ = rustls::crypto::ring::default_provider().install_default();
         });
-        let client = Client::builder()
+        let mut client = Client::builder()
             .user_agent(USER_AGENT)
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .connect_timeout(options.connect_timeout)
-            .timeout(options.request_timeout)
+            .timeout(options.request_timeout);
+        if base_url.scheme() == "http" {
+            // Plaintext bearer authentication is permitted only to a literal
+            // loopback address and must never traverse environment or system
+            // proxy configuration. HTTPS retains the platform proxy policy.
+            client = client.no_proxy();
+        }
+        let client = client
             .build()
             .map_err(|_| GenerationHttpError::InvalidConfiguration("HTTP client setup failed"))?;
         let capabilities = GenerationTransportCapabilities {
@@ -406,10 +414,13 @@ impl GenerationHttpTransport {
             };
             match read_wire_response(response, operation, content_type, maximum, status_retry) {
                 Ok(response) => return Ok(response),
-                Err(GenerationHttpError::Transport {
-                    retry: GenerationHttpRetryClassification::Transient,
-                    ..
-                }) if attempt < self.max_attempts => continue,
+                Err(error)
+                    if error.retry_classification()
+                        == GenerationHttpRetryClassification::Transient
+                        && attempt < self.max_attempts =>
+                {
+                    continue;
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -653,7 +664,7 @@ fn parse_base_url(base_url: &str) -> Result<reqwest::Url, GenerationHttpError> {
         ))?;
     match url.scheme() {
         "https" => {}
-        "http" if is_loopback_host(host) => {}
+        "http" if is_literal_loopback_host(host) => {}
         "http" => {
             return Err(GenerationHttpError::InvalidConfiguration(
                 "HTTP is allowed only for loopback hosts",
@@ -683,11 +694,16 @@ fn parse_base_url(base_url: &str) -> Result<reqwest::Url, GenerationHttpError> {
     Ok(url)
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
+fn is_literal_loopback_host(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => address.is_loopback(),
+        Ok(IpAddr::V6(address)) => address == Ipv6Addr::LOCALHOST,
+        Err(_) => false,
+    }
 }
 
 fn validate_opaque(
@@ -762,7 +778,7 @@ fn classify_transport_error(
 }
 
 fn read_wire_response(
-    response: reqwest::blocking::Response,
+    mut response: reqwest::blocking::Response,
     operation: GenerationHttpOperation,
     expected_content_type: &'static str,
     maximum: usize,
@@ -786,31 +802,76 @@ fn read_wire_response(
                 retry,
             }
         })?;
-    let body = response.bytes().map_err(|error| {
-        let (failure, transport_retry) = classify_transport_error(&error);
-        let retry = if status == StatusCode::OK {
-            transport_retry
-        } else {
-            retry
-        };
-        GenerationHttpError::Transport {
+    let hard_limit = maximum
+        .checked_add(1)
+        .ok_or(GenerationHttpError::InvalidResponse {
             operation,
-            failure,
-            retry,
-        }
-    })?;
+            status: Some(status.as_u16()),
+            problem: GenerationHttpResponseProblem::ContentLengthTooLarge,
+            retry: GenerationHttpRetryClassification::Never,
+        })?;
+    let mut body = Vec::with_capacity(content_length.min(maximum));
+    response
+        .by_ref()
+        .take(u64::try_from(hard_limit).unwrap_or(u64::MAX))
+        .read_to_end(&mut body)
+        .map_err(|error| {
+            let (failure, transport_retry) = classify_body_read_error(&error);
+            GenerationHttpError::Transport {
+                operation,
+                failure,
+                retry: if status == StatusCode::OK {
+                    transport_retry
+                } else {
+                    retry
+                },
+            }
+        })?;
+    if body.len() > maximum {
+        return Err(GenerationHttpError::InvalidResponse {
+            operation,
+            status: Some(status.as_u16()),
+            problem: GenerationHttpResponseProblem::ContentLengthTooLarge,
+            retry: GenerationHttpRetryClassification::Never,
+        });
+    }
     if body.len() != content_length {
         return Err(GenerationHttpError::InvalidResponse {
             operation,
             status: Some(status.as_u16()),
             problem: GenerationHttpResponseProblem::ContentLengthMismatch,
-            retry,
+            retry: if status == StatusCode::OK {
+                GenerationHttpRetryClassification::Transient
+            } else {
+                retry
+            },
         });
     }
-    Ok(WireResponse {
-        status,
-        body: body.to_vec(),
-    })
+    Ok(WireResponse { status, body })
+}
+
+fn classify_body_read_error(
+    error: &std::io::Error,
+) -> (
+    GenerationHttpTransportFailure,
+    GenerationHttpRetryClassification,
+) {
+    let timed_out = error.kind() == std::io::ErrorKind::TimedOut
+        || error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<reqwest::Error>())
+            .is_some_and(reqwest::Error::is_timeout);
+    if timed_out {
+        (
+            GenerationHttpTransportFailure::Timeout,
+            GenerationHttpRetryClassification::Transient,
+        )
+    } else {
+        (
+            GenerationHttpTransportFailure::ResponseBody,
+            GenerationHttpRetryClassification::Transient,
+        )
+    }
 }
 
 fn require_content_type(
