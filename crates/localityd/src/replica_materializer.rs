@@ -2107,7 +2107,7 @@ pub(crate) fn remove_workspace_generation(
         drop(validation_parent);
 
         let parent = WindowsDirectory::open_absolute(parent_path)?;
-        let root = parent.open_directory_for_cleanup(name)?;
+        let (root, root_sync) = parent.open_directory_for_cleanup_with_sync(name)?;
         if root.identity()? != expected {
             return Err(io::Error::other(
                 "workspace generation identity changed before cleanup",
@@ -2126,6 +2126,8 @@ pub(crate) fn remove_workspace_generation(
                 "workspace generation identity changed before removal",
             ));
         }
+        root_sync.sync()?;
+        drop(root_sync);
         root.mark_delete()?;
         parent.sync()
     }
@@ -2212,8 +2214,22 @@ pub(crate) fn repair_workspace_generation(
                 "workspace generation identity changed before mode repair",
             ));
         }
+        root.clear_read_only()?;
+        let root_sync = match parent.open_directory_for_sync(name) {
+            Ok(root_sync) => root_sync,
+            Err(error) => {
+                let _ = root.set_read_only();
+                return Err(error);
+            }
+        };
+        if root_sync.identity()? != expected {
+            return Err(io::Error::other(
+                "workspace generation changed while opening durability handle",
+            ));
+        }
         root.set_read_only()?;
-        root.sync()?;
+        root_sync.sync()?;
+        drop(root_sync);
         if parent.open_directory_read_only(name)?.identity()? != expected {
             return Err(io::Error::other(
                 "workspace generation identity changed while mode was repaired",
@@ -3139,7 +3155,8 @@ impl Drop for StagingDirectory {
                     let _ = self
                         .root
                         .preflight_contents(&self.path, expected.device)
-                        .and_then(|()| self.root.remove_contents(&self.path, expected.device));
+                        .and_then(|()| self.root.remove_contents(&self.path, expected.device))
+                        .and_then(|()| self.root.sync());
                     if self
                         .parent
                         .open_directory_read_only(&self.name)

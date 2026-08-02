@@ -388,9 +388,16 @@ fn rename_noreplace_durable_unix(
 ) -> io::Result<()> {
     use rustix::fs::RenameFlags;
 
-    let (source_parent, source_name) = open_unix_parent_without_symlinks(source_root, source)?;
+    if source_root != destination_root {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "durable rename requires one shared trusted root",
+        ));
+    }
+    let root = open_unix_root(source_root)?;
+    let (source_parent, source_name) = open_unix_parent_from_root(&root, source_root, source)?;
     let (destination_parent, destination_name) =
-        open_unix_parent_without_symlinks(destination_root, destination)?;
+        open_unix_parent_from_root(&root, source_root, destination)?;
     rustix::fs::renameat_with(
         &source_parent,
         &source_name,
@@ -693,6 +700,16 @@ fn open_unix_parent_without_symlinks(
     trusted_root: &Path,
     path: &Path,
 ) -> io::Result<(std::os::fd::OwnedFd, std::ffi::OsString)> {
+    let root = open_unix_root(trusted_root)?;
+    open_unix_parent_from_root(&root, trusted_root, path)
+}
+
+#[cfg(unix)]
+fn open_unix_parent_from_root(
+    root: &std::os::fd::OwnedFd,
+    trusted_root: &Path,
+    path: &Path,
+) -> io::Result<(std::os::fd::OwnedFd, std::ffi::OsString)> {
     validate_root_relative_path(trusted_root, path)?;
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
@@ -706,7 +723,7 @@ fn open_unix_parent_without_symlinks(
             format!("path `{}` has no filename", path.display()),
         )
     })?;
-    let mut directory = open_unix_root(trusted_root)?;
+    let mut directory = root.try_clone()?;
     let relative_parent = parent.strip_prefix(trusted_root).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -775,9 +792,12 @@ pub fn remove_dir_all_durable_anchored(trusted_root: &Path, path: &Path) -> io::
         validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
         let (parents, name) = open_windows_parent_anchored(trusted_root, path, true)?;
         let parent = parents.last().expect("anchored cleanup parent");
-        let directory = parent.open_directory_for_anchored_cleanup(&name)?;
+        let (directory, directory_sync) =
+            parent.open_directory_for_anchored_cleanup_with_sync(&name)?;
         let device = directory.identity()?.device;
         directory.remove_contents(path, device)?;
+        directory_sync.sync()?;
+        drop(directory_sync);
         directory.mark_delete()?;
         parent.sync()?;
         return Ok(());

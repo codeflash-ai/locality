@@ -23,6 +23,10 @@ use crate::watcher::{FileWatcher, NotifyFileWatcher, PollingStubReadWatcher};
 
 pub fn run_foreground(config: &DaemonConfig) -> LocalityResult<()> {
     std::fs::create_dir_all(&config.state_root)?;
+    let paths = locality_platform::DaemonProcessPaths::new(config.state_root.clone());
+    locality_platform::ensure_daemon_start_allowed(&paths).map_err(|error| {
+        LocalityError::InvalidState(format!("localityd startup is fenced: {}", error.message()))
+    })?;
     let runtime = DaemonRuntime::spawn(config.clone())?;
     let runtime_handle = runtime.handle();
     let watch_manager = Arc::new(Mutex::new(DaemonWatchManager::new(
@@ -548,6 +552,21 @@ mod tests {
     use crate::runtime::{RuntimeJobRunner, ScheduledPullRuntimeReport};
 
     use super::*;
+
+    #[test]
+    fn foreground_start_fails_closed_while_remount_fence_exists() {
+        let config = test_config("foreground-remount-fence");
+        std::fs::create_dir_all(&config.state_root).expect("create state root");
+        std::fs::write(
+            locality_platform::daemon_remount_fence_path(&config.state_root),
+            "version=1\n",
+        )
+        .expect("write remount fence");
+
+        let error = run_foreground(&config).expect_err("foreground daemon must honor fence");
+
+        assert!(error.to_string().contains("startup is fenced"));
+    }
 
     #[test]
     fn watch_manager_reload_adds_mounts_created_after_startup() {

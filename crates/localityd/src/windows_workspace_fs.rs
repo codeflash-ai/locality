@@ -53,7 +53,6 @@ const SYNC_DIRECTORY_ACCESS: u32 = FILE_LIST_DIRECTORY
 const CLEANUP_DIRECTORY_ACCESS: u32 = FILE_LIST_DIRECTORY
     | FILE_TRAVERSE
     | FILE_READ_ATTRIBUTES
-    | FILE_WRITE_DATA
     | FILE_WRITE_ATTRIBUTES
     | DELETE
     | SYNCHRONIZE;
@@ -130,6 +129,19 @@ impl WindowsDirectory {
             FILE_OPEN,
             FILE_DIRECTORY_FILE,
             ANCHOR_SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(Self { handle })
+    }
+
+    pub(crate) fn open_directory_for_sync(&self, name: &OsStr) -> io::Result<Self> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            SYNC_DIRECTORY_ACCESS,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE,
+            SHARING,
         )?;
         reject_reparse(&handle)?;
         Ok(Self { handle })
@@ -216,6 +228,21 @@ impl WindowsDirectory {
         Ok(Self { handle })
     }
 
+    pub(crate) fn open_directory_for_cleanup_with_sync(
+        &self,
+        name: &OsStr,
+    ) -> io::Result<(Self, Self)> {
+        let cleanup = self.open_directory_for_cleanup(name)?;
+        cleanup.clear_read_only()?;
+        let sync = self.open_directory_for_sync(name)?;
+        if cleanup.identity()? != sync.identity()? {
+            return Err(io::Error::other(
+                "workspace cleanup directory changed while opening durability handle",
+            ));
+        }
+        Ok((cleanup, sync))
+    }
+
     pub(crate) fn open_directory_for_anchored_cleanup(&self, name: &OsStr) -> io::Result<Self> {
         let handle = nt_open_relative(
             &self.handle,
@@ -227,6 +254,21 @@ impl WindowsDirectory {
         )?;
         reject_reparse(&handle)?;
         Ok(Self { handle })
+    }
+
+    pub(crate) fn open_directory_for_anchored_cleanup_with_sync(
+        &self,
+        name: &OsStr,
+    ) -> io::Result<(Self, Self)> {
+        let cleanup = self.open_directory_for_anchored_cleanup(name)?;
+        cleanup.clear_read_only()?;
+        let sync = self.open_directory_for_sync(name)?;
+        if cleanup.identity()? != sync.identity()? {
+            return Err(io::Error::other(
+                "anchored cleanup directory changed while opening durability handle",
+            ));
+        }
+        Ok((cleanup, sync))
     }
 
     pub(crate) fn open_directory_for_attributes(&self, name: &OsStr) -> io::Result<Self> {
@@ -458,14 +500,16 @@ impl WindowsDirectory {
         for entry in std::fs::read_dir(named_path)? {
             let entry = entry?;
             let name = entry.file_name();
-            match self.open_directory_for_cleanup(&name) {
-                Ok(child) => {
+            match self.open_directory_for_cleanup_with_sync(&name) {
+                Ok((child, child_sync)) => {
                     if child.identity()?.device != expected_device {
                         return Err(io::Error::other(
                             "workspace cleanup refuses to cross a volume boundary",
                         ));
                     }
                     child.remove_contents(&entry.path(), expected_device)?;
+                    child_sync.sync()?;
+                    drop(child_sync);
                     child.mark_delete()?;
                 }
                 Err(directory_error) => match self.open_any_cleanup_handle_allow_reparse(&name) {
@@ -484,7 +528,7 @@ impl WindowsDirectory {
                 },
             }
         }
-        self.sync()
+        Ok(())
     }
 
     pub(crate) fn mark_delete(&self) -> io::Result<()> {
@@ -1121,6 +1165,7 @@ mod lock_tests {
 
         root.remove_contents(&tree_path, expected.device)
             .expect("remove sealed tree through cleanup-specific handles");
+        root.sync().expect("flush cleaned root metadata");
         root.mark_delete().expect("remove empty cleanup root");
         drop(root);
         drop(parent);

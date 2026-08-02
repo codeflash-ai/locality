@@ -50,8 +50,7 @@ const AGENTS_GUIDANCE_IDENTIFIER: &str = "guidance:AGENTS.md";
 const CLAUDE_GUIDANCE_IDENTIFIER: &str = "guidance:CLAUDE.md";
 
 #[cfg(target_os = "macos")]
-static LEGACY_MACOS_CONTENT_REPAIRS: OnceLock<Mutex<BTreeMap<PathBuf, LocalityResult<()>>>> =
-    OnceLock::new();
+static LEGACY_MACOS_CONTENT_REPAIRS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
 
 pub fn source_root_identifier(connector: &str) -> String {
     format!(
@@ -1888,8 +1887,8 @@ fn repair_legacy_macos_content_root_for_paths(
     mount_id: &MountId,
 ) -> LocalityResult<()> {
     let key = current_content_root.to_path_buf();
-    if let Some(result) = legacy_macos_content_repair_result(&key)? {
-        return result;
+    if legacy_macos_content_repair_completed(&key)? {
+        return Ok(());
     }
 
     let result = repair_legacy_macos_content_root_for_paths_uncached(
@@ -1897,7 +1896,9 @@ fn repair_legacy_macos_content_root_for_paths(
         current_content_root,
         mount_id,
     );
-    record_legacy_macos_content_repair_result(key, result.clone())?;
+    if result.is_ok() {
+        record_legacy_macos_content_repair_success(key)?;
+    }
     result
 }
 
@@ -1949,11 +1950,11 @@ fn repair_legacy_macos_content_root_for_paths(
 }
 
 #[cfg(target_os = "macos")]
-fn legacy_macos_content_repair_result(key: &Path) -> LocalityResult<Option<LocalityResult<()>>> {
+fn legacy_macos_content_repair_completed(key: &Path) -> LocalityResult<bool> {
     LEGACY_MACOS_CONTENT_REPAIRS
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
         .lock()
-        .map(|repaired| repaired.get(key).cloned())
+        .map(|repaired| repaired.contains(key))
         .map_err(|_| {
             LocalityError::InvalidState(
                 "legacy macOS virtual filesystem content repair lock poisoned".to_string(),
@@ -1962,15 +1963,12 @@ fn legacy_macos_content_repair_result(key: &Path) -> LocalityResult<Option<Local
 }
 
 #[cfg(target_os = "macos")]
-fn record_legacy_macos_content_repair_result(
-    key: PathBuf,
-    result: LocalityResult<()>,
-) -> LocalityResult<()> {
+fn record_legacy_macos_content_repair_success(key: PathBuf) -> LocalityResult<()> {
     LEGACY_MACOS_CONTENT_REPAIRS
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
         .lock()
         .map(|mut repaired| {
-            repaired.insert(key, result);
+            repaired.insert(key);
         })
         .map_err(|_| {
             LocalityError::InvalidState(
@@ -2647,19 +2645,6 @@ where
         retitle_cached_page_if_present(new_content_path, title)?;
     }
 
-    // Keep the transition pending until obsolete source cleanup is durable.
-    // A cleanup error is therefore surfaced and retried by the next move
-    // reconciliation instead of being forgotten after SQLite finalization.
-    if old_path != new_content_path && old_path.exists() {
-        let source_root = virtual_move_source_trusted_root(content_root, &mount_id, old_path)?;
-        remove_path_durable(&source_root, old_path).map_err(|error| {
-            LocalityError::Io(format!(
-                "failed to durably remove obsolete virtual content `{}`: {error}",
-                old_path.display()
-            ))
-        })?;
-    }
-
     let finalized = store
         .finalize_virtual_move_content(
             &mount_id,
@@ -2669,6 +2654,20 @@ where
             &now_string(),
         )
         .map_err(LocalityError::from)?;
+
+    // SQLite must point at the published destination before best-effort legacy
+    // source cleanup. A surfaced cleanup failure therefore cannot make push
+    // read stale bytes through the old content pointer.
+    if old_path != new_content_path && old_path.exists() {
+        let source_root = virtual_move_source_trusted_root(content_root, &mount_id, old_path)?;
+        remove_path_durable(&source_root, old_path).map_err(|error| {
+            LocalityError::Io(format!(
+                "virtual move committed to `{}`, but durable cleanup of obsolete content `{}` failed: {error}",
+                new_content_path.display(),
+                old_path.display()
+            ))
+        })?;
+    }
 
     Ok(finalized)
 }
@@ -2682,28 +2681,19 @@ fn virtual_move_source_trusted_root(
         return Ok(content_root.to_path_buf());
     }
     #[cfg(target_os = "macos")]
-    for candidate in source.ancestors() {
-        if candidate.file_name().and_then(OsStr::to_str) == Some("files")
-            && candidate
-                .parent()
-                .and_then(Path::file_name)
-                .and_then(OsStr::to_str)
-                == Some(mount_id.0.as_str())
-            && candidate
-                .parent()
-                .and_then(Path::parent)
-                .and_then(Path::file_name)
-                .and_then(OsStr::to_str)
-                == Some("content")
-            && candidate
-                .parent()
-                .and_then(Path::parent)
-                .and_then(Path::parent)
-                .and_then(Path::file_name)
-                .and_then(OsStr::to_str)
-                == Some("C484HB7Q6S.group.ai.codeflash.locality")
-        {
-            return Ok(candidate.to_path_buf());
+    {
+        let inferred = state_root_for_current_content_root(content_root, mount_id);
+        let configured = locality_platform::default_state_root();
+        for state_root in inferred.iter().chain(std::iter::once(&configured)) {
+            if virtual_fs_content_root(state_root, mount_id) != content_root {
+                continue;
+            }
+            if let Some(legacy_root) = macos_app_group_container_for_state_root(state_root)
+                .map(|container| container.join("content").join(&mount_id.0).join("files"))
+                && source.starts_with(&legacy_root)
+            {
+                return Ok(legacy_root);
+            }
         }
     }
     Err(LocalityError::InvalidState(format!(
@@ -6371,7 +6361,8 @@ mod tests {
     fn legacy_move_cleanup_selects_the_actual_legacy_content_root() {
         let home = temp_root("loc-legacy-cleanup-root");
         let mount_id = MountId::new("notion-main");
-        let current_root = home.join("override/content/notion-main/files");
+        let state_root = home.join(".loc");
+        let current_root = virtual_fs_content_root(&state_root, &mount_id);
         let legacy_root = home
             .join("Library/Group Containers/C484HB7Q6S.group.ai.codeflash.locality")
             .join("content/notion-main/files");
@@ -6610,7 +6601,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn legacy_macos_content_repair_memoizes_failures_without_retrying_legacy_root() {
+    fn legacy_macos_content_repair_retries_failures_in_process() {
         let home = temp_root("loc-virtual-fs-legacy-repair-failure");
         let state_root = home.join(".loc");
         let mount_id = MountId::new("notion-main");
@@ -6630,16 +6621,17 @@ mod tests {
             .expect("current parent");
         fs::write(&blocking_current_path, b"not a directory").expect("write blocking file");
 
-        let first = repair_legacy_macos_content_root(&state_root, &mount_id)
+        repair_legacy_macos_content_root(&state_root, &mount_id)
             .expect_err("first repair should fail");
         fs::remove_file(&blocking_current_path).expect("remove blocking file");
-        fs::remove_dir_all(home.join("Library")).expect("remove legacy root");
 
-        let second = repair_legacy_macos_content_root(&state_root, &mount_id)
-            .expect_err("second repair should return cached failure");
+        repair_legacy_macos_content_root(&state_root, &mount_id)
+            .expect("second repair should retry and succeed");
 
-        assert_eq!(second, first);
-        assert!(!current_content_root.join("Roadmap/page.md").exists());
+        assert_eq!(
+            fs::read(current_content_root.join("Roadmap/page.md")).expect("repaired content"),
+            b"legacy dirty bytes"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -8123,7 +8115,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn virtual_move_cleanup_failure_is_surfaced_and_remains_retryable() {
+    fn virtual_move_cleanup_failure_is_surfaced_after_new_pointer_is_finalized() {
         use std::os::unix::fs::symlink;
 
         let mount_id = MountId::new("cleanup-retry");
@@ -8177,38 +8169,11 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .content_path,
-            Some(old_path.clone())
+            Some(new_path.clone())
         );
-
-        fs::remove_file(&old_path).expect("remove unsafe link");
-        fs::write(&old_path, "preserved bytes").expect("restore ordinary source");
-        let pending = store
-            .get_virtual_mutation(&mount_id, &mutation.local_id)
-            .unwrap()
-            .unwrap();
-        persist_and_publish_virtual_move(
-            &mut store,
-            VirtualMoveTransition {
-                mutation: pending,
-                entity: None,
-                freshness: None,
-                superseded_local_ids: Vec::new(),
-            },
-            &content_root,
-            &old_path,
-            &new_path,
-            None,
-            true,
-        )
-        .expect("retry cleanup and finalize");
-        assert!(!old_path.exists());
-        assert_eq!(
-            store
-                .get_virtual_mutation(&mount_id, &mutation.local_id)
-                .unwrap()
-                .unwrap()
-                .content_path,
-            Some(new_path)
+        assert!(
+            old_path.exists(),
+            "failed cleanup remains separately visible"
         );
         let _ = fs::remove_dir_all(state_root);
     }
