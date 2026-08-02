@@ -141,6 +141,10 @@ existing-box stopped remote - - Test 2026-08-02T00:00:00Z}"
       printf 'unexpected fake amika command: %s\n' "$*" >&2
       exit 2
     fi
+    if [ -n "${FAKE_AMIKA_SNAPSHOT_TABLE_PATH:-}" ]; then
+      cat "$FAKE_AMIKA_SNAPSHOT_TABLE_PATH"
+      exit 0
+    fi
     printf '%s\n' "${FAKE_AMIKA_SNAPSHOT_TABLE:-NAME STATE PROVIDER SOURCE CREATED
 locality-snapshot active daytona aseem-locality 2026-08-02T00:00:00Z
 mcp-snapshot active daytona aseem-mcp 2026-08-02T00:00:00Z}"
@@ -437,6 +441,32 @@ if [ "$failed_snapshot_rc" -eq 0 ]; then
 fi
 assert_contains "$failed_snapshot_err" "required Amika snapshot is not active: locality-snapshot (state=failed)"
 assert_not_contains "$failed_snapshot_log" "amika sandbox create"
+
+large_snapshot_log="${tmp_root}/large-snapshot-amika.log"
+large_snapshot_payload="$(printf '%*s' 350000 '' | tr ' ' x)"
+large_snapshot_table_path="${tmp_root}/large-snapshot-table.txt"
+printf '%s\n' 'NAME STATE PROVIDER SOURCE CREATED' > "$large_snapshot_table_path"
+printf '%s\n' 'locality-snapshot active daytona aseem-locality 2026-08-02T00:00:00Z' >> "$large_snapshot_table_path"
+printf 'filler-snapshot active daytona %s 2026-08-02T00:00:00Z\n' "$large_snapshot_payload" >> "$large_snapshot_table_path"
+printf '%s\n' 'mcp-snapshot active daytona aseem-mcp 2026-08-02T00:00:00Z' >> "$large_snapshot_table_path"
+if [ "$(wc -c < "$large_snapshot_table_path")" -lt 349000 ]; then
+  fail "large snapshot table fixture must exceed the pipe buffer"
+fi
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$large_snapshot_log" \
+  FAKE_AMIKA_SNAPSHOT_TABLE_PATH="$large_snapshot_table_path" \
+  RUN_ID="large-snapshot-table" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/large-snapshot-table-out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"${tmp_root}/large-snapshot-table.err"
+large_snapshot_rc=$?
+set -e
+if [ "$large_snapshot_rc" -ne 0 ]; then
+  cat "${tmp_root}/large-snapshot-table.err" >&2
+  fail "an active large snapshot table should reach sandbox creation, got ${large_snapshot_rc}"
+fi
+assert_contains "$large_snapshot_log" "amika sandbox create --remote --no-git --snapshot locality-snapshot --name launch-readiness-large-snapshot-table-locality"
 
 invalid_attempts_log="${tmp_root}/invalid-attempts-amika.log"
 invalid_attempts_err="${tmp_root}/invalid-attempts.err"

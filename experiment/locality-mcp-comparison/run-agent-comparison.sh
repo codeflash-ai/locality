@@ -393,7 +393,15 @@ amika_table_state() {
   local name="$1"
   local table="$2"
 
-  printf '%s\n' "$table" | awk -v name="$name" 'NR > 1 && $1 == name { print $2; exit }'
+  printf '%s\n' "$table" | awk -v name="$name" '
+    NR > 1 && !found && $1 == name {
+      state = $2
+      found = 1
+    }
+    END {
+      if (found) print state
+    }
+  '
 }
 
 load_amika_sandbox_table() {
