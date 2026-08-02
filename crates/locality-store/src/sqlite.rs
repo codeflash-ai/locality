@@ -5,7 +5,7 @@
 //! columns, while shadow block arrays and journal plans are stored as JSON blobs
 //! until query needs justify normalization.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -977,21 +977,21 @@ impl GenerationDeliveryRepository for SqliteStateStore {
         &mut self,
         mut seeds: Vec<GenerationBaselineSeedRecordV2>,
     ) -> StoreResult<()> {
-        let mut mount_layouts = BTreeMap::new();
+        let mut baseline_layout = None;
         for seed in &mut seeds {
             validate_seed_generation(&seed.seed.observed, &seed.seed.paths)?;
             let layout = (
                 seed.seed.observed.workspace_layout_version,
                 seed.seed.observed.workspace_layout_digest.clone(),
             );
-            if mount_layouts
-                .insert(seed.seed.observed.mount_id.clone(), layout.clone())
-                .is_some_and(|existing| existing != layout)
-            {
-                return Err(StoreError::InvalidState(format!(
-                    "mount `{}` baseline sources do not share one workspace layout",
-                    seed.seed.observed.mount_id.0
-                )));
+            match &baseline_layout {
+                Some(existing) if existing != &layout => {
+                    return Err(StoreError::InvalidState(
+                        "generation baseline mounts do not share one workspace layout".to_string(),
+                    ));
+                }
+                None => baseline_layout = Some(layout),
+                Some(_) => {}
             }
             let expected_mode = generation_seed_refresh_mode(&seed.seed.observed, &seed.seed.paths);
             if seed.refresh_mode != expected_mode {

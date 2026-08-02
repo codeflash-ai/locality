@@ -354,6 +354,7 @@ pub trait GenerationDeliveryRepository {
     ) -> StoreResult<()>;
 
     /// Atomically seeds every source record in one authenticated baseline.
+    /// Every mount/source record must carry that baseline's one sealed layout.
     /// A mount with an observed baseline accepts only an exact full-source
     /// replay; callers cannot extend it with records from another baseline.
     /// Legacy repositories safely support only a one-source batch.

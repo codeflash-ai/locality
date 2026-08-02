@@ -366,6 +366,51 @@ fn shared_mount_baseline_rejects_mixed_layouts_atomically() {
 }
 
 #[test]
+fn multi_mount_baseline_rejects_mixed_layouts_atomically() {
+    let fixture = Fixture::new("baseline-multi-mount-layout-validation");
+    let other_mount_id = MountId::new("mount-other");
+    let other_mount_root = fixture.state_root.parent().unwrap().join("mount-other");
+    fs::create_dir_all(&other_mount_root).unwrap();
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    for (mount_id, mount_root) in [
+        (&fixture.mount_id, &fixture.mount_root),
+        (&other_mount_id, &other_mount_root),
+    ] {
+        store
+            .save_mount(MountConfig::new(mount_id.clone(), "backend", mount_root))
+            .unwrap();
+    }
+    let first_mount = source_seed(
+        &fixture.mount_id,
+        "source-a",
+        "generation-a1",
+        Some(identity_for("projection-a", "A.md", "content-a1", 'a', 1)),
+    );
+    let mut second_mount = source_seed(
+        &other_mount_id,
+        "source-b",
+        "generation-b1",
+        Some(identity_for("projection-b", "B.md", "content-b1", 'b', 1)),
+    );
+    second_mount.observed.workspace_layout_version = 2;
+    second_mount.observed.workspace_layout_digest = digest('b');
+
+    assert!(
+        store
+            .seed_observed_generations(vec![first_mount, second_mount])
+            .is_err()
+    );
+    for mount_id in [&fixture.mount_id, &other_mount_id] {
+        assert!(
+            store
+                .list_observed_generations(mount_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
 fn shared_mount_sources_seed_atomically_replay_after_restart_and_keep_legacy_reads_safe() {
     let fixture = Fixture::new("shared-mount-baseline");
     let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
