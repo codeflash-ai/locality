@@ -354,6 +354,8 @@ pub trait GenerationDeliveryRepository {
     ) -> StoreResult<()>;
 
     /// Atomically seeds every source record in one authenticated baseline.
+    /// A mount with an observed baseline accepts only an exact full-source
+    /// replay; callers cannot extend it with records from another baseline.
     /// Legacy repositories safely support only a one-source batch.
     fn seed_observed_generations(
         &mut self,
@@ -369,7 +371,8 @@ pub trait GenerationDeliveryRepository {
         self.seed_observed_generation(seed.observed, seed.paths)
     }
 
-    /// Atomically seeds refresh-mode-aware source records. Legacy repositories
+    /// Atomically seeds refresh-mode-aware source records with the same
+    /// empty-mount-or-exact-full-source-replay contract. Legacy repositories
     /// can preserve only the released generation-delta route and reject a
     /// full-export-only state instead of later polling it as a delta source.
     fn seed_observed_generations_v2(

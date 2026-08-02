@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use locality_core::model::{MountId, RemoteId};
@@ -369,6 +371,87 @@ fn changed_multi_source_replay_rolls_back_new_source() {
             )
             .unwrap()
             .is_none()
+    );
+}
+
+#[test]
+fn sequential_partial_baselines_cannot_extend_an_existing_mount() {
+    let fixture = Fixture::new("shared-mount-sequential-partial-baselines");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "backend",
+            &fixture.mount_root,
+        ))
+        .unwrap();
+    let source_a = source_seed(&fixture.mount_id, "source-a", "generation-a1", None);
+    let source_b = source_seed(&fixture.mount_id, "source-b", "generation-b2", None);
+    store
+        .seed_observed_generations(vec![source_a.clone()])
+        .unwrap();
+
+    let error = store
+        .seed_observed_generations(vec![source_a, source_b])
+        .expect_err("a later baseline cannot append a source to an existing mount");
+
+    assert!(matches!(error, StoreError::InvalidState(_)));
+    let observed = store.list_observed_generations(&fixture.mount_id).unwrap();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(
+        observed[0].source_connection_id,
+        SourceConnectionId::new("source-a")
+    );
+}
+
+#[test]
+fn concurrent_partial_baselines_cannot_merge_on_an_empty_mount() {
+    let fixture = Fixture::new("shared-mount-concurrent-partial-baselines");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "backend",
+            &fixture.mount_root,
+        ))
+        .unwrap();
+    drop(store);
+
+    let barrier = Arc::new(Barrier::new(3));
+    let mut workers = Vec::new();
+    for (source, generation_id) in [("source-a", "generation-a1"), ("source-b", "generation-b2")] {
+        let state_root = fixture.state_root.clone();
+        let mount_id = fixture.mount_id.clone();
+        let barrier = Arc::clone(&barrier);
+        workers.push(thread::spawn(move || {
+            let mut store = SqliteStateStore::open(state_root).unwrap();
+            let seed = source_seed(&mount_id, source, generation_id, None);
+            barrier.wait();
+            store.seed_observed_generations(vec![seed])
+        }));
+    }
+    barrier.wait();
+
+    let results = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(StoreError::InvalidState(_))))
+            .count(),
+        1
+    );
+
+    let reopened = SqliteStateStore::open(fixture.state_root.clone()).unwrap();
+    assert_eq!(
+        reopened
+            .list_observed_generations(&fixture.mount_id)
+            .unwrap()
+            .len(),
+        1
     );
 }
 

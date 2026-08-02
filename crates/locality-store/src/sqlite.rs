@@ -1023,6 +1023,27 @@ impl GenerationDeliveryRepository for SqliteStateStore {
                     mount_id.0
                 )));
             }
+
+            // BEGIN IMMEDIATE serializes competing seeders. Once any source
+            // exists, the batch must name the complete durable source set;
+            // the exact record, inventory, layout, mode, and path checks below
+            // then bind the replay to that same baseline.
+            let existing_sources =
+                list_observed_generations_from_connection(&transaction, mount_id)?
+                    .into_iter()
+                    .map(|record| record.source_connection_id)
+                    .collect::<BTreeSet<_>>();
+            let incoming_sources = seeds
+                .iter()
+                .filter(|seed| &seed.seed.observed.mount_id == mount_id)
+                .map(|seed| seed.seed.observed.source_connection_id.clone())
+                .collect::<BTreeSet<_>>();
+            if !existing_sources.is_empty() && existing_sources != incoming_sources {
+                return Err(StoreError::InvalidState(format!(
+                    "mount `{}` already has a generation baseline; replay must include every exact source",
+                    mount_id.0
+                )));
+            }
         }
 
         // Validate every replay before inserting any new source. This keeps a
