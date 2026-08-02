@@ -2214,20 +2214,15 @@ pub(crate) fn repair_workspace_generation(
                 "workspace generation identity changed before mode repair",
             ));
         }
-        root.clear_read_only()?;
-        let root_sync = match parent.open_directory_for_sync(name) {
-            Ok(root_sync) => root_sync,
-            Err(error) => {
-                let _ = root.set_read_only();
-                return Err(error);
+        let root_sync = with_windows_directory_read_only_restored(&root, || {
+            let root_sync = parent.open_directory_for_sync(name)?;
+            if root_sync.identity()? != expected {
+                return Err(io::Error::other(
+                    "workspace generation changed while opening durability handle",
+                ));
             }
-        };
-        if root_sync.identity()? != expected {
-            return Err(io::Error::other(
-                "workspace generation changed while opening durability handle",
-            ));
-        }
-        root.set_read_only()?;
+            Ok(root_sync)
+        })?;
         root_sync.sync()?;
         drop(root_sync);
         if parent.open_directory_read_only(name)?.identity()? != expected {
@@ -2250,6 +2245,27 @@ pub(crate) fn repair_workspace_generation(
             .parent()
             .ok_or_else(|| io::Error::other("workspace generation has no parent"))?;
         sync_directory_if_supported(parent)
+    }
+}
+
+#[cfg(windows)]
+fn with_windows_directory_read_only_restored<T>(
+    root: &WindowsDirectory,
+    operation: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    root.clear_read_only()?;
+    let operation_result = operation();
+    let restore_result = root.set_read_only();
+    match (operation_result, restore_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(restore)) => Err(restore),
+        (Err(operation), Err(restore)) => Err(io::Error::new(
+            restore.kind(),
+            format!(
+                "failed to restore workspace generation read-only state: {restore}; preceding operation also failed: {operation}"
+            ),
+        )),
     }
 }
 
@@ -3184,6 +3200,98 @@ mod apple_tests {
     #[test]
     fn macos_mount_detection_rejects_the_filesystem_root() {
         assert!(workspace_root_is_mount_point(Path::new("/")).expect("inspect root mount"));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_mode_repair_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn test_directory(label: &str) -> (PathBuf, PathBuf, WindowsDirectory, WindowsDirectory) {
+        let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let parent_path = std::env::temp_dir().join(format!(
+            "locality-windows-mode-repair-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        let root_path = parent_path.join("generation");
+        fs::create_dir_all(&root_path).expect("create test generation");
+        let parent = WindowsDirectory::open_absolute(&parent_path).expect("open test parent");
+        let root = parent
+            .open_directory_for_attributes(OsStr::new("generation"))
+            .expect("open test generation");
+        root.set_read_only().expect("set initial read-only state");
+        (parent_path, root_path, parent, root)
+    }
+
+    fn cleanup_test_directory(
+        parent_path: PathBuf,
+        root_path: &Path,
+        parent: WindowsDirectory,
+        root: WindowsDirectory,
+    ) {
+        drop(root);
+        drop(parent);
+        let mut permissions = fs::metadata(root_path)
+            .expect("read cleanup permissions")
+            .permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(root_path, permissions).expect("clear cleanup read-only state");
+        fs::remove_dir_all(parent_path).expect("remove test directory");
+    }
+
+    #[test]
+    fn post_clear_sync_handle_error_restores_read_only() {
+        let (parent_path, root_path, parent, root) = test_directory("sync-open-error");
+
+        with_windows_directory_read_only_restored(&root, || {
+            parent
+                .open_directory_for_sync(OsStr::new("missing-generation"))
+                .map(drop)
+        })
+        .expect_err("missing durability handle must fail");
+
+        assert!(
+            fs::metadata(&root_path)
+                .expect("read restored metadata")
+                .permissions()
+                .readonly(),
+            "read-only state is restored after handle-open errors"
+        );
+        cleanup_test_directory(parent_path, &root_path, parent, root);
+    }
+
+    #[test]
+    fn post_clear_identity_mismatch_restores_read_only() {
+        let (parent_path, root_path, parent, root) = test_directory("identity-mismatch");
+        fs::create_dir(parent_path.join("replacement-generation"))
+            .expect("create mismatched generation");
+        let expected = root.identity().expect("read expected identity");
+
+        with_windows_directory_read_only_restored(&root, || {
+            let replacement =
+                parent.open_directory_for_sync(OsStr::new("replacement-generation"))?;
+            if replacement.identity()? != expected {
+                return Err(io::Error::other(
+                    "workspace generation changed while opening durability handle",
+                ));
+            }
+            drop(replacement);
+            Ok(())
+        })
+        .expect_err("mismatched identity must fail");
+
+        assert!(
+            fs::metadata(&root_path)
+                .expect("read restored metadata")
+                .permissions()
+                .readonly(),
+            "read-only state is restored after identity mismatches"
+        );
+        cleanup_test_directory(parent_path, &root_path, parent, root);
     }
 }
 
