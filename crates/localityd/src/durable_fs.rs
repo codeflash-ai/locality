@@ -6,6 +6,16 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
+/// Opens a Windows path without following reparse points and returns its
+/// volume plus full 128-bit FILE_ID_INFO identity. The handle requests only
+/// attributes and synchronization access, so restrictive data ACLs and cloud
+/// placeholders do not require FILE_READ_DATA.
+#[cfg(windows)]
+pub fn windows_path_identity_no_follow(path: &Path) -> io::Result<(u64, u64, u64)> {
+    let identity = crate::windows_workspace_fs::inspect_path_identity_no_follow(path)?;
+    Ok((identity.device, identity.inode, identity.inode_high))
+}
+
 #[cfg(not(any(
     windows,
     target_os = "linux",

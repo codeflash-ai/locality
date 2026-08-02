@@ -76,6 +76,22 @@ const SHARING: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 const ANCHOR_SHARING: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
 const LOCK_SHARING: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
 
+pub(crate) fn inspect_path_identity_no_follow(
+    path: &Path,
+) -> io::Result<WorkspaceGenerationIdentity> {
+    let file = OpenOptions::new()
+        .access_mode(IDENTITY_FILE_ACCESS)
+        .share_mode(SHARING)
+        .custom_flags(
+            windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS
+                | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+        .open(path)?;
+    let handle: OwnedHandle = file.into();
+    reject_reparse(&handle)?;
+    handle_identity(&handle)
+}
+
 pub(crate) struct WindowsDirectory {
     handle: OwnedHandle,
 }
@@ -1161,6 +1177,11 @@ mod lock_tests {
         let observed =
             handle_identity(&OwnedHandle::from(attributes_only)).expect("observed identity");
         assert_eq!(observed, expected);
+        assert_eq!(
+            inspect_path_identity_no_follow(&path.join("attributes-only.txt"))
+                .expect("inspect path with attributes-only native handle"),
+            expected
+        );
 
         let mut wrong = expected;
         wrong.inode ^= 1;

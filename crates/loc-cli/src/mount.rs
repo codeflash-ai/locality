@@ -32,7 +32,19 @@ pub struct RemountFilesystemIdentity {
 
 impl RemountFilesystemIdentity {
     pub fn inspect(path: &Path) -> io::Result<Self> {
+        #[cfg(windows)]
+        {
+            let (device, inode, inode_high) =
+                localityd::durable_fs::windows_path_identity_no_follow(path)?;
+            return Ok(Self {
+                device,
+                inode,
+                inode_high,
+            });
+        }
+        #[cfg(not(windows))]
         let metadata = fs::symlink_metadata(path)?;
+        #[cfg(not(windows))]
         if metadata.file_type().is_symlink() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -45,15 +57,6 @@ impl RemountFilesystemIdentity {
             return Ok(Self {
                 device: metadata.dev(),
                 inode: metadata.ino(),
-                inode_high: 0,
-            });
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            return Ok(Self {
-                device: metadata.volume_serial_number().unwrap_or_default() as u64,
-                inode: metadata.file_index().unwrap_or_default(),
                 inode_high: 0,
             });
         }
@@ -754,6 +757,32 @@ fn absolute_path(path: &Path) -> Result<PathBuf, MountError> {
 #[cfg(test)]
 mod remount_coordinator_tests {
     use super::{QuiescedWorkspaceRemountRuntime, run_quiesced_workspace_remount};
+
+    #[cfg(windows)]
+    #[test]
+    fn remount_identity_uses_native_attributes_only_file_id() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let path = std::env::temp_dir().join(format!(
+            "locality-remount-identity-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).expect("create identity test directory");
+        let identity =
+            super::RemountFilesystemIdentity::inspect(&path).expect("inspect remount identity");
+        let (device, inode, inode_high) =
+            localityd::durable_fs::windows_path_identity_no_follow(&path)
+                .expect("inspect native identity");
+        assert_eq!(
+            (identity.device, identity.inode, identity.inode_high),
+            (device, inode, inode_high)
+        );
+        std::fs::remove_dir(path).expect("remove identity test directory");
+    }
 
     struct Runtime {
         surface: &'static str,
