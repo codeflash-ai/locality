@@ -24,6 +24,7 @@ use locality_protocol::freshness_delivery_transport::{
     MAX_GENERATION_BODY_WINDOW_BYTES, MAX_GENERATION_BODY_WINDOW_METADATA_BYTES,
     MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES, MAX_GENERATION_TRANSPORT_REQUEST_BYTES,
 };
+use locality_protocol::workspace_layout::WorkspaceProfileId;
 use localityd::generation_sync::{
     AuthorizedGenerationBodyWindow, AuthorizedGenerationDelivery, AuthorizedGenerationDeliveryPoll,
     GenerationDeliveryRequest, GenerationDeliveryTransport,
@@ -40,7 +41,6 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_ATTEMPTS: u8 = 3;
 const MAX_ATTEMPTS: u8 = 10;
-const MAX_SESSION_ID_BYTES: usize = 128;
 const JSON_MEDIA_TYPE: &str = "application/json";
 const BODY_WINDOW_FRAME_OVERHEAD: usize =
     std::mem::size_of::<u32>() + MAX_GENERATION_BODY_WINDOW_METADATA_BYTES;
@@ -312,7 +312,11 @@ impl GenerationHttpTransport {
         validate_options(options)?;
         let base_url = parse_base_url(base_url)?;
         let session_id = session_id.into();
-        validate_opaque(&session_id, MAX_SESSION_ID_BYTES, "session ID")?;
+        if !is_canonical_route_uuid(&session_id) {
+            return Err(GenerationHttpError::InvalidConfiguration(
+                "session ID must be a canonical lowercase hyphenated non-nil UUID",
+            ));
+        }
         let session_secret = session_secret.into();
         validate_secret(&session_secret)?;
         let mut authorization = HeaderValue::from_str(&format!("Bearer {session_secret}"))
@@ -518,6 +522,14 @@ impl GenerationDeliveryTransport for GenerationHttpTransport {
                 let delivery = poll
                     .delivery
                     .expect("validated delivery poll has a delivery payload");
+                validate_response_delta_id(
+                    GenerationHttpOperation::Poll,
+                    &delivery.delta.delta_id,
+                )?;
+                validate_response_delta_id(
+                    GenerationHttpOperation::Poll,
+                    &delivery.terminal_receipt.delta_id,
+                )?;
                 Ok(AuthorizedGenerationDeliveryPoll {
                     selected_capabilities: poll.selected_capabilities,
                     delivery: Some(AuthorizedGenerationDelivery {
@@ -559,6 +571,7 @@ impl GenerationDeliveryTransport for GenerationHttpTransport {
         &mut self,
         request: &GenerationBodyWindowRequest,
     ) -> Result<Option<AuthorizedGenerationBodyWindow>, Self::Error> {
+        validate_request_delta_id(&request.delta_id)?;
         let body = Self::encode_request(request, GenerationBodyWindowRequest::decode_json)?;
         let maximum = BODY_WINDOW_FRAME_OVERHEAD
             .checked_add(usize::try_from(request.max_bytes).map_err(|_| {
@@ -604,6 +617,7 @@ impl GenerationDeliveryTransport for GenerationHttpTransport {
         &mut self,
         request: &GenerationDeliveryAcknowledgmentRequest,
     ) -> Result<Option<GenerationDeliveryAcknowledgment>, Self::Error> {
+        validate_request_delta_id(&request.delta_id)?;
         let body = Self::encode_request(
             request,
             GenerationDeliveryAcknowledgmentRequest::decode_json,
@@ -688,6 +702,34 @@ fn response_contract_error(
     }
 }
 
+fn is_canonical_route_uuid(value: &str) -> bool {
+    WorkspaceProfileId::new(value).is_ok()
+}
+
+fn validate_request_delta_id(delta_id: &str) -> Result<(), GenerationHttpError> {
+    if is_canonical_route_uuid(delta_id) {
+        Ok(())
+    } else {
+        Err(GenerationHttpError::RequestContract(
+            GenerationTransportContractError::InvalidOpaqueValue("delta_id"),
+        ))
+    }
+}
+
+fn validate_response_delta_id(
+    operation: GenerationHttpOperation,
+    delta_id: &str,
+) -> Result<(), GenerationHttpError> {
+    if is_canonical_route_uuid(delta_id) {
+        Ok(())
+    } else {
+        Err(response_contract_error(
+            operation,
+            GenerationTransportContractError::InvalidOpaqueValue("delta_id"),
+        ))
+    }
+}
+
 fn validate_options(options: GenerationHttpOptions) -> Result<(), GenerationHttpError> {
     if options.connect_timeout.is_zero() || options.request_timeout.is_zero() {
         return Err(GenerationHttpError::InvalidConfiguration(
@@ -751,22 +793,6 @@ fn is_literal_loopback_host(host: &str) -> bool {
         Ok(IpAddr::V4(address)) => address.is_loopback(),
         Ok(IpAddr::V6(address)) => address == Ipv6Addr::LOCALHOST,
         Err(_) => false,
-    }
-}
-
-fn validate_opaque(
-    value: &str,
-    maximum: usize,
-    label: &'static str,
-) -> Result<(), GenerationHttpError> {
-    if value.is_empty()
-        || value.len() > maximum
-        || value.trim() != value
-        || value.chars().any(char::is_control)
-    {
-        Err(GenerationHttpError::InvalidConfiguration(label))
-    } else {
-        Ok(())
     }
 }
 

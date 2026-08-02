@@ -3,7 +3,7 @@ use std::error::Error as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,16 @@ const DELTA_ID: &str = "018f4f6e-1111-7222-8333-444444444444";
 const CROSSED_DELTA_ID: &str = "018f4f6e-5555-7666-8777-888888888888";
 const SESSION_SECRET: &str = "session-secret-never-log-this";
 const PROXY_CHILD_TARGET_URL: &str = "LOCALITY_GENERATION_HTTP_TEST_TARGET_URL";
+const INVALID_ROUTE_UUIDS: &[&str] = &[
+    ".",
+    "..",
+    "../018f4f6e-1111-7222-8333-444444444444",
+    "018f4f6e-1111-7222-8333/444444444444",
+    "%2e%2e%2f018f4f6e-1111-7222-8333-444444444444",
+    "018F4F6E-1111-7222-8333-444444444444",
+    "00000000-0000-0000-0000-000000000000",
+    "not-a-uuid",
+];
 
 #[derive(Clone, Deserialize)]
 struct PollFixtures {
@@ -57,7 +67,6 @@ struct ResponseSpec {
     content_length: Option<usize>,
     headers: Vec<(&'static str, &'static str)>,
     body: Vec<u8>,
-    delay: Duration,
 }
 
 impl ResponseSpec {
@@ -68,7 +77,6 @@ impl ResponseSpec {
             content_length: Some(body.len()),
             headers: Vec::new(),
             body,
-            delay: Duration::ZERO,
         }
     }
 
@@ -79,7 +87,6 @@ impl ResponseSpec {
             content_length: Some(body.len()),
             headers: Vec::new(),
             body,
-            delay: Duration::ZERO,
         }
     }
 }
@@ -117,9 +124,6 @@ impl ScriptedServer {
                     .lock()
                     .expect("captured requests")
                     .push(read_request(&mut stream));
-                if !response.delay.is_zero() {
-                    thread::sleep(response.delay);
-                }
                 let mut head = format!(
                     "HTTP/1.1 {} {}\r\nConnection: close\r\n",
                     response.status,
@@ -153,6 +157,57 @@ impl ScriptedServer {
             .expect("only test owns request captures")
             .into_inner()
             .expect("captured requests")
+    }
+}
+
+struct WithholdingServer {
+    url: String,
+    accepted: mpsc::Receiver<CapturedRequest>,
+    release: mpsc::Sender<()>,
+    handle: JoinHandle<()>,
+}
+
+impl WithholdingServer {
+    fn start(expected_requests: usize) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind withholding server");
+        let address = listener.local_addr().expect("withholding server address");
+        let (accepted_tx, accepted) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut withheld = Vec::with_capacity(expected_requests);
+            for _ in 0..expected_requests {
+                let (mut stream, _) = listener.accept().expect("accept timeout request");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("timeout request read deadline");
+                let request = read_request(&mut stream);
+                accepted_tx
+                    .send(request)
+                    .expect("report accepted timeout request");
+                withheld.push(stream);
+            }
+            release_rx
+                .recv()
+                .expect("test releases withheld connections");
+            drop(withheld);
+        });
+        Self {
+            url: format!("http://{address}"),
+            accepted,
+            release,
+            handle,
+        }
+    }
+
+    fn accepted_request(&self) -> CapturedRequest {
+        self.accepted
+            .recv_timeout(Duration::from_secs(5))
+            .expect("client request accepted before test deadline")
+    }
+
+    fn finish(self) {
+        self.release.send(()).expect("release withheld connections");
+        self.handle.join().expect("withholding server thread");
     }
 }
 
@@ -405,6 +460,174 @@ fn assert_response_diagnostics_redact(error: &GenerationHttpError, sentinels: &[
 }
 
 #[test]
+fn session_and_local_delta_routes_require_canonical_non_nil_uuids() {
+    for invalid in INVALID_ROUTE_UUIDS {
+        let error = GenerationHttpTransport::new("http://127.0.0.1:9", *invalid, SESSION_SECRET)
+            .expect_err("invalid session route identity");
+        assert_eq!(
+            error,
+            GenerationHttpError::InvalidConfiguration(
+                "session ID must be a canonical lowercase hyphenated non-nil UUID"
+            ),
+            "session ID {invalid:?}"
+        );
+
+        let mut transport =
+            GenerationHttpTransport::new("http://127.0.0.1:9", SESSION_ID, SESSION_SECRET).unwrap();
+        let mut window = body_request();
+        window.delta_id = (*invalid).to_string();
+        assert_eq!(
+            transport
+                .open_content_window(&window)
+                .err()
+                .expect("invalid window route identity"),
+            GenerationHttpError::RequestContract(
+                GenerationTransportContractError::InvalidOpaqueValue("delta_id")
+            ),
+            "window delta ID {invalid:?}"
+        );
+
+        let mut acknowledgment = acknowledgment_fixture().request;
+        acknowledgment.delta_id = (*invalid).to_string();
+        assert_eq!(
+            transport.acknowledge_terminal_receipt(&acknowledgment),
+            Err(GenerationHttpError::RequestContract(
+                GenerationTransportContractError::InvalidOpaqueValue("delta_id")
+            )),
+            "acknowledgment delta ID {invalid:?}"
+        );
+    }
+}
+
+#[test]
+fn poll_rejects_noncanonical_server_delta_ids_without_echo_or_route_collapse() {
+    let request = delivery_request();
+    let responses = INVALID_ROUTE_UUIDS
+        .iter()
+        .map(|invalid| {
+            let mut poll = poll_fixtures().delivery;
+            poll.selected_capabilities = request.capabilities.clone();
+            let delivery = poll.delivery.as_mut().expect("delivery payload");
+            delivery.delta.delta_id = (*invalid).to_string();
+            delivery.terminal_receipt.delta_id = (*invalid).to_string();
+            delivery.terminal_receipt.delta_sha256 = delivery
+                .delta
+                .canonical_sha256()
+                .expect("generic protocol delta remains internally valid");
+            ResponseSpec::json(200, serde_json::to_vec(&poll).unwrap())
+        })
+        .collect();
+    let server = ScriptedServer::start(responses);
+    let mut transport = transport(&server);
+
+    for invalid in INVALID_ROUTE_UUIDS {
+        let error = transport
+            .next_delta_poll(&request)
+            .expect_err("noncanonical server delta ID");
+        assert!(matches!(
+            &error,
+            GenerationHttpError::InvalidResponse {
+                operation: GenerationHttpOperation::Poll,
+                problem: GenerationHttpResponseProblem::ProtocolViolation,
+                retry: GenerationHttpRetryClassification::Never,
+                ..
+            }
+        ));
+        assert_response_diagnostics_redact(&error, &[*invalid]);
+    }
+
+    let requests = server.finish();
+    assert_eq!(requests.len(), INVALID_ROUTE_UUIDS.len());
+    for request in &requests {
+        assert_authenticated_request(
+            request,
+            "/v2/sessions/018f4f6e-7b8c-7d9e-8f01-23456789abcd/generation-deliveries",
+        );
+    }
+}
+
+#[test]
+fn window_rejects_noncanonical_server_delta_ids_without_echo_or_route_collapse() {
+    let request = body_request();
+    let responses = INVALID_ROUTE_UUIDS
+        .iter()
+        .map(|invalid| {
+            let mut metadata = body_metadata();
+            metadata.delta_id = (*invalid).to_string();
+            ResponseSpec::window(raw_frame(&metadata, b"hello wo"))
+        })
+        .collect();
+    let server = ScriptedServer::start(responses);
+    let mut transport = transport(&server);
+
+    for invalid in INVALID_ROUTE_UUIDS {
+        let error = transport
+            .open_content_window(&request)
+            .err()
+            .expect("noncanonical server window delta ID");
+        assert!(matches!(
+            &error,
+            GenerationHttpError::InvalidResponse {
+                operation: GenerationHttpOperation::BodyWindow,
+                problem: GenerationHttpResponseProblem::CorrelationMismatch,
+                retry: GenerationHttpRetryClassification::Never,
+                ..
+            }
+        ));
+        assert_response_diagnostics_redact(&error, &[*invalid]);
+    }
+
+    let requests = server.finish();
+    assert_eq!(requests.len(), INVALID_ROUTE_UUIDS.len());
+    for captured in &requests {
+        assert_authenticated_request(
+            captured,
+            "/v2/sessions/018f4f6e-7b8c-7d9e-8f01-23456789abcd/generation-deliveries/018f4f6e-1111-7222-8333-444444444444/body-windows",
+        );
+    }
+}
+
+#[test]
+fn acknowledgment_rejects_noncanonical_server_delta_ids_without_echo_or_route_collapse() {
+    let fixture = acknowledgment_fixture();
+    let responses = INVALID_ROUTE_UUIDS
+        .iter()
+        .map(|invalid| {
+            let mut response = fixture.response.clone();
+            response.delta_id = (*invalid).to_string();
+            ResponseSpec::json(200, serde_json::to_vec(&response).unwrap())
+        })
+        .collect();
+    let server = ScriptedServer::start(responses);
+    let mut transport = transport(&server);
+
+    for invalid in INVALID_ROUTE_UUIDS {
+        let error = transport
+            .acknowledge_terminal_receipt(&fixture.request)
+            .expect_err("noncanonical server acknowledgment delta ID");
+        assert!(matches!(
+            &error,
+            GenerationHttpError::InvalidResponse {
+                operation: GenerationHttpOperation::Acknowledgment,
+                problem: GenerationHttpResponseProblem::CorrelationMismatch,
+                retry: GenerationHttpRetryClassification::Never,
+                ..
+            }
+        ));
+        assert_response_diagnostics_redact(&error, &[*invalid]);
+    }
+
+    let requests = server.finish();
+    assert_eq!(requests.len(), INVALID_ROUTE_UUIDS.len());
+    for captured in &requests {
+        assert_authenticated_request(
+            captured,
+            "/v2/sessions/018f4f6e-7b8c-7d9e-8f01-23456789abcd/generation-deliveries/018f4f6e-1111-7222-8333-444444444444/acknowledgments",
+        );
+    }
+}
+
+#[test]
 fn polls_no_delivery_and_delivery_with_the_exact_authenticated_route() {
     let mut fixtures = poll_fixtures();
     let request = delivery_request();
@@ -464,7 +687,6 @@ fn poll_rejects_malformed_oversized_and_crossed_responses() {
         content_length: Some(MAX_GENERATION_DELIVERY_POLL_RESPONSE_BYTES + 1),
         headers: Vec::new(),
         body: Vec::new(),
-        delay: Duration::ZERO,
     }]);
     let error = transport(&oversized)
         .next_delta_poll(&request)
@@ -702,7 +924,6 @@ fn body_window_enforces_request_and_response_bounds_before_allocation() {
         content_length: Some(32 * 1024),
         headers: Vec::new(),
         body: Vec::new(),
-        delay: Duration::ZERO,
     }]);
     let error = transport(&server)
         .open_content_window(&request)
@@ -809,7 +1030,6 @@ fn acknowledgment_rejects_malformed_crossed_and_oversized_responses() {
         content_length: Some(MAX_GENERATION_TRANSPORT_REQUEST_BYTES + 1),
         headers: Vec::new(),
         body: Vec::new(),
-        delay: Duration::ZERO,
     }]);
     let error = transport(&oversized)
         .acknowledge_terminal_receipt(&fixture.request)
@@ -859,7 +1079,6 @@ fn contradictory_small_content_length_cannot_bypass_chunked_response_bound() {
         content_length: Some(1),
         headers: vec![("Transfer-Encoding", "chunked")],
         body: chunked_body(&payload),
-        delay: Duration::ZERO,
     }]);
     let error = transport(&server)
         .acknowledge_terminal_receipt(&fixture.request)
@@ -884,7 +1103,6 @@ fn matching_content_length_cannot_make_transfer_encoding_acceptable() {
         content_length: Some(payload.len()),
         headers: vec![("Transfer-Encoding", "chunked")],
         body: chunked_body(&payload),
-        delay: Duration::ZERO,
     }]);
     let error = transport(&server)
         .acknowledge_terminal_receipt(&fixture.request)
@@ -963,25 +1181,28 @@ fn truncated_success_response_retries_with_identical_request_identity() {
 
 #[test]
 fn timeout_is_retried_boundedly_with_the_same_request() {
-    let body = serde_json::to_vec(&poll_fixtures().no_delivery).unwrap();
-    let delayed = ResponseSpec {
-        delay: Duration::from_millis(60),
-        ..ResponseSpec::json(200, body)
-    };
-    let server = ScriptedServer::start(vec![delayed.clone(), delayed.clone(), delayed]);
-    let mut transport = GenerationHttpTransport::new_with_options(
-        &server.url,
-        SESSION_ID,
-        SESSION_SECRET,
-        GenerationHttpOptions {
-            connect_timeout: Duration::from_millis(20),
-            request_timeout: Duration::from_millis(20),
-            max_attempts: 3,
-        },
-    )
-    .unwrap();
-    let error = transport
-        .next_delta_poll(&delivery_request())
+    let server = WithholdingServer::start(3);
+    let url = server.url.clone();
+    let client = thread::spawn(move || {
+        let mut transport = GenerationHttpTransport::new_with_options(
+            &url,
+            SESSION_ID,
+            SESSION_SECRET,
+            GenerationHttpOptions {
+                connect_timeout: Duration::from_millis(100),
+                request_timeout: Duration::from_millis(100),
+                max_attempts: 3,
+            },
+        )
+        .unwrap();
+        transport.next_delta_poll(&delivery_request())
+    });
+    let requests = (0..3)
+        .map(|_| server.accepted_request())
+        .collect::<Vec<_>>();
+    let error = client
+        .join()
+        .expect("timeout client thread")
         .expect_err("bounded timeout retries");
     assert!(matches!(
         error,
@@ -991,9 +1212,13 @@ fn timeout_is_retried_boundedly_with_the_same_request() {
             ..
         }
     ));
-    let requests = server.finish();
+    server.finish();
     assert_eq!(requests.len(), 3);
     assert!(requests.windows(2).all(|pair| pair[0].body == pair[1].body));
+    assert!(requests.windows(2).all(|pair| pair[0].path == pair[1].path));
+    assert!(requests.windows(2).all(|pair| {
+        pair[0].headers.get("authorization") == pair[1].headers.get("authorization")
+    }));
 }
 
 #[test]
