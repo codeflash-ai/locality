@@ -332,8 +332,6 @@ pub struct WorkspaceRemountOwnership {
     state_root: PathBuf,
     _lock: locality_platform::DaemonRemountCoordinatorLock,
     expected_fence: Option<Vec<u8>>,
-    owner: Option<String>,
-    generation: Option<String>,
     supervision_was_enabled: Option<bool>,
     daemon_was_ready: bool,
     daemon_manager: Option<DaemonManager>,
@@ -426,8 +424,6 @@ impl WorkspaceRemountOwnership {
             state_root: state_root.to_path_buf(),
             _lock: lock,
             expected_fence: Some(contents),
-            owner: Some(owner),
-            generation: Some(generation),
             supervision_was_enabled: daemon_state.supervision_was_enabled,
             daemon_was_ready: daemon_state.was_ready,
             daemon_manager: daemon_state.manager,
@@ -457,77 +453,58 @@ impl WorkspaceRemountOwnership {
                 path.display()
             ));
         }
-        let (
-            expected_fence,
-            owner,
-            generation,
-            supervision_was_enabled,
-            daemon_was_ready,
-            daemon_manager,
-        ) = if contents.is_none() {
-            (None, None, None, None, false, None)
-        } else if let Ok(record) = serde_json::from_slice::<WorkspaceRemountFenceRecord>(
-            contents.as_deref().expect("checked persisted fence"),
-        ) {
-            if !matches!(record.version, 2 | 3 | WORKSPACE_REMOUNT_FENCE_VERSION)
-                || record.owner.is_empty()
-                || record.generation.is_empty()
-                || (record.version >= WORKSPACE_REMOUNT_FENCE_VERSION
-                    && record.daemon_was_ready
-                    && !matches!(
-                        record.daemon_manager,
-                        Some(DaemonManager::Launchd | DaemonManager::Session)
-                    ))
+        let (expected_fence, supervision_was_enabled, daemon_was_ready, daemon_manager) =
+            if contents.is_none() {
+                (None, None, false, None)
+            } else if let Ok(record) = serde_json::from_slice::<WorkspaceRemountFenceRecord>(
+                contents.as_deref().expect("checked persisted fence"),
+            ) {
+                if !matches!(record.version, 2 | 3 | WORKSPACE_REMOUNT_FENCE_VERSION)
+                    || record.owner.is_empty()
+                    || record.generation.is_empty()
+                    || (record.version >= WORKSPACE_REMOUNT_FENCE_VERSION
+                        && record.daemon_was_ready
+                        && !matches!(
+                            record.daemon_manager,
+                            Some(DaemonManager::Launchd | DaemonManager::Session)
+                        ))
+                {
+                    return Err(format!(
+                        "Daemon remount fence `{}` has invalid owner/generation metadata",
+                        path.display()
+                    ));
+                }
+                let supervision_was_enabled = if record.version == 2 {
+                    // V2 always disabled launchd and therefore always restored it.
+                    Some(true)
+                } else {
+                    record.supervision_was_enabled
+                };
+                (
+                    contents,
+                    supervision_was_enabled,
+                    record.version >= WORKSPACE_REMOUNT_FENCE_VERSION && record.daemon_was_ready,
+                    (record.version >= WORKSPACE_REMOUNT_FENCE_VERSION)
+                        .then_some(record.daemon_manager)
+                        .flatten(),
+                )
+            } else if contents
+                .as_deref()
+                .is_some_and(|contents| contents.starts_with(b"version=1\n"))
             {
+                // Released v1 fences had no owner token. The exact observed bytes
+                // are their recovery generation and are rechecked before removal.
+                (contents.clone(), Some(true), false, None)
+            } else {
                 return Err(format!(
-                    "Daemon remount fence `{}` has invalid owner/generation metadata",
+                    "Daemon remount fence `{}` has an unsupported format",
                     path.display()
                 ));
-            }
-            let supervision_was_enabled = if record.version == 2 {
-                // V2 always disabled launchd and therefore always restored it.
-                Some(true)
-            } else {
-                record.supervision_was_enabled
             };
-            (
-                contents,
-                Some(record.owner),
-                Some(record.generation),
-                supervision_was_enabled,
-                record.version >= WORKSPACE_REMOUNT_FENCE_VERSION && record.daemon_was_ready,
-                (record.version >= WORKSPACE_REMOUNT_FENCE_VERSION)
-                    .then_some(record.daemon_manager)
-                    .flatten(),
-            )
-        } else if contents
-            .as_deref()
-            .is_some_and(|contents| contents.starts_with(b"version=1\n"))
-        {
-            // Released v1 fences had no owner token. The exact observed bytes
-            // are their recovery generation and are rechecked before removal.
-            (
-                contents.clone(),
-                Some("legacy-v1".to_string()),
-                Some(hex_generation(
-                    contents.as_deref().expect("checked legacy fence"),
-                )),
-                Some(true),
-                false,
-                None,
-            )
-        } else {
-            return Err(format!(
-                "Daemon remount fence `{}` has an unsupported format",
-                path.display()
-            ));
-        };
         Ok(Self {
             state_root: state_root.to_path_buf(),
             _lock: lock,
             expected_fence,
-            owner,
-            generation,
             supervision_was_enabled,
             daemon_was_ready,
             daemon_manager,
@@ -536,10 +513,6 @@ impl WorkspaceRemountOwnership {
 
     pub fn has_fence(&self) -> bool {
         self.expected_fence.is_some()
-    }
-
-    pub fn owner_generation(&self) -> Option<(&str, &str)> {
-        self.owner.as_deref().zip(self.generation.as_deref())
     }
 
     pub fn supervision_was_enabled(&self) -> Option<bool> {

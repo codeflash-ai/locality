@@ -9,6 +9,7 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -23,8 +24,6 @@ pub const DAEMON_STDOUT_LOG_FILENAME: &str = "localityd.out.log";
 pub const DAEMON_STDERR_LOG_FILENAME: &str = "localityd.err.log";
 pub const DAEMON_REMOUNT_FENCE_FILENAME: &str = "localityd.remount.fence";
 pub const DAEMON_REMOUNT_LOCK_FILENAME: &str = "localityd.remount.lock";
-pub const DAEMON_REMOUNT_START_OWNER_ENV: &str = "LOCALITY_REMOUNT_START_OWNER";
-pub const DAEMON_REMOUNT_START_GENERATION_ENV: &str = "LOCALITY_REMOUNT_START_GENERATION";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -139,6 +138,28 @@ pub fn daemon_remount_lock_path(state_root: &Path) -> PathBuf {
     state_root.join(DAEMON_REMOUNT_LOCK_FILENAME)
 }
 
+fn daemon_remount_recovery_gate_path(state_root: &Path) -> PathBuf {
+    let parent = state_root.parent().unwrap_or_else(|| Path::new("."));
+    let state_name = state_root
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("locality-state"))
+        .to_string_lossy();
+    parent.join(format!(
+        ".{state_name}.{DAEMON_REMOUNT_LOCK_FILENAME}.recovery"
+    ))
+}
+
+fn daemon_remount_start_handoff_path(state_root: &Path) -> PathBuf {
+    let parent = state_root.parent().unwrap_or_else(|| Path::new("."));
+    let state_name = state_root
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("locality-state"))
+        .to_string_lossy();
+    parent.join(format!(
+        ".{state_name}.{DAEMON_REMOUNT_LOCK_FILENAME}.startup"
+    ))
+}
+
 /// Resets local state while retaining exclusive ownership of the remount lock
 /// inode. This prevents an unlink/recreate race with daemon startup or remount
 /// recovery during the destructive state-root sweep.
@@ -165,35 +186,48 @@ pub fn reset_locality_state_storage_coordinated(
 /// exclusion boundary. Both CLI and Desktop use this same primitive.
 pub struct DaemonRemountCoordinatorLock {
     state_root: PathBuf,
-    _file: fs::File,
+    _recovery_gate: fs::File,
+    startup_handoff: fs::File,
+    file: fs::File,
+    startup_handoff_begun: AtomicBool,
 }
 
 impl DaemonRemountCoordinatorLock {
     pub fn try_acquire(state_root: &Path) -> io::Result<Self> {
         fs::create_dir_all(state_root)?;
         let path = daemon_remount_lock_path(state_root);
+        let recovery_gate_path = daemon_remount_recovery_gate_path(state_root);
+        let recovery_gate = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&recovery_gate_path)?;
+        prevent_coordination_file_inheritance(&recovery_gate)?;
+        try_lock_coordination_file(&recovery_gate, CoordinationLockMode::Exclusive)
+            .map_err(|error| remount_coordination_lock_error(error, &path))?;
+        let startup_handoff = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(daemon_remount_start_handoff_path(state_root))?;
+        prevent_coordination_file_inheritance(&startup_handoff)?;
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
             .open(&path)?;
-        try_lock_coordination_file(&file, CoordinationLockMode::Exclusive).map_err(|error| {
-            if matches!(error.kind(), io::ErrorKind::WouldBlock) {
-                io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    format!(
-                        "another Locality coordinator owns remount recovery through `{}`",
-                        path.display()
-                    ),
-                )
-            } else {
-                error
-            }
-        })?;
+        prevent_coordination_file_inheritance(&file)?;
+        try_lock_coordination_file(&file, CoordinationLockMode::Exclusive)
+            .map_err(|error| remount_coordination_lock_error(error, &path))?;
         Ok(Self {
             state_root: state_root.to_path_buf(),
-            _file: file,
+            _recovery_gate: recovery_gate,
+            startup_handoff,
+            file,
+            startup_handoff_begun: AtomicBool::new(false),
         })
     }
 
@@ -206,11 +240,58 @@ impl DaemonRemountCoordinatorLock {
     pub fn reset_locality_state_storage(
         &self,
     ) -> Result<locality_store::LocalStateResetStorageReport, DaemonProcessError> {
+        if self.startup_handoff_begun.load(Ordering::Acquire) {
+            return Err(DaemonProcessError::new(
+                "remount_handoff_started",
+                "state storage cannot be reset after daemon startup handoff begins",
+            ));
+        }
         locality_store::reset_locality_state_storage_preserving(
             &self.state_root,
             &[OsStr::new(DAEMON_REMOUNT_LOCK_FILENAME)],
         )
         .map_err(|error| DaemonProcessError::new("state_reset_failed", error.to_string()))
+    }
+
+    /// Retains the non-shareable recovery gate while allowing the replacement
+    /// daemon to acquire ordinary shared startup ownership. A second recovery
+    /// remains excluded throughout the manager launch and readiness wait.
+    fn begin_daemon_start_handoff(&self) -> Result<(), DaemonProcessError> {
+        if self
+            .startup_handoff_begun
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(DaemonProcessError::new(
+                "remount_handoff_started",
+                "daemon startup handoff has already begun for this recovery owner",
+            ));
+        }
+        if let Err(error) =
+            try_lock_coordination_file(&self.startup_handoff, CoordinationLockMode::Exclusive)
+        {
+            self.startup_handoff_begun.store(false, Ordering::Release);
+            return Err(DaemonProcessError::new("io_error", error.to_string()));
+        }
+        if let Err(error) = transition_coordination_file_to_shared(&self.file) {
+            self.startup_handoff_begun.store(false, Ordering::Release);
+            return Err(DaemonProcessError::new("io_error", error.to_string()));
+        }
+        Ok(())
+    }
+}
+
+fn remount_coordination_lock_error(error: io::Error, path: &Path) -> io::Error {
+    if matches!(error.kind(), io::ErrorKind::WouldBlock) {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "another Locality coordinator owns remount recovery through `{}`",
+                path.display()
+            ),
+        )
+    } else {
+        error
     }
 }
 
@@ -222,19 +303,13 @@ impl DaemonRemountCoordinatorLock {
 /// fence check between process launch and daemon readiness.
 #[must_use = "dropping startup ownership permits remount coordination"]
 pub struct DaemonStartupCoordinatorLock {
-    _file: Option<fs::File>,
+    _file: fs::File,
 }
 
 impl DaemonStartupCoordinatorLock {
     pub fn try_acquire(paths: &DaemonProcessPaths) -> Result<Self, DaemonProcessError> {
         fs::create_dir_all(&paths.state_root)
             .map_err(|error| DaemonProcessError::new("io_error", error.to_string()))?;
-        if remount_start_is_authorized(paths)? {
-            // The remount owner retains the exclusive lock while this exact
-            // fence generation starts its replacement daemon. Normal starts
-            // still require the shared lock below.
-            return Ok(Self { _file: None });
-        }
         let path = daemon_remount_lock_path(&paths.state_root);
         let file = OpenOptions::new()
             .create(true)
@@ -242,6 +317,8 @@ impl DaemonStartupCoordinatorLock {
             .read(true)
             .write(true)
             .open(&path)
+            .map_err(|error| DaemonProcessError::new("io_error", error.to_string()))?;
+        prevent_coordination_file_inheritance(&file)
             .map_err(|error| DaemonProcessError::new("io_error", error.to_string()))?;
         try_lock_coordination_file(&file, CoordinationLockMode::Shared).map_err(|error| {
             if matches!(error.kind(), io::ErrorKind::WouldBlock) {
@@ -256,48 +333,58 @@ impl DaemonStartupCoordinatorLock {
                 DaemonProcessError::new("io_error", error.to_string())
             }
         })?;
-        ensure_daemon_start_allowed(paths)?;
-        Ok(Self { _file: Some(file) })
+        if let Err(error) = ensure_daemon_start_allowed(paths) {
+            let live_handoff = error.code() == "remount_in_progress"
+                && recovery_start_handoff_is_live(paths)
+                    .map_err(|error| DaemonProcessError::new("io_error", error.to_string()))?;
+            if !live_handoff {
+                return Err(error);
+            }
+        }
+        Ok(Self { _file: file })
     }
-}
-
-fn remount_start_is_authorized(paths: &DaemonProcessPaths) -> Result<bool, DaemonProcessError> {
-    let Ok(owner) = std::env::var(DAEMON_REMOUNT_START_OWNER_ENV) else {
-        return Ok(false);
-    };
-    let Ok(generation) = std::env::var(DAEMON_REMOUNT_START_GENERATION_ENV) else {
-        return Ok(false);
-    };
-    if owner.is_empty() || generation.is_empty() {
-        return Ok(false);
-    }
-    let fence = daemon_remount_fence_path(&paths.state_root);
-    let contents = match fs::read(&fence) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(DaemonProcessError::new("io_error", error.to_string())),
-    };
-    let Ok(record) = std::str::from_utf8(&contents) else {
-        return Ok(false);
-    };
-    // Owner is generated from a fixed surface name plus a decimal pid, and
-    // generation is lowercase hex. Reject anything outside those alphabets so
-    // exact compact-JSON field matching cannot be confused by escaping.
-    if !owner
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':'))
-        || !generation.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Ok(false);
-    }
-    Ok(record.contains(&format!("\"owner\":\"{owner}\""))
-        && record.contains(&format!("\"generation\":\"{generation}\"")))
 }
 
 #[derive(Clone, Copy)]
 enum CoordinationLockMode {
     Shared,
     Exclusive,
+}
+
+#[cfg(unix)]
+fn prevent_coordination_file_inheritance(file: &fs::File) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn prevent_coordination_file_inheritance(file: &fs::File) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+    if unsafe { SetHandleInformation(file.as_raw_handle() as _, HANDLE_FLAG_INHERIT, 0) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn prevent_coordination_file_inheritance(_file: &fs::File) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cross-process remount ownership is unavailable on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn transition_coordination_file_to_shared(file: &fs::File) -> io::Result<()> {
+    try_lock_coordination_file(file, CoordinationLockMode::Shared)
 }
 
 #[cfg(unix)]
@@ -356,12 +443,62 @@ fn try_lock_coordination_file(file: &fs::File, mode: CoordinationLockMode) -> io
     }
 }
 
+#[cfg(windows)]
+fn transition_coordination_file_to_shared(file: &fs::File) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut overlapped = OVERLAPPED::default();
+    if unsafe {
+        UnlockFileEx(
+            file.as_raw_handle() as _,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    try_lock_coordination_file(file, CoordinationLockMode::Shared)
+}
+
 #[cfg(not(any(unix, windows)))]
 fn try_lock_coordination_file(_file: &fs::File, _mode: CoordinationLockMode) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "cross-process remount ownership is unavailable on this platform",
     ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn transition_coordination_file_to_shared(_file: &fs::File) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cross-process remount ownership is unavailable on this platform",
+    ))
+}
+
+fn recovery_start_handoff_is_live(paths: &DaemonProcessPaths) -> io::Result<bool> {
+    Ok(
+        coordination_gate_is_live(&daemon_remount_recovery_gate_path(&paths.state_root))?
+            && coordination_gate_is_live(&daemon_remount_start_handoff_path(&paths.state_root))?,
+    )
+}
+
+fn coordination_gate_is_live(gate_path: &Path) -> io::Result<bool> {
+    let gate = match OpenOptions::new().read(true).write(true).open(gate_path) {
+        Ok(gate) => gate,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    prevent_coordination_file_inheritance(&gate)?;
+    match try_lock_coordination_file(&gate, CoordinationLockMode::Shared) {
+        Ok(()) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn ensure_daemon_start_allowed(paths: &DaemonProcessPaths) -> Result<(), DaemonProcessError> {
@@ -628,6 +765,7 @@ impl DefaultDaemonProcessManager {
                 "daemon start does not match the remount owner's state root",
             ));
         }
+        ownership.begin_daemon_start_handoff()?;
         match self.resolve_start_manager(config.mode)? {
             DaemonManager::Launchd => start_launchd(config),
             DaemonManager::Session => start_session(config),
@@ -982,11 +1120,28 @@ mod tests {
     use super::{
         DaemonManager, DaemonProcessPaths, DaemonProcessStartConfig, DaemonRemountCoordinatorLock,
         DaemonStartMode, DaemonStartupCoordinatorLock, daemon_remount_fence_path,
-        daemon_socket_path, ensure_daemon_start_allowed, launch_agent_plist,
-        launchd_restart_fence_action, launchd_service_target, parse_launchd_service_enabled,
-        xml_escape,
+        daemon_remount_recovery_gate_path, daemon_remount_start_handoff_path, daemon_socket_path,
+        ensure_daemon_start_allowed, launch_agent_plist, launchd_restart_fence_action,
+        launchd_service_target, parse_launchd_service_enabled, xml_escape,
     };
     use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard};
+
+    static PROCESS_LOCK_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn process_lock_test_guard() -> MutexGuard<'static, ()> {
+        PROCESS_LOCK_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn remove_process_lock_test_root(root: &std::path::Path) {
+        let gate = daemon_remount_recovery_gate_path(root);
+        let handoff = daemon_remount_start_handoff_path(root);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(gate);
+        let _ = std::fs::remove_file(handoff);
+    }
 
     #[test]
     fn process_paths_use_stable_daemon_filenames() {
@@ -1057,6 +1212,7 @@ mod tests {
 
     #[test]
     fn startup_shared_locks_handoff_to_exclusive_remount_ownership() {
+        let _guard = process_lock_test_guard();
         let root = std::env::temp_dir().join(format!(
             "locality-daemon-startup-handoff-{}-{:?}",
             std::process::id(),
@@ -1090,11 +1246,13 @@ mod tests {
         drop(remount);
         let _startup = DaemonStartupCoordinatorLock::try_acquire(&paths)
             .expect("startup resumes after remount");
-        std::fs::remove_dir_all(root).expect("remove state root");
+        drop(_startup);
+        remove_process_lock_test_root(&root);
     }
 
     #[test]
-    fn exact_fence_generation_authorizes_replacement_daemon_under_owned_lock() {
+    fn copied_fence_and_environment_cannot_replay_remount_start_permission() {
+        let _guard = process_lock_test_guard();
         let root = std::env::temp_dir().join(format!(
             "locality-daemon-owned-restart-{}-{:?}",
             std::process::id(),
@@ -1109,35 +1267,72 @@ mod tests {
         )
         .expect("write exact remount fence");
 
-        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
-            .arg("--ignored")
-            .arg("--exact")
-            .arg("daemon::tests::authorized_remount_daemon_start_helper")
-            .arg("--nocapture")
-            .env("LOCALITY_REMOUNT_START_TEST_ROOT", &root)
-            .env(super::DAEMON_REMOUNT_START_OWNER_ENV, "desktop:123")
-            .env(super::DAEMON_REMOUNT_START_GENERATION_ENV, "aabbccdd")
-            .status()
-            .expect("run authorized replacement daemon helper");
+        let copied_values_status =
+            std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .arg("--ignored")
+                .arg("--exact")
+                .arg("daemon::tests::remount_daemon_start_helper")
+                .arg("--nocapture")
+                .env("LOCALITY_REMOUNT_START_TEST_ROOT", &root)
+                .env("LOCALITY_REMOUNT_START_TEST_EXPECT", "blocked")
+                .env("LOCALITY_REMOUNT_START_OWNER", "desktop:123")
+                .env("LOCALITY_REMOUNT_START_GENERATION", "aabbccdd")
+                .status()
+                .expect("run copied-value adversary helper");
+        assert!(copied_values_status.success());
 
-        assert!(status.success());
+        ownership
+            .begin_daemon_start_handoff()
+            .expect("begin live restart handoff");
+        let live_handoff_status =
+            std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .arg("--ignored")
+                .arg("--exact")
+                .arg("daemon::tests::remount_daemon_start_helper")
+                .arg("--nocapture")
+                .env("LOCALITY_REMOUNT_START_TEST_ROOT", &root)
+                .env("LOCALITY_REMOUNT_START_TEST_EXPECT", "allowed")
+                .status()
+                .expect("run live handoff replacement daemon helper");
+
+        assert!(live_handoff_status.success());
         drop(ownership);
-        std::fs::remove_dir_all(root).expect("remove state root");
+        remove_process_lock_test_root(&root);
     }
 
     #[test]
     #[ignore]
-    fn authorized_remount_daemon_start_helper() {
+    fn remount_daemon_start_helper() {
         let Some(root) = std::env::var_os("LOCALITY_REMOUNT_START_TEST_ROOT") else {
             return;
         };
+        let expectation = std::env::var("LOCALITY_REMOUNT_START_TEST_EXPECT")
+            .expect("helper startup expectation");
         let paths = DaemonProcessPaths::for_target(PathBuf::from(root), "linux", None);
-        let _startup = DaemonStartupCoordinatorLock::try_acquire(&paths)
-            .expect("exact owned fence generation authorizes replacement daemon startup");
+        let startup = DaemonStartupCoordinatorLock::try_acquire(&paths);
+        match expectation.as_str() {
+            "blocked" => assert_eq!(
+                startup
+                    .err()
+                    .expect("copied fence values cannot authorize startup")
+                    .code(),
+                "remount_in_progress"
+            ),
+            "allowed" => {
+                let startup = startup.expect("live lock handoff authorizes replacement startup");
+                drop(startup);
+                assert!(
+                    DaemonRemountCoordinatorLock::try_acquire(&paths.state_root).is_err(),
+                    "the live recovery gate excludes a second recovery after startup handoff"
+                );
+            }
+            value => panic!("unknown helper expectation `{value}`"),
+        }
     }
 
     #[test]
     fn coordinated_reset_preserves_lock_inode_and_rejects_active_remount() {
+        let _guard = process_lock_test_guard();
         let root = std::env::temp_dir().join(format!(
             "locality-daemon-reset-lock-{}-{:?}",
             std::process::id(),
@@ -1192,7 +1387,7 @@ mod tests {
         let _next = DaemonRemountCoordinatorLock::try_acquire(&root)
             .expect("preserved lock remains reusable");
         drop(_next);
-        std::fs::remove_dir_all(root).expect("remove state root");
+        remove_process_lock_test_root(&root);
     }
 
     #[test]
@@ -1282,5 +1477,7 @@ mod tests {
         assert!(plist.contains("<key>LOCALITY_DAEMON_TCP_ADDR</key>"));
         assert!(plist.contains("<key>NOTION_TOKEN</key>"));
         assert!(plist.contains("<string>secret&amp;value</string>"));
+        assert!(!plist.contains("LOCALITY_REMOUNT_START_OWNER"));
+        assert!(!plist.contains("LOCALITY_REMOUNT_START_GENERATION"));
     }
 }

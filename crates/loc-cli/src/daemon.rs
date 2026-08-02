@@ -5,10 +5,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use locality_platform::{
-    DAEMON_REMOUNT_START_GENERATION_ENV, DAEMON_REMOUNT_START_OWNER_ENV, DaemonManager,
-    DaemonProcessError, DaemonProcessManager, DaemonProcessPaths, DaemonProcessStartConfig,
-    DaemonProcessStartReport, DaemonStartMode, DaemonStartupCoordinatorLock,
-    DefaultDaemonProcessManager,
+    DaemonManager, DaemonProcessError, DaemonProcessManager, DaemonProcessPaths,
+    DaemonProcessStartConfig, DaemonProcessStartReport, DaemonStartMode,
+    DaemonStartupCoordinatorLock, DefaultDaemonProcessManager,
 };
 use localityd::ipc::{
     DaemonClientError, DaemonEndpoint, DaemonReloadReport, DaemonRequest, DaemonResponse,
@@ -293,23 +292,7 @@ fn start_daemon_inner(
         .resolve_start_manager(options.mode)
         .map_err(daemon_process_error)?;
     validate_start_endpoint(options)?;
-    let mut environment = included_environment(options)?;
-    if let Some(ownership) = remount_ownership {
-        let (owner, generation) = ownership.owner_generation().ok_or_else(|| {
-            DaemonControlError::new(
-                "remount_owner_missing",
-                "daemon recovery requires an owned durable remount fence",
-            )
-        })?;
-        environment.push((
-            DAEMON_REMOUNT_START_OWNER_ENV.to_string(),
-            owner.to_string(),
-        ));
-        environment.push((
-            DAEMON_REMOUNT_START_GENERATION_ENV.to_string(),
-            generation.to_string(),
-        ));
-    }
+    let environment = included_environment(options)?;
     let config = DaemonProcessStartConfig {
         mode: options.mode,
         paths,
