@@ -155,7 +155,7 @@ impl DaemonRemountCoordinatorLock {
             .read(true)
             .write(true)
             .open(&path)?;
-        try_lock_remount_file(&file).map_err(|error| {
+        try_lock_coordination_file(&file, CoordinationLockMode::Exclusive).map_err(|error| {
             if matches!(error.kind(), io::ErrorKind::WouldBlock) {
                 io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -172,9 +172,60 @@ impl DaemonRemountCoordinatorLock {
     }
 }
 
+/// Shared startup ownership that excludes remount coordination until the
+/// daemon's control endpoint is ready.
+///
+/// A process manager and the daemon it launches may hold this lock at the same
+/// time. A remount requires the exclusive counterpart, so it cannot pass the
+/// fence check between process launch and daemon readiness.
+#[must_use = "dropping startup ownership permits remount coordination"]
+pub struct DaemonStartupCoordinatorLock {
+    _file: fs::File,
+}
+
+impl DaemonStartupCoordinatorLock {
+    pub fn try_acquire(paths: &DaemonProcessPaths) -> Result<Self, DaemonProcessError> {
+        fs::create_dir_all(&paths.state_root)
+            .map_err(|error| DaemonProcessError::new("io_error", error.to_string()))?;
+        let path = daemon_remount_lock_path(&paths.state_root);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| DaemonProcessError::new("io_error", error.to_string()))?;
+        try_lock_coordination_file(&file, CoordinationLockMode::Shared).map_err(|error| {
+            if matches!(error.kind(), io::ErrorKind::WouldBlock) {
+                DaemonProcessError::new(
+                    "remount_in_progress",
+                    format!(
+                        "daemon start is fenced while remount coordination owns `{}`",
+                        path.display()
+                    ),
+                )
+            } else {
+                DaemonProcessError::new("io_error", error.to_string())
+            }
+        })?;
+        ensure_daemon_start_allowed(paths)?;
+        Ok(Self { _file: file })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CoordinationLockMode {
+    Shared,
+    Exclusive,
+}
+
 #[cfg(unix)]
-fn try_lock_remount_file(file: &fs::File) -> io::Result<()> {
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+fn try_lock_coordination_file(file: &fs::File, mode: CoordinationLockMode) -> io::Result<()> {
+    let operation = match mode {
+        CoordinationLockMode::Shared => libc::LOCK_SH,
+        CoordinationLockMode::Exclusive => libc::LOCK_EX,
+    };
+    let result = unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) };
     if result == 0 {
         Ok(())
     } else {
@@ -188,7 +239,7 @@ fn try_lock_remount_file(file: &fs::File) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn try_lock_remount_file(file: &fs::File) -> io::Result<()> {
+fn try_lock_coordination_file(file: &fs::File, mode: CoordinationLockMode) -> io::Result<()> {
     use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, ERROR_LOCK_VIOLATION};
     use windows_sys::Win32::Storage::FileSystem::{
         LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
@@ -199,7 +250,11 @@ fn try_lock_remount_file(file: &fs::File) -> io::Result<()> {
     let ok = unsafe {
         LockFileEx(
             file.as_raw_handle() as _,
-            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            if matches!(mode, CoordinationLockMode::Exclusive) {
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY
+            } else {
+                LOCKFILE_FAIL_IMMEDIATELY
+            },
             0,
             u32::MAX,
             u32::MAX,
@@ -221,7 +276,7 @@ fn try_lock_remount_file(file: &fs::File) -> io::Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn try_lock_remount_file(_file: &fs::File) -> io::Result<()> {
+fn try_lock_coordination_file(_file: &fs::File, _mode: CoordinationLockMode) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "cross-process remount ownership is unavailable on this platform",
@@ -818,10 +873,11 @@ fn xml_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonManager, DaemonProcessPaths, DaemonProcessStartConfig, DaemonStartMode,
-        daemon_remount_fence_path, daemon_socket_path, ensure_daemon_start_allowed,
-        launch_agent_plist, launchd_restart_fence_action, launchd_service_target,
-        parse_launchd_service_enabled, xml_escape,
+        DaemonManager, DaemonProcessPaths, DaemonProcessStartConfig, DaemonRemountCoordinatorLock,
+        DaemonStartMode, DaemonStartupCoordinatorLock, daemon_remount_fence_path,
+        daemon_socket_path, ensure_daemon_start_allowed, launch_agent_plist,
+        launchd_restart_fence_action, launchd_service_target, parse_launchd_service_enabled,
+        xml_escape,
     };
     use std::path::PathBuf;
 
@@ -889,6 +945,43 @@ mod tests {
             let error = ensure_daemon_start_allowed(&paths).expect_err("fence blocks start");
             assert_eq!(error.code(), "remount_in_progress");
         }
+        std::fs::remove_dir_all(root).expect("remove state root");
+    }
+
+    #[test]
+    fn startup_shared_locks_handoff_to_exclusive_remount_ownership() {
+        let root = std::env::temp_dir().join(format!(
+            "locality-daemon-startup-handoff-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let paths = DaemonProcessPaths::for_target(root.clone(), "linux", None);
+
+        let controller =
+            DaemonStartupCoordinatorLock::try_acquire(&paths).expect("controller startup lock");
+        let daemon =
+            DaemonStartupCoordinatorLock::try_acquire(&paths).expect("daemon startup lock");
+        assert!(
+            DaemonRemountCoordinatorLock::try_acquire(&root).is_err(),
+            "remount must not pass the controller/daemon startup handoff"
+        );
+
+        drop(controller);
+        assert!(
+            DaemonRemountCoordinatorLock::try_acquire(&root).is_err(),
+            "daemon retains startup exclusion until its endpoint is ready"
+        );
+
+        drop(daemon);
+        let remount =
+            DaemonRemountCoordinatorLock::try_acquire(&root).expect("exclusive remount ownership");
+        let error = DaemonStartupCoordinatorLock::try_acquire(&paths)
+            .err()
+            .expect("remount excludes daemon startup");
+        assert_eq!(error.code(), "remount_in_progress");
+
+        drop(remount);
+        DaemonStartupCoordinatorLock::try_acquire(&paths).expect("startup resumes after remount");
         std::fs::remove_dir_all(root).expect("remove state root");
     }
 

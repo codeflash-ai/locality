@@ -4302,10 +4302,9 @@ fn run_cli_coordinated_mount(
 struct CliQuiescedRemountRuntime<'a> {
     state_root: &'a Path,
     mount_id: &'a MountId,
-    daemon_was_ready: bool,
+    daemon_was_ready: Option<bool>,
     cleanup_failure: Rc<RefCell<Option<String>>>,
     remount_ownership: Option<WorkspaceRemountOwnership>,
-    supervision_was_enabled: Option<bool>,
 }
 
 impl<'a> CliQuiescedRemountRuntime<'a> {
@@ -4313,10 +4312,9 @@ impl<'a> CliQuiescedRemountRuntime<'a> {
         Self {
             state_root,
             mount_id,
-            daemon_was_ready: cli_daemon_is_ready(state_root),
+            daemon_was_ready: None,
             cleanup_failure: Rc::new(RefCell::new(None)),
             remount_ownership: None,
-            supervision_was_enabled: None,
         }
     }
 }
@@ -4331,14 +4329,15 @@ impl QuiescedWorkspaceRemountRuntime for CliQuiescedRemountRuntime<'_> {
             .as_nanos()
             .to_string();
         let paths = DaemonProcessPaths::new(self.state_root.to_path_buf());
-        self.supervision_was_enabled = daemon_manager_supervision_enabled(&paths)
-            .map_err(|error| error.message().to_string())?;
-        let ownership = WorkspaceRemountOwnership::begin_with_supervision(
+        let ownership = WorkspaceRemountOwnership::begin_capturing_supervision(
             self.state_root,
             self.mount_id,
             "cli",
             &created_at,
-            self.supervision_was_enabled,
+            || {
+                daemon_manager_supervision_enabled(&paths)
+                    .map_err(|error| error.message().to_string())
+            },
         )?;
         self.remount_ownership = Some(ownership);
         Ok(())
@@ -4355,9 +4354,13 @@ impl QuiescedWorkspaceRemountRuntime for CliQuiescedRemountRuntime<'_> {
     }
 
     fn suspend_supervision(&mut self) -> Result<Self::SupervisionFence, String> {
+        let supervision_was_enabled = self
+            .remount_ownership
+            .as_ref()
+            .and_then(WorkspaceRemountOwnership::supervision_was_enabled);
         DaemonManagerRestartFence::suspend(
             &DaemonProcessPaths::new(self.state_root.to_path_buf()),
-            self.supervision_was_enabled,
+            supervision_was_enabled,
         )
         .map_err(|error| error.message().to_string())
     }
@@ -4371,7 +4374,9 @@ impl QuiescedWorkspaceRemountRuntime for CliQuiescedRemountRuntime<'_> {
     }
 
     fn drain(&mut self) -> Result<(), String> {
-        if !self.daemon_was_ready {
+        let daemon_was_ready = cli_daemon_is_ready(self.state_root);
+        self.daemon_was_ready = Some(daemon_was_ready);
+        if !daemon_was_ready {
             return Ok(());
         }
         let response = send_request_with_timeout(
@@ -4406,7 +4411,7 @@ impl QuiescedWorkspaceRemountRuntime for CliQuiescedRemountRuntime<'_> {
     }
 
     fn ensure_running(&mut self) -> Result<(), String> {
-        if !self.daemon_was_ready || cli_daemon_is_ready(self.state_root) {
+        if self.daemon_was_ready != Some(true) || cli_daemon_is_ready(self.state_root) {
             return Ok(());
         }
         let args = vec![
@@ -4432,6 +4437,82 @@ fn cli_daemon_is_ready(state_root: &Path) -> bool {
     }
     send_request_with_timeout(state_root, &DaemonRequest::Ping, Duration::from_millis(250))
         .is_ok_and(|response| response.ok)
+}
+
+#[cfg(all(test, unix))]
+mod cli_remount_daemon_tests {
+    use std::io::ErrorKind;
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, Instant};
+
+    use locality_core::model::MountId;
+    use localityd::ipc::{DaemonRequest, DaemonResponse, read_request, write_response};
+
+    use super::CliQuiescedRemountRuntime;
+    use crate::mount::QuiescedWorkspaceRemountRuntime;
+
+    #[test]
+    fn drain_observes_daemon_that_became_ready_after_runtime_construction() {
+        let state_root = std::path::PathBuf::from("/tmp").join(format!(
+            "loc-remount-drain-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        let mount_id = MountId::new("notion-main");
+        let mut runtime = CliQuiescedRemountRuntime::new(&state_root, &mount_id);
+
+        std::fs::create_dir_all(&state_root).expect("create state root");
+        let socket_path = locality_platform::daemon_socket_path(&state_root);
+        let listener = UnixListener::bind(&socket_path).expect("bind late daemon socket");
+        listener
+            .set_nonblocking(true)
+            .expect("configure daemon socket");
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut shutdown_seen = false;
+            let mut requests = 0;
+            while requests < 4 && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = read_request(&mut stream).expect("read daemon request");
+                        let response = match request {
+                            DaemonRequest::Ping if !shutdown_seen => {
+                                DaemonResponse::ok(serde_json::json!({}))
+                            }
+                            DaemonRequest::Ping => {
+                                DaemonResponse::error("shutting_down", "daemon is shutting down")
+                            }
+                            DaemonRequest::Shutdown => {
+                                shutdown_seen = true;
+                                DaemonResponse::ok(serde_json::json!({}))
+                            }
+                            other => DaemonResponse::error(
+                                "unexpected_request",
+                                format!("unexpected request: {other:?}"),
+                            ),
+                        };
+                        write_response(&mut stream, &response).expect("write daemon response");
+                        requests += 1;
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept daemon request: {error}"),
+                }
+            }
+            shutdown_seen
+        });
+
+        runtime.drain().expect("drain live daemon");
+
+        assert_eq!(runtime.daemon_was_ready, Some(true));
+        assert!(server.join().expect("join daemon server"));
+        let _ = std::fs::remove_file(socket_path);
+        std::fs::remove_dir_all(state_root).expect("remove state root");
+    }
 }
 
 fn slack_settings_from_mount_args(args: &[String]) -> Result<String, CommandError> {

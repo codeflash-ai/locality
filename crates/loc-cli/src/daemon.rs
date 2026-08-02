@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use locality_platform::{
     DaemonManager, DaemonProcessError, DaemonProcessManager, DaemonProcessPaths,
     DaemonProcessStartConfig, DaemonProcessStartReport, DaemonStartMode,
-    DefaultDaemonProcessManager, ensure_daemon_start_allowed,
+    DaemonStartupCoordinatorLock, DefaultDaemonProcessManager,
 };
 use localityd::ipc::{
     DaemonClientError, DaemonEndpoint, DaemonReloadReport, DaemonRequest, DaemonResponse,
@@ -200,8 +200,10 @@ fn start_daemon(
     options: &DaemonOptions,
     paths: &DaemonPaths,
 ) -> Result<DaemonControlReport, DaemonControlError> {
-    ensure_daemon_start_allowed(paths).map_err(daemon_process_error)?;
+    let startup_lock =
+        DaemonStartupCoordinatorLock::try_acquire(paths).map_err(daemon_process_error)?;
     if is_running(options, paths) {
+        drop(startup_lock);
         repair_linux_fuse_units_for_daemon_start(&options.state_root);
         return Ok(report(
             options.action,
@@ -242,6 +244,7 @@ fn start_daemon(
             ),
         ));
     }
+    drop(startup_lock);
     write_metadata(options, paths, &artifacts)?;
     repair_linux_fuse_units_for_daemon_start(&options.state_root);
 

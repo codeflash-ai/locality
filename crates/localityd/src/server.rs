@@ -24,9 +24,10 @@ use crate::watcher::{FileWatcher, NotifyFileWatcher, PollingStubReadWatcher};
 pub fn run_foreground(config: &DaemonConfig) -> LocalityResult<()> {
     std::fs::create_dir_all(&config.state_root)?;
     let paths = locality_platform::DaemonProcessPaths::new(config.state_root.clone());
-    locality_platform::ensure_daemon_start_allowed(&paths).map_err(|error| {
-        LocalityError::InvalidState(format!("localityd startup is fenced: {}", error.message()))
-    })?;
+    let startup_lock = locality_platform::DaemonStartupCoordinatorLock::try_acquire(&paths)
+        .map_err(|error| {
+            LocalityError::InvalidState(format!("localityd startup is fenced: {}", error.message()))
+        })?;
     let runtime = DaemonRuntime::spawn(config.clone())?;
     let runtime_handle = runtime.handle();
     let watch_manager = Arc::new(Mutex::new(DaemonWatchManager::new(
@@ -62,6 +63,7 @@ pub fn run_foreground(config: &DaemonConfig) -> LocalityResult<()> {
             let mounts = load_mounts(config)?;
             print_startup_banner(None, Some(addr), &mounts, &reload.watches);
             println!("localityd is running (tcp: {addr})");
+            drop(startup_lock);
             accept_tcp_connections(listener, server);
             return Ok(());
         }
@@ -90,6 +92,11 @@ pub fn run_foreground(config: &DaemonConfig) -> LocalityResult<()> {
         );
 
         println!("localityd is running (socket: {})", socket_path.display());
+        // Binding and fully initializing the control endpoint completes the
+        // process-manager/daemon shared-lock handoff. A remount can acquire
+        // exclusive ownership only after clients have a live endpoint to
+        // inspect and drain.
+        drop(startup_lock);
         while !server.shutdown_requested() {
             match listener.accept() {
                 Ok((stream, _addr)) => {

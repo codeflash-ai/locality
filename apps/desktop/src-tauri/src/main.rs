@@ -7888,18 +7888,19 @@ fn persist_daemon_remount_fence(
     mount_id: &MountId,
 ) -> Result<WorkspaceRemountOwnership, String> {
     let paths = DaemonProcessPaths::new(state_root.to_path_buf());
-    let supervision_was_enabled = daemon_manager_supervision_enabled(&paths).map_err(|error| {
-        format!(
-            "Could not inspect localityd's process manager before remount: {}",
-            error.message()
-        )
-    })?;
-    WorkspaceRemountOwnership::begin_with_supervision(
+    WorkspaceRemountOwnership::begin_capturing_supervision(
         state_root,
         mount_id,
         "desktop",
         &activity_timestamp(),
-        supervision_was_enabled,
+        || {
+            daemon_manager_supervision_enabled(&paths).map_err(|error| {
+                format!(
+                    "Could not inspect localityd's process manager before remount: {}",
+                    error.message()
+                )
+            })
+        },
     )
 }
 

@@ -322,15 +322,17 @@ impl WorkspaceRemountOwnership {
         owner: &str,
         created_at: &str,
     ) -> Result<Self, String> {
-        Self::begin_with_supervision(state_root, mount_id, owner, created_at, None)
+        Self::begin_capturing_supervision(state_root, mount_id, owner, created_at, || Ok(None))
     }
 
-    pub fn begin_with_supervision(
+    /// Acquires exclusive remount ownership before inspecting process-manager
+    /// state, then persists that exact observation in the durable fence.
+    pub fn begin_capturing_supervision(
         state_root: &Path,
         mount_id: &MountId,
         owner: &str,
         created_at: &str,
-        supervision_was_enabled: Option<bool>,
+        capture_supervision: impl FnOnce() -> Result<Option<bool>, String>,
     ) -> Result<Self, String> {
         let lock = locality_platform::DaemonRemountCoordinatorLock::try_acquire(state_root)
             .map_err(|error| format!("Could not acquire remount coordinator ownership: {error}"))?;
@@ -350,6 +352,7 @@ impl WorkspaceRemountOwnership {
                 ));
             }
         }
+        let supervision_was_enabled = capture_supervision()?;
         let generation = remount_fence_generation()?;
         let owner = format!("{owner}:{}", std::process::id());
         let record = WorkspaceRemountFenceRecord {
@@ -1197,12 +1200,12 @@ mod remount_coordinator_tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let owner = WorkspaceRemountOwnership::begin_with_supervision(
+        let owner = WorkspaceRemountOwnership::begin_capturing_supervision(
             &root,
             &locality_core::model::MountId::new("notion-main"),
             "desktop",
             "1",
-            Some(false),
+            || Ok(Some(false)),
         )
         .unwrap();
         assert_eq!(owner.supervision_was_enabled(), Some(false));
@@ -1213,5 +1216,37 @@ mod remount_coordinator_tests {
         recovered.clear().unwrap();
         drop(recovered);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn supervision_capture_runs_after_exclusive_remount_ownership() {
+        let root = std::env::temp_dir().join(format!(
+            "locality-remount-supervision-capture-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let paths = locality_platform::DaemonProcessPaths::new(root.clone());
+        let mut owner = WorkspaceRemountOwnership::begin_capturing_supervision(
+            &root,
+            &locality_core::model::MountId::new("notion-main"),
+            "cli",
+            "1",
+            || {
+                let error = locality_platform::DaemonStartupCoordinatorLock::try_acquire(&paths)
+                    .err()
+                    .expect("startup must be excluded before supervision is captured");
+                assert_eq!(error.code(), "remount_in_progress");
+                Ok(Some(true))
+            },
+        )
+        .expect("capture supervision under remount ownership");
+
+        assert_eq!(owner.supervision_was_enabled(), Some(true));
+        owner.clear().expect("clear fence");
+        drop(owner);
+        std::fs::remove_dir_all(root).expect("remove state root");
     }
 }
