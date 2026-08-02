@@ -284,7 +284,7 @@ where
     }
 }
 
-const WORKSPACE_REMOUNT_FENCE_VERSION: u32 = 2;
+const WORKSPACE_REMOUNT_FENCE_VERSION: u32 = 3;
 const WORKSPACE_REMOUNT_FENCE_MAX_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -295,6 +295,8 @@ struct WorkspaceRemountFenceRecord {
     generation: String,
     mount_id: String,
     created_at: String,
+    #[serde(default)]
+    supervision_was_enabled: Option<bool>,
 }
 
 /// Exclusive cross-process ownership for one remount or recovery pass.
@@ -310,6 +312,7 @@ pub struct WorkspaceRemountOwnership {
     expected_fence: Option<Vec<u8>>,
     owner: Option<String>,
     generation: Option<String>,
+    supervision_was_enabled: Option<bool>,
 }
 
 impl WorkspaceRemountOwnership {
@@ -318,6 +321,16 @@ impl WorkspaceRemountOwnership {
         mount_id: &MountId,
         owner: &str,
         created_at: &str,
+    ) -> Result<Self, String> {
+        Self::begin_with_supervision(state_root, mount_id, owner, created_at, None)
+    }
+
+    pub fn begin_with_supervision(
+        state_root: &Path,
+        mount_id: &MountId,
+        owner: &str,
+        created_at: &str,
+        supervision_was_enabled: Option<bool>,
     ) -> Result<Self, String> {
         let lock = locality_platform::DaemonRemountCoordinatorLock::try_acquire(state_root)
             .map_err(|error| format!("Could not acquire remount coordinator ownership: {error}"))?;
@@ -345,6 +358,7 @@ impl WorkspaceRemountOwnership {
             generation: generation.clone(),
             mount_id: mount_id.0.clone(),
             created_at: created_at.to_string(),
+            supervision_was_enabled,
         };
         let mut contents = serde_json::to_vec(&record)
             .map_err(|error| format!("Could not encode daemon remount fence: {error}"))?;
@@ -361,6 +375,7 @@ impl WorkspaceRemountOwnership {
             expected_fence: Some(contents),
             owner: Some(owner),
             generation: Some(generation),
+            supervision_was_enabled,
         })
     }
 
@@ -387,12 +402,12 @@ impl WorkspaceRemountOwnership {
                 path.display()
             ));
         }
-        let (expected_fence, owner, generation) = if contents.is_none() {
-            (None, None, None)
+        let (expected_fence, owner, generation, supervision_was_enabled) = if contents.is_none() {
+            (None, None, None, None)
         } else if let Ok(record) = serde_json::from_slice::<WorkspaceRemountFenceRecord>(
             contents.as_deref().expect("checked persisted fence"),
         ) {
-            if record.version != WORKSPACE_REMOUNT_FENCE_VERSION
+            if !matches!(record.version, 2 | WORKSPACE_REMOUNT_FENCE_VERSION)
                 || record.owner.is_empty()
                 || record.generation.is_empty()
             {
@@ -401,7 +416,18 @@ impl WorkspaceRemountOwnership {
                     path.display()
                 ));
             }
-            (contents, Some(record.owner), Some(record.generation))
+            let supervision_was_enabled = if record.version == 2 {
+                // V2 always disabled launchd and therefore always restored it.
+                Some(true)
+            } else {
+                record.supervision_was_enabled
+            };
+            (
+                contents,
+                Some(record.owner),
+                Some(record.generation),
+                supervision_was_enabled,
+            )
         } else if contents
             .as_deref()
             .is_some_and(|contents| contents.starts_with(b"version=1\n"))
@@ -414,6 +440,7 @@ impl WorkspaceRemountOwnership {
                 Some(hex_generation(
                     contents.as_deref().expect("checked legacy fence"),
                 )),
+                Some(true),
             )
         } else {
             return Err(format!(
@@ -427,6 +454,7 @@ impl WorkspaceRemountOwnership {
             expected_fence,
             owner,
             generation,
+            supervision_was_enabled,
         })
     }
 
@@ -436,6 +464,10 @@ impl WorkspaceRemountOwnership {
 
     pub fn owner_generation(&self) -> Option<(&str, &str)> {
         self.owner.as_deref().zip(self.generation.as_deref())
+    }
+
+    pub fn supervision_was_enabled(&self) -> Option<bool> {
+        self.supervision_was_enabled
     }
 
     pub fn clear(&mut self) -> Result<(), String> {
@@ -1151,6 +1183,35 @@ mod remount_coordinator_tests {
             .expect_err("stale owner must not clear successor generation");
         assert!(locality_platform::daemon_remount_fence_path(&root).exists());
         drop(owner);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remount_fence_preserves_explicitly_disabled_supervision_across_recovery() {
+        let root = std::env::temp_dir().join(format!(
+            "locality-remount-disabled-supervision-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let owner = WorkspaceRemountOwnership::begin_with_supervision(
+            &root,
+            &locality_core::model::MountId::new("notion-main"),
+            "desktop",
+            "1",
+            Some(false),
+        )
+        .unwrap();
+        assert_eq!(owner.supervision_was_enabled(), Some(false));
+        drop(owner);
+
+        let mut recovered = WorkspaceRemountOwnership::recover(&root).unwrap();
+        assert_eq!(recovered.supervision_was_enabled(), Some(false));
+        recovered.clear().unwrap();
+        drop(recovered);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

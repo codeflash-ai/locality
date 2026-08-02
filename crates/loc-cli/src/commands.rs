@@ -40,7 +40,8 @@ use locality_notion::oauth::{
     HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NotionOAuthBrokerStart,
 };
 use locality_platform::{
-    DaemonManagerRestartFence, DaemonProcessPaths, restore_daemon_manager_supervision,
+    DaemonManagerRestartFence, DaemonProcessPaths, daemon_manager_supervision_enabled,
+    restore_daemon_manager_supervision,
 };
 use locality_slack::{
     DEFAULT_SLACK_OAUTH_BROKER_URL, DEFAULT_SLACK_OAUTH_REDIRECT_URI, HttpSlackOAuthBrokerClient,
@@ -4065,18 +4066,24 @@ fn reconcile_cli_workspace_remount_fence_with(
     restore: impl FnOnce(&DaemonProcessPaths) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut ownership = WorkspaceRemountOwnership::recover(state_root)?;
-    reconcile_cli_workspace_remount_fence_owned(state_root, &mut ownership, restore)
+    reconcile_cli_workspace_remount_fence_owned(state_root, &mut ownership, |paths, _| {
+        restore(paths)
+    })
 }
 
 fn reconcile_cli_workspace_remount_fence_owned(
     state_root: &Path,
     ownership: &mut WorkspaceRemountOwnership,
-    restore: impl FnOnce(&DaemonProcessPaths) -> Result<(), String>,
+    restore: impl FnOnce(&DaemonProcessPaths, Option<bool>) -> Result<(), String>,
 ) -> Result<(), String> {
     if !ownership.has_fence() {
         return Ok(());
     }
-    restore(&DaemonProcessPaths::new(state_root.to_path_buf())).map_err(|error| {
+    restore(
+        &DaemonProcessPaths::new(state_root.to_path_buf()),
+        ownership.supervision_was_enabled(),
+    )
+    .map_err(|error| {
         format!("could not restore daemon supervision after CLI remount recovery: {error}")
     })?;
     ownership.clear()
@@ -4150,8 +4157,9 @@ fn reconcile_cli_workspace_remount_recovery(
     }
     // Recovery owns the persisted fence too. Supervision must be restored
     // durably before daemon startup is unfenced, including restart recovery.
-    reconcile_cli_workspace_remount_fence_owned(state_root, &mut ownership, |paths| {
-        restore_daemon_manager_supervision(paths).map_err(|error| error.message().to_string())
+    reconcile_cli_workspace_remount_fence_owned(state_root, &mut ownership, |paths, was_enabled| {
+        restore_daemon_manager_supervision(paths, was_enabled)
+            .map_err(|error| error.message().to_string())
     })
 }
 
@@ -4297,6 +4305,7 @@ struct CliQuiescedRemountRuntime<'a> {
     daemon_was_ready: bool,
     cleanup_failure: Rc<RefCell<Option<String>>>,
     remount_ownership: Option<WorkspaceRemountOwnership>,
+    supervision_was_enabled: Option<bool>,
 }
 
 impl<'a> CliQuiescedRemountRuntime<'a> {
@@ -4307,6 +4316,7 @@ impl<'a> CliQuiescedRemountRuntime<'a> {
             daemon_was_ready: cli_daemon_is_ready(state_root),
             cleanup_failure: Rc::new(RefCell::new(None)),
             remount_ownership: None,
+            supervision_was_enabled: None,
         }
     }
 }
@@ -4320,8 +4330,16 @@ impl QuiescedWorkspaceRemountRuntime for CliQuiescedRemountRuntime<'_> {
             .unwrap_or_default()
             .as_nanos()
             .to_string();
-        let ownership =
-            WorkspaceRemountOwnership::begin(self.state_root, self.mount_id, "cli", &created_at)?;
+        let paths = DaemonProcessPaths::new(self.state_root.to_path_buf());
+        self.supervision_was_enabled = daemon_manager_supervision_enabled(&paths)
+            .map_err(|error| error.message().to_string())?;
+        let ownership = WorkspaceRemountOwnership::begin_with_supervision(
+            self.state_root,
+            self.mount_id,
+            "cli",
+            &created_at,
+            self.supervision_was_enabled,
+        )?;
         self.remount_ownership = Some(ownership);
         Ok(())
     }
@@ -4337,8 +4355,11 @@ impl QuiescedWorkspaceRemountRuntime for CliQuiescedRemountRuntime<'_> {
     }
 
     fn suspend_supervision(&mut self) -> Result<Self::SupervisionFence, String> {
-        DaemonManagerRestartFence::suspend(&DaemonProcessPaths::new(self.state_root.to_path_buf()))
-            .map_err(|error| error.message().to_string())
+        DaemonManagerRestartFence::suspend(
+            &DaemonProcessPaths::new(self.state_root.to_path_buf()),
+            self.supervision_was_enabled,
+        )
+        .map_err(|error| error.message().to_string())
     }
 
     fn restore_supervision(&mut self, fence: &mut Self::SupervisionFence) -> Result<(), String> {

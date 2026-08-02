@@ -100,8 +100,9 @@ use locality_notion::oauth::{
 };
 use locality_platform::{
     DAEMON_PID_FILENAME, DaemonManagerRestartFence, DaemonProcessPaths, append_service_log,
-    bundled_binary_next_to_current_exe, default_state_root as platform_default_state_root,
-    ensure_daemon_start_allowed, logs_dir as platform_logs_dir, restore_daemon_manager_supervision,
+    bundled_binary_next_to_current_exe, daemon_manager_supervision_enabled,
+    default_state_root as platform_default_state_root, ensure_daemon_start_allowed,
+    logs_dir as platform_logs_dir, restore_daemon_manager_supervision,
     user_home as platform_user_home,
 };
 use locality_slack::{
@@ -7832,13 +7833,20 @@ impl QuiescedWorkspaceRemountRuntime for DesktopQuiescedRemountRuntime<'_> {
     }
 
     fn suspend_supervision(&mut self) -> Result<Self::SupervisionFence, String> {
-        DaemonManagerRestartFence::suspend(&DaemonProcessPaths::new(self.state_root.to_path_buf()))
-            .map_err(|error| {
-                format!(
-                    "Could not suspend localityd's process manager before remount: {}",
-                    error.message()
-                )
-            })
+        let supervision_was_enabled = self
+            .remount_ownership
+            .as_ref()
+            .and_then(WorkspaceRemountOwnership::supervision_was_enabled);
+        DaemonManagerRestartFence::suspend(
+            &DaemonProcessPaths::new(self.state_root.to_path_buf()),
+            supervision_was_enabled,
+        )
+        .map_err(|error| {
+            format!(
+                "Could not suspend localityd's process manager before remount: {}",
+                error.message()
+            )
+        })
     }
 
     fn restore_supervision(&mut self, fence: &mut Self::SupervisionFence) -> Result<(), String> {
@@ -7879,7 +7887,20 @@ fn persist_daemon_remount_fence(
     state_root: &Path,
     mount_id: &MountId,
 ) -> Result<WorkspaceRemountOwnership, String> {
-    WorkspaceRemountOwnership::begin(state_root, mount_id, "desktop", &activity_timestamp())
+    let paths = DaemonProcessPaths::new(state_root.to_path_buf());
+    let supervision_was_enabled = daemon_manager_supervision_enabled(&paths).map_err(|error| {
+        format!(
+            "Could not inspect localityd's process manager before remount: {}",
+            error.message()
+        )
+    })?;
+    WorkspaceRemountOwnership::begin_with_supervision(
+        state_root,
+        mount_id,
+        "desktop",
+        &activity_timestamp(),
+        supervision_was_enabled,
+    )
 }
 
 fn remove_daemon_remount_fence(ownership: &mut WorkspaceRemountOwnership) -> Result<(), String> {
@@ -12028,8 +12049,9 @@ fn reconcile_desktop_remount_recovery(state_root: &Path) -> Result<(), String> {
         return Ok(());
     }
     let paths = DaemonProcessPaths::new(state_root.to_path_buf());
+    let supervision_was_enabled = ownership.supervision_was_enabled();
     restore_supervision_before_clearing_remount_fence(&mut ownership, || {
-        restore_daemon_manager_supervision(&paths).map_err(|error| {
+        restore_daemon_manager_supervision(&paths, supervision_was_enabled).map_err(|error| {
             format!(
                 "Could not restore daemon supervision after remount recovery: {}",
                 error.message()

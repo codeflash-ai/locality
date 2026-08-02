@@ -303,13 +303,17 @@ pub struct DaemonManagerRestartFence {
 }
 
 impl DaemonManagerRestartFence {
-    pub fn suspend(paths: &DaemonProcessPaths) -> Result<Self, DaemonProcessError> {
+    pub fn suspend(
+        paths: &DaemonProcessPaths,
+        supervision_was_enabled: Option<bool>,
+    ) -> Result<Self, DaemonProcessError> {
         #[cfg(target_os = "macos")]
         {
             let launchd_target = if paths
                 .launch_agent
                 .as_ref()
                 .is_some_and(|path| path.exists())
+                && supervision_was_enabled == Some(true)
             {
                 let target = launchd_service_target(&launchd_domain()?);
                 set_launchd_service_enabled(&target, false)?;
@@ -321,7 +325,7 @@ impl DaemonManagerRestartFence {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = paths;
+            let _ = (paths, supervision_was_enabled);
             Ok(Self {})
         }
     }
@@ -349,12 +353,14 @@ impl DaemonManagerRestartFence {
 
 pub fn restore_daemon_manager_supervision(
     paths: &DaemonProcessPaths,
+    supervision_was_enabled: Option<bool>,
 ) -> Result<(), DaemonProcessError> {
     #[cfg(target_os = "macos")]
     if paths
         .launch_agent
         .as_ref()
         .is_some_and(|path| path.exists())
+        && supervision_was_enabled == Some(true)
     {
         let target = launchd_service_target(&launchd_domain()?);
         set_launchd_service_enabled(&target, true)?;
@@ -362,6 +368,30 @@ pub fn restore_daemon_manager_supervision(
     #[cfg(not(target_os = "macos"))]
     let _ = paths;
     Ok(())
+}
+
+/// Captures whether the platform process manager should be restored after a
+/// coordinated daemon suspension. `None` means no managed service exists.
+pub fn daemon_manager_supervision_enabled(
+    paths: &DaemonProcessPaths,
+) -> Result<Option<bool>, DaemonProcessError> {
+    #[cfg(target_os = "macos")]
+    {
+        if !paths
+            .launch_agent
+            .as_ref()
+            .is_some_and(|path| path.exists())
+        {
+            return Ok(None);
+        }
+        let domain = launchd_domain()?;
+        return launchd_service_enabled(&domain).map(Some);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = paths;
+        Ok(None)
+    }
 }
 
 impl Drop for DaemonManagerRestartFence {
@@ -635,6 +665,50 @@ fn set_launchd_service_enabled(target: &str, enabled: bool) -> Result<(), Daemon
     run_launchctl(Command::new("launchctl").arg(verb).arg(target))
 }
 
+#[cfg(target_os = "macos")]
+fn launchd_service_enabled(domain: &str) -> Result<bool, DaemonProcessError> {
+    let output = Command::new("launchctl")
+        .arg("print-disabled")
+        .arg(domain)
+        .output()
+        .map_err(|error| DaemonProcessError::new("launchctl_failed", error.to_string()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(DaemonProcessError::new(
+            "launchctl_failed",
+            if stderr.is_empty() {
+                format!("launchctl print-disabled exited with {}", output.status)
+            } else {
+                stderr
+            },
+        ));
+    }
+    parse_launchd_service_enabled(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_launchd_service_enabled(output: &str) -> Result<bool, DaemonProcessError> {
+    let quoted_label = format!("\"{MACOS_LAUNCHD_LABEL}\"");
+    let Some(line) = output.lines().find(|line| line.contains(&quoted_label)) else {
+        // launchd omits services that retain their default enabled state.
+        return Ok(true);
+    };
+    let Some((_, value)) = line.split_once("=>") else {
+        return Err(DaemonProcessError::new(
+            "launchctl_failed",
+            "launchctl returned an invalid disabled-services entry",
+        ));
+    };
+    match value.trim().trim_end_matches(',').trim() {
+        "true" => Ok(false),
+        "false" => Ok(true),
+        _ => Err(DaemonProcessError::new(
+            "launchctl_failed",
+            "launchctl returned an invalid disabled-services value",
+        )),
+    }
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn launchd_restart_fence_action(target: &str, enabled: bool) -> (&'static str, &str) {
     (if enabled { "enable" } else { "disable" }, target)
@@ -746,7 +820,8 @@ mod tests {
     use super::{
         DaemonManager, DaemonProcessPaths, DaemonProcessStartConfig, DaemonStartMode,
         daemon_remount_fence_path, daemon_socket_path, ensure_daemon_start_allowed,
-        launch_agent_plist, launchd_restart_fence_action, launchd_service_target, xml_escape,
+        launch_agent_plist, launchd_restart_fence_action, launchd_service_target,
+        parse_launchd_service_enabled, xml_escape,
     };
     use std::path::PathBuf;
 
@@ -848,6 +923,28 @@ mod tests {
         assert_eq!(
             launchd_restart_fence_action(&target, true),
             ("enable", target.as_str())
+        );
+    }
+
+    #[test]
+    fn launchd_disabled_state_parser_preserves_explicit_service_state() {
+        assert!(
+            parse_launchd_service_enabled("disabled services = {\n}")
+                .expect("missing entry uses enabled default")
+        );
+        assert!(
+            !parse_launchd_service_enabled(&format!(
+                "disabled services = {{\n    \"{}\" => true\n}}",
+                super::MACOS_LAUNCHD_LABEL
+            ))
+            .expect("explicit disabled state")
+        );
+        assert!(
+            parse_launchd_service_enabled(&format!(
+                "disabled services = {{\n    \"{}\" => false,\n}}",
+                super::MACOS_LAUNCHD_LABEL
+            ))
+            .expect("explicit enabled state")
         );
     }
 
