@@ -1310,6 +1310,7 @@ where
                     freshness: None,
                     superseded_local_ids: Vec::new(),
                 },
+                content_root,
                 &old_path,
                 &new_content_path,
                 (rename_policy == VirtualRenamePolicy::FilenameDerived)
@@ -1393,6 +1394,7 @@ where
                 freshness: Some(freshness),
                 superseded_local_ids: remote_move_local_ids(&remote_id),
             },
+            content_root,
             &old_path,
             &new_content_path,
             (rename_policy == VirtualRenamePolicy::FilenameDerived)
@@ -1467,6 +1469,7 @@ where
                 freshness: None,
                 superseded_local_ids: Vec::new(),
             },
+            content_root,
             &old_path,
             &new_content_path,
             None,
@@ -1529,6 +1532,7 @@ where
             freshness: Some(freshness),
             superseded_local_ids: remote_move_local_ids(&remote_id),
         },
+        content_root,
         &old_path,
         &new_content_path,
         None,
@@ -2592,6 +2596,7 @@ where
 fn persist_and_publish_virtual_move<S>(
     store: &mut S,
     transition: VirtualMoveTransition,
+    content_root: &Path,
     old_path: &Path,
     new_content_path: &Path,
     retitle: Option<&str>,
@@ -2615,7 +2620,7 @@ where
         .map_err(LocalityError::from)?;
 
     if old_path != new_content_path && !new_content_path.exists() {
-        publish_virtual_move_cache(old_path, new_content_path, retitle)?;
+        publish_virtual_move_cache(content_root, old_path, new_content_path, retitle)?;
     } else if let Some(title) = retitle {
         retitle_cached_page_if_present(new_content_path, title)?;
     }
@@ -2631,12 +2636,13 @@ where
         .map_err(LocalityError::from)?;
 
     if old_path != new_content_path && old_path.exists() {
-        let _ = remove_path_durable(old_path);
+        let _ = remove_path_durable(content_root, old_path);
     }
     Ok(finalized)
 }
 
 fn publish_virtual_move_cache(
+    content_root: &Path,
     old_path: &Path,
     new_content_path: &Path,
     retitle: Option<&str>,
@@ -2651,26 +2657,28 @@ fn publish_virtual_move_cache(
             new_content_path.display()
         ))
     })?;
-    create_dir_all_durable(parent).map_err(|error| {
+    create_dir_all_durable(content_root, parent).map_err(|error| {
         LocalityError::Io(format!(
             "failed to create virtual filesystem content directory `{}`: {error}",
             parent.display()
         ))
     })?;
     let temp_path = virtual_move_temp_path(new_content_path);
-    write_new_file_durable(&temp_path, &contents).map_err(|error| {
+    write_new_file_durable(content_root, &temp_path, &contents).map_err(|error| {
         LocalityError::Io(format!(
             "failed to write virtual filesystem temp file `{}`: {error}",
             temp_path.display()
         ))
     })?;
-    rename_noreplace_durable(&temp_path, new_content_path).map_err(|error| {
-        let _ = remove_path_durable(&temp_path);
-        LocalityError::Io(format!(
-            "failed to publish virtual filesystem content `{}`: {error}",
-            new_content_path.display()
-        ))
-    })
+    rename_noreplace_durable(content_root, &temp_path, content_root, new_content_path).map_err(
+        |error| {
+            let _ = remove_path_durable(content_root, &temp_path);
+            LocalityError::Io(format!(
+                "failed to publish virtual filesystem content `{}`: {error}",
+                new_content_path.display()
+            ))
+        },
+    )
 }
 
 fn read_virtual_move_cache(path: &Path, retitle: Option<&str>) -> LocalityResult<Vec<u8>> {

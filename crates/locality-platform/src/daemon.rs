@@ -164,6 +164,58 @@ pub struct DaemonProcessStopReport {
     pub stopped_managed_process: bool,
 }
 
+/// Keeps a managed daemon from being relaunched while a coordinator-owned
+/// operation waits for the current process to exit.
+pub struct DaemonManagerRestartFence {
+    #[cfg(target_os = "macos")]
+    launchd_target: Option<String>,
+}
+
+impl DaemonManagerRestartFence {
+    pub fn suspend(paths: &DaemonProcessPaths) -> Result<Self, DaemonProcessError> {
+        #[cfg(target_os = "macos")]
+        {
+            let launchd_target = if paths
+                .launch_agent
+                .as_ref()
+                .is_some_and(|path| path.exists())
+            {
+                let target = launchd_service_target(&launchd_domain()?);
+                set_launchd_service_enabled(&target, false)?;
+                Some(target)
+            } else {
+                None
+            };
+            Ok(Self { launchd_target })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = paths;
+            Ok(Self {})
+        }
+    }
+
+    pub fn restore(&mut self) -> Result<(), DaemonProcessError> {
+        #[cfg(target_os = "macos")]
+        if let Some(target) = self.launchd_target.take() {
+            if let Err(error) = set_launchd_service_enabled(&target, true) {
+                self.launchd_target = Some(target);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DaemonManagerRestartFence {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(target) = self.launchd_target.take() {
+            let _ = set_launchd_service_enabled(&target, true);
+        }
+    }
+}
+
 pub trait DaemonProcessManager {
     fn resolve_start_manager(
         &self,
@@ -420,6 +472,17 @@ fn run_launchctl(command: &mut Command) -> Result<(), DaemonProcessError> {
 }
 
 #[cfg(target_os = "macos")]
+fn set_launchd_service_enabled(target: &str, enabled: bool) -> Result<(), DaemonProcessError> {
+    let (verb, target) = launchd_restart_fence_action(target, enabled);
+    run_launchctl(Command::new("launchctl").arg(verb).arg(target))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn launchd_restart_fence_action(target: &str, enabled: bool) -> (&'static str, &str) {
+    (if enabled { "enable" } else { "disable" }, target)
+}
+
+#[cfg(target_os = "macos")]
 fn launchctl_bootout_service(domain: &str) -> bool {
     Command::new("launchctl")
         .arg("bootout")
@@ -524,7 +587,8 @@ fn xml_escape(value: &str) -> String {
 mod tests {
     use super::{
         DaemonManager, DaemonProcessPaths, DaemonProcessStartConfig, DaemonStartMode,
-        daemon_socket_path, launch_agent_plist, launchd_service_target, xml_escape,
+        daemon_socket_path, launch_agent_plist, launchd_restart_fence_action,
+        launchd_service_target, xml_escape,
     };
     use std::path::PathBuf;
 
@@ -596,6 +660,19 @@ mod tests {
         assert_eq!(
             launchd_service_target("gui/501"),
             "gui/501/ai.codeflash.locality.localityd"
+        );
+    }
+
+    #[test]
+    fn launchd_restart_fence_disables_before_drain_and_enables_afterward() {
+        let target = launchd_service_target("gui/501");
+        assert_eq!(
+            launchd_restart_fence_action(&target, false),
+            ("disable", target.as_str())
+        );
+        assert_eq!(
+            launchd_restart_fence_action(&target, true),
+            ("enable", target.as_str())
         );
     }
 

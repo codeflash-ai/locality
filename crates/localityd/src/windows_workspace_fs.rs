@@ -44,9 +44,16 @@ const DIRECTORY_ACCESS: u32 = FILE_LIST_DIRECTORY
     | SYNCHRONIZE;
 const READ_DIRECTORY_ACCESS: u32 =
     FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+const SYNC_DIRECTORY_ACCESS: u32 = FILE_LIST_DIRECTORY
+    | FILE_TRAVERSE
+    | FILE_READ_ATTRIBUTES
+    | FILE_WRITE_DATA
+    | FILE_WRITE_ATTRIBUTES
+    | SYNCHRONIZE;
 const CLEANUP_DIRECTORY_ACCESS: u32 = FILE_LIST_DIRECTORY
     | FILE_TRAVERSE
     | FILE_READ_ATTRIBUTES
+    | FILE_WRITE_DATA
     | FILE_WRITE_ATTRIBUTES
     | DELETE
     | SYNCHRONIZE;
@@ -76,7 +83,7 @@ pub(crate) struct WindowsDirectory {
 impl WindowsDirectory {
     pub(crate) fn open_absolute_anchor(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new()
-            .access_mode(FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+            .access_mode(READ_DIRECTORY_ACCESS)
             .share_mode(ANCHOR_SHARING)
             .custom_flags(
                 windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS
@@ -93,6 +100,33 @@ impl WindowsDirectory {
             &self.handle,
             name,
             READ_DIRECTORY_ACCESS,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(Self { handle })
+    }
+
+    pub(crate) fn open_absolute_sync_anchor(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .access_mode(SYNC_DIRECTORY_ACCESS)
+            .share_mode(ANCHOR_SHARING)
+            .custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS
+                    | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+            .open(path)?;
+        let handle: OwnedHandle = file.into();
+        reject_reparse(&handle)?;
+        Ok(Self { handle })
+    }
+
+    pub(crate) fn open_directory_sync_anchor(&self, name: &OsStr) -> io::Result<Self> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            SYNC_DIRECTORY_ACCESS,
             FILE_OPEN,
             FILE_DIRECTORY_FILE,
             ANCHOR_SHARING,
@@ -244,6 +278,72 @@ impl WindowsDirectory {
         Ok(File::from(handle))
     }
 
+    pub(crate) fn create_file_anchored(&self, name: &OsStr) -> io::Result<File> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            MUTABLE_FILE_ACCESS,
+            FILE_CREATE,
+            FILE_NON_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(File::from(handle))
+    }
+
+    pub(crate) fn open_file_for_durable_copy(&self, name: &OsStr) -> io::Result<File> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            READ_FILE_ACCESS,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(File::from(handle))
+    }
+
+    pub(crate) fn open_file_for_durable_copy_allow_cloud_placeholder(
+        &self,
+        name: &OsStr,
+    ) -> io::Result<File> {
+        let named = nt_open_relative(
+            &self.handle,
+            name,
+            READ_FILE_ACCESS,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        let mut tag = FILE_ATTRIBUTE_TAG_INFO::default();
+        query_handle(
+            &named,
+            FileAttributeTagInfo,
+            (&mut tag as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>(),
+        )?;
+        if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+            return Ok(File::from(named));
+        }
+        if !is_cloud_files_placeholder(tag.FileAttributes, tag.ReparseTag) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "durable copy source reparse point is not a Cloud Files placeholder",
+            ));
+        }
+        let hydrated = nt_open_relative_follow_final(
+            &self.handle,
+            name,
+            READ_FILE_ACCESS,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        drop(named);
+        Ok(File::from(hydrated))
+    }
+
     pub(crate) fn open_or_create_lock_file(&self, name: &OsStr) -> io::Result<File> {
         let handle = nt_open_relative(
             &self.handle,
@@ -391,6 +491,19 @@ impl WindowsDirectory {
         mark_handle_delete(&self.handle)
     }
 
+    pub(crate) fn remove_file_for_anchored_cleanup(&self, name: &OsStr) -> io::Result<()> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            CLEANUP_FILE_ACCESS,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        mark_handle_delete(&handle)
+    }
+
     pub(crate) fn identity(&self) -> io::Result<WorkspaceGenerationIdentity> {
         handle_identity(&self.handle)
     }
@@ -398,18 +511,7 @@ impl WindowsDirectory {
     pub(crate) fn sync(&self) -> io::Result<()> {
         // SAFETY: the handle remains owned for the duration of the call.
         if unsafe { FlushFileBuffers(raw_handle(&self.handle)) } == 0 {
-            let error = io::Error::last_os_error();
-            if matches!(
-                error.kind(),
-                io::ErrorKind::PermissionDenied
-                    | io::ErrorKind::InvalidInput
-                    | io::ErrorKind::Unsupported
-            ) {
-                // Windows does not guarantee that directory handles support
-                // FlushFileBuffers. File bodies are flushed separately.
-                return Ok(());
-            }
-            return Err(error);
+            return Err(io::Error::last_os_error());
         }
         Ok(())
     }
@@ -665,6 +767,29 @@ fn nt_open_relative(
     kind: u32,
     sharing: u32,
 ) -> io::Result<OwnedHandle> {
+    nt_open_relative_impl(parent, name, access, disposition, kind, sharing, false)
+}
+
+fn nt_open_relative_follow_final(
+    parent: &OwnedHandle,
+    name: &OsStr,
+    access: u32,
+    disposition: u32,
+    kind: u32,
+    sharing: u32,
+) -> io::Result<OwnedHandle> {
+    nt_open_relative_impl(parent, name, access, disposition, kind, sharing, true)
+}
+
+fn nt_open_relative_impl(
+    parent: &OwnedHandle,
+    name: &OsStr,
+    access: u32,
+    disposition: u32,
+    kind: u32,
+    sharing: u32,
+    follow_final: bool,
+) -> io::Result<OwnedHandle> {
     let mut name = wide_name(name)?;
     let length = name
         .len()
@@ -698,7 +823,12 @@ fn nt_open_relative(
             FILE_ATTRIBUTE_NORMAL,
             sharing,
             disposition,
-            kind | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            kind | FILE_SYNCHRONOUS_IO_NONALERT
+                | if follow_final {
+                    0
+                } else {
+                    FILE_OPEN_REPARSE_POINT
+                },
             ptr::null(),
             0,
         );
@@ -717,6 +847,17 @@ fn nt_open_relative(
         }
         Ok(OwnedHandle::from_raw_handle(handle.cast()))
     }
+}
+
+fn is_cloud_files_placeholder(attributes: u32, reparse_tag: u32) -> bool {
+    use windows_sys::Win32::Storage::CloudFilters::{
+        CF_PLACEHOLDER_STATE_PLACEHOLDER, CfGetPlaceholderStateFromAttributeTag,
+    };
+
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        && unsafe { CfGetPlaceholderStateFromAttributeTag(attributes, reparse_tag) }
+            & CF_PLACEHOLDER_STATE_PLACEHOLDER
+            != 0
 }
 
 fn wide_name(name: &OsStr) -> io::Result<Vec<u16>> {
@@ -810,6 +951,28 @@ mod lock_tests {
             ANCHOR_SHARING & (FILE_SHARE_READ | FILE_SHARE_WRITE),
             ANCHOR_SHARING
         );
+        assert_ne!(SYNC_DIRECTORY_ACCESS & FILE_WRITE_DATA, 0);
+        assert_ne!(SYNC_DIRECTORY_ACCESS & FILE_WRITE_ATTRIBUTES, 0);
+        assert_eq!(
+            READ_DIRECTORY_ACCESS & (FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES),
+            0
+        );
+    }
+
+    #[test]
+    fn cloud_copy_allows_cloud_placeholder_tags_but_not_junctions() {
+        const IO_REPARSE_TAG_CLOUD: u32 = 0x9000_001a;
+        const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xa000_0003;
+
+        assert!(is_cloud_files_placeholder(
+            FILE_ATTRIBUTE_REPARSE_POINT,
+            IO_REPARSE_TAG_CLOUD
+        ));
+        assert!(!is_cloud_files_placeholder(
+            FILE_ATTRIBUTE_REPARSE_POINT,
+            IO_REPARSE_TAG_MOUNT_POINT
+        ));
+        assert!(!is_cloud_files_placeholder(0, IO_REPARSE_TAG_CLOUD));
     }
 
     #[test]

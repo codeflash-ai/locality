@@ -26,10 +26,10 @@ pub use cloud_files::{
 };
 pub use daemon::{
     DAEMON_METADATA_FILENAME, DAEMON_PID_FILENAME, DAEMON_SOCKET_FILENAME,
-    DAEMON_STDERR_LOG_FILENAME, DAEMON_STDOUT_LOG_FILENAME, DaemonManager, DaemonProcessError,
-    DaemonProcessManager, DaemonProcessPaths, DaemonProcessStartConfig, DaemonProcessStartReport,
-    DaemonProcessStopReport, DaemonStartMode, DefaultDaemonProcessManager, MACOS_LAUNCHD_LABEL,
-    daemon_socket_path,
+    DAEMON_STDERR_LOG_FILENAME, DAEMON_STDOUT_LOG_FILENAME, DaemonManager,
+    DaemonManagerRestartFence, DaemonProcessError, DaemonProcessManager, DaemonProcessPaths,
+    DaemonProcessStartConfig, DaemonProcessStartReport, DaemonProcessStopReport, DaemonStartMode,
+    DefaultDaemonProcessManager, MACOS_LAUNCHD_LABEL, daemon_socket_path,
 };
 pub use logs::{
     DESKTOP_LOG_FILENAME, FILE_PROVIDER_LOG_FILENAME, LOGS_DIR_NAME, append_service_log, logs_dir,

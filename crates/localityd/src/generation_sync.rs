@@ -528,6 +528,7 @@ fn apply_authorized_delivery_inner<T: GenerationDeliveryTransport>(
         .map(|(index, _)| *index)
         .collect::<BTreeSet<_>>();
     stage_contents(
+        &store.root,
         &stage_root,
         &journal.delta,
         &journal.receipt_sha256,
@@ -1339,7 +1340,7 @@ fn reconcile_generation_staging_locked(
                 if !index.is_some_and(|index| keep.contains(&index))
                     && !partial_index.is_some_and(|index| pending.contains(&index))
                 {
-                    remove_path_durable(&path)?;
+                    remove_path_durable(&store.root, &path)?;
                 }
             }
         }
@@ -1381,7 +1382,7 @@ fn reconcile_generation_staging_locked(
             && base.is_empty()
             && stage_root.exists()
         {
-            remove_path_durable(&stage_root)?;
+            remove_path_durable(&store.root, &stage_root)?;
             live_stages.remove(&expected_relative);
         }
     }
@@ -1394,7 +1395,7 @@ fn reconcile_generation_staging_locked(
                 .strip_prefix(&store.root)
                 .map_err(|_| GenerationSyncError::InvalidStagePath)?;
             if !live_stages.contains(relative) {
-                remove_path_durable(&path)?;
+                remove_path_durable(&store.root, &path)?;
             }
         }
     }
@@ -1454,7 +1455,7 @@ fn cleanup_terminal_payload(
     }
     let payload = stage_root.join("payloads").join(index.to_string());
     if payload.exists() {
-        remove_path_durable(&payload)?;
+        remove_path_durable(stage_root, &payload)?;
     }
     Ok(())
 }
@@ -1663,6 +1664,7 @@ fn stage_relative_path(delta: &GenerationDelta) -> Result<PathBuf, GenerationSyn
 }
 
 fn stage_contents<T: GenerationDeliveryTransport>(
+    trusted_root: &Path,
     stage_root: &Path,
     delta: &GenerationDelta,
     terminal_receipt_sha256: &str,
@@ -1671,7 +1673,7 @@ fn stage_contents<T: GenerationDeliveryTransport>(
     transport: &mut T,
 ) -> Result<(), GenerationSyncError> {
     let payload_root = stage_root.join("payloads");
-    create_dir_all_durable(&payload_root)?;
+    create_dir_all_durable(trusted_root, &payload_root)?;
     for (index, entry) in delta.entries.iter().enumerate() {
         if already_recorded.contains(&(index as u64)) {
             continue;
@@ -1684,18 +1686,19 @@ fn stage_contents<T: GenerationDeliveryTransport>(
             if verify_file(&payload, identity).is_ok() {
                 continue;
             }
-            remove_path_durable(&payload)?;
+            remove_path_durable(trusted_root, &payload)?;
         }
         let partial = payload_root.join(format!(".{index}.partial"));
         if partial.exists() {
             if verify_file(&partial, identity).is_ok() {
-                rename_noreplace_durable(&partial, &payload)?;
+                rename_noreplace_durable(trusted_root, &partial, trusted_root, &payload)?;
                 continue;
             }
-            remove_path_durable(&partial)?;
+            remove_path_durable(trusted_root, &partial)?;
         }
         if let Some(body_windows) = &capabilities.body_windows {
             write_verified_windows(
+                trusted_root,
                 &partial,
                 &delta.delta_id,
                 terminal_receipt_sha256,
@@ -1707,14 +1710,15 @@ fn stage_contents<T: GenerationDeliveryTransport>(
             let mut content = transport
                 .open_content(&delta.delta_id, identity)
                 .map_err(|error| GenerationSyncError::Transport(error.to_string()))?;
-            write_verified_stream(&partial, content.as_mut(), identity)?;
+            write_verified_stream(trusted_root, &partial, content.as_mut(), identity)?;
         }
-        rename_noreplace_durable(&partial, &payload)?;
+        rename_noreplace_durable(trusted_root, &partial, trusted_root, &payload)?;
     }
     Ok(())
 }
 
 fn write_verified_windows<T: GenerationTransport>(
+    trusted_root: &Path,
     path: &Path,
     delta_id: &str,
     terminal_receipt_sha256: &str,
@@ -1800,7 +1804,7 @@ fn write_verified_windows<T: GenerationTransport>(
     })();
     if result.is_err() {
         drop(file);
-        let _ = remove_path_durable(path);
+        let _ = remove_path_durable(trusted_root, path);
     }
     result
 }
@@ -2498,14 +2502,16 @@ fn verify_open_file(
 }
 
 fn write_verified_stream(
+    trusted_root: &Path,
     path: &Path,
     reader: &mut dyn Read,
     identity: &GenerationFileIdentity,
 ) -> Result<(), GenerationSyncError> {
-    write_verified_stream_with_sync(path, reader, identity, |file| file.sync_all())
+    write_verified_stream_with_sync(trusted_root, path, reader, identity, |file| file.sync_all())
 }
 
 fn write_verified_stream_with_sync(
+    trusted_root: &Path,
     path: &Path,
     reader: &mut dyn Read,
     identity: &GenerationFileIdentity,
@@ -2514,7 +2520,7 @@ fn write_verified_stream_with_sync(
     let file = OpenOptions::new().create_new(true).write(true).open(path)?;
     let result = write_verified_open_file_with_sync(file, reader, identity, sync);
     if result.is_err() {
-        let _ = remove_path_durable(path);
+        let _ = remove_path_durable(trusted_root, path);
     }
     result
 }
@@ -5462,6 +5468,7 @@ mod tests {
         let partial = fixture.state_root.join("payload.partial");
         fs::create_dir_all(&fixture.state_root).unwrap();
         let error = write_verified_stream_with_sync(
+            &fixture.state_root,
             &partial,
             &mut std::io::Cursor::new(b"remote"),
             &identity,
@@ -5471,7 +5478,13 @@ mod tests {
         assert!(matches!(error, GenerationSyncError::Io(_)));
         assert!(!partial.exists());
 
-        write_verified_stream(&partial, &mut std::io::Cursor::new(b"remote"), &identity).unwrap();
+        write_verified_stream(
+            &fixture.state_root,
+            &partial,
+            &mut std::io::Cursor::new(b"remote"),
+            &identity,
+        )
+        .unwrap();
         verify_file(&partial, &identity).unwrap();
     }
 

@@ -1018,7 +1018,13 @@ where
     match fs::symlink_metadata(&recovery_root) {
         Ok(_) => {
             validate_empty_recovery_scaffolding(&recovery_root)?;
-            remove_dir_all_durable(&recovery_root).map_err(LocalityError::from)?;
+            remove_dir_all_durable(
+                record.reservation.mount.root.parent().ok_or_else(|| {
+                    LocalityError::InvalidState("mount root has no recovery parent".to_string())
+                })?,
+                &recovery_root,
+            )
+            .map_err(LocalityError::from)?;
             return Ok(DiscoveryExecutionStep::RecoveryPayloadsRemoved);
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1102,7 +1108,11 @@ where
                 })?,
                 &recovery,
             )?;
-            rename_noreplace_durable(&destination, &recovery).map_err(LocalityError::from)?;
+            let owned_root = execution.mount_root.parent().ok_or_else(|| {
+                LocalityError::InvalidState("mount root has no recovery parent".to_string())
+            })?;
+            rename_noreplace_durable(owned_root, &destination, owned_root, &recovery)
+                .map_err(LocalityError::from)?;
             Ok(Some(DiscoveryExecutionStep::FilesystemMutation {
                 operation_id: operation.operation_id().to_string(),
                 mutation: DiscoveryFilesystemMutation::RolledBack,
@@ -1177,7 +1187,11 @@ where
         }
         (None, Some(fingerprint)) if fingerprint == *operation.expected_fingerprint() => {
             require_existing_safe_parent(&execution.mount_root, &source)?;
-            rename_noreplace_durable(&stage, &source).map_err(LocalityError::from)?;
+            let owned_root = execution.mount_root.parent().ok_or_else(|| {
+                LocalityError::InvalidState("mount root has no recovery parent".to_string())
+            })?;
+            rename_noreplace_durable(owned_root, &stage, owned_root, &source)
+                .map_err(LocalityError::from)?;
             Ok(Some(DiscoveryExecutionStep::FilesystemMutation {
                 operation_id: operation.operation_id().to_string(),
                 mutation: DiscoveryFilesystemMutation::RolledBack,
@@ -1242,7 +1256,7 @@ where
                 payload.display()
             ));
         }
-        remove_path_durable(&payload).map_err(LocalityError::from)?;
+        remove_path_durable(&execution.recovery_root, &payload).map_err(LocalityError::from)?;
         return Ok(Some(DiscoveryExecutionStep::FilesystemMutation {
             operation_id: operation.operation_id().to_string(),
             mutation: DiscoveryFilesystemMutation::RolledBack,
@@ -1260,7 +1274,7 @@ where
                 temporary.display()
             ));
         }
-        remove_path_durable(&temporary).map_err(LocalityError::from)?;
+        remove_path_durable(&execution.recovery_root, &temporary).map_err(LocalityError::from)?;
         return Ok(Some(DiscoveryExecutionStep::FilesystemMutation {
             operation_id: operation.operation_id().to_string(),
             mutation: DiscoveryFilesystemMutation::RolledBack,
@@ -1542,7 +1556,11 @@ where
                             source.display()
                         ));
                     }
-                    rename_noreplace_durable(&source, &stage).map_err(LocalityError::from)?;
+                    let owned_root = mount_root.parent().ok_or_else(|| {
+                        LocalityError::InvalidState("mount root has no recovery parent".to_string())
+                    })?;
+                    rename_noreplace_durable(owned_root, &source, owned_root, &stage)
+                        .map_err(LocalityError::from)?;
                     if fingerprint_path(&stage)? != *expected_fingerprint {
                         return invalid(format!(
                             "staged discovery source `{}` has the wrong fingerprint",
@@ -1631,7 +1649,10 @@ where
                             destination.display()
                         ));
                     }
-                    rename_noreplace_durable(&payload, &destination)
+                    let owned_root = mount_root.parent().ok_or_else(|| {
+                        LocalityError::InvalidState("mount root has no recovery parent".to_string())
+                    })?;
+                    rename_noreplace_durable(owned_root, &payload, owned_root, &destination)
                         .map_err(LocalityError::from)?;
                     let installed = fingerprint_path(&destination)?;
                     if installed != *expected_fingerprint {
@@ -1699,7 +1720,11 @@ where
                             "discovery move `{operation_id}` changed before install"
                         ));
                     }
-                    rename_noreplace_durable(&stage, &destination).map_err(LocalityError::from)?;
+                    let owned_root = mount_root.parent().ok_or_else(|| {
+                        LocalityError::InvalidState("mount root has no recovery parent".to_string())
+                    })?;
+                    rename_noreplace_durable(owned_root, &stage, owned_root, &destination)
+                        .map_err(LocalityError::from)?;
                     if fingerprint_path(&destination)? != *expected_fingerprint {
                         return invalid(format!(
                             "installed move destination `{}` has the wrong fingerprint",
@@ -1830,7 +1855,13 @@ where
         match fs::symlink_metadata(&recovery_root) {
             Ok(_) => {
                 validate_committed_recovery_tree(execution, effects, true)?;
-                remove_dir_all_durable(&recovery_root).map_err(LocalityError::from)?;
+                remove_dir_all_durable(
+                    record.reservation.mount.root.parent().ok_or_else(|| {
+                        LocalityError::InvalidState("mount root has no recovery parent".to_string())
+                    })?,
+                    &recovery_root,
+                )
+                .map_err(LocalityError::from)?;
                 return Ok(DiscoveryExecutionStep::RecoveryPayloadsRemoved);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2889,19 +2920,25 @@ fn publish_create_payload(
                     DiscoveryPathKind::File,
                     DiscoveryCreateMaterialization::Page { document, .. },
                 ) => {
-                    write_new_file_durable(temporary, document.as_bytes())
+                    write_new_file_durable(recovery_parent, temporary, document.as_bytes())
                         .map_err(LocalityError::from)?;
                 }
                 (DiscoveryPathKind::Directory, _) => {
-                    create_dir_all_durable(temporary).map_err(LocalityError::from)?;
+                    create_dir_all_durable(recovery_parent, temporary)
+                        .map_err(LocalityError::from)?;
                     match materialization {
                         DiscoveryCreateMaterialization::Page { document, .. } => {
-                            write_new_file_durable(&temporary.join("page.md"), document.as_bytes())
-                                .map_err(LocalityError::from)?;
+                            write_new_file_durable(
+                                recovery_parent,
+                                &temporary.join("page.md"),
+                                document.as_bytes(),
+                            )
+                            .map_err(LocalityError::from)?;
                         }
                         DiscoveryCreateMaterialization::Database { schema_yaml, .. } => {
                             if let Some(schema_yaml) = schema_yaml {
                                 write_new_file_durable(
+                                    recovery_parent,
                                     &temporary.join("_schema.yaml"),
                                     schema_yaml.as_bytes(),
                                 )
@@ -2927,7 +2964,8 @@ fn publish_create_payload(
             payload.display()
         ));
     }
-    rename_noreplace_durable(temporary, payload).map_err(LocalityError::from)?;
+    rename_noreplace_durable(recovery_parent, temporary, recovery_parent, payload)
+        .map_err(LocalityError::from)?;
     if fingerprint_path(payload)? != *expected_fingerprint {
         return invalid(format!(
             "published discovery payload `{}` has the wrong fingerprint",
@@ -2954,7 +2992,7 @@ fn publish_create_container_payload(
             ));
         }
         None => {
-            create_dir_all_durable(temporary).map_err(LocalityError::from)?;
+            create_dir_all_durable(recovery_parent, temporary).map_err(LocalityError::from)?;
             if fingerprint_path(temporary)? != *expected_fingerprint {
                 return invalid(format!(
                     "temporary discovery container payload `{}` has the wrong fingerprint",
@@ -2969,7 +3007,8 @@ fn publish_create_container_payload(
             payload.display()
         ));
     }
-    rename_noreplace_durable(temporary, payload).map_err(LocalityError::from)?;
+    rename_noreplace_durable(recovery_parent, temporary, recovery_parent, payload)
+        .map_err(LocalityError::from)?;
     if fingerprint_path(payload)? != *expected_fingerprint {
         return invalid(format!(
             "published discovery container payload `{}` has the wrong fingerprint",
@@ -3242,7 +3281,7 @@ fn ensure_recovery_parent(base: &Path, path: &Path) -> LocalityResult<()> {
             Err(error) => return Err(LocalityError::from(error)),
         }
     }
-    create_dir_all_durable(parent).map_err(LocalityError::from)
+    create_dir_all_durable(base, parent).map_err(LocalityError::from)
 }
 
 fn require_existing_safe_parent(base: &Path, path: &Path) -> LocalityResult<()> {

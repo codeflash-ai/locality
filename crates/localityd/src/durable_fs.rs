@@ -4,14 +4,18 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 
-pub fn create_dir_all_durable(path: &Path) -> io::Result<()> {
-    create_dir_all_durable_with_sync(path, sync_directory)
+pub fn create_dir_all_durable(trusted_root: &Path, path: &Path) -> io::Result<()> {
+    create_dir_all_durable_with_sync(trusted_root, path, |directory| {
+        sync_directory(trusted_root, directory)
+    })
 }
 
 pub(crate) fn create_dir_all_durable_with_sync(
+    trusted_root: &Path,
     path: &Path,
     mut sync: impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
+    validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
     let mut missing = Vec::new();
     let mut cursor = path;
     loop {
@@ -52,22 +56,73 @@ pub(crate) fn create_dir_all_durable_with_sync(
     Ok(())
 }
 
-pub fn write_new_file_durable(path: &Path, contents: &[u8]) -> io::Result<()> {
-    write_new_file_durable_with_sync(path, contents, |file| file.sync_all(), sync_directory)
+pub fn write_new_file_durable(trusted_root: &Path, path: &Path, contents: &[u8]) -> io::Result<()> {
+    write_new_file_durable_with_sync(
+        trusted_root,
+        path,
+        contents,
+        |file| file.sync_all(),
+        |directory| sync_directory(trusted_root, directory),
+    )
 }
 
-pub fn copy_new_file_durable(source: &Path, destination: &Path) -> io::Result<u64> {
-    copy_new_file_durable_with_sync(source, destination, |file| file.sync_all(), sync_directory)
+pub fn copy_new_file_durable(
+    source_root: &Path,
+    source: &Path,
+    destination_root: &Path,
+    destination: &Path,
+) -> io::Result<u64> {
+    #[cfg(windows)]
+    {
+        return copy_new_file_durable_windows(
+            source_root,
+            source,
+            destination_root,
+            destination,
+            false,
+        );
+    }
+    #[cfg(not(windows))]
+    copy_new_file_durable_with_sync(
+        source_root,
+        source,
+        destination_root,
+        destination,
+        |file| file.sync_all(),
+        |directory| sync_directory(destination_root, directory),
+    )
+}
+
+pub fn copy_new_file_durable_allow_cloud_placeholder(
+    source_root: &Path,
+    source: &Path,
+    destination_root: &Path,
+    destination: &Path,
+) -> io::Result<u64> {
+    #[cfg(windows)]
+    {
+        return copy_new_file_durable_windows(
+            source_root,
+            source,
+            destination_root,
+            destination,
+            true,
+        );
+    }
+    #[cfg(not(windows))]
+    copy_new_file_durable(source_root, source, destination_root, destination)
 }
 
 pub(crate) fn copy_new_file_durable_with_sync(
+    source_root: &Path,
     source: &Path,
+    destination_root: &Path,
     destination: &Path,
     sync_file: impl FnOnce(&File) -> io::Result<()>,
     mut sync_parent: impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<u64> {
-    validate_from_parent(source)?;
-    validate_from_parent(destination)?;
+    validate_no_symlink_or_reparse_ancestors(source_root, source)?;
+    validate_no_symlink_or_reparse_ancestors(destination_root, destination)?;
     let mut source = File::open(source)?;
     let mut destination_file = OpenOptions::new()
         .create_new(true)
@@ -86,12 +141,13 @@ pub(crate) fn copy_new_file_durable_with_sync(
 }
 
 pub(crate) fn write_new_file_durable_with_sync(
+    trusted_root: &Path,
     path: &Path,
     contents: &[u8],
     sync_file: impl FnOnce(&File) -> io::Result<()>,
     mut sync_parent: impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    validate_from_parent(path)?;
+    validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
     let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
     file.write_all(contents)?;
     sync_file(&file)?;
@@ -104,16 +160,22 @@ pub(crate) fn write_new_file_durable_with_sync(
     })?)
 }
 
-pub fn rename_noreplace_durable(source: &Path, destination: &Path) -> io::Result<()> {
-    validate_from_parent(source)?;
-    validate_from_parent(destination)?;
+pub fn rename_noreplace_durable(
+    source_root: &Path,
+    source: &Path,
+    destination_root: &Path,
+    destination: &Path,
+) -> io::Result<()> {
+    #[cfg(windows)]
+    validate_no_symlink_or_reparse_ancestors_allow_final(source_root, source)?;
+    #[cfg(not(windows))]
+    validate_no_symlink_or_reparse_ancestors(source_root, source)?;
+    validate_no_symlink_or_reparse_ancestors(destination_root, destination)?;
     #[cfg(all(
         unix,
         any(target_os = "linux", target_vendor = "apple", target_os = "redox")
     ))]
     {
-        let source_root = source.parent().expect("validated source parent");
-        let destination_root = destination.parent().expect("validated destination parent");
         return rename_noreplace_durable_unix(source_root, destination_root, source, destination);
     }
     #[cfg(not(all(
@@ -121,7 +183,27 @@ pub fn rename_noreplace_durable(source: &Path, destination: &Path) -> io::Result
         any(target_os = "linux", target_vendor = "apple", target_os = "redox")
     )))]
     {
-        rename_noreplace_durable_with_sync(source, destination, sync_directory)
+        #[cfg(windows)]
+        return rename_noreplace_durable_windows_anchored(
+            source_root,
+            source,
+            destination_root,
+            destination,
+        );
+        #[cfg(not(windows))]
+        rename_noreplace_durable_with_sync(
+            source_root,
+            source,
+            destination_root,
+            destination,
+            |directory| {
+                if directory.starts_with(destination_root) {
+                    sync_directory(destination_root, directory)
+                } else {
+                    sync_directory(source_root, directory)
+                }
+            },
+        )
     }
 }
 
@@ -130,43 +212,19 @@ pub fn rename_noreplace_durable_anchored(
     source: &Path,
     destination: &Path,
 ) -> io::Result<()> {
-    #[cfg(windows)]
-    validate_no_symlink_or_reparse_ancestors_allow_final(trusted_root, source)?;
-    #[cfg(not(windows))]
-    validate_no_symlink_or_reparse_ancestors(trusted_root, source)?;
-    validate_no_symlink_or_reparse_ancestors(trusted_root, destination)?;
-    #[cfg(all(
-        unix,
-        any(target_os = "linux", target_vendor = "apple", target_os = "redox")
-    ))]
-    {
-        return rename_noreplace_durable_unix(trusted_root, trusted_root, source, destination);
-    }
-    #[cfg(windows)]
-    {
-        return rename_noreplace_durable_windows_anchored(trusted_root, source, destination);
-    }
-    #[cfg(not(any(
-        all(
-            unix,
-            any(target_os = "linux", target_vendor = "apple", target_os = "redox")
-        ),
-        windows
-    )))]
-    {
-        rename_noreplace_durable_with_sync(source, destination, sync_directory)
-    }
+    rename_noreplace_durable(trusted_root, source, trusted_root, destination)
 }
 
 #[cfg(windows)]
 fn rename_noreplace_durable_windows_anchored(
-    trusted_root: &Path,
+    source_root: &Path,
     source: &Path,
+    destination_root: &Path,
     destination: &Path,
 ) -> io::Result<()> {
-    let (source_parents, source_name) = open_windows_parent_anchored(trusted_root, source)?;
+    let (source_parents, source_name) = open_windows_parent_anchored(source_root, source, true)?;
     let (destination_parents, destination_name) =
-        open_windows_parent_anchored(trusted_root, destination)?;
+        open_windows_parent_anchored(destination_root, destination, true)?;
     let source_parent = source_parents.last().expect("anchored source parent");
     let destination_parent = destination_parents
         .last()
@@ -184,9 +242,38 @@ fn rename_noreplace_durable_windows_anchored(
 }
 
 #[cfg(windows)]
+fn copy_new_file_durable_windows(
+    source_root: &Path,
+    source: &Path,
+    destination_root: &Path,
+    destination: &Path,
+    allow_cloud_placeholder: bool,
+) -> io::Result<u64> {
+    let (source_parents, source_name) = open_windows_parent_anchored(source_root, source, false)?;
+    let (destination_parents, destination_name) =
+        open_windows_parent_anchored(destination_root, destination, true)?;
+    let source_parent = source_parents.last().expect("anchored source parent");
+    let destination_parent = destination_parents
+        .last()
+        .expect("anchored destination parent");
+    let mut source_file = if allow_cloud_placeholder {
+        source_parent.open_file_for_durable_copy_allow_cloud_placeholder(&source_name)?
+    } else {
+        source_parent.open_file_for_durable_copy(&source_name)?
+    };
+    let mut destination_file = destination_parent.create_file_anchored(&destination_name)?;
+    let copied = io::copy(&mut source_file, &mut destination_file)?;
+    destination_file.sync_all()?;
+    drop(destination_file);
+    destination_parent.sync()?;
+    Ok(copied)
+}
+
+#[cfg(windows)]
 fn open_windows_parent_anchored(
     trusted_root: &Path,
     path: &Path,
+    writable_final: bool,
 ) -> io::Result<(
     Vec<crate::windows_workspace_fs::WindowsDirectory>,
     std::ffi::OsString,
@@ -210,22 +297,67 @@ fn open_windows_parent_anchored(
             format!("path `{}` is outside trusted root", path.display()),
         )
     })?;
-    let mut parents =
-        vec![crate::windows_workspace_fs::WindowsDirectory::open_absolute_anchor(trusted_root)?];
-    for component in relative.components() {
+    let components = relative.components().collect::<Vec<_>>();
+    let root = if writable_final && components.is_empty() {
+        crate::windows_workspace_fs::WindowsDirectory::open_absolute_sync_anchor(trusted_root)?
+    } else {
+        crate::windows_workspace_fs::WindowsDirectory::open_absolute_anchor(trusted_root)?
+    };
+    let mut parents = vec![root];
+    let component_count = components.len();
+    for (index, component) in components.into_iter().enumerate() {
         let std::path::Component::Normal(component) = component else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("path `{}` contains unsafe components", path.display()),
             ));
         };
-        let child = parents
-            .last()
-            .expect("anchored parent")
-            .open_directory_anchor(component)?;
+        let parent = parents.last().expect("anchored parent");
+        let child = if writable_final && index + 1 == component_count {
+            parent.open_directory_sync_anchor(component)?
+        } else {
+            parent.open_directory_anchor(component)?
+        };
         parents.push(child);
     }
     Ok((parents, name.to_os_string()))
+}
+
+#[cfg(windows)]
+fn open_windows_directory_anchored(
+    trusted_root: &Path,
+    path: &Path,
+) -> io::Result<Vec<crate::windows_workspace_fs::WindowsDirectory>> {
+    validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
+    let relative = path.strip_prefix(trusted_root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path `{}` is outside trusted root", path.display()),
+        )
+    })?;
+    let components = relative.components().collect::<Vec<_>>();
+    let root = if components.is_empty() {
+        crate::windows_workspace_fs::WindowsDirectory::open_absolute_sync_anchor(trusted_root)?
+    } else {
+        crate::windows_workspace_fs::WindowsDirectory::open_absolute_anchor(trusted_root)?
+    };
+    let mut directories = vec![root];
+    let component_count = components.len();
+    for (index, component) in components.into_iter().enumerate() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("path `{}` contains unsafe components", path.display()),
+            ));
+        };
+        let parent = directories.last().expect("anchored directory");
+        directories.push(if index + 1 == component_count {
+            parent.open_directory_sync_anchor(component)?
+        } else {
+            parent.open_directory_anchor(component)?
+        });
+    }
+    Ok(directories)
 }
 
 #[cfg(all(
@@ -315,12 +447,14 @@ fn open_unix_parent_without_symlinks(
     ))
 ))]
 pub(crate) fn rename_noreplace_durable_with_sync(
+    source_root: &Path,
     source: &Path,
+    destination_root: &Path,
     destination: &Path,
     mut sync: impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    validate_from_parent(source)?;
-    validate_from_parent(destination)?;
+    validate_no_symlink_or_reparse_ancestors(source_root, source)?;
+    validate_no_symlink_or_reparse_ancestors(destination_root, destination)?;
     rename_noreplace(source, destination)?;
     let source_parent = source.parent().ok_or_else(|| {
         io::Error::new(
@@ -341,15 +475,15 @@ pub(crate) fn rename_noreplace_durable_with_sync(
     Ok(())
 }
 
-pub fn remove_dir_all_durable(path: &Path) -> io::Result<()> {
-    remove_dir_all_durable_with_sync(path, sync_directory)
+pub fn remove_dir_all_durable(trusted_root: &Path, path: &Path) -> io::Result<()> {
+    remove_dir_all_durable_anchored(trusted_root, path)
 }
 
 pub fn remove_dir_all_durable_anchored(trusted_root: &Path, path: &Path) -> io::Result<()> {
     validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
     #[cfg(windows)]
     {
-        let (parents, name) = open_windows_parent_anchored(trusted_root, path)?;
+        let (parents, name) = open_windows_parent_anchored(trusted_root, path, true)?;
         let parent = parents.last().expect("anchored cleanup parent");
         let directory = parent.open_directory_for_anchored_cleanup(&name)?;
         let device = directory.identity()?.device;
@@ -360,15 +494,18 @@ pub fn remove_dir_all_durable_anchored(trusted_root: &Path, path: &Path) -> io::
     }
     #[cfg(not(windows))]
     {
-        remove_dir_all_durable(path)
+        remove_dir_all_durable_with_sync(trusted_root, path, |directory| {
+            sync_directory(trusted_root, directory)
+        })
     }
 }
 
 pub(crate) fn remove_dir_all_durable_with_sync(
+    trusted_root: &Path,
     path: &Path,
     mut sync_parent: impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    validate_from_parent(path)?;
+    validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -379,15 +516,38 @@ pub(crate) fn remove_dir_all_durable_with_sync(
     sync_parent(parent)
 }
 
-pub(crate) fn remove_path_durable(path: &Path) -> io::Result<()> {
-    remove_path_durable_with_sync(path, sync_directory)
+pub(crate) fn remove_path_durable(trusted_root: &Path, path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.is_dir() {
+            return remove_dir_all_durable_anchored(trusted_root, path);
+        }
+        if !metadata.is_file() || metadata_is_windows_reparse_point(&metadata) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("path `{}` is not an ordinary file", path.display()),
+            ));
+        }
+        let (parents, name) = open_windows_parent_anchored(trusted_root, path, true)?;
+        let parent = parents.last().expect("anchored cleanup parent");
+        parent.remove_file_for_anchored_cleanup(&name)?;
+        parent.sync()?;
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    remove_path_durable_with_sync(trusted_root, path, |directory| {
+        sync_directory(trusted_root, directory)
+    })
 }
 
 pub(crate) fn remove_path_durable_with_sync(
+    trusted_root: &Path,
     path: &Path,
     mut sync_parent: impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    validate_from_parent(path)?;
+    validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
         return Err(io::Error::new(
@@ -498,7 +658,20 @@ fn validate_no_symlink_or_reparse_ancestors_impl(
             ),
         ));
     }
-    path.strip_prefix(trusted_root).map_err(|_| {
+    let root_metadata = fs::symlink_metadata(trusted_root)?;
+    if root_metadata.file_type().is_symlink()
+        || metadata_is_windows_reparse_point(&root_metadata)
+        || !root_metadata.is_dir()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "trusted root `{}` is not an ordinary directory",
+                trusted_root.display()
+            ),
+        ));
+    }
+    let relative = path.strip_prefix(trusted_root).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -508,6 +681,17 @@ fn validate_no_symlink_or_reparse_ancestors_impl(
             ),
         )
     })?;
+    if relative.components().any(|component| {
+        !matches!(
+            component,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path `{}` contains unsafe components", path.display()),
+        ));
+    }
     let mut reached_root = false;
     for (index, ancestor) in path.ancestors().enumerate() {
         if ancestor == trusted_root {
@@ -552,16 +736,6 @@ fn validate_no_symlink_or_reparse_ancestors_impl(
     Ok(())
 }
 
-fn validate_from_parent(path: &Path) -> io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("path `{}` has no parent", path.display()),
-        )
-    })?;
-    validate_no_symlink_or_reparse_ancestors(parent, path)
-}
-
 #[cfg(windows)]
 fn metadata_is_windows_reparse_point(metadata: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
@@ -576,46 +750,32 @@ fn metadata_is_windows_reparse_point(_metadata: &fs::Metadata) -> bool {
 }
 
 #[cfg(unix)]
-pub fn sync_directory(path: &Path) -> io::Result<()> {
+pub fn sync_directory(trusted_root: &Path, path: &Path) -> io::Result<()> {
+    validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
     File::open(path)?.sync_all()
 }
 
 #[cfg(windows)]
-pub fn sync_directory(path: &Path) -> io::Result<()> {
-    sync_windows_directory_with(path, |directory| match directory.sync_all() {
-        Ok(()) => Ok(()),
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::PermissionDenied
-                    | io::ErrorKind::InvalidInput
-                    | io::ErrorKind::Unsupported
-            ) =>
-        {
-            // FlushFileBuffers is not supported for directory handles on all
-            // Windows filesystems. File bodies are flushed separately and
-            // renames request MOVEFILE_WRITE_THROUGH.
-            Ok(())
-        }
-        Err(error) => Err(error),
-    })
+pub fn sync_directory(trusted_root: &Path, path: &Path) -> io::Result<()> {
+    let directories = open_windows_directory_anchored(trusted_root, path)?;
+    directories.last().expect("anchored directory").sync()
 }
 
 #[cfg(windows)]
 fn sync_windows_directory_with(
+    trusted_root: &Path,
     path: &Path,
     flush: impl FnOnce(&File) -> io::Result<()>,
 ) -> io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
-    validate_no_symlink_or_reparse_ancestors(path, path)?;
+    validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
     let directory = OpenOptions::new()
         .access_mode(windows_directory_sync_access())
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
     flush(&directory)
@@ -630,7 +790,8 @@ fn windows_directory_sync_access() -> u32 {
 }
 
 #[cfg(not(any(unix, windows)))]
-pub fn sync_directory(path: &Path) -> io::Result<()> {
+pub fn sync_directory(trusted_root: &Path, path: &Path) -> io::Result<()> {
+    validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
     File::open(path)?.sync_all()
 }
 
@@ -725,6 +886,7 @@ mod tests {
         let parent_syncs = RefCell::new(Vec::new());
 
         let error = write_new_file_durable_with_sync(
+            &root,
             &path,
             b"record",
             |_| Err(io::Error::other("injected file sync failure")),
@@ -751,7 +913,9 @@ mod tests {
         let parent_syncs = RefCell::new(Vec::new());
 
         let error = copy_new_file_durable_with_sync(
+            &root,
             &source,
+            &root,
             &destination,
             |_| Err(io::Error::other("injected copied-file sync failure")),
             |parent| {
@@ -778,7 +942,7 @@ mod tests {
         let target = first.join("second");
         let synced = RefCell::new(Vec::new());
 
-        let error = create_dir_all_durable_with_sync(&target, |path| {
+        let error = create_dir_all_durable_with_sync(&root, &target, |path| {
             synced.borrow_mut().push(path.to_path_buf());
             if path == first {
                 Err(io::Error::other("injected created-directory sync failure"))
@@ -809,11 +973,39 @@ mod tests {
         symlink(&real, &alias).expect("create alias");
         let path = alias.join("record");
 
-        let error = validate_no_symlink_or_reparse_ancestors(&owned, &path)
+        let error = write_new_file_durable(&owned, &path, b"record")
             .expect_err("symlink ancestor must be rejected");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("symlink"));
         assert!(!real.join("record").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anchored_cloud_copy_rejects_symlink_inside_source_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("copy-symlink-ancestor");
+        let source_root = root.join("source");
+        let destination_root = root.join("destination");
+        let outside = root.join("outside");
+        fs::create_dir_all(&source_root).expect("create source root");
+        fs::create_dir_all(&destination_root).expect("create destination root");
+        fs::create_dir_all(&outside).expect("create outside root");
+        fs::write(outside.join("edit.md"), "outside").expect("write outside file");
+        symlink(&outside, source_root.join("alias")).expect("create source alias");
+
+        let error = copy_new_file_durable_allow_cloud_placeholder(
+            &source_root,
+            &source_root.join("alias/edit.md"),
+            &destination_root,
+            &destination_root.join("edit.md"),
+        )
+        .expect_err("copy must reject an internal source alias");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!destination_root.join("edit.md").exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -833,7 +1025,8 @@ mod tests {
 
         validate_no_symlink_or_reparse_ancestors(&trusted_root, &path)
             .expect("aliases above the explicit trusted root are accepted");
-        write_new_file_durable(&path, b"record").expect("write beneath trusted root");
+        write_new_file_durable(&trusted_root, &path, b"record")
+            .expect("write beneath trusted root");
         assert_eq!(
             fs::read_to_string(real_owned.join("record")).unwrap(),
             "record"
@@ -880,7 +1073,7 @@ mod tests {
         let root = temp_root("windows-directory-flush-failure");
         fs::create_dir_all(&root).expect("create root");
 
-        let error = sync_windows_directory_with(&root, |_| {
+        let error = sync_windows_directory_with(&root, &root, |_| {
             Err(io::Error::other("injected directory flush failure"))
         })
         .expect_err("directory flush failure must propagate");
@@ -916,11 +1109,12 @@ mod tests {
         let destination = destination_parent.join("record");
         fs::write(&source, "record").expect("write source");
 
-        let error = rename_noreplace_durable_with_sync(&source, &destination, |parent| {
-            assert_eq!(parent, destination_parent);
-            Err(io::Error::other("injected destination sync failure"))
-        })
-        .expect_err("destination parent sync failure must propagate");
+        let error =
+            rename_noreplace_durable_with_sync(&root, &source, &root, &destination, |parent| {
+                assert_eq!(parent, destination_parent);
+                Err(io::Error::other("injected destination sync failure"))
+            })
+            .expect_err("destination parent sync failure must propagate");
 
         assert_eq!(error.to_string(), "injected destination sync failure");
         assert!(!source.exists());
@@ -949,15 +1143,16 @@ mod tests {
         fs::write(&source, "record").expect("write source");
         let synced = RefCell::new(Vec::new());
 
-        let error = rename_noreplace_durable_with_sync(&source, &destination, |parent| {
-            synced.borrow_mut().push(parent.to_path_buf());
-            if parent == source_parent {
-                Err(io::Error::other("injected source sync failure"))
-            } else {
-                Ok(())
-            }
-        })
-        .expect_err("source parent sync failure must propagate");
+        let error =
+            rename_noreplace_durable_with_sync(&root, &source, &root, &destination, |parent| {
+                synced.borrow_mut().push(parent.to_path_buf());
+                if parent == source_parent {
+                    Err(io::Error::other("injected source sync failure"))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect_err("source parent sync failure must propagate");
 
         assert_eq!(error.to_string(), "injected source sync failure");
         assert_eq!(synced.into_inner(), vec![destination_parent, source_parent]);
@@ -976,7 +1171,7 @@ mod tests {
         let path = root.join("record");
         fs::write(&path, "record").expect("write record");
 
-        let error = remove_path_durable_with_sync(&path, |parent| {
+        let error = remove_path_durable_with_sync(&root, &path, |parent| {
             assert_eq!(parent, root);
             Err(io::Error::other("injected removal sync failure"))
         })

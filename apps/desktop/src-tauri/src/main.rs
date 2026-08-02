@@ -97,9 +97,9 @@ use locality_notion::oauth::{
     DEFAULT_LOCALITY_NOTION_OAUTH_BROKER_URL, HttpNotionOAuthBrokerClient, NotionOAuthBrokerStart,
 };
 use locality_platform::{
-    DAEMON_PID_FILENAME, append_service_log, bundled_binary_next_to_current_exe,
-    default_state_root as platform_default_state_root, logs_dir as platform_logs_dir,
-    user_home as platform_user_home,
+    DAEMON_PID_FILENAME, DaemonManagerRestartFence, DaemonProcessPaths, append_service_log,
+    bundled_binary_next_to_current_exe, default_state_root as platform_default_state_root,
+    logs_dir as platform_logs_dir, user_home as platform_user_home,
 };
 use locality_slack::{
     DEFAULT_SLACK_OAUTH_BROKER_URL, DEFAULT_SLACK_OAUTH_REDIRECT_URI, HttpSlackOAuthBrokerClient,
@@ -121,9 +121,10 @@ use locality_store::{
 use locality_store::{ConnectorProfileId, ConnectorProfileRecord, ConnectorProfileRepository};
 use localityd::autosave::auto_save_timestamp;
 use localityd::durable_fs::{
-    copy_new_file_durable, create_dir_all_durable, remove_dir_all_durable_anchored,
-    rename_noreplace_durable_anchored, sync_directory, validate_no_symlink_or_reparse_ancestors,
-    validate_no_symlink_or_reparse_ancestors_allow_final, write_new_file_durable,
+    copy_new_file_durable, copy_new_file_durable_allow_cloud_placeholder, create_dir_all_durable,
+    remove_dir_all_durable_anchored, rename_noreplace_durable_anchored, sync_directory,
+    validate_no_symlink_or_reparse_ancestors, validate_no_symlink_or_reparse_ancestors_allow_final,
+    write_new_file_durable,
 };
 use localityd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
 use localityd::google_docs::resolve_google_docs_connector_for_mount;
@@ -7764,7 +7765,27 @@ fn create_desktop_remount_quiesced(
     let _remount_guard = RemountInProgressGuard::begin();
 
     stop_windows_cloud_files_provider_supervisor(state_root)?;
-    drain_daemon_for_remount(state_root)?;
+    let daemon_paths = DaemonProcessPaths::new(state_root.to_path_buf());
+    let mut manager_fence = DaemonManagerRestartFence::suspend(&daemon_paths).map_err(|error| {
+        format!(
+            "Could not suspend localityd's process manager before remount: {}",
+            error.message()
+        )
+    })?;
+    if let Err(error) = drain_daemon_for_remount(state_root) {
+        if let Err(restore_error) = manager_fence.restore() {
+            return Err(format!(
+                "{error}; restoring localityd's process manager also failed: {}",
+                restore_error.message()
+            ));
+        }
+        return match ensure_daemon_running_locked(state_root) {
+            Ok(()) => Err(error),
+            Err(restart_error) => Err(format!(
+                "{error}; localityd restart after the cancelled remount also failed: {restart_error}"
+            )),
+        };
+    }
 
     let commit_result = (|| {
         let mut store = SqliteStateStore::open(state_root.to_path_buf())
@@ -7779,7 +7800,15 @@ fn create_desktop_remount_quiesced(
         Ok::<_, String>((store, report, preserved))
     })();
 
-    let restart_result = ensure_daemon_running_locked(state_root);
+    let restart_result = manager_fence
+        .restore()
+        .map_err(|error| {
+            format!(
+                "Could not restore localityd's process manager after remount: {}",
+                error.message()
+            )
+        })
+        .and_then(|()| ensure_daemon_running_locked(state_root));
     let (store, mount_report, preserved) = match (commit_result, restart_result) {
         (Ok(result), Ok(())) => result,
         (Err(error), Ok(())) => {
@@ -11406,7 +11435,7 @@ impl WorkspaceProjectionCleanupTransaction {
             path: directory.clone(),
         })?;
         self.staging_directories.push(directory.clone());
-        create_dir_all_durable(&directory).map_err(|error| {
+        create_dir_all_durable(parent, &directory).map_err(|error| {
             format!(
                 "could not create cleanup staging directory `{}`: {error}",
                 directory.display()
@@ -11650,7 +11679,7 @@ impl WorkspaceRemountRecoveryMarker {
             intended_mount: Box::new(intended_mount.clone()),
             preserved_directory: preserved_directory.map(Path::to_path_buf),
         })?;
-        sync_directory(&recovery_root).map_err(|error| {
+        sync_directory(state_root, &recovery_root).map_err(|error| {
             format!(
                 "could not persist remount recovery marker directory `{}`: {error}",
                 recovery_root.display()
@@ -11699,7 +11728,7 @@ impl WorkspaceRemountRecoveryMarker {
                 path.display()
             )
         })?;
-        sync_directory(&parent).map_err(|error| {
+        sync_directory(&self.state_root, &parent).map_err(|error| {
             format!(
                 "could not persist completed remount recovery marker removal `{}`: {error}",
                 path.display()
@@ -12198,7 +12227,7 @@ fn create_recovery_directory(state_root: &Path, path: &Path) -> Result<(), Strin
                     path.display()
                 )
             })?;
-            sync_directory(parent).map_err(|error| {
+            sync_directory(state_root, parent).map_err(|error| {
                 format!(
                     "could not persist remount recovery directory `{}`: {error}",
                     path.display()
@@ -12237,7 +12266,7 @@ fn restore_staged_projection_path(path: &StagedProjectionPath) -> Result<(), Str
         (true, false) => Ok(()),
         (false, true) => {
             if let Some(parent) = path.original.parent() {
-                create_dir_all_durable(parent).map_err(|error| {
+                create_dir_all_durable(trusted_root, parent).map_err(|error| {
                     format!("could not recreate `{}`: {error}", parent.display())
                 })?;
             }
@@ -12273,17 +12302,18 @@ fn remove_empty_staging_directory(directory: &Path) -> Result<(), String> {
         )
     })?;
     match fs::remove_dir(directory) {
-        Ok(()) => {
-            sync_directory(directory.parent().ok_or_else(|| {
+        Ok(()) => sync_directory(
+            trusted_root,
+            directory.parent().ok_or_else(|| {
                 format!("staging directory `{}` has no parent", directory.display())
-            })?)
-            .map_err(|error| {
-                format!(
-                    "could not persist removal of staging directory `{}`: {error}",
-                    directory.display()
-                )
-            })
-        }
+            })?,
+        )
+        .map_err(|error| {
+            format!(
+                "could not persist removal of staging directory `{}`: {error}",
+                directory.display()
+            )
+        }),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!(
             "could not remove staging directory `{}`: {error}",
@@ -12334,17 +12364,18 @@ fn remove_persisted_recovery_marker(state_root: &Path, marker_path: &Path) -> Re
         )
     })?;
     match fs::remove_file(marker_path) {
-        Ok(()) => {
-            sync_directory(marker_path.parent().ok_or_else(|| {
+        Ok(()) => sync_directory(
+            state_root,
+            marker_path.parent().ok_or_else(|| {
                 format!("recovery marker `{}` has no parent", marker_path.display())
-            })?)
-            .map_err(|error| {
-                format!(
-                    "could not persist completed remount recovery marker removal `{}`: {error}",
-                    marker_path.display()
-                )
-            })
-        }
+            })?,
+        )
+        .map_err(|error| {
+            format!(
+                "could not persist completed remount recovery marker removal `{}`: {error}",
+                marker_path.display()
+            )
+        }),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!(
             "could not remove completed remount recovery marker `{}`: {error}",
@@ -12447,7 +12478,7 @@ fn preserve_mount_pending_local_changes(
             directory.display()
         )
     })?;
-    create_dir_all_durable(&directory).map_err(|error| {
+    create_dir_all_durable(state_root, &directory).map_err(|error| {
         format!(
             "Could not create local change recovery folder at `{}`: {error}",
             directory.display()
@@ -12480,12 +12511,14 @@ fn preserve_mount_pending_local_changes(
     })?;
     let manifest_json = serde_json::to_string_pretty(&manifest)
         .map_err(|error| format!("Could not serialize local change manifest: {error}"))?;
-    write_new_file_durable(&manifest_path, manifest_json.as_bytes()).map_err(|error| {
-        format!(
-            "Could not write local change manifest at `{}`: {error}",
-            manifest_path.display()
-        )
-    })?;
+    write_new_file_durable(state_root, &manifest_path, manifest_json.as_bytes()).map_err(
+        |error| {
+            format!(
+                "Could not write local change manifest at `{}`: {error}",
+                manifest_path.display()
+            )
+        },
+    )?;
     let readme_path = directory.join("README.md");
     validate_no_symlink_or_reparse_ancestors(state_root, &readme_path).map_err(|error| {
         format!(
@@ -12494,6 +12527,7 @@ fn preserve_mount_pending_local_changes(
         )
     })?;
     write_new_file_durable(
+        state_root,
         &readme_path,
         b"Locality preserved these local Notion edits before refreshing the active mount for a changed Notion access scope.\n\nThe active mount was cleared so old pages outside the current Notion access do not keep appearing as pending changes. Review these files manually if you need to copy edits into the newly mounted workspace.\n",
     )
@@ -12618,14 +12652,24 @@ fn copy_preserved_file(
         )
     })?;
     if let Some(parent) = destination.parent() {
-        create_dir_all_durable(parent).map_err(|error| {
+        create_dir_all_durable(state_root, parent).map_err(|error| {
             format!(
                 "Could not create local change recovery folder at `{}`: {error}",
                 parent.display()
             )
         })?;
     }
-    copy_new_file_durable(source_path, &destination).map_err(|error| {
+    let copy_result = if cfg!(windows) && mount.projection == ProjectionMode::WindowsCloudFiles {
+        copy_new_file_durable_allow_cloud_placeholder(
+            source_root,
+            source_path,
+            state_root,
+            &destination,
+        )
+    } else {
+        copy_new_file_durable(source_root, source_path, state_root, &destination)
+    };
+    copy_result.map_err(|error| {
         format!(
             "Could not preserve local change from `{}` to `{}`: {error}",
             source_path.display(),
