@@ -111,3 +111,31 @@ that identity.
 All response, source-generation, mount, source-state, and file wire objects
 reject unknown fields. The contract contains no absolute host path,
 credential, provider cursor, mutable title, target label, or display name.
+
+## Durable local state boundary
+
+`locality-store` component `durable:generation_delivery` V7 is the local
+consumer boundary for delta-eligible baseline source states. A client converts
+each `generation_delta_v1` source state into one
+`GenerationBaselineSeedRecord`: the observed row carries the exact mount ID,
+source connection ID, generation, target-inventory digest, and sealed workspace
+layout; its path rows carry that source's file identities. Empty file
+inventories still produce an observed source record. As described above,
+`full_export_only` states are not seeded into generation-delta delivery state.
+
+All records selected from one baseline are committed with
+`seed_observed_generations`. The batch is one SQLite transaction: exact replay
+is a no-op, while a changed record, missing mount, or mount-wide projection or
+portable-path collision rolls back the entire batch. SQLite keys observed heads
+by `(mount_id, source_connection_id)` and durably binds every generation path
+to that pair. Projection IDs, remote logical paths, and local working paths
+remain mount-wide namespaces, so sharing a mount never permits two sources to
+claim colliding filesystem state.
+
+Polling, apply completion, retained merge bases, source-head advancement,
+clean-lineage reset, and terminal acknowledgments use the exact mount/source pair. The source-explicit
+`GenerationSyncClient::sync_mount_source` entry point handles one source;
+`sync_shared_mount` lists durable source heads in bytewise source-ID order and
+processes all of them deterministically. The legacy mount-only repository and
+sync entry points remain safe for single-source mounts and fail explicitly when
+a mount has multiple source heads.

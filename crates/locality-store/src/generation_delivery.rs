@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{StoreError, StoreResult};
 
-pub const GENERATION_DELIVERY_COMPONENT_VERSION: i64 = 6;
+pub const GENERATION_DELIVERY_COMPONENT_VERSION: i64 = 7;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservedGenerationRecord {
@@ -55,6 +55,21 @@ pub struct GenerationPathRecord {
     pub state: GenerationPathState,
     pub incoming_identity: Option<GenerationFileIdentity>,
     pub updated_at: String,
+}
+
+/// One source's complete observed head and merge-base inventory. A baseline
+/// containing multiple sources must be committed through the repository's
+/// batch API so callers never expose only part of a shared mount.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenerationBaselineSeedRecord {
+    pub observed: ObservedGenerationRecord,
+    pub paths: Vec<GenerationPathRecord>,
+}
+
+impl GenerationBaselineSeedRecord {
+    pub const fn new(observed: ObservedGenerationRecord, paths: Vec<GenerationPathRecord>) -> Self {
+        Self { observed, paths }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,12 +313,76 @@ pub trait GenerationDeliveryRepository {
         paths: Vec<GenerationPathRecord>,
     ) -> StoreResult<()>;
 
+    /// Atomically seeds every source record in one authenticated baseline.
+    /// Legacy repositories safely support only a one-source batch.
+    fn seed_observed_generations(
+        &mut self,
+        mut seeds: Vec<GenerationBaselineSeedRecord>,
+    ) -> StoreResult<()> {
+        if seeds.len() != 1 {
+            return Err(StoreError::InvalidState(
+                "generation repository does not support atomic multi-source baseline seeding"
+                    .to_string(),
+            ));
+        }
+        let seed = seeds.pop().expect("one seed was checked");
+        self.seed_observed_generation(seed.observed, seed.paths)
+    }
+
     fn get_observed_generation(
         &self,
         mount_id: &MountId,
     ) -> StoreResult<Option<ObservedGenerationRecord>>;
 
+    /// Reads one exact mount/source head. The default preserves compatibility
+    /// with repositories that can contain only one source per mount.
+    fn get_observed_generation_for_source(
+        &self,
+        mount_id: &MountId,
+        source_connection_id: &SourceConnectionId,
+    ) -> StoreResult<Option<ObservedGenerationRecord>> {
+        self.get_observed_generation(mount_id).map(|observed| {
+            observed.filter(|record| &record.source_connection_id == source_connection_id)
+        })
+    }
+
+    /// Lists source heads in deterministic source-ID order.
+    fn list_observed_generations(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Vec<ObservedGenerationRecord>> {
+        self.get_observed_generation(mount_id)
+            .map(|record| record.into_iter().collect())
+    }
+
     fn list_generation_paths(&self, mount_id: &MountId) -> StoreResult<Vec<GenerationPathRecord>>;
+
+    /// Lists merge bases owned by one exact mount/source pair.
+    fn list_generation_paths_for_source(
+        &self,
+        mount_id: &MountId,
+        source_connection_id: &SourceConnectionId,
+    ) -> StoreResult<Vec<GenerationPathRecord>> {
+        if self
+            .get_observed_generation_for_source(mount_id, source_connection_id)?
+            .is_none()
+        {
+            return Ok(Vec::new());
+        }
+        self.list_generation_paths(mount_id)
+    }
+
+    /// Retires completed clean delivery lineage for one exact source without
+    /// disturbing other source heads on the mount.
+    fn reset_observed_generation_source(
+        &mut self,
+        _mount_id: &MountId,
+        _source_connection_id: &SourceConnectionId,
+    ) -> StoreResult<()> {
+        Err(StoreError::InvalidState(
+            "generation repository does not support source-explicit reset".to_string(),
+        ))
+    }
 
     /// Reserves one immutable apply. Exact replay returns the existing journal;
     /// a changed payload or a concurrent source apply fails closed.
@@ -393,6 +472,22 @@ pub trait GenerationDeliveryRepository {
         _mount_id: &MountId,
     ) -> StoreResult<Vec<GenerationApplyJournalRecord>> {
         Ok(Vec::new())
+    }
+
+    /// Lists pending receipts for one exact source row. Legacy repositories
+    /// filter their mount-wide result without inventing source ownership.
+    fn list_pending_generation_acknowledgments_for_source(
+        &self,
+        mount_id: &MountId,
+        source_connection_id: &SourceConnectionId,
+    ) -> StoreResult<Vec<GenerationApplyJournalRecord>> {
+        self.list_pending_generation_acknowledgments(mount_id)
+            .map(|journals| {
+                journals
+                    .into_iter()
+                    .filter(|journal| &journal.delta.source_connection_id == source_connection_id)
+                    .collect()
+            })
     }
 
     fn mark_generation_acknowledged(

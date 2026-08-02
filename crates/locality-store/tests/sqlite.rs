@@ -117,8 +117,8 @@ fn sqlite_store_seeds_state_compatibility_components() {
             (
                 "durable:generation_delivery".to_string(),
                 "durable_transaction".to_string(),
-                6,
-                6,
+                7,
+                7,
                 1,
                 0
             ),
@@ -436,7 +436,7 @@ freshness_states: mount_id, remote_id, tier_json, last_checked_at, next_check_at
 generation_apply_journals: delta_id, mount_id, source_connection_id, base_generation_id, target_generation_id, delta_json, receipt_json, receipt_sha256, selected_capabilities_json, selection_binding, acknowledgment_required, acknowledged_at, stage_root, status, active, created_at, updated_at, completed_at
 generation_apply_outcomes: delta_id, entry_index, outcome_json, updated_at
 generation_inode_evidence: delta_id, entry_index, mount_id, logical_path, evidence_name, expected_sha256, byte_length, visible_evidence_name, visible_expected_sha256, visible_byte_length, base_payload_delta_id, base_payload_entry_index, resolved_at, created_at
-generation_paths: mount_id, projection_id, logical_path, local_logical_path, base_generation_id, base_identity_json, base_payload_delta_id, base_payload_entry_index, conflict_payload_delta_id, conflict_payload_entry_index, state, incoming_identity_json, updated_at
+generation_paths: mount_id, source_connection_id, projection_id, logical_path, local_logical_path, base_generation_id, base_identity_json, base_payload_delta_id, base_payload_entry_index, conflict_payload_delta_id, conflict_payload_entry_index, state, incoming_identity_json, updated_at
 hydration_jobs: mount_id, remote_id, path, target_state_json, reason_json, attempts, last_error
 journals: push_id, mount_id, remote_ids_json, plan_json, preimages_json, apply_effects_json, status_json, metadata_json, readable_diff_json
 metadata_discovery_jobs: mount_id, container_identifier, priority_json, depth, attempts, last_error, created_at, updated_at
