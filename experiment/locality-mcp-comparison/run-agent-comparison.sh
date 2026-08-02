@@ -377,7 +377,11 @@ remote_ssh() {
   if [ "${1:-}" = "--" ]; then
     shift
   fi
-  ssh "${SSH_ARGS[@]}" "$(remote_ssh_target "$sandbox")" "$@"
+  if [ -n "$SSH_OPTIONS" ]; then
+    ssh "${SSH_ARGS[@]}" "$(remote_ssh_target "$sandbox")" "$@"
+  else
+    ssh "$(remote_ssh_target "$sandbox")" "$@"
+  fi
 }
 
 create_amika_sandboxes() {
@@ -406,9 +410,9 @@ for name in (os.environ["LOCALITY_SANDBOX"], os.environ["MCP_SANDBOX"]):
         raise SystemExit(f"amika sandbox already exists: {name}")
 ' <<< "$sandboxes_json"
 
-  amika sandbox create --remote --no-git --snapshot "$LOCALITY_SNAPSHOT" --name "$LOCALITY_SANDBOX"
+  run_managed_command amika sandbox create --remote --no-git --snapshot "$LOCALITY_SNAPSHOT" --name "$LOCALITY_SANDBOX"
   CREATED_AMIKA_SANDBOXES+=("$LOCALITY_SANDBOX")
-  amika sandbox create --remote --no-git --snapshot "$MCP_SNAPSHOT" --name "$MCP_SANDBOX"
+  run_managed_command amika sandbox create --remote --no-git --snapshot "$MCP_SNAPSHOT" --name "$MCP_SANDBOX"
   CREATED_AMIKA_SANDBOXES+=("$MCP_SANDBOX")
 }
 
@@ -418,6 +422,19 @@ cleanup_amika_sandboxes() {
 
   amika sandbox delete --remote --force "${CREATED_AMIKA_SANDBOXES[@]}" || return $?
   CREATED_AMIKA_SANDBOXES=()
+}
+
+run_managed_command() {
+  local command_rc
+
+  "$@" &
+  active_operation_pid=$!
+  set +e
+  wait "$active_operation_pid"
+  command_rc=$?
+  set -e
+  active_operation_pid=""
+  return "$command_rc"
 }
 
 remote_rsync_ssh_command() {
@@ -916,12 +933,17 @@ sync_artifacts() {
     remote_ssh "$sandbox" -- "bash -lc $(shell_quote "$remote_cmd")" > "$archive_b64"
     ssh_rc=$?
     set -e
-    rm -rf "$dest"
-    mkdir -p "$dest"
-    if ! tr -d '\r' < "$archive_b64" | base64 -d | tar -xzf - -C "$dest"; then
+    if [ "$ssh_rc" -ne 0 ]; then
       return "$ssh_rc"
     fi
-    return
+    rm -rf "$dest"
+    mkdir -p "$dest"
+    local extract_rc
+    set +e
+    tr -d '\r' < "$archive_b64" | base64 -d | tar -xzf - -C "$dest"
+    extract_rc=$?
+    set -e
+    return "$extract_rc"
   fi
 
   ssh_target="$(remote_ssh_target "$sandbox")"
@@ -986,14 +1008,81 @@ wait_for_strategy_pipeline() {
   return "$rc"
 }
 
+collect_process_tree_pids() {
+  local parent_pid="$1"
+  local child_pid
+
+  while IFS= read -r child_pid; do
+    [ -n "$child_pid" ] || continue
+    collect_process_tree_pids "$child_pid"
+    printf '%s\n' "$child_pid"
+  done < <(ps -axo pid=,ppid= | awk -v parent="$parent_pid" '$2 == parent { print $1 }')
+}
+
+process_is_active() {
+  local pid="$1"
+  local state
+
+  kill -0 "$pid" >/dev/null 2>&1 || return 1
+  state="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+  case "$state" in
+    Z*|'') return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+wait_for_process_tree_exit() {
+  local attempts="$1"
+  shift
+  local pid
+  local active
+  local attempt=0
+
+  while [ "$attempt" -lt "$attempts" ]; do
+    active=0
+    for pid in "$@"; do
+      if process_is_active "$pid"; then
+        active=1
+        break
+      fi
+    done
+    [ "$active" -eq 1 ] || return 0
+    sleep 0.1
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+terminate_process_tree() {
+  local root_pid="$1"
+  local pid
+  local -a tree_pids=()
+
+  while IFS= read -r pid; do
+    [ -n "$pid" ] && tree_pids+=("$pid")
+  done < <(collect_process_tree_pids "$root_pid")
+  tree_pids+=("$root_pid")
+
+  for pid in "${tree_pids[@]}"; do
+    process_is_active "$pid" && kill -TERM "$pid" >/dev/null 2>&1 || true
+  done
+  if ! wait_for_process_tree_exit 50 "${tree_pids[@]}"; then
+    for pid in "${tree_pids[@]}"; do
+      process_is_active "$pid" && kill -KILL "$pid" >/dev/null 2>&1 || true
+    done
+    wait_for_process_tree_exit 50 "${tree_pids[@]}" || true
+  fi
+  wait "$root_pid" >/dev/null 2>&1 || true
+}
+
 stop_strategy_pipelines() {
   local signal_rc="$1"
   local pid
 
   trap - INT TERM
-  for pid in "${locality_pipeline_pid:-}" "${mcp_pipeline_pid:-}"; do
+  for pid in "${active_operation_pid:-}" "${locality_pipeline_pid:-}" "${mcp_pipeline_pid:-}"; do
     if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
-      kill "$pid" >/dev/null 2>&1 || true
+      terminate_process_tree "$pid"
     fi
   done
   exit "$signal_rc"
@@ -1007,6 +1096,12 @@ cleanup_amika_sandboxes_on_exit() {
   set +e
   cleanup_amika_sandboxes
   cleanup_rc=$?
+
+  if [ "$cleanup_rc" -ne 0 ]; then
+    printf 'Amika sandbox cleanup failed with exit code %s; owned sandboxes:' "$cleanup_rc" >&2
+    printf ' %s' "${CREATED_AMIKA_SANDBOXES[@]}" >&2
+    printf '\n' >&2
+  fi
 
   if [ "$original_rc" -ne 0 ]; then
     exit "$original_rc"
@@ -1059,6 +1154,8 @@ EOF
 
 load_mcp_credentials_from_zshrc
 trap cleanup_amika_sandboxes_on_exit EXIT
+trap 'stop_strategy_pipelines 130' INT
+trap 'stop_strategy_pipelines 143' TERM
 if [ "$REMOTE_PROVIDER" = "amika" ] && [ "$SYNC_ARTIFACTS" = "0" ]; then
   echo "SYNC_ARTIFACTS=0; ephemeral Amika sandboxes will be deleted without retaining remote artifacts" >&2
 fi
@@ -1066,8 +1163,6 @@ create_amika_sandboxes
 write_artifacts_manifest
 
 echo "Launching Locality and MCP strategy pipelines in parallel"
-trap 'stop_strategy_pipelines 130' INT
-trap 'stop_strategy_pipelines 143' TERM
 run_strategy_pipeline "$LOCALITY_SANDBOX" "locality" "$LOCALITY_REMOTE_OUT_DIR" &
 locality_pipeline_pid=$!
 run_strategy_pipeline "$MCP_SANDBOX" "notion-mcp" "$MCP_REMOTE_OUT_DIR" &

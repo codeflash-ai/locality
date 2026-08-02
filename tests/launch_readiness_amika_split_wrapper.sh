@@ -60,6 +60,45 @@ for arg in "$@"; do
 done
 printf '%s\n' "$logged_command" >> "${FAKE_AMIKA_LOG:?}"
 
+block_operation_if_requested() {
+  local operation="$1"
+  if [ "${FAKE_AMIKA_BLOCK_OPERATION:-}" != "$operation" ]; then
+    return 0
+  fi
+  if [ -n "${FAKE_AMIKA_BLOCK_MATCH:-}" ] && [[ "$joined_args" != *"${FAKE_AMIKA_BLOCK_MATCH}"* ]]; then
+    return 0
+  fi
+
+  local activity_dir="${FAKE_AMIKA_ACTIVITY_DIR:?}"
+  local active_file="$activity_dir/active.$$"
+  mkdir -p "$activity_dir"
+  : > "$active_file"
+  : > "$activity_dir/ready.$$"
+  stop_blocked_operation() {
+    rm -f "$active_file"
+    : > "$activity_dir/stopped.$$"
+    exit 143
+  }
+  trap stop_blocked_operation INT TERM
+  while :; do
+    sleep 0.1
+  done
+}
+
+fail_delete_while_operation_is_active() {
+  local active_file
+  local active_pid
+  [ -n "${FAKE_AMIKA_ACTIVITY_DIR:-}" ] || return 0
+  for active_file in "$FAKE_AMIKA_ACTIVITY_DIR"/active.*; do
+    [ -e "$active_file" ] || continue
+    active_pid="${active_file##*.}"
+    if kill -0 "$active_pid" >/dev/null 2>&1; then
+      printf 'delete while remote child active: %s\n' "$active_pid" >> "$FAKE_AMIKA_LOG"
+      exit 98
+    fi
+  done
+}
+
 if [ "${1:-}" != "sandbox" ]; then
   printf 'unexpected fake amika command: %s\n' "$*" >&2
   exit 2
@@ -71,6 +110,22 @@ fi
 if [ "${2:-}" = "delete" ] && [ "${FAKE_AMIKA_FAIL_DELETE:-0}" = "1" ]; then
   exit 29
 fi
+if [ "${2:-}" = "ssh" ] && [ -n "${FAKE_AMIKA_FAIL_SSH_RC:-}" ]; then
+  exit "$FAKE_AMIKA_FAIL_SSH_RC"
+fi
+if [ "${2:-}" = "ssh" ] && [ "${3:-}" != "--print" ] && [ -n "${FAKE_AMIKA_FAIL_SSH_CALL:-}" ]; then
+  call_file="${FAKE_AMIKA_CALL_DIR:?}/${3}.count"
+  mkdir -p "$FAKE_AMIKA_CALL_DIR"
+  call_count=0
+  if [ -f "$call_file" ]; then
+    call_count="$(cat "$call_file")"
+  fi
+  call_count=$((call_count + 1))
+  printf '%s\n' "$call_count" > "$call_file"
+  if [ "$call_count" -eq "$FAKE_AMIKA_FAIL_SSH_CALL" ]; then
+    exit "${FAKE_AMIKA_FAIL_SSH_CALL_RC:-47}"
+  fi
+fi
 
 case "${2:-}" in
   list)
@@ -78,14 +133,17 @@ case "${2:-}" in
     exit 0
     ;;
   create)
+    block_operation_if_requested create
     shift 2
     exit 0
     ;;
   delete)
+    fail_delete_while_operation_is_active
     shift 2
     exit 0
     ;;
   ssh)
+    block_operation_if_requested ssh
     ;;
   *)
     printf 'unexpected fake amika command: %s\n' "$*" >&2
@@ -130,6 +188,133 @@ fi
 printf 'fake remote ok\n'
 SH
 chmod +x "${fake_bin}/amika"
+
+cat > "${fake_bin}/rsync" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+logged_command="rsync"
+for arg in "$@"; do
+  printf -v quoted_arg '%q' "$arg"
+  logged_command="${logged_command} ${quoted_arg}"
+done
+printf '%s\n' "$logged_command" >> "${FAKE_AMIKA_LOG:?}"
+SH
+chmod +x "${fake_bin}/rsync"
+
+cat > "${fake_bin}/ssh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+logged_command="ssh"
+for arg in "$@"; do
+  printf -v quoted_arg '%q' "$arg"
+  logged_command="${logged_command} ${quoted_arg}"
+done
+printf '%s\n' "$logged_command" >> "${FAKE_TRANSPORT_LOG:?}"
+SH
+chmod +x "${fake_bin}/ssh"
+
+signal_runner="${tmp_root}/run-and-signal.py"
+cat > "$signal_runner" <<'PY'
+import glob
+import os
+import signal
+import subprocess
+import sys
+import time
+
+signal_name, activity_dir, ready_count, stdout_path, stderr_path, wrapper, *wrapper_args = sys.argv[1:]
+with open(stdout_path, "wb") as stdout_file, open(stderr_path, "wb") as stderr_file:
+    process = subprocess.Popen(
+        [wrapper, *wrapper_args],
+        stdout=stdout_file,
+        stderr=stderr_file,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 10
+    while len(glob.glob(os.path.join(activity_dir, "ready.*"))) < int(ready_count):
+        if process.poll() is not None:
+            raise SystemExit(f"wrapper exited before signal injection: {process.returncode}")
+        if time.monotonic() >= deadline:
+            os.killpg(process.pid, signal.SIGKILL)
+            raise SystemExit("timed out waiting for blocked fake Amika child")
+        time.sleep(0.05)
+
+    os.kill(process.pid, getattr(signal, f"SIG{signal_name}"))
+    try:
+        return_code = process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+        raise SystemExit("wrapper did not exit after signal injection")
+
+try:
+    os.killpg(process.pid, signal.SIGKILL)
+except ProcessLookupError:
+    pass
+print(return_code)
+PY
+
+pty_runner="${tmp_root}/run-with-pty.py"
+cat > "$pty_runner" <<'PY'
+import errno
+import os
+import pty
+import sys
+
+transcript_path, *command = sys.argv[1:]
+child_pid, master_fd = pty.fork()
+if child_pid == 0:
+    os.execvpe(command[0], command, os.environ)
+
+with open(transcript_path, "wb") as transcript:
+    while True:
+        try:
+            output = os.read(master_fd, 65536)
+        except OSError as error:
+            if error.errno == errno.EIO:
+                break
+            raise
+        if not output:
+            break
+        transcript.write(output)
+os.close(master_fd)
+_, wait_status = os.waitpid(child_pid, 0)
+raise SystemExit(os.waitstatus_to_exitcode(wait_status))
+PY
+
+forced_tty_bin="${tmp_root}/forced-tty-bin"
+mkdir -p "$forced_tty_bin"
+cat > "$forced_tty_bin/ssh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf 'ssh' >> "${FAKE_TRANSPORT_LOG:?}"
+for arg in "$@"; do
+  printf ' %q' "$arg" >> "$FAKE_TRANSPORT_LOG"
+done
+printf '\n' >> "$FAKE_TRANSPORT_LOG"
+
+if [ "${FAKE_SSH_INVALID_ARTIFACT:-0}" = "1" ] && [[ " $* " == *tar* ]]; then
+  printf 'not-a-base64-tar-archive\n'
+  exit 0
+fi
+printf '\n__AMIKA_REMOTE_RC__=0\n'
+SH
+chmod +x "$forced_tty_bin/ssh"
+
+real_tar="$(command -v tar)"
+cat > "$forced_tty_bin/tar" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "${1:-}" = "-xzf" ] && [ "${FAKE_TAR_EXTRACT_RC:-0}" -ne 0 ]; then
+  exit "$FAKE_TAR_EXTRACT_RC"
+fi
+exec "${REAL_TAR:?}" "$@"
+SH
+chmod +x "$forced_tty_bin/tar"
 
 help_out="${tmp_root}/help.out"
 "$WRAPPER" --help > "$help_out"
@@ -200,6 +385,42 @@ fi
 assert_not_contains "$collision_log" "amika sandbox create"
 assert_not_contains "$collision_log" "amika sandbox delete"
 
+mcp_collision_log="${tmp_root}/mcp-collision-amika.log"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$mcp_collision_log" \
+  FAKE_AMIKA_LIST_JSON='[{"name":"launch-readiness-mcp-collision-mcp"}]' \
+  RUN_ID="mcp-collision" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/mcp-collision-out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"${tmp_root}/mcp-collision.err"
+mcp_collision_rc=$?
+set -e
+if [ "$mcp_collision_rc" -eq 0 ]; then
+  fail "an existing MCP Amika sandbox name should fail before creation"
+fi
+assert_not_contains "$mcp_collision_log" "amika sandbox create"
+assert_not_contains "$mcp_collision_log" "amika sandbox delete"
+
+first_create_log="${tmp_root}/first-create-amika.log"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$first_create_log" \
+  FAKE_AMIKA_LIST_JSON='[]' \
+  FAKE_AMIKA_FAIL_CREATE_SNAPSHOT="locality-snapshot" \
+  RUN_ID="first-create" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/first-create-out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"${tmp_root}/first-create.err"
+first_create_rc=$?
+set -e
+if [ "$first_create_rc" -ne 23 ]; then
+  fail "first Amika creation should preserve create failure 23, got ${first_create_rc}"
+fi
+assert_contains "$first_create_log" "amika sandbox create --remote --no-git --snapshot locality-snapshot --name launch-readiness-first-create-locality"
+assert_not_contains "$first_create_log" "amika sandbox create --remote --no-git --snapshot mcp-snapshot"
+assert_not_contains "$first_create_log" "amika sandbox delete"
+
 partial_create_log="${tmp_root}/partial-create-amika.log"
 set +e
 PATH="${fake_bin}:$PATH" \
@@ -229,6 +450,111 @@ PATH="${fake_bin}:$PATH" \
   "$WRAPPER" --scenario scenario2 >/dev/null 2>"$no_sync_err"
 assert_contains "$no_sync_err" "SYNC_ARTIFACTS=0; ephemeral Amika sandboxes will be deleted without retaining remote artifacts"
 assert_contains "$no_sync_log" "amika sandbox delete --remote --force launch-readiness-no-sync-locality launch-readiness-no-sync-mcp"
+
+sync_after_failure_log="${tmp_root}/sync-after-failure.log"
+sync_after_failure_call_dir="${tmp_root}/sync-after-failure-calls"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$sync_after_failure_log" \
+  FAKE_AMIKA_LIST_JSON='[]' \
+  FAKE_AMIKA_FAIL_SSH_CALL=2 \
+  FAKE_AMIKA_FAIL_SSH_CALL_RC=47 \
+  FAKE_AMIKA_CALL_DIR="$sync_after_failure_call_dir" \
+  RUN_ID="sync-after-failure" \
+  SYNC_ARTIFACTS=1 \
+  LOCAL_OUT_DIR="${tmp_root}/sync-after-failure-out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"${tmp_root}/sync-after-failure.err"
+sync_after_failure_rc=$?
+set -e
+if [ "$sync_after_failure_rc" -ne 47 ]; then
+  fail "benchmark failure 47 should win after artifact sync, got ${sync_after_failure_rc}"
+fi
+assert_contains "$sync_after_failure_log" "rsync -az --delete"
+assert_line_before "$sync_after_failure_log" "rsync -az --delete" "amika sandbox delete --remote --force launch-readiness-sync-after-failure-locality launch-readiness-sync-after-failure-mcp"
+
+ssh_provider_amika_log="${tmp_root}/ssh-provider-amika.log"
+ssh_provider_transport_log="${tmp_root}/ssh-provider-transport.log"
+: > "$ssh_provider_amika_log"
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$ssh_provider_amika_log" \
+  FAKE_TRANSPORT_LOG="$ssh_provider_transport_log" \
+  REMOTE_PROVIDER=ssh \
+  LOCALITY_SSH_TARGET="locality@example.invalid" \
+  MCP_SSH_TARGET="mcp@example.invalid" \
+  RUN_ID="ssh-provider" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/ssh-provider-out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null
+assert_not_contains "$ssh_provider_amika_log" "amika sandbox create"
+assert_not_contains "$ssh_provider_amika_log" "amika sandbox delete"
+assert_contains "$ssh_provider_transport_log" "ssh locality@example.invalid"
+assert_contains "$ssh_provider_transport_log" "ssh mcp@example.invalid"
+
+term_log="${tmp_root}/term-amika.log"
+term_activity="${tmp_root}/term-activity"
+term_rc="$(
+  PATH="${fake_bin}:$PATH" \
+    FAKE_AMIKA_LOG="$term_log" \
+    FAKE_AMIKA_LIST_JSON='[]' \
+    FAKE_AMIKA_BLOCK_OPERATION=ssh \
+    FAKE_AMIKA_ACTIVITY_DIR="$term_activity" \
+    RUN_ID="term-signal" \
+    SYNC_ARTIFACTS=0 \
+    LOCAL_OUT_DIR="${tmp_root}/term-out" \
+    python3 "$signal_runner" TERM "$term_activity" 2 \
+      "${tmp_root}/term.out" "${tmp_root}/term.err" "$WRAPPER" --scenario scenario2
+)"
+if [ "$term_rc" -ne 143 ]; then
+  fail "TERM should return 143, got ${term_rc}"
+fi
+assert_not_contains "$term_log" "delete while remote child active"
+assert_contains "$term_log" "amika sandbox delete --remote --force launch-readiness-term-signal-locality launch-readiness-term-signal-mcp"
+
+int_log="${tmp_root}/int-amika.log"
+int_activity="${tmp_root}/int-activity"
+int_rc="$(
+  PATH="${fake_bin}:$PATH" \
+    FAKE_AMIKA_LOG="$int_log" \
+    FAKE_AMIKA_LIST_JSON='[]' \
+    FAKE_AMIKA_BLOCK_OPERATION=create \
+    FAKE_AMIKA_BLOCK_MATCH='--snapshot mcp-snapshot' \
+    FAKE_AMIKA_ACTIVITY_DIR="$int_activity" \
+    RUN_ID="int-signal" \
+    SYNC_ARTIFACTS=0 \
+    LOCAL_OUT_DIR="${tmp_root}/int-out" \
+    python3 "$signal_runner" INT "$int_activity" 1 \
+      "${tmp_root}/int.out" "${tmp_root}/int.err" "$WRAPPER" --scenario scenario2
+)"
+if [ "$int_rc" -ne 130 ]; then
+  fail "INT during sandbox creation should return 130, got ${int_rc}"
+fi
+assert_not_contains "$int_log" "delete while remote child active"
+assert_contains "$int_log" "amika sandbox delete --remote --force launch-readiness-int-signal-locality"
+assert_not_contains "$int_log" "amika sandbox delete --remote --force launch-readiness-int-signal-locality launch-readiness-int-signal-mcp"
+
+forced_tty_log="${tmp_root}/forced-tty-amika.log"
+forced_tty_transport_log="${tmp_root}/forced-tty-transport.log"
+forced_tty_transcript="${tmp_root}/forced-tty-extract.transcript"
+set +e
+PATH="${forced_tty_bin}:${fake_bin}:$PATH" \
+  REAL_TAR="$real_tar" \
+  FAKE_TAR_EXTRACT_RC=37 \
+  FAKE_SSH_INVALID_ARTIFACT=1 \
+  FAKE_TRANSPORT_LOG="$forced_tty_transport_log" \
+  FAKE_AMIKA_LOG="$forced_tty_log" \
+  FAKE_AMIKA_LIST_JSON='[]' \
+  RUN_ID="forced-tty-extract" \
+  AMIKA_SSH_FORCE_TTY=1 \
+  SYNC_ARTIFACTS=1 \
+  LOCAL_OUT_DIR="${tmp_root}/forced-tty-extract-out" \
+  python3 "$pty_runner" "$forced_tty_transcript" "$WRAPPER" --scenario scenario2
+forced_tty_rc=$?
+set -e
+if [ "$forced_tty_rc" -ne 37 ]; then
+  fail "forced-TTY artifact extraction failure should return 37, got ${forced_tty_rc}"
+fi
+assert_contains "$forced_tty_transcript" "pipeline failed with exit code 37"
+assert_contains "$forced_tty_log" "amika sandbox delete --remote --force launch-readiness-forced-tty-extract-locality launch-readiness-forced-tty-extract-mcp"
 
 custom_log="${tmp_root}/custom-amika.log"
 custom_out="${tmp_root}/custom-out"
@@ -274,6 +600,26 @@ if [ "$cleanup_failure_rc" -ne 29 ]; then
   fail "successful benchmark should return cleanup failure, got ${cleanup_failure_rc}"
 fi
 assert_contains "$cleanup_failure_log" "amika sandbox delete --remote --force launch-readiness-cleanup-failure-locality launch-readiness-cleanup-failure-mcp"
+
+combined_failure_log="${tmp_root}/combined-failure-amika.log"
+combined_failure_err="${tmp_root}/combined-failure.err"
+set +e
+PATH="${fake_bin}:$PATH" \
+  FAKE_AMIKA_LOG="$combined_failure_log" \
+  FAKE_AMIKA_LIST_JSON='[]' \
+  FAKE_AMIKA_FAIL_SSH_RC=41 \
+  FAKE_AMIKA_FAIL_DELETE=1 \
+  RUN_ID="combined-failure" \
+  SYNC_ARTIFACTS=0 \
+  LOCAL_OUT_DIR="${tmp_root}/combined-failure-out" \
+  "$WRAPPER" --scenario scenario2 >/dev/null 2>"$combined_failure_err"
+combined_failure_rc=$?
+set -e
+if [ "$combined_failure_rc" -ne 41 ]; then
+  fail "operation failure 41 should win over cleanup failure, got ${combined_failure_rc}"
+fi
+assert_contains "$combined_failure_err" "Amika sandbox cleanup failed with exit code 29; owned sandboxes: launch-readiness-combined-failure-locality launch-readiness-combined-failure-mcp"
+assert_contains "$combined_failure_log" "amika sandbox delete --remote --force launch-readiness-combined-failure-locality launch-readiness-combined-failure-mcp"
 
 set +e
 PATH="${fake_bin}:$PATH" \
