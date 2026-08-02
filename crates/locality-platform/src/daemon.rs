@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io;
 #[cfg(unix)]
@@ -134,6 +135,29 @@ pub fn daemon_remount_fence_path(state_root: &Path) -> PathBuf {
 
 pub fn daemon_remount_lock_path(state_root: &Path) -> PathBuf {
     state_root.join(DAEMON_REMOUNT_LOCK_FILENAME)
+}
+
+/// Resets local state while retaining exclusive ownership of the remount lock
+/// inode. This prevents an unlink/recreate race with daemon startup or remount
+/// recovery during the destructive state-root sweep.
+pub fn reset_locality_state_storage_coordinated(
+    state_root: &Path,
+) -> Result<locality_store::LocalStateResetStorageReport, DaemonProcessError> {
+    let _ownership = DaemonRemountCoordinatorLock::try_acquire(state_root).map_err(|error| {
+        DaemonProcessError::new(
+            if error.kind() == io::ErrorKind::WouldBlock {
+                "remount_in_progress"
+            } else {
+                "io_error"
+            },
+            error.to_string(),
+        )
+    })?;
+    locality_store::reset_locality_state_storage_preserving(
+        state_root,
+        &[OsStr::new(DAEMON_REMOUNT_LOCK_FILENAME)],
+    )
+    .map_err(|error| DaemonProcessError::new("state_reset_failed", error.to_string()))
 }
 
 /// Process-scoped exclusive ownership of remount coordination and recovery.
@@ -983,6 +1007,40 @@ mod tests {
         drop(remount);
         let _startup = DaemonStartupCoordinatorLock::try_acquire(&paths)
             .expect("startup resumes after remount");
+        std::fs::remove_dir_all(root).expect("remove state root");
+    }
+
+    #[test]
+    fn coordinated_reset_preserves_lock_inode_and_rejects_active_remount() {
+        let root = std::env::temp_dir().join(format!(
+            "locality-daemon-reset-lock-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create state root");
+        let ordinary = root.join("ordinary-state");
+        std::fs::write(&ordinary, "state").expect("write ordinary state");
+
+        let remount =
+            DaemonRemountCoordinatorLock::try_acquire(&root).expect("active remount ownership");
+        let error = super::reset_locality_state_storage_coordinated(&root)
+            .expect_err("active remount blocks reset");
+        assert_eq!(error.code(), "remount_in_progress");
+        assert!(ordinary.exists());
+        drop(remount);
+
+        let report =
+            super::reset_locality_state_storage_coordinated(&root).expect("coordinated reset");
+        assert!(!ordinary.exists());
+        assert_eq!(
+            report.preserved_state_entries,
+            vec![super::DAEMON_REMOUNT_LOCK_FILENAME.to_string()]
+        );
+        let lock_path = super::daemon_remount_lock_path(&root);
+        assert!(lock_path.is_file());
+        let _next = DaemonRemountCoordinatorLock::try_acquire(&root)
+            .expect("preserved lock remains reusable");
+        drop(_next);
         std::fs::remove_dir_all(root).expect("remove state root");
     }
 

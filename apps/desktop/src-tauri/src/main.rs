@@ -118,7 +118,7 @@ use locality_store::{
     RemoteObservationRepository, ShadowRepository, SqliteStateStore, StoreError,
     VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
     WorkspaceBindingRepository, WorkspaceRemountRecoveryOutcome,
-    is_live_mode_state_change_signal_path, open_credential_store, reset_locality_state_storage,
+    is_live_mode_state_change_signal_path, open_credential_store,
     save_mount_live_mode_and_publish_signal,
 };
 #[cfg(test)]
@@ -6096,7 +6096,8 @@ fn reset_locality_state_at(state_root: &Path) -> Result<(), String> {
         stop_daemon_for_reset(state_root);
         reset_platform_projection_state(state_root)?;
         remove_desktop_support_state()?;
-        reset_locality_state_storage(state_root).map_err(|error| error.to_string())?;
+        locality_platform::reset_locality_state_storage_coordinated(state_root)
+            .map_err(|error| error.message().to_string())?;
         Ok(())
     })();
     LOCAL_STATE_RESET_IN_PROGRESS.store(false, Ordering::Release);
@@ -6162,9 +6163,9 @@ fn reset_platform_projection_state(state_root: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 fn clear_state_root_contents(state_root: &Path) -> Result<(), String> {
-    reset_locality_state_storage(state_root)
+    locality_platform::reset_locality_state_storage_coordinated(state_root)
         .map(|_| ())
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.message().to_string())
 }
 
 fn remove_desktop_support_state() -> Result<(), String> {

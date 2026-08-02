@@ -32,7 +32,8 @@ pub use daemon::{
     DaemonRemountCoordinatorLock, DaemonStartMode, DaemonStartupCoordinatorLock,
     DefaultDaemonProcessManager, MACOS_LAUNCHD_LABEL, daemon_manager_supervision_enabled,
     daemon_remount_fence_path, daemon_remount_lock_path, daemon_socket_path,
-    ensure_daemon_start_allowed, restore_daemon_manager_supervision,
+    ensure_daemon_start_allowed, reset_locality_state_storage_coordinated,
+    restore_daemon_manager_supervision,
 };
 pub use logs::{
     DESKTOP_LOG_FILENAME, FILE_PROVIDER_LOG_FILENAME, LOGS_DIR_NAME, append_service_log, logs_dir,

@@ -64,7 +64,7 @@ pub use repository::{
 };
 pub use reset::{
     LocalStateResetCredentialError, LocalStateResetError, LocalStateResetStorageReport,
-    connection_secret_refs, reset_locality_state_storage,
+    connection_secret_refs, reset_locality_state_storage, reset_locality_state_storage_preserving,
 };
 pub use sqlite::SqliteStateStore;
 pub use workspace_binding::{

@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -44,10 +45,19 @@ impl std::error::Error for LocalStateResetError {}
 pub fn reset_locality_state_storage(
     state_root: &Path,
 ) -> Result<LocalStateResetStorageReport, LocalStateResetError> {
+    reset_locality_state_storage_preserving(state_root, &[])
+}
+
+/// Low-level reset used by platform coordinators that must retain ownership
+/// files in the state root for the duration of a destructive reset.
+pub fn reset_locality_state_storage_preserving(
+    state_root: &Path,
+    preserved_entry_names: &[&OsStr],
+) -> Result<LocalStateResetStorageReport, LocalStateResetError> {
     let secret_refs = connection_secret_refs(state_root);
     let (deleted_secret_refs, credential_errors) =
         delete_connection_secrets(state_root, &secret_refs);
-    let clear = clear_state_root_contents(state_root)?;
+    let clear = clear_state_root_contents(state_root, preserved_entry_names)?;
     Ok(LocalStateResetStorageReport {
         state_root: state_root.display().to_string(),
         deleted_secret_refs,
@@ -110,6 +120,7 @@ struct StateRootClearReport {
 
 fn clear_state_root_contents(
     state_root: &Path,
+    preserved_entry_names: &[&OsStr],
 ) -> Result<StateRootClearReport, LocalStateResetError> {
     if !state_root.exists() {
         fs::create_dir_all(state_root).map_err(|error| reset_io_error(state_root, error))?;
@@ -126,7 +137,11 @@ fn clear_state_root_contents(
         let entry = entry.map_err(|error| reset_io_error(state_root, error))?;
         let path = entry.path();
         let display_name = state_entry_name(&path);
-        if should_preserve_state_reset_entry(&path) {
+        if path
+            .file_name()
+            .is_some_and(|name| preserved_entry_names.contains(&name))
+            || should_preserve_state_reset_entry(&path)
+        {
             preserved_state_entries.push(display_name);
             continue;
         }
