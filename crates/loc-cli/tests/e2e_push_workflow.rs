@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, hash_map::DefaultHasher};
+use std::ffi::OsString;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -3744,12 +3745,14 @@ fn cli_reset_requires_yes_and_clears_isolated_state_without_deleting_visible_fil
         !reset.stdout.contains("reset-secret"),
         "reset report should not expose credential values"
     );
-    assert!(
-        fs::read_dir(&fixture.state_root)
-            .expect("read reset state root")
-            .next()
-            .is_none(),
-        "confirmed reset should clear state root"
+    let remaining_entries = fs::read_dir(&fixture.state_root)
+        .expect("read reset state root")
+        .map(|entry| entry.expect("read reset state entry").file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        remaining_entries,
+        vec![OsString::from("localityd.remount.lock")],
+        "confirmed reset should retain only the remount coordination inode"
     );
     assert_eq!(
         fs::read(fixture.root.join("page.md")).expect("read visible file"),

@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,10 +17,57 @@ use locality_store::{
     LegacyLayout0Reason, LegacyWorkspaceMount, MountConfig, MountRepository, ProjectionMode,
     ShadowRepository, SqliteStateStore, StateCompatibilityIssue, StateCompatibilityStatus,
     StoreError, WorkspaceBinding, WorkspaceBindingRecord, WorkspaceBindingRepository,
-    WorkspaceHostBindingError, WorkspaceHostBindingResolver, WorkspaceHostPlatform,
-    WorkspaceRebindBlocker,
+    WorkspaceHostBinding, WorkspaceHostBindingError, WorkspaceHostBindingResolver,
+    WorkspaceHostPlatform, WorkspaceId, WorkspaceProjectionIdentity, WorkspaceRebindBlocker,
+    WorkspaceRemountRecoveryOutcome,
 };
 use rusqlite::{Connection, params};
+
+#[cfg(unix)]
+#[test]
+fn host_binding_equivalent_alias_replay_retains_existing_spelling_in_both_stores() {
+    let fixture = Fixture::new();
+    assert_equivalent_host_replay_retains_spelling(InMemoryStateStore::new(), &fixture);
+    assert_equivalent_host_replay_retains_spelling(fixture.open(), &fixture);
+}
+
+#[cfg(unix)]
+fn assert_equivalent_host_replay_retains_spelling<S>(mut store: S, fixture: &Fixture)
+where
+    S: MountRepository + WorkspaceBindingRepository,
+{
+    let mount = fixture.mount_config(ProjectionMode::LinuxFuse);
+    store.save_mount(mount).expect("save mount");
+    let (host, record) = fixture_atomic_workspace_binding(fixture);
+    store
+        .commit_workspace_binding(host.clone(), record.clone())
+        .expect("commit canonical host spelling");
+    let alias = fixture.root.join("workspace-alias");
+    symlink(host.trusted_workspace_root(), &alias).expect("create equivalent host alias");
+    let alias_host = WorkspaceHostBinding::new(
+        WorkspaceHostPlatform::current(),
+        host.workspace_id().clone(),
+        alias.clone(),
+        host.projection_identity().clone(),
+        host.layout_sequence(),
+    )
+    .expect("alias host binding");
+
+    store
+        .commit_workspace_binding(alias_host, record)
+        .expect("equivalent host replay");
+
+    assert_eq!(
+        store
+            .get_workspace_host_binding(host.workspace_id())
+            .expect("read host")
+            .expect("host exists")
+            .trusted_workspace_root(),
+        host.trusted_workspace_root(),
+        "equivalent replay keeps the established host spelling"
+    );
+    fs::remove_file(alias).expect("remove equivalent host alias");
+}
 
 #[test]
 fn legacy_v20_upgrade_preserves_dirty_shadow_apply_journal_and_mount_identity() {
@@ -191,6 +240,566 @@ fn coordinator_binding_survives_restart_and_resolves_host_roots_without_mutating
             .expect("journal after rebind"),
         Some(journal)
     );
+}
+
+#[test]
+fn layout1_host_binding_persists_identity_root_domain_sequence_and_resolves_mount() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let mount = fixture.mount_config(ProjectionMode::LinuxFuse);
+    store.save_mount(mount.clone()).expect("save mount");
+    let workspace_id = WorkspaceId::new("locality.workspace.linux_fuse").expect("workspace ID");
+    let host = WorkspaceHostBinding::new(
+        WorkspaceHostPlatform::current(),
+        workspace_id.clone(),
+        fixture.mount_root.parent().expect("workspace root"),
+        WorkspaceProjectionIdentity::new("linux-fuse:locality-shared-root")
+            .expect("projection identity"),
+        1,
+    )
+    .expect("host binding");
+    let binding = WorkspaceBinding::for_workspace(
+        workspace_id.clone(),
+        MountTarget::new("notion-main").expect("target"),
+    );
+    store
+        .commit_workspace_binding(
+            host.clone(),
+            WorkspaceBindingRecord::new(fixture.mount_id.clone(), binding),
+        )
+        .expect("commit workspace binding");
+
+    assert_eq!(
+        store
+            .resolve_workspace_mount_root(&mount)
+            .expect("resolve root"),
+        fixture.mount_root
+    );
+    drop(store);
+
+    let reopened = fixture.open();
+    assert_eq!(
+        reopened
+            .get_workspace_host_binding(&workspace_id)
+            .expect("read host binding"),
+        Some(host)
+    );
+    assert_eq!(
+        reopened
+            .resolve_workspace_mount_root(&mount)
+            .expect("resolve after restart"),
+        fixture.mount_root
+    );
+}
+
+#[test]
+fn layout1_commit_rejects_a_host_root_that_would_move_the_mount() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config(ProjectionMode::LinuxFuse))
+        .expect("save mount");
+    let workspace_id = WorkspaceId::new("locality.workspace.linux_fuse").expect("workspace ID");
+    let host = WorkspaceHostBinding::new(
+        WorkspaceHostPlatform::current(),
+        workspace_id.clone(),
+        fixture.root.join("DifferentLocality"),
+        WorkspaceProjectionIdentity::new("linux-fuse:locality-shared-root")
+            .expect("projection identity"),
+        1,
+    )
+    .expect("host binding");
+    let result = store.commit_workspace_binding(
+        host,
+        WorkspaceBindingRecord::new(
+            fixture.mount_id.clone(),
+            WorkspaceBinding::for_workspace(
+                workspace_id.clone(),
+                MountTarget::new("notion-main").expect("target"),
+            ),
+        ),
+    );
+
+    assert!(
+        matches!(result, Err(StoreError::InvalidState(message)) if message.contains("preserved root"))
+    );
+    assert_eq!(
+        store
+            .get_workspace_binding(&fixture.mount_id)
+            .expect("binding lookup"),
+        None
+    );
+    assert_eq!(
+        store
+            .get_workspace_host_binding(&workspace_id)
+            .expect("host lookup"),
+        None
+    );
+}
+
+#[test]
+fn failed_atomic_remount_preserves_mount_root_and_source_state() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let original = fixture.mount_config(ProjectionMode::LinuxFuse);
+    let workspace_id = WorkspaceId::new("locality.workspace.linux_fuse").expect("workspace ID");
+    let projection_identity = WorkspaceProjectionIdentity::new("linux-fuse:locality-shared-root")
+        .expect("projection identity");
+    let host = WorkspaceHostBinding::new(
+        WorkspaceHostPlatform::current(),
+        workspace_id.clone(),
+        fixture.mount_root.parent().expect("workspace root"),
+        projection_identity.clone(),
+        1,
+    )
+    .expect("host binding");
+    let record = WorkspaceBindingRecord::new(
+        fixture.mount_id.clone(),
+        WorkspaceBinding::for_workspace(
+            workspace_id.clone(),
+            MountTarget::new("notion-main").expect("target"),
+        ),
+    );
+    store
+        .save_mount_with_workspace_binding(original.clone(), host, record.clone())
+        .expect("initial atomic mount");
+    let entity = dirty_entity(&fixture.mount_id);
+    store
+        .save_entity(entity.clone())
+        .expect("save source state");
+
+    let moved_parent = fixture.root.join("MovedLocality");
+    fs::create_dir_all(&moved_parent).expect("moved parent");
+    let requested = MountConfig::new(
+        fixture.mount_id.clone(),
+        "different-connector",
+        moved_parent.join("notion-main"),
+    )
+    .projection(ProjectionMode::LinuxFuse)
+    .with_settings_json("{\"changed\":true}");
+    let requested_host = WorkspaceHostBinding::new(
+        WorkspaceHostPlatform::current(),
+        workspace_id,
+        moved_parent,
+        projection_identity,
+        1,
+    )
+    .expect("requested host");
+
+    assert!(matches!(
+        store.save_mount_with_workspace_binding(requested, requested_host, record),
+        Err(StoreError::InvalidState(message))
+            if message.contains("immutable outside an owning coordinator")
+    ));
+    assert_eq!(
+        store
+            .get_mount(&fixture.mount_id)
+            .expect("mount after failure"),
+        Some(original)
+    );
+    assert_eq!(
+        store
+            .get_entity(&fixture.mount_id, &RemoteId::new("page-1"))
+            .expect("source state after failure"),
+        Some(entity)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_binding_rejects_mount_symlink_that_escapes_trusted_root() {
+    let fixture = Fixture::new();
+    let trusted_root = fixture.root.join("TrustedLocality");
+    let outside = fixture.root.join("Outside/notion-main");
+    fs::create_dir_all(&trusted_root).expect("trusted root");
+    fs::create_dir_all(&outside).expect("outside target");
+    let mount_root = trusted_root.join("notion-main");
+    symlink(&outside, &mount_root).expect("escaping mount symlink");
+    let workspace_id = WorkspaceId::new("locality.workspace.symlink-test").expect("workspace ID");
+    let host = WorkspaceHostBinding::new(
+        WorkspaceHostPlatform::current(),
+        workspace_id.clone(),
+        &trusted_root,
+        WorkspaceProjectionIdentity::new("linux-fuse:symlink-test").expect("projection identity"),
+        1,
+    )
+    .expect("host binding");
+    let mount_id = MountId::new("symlink-mount");
+    let mount = MountConfig::new(mount_id.clone(), "notion", &mount_root)
+        .projection(ProjectionMode::LinuxFuse);
+    let record = WorkspaceBindingRecord::new(
+        mount_id.clone(),
+        WorkspaceBinding::for_workspace(
+            workspace_id,
+            MountTarget::new("notion-main").expect("target"),
+        ),
+    );
+    let mut store = fixture.open();
+
+    assert!(matches!(
+        store.save_mount_with_workspace_binding(mount, host, record),
+        Err(StoreError::InvalidState(message)) if message.contains("escapes")
+    ));
+    assert_eq!(store.get_mount(&mount_id).expect("mount lookup"), None);
+}
+
+#[test]
+fn identical_targets_are_unique_per_workspace_not_globally() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    for (ordinal, workspace_name) in ["alpha", "beta"].into_iter().enumerate() {
+        let workspace_root = fixture.root.join(format!("Locality-{workspace_name}"));
+        fs::create_dir_all(&workspace_root).expect("workspace root");
+        let mount_id = MountId::new(format!("mount-{workspace_name}"));
+        let workspace_id =
+            WorkspaceId::new(format!("locality.workspace.{workspace_name}")).expect("workspace");
+        let host = WorkspaceHostBinding::new(
+            WorkspaceHostPlatform::current(),
+            workspace_id.clone(),
+            &workspace_root,
+            WorkspaceProjectionIdentity::new(format!("linux-fuse:{workspace_name}"))
+                .expect("projection identity"),
+            1,
+        )
+        .expect("host binding");
+        let mount = MountConfig::new(
+            mount_id.clone(),
+            "notion",
+            workspace_root.join("shared-target"),
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let record = WorkspaceBindingRecord::new(
+            mount_id,
+            WorkspaceBinding::for_workspace(
+                workspace_id,
+                MountTarget::new("shared-target").expect("target"),
+            ),
+        );
+        store
+            .save_mount_with_workspace_binding(mount, host, record)
+            .unwrap_or_else(|error| panic!("workspace {ordinal} commit: {error}"));
+    }
+
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    let scopes: Vec<String> = connection
+        .prepare(
+            "SELECT workspace_id FROM workspace_bindings
+             WHERE target_collision_key = 'shared-target' ORDER BY workspace_id",
+        )
+        .expect("prepare scopes")
+        .query_map([], |row| row.get(0))
+        .expect("query scopes")
+        .collect::<Result<_, _>>()
+        .expect("collect scopes");
+    assert_eq!(
+        scopes,
+        vec![
+            "locality.workspace.alpha".to_string(),
+            "locality.workspace.beta".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn current_v2_component_migration_preserves_existing_v1_sqlite_binding() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let mount = fixture.mount_config(ProjectionMode::LinuxFuse);
+    store.save_mount(mount.clone()).expect("save mount");
+    save_trusted_fixture_binding(&mut store, &fixture);
+    drop(store);
+
+    let connection = Connection::open(fixture.state_root.join("state.sqlite3"))
+        .expect("raw current schema connection");
+    connection
+        .execute_batch(
+            "DROP TABLE workspace_host_bindings;
+             UPDATE state_components
+             SET version = 2, min_reader_version = 2,
+                 data_json = '{\"format\":\"workspace_binding.v1\",\"layout_0_without_binding\":true}'
+             WHERE component_id = 'durable:workspace_bindings';",
+        )
+        .expect("downgrade workspace component");
+    drop(connection);
+
+    let reopened = fixture.open();
+    let binding = reopened
+        .get_workspace_binding(&fixture.mount_id)
+        .expect("read migrated binding")
+        .expect("binding preserved");
+    assert_eq!(binding.mount_target().as_str(), "notion-main");
+    assert_eq!(binding.workspace_id(), None);
+    assert_eq!(
+        reopened
+            .resolve_workspace_mount_root(&mount)
+            .expect("legacy binding fallback"),
+        fixture.mount_root
+    );
+    let connection = Connection::open(fixture.state_root.join("state.sqlite3"))
+        .expect("raw migrated connection");
+    let component_version: i64 = connection
+        .query_row(
+            "SELECT version FROM state_components WHERE component_id = 'durable:workspace_bindings'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("component version");
+    assert_eq!(component_version, 4);
+}
+
+#[test]
+fn current_v3_component_migration_adds_remount_outcome_table() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    let connection = Connection::open(&store.db_path).expect("raw current schema connection");
+    connection
+        .execute_batch(
+            "DROP TABLE workspace_remount_recoveries;
+             UPDATE state_components
+             SET version = 3, min_reader_version = 3,
+                 data_json = '{\"format\":\"workspace_binding.v2\",\"layout_0_without_binding\":true,\"legacy_v1_readable\":true,\"target_scope\":\"workspace_id\"}'
+             WHERE component_id = 'durable:workspace_bindings';",
+        )
+        .expect("downgrade workspace component");
+    drop(connection);
+    drop(store);
+
+    let reopened = fixture.open();
+    let connection = Connection::open(&reopened.db_path).expect("raw migrated connection");
+    let migrated: (i64, bool, bool) = connection
+        .query_row(
+            "SELECT
+                (SELECT version FROM state_components
+                 WHERE component_id = 'durable:workspace_bindings'),
+                EXISTS(SELECT 1 FROM sqlite_master
+                       WHERE type = 'table' AND name = 'workspace_remount_recoveries'),
+                EXISTS(SELECT 1 FROM sqlite_master
+                       WHERE type = 'index'
+                         AND name = 'workspace_remount_recoveries_mount_unique')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("migration state");
+    assert_eq!(migrated, (4, true, true));
+}
+
+#[test]
+fn identical_mount_commit_persists_atomic_remount_outcome_across_reopen() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let mount = fixture.mount_config(ProjectionMode::LinuxFuse);
+    let (host, record) = fixture_atomic_workspace_binding(&fixture);
+    store
+        .save_mount_with_workspace_binding(mount.clone(), host.clone(), record.clone())
+        .expect("save atomic mount");
+
+    store
+        .begin_workspace_remount_recovery("identical-commit", &fixture.mount_id)
+        .expect("prepare outcome");
+    let mut cleanup = || Ok(());
+    store
+        .save_mount_with_workspace_binding_and_cleanup(mount.clone(), host, record, &mut cleanup)
+        .expect("commit identical mount");
+    assert_eq!(
+        store
+            .get_workspace_remount_recovery("identical-commit")
+            .expect("outcome"),
+        Some((
+            fixture.mount_id.clone(),
+            WorkspaceRemountRecoveryOutcome::Committed
+        ))
+    );
+    drop(store);
+
+    let reopened = fixture.open();
+    assert_eq!(
+        reopened
+            .get_workspace_remount_recovery("identical-commit")
+            .expect("reopened outcome"),
+        Some((
+            fixture.mount_id.clone(),
+            WorkspaceRemountRecoveryOutcome::Committed
+        ))
+    );
+    assert_eq!(
+        reopened.get_mount(&fixture.mount_id).expect("mount"),
+        Some(mount)
+    );
+}
+
+#[test]
+fn identical_mount_failed_cleanup_stays_prepared_and_stale_token_is_rejected() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open();
+    let mount = fixture.mount_config(ProjectionMode::LinuxFuse);
+    let (host, record) = fixture_atomic_workspace_binding(&fixture);
+    store
+        .save_mount_with_workspace_binding(mount.clone(), host.clone(), record.clone())
+        .expect("save atomic mount");
+
+    store
+        .begin_workspace_remount_recovery("identical-prepared", &fixture.mount_id)
+        .expect("prepare outcome");
+    assert!(matches!(
+        store.begin_workspace_remount_recovery("stale-second-token", &fixture.mount_id),
+        Err(StoreError::InvalidState(message)) if message.contains("already has")
+    ));
+    let mut cleanup = || {
+        Err(StoreError::InvalidState(
+            "injected cleanup failure".to_string(),
+        ))
+    };
+    assert!(matches!(
+        store.save_mount_with_workspace_binding_and_cleanup(
+            mount.clone(), host, record, &mut cleanup
+        ),
+        Err(StoreError::InvalidState(message)) if message == "injected cleanup failure"
+    ));
+    assert_eq!(
+        store
+            .get_workspace_remount_recovery("identical-prepared")
+            .expect("outcome"),
+        Some((
+            fixture.mount_id.clone(),
+            WorkspaceRemountRecoveryOutcome::Prepared
+        ))
+    );
+    assert_eq!(
+        store.get_mount(&fixture.mount_id).expect("mount"),
+        Some(mount)
+    );
+}
+
+#[test]
+fn workspace_component_upgrade_preflights_global_compatibility_before_schema_mutation() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    connection
+        .execute_batch(
+            "DROP TABLE workspace_bindings;
+             DROP TABLE workspace_host_bindings;
+             CREATE TABLE workspace_bindings (
+                 mount_id TEXT PRIMARY KEY,
+                 binding_json TEXT NOT NULL,
+                 target_collision_key TEXT NOT NULL UNIQUE,
+                 FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+             );
+             UPDATE state_components
+             SET version = 2, min_reader_version = 2
+             WHERE component_id = 'durable:workspace_bindings';
+             INSERT INTO state_components (
+                 component_id, component_kind, version, min_reader_version,
+                 required, rebuildable, data_json, updated_at
+             ) VALUES (
+                 'future:incompatible', 'durable_json', 1, 99,
+                 1, 0, '{}', '2026-08-02T00:00:00Z'
+             );",
+        )
+        .expect("prepare incompatible component fixture");
+    drop(connection);
+    let db_path = store.db_path.clone();
+    drop(store);
+
+    assert!(matches!(
+        SqliteStateStore::open(fixture.state_root.clone()),
+        Err(StoreError::StateCompatibility(message))
+            if message.contains("future:incompatible")
+    ));
+    let connection = Connection::open(db_path).expect("raw failed-upgrade connection");
+    let host_table_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'workspace_host_bindings'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("host table existence");
+    let workspace_column_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('workspace_bindings')
+                WHERE name = 'workspace_id'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("workspace column existence");
+    let component_version: i64 = connection
+        .query_row(
+            "SELECT version FROM state_components
+             WHERE component_id = 'durable:workspace_bindings'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("workspace component version");
+    assert!(!host_table_exists);
+    assert!(!workspace_column_exists);
+    assert_eq!(component_version, 2);
+}
+
+#[test]
+fn workspace_component_upgrade_allows_other_supported_component_migrations() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    connection
+        .execute_batch(
+            "DROP TABLE workspace_bindings;
+             DROP TABLE workspace_host_bindings;
+             CREATE TABLE workspace_bindings (
+                 mount_id TEXT PRIMARY KEY,
+                 binding_json TEXT NOT NULL,
+                 target_collision_key TEXT NOT NULL UNIQUE,
+                 FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+             );
+             UPDATE state_components
+             SET version = 2, min_reader_version = 2
+             WHERE component_id = 'durable:workspace_bindings';
+             UPDATE state_components
+             SET version = 2, min_reader_version = 1
+             WHERE component_id = 'durable:journals';",
+        )
+        .expect("prepare mixed supported component fixture");
+    drop(connection);
+    drop(store);
+
+    let reopened = fixture.open();
+    let connection = Connection::open(&reopened.db_path).expect("raw migrated connection");
+    let versions = connection
+        .prepare(
+            "SELECT component_id, version
+             FROM state_components
+             WHERE component_id IN ('durable:journals', 'durable:workspace_bindings')
+             ORDER BY component_id",
+        )
+        .expect("prepare component versions")
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .expect("query component versions")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect component versions");
+    assert_eq!(
+        versions,
+        vec![
+            ("durable:journals".to_string(), 3),
+            ("durable:workspace_bindings".to_string(), 4),
+        ]
+    );
+    let workspace_column_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('workspace_bindings')
+                WHERE name = 'workspace_id'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("workspace scope column");
+    assert!(workspace_column_exists);
 }
 
 #[test]
@@ -523,6 +1132,332 @@ fn workspace_binding_collision_includes_unbound_layout_zero_mounts() {
 
     let fixture = Fixture::new();
     assert_layout_zero_collision_is_reserved(fixture.open());
+}
+
+#[test]
+fn in_memory_v1_upgrade_still_scans_workspace_collisions() {
+    let fixture = Fixture::new();
+    assert_v1_upgrade_scans_workspace_collisions(InMemoryStateStore::default(), &fixture.root);
+}
+
+#[test]
+fn sqlite_v1_upgrade_still_scans_workspace_collisions() {
+    let fixture = Fixture::new();
+    assert_v1_upgrade_scans_workspace_collisions(fixture.open(), &fixture.root);
+}
+
+#[test]
+fn in_memory_stale_v1_target_still_reserves_authoritative_legacy_root() {
+    let fixture = Fixture::new();
+    assert_stale_v1_target_reserves_authoritative_legacy_root(
+        InMemoryStateStore::default(),
+        &fixture.root,
+    );
+}
+
+#[test]
+fn sqlite_stale_v1_target_still_reserves_authoritative_legacy_root() {
+    let fixture = Fixture::new();
+    assert_stale_v1_target_reserves_authoritative_legacy_root(fixture.open(), &fixture.root);
+}
+
+#[cfg(unix)]
+#[test]
+fn in_memory_legacy_root_alias_reserves_canonical_workspace_target() {
+    let fixture = Fixture::new();
+    assert_legacy_root_alias_reserves_canonical_workspace_target(
+        InMemoryStateStore::default(),
+        &fixture.root,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sqlite_legacy_root_alias_reserves_canonical_workspace_target() {
+    let fixture = Fixture::new();
+    assert_legacy_root_alias_reserves_canonical_workspace_target(fixture.open(), &fixture.root);
+}
+
+#[cfg(unix)]
+fn assert_legacy_root_alias_reserves_canonical_workspace_target<S>(mut store: S, root: &Path)
+where
+    S: MountRepository + WorkspaceBindingRepository,
+{
+    let workspace_root = root.join("AliasWorkspace");
+    let alias_root = root.join("AliasParent");
+    let target = MountTarget::new("canonical-target").expect("target");
+    fs::create_dir_all(workspace_root.join(target.as_str())).expect("canonical mount root");
+    symlink(&workspace_root, &alias_root).expect("workspace-root alias");
+
+    let legacy_mount_id = MountId::new("legacy-alias");
+    store
+        .save_mount(MountConfig::new(
+            legacy_mount_id.clone(),
+            "notion",
+            alias_root.join(target.as_str()),
+        ))
+        .expect("save aliased legacy mount");
+    store
+        .save_workspace_binding(WorkspaceBindingRecord::new(
+            legacy_mount_id.clone(),
+            WorkspaceBinding::new(MountTarget::new("stale-alias-target").expect("stale target")),
+        ))
+        .expect("save stale v1 binding");
+
+    let candidate_mount_id = MountId::new("candidate-canonical");
+    store
+        .save_mount(MountConfig::new(
+            candidate_mount_id.clone(),
+            "google-docs",
+            workspace_root.join(target.as_str()),
+        ))
+        .expect("save candidate mount");
+    let workspace_id = WorkspaceId::new("locality.workspace.alias-collision").expect("workspace");
+    let error = store
+        .commit_workspace_binding(
+            WorkspaceHostBinding::new(
+                WorkspaceHostPlatform::current(),
+                workspace_id.clone(),
+                &workspace_root,
+                WorkspaceProjectionIdentity::new("test:alias-collision")
+                    .expect("projection identity"),
+                1,
+            )
+            .expect("host binding"),
+            WorkspaceBindingRecord::new(
+                candidate_mount_id,
+                WorkspaceBinding::for_workspace(workspace_id, target.clone()),
+            ),
+        )
+        .expect_err("canonical alias must reserve the actual legacy target");
+
+    assert_eq!(
+        error,
+        StoreError::WorkspaceMountTargetCollision {
+            target: target.as_str().to_string(),
+            existing_mount_id: legacy_mount_id,
+        }
+    );
+}
+
+#[test]
+fn exact_replay_skips_workspace_collision_scan() {
+    let memory_fixture = Fixture::new();
+    assert_exact_replay_skips_workspace_collision_scan(
+        InMemoryStateStore::default(),
+        &memory_fixture.root,
+    );
+    let sqlite_fixture = Fixture::new();
+    assert_exact_replay_skips_workspace_collision_scan(sqlite_fixture.open(), &sqlite_fixture.root);
+}
+
+fn assert_exact_replay_skips_workspace_collision_scan<S>(mut store: S, root: &Path)
+where
+    S: MountRepository + WorkspaceBindingRepository,
+{
+    let workspace_root = root.join("ExactReplayWorkspace");
+    fs::create_dir_all(&workspace_root).expect("workspace root");
+    let mount_id = MountId::new("exact-replay");
+    let collision_mount_id = MountId::new("later-layout-zero-collision");
+    let target = MountTarget::new("shared-target").expect("target");
+    let workspace_id = WorkspaceId::new("locality.workspace.exact-replay").expect("workspace");
+    let host = WorkspaceHostBinding::new(
+        WorkspaceHostPlatform::current(),
+        workspace_id.clone(),
+        &workspace_root,
+        WorkspaceProjectionIdentity::new("test:exact-replay").expect("projection identity"),
+        1,
+    )
+    .expect("host binding");
+    let record = WorkspaceBindingRecord::new(
+        mount_id.clone(),
+        WorkspaceBinding::for_workspace(workspace_id, target.clone()),
+    );
+
+    store
+        .save_mount(MountConfig::new(
+            mount_id,
+            "notion",
+            workspace_root.join(target.as_str()),
+        ))
+        .expect("save bound mount");
+    store
+        .commit_workspace_binding(host.clone(), record.clone())
+        .expect("initial binding commit");
+    store
+        .save_mount(MountConfig::new(
+            collision_mount_id,
+            "google-docs",
+            workspace_root.join(target.as_str()),
+        ))
+        .expect("introduce later layout-zero collision");
+
+    store
+        .commit_workspace_binding(host, record)
+        .expect("exact replay must not rescan later collisions");
+}
+
+fn assert_stale_v1_target_reserves_authoritative_legacy_root<S>(mut store: S, root: &Path)
+where
+    S: MountRepository + WorkspaceBindingRepository,
+{
+    let workspace_root = root.join("StaleV1Workspace");
+    fs::create_dir_all(&workspace_root).expect("workspace root");
+    let legacy_mount_id = MountId::new("legacy-stale-v1");
+    let candidate_mount_id = MountId::new("candidate-layout-1");
+    let authoritative_target = MountTarget::new("authoritative-root").expect("target");
+    let stale_target = MountTarget::new("stale-v1-metadata").expect("stale target");
+    let authoritative_root = workspace_root.join(authoritative_target.as_str());
+
+    store
+        .save_mount(MountConfig::new(
+            legacy_mount_id.clone(),
+            "notion",
+            authoritative_root.clone(),
+        ))
+        .expect("save legacy mount");
+    store
+        .save_workspace_binding(WorkspaceBindingRecord::new(
+            legacy_mount_id.clone(),
+            WorkspaceBinding::new(stale_target),
+        ))
+        .expect("save stale v1 binding");
+    store
+        .save_mount(MountConfig::new(
+            candidate_mount_id.clone(),
+            "google-docs",
+            authoritative_root,
+        ))
+        .expect("save layout-1 candidate");
+
+    let workspace_id = WorkspaceId::new("locality.workspace.stale-v1").expect("workspace");
+    let error = store
+        .commit_workspace_binding(
+            WorkspaceHostBinding::new(
+                WorkspaceHostPlatform::current(),
+                workspace_id.clone(),
+                &workspace_root,
+                WorkspaceProjectionIdentity::new("test:stale-v1-root")
+                    .expect("projection identity"),
+                1,
+            )
+            .expect("host binding"),
+            WorkspaceBindingRecord::new(
+                candidate_mount_id,
+                WorkspaceBinding::for_workspace(workspace_id, authoritative_target.clone()),
+            ),
+        )
+        .expect_err("authoritative legacy root must remain reserved");
+
+    assert_eq!(
+        error,
+        StoreError::WorkspaceMountTargetCollision {
+            target: authoritative_target.as_str().to_string(),
+            existing_mount_id: legacy_mount_id,
+        }
+    );
+}
+
+fn assert_v1_upgrade_scans_workspace_collisions<S>(mut store: S, root: &Path)
+where
+    S: MountRepository + WorkspaceBindingRepository,
+{
+    let legacy_mount_id = MountId::new("legacy-v1");
+    let existing_mount_id = MountId::new("existing-v2");
+    let legacy_workspace_root = root.join("LegacyWorkspace");
+    let target_workspace_root = root.join("TargetWorkspace");
+    fs::create_dir_all(&legacy_workspace_root).expect("legacy workspace root");
+    fs::create_dir_all(&target_workspace_root).expect("target workspace root");
+    let target = MountTarget::new("shared-target").expect("shared target");
+
+    store
+        .save_mount(MountConfig::new(
+            legacy_mount_id.clone(),
+            "notion",
+            legacy_workspace_root.join(target.as_str()),
+        ))
+        .expect("save legacy mount");
+    store
+        .save_workspace_binding(WorkspaceBindingRecord::new(
+            legacy_mount_id.clone(),
+            WorkspaceBinding::new(target.clone()),
+        ))
+        .expect("save v1 binding");
+
+    store
+        .save_mount(MountConfig::new(
+            existing_mount_id.clone(),
+            "google-docs",
+            target_workspace_root.join(target.as_str()),
+        ))
+        .expect("save existing v2 mount");
+    let workspace_id = WorkspaceId::new("locality.workspace.v1-upgrade").expect("workspace");
+    let projection_identity =
+        WorkspaceProjectionIdentity::new("test:v1-upgrade-collision").expect("projection identity");
+    store
+        .commit_workspace_binding(
+            WorkspaceHostBinding::new(
+                WorkspaceHostPlatform::current(),
+                workspace_id.clone(),
+                &target_workspace_root,
+                projection_identity.clone(),
+                1,
+            )
+            .expect("initial host binding"),
+            WorkspaceBindingRecord::new(
+                existing_mount_id.clone(),
+                WorkspaceBinding::for_workspace(workspace_id.clone(), target.clone()),
+            ),
+        )
+        .expect("save existing v2 binding");
+
+    store
+        .save_mount(MountConfig::new(
+            legacy_mount_id.clone(),
+            "notion",
+            target_workspace_root.join(target.as_str()),
+        ))
+        .expect("move legacy mount under target workspace");
+    let error = store
+        .commit_workspace_binding(
+            WorkspaceHostBinding::new(
+                WorkspaceHostPlatform::current(),
+                workspace_id.clone(),
+                &target_workspace_root,
+                projection_identity,
+                2,
+            )
+            .expect("next host binding"),
+            WorkspaceBindingRecord::new(
+                legacy_mount_id.clone(),
+                WorkspaceBinding::for_workspace(workspace_id.clone(), target.clone()),
+            ),
+        )
+        .expect_err("v1 upgrade must scan the target workspace");
+
+    assert_eq!(
+        error,
+        StoreError::WorkspaceMountTargetCollision {
+            target: target.as_str().to_string(),
+            existing_mount_id,
+        }
+    );
+    assert_eq!(
+        store
+            .get_workspace_binding(&legacy_mount_id)
+            .expect("legacy binding after collision")
+            .expect("legacy binding remains")
+            .workspace_id(),
+        None
+    );
+    assert_eq!(
+        store
+            .get_workspace_host_binding(&workspace_id)
+            .expect("host after collision")
+            .expect("host remains")
+            .layout_sequence(),
+        1
+    );
 }
 
 fn assert_layout_zero_collision_is_reserved<S>(mut store: S)
@@ -1236,7 +2171,7 @@ fn current_reader_rejects_newer_binding_metadata_without_touching_mount() {
              SET binding_json = ?1
              WHERE mount_id = ?2",
             params![
-                r#"{"binding_version":2,"layout_version":1,"mount_target":"notion-main"}"#,
+                r#"{"binding_version":3,"layout_version":1,"mount_target":"notion-main"}"#,
                 fixture.mount_id.0.as_str()
             ],
         )
@@ -1406,6 +2341,28 @@ where
     store
         .save_workspace_binding(binding)
         .expect("save trusted fixture binding");
+}
+
+fn fixture_atomic_workspace_binding(
+    fixture: &Fixture,
+) -> (WorkspaceHostBinding, WorkspaceBindingRecord) {
+    let workspace_id = WorkspaceId::new("locality.workspace.remount-test").expect("workspace ID");
+    let host = WorkspaceHostBinding::new(
+        WorkspaceHostPlatform::current(),
+        workspace_id.clone(),
+        fixture.mount_root.parent().expect("workspace root"),
+        WorkspaceProjectionIdentity::new("linux-fuse:remount-test").expect("projection identity"),
+        1,
+    )
+    .expect("host binding");
+    let record = WorkspaceBindingRecord::new(
+        fixture.mount_id.clone(),
+        WorkspaceBinding::for_workspace(
+            workspace_id,
+            MountTarget::new("notion-main").expect("target"),
+        ),
+    );
+    (host, record)
 }
 
 fn dirty_entity(mount_id: &MountId) -> EntityRecord {

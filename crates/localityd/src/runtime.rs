@@ -93,7 +93,7 @@ pub struct DaemonRuntimeHandle {
     sender: Sender<RuntimeMessage>,
 }
 
-const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const FRESHNESS_JOB_BUDGET_UNITS: u16 = 5;
 const MAX_WORKSPACE_FRESHNESS_JOBS_PER_TICK: usize = 100;
 const LIVE_MODE_REMOTE_OBSERVE_QUEUE_SHARE: f64 = 1.0 / 3.0;
@@ -1408,6 +1408,8 @@ struct RuntimeState {
     scheduler: PullScheduler,
     last_scheduler_advance: Instant,
     active_job: Option<ActiveRuntimeJob>,
+    shutdown_requested: bool,
+    shutdown_responders: Vec<Sender<DaemonResponse>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1561,6 +1563,8 @@ impl RuntimeState {
             active_scheduled_fetch: None,
             pending_scheduled_reconcile: None,
             active_job: None,
+            shutdown_requested: false,
+            shutdown_responders: Vec::new(),
         }
     }
 
@@ -1571,6 +1575,13 @@ impl RuntimeState {
                     request,
                     respond_to,
                 }) => {
+                    if self.shutdown_requested {
+                        let _ = respond_to.send(DaemonResponse::error(
+                            "runtime_stopped",
+                            "daemon runtime is shutting down",
+                        ));
+                        continue;
+                    }
                     if matches!(
                         self.handle_request(request, respond_to),
                         RuntimeLoopDecision::Stop
@@ -1583,11 +1594,47 @@ impl RuntimeState {
                     let _ = respond_to.send(self.status());
                 }
                 Ok(RuntimeMessage::PrimeVirtualMounts) => self.prime_virtual_mounts(),
-                Ok(RuntimeMessage::JobFinished(completion)) => self.handle_completion(completion),
-                Ok(RuntimeMessage::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
-                Err(RecvTimeoutError::Timeout) => self.handle_timeout(),
+                Ok(RuntimeMessage::JobFinished(completion)) => {
+                    self.handle_completion(completion);
+                    if self.finish_shutdown_if_drained() {
+                        break;
+                    }
+                }
+                Ok(RuntimeMessage::Shutdown) => {
+                    self.begin_shutdown(None);
+                    if self.finish_shutdown_if_drained() {
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) if !self.shutdown_requested => self.handle_timeout(),
+                Err(RecvTimeoutError::Timeout) => {}
             }
         }
+    }
+
+    fn begin_shutdown(&mut self, responder: Option<Sender<DaemonResponse>>) {
+        self.shutdown_requested = true;
+        self.pending_requests.clear();
+        if let Some(responder) = responder {
+            self.shutdown_responders.push(responder);
+        }
+    }
+
+    fn finish_shutdown_if_drained(&mut self) -> bool {
+        if !self.shutdown_requested
+            || self.active_job.is_some()
+            || self.active_scheduled_fetch.is_some()
+            || !self.active_child_refreshes.is_empty()
+        {
+            return false;
+        }
+        for responder in self.shutdown_responders.drain(..) {
+            let _ = responder.send(DaemonResponse::ok(json!({
+                "status": "shutting_down"
+            })));
+        }
+        true
     }
 
     fn handle_request(
@@ -1612,10 +1659,10 @@ impl RuntimeState {
                 ));
             }
             DaemonRequest::Shutdown => {
-                let _ = respond_to.send(DaemonResponse::ok(json!({
-                    "status": "shutting_down"
-                })));
-                return RuntimeLoopDecision::Stop;
+                self.begin_shutdown(Some(respond_to));
+                if self.finish_shutdown_if_drained() {
+                    return RuntimeLoopDecision::Stop;
+                }
             }
             DaemonRequest::Pull { path } => {
                 self.pending_requests
@@ -2231,6 +2278,9 @@ impl RuntimeState {
     }
 
     fn maybe_start_next_job(&mut self) {
+        if self.shutdown_requested {
+            return;
+        }
         if self.active_job.is_none() {
             let job = if let Some(request) = self.pop_next_pending_request() {
                 Some(MutatingJob::Request(request))

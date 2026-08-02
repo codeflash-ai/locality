@@ -42,8 +42,21 @@ const DIRECTORY_ACCESS: u32 = FILE_LIST_DIRECTORY
     | FILE_ADD_SUBDIRECTORY
     | DELETE
     | SYNCHRONIZE;
+const MUTATION_DIRECTORY_ACCESS: u32 = FILE_LIST_DIRECTORY
+    | FILE_TRAVERSE
+    | FILE_READ_ATTRIBUTES
+    | FILE_WRITE_ATTRIBUTES
+    | FILE_ADD_FILE
+    | FILE_ADD_SUBDIRECTORY
+    | SYNCHRONIZE;
 const READ_DIRECTORY_ACCESS: u32 =
     FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+const SYNC_DIRECTORY_ACCESS: u32 = FILE_LIST_DIRECTORY
+    | FILE_TRAVERSE
+    | FILE_READ_ATTRIBUTES
+    | FILE_WRITE_DATA
+    | FILE_WRITE_ATTRIBUTES
+    | SYNCHRONIZE;
 const CLEANUP_DIRECTORY_ACCESS: u32 = FILE_LIST_DIRECTORY
     | FILE_TRAVERSE
     | FILE_READ_ATTRIBUTES
@@ -63,16 +76,128 @@ const MUTABLE_FILE_ACCESS: u32 = FILE_READ_DATA
     | SYNCHRONIZE;
 const CLEANUP_FILE_ACCESS: u32 =
     FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | DELETE | SYNCHRONIZE;
+const IDENTITY_FILE_ACCESS: u32 = FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const READ_FILE_ACCESS: u32 = FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const LOCK_FILE_ACCESS: u32 = FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const SHARING: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+const ANCHOR_SHARING: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
 const LOCK_SHARING: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
+
+pub(crate) fn inspect_path_identity_no_follow(
+    path: &Path,
+) -> io::Result<WorkspaceGenerationIdentity> {
+    let file = OpenOptions::new()
+        .access_mode(IDENTITY_FILE_ACCESS)
+        .share_mode(SHARING)
+        .custom_flags(
+            windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS
+                | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+        .open(path)?;
+    let handle: OwnedHandle = file.into();
+    reject_reparse(&handle)?;
+    handle_identity(&handle)
+}
 
 pub(crate) struct WindowsDirectory {
     handle: OwnedHandle,
 }
 
 impl WindowsDirectory {
+    pub(crate) fn open_absolute_anchor(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .access_mode(READ_DIRECTORY_ACCESS)
+            .share_mode(ANCHOR_SHARING)
+            .custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS
+                    | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+            .open(path)?;
+        let handle: OwnedHandle = file.into();
+        reject_reparse(&handle)?;
+        Ok(Self { handle })
+    }
+
+    pub(crate) fn open_absolute_mutation_anchor(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .access_mode(MUTATION_DIRECTORY_ACCESS)
+            .share_mode(ANCHOR_SHARING)
+            .custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS
+                    | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+            .open(path)?;
+        let handle: OwnedHandle = file.into();
+        reject_reparse(&handle)?;
+        Ok(Self { handle })
+    }
+
+    pub(crate) fn open_directory_anchor(&self, name: &OsStr) -> io::Result<Self> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            READ_DIRECTORY_ACCESS,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(Self { handle })
+    }
+
+    pub(crate) fn open_directory_mutation_anchor(&self, name: &OsStr) -> io::Result<Self> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            MUTATION_DIRECTORY_ACCESS,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(Self { handle })
+    }
+
+    pub(crate) fn open_absolute_sync_anchor(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .access_mode(SYNC_DIRECTORY_ACCESS)
+            .share_mode(ANCHOR_SHARING)
+            .custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS
+                    | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+            .open(path)?;
+        let handle: OwnedHandle = file.into();
+        reject_reparse(&handle)?;
+        Ok(Self { handle })
+    }
+
+    pub(crate) fn open_directory_sync_anchor(&self, name: &OsStr) -> io::Result<Self> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            SYNC_DIRECTORY_ACCESS,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(Self { handle })
+    }
+
+    pub(crate) fn open_directory_for_sync(&self, name: &OsStr) -> io::Result<Self> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            SYNC_DIRECTORY_ACCESS,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE,
+            SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(Self { handle })
+    }
+
     pub(crate) fn open_absolute(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -115,6 +240,19 @@ impl WindowsDirectory {
         Ok(Self { handle })
     }
 
+    pub(crate) fn create_directory_anchored(&self, name: &OsStr) -> io::Result<Self> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            MUTATION_DIRECTORY_ACCESS,
+            FILE_CREATE,
+            FILE_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(Self { handle })
+    }
+
     pub(crate) fn open_directory(&self, name: &OsStr) -> io::Result<Self> {
         let handle = nt_open_relative(
             &self.handle,
@@ -152,6 +290,53 @@ impl WindowsDirectory {
         )?;
         reject_reparse(&handle)?;
         Ok(Self { handle })
+    }
+
+    pub(crate) fn open_directory_for_cleanup_with_sync(
+        &self,
+        name: &OsStr,
+    ) -> io::Result<(Self, Self)> {
+        let cleanup = self.open_directory_for_cleanup(name)?;
+        let sync = cleanup.with_read_only_cleared_for_cleanup(|| {
+            let sync = self.open_directory_for_sync(name)?;
+            if cleanup.identity()? != sync.identity()? {
+                return Err(io::Error::other(
+                    "workspace cleanup directory changed while opening durability handle",
+                ));
+            }
+            Ok(sync)
+        })?;
+        Ok((cleanup, sync))
+    }
+
+    pub(crate) fn open_directory_for_anchored_cleanup(&self, name: &OsStr) -> io::Result<Self> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            CLEANUP_DIRECTORY_ACCESS,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(Self { handle })
+    }
+
+    pub(crate) fn open_directory_for_anchored_cleanup_with_sync(
+        &self,
+        name: &OsStr,
+    ) -> io::Result<(Self, Self)> {
+        let cleanup = self.open_directory_for_anchored_cleanup(name)?;
+        let sync = cleanup.with_read_only_cleared_for_cleanup(|| {
+            let sync = self.open_directory_for_sync(name)?;
+            if cleanup.identity()? != sync.identity()? {
+                return Err(io::Error::other(
+                    "anchored cleanup directory changed while opening durability handle",
+                ));
+            }
+            Ok(sync)
+        })?;
+        Ok((cleanup, sync))
     }
 
     pub(crate) fn open_directory_for_attributes(&self, name: &OsStr) -> io::Result<Self> {
@@ -203,6 +388,98 @@ impl WindowsDirectory {
         Ok(File::from(handle))
     }
 
+    pub(crate) fn create_file_anchored(&self, name: &OsStr) -> io::Result<File> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            MUTABLE_FILE_ACCESS,
+            FILE_CREATE,
+            FILE_NON_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(File::from(handle))
+    }
+
+    pub(crate) fn open_file_for_durable_copy(&self, name: &OsStr) -> io::Result<File> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            READ_FILE_ACCESS,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(File::from(handle))
+    }
+
+    pub(crate) fn open_file_for_retained_identity_read(&self, name: &OsStr) -> io::Result<File> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            READ_FILE_ACCESS,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE,
+            SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(File::from(handle))
+    }
+
+    pub(crate) fn open_file_for_identity(&self, name: &OsStr) -> io::Result<File> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            IDENTITY_FILE_ACCESS,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(File::from(handle))
+    }
+
+    pub(crate) fn open_file_for_durable_copy_allow_cloud_placeholder(
+        &self,
+        name: &OsStr,
+    ) -> io::Result<File> {
+        let named = nt_open_relative(
+            &self.handle,
+            name,
+            READ_FILE_ACCESS,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        let mut tag = FILE_ATTRIBUTE_TAG_INFO::default();
+        query_handle(
+            &named,
+            FileAttributeTagInfo,
+            (&mut tag as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>(),
+        )?;
+        if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+            return Ok(File::from(named));
+        }
+        if !is_cloud_files_placeholder(tag.FileAttributes, tag.ReparseTag) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "durable copy source reparse point is not a Cloud Files placeholder",
+            ));
+        }
+        let hydrated = nt_open_relative_follow_final(
+            &self.handle,
+            name,
+            READ_FILE_ACCESS,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        drop(named);
+        Ok(File::from(hydrated))
+    }
+
     pub(crate) fn open_or_create_lock_file(&self, name: &OsStr) -> io::Result<File> {
         let handle = nt_open_relative(
             &self.handle,
@@ -227,6 +504,17 @@ impl WindowsDirectory {
         )?;
         reject_reparse(&handle)?;
         Ok(handle)
+    }
+
+    fn open_any_cleanup_handle_allow_reparse(&self, name: &OsStr) -> io::Result<OwnedHandle> {
+        nt_open_relative(
+            &self.handle,
+            name,
+            FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | DELETE | SYNCHRONIZE,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT,
+            SHARING,
+        )
     }
 
     fn open_file_read_handle(&self, name: &OsStr) -> io::Result<OwnedHandle> {
@@ -279,9 +567,9 @@ impl WindowsDirectory {
                     }
                     child.preflight_contents(&entry.path(), expected_device)?;
                 }
-                Err(directory_error) => match self.open_file_read_handle(&name) {
+                Err(directory_error) => match self.open_file_for_identity(&name) {
                     Ok(file) => {
-                        if handle_identity(&file)?.device != expected_device {
+                        if handle_identity(&OwnedHandle::from(file))?.device != expected_device {
                             return Err(io::Error::other(
                                 "workspace cleanup refuses to cross a volume boundary",
                             ));
@@ -302,21 +590,32 @@ impl WindowsDirectory {
         named_path: &Path,
         expected_device: u64,
     ) -> io::Result<()> {
-        self.clear_read_only()?;
+        self.with_read_only_cleared_for_cleanup(|| {
+            self.remove_contents_after_read_only_clear(named_path, expected_device)
+        })
+    }
+
+    fn remove_contents_after_read_only_clear(
+        &self,
+        named_path: &Path,
+        expected_device: u64,
+    ) -> io::Result<()> {
         for entry in std::fs::read_dir(named_path)? {
             let entry = entry?;
             let name = entry.file_name();
-            match self.open_directory_for_cleanup(&name) {
-                Ok(child) => {
+            match self.open_directory_for_cleanup_with_sync(&name) {
+                Ok((child, child_sync)) => {
                     if child.identity()?.device != expected_device {
                         return Err(io::Error::other(
                             "workspace cleanup refuses to cross a volume boundary",
                         ));
                     }
                     child.remove_contents(&entry.path(), expected_device)?;
+                    child_sync.sync()?;
+                    drop(child_sync);
                     child.mark_delete()?;
                 }
-                Err(directory_error) => match self.open_file_cleanup_handle(&name) {
+                Err(directory_error) => match self.open_any_cleanup_handle_allow_reparse(&name) {
                     Ok(file) => {
                         if handle_identity(&file)?.device != expected_device {
                             return Err(io::Error::other(
@@ -332,11 +631,46 @@ impl WindowsDirectory {
                 },
             }
         }
-        self.sync()
+        Ok(())
     }
 
     pub(crate) fn mark_delete(&self) -> io::Result<()> {
         mark_handle_delete(&self.handle)
+    }
+
+    pub(crate) fn remove_file_for_anchored_cleanup(&self, name: &OsStr) -> io::Result<()> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            CLEANUP_FILE_ACCESS,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        mark_handle_delete(&handle)
+    }
+
+    pub(crate) fn remove_file_for_anchored_cleanup_if_identity(
+        &self,
+        name: &OsStr,
+        expected: WorkspaceGenerationIdentity,
+    ) -> io::Result<()> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            CLEANUP_FILE_ACCESS,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        if handle_identity(&handle)? != expected {
+            return Err(io::Error::other(
+                "file identity changed before anchored cleanup",
+            ));
+        }
+        mark_handle_delete(&handle)
     }
 
     pub(crate) fn identity(&self) -> io::Result<WorkspaceGenerationIdentity> {
@@ -346,18 +680,7 @@ impl WindowsDirectory {
     pub(crate) fn sync(&self) -> io::Result<()> {
         // SAFETY: the handle remains owned for the duration of the call.
         if unsafe { FlushFileBuffers(raw_handle(&self.handle)) } == 0 {
-            let error = io::Error::last_os_error();
-            if matches!(
-                error.kind(),
-                io::ErrorKind::PermissionDenied
-                    | io::ErrorKind::InvalidInput
-                    | io::ErrorKind::Unsupported
-            ) {
-                // Windows does not guarantee that directory handles support
-                // FlushFileBuffers. File bodies are flushed separately.
-                return Ok(());
-            }
-            return Err(error);
+            return Err(io::Error::last_os_error());
         }
         Ok(())
     }
@@ -370,45 +693,93 @@ impl WindowsDirectory {
         set_handle_read_only(&self.handle, false)
     }
 
+    pub(crate) fn with_read_only_cleared_for_cleanup<T>(
+        &self,
+        operation: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        let original_read_only = handle_is_read_only(&self.handle)?;
+        if original_read_only {
+            self.clear_read_only()?;
+        }
+        let operation_result = operation();
+        let restore_result = set_handle_read_only(&self.handle, original_read_only);
+        match (operation_result, restore_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(operation), Ok(())) => Err(operation),
+            (Ok(_), Err(restore)) => Err(restore),
+            (Err(operation), Err(restore)) => Err(io::Error::new(
+                restore.kind(),
+                format!(
+                    "failed to restore original directory read-only state: {restore}; preceding cleanup operation also failed: {operation}"
+                ),
+            )),
+        }
+    }
+
     pub(crate) fn rename_no_replace(
         &self,
         destination_parent: &WindowsDirectory,
         destination_name: &OsStr,
     ) -> io::Result<()> {
-        let name = wide_name(destination_name)?;
-        let byte_len = name
-            .len()
-            .checked_mul(2)
-            .and_then(|length| u32::try_from(length).ok())
-            .ok_or_else(|| io::Error::other("workspace destination name is too long"))?;
-        let total = rename_information_buffer_size(name.len())?;
-        let total_u32 = u32::try_from(total)
-            .map_err(|_| io::Error::other("workspace rename buffer is too large"))?;
-        let words = total.div_ceil(size_of::<usize>());
-        let mut storage = vec![0_usize; words];
-        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
-        // SAFETY: `storage` is suitably aligned and large enough for the fixed
-        // header plus the exact UTF-16 name payload. Both source and parent
-        // handles remain owned for the synchronous native rename call.
-        unsafe {
-            (*info).Anonymous.ReplaceIfExists = false;
-            (*info).RootDirectory = raw_handle(&destination_parent.handle);
-            (*info).FileNameLength = byte_len;
-            ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
-            let mut status_block: IO_STATUS_BLOCK = zeroed();
-            let status = NtSetInformationFile(
-                raw_handle(&self.handle),
-                &mut status_block,
-                info.cast(),
-                total_u32,
-                FileRenameInformation,
-            );
-            if status < 0 || status == STATUS_OBJECT_NAME_EXISTS {
-                return Err(rename_status_error(status));
-            }
-        }
-        Ok(())
+        rename_handle_no_replace(&self.handle, destination_parent, destination_name)
     }
+
+    pub(crate) fn rename_child_no_replace_allow_final_reparse(
+        &self,
+        source_name: &OsStr,
+        destination_parent: &WindowsDirectory,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        let source = nt_open_relative(
+            &self.handle,
+            source_name,
+            FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT,
+            SHARING,
+        )?;
+        rename_handle_no_replace(&source, destination_parent, destination_name)
+    }
+}
+
+fn rename_handle_no_replace(
+    source: &OwnedHandle,
+    destination_parent: &WindowsDirectory,
+    destination_name: &OsStr,
+) -> io::Result<()> {
+    let name = wide_name(destination_name)?;
+    let byte_len = name
+        .len()
+        .checked_mul(2)
+        .and_then(|length| u32::try_from(length).ok())
+        .ok_or_else(|| io::Error::other("workspace destination name is too long"))?;
+    let total = rename_information_buffer_size(name.len())?;
+    let total_u32 = u32::try_from(total)
+        .map_err(|_| io::Error::other("workspace rename buffer is too large"))?;
+    let words = total.div_ceil(size_of::<usize>());
+    let mut storage = vec![0_usize; words];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    // SAFETY: `storage` is suitably aligned and large enough for the fixed
+    // header plus the exact UTF-16 name payload. Both source and parent
+    // handles remain owned for the synchronous native rename call.
+    unsafe {
+        (*info).Anonymous.ReplaceIfExists = false;
+        (*info).RootDirectory = raw_handle(&destination_parent.handle);
+        (*info).FileNameLength = byte_len;
+        ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+        let mut status_block: IO_STATUS_BLOCK = zeroed();
+        let status = NtSetInformationFile(
+            raw_handle(source),
+            &mut status_block,
+            info.cast(),
+            total_u32,
+            FileRenameInformation,
+        );
+        if status < 0 || status == STATUS_OBJECT_NAME_EXISTS {
+            return Err(rename_status_error(status));
+        }
+    }
+    Ok(())
 }
 
 fn rename_information_buffer_size(name_units: usize) -> io::Result<usize> {
@@ -533,6 +904,17 @@ fn set_handle_read_only(handle: &OwnedHandle, read_only: bool) -> io::Result<()>
     Ok(())
 }
 
+fn handle_is_read_only(handle: &OwnedHandle) -> io::Result<bool> {
+    let mut basic = FILE_BASIC_INFO::default();
+    query_handle(
+        handle,
+        FileBasicInfo,
+        (&mut basic as *mut FILE_BASIC_INFO).cast(),
+        size_of::<FILE_BASIC_INFO>(),
+    )?;
+    Ok(basic.FileAttributes & FILE_ATTRIBUTE_READONLY != 0)
+}
+
 pub(crate) fn set_file_read_only(file: &File) -> io::Result<()> {
     let handle: HANDLE = file.as_raw_handle().cast();
     let mut basic = FILE_BASIC_INFO::default();
@@ -559,7 +941,10 @@ pub(crate) fn set_file_read_only(file: &File) -> io::Result<()> {
 }
 
 fn mark_handle_delete(handle: &OwnedHandle) -> io::Result<()> {
-    set_handle_read_only(handle, false)?;
+    let original_read_only = handle_is_read_only(handle)?;
+    if original_read_only {
+        set_handle_read_only(handle, false)?;
+    }
     let disposition = FILE_DISPOSITION_INFO_EX {
         Flags: FILE_DISPOSITION_FLAG_DELETE
             | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
@@ -575,7 +960,16 @@ fn mark_handle_delete(handle: &OwnedHandle) -> io::Result<()> {
         )
     } == 0
     {
-        return Err(io::Error::last_os_error());
+        let operation = io::Error::last_os_error();
+        return match set_handle_read_only(handle, original_read_only) {
+            Ok(()) => Err(operation),
+            Err(restore) => Err(io::Error::new(
+                restore.kind(),
+                format!(
+                    "failed to restore original read-only state after delete failure: {restore}; delete also failed: {operation}"
+                ),
+            )),
+        };
     }
     Ok(())
 }
@@ -587,6 +981,29 @@ fn nt_open_relative(
     disposition: u32,
     kind: u32,
     sharing: u32,
+) -> io::Result<OwnedHandle> {
+    nt_open_relative_impl(parent, name, access, disposition, kind, sharing, false)
+}
+
+fn nt_open_relative_follow_final(
+    parent: &OwnedHandle,
+    name: &OsStr,
+    access: u32,
+    disposition: u32,
+    kind: u32,
+    sharing: u32,
+) -> io::Result<OwnedHandle> {
+    nt_open_relative_impl(parent, name, access, disposition, kind, sharing, true)
+}
+
+fn nt_open_relative_impl(
+    parent: &OwnedHandle,
+    name: &OsStr,
+    access: u32,
+    disposition: u32,
+    kind: u32,
+    sharing: u32,
+    follow_final: bool,
 ) -> io::Result<OwnedHandle> {
     let mut name = wide_name(name)?;
     let length = name
@@ -621,7 +1038,12 @@ fn nt_open_relative(
             FILE_ATTRIBUTE_NORMAL,
             sharing,
             disposition,
-            kind | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            kind | FILE_SYNCHRONOUS_IO_NONALERT
+                | if follow_final {
+                    0
+                } else {
+                    FILE_OPEN_REPARSE_POINT
+                },
             ptr::null(),
             0,
         );
@@ -640,6 +1062,17 @@ fn nt_open_relative(
         }
         Ok(OwnedHandle::from_raw_handle(handle.cast()))
     }
+}
+
+fn is_cloud_files_placeholder(attributes: u32, reparse_tag: u32) -> bool {
+    use windows_sys::Win32::Storage::CloudFilters::{
+        CF_PLACEHOLDER_STATE_PLACEHOLDER, CfGetPlaceholderStateFromAttributeTag,
+    };
+
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        && unsafe { CfGetPlaceholderStateFromAttributeTag(attributes, reparse_tag) }
+            & CF_PLACEHOLDER_STATE_PLACEHOLDER
+            != 0
 }
 
 fn wide_name(name: &OsStr) -> io::Result<Vec<u16>> {
@@ -727,12 +1160,93 @@ mod lock_tests {
     }
 
     #[test]
+    fn ancestor_anchor_handles_deny_reparse_substitution() {
+        assert_eq!(ANCHOR_SHARING & FILE_SHARE_DELETE, 0);
+        assert_eq!(
+            ANCHOR_SHARING & (FILE_SHARE_READ | FILE_SHARE_WRITE),
+            ANCHOR_SHARING
+        );
+        assert_ne!(SYNC_DIRECTORY_ACCESS & FILE_WRITE_DATA, 0);
+        assert_ne!(SYNC_DIRECTORY_ACCESS & FILE_WRITE_ATTRIBUTES, 0);
+        assert_eq!(
+            READ_DIRECTORY_ACCESS & (FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES),
+            0
+        );
+        assert_eq!(MUTATION_DIRECTORY_ACCESS & DELETE, 0);
+        assert_ne!(MUTATION_DIRECTORY_ACCESS & FILE_ADD_FILE, 0);
+        assert_ne!(MUTATION_DIRECTORY_ACCESS & FILE_ADD_SUBDIRECTORY, 0);
+    }
+
+    #[test]
+    fn cloud_copy_allows_cloud_placeholder_tags_but_not_junctions() {
+        const IO_REPARSE_TAG_CLOUD: u32 = 0x9000_001a;
+        const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xa000_0003;
+
+        assert!(is_cloud_files_placeholder(
+            FILE_ATTRIBUTE_REPARSE_POINT,
+            IO_REPARSE_TAG_CLOUD
+        ));
+        assert!(!is_cloud_files_placeholder(
+            FILE_ATTRIBUTE_REPARSE_POINT,
+            IO_REPARSE_TAG_MOUNT_POINT
+        ));
+        assert!(!is_cloud_files_placeholder(0, IO_REPARSE_TAG_CLOUD));
+    }
+
+    #[test]
     fn publication_state_open_contract_does_not_follow_reparse_points() {
         assert_ne!(
             PUBLICATION_STATE_OPEN_FLAGS
                 & windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
             0
         );
+    }
+
+    #[test]
+    fn identity_probe_needs_attributes_without_file_data_or_reparse_following() {
+        assert_ne!(IDENTITY_FILE_ACCESS & FILE_READ_ATTRIBUTES, 0);
+        assert_eq!(IDENTITY_FILE_ACCESS & FILE_READ_DATA, 0);
+        assert_eq!(
+            IDENTITY_FILE_ACCESS & (FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | DELETE),
+            0
+        );
+
+        let path = temporary_test_directory("identity-probe");
+        std::fs::create_dir(&path).expect("create identity probe directory");
+        let parent = WindowsDirectory::open_absolute(&path).expect("open identity probe parent");
+        let mut created = parent
+            .create_file(OsStr::new("attributes-only.txt"))
+            .expect("create identity probe file");
+        created.write_all(b"contents require data access").unwrap();
+        created.sync_all().unwrap();
+        let expected = handle_identity(&OwnedHandle::from(created)).expect("created identity");
+
+        let attributes_only = parent
+            .open_file_for_identity(OsStr::new("attributes-only.txt"))
+            .expect("open attributes-only identity handle");
+        let observed =
+            handle_identity(&OwnedHandle::from(attributes_only)).expect("observed identity");
+        assert_eq!(observed, expected);
+        assert_eq!(
+            inspect_path_identity_no_follow(&path.join("attributes-only.txt"))
+                .expect("inspect path with attributes-only native handle"),
+            expected
+        );
+
+        let mut wrong = expected;
+        wrong.inode ^= 1;
+        parent
+            .remove_file_for_anchored_cleanup_if_identity(OsStr::new("attributes-only.txt"), wrong)
+            .expect_err("identity mismatch must preserve the named file");
+        parent
+            .open_file_for_identity(OsStr::new("attributes-only.txt"))
+            .expect("identity mismatch preserves file");
+
+        parent
+            .remove_file_for_anchored_cleanup(OsStr::new("attributes-only.txt"))
+            .expect("remove identity probe file");
+        drop(parent);
+        std::fs::remove_dir(path).expect("remove identity probe directory");
     }
 
     #[test]
@@ -872,11 +1386,81 @@ mod lock_tests {
 
         root.remove_contents(&tree_path, expected.device)
             .expect("remove sealed tree through cleanup-specific handles");
+        root.sync().expect("flush cleaned root metadata");
         root.mark_delete().expect("remove empty cleanup root");
         drop(root);
         drop(parent);
         assert!(!tree_path.exists());
         std::fs::remove_dir_all(path).expect("remove cleanup test directory");
+    }
+
+    #[test]
+    fn cleanup_preparation_error_restores_directory_read_only_attribute() {
+        let path = temporary_test_directory("cleanup-restore");
+        std::fs::create_dir(&path).expect("create cleanup restore directory");
+        let root = WindowsDirectory::open_absolute(&path).expect("open cleanup restore directory");
+        root.set_read_only()
+            .expect("seal cleanup restore directory");
+
+        root.with_read_only_cleared_for_cleanup(|| {
+            Err::<(), _>(io::Error::other("injected post-clear failure"))
+        })
+        .expect_err("injected cleanup preparation must fail");
+
+        assert!(
+            std::fs::metadata(&path)
+                .expect("read restored directory metadata")
+                .permissions()
+                .readonly(),
+            "every post-clear error restores the read-only attribute"
+        );
+        root.clear_read_only()
+            .expect("clear test directory attribute");
+        drop(root);
+        std::fs::remove_dir(path).expect("remove cleanup restore directory");
+    }
+
+    #[test]
+    fn late_cleanup_failures_preserve_writable_and_read_only_original_state() {
+        for original_read_only in [false, true] {
+            let path = temporary_test_directory(if original_read_only {
+                "late-failure-read-only"
+            } else {
+                "late-failure-writable"
+            });
+            std::fs::create_dir(&path).expect("create late-failure parent");
+            let parent = WindowsDirectory::open_absolute(&path).expect("open late-failure parent");
+            let child_path = path.join("child");
+            std::fs::create_dir(&child_path).expect("create late-failure child");
+            let child = parent
+                .open_directory_for_attributes(OsStr::new("child"))
+                .expect("open attributes-only child");
+            if original_read_only {
+                child.set_read_only().expect("seal child");
+            }
+
+            child
+                .with_read_only_cleared_for_cleanup(|| Ok(()))
+                .expect("complete cleanup preparation");
+            child
+                .mark_delete()
+                .expect_err("attributes-only handle cannot complete late deletion");
+            assert_eq!(
+                std::fs::metadata(&child_path)
+                    .expect("read child metadata")
+                    .permissions()
+                    .readonly(),
+                original_read_only,
+                "late delete failure preserves the original attribute state"
+            );
+
+            child
+                .clear_read_only()
+                .expect("clear child for test cleanup");
+            drop(child);
+            drop(parent);
+            std::fs::remove_dir_all(path).expect("remove late-failure fixture");
+        }
     }
 
     fn temporary_test_directory(label: &str) -> std::path::PathBuf {

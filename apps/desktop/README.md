@@ -109,10 +109,22 @@ schema migration, and is repeated at the materializer's prepublication
 boundary. It recognizes locally resolvable filesystem aliases, but does not
 provide a global lock against a mount created after the final inspection.
 
-Production Desktop mounts continue to resolve from `MountConfig.root`; they do
-not replace active File Provider, FUSE, or Cloud Files roots with
-`WorkspaceBinding`. The next integration step is a Desktop-owned coordinator
-transaction that supplies its trusted workspace root to
-`WorkspaceHostBindingResolver::plan_legacy_migration`, commits only returned
-layout 1 bindings with a layout-change sequence, and leaves returned layout 0
-mounts on their exact legacy roots.
+Desktop-created virtual mounts persist a stable workspace identity, trusted
+workspace root, projection/domain identity, and layout sequence through the
+shared CLI coordinator. Creation reporting and Desktop path matching use the
+same binding resolver as CLI. Missing and released v1 bindings still resolve
+through exact `MountConfig.root`. Existing-source account or source changes from
+either surface enter the shared quiesced remount coordinator, which persists a
+daemon fence, drains supervision, commits source-state cleanup, and restores
+supervision before clearing the fence. Its version-3 recovery journal records
+the exact recovery ID, original and staged paths, and filesystem identities, so
+either Desktop startup or a later CLI invocation can reconcile the same crash.
+The CLI and Desktop share an OS-level exclusive recovery lock; owner/generation
+metadata is checked before fence deletion. Desktop also revalidates exact
+identity and emptiness after each staging rename, preserving a raced
+replacement in quarantine and failing closed.
+CLI remounts fail closed while dirty/conflicted entities or pending virtual
+creates/renames exist, retain an equivalent existing host-root spelling, and
+reject virtual-to-plain conversion until an explicit projection migration owns
+the layout-1 binding transition. Target rename/removal and root-relocation
+lifecycle remain future coordinator work.

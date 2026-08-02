@@ -32,11 +32,13 @@ use crate::repository::{
     EntityRepository, EntitySearchRepository, FreshnessStateRepository, HydrationJobRepository,
     JournalRepository, MetadataDiscoveryJobRepository, MountLiveModeRepository, MountRepository,
     RemoteObservationRepository, ShadowRepository, VirtualMoveRepository, VirtualMoveTransition,
-    VirtualMutationRepository, WorkspaceBindingRepository, validate_virtual_move_transition,
-    virtual_move_content_changed, virtual_move_missing,
+    VirtualMutationRepository, WorkspaceBindingRepository, WorkspaceRemountRecoveryOutcome,
+    validate_virtual_move_transition, virtual_move_content_changed, virtual_move_missing,
 };
 use crate::workspace_binding::{
-    WorkspaceBinding, WorkspaceBindingRecord, WorkspaceRebindBlocker, legacy_mount_collision_key,
+    WorkspaceBinding, WorkspaceBindingRecord, WorkspaceHostBinding, WorkspaceHostBindingResolver,
+    WorkspaceId, WorkspaceRebindBlocker, host_paths_equivalent, legacy_mount_collision_key,
+    legacy_mount_collision_key_for_host,
 };
 
 type EntityKey = (MountId, RemoteId);
@@ -67,6 +69,8 @@ fn illegal_transition(
 pub struct InMemoryStateStore {
     mounts: BTreeMap<MountId, MountConfig>,
     workspace_bindings: BTreeMap<MountId, WorkspaceBinding>,
+    workspace_host_bindings: BTreeMap<WorkspaceId, WorkspaceHostBinding>,
+    workspace_remount_recoveries: BTreeMap<String, (MountId, WorkspaceRemountRecoveryOutcome)>,
     mount_live_modes: BTreeMap<MountId, MountLiveModeRecord>,
     connections: BTreeMap<ConnectionId, ConnectionRecord>,
     connector_profiles: BTreeMap<ConnectorProfileId, ConnectorProfileRecord>,
@@ -181,6 +185,11 @@ impl MountRepository for InMemoryStateStore {
 
 impl WorkspaceBindingRepository for InMemoryStateStore {
     fn save_workspace_binding(&mut self, record: WorkspaceBindingRecord) -> StoreResult<()> {
+        if record.binding.workspace_id().is_some() {
+            return Err(StoreError::InvalidState(
+                "layout-1 workspace bindings require an atomic host-binding commit".to_string(),
+            ));
+        }
         if !self.mounts.contains_key(&record.mount_id) {
             return Err(StoreError::MountMissing(record.mount_id));
         }
@@ -230,6 +239,255 @@ impl WorkspaceBindingRepository for InMemoryStateStore {
                 WorkspaceBindingRecord::new(mount_id.clone(), binding.clone())
             })
             .collect())
+    }
+
+    fn commit_workspace_binding(
+        &mut self,
+        mut host_binding: WorkspaceHostBinding,
+        record: WorkspaceBindingRecord,
+    ) -> StoreResult<()> {
+        let workspace_id = record.binding.workspace_id().ok_or_else(|| {
+            StoreError::InvalidState(
+                "atomic workspace commit requires a layout-1 mount binding".to_string(),
+            )
+        })?;
+        if workspace_id != host_binding.workspace_id() {
+            return Err(StoreError::InvalidState(
+                "workspace mount binding does not match its host workspace identity".to_string(),
+            ));
+        }
+        let mount = self
+            .mounts
+            .get(&record.mount_id)
+            .ok_or_else(|| StoreError::MountMissing(record.mount_id.clone()))?;
+        let resolved_root = host_binding.mount_root(record.binding.mount_target());
+        if !host_paths_equivalent(
+            crate::WorkspaceHostPlatform::current(),
+            &resolved_root,
+            &mount.root,
+        ) {
+            return Err(StoreError::InvalidState(format!(
+                "workspace binding for mount `{}` resolves to `{}` instead of its preserved root `{}`",
+                record.mount_id.as_str(),
+                resolved_root.display(),
+                mount.root.display()
+            )));
+        }
+        WorkspaceHostBindingResolver::current()
+            .validate_persistent_mount_root(
+                &host_binding,
+                &resolved_root,
+                record.binding.mount_target(),
+            )
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+
+        let existing_binding = self.workspace_bindings.get(&record.mount_id);
+        let exact_replay = existing_binding == Some(&record.binding);
+        let safe_v1_upgrade = existing_binding.is_some_and(|existing| {
+            existing.workspace_id().is_none()
+                && existing.mount_target() == record.binding.mount_target()
+        });
+        if let Some(existing) = existing_binding
+            && !exact_replay
+            && !safe_v1_upgrade
+        {
+            return Err(StoreError::WorkspaceBindingTargetImmutable {
+                mount_id: record.mount_id,
+                existing_target: existing.mount_target().as_str().to_string(),
+                requested_target: record.binding.mount_target().as_str().to_string(),
+            });
+        }
+
+        if let Some(existing_host) = self.workspace_host_bindings.get(workspace_id) {
+            if !host_paths_equivalent(
+                crate::WorkspaceHostPlatform::current(),
+                existing_host.trusted_workspace_root(),
+                host_binding.trusted_workspace_root(),
+            ) || existing_host.projection_identity() != host_binding.projection_identity()
+            {
+                return Err(StoreError::InvalidState(format!(
+                    "workspace `{}` host root or projection identity is immutable outside an owning coordinator",
+                    workspace_id.as_str()
+                )));
+            }
+            let expected_sequence = if exact_replay {
+                existing_host.layout_sequence()
+            } else {
+                existing_host
+                    .next_layout_sequence()
+                    .map_err(|error| StoreError::InvalidState(error.to_string()))?
+            };
+            if host_binding.layout_sequence() != expected_sequence {
+                return Err(StoreError::InvalidState(format!(
+                    "workspace `{}` layout sequence must be {expected_sequence}, got {}",
+                    workspace_id.as_str(),
+                    host_binding.layout_sequence()
+                )));
+            }
+            host_binding = WorkspaceHostBinding::new(
+                crate::WorkspaceHostPlatform::current(),
+                workspace_id.clone(),
+                existing_host.trusted_workspace_root().to_path_buf(),
+                host_binding.projection_identity().clone(),
+                host_binding.layout_sequence(),
+            )
+            .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+        } else if host_binding.layout_sequence() != 1 {
+            return Err(StoreError::InvalidState(format!(
+                "new workspace `{}` must start at layout sequence 1",
+                workspace_id.as_str()
+            )));
+        }
+
+        if !exact_replay {
+            let requested_collision_key = record.binding.collision_key();
+            if let Some(existing_mount_id) = self.mounts.iter().find_map(|(mount_id, mount)| {
+                if *mount_id == record.mount_id {
+                    return None;
+                }
+                let collision_key = match self.workspace_bindings.get(mount_id) {
+                    Some(binding) if binding.workspace_id().is_some() => (binding.workspace_id()
+                        == Some(workspace_id))
+                    .then(|| binding.collision_key()),
+                    Some(_) => legacy_mount_collision_key_for_host(&host_binding, &mount.root),
+                    None => legacy_mount_collision_key_for_host(&host_binding, &mount.root),
+                };
+                (collision_key.as_deref() == Some(requested_collision_key.as_str()))
+                    .then(|| mount_id.clone())
+            }) {
+                return Err(StoreError::WorkspaceMountTargetCollision {
+                    target: record.binding.mount_target().as_str().to_string(),
+                    existing_mount_id,
+                });
+            }
+        }
+
+        self.workspace_host_bindings
+            .insert(workspace_id.clone(), host_binding);
+        self.workspace_bindings
+            .insert(record.mount_id, record.binding);
+        Ok(())
+    }
+
+    fn save_mount_with_workspace_binding(
+        &mut self,
+        mount: MountConfig,
+        host_binding: WorkspaceHostBinding,
+        record: WorkspaceBindingRecord,
+    ) -> StoreResult<()> {
+        let previous = self.clone();
+        self.save_mount(mount)?;
+        if let Err(error) = self.commit_workspace_binding(host_binding, record) {
+            *self = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn save_mount_with_workspace_binding_and_cleanup(
+        &mut self,
+        mount: MountConfig,
+        host_binding: WorkspaceHostBinding,
+        record: WorkspaceBindingRecord,
+        cleanup: &mut dyn FnMut() -> StoreResult<()>,
+    ) -> StoreResult<()> {
+        let previous = self.clone();
+        let mount_id = mount.mount_id.clone();
+        let prepared = self
+            .workspace_remount_recoveries
+            .iter()
+            .filter(|(_, (recovery_mount_id, outcome))| {
+                recovery_mount_id == &mount_id
+                    && *outcome == WorkspaceRemountRecoveryOutcome::Prepared
+            })
+            .map(|(recovery_id, _)| recovery_id.clone())
+            .collect::<Vec<_>>();
+        let [recovery_id] = prepared.as_slice() else {
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` must have exactly one prepared workspace remount recovery",
+                mount_id.as_str()
+            )));
+        };
+        self.save_mount(mount)?;
+        if let Err(error) = self.commit_workspace_binding(host_binding, record) {
+            *self = previous;
+            return Err(error);
+        }
+        self.clear_mount_source_state(&mount_id);
+        if let Err(error) = cleanup() {
+            *self = previous;
+            return Err(error);
+        }
+        self.workspace_remount_recoveries.insert(
+            recovery_id.clone(),
+            (mount_id, WorkspaceRemountRecoveryOutcome::Committed),
+        );
+        Ok(())
+    }
+
+    fn begin_workspace_remount_recovery(
+        &mut self,
+        recovery_id: &str,
+        mount_id: &MountId,
+    ) -> StoreResult<()> {
+        match self.workspace_remount_recoveries.get(recovery_id) {
+            Some((existing_mount_id, WorkspaceRemountRecoveryOutcome::Prepared))
+                if existing_mount_id == mount_id =>
+            {
+                Ok(())
+            }
+            Some(_) => Err(StoreError::InvalidState(format!(
+                "workspace remount recovery `{recovery_id}` already exists with different state"
+            ))),
+            None => {
+                if self
+                    .workspace_remount_recoveries
+                    .values()
+                    .any(|(existing_mount_id, _)| existing_mount_id == mount_id)
+                {
+                    return Err(StoreError::InvalidState(format!(
+                        "mount `{}` already has a workspace remount recovery",
+                        mount_id.as_str()
+                    )));
+                }
+                self.workspace_remount_recoveries.insert(
+                    recovery_id.to_string(),
+                    (mount_id.clone(), WorkspaceRemountRecoveryOutcome::Prepared),
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn get_workspace_remount_recovery(
+        &self,
+        recovery_id: &str,
+    ) -> StoreResult<Option<(MountId, WorkspaceRemountRecoveryOutcome)>> {
+        Ok(self.workspace_remount_recoveries.get(recovery_id).cloned())
+    }
+
+    fn list_workspace_remount_recoveries(
+        &self,
+    ) -> StoreResult<Vec<(String, MountId, WorkspaceRemountRecoveryOutcome)>> {
+        Ok(self
+            .workspace_remount_recoveries
+            .iter()
+            .map(|(recovery_id, (mount_id, outcome))| {
+                (recovery_id.clone(), mount_id.clone(), *outcome)
+            })
+            .collect())
+    }
+
+    fn finish_workspace_remount_recovery(&mut self, recovery_id: &str) -> StoreResult<()> {
+        self.workspace_remount_recoveries.remove(recovery_id);
+        Ok(())
+    }
+
+    fn get_workspace_host_binding(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> StoreResult<Option<WorkspaceHostBinding>> {
+        Ok(self.workspace_host_bindings.get(workspace_id).cloned())
     }
 
     fn check_workspace_rebind(&self, mount_id: &MountId) -> StoreResult<()> {

@@ -149,16 +149,16 @@ fn sqlite_store_seeds_state_compatibility_components() {
             (
                 "durable:virtual_mutations".to_string(),
                 "durable_json".to_string(),
-                3,
-                3,
+                4,
+                4,
                 1,
                 0,
             ),
             (
                 "durable:workspace_bindings".to_string(),
                 "durable_json".to_string(),
-                2,
-                2,
+                4,
+                4,
                 1,
                 0,
             ),
@@ -450,7 +450,9 @@ shadows: mount_id, entity_id, frontmatter, body_hash, rendered_body, blocks_json
 state_components: component_id, component_kind, version, min_reader_version, required, rebuildable, data_json, updated_at
 state_migrations: migration_id, from_schema_version, to_schema_version, app_version, app_build_id, daemon_build_id, started_at, finished_at, status, error_json
 virtual_mutations: mount_id, local_id, mutation_kind_json, target_remote_id, parent_remote_id, original_path, projected_path, title, content_path, created_at, updated_at
-workspace_bindings: mount_id, binding_json, target_collision_key"
+workspace_bindings: mount_id, workspace_id, binding_json, target_collision_key
+workspace_host_bindings: workspace_id, binding_json
+workspace_remount_recoveries: recovery_id, mount_id, committed"
     );
 }
 
@@ -860,8 +862,8 @@ fn sqlite_store_does_not_rewrite_v2_linux_fuse_mount_point_roots() {
 }
 
 #[test]
-fn sqlite_store_migrates_virtual_mutations_v1_and_v2_to_v3_without_rewriting_rows() {
-    for old_version in [1, 2] {
+fn sqlite_store_migrates_virtual_mutations_v1_through_v3_to_v4_without_rewriting_rows() {
+    for old_version in [1, 2, 3] {
         let fixture = SqliteFixture::new();
         let mut store = fixture.open();
         store
@@ -894,7 +896,7 @@ fn sqlite_store_migrates_virtual_mutations_v1_and_v2_to_v3_without_rewriting_row
             vec![StateCompatibilityIssue::OlderComponent {
                 component_id: "durable:virtual_mutations".to_string(),
                 found: old_version,
-                current: 3,
+                current: 4,
             }]
         );
 
@@ -912,14 +914,14 @@ fn sqlite_store_migrates_virtual_mutations_v1_and_v2_to_v3_without_rewriting_row
         let after_user_version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user version");
-        assert_eq!(component, (3, 3));
+        assert_eq!(component, (4, 4));
         assert_eq!(virtual_mutation_raw_row(&connection), before_row);
         assert_eq!(after_user_version, before_user_version);
     }
 }
 
 #[test]
-fn sqlite_store_reports_virtual_mutations_v4_without_mutating_state() {
+fn sqlite_store_reports_virtual_mutations_v5_without_mutating_state() {
     let fixture = SqliteFixture::new();
     let mut store = fixture.open();
     store
@@ -933,7 +935,7 @@ fn sqlite_store_reports_virtual_mutations_v4_without_mutating_state() {
     connection
         .execute(
             "UPDATE state_components
-             SET version = 4, min_reader_version = 4
+             SET version = 5, min_reader_version = 5
              WHERE component_id = 'durable:virtual_mutations'",
             [],
         )
@@ -943,14 +945,14 @@ fn sqlite_store_reports_virtual_mutations_v4_without_mutating_state() {
     drop(store);
 
     let report =
-        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect v4");
+        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect v5");
     assert_eq!(report.status, StateCompatibilityStatus::NeedsUpdate);
     assert_eq!(
         report.issues,
         vec![StateCompatibilityIssue::NewerComponent {
             component_id: "durable:virtual_mutations".to_string(),
-            found: 4,
-            supported: 3,
+            found: 5,
+            supported: 4,
         }]
     );
     assert!(matches!(
@@ -967,7 +969,7 @@ fn sqlite_store_reports_virtual_mutations_v4_without_mutating_state() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("component metadata");
-    assert_eq!(component, (4, 4));
+    assert_eq!(component, (5, 5));
 }
 
 #[test]

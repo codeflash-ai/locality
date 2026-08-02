@@ -1,7 +1,7 @@
 pub mod autosave;
 pub mod discovery;
 pub mod discovery_execution;
-mod durable_fs;
+pub mod durable_fs;
 pub mod execution;
 pub mod file_provider;
 pub mod freshness;
@@ -36,6 +36,8 @@ pub mod trace;
 pub mod virtual_fs;
 pub mod virtual_projection;
 pub mod watcher;
+#[cfg(windows)]
+pub(crate) mod windows_workspace_fs;
 pub mod workspace_archive;
 pub mod workspace_materializer;
 

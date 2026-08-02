@@ -17,12 +17,20 @@ use crate::records::{
     HydrationJobRecord, MetadataDiscoveryJobRecord, MountConfig, MountLiveModeRecord,
     RemoteObservationRecord, ShadowSnapshotRecord, VirtualMutationRecord,
 };
-use crate::workspace_binding::{WorkspaceBinding, WorkspaceBindingRecord};
+use crate::workspace_binding::{
+    WorkspaceBinding, WorkspaceBindingRecord, WorkspaceHostBinding, WorkspaceId,
+};
 
 pub trait MountRepository {
     fn save_mount(&mut self, mount: MountConfig) -> StoreResult<()>;
     fn get_mount(&self, mount_id: &MountId) -> StoreResult<Option<MountConfig>>;
     fn load_mounts(&self) -> StoreResult<Vec<MountConfig>>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceRemountRecoveryOutcome {
+    Prepared,
+    Committed,
 }
 
 /// Durable portable placement metadata keyed by the existing mount identity.
@@ -35,6 +43,120 @@ pub trait WorkspaceBindingRepository {
     fn save_workspace_binding(&mut self, record: WorkspaceBindingRecord) -> StoreResult<()>;
     fn get_workspace_binding(&self, mount_id: &MountId) -> StoreResult<Option<WorkspaceBinding>>;
     fn load_workspace_bindings(&self) -> StoreResult<Vec<WorkspaceBindingRecord>>;
+
+    /// Atomically commit one workspace-level host binding and one accepted
+    /// mount binding. Implementations reject root/domain changes and require a
+    /// monotonic sequence for a newly added mount.
+    fn commit_workspace_binding(
+        &mut self,
+        _host_binding: WorkspaceHostBinding,
+        _record: WorkspaceBindingRecord,
+    ) -> StoreResult<()> {
+        Err(StoreError::NotImplemented(
+            "atomic portable workspace binding persistence",
+        ))
+    }
+
+    /// Atomically save a mount and its accepted layout-1 binding. Production
+    /// stores override this so a failed binding preflight cannot change the
+    /// mount row or clear source-scoped state.
+    fn save_mount_with_workspace_binding(
+        &mut self,
+        _mount: MountConfig,
+        _host_binding: WorkspaceHostBinding,
+        _record: WorkspaceBindingRecord,
+    ) -> StoreResult<()>
+    where
+        Self: MountRepository,
+    {
+        // A compatibility fallback cannot emulate this with two writes: either
+        // order can expose partial state if the second operation fails.
+        Err(StoreError::NotImplemented(
+            "atomic portable workspace mount persistence",
+        ))
+    }
+
+    /// Save a mount and binding while keeping the durable transaction open
+    /// through a coordinator-owned cleanup step. A cleanup error rolls back
+    /// mount, binding, host, and source-state mutations together.
+    fn save_mount_with_workspace_binding_and_cleanup(
+        &mut self,
+        _mount: MountConfig,
+        _host_binding: WorkspaceHostBinding,
+        _record: WorkspaceBindingRecord,
+        _cleanup: &mut dyn FnMut() -> StoreResult<()>,
+    ) -> StoreResult<()>
+    where
+        Self: MountRepository,
+    {
+        Err(StoreError::NotImplemented(
+            "transactional portable workspace mount cleanup",
+        ))
+    }
+
+    /// Reserve an externally journaled remount before any projection path is
+    /// staged. The matching mount transaction atomically advances this record
+    /// to `Committed`; a rolled-back transaction leaves it `Prepared`.
+    fn begin_workspace_remount_recovery(
+        &mut self,
+        _recovery_id: &str,
+        _mount_id: &MountId,
+    ) -> StoreResult<()> {
+        Err(StoreError::NotImplemented(
+            "durable workspace remount recovery",
+        ))
+    }
+
+    fn get_workspace_remount_recovery(
+        &self,
+        _recovery_id: &str,
+    ) -> StoreResult<Option<(MountId, WorkspaceRemountRecoveryOutcome)>> {
+        Err(StoreError::NotImplemented(
+            "durable workspace remount recovery",
+        ))
+    }
+
+    fn list_workspace_remount_recoveries(
+        &self,
+    ) -> StoreResult<Vec<(String, MountId, WorkspaceRemountRecoveryOutcome)>> {
+        Err(StoreError::NotImplemented(
+            "durable workspace remount recovery",
+        ))
+    }
+
+    fn finish_workspace_remount_recovery(&mut self, _recovery_id: &str) -> StoreResult<()> {
+        Err(StoreError::NotImplemented(
+            "durable workspace remount recovery",
+        ))
+    }
+
+    fn get_workspace_host_binding(
+        &self,
+        _workspace_id: &WorkspaceId,
+    ) -> StoreResult<Option<WorkspaceHostBinding>> {
+        Ok(None)
+    }
+
+    /// Resolve the actual mount root through trusted layout-1 metadata when it
+    /// exists. Missing and v1 bindings retain the exact legacy root.
+    fn resolve_workspace_mount_root(&self, mount: &MountConfig) -> StoreResult<std::path::PathBuf> {
+        let Some(binding) = self.get_workspace_binding(&mount.mount_id)? else {
+            return Ok(mount.root.clone());
+        };
+        let Some(workspace_id) = binding.workspace_id() else {
+            return Ok(mount.root.clone());
+        };
+        let host_binding = self
+            .get_workspace_host_binding(workspace_id)?
+            .ok_or_else(|| {
+                StoreError::InvalidState(format!(
+                    "workspace binding for mount `{}` references missing workspace `{}`",
+                    mount.mount_id.as_str(),
+                    workspace_id.as_str()
+                ))
+            })?;
+        Ok(host_binding.mount_root(binding.mount_target()))
+    }
 
     /// Report the first durable blocker to a workspace move. This metadata
     /// boundary never updates roots or moves files; even a clean plain-file

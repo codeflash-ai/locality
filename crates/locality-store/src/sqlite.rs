@@ -65,12 +65,13 @@ use crate::repository::{
     FreshnessStateRepository, HydrationJobRepository, JournalRepository,
     MetadataDiscoveryJobRepository, MountLiveModeRepository, MountRepository,
     RemoteObservationRepository, ShadowRepository, VirtualMoveRepository, VirtualMoveTransition,
-    VirtualMutationRepository, WorkspaceBindingRepository, validate_virtual_move_transition,
-    virtual_move_content_changed, virtual_move_missing,
+    VirtualMutationRepository, WorkspaceBindingRepository, WorkspaceRemountRecoveryOutcome,
+    validate_virtual_move_transition, virtual_move_content_changed, virtual_move_missing,
 };
 use crate::workspace_binding::{
-    LegacyWorkspaceMount, WorkspaceBinding, WorkspaceBindingRecord, WorkspaceRebindBlocker,
-    legacy_mount_collision_key,
+    LegacyWorkspaceMount, WorkspaceBinding, WorkspaceBindingRecord, WorkspaceHostBinding,
+    WorkspaceHostBindingResolver, WorkspaceId, WorkspaceRebindBlocker, host_paths_equivalent,
+    legacy_mount_collision_key, legacy_mount_collision_key_for_host,
 };
 use locality_protocol::freshness_delivery_transport::GenerationTransportCapabilities;
 
@@ -78,6 +79,7 @@ const DB_FILE: &str = "state.sqlite3";
 const SCHEMA_VERSION: i64 = 27;
 const ENTITY_SEARCH_COMPONENT_VERSION: i64 = 2;
 const JOURNALS_COMPONENT_VERSION: i64 = 3;
+const VIRTUAL_MUTATIONS_COMPONENT_VERSION: i64 = 4;
 const LINUX_FUSE_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const WINDOWS_CLOUD_FILES_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const RETIRED_NOTION_WORKSPACE_ROOTS_COMPONENT_ID: &str = "projection:notion_workspace_roots";
@@ -164,8 +166,8 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
     StateComponentDefinition {
         component_id: "durable:virtual_mutations",
         component_kind: "durable_json",
-        current_version: 3,
-        min_reader_version: 3,
+        current_version: VIRTUAL_MUTATIONS_COMPONENT_VERSION,
+        min_reader_version: VIRTUAL_MUTATIONS_COMPONENT_VERSION,
         required: true,
         rebuildable: false,
         data_json: "{}",
@@ -191,11 +193,11 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
     StateComponentDefinition {
         component_id: "durable:workspace_bindings",
         component_kind: "durable_json",
-        current_version: 2,
-        min_reader_version: 2,
+        current_version: 4,
+        min_reader_version: 4,
         required: true,
         rebuildable: false,
-        data_json: "{\"format\":\"workspace_binding.v1\",\"layout_0_without_binding\":true}",
+        data_json: "{\"format\":\"workspace_binding.v2\",\"layout_0_without_binding\":true,\"legacy_v1_readable\":true,\"target_scope\":\"workspace_id\",\"remount_recovery\":\"v1\"}",
     },
     StateComponentDefinition {
         component_id: "durable:metadata_discovery",
@@ -2747,6 +2749,11 @@ impl MountRepository for SqliteStateStore {
 
 impl WorkspaceBindingRepository for SqliteStateStore {
     fn save_workspace_binding(&mut self, record: WorkspaceBindingRecord) -> StoreResult<()> {
+        if record.binding.workspace_id().is_some() {
+            return Err(StoreError::InvalidState(
+                "layout-1 workspace bindings require an atomic host-binding commit".to_string(),
+            ));
+        }
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         let mount_exists = transaction.query_row(
@@ -2759,14 +2766,20 @@ impl WorkspaceBindingRepository for SqliteStateStore {
         }
         let existing = transaction
             .query_row(
-                "SELECT binding_json, target_collision_key
+                "SELECT workspace_id, binding_json, target_collision_key
                  FROM workspace_bindings
                  WHERE mount_id = ?1",
                 params![record.mount_id.0.as_str()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?
-            .map(workspace_binding_from_row)
+            .map(workspace_binding_from_persisted_row)
             .transpose()?;
         if let Some(existing) = existing {
             if existing == record.binding {
@@ -2824,8 +2837,9 @@ impl WorkspaceBindingRepository for SqliteStateStore {
             });
         }
         transaction.execute(
-            "INSERT INTO workspace_bindings (mount_id, binding_json, target_collision_key)
-             VALUES (?1, ?2, ?3)",
+            "INSERT INTO workspace_bindings (
+                mount_id, workspace_id, binding_json, target_collision_key
+             ) VALUES (?1, NULL, ?2, ?3)",
             params![
                 record.mount_id.0.as_str(),
                 to_json(&record.binding)?,
@@ -2840,39 +2854,267 @@ impl WorkspaceBindingRepository for SqliteStateStore {
         let connection = self.connection()?;
         connection
             .query_row(
-                "SELECT binding_json, target_collision_key
+                "SELECT workspace_id, binding_json, target_collision_key
                  FROM workspace_bindings
                  WHERE mount_id = ?1",
                 params![mount_id.0.as_str()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?
-            .map(workspace_binding_from_row)
+            .map(workspace_binding_from_persisted_row)
             .transpose()
     }
 
     fn load_workspace_bindings(&self) -> StoreResult<Vec<WorkspaceBindingRecord>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT mount_id, binding_json, target_collision_key
+            "SELECT mount_id, workspace_id, binding_json, target_collision_key
              FROM workspace_bindings
              ORDER BY mount_id",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?;
         rows.map(|row| {
-            let (mount_id, binding_json, collision_key) = row?;
+            let (mount_id, workspace_id, binding_json, collision_key) = row?;
             Ok(WorkspaceBindingRecord::new(
                 MountId(mount_id),
-                workspace_binding_from_row((binding_json, collision_key))?,
+                workspace_binding_from_persisted_row((workspace_id, binding_json, collision_key))?,
             ))
         })
         .collect()
+    }
+
+    fn commit_workspace_binding(
+        &mut self,
+        host_binding: WorkspaceHostBinding,
+        record: WorkspaceBindingRecord,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mount = mount_from_connection(&transaction, &record.mount_id)?
+            .ok_or_else(|| StoreError::MountMissing(record.mount_id.clone()))?;
+        commit_workspace_binding_in_transaction(&transaction, &mount, &host_binding, &record)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn save_mount_with_workspace_binding(
+        &mut self,
+        mount: MountConfig,
+        host_binding: WorkspaceHostBinding,
+        record: WorkspaceBindingRecord,
+    ) -> StoreResult<()> {
+        if mount.mount_id != record.mount_id {
+            return Err(StoreError::InvalidState(
+                "mount and workspace binding identities do not match".to_string(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = mount_from_connection(&transaction, &mount.mount_id)?;
+        validate_workspace_binding_commit(&mount, &host_binding, &record)?;
+        if existing
+            .as_ref()
+            .is_some_and(|existing| mount_source_identity_changed(existing, &mount))
+        {
+            clear_mount_source_state(&transaction, &mount.mount_id)?;
+        }
+        save_mount_row(&transaction, &mount)?;
+        commit_workspace_binding_in_transaction(&transaction, &mount, &host_binding, &record)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn save_mount_with_workspace_binding_and_cleanup(
+        &mut self,
+        mount: MountConfig,
+        host_binding: WorkspaceHostBinding,
+        record: WorkspaceBindingRecord,
+        cleanup: &mut dyn FnMut() -> StoreResult<()>,
+    ) -> StoreResult<()> {
+        if mount.mount_id != record.mount_id {
+            return Err(StoreError::InvalidState(
+                "mount and workspace binding identities do not match".to_string(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let prepared = {
+            let mut statement = transaction.prepare(
+                "SELECT recovery_id FROM workspace_remount_recoveries
+                 WHERE mount_id = ?1 AND committed = 0",
+            )?;
+            statement
+                .query_map(params![mount.mount_id.as_str()], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let [recovery_id] = prepared.as_slice() else {
+            return Err(StoreError::InvalidState(format!(
+                "mount `{}` must have exactly one prepared workspace remount recovery",
+                mount.mount_id.as_str()
+            )));
+        };
+        validate_workspace_binding_commit(&mount, &host_binding, &record)?;
+        clear_mount_source_state_after_durable_preservation(&transaction, &mount.mount_id)?;
+        save_mount_row(&transaction, &mount)?;
+        commit_workspace_binding_in_transaction(&transaction, &mount, &host_binding, &record)?;
+        cleanup()?;
+        let updated = transaction.execute(
+            "UPDATE workspace_remount_recoveries
+             SET committed = 1
+             WHERE recovery_id = ?1 AND mount_id = ?2 AND committed = 0",
+            params![recovery_id, mount.mount_id.as_str()],
+        )?;
+        if updated != 1 {
+            return Err(StoreError::InvalidState(format!(
+                "workspace remount recovery `{recovery_id}` lost its prepared outcome"
+            )));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn begin_workspace_remount_recovery(
+        &mut self,
+        recovery_id: &str,
+        mount_id: &MountId,
+    ) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        let existing = connection
+            .query_row(
+                "SELECT mount_id, committed FROM workspace_remount_recoveries
+                 WHERE recovery_id = ?1",
+                params![recovery_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        match existing {
+            Some((existing_mount_id, 0)) if existing_mount_id == mount_id.as_str() => Ok(()),
+            Some(_) => Err(StoreError::InvalidState(format!(
+                "workspace remount recovery `{recovery_id}` already exists with different state"
+            ))),
+            None => connection
+                .execute(
+                    "INSERT INTO workspace_remount_recoveries (
+                        recovery_id, mount_id, committed
+                     ) VALUES (?1, ?2, 0)",
+                    params![recovery_id, mount_id.as_str()],
+                )
+                .map(|_| ())
+                .map_err(|error| {
+                    if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+                        StoreError::InvalidState(format!(
+                            "mount `{}` already has a workspace remount recovery",
+                            mount_id.as_str()
+                        ))
+                    } else {
+                        error.into()
+                    }
+                }),
+        }
+    }
+
+    fn get_workspace_remount_recovery(
+        &self,
+        recovery_id: &str,
+    ) -> StoreResult<Option<(MountId, WorkspaceRemountRecoveryOutcome)>> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT mount_id, committed FROM workspace_remount_recoveries
+                 WHERE recovery_id = ?1",
+                params![recovery_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .map(|(mount_id, committed)| match committed {
+                0 => Ok((
+                    MountId::new(mount_id),
+                    WorkspaceRemountRecoveryOutcome::Prepared,
+                )),
+                1 => Ok((
+                    MountId::new(mount_id),
+                    WorkspaceRemountRecoveryOutcome::Committed,
+                )),
+                _ => Err(StoreError::InvalidState(format!(
+                    "workspace remount recovery `{recovery_id}` has invalid outcome"
+                ))),
+            })
+            .transpose()
+    }
+
+    fn list_workspace_remount_recoveries(
+        &self,
+    ) -> StoreResult<Vec<(String, MountId, WorkspaceRemountRecoveryOutcome)>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT recovery_id, mount_id, committed
+             FROM workspace_remount_recoveries ORDER BY recovery_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .map(|row| {
+                let (recovery_id, mount_id, committed) = row?;
+                let outcome = match committed {
+                    0 => WorkspaceRemountRecoveryOutcome::Prepared,
+                    1 => WorkspaceRemountRecoveryOutcome::Committed,
+                    _ => {
+                        return Err(StoreError::InvalidState(format!(
+                            "workspace remount recovery `{recovery_id}` has invalid outcome"
+                        )));
+                    }
+                };
+                Ok((recovery_id, MountId::new(mount_id), outcome))
+            })
+            .collect()
+    }
+
+    fn finish_workspace_remount_recovery(&mut self, recovery_id: &str) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        connection.execute(
+            "DELETE FROM workspace_remount_recoveries WHERE recovery_id = ?1",
+            params![recovery_id],
+        )?;
+        Ok(())
+    }
+
+    fn get_workspace_host_binding(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> StoreResult<Option<WorkspaceHostBinding>> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT binding_json FROM workspace_host_bindings WHERE workspace_id = ?1",
+                params![workspace_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|json| workspace_host_binding_from_row(&json))
+            .transpose()
     }
 
     fn check_workspace_rebind(&self, mount_id: &MountId) -> StoreResult<()> {
@@ -4442,7 +4684,7 @@ impl VirtualMutationRepository for SqliteStateStore {
                 mutation
                     .content_path
                     .as_ref()
-                    .map(|path| path_to_text(path)),
+                    .map(|path| native_path_to_text(path)),
                 mutation.created_at,
                 mutation.updated_at,
             ],
@@ -4623,7 +4865,7 @@ impl VirtualMoveRepository for SqliteStateStore {
                 mutation
                     .content_path
                     .as_ref()
-                    .map(|path| path_to_text(path)),
+                    .map(|path| native_path_to_text(path)),
                 mutation.created_at,
                 mutation.updated_at,
             ],
@@ -4665,7 +4907,7 @@ impl VirtualMoveRepository for SqliteStateStore {
             params![
                 mount_id.0,
                 local_id,
-                path_to_text(&content_path),
+                native_path_to_text(&content_path),
                 updated_at
             ],
         )?;
@@ -5085,6 +5327,23 @@ fn mount_source_identity_changed(existing: &MountConfig, next: &MountConfig) -> 
 }
 
 fn clear_mount_source_state(connection: &Connection, mount_id: &MountId) -> StoreResult<()> {
+    clear_mount_source_state_with_policy(connection, mount_id, false)
+}
+
+/// Coordinator-only source reset used after Desktop has durably copied every
+/// pending local mutation into the remount recovery directory.
+fn clear_mount_source_state_after_durable_preservation(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<()> {
+    clear_mount_source_state_with_policy(connection, mount_id, true)
+}
+
+fn clear_mount_source_state_with_policy(
+    connection: &Connection,
+    mount_id: &MountId,
+    local_mutations_were_durably_preserved: bool,
+) -> StoreResult<()> {
     let pending_virtual_mutation: Option<String> = connection
         .query_row(
             "SELECT local_id FROM virtual_mutations WHERE mount_id = ?1 LIMIT 1",
@@ -5092,7 +5351,9 @@ fn clear_mount_source_state(connection: &Connection, mount_id: &MountId) -> Stor
             |row| row.get(0),
         )
         .optional()?;
-    if let Some(local_id) = pending_virtual_mutation {
+    if let Some(local_id) = pending_virtual_mutation
+        && !local_mutations_were_durably_preserved
+    {
         return Err(StoreError::InvalidState(format!(
             "mount `{}` cannot change source while virtual mutation `{local_id}` is pending",
             mount_id.0
@@ -5399,6 +5660,7 @@ fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
         });
     }
     if user_version == SCHEMA_VERSION {
+        migrate_workspace_bindings_component_to_v4(connection)?;
         ensure_state_components_safe_before_mutation(connection, user_version)?;
         validate_workspace_bindings(connection)?;
         retire_removed_state_components(connection)?;
@@ -5407,7 +5669,7 @@ fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
         migrate_linux_fuse_projection_layout_to_v2(connection, false)?;
         migrate_windows_cloud_files_projection_layout_to_v2(connection, false)?;
         migrate_journals_component_to_v3(connection)?;
-        migrate_virtual_mutations_component_to_v3(connection)?;
+        migrate_virtual_mutations_component_to_v4(connection)?;
         migrate_entity_search_component_to_v2(connection)?;
         migrate_generation_delivery_to_v7(connection, None, true)?;
         return Ok(());
@@ -6045,6 +6307,44 @@ fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
     Ok(())
 }
 
+fn migrate_workspace_bindings_component_to_v4(connection: &mut Connection) -> StoreResult<()> {
+    if !table_exists(connection, "state_components")? {
+        return Ok(());
+    }
+    let version = connection
+        .query_row(
+            "SELECT version FROM state_components WHERE component_id = 'durable:workspace_bindings'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let needs_table_migration = table_exists(connection, "workspace_bindings")?
+        && !column_exists(connection, "workspace_bindings", "workspace_id")?;
+    if !matches!(version, Some(2 | 3)) && !needs_table_migration {
+        return Ok(());
+    }
+
+    ensure_state_components_safe_before_mutation(connection, SCHEMA_VERSION)?;
+
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    create_workspace_host_bindings_table(&transaction)?;
+    migrate_workspace_bindings_table_to_v3(&transaction)?;
+    create_workspace_remount_recoveries_table(&transaction)?;
+    if matches!(version, Some(2 | 3)) {
+        transaction.execute(
+            "UPDATE state_components
+             SET version = 4,
+                 min_reader_version = 4,
+                 data_json = ?1
+             WHERE component_id = 'durable:workspace_bindings' AND version IN (2, 3)",
+            params!["{\"format\":\"workspace_binding.v2\",\"layout_0_without_binding\":true,\"legacy_v1_readable\":true,\"target_scope\":\"workspace_id\",\"remount_recovery\":\"v1\"}"],
+        )?;
+    }
+    validate_workspace_bindings(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn ensure_state_components_safe_before_mutation(
     connection: &Connection,
     user_version: i64,
@@ -6134,8 +6434,8 @@ fn state_component_issue_allows_schema_migration(
         StateCompatibilityIssue::OlderComponent {
             component_id,
             found,
-            current: 3,
-        } if component_id == "durable:virtual_mutations" && matches!(*found, 1 | 2)
+            current: VIRTUAL_MUTATIONS_COMPONENT_VERSION,
+        } if component_id == "durable:virtual_mutations" && matches!(*found, 1 | 2 | 3)
     ) || matches!(
         issue,
         StateCompatibilityIssue::OlderComponent {
@@ -6171,9 +6471,11 @@ fn state_component_issue_allows_schema_migration(
         issue,
         StateCompatibilityIssue::OlderComponent {
             component_id,
-            found: 1,
-            current: 2,
-        } if user_version < SCHEMA_VERSION && component_id == "durable:workspace_bindings"
+            found,
+            current: 4,
+        } if component_id == "durable:workspace_bindings"
+            && ((matches!(*found, 2 | 3) && user_version == SCHEMA_VERSION)
+                || (matches!(*found, 1 | 2 | 3) && user_version < SCHEMA_VERSION))
     ) || matches!(
         issue,
         StateCompatibilityIssue::MissingComponent { component_id }
@@ -6209,8 +6511,12 @@ fn migrate_workspace_bindings_schema_v21(
         MissingProjectionComponent::TreatAsV1,
     )?;
     migrate_entity_search_component_to_v2(&transaction)?;
-    create_workspace_bindings_table(&transaction)?;
-    discard_untrusted_legacy_workspace_bindings(&transaction)?;
+    create_workspace_host_bindings_table(&transaction)?;
+    migrate_workspace_bindings_table_to_v3(&transaction)?;
+    create_workspace_remount_recoveries_table(&transaction)?;
+    if user_version < 27 {
+        discard_untrusted_legacy_workspace_bindings(&transaction)?;
+    }
     seed_current_state_components(&transaction)?;
     record_schema_migration(&transaction, user_version, SCHEMA_VERSION)?;
     transaction.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -6223,9 +6529,89 @@ fn create_workspace_bindings_table(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS workspace_bindings (
             mount_id TEXT PRIMARY KEY,
+            workspace_id TEXT,
             binding_json TEXT NOT NULL,
-            target_collision_key TEXT NOT NULL UNIQUE,
+            target_collision_key TEXT NOT NULL,
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE,
+            FOREIGN KEY (workspace_id) REFERENCES workspace_host_bindings(workspace_id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS workspace_bindings_workspace_target_unique
+            ON workspace_bindings(workspace_id, target_collision_key)
+            WHERE workspace_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS workspace_bindings_legacy_target_unique
+            ON workspace_bindings(target_collision_key)
+            WHERE workspace_id IS NULL;",
+    )?;
+    Ok(())
+}
+
+fn create_workspace_remount_recoveries_table(connection: &Connection) -> StoreResult<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS workspace_remount_recoveries (
+            recovery_id TEXT PRIMARY KEY,
+            mount_id TEXT NOT NULL,
+            committed INTEGER NOT NULL CHECK (committed IN (0, 1)),
             FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS workspace_remount_recoveries_mount_unique
+            ON workspace_remount_recoveries(mount_id);",
+    )?;
+    Ok(())
+}
+
+fn migrate_workspace_bindings_table_to_v3(connection: &Connection) -> StoreResult<()> {
+    if !table_exists(connection, "workspace_bindings")? {
+        create_workspace_bindings_table(connection)?;
+        return Ok(());
+    }
+    if column_exists(connection, "workspace_bindings", "workspace_id")? {
+        create_workspace_bindings_table(connection)?;
+        return Ok(());
+    }
+
+    let rows = {
+        let mut statement = connection.prepare(
+            "SELECT mount_id, binding_json, target_collision_key
+             FROM workspace_bindings
+             ORDER BY mount_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    connection.execute_batch(
+        "ALTER TABLE workspace_bindings RENAME TO workspace_bindings_component_v2;",
+    )?;
+    create_workspace_bindings_table(connection)?;
+    for (mount_id, binding_json, collision_key) in rows {
+        let binding = workspace_binding_from_row((binding_json.clone(), collision_key.clone()))?;
+        connection.execute(
+            "INSERT INTO workspace_bindings (
+                mount_id, workspace_id, binding_json, target_collision_key
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                mount_id,
+                binding.workspace_id().map(WorkspaceId::as_str),
+                binding_json,
+                collision_key,
+            ],
+        )?;
+    }
+    connection.execute_batch("DROP TABLE workspace_bindings_component_v2;")?;
+    Ok(())
+}
+
+fn create_workspace_host_bindings_table(connection: &Connection) -> StoreResult<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS workspace_host_bindings (
+            workspace_id TEXT PRIMARY KEY,
+            binding_json TEXT NOT NULL
         );",
     )?;
     Ok(())
@@ -6248,18 +6634,65 @@ fn validate_workspace_bindings(connection: &Connection) -> StoreResult<()> {
             "missing required non-rebuildable workspace binding table".to_string(),
         ));
     }
+    if !table_exists(connection, "workspace_host_bindings")? {
+        return Err(StoreError::StateCompatibility(
+            "missing required non-rebuildable workspace host binding table".to_string(),
+        ));
+    }
+    let mut host_statement = connection.prepare(
+        "SELECT workspace_id, binding_json
+         FROM workspace_host_bindings
+         ORDER BY workspace_id",
+    )?;
+    let host_rows = host_statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut host_ids = BTreeSet::new();
+    for row in host_rows {
+        let (workspace_id, binding_json) = row?;
+        let host_binding = workspace_host_binding_from_row(&binding_json)?;
+        if host_binding.workspace_id().as_str() != workspace_id {
+            return Err(StoreError::InvalidState(
+                "workspace host binding key does not match its metadata".to_string(),
+            ));
+        }
+        host_ids.insert(workspace_id);
+    }
     let mut statement = connection.prepare(
-        "SELECT binding_json, target_collision_key
+        "SELECT mount_id, workspace_id, binding_json, target_collision_key
          FROM workspace_bindings
          ORDER BY mount_id",
     )?;
     let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
     })?;
     for row in rows {
-        workspace_binding_from_row(row?)?;
+        let (mount_id, workspace_id, binding_json, collision_key) = row?;
+        let binding =
+            workspace_binding_from_persisted_row((workspace_id, binding_json, collision_key))?;
+        if let Some(workspace_id) = binding.workspace_id()
+            && !host_ids.contains(workspace_id.as_str())
+        {
+            return Err(StoreError::InvalidState(format!(
+                "workspace binding for mount `{mount_id}` references missing workspace `{}`",
+                workspace_id.as_str()
+            )));
+        }
     }
     Ok(())
+}
+
+fn workspace_host_binding_from_row(binding_json: &str) -> StoreResult<WorkspaceHostBinding> {
+    serde_json::from_str::<WorkspaceHostBinding>(binding_json).map_err(|error| {
+        StoreError::StateCompatibility(format!(
+            "workspace host binding metadata is not readable by this binary; update required or repair invalid metadata: {error}"
+        ))
+    })
 }
 
 fn workspace_binding_from_row(row: (String, String)) -> StoreResult<WorkspaceBinding> {
@@ -6274,6 +6707,279 @@ fn workspace_binding_from_row(row: (String, String)) -> StoreResult<WorkspaceBin
         ));
     }
     Ok(binding)
+}
+
+fn workspace_binding_from_persisted_row(
+    row: (Option<String>, String, String),
+) -> StoreResult<WorkspaceBinding> {
+    let (stored_workspace_id, binding_json, collision_key) = row;
+    let binding = workspace_binding_from_row((binding_json, collision_key))?;
+    if binding.workspace_id().map(WorkspaceId::as_str) != stored_workspace_id.as_deref() {
+        return Err(StoreError::InvalidState(
+            "workspace binding identity column does not match its metadata".to_string(),
+        ));
+    }
+    Ok(binding)
+}
+
+fn mount_from_connection(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> StoreResult<Option<MountConfig>> {
+    connection
+        .query_row(
+            "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, settings_json
+             FROM mounts WHERE mount_id = ?1",
+            params![mount_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(mount_from_row)
+        .transpose()
+}
+
+fn save_mount_row(connection: &Connection, mount: &MountConfig) -> StoreResult<()> {
+    connection.execute(
+        "INSERT INTO mounts (mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, settings_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(mount_id) DO UPDATE SET
+            connector = excluded.connector,
+            root = excluded.root,
+            remote_root_id = excluded.remote_root_id,
+            read_only = excluded.read_only,
+            projection_json = excluded.projection_json,
+            connection_id = excluded.connection_id,
+            settings_json = excluded.settings_json",
+        params![
+            mount.mount_id.as_str(),
+            &mount.connector,
+            path_to_text(&mount.root),
+            mount.remote_root_id.as_ref().map(|remote_id| remote_id.0.as_str()),
+            bool_to_int(mount.read_only),
+            to_json(&mount.projection)?,
+            mount.connection_id.as_ref().map(|connection_id| connection_id.0.as_str()),
+            mount.settings_json.as_str(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn validate_workspace_binding_commit(
+    mount: &MountConfig,
+    host_binding: &WorkspaceHostBinding,
+    record: &WorkspaceBindingRecord,
+) -> StoreResult<()> {
+    let workspace_id = record.binding.workspace_id().ok_or_else(|| {
+        StoreError::InvalidState(
+            "atomic workspace commit requires a layout-1 mount binding".to_string(),
+        )
+    })?;
+    if record.mount_id != mount.mount_id || workspace_id != host_binding.workspace_id() {
+        return Err(StoreError::InvalidState(
+            "workspace mount binding does not match its mount or host identity".to_string(),
+        ));
+    }
+    let resolved_root = host_binding.mount_root(record.binding.mount_target());
+    if !host_paths_equivalent(
+        crate::WorkspaceHostPlatform::current(),
+        &resolved_root,
+        &mount.root,
+    ) {
+        return Err(StoreError::InvalidState(format!(
+            "workspace binding for mount `{}` resolves to `{}` instead of its preserved root `{}`",
+            record.mount_id.as_str(),
+            resolved_root.display(),
+            mount.root.display()
+        )));
+    }
+    WorkspaceHostBindingResolver::current()
+        .validate_persistent_mount_root(host_binding, &resolved_root, record.binding.mount_target())
+        .map_err(|error| StoreError::InvalidState(error.to_string()))
+}
+
+fn commit_workspace_binding_in_transaction(
+    connection: &Connection,
+    mount: &MountConfig,
+    host_binding: &WorkspaceHostBinding,
+    record: &WorkspaceBindingRecord,
+) -> StoreResult<()> {
+    validate_workspace_binding_commit(mount, host_binding, record)?;
+    let workspace_id = record
+        .binding
+        .workspace_id()
+        .expect("validated layout-1 workspace binding");
+    let existing_binding = connection
+        .query_row(
+            "SELECT workspace_id, binding_json, target_collision_key
+             FROM workspace_bindings WHERE mount_id = ?1",
+            params![record.mount_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(workspace_binding_from_persisted_row)
+        .transpose()?;
+    let exact_replay = existing_binding.as_ref() == Some(&record.binding);
+    let safe_v1_upgrade = existing_binding.as_ref().is_some_and(|existing| {
+        existing.workspace_id().is_none()
+            && existing.mount_target() == record.binding.mount_target()
+    });
+    if let Some(existing) = &existing_binding
+        && !exact_replay
+        && !safe_v1_upgrade
+    {
+        return Err(StoreError::WorkspaceBindingTargetImmutable {
+            mount_id: record.mount_id.clone(),
+            existing_target: existing.mount_target().as_str().to_string(),
+            requested_target: record.binding.mount_target().as_str().to_string(),
+        });
+    }
+
+    let existing_host = connection
+        .query_row(
+            "SELECT binding_json FROM workspace_host_bindings WHERE workspace_id = ?1",
+            params![workspace_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| workspace_host_binding_from_row(&json))
+        .transpose()?;
+    if let Some(existing_host) = &existing_host {
+        if !host_paths_equivalent(
+            crate::WorkspaceHostPlatform::current(),
+            existing_host.trusted_workspace_root(),
+            host_binding.trusted_workspace_root(),
+        ) || existing_host.projection_identity() != host_binding.projection_identity()
+        {
+            return Err(StoreError::InvalidState(format!(
+                "workspace `{}` host root or projection identity is immutable outside an owning coordinator",
+                workspace_id.as_str()
+            )));
+        }
+        let expected_sequence = if exact_replay {
+            existing_host.layout_sequence()
+        } else {
+            existing_host
+                .next_layout_sequence()
+                .map_err(|error| StoreError::InvalidState(error.to_string()))?
+        };
+        if host_binding.layout_sequence() != expected_sequence {
+            return Err(StoreError::InvalidState(format!(
+                "workspace `{}` layout sequence must be {expected_sequence}, got {}",
+                workspace_id.as_str(),
+                host_binding.layout_sequence()
+            )));
+        }
+    } else if host_binding.layout_sequence() != 1 {
+        return Err(StoreError::InvalidState(format!(
+            "new workspace `{}` must start at layout sequence 1",
+            workspace_id.as_str()
+        )));
+    }
+    let persisted_host = if let Some(existing_host) = &existing_host {
+        WorkspaceHostBinding::new(
+            crate::WorkspaceHostPlatform::current(),
+            workspace_id.clone(),
+            existing_host.trusted_workspace_root().to_path_buf(),
+            host_binding.projection_identity().clone(),
+            host_binding.layout_sequence(),
+        )
+        .map_err(|error| StoreError::InvalidState(error.to_string()))?
+    } else {
+        host_binding.clone()
+    };
+
+    if !exact_replay {
+        let collision_key = record.binding.collision_key();
+        let mut statement = connection.prepare(
+            "SELECT m.mount_id, m.root, b.workspace_id, b.binding_json, b.target_collision_key
+             FROM mounts m
+             LEFT JOIN workspace_bindings b ON b.mount_id = m.mount_id
+             WHERE m.mount_id <> ?1
+             ORDER BY m.mount_id",
+        )?;
+        let rows = statement.query_map(params![record.mount_id.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                PathBuf::from(row.get::<_, String>(1)?),
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (mount_id, root, stored_workspace_id, binding_json, stored_collision_key) = row?;
+            let existing_collision_key = match (binding_json, stored_collision_key) {
+                (Some(binding_json), Some(stored_collision_key)) => {
+                    let binding = workspace_binding_from_persisted_row((
+                        stored_workspace_id,
+                        binding_json,
+                        stored_collision_key,
+                    ))?;
+                    match binding.workspace_id() {
+                        Some(existing_workspace_id) if existing_workspace_id == workspace_id => {
+                            Some(binding.collision_key())
+                        }
+                        Some(_) => None,
+                        None => legacy_mount_collision_key_for_host(&persisted_host, &root),
+                    }
+                }
+                (None, None) => legacy_mount_collision_key_for_host(&persisted_host, &root),
+                _ => {
+                    return Err(StoreError::InvalidState(
+                        "workspace binding row is partially present".to_string(),
+                    ));
+                }
+            };
+            if existing_collision_key.as_deref() == Some(collision_key.as_str()) {
+                return Err(StoreError::WorkspaceMountTargetCollision {
+                    target: record.binding.mount_target().as_str().to_string(),
+                    existing_mount_id: MountId(mount_id),
+                });
+            }
+        }
+    }
+
+    connection.execute(
+        "INSERT INTO workspace_host_bindings (workspace_id, binding_json)
+         VALUES (?1, ?2)
+         ON CONFLICT(workspace_id) DO UPDATE SET binding_json = excluded.binding_json",
+        params![workspace_id.as_str(), to_json(&persisted_host)?],
+    )?;
+    if !exact_replay {
+        connection.execute(
+            "INSERT INTO workspace_bindings (
+                mount_id, workspace_id, binding_json, target_collision_key
+             ) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(mount_id) DO UPDATE SET
+                workspace_id = excluded.workspace_id,
+                binding_json = excluded.binding_json,
+                target_collision_key = excluded.target_collision_key",
+            params![
+                record.mount_id.as_str(),
+                workspace_id.as_str(),
+                to_json(&record.binding)?,
+                record.binding.collision_key(),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn mount_from_row(row: MountRow) -> StoreResult<MountConfig> {
@@ -6479,7 +7185,7 @@ fn virtual_mutation_from_row(row: VirtualMutationRow) -> StoreResult<VirtualMuta
         original_path: row.5.map(PathBuf::from),
         projected_path: PathBuf::from(row.6),
         title: row.7,
-        content_path: row.8.map(PathBuf::from),
+        content_path: row.8.map(|path| native_path_from_text(&path)).transpose()?,
         created_at: row.9,
         updated_at: row.10,
     })
@@ -7194,7 +7900,7 @@ fn migrate_windows_cloud_files_projection_layout_to_v2(
     )
 }
 
-fn migrate_virtual_mutations_component_to_v3(connection: &Connection) -> StoreResult<()> {
+fn migrate_virtual_mutations_component_to_v4(connection: &Connection) -> StoreResult<()> {
     migrate_state_component_to_current(connection, "durable:virtual_mutations")
 }
 
@@ -9218,6 +9924,112 @@ fn table_exists(connection: &Connection, table: &str) -> StoreResult<bool> {
 
 fn path_to_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+const NATIVE_PATH_ENCODING_PREFIX: &str = "locality-native-path-v1:";
+
+fn native_path_to_text(path: &Path) -> String {
+    if let Some(path) = path.to_str() {
+        return format!(
+            "{NATIVE_PATH_ENCODING_PREFIX}utf8:{}",
+            encode_hex(path.as_bytes())
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        return format!(
+            "{NATIVE_PATH_ENCODING_PREFIX}unix:{}",
+            encode_hex(path.as_os_str().as_bytes())
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let bytes = path
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        return format!(
+            "{NATIVE_PATH_ENCODING_PREFIX}windows:{}",
+            encode_hex(&bytes)
+        );
+    }
+    #[cfg(not(any(unix, windows)))]
+    unreachable!("non-UTF-8 native paths are unsupported on this platform")
+}
+
+fn native_path_from_text(encoded: &str) -> StoreResult<PathBuf> {
+    let Some(encoded) = encoded.strip_prefix(NATIVE_PATH_ENCODING_PREFIX) else {
+        return Ok(PathBuf::from(encoded));
+    };
+    let (kind, bytes) = encoded.split_once(':').ok_or_else(|| {
+        StoreError::InvalidState("invalid durable native path encoding".to_string())
+    })?;
+    let bytes = decode_hex(bytes)?;
+    match kind {
+        "utf8" => String::from_utf8(bytes).map(PathBuf::from).map_err(|_| {
+            StoreError::InvalidState("durable native UTF-8 path is invalid".to_string())
+        }),
+        #[cfg(unix)]
+        "unix" => {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+            Ok(PathBuf::from(OsString::from_vec(bytes)))
+        }
+        #[cfg(windows)]
+        "windows" => {
+            use std::ffi::OsString;
+            use std::os::windows::ffi::OsStringExt;
+            if bytes.len() % 2 != 0 {
+                return Err(StoreError::InvalidState(
+                    "durable native Windows path has an odd byte count".to_string(),
+                ));
+            }
+            let wide = bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect::<Vec<_>>();
+            Ok(PathBuf::from(OsString::from_wide(&wide)))
+        }
+        _ => Err(StoreError::InvalidState(format!(
+            "durable native path encoding `{kind}` is unsupported on this host"
+        ))),
+    }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn decode_hex(encoded: &str) -> StoreResult<Vec<u8>> {
+    if encoded.len() % 2 != 0 {
+        return Err(StoreError::InvalidState(
+            "durable native path has an odd hex length".to_string(),
+        ));
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16);
+            let low = (pair[1] as char).to_digit(16);
+            match (high, low) {
+                (Some(high), Some(low)) => Ok(((high << 4) | low) as u8),
+                _ => Err(StoreError::InvalidState(
+                    "durable native path contains invalid hex".to_string(),
+                )),
+            }
+        })
+        .collect()
 }
 
 fn logical_path_to_text(path: &Path) -> String {

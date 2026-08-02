@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use locality_platform::{
     DaemonManager, DaemonProcessError, DaemonProcessManager, DaemonProcessPaths,
     DaemonProcessStartConfig, DaemonProcessStartReport, DaemonStartMode,
-    DefaultDaemonProcessManager,
+    DaemonStartupCoordinatorLock, DefaultDaemonProcessManager,
 };
 use localityd::ipc::{
     DaemonClientError, DaemonEndpoint, DaemonReloadReport, DaemonRequest, DaemonResponse,
@@ -156,6 +156,63 @@ pub fn run_daemon_control(args: &[String]) -> Result<DaemonControlReport, Daemon
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RemountDaemonRestartPlan {
+    manager: DaemonManager,
+}
+
+impl RemountDaemonRestartPlan {
+    fn new(manager: DaemonManager) -> Result<Self, DaemonControlError> {
+        match manager {
+            DaemonManager::Launchd | DaemonManager::Session => Ok(Self { manager }),
+            DaemonManager::Unknown => Err(DaemonControlError::new(
+                "daemon_manager_unknown",
+                "could not determine the live daemon manager before remount",
+            )),
+        }
+    }
+}
+
+pub(crate) fn detected_daemon_manager(paths: &DaemonProcessPaths) -> DaemonManager {
+    DefaultDaemonProcessManager.detected_manager(paths)
+}
+
+pub fn restart_daemon_after_remount(
+    state_root: &Path,
+    manager: DaemonManager,
+    localityd_bin: Option<&Path>,
+    ownership: &crate::mount::WorkspaceRemountOwnership,
+) -> Result<(), DaemonControlError> {
+    let plan = RemountDaemonRestartPlan::new(manager)?;
+    let options = DaemonOptions {
+        action: DaemonAction::Start,
+        mode: match plan.manager {
+            DaemonManager::Launchd => StartMode::Launchd,
+            DaemonManager::Session => StartMode::Session,
+            DaemonManager::Unknown => unreachable!("validated remount daemon manager"),
+        },
+        state_root: state_root.to_path_buf(),
+        localityd_bin: localityd_bin.map(Path::to_path_buf),
+        tcp_addr: env::var("LOCALITY_DAEMON_TCP_ADDR")
+            .ok()
+            .filter(|value| !value.is_empty()),
+        include_env: Vec::new(),
+    };
+    let paths = DaemonPaths::new(options.state_root.clone());
+    let report = start_daemon_inner(&options, &paths, Some(ownership))?;
+    if report.state != DaemonRunState::Running || report.manager != manager {
+        return Err(DaemonControlError::new(
+            "daemon_manager_mismatch",
+            format!(
+                "daemon recovery required {} readiness but observed {}",
+                manager.as_str(),
+                report.manager.as_str()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_options(args: &[String]) -> Result<DaemonOptions, DaemonControlError> {
     let action = first_positional(args)
         .and_then(DaemonAction::parse)
@@ -200,7 +257,21 @@ fn start_daemon(
     options: &DaemonOptions,
     paths: &DaemonPaths,
 ) -> Result<DaemonControlReport, DaemonControlError> {
+    start_daemon_inner(options, paths, None)
+}
+
+fn start_daemon_inner(
+    options: &DaemonOptions,
+    paths: &DaemonPaths,
+    remount_ownership: Option<&crate::mount::WorkspaceRemountOwnership>,
+) -> Result<DaemonControlReport, DaemonControlError> {
+    let startup_lock = if remount_ownership.is_none() {
+        Some(DaemonStartupCoordinatorLock::try_acquire(paths).map_err(daemon_process_error)?)
+    } else {
+        None
+    };
     if is_running(options, paths) {
+        drop(startup_lock);
         repair_linux_fuse_units_for_daemon_start(&options.state_root);
         return Ok(report(
             options.action,
@@ -222,15 +293,20 @@ fn start_daemon(
         .map_err(daemon_process_error)?;
     validate_start_endpoint(options)?;
     let environment = included_environment(options)?;
-    let artifacts = process_manager
-        .start(&DaemonProcessStartConfig {
-            mode: options.mode,
-            paths,
-            localityd_bin: &localityd_bin,
-            tcp_addr: options.tcp_addr.as_deref(),
-            environment,
-        })
-        .map_err(daemon_process_error)?;
+    let config = DaemonProcessStartConfig {
+        mode: options.mode,
+        paths,
+        localityd_bin: &localityd_bin,
+        tcp_addr: options.tcp_addr.as_deref(),
+        environment,
+    };
+    let artifacts = match remount_ownership {
+        Some(ownership) => {
+            process_manager.start_during_remount(&config, ownership.coordinator_lock())
+        }
+        None => process_manager.start(&config),
+    }
+    .map_err(daemon_process_error)?;
 
     if !wait_for_state(options, paths, DaemonRunState::Running, START_TIMEOUT) {
         return Err(DaemonControlError::new(
@@ -241,6 +317,7 @@ fn start_daemon(
             ),
         ));
     }
+    drop(startup_lock);
     write_metadata(options, paths, &artifacts)?;
     repair_linux_fuse_units_for_daemon_start(&options.state_root);
 
@@ -883,6 +960,31 @@ mod tests {
     }
 
     #[test]
+    fn competing_cli_start_is_rejected_by_persisted_remount_fence() {
+        let root = temp_root("loc-daemon-remount-fence");
+        fs::create_dir_all(&root).expect("create state root");
+        fs::write(
+            locality_platform::daemon_remount_fence_path(&root),
+            "version=1\n",
+        )
+        .expect("write fence");
+        let options = DaemonOptions {
+            action: DaemonAction::Start,
+            mode: StartMode::Session,
+            state_root: root.clone(),
+            localityd_bin: Some(root.join("unused-localityd")),
+            tcp_addr: None,
+            include_env: Vec::new(),
+        };
+        let paths = DaemonPaths::new(root.clone());
+
+        let error = start_daemon(&options, &paths).expect_err("fenced start must fail closed");
+
+        assert_eq!(error.code(), "remount_in_progress");
+        fs::remove_dir_all(root).expect("remove state root");
+    }
+
+    #[test]
     fn launchd_stop_unloads_manager_after_graceful_shutdown() {
         assert!(should_stop_managed_process(StartMode::Auto, true, "macos"));
         assert!(should_stop_managed_process(
@@ -901,6 +1003,35 @@ mod tests {
             false,
             "macos"
         ));
+    }
+
+    #[test]
+    fn remount_restart_preserves_live_session_manager() {
+        let root = temp_root("loc-remount-session-manager");
+        let paths = DaemonPaths::for_target(root.clone(), "macos", Some(root.join("home")));
+        let launch_agent = paths
+            .launch_agent
+            .as_ref()
+            .expect("macOS launch agent path");
+        fs::create_dir_all(launch_agent.parent().expect("launch agent parent"))
+            .expect("create launch agent parent");
+        fs::write(launch_agent, "launch agent").expect("write launch agent");
+        fs::create_dir_all(&paths.state_root).expect("create state root");
+        fs::write(&paths.pid_file, "123").expect("write session pid");
+
+        let manager = detected_daemon_manager(&paths);
+        let plan = RemountDaemonRestartPlan::new(manager).expect("restart plan");
+
+        assert_eq!(manager, DaemonManager::Session);
+        assert_eq!(plan.manager, DaemonManager::Session);
+        fs::remove_dir_all(root).expect("remove temp root");
+    }
+
+    #[test]
+    fn remount_restart_preserves_live_launchd_manager() {
+        let plan = RemountDaemonRestartPlan::new(DaemonManager::Launchd).expect("restart plan");
+
+        assert_eq!(plan.manager, DaemonManager::Launchd);
     }
 
     #[test]

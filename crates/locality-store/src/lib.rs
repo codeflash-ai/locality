@@ -61,17 +61,18 @@ pub use repository::{
     FreshnessStateRepository, HydrationJobRepository, JournalRepository,
     MetadataDiscoveryJobRepository, MountLiveModeRepository, MountRepository,
     RemoteObservationRepository, ShadowRepository, VirtualMoveRepository, VirtualMoveTransition,
-    VirtualMutationRepository, WorkspaceBindingRepository,
+    VirtualMutationRepository, WorkspaceBindingRepository, WorkspaceRemountRecoveryOutcome,
 };
 pub use reset::{
     LocalStateResetCredentialError, LocalStateResetError, LocalStateResetStorageReport,
-    connection_secret_refs, reset_locality_state_storage,
+    connection_secret_refs, reset_locality_state_storage, reset_locality_state_storage_preserving,
 };
 pub use sqlite::SqliteStateStore;
 pub use workspace_binding::{
-    LegacyLayout0Mount, LegacyLayout0Reason, LegacyWorkspaceMount,
-    WORKSPACE_BINDING_LAYOUT_VERSION, WORKSPACE_BINDING_VERSION, WorkspaceBinding,
-    WorkspaceBindingError, WorkspaceBindingMigrationPlan, WorkspaceBindingRecord,
-    WorkspaceHostBindingError, WorkspaceHostBindingResolver, WorkspaceHostPlatform,
-    WorkspaceRebindBlocker,
+    LEGACY_WORKSPACE_BINDING_VERSION, LegacyLayout0Mount, LegacyLayout0Reason,
+    LegacyWorkspaceMount, WORKSPACE_BINDING_LAYOUT_VERSION, WORKSPACE_BINDING_VERSION,
+    WORKSPACE_HOST_BINDING_VERSION, WorkspaceBinding, WorkspaceBindingError,
+    WorkspaceBindingMigrationPlan, WorkspaceBindingRecord, WorkspaceHostBinding,
+    WorkspaceHostBindingError, WorkspaceHostBindingResolver, WorkspaceHostPlatform, WorkspaceId,
+    WorkspaceProjectionIdentity, WorkspaceRebindBlocker, host_paths_equivalent,
 };

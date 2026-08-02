@@ -6,7 +6,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use loc_cli::mount::{GuidanceFileAction, MountOptions, run_mount};
+use loc_cli::mount::{
+    GuidanceFileAction, MountError, MountOptions, resolve_workspace_mount_root, run_mount,
+};
 use locality_connector::ConnectorCapabilities;
 use locality_core::model::{MountId, RemoteId};
 use locality_gmail::{GMAIL_OAUTH_SCOPES, gmail_capabilities_json};
@@ -20,7 +22,7 @@ use locality_slack::{
 use locality_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorProfileRepository, CredentialStore, FileCredentialStore,
-    InMemoryStateStore, MountRepository, ProjectionMode, SqliteStateStore,
+    InMemoryStateStore, LegacyLayout0Reason, MountRepository, ProjectionMode, SqliteStateStore,
     WorkspaceBindingRepository,
 };
 use serde_json::Value;
@@ -263,9 +265,136 @@ fn linux_fuse_cli_mounts_persist_bindings_before_daemon_reopen() {
     );
     assert_eq!(bindings[1].mount_id, MountId::new("notion-main"));
     assert_eq!(bindings[1].binding.mount_target().as_str(), "notion-main");
+    let workspace_id = bindings[0]
+        .binding
+        .workspace_id()
+        .expect("new CLI binding has stable workspace identity");
+    assert_eq!(bindings[1].binding.workspace_id(), Some(workspace_id));
+    let host_binding = store
+        .get_workspace_host_binding(workspace_id)
+        .expect("load host binding")
+        .expect("host binding exists");
+    assert_eq!(host_binding.trusted_workspace_root(), locality_root);
+    assert_eq!(host_binding.layout_sequence(), 2);
     drop(store);
 
     SqliteStateStore::open(state_root).expect("daemon process transition remains readable");
+}
+
+#[test]
+fn cli_resolves_the_canonical_path_from_the_persisted_workspace_binding() {
+    let fixture = MountFixture::new("loc-cli-shared-workspace-resolver");
+    let mount_root = fixture.root.join("Locality/notion-main");
+    let mut store = InMemoryStateStore::new();
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: MountId::new("notion-main"),
+            connector: "notion".to_string(),
+            root: mount_root.clone(),
+            remote_root_id: None,
+            connection_id: None,
+            read_only: false,
+            projection: ProjectionMode::LinuxFuse,
+            settings_json: "{}".to_string(),
+        },
+    )
+    .expect("mount through CLI coordinator");
+    let mount = store
+        .get_mount(&MountId::new("notion-main"))
+        .expect("load mount")
+        .expect("mount exists");
+
+    assert_eq!(
+        resolve_workspace_mount_root(&store, &mount).expect("resolve CLI path"),
+        mount_root
+    );
+}
+
+#[test]
+fn failed_cli_virtual_remount_keeps_the_persisted_mount_unchanged() {
+    let fixture = MountFixture::new("loc-cli-atomic-workspace-remount");
+    let original_root = fixture.root.join("Locality/notion-main");
+    let moved_root = fixture.root.join("MovedLocality/notion-main");
+    let mount_id = MountId::new("notion-main");
+    let mut store = InMemoryStateStore::new();
+    let options = |root: PathBuf, connector: &str| MountOptions {
+        mount_id: mount_id.clone(),
+        connector: connector.to_string(),
+        root,
+        remote_root_id: None,
+        connection_id: None,
+        read_only: false,
+        projection: ProjectionMode::LinuxFuse,
+        settings_json: "{}".to_string(),
+    };
+
+    run_mount(&mut store, options(original_root.clone(), "notion")).expect("initial virtual mount");
+    let original = store
+        .get_mount(&mount_id)
+        .expect("load initial mount")
+        .expect("initial mount exists");
+
+    run_mount(&mut store, options(moved_root, "different-connector"))
+        .expect_err("trusted workspace root is immutable");
+
+    assert_eq!(
+        store.get_mount(&mount_id).expect("mount after failure"),
+        Some(original)
+    );
+}
+
+// This test intentionally runs on Windows CI too: Windows host-path comparison
+// trims trailing dots, but the portable mount target must reject the raw leaf.
+#[test]
+fn cli_rejects_raw_trailing_dot_target_without_retaining_success() {
+    let fixture = MountFixture::new("loc-cli-layout-zero-plan");
+    let workspace_root = fixture.root.join("Locality");
+    let mount_id = MountId::new("notion-main");
+    let mut store = InMemoryStateStore::new();
+    let options = |root: PathBuf| MountOptions {
+        mount_id: mount_id.clone(),
+        connector: "notion".to_string(),
+        root,
+        remote_root_id: None,
+        connection_id: None,
+        read_only: false,
+        projection: ProjectionMode::LinuxFuse,
+        settings_json: "{}".to_string(),
+    };
+
+    run_mount(&mut store, options(workspace_root.join("notion-main")))
+        .expect("initial portable mount");
+    let original_mount = store
+        .get_mount(&mount_id)
+        .expect("load original mount")
+        .expect("original mount");
+    let original_binding = store
+        .get_workspace_binding(&mount_id)
+        .expect("load original binding")
+        .expect("original binding");
+
+    let error = run_mount(&mut store, options(workspace_root.join("trailing.")))
+        .expect_err("layout-0 plan must fail");
+
+    assert_eq!(
+        error,
+        MountError::WorkspaceBindingUnavailable {
+            mount_id: mount_id.clone(),
+            reason: LegacyLayout0Reason::InvalidMountTarget,
+        }
+    );
+    assert_eq!(error.code(), "invalid_mount_binding");
+    assert_eq!(
+        store.get_mount(&mount_id).expect("mount after rejection"),
+        Some(original_mount)
+    );
+    assert_eq!(
+        store
+            .get_workspace_binding(&mount_id)
+            .expect("binding after rejection"),
+        Some(original_binding)
+    );
 }
 
 #[test]
