@@ -35,14 +35,69 @@ pub fn create_dir_all_durable(trusted_root: &Path, path: &Path) -> io::Result<()
         return create_dir_all_durable_unix(trusted_root, path);
     }
     #[cfg(windows)]
-    return create_dir_all_durable_with_sync(trusted_root, path, |directory| {
-        sync_directory(trusted_root, directory)
-    });
+    return create_dir_all_durable_windows(trusted_root, path);
     #[cfg(not(any(unix, windows)))]
     unsupported_descriptor_relative_operation()
 }
 
-#[cfg(any(test, not(unix)))]
+#[cfg(windows)]
+fn create_dir_all_durable_windows(trusted_root: &Path, path: &Path) -> io::Result<()> {
+    create_dir_all_durable_windows_with_post_validation_hook(trusted_root, path, || {})
+}
+
+#[cfg(windows)]
+fn create_dir_all_durable_windows_with_post_validation_hook(
+    trusted_root: &Path,
+    path: &Path,
+    after_validation: impl FnOnce(),
+) -> io::Result<()> {
+    validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
+    after_validation();
+
+    let relative = path.strip_prefix(trusted_root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path `{}` is outside trusted root", path.display()),
+        )
+    })?;
+    let mut directories = vec![
+        crate::windows_workspace_fs::WindowsDirectory::open_absolute_mutation_anchor(trusted_root)?,
+    ];
+    for component in relative.components() {
+        let component = match component {
+            std::path::Component::Normal(component) => component,
+            std::path::Component::CurDir => continue,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("path `{}` contains unsafe components", path.display()),
+                ));
+            }
+        };
+        let parent = directories.last().expect("anchored directory parent");
+        let child = match parent.open_directory_mutation_anchor(component) {
+            Ok(child) => child,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match parent.create_directory_anchored(component) {
+                    Ok(child) => {
+                        parent.sync()?;
+                        child.sync()?;
+                        child
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        parent.open_directory_mutation_anchor(component)?
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        directories.push(child);
+    }
+    Ok(())
+}
+
+#[cfg(any(test, not(any(unix, windows))))]
 pub(crate) fn create_dir_all_durable_with_sync(
     trusted_root: &Path,
     path: &Path,
@@ -95,15 +150,56 @@ pub fn write_new_file_durable(trusted_root: &Path, path: &Path, contents: &[u8])
         return write_new_file_durable_unix(trusted_root, path, contents);
     }
     #[cfg(windows)]
-    return write_new_file_durable_with_sync(
-        trusted_root,
-        path,
-        contents,
-        |file| file.sync_all(),
-        |directory| sync_directory(trusted_root, directory),
-    );
+    return write_new_file_durable_windows(trusted_root, path, contents);
     #[cfg(not(any(unix, windows)))]
     unsupported_descriptor_relative_operation()
+}
+
+pub(crate) fn create_new_file(trusted_root: &Path, path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        let (_, file) =
+            create_new_file_windows_with_post_validation_hook(trusted_root, path, || {})?;
+        return Ok(file);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = trusted_root;
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+    }
+}
+
+#[cfg(windows)]
+fn write_new_file_durable_windows(
+    trusted_root: &Path,
+    path: &Path,
+    contents: &[u8],
+) -> io::Result<()> {
+    let (parents, mut file) =
+        create_new_file_windows_with_post_validation_hook(trusted_root, path, || {})?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    drop(file);
+    parents.last().expect("anchored file parent").sync()
+}
+
+#[cfg(windows)]
+fn create_new_file_windows_with_post_validation_hook(
+    trusted_root: &Path,
+    path: &Path,
+    after_validation: impl FnOnce(),
+) -> io::Result<(Vec<crate::windows_workspace_fs::WindowsDirectory>, File)> {
+    validate_no_symlink_or_reparse_ancestors(trusted_root, path)?;
+    after_validation();
+    let (parents, name) = open_windows_parent_anchored_after_validation(trusted_root, path, true)?;
+    let file = parents
+        .last()
+        .expect("anchored file parent")
+        .create_file_anchored(&name)?;
+    Ok((parents, file))
 }
 
 pub fn copy_new_file_durable(
@@ -178,7 +274,7 @@ pub(crate) fn copy_new_file_durable_with_sync(
     Ok(copied)
 }
 
-#[cfg(any(test, not(unix)))]
+#[cfg(any(test, not(any(unix, windows))))]
 pub(crate) fn write_new_file_durable_with_sync(
     trusted_root: &Path,
     path: &Path,
@@ -305,6 +401,18 @@ fn open_windows_parent_anchored(
     std::ffi::OsString,
 )> {
     validate_no_symlink_or_reparse_ancestors_allow_final(trusted_root, path)?;
+    open_windows_parent_anchored_after_validation(trusted_root, path, writable_final)
+}
+
+#[cfg(windows)]
+fn open_windows_parent_anchored_after_validation(
+    trusted_root: &Path,
+    path: &Path,
+    writable_final: bool,
+) -> io::Result<(
+    Vec<crate::windows_workspace_fs::WindowsDirectory>,
+    std::ffi::OsString,
+)> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1831,6 +1939,75 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_create_rejects_post_validation_junction_substitution() {
+        let container = temp_root("windows-anchored-directory-create-race");
+        let root = container.join("trusted");
+        let ancestor = root.join("ancestor");
+        let displaced = root.join("displaced-ancestor");
+        let outside = container.join("outside");
+        let target = ancestor.join("created");
+        fs::create_dir_all(&ancestor).expect("create trusted ancestor");
+        fs::create_dir_all(&outside).expect("create outside directory");
+
+        let error =
+            create_dir_all_durable_windows_with_post_validation_hook(&root, &target, || {
+                fs::rename(&ancestor, &displaced)
+                    .expect("replace validated ancestor before directory create");
+                create_windows_junction(&ancestor, &outside);
+            })
+            .expect_err("anchored directory create must reject the substituted junction");
+
+        assert!(error.to_string().contains("reparse point"));
+        assert!(!outside.join("created").exists());
+        assert!(!displaced.join("created").exists());
+        fs::remove_dir(&ancestor).expect("remove injected junction");
+        fs::remove_dir_all(container).expect("remove directory race fixture");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_create_rejects_post_validation_junction_substitution() {
+        let container = temp_root("windows-anchored-file-create-race");
+        let root = container.join("trusted");
+        let ancestor = root.join("ancestor");
+        let displaced = root.join("displaced-ancestor");
+        let outside = container.join("outside");
+        let target = ancestor.join("record");
+        fs::create_dir_all(&ancestor).expect("create trusted ancestor");
+        fs::create_dir_all(&outside).expect("create outside directory");
+
+        let result = create_new_file_windows_with_post_validation_hook(&root, &target, || {
+            fs::rename(&ancestor, &displaced)
+                .expect("replace validated ancestor before file create");
+            create_windows_junction(&ancestor, &outside);
+        });
+        let error = match result {
+            Ok(_) => panic!("anchored file create must reject the substituted junction"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("reparse point"));
+        assert!(!outside.join("record").exists());
+        assert!(!displaced.join("record").exists());
+        fs::remove_dir(&ancestor).expect("remove injected junction");
+        fs::remove_dir_all(container).expect("remove file race fixture");
+    }
+
+    #[cfg(windows)]
+    fn create_windows_junction(alias: &Path, target: &Path) {
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(alias)
+            .arg(target)
+            .status()
+            .expect("create ancestor junction");
+        assert!(status.success(), "mklink /J failed with {status}");
+    }
 
     #[cfg(windows)]
     #[test]

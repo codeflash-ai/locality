@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Display, Formatter};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -37,7 +37,9 @@ use locality_store::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::durable_fs::{create_dir_all_durable, remove_path_durable, rename_noreplace_durable};
+use crate::durable_fs::{
+    create_dir_all_durable, create_new_file, remove_path_durable, rename_noreplace_durable,
+};
 use crate::generation_mount::{
     GENERATION_MOUNT_LOCK_FILE, GenerationStateLock, SecureMount, SecureTarget,
 };
@@ -1726,7 +1728,7 @@ fn write_verified_windows<T: GenerationTransport>(
     max_window_bytes: u64,
     transport: &mut T,
 ) -> Result<(), GenerationSyncError> {
-    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    let mut file = create_new_file(trusted_root, path)?;
     let result = (|| {
         let mut content_digest = Sha256::new();
         let mut offset = 0_u64;
@@ -2517,7 +2519,7 @@ fn write_verified_stream_with_sync(
     identity: &GenerationFileIdentity,
     sync: impl FnOnce(&File) -> std::io::Result<()>,
 ) -> Result<(), GenerationSyncError> {
-    let file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    let file = create_new_file(trusted_root, path)?;
     let result = write_verified_open_file_with_sync(file, reader, identity, sync);
     if result.is_err() {
         let _ = remove_path_durable(trusted_root, path);

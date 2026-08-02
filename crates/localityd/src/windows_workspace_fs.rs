@@ -42,6 +42,13 @@ const DIRECTORY_ACCESS: u32 = FILE_LIST_DIRECTORY
     | FILE_ADD_SUBDIRECTORY
     | DELETE
     | SYNCHRONIZE;
+const MUTATION_DIRECTORY_ACCESS: u32 = FILE_LIST_DIRECTORY
+    | FILE_TRAVERSE
+    | FILE_READ_ATTRIBUTES
+    | FILE_WRITE_ATTRIBUTES
+    | FILE_ADD_FILE
+    | FILE_ADD_SUBDIRECTORY
+    | SYNCHRONIZE;
 const READ_DIRECTORY_ACCESS: u32 =
     FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const SYNC_DIRECTORY_ACCESS: u32 = FILE_LIST_DIRECTORY
@@ -111,11 +118,38 @@ impl WindowsDirectory {
         Ok(Self { handle })
     }
 
+    pub(crate) fn open_absolute_mutation_anchor(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .access_mode(MUTATION_DIRECTORY_ACCESS)
+            .share_mode(ANCHOR_SHARING)
+            .custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS
+                    | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+            .open(path)?;
+        let handle: OwnedHandle = file.into();
+        reject_reparse(&handle)?;
+        Ok(Self { handle })
+    }
+
     pub(crate) fn open_directory_anchor(&self, name: &OsStr) -> io::Result<Self> {
         let handle = nt_open_relative(
             &self.handle,
             name,
             READ_DIRECTORY_ACCESS,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE,
+            ANCHOR_SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(Self { handle })
+    }
+
+    pub(crate) fn open_directory_mutation_anchor(&self, name: &OsStr) -> io::Result<Self> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            MUTATION_DIRECTORY_ACCESS,
             FILE_OPEN,
             FILE_DIRECTORY_FILE,
             ANCHOR_SHARING,
@@ -201,6 +235,19 @@ impl WindowsDirectory {
             FILE_CREATE,
             FILE_DIRECTORY_FILE,
             SHARING,
+        )?;
+        reject_reparse(&handle)?;
+        Ok(Self { handle })
+    }
+
+    pub(crate) fn create_directory_anchored(&self, name: &OsStr) -> io::Result<Self> {
+        let handle = nt_open_relative(
+            &self.handle,
+            name,
+            MUTATION_DIRECTORY_ACCESS,
+            FILE_CREATE,
+            FILE_DIRECTORY_FILE,
+            ANCHOR_SHARING,
         )?;
         reject_reparse(&handle)?;
         Ok(Self { handle })
@@ -1125,6 +1172,9 @@ mod lock_tests {
             READ_DIRECTORY_ACCESS & (FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES),
             0
         );
+        assert_eq!(MUTATION_DIRECTORY_ACCESS & DELETE, 0);
+        assert_ne!(MUTATION_DIRECTORY_ACCESS & FILE_ADD_FILE, 0);
+        assert_ne!(MUTATION_DIRECTORY_ACCESS & FILE_ADD_SUBDIRECTORY, 0);
     }
 
     #[test]
