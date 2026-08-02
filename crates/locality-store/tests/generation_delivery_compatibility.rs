@@ -1,15 +1,18 @@
 use locality_core::model::MountId;
+use locality_core::portable::{SourceConnectionId, SourceGenerationId};
 use locality_protocol::freshness_delivery::{
     GENERATION_DELTA_RECEIPT_V1_GOLDEN_JSON, GENERATION_DELTA_V1_GOLDEN_JSON, GenerationDelta,
     GenerationDeltaTerminalReceipt,
 };
 use locality_protocol::freshness_delivery_transport::GenerationTransportCapabilities;
+use locality_protocol::generation_baseline::GenerationBaselineRefreshModeV1;
 use locality_store::{
     GenerationApplyJournalRecord, GenerationApplyOutcome, GenerationApplyStatus,
-    GenerationDeliveryRepository, GenerationInodeEvidenceConflictUpdate,
-    GenerationInodeEvidenceRecord, GenerationInodeEvidenceResolution, GenerationPathRecord,
-    ObservedGenerationRecord, PreparedGenerationApply, PreparedGenerationApplyV2,
-    PreparedGenerationApplyV3, StoreError, StoreResult,
+    GenerationBaselineSeedRecord, GenerationBaselineSeedRecordV2, GenerationDeliveryRepository,
+    GenerationInodeEvidenceConflictUpdate, GenerationInodeEvidenceRecord,
+    GenerationInodeEvidenceResolution, GenerationPathRecord, ObservedGenerationRecord,
+    PreparedGenerationApply, PreparedGenerationApplyV2, PreparedGenerationApplyV3, StoreError,
+    StoreResult,
 };
 
 struct LegacyGenerationRepository;
@@ -157,6 +160,77 @@ fn original_repository_implementation_uses_safe_additive_defaults() {
             .unwrap()
             .is_empty()
     );
+    assert!(
+        repository
+            .list_pending_generation_acknowledgments_for_source(
+                &MountId::new("legacy-mount"),
+                &SourceConnectionId::new("legacy-source"),
+            )
+            .unwrap()
+            .is_empty()
+    );
+    let error = repository
+        .seed_observed_generations(vec![
+            GenerationBaselineSeedRecord::new(
+                ObservedGenerationRecord {
+                    mount_id: MountId::new("legacy-mount"),
+                    source_connection_id: SourceConnectionId::new("source-a"),
+                    generation_id: SourceGenerationId::new("generation-a").unwrap(),
+                    inventory_sha256:
+                        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .to_string(),
+                    workspace_layout_version: 1,
+                    workspace_layout_digest:
+                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            .to_string(),
+                    last_receipt_sha256: None,
+                    updated_at: "2026-08-02T00:00:00Z".to_string(),
+                },
+                Vec::new(),
+            ),
+            GenerationBaselineSeedRecord::new(
+                ObservedGenerationRecord {
+                    mount_id: MountId::new("legacy-mount"),
+                    source_connection_id: SourceConnectionId::new("source-b"),
+                    generation_id: SourceGenerationId::new("generation-b").unwrap(),
+                    inventory_sha256:
+                        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                            .to_string(),
+                    workspace_layout_version: 1,
+                    workspace_layout_digest:
+                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            .to_string(),
+                    last_receipt_sha256: None,
+                    updated_at: "2026-08-02T00:00:00Z".to_string(),
+                },
+                Vec::new(),
+            ),
+        ])
+        .expect_err("legacy repository must reject a non-atomic multi-source seed");
+    assert!(matches!(error, StoreError::InvalidState(_)));
+    let error = repository
+        .seed_observed_generations_v2(vec![GenerationBaselineSeedRecordV2::new(
+            GenerationBaselineSeedRecord::new(
+                ObservedGenerationRecord {
+                    mount_id: MountId::new("legacy-mount"),
+                    source_connection_id: SourceConnectionId::new("source-full"),
+                    generation_id: SourceGenerationId::new("generation-full").unwrap(),
+                    inventory_sha256:
+                        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                            .to_string(),
+                    workspace_layout_version: 1,
+                    workspace_layout_digest:
+                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            .to_string(),
+                    last_receipt_sha256: None,
+                    updated_at: "2026-08-02T00:00:00Z".to_string(),
+                },
+                Vec::new(),
+            ),
+            GenerationBaselineRefreshModeV1::FullExportOnly,
+        )])
+        .expect_err("legacy repository must not silently store an unsupported refresh route");
+    assert!(matches!(error, StoreError::InvalidState(_)));
 
     let delta: GenerationDelta = serde_json::from_slice(GENERATION_DELTA_V1_GOLDEN_JSON).unwrap();
     let receipt: GenerationDeltaTerminalReceipt =

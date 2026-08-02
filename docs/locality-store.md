@@ -80,6 +80,11 @@
   journals permit only exact terminal replay and preserve only their recorded
   acknowledgment requirement. Prerelease v26 rows are bound only when their
   stored body-window or pin data proves the complete selection.
+- Generation-delivery component v7 keys observed heads by mount/source, stores
+  the typed baseline refresh mode, and permits only one active apply per mount.
+  V6 rows become delta-capable only when their durable identifiers and file
+  facts satisfy the V1 ceilings; otherwise they are retained as
+  `full_export_only` for explicit full-export routing.
 - SQLite records component versions for durable subsystems so compatibility is
   decided from persisted state contracts instead of desktop build IDs.
 - SQLite enables WAL mode, a busy timeout, foreign keys, and `PRAGMA user_version` schema versioning.
