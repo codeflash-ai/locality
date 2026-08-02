@@ -17631,6 +17631,13 @@ mod tests {
             drop(cleanup);
             drop(store);
 
+            // Another parallel test may expose a process-wide TCP daemon. If
+            // that daemon answers this fixture's readiness probe, retain an
+            // unambiguous synthetic manager identity for the recovery test.
+            let daemon_paths = super::DaemonProcessPaths::new(temp.path().to_path_buf());
+            fs::write(&daemon_paths.pid_file, std::process::id().to_string())
+                .expect("record synthetic session daemon manager");
+
             let ownership = super::persist_daemon_remount_fence(temp.path(), &mount_id)
                 .expect("hold remount ownership");
             let mut runtime = super::DesktopQuiescedRemountRuntime {
