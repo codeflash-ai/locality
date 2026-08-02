@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod diff;
 pub mod doctor;
 pub mod file_provider;
+pub mod generation_http;
 pub mod history;
 pub mod info;
 pub mod inspect;
