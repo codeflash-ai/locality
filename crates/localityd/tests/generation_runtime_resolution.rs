@@ -11,12 +11,9 @@ const CREDENTIAL_REF: &str = "workspace-session:test-profile";
 #[test]
 fn runtime_reference_resolves_the_session_credential_on_each_call() {
     let credentials = InMemoryCredentialStore::new();
-    let mut session_fixture: serde_json::Value =
-        serde_json::from_slice(WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON)
-            .expect("session fixture JSON");
-    session_fixture["session_id"] = serde_json::json!("018f4f6e-7b8c-7d9e-8f01-23456789abcd");
-    let encoded_session = serde_json::to_string(&session_fixture).expect("encoded session fixture");
-    let session = WorkspaceProfileSessionV2::decode_json(encoded_session.as_bytes())
+    let encoded_session = std::str::from_utf8(WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON)
+        .expect("session fixture UTF-8");
+    let session = WorkspaceProfileSessionV2::decode_json(WORKSPACE_PROFILE_SESSION_V2_GOLDEN_JSON)
         .expect("session fixture");
     credentials
         .put(CREDENTIAL_REF, &encoded_session)
@@ -54,4 +51,18 @@ fn runtime_reference_reports_missing_and_empty_credential_references() {
         GenerationHttpRuntimeReference::new("https://locality.example", "").unwrap_err(),
         GenerationHttpRuntimeResolutionError::EmptyCredentialReference
     );
+}
+
+#[test]
+fn runtime_reference_rejects_sensitive_base_urls_before_it_can_be_retained() {
+    for base_url in [
+        "https://user:reference-secret@locality.example",
+        "https://locality.example?token=reference-secret",
+        "https://locality.example/#reference-secret",
+    ] {
+        let error = GenerationHttpRuntimeReference::new(base_url, CREDENTIAL_REF)
+            .expect_err("sensitive base URL");
+        let diagnostics = format!("{error:?} {error}");
+        assert!(!diagnostics.contains("reference-secret"));
+    }
 }

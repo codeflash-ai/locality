@@ -307,6 +307,7 @@ impl GenerationHttpRuntimeReference {
         if session_credential_ref.is_empty() {
             return Err(GenerationHttpRuntimeResolutionError::EmptyCredentialReference);
         }
+        parse_base_url(&base_url).map_err(GenerationHttpRuntimeResolutionError::Http)?;
         Ok(Self {
             base_url,
             session_credential_ref,
@@ -618,9 +619,9 @@ impl GenerationHttpTransport {
         validate_options(options)?;
         let base_url = parse_base_url(base_url)?;
         let session_id = session_id.into();
-        if !is_canonical_route_uuid(&session_id) {
+        if !is_route_safe_opaque_segment(&session_id) {
             return Err(GenerationHttpError::InvalidConfiguration(
-                "session ID must be a canonical lowercase hyphenated non-nil UUID",
+                "session ID must be a non-empty opaque route segment",
             ));
         }
         let session_secret = session_secret.into();
@@ -1107,11 +1108,15 @@ fn is_canonical_route_uuid(value: &str) -> bool {
 fn require_route_safe_opaque_segment(value: &str) -> Result<(), GenerationHttpError> {
     // `url` follows the URL standard and normalizes these two exact path
     // segments, so accepting either would silently change the opaque route ID.
-    if matches!(value, "." | "..") {
+    if !is_route_safe_opaque_segment(value) {
         Err(GenerationHttpError::InvalidBaselineContext)
     } else {
         Ok(())
     }
+}
+
+fn is_route_safe_opaque_segment(value: &str) -> bool {
+    !value.is_empty() && !matches!(value, "." | "..")
 }
 
 fn validate_request_delta_id(delta_id: &str) -> Result<(), GenerationHttpError> {
