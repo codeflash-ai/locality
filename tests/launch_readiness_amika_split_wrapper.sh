@@ -45,10 +45,27 @@ for arg in "$@"; do
 done
 printf '\n' >> "$FAKE_AMIKA_LOG"
 
-if [ "${1:-}" != "sandbox" ] || [ "${2:-}" != "ssh" ]; then
+if [ "${1:-}" != "sandbox" ]; then
   printf 'unexpected fake amika command: %s\n' "$*" >&2
   exit 2
 fi
+
+case "${2:-}" in
+  list)
+    printf '[{"name":"aseem-locality","state":"stopped"},{"name":"aseem-mcp","state":"stopped"},{"name":"custom-locality","state":"started"},{"name":"custom-mcp","state":"started"}]\n'
+    exit 0
+    ;;
+  start)
+    shift 2
+    exit 0
+    ;;
+  ssh)
+    ;;
+  *)
+    printf 'unexpected fake amika command: %s\n' "$*" >&2
+    exit 2
+    ;;
+esac
 
 if [ "${3:-}" = "--print" ]; then
   printf 'fake-user@fake-host-%s\n' "${4:-missing}"
@@ -111,6 +128,8 @@ assert_contains "$run_default_out/run.env" "sync_artifacts=0"
 assert_contains "$run_default_out/run.env" "strategy_execution=parallel"
 assert_contains "$run_default_out/artifacts.tsv" "locality"$'\t'"aseem-locality"
 assert_contains "$run_default_out/artifacts.tsv" "notion-mcp"$'\t'"aseem-mcp"
+assert_contains "$fake_log" "amika sandbox list -o json"
+assert_contains "$fake_log" "amika sandbox start aseem-locality aseem-mcp"
 test -f "$concurrency_dir/locality.overlapped" || fail "Locality launch did not overlap MCP launch"
 test -f "$concurrency_dir/notion-mcp.overlapped" || fail "MCP launch did not overlap Locality launch"
 

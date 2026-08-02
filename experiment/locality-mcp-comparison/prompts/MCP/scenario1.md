@@ -1,6 +1,6 @@
-Generate a concise, accurate launch-readiness report for `Locality` from the local git checkout at `~/workspace/locality` plus Notion information.
+Generate a concise, accurate launch-readiness report for `Locality` from the local git checkout at `{{SANDBOX_HOME}}/workspace/locality` plus Notion information.
 
-Write the final Markdown report to `/home/ubuntu/final_report.md`. Do not create a new notion page or modify existing notion pages.
+Write the final Markdown report to `{{AGENT_REPORT_PATH}}`. Do not create a new notion page or modify existing notion pages.
 
 Report format:
 

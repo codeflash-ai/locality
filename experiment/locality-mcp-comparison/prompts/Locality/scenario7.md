@@ -8,7 +8,7 @@ action should be.
 
 Do not use direct Notion/Linear/Slack APIs or browser automation in this run. Do not create a new notion page or modify existing notion pages.
 
-Write the final Markdown report to `/home/ubuntu/final_report.md`.
+Write the final Markdown report to `{{AGENT_REPORT_PATH}}`.
 
 Report format:
 

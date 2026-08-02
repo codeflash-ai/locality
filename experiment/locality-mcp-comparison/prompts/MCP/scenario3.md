@@ -1,13 +1,13 @@
-We are considering whether Locality is ready for a broader launch. Review recent engineering work from `~/workspace/locality` and relevant notion context, then draft a launch-readiness assessment with evidence, risks, blockers, and the next validation steps. Do not publish it remotely.
+We are considering whether Locality is ready for a broader launch. Review recent engineering work from `{{SANDBOX_HOME}}/workspace/locality` and relevant notion context, then draft a launch-readiness assessment with evidence, risks, blockers, and the next validation steps. Do not publish it remotely.
 
 Use the Notion MCP server you have access to for launch/readiness context, and
-use the codebase at `~/workspace/locality` for repository evidence.
+use the codebase at `{{SANDBOX_HOME}}/workspace/locality` for repository evidence.
 
 Do not use direct non-MCP Notion APIs or browser automation in this run. Do not
-read mounted Locality files under `~/Locality`. Do not create a new notion page
+read mounted Locality files under `{{SANDBOX_HOME}}/Locality`. Do not create a new notion page
 or modify existing notion pages.
 
-Write the final Markdown report to `/home/ubuntu/final_report.md`.
+Write the final Markdown report to `{{AGENT_REPORT_PATH}}`.
 
 Report format:
 

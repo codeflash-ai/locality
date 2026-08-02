@@ -1,13 +1,13 @@
-You are preparing a launch gate memo for Locality. Find the relevant project context and recent code changes at `~/workspace/locality`, decide what is actually proven, what is still unverified, and what should block launch. Produce a concise Markdown memo.
+You are preparing a launch gate memo for Locality. Find the relevant project context and recent code changes at `{{SANDBOX_HOME}}/workspace/locality`, decide what is actually proven, what is still unverified, and what should block launch. Produce a concise Markdown memo.
 
 Use the Notion MCP server you have access to for project and launch context, and
-use the codebase at `~/workspace/locality` for repository evidence.
+use the codebase at `{{SANDBOX_HOME}}/workspace/locality` for repository evidence.
 
 Do not use direct non-MCP Notion APIs or browser automation in this run. Do not
-read mounted Locality files under `~/Locality`. Do not create a new notion page
+read mounted Locality files under `{{SANDBOX_HOME}}/Locality`. Do not create a new notion page
 or modify existing notion pages.
 
-Write the final Markdown report to `/home/ubuntu/final_report.md`.
+Write the final Markdown report to `{{AGENT_REPORT_PATH}}`.
 
 Report format:
 

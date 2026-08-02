@@ -2,15 +2,15 @@ Find launch or product decisions that appear in Slack but are not clearly
 captured in Linear or Notion. Identify the source-of-truth gaps that could cause
 the team to miss work, duplicate work, or make a stale launch decision.
 
-Use the filesystem at `~/Locality` for Slack, Linear, and Notion context. Use the
-codebase at `~/workspace/locality` only if repository evidence is needed to
+Use the filesystem at `{{SANDBOX_HOME}}/Locality` for Slack, Linear, and Notion context. Use the
+codebase at `{{SANDBOX_HOME}}/workspace/locality` only if repository evidence is needed to
 confirm whether a decision was implemented.
 
 Do not use Notion MCP, Linear MCP, Slack MCP, direct Notion/Linear/Slack APIs, or
 browser automation in this run. Do not create docs, post messages, close issues,
 push changes, or update any remote source.
 
-Write the final Markdown report to `/home/ubuntu/final_report.md`.
+Write the final Markdown report to `{{AGENT_REPORT_PATH}}`.
 
 Report format:
 

@@ -7,14 +7,14 @@ Slack, Linear, GitHub work, or Notion docs, and what the safest next engineering
 action should be.
 
 Use the Slack, Linear, and Notion MCP servers you have access to for remote
-evidence, and use the codebase at `~/workspace/locality` for implementation and
+evidence, and use the codebase at `{{SANDBOX_HOME}}/workspace/locality` for implementation and
 test evidence.
 
 Do not use direct non-MCP Notion/Linear/Slack APIs or browser automation in this
-run. Do not read mounted Locality files under `~/Locality`. Do not create a new
+run. Do not read mounted Locality files under `{{SANDBOX_HOME}}/Locality`. Do not create a new
 notion page or modify existing notion pages.
 
-Write the final Markdown report to `/home/ubuntu/final_report.md`.
+Write the final Markdown report to `{{AGENT_REPORT_PATH}}`.
 
 Report format:
 

@@ -200,10 +200,12 @@ prompts/MCP/scenario2.md
 ```
 
 Every Locality scenario must have a matching MCP prompt with the same basename
-when the `notion-mcp` strategy runs. The simplified prompts write their final
-Markdown report to `/home/amika/final_report.md`. The runner copies that file
-into the scenario artifacts as `report-body.md` for Locality and
-`notion-mcp-report-body.md` for MCP.
+when the `notion-mcp` strategy runs. Scenario prompts may use
+`{{SANDBOX_HOME}}` for sandbox-home paths and `{{AGENT_REPORT_PATH}}` for the
+final report path. The runner renders those placeholders for the active sandbox
+before passing the prompt to Codex, then copies the report into the scenario
+artifacts as `report-body.md` for Locality and `notion-mcp-report-body.md` for
+MCP.
 
 The runner also sets `OUT_DIR`, `REPORT_FILE`, `TRACE_FILE`,
 `LOCALITY_CONTEXT_PATHS_FILE`, `LOCALITY_CONTEXT_INVENTORY`,

@@ -9,20 +9,22 @@ Runs the artifact-only Locality vs MCP benchmark from paired prompt files:
   prompts/Locality/*.md
   prompts/MCP/*.md
 
-The simplified prompts write their report to /home/ubuntu/final_report.md.
+The simplified prompts write their report to AGENT_REPORT_PATH.
 This runner copies that file into the scenario artifact directory as:
   - report-body.md for Locality
   - notion-mcp-report-body.md for MCP
 
 Important environment:
-  REPO_DIR                 Repository path. Default: /home/ubuntu/workspace/locality
+  SANDBOX_HOME             Remote sandbox home used when rendering prompts.
+                           Default: $HOME
+  REPO_DIR                 Repository path. Default: $SANDBOX_HOME/workspace/locality
   LOC_BIN                  installed loc binary for Locality runs.
                            Default: loc found on PATH. No source-build fallback.
   PROMPT_ROOT              Prompt root. Default: <script-dir>/prompts
   LOCALITY_PROMPT_DIR      Default: $PROMPT_ROOT/Locality
   MCP_PROMPT_DIR           Default: $PROMPT_ROOT/MCP
   LOCALITY_CONTEXT_DIRS    Newline-delimited or colon-delimited mounted Locality roots.
-                           If unset, existing /home/ubuntu/Locality/{notion,slack,linear}
+                           If unset, existing $SANDBOX_HOME/Locality/{notion,slack,linear}
                            and legacy roots are added when present.
   CODEX_MODEL              Default: gpt-5.6-sol
   CODEX_REASONING_EFFORT   Default: low
@@ -33,7 +35,7 @@ Important environment:
                            Delete Codex rollout/session history after each
                            scenario to keep sandbox disk usage bounded.
                            Default: 1.
-  AGENT_REPORT_PATH        Agent-written report path. Default: /home/ubuntu/final_report.md
+  AGENT_REPORT_PATH        Agent-written report path. Default: $SANDBOX_HOME/final_report.md
   LINEAR_API_KEY           Required for MCP strategy.
   NOTION_API_TOKEN         Required for MCP strategy. NOTION_TOKEN and
                            NOTION_ACCESS_TOKEN are accepted aliases.
@@ -88,7 +90,11 @@ case "$RUN_STRATEGY" in
 esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="${REPO_DIR:-/home/ubuntu/workspace/locality}"
+SANDBOX_HOME="${SANDBOX_HOME:-$HOME}"
+if [ "$SANDBOX_HOME" != "/" ]; then
+  SANDBOX_HOME="${SANDBOX_HOME%/}"
+fi
+REPO_DIR="${REPO_DIR:-$SANDBOX_HOME/workspace/locality}"
 LOC_BIN="${LOC_BIN:-$(command -v loc 2>/dev/null || true)}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT_DIR="${OUT_DIR:-$REPO_DIR/experiment/runs/$RUN_ID}"
@@ -100,7 +106,7 @@ CODEX_REASONING_EFFORT="${CODEX_REASONING_EFFORT:-low}"
 CODEX_HOOKS_MODE="${CODEX_HOOKS_MODE:-hooks}"
 CODEX_EXEC_TIMEOUT_SECONDS="${CODEX_EXEC_TIMEOUT_SECONDS:-900}"
 CLEAN_CODEX_SESSION_STATE="${CLEAN_CODEX_SESSION_STATE:-1}"
-AGENT_REPORT_PATH="${AGENT_REPORT_PATH:-/home/ubuntu/final_report.md}"
+AGENT_REPORT_PATH="${AGENT_REPORT_PATH:-$SANDBOX_HOME/final_report.md}"
 LOCALITY_CONTEXT_DIRS="${LOCALITY_CONTEXT_DIRS:-${LOCALITY_CONTEXT_ROOTS:-}}"
 BASE_CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 CODEX_STRATEGY_ROOT="${CODEX_STRATEGY_ROOT:-$OUT_DIR/codex}"
@@ -500,6 +506,30 @@ scenario_name_for_file() {
   printf '%s\n' "${1%.md}"
 }
 
+render_prompt() {
+  local prompt_file="$1"
+  SANDBOX_HOME="$SANDBOX_HOME" AGENT_REPORT_PATH="$AGENT_REPORT_PATH" python3 - "$prompt_file" <<'PY'
+import os
+import re
+import sys
+from pathlib import Path
+
+prompt_file = Path(sys.argv[1])
+sandbox_home = os.environ["SANDBOX_HOME"].rstrip("/") or "/"
+agent_report_path = os.environ["AGENT_REPORT_PATH"]
+text = prompt_file.read_text(encoding="utf-8")
+
+text = text.replace("{{SANDBOX_HOME}}", sandbox_home)
+text = text.replace("{{AGENT_REPORT_PATH}}", agent_report_path)
+for user in ("ubuntu", "amika"):
+    text = text.replace(f"/home/{user}/final_report.md", agent_report_path)
+text = re.sub(r"/home/(?:ubuntu|amika)(?=/|`|\s|$)", sandbox_home, text)
+text = text.replace("~/", f"{sandbox_home}/")
+
+sys.stdout.write(text)
+PY
+}
+
 append_context_paths_from_var() {
   local raw="$1"
   if [ -z "$raw" ]; then
@@ -528,16 +558,17 @@ prepare_locality_context_files() {
     append_context_paths_from_var "$LOCALITY_CONTEXT_DIRS"
   else
     local dir
+    local context_home="$SANDBOX_HOME"
     for dir in \
-      "$HOME/Locality/notion" \
-      "$HOME/Locality/slack" \
-      "$HOME/Locality/linear" \
-      "$HOME/Locality/Notion" \
-      "$HOME/Locality/Slack" \
-      "$HOME/Locality/Linear" \
-      "$HOME/notion" \
-      "$HOME/slack" \
-      "$HOME/linear"; do
+      "$context_home/Locality/notion" \
+      "$context_home/Locality/slack" \
+      "$context_home/Locality/linear" \
+      "$context_home/Locality/Notion" \
+      "$context_home/Locality/Slack" \
+      "$context_home/Locality/Linear" \
+      "$context_home/notion" \
+      "$context_home/slack" \
+      "$context_home/linear"; do
       [ -d "$dir" ] && printf '%s\n' "$dir" >> "$CONTEXT_PATHS_FILE"
     done
   fi
@@ -588,8 +619,8 @@ run_codex_agent() {
   local prompt_snapshot="$scenario_out_dir/$strategy-prompt.md"
 
   codex_home="$(codex_home_for_strategy "$strategy")"
-  prompt="$(cat "$prompt_file")"
-  cp "$prompt_file" "$prompt_snapshot"
+  prompt="$(render_prompt "$prompt_file")"
+  printf '%s' "$prompt" > "$prompt_snapshot"
   rm -f "$AGENT_REPORT_PATH" "$report_file" "$trace_file" "$final_file"
   : > "$hook_events_file"
   rm -f "$hook_state_file"
@@ -629,6 +660,7 @@ run_codex_agent() {
   {
     printf 'timeout_seconds=%s\n' "$CODEX_EXEC_TIMEOUT_SECONDS"
     printf 'codex_home=%s\n' "$codex_home"
+    printf 'sandbox_home=%s\n' "$SANDBOX_HOME"
     printf 'hooks_mode=%s\n' "$CODEX_HOOKS_MODE"
     printf 'report_source=%s\n' "$AGENT_REPORT_PATH"
     printf 'report_file=%s\n' "$report_file"
@@ -646,6 +678,7 @@ run_codex_agent() {
   set -o pipefail
   if [ "$CODEX_HOOKS_MODE" = "hooks" ]; then
     CODEX_HOME="$codex_home" \
+      SANDBOX_HOME="$SANDBOX_HOME" \
       OUT_DIR="$scenario_out_dir" \
       REPORT_FILE="$AGENT_REPORT_PATH" \
       TRACE_FILE="$trace_file" \
@@ -660,6 +693,7 @@ run_codex_agent() {
       "${run_cmd[@]}" < /dev/null 2> "$err_file" | python3 "$SCRIPT_DIR/scripts/timestamp-jsonl.py" > "$raw_events_file"
   else
     CODEX_HOME="$codex_home" \
+      SANDBOX_HOME="$SANDBOX_HOME" \
       OUT_DIR="$scenario_out_dir" \
       REPORT_FILE="$AGENT_REPORT_PATH" \
       TRACE_FILE="$trace_file" \

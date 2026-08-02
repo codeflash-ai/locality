@@ -3,13 +3,13 @@ Slack discussions, Linear issues, and Notion launch/readiness docs. Focus on ris
 that are still actionable, not historical noise.
 
 Use the Slack, Linear, and Notion MCP servers you have access to, and use the
-codebase at `~/workspace/locality` only when code evidence is needed.
+codebase at `{{SANDBOX_HOME}}/workspace/locality` only when code evidence is needed.
 
 Do not use direct Notion/Linear/Slack APIs or browser automation in this run. Do
-not read mounted Locality files under `~/Locality`. Do not create docs, post
+not read mounted Locality files under `{{SANDBOX_HOME}}/Locality`. Do not create docs, post
 messages, close issues, push changes, or update any remote source.
 
-Write the final Markdown report to `/home/ubuntu/final_report.md`.
+Write the final Markdown report to `{{AGENT_REPORT_PATH}}`.
 
 Report format:
 

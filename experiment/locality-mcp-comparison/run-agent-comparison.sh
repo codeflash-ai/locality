@@ -13,8 +13,9 @@ Defaults:
   LOCALITY_SANDBOX=aseem-locality
   MCP_SANDBOX=aseem-mcp
   LOCAL_OUT_DIR=target/launch-readiness-amika/<UTC_RUN_ID>/
-  REMOTE_SOURCE_REPO=/home/ubuntu/workspace/locality
-  REMOTE_WORKTREE=/home/ubuntu/workspace/locality-launch-readiness-<UTC_RUN_ID>
+  REMOTE_HOME=/home/amika
+  REMOTE_SOURCE_REPO=/home/amika/workspace/locality
+  REMOTE_WORKTREE=/home/amika/workspace/locality-launch-readiness-<UTC_RUN_ID>
   LOCALITY_REMOTE_OUT_DIR=<REMOTE_WORKTREE>/target/launch-readiness-<UTC_RUN_ID>-locality
   MCP_REMOTE_OUT_DIR=<REMOTE_WORKTREE>/target/launch-readiness-<UTC_RUN_ID>-mcp
 
@@ -24,6 +25,9 @@ Environment:
   MCP_SANDBOX                    Label or Amika sandbox for MCP runs.
   LOCAL_OUT_DIR or OUT_DIR       Local metadata/log output directory.
   REMOTE_SOURCE_REPO             Existing git checkout inside each sandbox.
+  REMOTE_HOME                    Home directory inside each sandbox.
+                                  Default: /home/amika for REMOTE_PROVIDER=amika,
+                                  /home/ubuntu for REMOTE_PROVIDER=ssh.
   REMOTE_WORKTREE_ROOT           Parent for clean detached benchmark worktrees.
   REMOTE_WORKTREE                Exact clean detached worktree path.
   REMOTE_LOC_BIN                 installed loc binary in the Locality sandbox.
@@ -45,7 +49,7 @@ Environment:
   CODEX_HOOKS_MODE               Passed through to the benchmark worker.
   AZURE_OPENAI_API_KEY           Forwarded to remote Codex when set locally.
   AZURE_OPENAI_BASE_URL          Forwarded to remote Codex when set locally.
-  AGENT_REPORT_PATH              Agent report path. Default: /home/ubuntu/final_report.md.
+  AGENT_REPORT_PATH              Agent report path. Default: $REMOTE_HOME/final_report.md.
   LOCALITY_CONTEXT_DIRS          Prehydrated Locality roots for the Locality worker.
   LOCALITY_CONTEXT_ROOTS         Alias accepted by the worker.
   LINEAR_API_KEY                 MCP credential forwarded when set.
@@ -73,12 +77,22 @@ RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 
 LOCALITY_SANDBOX="${LOCALITY_SANDBOX:-aseem-locality}"
 MCP_SANDBOX="${MCP_SANDBOX:-aseem-mcp}"
-REMOTE_SOURCE_REPO="${REMOTE_SOURCE_REPO:-/home/ubuntu/workspace/locality}"
-REMOTE_WORKTREE_ROOT="${REMOTE_WORKTREE_ROOT:-/home/ubuntu/workspace}"
+REMOTE_PROVIDER="${REMOTE_PROVIDER:-amika}"
+REMOTE_HOME="${REMOTE_HOME:-}"
+if [ -z "$REMOTE_HOME" ]; then
+  case "$REMOTE_PROVIDER" in
+    amika) REMOTE_HOME="/home/amika" ;;
+    *) REMOTE_HOME="/home/ubuntu" ;;
+  esac
+fi
+if [ "$REMOTE_HOME" != "/" ]; then
+  REMOTE_HOME="${REMOTE_HOME%/}"
+fi
+REMOTE_SOURCE_REPO="${REMOTE_SOURCE_REPO:-$REMOTE_HOME/workspace/locality}"
+REMOTE_WORKTREE_ROOT="${REMOTE_WORKTREE_ROOT:-$REMOTE_HOME/workspace}"
 REMOTE_WORKTREE="${REMOTE_WORKTREE:-$REMOTE_WORKTREE_ROOT/locality-launch-readiness-$RUN_ID}"
 BENCHMARK_REF="${BENCHMARK_REF:-origin/main}"
 REMOTE_LOC_BIN="${REMOTE_LOC_BIN:-/usr/bin/loc}"
-REMOTE_PROVIDER="${REMOTE_PROVIDER:-amika}"
 AMIKA_SSH_FORCE_TTY="${AMIKA_SSH_FORCE_TTY:-0}"
 LOCALITY_SSH_TARGET="${LOCALITY_SSH_TARGET:-}"
 MCP_SSH_TARGET="${MCP_SSH_TARGET:-}"
@@ -254,6 +268,7 @@ forwarded_worker_env_b64() {
   local name
   local names=(
     AGENT_REPORT_PATH
+    SANDBOX_HOME
     CODEX_HOOKS_MODE
     AZURE_OPENAI_API_KEY
     AZURE_OPENAI_BASE_URL
@@ -347,6 +362,48 @@ remote_ssh() {
     shift
   fi
   ssh "${SSH_ARGS[@]}" "$(remote_ssh_target "$sandbox")" "$@"
+}
+
+ensure_amika_sandboxes_started() {
+  [ "$REMOTE_PROVIDER" = "amika" ] || return 0
+
+  local states_json
+  states_json="$(amika sandbox list -o json)"
+
+  local to_start=()
+  local sandbox
+  local state
+  for sandbox in "$LOCALITY_SANDBOX" "$MCP_SANDBOX"; do
+    state="$(
+      SANDBOX_NAME="$sandbox" python3 -c '
+import json
+import os
+import sys
+
+name = os.environ["SANDBOX_NAME"]
+try:
+    sandboxes = json.load(sys.stdin)
+except json.JSONDecodeError as error:
+    raise SystemExit(f"could not parse amika sandbox list JSON: {error}")
+
+for sandbox in sandboxes:
+    if sandbox.get("name") == name:
+        print(sandbox.get("state", ""))
+        break
+' <<< "$states_json"
+    )"
+    if [ -z "$state" ]; then
+      echo "amika sandbox not found: $sandbox" >&2
+      return 2
+    fi
+    if [ "$state" != "started" ]; then
+      to_start+=("$sandbox")
+    fi
+  done
+
+  if [ "${#to_start[@]}" -gt 0 ]; then
+    amika sandbox start "${to_start[@]}"
+  fi
 }
 
 remote_rsync_ssh_command() {
@@ -684,7 +741,9 @@ export OUT_DIR="\$out_dir"
 export CODEX_MODEL="\$model"
 export CODEX_REASONING_EFFORT="\$effort"
 export CODEX_EXEC_TIMEOUT_SECONDS="\$timeout_seconds"
-export AGENT_REPORT_PATH="\${AGENT_REPORT_PATH:-/home/ubuntu/final_report.md}"
+sandbox_home="\${SANDBOX_HOME:-\$HOME}"
+export SANDBOX_HOME="\$sandbox_home"
+export AGENT_REPORT_PATH="\${AGENT_REPORT_PATH:-\$sandbox_home/final_report.md}"
 if [ "\$strategy" = "locality" ]; then
   export LOC_BIN="\${LOC_BIN:-\$loc_bin}"
 fi
@@ -788,7 +847,9 @@ export OUT_DIR="$out_dir"
 export CODEX_MODEL="$model"
 export CODEX_REASONING_EFFORT="$effort"
 export CODEX_EXEC_TIMEOUT_SECONDS="$timeout_seconds"
-export AGENT_REPORT_PATH="${AGENT_REPORT_PATH:-/home/ubuntu/final_report.md}"
+sandbox_home="${SANDBOX_HOME:-$HOME}"
+export SANDBOX_HOME="$sandbox_home"
+export AGENT_REPORT_PATH="${AGENT_REPORT_PATH:-$sandbox_home/final_report.md}"
 if [ "$strategy" = "locality" ]; then
   export LOC_BIN="${LOC_BIN:-$loc_bin}"
 fi
@@ -936,6 +997,7 @@ EOF
     printf 'mcp_ssh_target=%s\n' "$MCP_SSH_TARGET"
     printf 'ssh_options=%s\n' "$SSH_OPTIONS"
   fi
+  printf 'remote_home=%s\n' "$REMOTE_HOME"
   printf 'remote_source_repo=%s\n' "$REMOTE_SOURCE_REPO"
   printf 'remote_worktree=%s\n' "$REMOTE_WORKTREE"
   printf 'remote_loc_bin=%s\n' "$REMOTE_LOC_BIN"
@@ -957,6 +1019,7 @@ EOF
 } > "$LOCAL_OUT_DIR/run.env"
 
 load_mcp_credentials_from_zshrc
+ensure_amika_sandboxes_started
 write_artifacts_manifest
 
 echo "Launching Locality and MCP strategy pipelines in parallel"

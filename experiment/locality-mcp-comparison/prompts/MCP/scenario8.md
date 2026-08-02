@@ -3,12 +3,12 @@ around launch/release readiness, current engineering risks, open issues,
 recent GitHub activity, and team discussions. Give a practical release call:
 go, no-go, or go with named conditions.
 
-Use the MCP servers you have acces to and the codebase at `~/workspace/locality` to fulfil your task.
+Use the MCP servers you have acces to and the codebase at `{{SANDBOX_HOME}}/workspace/locality` to fulfil your task.
 
 Do not use direct Notion/Linear/Slack APIs, or browser automation in this run. Do not create a release, create docs, push
 changes, post messages, close issues, or update any remote source.
 
-Write the final Markdown report to `/home/ubuntu/final_report.md`.
+Write the final Markdown report to `{{AGENT_REPORT_PATH}}`.
 
 Report format:
 
